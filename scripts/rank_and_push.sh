@@ -73,6 +73,18 @@
 #   --keep-intermediates  retain qualifying_positions_72hr.csv (the >5 GB pass-1 intermediate) instead
 #                         of auto-pruning it after pass-2; useful for debugging the raw position set.
 #   Pure re-push:  --skip-discovery --skip-backfill --skip-rank --out-dir <prior run>
+#
+# Schema-two private-candidate lane (#588): a zero-argument production cycle whose
+# installed cache is already schema two, or whose .env sets PE_RANK_SCHEMA_TWO_CUTOVER=1
+# while it is still schema one, replaces Step 0 with: stage an immutable prior and a
+# private candidate beside the physical fixed file (cache-stage-v2) → migrate the
+# initial schema-one candidate once (cache-migrate-v2) → discover → activate →
+# collect complete activity for the union of current acquisition candidates and
+# retained histories (cache-populate-activity-v2 --fresh-generation) → payout →
+# cache-finalize-v2 → the existing cutover path (rank, targeted prices, re-finalize,
+# prepare-only publication, cache-activate, exact resume). Legacy backfill/events/
+# resolutions read retired tables and do not run in this lane. The lane is frozen
+# in the cycle configuration, so a resumed cycle keeps its lane.
 
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -409,6 +421,9 @@ validate_cycle_pointer() {
   printf '%s' "$cycle_dir"
 }
 
+# The schema-two candidate lane (#588) is a cycle property: chosen when the cycle
+# is created and read back from its frozen configuration on every resume.
+FRESH_LANE="0"
 if [[ "$PRODUCTION_CYCLE" == "1" ]]; then
   if [[ -e "$CYCLE_FILE" || -L "$CYCLE_FILE" ]]; then
     OUT_DIR="$(validate_cycle_pointer)" || exit $?
@@ -416,8 +431,21 @@ if [[ "$PRODUCTION_CYCLE" == "1" ]]; then
       echo "FATAL: resumed production cycle omitted its frozen cycle manifest" >&2
       exit 2
     }
+    FRESH_LANE="$("$PYTHON_BIN" -c 'import json, sys
+configuration = json.load(open(sys.argv[1], encoding="utf-8"))
+print(1 if configuration.get("cache_lane") == "fresh_v2" else 0)' "$OUT_DIR/cycle_configuration.json")"
     echo "RANK_AND_PUSH_CYCLE_RESUME=$OUT_DIR"
   else
+    INSTALLED_SCHEMA="$("$PYTHON_BIN" -c 'import sqlite3, sys
+with sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True) as connection:
+    print(int(connection.execute("PRAGMA user_version").fetchone()[0]))' "$DB")"
+    case "${PE_RANK_SCHEMA_TWO_CUTOVER:-0}" in
+      0|1|prepare) ;;
+      *) echo "FATAL: PE_RANK_SCHEMA_TWO_CUTOVER must be 0, 1, or prepare" >&2; exit 2;;
+    esac
+    if [[ "$INSTALLED_SCHEMA" == "2" || "${PE_RANK_SCHEMA_TWO_CUTOVER:-0}" != "0" ]]; then
+      FRESH_LANE="1"
+    fi
     PIPELINE_VERSIONS_TMP="data/eval-results/.pipeline_versions.$$.json"
     CYCLE_CONFIG_TMP="data/eval-results/.cycle_configuration.$$.json"
     CURRENT_CYCLE_TMP="data/eval-results/.cycle_manifest.$$.json"
@@ -425,7 +453,7 @@ if [[ "$PRODUCTION_CYCLE" == "1" ]]; then
     "$PYTHON_BIN" - "$CYCLE_CONFIG_TMP" \
       "$HALF_LIFE_DAYS" "$TTR_HOURS" "$PRICE_MIN" "$PRICE_MAX" "$FLOOR_TSTAT" \
       "$MIN_TRL" "$MIN_AVG_PER_MONTH" "$MIN_ACTIVE_MONTHS" "$LATENCY_SHIFT_SECS" \
-      "$FILL_WINDOW_SECS" "$TOP_N" <<'PY'
+      "$FILL_WINDOW_SECS" "$TOP_N" "$FRESH_LANE" <<'PY'
 import json
 import sys
 
@@ -434,8 +462,13 @@ keys = [
     "min_trl", "min_avg_per_month", "min_active_months", "latency_shift_secs",
     "fill_window_secs", "top_n",
 ]
+configuration = dict(zip(keys, sys.argv[2:-1], strict=True))
+# The lane is part of the daily watermark identity: switching lanes is a
+# configuration change, not an unchanged day. Legacy bytes stay identical.
+if sys.argv[-1] == "1":
+    configuration["cache_lane"] = "fresh_v2"
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
-    json.dump(dict(zip(keys, sys.argv[2:], strict=True)), handle, sort_keys=True)
+    json.dump(configuration, handle, sort_keys=True)
     handle.write("\n")
 PY
     CYCLE_DAY_UTC="$(date -u +%Y-%m-%d)"
@@ -470,8 +503,11 @@ echo "RANK_AND_PUSH_RUN_DIR=$OUT_DIR"
 
 CUTOVER_MODE="0"
 BEFORE_RANKING_JSON=""
-if [[ -n "$CACHE_STAGE_RECORD" ]]; then
-  CUTOVER_MODE="1"
+[[ -z "$CACHE_STAGE_RECORD" ]] || CUTOVER_MODE="1"
+
+# Validate the finalized candidate and snapshot the current publication. Runs
+# after Step 0 because the candidate lane finalizes its candidate there.
+require_cutover_inputs() {
   [[ -f "$CACHE_STAGE_RECORD" && ! -L "$CACHE_STAGE_RECORD" ]] || {
     echo "FATAL: --cache-stage-record must be a regular file" >&2; exit 2;
   }
@@ -495,7 +531,7 @@ PY
   BEFORE_RANKING_JSON="$OUT_DIR/before_ranking.json"
   "$PYTHON_BIN" scripts/push_ranking_to_supabase.py \
     --snapshot-current "$BEFORE_RANKING_JSON"
-fi
+}
 
 ACTIVATION_RUN_HASH="$("$PYTHON_BIN" -c \
   'import hashlib, os, sys; print(hashlib.sha256(os.path.realpath(os.path.abspath(sys.argv[1])).encode()).hexdigest()[:16])' \
@@ -666,10 +702,122 @@ refresh_data() {
   fi
 }
 
-if [[ "$CUTOVER_MODE" == "1" ]]; then
+# Schema-two private-candidate lane (#588). Every path is a Rust owner that
+# resumes from its own durable state; the wrapper only derives the cycle's
+# physical names and the two targets fixed by the immutable prior.
+stage_candidate_cache() {
+  "$PE_BOOTSTRAP_BIN" cache-stage-v2 --db "$FIXED_DB" --prior "$1" --side "$2" \
+    --manifest "$3" > "$4"
+}
+
+refresh_candidate_v2() {
+  echo "── Step 0: schema-two private candidate (stage → discover → activate → activity → payout → finalize) ──"
+  FIXED_DB="$(readlink -f -- "$DB" 2>/dev/null || true)"
+  [[ -n "$FIXED_DB" && -f "$FIXED_DB" && ! -L "$FIXED_DB" ]] || {
+    echo "FATAL: installed cache does not resolve to a regular file: $DB" >&2
+    exit 2
+  }
+  # The Rust lock owners derive the cache lock and the loop/run lock directory
+  # from the physical fixed path; both must be the repository inodes (docs/26).
+  local phys_dir
+  phys_dir="$(dirname -- "$FIXED_DB")"
+  local fixed_name
+  fixed_name="$(basename -- "$FIXED_DB")"
+  [[ "$(readlink -f -- "$phys_dir/eval-results" 2>/dev/null || true)" == "$(readlink -f -- data/eval-results)" ]] || {
+    echo "FATAL: $phys_dir/eval-results must resolve to data/eval-results" >&2
+    exit 2
+  }
+  [[ "$(readlink -f -- "$phys_dir/$fixed_name.lock" 2>/dev/null || true)" == "$(readlink -f -- "$(dirname -- "$DB")")/$(basename -- "$DB").lock" ]] || {
+    echo "FATAL: $phys_dir/$fixed_name.lock must resolve to $DB.lock" >&2
+    exit 2
+  }
+  local cycle_name
+  cycle_name="$(basename -- "$OUT_DIR")"
+  local side="$phys_dir/wallet_cache.$cycle_name.side.db"
+  local prior="$phys_dir/wallet_cache.$cycle_name.prior.db"
+  echo "RANK_AND_PUSH_CACHE_SIDE=$side"
+  echo "RANK_AND_PUSH_CACHE_PRIOR=$prior"
+  echo "RANK_AND_PUSH_CACHE_DISPLACED=$phys_dir/wallet_cache.$cycle_name.displaced.db"
+
+  local stage_json="$OUT_DIR/cache_stage.json"
+  local build_manifest="$OUT_DIR/cache_build_manifest.json"
+  run_refresh_stage "cache-stage" stage_candidate_cache "$prior" "$side" "$build_manifest" "$stage_json"
+  export PE_BOOTSTRAP_CACHE_PATH="$side"
+  local side_schema
+  side_schema="$("$PYTHON_BIN" -c 'import json, sys
+print(int(json.load(open(sys.argv[1], encoding="utf-8"))["side_schema"]))' "$stage_json")"
+  if [[ "$side_schema" != "2" ]]; then
+    # Initial schema-one candidate: seal it once against the hash-bound build
+    # manifest that staging wrote from the verified prior bytes. A sealed
+    # candidate records that manifest's hash itself and is not migrated again.
+    run_refresh_stage "cache-migrate" "$PE_BOOTSTRAP_BIN" cache-migrate-v2 --db "$side" \
+      --manifest "$build_manifest" "${BOOTSTRAP_CONFIG_ARGS[@]}"
+  fi
+
+  run_refresh_stage "winner-discovery" "$PE_BOOTSTRAP_BIN" winner-discovery --defer-activation "${BOOTSTRAP_CONFIG_ARGS[@]}"
+  run_refresh_stage "activate-next" "$PE_BOOTSTRAP_BIN" activate-next \
+    --batch-id "$ACTIVATION_BATCH_ID" --audit-csv "$ACTIVATION_AUDIT_CSV" \
+    "${BOOTSTRAP_CONFIG_ARGS[@]}"
+
+  # Both targets are fixed by the immutable prior, so a retry requests the same
+  # generation and the same payout walk; a walk already completed on the
+  # candidate is reused rather than restarted.
+  local -a targets=()
+  mapfile -t targets < <("$PYTHON_BIN" - "$prior" "$side" <<'PY'
+import sqlite3
+import sys
+
+prior_path, side_path = sys.argv[1:3]
+def one(connection, query, args=()):
+    row = connection.execute(query, args).fetchone()
+    return None if row is None else row[0]
+with sqlite3.connect(f"file:{prior_path}?mode=ro&immutable=1", uri=True) as prior:
+    schema = int(one(prior, "PRAGMA user_version") or 0)
+    generation = 1 if schema < 2 else int(
+        one(prior, "SELECT COALESCE(MAX(generation), 0) FROM activity_coverage_manifests_v2")
+    ) + 1
+    active = one(prior, "SELECT generation FROM clob_payout_walk_state_v2 WHERE singleton = 1")
+    payout = int(active) if active is not None else int(
+        one(prior, "SELECT COALESCE(MAX(generation), 0) FROM clob_payout_coverage_manifests_v2")
+    ) + 1
+with sqlite3.connect(f"file:{side_path}?mode=ro", uri=True) as side:
+    payout_done = int(one(
+        side,
+        "SELECT EXISTS(SELECT 1 FROM clob_payout_coverage_manifests_v2 WHERE generation = ?)",
+        (payout,),
+    ))
+print(generation)
+print(payout)
+print(payout_done)
+PY
+)
+  [[ "${#targets[@]}" -eq 3 ]] || { echo "FATAL: could not derive candidate targets" >&2; exit 2; }
+  echo "   [targets] activity generation ${targets[0]}; payout generation ${targets[1]} (complete=${targets[2]})"
+  run_refresh_stage "activity" "$PE_BOOTSTRAP_BIN" cache-populate-activity-v2 --db "$side" \
+    --fresh-generation "${targets[0]}" "${BOOTSTRAP_CONFIG_ARGS[@]}"
+  if [[ "${targets[2]}" == "1" ]]; then
+    echo "   [payout] generation ${targets[1]} already complete on the candidate; reused"
+  else
+    run_refresh_stage "payout" "$PE_BOOTSTRAP_BIN" cache-populate-payout-v2 --db "$side" \
+      "${BOOTSTRAP_CONFIG_ARGS[@]}"
+  fi
+  CACHE_STAGE_RECORD="$OUT_DIR/cache_stage_record.json"
+  run_refresh_stage "cache-finalize" "$PE_BOOTSTRAP_BIN" cache-finalize-v2 --db "$side" \
+    --stage-record "$CACHE_STAGE_RECORD" "${BOOTSTRAP_CONFIG_ARGS[@]}"
+  DB="$side"
+  PRIOR_CACHE_BACKUP="$prior"
+  CUTOVER_MODE="1"
+}
+
+if [[ "$FRESH_LANE" == "1" ]]; then
+  refresh_candidate_v2
+elif [[ "$CUTOVER_MODE" == "1" ]]; then
   echo "── Step 0: finalized schema-two side cache; legacy refresh skipped ──"
 else
   refresh_data
+fi
+if [[ "$CUTOVER_MODE" == "1" ]]; then
+  require_cutover_inputs
 fi
 
 # ── Step 0a: Parquet snapshot for the DuckDB read-layer (#375) ────────────────────────────
@@ -697,7 +845,7 @@ if [[ "$SKIP_RANK" == "0" ]]; then
   if [[ "$CUTOVER_MODE" == "1" ]]; then
     RERANK_CACHE_ARGS+=(
       --before-ranking-json "$BEFORE_RANKING_JSON"
-      --cycle-manifest-file "$OUT_DIR/cycle_manifest.json"
+      --cycle-manifest-file "$OUT_DIR/candidate_cycle_manifest.json"
       --cache-stage-record "$CACHE_STAGE_RECORD"
     )
   fi
@@ -728,13 +876,15 @@ if [[ "$SKIP_RANK" == "0" ]]; then
     --targets-csv "$TARGETS_CSV" "${BOOTSTRAP_CONFIG_ARGS[@]}"
   if [[ "$CUTOVER_MODE" == "1" ]]; then
     # The price store lives in the same SQLite file. Re-finalize after its
-    # targeted writes so activation is bound to the exact ranked cache bytes.
+    # targeted writes so activation is bound to the exact ranked cache bytes,
+    # and capture the finalized candidate separately from the cycle's initial
+    # installed-cache watermark.
     "$PE_BOOTSTRAP_BIN" cache-finalize-v2 --db "$DB" \
       --stage-record "$CACHE_STAGE_RECORD" "${BOOTSTRAP_CONFIG_ARGS[@]}"
     "$PYTHON_BIN" scripts/rank_cycle_manifest.py capture --db "$DB" \
       --day-utc "$(date -u +%Y-%m-%d)" --versions-file "$PIPELINE_VERSIONS_FILE" \
       --configuration-file "$OUT_DIR/cycle_configuration.json" \
-      --output "$OUT_DIR/cycle_manifest.json"
+      --output "$OUT_DIR/candidate_cycle_manifest.json"
   fi
 
   echo "── Stage 2c/3: pass-2 reference-oracle rerank (adds hit_rate) ─────────────────"
@@ -820,6 +970,7 @@ else
   fi
 fi
 
+ACCEPTED_DB="$DB"
 activate_bound_cache() {
   local request_path="$1"
   local -a binding=()
@@ -834,6 +985,14 @@ activate_bound_cache() {
     echo "FATAL: publication request has malformed cache activation evidence" >&2
     return 2
   }
+  # The request's fixed path is the installed cache the accepted watermark
+  # must be captured from on every entry, including recovery.
+  ACCEPTED_DB="${binding[1]}"
+  if [[ "${PE_RANK_SCHEMA_TWO_CUTOVER:-0}" == "prepare" ]]; then
+    echo "RANK_AND_PUSH_PREPARED_ONLY=$request_path"
+    echo "FATAL: PE_RANK_SCHEMA_TWO_CUTOVER=prepare holds the prepared request at the acceptance boundary; set it to 1 to activate and publish" >&2
+    return 2
+  fi
   local -a lock_handoff=(
     --held-run-lock-fd 8
     --held-run-lock-pid "$$"
@@ -857,6 +1016,17 @@ push_rc=0
 if [[ "$CUTOVER_MODE" == "1" && "$RESUME_PENDING" != "1" ]]; then
   run_ranking_stage "push" "$PYTHON_BIN" scripts/push_ranking_to_supabase.py \
     "${PUSH_ARGS[@]}" --prepare-only || push_rc=$?
+  if [[ "$push_rc" -eq 0 && "$FRESH_LANE" == "1" && "${PE_RANK_SCHEMA_TWO_CUTOVER:-0}" == "prepare" ]]; then
+    # Acceptance boundary (#588 §6.3): the full candidate has reached exact
+    # request preparation within the publisher's unchanged freshness checks.
+    # Stop here with the pending request retained. Exit 2 stops the supervisor
+    # (non-75) instead of retrying into activation; recovery refuses to
+    # activate until the operator records the measurement and sets the value
+    # to 1, after which the ordinary pending-publication recovery activates and
+    # publishes exactly this request.
+    echo "RANK_AND_PUSH_PREPARED_ONLY=$PUBLISH_REQUEST_FILE"
+    exit 2
+  fi
   if [[ "$push_rc" -eq 0 ]]; then
     activate_bound_cache "$PUBLISH_REQUEST_FILE"
     run_ranking_stage "push" "$PYTHON_BIN" scripts/push_ranking_to_supabase.py \
@@ -874,13 +1044,15 @@ if [[ "$push_rc" -ne 0 ]]; then
 fi
 echo "✓ Supabase exact batch published and verified. pe-service picks it up within one refresh interval."
 
-if [[ "$PRODUCTION_CYCLE" == "1" ]]; then
-  # The accepted watermark is captured only after the exact publication
-  # succeeds. A later same-day zero-argument invocation compares against this
+if [[ -f "$OUT_DIR/cycle_configuration.json" ]]; then
+  # The accepted watermark is captured from the installed cache only after the
+  # exact publication succeeds — on the fresh path and on either recovery entry
+  # (automatic or --resume-pending), since activation may have replaced the
+  # fixed file. A later same-day zero-argument invocation compares against this
   # post-refresh state before discovery or any other cache mutation.
   "$PE_BOOTSTRAP_BIN" pipeline-versions > "$OUT_DIR/pipeline_versions.json"
   "$PYTHON_BIN" scripts/rank_cycle_manifest.py capture \
-    --db "$DB" --day-utc "$(date -u +%Y-%m-%d)" \
+    --db "$ACCEPTED_DB" --day-utc "$(date -u +%Y-%m-%d)" \
     --versions-file "$OUT_DIR/pipeline_versions.json" \
     --configuration-file "$OUT_DIR/cycle_configuration.json" \
     --output "$OUT_DIR/accepted_cycle_manifest.json"

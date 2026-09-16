@@ -66,13 +66,7 @@ impl ForgeActivationLocks {
         cache_path: &Path,
         handoff: Option<&ForgeLockHandoff>,
     ) -> Result<Self, BootstrapError> {
-        let parent = cache_path
-            .parent()
-            .filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let eval_results = parent.join("eval-results");
-        let loop_path = eval_results.join(".rank_and_push_loop.lock");
-        let run_path = eval_results.join(".rank_and_push.lock");
+        let [loop_path, run_path] = forge_named_lock_paths(cache_path);
         let loop_file = match handoff.and_then(|value| value.loop_lock.as_ref()) {
             Some(inherited) => {
                 verify_inherited_lock(&loop_path, "ranking loop", inherited, false)?;
@@ -231,6 +225,20 @@ impl CacheMutationLock {
 
 /// Compute the persistent lock-file path for `cache_path`.
 #[must_use]
+/// The named Forge lock files beside `cache_path`: the ranking loop lock and
+/// the one-shot run lock, in acquisition order.
+pub fn forge_named_lock_paths(cache_path: &Path) -> [PathBuf; 2] {
+    let parent = cache_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let eval_results = parent.join("eval-results");
+    [
+        eval_results.join(".rank_and_push_loop.lock"),
+        eval_results.join(".rank_and_push.lock"),
+    ]
+}
+
 pub fn lock_path_for(cache_path: &Path) -> PathBuf {
     let mut path = cache_path.as_os_str().to_owned();
     path.push(CacheMutationLock::LOCK_FILE_SUFFIX);
@@ -336,6 +344,17 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(lock.path()).unwrap(),
             format!("{}\n", std::process::id())
+        );
+    }
+
+    #[test]
+    fn forge_named_lock_paths_live_in_eval_results_beside_the_cache() {
+        assert_eq!(
+            forge_named_lock_paths(Path::new("/tmp/foo.db")),
+            [
+                PathBuf::from("/tmp/eval-results/.rank_and_push_loop.lock"),
+                PathBuf::from("/tmp/eval-results/.rank_and_push.lock"),
+            ]
         );
     }
 

@@ -21,12 +21,15 @@ use pe_bootstrap::cache::WalletCache;
 use pe_bootstrap::cache_migration::{
     CacheActivationRequest, CacheV2BuildManifest, FrozenCacheFreshness, FrozenPayloadReference,
     PriorCacheBinding, PublicationConsumptionProbe, activate_cache_v2, finalize_cache_v2,
-    migrate_cache_v2, populate_activity_v2, restore_prior_cache, sha256_file,
-    verify_frozen_payload_v1,
+    migrate_cache_v2, populate_activity_fresh_v2, populate_activity_v2, restore_prior_cache,
+    sha256_file, verify_frozen_payload_v1,
 };
 use pe_bootstrap::clob::ClobFetcher;
 use pe_bootstrap::pile::SRC_TRADES;
-use pe_core_types::{ReceivedAt, ReconstructionQuality, SourceId, SourceTimestamp, WalletAddress};
+use pe_core_types::{
+    LeaderAction, ReceivedAt, ReconstructionQuality, ShareAmount, SourceId, SourceTimestamp,
+    WalletAddress,
+};
 use pe_position_ledger::{
     EntryClassification, LedgerMutation, PositionLedger, SecondVerdict,
     classify_complete_second_legacy,
@@ -596,6 +599,84 @@ urllib.request.urlopen = urlopen
     .await
     .unwrap_err();
     assert!(unavailable.to_string().contains("authority unavailable"));
+    assert_eq!(sha256_file(&fixed).unwrap(), current_hash);
+    // Restore writes the displaced copy through its `.pending` name and
+    // removes the fixed cache's sidecars, so those names may not be roles: a
+    // prior named like the displaced copy's staging file is refused intact.
+    let saved_pending = dir.path().join("saved.pending");
+    std::fs::rename(&prior_v2, &saved_pending).unwrap();
+    let (colliding_request, colliding_pending) =
+        write_pending_publication(&dir, "v2c", &consumed_side, &fixed, &fixed, &saved_pending);
+    let colliding = restore_prior_cache(
+        &fixed,
+        &saved_pending,
+        &dir.path().join("saved"),
+        &v2_binding,
+        &colliding_request,
+        &colliding_pending,
+        &FixedPublicationProbe(false),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        colliding.to_string().contains("not an independent file"),
+        "{colliding}"
+    );
+    assert_eq!(sha256_file(&saved_pending).unwrap(), v2_binding.sha256);
+    assert_eq!(sha256_file(&fixed).unwrap(), current_hash);
+    assert!(!dir.path().join("saved").exists());
+    std::fs::rename(&saved_pending, &prior_v2).unwrap();
+    // The lock stack rewrites its lock files and the displaced copy's sidecars
+    // are written through their own `.pending` names, so those names are
+    // refused before any lock is taken and the prior stays intact.
+    let lock_named = pe_bootstrap::lock::lock_path_for(&fixed);
+    let _ = std::fs::remove_file(&lock_named);
+    let wal_pending = dir.path().join("saved-wal.pending");
+    for colliding_prior in [&lock_named, &wal_pending] {
+        std::fs::rename(&prior_v2, colliding_prior).unwrap();
+        let refused = restore_prior_cache(
+            &fixed,
+            colliding_prior,
+            &dir.path().join("saved"),
+            &v2_binding,
+            &v2_request,
+            &v2_pending,
+            &FixedPublicationProbe(false),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            refused.to_string().contains("not an independent file"),
+            "{}: {refused}",
+            colliding_prior.display()
+        );
+        assert_eq!(sha256_file(colliding_prior).unwrap(), v2_binding.sha256);
+        assert_eq!(sha256_file(&fixed).unwrap(), current_hash);
+        assert!(!dir.path().join("saved").exists());
+        std::fs::rename(colliding_prior, &prior_v2).unwrap();
+    }
+    // The publication request and its pending pointer are evidence restore
+    // reads and must never write over: naming the displaced copy after the
+    // pointer is refused with the pointer unchanged.
+    let pointer_bytes = std::fs::read(&v2_pending).unwrap();
+    let evidence_role = restore_prior_cache(
+        &fixed,
+        &prior_v2,
+        &v2_pending,
+        &v2_binding,
+        &v2_request,
+        &v2_pending,
+        &FixedPublicationProbe(false),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        evidence_role
+            .to_string()
+            .contains("not an independent file"),
+        "{evidence_role}"
+    );
+    assert_eq!(std::fs::read(&v2_pending).unwrap(), pointer_bytes);
     assert_eq!(sha256_file(&fixed).unwrap(), current_hash);
     let displaced_next = dir.path().join("wallet_cache.displaced.next.v2.db");
     restore_prior_cache(
@@ -1900,4 +1981,1478 @@ async fn activity_wallet_receipts_bound_resume_and_finalize_atomically() {
             .unwrap(),
         0
     );
+}
+
+// ── #588: fresh private-generation collection and cycle staging ──────────────
+//
+// PASS: a fresh generation binds the union of current acquisition candidates
+// and retained histories, resumes only missing wallets, keeps the immutable
+// prior byte-identical, certifies classifier two without a frozen reference,
+// and staging copies the checkpointed fixed main exactly under the cache lock.
+// FAIL: a wallet outside the union is fetched, a retry refetches or clears
+// progress, a stale/tampered identity certifies, or a staged copy differs.
+
+const WALLET_B: &str = "0x2222222222222222222222222222222222222222";
+const WALLET_C: &str = "0x3333333333333333333333333333333333333333";
+const WALLET_D: &str = "0x4444444444444444444444444444444444444444";
+const WALLET_E: &str = "0x5555555555555555555555555555555555555555";
+const FRESH_END: i64 = 1_800_000_000;
+
+// Fresh collection reaches full history: the exclusive bound 0 is `start=1`
+// on the wire, where an omitted `start` returns only the venue's recent window.
+fn activity_url(wallet: &str, end: i64) -> String {
+    format!(
+        "https://data.example/activity?user={wallet}&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&limit=500&offset=0&sortDirection=DESC&end={end}&start=1"
+    )
+}
+
+// Every wallet other than the original trades one distinct market per epoch.
+fn market_for(wallet: &str, epoch: i64) -> String {
+    format!("market-{}-{epoch}", &wallet[2..6])
+}
+
+// The original wallet always returns one scripted history on one market: an
+// old entry, a complete exit, and a recent re-entry. Full history makes the
+// recent buy a re-entry; the venue's default window would show it as a first
+// entry. Its `epochs` are ignored.
+fn activity_rows(wallet: &str, epochs: &[i64], revised: bool) -> Vec<u8> {
+    let size = if revised { "2" } else { "1" };
+    let usdc = if revised { "1" } else { "0.5" };
+    let row = |market: String, side: &str, epoch: i64| {
+        serde_json::json!({
+            "proxyWallet": wallet, "type": "TRADE", "conditionId": market,
+            "asset": "123", "outcome": "Yes", "side": side, "size": size,
+            "usdcSize": usdc, "price": "0.5", "timestamp": epoch,
+            "transactionHash": format!("trade-{epoch}"), "outcomeIndex": "0",
+        })
+    };
+    let rows = if wallet == WALLET {
+        vec![
+            row("0xsame".to_owned(), "BUY", FRESH_END - 1),
+            row("0xsame".to_owned(), "SELL", FRESH_END - 151),
+            row("0xsame".to_owned(), "BUY", FRESH_END - 201),
+        ]
+    } else {
+        epochs
+            .iter()
+            .map(|epoch| row(market_for(wallet, *epoch), "BUY", *epoch))
+            .collect()
+    };
+    serde_json::to_vec(&rows).unwrap()
+}
+
+fn fresh_fetcher(wallets: &[&str], end: i64, epochs: &[i64], revised: bool) -> FixtureFetcher {
+    FixtureFetcher::new(
+        wallets
+            .iter()
+            .map(|wallet| {
+                (
+                    activity_url(wallet, end),
+                    activity_rows(wallet, epochs, revised),
+                )
+            })
+            .collect(),
+    )
+}
+
+fn fresh_record(path: &std::path::Path) -> Value {
+    let stored: String = Connection::open(path)
+        .unwrap()
+        .query_row(
+            "SELECT fresh_collection_json FROM cache_v2_migration_state",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    serde_json::from_str(&stored).unwrap()
+}
+
+fn generation_rows(path: &std::path::Path, generation: i64) -> i64 {
+    Connection::open(path)
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM activity_groups_v2 WHERE coverage_generation = ?1",
+            [generation],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn count(path: &std::path::Path, sql: &str) -> i64 {
+    Connection::open(path)
+        .unwrap()
+        .query_row(sql, [], |row| row.get(0))
+        .unwrap()
+}
+
+/// Initial candidate: schema-one history with an active wallet, an inactive
+/// wallet with retained trades, an infrastructure-flagged wallet with retained
+/// trades and an active wallet without any history.
+fn seed_initial_candidate(side: &std::path::Path) {
+    let mut cache = seed_v1(side, FRESH_END - 10);
+    for (wallet, active, infra, trade) in [
+        (WALLET_B, 0, false, true),
+        (WALLET_C, 1, true, true),
+        (WALLET_D, 1, false, false),
+    ] {
+        cache
+            .upsert_wallets_bulk(&[(wallet.to_owned(), SRC_TRADES, infra, None, None, None, 0)])
+            .unwrap();
+        cache.conn_for_test_set_active(wallet, active);
+        if trade {
+            cache.conn_for_test_insert_trade(wallet, &format!("legacy-{wallet}"), FRESH_END - 10);
+        }
+    }
+    drop(cache);
+}
+
+async fn finalize_fresh_initial(dir: &TempDir, side: &std::path::Path) -> String {
+    seed_initial_candidate(side);
+    let manifest = write_build_manifest(dir, side);
+    migrate_cache_v2(side, &manifest).unwrap();
+    let union = [WALLET, WALLET_B, WALLET_C, WALLET_D];
+    let manifest = populate_activity_fresh_v2(
+        side,
+        &fresh_fetcher(&union, FRESH_END, &[FRESH_END - 1, FRESH_END - 101], false),
+        "https://data.example",
+        1,
+        FRESH_END,
+        FRESH_END + 1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(manifest.generation, 1);
+    assert_eq!(manifest.wallet_count, 4);
+    install_fresh_payouts(side).await;
+    finalize_cache_v2(
+        side,
+        &dir.path().join("fresh-initial-stage.json"),
+        FRESH_END + 2,
+    )
+    .unwrap()
+    .cache_sha256
+}
+
+/// Resolved payout evidence for the shared market and the wallets C and D, so
+/// the classifier projects real first entries while the inactive retained
+/// wallet B keeps zero projected entries (retention is not projection).
+async fn install_fresh_payouts(side: &std::path::Path) {
+    let markets = [
+        "0xsame".to_owned(),
+        market_for(WALLET_C, FRESH_END - 1),
+        market_for(WALLET_C, FRESH_END - 101),
+        market_for(WALLET_D, FRESH_END - 1),
+        market_for(WALLET_D, FRESH_END - 101),
+    ]
+    .map(|market| {
+        serde_json::json!({
+            "condition_id": market, "active": true, "closed": true,
+            "end_date_iso": "2027-01-16T00:00:00Z", "is_50_50_outcome": false,
+            "tokens": [{"token_id":"123","outcome":"Yes","price":1,"winner":true},
+                       {"token_id":"456","outcome":"No","price":0,"winner":false}],
+        })
+    });
+    ClobFetcher::new(
+        "https://clob.example".to_owned(),
+        FixtureFetcher::new(HashMap::from([(
+            "https://clob.example/markets?closed=true&limit=1000".to_owned(),
+            serde_json::to_vec(&serde_json::json!({"data": markets, "next_cursor": "LTE="}))
+                .unwrap(),
+        )])),
+    )
+    .fetch_closed_markets(&mut WalletCache::open(side).unwrap())
+    .await
+    .unwrap();
+}
+
+fn projected_entries(path: &std::path::Path) -> Vec<(String, String, i64)> {
+    Connection::open(path)
+        .unwrap()
+        .prepare(
+            "SELECT groups_v2.wallet_hex, groups_v2.condition_id, groups_v2.source_time_unix
+             FROM ranker_entries_v2 ranker
+             JOIN activity_groups_v2 groups_v2 USING (source_trade_id)
+             ORDER BY 1, 2, 3",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn fresh_generation_on_initial_base_binds_the_union_and_certifies_without_frozen_rows() {
+    let dir = tempfile::Builder::new()
+        .prefix("pe-fresh-initial-")
+        .tempdir_in(std::env::current_dir().unwrap())
+        .unwrap();
+    std::fs::create_dir_all(dir.path().join("eval-results")).unwrap();
+    let side = dir.path().join("side.db");
+    let side_sha256 = finalize_fresh_initial(&dir, &side).await;
+
+    let record = fresh_record(&side);
+    assert_eq!(record["version"], 1);
+    assert_eq!(record["generation"], 1);
+    assert_eq!(record["fixed_end_unix"], FRESH_END);
+    assert_eq!(
+        record["wallets"],
+        serde_json::json!([WALLET, WALLET_B, WALLET_C, WALLET_D])
+    );
+    assert_eq!(
+        count(
+            &side,
+            "SELECT COUNT(*) FROM cache_frozen_payload_verifications"
+        ),
+        0
+    );
+    assert_eq!(
+        count(
+            &side,
+            "SELECT COUNT(DISTINCT reference_sha256) FROM activity_coverage_manifests_v2"
+        ),
+        1
+    );
+    let bound: String = Connection::open(&side)
+        .unwrap()
+        .query_row(
+            "SELECT reference_sha256 FROM activity_coverage_manifests_v2 WHERE generation = 1",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(Value::String(bound), record["digest"]);
+    assert_eq!(generation_rows(&side, 1), 9);
+    // Full history makes the old buy the only first entry on the shared market:
+    // the recent buy after a complete exit is a re-entry and is not projected.
+    // C and D project both of their markets; the inactive retained wallet B has
+    // no payout evidence and therefore no projected entry at all.
+    let mut expected = vec![(WALLET.to_owned(), "0xsame".to_owned(), FRESH_END - 201)];
+    for wallet in [WALLET_C, WALLET_D] {
+        for epoch in [FRESH_END - 101, FRESH_END - 1] {
+            expected.push((wallet.to_owned(), market_for(wallet, epoch), epoch));
+        }
+    }
+    expected.sort();
+    assert_eq!(projected_entries(&side), expected);
+    assert_eq!(
+        count(
+            &side,
+            "SELECT COUNT(*) FROM ranker_entries_v2 WHERE classifier_version = 2"
+        ),
+        5
+    );
+    // The same fixture through the real ledger and classifier: the old buy is
+    // an admitted entry, the sell is an exit that empties the position, and the
+    // recent buy is an entry (not an add-on) refused as not-first-entry.
+    let wallet = WalletAddress::from_hex(WALLET).unwrap();
+    let observed = time::OffsetDateTime::from_unix_timestamp(FRESH_END + 1).unwrap();
+    let mut aggregates = parse_activity_response(
+        &activity_rows(WALLET, &[], false),
+        wallet,
+        &ActivityParseContext {
+            source_id: SourceId("polymarket-data-api".to_owned()),
+            observed_at: SourceTimestamp(observed),
+            received_at: ReceivedAt(observed),
+            transport: ActivityTransport::Rest,
+        },
+    )
+    .unwrap()
+    .aggregates()
+    .unwrap();
+    aggregates.sort_by_key(|aggregate| aggregate.source_time.0);
+    let mut ledger = PositionLedger::new();
+    let mut history = std::collections::BTreeSet::<String>::new();
+    let mut classified = Vec::new();
+    for aggregate in &aggregates {
+        let mutation = LedgerMutation::from_activity(aggregate).unwrap();
+        let SecondVerdict::OrderIndependent { decisions, .. } =
+            pe_position_ledger::classify_complete_historical_second(
+                &ledger,
+                wallet,
+                std::slice::from_ref(&mutation),
+                ReconstructionQuality::new(100).unwrap(),
+                &|market| history.contains(&market.to_string()),
+            )
+            .unwrap()
+        else {
+            panic!("scripted history is order independent");
+        };
+        assert_eq!(decisions.len(), 1);
+        classified.push((decisions[0].action, decisions[0].entry));
+        ledger
+            .apply_all_or_none(std::slice::from_ref(&mutation))
+            .unwrap();
+        for key in mutation.touched_keys() {
+            history.insert(key.market().to_string());
+        }
+        if decisions[0].action == LeaderAction::Exit {
+            assert!(
+                ledger.position(&wallet).is_some_and(|snapshot| {
+                    snapshot.positions.values().all(|state| {
+                        state.long_contracts == ShareAmount::ZERO
+                            && state.short_contracts == ShareAmount::ZERO
+                    })
+                }),
+                "the exit must leave no inventory: {:?}",
+                ledger.position(&wallet)
+            );
+        }
+    }
+    assert_eq!(
+        classified,
+        vec![
+            (LeaderAction::Entry, EntryClassification::Admitted),
+            (LeaderAction::Exit, EntryClassification::NotBuy),
+            (LeaderAction::Entry, EntryClassification::NotFirstEntry),
+        ]
+    );
+
+    // A completed generation is returned without any source call, and an older
+    // or equal generation cannot be started.
+    let silent = FixtureFetcher::new(HashMap::new());
+    let repeated = populate_activity_fresh_v2(
+        &side,
+        &silent,
+        "https://data.example",
+        1,
+        FRESH_END + 500,
+        FRESH_END + 3,
+    )
+    .await
+    .unwrap();
+    assert_eq!(repeated.generation, 1);
+    assert_eq!(repeated.wallet_count, 4);
+    let stale = populate_activity_fresh_v2(
+        &side,
+        &silent,
+        "https://data.example",
+        0,
+        FRESH_END,
+        FRESH_END + 3,
+    )
+    .await
+    .unwrap_err();
+    assert!(stale.to_string().contains("must exceed"), "{stale}");
+
+    // Activation certifies the fresh identity with no frozen verification row.
+    let fixed = dir.path().join("fixed.db");
+    drop(seed_v1(&fixed, FRESH_END - 100));
+    let request = CacheActivationRequest {
+        fixed_path: fixed.clone(),
+        side_path: side.clone(),
+        prior_cache_backup_path: dir.path().join("prior.db"),
+        expected_side_sha256: side_sha256.clone(),
+    };
+    let installed = activate_cache_v2(&request).unwrap();
+    assert!(!installed.resumed);
+    assert_eq!(installed.installed_sha256, side_sha256);
+    assert_eq!(installed.prior_cache_schema, 1);
+    assert!(activate_cache_v2(&request).unwrap().resumed);
+}
+
+struct InterruptAfterFirst {
+    side: std::path::PathBuf,
+    generation: i64,
+    first: &'static str,
+}
+
+impl PageFetcher for InterruptAfterFirst {
+    fn fetch_page(
+        &self,
+        url: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, SourceError>> + Send {
+        let side = self.side.clone();
+        let generation = self.generation;
+        let first = self.first;
+        let url = url.to_owned();
+        async move {
+            if url.contains(first) {
+                return Ok(activity_rows(first, &[FRESH_END + 50], false));
+            }
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let committed: i64 = Connection::open(&side)
+                    .unwrap()
+                    .query_row(
+                        "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2
+                         WHERE generation = ?1 AND wallet_hex = ?2",
+                        params![generation, first],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                if committed == 1 {
+                    return Err(SourceError::Transient {
+                        message: "controlled interruption after the first receipt".to_owned(),
+                    });
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "first wallet never committed"
+                );
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct RecordingFetcher {
+    calls: Arc<Mutex<Vec<String>>>,
+    revised: bool,
+}
+
+impl PageFetcher for RecordingFetcher {
+    fn fetch_page(
+        &self,
+        url: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, SourceError>> + Send {
+        self.calls.lock().unwrap().push(url.to_owned());
+        let wallet = [WALLET, WALLET_B, WALLET_C, WALLET_D, WALLET_E]
+            .into_iter()
+            .find(|wallet| url.contains(wallet))
+            .unwrap();
+        let body = activity_rows(wallet, &[FRESH_END + 50, FRESH_END - 101], self.revised);
+        async move { Ok(body) }
+    }
+}
+
+#[tokio::test]
+async fn fresh_generation_on_recurring_base_preserves_the_prior_and_resumes_only_missing_wallets() {
+    let dir = tempfile::Builder::new()
+        .prefix("pe-fresh-recurring-")
+        .tempdir_in(std::env::current_dir().unwrap())
+        .unwrap();
+    std::fs::create_dir_all(dir.path().join("eval-results")).unwrap();
+    let prior = dir.path().join("prior.db");
+    finalize_fresh_initial(&dir, &prior).await;
+    let prior_sha256 = sha256_file(&prior).unwrap();
+    let side = dir.path().join("side.db");
+    std::fs::copy(&prior, &side).unwrap();
+
+    // Current acquisition changes on the candidate: a new active wallet, the
+    // original wallet now infrastructure-flagged, one retained history whose
+    // wallet row is gone. Every retained history must stay in the union.
+    let mut cache = WalletCache::open(&side).unwrap();
+    cache
+        .upsert_wallets_bulk(&[(WALLET_E.to_owned(), SRC_TRADES, false, None, None, None, 0)])
+        .unwrap();
+    cache.conn_for_test_set_active(WALLET_E, 1);
+    cache.mark_infra(WALLET).unwrap();
+    cache
+        .raw_conn_for_test()
+        .execute(
+            "DELETE FROM wallets WHERE wallet_hex = ?1",
+            params![WALLET_C],
+        )
+        .unwrap();
+    drop(cache);
+    let next_end = FRESH_END + 100;
+
+    let interrupted = populate_activity_fresh_v2(
+        &side,
+        &InterruptAfterFirst {
+            side: side.clone(),
+            generation: 2,
+            first: WALLET_B,
+        },
+        "https://data.example",
+        2,
+        next_end,
+        next_end + 1,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            interrupted,
+            pe_bootstrap::error::BootstrapError::TransientSource { .. }
+        ),
+        "{interrupted}"
+    );
+    assert_eq!(interrupted.exit_code(), 75);
+    let record = fresh_record(&side);
+    assert_eq!(record["generation"], 2);
+    assert_eq!(record["fixed_end_unix"], next_end);
+    assert_eq!(
+        record["wallets"],
+        serde_json::json!([WALLET, WALLET_B, WALLET_C, WALLET_D, WALLET_E])
+    );
+    assert_eq!(
+        generation_rows(&side, 1),
+        0,
+        "superseded activity must be cleared"
+    );
+    assert_eq!(generation_rows(&side, 2), 1);
+    assert_eq!(
+        count(&side, "SELECT COUNT(*) FROM activity_coverage_manifests_v2"),
+        0
+    );
+    assert_eq!(count(&side, "SELECT COUNT(*) FROM ranker_entries_v2"), 0);
+    assert_eq!(
+        count(
+            &side,
+            "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2"
+        ),
+        1
+    );
+    assert_eq!(sha256_file(&prior).unwrap(), prior_sha256);
+    assert_eq!(generation_rows(&prior, 1), 9);
+
+    // An unfinished generation can only be resumed.
+    let skipped = populate_activity_fresh_v2(
+        &side,
+        &RecordingFetcher::default(),
+        "https://data.example",
+        3,
+        next_end + 10,
+        next_end + 2,
+    )
+    .await
+    .unwrap_err();
+    assert!(skipped.to_string().contains("incomplete"), "{skipped}");
+    assert_eq!(fresh_record(&side)["generation"], 2);
+
+    // The retry fetches exactly the missing wallets at the recorded end and
+    // accepts a revised historical row in this private generation.
+    let resumed = RecordingFetcher {
+        revised: true,
+        ..RecordingFetcher::default()
+    };
+    let manifest = populate_activity_fresh_v2(
+        &side,
+        &resumed,
+        "https://data.example",
+        2,
+        next_end + 999,
+        next_end + 3,
+    )
+    .await
+    .unwrap();
+    let mut calls = resumed.calls.lock().unwrap().clone();
+    calls.sort();
+    assert_eq!(
+        calls,
+        [WALLET, WALLET_C, WALLET_D, WALLET_E]
+            .map(|wallet| activity_url(wallet, next_end))
+            .to_vec()
+    );
+    assert_eq!(manifest.generation, 2);
+    assert_eq!(manifest.wallet_count, 5);
+    assert_eq!(generation_rows(&side, 2), 10);
+    assert_eq!(
+        count(
+            &side,
+            "SELECT COUNT(*) FROM activity_groups_v2 WHERE share_amount_str = '2'"
+        ),
+        9,
+        "revised historical rows are accepted in the private generation"
+    );
+    // Retained histories stay in the union independently of ranker membership:
+    // the inactive wallet B has retained rows but no projected entry in the
+    // prior, and it was collected anyway.
+    let prior_projection = projected_entries(&prior);
+    assert!(
+        !prior_projection
+            .iter()
+            .any(|(wallet, _, _)| wallet == WALLET_B)
+    );
+    assert_eq!(
+        prior_projection
+            .iter()
+            .filter(|(wallet, _, _)| wallet == WALLET)
+            .count(),
+        1
+    );
+
+    let silent = FixtureFetcher::new(HashMap::new());
+    let repeated = populate_activity_fresh_v2(
+        &side,
+        &silent,
+        "https://data.example",
+        2,
+        next_end + 5,
+        next_end + 3,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        repeated, manifest,
+        "a complete generation is revalidated, not refetched"
+    );
+
+    let stage = finalize_cache_v2(
+        &side,
+        &dir.path().join("recurring-stage.json"),
+        next_end + 5,
+    )
+    .unwrap();
+    assert_eq!(stage.activity_coverage_generation, 2);
+    assert_eq!(stage.ranker_classifier_version, 2);
+
+    // The fresh-identity prior validates as the historical fixed cache and is
+    // preserved byte for byte by activation.
+    let fixed = dir.path().join("fixed.db");
+    std::fs::copy(&prior, &fixed).unwrap();
+    let request = CacheActivationRequest {
+        fixed_path: fixed.clone(),
+        side_path: side.clone(),
+        prior_cache_backup_path: dir.path().join("prior-backup.db"),
+        expected_side_sha256: stage.cache_sha256.clone(),
+    };
+    let installed = activate_cache_v2(&request).unwrap();
+    assert_eq!(installed.prior_cache_schema, 2);
+    assert_eq!(installed.prior_cache_sha256, prior_sha256);
+    assert_eq!(
+        sha256_file(&request.prior_cache_backup_path).unwrap(),
+        prior_sha256
+    );
+    assert_eq!(sha256_file(&fixed).unwrap(), stage.cache_sha256);
+}
+
+#[tokio::test]
+async fn fresh_generation_supersedes_a_legacy_frozen_identity_and_refuses_tampering() {
+    let dir = TempDir::new().unwrap();
+    let side = dir.path().join("side.db");
+    retained_classifier_activity(&dir, &side).await;
+    assert_eq!(
+        count(
+            &side,
+            "SELECT COUNT(*) FROM cache_frozen_payload_verifications"
+        ),
+        1
+    );
+    let older = populate_activity_fresh_v2(
+        &side,
+        &FixtureFetcher::new(HashMap::new()),
+        "https://data.example",
+        7,
+        FRESH_END + 100,
+        FRESH_END + 10,
+    )
+    .await
+    .unwrap_err();
+    assert!(older.to_string().contains("must exceed"), "{older}");
+
+    let fresh = RecordingFetcher::default();
+    let manifest = populate_activity_fresh_v2(
+        &side,
+        &fresh,
+        "https://data.example",
+        8,
+        FRESH_END + 100,
+        FRESH_END + 11,
+    )
+    .await
+    .unwrap();
+    assert_eq!(manifest.generation, 8);
+    assert_eq!(
+        fresh.calls.lock().unwrap().as_slice(),
+        [activity_url(WALLET, FRESH_END + 100)]
+    );
+    assert_eq!(generation_rows(&side, 7), 0);
+    assert_eq!(generation_rows(&side, 8), 3);
+    assert_eq!(
+        count(
+            &side,
+            "SELECT COUNT(*) FROM cache_frozen_payload_verifications"
+        ),
+        1,
+        "legacy verification history is retained"
+    );
+    let stage =
+        finalize_cache_v2(&side, &dir.path().join("superseded.json"), FRESH_END + 12).unwrap();
+    assert_eq!(stage.activity_coverage_generation, 8);
+
+    // A manifest that carries the recorded generation but another identity does
+    // not count as completion for starting a later generation.
+    let connection = Connection::open(&side).unwrap();
+    connection
+        .execute(
+            "UPDATE activity_coverage_manifests_v2 SET reference_sha256 = ?1 WHERE generation = 8",
+            params!["f".repeat(64)],
+        )
+        .unwrap();
+    drop(connection);
+    let foreign = populate_activity_fresh_v2(
+        &side,
+        &FixtureFetcher::new(HashMap::new()),
+        "https://data.example",
+        9,
+        FRESH_END + 200,
+        FRESH_END + 12,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        foreign.to_string().contains("identity mismatch"),
+        "{foreign}"
+    );
+    assert_eq!(fresh_record(&side)["generation"], 8);
+    assert_eq!(
+        generation_rows(&side, 8),
+        3,
+        "no clearing on a refused start"
+    );
+    let connection = Connection::open(&side).unwrap();
+    connection
+        .execute(
+            "UPDATE activity_coverage_manifests_v2 SET reference_sha256 = ?1 WHERE generation = 8",
+            params![fresh_record(&side)["digest"].as_str().unwrap()],
+        )
+        .unwrap();
+    drop(connection);
+
+    // A record whose digest no longer matches its fields cannot certify or resume.
+    let connection = Connection::open(&side).unwrap();
+    let stored: String = connection
+        .query_row(
+            "SELECT fresh_collection_json FROM cache_v2_migration_state",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut tampered: Value = serde_json::from_str(&stored).unwrap();
+    tampered["wallets"]
+        .as_array_mut()
+        .unwrap()
+        .push(Value::String(WALLET_B.to_owned()));
+    connection
+        .execute(
+            "UPDATE cache_v2_migration_state SET fresh_collection_json = ?1",
+            params![tampered.to_string()],
+        )
+        .unwrap();
+    drop(connection);
+    let refused =
+        finalize_cache_v2(&side, &dir.path().join("tampered.json"), FRESH_END + 13).unwrap_err();
+    assert!(refused.to_string().contains("digest mismatch"), "{refused}");
+    let refused = populate_activity_fresh_v2(
+        &side,
+        &FixtureFetcher::new(HashMap::new()),
+        "https://data.example",
+        8,
+        FRESH_END + 100,
+        FRESH_END + 14,
+    )
+    .await
+    .unwrap_err();
+    assert!(refused.to_string().contains("digest mismatch"), "{refused}");
+}
+
+#[tokio::test]
+async fn legacy_identity_still_requires_its_frozen_verification_row() {
+    let dir = tempfile::Builder::new()
+        .prefix("pe-legacy-frozen-")
+        .tempdir_in(std::env::current_dir().unwrap())
+        .unwrap();
+    std::fs::create_dir_all(dir.path().join("eval-results")).unwrap();
+    let side = dir.path().join("side.db");
+    let side_sha256 = finalize_empty_activity_side(&dir, &side, FRESH_END).await;
+    let connection = Connection::open(&side).unwrap();
+    connection
+        .execute("DELETE FROM cache_frozen_payload_verifications", [])
+        .unwrap();
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    drop(connection);
+    for suffix in ["db-wal", "db-shm"] {
+        let _ = std::fs::remove_file(side.with_extension(suffix));
+    }
+    let fixed = dir.path().join("fixed.db");
+    drop(seed_v1(&fixed, FRESH_END - 100));
+    let refused = activate_cache_v2(&CacheActivationRequest {
+        fixed_path: fixed,
+        side_path: side.clone(),
+        prior_cache_backup_path: dir.path().join("prior.db"),
+        expected_side_sha256: sha256_file(&side).unwrap(),
+    })
+    .unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("frozen activity identity is missing"),
+        "{refused}"
+    );
+    assert_ne!(sha256_file(&side).unwrap(), side_sha256);
+}
+
+#[test]
+fn cycle_staging_copies_the_checkpointed_fixed_main_exactly_and_resumes_its_own_candidate() {
+    use pe_bootstrap::cache_migration::stage_cache_cycle_v2;
+    let dir = TempDir::new().unwrap();
+    let fixed = dir.path().join("wallet_cache.db");
+    let prior = dir.path().join("wallet_cache.cron-1.prior.db");
+    let side = dir.path().join("wallet_cache.cron-1.side.db");
+    // The seeded row lives only in the WAL while this handle stays open.
+    let wal_owner = seed_v1(&fixed, FRESH_END - 10);
+    assert!(fixed.with_extension("db-wal").metadata().unwrap().len() > 0);
+
+    let manifest = dir.path().join("cache_build_manifest.json");
+    let held = pe_bootstrap::lock::CacheMutationLock::acquire(&fixed).unwrap();
+    let locked = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest)).unwrap_err();
+    assert!(
+        locked.to_string().contains("cache mutation lock"),
+        "{locked}"
+    );
+    assert!(!prior.exists() && !side.exists() && !manifest.exists());
+    drop(held);
+
+    let interrupted = std::path::PathBuf::from(format!("{}.pending", side.display()));
+    std::fs::write(&interrupted, b"interrupted private staging").unwrap();
+    let staged = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest)).unwrap();
+    drop(wal_owner);
+    assert!(!staged.resumed);
+    assert_eq!(staged.prior_schema, 1);
+    assert!(!interrupted.exists());
+    // Checked before any test connection reopens a role: a later read-write
+    // close would tidy sidecars that staging itself left behind.
+    for role in [&prior, &side] {
+        for suffix in ["db-wal", "db-shm"] {
+            assert!(
+                !role.with_extension(suffix).exists(),
+                "staging left a sidecar beside {}",
+                role.display()
+            );
+        }
+    }
+    // Spellings with repeated separators name the same files; the immutable
+    // prior read builds its SQLite URI from the canonical path.
+    let doubled = |path: &std::path::Path| std::path::PathBuf::from(format!("/{}", path.display()));
+    let respelled = stage_cache_cycle_v2(
+        &doubled(&fixed),
+        &doubled(&prior),
+        &doubled(&side),
+        Some(&doubled(&manifest)),
+    )
+    .unwrap();
+    assert!(respelled.resumed);
+    assert_eq!(respelled.prior_schema, 1);
+    let fixed_sha256 = sha256_file(&fixed).unwrap();
+    assert_eq!(staged.prior_sha256.as_deref(), Some(fixed_sha256.as_str()));
+    assert_eq!(staged.side_sha256.as_deref(), Some(fixed_sha256.as_str()));
+    assert_eq!(sha256_file(&prior).unwrap(), fixed_sha256);
+    assert_eq!(sha256_file(&side).unwrap(), fixed_sha256);
+    assert_eq!(
+        count(&prior, "SELECT COUNT(*) FROM trades"),
+        1,
+        "the WAL-only committed row must reach the immutable prior"
+    );
+    // The staged build manifest is the authentic hash-bound input the initial
+    // migration seals against; it is written before the candidate is adopted.
+    let build: CacheV2BuildManifest =
+        serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+    assert_eq!(build.backup_sha256, fixed_sha256);
+    assert_eq!(build.source_bounds["newest_trade_unix"], FRESH_END - 10);
+    assert_eq!(build.cursors["clob_closed"], "");
+    assert_eq!(staged.side_schema, 1);
+    // A manifest lost before the seal is recreated from the immutable prior
+    // and still seals the candidate.
+    std::fs::remove_file(&manifest).unwrap();
+    let recovered = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest)).unwrap();
+    assert!(recovered.resumed);
+    let rebuilt: CacheV2BuildManifest =
+        serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+    assert_eq!(rebuilt.backup_sha256, build.backup_sha256);
+    assert_eq!(rebuilt.source_bounds, build.source_bounds);
+    // A stale but valid write-ahead log beside the immutable prior (never
+    // produced by staging) is ignored: the manifest is rebuilt from the main
+    // file's bytes, the prior is not checkpointed and no index is created.
+    let scratch = dir.path().join("scratch.db");
+    std::fs::copy(&prior, &scratch).unwrap();
+    let mut stale = WalletCache::open(&scratch).unwrap();
+    stale
+        .raw_conn_for_test()
+        .execute_batch("PRAGMA wal_autocheckpoint = 0")
+        .unwrap();
+    stale.conn_for_test_insert_trade(WALLET, "0xstale", FRESH_END + 100);
+    std::fs::copy(
+        scratch.with_extension("db-wal"),
+        prior.with_extension("db-wal"),
+    )
+    .unwrap();
+    drop(stale);
+    // The copied log is one SQLite honors for these exact main bytes: an
+    // ordinary read-write open of an identical copy sees the extra trade.
+    let probe = dir.path().join("probe.db");
+    std::fs::copy(&prior, &probe).unwrap();
+    std::fs::copy(
+        prior.with_extension("db-wal"),
+        probe.with_extension("db-wal"),
+    )
+    .unwrap();
+    assert_eq!(count(&probe, "SELECT COUNT(*) FROM trades"), 2);
+    std::fs::remove_file(&manifest).unwrap();
+    let ignoring = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest)).unwrap();
+    assert!(ignoring.resumed);
+    assert_eq!(ignoring.prior_schema, 1);
+    let from_main: CacheV2BuildManifest =
+        serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
+    assert_eq!(from_main.source_bounds["newest_trade_unix"], FRESH_END - 10);
+    assert_eq!(sha256_file(&prior).unwrap(), fixed_sha256);
+    assert!(!prior.with_extension("db-shm").exists());
+    std::fs::remove_file(prior.with_extension("db-wal")).unwrap();
+    let migrated = migrate_cache_v2(&side, &manifest).unwrap();
+    assert!(!migrated.resumed);
+    assert_eq!(migrated.legacy_trade_count, 1);
+    assert_eq!(sha256_file(&prior).unwrap(), fixed_sha256);
+    // Once sealed, the candidate records the manifest hash itself: a resume
+    // reports the sealed schema and does not fabricate a manifest that the
+    // seal could no longer verify.
+    std::fs::remove_file(&manifest).unwrap();
+    let sealed = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest)).unwrap();
+    assert!(sealed.resumed);
+    assert_eq!(sealed.side_schema, 2);
+    assert!(!manifest.exists());
+    for suffix in ["db-wal", "db-shm"] {
+        assert!(!prior.with_extension(suffix).exists());
+    }
+
+    // A retry returns the cycle's own candidate untouched and never rewrites
+    // the completed prior.
+    let mut candidate = WalletCache::open(&side).unwrap();
+    candidate
+        .upsert_wallets_bulk(&[(WALLET_B.to_owned(), SRC_TRADES, false, None, None, None, 0)])
+        .unwrap();
+    drop(candidate);
+    let mutated = sha256_file(&side).unwrap();
+    assert_ne!(mutated, fixed_sha256);
+    let resumed = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest)).unwrap();
+    assert!(resumed.resumed);
+    assert_eq!(resumed.prior_sha256, None);
+    assert_eq!(sha256_file(&side).unwrap(), mutated);
+    assert_eq!(sha256_file(&prior).unwrap(), fixed_sha256);
+    assert!(!manifest.exists());
+
+    // A candidate without its prior is not a resumable cycle.
+    std::fs::remove_file(&prior).unwrap();
+    let orphan = stage_cache_cycle_v2(&fixed, &prior, &side, None).unwrap_err();
+    assert!(
+        orphan.to_string().contains("without its immutable prior"),
+        "{orphan}"
+    );
+    assert_eq!(sha256_file(&side).unwrap(), mutated);
+
+    // The three roles must be independent files: same path, a hard link and
+    // a symbolic link are refused before anything is copied.
+    let fixed_sha256_now = sha256_file(&fixed).unwrap();
+    let same = stage_cache_cycle_v2(&fixed, &fixed, &side, None).unwrap_err();
+    assert!(
+        same.to_string().contains("not an independent file"),
+        "{same}"
+    );
+    let linked = dir.path().join("wallet_cache.cron-2.prior.db");
+    std::fs::hard_link(&fixed, &linked).unwrap();
+    let hard = stage_cache_cycle_v2(&fixed, &linked, &dir.path().join("cron-2.side.db"), None)
+        .unwrap_err();
+    assert!(
+        hard.to_string().contains("not an independent file"),
+        "{hard}"
+    );
+    let symlinked = dir.path().join("wallet_cache.cron-3.prior.db");
+    std::os::unix::fs::symlink(&fixed, &symlinked).unwrap();
+    let soft = stage_cache_cycle_v2(&fixed, &symlinked, &dir.path().join("cron-3.side.db"), None)
+        .unwrap_err();
+    assert!(
+        soft.to_string().contains("not an independent file"),
+        "{soft}"
+    );
+    // A role that is another role's `.pending` staging name would be deleted
+    // by the copy; refused before any checkpoint or copy.
+    let colliding_prior = dir.path().join("cron-4.side.db.pending");
+    let colliding_side = dir.path().join("cron-4.side.db");
+    let pending_role =
+        stage_cache_cycle_v2(&fixed, &colliding_prior, &colliding_side, None).unwrap_err();
+    assert!(
+        pending_role.to_string().contains("not an independent file"),
+        "{pending_role}"
+    );
+    let fixed_named_as_pending = dir.path().join("cron-5.prior.db.pending");
+    std::fs::copy(&fixed, &fixed_named_as_pending).unwrap();
+    let pending_fixed = stage_cache_cycle_v2(
+        &fixed_named_as_pending,
+        &dir.path().join("cron-5.prior.db"),
+        &dir.path().join("cron-5.side.db"),
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        pending_fixed
+            .to_string()
+            .contains("not an independent file"),
+        "{pending_fixed}"
+    );
+    assert!(
+        fixed_named_as_pending.is_file(),
+        "the fixed cache must survive a refused staging"
+    );
+    assert!(!colliding_prior.exists() && !colliding_side.exists());
+    // The build manifest is written before the copies, so it must not be a
+    // role or a staging name either.
+    let manifest_as_pending = dir.path().join("cron-6.side.db.pending");
+    let manifest_role = stage_cache_cycle_v2(
+        &fixed,
+        &dir.path().join("cron-6.prior.db"),
+        &dir.path().join("cron-6.side.db"),
+        Some(&manifest_as_pending),
+    )
+    .unwrap_err();
+    assert!(
+        manifest_role
+            .to_string()
+            .contains("not an independent file"),
+        "{manifest_role}"
+    );
+    assert!(!dir.path().join("cron-6.prior.db").exists());
+    // Staging never creates directories: a manifest whose directory does not
+    // exist yet is refused before any copy, whether spelled directly, through
+    // `..`, or through a directory that would have to appear at a role.
+    for spelling in [
+        "new-dir/nested/build.json",
+        "missing-b/../build.json",
+        "cron-7.side.db/../build.json",
+        "cron-7.side.db/build.json",
+    ] {
+        let manifest = dir.path().join(spelling);
+        let refused = stage_cache_cycle_v2(
+            &fixed,
+            &dir.path().join("cron-7.prior.db"),
+            &dir.path().join("cron-7.side.db"),
+            Some(&manifest),
+        )
+        .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("parent directory is not available"),
+            "{spelling}: {refused}"
+        );
+        assert!(!dir.path().join("cron-7.prior.db").exists(), "{spelling}");
+        assert!(!dir.path().join("cron-7.side.db").exists(), "{spelling}");
+    }
+    assert!(!dir.path().join("new-dir").exists());
+    assert!(!dir.path().join("missing-b").exists());
+    // `..` through an existing directory resolves through the file system, so
+    // a manifest spelled that way onto a role is a collision.
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    let manifest_on_role = dir.path().join("sub/../cron-8.side.db");
+    let dotted_role = stage_cache_cycle_v2(
+        &fixed,
+        &dir.path().join("cron-8.prior.db"),
+        &dir.path().join("cron-8.side.db"),
+        Some(&manifest_on_role),
+    )
+    .unwrap_err();
+    assert!(
+        dotted_role.to_string().contains("not an independent file"),
+        "{dotted_role}"
+    );
+    assert!(!dir.path().join("cron-8.prior.db").exists());
+    // A link without a target is not an existing directory either, so nothing
+    // is created that could later give it one.
+    let link = dir.path().join("link");
+    std::os::unix::fs::symlink("missing-c/..", &link).unwrap();
+    let manifest_through_link = link.join(fixed.file_name().unwrap());
+    let broken = stage_cache_cycle_v2(
+        &fixed,
+        &dir.path().join("cron-10.prior.db"),
+        &dir.path().join("cron-10.side.db"),
+        Some(&manifest_through_link),
+    )
+    .unwrap_err();
+    assert!(
+        broken
+            .to_string()
+            .contains("parent directory is not available"),
+        "{broken}"
+    );
+    assert!(!dir.path().join("missing-c").exists());
+    assert!(!dir.path().join("cron-10.prior.db").exists());
+    // A manifest name that is itself a link without a target is refused: the
+    // prior copied later could give it a target and make it an alias.
+    let dangling_manifest = dir.path().join("dangling.json");
+    std::os::unix::fs::symlink("cron-11.prior.db", &dangling_manifest).unwrap();
+    let dangling = stage_cache_cycle_v2(
+        &fixed,
+        &dir.path().join("cron-11.prior.db"),
+        &dir.path().join("cron-11.side.db"),
+        Some(&dangling_manifest),
+    )
+    .unwrap_err();
+    assert!(
+        dangling
+            .to_string()
+            .contains("symbolic link without a target"),
+        "{dangling}"
+    );
+    assert!(!dir.path().join("cron-11.prior.db").exists());
+    // A spelling that names a directory (a trailing `/` or `/.`) is refused:
+    // the manifest is read again under the same spelling by the migration,
+    // which cannot open it that way once a file exists there.
+    for spelling in ["spelled.json/.", "spelled.json/"] {
+        let spelled = std::path::PathBuf::from(format!("{}/{spelling}", dir.path().display()));
+        let refused = stage_cache_cycle_v2(
+            &fixed,
+            &dir.path().join("cron-12.prior.db"),
+            &dir.path().join("cron-12.side.db"),
+            Some(&spelled),
+        )
+        .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("names a directory, not a file"),
+            "{spelling}: {refused}"
+        );
+        assert!(!dir.path().join("spelled.json").exists());
+        assert!(!dir.path().join("cron-12.prior.db").exists());
+    }
+    // The writer's temporary file beside the manifest is a role as well: a
+    // candidate named like it would receive the manifest bytes first.
+    let temp_named_side = dir
+        .path()
+        .join(format!(".build.json.{}.tmp", std::process::id()));
+    let temp_role = stage_cache_cycle_v2(
+        &fixed,
+        &dir.path().join("cron-13.prior.db"),
+        &temp_named_side,
+        Some(&dir.path().join("build.json")),
+    )
+    .unwrap_err();
+    assert!(
+        temp_role.to_string().contains("not an independent file"),
+        "{temp_role}"
+    );
+    assert!(!dir.path().join("cron-13.prior.db").exists());
+    assert!(!dir.path().join("build.json").exists());
+    // The candidate's and the fixed cache's SQLite sidecar names are roles:
+    // a prior named like the candidate's shared-memory index would be
+    // truncated when staging reads the candidate.
+    let sidecar_named_prior = dir.path().join("cron-14.side.db-shm");
+    let sidecar_role = stage_cache_cycle_v2(
+        &fixed,
+        &sidecar_named_prior,
+        &dir.path().join("cron-14.side.db"),
+        Some(&dir.path().join("build.json")),
+    )
+    .unwrap_err();
+    assert!(
+        sidecar_role.to_string().contains("not an independent file"),
+        "{sidecar_role}"
+    );
+    assert!(!sidecar_named_prior.exists());
+    assert!(!dir.path().join("cron-14.side.db").exists());
+    // A rollback journal SQLite finds beside a database it opens is played
+    // back and deleted, so that name is a role too.
+    let journal_named_prior = dir.path().join("cron-15.side.db-journal");
+    let journal_role = stage_cache_cycle_v2(
+        &fixed,
+        &journal_named_prior,
+        &dir.path().join("cron-15.side.db"),
+        Some(&dir.path().join("build.json")),
+    )
+    .unwrap_err();
+    assert!(
+        journal_role.to_string().contains("not an independent file"),
+        "{journal_role}"
+    );
+    assert!(!journal_named_prior.exists());
+    assert!(!dir.path().join("cron-15.side.db").exists());
+    assert!(std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")
+    }));
+    assert_eq!(sha256_file(&fixed).unwrap(), fixed_sha256_now);
+}
+
+#[test]
+fn cycle_staging_checks_the_lock_file_name_before_taking_the_lock() {
+    use pe_bootstrap::cache_migration::stage_cache_cycle_v2;
+    let dir = TempDir::new().unwrap();
+    let fixed = dir.path().join("wallet_cache.db");
+    drop(seed_v1(&fixed, FRESH_END - 10));
+    let lock = pe_bootstrap::lock::lock_path_for(&fixed);
+    let before = std::fs::read(&lock).ok();
+    // Taking the lock creates and rewrites the lock file, so a role named
+    // like it is refused before the lock is taken.
+    let refused =
+        stage_cache_cycle_v2(&fixed, &lock, &dir.path().join("cron-1.side.db"), None).unwrap_err();
+    assert!(
+        refused.to_string().contains("not an independent file"),
+        "{refused}"
+    );
+    assert_eq!(std::fs::read(&lock).ok(), before);
+    assert!(!dir.path().join("cron-1.side.db").exists());
+    // The commands after staging take the candidate's own lock, so a prior
+    // named like it is refused as well.
+    let side = dir.path().join("cron-1.side.db");
+    let side_lock = pe_bootstrap::lock::lock_path_for(&side);
+    let refused_side = stage_cache_cycle_v2(&fixed, &side_lock, &side, None).unwrap_err();
+    assert!(
+        refused_side.to_string().contains("not an independent file"),
+        "{refused_side}"
+    );
+    assert!(!side_lock.exists());
+    assert!(!side.exists());
+
+    // The documented alias layout links the physical lock name to the
+    // repository's lock file before that file exists: the link's target is
+    // the reserved name, staging proceeds and taking the lock creates it.
+    let phys = dir.path().join("phys");
+    let data = dir.path().join("data");
+    std::fs::create_dir_all(&phys).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    let physical = phys.join("wallet_cache.db");
+    drop(seed_v1(&physical, FRESH_END - 10));
+    let _ = std::fs::remove_file(phys.join("wallet_cache.db.lock"));
+    let repo_lock = data.join("wallet_cache.db.lock");
+    std::os::unix::fs::symlink(&repo_lock, phys.join("wallet_cache.db.lock")).unwrap();
+    assert!(!repo_lock.exists());
+    let staged = stage_cache_cycle_v2(
+        &physical,
+        &phys.join("cron-2.prior.db"),
+        &phys.join("cron-2.side.db"),
+        None,
+    )
+    .unwrap();
+    assert!(!staged.resumed);
+    assert!(repo_lock.is_file());
+
+    // A lock link whose target is another name of the fixed cache is refused
+    // by identity: taking the lock would rewrite the fixed cache.
+    let other = dir.path().join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    let victim = other.join("wallet_cache.db");
+    drop(seed_v1(&victim, FRESH_END - 10));
+    let _ = std::fs::remove_file(other.join("wallet_cache.db.lock"));
+    let victim_sha256 = sha256_file(&victim).unwrap();
+    std::fs::hard_link(&victim, other.join("alias.db")).unwrap();
+    std::os::unix::fs::symlink("alias.db", other.join("wallet_cache.db.lock")).unwrap();
+    let aliased = stage_cache_cycle_v2(
+        &victim,
+        &other.join("cron-3.prior.db"),
+        &other.join("cron-3.side.db"),
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        aliased.to_string().contains("not an independent file"),
+        "{aliased}"
+    );
+    assert_eq!(sha256_file(&victim).unwrap(), victim_sha256);
+    assert!(!other.join("cron-3.prior.db").exists());
+}
+
+#[test]
+fn cycle_staging_honors_a_seal_committed_only_to_the_write_ahead_log() {
+    use pe_bootstrap::cache_migration::stage_cache_cycle_v2;
+    let dir = TempDir::new().unwrap();
+    let fixed = dir.path().join("wallet_cache.db");
+    let prior = dir.path().join("wallet_cache.cron-1.prior.db");
+    let side = dir.path().join("wallet_cache.cron-1.side.db");
+    let manifest = dir.path().join("cache_build_manifest.json");
+    drop(seed_v1(&fixed, FRESH_END - 10));
+    let staged = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest)).unwrap();
+    assert_eq!(staged.side_schema, 1);
+    // A seal whose `user_version` commit sits in the write-ahead log while the
+    // main header still says one (interrupted before its checkpoint) must be
+    // seen as sealed: no manifest is fabricated for it.
+    let sealing = Connection::open(&side).unwrap();
+    sealing
+        .execute_batch("PRAGMA journal_mode = WAL; PRAGMA user_version = 2;")
+        .unwrap();
+    std::fs::remove_file(&manifest).unwrap();
+    let resumed = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest)).unwrap();
+    assert!(resumed.resumed);
+    assert_eq!(resumed.side_schema, 2);
+    assert!(!manifest.exists());
+    assert!(
+        side.with_extension("db-wal").metadata().unwrap().len() > 0,
+        "the committed write-ahead log must be left intact"
+    );
+    // A connection that stays open across a resume keeps its shared-memory
+    // index and truncated log: staging never unlinks sidecars itself, so the
+    // held connection still commits and its write is visible afterwards.
+    sealing
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    assert_eq!(side.with_extension("db-wal").metadata().unwrap().len(), 0);
+    let held = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest)).unwrap();
+    assert_eq!(held.side_schema, 2);
+    assert!(side.with_extension("db-shm").exists());
+    let changed = sealing
+        .execute(
+            "UPDATE source_cursor SET value = 'live' WHERE key = 'clob_closed'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(changed, 1);
+    drop(sealing);
+    let value: String = Connection::open(&side)
+        .unwrap()
+        .query_row(
+            "SELECT value FROM source_cursor WHERE key = 'clob_closed'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(value, "live");
+    for suffix in ["db-wal", "db-shm"] {
+        assert!(!side.with_extension(suffix).exists());
+    }
+}
+
+#[tokio::test]
+async fn activation_refuses_a_fixed_cache_changed_after_its_prior_was_staged() {
+    use pe_bootstrap::cache_migration::stage_cache_cycle_v2;
+    let dir = tempfile::Builder::new()
+        .prefix("pe-fixed-drift-")
+        .tempdir_in(std::env::current_dir().unwrap())
+        .unwrap();
+    std::fs::create_dir_all(dir.path().join("eval-results")).unwrap();
+    let fixed = dir.path().join("fixed.db");
+    let prior = dir.path().join("fixed.cron-1.prior.db");
+    let side = dir.path().join("fixed.cron-1.side.db");
+    drop(seed_v1(&fixed, FRESH_END - 10));
+    let staged = stage_cache_cycle_v2(&fixed, &prior, &side, None).unwrap();
+    let prior_sha256 = staged.prior_sha256.unwrap();
+
+    // Build a finalized candidate elsewhere and place it at the side path.
+    let candidate = dir.path().join("candidate.db");
+    let side_sha256 = finalize_fresh_initial(&dir, &candidate).await;
+    std::fs::copy(&candidate, &side).unwrap();
+    let request = CacheActivationRequest {
+        fixed_path: fixed.clone(),
+        side_path: side.clone(),
+        prior_cache_backup_path: prior.clone(),
+        expected_side_sha256: side_sha256.clone(),
+    };
+
+    // A fixed cache written after the prior was captured is refused; the
+    // candidate and the staged prior are preserved for the operator.
+    let mut drifting = WalletCache::open(&fixed).unwrap();
+    drifting
+        .upsert_wallets_bulk(&[(WALLET_E.to_owned(), SRC_TRADES, false, None, None, None, 0)])
+        .unwrap();
+    drop(drifting);
+    let refused = activate_cache_v2(&request).unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("existing prior-cache backup differs from the fixed cache"),
+        "{refused}"
+    );
+    assert!(side.exists());
+    assert_eq!(sha256_file(&prior).unwrap(), prior_sha256);
+    assert_ne!(sha256_file(&fixed).unwrap(), prior_sha256);
+
+    // Restaging from the drifted fixed would need a new cycle: the completed
+    // prior is never rewritten beneath the candidate.
+    let resumed = stage_cache_cycle_v2(&fixed, &prior, &side, None).unwrap();
+    assert!(resumed.resumed);
+    assert_eq!(sha256_file(&prior).unwrap(), prior_sha256);
+
+    // The unchanged control installs the candidate and keeps the prior.
+    let fixed_control = dir.path().join("control.db");
+    let prior_control = dir.path().join("control.cron-1.prior.db");
+    let side_control = dir.path().join("control.cron-1.side.db");
+    drop(seed_v1(&fixed_control, FRESH_END - 10));
+    let control =
+        stage_cache_cycle_v2(&fixed_control, &prior_control, &side_control, None).unwrap();
+    std::fs::copy(&candidate, &side_control).unwrap();
+    let installed = activate_cache_v2(&CacheActivationRequest {
+        fixed_path: fixed_control.clone(),
+        side_path: side_control.clone(),
+        prior_cache_backup_path: prior_control.clone(),
+        expected_side_sha256: side_sha256.clone(),
+    })
+    .unwrap();
+    assert!(!installed.resumed);
+    assert_eq!(installed.prior_cache_sha256, control.prior_sha256.unwrap());
+    assert_eq!(sha256_file(&fixed_control).unwrap(), side_sha256);
+    assert!(!side_control.exists());
+}
+
+#[tokio::test]
+async fn historical_cache_without_the_fresh_column_keeps_its_legacy_identity() {
+    let dir = tempfile::Builder::new()
+        .prefix("pe-legacy-column-")
+        .tempdir_in(std::env::current_dir().unwrap())
+        .unwrap();
+    std::fs::create_dir_all(dir.path().join("eval-results")).unwrap();
+    let fixed = dir.path().join("fixed.db");
+    retained_classifier_activity(&dir, &fixed).await;
+    // Reproduce a cache finalized before the column existed: rebuild the
+    // singleton without it (SQLite cannot drop a column in place here).
+    let connection = Connection::open(&fixed).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE cache_v2_migration_state_legacy AS
+                 SELECT singleton, phase, input_manifest_sha256, ranker_projection_count,
+                        ranker_projection_digest, ranker_classifier_version, updated_at_unix
+                 FROM cache_v2_migration_state;
+             DROP TABLE cache_v2_migration_state;
+             ALTER TABLE cache_v2_migration_state_legacy RENAME TO cache_v2_migration_state;
+             PRAGMA wal_checkpoint(TRUNCATE);",
+        )
+        .unwrap();
+    drop(connection);
+    for suffix in ["db-wal", "db-shm"] {
+        let _ = std::fs::remove_file(fixed.with_extension(suffix));
+    }
+    assert_eq!(
+        count(
+            &fixed,
+            "SELECT COUNT(*) FROM pragma_table_info('cache_v2_migration_state')
+             WHERE name = 'fresh_collection_json'"
+        ),
+        0
+    );
+    let fixed_sha256 = sha256_file(&fixed).unwrap();
+
+    // The historical fixed cache validates through its legacy identity during
+    // activation of a fresh-identity candidate, without being upgraded.
+    let side = dir.path().join("side.db");
+    let side_sha256 = finalize_fresh_initial(&dir, &side).await;
+    let installed = activate_cache_v2(&CacheActivationRequest {
+        fixed_path: fixed.clone(),
+        side_path: side,
+        prior_cache_backup_path: dir.path().join("prior.db"),
+        expected_side_sha256: side_sha256,
+    })
+    .unwrap();
+    assert_eq!(installed.prior_cache_schema, 2);
+    assert_eq!(installed.prior_cache_sha256, fixed_sha256);
+    assert_eq!(
+        sha256_file(&installed.prior_cache_backup_path).unwrap(),
+        fixed_sha256
+    );
+
+    // A fatal source answer keeps the permanent classification.
+    let candidate = dir.path().join("fatal.db");
+    seed_initial_candidate(&candidate);
+    let manifest = write_build_manifest(&dir, &candidate);
+    migrate_cache_v2(&candidate, &manifest).unwrap();
+    let fatal = populate_activity_fresh_v2(
+        &candidate,
+        &FixtureFetcher::new(HashMap::new()),
+        "https://data.example",
+        1,
+        FRESH_END,
+        FRESH_END + 1,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            fatal,
+            pe_bootstrap::error::BootstrapError::Polymarket { .. }
+        ),
+        "{fatal}"
+    );
+    assert_eq!(fatal.exit_code(), 1);
 }

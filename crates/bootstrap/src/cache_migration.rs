@@ -22,14 +22,15 @@ use pe_position_ledger::{
     EntryClassification, LedgerEffect, LedgerMutation, PositionLedger, SecondVerdict,
     classify_complete_historical_second,
 };
+use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
     ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ActivityAggregate, ActivitySemanticRevision,
     PriceWeightedShareAmount, ReconciliationPageEvidence, SourceActivityGroupComponents,
     SourceActivityGroupId,
 };
 use pe_source_polymarket_public::{
-    CLOB_RESOLUTION_PARSER_VERSION, CLOB_RESOLUTION_SCHEMA_VERSION, ClobCoverageManifest,
-    ReconciliationFetcher, fetch_complete_activity,
+    ActivityReadError, CLOB_RESOLUTION_PARSER_VERSION, CLOB_RESOLUTION_SCHEMA_VERSION,
+    ClobCoverageManifest, ReconciliationFetcher, fetch_complete_activity,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
@@ -48,6 +49,7 @@ const CACHE_BUILD_MANIFEST_VERSION: u32 = 1;
 const FROZEN_PAYLOAD_REFERENCE_VERSION: u32 = 1;
 const FINAL_STAGE_RECORD_VERSION: u32 = 2;
 const RANKER_CLASSIFIER_VERSION: u32 = 2;
+const FRESH_COLLECTION_VERSION: u32 = 1;
 const MAX_ACTIVITY_WALLET_FETCHES: usize = 16;
 
 const V2_SCHEMA: &str = "
@@ -148,6 +150,7 @@ CREATE TABLE IF NOT EXISTS cache_v2_migration_state (
     ranker_projection_count INTEGER NULL,
     ranker_projection_digest TEXT NULL,
     ranker_classifier_version INTEGER NULL,
+    fresh_collection_json  TEXT    NULL,
     updated_at_unix        INTEGER NOT NULL
 );
 ";
@@ -194,6 +197,103 @@ pub struct FrozenCacheFreshness {
 }
 
 type FinalizedProjectionState = (String, Option<i64>, Option<String>, Option<i64>);
+
+/// Versioned identity of one fresh activity collection recorded in the
+/// candidate's migration-state singleton (#588). `digest` binds the other
+/// fields and is the `reference_sha256` of that generation's receipts and
+/// activity manifest; projection rows bind it indirectly through their
+/// activity generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FreshCollectionIdentity {
+    version: u32,
+    generation: u64,
+    fixed_end_unix: i64,
+    wallets: Vec<String>,
+    digest: String,
+}
+
+impl FreshCollectionIdentity {
+    fn new(
+        generation: u64,
+        fixed_end_unix: i64,
+        wallets: Vec<String>,
+    ) -> Result<Self, BootstrapError> {
+        let digest = fresh_collection_digest(generation, fixed_end_unix, &wallets)?;
+        Ok(Self {
+            version: FRESH_COLLECTION_VERSION,
+            generation,
+            fixed_end_unix,
+            wallets,
+            digest,
+        })
+    }
+
+    fn verified(self) -> Result<Self, BootstrapError> {
+        if self.version != FRESH_COLLECTION_VERSION {
+            return invalid(format!(
+                "fresh collection identity version {} is unsupported",
+                self.version
+            ));
+        }
+        if self.wallets.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return invalid("fresh collection wallet list is not sorted and unique".to_owned());
+        }
+        for wallet in &self.wallets {
+            validate_wallet_hex(wallet)?;
+        }
+        if self.digest
+            != fresh_collection_digest(self.generation, self.fixed_end_unix, &self.wallets)?
+        {
+            return invalid("fresh collection identity digest mismatch".to_owned());
+        }
+        Ok(self)
+    }
+}
+
+fn fresh_collection_digest(
+    generation: u64,
+    fixed_end_unix: i64,
+    wallets: &[String],
+) -> Result<String, BootstrapError> {
+    Ok(sha256_bytes(
+        canonical_json(&serde_json::json!({
+            "version": FRESH_COLLECTION_VERSION,
+            "generation": generation,
+            "fixed_end_unix": fixed_end_unix,
+            "wallets": wallets,
+        }))?
+        .as_bytes(),
+    ))
+}
+
+/// The one activity identity a schema-two cache is bound to: a fresh
+/// collection record when present, otherwise the legacy frozen-payload binding.
+struct ActivityIdentity {
+    generation: u64,
+    reference_sha256: String,
+    fixed_end_unix: i64,
+    wallets: Vec<String>,
+}
+
+/// Exclusive lower bound that reaches a wallet's full history: it goes on the
+/// wire as `start=1`, whereas an omitted `start` returns only the venue's
+/// default recent window (docs/15, checked 2026-09-12).
+const FULL_HISTORY_START_EXCLUSIVE: Option<i64> = Some(0);
+
+/// Byte-exact cycle staging receipt for the fixed cache (#588).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct CacheStageReport {
+    pub fixed_path: PathBuf,
+    pub prior_path: PathBuf,
+    pub side_path: PathBuf,
+    pub prior_schema: i64,
+    /// Differs from `prior_schema` only after the initial candidate was sealed.
+    pub side_schema: i64,
+    pub prior_sha256: Option<String>,
+    pub side_sha256: Option<String>,
+    pub resumed: bool,
+}
 
 /// Supplied frozen reference used to rerun the production active filter against
 /// the sealed v1 tables. `ranked_wallets` is the pre-filter universe and
@@ -395,21 +495,224 @@ pub async fn populate_activity_v2(
         generation,
         fixed_end_unix,
     )?;
-    if let Some(manifest) = completed_activity_manifest(
-        &connection,
+    let identity = ActivityIdentity {
         generation,
-        &verification.reference_sha256,
+        reference_sha256: verification.reference_sha256,
         fixed_end_unix,
-        &wallets,
+        wallets,
+    };
+    // The legacy reference reads keep their authentic request shape so a
+    // resumed legacy collection matches its recorded receipts.
+    collect_activity_v2(
+        &mut connection,
+        fetcher,
+        base_url,
+        &identity,
+        None,
+        completed_at_unix,
+    )
+    .await
+}
+
+/// Collect complete activity for a fresh private generation without a frozen
+/// payload reference (#588).
+///
+/// A generation that is not yet recorded is started atomically: its wallet
+/// union and end are recorded in the migration-state singleton, finalization is
+/// invalidated, and the candidate's superseded projection, activity rows,
+/// receipts and manifests are cleared. Repeating a recorded generation keeps
+/// its recorded end and wallet list and fetches only wallets without a valid
+/// receipt; a completed generation returns its manifest without any source
+/// call. `new_generation_end_unix` bounds only a newly started generation.
+pub async fn populate_activity_fresh_v2(
+    cache_path: &Path,
+    fetcher: &dyn ReconciliationFetcher,
+    base_url: &str,
+    generation: u64,
+    new_generation_end_unix: i64,
+    completed_at_unix: i64,
+) -> Result<ActivityCoverageManifestV2, BootstrapError> {
+    let mut connection = open_existing_rw(cache_path)?;
+    require_schema(&connection, CACHE_SCHEMA_VERSION_V2)?;
+    ensure_lane_a_v2_schema(&connection)?;
+    let record = begin_or_resume_fresh_collection(
+        &mut connection,
+        generation,
+        new_generation_end_unix,
+        completed_at_unix,
+    )?;
+    let identity = ActivityIdentity {
+        generation: record.generation,
+        reference_sha256: record.digest,
+        fixed_end_unix: record.fixed_end_unix,
+        wallets: record.wallets,
+    };
+    collect_activity_v2(
+        &mut connection,
+        fetcher,
+        base_url,
+        &identity,
+        FULL_HISTORY_START_EXCLUSIVE,
+        completed_at_unix,
+    )
+    .await
+}
+
+fn begin_or_resume_fresh_collection(
+    connection: &mut Connection,
+    generation: u64,
+    fixed_end_unix: i64,
+    started_at_unix: i64,
+) -> Result<FreshCollectionIdentity, BootstrapError> {
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let recorded = fresh_collection_record(&transaction)?;
+    if let Some(record) = recorded.as_ref() {
+        if record.generation == generation {
+            return Ok(record.clone());
+        }
+        // Starting a generation clears the candidate's retained activity, so an
+        // unfinished collection can only be resumed: its frozen universe is
+        // otherwise no longer derivable from this copy. Only a manifest that
+        // proves the recorded identity counts as complete.
+        let completed = completed_activity_manifest(
+            &transaction,
+            record.generation,
+            &record.digest,
+            record.fixed_end_unix,
+            &record.wallets,
+        )?;
+        if completed.is_none() {
+            return invalid(format!(
+                "fresh activity generation {} is incomplete; resume it instead of starting {generation}",
+                record.generation
+            ));
+        }
+    }
+    let generation_i64 = to_i64(generation, "fresh activity generation")?;
+    let mut known = recorded
+        .as_ref()
+        .map(|record| to_i64(record.generation, "fresh activity generation"))
+        .transpose()?;
+    for sql in [
+        "SELECT MAX(generation) FROM activity_coverage_manifests_v2",
+        "SELECT MAX(generation) FROM activity_wallet_coverage_staging_v2",
+        "SELECT MAX(activity_generation) FROM cache_frozen_payload_verifications",
+    ] {
+        let value: Option<i64> = transaction.query_row(sql, [], |row| row.get(0))?;
+        known = known.max(value);
+    }
+    if known.is_some_and(|known| generation_i64 <= known) {
+        return invalid(format!(
+            "fresh activity generation {generation} must exceed the recorded generation {}",
+            known.unwrap_or_default()
+        ));
+    }
+
+    // The union is read before any clearing: current acquisition candidates plus
+    // every wallet with retained history in this byte copy of the immutable
+    // prior (activity from a prior fresh/legacy collection, else the sealed
+    // schema-one trades of an initial candidate).
+    let mut wallets = BTreeSet::new();
+    let retained_activity = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM activity_coverage_manifests_v2)",
+        [],
+        |row| row.get::<_, bool>(0),
+    )?;
+    let retained_sql = if retained_activity {
+        "SELECT DISTINCT wallet_hex FROM activity_groups_v2"
+    } else {
+        "SELECT DISTINCT wallet_hex FROM trades_v1_sealed"
+    };
+    for sql in [
+        "SELECT wallet_hex FROM active_tradeable_wallets",
+        retained_sql,
+    ] {
+        let mut statement = transaction.prepare(sql)?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        for wallet in rows {
+            let wallet = wallet?.to_ascii_lowercase();
+            validate_wallet_hex(&wallet)?;
+            wallets.insert(wallet);
+        }
+    }
+    let record =
+        FreshCollectionIdentity::new(generation, fixed_end_unix, wallets.into_iter().collect())?;
+    transaction.execute(
+        "UPDATE cache_v2_migration_state
+         SET fresh_collection_json = ?1, phase = 'schema_sealed',
+             ranker_projection_count = NULL, ranker_projection_digest = NULL,
+             ranker_classifier_version = NULL, updated_at_unix = ?2
+         WHERE singleton = 1",
+        params![canonical_json(&record)?, started_at_unix],
+    )?;
+    transaction.execute_batch(
+        "DELETE FROM ranker_entries_v2;
+         DELETE FROM activity_groups_v2;
+         DELETE FROM activity_wallet_coverage_staging_v2;
+         DELETE FROM activity_coverage_manifests_v2;",
+    )?;
+    transaction.commit()?;
+    Ok(record)
+}
+
+fn fresh_collection_record(
+    connection: &Connection,
+) -> Result<Option<FreshCollectionIdentity>, BootstrapError> {
+    // Historical caches finalized before #588 lack the column and are read
+    // without being upgraded; they carry only the legacy identity.
+    let column_present: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('cache_v2_migration_state')
+                       WHERE name = 'fresh_collection_json')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !column_present {
+        return Ok(None);
+    }
+    let stored: Option<String> = connection
+        .query_row(
+            "SELECT fresh_collection_json FROM cache_v2_migration_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    stored
+        .map(|json| serde_json::from_str::<FreshCollectionIdentity>(&json)?.verified())
+        .transpose()
+}
+
+async fn collect_activity_v2(
+    connection: &mut Connection,
+    fetcher: &dyn ReconciliationFetcher,
+    base_url: &str,
+    identity: &ActivityIdentity,
+    history_start_exclusive: Option<i64>,
+    completed_at_unix: i64,
+) -> Result<ActivityCoverageManifestV2, BootstrapError> {
+    let ActivityIdentity {
+        generation,
+        reference_sha256,
+        fixed_end_unix,
+        wallets,
+    } = identity;
+    let (generation, fixed_end_unix) = (*generation, *fixed_end_unix);
+    if let Some(manifest) = completed_activity_manifest(
+        connection,
+        generation,
+        reference_sha256,
+        fixed_end_unix,
+        wallets,
     )? {
         return Ok(manifest);
     }
     let completed = validate_activity_staging(
-        &connection,
+        connection,
         generation,
-        &verification.reference_sha256,
+        reference_sha256,
         fixed_end_unix,
-        &wallets,
+        wallets,
         false,
     )?
     .completed_wallets;
@@ -424,12 +727,15 @@ pub async fn populate_activity_v2(
             WalletAddress::from_hex(&wallet_hex).map_err(|error| BootstrapError::Invalid {
                 message: format!("frozen universe contains invalid wallet {wallet_hex}: {error}"),
             })?;
-        let complete = fetch_complete_activity(fetcher, base_url, wallet, None, fixed_end_unix)
-            .await
-            .map_err(|error| BootstrapError::Polymarket {
-                wallet: wallet_hex.clone(),
-                message: error.to_string(),
-            })?;
+        let complete = fetch_complete_activity(
+            fetcher,
+            base_url,
+            wallet,
+            history_start_exclusive,
+            fixed_end_unix,
+        )
+        .await
+        .map_err(|error| activity_read_failure(&wallet_hex, error))?;
         let source_row_count =
             u64::try_from(complete.rows.len()).map_err(|_| BootstrapError::Invalid {
                 message: format!("activity source-row count overflow for {wallet_hex}"),
@@ -461,9 +767,9 @@ pub async fn populate_activity_v2(
     futures::pin_mut!(reads);
     while let Some(completion) = reads.next().await {
         commit_activity_wallet_v2(
-            &mut connection,
+            connection,
             generation,
-            &verification.reference_sha256,
+            reference_sha256,
             fixed_end_unix,
             completed_at_unix,
             &completion?,
@@ -471,19 +777,39 @@ pub async fn populate_activity_v2(
     }
 
     let staged = validate_activity_staging(
-        &connection,
+        connection,
         generation,
-        &verification.reference_sha256,
+        reference_sha256,
         fixed_end_unix,
-        &wallets,
+        wallets,
         true,
     )?;
     staged.into_manifest(
         generation,
-        verification.reference_sha256,
+        reference_sha256.clone(),
         fixed_end_unix,
         completed_at_unix,
     )
+}
+
+// A source read that exhausted the fetcher's transient retries, or that the
+// venue rate-limited, is the supervised temporary failure (exit 75), the same
+// classification `clob.rs`/`events.rs` use; every completed wallet keeps its
+// durable receipt, so the retry fetches only the remainder.
+fn activity_read_failure(wallet_hex: &str, error: ActivityReadError) -> BootstrapError {
+    match error {
+        ActivityReadError::Fetch {
+            source: SourceError::Transient { .. } | SourceError::RateLimited { .. },
+            ..
+        } => BootstrapError::TransientSource {
+            source_name: "polymarket-activity",
+            message: format!("{wallet_hex}: {error}"),
+        },
+        other => BootstrapError::Polymarket {
+            wallet: wallet_hex.to_owned(),
+            message: other.to_string(),
+        },
+    }
 }
 
 /// Seal a verified hash-qualified online backup as generation two.
@@ -1411,9 +1737,15 @@ pub fn verify_frozen_payload_v1(
     })
 }
 
-fn activity_identity(
-    connection: &Connection,
-) -> Result<(u64, String, i64, Vec<String>), BootstrapError> {
+fn activity_identity(connection: &Connection) -> Result<ActivityIdentity, BootstrapError> {
+    if let Some(record) = fresh_collection_record(connection)? {
+        return Ok(ActivityIdentity {
+            generation: record.generation,
+            reference_sha256: record.digest,
+            fixed_end_unix: record.fixed_end_unix,
+            wallets: record.wallets,
+        });
+    }
     let rows = connection
         .prepare(
             "SELECT activity_generation, reference_sha256, fixed_end_unix, active_wallets_json
@@ -1439,19 +1771,24 @@ fn activity_identity(
     let mut wallets: Vec<String> = serde_json::from_str(&selected.3)?;
     wallets.sort();
     wallets.dedup();
-    Ok((
-        to_u64(selected.0, "activity generation")?,
-        selected.1.clone(),
-        selected.2,
+    Ok(ActivityIdentity {
+        generation: to_u64(selected.0, "activity generation")?,
+        reference_sha256: selected.1.clone(),
+        fixed_end_unix: selected.2,
         wallets,
-    ))
+    })
 }
 
 fn install_activity_manifest(
     transaction: &rusqlite::Transaction<'_>,
     finalized_at_unix: i64,
 ) -> Result<ActivityCoverageManifestV2, BootstrapError> {
-    let (generation, reference_sha256, fixed_end_unix, wallets) = activity_identity(transaction)?;
+    let ActivityIdentity {
+        generation,
+        reference_sha256,
+        fixed_end_unix,
+        wallets,
+    } = activity_identity(transaction)?;
     if let Some(manifest) = completed_activity_manifest(
         transaction,
         generation,
@@ -1680,7 +2017,7 @@ pub fn finalize_cache_v2(
     verify_payout_coverage(&connection, payout_generation)?;
     let transaction = connection.transaction()?;
     let activity_manifest = install_activity_manifest(&transaction, finalized_at_unix)?;
-    let (_, _, _, wallets) = activity_identity(&transaction)?;
+    let wallets = activity_identity(&transaction)?.wallets;
     let (ranker_projection_count, ranker_projection_digest) =
         rebuild_ranker_projection(&transaction, activity_manifest.generation, &wallets)?;
     transaction.execute(
@@ -1715,6 +2052,345 @@ pub fn finalize_cache_v2(
     };
     atomic_write_json(stage_record_path, &record)?;
     Ok(record)
+}
+
+/// Stage one cycle's immutable prior and private candidate from the fixed
+/// cache as byte-exact copies (#588).
+///
+/// Under the cache mutation lock the fixed main is checkpointed, integrity
+/// checked and closed, then copied to `prior_path` through the private
+/// `.pending` → fsync → rename → parent-sync pattern and hash-verified; the
+/// candidate is created from that prior the same way. A completed prior is
+/// never rewritten and an existing candidate is returned untouched so a retry
+/// resumes the cycle's own copy; a candidate without its prior is refused.
+pub fn stage_cache_cycle_v2(
+    fixed_path: &Path,
+    prior_path: &Path,
+    side_path: &Path,
+    build_manifest_path: Option<&Path>,
+) -> Result<CacheStageReport, BootstrapError> {
+    require_regular_file(fixed_path, "current fixed cache")?;
+    require_same_device(fixed_path, prior_path, side_path)?;
+    // The copies delete and rename their `.pending` names, so those must be
+    // independent of every role as well.
+    let prior_pending = pending_path_for(prior_path);
+    let side_pending = pending_path_for(side_path);
+    // SQLite creates, truncates or deletes the fixed cache's and the
+    // candidate's write-ahead, shared-memory and rollback-journal sidecars
+    // when staging opens them, so those names are roles as well.
+    let sidecars: Vec<(&str, PathBuf)> = [
+        ("current fixed cache sidecar", fixed_path),
+        ("private candidate sidecar", side_path),
+    ]
+    .into_iter()
+    .flat_map(|(label, path)| {
+        ["-wal", "-shm", "-journal"].map(move |suffix| (label, sidecar_path(path, suffix)))
+    })
+    .collect();
+    let mut roles = vec![
+        ("current fixed cache", fixed_path),
+        ("immutable prior cache", prior_path),
+        ("private candidate cache", side_path),
+        ("immutable prior staging file", prior_pending.as_path()),
+        ("private candidate staging file", side_pending.as_path()),
+    ];
+    roles.extend(
+        sidecars
+            .iter()
+            .map(|(label, path)| (*label, path.as_path())),
+    );
+    // Taking the cache lock creates and rewrites the lock file, so the roles
+    // are validated before the lock is taken.
+    let lock_target = lock_target_path(fixed_path)?;
+    roles.push(("cache mutation lock", lock_target.as_path()));
+    // The commands that follow staging take the candidate's own lock.
+    let side_lock_target = lock_target_path(side_path)?;
+    roles.push(("private candidate lock", side_lock_target.as_path()));
+    // The manifest is checked and written under one spelling: its resolved
+    // identity, whose parent directory exists. The writer's temporary file
+    // beside it is a role too.
+    let build_manifest_path = build_manifest_path
+        .map(canonical_intended_path)
+        .transpose()?;
+    let build_manifest_temp = build_manifest_path.as_deref().map(atomic_write_temp_path);
+    if let Some(path) = build_manifest_path.as_deref() {
+        roles.push(("cache build manifest", path));
+    }
+    if let Some(path) = build_manifest_temp.as_deref() {
+        roles.push(("cache build manifest staging file", path));
+    }
+    require_distinct_files(&roles)?;
+    let _lock = crate::lock::CacheMutationLock::acquire(fixed_path)?;
+    if side_path.exists() {
+        require_regular_file(side_path, "private candidate cache")?;
+        if !prior_path.exists() {
+            return invalid(format!(
+                "private candidate {} exists without its immutable prior {}",
+                side_path.display(),
+                prior_path.display()
+            ));
+        }
+        require_regular_file(prior_path, "immutable prior cache")?;
+        let report = stage_report(fixed_path, prior_path, side_path, None, true)?;
+        // An unsealed initial candidate whose manifest went missing gets it
+        // back from the immutable prior; a sealed candidate keeps its recorded
+        // input hash in `sealed_generation_manifests` and needs no file.
+        if let Some(path) = build_manifest_path.as_deref()
+            && report.side_schema != CACHE_SCHEMA_VERSION_V2
+            && !path.exists()
+        {
+            write_build_manifest(prior_path, &sha256_file(prior_path)?, path)?;
+        }
+        return Ok(report);
+    }
+    let prior_sha256 = if prior_path.exists() {
+        require_regular_file(prior_path, "immutable prior cache")?;
+        sha256_file(prior_path)?
+    } else {
+        let current = open_existing_rw(fixed_path)?;
+        checkpoint_truncate(&current)?;
+        integrity_check(&current)?;
+        current.close().map_err(|(_, error)| error)?;
+        let fixed_sha256 = sha256_file(fixed_path)?;
+        copy_file_atomic_verified(fixed_path, prior_path, Some(&fixed_sha256))?;
+        fixed_sha256
+    };
+    // An initial schema-one candidate is sealed by `cache-migrate-v2` against
+    // this authentic hash-bound build manifest; the candidate is a byte copy
+    // of the verified prior, so the prior hash is the backup hash. Written
+    // before the candidate is adopted so an interrupted cycle resumes with it.
+    if let Some(path) = build_manifest_path.as_deref()
+        && verified_user_version(prior_path)? != CACHE_SCHEMA_VERSION_V2
+        && !path.exists()
+    {
+        write_build_manifest(prior_path, &prior_sha256, path)?;
+    }
+    copy_file_atomic_verified(prior_path, side_path, Some(&prior_sha256))?;
+    stage_report(fixed_path, prior_path, side_path, Some(prior_sha256), false)
+}
+
+fn write_build_manifest(
+    prior_path: &Path,
+    prior_sha256: &str,
+    path: &Path,
+) -> Result<(), BootstrapError> {
+    let prior = open_immutable(prior_path)?;
+    let newest_trade: Option<i64> =
+        prior.query_row("SELECT MAX(timestamp_unix) FROM trades", [], |row| {
+            row.get(0)
+        })?;
+    let newest_resolution: Option<i64> = prior.query_row(
+        "SELECT MAX(fetched_at_unix) FROM market_resolutions",
+        [],
+        |row| row.get(0),
+    )?;
+    let clob_cursor: Option<String> = prior
+        .query_row(
+            "SELECT value FROM source_cursor WHERE key = 'clob_closed'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    prior.close().map_err(|(_, error)| error)?;
+    atomic_write_json(
+        path,
+        &CacheV2BuildManifest {
+            manifest_version: CACHE_BUILD_MANIFEST_VERSION,
+            backup_sha256: prior_sha256.to_owned(),
+            source_bounds: serde_json::json!({
+                "newest_trade_unix": newest_trade,
+                "newest_resolution_fetch_unix": newest_resolution,
+            }),
+            cursors: serde_json::json!({ "clob_closed": clob_cursor }),
+            hashes: BTreeMap::new(),
+            sealed_at_unix: OffsetDateTime::now_utc().unix_timestamp(),
+        },
+    )
+}
+
+/// Open a checkpointed and closed main for reading exactly as its bytes are.
+/// SQLite's immutable mode takes no locks, creates no write-ahead or
+/// shared-memory sidecar beside the file and ignores any it finds, so the
+/// immutable prior is inspected without being touched.
+fn open_immutable(path: &Path) -> Result<Connection, BootstrapError> {
+    // SQLite's URI rules want a canonical absolute path: repeated separators
+    // (a leading `//` would read as a URI authority) and links resolved.
+    let canonical = std::fs::canonicalize(path)?;
+    let text = canonical.to_str().ok_or_else(|| BootstrapError::Invalid {
+        message: format!("{} is not a UTF-8 path", path.display()),
+    })?;
+    let mut uri = String::from("file:");
+    for character in text.chars() {
+        match character {
+            '%' => uri.push_str("%25"),
+            '?' => uri.push_str("%3F"),
+            '#' => uri.push_str("%23"),
+            other => uri.push(other),
+        }
+    }
+    uri.push_str("?immutable=1");
+    Connection::open_with_flags(
+        uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(BootstrapError::from)
+}
+
+/// The immutable prior's `user_version`, read without touching the file.
+fn verified_user_version(path: &Path) -> Result<i64, BootstrapError> {
+    let connection = open_immutable(path)?;
+    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    connection.close().map_err(|(_, error)| error)?;
+    Ok(version)
+}
+
+/// Read the candidate's `user_version` through SQLite so a seal committed to
+/// the write-ahead log but not yet checkpointed is honored. The read-write
+/// connection only reads; SQLite removes the sidecars it created when this is
+/// the last connection to close and leaves them to any connection still open.
+fn candidate_user_version(path: &Path) -> Result<i64, BootstrapError> {
+    let connection = open_existing_rw(path)?;
+    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    connection.close().map_err(|(_, error)| error)?;
+    Ok(version)
+}
+
+/// The staged roles must be independent files: the same path, a hard link or a
+/// symbolic link would let candidate writes reach the prior or the fixed cache.
+fn require_distinct_files(roles: &[(&str, &Path)]) -> Result<(), BootstrapError> {
+    let mut identities: Vec<(PathBuf, Option<(u64, u64)>)> = Vec::new();
+    for (label, path) in roles {
+        let canonical = canonical_intended_path(path).map_err(|error| match error {
+            BootstrapError::Invalid { message } => BootstrapError::Invalid {
+                message: format!("{label}: {message}"),
+            },
+            other => other,
+        })?;
+        let inode = file_identity(path)?;
+        for (other_path, other_inode) in &identities {
+            if *other_path == canonical || (inode.is_some() && inode == *other_inode) {
+                return invalid(format!(
+                    "{label} {} is not an independent file",
+                    path.display()
+                ));
+            }
+        }
+        identities.push((canonical, inode));
+    }
+    Ok(())
+}
+
+/// The file the cache lock will create or rewrite: the lock name with links
+/// followed, including a link whose target does not exist yet (the documented
+/// alias layout links the physical lock name to the repository's lock file
+/// before either exists).
+fn lock_target_path(fixed_path: &Path) -> Result<PathBuf, BootstrapError> {
+    link_target_path(crate::lock::lock_path_for(fixed_path))
+}
+
+/// A path with symbolic links followed one by one, including a final link
+/// whose target does not exist yet: the file that creating or rewriting the
+/// path would actually touch.
+fn link_target_path(mut path: PathBuf) -> Result<PathBuf, BootstrapError> {
+    let spelled = path.clone();
+    for _ in 0..16 {
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                let target = std::fs::read_link(&path)?;
+                path = match path.parent() {
+                    Some(parent) if !target.is_absolute() => parent.join(target),
+                    _ => target,
+                };
+            }
+            Ok(_) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(path),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    invalid(format!(
+        "{} resolves through too many links",
+        spelled.display()
+    ))
+}
+
+/// Identity of a staged path: its parent directory resolved through the file
+/// system, joined with its file name, itself resolved when it already exists
+/// so a linked alias of a role collides; a link without a target is refused.
+/// The parent must already exist.
+/// Staging never creates directories, so a spelling that would put a
+/// directory or a file at a cache role is refused before anything is written.
+fn canonical_intended_path(path: &Path) -> Result<PathBuf, BootstrapError> {
+    let spelled = path.as_os_str().as_encoded_bytes();
+    if spelled.ends_with(b"/") || spelled.ends_with(b"/.") {
+        return invalid(format!("{} names a directory, not a file", path.display()));
+    }
+    let name = path.file_name().ok_or_else(|| BootstrapError::Invalid {
+        message: format!("{} has no file name", path.display()),
+    })?;
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let parent = std::fs::canonicalize(parent).map_err(|error| BootstrapError::Invalid {
+        message: format!(
+            "{}: parent directory is not available: {error}",
+            path.display()
+        ),
+    })?;
+    let intended = parent.join(name);
+    match std::fs::canonicalize(&intended) {
+        Ok(existing) => Ok(existing),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A link without a target is not an absent file: a copy made
+            // later could give it one and turn it into an alias.
+            match std::fs::symlink_metadata(&intended) {
+                Ok(_) => invalid(format!(
+                    "{} is a symbolic link without a target",
+                    path.display()
+                )),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(intended),
+                Err(error) => Err(error.into()),
+            }
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(unix)]
+/// Device and inode of the file a spelling opens, links followed.
+fn file_identity(path: &Path) -> Result<Option<(u64, u64)>, BootstrapError> {
+    use std::os::unix::fs::MetadataExt as _;
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(Some((metadata.dev(), metadata.ino()))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(not(unix))]
+fn file_identity(_path: &Path) -> Result<Option<(u64, u64)>, BootstrapError> {
+    Ok(None)
+}
+
+fn stage_report(
+    fixed_path: &Path,
+    prior_path: &Path,
+    side_path: &Path,
+    prior_sha256: Option<String>,
+    resumed: bool,
+) -> Result<CacheStageReport, BootstrapError> {
+    let prior_schema = verified_user_version(prior_path)?;
+    let side_schema = candidate_user_version(side_path)?;
+    Ok(CacheStageReport {
+        fixed_path: std::fs::canonicalize(fixed_path)?,
+        prior_path: std::fs::canonicalize(prior_path)?,
+        side_path: std::fs::canonicalize(side_path)?,
+        prior_schema,
+        side_schema,
+        side_sha256: prior_sha256.clone(),
+        prior_sha256,
+        resumed,
+    })
 }
 
 /// Install a finalized v2 main at the fixed Forge path under the reviewed
@@ -1861,6 +2537,55 @@ pub async fn restore_prior_cache(
     pending_pointer_path: &Path,
     publication_probe: &dyn PublicationConsumptionProbe,
 ) -> Result<(), BootstrapError> {
+    // Taking the lock stack creates and rewrites three lock files, the
+    // displaced copy and its sidecars are written through `.pending` names
+    // and the fixed cache's sidecars are removed, so none of those names may
+    // be another role; checked before any lock is taken.
+    let displaced_pending = pending_path_for(displaced_cache_backup_path);
+    let sidecars: Vec<(&str, PathBuf)> = [
+        ("corrected fixed cache sidecar", fixed_path),
+        (
+            "displaced-cache backup sidecar",
+            displaced_cache_backup_path,
+        ),
+    ]
+    .into_iter()
+    .flat_map(|(label, path)| {
+        ["-wal", "-shm", "-journal"].map(move |suffix| (label, sidecar_path(path, suffix)))
+    })
+    .collect();
+    let sidecar_pendings = ["-wal", "-shm"]
+        .map(|suffix| pending_path_for(&sidecar_path(displaced_cache_backup_path, suffix)));
+    let [loop_lock, run_lock] = crate::lock::forge_named_lock_paths(fixed_path);
+    let lock_targets = [
+        link_target_path(loop_lock)?,
+        link_target_path(run_lock)?,
+        lock_target_path(fixed_path)?,
+    ];
+    let mut roles = vec![
+        ("corrected fixed cache", fixed_path),
+        ("prior cache restore main", prior_cache_backup_path),
+        ("displaced-cache backup", displaced_cache_backup_path),
+        ("displaced-cache staging file", displaced_pending.as_path()),
+        ("publication request", publication_request_path),
+        ("pending publication pointer", pending_pointer_path),
+    ];
+    roles.extend(
+        sidecars
+            .iter()
+            .map(|(label, path)| (*label, path.as_path())),
+    );
+    roles.extend(
+        sidecar_pendings
+            .iter()
+            .map(|path| ("displaced-cache sidecar staging file", path.as_path())),
+    );
+    roles.extend(
+        lock_targets
+            .iter()
+            .map(|path| ("Forge lock file", path.as_path())),
+    );
+    require_distinct_files(&roles)?;
     let _locks = ForgeActivationLocks::acquire(fixed_path)?;
     let request = verified_pending_publication(
         publication_request_path,
@@ -2126,6 +2851,11 @@ fn ensure_lane_a_v2_schema(connection: &Connection) -> Result<(), BootstrapError
             "ranker_classifier_version",
             "INTEGER NULL",
         ),
+        (
+            "cache_v2_migration_state",
+            "fresh_collection_json",
+            "TEXT NULL",
+        ),
         ("clob_payout_evidence_v2", "end_date_unix", "INTEGER NULL"),
         (
             "clob_payout_evidence_staging_v2",
@@ -2165,14 +2895,21 @@ fn checkpoint_truncate(connection: &Connection) -> Result<(), BootstrapError> {
 }
 
 fn open_existing_rw(path: &Path) -> Result<Connection, BootstrapError> {
-    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)?;
+    // A canonical absolute path is never read as a SQLite URI (`file:` names).
+    let connection = Connection::open_with_flags(
+        std::fs::canonicalize(path)?,
+        OpenFlags::SQLITE_OPEN_READ_WRITE,
+    )?;
     connection.busy_timeout(Duration::from_secs(5))?;
     Ok(connection)
 }
 
 fn open_existing_ro(path: &Path) -> Result<Connection, BootstrapError> {
-    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(BootstrapError::from)
+    Connection::open_with_flags(
+        std::fs::canonicalize(path)?,
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .map_err(BootstrapError::from)
 }
 
 fn require_schema(connection: &Connection, expected: i64) -> Result<(), BootstrapError> {
@@ -2186,8 +2923,10 @@ fn require_schema(connection: &Connection, expected: i64) -> Result<(), Bootstra
     }
 }
 
+/// Schema of a checkpointed, hash-bound main, read in immutable mode so the
+/// check creates no sidecar beside it.
 fn verified_cache_schema(path: &Path) -> Result<i64, BootstrapError> {
-    let connection = open_existing_ro(path)?;
+    let connection = open_immutable(path)?;
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match version {
         0 | CACHE_SCHEMA_VERSION_V1 => {}
@@ -2241,8 +2980,14 @@ fn verify_finalized_v2_manifests(
     if required_max(connection, "sealed_generation_manifests", "generation")? != 1 {
         return invalid("installed cache has an invalid sealed generation".to_owned());
     }
-    let (activity_generation, reference_sha256, fixed_end_unix, wallets) =
-        activity_identity(connection)?;
+    // A legacy identity exists only through a frozen-payload verification row
+    // carrying its activity binding; a fresh collection identity needs none.
+    let ActivityIdentity {
+        generation: activity_generation,
+        reference_sha256,
+        fixed_end_unix,
+        wallets,
+    } = activity_identity(connection)?;
     completed_activity_manifest(
         connection,
         activity_generation,
@@ -2259,11 +3004,6 @@ fn verify_finalized_v2_manifests(
         "generation",
     )?;
     verify_payout_coverage(connection, payout_generation)?;
-    let frozen: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM cache_frozen_payload_verifications",
-        [],
-        |row| row.get(0),
-    )?;
     let state: Option<FinalizedProjectionState> = connection
         .query_row(
             "SELECT phase, ranker_projection_count, ranker_projection_digest,
@@ -2293,8 +3033,7 @@ fn verify_finalized_v2_manifests(
         params![classifier_version],
         |row| row.get(0),
     )?;
-    if frozen == 0
-        || phase != "finalized"
+    if phase != "finalized"
         || projection_count != Some(actual_projection_count)
         || projection_digest.as_deref() != Some(actual_projection_digest.as_str())
         || !classifier_matches
@@ -2544,19 +3283,28 @@ fn sync_parent(path: &Path) -> Result<(), BootstrapError> {
     Ok(())
 }
 
+/// The temporary file [`atomic_write_json`] renames onto `path`.
+fn atomic_write_temp_path(path: &Path) -> PathBuf {
+    let parent = path
+        .parent()
+        .filter(|value| !value.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    parent.join(format!(
+        ".{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("stage"),
+        std::process::id()
+    ))
+}
+
 fn atomic_write_json(path: &Path, value: &impl Serialize) -> Result<(), BootstrapError> {
     let parent = path
         .parent()
         .filter(|value| !value.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     std::fs::create_dir_all(parent)?;
-    let temp = parent.join(format!(
-        ".{}.{}.tmp",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("stage"),
-        std::process::id()
-    ));
+    let temp = atomic_write_temp_path(path);
     let rendered = serde_json::to_vec_pretty(value)?;
     let mut file = OpenOptions::new()
         .create_new(true)
@@ -2567,6 +3315,10 @@ fn atomic_write_json(path: &Path, value: &impl Serialize) -> Result<(), Bootstra
     file.sync_all()?;
     std::fs::rename(&temp, path).map_err(map_rename_error)?;
     sync_parent(path)
+}
+
+fn pending_path_for(target: &Path) -> PathBuf {
+    sidecar_path(target, ".pending")
 }
 
 fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
@@ -2637,9 +3389,18 @@ fn preserve_main_and_sidecars(source: &Path, target: &Path) -> Result<(), Bootst
 }
 
 fn copy_file_atomic(source: &Path, target: &Path) -> Result<(), BootstrapError> {
-    let mut pending = target.as_os_str().to_owned();
-    pending.push(".pending");
-    let pending = PathBuf::from(pending);
+    copy_file_atomic_verified(source, target, None)
+}
+
+/// Copy through a private `.pending` file, synchronize it, optionally require
+/// its bytes to hash to `expected_sha256` before it is renamed into place, then
+/// synchronize the parent directory.
+fn copy_file_atomic_verified(
+    source: &Path,
+    target: &Path,
+    expected_sha256: Option<&str>,
+) -> Result<(), BootstrapError> {
+    let pending = pending_path_for(target);
     match std::fs::remove_file(&pending) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -2651,6 +3412,16 @@ fn copy_file_atomic(source: &Path, target: &Path) -> Result<(), BootstrapError> 
         .write(true)
         .open(&pending)?
         .sync_all()?;
+    if let Some(expected) = expected_sha256 {
+        let actual = sha256_file(&pending)?;
+        if actual != expected {
+            std::fs::remove_file(&pending)?;
+            return invalid(format!(
+                "staged copy hash mismatch: {} is {actual}, source is {expected}",
+                pending.display()
+            ));
+        }
+    }
     std::fs::rename(&pending, target).map_err(map_rename_error)?;
     sync_parent(target)
 }
