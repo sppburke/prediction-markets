@@ -426,11 +426,13 @@ Copies only a leader's first-ever BUY entry into a market that resolves within t
 
 Every causal bracket requests full attributable history through exclusive `Some(0)` (wire
 `start=1`) for each of its three independently bounded activity walks. During catch-up, verified
-prior purchases consume all missing markets through the existing bucket transaction and history
-projection, including while reanchoring is required and when a group was already stored without
-history. Stored dispositions, effects and proof bytes remain unchanged; historical balances are
-not applied again and no copy continuation is created. Newly recovered history counts as activity
-for the bracket's bounded retry. Running history changes only after the transaction succeeds.
+prior purchases for unfenced wallets consume all missing markets through the existing bucket
+transaction and history projection, including while reanchoring is required and when a group was
+already stored without history. Fenced wallets retain the existing conservative recording of newly
+seen verified purchases and receive no stored-group repair. Stored dispositions, effects and proof
+bytes remain unchanged; historical balances are not applied again and no copy continuation is
+created. Newly recovered history counts as activity for the bracket's bounded retry. Running
+history changes only after the transaction succeeds.
 Existing complete records and historical membership proof snapshots remain intact; the corrected
 durable anchor proves current full-history coverage (#641).
 

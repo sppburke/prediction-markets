@@ -1338,7 +1338,7 @@ async fn post_start_boot_bankroll_case(case: PostStartBootCase) {
             updated_at_unix: now_unix,
         })
         .unwrap();
-    support::install_empty_anchor(&paper, wallet, now_unix);
+    support::install_full_history_anchor(&paper, wallet, now_unix);
     // The offline Start resets the local store onto the baseline; the wrong-balance case models a
     // reset onto the wrong amount.
     let local_reset = match case {

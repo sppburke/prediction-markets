@@ -2897,26 +2897,11 @@ impl BucketCommitEngine {
                         .last_activity_group_epoch(&wallet)?
                         .is_some_and(|last_epoch| last_epoch >= source_epoch)))
         {
-            let trigger = aggregates
-                .iter()
-                .find(|aggregate| {
-                    !context
-                        .identity_unresolved
-                        .contains(aggregate.group_id.key())
-                })
-                .map(|aggregate| aggregate.group_id.key().clone())
-                .or_else(|| {
-                    aggregates
-                        .first()
-                        .map(|aggregate| aggregate.group_id.key().clone())
-                })
-                .ok_or(BucketCommitError::Empty)?;
             return self.commit_late_group_reanchor(
                 &aggregates,
                 &recordable_mutations,
                 wallet,
                 source_epoch,
-                trigger,
                 context,
             );
         }
@@ -3307,17 +3292,29 @@ impl BucketCommitEngine {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn commit_late_group_reanchor(
         &mut self,
         aggregates: &[ActivityAggregate],
         resolved_mutations: &[LedgerMutation],
         wallet: WalletAddress,
         source_epoch: i64,
-        trigger: SourceTradeId,
         context: &BucketDecisionContext,
     ) -> Result<BucketCommitResult, BucketCommitError> {
         const DISPOSITION: &str = "reanchor_required_late_group";
+        let trigger = aggregates
+            .iter()
+            .find(|aggregate| {
+                !context
+                    .identity_unresolved
+                    .contains(aggregate.group_id.key())
+            })
+            .map(|aggregate| aggregate.group_id.key().clone())
+            .or_else(|| {
+                aggregates
+                    .first()
+                    .map(|aggregate| aggregate.group_id.key().clone())
+            })
+            .ok_or(BucketCommitError::Empty)?;
         let mut dispositions = BTreeMap::new();
         let records = aggregates
             .iter()
@@ -3379,6 +3376,7 @@ impl BucketCommitEngine {
         late: bool,
         context: &BucketDecisionContext,
     ) -> Result<BucketCommitResult, BucketCommitError> {
+        let all_stored = durable.iter().all(Option::is_some);
         let disposition = if late {
             "anchor_covered_late"
         } else {
@@ -3440,8 +3438,6 @@ impl BucketCommitEngine {
             source_epoch,
             if repair_history {
                 resolved_mutations
-            } else if context.bracket_commit {
-                &[]
             } else {
                 &mutations
             },
@@ -3488,8 +3484,11 @@ impl BucketCommitEngine {
                             reason: disposition.to_owned(),
                         })
                     }),
-                advance_cursor: true,
+                advance_cursor: !all_stored,
             })?;
+        if all_stored {
+            self.paper_state.set_cursor(&wallet, source_epoch)?;
+        }
         self.apply_history_projection(wallet, &history_effects, context.history_status.as_ref());
         Ok(BucketCommitResult {
             wallet,

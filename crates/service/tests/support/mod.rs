@@ -359,6 +359,43 @@ pub fn install_empty_anchor(
         .unwrap();
 }
 
+pub fn install_full_history_anchor(
+    paper_state: &pe_paper_state::PaperStateDb,
+    wallet: pe_core_types::WalletAddress,
+    cutoff_unix: i64,
+) {
+    if !paper_state.position_anchors(&wallet).unwrap().is_empty()
+        || paper_state
+            .leader_positions()
+            .unwrap()
+            .iter()
+            .any(|position| position.wallet == wallet)
+    {
+        return;
+    }
+    paper_state.set_cursor(&wallet, cutoff_unix).unwrap();
+    let walks = [cutoff_unix; 3].map(|end| {
+        serde_json::json!({"fixed_end": end, "pages": [
+            {"offset": 0, "bounds": {"start": 0, "end": end}}
+        ]})
+    });
+    paper_state
+        .install_anchors(&[pe_paper_state::AnchorInstallRecord {
+            history_status: None,
+            wallet,
+            balances: Vec::new(),
+            activity_cutoff_unix: cutoff_unix,
+            anchored_at_unix: cutoff_unix,
+            ledger_hash_after: "scenario-empty".to_owned(),
+            positions_proof_hash: "scenario-positions".to_owned(),
+            activity_bounds_json: "[]".to_owned(),
+            source_log_generation: "scenario".to_owned(),
+            proof_json: serde_json::json!({"activity_walks": walks}).to_string(),
+            recorded_at_unix: cutoff_unix,
+        }])
+        .unwrap();
+}
+
 fn activity_body(trade: &IncomingTrade) -> Vec<u8> {
     let side = match trade.side {
         Side::Buy => "BUY",

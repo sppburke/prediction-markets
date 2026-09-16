@@ -733,8 +733,11 @@ Before accepting rollout, verify the running revision and record which old omitt
 were revalidated or excluded. Inspect the selected durable `position_anchors` proof for all three
 original page-zero activity requests: exclusive start zero, wire `start=1`, and each walk's fixed
 end. An old complete flag alone cannot justify reuse; failed or deferred boot validation leaves
-that wallet excluded. Record actual validation duration and outcomes. Full reads can take longer;
-retain the existing request/retry bounds without a new timeout or fallback.
+that wallet excluded. Record activity and metadata request counts, actual validation duration,
+total boot duration, and accepted and deferred wallet counts. Every revalidated old anchor performs
+at least seven source requests (three activity walks and two position reads over both partitions)
+before pagination. Full reads can take longer; retain the existing request/retry bounds without
+a new timeout or fallback.
 
 For recovery, preserve all state and use a compatible binary containing both the history repair
 and boot-proof check. An older binary can decode the unchanged formats but resumes the defective

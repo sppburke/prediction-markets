@@ -856,9 +856,11 @@ async fn stored_market_recovered_in_second_read_counts_as_activity_and_retries()
     let wallet = wallet(0x92);
     let (dir, paper, mut engine) = fresh(&[wallet]);
     let path = dir.path().join("paper.db");
-    install_empty_anchor(&mut engine, &paper, wallet, 50);
+    install_empty_anchor(&mut engine, &paper, wallet, 0);
     require_reanchor(&path, wallet);
     store_old_late_groups(&mut engine, wallet);
+    assert_eq!(paper.cursor(&wallet).unwrap(), Some(0));
+    assert_eq!(paper.activity(&wallet).unwrap(), None);
     let before = stored_activity_snapshot(&path);
     let mut responses = older_market_responses(wallet, 2);
     let first = serde_json::to_vec(&vec![
@@ -886,7 +888,67 @@ async fn stored_market_recovered_in_second_read_counts_as_activity_and_retries()
         5
     );
     assert_eq!(paper.gate_history().unwrap()[&wallet].len(), 3);
+    assert_eq!(paper.cursor(&wallet).unwrap(), Some(30));
+    assert_eq!(paper.activity(&wallet).unwrap(), None);
     assert_eq!(stored_activity_snapshot(&path), before);
+    assert!(paper.decision_pending_history().unwrap().is_empty());
+}
+
+#[test]
+fn fenced_bracket_records_new_covered_purchases_without_repairing_stored_groups() {
+    let wallet = wallet(0x98);
+    let (dir, paper, mut engine) = fresh(&[wallet]);
+    let path = dir.path().join("paper.db");
+    install_empty_anchor(&mut engine, &paper, wallet, 50);
+    require_reanchor(&path, wallet);
+    store_old_late_groups(&mut engine, wallet);
+    let stored = aggregate(activity(wallet, 3, "1", "0xbase3", 30), wallet);
+    let stored_before = paper.activity_group_state(stored.group_id.key()).unwrap();
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute(
+            "INSERT INTO wallet_fences \
+             (wallet_hex, source_trade_id, cause, proof_json, fenced_at_unix) \
+             VALUES (?1, 'test', 'invalid_mapping', '{}', 50)",
+            [wallet.to_string()],
+        )
+        .unwrap();
+    let mut engine =
+        BucketCommitEngine::load(paper.clone(), build_leader_ledger(&paper).unwrap()).unwrap();
+    assert!(engine.is_fenced(&wallet));
+    let mut bracket = context(END);
+    bracket.bracket_commit = true;
+    let result = engine
+        .commit(vec![stored.clone()], &bracket, zero_basis())
+        .unwrap();
+    assert!(result.already_committed);
+    assert!(paper.gate_history().unwrap()[&wallet].is_empty());
+
+    // A bracket already in flight can contain both a stored group and an unseen BUY below cutoff.
+    let new = aggregate(activity(wallet, 4, "1", "0xnew-covered", 30), wallet);
+    let new_id = new.group_id.key().0.clone();
+    let groups = vec![stored.clone(), new];
+    let result = engine
+        .commit(groups.clone(), &bracket, zero_basis())
+        .unwrap();
+    assert_eq!(result.dispositions[&new_id], "anchor_covered_late");
+    assert_eq!(
+        result.dispositions[&stored.group_id.key().0],
+        "already_committed"
+    );
+    assert!(result.pending.is_empty());
+    assert!(!result.already_committed);
+    let expected = HashSet::from([MarketId(VenueMarketId(condition(4)))]);
+    assert_eq!(paper.gate_history().unwrap()[&wallet], expected);
+    assert_eq!(
+        paper.activity_group_state(stored.group_id.key()).unwrap(),
+        stored_before
+    );
+
+    let retry = engine.commit(groups, &bracket, zero_basis()).unwrap();
+    assert!(retry.already_committed);
+    assert_eq!(paper.gate_history().unwrap()[&wallet], expected);
+    assert!(paper.is_wallet_fenced(&wallet).unwrap());
     assert!(paper.decision_pending_history().unwrap().is_empty());
 }
 
