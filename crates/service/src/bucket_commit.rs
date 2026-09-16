@@ -2858,6 +2858,25 @@ impl BucketCommitEngine {
         let coverage = self.paper_state.wallet_coverage(&wallet)?;
         let seen = durable.iter().filter(|state| state.is_some()).count();
         if seen == aggregates.len() {
+            if context.bracket_commit
+                && !self.fences.contains(&wallet)
+                && !self
+                    .covered_history_effects(wallet, source_epoch, &recordable_mutations)
+                    .is_empty()
+            {
+                // An older bracket may have recorded these groups without consuming
+                // their markets. Keep those exact records while repairing history
+                // from this verified read; the repair must count as bracket activity.
+                return self.commit_covered_bucket(
+                    &aggregates,
+                    &durable,
+                    &recordable_mutations,
+                    wallet,
+                    source_epoch,
+                    coverage.anchor_seq.is_some(),
+                    context,
+                );
+            }
             self.paper_state.set_cursor(&wallet, source_epoch)?;
             return Ok(BucketCommitResult {
                 wallet,
@@ -2894,6 +2913,7 @@ impl BucketCommitEngine {
                 .ok_or(BucketCommitError::Empty)?;
             return self.commit_late_group_reanchor(
                 &aggregates,
+                &recordable_mutations,
                 wallet,
                 source_epoch,
                 trigger,
@@ -3287,9 +3307,11 @@ impl BucketCommitEngine {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn commit_late_group_reanchor(
         &mut self,
         aggregates: &[ActivityAggregate],
+        resolved_mutations: &[LedgerMutation],
         wallet: WalletAddress,
         source_epoch: i64,
         trigger: SourceTradeId,
@@ -3313,6 +3335,11 @@ impl BucketCommitEngine {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let history_effects = if context.bracket_commit && !self.fences.contains(&wallet) {
+            self.covered_history_effects(wallet, source_epoch, resolved_mutations)
+        } else {
+            Vec::new()
+        };
         self.paper_state
             .commit_activity_bucket(&ActivityBucketCommit {
                 wallet,
@@ -3320,7 +3347,7 @@ impl BucketCommitEngine {
                 dispositions: records,
                 leader_positions: Vec::new(),
                 gate_results: Vec::new(),
-                history_effects: Vec::new(),
+                history_effects: history_effects.clone(),
                 history_status: context.history_status.clone(),
                 pending: Vec::new(),
                 fence: None,
@@ -3330,6 +3357,7 @@ impl BucketCommitEngine {
                 }),
                 advance_cursor: false,
             })?;
+        self.apply_history_projection(wallet, &history_effects, None);
         Ok(BucketCommitResult {
             wallet,
             source_epoch,
@@ -3359,13 +3387,32 @@ impl BucketCommitEngine {
         let mut dispositions = BTreeMap::new();
         let mut records = Vec::new();
         let mut mutations = Vec::new();
+        let repair_history = context.bracket_commit && !self.fences.contains(&wallet);
         for ((aggregate, state), mutation) in aggregates.iter().zip(durable).zip(resolved_mutations)
         {
-            if state.is_some() {
+            if let Some(state) = state {
                 dispositions.insert(
                     aggregate.group_id.key().0.clone(),
                     "already_committed".to_owned(),
                 );
+                if repair_history {
+                    records.push(ActivityDispositionRecord {
+                        source_trade_id: aggregate.group_id.key().clone(),
+                        transaction_hash: state.transaction_hash.clone(),
+                        wallet,
+                        source_epoch: state.source_epoch,
+                        semantic_revision: state.semantic_revision.clone(),
+                        activity_type: aggregate
+                            .group_id
+                            .components()
+                            .activity_type
+                            .as_str()
+                            .to_owned(),
+                        disposition: state.disposition.clone(),
+                        proof_json: state.proof_json.clone(),
+                        no_copy: None,
+                    });
+                }
                 continue;
             }
             let unresolved = context
@@ -3388,7 +3435,17 @@ impl BucketCommitEngine {
             )?);
             mutations.push(mutation.clone());
         }
-        let history_effects = self.covered_history_effects(wallet, source_epoch, &mutations);
+        let history_effects = self.covered_history_effects(
+            wallet,
+            source_epoch,
+            if repair_history {
+                resolved_mutations
+            } else if context.bracket_commit {
+                &[]
+            } else {
+                &mutations
+            },
+        );
         let unresolved_trigger = (!context.bracket_commit)
             .then(|| {
                 mutations.iter().find_map(|mutation| {

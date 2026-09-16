@@ -81,6 +81,16 @@
 >
 > **CLOB `/markets?closed=true` does NOT populate `tokens[].winner` on old markets (2026-06-18, issue #369 PR1 live reconciliation).** Response: `{count, limit, next_cursor, data:[…]}`; each market carries snake_case `condition_id`, `closed`, `end_date_iso`, and `tokens:[{outcome, price, token_id, winner}]`; `next_cursor` terminator is `LTE=`. **Gotcha:** for old markets (≈2022–2023) the resolved winner is reflected only in the terminal token `price` (~1.0 winner / ~0.0 loser) — `tokens[].winner` is `false` on **every** token, so `clob.rs::winner_index` reports the market as voided. Measured against `source='polygon'` over 848,098 traded markets: 0 winner *contradictions* (99.976% agreement) but 202 CLOB-null-vs-polygon-winner, **all** in 2022–2023; by 2024 winner-flag coverage is complete (2024 0/11,674, 2025 2/125,388, 2026 10/709,318 null). Benign for issue #369 because the 1.19M `source='polygon'` rows are kept; CLOB only needs correctness for new markets. Also confirmed: 0 traded multi-outcome (>2-token) markets, so the positional `winner_index`↔`outcome_id` mapping risk is empirically binary-only.
 
+> **Service bracket full-history repair (#641), Last checked: 2026-09-16;
+> re-verify by 2026-11-15.** Implementation-time review of the
+> [official activity reference](https://docs.polymarket.com/api-reference/core/get-user-activity)
+> reconfirmed the positive-start requirement for full history on descending `/activity` reads.
+> The service bracket now requests exclusive `Some(0)`, translated by the existing reader to
+> wire `start=1`, on all three walks while retaining each sampled end and the existing split
+> pagination. Omitted/zero wire start selects the documented recent default window. This is
+> a documentation contract check, not a measurement of production-wallet exposure or of the
+> exact live default-window boundary. The existing reader and its other callers are unchanged.
+
 > **Schema-one bootstrap history contract (#608), Last checked: 2026-09-12;
 > re-verify by 2026-11-11.** The [official activity reference](https://docs.polymarket.com/api-reference/core/get-user-activity)
 > confirms that omitted/zero `start` on DESC reads uses the most recent roughly
@@ -180,7 +190,7 @@
 | https://docs.polymarket.com/api-reference/relayer/get-relayer-address-and-nonce | 2026-08-11 | 2026-10-10 |
 | https://docs.polymarket.com/api-reference/relayer/get-a-transaction-by-id | 2026-08-11 | 2026-10-10 |
 | https://docs.polymarket.com/api-reference/core/get-trader-leaderboard-rankings | 2026-05-04 | 2026-07-03 |
-| https://docs.polymarket.com/api-reference/core/get-user-activity | 2026-09-12 | 2026-11-11 |
+| https://docs.polymarket.com/api-reference/core/get-user-activity | 2026-09-16 | 2026-11-15 |
 | https://docs.polymarket.com/api-reference/feeds/list-account-activity | 2026-09-10 | 2026-11-09 |
 | https://docs.polymarket.com/api-reference/service/get-data-freshness | 2026-09-10 | 2026-11-09 |
 | https://docs.polymarket.com/api-reference/data-api/migrating-from-v1 | 2026-09-10 | 2026-11-09 |

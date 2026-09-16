@@ -113,7 +113,19 @@ fn select_boot_anchor_wallets(
                 now_unix,
                 pe_service::trade_poller::ANCHOR_REFRESH_SECS,
             );
-        if reusable {
+        let full_history = if reusable {
+            match coverage.anchor_seq {
+                Some(sequence) => paper_state
+                    .position_anchor_proof(wallet, sequence)?
+                    .is_some_and(|proof| {
+                        pe_service::position_seeder::anchor_proves_full_history(&proof)
+                    }),
+                None => false,
+            }
+        } else {
+            false
+        };
+        if full_history {
             selection.reused.push(*wallet);
         } else {
             selection.walked.push(*wallet);
@@ -2213,6 +2225,17 @@ mod tests {
         WalletAddress::from_hex(&format!("0x{id:040x}")).unwrap()
     }
 
+    fn full_history_proof() -> serde_json::Value {
+        let walks = [9_000, 9_001, 9_002].map(|end| {
+            serde_json::json!({"fixed_end": end, "pages": [
+                {"offset": 0, "bounds": {"start": 0, "end": 100}},
+                {"offset": 0, "bounds": {"start": 0, "end": end}},
+                {"offset": 0, "bounds": {"start": 100, "end": end}}
+            ]})
+        });
+        serde_json::json!({"activity_walks": walks})
+    }
+
     fn install_reusable_facts(
         paper_state: &PaperStateDb,
         wallet: WalletAddress,
@@ -2238,10 +2261,69 @@ mod tests {
                 positions_proof_hash: "positions".to_owned(),
                 activity_bounds_json: "{}".to_owned(),
                 source_log_generation: "generation".to_owned(),
-                proof_json: "{}".to_owned(),
+                proof_json: full_history_proof().to_string(),
                 recorded_at_unix: NOW,
             }])
             .unwrap();
+    }
+
+    #[test]
+    fn boot_anchor_requires_all_three_original_full_history_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("paper.db");
+        let paper = PaperStateDb::open(&path).unwrap();
+        let wallet = wallet(1);
+        install_reusable_facts(&paper, wallet, NOW);
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        let valid = full_history_proof();
+        let mut omitted = valid.clone();
+        omitted["activity_walks"][0]["pages"][1]["bounds"]["start"] = serde_json::Value::Null;
+        let mut partial = valid.clone();
+        partial["activity_walks"].as_array_mut().unwrap().pop();
+        let mut split_only = valid.clone();
+        split_only["activity_walks"][1]["pages"]
+            .as_array_mut()
+            .unwrap()
+            .remove(1);
+        let mut wrong_end = valid.clone();
+        wrong_end["activity_walks"][2]["fixed_end"] = serde_json::json!(9_003);
+        let mut nonzero_page = valid.clone();
+        nonzero_page["activity_walks"][2]["pages"][1]["offset"] = serde_json::json!(500);
+        for proof in [
+            serde_json::json!({}),
+            omitted,
+            partial,
+            split_only,
+            wrong_end,
+            nonzero_page,
+        ] {
+            connection
+                .execute(
+                    "UPDATE position_anchors SET proof_json = ?1 WHERE wallet_hex = ?2",
+                    params![proof.to_string(), wallet.to_string()],
+                )
+                .unwrap();
+            let selection = select_boot_anchor_wallets(&paper, &[wallet], false, NOW).unwrap();
+            assert!(selection.reused.is_empty(), "{proof}");
+            assert_eq!(selection.walked, vec![wallet]);
+            assert!(paper.wallet_history_complete(&wallet).unwrap());
+        }
+        // A corrected anchor supersedes the old one without replacing its complete proof.
+        install_reusable_facts(&paper, wallet, NOW);
+        assert_eq!(
+            paper
+                .wallet_history_status(&wallet)
+                .unwrap()
+                .unwrap()
+                .proof_json,
+            "{}"
+        );
+        assert_eq!(
+            select_boot_anchor_wallets(&paper, &[wallet], false, NOW)
+                .unwrap()
+                .reused,
+            vec![wallet]
+        );
     }
 
     #[test]
@@ -2312,6 +2394,9 @@ mod tests {
             )
             .unwrap();
 
+        drop(connection);
+        drop(paper_state);
+        let paper_state = PaperStateDb::open(&path).unwrap();
         let wallets = [
             with_validation,
             without_validation,

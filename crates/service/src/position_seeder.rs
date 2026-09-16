@@ -72,6 +72,38 @@ pub struct AnchorProof {
     pub recorded_at_unix: i64,
 }
 
+/// Whether an accepted anchor retained the original full-history request for
+/// each bracket walk. Split pages can have narrower bounds and are not substitutes
+/// for the original page-zero evidence. Older proof shapes require revalidation.
+#[must_use]
+pub fn anchor_proves_full_history(document: &str) -> bool {
+    #[derive(Deserialize)]
+    struct Proof {
+        activity_walks: [Walk; 3],
+    }
+    #[derive(Deserialize)]
+    struct Walk {
+        fixed_end: i64,
+        pages: Vec<Page>,
+    }
+    #[derive(Deserialize)]
+    struct Page {
+        offset: u32,
+        bounds: Option<pe_source_polymarket_public::ActivityRequestBounds>,
+    }
+
+    serde_json::from_str::<Proof>(document).is_ok_and(|proof| {
+        proof.activity_walks.iter().all(|walk| {
+            walk.pages.iter().any(|page| {
+                page.offset == 0
+                    && page.bounds.is_some_and(|bounds| {
+                        bounds.start == Some(0) && bounds.end == walk.fixed_end
+                    })
+            })
+        })
+    })
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnchorExpectation {
     pub ledger_hash: String,
@@ -649,7 +681,7 @@ impl CausalPositionValidator {
             self.fetcher.as_ref(),
             &self.base_url,
             wallet,
-            None,
+            Some(0),
             (self.now)(),
         )
         .await

@@ -22,7 +22,7 @@ use pe_service::orchestrator_control::OrchestratorControl;
 use pe_service::paper_recovery::{build_leader_ledger, replay_wallet_ledger};
 use pe_service::position_seeder::{
     AnchorExpectation, AnchorInstall, AnchorProof, CausalPositionError, CausalPositionValidator,
-    is_deferred_causal_position_error, ledger_capture,
+    anchor_proves_full_history, is_deferred_causal_position_error, ledger_capture,
 };
 use pe_service::source_event_sink::SourceEventSink;
 use pe_service::watchlist_admission::{AdmissionError, AdmissionPreparer, AnchorRefreshOutcome};
@@ -106,6 +106,9 @@ impl PageFetcher for QueueFetcher {
             return serde_json::to_vec(&markets).map_err(|error| SourceError::Fatal {
                 message: error.to_string(),
             });
+        }
+        if url.contains("/activity?") && !url.contains("start=") {
+            return Ok(b"[]".to_vec());
         }
         self.responses
             .lock()
@@ -284,11 +287,58 @@ fn activity_url(wallet: WalletAddress) -> String {
     activity_url_at(wallet, END)
 }
 
+fn assert_full_history_proof(document: &str) {
+    assert!(anchor_proves_full_history(document));
+    let proof: Value = serde_json::from_str(document).unwrap();
+    let walks = proof["activity_walks"].as_array().unwrap();
+    assert_eq!(walks.len(), 3);
+    for walk in walks {
+        assert!(walk["pages"].as_array().unwrap().iter().any(|page| {
+            page["offset"] == 0
+                && page["bounds"]["start"] == 0
+                && page["bounds"]["end"] == walk["fixed_end"]
+                && page["request_url"].as_str().unwrap().ends_with("&start=1")
+        }));
+    }
+}
+
+fn older_market_responses(wallet: WalletAddress, attempts: usize) -> HashMap<String, Vec<Vec<u8>>> {
+    let rows = (1..=3)
+        .rev()
+        .map(|byte| {
+            activity(
+                wallet,
+                byte,
+                "1",
+                &format!("0xbase{byte}"),
+                i64::from(byte) * 10,
+            )
+        })
+        .collect::<Vec<_>>();
+    let positions = (1..=3)
+        .map(|byte| position(wallet, byte, "1"))
+        .collect::<Vec<_>>();
+    HashMap::from([
+        (
+            activity_url(wallet),
+            vec![serde_json::to_vec(&rows).unwrap(); 3 * attempts],
+        ),
+        (
+            position_url(wallet, PositionPartition::NotRedeemable),
+            vec![serde_json::to_vec(&positions).unwrap(); 2 * attempts],
+        ),
+        (
+            position_url(wallet, PositionPartition::Redeemable),
+            vec![b"[]".to_vec(); 2 * attempts],
+        ),
+    ])
+}
+
 fn activity_url_at(wallet: WalletAddress, end: i64) -> String {
     PolymarketEndpoint::UserPositionActivityPage {
         user: wallet.to_string(),
         end,
-        start: None,
+        start: Some(1),
         offset: 0,
     }
     .url(BASE)
@@ -594,6 +644,380 @@ async fn stable_complete_bracket_installs_and_restart_is_identical() {
     );
 }
 
+fn stored_activity_snapshot(path: &std::path::Path) -> Vec<Vec<Vec<rusqlite::types::Value>>> {
+    let connection = rusqlite::Connection::open(path).unwrap();
+    [
+        "activity_groups",
+        "activity_group_revisions",
+        "no_copy_dispositions",
+        "seen_trades",
+    ]
+    .into_iter()
+    .map(|table| {
+        let mut statement = connection
+            .prepare(&format!("SELECT * FROM {table} ORDER BY 1, 2"))
+            .unwrap();
+        let columns = statement.column_count();
+        statement
+            .query_map([], |row| (0..columns).map(|index| row.get(index)).collect())
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    })
+    .collect()
+}
+
+fn require_reanchor(path: &std::path::Path, wallet: WalletAddress) {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .execute(
+            "UPDATE poll_cursors SET reanchor_required = 1 WHERE wallet_hex = ?1",
+            [wallet.to_string()],
+        )
+        .unwrap();
+}
+
+fn store_old_late_groups(engine: &mut BucketCommitEngine, wallet: WalletAddress) {
+    for byte in 1..=3 {
+        let epoch = i64::from(byte) * 10;
+        let result = engine
+            .commit(
+                vec![aggregate(
+                    activity(wallet, byte, "1", &format!("0xbase{byte}"), epoch),
+                    wallet,
+                )],
+                &context(epoch),
+                zero_basis(),
+            )
+            .unwrap();
+        assert!(
+            result
+                .dispositions
+                .values()
+                .all(|value| value == "reanchor_required_late_group")
+        );
+    }
+}
+
+#[tokio::test]
+async fn full_history_repairs_all_older_markets_and_preserves_old_records_on_restart() {
+    for kind in ["anchored", "reanchor", "stored", "seeded"] {
+        let wallet = wallet(0x91);
+        let (dir, paper, mut engine) = fresh(&[wallet]);
+        let path = dir.path().join("paper.db");
+        if kind == "seeded" {
+            paper
+                .record_reconciled_history_status(&WalletHistoryStatusRecord {
+                    wallet,
+                    complete: false,
+                    proof_json: "{\"seed\":true}".to_owned(),
+                    updated_at_unix: 1,
+                })
+                .unwrap();
+        }
+        let old_status = paper.wallet_history_status(&wallet).unwrap();
+        install_empty_anchor(&mut engine, &paper, wallet, 50);
+        let original_anchor = paper.position_anchors(&wallet).unwrap()[0].clone();
+        if matches!(kind, "reanchor" | "stored") {
+            require_reanchor(&path, wallet);
+        }
+        if kind == "stored" {
+            store_old_late_groups(&mut engine, wallet);
+            assert!(
+                paper
+                    .gate_history()
+                    .unwrap()
+                    .get(&wallet)
+                    .is_none_or(HashSet::is_empty)
+            );
+        }
+        let before_groups = stored_activity_snapshot(&path);
+        let before_financial = paper.financial_snapshot(END).unwrap();
+        let fetcher = Arc::new(QueueFetcher::new(older_market_responses(wallet, 2)));
+        let (_source_dir, source_path, validator) = recording_validator(fetcher.clone());
+        let accepted = validator
+            .validate_direct(&[wallet], &mut engine, &paper)
+            .await
+            .unwrap();
+        assert_eq!(accepted.len(), 1, "{kind}");
+        assert!(accepted[0].history_status.is_none());
+        assert_full_history_proof(&accepted[0].proof.document);
+        let expected = (1..=3)
+            .map(|byte| MarketId(VenueMarketId(condition(byte))))
+            .collect::<HashSet<_>>();
+        assert_eq!(paper.gate_history().unwrap()[&wallet], expected, "{kind}");
+        assert!(paper.wallet_history_complete(&wallet).unwrap());
+        if kind != "seeded" {
+            assert_eq!(paper.wallet_history_status(&wallet).unwrap(), old_status);
+        }
+        assert_eq!(paper.position_anchors(&wallet).unwrap()[0], original_anchor);
+        if kind == "stored" {
+            assert_eq!(stored_activity_snapshot(&path), before_groups);
+        }
+        assert_eq!(paper.financial_snapshot(END).unwrap(), before_financial);
+        assert!(paper.decision_pending_history().unwrap().is_empty());
+        let groups = stored_activity_snapshot(&path);
+        let balances = ledger_capture(engine.ledger(), &paper, wallet)
+            .unwrap()
+            .hash;
+        validator
+            .validate_direct(&[wallet], &mut engine, &paper)
+            .await
+            .unwrap();
+        assert_eq!(stored_activity_snapshot(&path), groups);
+        assert_eq!(
+            ledger_capture(engine.ledger(), &paper, wallet)
+                .unwrap()
+                .hash,
+            balances
+        );
+        // Every market rejects a later entry through the running gate, before restart.
+        for byte in 1..=3 {
+            for (side, delta) in [("SELL", 0), ("BUY", 1)] {
+                let epoch = END + i64::from(byte) * 2 + delta;
+                let mut row = activity(wallet, byte, "1", &format!("0xlater-{byte}-{side}"), epoch);
+                row["side"] = json!(side);
+                let mut ordinary = context(epoch);
+                ordinary.copy_eligible = true;
+                let result = engine
+                    .commit(vec![aggregate(row, wallet)], &ordinary, zero_basis())
+                    .unwrap();
+                assert!(result.pending.is_empty());
+                if side == "BUY" {
+                    assert!(
+                        result
+                            .dispositions
+                            .values()
+                            .all(|value| value == "not_first_entry")
+                    );
+                }
+            }
+        }
+        assert_eq!(paper.financial_snapshot(END).unwrap(), before_financial);
+        drop(validator);
+        assert_eq!(
+            Reader::replay(&source_path)
+                .unwrap()
+                .filter(|entry| {
+                    entry.as_ref().unwrap().1.source_id.0
+                        == pe_service::trade_poller::ACTIVITY_POLL_SOURCE_ID
+                })
+                .count(),
+            14
+        );
+        drop(engine);
+        drop(paper);
+        let reopened = Arc::new(PaperStateDb::open(&path).unwrap());
+        let ledger = build_leader_ledger(&reopened).unwrap();
+        let replayed = replay_wallet_ledger(&reopened, wallet).unwrap();
+        assert_eq!(
+            ledger_capture(&ledger, &reopened, wallet).unwrap().hash,
+            balances
+        );
+        assert_eq!(
+            ledger_capture(&replayed, &reopened, wallet).unwrap().hash,
+            balances
+        );
+        let mut engine = BucketCommitEngine::load(reopened.clone(), ledger).unwrap();
+        assert!(engine.history_complete(&wallet));
+        assert_eq!(reopened.gate_history().unwrap()[&wallet], expected);
+        for byte in 1..=3 {
+            let epoch = END + 10 + i64::from(byte) * 2;
+            for (side, epoch) in [("SELL", epoch), ("BUY", epoch + 1)] {
+                let mut row = activity(
+                    wallet,
+                    byte,
+                    "1",
+                    &format!("0xrestart-{byte}-{side}"),
+                    epoch,
+                );
+                row["side"] = json!(side);
+                let mut ordinary = context(epoch);
+                ordinary.copy_eligible = true;
+                let result = engine
+                    .commit(vec![aggregate(row, wallet)], &ordinary, zero_basis())
+                    .unwrap();
+                assert!(result.pending.is_empty());
+                if side == "BUY" {
+                    assert!(
+                        result
+                            .dispositions
+                            .values()
+                            .all(|value| value == "not_first_entry")
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn stored_market_recovered_in_second_read_counts_as_activity_and_retries() {
+    let wallet = wallet(0x92);
+    let (dir, paper, mut engine) = fresh(&[wallet]);
+    let path = dir.path().join("paper.db");
+    install_empty_anchor(&mut engine, &paper, wallet, 50);
+    require_reanchor(&path, wallet);
+    store_old_late_groups(&mut engine, wallet);
+    let before = stored_activity_snapshot(&path);
+    let mut responses = older_market_responses(wallet, 2);
+    let first = serde_json::to_vec(&vec![
+        activity(wallet, 1, "1", "0xbase1", 10),
+        activity(wallet, 2, "1", "0xbase2", 20),
+    ])
+    .unwrap();
+    responses.get_mut(&activity_url(wallet)).unwrap()[0] = first;
+    responses.insert(
+        position_url(wallet, PositionPartition::NotRedeemable),
+        vec![b"[]".to_vec(); 4],
+    );
+    let fetcher = Arc::new(QueueFetcher::new(responses));
+    let accepted = validator_from_fetcher(fetcher.clone())
+        .validate_direct(&[wallet], &mut engine, &paper)
+        .await
+        .unwrap();
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(
+        fetcher
+            .urls()
+            .iter()
+            .filter(|url| url.contains("/activity?"))
+            .count(),
+        5
+    );
+    assert_eq!(paper.gate_history().unwrap()[&wallet].len(), 3);
+    assert_eq!(stored_activity_snapshot(&path), before);
+    assert!(paper.decision_pending_history().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn failed_history_repair_rolls_back_projection_and_restart_converges() {
+    for stored in [false, true] {
+        let wallet = wallet(0x93);
+        let (dir, paper, mut engine) = fresh(&[wallet]);
+        let path = dir.path().join("paper.db");
+        install_empty_anchor(&mut engine, &paper, wallet, 50);
+        require_reanchor(&path, wallet);
+        if stored {
+            store_old_late_groups(&mut engine, wallet);
+        }
+        let before = stored_activity_snapshot(&path);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_repair BEFORE INSERT ON wallet_market_history_v2 BEGIN SELECT RAISE(FAIL, 'history repair fault'); END;").unwrap();
+        let error = validator(older_market_responses(wallet, 1))
+            .validate_direct(&[wallet], &mut engine, &paper)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CausalPositionError::BucketCommit { .. }));
+        assert_eq!(stored_activity_snapshot(&path), before);
+        assert!(
+            paper
+                .gate_history()
+                .unwrap()
+                .get(&wallet)
+                .is_none_or(HashSet::is_empty)
+        );
+        assert_eq!(paper.position_anchors(&wallet).unwrap().len(), 1);
+        conn.execute_batch("DROP TRIGGER fail_repair").unwrap();
+        // A successful retry in the same engine proves that failed writes did not publish history.
+        validator(older_market_responses(wallet, 1))
+            .validate_direct(&[wallet], &mut engine, &paper)
+            .await
+            .unwrap();
+        assert_eq!(paper.gate_history().unwrap()[&wallet].len(), 3);
+        drop(engine);
+        drop(paper);
+        let paper = Arc::new(PaperStateDb::open(&path).unwrap());
+        let mut engine =
+            BucketCommitEngine::load(paper.clone(), build_leader_ledger(&paper).unwrap()).unwrap();
+        validator(older_market_responses(wallet, 1))
+            .validate_direct(&[wallet], &mut engine, &paper)
+            .await
+            .unwrap();
+        assert_eq!(paper.gate_history().unwrap()[&wallet].len(), 3);
+        assert!(paper.decision_pending_history().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn deferred_old_complete_wallet_restarts_from_partial_bracket_without_recopying() {
+    let wallet = wallet(0x96);
+    let (dir, paper, mut engine) = fresh(&[wallet]);
+    let path = dir.path().join("paper.db");
+    install_empty_anchor(&mut engine, &paper, wallet, 50);
+    let old_status = paper.wallet_history_status(&wallet).unwrap();
+    let old_anchor = paper.position_anchors(&wallet).unwrap();
+    let mut responses = older_market_responses(wallet, 2);
+    let stable = responses[&position_url(wallet, PositionPartition::NotRedeemable)][0].clone();
+    let mut revised: Value = serde_json::from_slice(&stable).unwrap();
+    revised[0]["size"] = json!("2");
+    let revised = serde_json::to_vec(&revised).unwrap();
+    responses.insert(
+        position_url(wallet, PositionPartition::NotRedeemable),
+        vec![stable.clone(), revised.clone(), stable, revised],
+    );
+    let accepted = validator(responses)
+        .validate_direct(&[wallet], &mut engine, &paper)
+        .await
+        .unwrap();
+    assert!(
+        accepted.is_empty(),
+        "an old complete flag cannot turn deferral into acceptance"
+    );
+    assert_eq!(paper.position_anchors(&wallet).unwrap(), old_anchor);
+    assert_eq!(paper.wallet_history_status(&wallet).unwrap(), old_status);
+    assert_eq!(paper.gate_history().unwrap()[&wallet].len(), 3);
+    let groups = stored_activity_snapshot(&path);
+    drop(engine);
+    drop(paper);
+    let paper = Arc::new(PaperStateDb::open(&path).unwrap());
+    let mut engine =
+        BucketCommitEngine::load(paper.clone(), build_leader_ledger(&paper).unwrap()).unwrap();
+    let accepted = validator(older_market_responses(wallet, 1))
+        .validate_direct(&[wallet], &mut engine, &paper)
+        .await
+        .unwrap();
+    assert_eq!(accepted.len(), 1);
+    assert_full_history_proof(&accepted[0].proof.document);
+    assert_eq!(stored_activity_snapshot(&path), groups);
+    assert_eq!(paper.gate_history().unwrap()[&wallet].len(), 3);
+    assert!(paper.decision_pending_history().unwrap().is_empty());
+    assert!(paper.list_fills().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn reanchor_history_repair_excludes_sells_and_unresolved_assets() {
+    let wallet = wallet(0x97);
+    let (dir, paper, mut engine) = fresh(&[wallet]);
+    install_empty_anchor(&mut engine, &paper, wallet, 50);
+    require_reanchor(&dir.path().join("paper.db"), wallet);
+    let mut responses = older_market_responses(wallet, 1);
+    let mut rows: Vec<Value> =
+        serde_json::from_slice(&responses[&activity_url(wallet)][0]).unwrap();
+    let mut sell = activity(wallet, 4, "1", "0xsell-only", 40);
+    sell["side"] = json!("SELL");
+    let mut unresolved = activity(wallet, 5, "1", "0xunresolved", 45);
+    unresolved["asset"] = json!("unmapped-token");
+    rows.extend([sell, unresolved]);
+    responses.insert(
+        activity_url(wallet),
+        vec![serde_json::to_vec(&rows).unwrap(); 3],
+    );
+    let accepted = validator(responses)
+        .validate_direct(&[wallet], &mut engine, &paper)
+        .await
+        .unwrap();
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(
+        paper.gate_history().unwrap()[&wallet],
+        (1..=3)
+            .map(|byte| MarketId(VenueMarketId(condition(byte))))
+            .collect()
+    );
+    assert!(paper.decision_pending_history().unwrap().is_empty());
+    assert!(!paper.is_wallet_fenced(&wallet).unwrap());
+}
+
 #[tokio::test]
 async fn corrected_bracket_records_metadata_reuses_provenance_and_keeps_full_reads() {
     let wallet = wallet(0x12);
@@ -645,7 +1069,7 @@ async fn corrected_bracket_records_metadata_reuses_provenance_and_keeps_full_rea
         .filter(|url| url.contains("/activity?"))
         .collect::<Vec<_>>();
     assert_eq!(activity_urls.len(), 6);
-    assert!(activity_urls.iter().all(|url| !url.contains("start=")));
+    assert!(activity_urls.iter().all(|url| url.ends_with("&start=1")));
     assert_eq!(
         urls.iter()
             .filter(|url| url.contains("/markets?clob_token_ids="))
@@ -684,7 +1108,7 @@ async fn corrected_bracket_records_metadata_reuses_provenance_and_keeps_full_rea
 }
 
 #[tokio::test]
-async fn direct_bracket_uses_three_unbounded_ends_and_step_three_cutoff() {
+async fn direct_bracket_uses_three_full_history_walks_and_step_three_cutoff() {
     let wallet = wallet(0x76);
     let (_dir, paper, mut engine) = fresh(&[wallet]);
     let activity = serde_json::to_vec(&vec![activity(
@@ -726,6 +1150,7 @@ async fn direct_bracket_uses_three_unbounded_ends_and_step_three_cutoff() {
         .unwrap();
 
     assert_eq!(accepted[0].cutoff, 101);
+    assert_full_history_proof(&accepted[0].proof.document);
     let activity_urls = fetcher
         .urls()
         .into_iter()
@@ -739,7 +1164,7 @@ async fn direct_bracket_uses_three_unbounded_ends_and_step_three_cutoff() {
             activity_url_at(wallet, 102),
         ]
     );
-    assert!(activity_urls.iter().all(|url| !url.contains("start=")));
+    assert!(activity_urls.iter().all(|url| url.ends_with("&start=1")));
 }
 
 #[tokio::test]
@@ -793,6 +1218,7 @@ async fn row_older_than_the_previous_end_is_fetched_and_triggers_the_bounded_ret
         .unwrap();
 
     assert_eq!(accepted[0].cutoff, 101);
+    assert_full_history_proof(&accepted[0].proof.document);
     let activity_urls = fetcher
         .urls()
         .into_iter()
@@ -809,7 +1235,7 @@ async fn row_older_than_the_previous_end_is_fetched_and_triggers_the_bounded_ret
         ],
         "the second read detected the inserted old row and forced one full retry"
     );
-    assert!(activity_urls.iter().all(|url| !url.contains("start=")));
+    assert!(activity_urls.iter().all(|url| url.ends_with("&start=1")));
     assert!(
         paper
             .activity_group_state(&intervening_id)
@@ -820,7 +1246,7 @@ async fn row_older_than_the_previous_end_is_fetched_and_triggers_the_bounded_ret
 }
 
 #[tokio::test]
-async fn runtime_control_bracket_uses_three_unbounded_reads() {
+async fn runtime_control_bracket_uses_three_full_history_walks() {
     let wallet = wallet(0x78);
     let (_dir, paper, engine) = fresh(&[wallet]);
     let activity = serde_json::to_vec(&vec![activity(
@@ -869,6 +1295,7 @@ async fn runtime_control_bracket_uses_three_unbounded_reads() {
         .unwrap();
 
     assert_eq!(accepted[0].cutoff, 101);
+    assert_full_history_proof(&accepted[0].proof.document);
     let activity_urls = fetcher
         .urls()
         .into_iter()
@@ -882,7 +1309,7 @@ async fn runtime_control_bracket_uses_three_unbounded_reads() {
             activity_url_at(wallet, 102),
         ]
     );
-    assert!(activity_urls.iter().all(|url| !url.contains("start=")));
+    assert!(activity_urls.iter().all(|url| url.ends_with("&start=1")));
     drop(control_tx);
     actor.await.unwrap();
 }
@@ -1704,7 +2131,7 @@ async fn backwards_activity_fixed_end_retries_without_installing() {
             PolymarketEndpoint::UserPositionActivityPage {
                 user: wallet.to_string(),
                 end: 100,
-                start: None,
+                start: Some(1),
                 offset: 0,
             }
             .url(BASE),
@@ -1714,7 +2141,7 @@ async fn backwards_activity_fixed_end_retries_without_installing() {
             PolymarketEndpoint::UserPositionActivityPage {
                 user: wallet.to_string(),
                 end: 99,
-                start: None,
+                start: Some(1),
                 offset: 0,
             }
             .url(BASE),
@@ -1724,7 +2151,7 @@ async fn backwards_activity_fixed_end_retries_without_installing() {
             PolymarketEndpoint::UserPositionActivityPage {
                 user: wallet.to_string(),
                 end: 101,
-                start: None,
+                start: Some(1),
                 offset: 0,
             }
             .url(BASE),
@@ -2746,12 +3173,12 @@ fn financial_preparer(
 async fn routine_refresh_defers_read(read_index: usize) {
     let wallet = wallet(0x81);
     let (dir, paper, mut engine) = fresh(&[wallet]);
-    install_empty_anchor(&mut engine, &paper, wallet, 0);
+    install_empty_anchor(&mut engine, &paper, wallet, 1);
     drop(engine);
     let h = golden::BracketFinancialHarness::new(dir.path(), paper.clone(), &[wallet]).await;
     let entry_payload = golden::BracketFinancialHarness::entry_payload(wallet, 90);
     let row: Vec<Value> = serde_json::from_slice(&entry_payload).unwrap();
-    let covered = activity(wallet, 9, "1", "0xunseen-covered", 0);
+    let covered = activity(wallet, 9, "1", "0xunseen-covered", 1);
     let covered_id = aggregate(covered.clone(), wallet).group_id.key().clone();
     let payload = serde_json::to_vec(&vec![covered, row[0].clone()]).unwrap();
     let id = aggregate(row[0].clone(), wallet).group_id.key().clone();
@@ -2799,7 +3226,7 @@ async fn routine_refresh_defers_read(read_index: usize) {
     assert!(paper.gate_history().unwrap()[&wallet].is_empty());
     assert!(paper.decision_pending_history().unwrap().is_empty());
     assert_eq!(h.mutations(), 0);
-    assert_eq!(paper.cursor(&wallet).unwrap(), Some(0));
+    assert_eq!(paper.cursor(&wallet).unwrap(), Some(1));
     let committed = h.ordinary_entry(wallet, 90).await;
     assert_eq!(committed.pending.len(), 1);
     assert_eq!(h.mutations(), 1);
@@ -2871,7 +3298,7 @@ async fn routine_refresh_preflights_every_group_after_known_activity() {
         for same_bucket in [false, true] {
             let wallet = wallet(0x91);
             let (_dir, paper, mut engine) = fresh(&[wallet]);
-            install_empty_anchor(&mut engine, &paper, wallet, 0);
+            install_empty_anchor(&mut engine, &paper, wallet, 1);
             let known_epoch = if same_bucket { 90 } else { 89 };
             let first = activity(wallet, 1, "1", "0xfirst", known_epoch);
             let second = activity(wallet, 2, "1", "0xsecond", 90);
@@ -2897,7 +3324,7 @@ async fn routine_refresh_preflights_every_group_after_known_activity() {
                 .activity_group_state(known_group.group_id.key())
                 .unwrap();
             let history = paper.gate_history().unwrap();
-            let covered = activity(wallet, 9, "1", "0xcovered", 0);
+            let covered = activity(wallet, 9, "1", "0xcovered", 1);
             let covered_id = aggregate(covered.clone(), wallet).group_id.key().clone();
             let mut reads = vec![serde_json::to_vec(&vec![known.clone()]).unwrap(); read_index];
             reads.push(serde_json::to_vec(&vec![covered, known.clone(), unseen]).unwrap());
@@ -3026,6 +3453,7 @@ async fn runtime_completion_case(
     );
     let proof: Value = serde_json::from_str(&complete.proof_json).unwrap();
     assert_eq!(proof["activity_walks"].as_array().unwrap().len(), 3);
+    assert_full_history_proof(&complete.proof_json);
     assert_eq!(
         h.live.snapshot().entries.len(),
         1,
@@ -3148,6 +3576,132 @@ async fn runtime_completion_case(
             expected_membership
         );
         assert_eq!(restored.last_ranking_batch_id, 546);
+    }
+}
+
+#[tokio::test]
+async fn runtime_repairs_stored_history_before_membership_and_preserves_financial_replay() {
+    for complete in [false, true] {
+        let incumbent = wallet(0x94);
+        let newcomer = wallet(0x95);
+        let (dir, paper, mut engine) = fresh(&[incumbent]);
+        let path = dir.path().join("paper.db");
+        paper
+            .record_reconciled_history_status(&WalletHistoryStatusRecord {
+                wallet: newcomer,
+                complete,
+                proof_json: "{\"old\":true}".to_owned(),
+                updated_at_unix: 1,
+            })
+            .unwrap();
+        install_empty_anchor(&mut engine, &paper, incumbent, 0);
+        install_empty_anchor(&mut engine, &paper, newcomer, 50);
+        require_reanchor(&path, newcomer);
+        store_old_late_groups(&mut engine, newcomer);
+        drop(engine);
+        let old_groups = paper.activity_groups_after(&newcomer, -1).unwrap();
+        let old_status = paper.wallet_history_status(&newcomer).unwrap();
+        let h = golden::BracketFinancialHarness::new(dir.path(), paper.clone(), &[incumbent]).await;
+        assert_eq!(h.ordinary_entry(incumbent, END + 1).await.pending.len(), 1);
+        let financial = paper.financial_snapshot(END + 1).unwrap();
+        let prior_decisions = paper.decision_pending_history().unwrap();
+        let fetcher = Arc::new(QueueFetcher::new(older_market_responses(newcomer, 2)));
+        let preparer = financial_preparer(&h, &paper, fetcher);
+        preparer.prepare(&[newcomer]).await.unwrap();
+        assert_eq!(paper.gate_history().unwrap()[&newcomer].len(), 3);
+        assert!(paper.wallet_history_complete(&newcomer).unwrap());
+        if complete {
+            assert_eq!(paper.wallet_history_status(&newcomer).unwrap(), old_status);
+        }
+        assert_eq!(
+            paper.activity_groups_after(&newcomer, -1).unwrap(),
+            old_groups
+        );
+        assert_full_history_proof(
+            &paper
+                .position_validation(&newcomer)
+                .unwrap()
+                .unwrap()
+                .proof_json,
+        );
+        assert_eq!(h.live.snapshot().entries[0].wallet, incumbent);
+        assert_eq!(h.mutations(), 1);
+        preparer
+            .scenario_publish_ranking(
+                &h.live,
+                &h.writer_lock,
+                golden::BracketFinancialHarness::entries(&[newcomer]),
+                &HashMap::from([(newcomer, 10)]),
+                1,
+            )
+            .await
+            .unwrap();
+        for byte in 1..=3 {
+            for (side, delta) in [("SELL", 0), ("BUY", 1)] {
+                let epoch = END + i64::from(byte) * 2 + delta;
+                let mut row = activity(
+                    newcomer,
+                    byte,
+                    "1",
+                    &format!("0xruntime-{byte}-{side}"),
+                    epoch,
+                );
+                row["side"] = json!(side);
+                let mut ordinary = context(epoch);
+                ordinary.copy_eligible = true;
+                let (committed, ack) = tokio::sync::oneshot::channel();
+                h.control
+                    .send(OrchestratorControl::CommitActivityBucket {
+                        aggregates: vec![aggregate(row, newcomer)],
+                        context: Arc::new(ordinary),
+                        committed,
+                    })
+                    .await
+                    .unwrap();
+                let result = ack.await.unwrap().unwrap();
+                assert!(result.pending.is_empty());
+                if side == "BUY" {
+                    assert!(
+                        result
+                            .dispositions
+                            .values()
+                            .all(|value| value == "not_first_entry")
+                    );
+                }
+            }
+        }
+        assert_eq!(paper.financial_snapshot(END + 1).unwrap(), financial);
+        assert_eq!(paper.decision_pending_history().unwrap(), prior_decisions);
+        assert_eq!(h.mutations(), 1);
+        let membership = serde_json::to_vec(&h.live.snapshot().entries).unwrap();
+        let initial = h.initial.clone();
+        let source_path = h.source_path.clone();
+        let paper_path = h.paper_path.clone();
+        drop(preparer);
+        h.shutdown().await;
+        drop(paper);
+        let paper = Arc::new(PaperStateDb::open(&path).unwrap());
+        let ledger = build_leader_ledger(&paper).unwrap();
+        let replayed = replay_wallet_ledger(&paper, newcomer).unwrap();
+        assert_eq!(
+            ledger_capture(&ledger, &paper, newcomer).unwrap().hash,
+            ledger_capture(&replayed, &paper, newcomer).unwrap().hash
+        );
+        assert_eq!(paper.gate_history().unwrap()[&newcomer].len(), 3);
+        assert_eq!(paper.financial_snapshot(END + 1).unwrap(), financial);
+        for row in paper.decision_pending_history().unwrap() {
+            pe_service::decision_replay::replay_decision_pending(&row).unwrap();
+        }
+        let era = pe_service::paper_recovery::paper_era(
+            pe_service::paper_recovery::scan_paper_log(&paper_path).unwrap(),
+        );
+        let restored = pe_service::paper_recovery::replay_membership(&era, initial, &source_path)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_vec(&restored.watchlist.entries).unwrap(),
+            membership
+        );
     }
 }
 
@@ -3335,12 +3889,10 @@ async fn boot_newcomer_and_required_reanchor_history_never_copy() {
                     .iter()
                     .all(|group| group.disposition == "reanchor_required_late_group")
             );
-        } else {
-            assert!(
-                paper.gate_history().unwrap()[&wallet]
-                    .contains(&MarketId(VenueMarketId(condition(1))))
-            );
         }
+        assert!(
+            paper.gate_history().unwrap()[&wallet].contains(&MarketId(VenueMarketId(condition(1))))
+        );
         assert!(!paper.wallet_coverage(&wallet).unwrap().reanchor_required);
     }
 }

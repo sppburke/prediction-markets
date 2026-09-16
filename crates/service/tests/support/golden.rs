@@ -3384,7 +3384,7 @@ impl BracketFinancialHarness {
                         let mut rows: serde_json::Value = serde_json::from_slice(&history.activity).unwrap();
                         rows[0]["proxyWallet"] = wallet.to_string().into();
                         if request.url.contains("/activity?") {
-                            assert!(!request.url.contains("start="), "runtime validation requires full history");
+                            assert!(request.url.ends_with("&start=1"), "runtime validation requires full history");
                             serde_json::to_vec(&rows).unwrap()
                         } else {
                             assert!(request.url.contains("/positions?"), "{}", request.url);
