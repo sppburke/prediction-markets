@@ -655,6 +655,29 @@ urllib.request.urlopen = urlopen
         assert!(!dir.path().join("saved").exists());
         std::fs::rename(colliding_prior, &prior_v2).unwrap();
     }
+    // The publication request and its pending pointer are evidence restore
+    // reads and must never write over: naming the displaced copy after the
+    // pointer is refused with the pointer unchanged.
+    let pointer_bytes = std::fs::read(&v2_pending).unwrap();
+    let evidence_role = restore_prior_cache(
+        &fixed,
+        &prior_v2,
+        &v2_pending,
+        &v2_binding,
+        &v2_request,
+        &v2_pending,
+        &FixedPublicationProbe(false),
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        evidence_role
+            .to_string()
+            .contains("not an independent file"),
+        "{evidence_role}"
+    );
+    assert_eq!(std::fs::read(&v2_pending).unwrap(), pointer_bytes);
+    assert_eq!(sha256_file(&fixed).unwrap(), current_hash);
     let displaced_next = dir.path().join("wallet_cache.displaced.next.v2.db");
     restore_prior_cache(
         &fixed,

@@ -2567,6 +2567,8 @@ pub async fn restore_prior_cache(
         ("prior cache restore main", prior_cache_backup_path),
         ("displaced-cache backup", displaced_cache_backup_path),
         ("displaced-cache staging file", displaced_pending.as_path()),
+        ("publication request", publication_request_path),
+        ("pending publication pointer", pending_pointer_path),
     ];
     roles.extend(
         sidecars
