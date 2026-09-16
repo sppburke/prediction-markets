@@ -3486,10 +3486,13 @@ impl BucketCommitEngine {
                     }),
                 advance_cursor: !all_stored,
             })?;
+        // The running projection follows the committed transaction before any
+        // later write, so a failed cursor update cannot leave durable history
+        // unpublished.
+        self.apply_history_projection(wallet, &history_effects, context.history_status.as_ref());
         if all_stored {
             self.paper_state.set_cursor(&wallet, source_epoch)?;
         }
-        self.apply_history_projection(wallet, &history_effects, context.history_status.as_ref());
         Ok(BucketCommitResult {
             wallet,
             source_epoch,

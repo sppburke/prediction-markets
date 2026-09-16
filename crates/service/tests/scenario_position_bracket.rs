@@ -952,6 +952,49 @@ fn fenced_bracket_records_new_covered_purchases_without_repairing_stored_groups(
     assert!(paper.decision_pending_history().unwrap().is_empty());
 }
 
+#[test]
+fn cursor_write_failure_after_stored_repair_keeps_the_projection_published() {
+    let wallet = wallet(0x99);
+    let (dir, paper, mut engine) = fresh(&[wallet]);
+    let path = dir.path().join("paper.db");
+    install_empty_anchor(&mut engine, &paper, wallet, 0);
+    require_reanchor(&path, wallet);
+    store_old_late_groups(&mut engine, wallet);
+    let stored = aggregate(activity(wallet, 3, "1", "0xbase3", 30), wallet);
+    let stored_before = paper.activity_group_state(stored.group_id.key()).unwrap();
+    assert_eq!(paper.cursor(&wallet).unwrap(), Some(0));
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER fail_cursor BEFORE UPDATE ON poll_cursors          BEGIN SELECT RAISE(FAIL, 'cursor fault'); END;",
+    )
+    .unwrap();
+    let mut bracket = context(END);
+    bracket.bracket_commit = true;
+    // The stored-group repair commits history, publishes it, then fails to
+    // move the delivery cursor: durable history and the projection agree.
+    engine
+        .commit(vec![stored.clone()], &bracket, zero_basis())
+        .unwrap_err();
+    let expected = HashSet::from([MarketId(VenueMarketId(condition(3)))]);
+    assert_eq!(paper.gate_history().unwrap()[&wallet], expected);
+    assert_eq!(paper.cursor(&wallet).unwrap(), Some(0));
+    assert_eq!(
+        paper.activity_group_state(stored.group_id.key()).unwrap(),
+        stored_before
+    );
+    conn.execute_batch("DROP TRIGGER fail_cursor").unwrap();
+    // With the projection already published, the retry is the plain
+    // all-stored shortcut: no second repair, cursor advanced.
+    let retry = engine
+        .commit(vec![stored.clone()], &bracket, zero_basis())
+        .unwrap();
+    assert!(retry.already_committed);
+    assert_eq!(paper.gate_history().unwrap()[&wallet], expected);
+    assert_eq!(paper.cursor(&wallet).unwrap(), Some(30));
+    assert_eq!(paper.activity(&wallet).unwrap(), None);
+    assert!(paper.decision_pending_history().unwrap().is_empty());
+}
+
 #[tokio::test]
 async fn failed_history_repair_rolls_back_projection_and_restart_converges() {
     for stored in [false, true] {
