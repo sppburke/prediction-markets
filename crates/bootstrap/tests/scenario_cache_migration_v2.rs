@@ -3110,6 +3110,157 @@ fn ambiguous_fill_rows(wallet: &str) -> Vec<u8> {
     serde_json::to_vec(&rows).unwrap()
 }
 
+/// A TRADE row priced outside the unit interval: the shape the parser refuses
+/// (observed on Forge for `0x1b5f1f…` on 2026-09-17, price 3.1968021978).
+fn unparseable_price_rows(wallet: &str) -> Vec<u8> {
+    let rows = [serde_json::json!({
+        "proxyWallet": wallet, "type": "TRADE", "conditionId": market_for(wallet, FRESH_END - 1),
+        "asset": "123", "outcome": "Yes", "side": "BUY", "size": "210",
+        "usdcSize": "112.41", "price": "3.1968021978", "timestamp": FRESH_END - 1,
+        "transactionHash": "trade-unparseable", "outcomeIndex": "0",
+    })];
+    serde_json::to_vec(&rows).unwrap()
+}
+
+/// Serves an unparseable history for wallet C and ordinary rows for the rest.
+struct UnparseableWalletFetcher;
+
+impl PageFetcher for UnparseableWalletFetcher {
+    fn fetch_page(
+        &self,
+        url: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, SourceError>> + Send {
+        let body = if url.contains(WALLET_C) {
+            unparseable_price_rows(WALLET_C)
+        } else {
+            let wallet = [WALLET, WALLET_B, WALLET_D]
+                .into_iter()
+                .find(|wallet| url.contains(wallet))
+                .unwrap();
+            activity_rows(wallet, &[FRESH_END - 1], false)
+        };
+        async move { Ok(body) }
+    }
+}
+
+/// A wallet whose venue payload the parser refuses is excluded from the
+/// generation with the reason on its receipt, which is the whole record because
+/// a read that failed while parsing kept no page evidence: the other wallets
+/// complete, the resume does not refetch it, finalization projects nothing for
+/// it, and the next generation's union still contains it.
+#[tokio::test]
+async fn fresh_generation_excludes_a_wallet_whose_history_cannot_be_parsed() {
+    let dir = tempfile::Builder::new()
+        .prefix("pe-fresh-unparseable-")
+        .tempdir_in(std::env::current_dir().unwrap())
+        .unwrap();
+    std::fs::create_dir_all(dir.path().join("eval-results")).unwrap();
+    let side = dir.path().join("side.db");
+    seed_initial_candidate(&side);
+    let manifest = write_build_manifest(&dir, &side);
+    migrate_cache_v2(&side, &manifest).unwrap();
+
+    let manifest = populate_activity_fresh_v2(
+        &side,
+        &UnparseableWalletFetcher,
+        "https://data.example",
+        1,
+        FRESH_END,
+        FRESH_END + 1,
+    )
+    .await
+    .unwrap();
+    assert_eq!((manifest.generation, manifest.wallet_count), (1, 4));
+    assert_eq!(
+        receipt(&side, 1, WALLET_C),
+        Some((0, 0, 0)),
+        "a parse failure keeps no page evidence"
+    );
+    let reason: Option<String> = Connection::open(&side)
+        .unwrap()
+        .query_row(
+            "SELECT exclusion_reason FROM activity_wallet_coverage_staging_v2
+             WHERE generation = 1 AND wallet_hex = ?1",
+            [WALLET_C],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("price")),
+        "the receipt records why the wallet was excluded: {reason:?}"
+    );
+    for wallet in [WALLET, WALLET_B, WALLET_D] {
+        assert!(receipt(&side, 1, wallet).is_some_and(|counts| counts.0 > 0));
+    }
+    assert_eq!(
+        count(
+            &side,
+            &format!("SELECT COUNT(*) FROM activity_groups_v2 WHERE wallet_hex = '{WALLET_C}'")
+        ),
+        0
+    );
+
+    // A resume performs no read at all: every wallet has a receipt.
+    let silent = FixtureFetcher::new(HashMap::new());
+    populate_activity_fresh_v2(
+        &side,
+        &silent,
+        "https://data.example",
+        1,
+        FRESH_END + 500,
+        FRESH_END + 2,
+    )
+    .await
+    .unwrap();
+
+    install_fresh_payouts(&side).await;
+    finalize_cache_v2(
+        &side,
+        &dir.path().join("unparseable-stage.json"),
+        FRESH_END + 3,
+    )
+    .unwrap();
+    assert_eq!(
+        count(
+            &side,
+            &format!(
+                "SELECT COUNT(*) FROM ranker_entries_v2 ranker
+                 JOIN activity_groups_v2 groups ON groups.source_trade_id = ranker.source_trade_id
+                 WHERE groups.wallet_hex = '{WALLET_C}'"
+            )
+        ),
+        0
+    );
+
+    // The excluded wallet stays in the next generation's union even though the
+    // next prior retains no history for it.
+    let next = dir.path().join("next.db");
+    std::fs::copy(&side, &next).unwrap();
+    let next_end = FRESH_END + 100;
+    populate_activity_fresh_v2(
+        &next,
+        &fresh_fetcher(
+            &[WALLET, WALLET_B, WALLET_C, WALLET_D],
+            next_end,
+            &[FRESH_END - 1, FRESH_END - 101],
+            false,
+        ),
+        "https://data.example",
+        2,
+        next_end,
+        next_end + 1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        fresh_record(&next)["wallets"],
+        serde_json::json!([WALLET, WALLET_B, WALLET_C, WALLET_D])
+    );
+    assert!(receipt(&next, 2, WALLET_C).is_some_and(|counts| counts.0 > 0));
+}
+
 /// Serves the ambiguous retained wallet B and the ordinary wallet D, then
 /// interrupts every other read transiently once both receipts are durable.
 struct InterruptAfterAmbiguous {
