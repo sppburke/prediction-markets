@@ -655,6 +655,25 @@ fn begin_or_resume_fresh_collection(
         )
         .optional()?;
     if let Some((generation, cursors)) = prior_manifest {
+        // Bind the selected manifest to the activity identity before choosing
+        // its receipt representation. Fresh predecessors were verified above;
+        // frozen predecessors use the same verifier even for legacy arrays.
+        let identity = activity_identity(&transaction)?;
+        if to_i64(identity.generation, "activity generation")? != generation {
+            return invalid("prior activity manifest generation mismatch".to_owned());
+        }
+        if recorded.is_none() {
+            completed_activity_manifest(
+                &transaction,
+                identity.generation,
+                &identity.reference_sha256,
+                identity.fixed_end_unix,
+                &identity.wallets,
+            )?
+            .ok_or_else(|| BootstrapError::Invalid {
+                message: "prior activity manifest is missing".to_owned(),
+            })?;
+        }
         let cursors: Value = serde_json::from_str(&cursors)?;
         let mut retain_excluded = |wallet: String, count, pages: &[ReconciliationPageEvidence]| {
             if is_excluded_receipt(count, pages) {
@@ -665,25 +684,6 @@ fn begin_or_resume_fresh_collection(
             Ok::<_, BootstrapError>(())
         };
         if uses_retained_receipts(&cursors)? {
-            // Fresh predecessors were verified above. A frozen-identity
-            // predecessor can also use retained rows; verify its exact proof
-            // before any clearing can lose an excluded wallet.
-            if recorded.is_none() {
-                let identity = activity_identity(&transaction)?;
-                if to_i64(identity.generation, "activity generation")? != generation {
-                    return invalid("prior activity manifest generation mismatch".to_owned());
-                }
-                completed_activity_manifest(
-                    &transaction,
-                    identity.generation,
-                    &identity.reference_sha256,
-                    identity.fixed_end_unix,
-                    &identity.wallets,
-                )?
-                .ok_or_else(|| BootstrapError::Invalid {
-                    message: "prior activity manifest is missing".to_owned(),
-                })?;
-            }
             let mut statement = transaction.prepare(
                 "SELECT wallet_hex, aggregate_count, page_evidence_json
                  FROM activity_wallet_coverage_staging_v2

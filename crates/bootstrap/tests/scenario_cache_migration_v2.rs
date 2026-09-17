@@ -2910,6 +2910,7 @@ async fn fresh_generation_on_recurring_base_preserves_the_prior_and_resumes_only
     std::fs::create_dir_all(dir.path().join("eval-results")).unwrap();
     let prior = dir.path().join("prior.db");
     finalize_fresh_initial(&dir, &prior).await;
+    assert_successor_rejects_damaged_predecessor(&dir, &prior, 1).await;
     let prior_sha256 = sha256_file(&prior).unwrap();
     let side = dir.path().join("side.db");
     std::fs::copy(&prior, &side).unwrap();
@@ -3324,11 +3325,94 @@ async fn fresh_generation_excludes_a_wallet_whose_history_cannot_be_aggregated()
     }
 }
 
+async fn assert_successor_rejects_damaged_predecessor(
+    dir: &TempDir,
+    prior: &std::path::Path,
+    generation: i64,
+) {
+    for (name, sql, expected) in [
+        (
+            "marker_as_array",
+            "UPDATE activity_coverage_manifests_v2 SET cursors_json = '[]'",
+            "legacy activity manifest retained staging receipts",
+        ),
+        (
+            "receipt_digest",
+            "UPDATE activity_wallet_coverage_staging_v2 SET ordered_aggregate_digest = printf('%064d', 0)",
+            "activity receipt aggregate mismatch",
+        ),
+        (
+            "missing_receipts",
+            "DELETE FROM activity_wallet_coverage_staging_v2",
+            "missing frozen wallets",
+        ),
+        (
+            "foreign_generation",
+            "INSERT INTO activity_coverage_manifests_v2
+                 (generation, reference_sha256, wallet_count, receipt_set_digest,
+                  aggregate_digest, source_row_count, source_bounds_json, cursors_json,
+                  page_hashes_json, group_count, schema_version, parser_version, completed_at_unix)
+             SELECT generation + 1, reference_sha256, wallet_count, receipt_set_digest,
+                    aggregate_digest, source_row_count, source_bounds_json, cursors_json,
+                    page_hashes_json, group_count, schema_version, parser_version, completed_at_unix
+             FROM activity_coverage_manifests_v2",
+            "prior activity manifest generation mismatch",
+        ),
+    ] {
+        let damaged = dir.path().join(format!("damaged-{generation}-{name}.db"));
+        std::fs::copy(prior, &damaged).unwrap();
+        let connection = Connection::open(&damaged).unwrap();
+        connection.execute_batch(sql).unwrap();
+        let state = || {
+            connection
+                .query_row(
+                    "SELECT phase, fresh_collection_json FROM cache_v2_migration_state",
+                    [],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                )
+                .unwrap()
+        };
+        let before_state = state();
+        assert_eq!(before_state.0, "finalized");
+        let before_activity = retained_activity_rows(&damaged);
+        assert!(before_activity.values().all(|rows| !rows.is_empty()));
+        let before_receipts = stored_receipt_proofs(&connection, generation);
+        assert_eq!(before_receipts.is_empty(), name == "missing_receipts");
+        let before_projection = classifier_projection_rows(&damaged);
+        let fetcher = RecordingFetcher::default();
+        let refused = populate_activity_fresh_v2(
+            &damaged,
+            &fetcher,
+            "https://data.example",
+            u64::try_from(generation + 2).unwrap(),
+            FRESH_END + 100,
+            FRESH_END + 11,
+        )
+        .await
+        .unwrap_err();
+        assert!(refused.to_string().contains(expected), "{name}: {refused}");
+        assert!(fetcher.calls.lock().unwrap().is_empty(), "{name}");
+        assert_eq!(retained_activity_rows(&damaged), before_activity, "{name}");
+        assert_eq!(
+            stored_receipt_proofs(&connection, generation),
+            before_receipts,
+            "{name}"
+        );
+        assert_eq!(
+            classifier_projection_rows(&damaged),
+            before_projection,
+            "{name}"
+        );
+        assert_eq!(state(), before_state, "{name}");
+    }
+}
+
 #[tokio::test]
 async fn fresh_generation_supersedes_a_legacy_frozen_identity_and_refuses_tampering() {
     let dir = TempDir::new().unwrap();
     let side = dir.path().join("side.db");
     retained_classifier_activity(&dir, &side).await;
+    assert_successor_rejects_damaged_predecessor(&dir, &side, 7).await;
     assert_eq!(
         count(
             &side,
@@ -3348,27 +3432,22 @@ async fn fresh_generation_supersedes_a_legacy_frozen_identity_and_refuses_tamper
     .unwrap_err();
     assert!(older.to_string().contains("must exceed"), "{older}");
 
-    let damaged = dir.path().join("damaged-frozen-receipts.db");
-    std::fs::copy(&side, &damaged).unwrap();
-    Connection::open(&damaged)
-        .unwrap()
-        .execute("DELETE FROM activity_wallet_coverage_staging_v2", [])
-        .unwrap();
-    let refused = populate_activity_fresh_v2(
-        &damaged,
-        &FixtureFetcher::new(HashMap::new()),
+    let legacy = dir.path().join("legacy-frozen-receipts.db");
+    std::fs::copy(&side, &legacy).unwrap();
+    install_legacy_receipt_manifest(&legacy, 7);
+    let legacy_manifest = populate_activity_fresh_v2(
+        &legacy,
+        &RecordingFetcher::default(),
         "https://data.example",
         8,
         FRESH_END + 100,
         FRESH_END + 11,
     )
     .await
-    .unwrap_err();
-    assert!(
-        refused.to_string().contains("missing frozen wallets"),
-        "{refused}"
-    );
-    assert_eq!(generation_rows(&damaged, 7), generation_rows(&side, 7));
+    .unwrap();
+    assert_eq!(legacy_manifest.generation, 8);
+    assert_eq!(generation_rows(&legacy, 7), 0);
+    assert_eq!(generation_rows(&legacy, 8), 3);
 
     let fresh = RecordingFetcher::default();
     let manifest = populate_activity_fresh_v2(
@@ -4236,6 +4315,8 @@ fn streamed_aggregate_digest_matches_whole_typed_vector() {
     let cases: Vec<Vec<(&str, Vec<ActivityAggregate>)>> = vec![
         vec![],
         vec![(WALLET, vec![]), (WALLET_C, vec![])], // empty and excluded
+        // The last wallet is empty/excluded after a populated wallet.
+        vec![(WALLET_B, populated_b.clone()), (WALLET_E, vec![])],
         vec![
             (WALLET_E, populated_e.clone()),
             (WALLET_C, vec![]),
