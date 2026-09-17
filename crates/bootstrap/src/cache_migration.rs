@@ -1597,6 +1597,14 @@ impl ActivityValidation {
         receipt: &ActivityWalletReceiptProof,
     ) -> Result<(), BootstrapError> {
         let aggregates = load_activity_aggregates(connection, generation, &receipt.wallet_hex)?;
+        self.visit_loaded(receipt, &aggregates)
+    }
+
+    fn visit_loaded(
+        &mut self,
+        receipt: &ActivityWalletReceiptProof,
+        aggregates: &[ActivityAggregate],
+    ) -> Result<(), BootstrapError> {
         let source_rows = aggregates.iter().try_fold(0_u64, |total, aggregate| {
             checked_activity_count(total, aggregate.row_count)
         })?;
@@ -1611,7 +1619,7 @@ impl ActivityValidation {
                 receipt.wallet_hex
             ));
         }
-        incremental::validate_result(receipt, &aggregates)?;
+        incremental::validate_result(receipt, aggregates)?;
         self.aggregates.extend_array(&json)?;
         self.receipts.push(receipt)?;
         self.wallet_count = checked_activity_count(self.wallet_count, 1)?;
@@ -1953,6 +1961,33 @@ fn validate_activity_staging(
     fixed_end_unix: i64,
     wallets: &[String],
 ) -> Result<ValidatedActivityStaging, BootstrapError> {
+    validate_activity_staging_with(
+        connection,
+        generation,
+        reference_sha256,
+        fixed_end_unix,
+        wallets,
+        |validation, receipt| {
+            validation.visit(
+                connection,
+                to_i64(generation, "activity generation")?,
+                receipt,
+            )
+        },
+    )
+}
+
+fn validate_activity_staging_with(
+    connection: &Connection,
+    generation: u64,
+    reference_sha256: &str,
+    fixed_end_unix: i64,
+    wallets: &[String],
+    mut visit: impl FnMut(
+        &mut ActivityValidation,
+        &ActivityWalletReceiptProof,
+    ) -> Result<(), BootstrapError>,
+) -> Result<ValidatedActivityStaging, BootstrapError> {
     let generation_i64 = to_i64(generation, "activity generation")?;
     let mut validation = ActivityValidation::new(generation, reference_sha256, fixed_end_unix)?;
     visit_activity_receipts(
@@ -1961,7 +1996,7 @@ fn validate_activity_staging(
         reference_sha256,
         fixed_end_unix,
         wallets,
-        |receipt| validation.visit(connection, generation_i64, &receipt),
+        |receipt| visit(&mut validation, &receipt),
     )?;
     // The table's primary key makes wallets unique, and the visitor rejects
     // every wallet outside the sorted identity. Equal counts prove completeness.
@@ -2168,6 +2203,33 @@ fn verify_activity_manifest(
     fixed_end_unix: i64,
     wallets: &[String],
 ) -> Result<(), BootstrapError> {
+    verify_activity_manifest_with(
+        connection,
+        manifest,
+        reference_sha256,
+        fixed_end_unix,
+        wallets,
+        |validation, receipt| {
+            validation.visit(
+                connection,
+                to_i64(manifest.generation, "activity generation")?,
+                receipt,
+            )
+        },
+    )
+}
+
+fn verify_activity_manifest_with(
+    connection: &Connection,
+    manifest: &ActivityCoverageManifestV2,
+    reference_sha256: &str,
+    fixed_end_unix: i64,
+    wallets: &[String],
+    mut visit: impl FnMut(
+        &mut ActivityValidation,
+        &ActivityWalletReceiptProof,
+    ) -> Result<(), BootstrapError>,
+) -> Result<(), BootstrapError> {
     validate_hex_sha256(&manifest.receipt_set_digest, "receipt set digest")?;
     validate_hex_sha256(&manifest.aggregate_digest, "activity aggregate digest")?;
     let wallet_count = u64::try_from(wallets.len()).map_err(|_| BootstrapError::Internal)?;
@@ -2212,12 +2274,13 @@ fn verify_activity_manifest(
         if !manifest.page_hashes.is_empty() {
             return invalid("retained activity manifest has embedded page hashes".to_owned());
         }
-        validate_activity_staging(
+        validate_activity_staging_with(
             connection,
             manifest.generation,
             reference_sha256,
             fixed_end_unix,
             wallets,
+            &mut visit,
         )?
     } else {
         let staged_count: i64 = connection.query_row(
@@ -2259,11 +2322,7 @@ fn verify_activity_manifest(
             {
                 return invalid("activity manifest receipt version mismatch".to_owned());
             }
-            validation.visit(
-                connection,
-                to_i64(manifest.generation, "activity generation")?,
-                &receipt,
-            )?;
+            visit(&mut validation, &receipt)?;
         }
         validation.finish()
     };
@@ -2442,31 +2501,45 @@ fn activity_identity(connection: &Connection) -> Result<ActivityIdentity, Bootst
     })
 }
 
-fn install_activity_manifest(
+fn prepare_activity_manifest(
     transaction: &rusqlite::Transaction<'_>,
     finalized_at_unix: i64,
-) -> Result<ActivityCoverageManifestV2, BootstrapError> {
+    mut consume: impl FnMut(&str, &[ActivityAggregate]),
+) -> Result<(ActivityCoverageManifestV2, bool), BootstrapError> {
     let ActivityIdentity {
         generation,
         reference_sha256,
         fixed_end_unix,
         wallets,
     } = activity_identity(transaction)?;
-    if let Some(manifest) = completed_activity_manifest(
-        transaction,
-        generation,
-        &reference_sha256,
-        fixed_end_unix,
-        &wallets,
-    )? {
-        return Ok(manifest);
+    let generation_i64 = to_i64(generation, "activity generation")?;
+    let visit = |validation: &mut ActivityValidation, receipt: &ActivityWalletReceiptProof| {
+        let aggregates =
+            load_activity_aggregates(transaction, generation_i64, &receipt.wallet_hex)?;
+        // Classification may stop at an unusable second; content validation must
+        // cover the entire wallet, including everything after that stopping point.
+        validation.visit_loaded(receipt, &aggregates)?;
+        consume(&receipt.wallet_hex, &aggregates);
+        Ok(())
+    };
+    if let Some(manifest) = stored_activity_manifest(transaction, generation)? {
+        verify_activity_manifest_with(
+            transaction,
+            &manifest,
+            &reference_sha256,
+            fixed_end_unix,
+            &wallets,
+            visit,
+        )?;
+        return Ok((manifest, false));
     }
-    let mut manifest = validate_activity_staging(
+    let mut manifest = validate_activity_staging_with(
         transaction,
         generation,
         &reference_sha256,
         fixed_end_unix,
         &wallets,
+        visit,
     )?
     .into_manifest(
         generation,
@@ -2477,117 +2550,150 @@ fn install_activity_manifest(
     if CollectionProof::load(transaction, generation)?.is_some() {
         manifest.cursors = incremental::receipt_marker_v2();
     }
-    record_completed_manifest(transaction, &manifest)?;
-    Ok(manifest)
+    Ok((manifest, true))
 }
 
 fn rebuild_ranker_projection(
     transaction: &rusqlite::Transaction<'_>,
     activity_generation: u64,
-    wallets: &[String],
-) -> Result<(u64, String), BootstrapError> {
+    finalized_at_unix: i64,
+) -> Result<(ActivityCoverageManifestV2, u64, String), BootstrapError> {
     let generation = to_i64(activity_generation, "activity generation")?;
-    let payout_markets = transaction
-        .prepare(
-            "SELECT market_id FROM clob_payout_evidence_v2
+    let projection = (|| -> Result<_, BootstrapError> {
+        let payout_markets = transaction
+            .prepare(
+                "SELECT market_id FROM clob_payout_evidence_v2
              WHERE end_date_unix IS NOT NULL
                AND payout_status = 'resolved'
                AND payout_vector_json IN ('[\"1\",\"0\"]','[\"0\",\"1\"]','[\"0.5\",\"0.5\"]')
              ORDER BY market_id",
-        )?
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<Result<BTreeSet<_>, _>>()?;
-    let quality = ReconstructionQuality::new(100).map_err(|error| BootstrapError::Invalid {
-        message: format!("bootstrap reconstruction quality is invalid: {error}"),
-    })?;
-    transaction.execute("DELETE FROM ranker_entries_v2", [])?;
-    let mut insert = transaction.prepare(
-        "INSERT INTO ranker_entries_v2
+            )?
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        let quality = ReconstructionQuality::new(100).map_err(|error| BootstrapError::Invalid {
+            message: format!("bootstrap reconstruction quality is invalid: {error}"),
+        })?;
+        transaction.execute("DELETE FROM ranker_entries_v2", [])?;
+        let insert = transaction.prepare(
+            "INSERT INTO ranker_entries_v2
              (source_trade_id, activity_generation, classifier_version)
          VALUES (?1, ?2, ?3)
          ON CONFLICT(source_trade_id) DO NOTHING",
-    )?;
-    for wallet_hex in wallets {
-        let wallet =
-            WalletAddress::from_hex(wallet_hex).map_err(|error| BootstrapError::Invalid {
-                message: format!("frozen universe contains invalid wallet {wallet_hex}: {error}"),
-            })?;
-        let aggregates = load_activity_aggregates(transaction, generation, wallet_hex)?;
-        let mut buckets = BTreeMap::<i64, Vec<ActivityAggregate>>::new();
-        for aggregate in aggregates {
-            buckets
-                .entry(aggregate.source_time.0.unix_timestamp())
-                .or_default()
-                .push(aggregate);
-        }
-        let mut ledger = PositionLedger::new();
-        let mut history = BTreeSet::<String>::new();
-        for aggregates in buckets.into_values() {
-            let mutations = match aggregates
-                .iter()
-                .map(LedgerMutation::from_activity)
-                .collect::<Result<Vec<_>, _>>()
+        )?;
+        Ok((payout_markets, quality, insert))
+    })();
+    let (mut projection, mut projection_error) = match projection {
+        Ok(projection) => (Some(projection), None),
+        Err(error) => (None, Some(error)),
+    };
+    let (manifest, needs_install) =
+        prepare_activity_manifest(transaction, finalized_at_unix, |wallet, aggregates| {
+            if projection_error.is_none()
+                && let Some((payout_markets, quality, insert)) = projection.as_mut()
             {
-                Ok(mutations) => mutations,
-                Err(_) => break,
-            };
-            if mutations
-                .iter()
-                .any(|mutation| matches!(mutation.effect.effective(), LedgerEffect::RequiresAnchor))
-            {
-                break;
+                projection_error = project_loaded_wallet(
+                    wallet,
+                    aggregates,
+                    generation,
+                    payout_markets,
+                    *quality,
+                    insert,
+                )
+                .err();
             }
-            let decisions = match classify_complete_historical_second(
-                &ledger,
-                wallet,
-                &mutations,
-                quality,
-                &|market: &MarketId| history.contains(&market.to_string()),
-            ) {
-                Ok(SecondVerdict::OrderIndependent { decisions, .. }) => decisions,
-                Ok(SecondVerdict::OrderDependent { .. }) | Err(_) => break,
-            };
-            for decision in decisions {
-                if decision.entry != EntryClassification::Admitted
-                    || decision.amount == ShareAmount::ZERO
-                    || !payout_markets.contains(&decision.market_id.to_string())
-                {
-                    continue;
-                }
-                let complete_identifiers = aggregates.iter().any(|aggregate| {
-                    aggregate.group_id.key() == &decision.source_trade_id
-                        && aggregate.group_id.components().condition_id.is_some()
-                        && aggregate.group_id.components().asset.is_some()
-                        && aggregate.group_id.components().outcome.is_some()
-                        && aggregate.group_id.components().side.is_some()
-                });
-                if complete_identifiers {
-                    validate_g2_id(&decision.source_trade_id.0)?;
-                    insert.execute(params![
-                        decision.source_trade_id.0,
-                        generation,
-                        i64::from(RANKER_CLASSIFIER_VERSION)
-                    ])?;
-                }
-            }
-            if ledger.apply_all_or_none(&mutations).is_err() {
-                break;
-            }
-            for mutation in &mutations {
-                for key in mutation.touched_keys() {
-                    history.insert(key.market().to_string());
-                }
-            }
-        }
+        })?;
+    // Content/receipt/manifest validation failures retain precedence over SQL
+    // errors. Return a deferred projection error before installing the manifest:
+    // SQLite may already have rolled back the transaction, so later writes could
+    // otherwise commit independently in autocommit mode.
+    if let Some(error) = projection_error {
+        return Err(error);
     }
-
+    if needs_install {
+        record_completed_manifest(transaction, &manifest)?;
+    }
     let digest = ranker_projection_digest(transaction, activity_generation)?;
     let count: i64 =
         transaction.query_row("SELECT COUNT(*) FROM ranker_entries_v2", [], |row| {
             row.get(0)
         })?;
     let count = to_u64(count, "ranker projection count")?;
-    Ok((count, digest))
+    Ok((manifest, count, digest))
+}
+
+// Aggregates retain the loader's (source_time_unix, source_trade_id) order.
+// Borrow contiguous seconds so classification uses the validated vector itself.
+fn project_loaded_wallet(
+    wallet_hex: &str,
+    aggregates: &[ActivityAggregate],
+    generation: i64,
+    payout_markets: &BTreeSet<String>,
+    quality: ReconstructionQuality,
+    insert: &mut rusqlite::Statement<'_>,
+) -> Result<(), BootstrapError> {
+    let wallet = WalletAddress::from_hex(wallet_hex).map_err(|error| BootstrapError::Invalid {
+        message: format!("frozen universe contains invalid wallet {wallet_hex}: {error}"),
+    })?;
+    let mut ledger = PositionLedger::new();
+    let mut history = BTreeSet::<String>::new();
+    for aggregates in aggregates.chunk_by(|a, b| a.source_time == b.source_time) {
+        let mutations = match aggregates
+            .iter()
+            .map(LedgerMutation::from_activity)
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(mutations) => mutations,
+            Err(_) => break,
+        };
+        if mutations
+            .iter()
+            .any(|mutation| matches!(mutation.effect.effective(), LedgerEffect::RequiresAnchor))
+        {
+            break;
+        }
+        let decisions = match classify_complete_historical_second(
+            &ledger,
+            wallet,
+            &mutations,
+            quality,
+            &|market: &MarketId| history.contains(&market.to_string()),
+        ) {
+            Ok(SecondVerdict::OrderIndependent { decisions, .. }) => decisions,
+            Ok(SecondVerdict::OrderDependent { .. }) | Err(_) => break,
+        };
+        for decision in decisions {
+            if decision.entry != EntryClassification::Admitted
+                || decision.amount == ShareAmount::ZERO
+                || !payout_markets.contains(&decision.market_id.to_string())
+            {
+                continue;
+            }
+            let complete_identifiers = aggregates.iter().any(|aggregate| {
+                aggregate.group_id.key() == &decision.source_trade_id
+                    && aggregate.group_id.components().condition_id.is_some()
+                    && aggregate.group_id.components().asset.is_some()
+                    && aggregate.group_id.components().outcome.is_some()
+                    && aggregate.group_id.components().side.is_some()
+            });
+            if complete_identifiers {
+                validate_g2_id(&decision.source_trade_id.0)?;
+                insert.execute(params![
+                    decision.source_trade_id.0,
+                    generation,
+                    i64::from(RANKER_CLASSIFIER_VERSION)
+                ])?;
+            }
+        }
+        if ledger.apply_all_or_none(&mutations).is_err() {
+            break;
+        }
+        for mutation in &mutations {
+            for key in mutation.touched_keys() {
+                history.insert(key.market().to_string());
+            }
+        }
+    }
+    Ok(())
 }
 
 // Keep the projection as the outer loop even with stale SQLite statistics.
@@ -2737,13 +2843,9 @@ pub fn finalize_cache_v2(
         } else if state.0 == "finalized" && state.3.is_none() {
             return invalid("finalized ranker projection classifier version is missing".to_owned());
         } else {
-            let activity_manifest = install_activity_manifest(&transaction, finalized_at_unix)?;
             let identity = activity_identity(&transaction)?;
-            let (count, digest) = rebuild_ranker_projection(
-                &transaction,
-                activity_manifest.generation,
-                &identity.wallets,
-            )?;
+            let (activity_manifest, count, digest) =
+                rebuild_ranker_projection(&transaction, identity.generation, finalized_at_unix)?;
             let inputs = RankerProjectionInputs::read(
                 &transaction,
                 &activity_manifest,
@@ -3223,7 +3325,9 @@ pub fn activate_cache_v2_with_handoff(
             &prior_cache_sha256,
         )?;
     }
-    if verified_cache_schema(&request.prior_cache_backup_path)? != current_version {
+    // Hash equality (or the hash-verified copy above) transfers the just-validated
+    // fixed main's content proof. Read only the backup schema, without sidecars.
+    if verified_user_version(&request.prior_cache_backup_path)? != current_version {
         return invalid("prior-cache backup schema changed during activation".to_owned());
     }
 
