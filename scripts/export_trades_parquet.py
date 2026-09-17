@@ -23,6 +23,7 @@ Run: `python3 scripts/export_trades_parquet.py --db data/wallet_cache.db --out-d
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterable, Iterator
 import os
 import sqlite3
 import sys
@@ -50,6 +51,7 @@ V2_TABLES = (
     "cache_v2_migration_state",
 )
 V2_EXPORT_MANIFEST = "schema_v2_export_manifest.json"
+PROJECTION_BATCH_SIZE = 1024
 
 
 def log(msg: str) -> None:
@@ -87,10 +89,10 @@ def _export_table(con, out_dir: str, tbl: str, row_group_size: int) -> int:
     return int(n)
 
 
-def _projection_rows(con, relation_prefix: str) -> list[dict]:
+def _projection_rows(con, relation_prefix: str) -> Iterator[dict]:
     """Canonical joined schema-two rows, matching Rust's projection digest."""
     prefix = f"{relation_prefix}." if relation_prefix else ""
-    rows = con.execute(
+    cursor = con.execute(
         f"SELECT ranker.source_trade_id, ranker.activity_generation, "
         f"ranker.classifier_version, groups_v2.wallet_hex, "
         f"groups_v2.condition_id, groups_v2.asset, groups_v2.outcome_id, "
@@ -105,7 +107,7 @@ def _projection_rows(con, relation_prefix: str) -> list[dict]:
         f"JOIN {prefix}clob_payout_evidence_v2 payout "
         "ON payout.market_id = groups_v2.condition_id "
         "ORDER BY ranker.source_trade_id"
-    ).fetchall()
+    )
     names = (
         "source_trade_id", "activity_generation", "classifier_version",
         "wallet_hex", "condition_id", "asset", "outcome_id", "side",
@@ -113,15 +115,24 @@ def _projection_rows(con, relation_prefix: str) -> list[dict]:
         "source_usdc_amount_str", "source_time_unix", "payout_vector_json",
         "end_date_unix",
     )
-    return [dict(zip(names, row, strict=True)) for row in rows]
+    while batch := cursor.fetchmany(PROJECTION_BATCH_SIZE):
+        for row in batch:
+            yield dict(zip(names, row, strict=True))
 
 
-def _projection_digest(rows: list[dict]) -> str:
+def _projection_digest(rows: Iterable[dict]) -> tuple[int, str]:
     import hashlib
     import json
 
-    rendered = json.dumps(rows, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(rendered.encode()).hexdigest()
+    digest = hashlib.sha256(b"[")
+    count = 0
+    for row in rows:
+        if count:
+            digest.update(b",")
+        digest.update(json.dumps(row, sort_keys=True, separators=(",", ":")).encode())
+        count += 1
+    digest.update(b"]")
+    return count, digest.hexdigest()
 
 
 def _file_sha256(path: str) -> str:
@@ -143,10 +154,10 @@ def _verify_v2_projection(con, out_dir: str) -> dict:
     ).fetchone()
     if state is None or state[0] != "finalized":
         raise ValueError("schema-two cache is not finalized")
-    source_rows = _projection_rows(con, "src")
+    source_count, source_digest = _projection_digest(_projection_rows(con, "src"))
     expected_count = int(state[1]) if state[1] is not None else -1
     expected_digest = str(state[2]) if state[2] is not None else ""
-    if len(source_rows) != expected_count or _projection_digest(source_rows) != expected_digest:
+    if source_count != expected_count or source_digest != expected_digest:
         raise ValueError("schema-two SQLite projection count/digest does not match final state")
 
     con.execute("CREATE SCHEMA IF NOT EXISTS exported")
@@ -156,10 +167,10 @@ def _verify_v2_projection(con, out_dir: str) -> dict:
             f"CREATE OR REPLACE VIEW exported.{table} AS "
             f"SELECT * FROM read_parquet('{path}')"
         )
-    exported_rows = _projection_rows(con, "exported")
+    exported_count, exported_digest = _projection_digest(_projection_rows(con, "exported"))
     # `_projection_rows` addresses `exported.<table>`; DuckDB schemas are used here
     # so that the exact same join text verifies the Parquet side.
-    if len(exported_rows) != expected_count or _projection_digest(exported_rows) != expected_digest:
+    if exported_count != expected_count or exported_digest != expected_digest:
         raise ValueError("schema-two Parquet projection count/digest mismatch")
     log(
         "schema-two projection verified: "

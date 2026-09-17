@@ -417,7 +417,7 @@ async fn main() {
                                 now,
                             )
                             .await
-                            .and_then(json_report);
+                            .and_then(activity_json_report);
                         }
                         let (fixed_end, generation) = fixed_end_arg.zip(generation_arg).ok_or_else(
                             || BootstrapError::Invalid {
@@ -444,7 +444,7 @@ async fn main() {
                             now,
                         )
                         .await
-                        .and_then(json_report)
+                        .and_then(activity_json_report)
                     }
                     .await
                 }
@@ -1383,6 +1383,18 @@ fn resolutions_error_exit_code(error: &BootstrapError) -> i32 {
         // #534) to tempfail 75 and every permanent error to 1.
         _ => error.exit_code(),
     }
+}
+
+fn activity_json_report(
+    mut manifest: pe_bootstrap::cache_migration::ActivityCoverageManifestV2,
+) -> Result<serde_json::Value, BootstrapError> {
+    // Historical manifests still validate their embedded proofs, but reports
+    // only need bounded metadata. Null means legacy proof omitted from output.
+    if manifest.cursors.is_array() {
+        manifest.cursors = serde_json::Value::Null;
+        manifest.page_hashes.clear();
+    }
+    json_report(manifest)
 }
 
 fn json_report<T: serde::Serialize>(report: T) -> Result<serde_json::Value, BootstrapError> {
