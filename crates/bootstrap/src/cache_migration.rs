@@ -736,26 +736,45 @@ async fn collect_activity_v2(
         )
         .await
         .map_err(|error| activity_read_failure(&wallet_hex, error))?;
-        let source_row_count =
-            u64::try_from(complete.rows.len()).map_err(|_| BootstrapError::Invalid {
-                message: format!("activity source-row count overflow for {wallet_hex}"),
-            })?;
-        let mut aggregates = complete
-            .buckets()
-            .map_err(|error| BootstrapError::Polymarket {
-                wallet: wallet_hex.clone(),
-                message: error.to_string(),
-            })?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-        aggregates.sort_by(|left, right| {
-            left.source_time
-                .0
-                .unix_timestamp()
-                .cmp(&right.source_time.0.unix_timestamp())
-                .then_with(|| left.group_id.key().0.cmp(&right.group_id.key().0))
-        });
+        let (aggregates, source_row_count) = match complete.buckets() {
+            Ok(buckets) => {
+                let mut aggregates = buckets.into_iter().flatten().collect::<Vec<_>>();
+                aggregates.sort_by(|left, right| {
+                    left.source_time
+                        .0
+                        .unix_timestamp()
+                        .cmp(&right.source_time.0.unix_timestamp())
+                        .then_with(|| left.group_id.key().0.cmp(&right.group_id.key().0))
+                });
+                let source_row_count = u64::try_from(complete.rows.len()).map_err(|_| {
+                    BootstrapError::Invalid {
+                        message: format!("activity source-row count overflow for {wallet_hex}"),
+                    }
+                })?;
+                (aggregates, source_row_count)
+            }
+            // A history the aggregator cannot bucket deterministically (one fill
+            // whose rows carry different venue timestamps) excludes this wallet
+            // from the generation instead of failing the cycle: its receipt
+            // keeps the fetched page evidence with zero aggregates, so the
+            // ranker never sees the wallet, the resume does not refetch it, and
+            // every other wallet keeps collecting.
+            Err(ActivityReadError::Aggregate(error)) => {
+                tracing::warn!(
+                    wallet = %wallet_hex,
+                    generation,
+                    %error,
+                    "activity wallet excluded from the generation: history cannot be aggregated deterministically"
+                );
+                (Vec::new(), 0)
+            }
+            Err(error) => {
+                return Err(BootstrapError::Polymarket {
+                    wallet: wallet_hex,
+                    message: error.to_string(),
+                });
+            }
+        };
         Ok::<_, BootstrapError>(WalletActivityCompletion {
             wallet_hex,
             pages: complete.pages,
@@ -942,6 +961,8 @@ struct WalletActivityCompletion {
     wallet_hex: String,
     pages: Vec<ReconciliationPageEvidence>,
     aggregates: Vec<ActivityAggregate>,
+    /// Rows that entered `aggregates`; zero for a wallet excluded from the
+    /// generation, whose `pages` still record the rows the venue returned.
     source_row_count: u64,
 }
 

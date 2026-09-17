@@ -2610,6 +2610,174 @@ async fn fresh_generation_on_recurring_base_preserves_the_prior_and_resumes_only
     assert_eq!(sha256_file(&fixed).unwrap(), stage.cache_sha256);
 }
 
+/// One fill reported as two rows with different venue timestamps (the shape
+/// the aggregator refuses as causally ambiguous; observed on Forge for
+/// `0x04902c…` on 2026-09-17).
+fn ambiguous_fill_rows(wallet: &str) -> Vec<u8> {
+    let rows = [FRESH_END - 1, FRESH_END - 3].map(|epoch| {
+        serde_json::json!({
+            "proxyWallet": wallet, "type": "TRADE", "conditionId": market_for(wallet, FRESH_END - 1),
+            "asset": "123", "outcome": "Yes", "side": "BUY", "size": "210",
+            "usdcSize": "112.41", "price": "0.5352857143", "timestamp": epoch,
+            "transactionHash": "trade-shared", "outcomeIndex": "0",
+        })
+    });
+    serde_json::to_vec(&rows).unwrap()
+}
+
+/// Serves the ambiguous wallet and one ordinary wallet, then interrupts every
+/// other read transiently once the ambiguous wallet's receipt is durable.
+struct InterruptAfterAmbiguous {
+    side: std::path::PathBuf,
+}
+
+impl PageFetcher for InterruptAfterAmbiguous {
+    fn fetch_page(
+        &self,
+        url: &str,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, SourceError>> + Send {
+        let side = self.side.clone();
+        let url = url.to_owned();
+        async move {
+            if url.contains(WALLET_D) {
+                return Ok(ambiguous_fill_rows(WALLET_D));
+            }
+            if url.contains(WALLET_B) {
+                return Ok(activity_rows(WALLET_B, &[FRESH_END - 1], false));
+            }
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let committed: i64 = Connection::open(&side)
+                    .unwrap()
+                    .query_row(
+                        "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2
+                         WHERE generation = 1 AND wallet_hex = ?1",
+                        params![WALLET_D],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                if committed == 1 {
+                    return Err(SourceError::Transient {
+                        message: "controlled interruption after the excluded receipt".to_owned(),
+                    });
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "excluded wallet never committed"
+                );
+                tokio::task::yield_now().await;
+            }
+        }
+    }
+}
+
+/// A wallet whose fetched history cannot be aggregated deterministically is
+/// excluded from the generation instead of failing it: its receipt keeps the
+/// page evidence with zero aggregates, the other wallets keep collecting, the
+/// resume fetches only wallets without a receipt, validation and finalization
+/// accept the receipt set, and the ranker projects nothing for the wallet.
+#[tokio::test]
+async fn fresh_generation_excludes_a_wallet_whose_history_cannot_be_aggregated() {
+    let dir = tempfile::Builder::new()
+        .prefix("pe-fresh-excluded-")
+        .tempdir_in(std::env::current_dir().unwrap())
+        .unwrap();
+    std::fs::create_dir_all(dir.path().join("eval-results")).unwrap();
+    let side = dir.path().join("side.db");
+    seed_initial_candidate(&side);
+    let manifest = write_build_manifest(&dir, &side);
+    migrate_cache_v2(&side, &manifest).unwrap();
+
+    let interrupted = populate_activity_fresh_v2(
+        &side,
+        &InterruptAfterAmbiguous { side: side.clone() },
+        "https://data.example",
+        1,
+        FRESH_END,
+        FRESH_END + 1,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(interrupted.exit_code(), 75, "{interrupted}");
+    let receipt = |wallet: &str| -> Option<(i64, i64, u64)> {
+        Connection::open(&side)
+            .unwrap()
+            .query_row(
+                "SELECT aggregate_count, source_row_count, page_evidence_json
+                 FROM activity_wallet_coverage_staging_v2
+                 WHERE generation = 1 AND wallet_hex = ?1",
+                [wallet],
+                |row| {
+                    let pages: Value = serde_json::from_str(&row.get::<_, String>(2)?).unwrap();
+                    let page_rows = pages
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|page| page["row_count"].as_u64().unwrap())
+                        .sum::<u64>();
+                    Ok((row.get(0)?, row.get(1)?, page_rows))
+                },
+            )
+            .optional()
+            .unwrap()
+    };
+    assert_eq!(
+        receipt(WALLET_D),
+        Some((0, 0, 2)),
+        "excluded receipt keeps the page evidence with zero aggregates"
+    );
+    assert_eq!(receipt(WALLET_B), Some((1, 1, 1)));
+    assert_eq!(receipt(WALLET), None);
+    assert_eq!(
+        count(
+            &side,
+            &format!("SELECT COUNT(*) FROM activity_groups_v2 WHERE wallet_hex = '{WALLET_D}'")
+        ),
+        0
+    );
+
+    // The resume fetches only the wallets without a receipt: this fetcher has
+    // no response for the excluded wallet, so a refetch would fail the resume.
+    let manifest = populate_activity_fresh_v2(
+        &side,
+        &fresh_fetcher(
+            &[WALLET, WALLET_C],
+            FRESH_END,
+            &[FRESH_END - 1, FRESH_END - 101],
+            false,
+        ),
+        "https://data.example",
+        1,
+        FRESH_END + 500,
+        FRESH_END + 2,
+    )
+    .await
+    .unwrap();
+    assert_eq!((manifest.generation, manifest.wallet_count), (1, 4));
+    assert_eq!(receipt(WALLET_D), Some((0, 0, 2)));
+    assert_eq!(generation_rows(&side, 1), 3 + 1 + 2);
+
+    install_fresh_payouts(&side).await;
+    finalize_cache_v2(
+        &side,
+        &dir.path().join("excluded-stage.json"),
+        FRESH_END + 3,
+    )
+    .unwrap();
+    assert_eq!(
+        count(
+            &side,
+            &format!(
+                "SELECT COUNT(*) FROM ranker_entries_v2 ranker
+                 JOIN activity_groups_v2 groups ON groups.source_trade_id = ranker.source_trade_id
+                 WHERE groups.wallet_hex = '{WALLET_D}'"
+            )
+        ),
+        0
+    );
+    assert!(count(&side, "SELECT COUNT(*) FROM ranker_entries_v2") > 0);
+}
+
 #[tokio::test]
 async fn fresh_generation_supersedes_a_legacy_frozen_identity_and_refuses_tampering() {
     let dir = TempDir::new().unwrap();

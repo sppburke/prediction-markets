@@ -653,7 +653,11 @@ receipt; a completed generation returns its manifest without any source call. Fr
 request each wallet's full history (`start=1` on the wire; an omitted `start` returns only
 the venue's recent window). A read that exhausts the fetcher's transient retries or is
 rate-limited by the venue exits `rank_and_push_tempfail_exit` (75) so the supervisor resumes the
-collection.
+collection. A wallet whose fetched history the aggregator refuses as causally ambiguous (one
+fill whose rows carry different venue timestamps) is excluded from the generation instead of
+failing the cycle: the command logs a warning naming the wallet and the reason, its receipt keeps
+the page evidence with zero aggregates and a zero source-row count, the resume does not refetch
+it, and finalization projects no ranker entry for it.
 Finalization, activation and the installed-cache validator accept the fresh identity without
 a frozen-payload row; caches finalized under the frozen flow keep their authentic legacy
 identity, including caches that physically lack the new column.
