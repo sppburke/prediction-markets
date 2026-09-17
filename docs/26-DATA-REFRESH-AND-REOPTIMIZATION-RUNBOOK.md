@@ -560,8 +560,9 @@ receipt together; restart schedules only missing exact receipts, and finalizatio
 receipt set to equal the frozen universe before atomically installing the activity manifest and
 deleting staging. Finalization also verifies payout coverage, builds the Rust ledger/classifier
 projection, and records its count and digest.
-For frozen and fresh collections, restart validates receipt identity, shape and count
-constraints without reading aggregate content; invalid receipts fail before source I/O.
+For frozen and fresh collections, resuming an unfinished collection (no activity manifest
+installed yet) validates receipt identity, shape and count constraints without reading
+aggregate content; invalid receipts fail before source I/O.
 Because wallet writes are atomic, completed-wallet content corruption (such as a deleted
 group with its receipt intact) is detected at collection completion instead of restart,
 and full content validation remains mandatory at completion and finalization.

@@ -834,6 +834,9 @@ async fn collect_activity_v2(
                     break;
                 }
             }
+            // Free any queued completions before signalling, so the collector's
+            // synchronous join never waits on their destruction.
+            drop(receiver);
             let _ = finished_sender.send(());
             connection
         })?;
