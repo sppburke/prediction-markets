@@ -576,15 +576,19 @@ diff, durably prepares the publication request, activates the side cache, then r
 request. The targeted price-store write is re-finalized before request preparation so the stage
 hash covers the installed bytes.
 Refinalization reuses the projection only when the finalized database's saved activity generation,
-reference, aggregate and manifest digests, payout generation/coverage, and classifier version are
-unchanged, and the existing projection's recomputed count and digest match the recorded values;
-missing or changed proof refuses reuse. A different recorded classifier version instead runs
-full activity verification and rebuilds the projection with the current classifier. First
-finalization still validates the complete receipts and activity before building the projection.
-Reuse skips that activity-generation verification and reclassification. Digest recomputation
-walks the projection and looks up its activity rows by source-trade key; the join order prevents
-SQLite from choosing a full activity traversal. It retains payout coverage verification,
-checkpointing, sidecar checks, the full-file hash and the stage-record write. Receipt or activity
+reference, aggregate and manifest digests, payout generation/coverage and evidence digest, and
+classifier version are unchanged, and the existing projection's recomputed count and digest match
+the recorded values; missing or changed proof refuses reuse. A different recorded classifier
+version instead runs full activity verification and rebuilds the projection with the current
+classifier. First finalization still validates the complete receipts and activity before building
+the projection.
+Reuse skips that activity-generation verification and reclassification. The payout evidence digest
+streams every evidence row in market-ID order, binding `market_id`, `end_date_unix`, `payout_status`,
+and `payout_vector_json`, including markets currently excluded from the projection. It covers the
+entire payout table because the rebuild's eligibility query has no generation filter. Projection
+digest recomputation walks the projection and looks up its activity rows by source-trade key;
+the join order prevents SQLite from choosing a full activity traversal. It retains payout coverage
+verification, checkpointing, sidecar checks, the full-file hash and the stage-record write. Receipt or activity
 corruption outside the projected values introduced after first finalization is detected by
 activation's unchanged full manifest/content validation, before replacing the fixed cache:
 

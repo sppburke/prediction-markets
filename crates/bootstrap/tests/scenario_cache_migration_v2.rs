@@ -1548,6 +1548,133 @@ async fn refinalization_reuses_projection_after_targeted_price_write() {
 }
 
 #[tokio::test]
+async fn refinalization_refuses_newly_eligible_payout_without_manifest_change() {
+    let dir = TempDir::new().unwrap();
+    let side = dir.path().join("side.db");
+    prepare_fresh_initial(&dir, &side).await;
+    let connection = Connection::open(&side).unwrap();
+    let original_end: i64 = connection
+        .query_row(
+            "SELECT end_date_unix FROM clob_payout_evidence_v2
+             WHERE market_id = '0xsame' AND payout_status = 'resolved'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE clob_payout_evidence_v2 SET end_date_unix = NULL
+                 WHERE market_id = '0xsame'",
+                [],
+            )
+            .unwrap(),
+        1
+    );
+    drop(connection);
+    let stage_path = dir.path().join("first-stage.json");
+    let first = finalize_cache_v2(&side, &stage_path, FRESH_END + 2).unwrap();
+    let stage_bytes = std::fs::read(&stage_path).unwrap();
+    let rows_before = projected_entries(&side);
+    let newly_eligible = (WALLET.to_owned(), "0xsame".to_owned(), FRESH_END - 201);
+    assert_eq!(first.ranker_projection_count, 4);
+    assert_eq!(rows_before.len(), 4);
+    assert!(!rows_before.contains(&newly_eligible));
+    let activity_before = retained_activity_rows(&side);
+    let payout_coverage = || {
+        Connection::open(&side)
+            .unwrap()
+            .query_row(
+                "SELECT generation, manifest_json, market_count,
+                        (SELECT COUNT(*) FROM clob_payout_evidence_v2
+                         WHERE coverage_generation = manifest.generation)
+                 FROM clob_payout_coverage_manifests_v2 manifest
+                 ORDER BY generation DESC LIMIT 1",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .unwrap()
+    };
+    let coverage_before = payout_coverage();
+    assert_eq!(coverage_before.2, 5);
+    assert_eq!(coverage_before.3, 5);
+
+    // Only this previously excluded market changes. The old manifest binding
+    // and projection digest cannot see the new membership requirement.
+    assert_eq!(
+        Connection::open(&side)
+            .unwrap()
+            .execute(
+                "UPDATE clob_payout_evidence_v2 SET end_date_unix = ?1
+                 WHERE market_id = '0xsame' AND end_date_unix IS NULL
+                   AND payout_status = 'resolved' AND payout_vector_json = '[\"1\",\"0\"]'",
+                params![original_end],
+            )
+            .unwrap(),
+        1
+    );
+    assert_eq!(payout_coverage(), coverage_before);
+    assert_eq!(retained_activity_rows(&side), activity_before);
+    assert_eq!(projected_entries(&side), rows_before);
+    assert_eq!(
+        reference_projection_digest(&side),
+        first.ranker_projection_digest
+    );
+    let hash_before_refusal = sha256_file(&side).unwrap();
+    let error = finalize_cache_v2(&side, &stage_path, FRESH_END + 3).unwrap_err();
+    assert!(
+        error.to_string().contains("input binding changed"),
+        "{error}"
+    );
+    assert_eq!(std::fs::read(&stage_path).unwrap(), stage_bytes);
+    assert_eq!(sha256_file(&side).unwrap(), hash_before_refusal);
+    assert_eq!(projected_entries(&side), rows_before);
+
+    // Changed inputs fail closed rather than silently rebuilding a finalized
+    // generation. A normal fresh collection rebuilds from the corrected payout
+    // inputs and proves the missing entry was otherwise eligible all along.
+    populate_activity_fresh_v2(
+        &side,
+        &fresh_fetcher(
+            &[WALLET, WALLET_B, WALLET_C, WALLET_D],
+            FRESH_END,
+            &[FRESH_END - 1, FRESH_END - 101],
+            false,
+        ),
+        "https://data.example",
+        2,
+        FRESH_END,
+        FRESH_END + 4,
+    )
+    .await
+    .unwrap();
+    let rebuilt = finalize_cache_v2(&side, &stage_path, FRESH_END + 5).unwrap();
+    assert_eq!(rebuilt.activity_coverage_generation, 2);
+    assert_eq!(
+        rebuilt.ranker_classifier_version,
+        first.ranker_classifier_version
+    );
+    assert_eq!(rebuilt.ranker_projection_count, 5);
+    let mut expected = rows_before;
+    expected.push(newly_eligible);
+    expected.sort();
+    assert_eq!(projected_entries(&side), expected);
+    assert_eq!(payout_coverage(), coverage_before);
+    assert_eq!(
+        rebuilt.ranker_projection_digest,
+        reference_projection_digest(&side)
+    );
+    assert_eq!(rebuilt.cache_sha256, sha256_file(&side).unwrap());
+}
+
+#[tokio::test]
 async fn refinalization_refuses_changed_or_missing_projection_proof() {
     let dir = TempDir::new().unwrap();
     let original = dir.path().join("original.db");
@@ -1600,6 +1727,25 @@ async fn refinalization_refuses_changed_or_missing_projection_proof() {
             "CLOB payout coverage is incomplete",
         ),
         (
+            "payout_market",
+            "UPDATE clob_payout_evidence_v2 SET market_id = '0xother'
+             WHERE market_id = '0xlater-a'",
+            "input binding changed",
+        ),
+        (
+            "payout_status",
+            "UPDATE clob_payout_evidence_v2
+             SET payout_status = 'unresolved_incomplete', payout_vector_json = NULL
+             WHERE market_id = '0xlater-a'",
+            "input binding changed",
+        ),
+        (
+            "payout_vector",
+            "UPDATE clob_payout_evidence_v2 SET payout_vector_json = '[\"0\",\"1\"]'
+             WHERE market_id = '0xlater-a'",
+            "input binding changed",
+        ),
+        (
             "projection_row",
             "UPDATE ranker_entries_v2 SET source_trade_id = 'g2:' || printf('%064d', 0)
              WHERE source_trade_id = (SELECT MIN(source_trade_id) FROM ranker_entries_v2)",
@@ -1634,6 +1780,12 @@ async fn refinalization_refuses_changed_or_missing_projection_proof() {
         (
             "malformed_binding",
             "UPDATE cache_v2_migration_state SET ranker_projection_inputs_json = '{}'",
+            "input binding is invalid",
+        ),
+        (
+            "missing_payout_evidence_binding",
+            "UPDATE cache_v2_migration_state SET ranker_projection_inputs_json =
+             json_remove(ranker_projection_inputs_json, '$.payout_evidence_digest')",
             "input binding is invalid",
         ),
         (

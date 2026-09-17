@@ -217,6 +217,7 @@ struct RankerProjectionInputs {
     activity_identity_sha256: String,
     payout_generation: u64,
     payout_manifest_sha256: String,
+    payout_evidence_digest: String,
 }
 
 impl RankerProjectionInputs {
@@ -231,6 +232,26 @@ impl RankerProjectionInputs {
             params![payout_generation],
             |row| row.get(0),
         )?;
+        // Bind every payout input read by rebuild_ranker_projection and the
+        // projection digest, including markets that are not currently eligible.
+        // Like the rebuild, read the whole payout table without a generation
+        // filter. No activity rows are needed for this commitment.
+        let mut statement = connection.prepare(
+            "SELECT market_id, end_date_unix, payout_status, payout_vector_json
+             FROM clob_payout_evidence_v2 ORDER BY market_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        let mut payout_evidence_digest = JsonArrayDigest::new();
+        for row in rows {
+            payout_evidence_digest.push(&row?)?;
+        }
         Ok(Self {
             activity_generation: manifest.generation,
             activity_reference_sha256: manifest.reference_sha256.clone(),
@@ -247,6 +268,7 @@ impl RankerProjectionInputs {
             ),
             payout_generation: to_u64(payout_generation, "payout generation")?,
             payout_manifest_sha256: sha256_bytes(payout_manifest.as_bytes()),
+            payout_evidence_digest: payout_evidence_digest.finish(),
         })
     }
 }
@@ -2360,12 +2382,13 @@ fn verify_reusable_ranker_projection(
     })?;
     let current =
         RankerProjectionInputs::read(connection, &manifest, &identity, payout_generation)?;
-    // The durable binding proves activity identity/manifest and payout coverage
-    // unchanged; recheck only projected rows and their joined content. Missing
-    // proof, changed inputs or count/digest mismatch refuses reuse. The caller
-    // rebuilds instead when a recorded classifier version differs from current.
+    // The durable binding proves activity identity/manifest, payout coverage
+    // and eligibility inputs unchanged; recheck only projected rows and their
+    // joined content. Missing proof, changed inputs or count/digest mismatch
+    // refuses reuse. The caller rebuilds instead when a recorded classifier
+    // version differs from current.
     if current != recorded {
-        return invalid("finalized ranker projection input binding changed (activity identity/manifest or payout coverage)".to_owned());
+        return invalid("finalized ranker projection input binding changed (activity identity/manifest or payout coverage/evidence)".to_owned());
     }
     let actual_count = count_rows(connection, "ranker_entries_v2")?;
     if actual_count != projection_count {
