@@ -190,6 +190,10 @@ impl CollectionProof {
         connection: &Connection,
         generation: u64,
     ) -> Result<Option<Self>, BootstrapError> {
+        // The collector loads outside a transaction. Bracket every proof read
+        // so an external commit cannot become the baseline for stale fields.
+        let data_version: i64 =
+            connection.pragma_query_value(None, "data_version", |row| row.get(0))?;
         let Some(identity) = generation_identity(connection, generation)? else {
             return Ok(None);
         };
@@ -230,7 +234,10 @@ impl CollectionProof {
             .as_ref()
             .map(|(manifest, identity)| manifest_link(manifest, identity))
             .transpose()?;
-        let data_version = connection.pragma_query_value(None, "data_version", |row| row.get(0))?;
+        let after: i64 = connection.pragma_query_value(None, "data_version", |row| row.get(0))?;
+        if after != data_version {
+            return invalid("collection changed externally while loading proof".to_owned());
+        }
         Ok(Some(Self {
             identity,
             base,

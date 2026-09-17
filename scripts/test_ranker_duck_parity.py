@@ -207,6 +207,33 @@ def whole_projection_digest(rows: list[dict]) -> str:
     return hashlib.sha256(json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def _export_certified_cache(db: str, pq: str, expected_wallets: set[str] | None = None) -> dict:
+    os.makedirs(pq, exist_ok=True)
+    con = duckdb.connect(config={"autoinstall_known_extensions": "false"})
+    try:
+        con.execute("LOAD sqlite_scanner")
+        con.execute(f"ATTACH '{exp._q(os.path.abspath(db))}' AS src (TYPE sqlite, READ_ONLY)")
+        counts = {table: exp._export_table(con, pq, table, 100) for table in exp.V2_TABLES}
+        projection = exp._verify_v2_projection(con, pq)
+        exp._write_v2_export_manifest(pq, counts, projection)
+        if expected_wallets is not None:
+            # Retained excluded history remains audit data in activity_groups_v2;
+            # neither the source nor exported ranker projection may admit it.
+            for prefix in ("src", "exported"):
+                wallets = {row["wallet_hex"] for row in exp._projection_rows(con, prefix)}
+                assert wallets == expected_wallets, (prefix, wallets, expected_wallets)
+        return projection
+    finally:
+        con.close()
+
+
+def assert_certified_export_wallets(db: str, expected_wallets: set[str]) -> None:
+    with tempfile.TemporaryDirectory() as pq:
+        _export_certified_cache(db, pq, expected_wallets)
+    with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as sqlite:
+        assert set(rk.load_universe_from_trades(sqlite, 0, 2)) == expected_wallets
+
+
 def assert_certified_full_incremental_equivalence(full: str, incremental: str) -> None:
     """Called by the Rust collector scenario with its two real certified caches.
 
@@ -221,14 +248,7 @@ def assert_certified_full_incremental_equivalence(full: str, incremental: str) -
     with tempfile.TemporaryDirectory() as tmp:
         for index, db in enumerate((full, incremental)):
             pq = str(Path(tmp) / str(index))
-            os.makedirs(pq)
-            con = duckdb.connect(config={"autoinstall_known_extensions": "false"})
-            con.execute("LOAD sqlite_scanner")
-            con.execute(f"ATTACH '{exp._q(os.path.abspath(db))}' AS src (TYPE sqlite, READ_ONLY)")
-            counts = {table: exp._export_table(con, pq, table, 100) for table in exp.V2_TABLES}
-            projection = exp._verify_v2_projection(con, pq)
-            exp._write_v2_export_manifest(pq, counts, projection)
-            con.close()
+            projection = _export_certified_cache(db, pq)
             with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as sqlite:
                 wallets = sorted(rk.load_universe_from_trades(sqlite, 0, 2))
                 all_wallets = [row[0] for row in sqlite.execute("SELECT DISTINCT wallet_hex FROM activity_groups_v2")]

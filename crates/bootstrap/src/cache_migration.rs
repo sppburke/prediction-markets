@@ -1078,8 +1078,12 @@ async fn collect_activity_v2(
         message: "activity cache writer thread panicked".to_owned(),
     })?;
 
+    // Validate and install against one snapshot. If an external WAL writer
+    // commits after validation, SQLite refuses to promote this stale snapshot
+    // to a write transaction instead of certifying changed rows.
+    let transaction = connection.transaction()?;
     let staged = validate_activity_staging(
-        &connection,
+        &transaction,
         generation,
         reference_sha256,
         fixed_end_unix,
@@ -1102,10 +1106,30 @@ async fn collect_activity_v2(
     if proof.is_some() {
         manifest.cursors = incremental::receipt_marker_v2();
     }
-    let transaction = connection.transaction()?;
     record_completed_manifest(&transaction, &manifest)?;
     transaction.commit()?;
     Ok(manifest)
+}
+
+/// Resume the collector on a scenario-owned connection, allowing SQL tracing
+/// to schedule external commits at exact read/write boundaries without sleeps.
+#[cfg(feature = "scenario")]
+pub async fn collect_activity_v2_for_test(
+    connection: Connection,
+    fetcher: &dyn ReconciliationFetcher,
+    base_url: &str,
+    completed_at_unix: i64,
+) -> Result<ActivityCoverageManifestV2, BootstrapError> {
+    let identity = activity_identity(&connection)?;
+    collect_activity_v2(
+        connection,
+        fetcher,
+        base_url,
+        &identity,
+        FULL_HISTORY_START_EXCLUSIVE,
+        completed_at_unix,
+    )
+    .await
 }
 
 // A source read that exhausted the fetcher's transient retries, or that the

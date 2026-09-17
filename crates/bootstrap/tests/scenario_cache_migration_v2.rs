@@ -5132,16 +5132,7 @@ async fn incremental_full_read_equivalence_through_aggregation_certification_and
             .any(|(_, market, _)| market == "0xequal")
     );
     assert_eq!(root.group_count + 8, delta_manifest.group_count);
-    let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let parity = Command::new("python3").current_dir(repository).args(["-c",
-        "import sys; sys.path.insert(0, 'scripts'); from test_ranker_duck_parity import assert_certified_full_incremental_equivalence; assert_certified_full_incremental_equivalence(sys.argv[1], sys.argv[2])"])
-        .arg(&full).arg(&incremental).output().unwrap();
-    assert!(
-        parity.status.success(),
-        "Python consumer parity: {}\n{}",
-        String::from_utf8_lossy(&parity.stdout),
-        String::from_utf8_lossy(&parity.stderr)
-    );
+    assert_python_consumer_parity(&full, &incremental);
 
     // The old row-selection contract is unchanged: MAX(completed generation)
     // selects every effective row, including the old empty-delta wallet.
@@ -5154,6 +5145,19 @@ async fn incremental_full_read_equivalence_through_aggregation_certification_and
             &full,
             "SELECT source_trade_id FROM activity_groups_v2 WHERE coverage_generation = 7 ORDER BY source_trade_id"
         )
+    );
+}
+
+fn assert_python_consumer_parity(full: &std::path::Path, incremental: &std::path::Path) {
+    let repository = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let parity = Command::new("python3").current_dir(repository).args(["-c",
+        "import sys; sys.path.insert(0, 'scripts'); from test_ranker_duck_parity import assert_certified_full_incremental_equivalence; assert_certified_full_incremental_equivalence(sys.argv[1], sys.argv[2])"])
+        .arg(full).arg(incremental).output().unwrap();
+    assert!(
+        parity.status.success(),
+        "Python consumer parity: {}\n{}",
+        String::from_utf8_lossy(&parity.stdout),
+        String::from_utf8_lossy(&parity.stderr)
     );
 }
 
@@ -5213,6 +5217,28 @@ async fn incremental_collision_exclusion_then_full_replacement_and_empty_replace
     assert_eq!(proofs[0]["acquisition"]["aggregation_status"], "complete");
     assert_eq!(proofs[0]["acquisition"]["fetched_aggregate_count"], 1);
     assert_eq!(proofs[0]["acquisition"]["predecessor"]["carried"], false);
+    dataset_payouts(&side, &source.rows).await;
+    let excluded_stage = finalize_cache_v2(
+        &side,
+        &dir.path().join("excluded-stage.json"),
+        FRESH_END + 4,
+    )
+    .unwrap();
+    assert_eq!(excluded_stage.ranker_projection_count, 1);
+    assert_eq!(
+        projected_entries(&side),
+        vec![(WALLET_B.to_owned(), "0xb".to_owned(), FRESH_END)]
+    );
+    let export = Command::new("python3")
+        .current_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+        .args(["-c", "import sys; sys.path.insert(0, 'scripts'); from test_ranker_duck_parity import assert_certified_export_wallets; assert_certified_export_wallets(sys.argv[1], {sys.argv[2]})"])
+        .arg(&side).arg(WALLET_B).output().unwrap();
+    assert!(
+        export.status.success(),
+        "excluded-wallet export: {}\n{}",
+        String::from_utf8_lossy(&export.stdout),
+        String::from_utf8_lossy(&export.stderr)
+    );
     let no_reads = DatasetFetcher::default();
     assert_eq!(
         populate_activity_fresh_v2(
@@ -5238,7 +5264,7 @@ async fn incremental_collision_exclusion_then_full_replacement_and_empty_replace
     revised["size"] = Value::from("2.5");
     source.rows.push(revised);
     source.calls.lock().unwrap().clear();
-    populate_activity_fresh_v2(
+    let recovered = populate_activity_fresh_v2(
         &side,
         &source,
         "https://data.example",
@@ -5264,6 +5290,62 @@ async fn incremental_collision_exclusion_then_full_replacement_and_empty_replace
     );
     assert_eq!(generation_rows(&side, 1), 0);
     assert_eq!(receipt(&side, 8, WALLET), Some((1, 1, 1)));
+    let full = dataset_candidate(&dir, "repaired-full.db", &[WALLET_B]);
+    let fresh = populate_activity_fresh_v2(
+        &full,
+        &source,
+        "https://data.example",
+        8,
+        FRESH_END + 4,
+        FRESH_END + 5,
+    )
+    .await
+    .unwrap();
+    assert_eq!(fresh.aggregate_digest, recovered.aggregate_digest);
+    assert_eq!(fresh.group_count, recovered.group_count);
+    assert_eq!(fresh.source_row_count, recovered.source_row_count);
+    assert_eq!(
+        classify_dataset(
+            &WalletCache::open_read_only(&full)
+                .unwrap()
+                .activity_aggregates_v2()
+                .unwrap()
+        ),
+        classify_dataset(
+            &WalletCache::open_read_only(&side)
+                .unwrap()
+                .activity_aggregates_v2()
+                .unwrap()
+        ),
+    );
+    dataset_payouts(&full, &source.rows).await;
+    let full_stage = finalize_cache_v2(
+        &full,
+        &dir.path().join("repaired-full-stage.json"),
+        FRESH_END + 6,
+    )
+    .unwrap();
+    let recovered_stage = finalize_cache_v2(
+        &side,
+        &dir.path().join("recovered-stage.json"),
+        FRESH_END + 6,
+    )
+    .unwrap();
+    assert_eq!(full_stage.ranker_projection_count, 2);
+    assert_eq!(
+        full_stage.ranker_projection_count,
+        recovered_stage.ranker_projection_count
+    );
+    assert_eq!(
+        full_stage.ranker_projection_digest,
+        recovered_stage.ranker_projection_digest
+    );
+    assert_eq!(
+        classifier_projection_rows(&full),
+        classifier_projection_rows(&side)
+    );
+    assert_eq!(projected_entries(&full), projected_entries(&side));
+    assert_python_consumer_parity(&full, &side);
     // An explicit empty full read deletes every retained row; an empty delta on B carries.
     source.rows.retain(|row| row["proxyWallet"] != WALLET);
     pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
@@ -6295,6 +6377,193 @@ async fn incremental_admission_rejects_invalid_bounds_generation_and_full_read_s
             0
         );
     }
+}
+
+#[tokio::test]
+async fn incremental_proof_loading_refuses_external_commit_before_wallet_writes() {
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "proof-loading-race.db", &[]);
+    let source = DatasetFetcher {
+        rows: vec![dataset_row(WALLET, "0xmarket", "old", "BUY", FRESH_END)],
+        ..Default::default()
+    };
+    populate_activity_fresh_v2(
+        &side,
+        &source,
+        "https://data.example",
+        1,
+        FRESH_END,
+        FRESH_END + 1,
+    )
+    .await
+    .unwrap();
+    // Admit the successor, but leave it without any completed wallets.
+    populate_activity_fresh_v2(
+        &side,
+        &FixtureFetcher::new(HashMap::new()),
+        "https://data.example",
+        7,
+        FRESH_END + 2,
+        FRESH_END + 3,
+    )
+    .await
+    .unwrap_err();
+    source.calls.lock().unwrap().clear();
+    let connection = trace_collection_interleaving(
+        &side,
+        "SELECT MAX(generation) FROM activity_coverage_manifests_v2 WHERE generation < 7",
+        // Skip receipt-only startup's proof load; target the collector's proof.
+        1,
+        // This changes the manifest commitment after it was read, while leaving
+        // historical receipt validation valid against the cached manifest.
+        "UPDATE activity_coverage_manifests_v2 SET completed_at_unix = completed_at_unix + 1 WHERE generation = 1",
+    );
+    let error = pe_bootstrap::cache_migration::collect_activity_v2_for_test(
+        connection,
+        &source,
+        "https://data.example",
+        FRESH_END + 3,
+    )
+    .await
+    .unwrap_err();
+    assert_collection_interleaving_committed();
+    assert_eq!(
+        generation_rows(&side, 7),
+        0,
+        "stale proof must not carry rows"
+    );
+    assert_eq!(receipt(&side, 7, WALLET), None);
+    assert_eq!(generation_rows(&side, 1), 1);
+    assert_eq!(
+        count(
+            &side,
+            "SELECT COUNT(*) FROM activity_coverage_manifests_v2 WHERE generation = 7"
+        ),
+        0
+    );
+    assert!(source.calls.lock().unwrap().is_empty());
+    assert!(
+        error
+            .to_string()
+            .contains("collection changed externally while loading proof"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn incremental_completion_refuses_external_commit_after_validation() {
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "completion-race.db", &[]);
+    let source = DatasetFetcher {
+        rows: vec![dataset_row(WALLET, "0xmarket", "old", "BUY", FRESH_END)],
+        ..Default::default()
+    };
+    populate_activity_fresh_v2(
+        &side,
+        &source,
+        "https://data.example",
+        1,
+        FRESH_END,
+        FRESH_END + 1,
+    )
+    .await
+    .unwrap();
+    // Resume with all wallet receipts present and only manifest installation left.
+    Connection::open(&side)
+        .unwrap()
+        .execute("DELETE FROM activity_coverage_manifests_v2", [])
+        .unwrap();
+    let connection = trace_collection_interleaving(
+        &side,
+        "FROM activity_coverage_manifests_v2 WHERE generation = 1",
+        // Skip the initial completed-manifest probe. The next lookup begins
+        // installation, after every receipt, row digest and total was validated.
+        1,
+        "DELETE FROM activity_groups_v2 WHERE coverage_generation = 1",
+    );
+    let no_reads = DatasetFetcher::default();
+    let result = pe_bootstrap::cache_migration::collect_activity_v2_for_test(
+        connection,
+        &no_reads,
+        "https://data.example",
+        FRESH_END + 1,
+    )
+    .await;
+    assert_collection_interleaving_committed();
+    assert_eq!(generation_rows(&side, 1), 0, "external deletion committed");
+    assert!(no_reads.calls.lock().unwrap().is_empty());
+    assert_eq!(
+        count(&side, "SELECT COUNT(*) FROM activity_coverage_manifests_v2"),
+        0,
+        "changed rows must not acquire a completed manifest"
+    );
+    let error = result.unwrap_err();
+    assert!(
+        matches!(error, pe_bootstrap::error::BootstrapError::Sqlite(
+        rusqlite::Error::SqliteFailure(ref failure, _)
+    ) if failure.extended_code == rusqlite::ffi::SQLITE_BUSY_SNAPSHOT),
+        "{error}"
+    );
+}
+
+struct CollectionInterleaving {
+    path: std::path::PathBuf,
+    sql_fragment: &'static str,
+    skip: usize,
+    mutation: &'static str,
+    committed: bool,
+}
+
+thread_local! {
+    // The current-thread Tokio scenarios each own their trace state. The
+    // collector's writer thread has none; unrelated parallel tests are isolated.
+    static COLLECTION_INTERLEAVING: std::cell::RefCell<Option<CollectionInterleaving>> = const { std::cell::RefCell::new(None) };
+}
+
+fn trace_collection_interleaving(
+    path: &std::path::Path,
+    sql_fragment: &'static str,
+    skip: usize,
+    mutation: &'static str,
+) -> Connection {
+    let mut connection = Connection::open(path).unwrap();
+    connection
+        .pragma_update(None, "journal_mode", "WAL")
+        .unwrap();
+    COLLECTION_INTERLEAVING.with(|state| {
+        assert!(state.borrow().is_none());
+        *state.borrow_mut() = Some(CollectionInterleaving {
+            path: path.to_owned(),
+            sql_fragment,
+            skip,
+            mutation,
+            committed: false,
+        });
+    });
+    connection.trace(Some(|sql| {
+        COLLECTION_INTERLEAVING.with(|state| {
+            let mut state = state.borrow_mut();
+            let Some(state) = state.as_mut() else { return };
+            if state.committed || !sql.contains(state.sql_fragment) {
+                return;
+            }
+            if state.skip > 0 {
+                state.skip -= 1;
+                return;
+            }
+            let external = Connection::open(&state.path).unwrap();
+            external.busy_timeout(std::time::Duration::ZERO).unwrap();
+            assert_eq!(external.execute(state.mutation, []).unwrap(), 1);
+            state.committed = true;
+        });
+    }));
+    connection
+}
+
+fn assert_collection_interleaving_committed() {
+    // rusqlite catches trace callback panics; assert outside the callback that
+    // the scheduled external mutation really committed before checking refusal.
+    COLLECTION_INTERLEAVING.with(|state| assert!(state.borrow_mut().take().unwrap().committed));
 }
 
 #[tokio::test]
