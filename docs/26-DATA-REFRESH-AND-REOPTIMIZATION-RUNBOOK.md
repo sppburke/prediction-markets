@@ -624,14 +624,14 @@ authority refuses restoration; recover by rolling forward through the existing p
 path. There is no operator assertion flag. Schema one retains `auto | duck | sqlite`; schema two
 requires the verified DuckDB snapshot and refuses SQLite.
 
-### Fresh private-candidate cycles and the scheduled schema-two lane (#588)
+### Fresh private-candidate cycles and the scheduled schema-two lane (#588, #648)
 
 The frozen-payload flow above seals one historical snapshot; it cannot collect a later
 generation because the frozen reference is bound to one generation and end, the wallet
 list is fixed to the sealed schema-one history, and activity insertion moves matching rows
 between generations inside one database. Recurring classifier-two publication therefore
 builds every cycle in a **private candidate** copied from an **immutable prior** of the fixed
-cache and collects fresh complete activity for the union of current acquisition candidates,
+cache and certifies one complete current activity generation for the union of acquisition candidates,
 every retained history and every wallet the prior's newest generation excluded, without a
 frozen reference:
 
@@ -651,29 +651,51 @@ pe-bootstrap cache-populate-payout-v2 --db "$SIDE"         # unless generation T
 pe-bootstrap cache-finalize-v2 --db "$SIDE" --stage-record "$CACHE_STAGE_RECORD"
 ```
 
-`--fresh-generation N` records one versioned collection identity in the candidate
-(`fresh_collection_json`, `_GLOSSARY.md`): the requested generation, its fixed end
-(`now − ACTIVITY_SETTLE_LAG_SECS` at start), the sorted wallet union and its digest, which
-is the `reference_sha256` of every receipt and manifest of that generation. Starting a
-generation atomically invalidates finalization and clears only the candidate's superseded
-projection, activity rows, receipts and manifests; `N` must exceed every generation the
-candidate knows, and an unfinished generation can only be resumed. A retry with the same
-`N` keeps the recorded end and wallet list and fetches only wallets without a valid
-receipt; a completed generation returns its manifest without any source call. Fresh reads
-request each wallet's full history (`start=1` on the wire; an omitted `start` returns only
-the venue's recent window). A venue `Retry-After` of at most
-`reconciliation_rate_limit_retry_secs` is waited out inside the fetcher's retry budget; a read
-that exhausts the fetcher's transient retries or is still rate-limited exits
-`rank_and_push_tempfail_exit` (75) so the supervisor resumes the collection. A wallet whose fetched history the aggregator cannot bucket deterministically
-(observed: one fill reported as two rows with different venue timestamps) is excluded from the
-generation instead of failing the cycle: the command logs a warning naming the wallet and the
-reason (and the excluded count when the generation completes), its receipt keeps the page
-evidence with zero aggregates and a zero source-row count, the resume does not refetch it,
-finalization projects no ranker entry for it, and the next generation's union keeps the wallet
-so its history is read again.
-Finalization, activation and the installed-cache validator accept the fresh identity without
-a frozen-payload row; caches finalized under the frozen flow keep their authentic legacy
-identity, including caches that physically lack the new column.
+`--fresh-generation N` records the versioned acquisition identity specified in
+[`_GLOSSARY.md`](_GLOSSARY.md#complete-activity-generations-and-incremental-acquisition-648).
+The collector first validates its completed predecessor and derives the wallet union, then samples
+and freezes the settled end. New roots read full history; successors read only `(previous_end,new_end]`
+for wallets with usable predecessor history. New wallets and previous exclusions read full history.
+Generation numbers may have gaps; carry always uses the recorded predecessor generation.
+
+Admission preserves activity rows, receipts and historical manifests, clears the derived projection
+and invalidates finalization. Each successful wallet atomically re-stamps its verified predecessor
+rows, strictly inserts delta rows and commits complete-history counts/digest plus acquisition proof.
+The bounded carry batches use the existing wallet/time/ID index and advance by key; all batches stay
+in one wallet transaction. A full read replaces every retained row for that wallet, including an empty
+replacement. Collection installs its completed manifest independently of payout and classification,
+so another activity generation can start immediately. Historical manifests in the mutated candidate
+are commitments, not physical snapshots; retain the immutable prior for restore.
+
+A retry resumes the exact recorded bounds and lists and fetches only wallets without a valid receipt.
+Receipt-only startup validates proof metadata without reading completed wallets' aggregates;
+completion and finalization verify the content. A completed generation returns the same manifest
+without source calls or a new clock. Authentic version-1 roots resume without rewriting their
+identity or receipt bytes; their identity is archived when a successor starts. Storage version,
+aggregate and projection digest encodings, and generation-equality consumers remain unchanged.
+
+A wallet with unbucketable activity or a cross-boundary ID collision is excluded from this generation.
+The warning names the wallet and stable reason, and completion reports the excluded count. Its
+receipt retains actual read evidence but certifies empty resulting history; older rows stay untouched
+and produce no current projection entries. Resume skips the exclusion; the next generation includes
+that wallet for a full read. Equal-revision collisions also exclude. Missing predecessor proof,
+foreign-wallet collisions or unreceipted current rows are fatal cache errors.
+
+Incremental acquisition does not discover revisions wholly before the lower bound. For reconciliation,
+select wallets **before starting a new generation**:
+
+```bash
+pe-bootstrap cache-populate-activity-v2 --db "$SIDE" --fresh-generation "$N" \
+  --full-read-wallets "$WALLET_A,$WALLET_B"
+```
+
+Selection is a frozen subset of the union; it cannot change on resume. A full-read replacement
+reconciles old revisions and deletions. The venue freshness endpoint does not promise immutable
+historical buckets. Slower revision discovery remains outside the publication path. This change
+retains the shared paced fetcher, bounded reads/channel and single writer from #646 and exclusions
+from #645. Exhausted transient source retries still exit `rank_and_push_tempfail_exit`; permanent
+errors stop the cycle. Payout, finalization, activation, restore and exact-request validation retain
+their existing contracts.
 
 The zero-argument `rank_and_push.sh` production cycle enters this lane automatically when
 the installed cache is schema two, and for the one-time initial cutover when `.env` sets
@@ -685,12 +707,15 @@ retired `trades`/`source_cursor` and do not run), followed by the existing cutov
 Parquet export, pass one, targeted `prices-history`, second finalization, candidate
 recapture into `candidate_cycle_manifest.json` (bound into pass two; `cycle_manifest.json`
 keeps the cycle's initial installed-cache watermark), `--prepare-only`, `cache-activate` and
-the exact `--resume-request`. Both targets are fixed by the immutable prior and reused on
-retry: `N` is the prior's newest activity generation plus one (1 for a schema-one prior);
-the payout target is the prior's active walk if one exists, else its newest coverage
-generation plus one, and a walk already completed on the candidate is reused rather than
-restarted. After every successful publication — the fresh path, the automatic pending
-resume and explicit `--resume-pending` — the accepted watermark is captured from the
+the exact `--resume-request`. The immutable prior fixes the initial activity generation and payout
+target. The activity owner resumes the candidate's recorded head, including a manually started or
+interrupted successor belonging to this cycle. If the completed initial head's age exceeds the
+publisher's unchanged `max_cache_staleness_hours`, the wrapper admits one linked top-up. Its persisted
+base link consumes that allowance across restarts; a stale top-up stops before ranking and never
+starts another. Actual trade/payout source times still govern preparation after downstream work.
+The payout target is the prior's active walk if present, otherwise its newest completed walk plus one;
+a completed target on the candidate is reused. After every successful publication — the fresh path,
+the automatic pending resume and explicit `--resume-pending` — the accepted watermark is captured from the
 request's installed fixed path before the pointers clear, so the next unchanged same-day
 invocation skips before staging.
 
@@ -743,13 +768,101 @@ no held lock; then confirm `rank_and_push.pending` is absent and the cycle direc
 `ranking_publish_request.json`, remove `rank_and_push.cycle`, and delete only that cycle's
 candidate. The fixed cache was never modified and the prior may be kept as evidence. Once a
 request is prepared, never delete it or start another cycle: the pending pointer resumes
-activation and publication. After activation but before the publication is consumed,
+activation and publication. If the pointer is missing but this cycle has a durable
+`ranking_publish_request.json`, both recovery entries validate that request and reconstruct its pointer
+through the publisher before discovery or collection. Both remain held while cutover is `prepare`.
+After activation but before the publication is consumed,
 `cache-restore-prior` with the cycle's prior and displaced names restores the exact prior
 bytes; the restore renames the prior file onto the fixed path, so the prior name is consumed
 and the supervisor must stay paused until the recovery is resolved. After consumption, roll
 forward. Forge's boot card is failing (#637); the caches, repository and evaluation results
 live on the SSDs, but confirm the host before any cutover and keep the prior until the
 publication is confirmed.
+
+### Incremental top-up measurement and paused-cycle handoff (#648)
+
+The implementation fixtures prove acquisition/certification equivalence, crash atomicity and consumer
+selection. They do **not** establish production throughput, disk budget or freshness acceptance.
+The following measurement and deployment gates remain mandatory before calling the release publishable.
+Use an authorized disposable candidate with representative wallet sizes, physical interleaving and
+indexes. Preserve fixed/prior/cycle/request recovery artifacts throughout the measurement.
+
+Capture table versus index bytes with `dbstat` before and after collection:
+
+```sql
+SELECT name, SUM(pgsize) AS bytes FROM dbstat GROUP BY name ORDER BY name;
+```
+
+Record the actual collector writer's startup log: `journal_mode`, `synchronous`,
+`wal_autocheckpoint`, `page_size`, `cache_size`, `mmap_size`, SQLite version/source ID. This connection
+uses `open_existing_rw` and sets busy timeout only; do not infer its connection-local settings from
+`WalletCache` or a separate SQLite shell. Keep durability and automatic checkpoint settings unchanged.
+Enable the `pe_bootstrap::cache_migration` debug log for wallet transaction elapsed time and advancing
+carry counts/batches. Record all of:
+
+- `/proc/<collector-pid>/io` read/write-byte deltas, device-counter deltas and elapsed time;
+- WAL peak space and checkpoint progress/time across completed wallet transactions, including the
+  largest wallet; SQL batching does not cap the wallet transaction's WAL;
+- initial `1 → 2`, a same-width increment, and a SQLite integer-width boundary;
+- validation, classification, hashing, export and ranking elapsed time separately.
+
+A generation-only update preserves rowid and indexed values but dirties table pages; integer-width
+changes can allocate additional space. If T is table-page bytes touched once, ideal carry writes
+are approximately T to WAL plus T to the database. Add delta/index writes, replacements, repeated
+page dirtying, splits, receipts, projections and filesystem amplification. Index-inclusive cache size
+is not T. WAL file size is peak space, not cumulative writes. Do not claim a measured duration from
+these sensitivity estimates.
+
+Do not hold a long-lived candidate read transaction across wallet commits. WAL growth must stabilize
+and checkpoint progress must continue; checkpoint starvation fails the gate. Reserve space for the
+largest wallet, the candidate/prior and export, not just the automatic checkpoint threshold. Final
+sealing still requires successful checkpoint/truncate and sidecar checks; never truncate WAL externally.
+Require the complete production-sized top-up → preparation → activation path to fit the unchanged
+freshness and measured disk budget. Preparation must accept actual trade/payout times with the full
+union. Report any bottleneck and keep recovery evidence; never relabel clocks or relax gates.
+
+For the paused `cron-20260916T164030Z` handoff, first install the compatible, locally gated release
+while the loop is paused and the ranking locks have no holder. Confirm the cycle pointer and
+`fresh_v2` configuration, authentic generation-1 identity/receipts/end, agreement of fixed/prior/candidate
+paths and backup evidence, unchanged fixed/prior bytes, stale initial end, no pending pointer or
+request, and `PE_RANK_SCHEMA_TWO_CUTOVER=prepare`. Verify the recorded payout target and whether it
+completed; the reported target of 10 is an observation to check, not an assumed contract. After the
+representative measurement gate passes, execute each step only after its preceding checks succeed:
+
+```bash
+cd "$HOME/prediction-markets"
+bash scripts/deploy/forge_pause.sh pause
+bash scripts/deploy/forge_pause.sh status
+TASK_RUN=data/eval-results/cron-20260916T164030Z
+test "$(cat data/eval-results/rank_and_push.cycle)" = "$TASK_RUN"
+test ! -e data/eval-results/rank_and_push.pending
+test ! -L data/eval-results/rank_and_push.pending
+test ! -e "$TASK_RUN/ranking_publish_request.json"
+set -a
+source .env
+set +a
+test "$PE_RANK_SCHEMA_TWO_CUTOVER" = prepare
+TASK_BOOTSTRAP="${PE_BOOTSTRAP_BIN:-target/release/pe-bootstrap}"
+TASK_SIDE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["side_path"])' "$TASK_RUN/cache_stage.json")"
+"$TASK_BOOTSTRAP" cache-populate-activity-v2 --db "$TASK_SIDE" --fresh-generation 1
+bash scripts/rank_and_push.sh
+```
+
+The explicit generation-1 retry installs its completed manifest from valid receipts without venue
+reads, payout or ranking. The wrapper then selects exactly one linked generation-2 top-up, or adopts
+an already recorded generation 2. An unfinished generation resumes; a stale completed top-up stops
+before ranking. A durable request always takes precedence. Acceptance is specifically
+`RANK_AND_PUSH_PREPARED_ONLY=...`, exit 2, retained pending state and unchanged fixed bytes; unrelated
+exit-2 failures are not acceptance. Record measured costs and the source timestamps preparation accepted.
+
+After operator acceptance, set `PE_RANK_SCHEMA_TWO_CUTOVER=1`, run `bash scripts/rank_and_push.sh` to
+activate/publish the exact pending request, then `bash scripts/deploy/forge_pause.sh restore` to restore
+the recorded supervisor state. Require one real recurring publication before closing the handoff.
+The #643 branch separately owns fewer whole-cache checks, prior retention and second-finalization
+projection reuse. This change only invalidates finalization on admission/replacement and installs
+activity coverage earlier; any #643 reuse must bind the current activity proof, payout coverage and
+classifier, and preserve this cycle's recovery prior. Recheck those integration points on the combined
+revision; do not infer reuse from historical commitments or a pre-mutation artifact hash.
 
 ### Continuous Forge supervisor
 

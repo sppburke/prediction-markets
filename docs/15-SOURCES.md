@@ -81,6 +81,21 @@
 >
 > **CLOB `/markets?closed=true` does NOT populate `tokens[].winner` on old markets (2026-06-18, issue #369 PR1 live reconciliation).** Response: `{count, limit, next_cursor, data:[…]}`; each market carries snake_case `condition_id`, `closed`, `end_date_iso`, and `tokens:[{outcome, price, token_id, winner}]`; `next_cursor` terminator is `LTE=`. **Gotcha:** for old markets (≈2022–2023) the resolved winner is reflected only in the terminal token `price` (~1.0 winner / ~0.0 loser) — `tokens[].winner` is `false` on **every** token, so `clob.rs::winner_index` reports the market as voided. Measured against `source='polygon'` over 848,098 traded markets: 0 winner *contradictions* (99.976% agreement) but 202 CLOB-null-vs-polygon-winner, **all** in 2022–2023; by 2024 winner-flag coverage is complete (2024 0/11,674, 2025 2/125,388, 2026 10/709,318 null). Benign for issue #369 because the 1.19M `source='polygon'` rows are kept; CLOB only needs correctness for new markets. Also confirmed: 0 traded multi-outcome (>2-token) markets, so the positional `winner_index`↔`outcome_id` mapping risk is empirically binary-only.
 
+> **Incremental bootstrap acquisition (#648), Last checked: 2026-09-17;
+> re-verify by 2026-11-16.** Re-read the [official activity reference](https://docs.polymarket.com/api-reference/core/get-user-activity):
+> positive wire start is required for full DESC history, and bounded windows retain stable offset
+> pagination. The [freshness reference](https://docs.polymarket.com/api-reference/service/get-data-freshness)
+> describes service freshness, not immutable historical buckets. Incremental generations certify their
+> observed windows; selected full replacement reconciles older revisions. No live-wallet completeness
+> or production performance measurement was performed for this source check.
+>
+> Re-read SQLite's [WAL documentation](https://www.sqlite.org/wal.html) and
+> [record format](https://www.sqlite.org/fileformat2.html#record_format) for the carry-write gate:
+> automatic checkpoints recycle WAL, readers can prevent checkpoint completion, large transactions
+> can exceed the checkpoint threshold, and integer encodings have width boundaries. Measure effective
+> pragmas on the actual writer; `open_existing_rw` does not inherit `WalletCache` connection tuning.
+> See the #648 measurement/handoff procedure in `26-DATA-REFRESH-AND-REOPTIMIZATION-RUNBOOK.md`.
+
 > **Service bracket full-history repair (#641), Last checked: 2026-09-16;
 > re-verify by 2026-11-15.** Implementation-time review of the
 > [official activity reference](https://docs.polymarket.com/api-reference/core/get-user-activity)

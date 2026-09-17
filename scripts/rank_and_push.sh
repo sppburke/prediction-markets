@@ -208,9 +208,13 @@ if [[ "$INVOCATION_ARGC" -eq 0 && ( -e "$PENDING_FILE" || -L "$PENDING_FILE" ) ]
   echo "RANK_AND_PUSH_AUTO_RESUME_PENDING=$PENDING_FILE"
 fi
 
+if [[ "$RESUME_PENDING" == "1" && "$INVOCATION_ARGC" -gt 1 ]]; then
+  echo "FATAL: --resume-pending cannot be combined with other arguments" >&2; exit 2
+fi
+
 # The internal recovery path accepts no other flags and follows only an atomically-written
 # production pointer. Resolve + validate it before creating any output or taking the run lock.
-if [[ "$RESUME_PENDING" == "1" ]]; then
+if [[ "$RESUME_PENDING" == "1" && ( -e "$PENDING_FILE" || -L "$PENDING_FILE" ) ]]; then
   if [[ "$INVOCATION_ARGC" -ne 0 && "$INVOCATION_ARGC" -ne 1 ]]; then
     echo "FATAL: --resume-pending cannot be combined with other arguments" >&2
     exit 2
@@ -248,7 +252,7 @@ if [[ "$RESUME_PENDING" == "1" ]]; then
   SKIP_RANK="1"
   SKIP_EXPORT="1"
   echo "RANK_AND_PUSH_RESUME_REQUEST=$PENDING_REQUEST"
-elif [[ "$INVOCATION_ARGC" -eq 0 ]]; then
+elif [[ "$INVOCATION_ARGC" -eq 0 || "$RESUME_PENDING" == "1" ]]; then
   PRODUCTION_CYCLE="1"
 fi
 
@@ -420,6 +424,33 @@ validate_cycle_pointer() {
   }
   printf '%s' "$cycle_dir"
 }
+
+# Recover the crash seam between durable request creation and pointer creation.
+# Validate through the publisher before its existing atomic pointer writer runs.
+if [[ "$PRODUCTION_CYCLE" == "1" && ( -e "$CYCLE_FILE" || -L "$CYCLE_FILE" ) ]]; then
+  recovery_cycle="$(validate_cycle_pointer)" || exit $?
+  recovery_request="$recovery_cycle/ranking_publish_request.json"
+  if [[ -e "$recovery_request" || -L "$recovery_request" ]]; then
+    [[ -f "$recovery_request" && ! -L "$recovery_request" ]] || {
+      echo "FATAL: durable cycle request is not a regular file" >&2; exit 2;
+    }
+    "$PYTHON_BIN" scripts/push_ranking_to_supabase.py --validate-request "$recovery_request" > /dev/null
+    "$PYTHON_BIN" - "$PENDING_FILE" "$recovery_request" <<'PY'
+import sys
+sys.path.insert(0, "scripts")
+from push_ranking_to_supabase import save_pending_pointer
+save_pending_pointer(sys.argv[1], sys.argv[2])
+PY
+    OUT_DIR="$recovery_cycle"
+    RESUME_PENDING="1"
+    PRODUCTION_CYCLE="0"
+    SKIP_DISCOVERY="1"; SKIP_BACKFILL="1"; SKIP_RANK="1"; SKIP_EXPORT="1"
+    echo "RANK_AND_PUSH_RECOVERED_REQUEST=$recovery_request"
+  fi
+fi
+if [[ "$RESUME_PENDING" == "1" && "$PRODUCTION_CYCLE" == "1" ]]; then
+  echo "FATAL: no pending pointer or durable cycle request to recover" >&2; exit 2
+fi
 
 # The schema-two candidate lane (#588) is a cycle property: chosen when the cycle
 # is created and read back from its frozen configuration on every resume.
@@ -704,7 +735,8 @@ refresh_data() {
 
 # Schema-two private-candidate lane (#588). Every path is a Rust owner that
 # resumes from its own durable state; the wrapper only derives the cycle's
-# physical names and the two targets fixed by the immutable prior.
+# physical names, the prior-derived initial activity/payout targets, and the
+# one linked activity top-up recorded on the candidate.
 stage_candidate_cache() {
   "$PE_BOOTSTRAP_BIN" cache-stage-v2 --db "$FIXED_DB" --prior "$1" --side "$2" \
     --manifest "$3" > "$4"
@@ -759,42 +791,30 @@ print(int(json.load(open(sys.argv[1], encoding="utf-8"))["side_schema"]))' "$sta
     --batch-id "$ACTIVATION_BATCH_ID" --audit-csv "$ACTIVATION_AUDIT_CSV" \
     "${BOOTSTRAP_CONFIG_ARGS[@]}"
 
-  # Both targets are fixed by the immutable prior, so a retry requests the same
-  # generation and the same payout walk; a walk already completed on the
-  # candidate is reused rather than restarted.
+  # Read the recorded candidate head, including an interrupted or manually
+  # started top-up. Its persisted base link consumes this cycle's one allowance.
   local -a targets=()
-  mapfile -t targets < <("$PYTHON_BIN" - "$prior" "$side" <<'PY'
-import sqlite3
-import sys
-
-prior_path, side_path = sys.argv[1:3]
-def one(connection, query, args=()):
-    row = connection.execute(query, args).fetchone()
-    return None if row is None else row[0]
-with sqlite3.connect(f"file:{prior_path}?mode=ro&immutable=1", uri=True) as prior:
-    schema = int(one(prior, "PRAGMA user_version") or 0)
-    generation = 1 if schema < 2 else int(
-        one(prior, "SELECT COALESCE(MAX(generation), 0) FROM activity_coverage_manifests_v2")
-    ) + 1
-    active = one(prior, "SELECT generation FROM clob_payout_walk_state_v2 WHERE singleton = 1")
-    payout = int(active) if active is not None else int(
-        one(prior, "SELECT COALESCE(MAX(generation), 0) FROM clob_payout_coverage_manifests_v2")
-    ) + 1
-with sqlite3.connect(f"file:{side_path}?mode=ro", uri=True) as side:
-    payout_done = int(one(
-        side,
-        "SELECT EXISTS(SELECT 1 FROM clob_payout_coverage_manifests_v2 WHERE generation = ?)",
-        (payout,),
-    ))
-print(generation)
-print(payout)
-print(payout_done)
-PY
-)
+  local target_output
+  target_output="$("$PYTHON_BIN" scripts/rank_cycle_manifest.py candidate-targets --prior "$prior" --side "$side")" || exit $?
+  mapfile -t targets <<< "$target_output"
   [[ "${#targets[@]}" -eq 3 ]] || { echo "FATAL: could not derive candidate targets" >&2; exit 2; }
-  echo "   [targets] activity generation ${targets[0]}; payout generation ${targets[1]} (complete=${targets[2]})"
+  local activity_target="${targets[0]}"
+  echo "   [targets] activity generation $activity_target; payout generation ${targets[1]} (complete=${targets[2]})"
   run_refresh_stage "activity" "$PE_BOOTSTRAP_BIN" cache-populate-activity-v2 --db "$side" \
-    --fresh-generation "${targets[0]}" "${BOOTSTRAP_CONFIG_ARGS[@]}"
+    --fresh-generation "$activity_target" "${BOOTSTRAP_CONFIG_ARGS[@]}"
+  local -a freshness_args=()
+  [[ -z "$MAX_CACHE_STALENESS_HOURS" ]] || freshness_args+=(--max-staleness-hours "$MAX_CACHE_STALENESS_HOURS")
+  target_output="$("$PYTHON_BIN" scripts/rank_cycle_manifest.py candidate-targets --prior "$prior" --side "$side" --after-collection "${freshness_args[@]}")" || exit $?
+  mapfile -t targets <<< "$target_output"
+  if [[ "${targets[0]}" != "$activity_target" ]]; then
+    activity_target="${targets[0]}"
+    run_refresh_stage "activity-top-up" "$PE_BOOTSTRAP_BIN" cache-populate-activity-v2 --db "$side" \
+      --fresh-generation "$activity_target" "${BOOTSTRAP_CONFIG_ARGS[@]}"
+    # Recheck after the only allowed top-up; a stale successor fails before ranking.
+    target_output="$("$PYTHON_BIN" scripts/rank_cycle_manifest.py candidate-targets --prior "$prior" --side "$side" --after-collection "${freshness_args[@]}")" || exit $?
+    mapfile -t targets <<< "$target_output"
+    [[ "${targets[0]}" == "$activity_target" ]] || { echo "FATAL: unexpected second activity top-up" >&2; exit 2; }
+  fi
   if [[ "${targets[2]}" == "1" ]]; then
     echo "   [payout] generation ${targets[1]} already complete on the candidate; reused"
   else

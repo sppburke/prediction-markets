@@ -4,7 +4,7 @@ use pe_bootstrap::{
     cache_migration::{
         CacheActivationRequest, PriorCacheBinding, SupabasePublicationProbe,
         activate_cache_v2_with_handoff, finalize_cache_v2, migrate_cache_v2,
-        populate_activity_fresh_v2, populate_activity_v2, restore_prior_cache,
+        populate_activity_fresh_v2_with_clock, populate_activity_v2, restore_prior_cache,
         stage_cache_cycle_v2, verify_frozen_payload_v1,
     },
     config, coverage,
@@ -119,6 +119,7 @@ async fn main() {
         let mut held_run_lock_pid_arg: Option<u32> = None;
         let mut fixed_end_arg: Option<i64> = None;
         let mut generation_arg: Option<u64> = None;
+        let mut full_read_wallets_arg: Option<&str> = None;
         let mut fresh_generation_arg: Option<Result<u64, String>> = None;
         let mut prior_arg: Option<std::path::PathBuf> = None;
         let mut side_arg: Option<std::path::PathBuf> = None;
@@ -281,6 +282,12 @@ async fn main() {
                 fresh_generation_arg = Some(rest[i].parse().map_err(|_| rest[i].to_owned()));
             } else if let Some(v) = a.strip_prefix("--fresh-generation=") {
                 fresh_generation_arg = Some(v.parse().map_err(|_| v.to_owned()));
+            } else if a == "--full-read-wallets" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                full_read_wallets_arg = Some(rest[i]);
+            } else if let Some(v) = a.strip_prefix("--full-read-wallets=") {
+                full_read_wallets_arg = Some(v);
             } else if a == "--prior" && i + 1 < rest.len() {
                 i += 1;
                 flag_values.insert(rest[i]);
@@ -408,16 +415,28 @@ async fn main() {
                             let _lock = pe_bootstrap::lock::CacheMutationLock::acquire(
                                 &bootstrap_config.cache_path,
                             )?;
-                            return populate_activity_fresh_v2(
+                            let full_reads = match full_read_wallets_arg {
+                                Some(value) if !value.is_empty() => value.split(',').map(str::to_owned).collect::<Vec<_>>(),
+                                Some(_) => return Err(BootstrapError::Invalid { message: "--full-read-wallets requires comma-separated wallet addresses".to_owned() }),
+                                None if flag_present("--full-read-wallets") => return Err(BootstrapError::Invalid { message: "--full-read-wallets requires a value".to_owned() }),
+                                None => Vec::new(),
+                            };
+                            return populate_activity_fresh_v2_with_clock(
                                 &bootstrap_config.cache_path,
                                 &fetcher,
                                 &bootstrap_config.polymarket_base_url,
                                 generation,
-                                now - pe_bootstrap::polymarket::ACTIVITY_SETTLE_LAG_SECS,
+                                &full_reads,
+                                || time::OffsetDateTime::now_utc().unix_timestamp()
+                                    .checked_sub(pe_bootstrap::polymarket::ACTIVITY_SETTLE_LAG_SECS)
+                                    .ok_or_else(|| BootstrapError::Invalid { message: "settled activity clock underflow".to_owned() }),
                                 now,
                             )
                             .await
                             .and_then(activity_json_report);
+                        }
+                        if flag_present("--full-read-wallets") {
+                            return Err(BootstrapError::Invalid { message: "--full-read-wallets requires --fresh-generation".to_owned() });
                         }
                         let (fixed_end, generation) = fixed_end_arg.zip(generation_arg).ok_or_else(
                             || BootstrapError::Invalid {

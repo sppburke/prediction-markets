@@ -240,6 +240,14 @@ class RankAndPushScenario(unittest.TestCase):
             'raise SystemExit(int(os.environ.get("STUB_PUSH_EXIT", "0")))\n',
         )
 
+        # Keep importable publisher contract owners real while stubbing network/CLI work.
+        shutil.copy(WRAPPER.parent / "push_ranking_to_supabase.py", self.root / "scripts" / "publisher_contract.py")
+        publisher = self.root / "scripts" / "push_ranking_to_supabase.py"
+        body = publisher.read_text()
+        publisher.write_text("from publisher_contract import build_parser, save_pending_pointer\n"
+                             + "if __name__ == '__main__':\n"
+                             + "".join("    " + line + "\n" for line in body.splitlines()))
+
     def tearDown(self):
         self._tmp.cleanup()
 
@@ -905,7 +913,7 @@ class RankAndPushScenario(unittest.TestCase):
                     ranker_projection_digest TEXT, ranker_classifier_version INTEGER
                 );
                 INSERT INTO wallets VALUES ('0xabc', 1, 0);
-                INSERT INTO activity_coverage_manifests_v2 VALUES
+                INSERT INTO activity_coverage_manifests_v2 (generation, cursors_json, completed_at_unix, reference_sha256, wallet_count, receipt_set_digest, aggregate_digest, source_row_count) VALUES
                     (1, '{"0xabc":10}', 20, 'aa', 1, 'bb', 'cc', 2);
                 INSERT INTO activity_groups_v2 VALUES ('0xabc', 10, 'TRADE', 1);
                 INSERT INTO activity_groups_v2 VALUES ('0xignored', 99, 'TRADE', 2);
@@ -966,8 +974,8 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertEqual(manifest["configuration"]["cache_lane"], "fresh_v2")
         self.assertEqual(manifest["universe"]["backfill_partial_wallets"], [])
         self.assertEqual(manifest["source_watermark"]["activity"]["generation"], 2)
-        self.assertEqual(manifest["source_watermark"]["activity"]["count"], 1)
-        self.assertEqual(manifest["source_watermark"]["activity"]["reference_sha256"], "fresh-2")
+        self.assertEqual(manifest["source_watermark"]["activity"]["count"], 2)
+        self.assertRegex(manifest["source_watermark"]["activity"]["reference_sha256"], r"^[0-9a-f]{64}$")
         self.assertEqual(
             manifest["source_watermark"]["activity"]["ranker_projection"]["classifier_version"], 2
         )
@@ -991,7 +999,7 @@ class RankAndPushScenario(unittest.TestCase):
                 CREATE TABLE activity_coverage_manifests_v2 (
                     generation INTEGER PRIMARY KEY, cursors_json TEXT, completed_at_unix INTEGER,
                     reference_sha256 TEXT, wallet_count INTEGER, receipt_set_digest TEXT,
-                    aggregate_digest TEXT, source_row_count INTEGER);
+                    aggregate_digest TEXT, source_row_count INTEGER, collection_identity_json TEXT);
                 CREATE TABLE activity_groups_v2 (
                     wallet_hex TEXT, source_time_unix INTEGER, activity_type TEXT,
                     coverage_generation INTEGER);
@@ -1004,7 +1012,7 @@ class RankAndPushScenario(unittest.TestCase):
                     singleton INTEGER PRIMARY KEY, ranker_projection_count INTEGER,
                     ranker_projection_digest TEXT, ranker_classifier_version INTEGER);
                 INSERT INTO wallets VALUES ('0xabc', 1, 0);
-                INSERT INTO activity_coverage_manifests_v2 VALUES
+                INSERT INTO activity_coverage_manifests_v2 (generation, cursors_json, completed_at_unix, reference_sha256, wallet_count, receipt_set_digest, aggregate_digest, source_row_count) VALUES
                     (1, '[]', 20, 'aa', 1, 'bb', 'cc', 1);
                 INSERT INTO activity_groups_v2 VALUES ('0xabc', 10, 'TRADE', 1);
                 INSERT INTO clob_payout_coverage_manifests_v2 VALUES
@@ -1417,7 +1425,7 @@ class RankAndPushScenario(unittest.TestCase):
         CREATE TABLE IF NOT EXISTS activity_coverage_manifests_v2 (
             generation INTEGER PRIMARY KEY, cursors_json TEXT, completed_at_unix INTEGER,
             reference_sha256 TEXT, wallet_count INTEGER, receipt_set_digest TEXT,
-            aggregate_digest TEXT, source_row_count INTEGER);
+            aggregate_digest TEXT, source_row_count INTEGER, collection_identity_json TEXT);
         CREATE TABLE IF NOT EXISTS activity_groups_v2 (
             wallet_hex TEXT, source_time_unix INTEGER, activity_type TEXT,
             coverage_generation INTEGER);
@@ -1451,7 +1459,7 @@ class RankAndPushScenario(unittest.TestCase):
                     """
                     PRAGMA user_version = 2;
                     DROP TABLE trades; DROP TABLE market_resolutions; DROP TABLE source_cursor;
-                    INSERT INTO activity_coverage_manifests_v2 VALUES
+                    INSERT INTO activity_coverage_manifests_v2 (generation, cursors_json, completed_at_unix, reference_sha256, wallet_count, receipt_set_digest, aggregate_digest, source_row_count) VALUES
                         (1, '[]', 20, 'fresh-1', 1, 'bb', 'cc', 1);
                     INSERT INTO activity_groups_v2 VALUES ('0xabc', 10, 'TRADE', 1);
                     INSERT INTO clob_payout_coverage_manifests_v2 VALUES
@@ -1498,13 +1506,13 @@ class RankAndPushScenario(unittest.TestCase):
             "    prior, side, manifest = opt('--prior'), opt('--side'), opt('--manifest')\n"
             "    if os.path.exists(side):\n"
             "        assert os.path.exists(prior), 'candidate without prior'\n"
-            "        print(json.dumps({'prior_schema': schema(prior), 'side_schema': schema(side), 'prior_sha256': None, 'side_sha256': None, 'resumed': True}))\n"
+            "        print(json.dumps({'prior_path': prior, 'side_path': side, 'prior_schema': schema(prior), 'side_schema': schema(side), 'prior_sha256': None, 'side_sha256': None, 'resumed': True}))\n"
             "        raise SystemExit(0)\n"
             "    if not os.path.exists(prior): shutil.copyfile(db, prior)\n"
             "    shutil.copyfile(prior, side)\n"
             "    if schema(prior) != 2 and manifest and not os.path.exists(manifest):\n"
             "        json.dump({'manifest_version': 1, 'backup_sha256': sha(prior), 'source_bounds': {}, 'cursors': {}, 'hashes': {}, 'sealed_at_unix': now}, open(manifest, 'w'))\n"
-            "    print(json.dumps({'prior_schema': schema(prior), 'side_schema': schema(side), 'prior_sha256': sha(prior), 'side_sha256': sha(side), 'resumed': False}))\n"
+            "    print(json.dumps({'prior_path': prior, 'side_path': side, 'prior_schema': schema(prior), 'side_schema': schema(side), 'prior_sha256': sha(prior), 'side_sha256': sha(side), 'resumed': False}))\n"
             "elif sub == 'cache-migrate-v2':\n"
             "    manifest = json.load(open(opt('--manifest')))\n"
             "    if schema(db) != 2:\n"
@@ -1519,9 +1527,16 @@ class RankAndPushScenario(unittest.TestCase):
             "        row = c.execute('SELECT fresh_collection_json FROM cache_v2_migration_state').fetchone()\n"
             "        recorded = json.loads(row[0]) if row and row[0] else None\n"
             "        if recorded is None or recorded['generation'] != generation:\n"
-            "            c.execute(\"UPDATE cache_v2_migration_state SET fresh_collection_json = ?, ranker_projection_count = NULL, ranker_projection_digest = NULL, ranker_classifier_version = NULL\", (json.dumps({'generation': generation, 'started_at': now}),))\n"
-            "            c.execute('DELETE FROM activity_groups_v2'); c.execute('DELETE FROM activity_coverage_manifests_v2')\n"
-            "        c.execute('INSERT INTO activity_groups_v2 VALUES (?, ?, ?, ?)', ('0xabc', now, 'TRADE', generation))\n"
+            "            base = recorded['generation'] if recorded else None\n"
+            "            end = now - int(os.environ.get('STUB_ACTIVITY_AGE_' + str(generation), '120'))\n"
+            "            recorded = {'version': 2, 'generation': generation, 'fixed_end_unix': end, 'wallets': ['0xabc'], 'base_generation': base, 'base_manifest_sha256': 'a'*64 if base else None, 'start_exclusive': recorded['fixed_end_unix'] if base else 0, 'full_read_wallets': [] if base else ['0xabc']}\n"
+            "            recorded['digest'] = hashlib.sha256(json.dumps(recorded, sort_keys=True, separators=(',', ':')).encode()).hexdigest()\n"
+            "            c.execute('UPDATE cache_v2_migration_state SET fresh_collection_json = ?, ranker_projection_count = NULL, ranker_projection_digest = NULL, ranker_classifier_version = NULL', (json.dumps(recorded),))\n"
+            "        if os.environ.get('STUB_FAIL_ACTIVITY_GENERATION') == str(generation): c.commit(); raise SystemExit(75)\n"
+            "        if not c.execute('SELECT 1 FROM activity_coverage_manifests_v2 WHERE generation = ?', (generation,)).fetchone():\n"
+            "            c.execute('UPDATE activity_groups_v2 SET coverage_generation = ?', (generation,))\n"
+            "            c.execute('INSERT INTO activity_groups_v2 VALUES (?, ?, ?, ?)', ('0xabc', recorded['fixed_end_unix'], 'TRADE', generation))\n"
+            "            c.execute('INSERT INTO activity_coverage_manifests_v2 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', (generation, '{}', now, recorded['digest'], 1, 'bb', 'cc', 1, json.dumps(recorded)))\n"
             "    print(json.dumps({'generation': generation}))\n"
             "elif sub == 'cache-populate-payout-v2':\n"
             "    with sqlite3.connect(db) as c:\n"
@@ -1534,7 +1549,7 @@ class RankAndPushScenario(unittest.TestCase):
             "elif sub == 'cache-finalize-v2':\n"
             "    with sqlite3.connect(db) as c:\n"
             "        generation = json.loads(c.execute('SELECT fresh_collection_json FROM cache_v2_migration_state').fetchone()[0])['generation']\n"
-            "        c.execute('INSERT OR IGNORE INTO activity_coverage_manifests_v2 VALUES (?, ?, ?, ?, ?, ?, ?, ?)', (generation, '[]', now, f'fresh-{generation}', 1, 'bb', 'cc', 1))\n"
+            "        c.execute('INSERT OR IGNORE INTO activity_coverage_manifests_v2 (generation, cursors_json, completed_at_unix, reference_sha256, wallet_count, receipt_set_digest, aggregate_digest, source_row_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', (generation, '[]', now, f'fresh-{generation}', 1, 'bb', 'cc', 1))\n"
             "        c.execute('UPDATE cache_v2_migration_state SET ranker_projection_count = 1, ranker_projection_digest = ?, ranker_classifier_version = 2', (f'digest-{generation}',))\n"
             "    json.dump({'cache_path': os.path.abspath(db), 'cache_sha256': sha(db)}, open(opt('--stage-record'), 'w'))\n"
             "elif sub == 'cache-activate':\n"
@@ -1552,6 +1567,117 @@ class RankAndPushScenario(unittest.TestCase):
     def _bootstrap_lines(self, op):
         return [line for line in (self._log("pe_bootstrap.log") or "").splitlines()
                 if line.startswith(op + " ")]
+
+    def _prepare_incremental_fixture(self):
+        fixed = self._install_candidate_layout(schema=1)
+        self._install_candidate_stub()
+        with (self.root / ".env").open("a") as handle:
+            handle.write("PE_RANK_SCHEMA_TWO_CUTOVER=prepare\n")
+        return fixed
+
+    def test_stale_initial_head_gets_one_top_up_then_prepares(self):
+        fixed = self._prepare_incremental_fixture()
+        before = fixed.read_bytes()
+        result = self._run(exit_env={"STUB_ACTIVITY_AGE_1": "90000"})
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("RANK_AND_PUSH_PREPARED_ONLY=", result.stdout)
+        lines = self._bootstrap_lines("cache-populate-activity-v2")
+        self.assertEqual(len(lines), 2)
+        self.assertIn("--fresh-generation 1", lines[0])
+        self.assertIn("--fresh-generation 2", lines[1])
+        self.assertEqual(fixed.read_bytes(), before)
+        self.assertTrue((self.root / "data/eval-results/rank_and_push.pending").is_file())
+
+    def test_interrupted_top_up_resumes_recorded_head_and_stale_top_up_never_gets_third(self):
+        self._prepare_incremental_fixture()
+        first = self._run(exit_env={"STUB_ACTIVITY_AGE_1": "180000", "STUB_FAIL_ACTIVITY_GENERATION": "2"})
+        self.assertEqual(first.returncode, 75, first.stderr)
+        before = len(self._bootstrap_lines("cache-populate-activity-v2"))
+        resumed = self._run()
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        self.assertIn("RANK_AND_PUSH_PREPARED_ONLY=", resumed.stdout)
+        self.assertEqual(len(self._bootstrap_lines("cache-populate-activity-v2")), before + 1)
+        self.assertIn("--fresh-generation 2", self._bootstrap_lines("cache-populate-activity-v2")[-1])
+
+    def test_manually_completed_top_up_is_adopted_and_uses_exact_freshness_boundary(self):
+        self._prepare_incremental_fixture()
+        first = self._run(exit_env={"STUB_ACTIVITY_AGE_1": "180000", "STUB_FAIL_ACTIVITY_GENERATION": "2"})
+        self.assertEqual(first.returncode, 75, first.stderr)
+        cycle = self.root / (self.root / "data/eval-results/rank_and_push.cycle").read_text().strip()
+        stage = json.loads((cycle / "cache_stage.json").read_text())
+        side = Path(stage["side_path"])
+        prior = Path(stage["prior_path"])
+        manual = subprocess.run([str(self.root / "target/release/pe-bootstrap"), "cache-populate-activity-v2", "--db", str(side), "--fresh-generation", "2"], cwd=self.root, capture_output=True, text=True)
+        self.assertEqual(manual.returncode, 0, manual.stderr)
+        # Keep the real owner isolated from this suite's importable stub modules.
+        check = subprocess.run([sys.executable, "-c", """
+import hashlib, json, sqlite3, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from rank_cycle_manifest import candidate_targets
+prior, side = map(Path, sys.argv[2:])
+with sqlite3.connect(side) as connection:
+    raw = connection.execute("SELECT fresh_collection_json FROM cache_v2_migration_state").fetchone()[0]
+identity = json.loads(raw)
+end = identity["fixed_end_unix"]
+assert candidate_targets(prior, side, after_collection=True, now=end + 24 * 3600, max_staleness_hours=24)[0] == 2
+try:
+    candidate_targets(prior, side, after_collection=True, now=end + 24 * 3600 + 1, max_staleness_hours=24)
+except ValueError as error:
+    assert "top-up is stale" in str(error)
+else:
+    raise AssertionError("stale top-up accepted")
+try:
+    identity.update(generation=3, base_generation=2)
+    identity.pop("digest")
+    identity["digest"] = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    with sqlite3.connect(side) as connection:
+        connection.execute("UPDATE cache_v2_migration_state SET fresh_collection_json = ?", (json.dumps(identity),))
+    try:
+        candidate_targets(prior, side)
+    except ValueError as error:
+        assert "single top-up allowance" in str(error)
+    else:
+        raise AssertionError("unrelated third head accepted")
+finally:
+    with sqlite3.connect(side) as connection:
+        connection.execute("UPDATE cache_v2_migration_state SET fresh_collection_json = ?", (raw,))
+""", str(WRAPPER.parent), str(prior), str(side)], capture_output=True, text=True)
+        self.assertEqual(check.returncode, 0, check.stderr)
+        before = len(self._bootstrap_lines("cache-populate-activity-v2"))
+        resumed = self._run()
+        self.assertIn("RANK_AND_PUSH_PREPARED_ONLY=", resumed.stdout, resumed.stderr)
+        self.assertEqual(len(self._bootstrap_lines("cache-populate-activity-v2")), before + 1)
+        self.assertIn("--fresh-generation 2", self._bootstrap_lines("cache-populate-activity-v2")[-1])
+
+    def test_stale_completed_top_up_stops_before_ranking_on_every_restart(self):
+        self._prepare_incremental_fixture()
+        for _ in range(2):
+            result = self._run(exit_env={"STUB_ACTIVITY_AGE_1": "180000", "STUB_ACTIVITY_AGE_2": "90000"})
+            self.assertNotEqual(result.returncode, 0)
+            self.assertNotIn("RANK_AND_PUSH_PREPARED_ONLY=", result.stdout)
+            self.assertIn("top-up is stale", result.stderr)
+        self.assertFalse(any("--fresh-generation 3" in line for line in self._bootstrap_lines("cache-populate-activity-v2")))
+        self.assertIsNone(self._log("rank.log"))
+        self.assertFalse((self.root / "data/eval-results/rank_and_push.pending").exists())
+
+    def test_durable_request_without_pointer_recovers_before_discovery_for_both_entries(self):
+        fixed = self._prepare_incremental_fixture()
+        prepared = self._run()
+        self.assertIn("RANK_AND_PUSH_PREPARED_ONLY=", prepared.stdout, prepared.stderr)
+        before = self._bootstrap_ops()
+        fixed_bytes = fixed.read_bytes()
+        pending = self.root / "data/eval-results/rank_and_push.pending"
+        request = pending.read_text()
+        for args in [(), ("--resume-pending",)]:
+            pending.unlink()
+            result = self._run(*args)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("RANK_AND_PUSH_RECOVERED_REQUEST=", result.stdout)
+            self.assertIn("RANK_AND_PUSH_PREPARED_ONLY=", result.stdout)
+            self.assertEqual(pending.read_text(), request)
+            self.assertEqual(self._bootstrap_ops(), before)
+            self.assertEqual(fixed.read_bytes(), fixed_bytes)
 
     def test_initial_cutover_lane_stages_seals_collects_and_publishes_from_schema_one(self):
         """PASS: with the opt-in, a zero-argument schema-one cycle stages the prior

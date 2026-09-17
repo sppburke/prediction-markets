@@ -288,6 +288,21 @@ class ActiveFilterTest(unittest.TestCase):
         self.assertEqual(kept, [{"wallet": "0xaaa"}])
         self.assertEqual(dropped, 0)
 
+    def test_incremental_complete_history_and_retained_exclusions_preserve_freshness_boundary(self) -> None:
+        _make_v2_cache(self.db)
+        with sqlite3.connect(self.db) as con:
+            con.execute("DELETE FROM activity_groups_v2 WHERE coverage_generation = 2")
+            con.execute("UPDATE activity_groups_v2 SET coverage_generation = 7, source_time_unix = ? WHERE wallet_hex = '0xaaa'", (NOW - 24 * HOUR,))
+            con.execute("INSERT INTO activity_groups_v2 VALUES ('0xexcluded', ?, 'TRADE', 1)", (NOW,))
+            con.execute("INSERT INTO activity_coverage_manifests_v2 VALUES (7, ?)", (NOW,))
+        rows = [{"wallet": "0xaaa"}, {"wallet": "0xexcluded"}]
+        kept, dropped, last = pr.filter_active_rows(rows, self.db, 72, 24, NOW)
+        self.assertEqual((kept, dropped, last), ([rows[0]], 1, {"0xaaa": NOW - 24 * HOUR}))
+        # Neither a recent historical excluded row nor a recent manifest clock
+        # can make an old effective trade pass the unchanged source-time gate.
+        with self.assertRaises(pr.CacheStaleError):
+            pr.filter_active_rows(rows, self.db, 72, 24, NOW + 1)
+
     def test_v2_filter_reads_only_latest_completed_trade_and_payout_generations(self) -> None:
         _make_v2_cache(self.db)
         rows = [

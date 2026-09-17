@@ -207,6 +207,49 @@ def whole_projection_digest(rows: list[dict]) -> str:
     return hashlib.sha256(json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+def assert_certified_full_incremental_equivalence(full: str, incremental: str) -> None:
+    """Called by the Rust collector scenario with its two real certified caches.
+
+    Exercise the existing SQLite, export, DuckDB, watermark and publication
+    readers against precisely the same full-versus-delta dataset as Rust.
+    """
+    import pandas as pd
+    import push_ranking_to_supabase as publisher
+    import rank_cycle_manifest as cycle
+
+    results = []
+    with tempfile.TemporaryDirectory() as tmp:
+        for index, db in enumerate((full, incremental)):
+            pq = str(Path(tmp) / str(index))
+            os.makedirs(pq)
+            con = duckdb.connect(config={"autoinstall_known_extensions": "false"})
+            con.execute("LOAD sqlite_scanner")
+            con.execute(f"ATTACH '{exp._q(os.path.abspath(db))}' AS src (TYPE sqlite, READ_ONLY)")
+            counts = {table: exp._export_table(con, pq, table, 100) for table in exp.V2_TABLES}
+            projection = exp._verify_v2_projection(con, pq)
+            exp._write_v2_export_manifest(pq, counts, projection)
+            con.close()
+            with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as sqlite:
+                wallets = sorted(rk.load_universe_from_trades(sqlite, 0, 2))
+                all_wallets = [row[0] for row in sqlite.execute("SELECT DISTINCT wallet_hex FROM activity_groups_v2")]
+                last = publisher._wallet_last_trade(sqlite, all_wallets)
+                newest = publisher._newest_trade_unix(sqlite)
+            engine = ranker_duck.get_engine(force="duck", parquet_dir=pq, max_age_hours=0, schema_version=2)
+            positions = ranker_duck.duck_extract_positions_v2(engine, wallets, 0, 2**62)
+            engine.close()
+            watermark = cycle.snapshot(Path(db), "2027-01-15", {}, {})["source_watermark"]["activity"]
+            results.append((wallets, last, newest, positions, projection, watermark))
+        a, b = results
+        assert a[:3] == b[:3], "wallet universe or publisher source times changed"
+        pd.testing.assert_frame_equal(a[3], b[3], check_exact=True)
+        assert a[4] == b[4], "exported projection certification changed"
+        for field in ("generation", "count", "newest_source_unix", "wallet_count", "aggregate_digest", "source_row_count"):
+            assert a[5][field] == b[5][field], field
+        assert a[5]["reference_sha256"] != b[5]["reference_sha256"]
+        assert a[5]["receipt_set_digest"] != b[5]["receipt_set_digest"]
+        print("PASS: real full/delta caches have identical exported positions, wallet universe, publisher times and content watermarks")
+
+
 class DuckParityTest(unittest.TestCase):
     def test_streamed_projection_digest_matches_whole_list(self) -> None:
         for rows in ([], [{"z": None, "a": 'quote"\n\\é', "amount": "1.250000"}],
@@ -302,6 +345,13 @@ class DuckParityTest(unittest.TestCase):
             conn.execute("ALTER TABLE activity_groups_v2 ADD COLUMN activity_type TEXT DEFAULT 'TRADE'")
             conn.execute("ALTER TABLE clob_payout_evidence_v2 ADD COLUMN coverage_generation INTEGER DEFAULT 8")
             conn.execute("ALTER TABLE clob_payout_evidence_v2 ADD COLUMN fetched_at_unix INTEGER DEFAULT 1")
+            # Re-stamping changes only generation; retained excluded history is
+            # outside the current head and must not enter any equality join.
+            conn.execute("UPDATE activity_groups_v2 SET coverage_generation = 1")
+            conn.execute("UPDATE activity_groups_v2 SET coverage_generation = 7")
+            conn.execute("INSERT INTO activity_groups_v2 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                         ("g2:" + "f" * 64, 1, W("f"), "condition", "token", 1, "buy",
+                          "1.0", "0.5", "0.5", entry + 999, "TRADE"))
             conn.commit()
             conn.close()
 

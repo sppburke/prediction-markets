@@ -932,8 +932,9 @@ looks, extensions, and second windows are not promotion inputs.
 | `ranker_price_fidelity_minutes` | 1 | Fidelity of the targeted ranker fill-oracle fetch (#536): `RANKER_PRICE_FIDELITY_MINUTES` in `pe_bootstrap::prices_history`. Part of the `ranker_price_pages` coverage identity — a fidelity change invalidates coverage; a code deploy (parser version, provenance-only) does not. |
 | `ranker_price_page_max_span_secs` | 80_000 | Maximum requested span per targeted `/prices-history` page (#536): safely under the measured ~1,437-point (~24 h at minute fidelity) END-anchored response cap, so silent truncation cannot occur (80,000 s → ≤ 1,334 points). Const `RANKER_PAGE_MAX_SPAN_SECS`. The endpoint also rejects spans somewhere above 14 days with HTTP 400 at any fidelity; the `interval` enum mode returns empty on resolved markets and is never used. |
 | `ranker_price_store` | `ranker_price_points` + `ranker_price_pages` | Isolated minute price-reference store for the pass-2 fill oracle (#536) — deliberately separate from `market_price_history`, whose every `source='clob'` row feeds true-CLV and the mark index. Points are write-once `(token_id, t)`; pages are an append-only validated ledger (`complete`/`empty`, full per-page provenance incl. `raw_sha256`) committed atomically with their points. Coverage = range algebra over terminal pages; a conflicting duplicate point rolls back its whole page. Written only by `pe-bootstrap prices-history --targets-csv` (cache-mutation-locked); read by `latency_shift_rerank.py` (the sole pass-2 oracle since the #536 cutover), whose binary publication gate exits 75 (supervised retry) while any needed window is un-terminal. Pass-2 also writes `oracle_outcomes.csv` (per-position provenance) and `oracle_manifest.json`, whose canonical sha256 the push stores as `ranking_batches.config_hash` with a round-trip check. |
-| `fresh_collection_json` | version 1 | Nullable column of the `cache_v2_migration_state` singleton written by `cache-populate-activity-v2 --fresh-generation N` (#588): `{"version":1,"generation":N,"fixed_end_unix":E,"wallets":[…],"digest":D}` where `D` is the sha256 of the canonical JSON of the first four fields and is the `reference_sha256` bound into that generation's receipts and activity manifest; projection rows bind it through their activity generation. `E` is `now − ACTIVITY_SETTLE_LAG_SECS` at the generation's start and is retained on every retry; `wallets` is the sorted union of the candidate's `active_tradeable_wallets` view, every wallet with retained history in the byte copy of the immutable prior, and every wallet that the prior's newest activity manifest records as excluded. When present it is the cache's activity identity; absent or NULL selects the legacy frozen-payload binding. Starting a generation clears the candidate's projection, activity rows, receipts and manifests; an unfinished generation can only be resumed. A wallet whose fetched history the aggregator cannot bucket deterministically is excluded from the generation rather than failing it: its receipt keeps the page evidence with zero aggregates and a zero source-row count, the collection logs a warning naming the wallet, and the next generation's union keeps the wallet (an excluded receipt is one with rows in its pages and no aggregates). |
-| `activity_coverage_manifests_v2` receipt storage | marker version 1 | New manifests store `cursors_json = {"receipt_storage":"activity_wallet_coverage_staging_v2","version":1}` and `page_hashes_json = []`, retaining the exact generation's receipts in the existing table until the next generation clears them. Counts and byte-identical aggregate/receipt digests are verified by streaming receipts and one wallet's aggregates; an authentic legacy `cursors_json` array still requires its embedded page hashes and no retained receipts, while unknown markers or missing, extra or altered proofs fail closed. |
+| `fresh_collection_json` | version 2 | Frozen fresh acquisition identity owned by `cache_migration`: generation, preceding completed fresh generation and manifest commitment (both null for a root), exclusive start, fixed end, sorted wallet union, sorted `full_read_wallets` subset, and canonical identity digest. Existing version-1 collections resume authentically. See the acquisition contract below. |
+| `activity_coverage_manifests_v2` receipt storage | marker version 2 for new fresh collections | `cursors_json = {"receipt_storage":"activity_wallet_coverage_staging_v2","version":2}`, `page_hashes_json = []`; receipts and historical manifest commitments remain retained. Version-1 retained and authentic embedded proofs remain readable; unknown versions and downgrades fail closed. `collection_identity_json TEXT NULL` archives the completed fresh identity; `acquisition_json TEXT NULL` on wallet receipts holds version-2 read/carry proof. NULL selects authentic historical decoding only. |
+| `activity_carry_batch_size` | 512 | Module const `CARRY_BATCH_SIZE` in `cache_migration::incremental`. Rows per advancing wallet-index batch; all batches remain in one atomic wallet transaction. This bounds in-memory carry work, not transaction/WAL size. |
 | `ranker_classifier_version` | 2 | **Module const** `RANKER_CLASSIFIER_VERSION` in `bootstrap::cache_migration`. Generation of the derived `ranker_entries_v2` first-entry projection rebuilt from retained complete activity. Distinct from `CACHE_SCHEMA_VERSION_V2` (cache schema) and `FINAL_STAGE_RECORD_VERSION` (finalization receipt format), both unchanged. Newly finalized/installed candidates require the current classifier; hash-bound historical caches retain their authentic classifier generation, with projection rows required to match their certified state. |
 | `bootstrap_pile_activation_min_trades` | 100 | Minimum trade count (DB `trade_count` OR Dune `dune_closed_markets`) for a non-infra wallet to be activated in the pile (issue #166). Curation-list membership (Polymarket leaderboard / 502-gap / datadash) bypasses this gate. Hardcoded as `pe_bootstrap::pile::PILE_ACTIVATION_MIN_TRADES`; changing it requires re-migrating the pile. |
 | `bootstrap_pipeline_activation_batch_wallets` | 20,000 | Maximum inactive, non-infra, non-tombstoned wallets activated by one zero-argument `rank_and_push.sh` cycle. Discovery and backfill defer the legacy global rule inside this wrapper; `activate-next` owns the single deterministic, transactionally audited batch. If fewer remain it activates all and warns; if none remain it warns and skips. Hardcoded as `pe_bootstrap::pile::PIPELINE_ACTIVATION_BATCH_WALLETS`. |
@@ -955,6 +956,70 @@ looks, extensions, and second windows are not promotion inputs.
 | `bootstrap_datadash_exclude_ids` | `["07NQHFRAGB6HV"]` | datadash cohort ids excluded from ingest, matched **exactly** (never substring; issue #365). Default drops the ~103k-wallet `Polymarket Twitter/X Linked Traders` cohort. Set via `PE_BOOTSTRAP_DATADASH_EXCLUDE_IDS` (TOML array of ids). |
 | `bootstrap_datadash_exclude_titles` | `["Polymarket Twitter/X Linked Traders"]` | datadash cohort titles excluded from ingest, matched **exactly** (issue #365). Default drops `Polymarket Twitter/X Linked Traders` while keeping the distinct `Polymarket Twitter/X Linked with PnL >$100k` cohort. Set via `PE_BOOTSTRAP_DATADASH_EXCLUDE_TITLES` (TOML array of titles). |
 | `bootstrap_datadash_max_cohort_wallets` | 10_000 | Magnitude cap: any datadash cohort whose advertised `numWallets` exceeds this is skipped with a `warn!` before its wallets are fetched (issue #365). Belt-and-braces safety net so a recreated/misnamed mega-cohort cannot flood the pile even if the id/title guards drift (largest legitimate cohort is currently 706). Set via `PE_BOOTSTRAP_DATADASH_MAX_COHORT_WALLETS`. |
+
+#### Complete activity generations and incremental acquisition (#648)
+
+New fresh collections keep cache storage, activity schema/parser and classifier versions unchanged.
+The identity is `{version:2,generation:N,base_generation:B,base_manifest_sha256:H,
+start_exclusive:E1,fixed_end_unix:E2,wallets:[…],full_read_wallets:[…],digest:D}`. Validate the
+predecessor's complete content and derive membership before sampling
+`E2 = now − ACTIVITY_SETTLE_LAG_SECS`. Require `0 <= E1 < E2` and N above every known generation;
+numbers need not be consecutive. Freeze both bounds and lists before source I/O. The union contains
+current acquisition candidates, all retained-history wallets (including inactive/infrastructure
+wallets or wallets absent from the pile/projection), and predecessor exclusions. A missing or corrupt
+established-wallet proof is fatal. New wallets, previous exclusions and explicit
+`--full-read-wallets wallet1,wallet2` selections read `(0,E2]` (wire `start=1`); ordinary wallets read
+`(E1,E2]` (wire `start=E1+1`). A root has null base fields, E1=0 and every wallet full-read. Resume
+keeps the authentic recorded identity and skips all valid receipts, including exclusions.
+
+Admission archives the predecessor identity, clears the derived projection and invalidates
+finalization; it preserves activity rows, receipts and manifests. Successful delta collection verifies
+and re-stamps only the wallet's B rows to N, strictly inserts delta rows and writes a complete-history
+receipt in one transaction. Successful full reads replace all retained rows for that wallet, including
+an empty replacement. Empty delta reads carry history. Aggregation failure or any delta/predecessor
+ID collision excludes the whole wallet, even for an equal semantic revision. Exclusion records zero
+resulting counts and the empty history digest, keeps older rows untouched and admits no rows at N.
+Unexpected N rows, foreign-wallet collisions or contradictory predecessor evidence fail the cache.
+
+The acquisition object commits read mode/window, pages, aggregation status, fetched aggregate
+digest/counts, predecessor identity and manifest/wallet receipt/history commitments, whether history
+was carried, and explicit complete/excluded disposition. Stable reasons are `aggregation_failure` and
+`cross_boundary_collision`. Failed aggregation has null fetched aggregate digest/count but records
+the actual fetched source-row count. Collision retains its valid fetched commitment. Existing receipt
+counts/digest always describe complete admitted history at N; pages describe this generation's read.
+
+Let H be lowercase SHA-256, J compact UTF-8 JSON through `serde_json::Value` (lexical recursive keys,
+ordered arrays, no trailing newline), and T the existing direct typed aggregate-vector serialization.
+The encodings are:
+
+- Identity digest: `H(J(identity with only digest omitted))`.
+- Read commitment: `H(J({version:2,wallet_hex,mode,start_exclusive,fixed_end_unix,pages,
+  aggregation_status,ordered_aggregate_digest:fetched_digest_or_null,
+  aggregate_count:fetched_count_or_null,source_row_count:fetched_source_rows}))`.
+- Wallet receipt commitment: `H(J({version:receipt_version,generation,reference_sha256,
+  fixed_end_unix,receipt:authentic_proof}))`. The version-2 proof extends the original fields only
+  with `acquisition`; recording time remains outside the hash.
+- Predecessor manifest commitment: `H(J({version:1,manifest:authentic_manifest,
+  collection_identity:authentic_completed_identity}))`. The manifest has its existing fields,
+  including completion time; new SQL metadata columns do not implicitly enter it.
+- Receipt set: the unchanged `H(J({fixed_end_unix,generation,receipts,reference_sha256}))` envelope,
+  with wallets sorted. Version-2 receipts intentionally change the content.
+- Wallet/generation aggregate digests: H(T(rows)), ordered by `(source_time_unix,source_trade_id)`
+  within wallet and by wallet first across the generation. Typed field order, escaping, decimal scale
+  and timestamps remain unchanged; generation stamps are outside T. Projection digest is unchanged.
+
+Validation separately proves fetched pages/window, predecessor binding, complete rows/counts/digest,
+carried rows through E1, fetched rows after E1, and carried-plus-fetched counts. Generation and receipt
+hashes stream through the existing digest owners. After the writer joins, completion certifies every
+wallet and the total row count at N, then atomically installs the manifest and archived identity.
+It requires no payout or classification and does not finalize the cache. Finalization still classifies
+complete histories from their beginning and seals activity, payout and projection evidence together.
+
+Historical manifests in a mutated candidate are commitments, not independently queryable physical
+snapshots. The immutable prior is the restore artifact. Incremental acquisition proves the observed
+window; it does not rediscover changes wholly before E1. Explicit full-read selection provides repair
+on a newly admitted generation; slower revision discovery is outside publication. See the operator
+procedure and measurement gate in [the refresh runbook](26-DATA-REFRESH-AND-REOPTIMIZATION-RUNBOOK.md).
 
 #### Wallet pile (`wallets` table, issue #166)
 

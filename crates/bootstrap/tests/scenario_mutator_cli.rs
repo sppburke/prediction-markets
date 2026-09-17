@@ -575,6 +575,29 @@ fn fresh_generation_cli_refuses_malformed_values_and_legacy_flag_mixes() {
             ],
             "cannot be combined",
         ),
+        (
+            vec![
+                "cache-populate-activity-v2",
+                "--fresh-generation=1",
+                "--full-read-wallets",
+            ],
+            "--full-read-wallets requires a value",
+        ),
+        (
+            vec![
+                "cache-populate-activity-v2",
+                "--fresh-generation=1",
+                "--full-read-wallets=",
+            ],
+            "--full-read-wallets requires comma-separated wallet addresses",
+        ),
+        (
+            vec![
+                "cache-populate-activity-v2",
+                "--full-read-wallets=0x1111111111111111111111111111111111111111",
+            ],
+            "--full-read-wallets requires --fresh-generation",
+        ),
     ] {
         let output = run_cli_with_env(dir.path(), &cache_path, &args, &[("RUST_LOG", "error")]);
         assert_eq!(output.status.code(), Some(1), "{args:?}");
