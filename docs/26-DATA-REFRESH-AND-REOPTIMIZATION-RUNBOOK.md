@@ -581,8 +581,9 @@ reference, aggregate and manifest digests, payout generation/coverage and eviden
 classifier version are unchanged, and the existing projection's recomputed count and digest match
 the recorded values; missing or changed proof refuses reuse. A different recorded classifier
 version instead runs full activity verification and rebuilds the projection with the current
-classifier. First finalization still validates the complete receipts and activity before building
-the projection.
+classifier. Each rebuilding finalization loads a wallet once, validates its entire aggregate
+vector, then classifies that same vector; a classifier stopping point never truncates validation.
+Manifest verification/installation, projection replacement and finalized state share one transaction.
 Reuse skips that activity-generation verification and reclassification. The payout evidence digest
 streams every evidence row in market-ID order, binding `market_id`, `end_date_unix`, `payout_status`,
 and `payout_vector_json`, including markets currently excluded from the projection. It covers the
@@ -591,7 +592,7 @@ digest recomputation walks the projection and looks up its activity rows by sour
 the join order prevents SQLite from choosing a full activity traversal. It retains payout coverage
 verification, checkpointing, sidecar checks, the full-file hash and the stage-record write. Receipt or activity
 corruption outside the projected values introduced after first finalization is detected by
-activation's unchanged full manifest/content validation, before replacing the fixed cache:
+activation's full candidate manifest/content validation, before replacing the fixed cache:
 
 ```bash
 PE_PYTHON="$PE_PYTHON" bash scripts/rank_and_push.sh \
@@ -610,7 +611,10 @@ either first activation or resumed activation, the publisher validates the compl
 returns the sole activation tuple consumed by the wrapper. A content-hash mismatch therefore fails
 before any cache mutation. Request and pointer replacement fsync both the new file and containing
 directory. Activation accepts a verified schema-one or schema-two fixed cache and retains one
-generic prior-main backup.
+generic prior-main backup. Ordinary activation fully validates the installed cache and candidate;
+once the prior backup's hash equals the just-validated fixed main (including a hash-verified new
+copy), it reads and compares the prior's schema immutably without repeating content validation.
+Missing-side recovery and restore retain their existing content checks.
 
 The wrapper remains the one-shot run-lock owner. For activation it passes the inherited run-lock
 descriptor and, under the supervisor, the inherited loop-lock descriptor. `pe-bootstrap` verifies
