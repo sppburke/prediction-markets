@@ -622,8 +622,9 @@ generation because the frozen reference is bound to one generation and end, the 
 list is fixed to the sealed schema-one history, and activity insertion moves matching rows
 between generations inside one database. Recurring classifier-two publication therefore
 builds every cycle in a **private candidate** copied from an **immutable prior** of the fixed
-cache and collects fresh complete activity for the union of current acquisition candidates
-and every retained history, without a frozen reference:
+cache and collects fresh complete activity for the union of current acquisition candidates,
+every retained history and every wallet the prior's newest generation excluded, without a
+frozen reference:
 
 ```bash
 # Under the cache lock: checkpoint + quick-check the fixed main, copy it to the
@@ -651,9 +652,16 @@ candidate knows, and an unfinished generation can only be resumed. A retry with 
 `N` keeps the recorded end and wallet list and fetches only wallets without a valid
 receipt; a completed generation returns its manifest without any source call. Fresh reads
 request each wallet's full history (`start=1` on the wire; an omitted `start` returns only
-the venue's recent window). A read that exhausts the fetcher's transient retries or is
-rate-limited by the venue exits `rank_and_push_tempfail_exit` (75) so the supervisor resumes the
-collection.
+the venue's recent window). A venue `Retry-After` of at most
+`reconciliation_rate_limit_retry_secs` is waited out inside the fetcher's retry budget; a read
+that exhausts the fetcher's transient retries or is still rate-limited exits
+`rank_and_push_tempfail_exit` (75) so the supervisor resumes the collection. A wallet whose fetched history the aggregator cannot bucket deterministically
+(observed: one fill reported as two rows with different venue timestamps) is excluded from the
+generation instead of failing the cycle: the command logs a warning naming the wallet and the
+reason (and the excluded count when the generation completes), its receipt keeps the page
+evidence with zero aggregates and a zero source-row count, the resume does not refetch it,
+finalization projects no ranker entry for it, and the next generation's union keeps the wallet
+so its history is read again.
 Finalization, activation and the installed-cache validator accept the fresh identity without
 a frozen-payload row; caches finalized under the frozen flow keep their authentic legacy
 identity, including caches that physically lack the new column.

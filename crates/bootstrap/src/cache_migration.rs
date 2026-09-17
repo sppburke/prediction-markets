@@ -636,6 +636,29 @@ fn begin_or_resume_fresh_collection(
             wallets.insert(wallet);
         }
     }
+    // A wallet the prior's collection excluded (`collect_activity_v2`) retains
+    // no history but keeps its place in the union, so the exclusion stays
+    // local to the generation that recorded it and the next collection reads
+    // the wallet's history again. The prior's newest manifest carries that
+    // generation's receipts.
+    let receipts: Option<String> = transaction
+        .query_row(
+            "SELECT cursors_json FROM activity_coverage_manifests_v2
+             ORDER BY generation DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(receipts) = receipts {
+        let receipts: Vec<ActivityWalletReceiptProof> = serde_json::from_str(&receipts)?;
+        for receipt in receipts {
+            if is_excluded_receipt(receipt.aggregate_count, &receipt.pages) {
+                let wallet = receipt.wallet_hex.to_ascii_lowercase();
+                validate_wallet_hex(&wallet)?;
+                wallets.insert(wallet);
+            }
+        }
+    }
     let record =
         FreshCollectionIdentity::new(generation, fixed_end_unix, wallets.into_iter().collect())?;
     transaction.execute(
@@ -736,26 +759,46 @@ async fn collect_activity_v2(
         )
         .await
         .map_err(|error| activity_read_failure(&wallet_hex, error))?;
-        let source_row_count =
-            u64::try_from(complete.rows.len()).map_err(|_| BootstrapError::Invalid {
-                message: format!("activity source-row count overflow for {wallet_hex}"),
-            })?;
-        let mut aggregates = complete
-            .buckets()
-            .map_err(|error| BootstrapError::Polymarket {
-                wallet: wallet_hex.clone(),
-                message: error.to_string(),
-            })?
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>();
-        aggregates.sort_by(|left, right| {
-            left.source_time
-                .0
-                .unix_timestamp()
-                .cmp(&right.source_time.0.unix_timestamp())
-                .then_with(|| left.group_id.key().0.cmp(&right.group_id.key().0))
-        });
+        let (aggregates, source_row_count) = match complete.buckets() {
+            Ok(buckets) => {
+                let mut aggregates = buckets.into_iter().flatten().collect::<Vec<_>>();
+                aggregates.sort_by(|left, right| {
+                    left.source_time
+                        .0
+                        .unix_timestamp()
+                        .cmp(&right.source_time.0.unix_timestamp())
+                        .then_with(|| left.group_id.key().0.cmp(&right.group_id.key().0))
+                });
+                let source_row_count = u64::try_from(complete.rows.len()).map_err(|_| {
+                    BootstrapError::Invalid {
+                        message: format!("activity source-row count overflow for {wallet_hex}"),
+                    }
+                })?;
+                (aggregates, source_row_count)
+            }
+            // A history the aggregator cannot bucket deterministically (observed:
+            // one fill reported as two rows with different venue timestamps)
+            // excludes this wallet from the generation instead of failing the
+            // cycle: its receipt keeps the fetched page evidence with zero
+            // aggregates (`is_excluded_receipt`), so the ranker never sees the
+            // wallet, the resume does not refetch it, every other wallet keeps
+            // collecting, and the next generation reads the wallet again.
+            Err(ActivityReadError::Aggregate(error)) => {
+                tracing::warn!(
+                    wallet = %wallet_hex,
+                    generation,
+                    %error,
+                    "activity wallet excluded from the generation: history cannot be aggregated deterministically"
+                );
+                (Vec::new(), 0)
+            }
+            Err(error) => {
+                return Err(BootstrapError::Polymarket {
+                    wallet: wallet_hex,
+                    message: error.to_string(),
+                });
+            }
+        };
         Ok::<_, BootstrapError>(WalletActivityCompletion {
             wallet_hex,
             pages: complete.pages,
@@ -784,6 +827,18 @@ async fn collect_activity_v2(
         wallets,
         true,
     )?;
+    let excluded = staged
+        .receipts
+        .iter()
+        .filter(|receipt| is_excluded_receipt(receipt.aggregate_count, &receipt.pages))
+        .count();
+    if excluded > 0 {
+        tracing::warn!(
+            generation,
+            excluded,
+            "activity wallets excluded from the generation: their histories could not be aggregated deterministically"
+        );
+    }
     staged.into_manifest(
         generation,
         reference_sha256.clone(),
@@ -942,6 +997,8 @@ struct WalletActivityCompletion {
     wallet_hex: String,
     pages: Vec<ReconciliationPageEvidence>,
     aggregates: Vec<ActivityAggregate>,
+    /// Rows that entered `aggregates`; zero for a wallet excluded from the
+    /// generation, whose `pages` still record the rows the venue returned.
     source_row_count: u64,
 }
 
@@ -955,6 +1012,13 @@ struct ActivityWalletReceiptProof {
     aggregate_count: u64,
     schema_version: u32,
     parser_version: u32,
+}
+
+/// A receipt whose pages carried rows that produced no aggregates: the wallet
+/// was excluded from its generation by `collect_activity_v2`. A wallet with no
+/// history has zero aggregates too, but its pages carry no rows.
+fn is_excluded_receipt(aggregate_count: u64, pages: &[ReconciliationPageEvidence]) -> bool {
+    aggregate_count == 0 && pages.iter().any(|page| page.row_count > 0)
 }
 
 struct ValidatedActivityStaging {

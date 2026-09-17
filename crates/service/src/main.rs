@@ -75,10 +75,6 @@ use pe_service::watchlist_capacity::SupabaseWatchlistCapacity;
 use pe_service::watchlist_maintenance::{MaintenanceConfig, MembershipMode, run_maintenance_loop};
 use time::OffsetDateTime;
 
-/// Longest HTTP 429 `Retry-After` the reconciliation fetcher waits out in-line (issue #555;
-/// `docs/_GLOSSARY.md`): the venue answers a boot-bracket page burst with `Retry-After: 1`.
-const RECONCILIATION_RATE_LIMIT_RETRY_SECS: u32 = 1;
-
 #[derive(Debug, PartialEq, Eq)]
 struct BootAnchorSelection {
     reused: Vec<WalletAddress>,
@@ -738,8 +734,9 @@ async fn main() -> Result<()> {
     // One fetcher owns the documented public-API rate gate for boot brackets
     // and runtime reconciliation (#544).
     let position_fetcher: Arc<dyn ReconciliationFetcher> = Arc::new(
-        ReqwestFetcher::new(reqwest::Client::new())
-            .with_rate_limit_retry_max_secs(RECONCILIATION_RATE_LIMIT_RETRY_SECS),
+        ReqwestFetcher::new(reqwest::Client::new()).with_rate_limit_retry_max_secs(
+            pe_source_polymarket_public::RECONCILIATION_RATE_LIMIT_RETRY_SECS,
+        ),
     );
     let boot_source_log = Arc::new(tokio::sync::Mutex::new(match boot_sink.take() {
         Some(sink) => sink,

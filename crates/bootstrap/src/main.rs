@@ -359,8 +359,14 @@ async fn main() {
                     }),
                 "cache-populate-activity-v2" => {
                     async {
+                        // A venue `Retry-After: 1` answer to a page burst is waited
+                        // out in-line rather than ending a collection of hundreds of
+                        // thousands of wallets with exit 75 (#588).
                         let fetcher = pe_source_polymarket_public::ReqwestFetcher::new(
                             reqwest::Client::new(),
+                        )
+                        .with_rate_limit_retry_max_secs(
+                            pe_source_polymarket_public::RECONCILIATION_RATE_LIMIT_RETRY_SECS,
                         );
                         // Fresh mode (#588): no frozen reference; a newly started
                         // generation is bounded by the same settled read end the
