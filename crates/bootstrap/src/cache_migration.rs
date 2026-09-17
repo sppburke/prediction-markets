@@ -636,6 +636,29 @@ fn begin_or_resume_fresh_collection(
             wallets.insert(wallet);
         }
     }
+    // A wallet the prior's collection excluded (`collect_activity_v2`) retains
+    // no history but keeps its place in the union, so the exclusion stays
+    // local to the generation that recorded it and the next collection reads
+    // the wallet's history again. The prior's newest manifest carries that
+    // generation's receipts.
+    let receipts: Option<String> = transaction
+        .query_row(
+            "SELECT cursors_json FROM activity_coverage_manifests_v2
+             ORDER BY generation DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(receipts) = receipts {
+        let receipts: Vec<ActivityWalletReceiptProof> = serde_json::from_str(&receipts)?;
+        for receipt in receipts {
+            if is_excluded_receipt(receipt.aggregate_count, &receipt.pages) {
+                let wallet = receipt.wallet_hex.to_ascii_lowercase();
+                validate_wallet_hex(&wallet)?;
+                wallets.insert(wallet);
+            }
+        }
+    }
     let record =
         FreshCollectionIdentity::new(generation, fixed_end_unix, wallets.into_iter().collect())?;
     transaction.execute(
@@ -753,12 +776,13 @@ async fn collect_activity_v2(
                 })?;
                 (aggregates, source_row_count)
             }
-            // A history the aggregator cannot bucket deterministically (one fill
-            // whose rows carry different venue timestamps) excludes this wallet
-            // from the generation instead of failing the cycle: its receipt
-            // keeps the fetched page evidence with zero aggregates, so the
-            // ranker never sees the wallet, the resume does not refetch it, and
-            // every other wallet keeps collecting.
+            // A history the aggregator cannot bucket deterministically (observed:
+            // one fill reported as two rows with different venue timestamps)
+            // excludes this wallet from the generation instead of failing the
+            // cycle: its receipt keeps the fetched page evidence with zero
+            // aggregates (`is_excluded_receipt`), so the ranker never sees the
+            // wallet, the resume does not refetch it, every other wallet keeps
+            // collecting, and the next generation reads the wallet again.
             Err(ActivityReadError::Aggregate(error)) => {
                 tracing::warn!(
                     wallet = %wallet_hex,
@@ -803,6 +827,18 @@ async fn collect_activity_v2(
         wallets,
         true,
     )?;
+    let excluded = staged
+        .receipts
+        .iter()
+        .filter(|receipt| is_excluded_receipt(receipt.aggregate_count, &receipt.pages))
+        .count();
+    if excluded > 0 {
+        tracing::warn!(
+            generation,
+            excluded,
+            "activity wallets excluded from the generation: their histories could not be aggregated deterministically"
+        );
+    }
     staged.into_manifest(
         generation,
         reference_sha256.clone(),
@@ -976,6 +1012,13 @@ struct ActivityWalletReceiptProof {
     aggregate_count: u64,
     schema_version: u32,
     parser_version: u32,
+}
+
+/// A receipt whose pages carried rows that produced no aggregates: the wallet
+/// was excluded from its generation by `collect_activity_v2`. A wallet with no
+/// history has zero aggregates too, but its pages carry no rows.
+fn is_excluded_receipt(aggregate_count: u64, pages: &[ReconciliationPageEvidence]) -> bool {
+    aggregate_count == 0 && pages.iter().any(|page| page.row_count > 0)
 }
 
 struct ValidatedActivityStaging {

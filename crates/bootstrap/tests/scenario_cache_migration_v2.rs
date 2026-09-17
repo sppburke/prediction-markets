@@ -2625,8 +2625,8 @@ fn ambiguous_fill_rows(wallet: &str) -> Vec<u8> {
     serde_json::to_vec(&rows).unwrap()
 }
 
-/// Serves the ambiguous wallet and one ordinary wallet, then interrupts every
-/// other read transiently once the ambiguous wallet's receipt is durable.
+/// Serves the ambiguous retained wallet B and the ordinary wallet D, then
+/// interrupts every other read transiently once both receipts are durable.
 struct InterruptAfterAmbiguous {
     side: std::path::PathBuf,
 }
@@ -2639,11 +2639,11 @@ impl PageFetcher for InterruptAfterAmbiguous {
         let side = self.side.clone();
         let url = url.to_owned();
         async move {
-            if url.contains(WALLET_D) {
-                return Ok(ambiguous_fill_rows(WALLET_D));
-            }
             if url.contains(WALLET_B) {
-                return Ok(activity_rows(WALLET_B, &[FRESH_END - 1], false));
+                return Ok(ambiguous_fill_rows(WALLET_B));
+            }
+            if url.contains(WALLET_D) {
+                return Ok(activity_rows(WALLET_D, &[FRESH_END - 1], false));
             }
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
             loop {
@@ -2651,19 +2651,19 @@ impl PageFetcher for InterruptAfterAmbiguous {
                     .unwrap()
                     .query_row(
                         "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2
-                         WHERE generation = 1 AND wallet_hex = ?1",
-                        params![WALLET_D],
+                         WHERE generation = 1 AND wallet_hex IN (?1, ?2)",
+                        params![WALLET_B, WALLET_D],
                         |row| row.get(0),
                     )
                     .unwrap();
-                if committed == 1 {
+                if committed == 2 {
                     return Err(SourceError::Transient {
                         message: "controlled interruption after the excluded receipt".to_owned(),
                     });
                 }
                 assert!(
                     tokio::time::Instant::now() < deadline,
-                    "excluded wallet never committed"
+                    "the served wallets never committed"
                 );
                 tokio::task::yield_now().await;
             }
@@ -2671,11 +2671,38 @@ impl PageFetcher for InterruptAfterAmbiguous {
     }
 }
 
+/// `(aggregate_count, source_row_count, rows across the page evidence)` of a
+/// wallet's receipt in `generation`.
+fn receipt(side: &std::path::Path, generation: i64, wallet: &str) -> Option<(i64, i64, u64)> {
+    Connection::open(side)
+        .unwrap()
+        .query_row(
+            "SELECT aggregate_count, source_row_count, page_evidence_json
+             FROM activity_wallet_coverage_staging_v2
+             WHERE generation = ?1 AND wallet_hex = ?2",
+            params![generation, wallet],
+            |row| {
+                let pages: Value = serde_json::from_str(&row.get::<_, String>(2)?).unwrap();
+                let page_rows = pages
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|page| page["row_count"].as_u64().unwrap())
+                    .sum::<u64>();
+                Ok((row.get(0)?, row.get(1)?, page_rows))
+            },
+        )
+        .optional()
+        .unwrap()
+}
+
 /// A wallet whose fetched history cannot be aggregated deterministically is
 /// excluded from the generation instead of failing it: its receipt keeps the
 /// page evidence with zero aggregates, the other wallets keep collecting, the
 /// resume fetches only wallets without a receipt, validation and finalization
-/// accept the receipt set, and the ranker projects nothing for the wallet.
+/// accept the receipt set, the ranker projects nothing for the wallet, and the
+/// next generation's union keeps the wallet even though it is inactive and
+/// retains no history, so a valid history is collected again.
 #[tokio::test]
 async fn fresh_generation_excludes_a_wallet_whose_history_cannot_be_aggregated() {
     let dir = tempfile::Builder::new()
@@ -2699,42 +2726,20 @@ async fn fresh_generation_excludes_a_wallet_whose_history_cannot_be_aggregated()
     .await
     .unwrap_err();
     assert_eq!(interrupted.exit_code(), 75, "{interrupted}");
-    let receipt = |wallet: &str| -> Option<(i64, i64, u64)> {
-        Connection::open(&side)
-            .unwrap()
-            .query_row(
-                "SELECT aggregate_count, source_row_count, page_evidence_json
-                 FROM activity_wallet_coverage_staging_v2
-                 WHERE generation = 1 AND wallet_hex = ?1",
-                [wallet],
-                |row| {
-                    let pages: Value = serde_json::from_str(&row.get::<_, String>(2)?).unwrap();
-                    let page_rows = pages
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .map(|page| page["row_count"].as_u64().unwrap())
-                        .sum::<u64>();
-                    Ok((row.get(0)?, row.get(1)?, page_rows))
-                },
-            )
-            .optional()
-            .unwrap()
-    };
     assert_eq!(
-        receipt(WALLET_D),
+        receipt(&side, 1, WALLET_B),
         Some((0, 0, 2)),
         "excluded receipt keeps the page evidence with zero aggregates"
     );
-    assert_eq!(receipt(WALLET_B), Some((1, 1, 1)));
-    assert_eq!(receipt(WALLET), None);
-    assert_eq!(
+    assert_eq!(receipt(&side, 1, WALLET_D), Some((1, 1, 1)));
+    assert_eq!(receipt(&side, 1, WALLET), None);
+    let groups_for = |wallet: &str| {
         count(
             &side,
-            &format!("SELECT COUNT(*) FROM activity_groups_v2 WHERE wallet_hex = '{WALLET_D}'")
-        ),
-        0
-    );
+            &format!("SELECT COUNT(*) FROM activity_groups_v2 WHERE wallet_hex = '{wallet}'"),
+        )
+    };
+    assert_eq!(groups_for(WALLET_B), 0);
 
     // The resume fetches only the wallets without a receipt: this fetcher has
     // no response for the excluded wallet, so a refetch would fail the resume.
@@ -2754,8 +2759,8 @@ async fn fresh_generation_excludes_a_wallet_whose_history_cannot_be_aggregated()
     .await
     .unwrap();
     assert_eq!((manifest.generation, manifest.wallet_count), (1, 4));
-    assert_eq!(receipt(WALLET_D), Some((0, 0, 2)));
-    assert_eq!(generation_rows(&side, 1), 3 + 1 + 2);
+    assert_eq!(receipt(&side, 1, WALLET_B), Some((0, 0, 2)));
+    assert_eq!(generation_rows(&side, 1), 3 + 2 + 1);
 
     install_fresh_payouts(&side).await;
     finalize_cache_v2(
@@ -2770,12 +2775,56 @@ async fn fresh_generation_excludes_a_wallet_whose_history_cannot_be_aggregated()
             &format!(
                 "SELECT COUNT(*) FROM ranker_entries_v2 ranker
                  JOIN activity_groups_v2 groups ON groups.source_trade_id = ranker.source_trade_id
-                 WHERE groups.wallet_hex = '{WALLET_D}'"
+                 WHERE groups.wallet_hex = '{WALLET_B}'"
             )
         ),
         0
     );
     assert!(count(&side, "SELECT COUNT(*) FROM ranker_entries_v2") > 0);
+
+    // The finalized cache is the next cycle's prior: the excluded wallet is
+    // inactive and retains no history there, and only its excluded receipt
+    // can carry it into the next union.
+    let next = dir.path().join("next.db");
+    std::fs::copy(&side, &next).unwrap();
+    assert_eq!(
+        count(
+            &next,
+            &format!(
+                "SELECT COUNT(*) FROM active_tradeable_wallets WHERE wallet_hex = '{WALLET_B}'"
+            )
+        ),
+        0
+    );
+    assert_eq!(
+        count(
+            &next,
+            &format!("SELECT COUNT(*) FROM activity_groups_v2 WHERE wallet_hex = '{WALLET_B}'")
+        ),
+        0
+    );
+    let next_end = FRESH_END + 100;
+    let manifest = populate_activity_fresh_v2(
+        &next,
+        &fresh_fetcher(
+            &[WALLET, WALLET_B, WALLET_C, WALLET_D],
+            next_end,
+            &[FRESH_END - 1, FRESH_END - 101],
+            false,
+        ),
+        "https://data.example",
+        2,
+        next_end,
+        next_end + 1,
+    )
+    .await
+    .unwrap();
+    assert_eq!((manifest.generation, manifest.wallet_count), (2, 4));
+    assert_eq!(
+        fresh_record(&next)["wallets"],
+        serde_json::json!([WALLET, WALLET_B, WALLET_C, WALLET_D])
+    );
+    assert_eq!(receipt(&next, 2, WALLET_B), Some((2, 2, 2)));
 }
 
 #[tokio::test]
