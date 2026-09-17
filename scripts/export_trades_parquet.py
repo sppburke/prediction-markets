@@ -9,6 +9,11 @@ and `clob_payout_evidence_v2`, issue #544, when present) -> zstd Parquet under
 written to `<name>.parquet.tmp` then `os.replace`-d into place, so a concurrent
 reader never sees a half-written file.
 
+Schema two exports only the complete certified projection's activity rows; the
+other five required tables remain full exports. Full activity history, including
+publisher freshness evidence, stays in SQLite. Manifest version 2 declares this
+scope so older readers refuse it.
+
 SQLite stays the system-of-record; this is a read-only snapshot. sqlite_scanner
 preserves the declared column types (INTEGER->BIGINT, TEXT->VARCHAR), so the DuckDB
 ranker queries see `outcome_id`/`contracts` as BIGINT and `price_str` as VARCHAR —
@@ -52,6 +57,12 @@ V2_TABLES = (
 )
 V2_EXPORT_MANIFEST = "schema_v2_export_manifest.json"
 PROJECTION_BATCH_SIZE = 1024
+CERTIFIED_ACTIVITY_SQL = (
+    "SELECT g.* FROM ranker_entries_v2 AS r "
+    "CROSS JOIN activity_groups_v2 AS g "
+    "WHERE g.source_trade_id = r.source_trade_id "
+    "AND g.coverage_generation = r.activity_generation"
+)
 
 
 def log(msg: str) -> None:
@@ -71,17 +82,44 @@ def _table_exists(con, tbl: str) -> bool:
         return False
 
 
+def _typed_sqlite_query(con, query: str, typed_query: str) -> str:
+    """Run SQL inside SQLite, restoring sqlite_scanner's BIGINT/VARCHAR types.
+
+    sqlite_query returns every column as VARCHAR, including integers. DESCRIBE
+    binds the equivalent attached-table query without scanning its source rows.
+    Reject fractional integer text before CAST (DuckDB otherwise rounds it),
+    and never use TRY_CAST: malformed integers must fail the export.
+    """
+    columns = []
+    for name, dtype, *_ in con.execute(f"DESCRIBE {typed_query}").fetchall():
+        if dtype not in ("BIGINT", "VARCHAR"):
+            raise ValueError(f"unsupported SQLite export type {name}: {dtype}")
+        quoted = '"' + name.replace('"', '""') + '"'
+        value = quoted
+        if dtype == "BIGINT":
+            value = (
+                f"CASE WHEN {quoted} IS NULL OR regexp_full_match({quoted}, '-?[0-9]+') "
+                f"THEN {quoted} ELSE error('invalid SQLite INTEGER: {_q(name)}') END"
+            )
+        columns.append(f"CAST({value} AS {dtype}) AS {quoted}")
+    return f"SELECT {', '.join(columns)} FROM sqlite_query('src', '{_q(query)}')"
+
+
 def _export_table(con, out_dir: str, tbl: str, row_group_size: int) -> int:
     """Atomically export `src.{tbl}` to `{out_dir}/{tbl}.parquet` (zstd) via tmp + os.replace."""
     final = os.path.join(out_dir, f"{tbl}.parquet")
     tmp = final + ".tmp"
+    query = f"SELECT * FROM src.{tbl}"
+    if tbl == "activity_groups_v2":
+        query = _typed_sqlite_query(con, CERTIFIED_ACTIVITY_SQL, query)
     con.execute(
-        f"COPY (SELECT * FROM src.{tbl}) TO '{_q(tmp)}' "
+        f"COPY ({query}) TO '{_q(tmp)}' "
         f"(FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE {int(row_group_size)});"
     )
     os.replace(tmp, final)
     n = con.execute(f"SELECT COUNT(*) FROM read_parquet('{_q(final)}')").fetchone()[0]
-    source_n = con.execute(f"SELECT COUNT(*) FROM src.{tbl}").fetchone()[0]
+    count_table = "ranker_entries_v2" if tbl == "activity_groups_v2" else tbl
+    source_n = con.execute(f"SELECT COUNT(*) FROM src.{count_table}").fetchone()[0]
     if n != source_n:
         raise ValueError(f"{tbl}: Parquet count {n} != SQLite count {source_n}")
     size_gb = os.path.getsize(final) / 1e9
@@ -92,7 +130,7 @@ def _export_table(con, out_dir: str, tbl: str, row_group_size: int) -> int:
 def _projection_rows(con, relation_prefix: str) -> Iterator[dict]:
     """Canonical joined schema-two rows, matching Rust's projection digest."""
     prefix = f"{relation_prefix}." if relation_prefix else ""
-    cursor = con.execute(
+    query = (
         f"SELECT ranker.source_trade_id, ranker.activity_generation, "
         f"ranker.classifier_version, groups_v2.wallet_hex, "
         f"groups_v2.condition_id, groups_v2.asset, groups_v2.outcome_id, "
@@ -101,13 +139,18 @@ def _projection_rows(con, relation_prefix: str) -> Iterator[dict]:
         f"groups_v2.source_usdc_amount_str, groups_v2.source_time_unix, "
         f"payout.payout_vector_json, payout.end_date_unix "
         f"FROM {prefix}ranker_entries_v2 ranker "
-        f"JOIN {prefix}activity_groups_v2 groups_v2 "
-        "ON groups_v2.source_trade_id = ranker.source_trade_id "
-        "AND groups_v2.coverage_generation = ranker.activity_generation "
+        f"CROSS JOIN {prefix}activity_groups_v2 groups_v2 "
         f"JOIN {prefix}clob_payout_evidence_v2 payout "
         "ON payout.market_id = groups_v2.condition_id "
+        "WHERE groups_v2.source_trade_id = ranker.source_trade_id "
+        "AND groups_v2.coverage_generation = ranker.activity_generation "
         "ORDER BY ranker.source_trade_id"
     )
+    if relation_prefix == "src":
+        # Keep source verification proportional to the projection too, rather
+        # than letting DuckDB scan the full attached activity table for its join.
+        query = _typed_sqlite_query(con, query.replace("src.", ""), query)
+    cursor = con.execute(query)
     names = (
         "source_trade_id", "activity_generation", "classifier_version",
         "wallet_hex", "condition_id", "asset", "outcome_id", "side",
@@ -154,6 +197,15 @@ def _verify_v2_projection(con, out_dir: str) -> dict:
     ).fetchone()
     if state is None or state[0] != "finalized":
         raise ValueError("schema-two cache is not finalized")
+    generation = con.execute(
+        "SELECT MAX(generation) FROM src.activity_coverage_manifests_v2"
+    ).fetchone()[0]
+    if generation is None or con.execute(
+        "SELECT COUNT(*) FROM src.ranker_entries_v2 "
+        "WHERE activity_generation IS NULL OR activity_generation != ?",
+        [generation],
+    ).fetchone()[0]:
+        raise ValueError("schema-two projection activity generation mismatch")
     source_count, source_digest = _projection_digest(_projection_rows(con, "src"))
     expected_count = int(state[1]) if state[1] is not None else -1
     expected_digest = str(state[2]) if state[2] is not None else ""
@@ -181,14 +233,18 @@ def _verify_v2_projection(con, out_dir: str) -> dict:
         "count": expected_count,
         "digest": expected_digest,
         "classifier_version": int(state[3]),
+        "activity_generation": int(generation),
     }
 
 
 def _write_v2_export_manifest(out_dir: str, counts: dict[str, int], projection: dict) -> None:
     import json
 
+    if not (counts["activity_groups_v2"] == counts["ranker_entries_v2"] == projection["count"]):
+        raise ValueError("schema-two certified activity/projection count mismatch")
     value = {
-        "version": 1,
+        "version": 2,
+        "activity_scope": "certified_ranker_entries",
         "tables": {
             table: {
                 "count": counts[table],
