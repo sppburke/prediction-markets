@@ -976,17 +976,20 @@ Admission archives the predecessor identity, clears the derived projection and i
 finalization; it preserves activity rows, receipts and manifests. Successful delta collection verifies
 and re-stamps only the wallet's B rows to N, strictly inserts delta rows and writes a complete-history
 receipt in one transaction. Successful full reads replace all retained rows for that wallet, including
-an empty replacement. Empty delta reads carry history. Aggregation failure or any delta/predecessor
-ID collision excludes the whole wallet, even for an equal semantic revision. Exclusion records zero
+an empty replacement. Empty delta reads carry history. Unparseable, unidentifiable or out-of-bounds
+venue history, aggregation failure or any delta/predecessor ID collision excludes the whole wallet,
+even for an equal semantic revision. Exclusion records zero
 resulting counts and the empty history digest, keeps older rows untouched and admits no rows at N.
 Unexpected N rows, foreign-wallet collisions or contradictory predecessor evidence fail the cache.
 
 The acquisition object commits read mode/window, pages, aggregation status, fetched aggregate
 digest/counts, predecessor identity and manifest/wallet receipt/history commitments, whether history
-was carried, and explicit complete/excluded disposition. Stable reasons are `aggregation_failure` and
-`cross_boundary_collision`. Failed aggregation has null fetched aggregate digest/count but records
-the actual fetched source-row count. Collision retains its valid fetched commitment. Existing receipt
-counts/digest always describe complete admitted history at N; pages describe this generation's read.
+was carried, and explicit complete/excluded disposition. Stable reasons are `acquisition_failure`,
+`aggregation_failure` and `cross_boundary_collision`. Failed acquisition has aggregation status
+`not_attempted`, no page evidence, null fetched aggregate digest/count and zero fetched source rows;
+it requires the receipt's nonempty `exclusion_reason`. Failed aggregation has status `failed`, null
+fetched aggregate digest/count and the actual fetched source-row count. Collision retains its valid
+fetched commitment with status `complete`. Existing receipt counts/digest always describe complete admitted history at N; pages describe this generation's read.
 
 Let H be lowercase SHA-256, J compact UTF-8 JSON through `serde_json::Value` (lexical recursive keys,
 ordered arrays, no trailing newline), and T the existing direct typed aggregate-vector serialization.
@@ -998,7 +1001,9 @@ The encodings are:
   aggregate_count:fetched_count_or_null,source_row_count:fetched_source_rows}))`.
 - Wallet receipt commitment: `H(J({version:receipt_version,generation,reference_sha256,
   fixed_end_unix,receipt:authentic_proof}))`. The version-2 proof extends the original fields only
-  with `acquisition`; recording time remains outside the hash.
+  with `acquisition`, alongside #649's optional `exclusion_reason`. The reason is omitted when absent,
+  preserving ordinary proof bytes; older exclusions without a reason retain the page-rows/no-aggregates
+  inference. Recording time remains outside the hash.
 - Predecessor manifest commitment: `H(J({version:1,manifest:authentic_manifest,
   collection_identity:authentic_completed_identity}))`. The manifest has its existing fields,
   including completion time; new SQL metadata columns do not implicitly enter it.
@@ -1012,8 +1017,9 @@ Validation separately proves fetched pages/window, predecessor binding, complete
 carried rows through E1, fetched rows after E1, and carried-plus-fetched counts. Generation and receipt
 hashes stream through the existing digest owners. After the writer joins, completion certifies every
 wallet and the total row count at N, then atomically installs the manifest and archived identity.
-It requires no payout or classification and does not finalize the cache. Finalization still classifies
-complete histories from their beginning and seals activity, payout and projection evidence together.
+It requires no payout or classification and does not finalize the cache. First finalization classifies
+complete histories from their beginning and seals activity, payout and projection evidence together;
+refinalization may reuse the projection only with its unchanged recorded input binding (see the runbook).
 
 Historical manifests in a mutated candidate are commitments, not independently queryable physical
 snapshots. The immutable prior is the restore artifact. Incremental acquisition proves the observed

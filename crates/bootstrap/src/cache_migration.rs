@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr as _;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::{StreamExt as _, stream};
 use pe_core_types::{
@@ -44,7 +44,7 @@ mod digests;
 mod incremental;
 use digests::{JsonArrayDigest, ReceiptSetDigest};
 use incremental::{
-    CollectionProof, commit_incremental_wallet, generation_identity, manifest_link, read_manifest,
+    CollectionProof, commit_incremental_wallet, generation_identity, manifest_link,
     record_completed_manifest,
 };
 
@@ -103,6 +103,9 @@ CREATE TABLE IF NOT EXISTS activity_wallet_coverage_staging_v2 (
     schema_version           INTEGER NOT NULL CHECK(schema_version = 2),
     parser_version           INTEGER NOT NULL CHECK(parser_version = 2),
     completed_at_unix        INTEGER NOT NULL,
+    -- Set when the venue's history for this wallet could not be read
+    -- deterministically; the wallet is excluded from this generation (#588).
+    exclusion_reason         TEXT    NULL,
     PRIMARY KEY (generation, wallet_hex)
 );
 
@@ -160,6 +163,7 @@ CREATE TABLE IF NOT EXISTS cache_v2_migration_state (
     ranker_projection_count INTEGER NULL,
     ranker_projection_digest TEXT NULL,
     ranker_classifier_version INTEGER NULL,
+    ranker_projection_inputs_json TEXT NULL,
     fresh_collection_json  TEXT    NULL,
     updated_at_unix        INTEGER NOT NULL
 );
@@ -207,6 +211,72 @@ pub struct FrozenCacheFreshness {
 }
 
 type FinalizedProjectionState = (String, Option<i64>, Option<String>, Option<i64>);
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RankerProjectionInputs {
+    activity_generation: u64,
+    activity_reference_sha256: String,
+    activity_aggregate_digest: String,
+    activity_manifest_sha256: String,
+    activity_identity_sha256: String,
+    payout_generation: u64,
+    payout_manifest_sha256: String,
+    payout_evidence_digest: String,
+}
+
+impl RankerProjectionInputs {
+    fn read(
+        connection: &Connection,
+        manifest: &ActivityCoverageManifestV2,
+        identity: &ActivityIdentity,
+        payout_generation: i64,
+    ) -> Result<Self, BootstrapError> {
+        let payout_manifest: String = connection.query_row(
+            "SELECT manifest_json FROM clob_payout_coverage_manifests_v2 WHERE generation = ?1",
+            params![payout_generation],
+            |row| row.get(0),
+        )?;
+        // Bind every payout input read by rebuild_ranker_projection and the
+        // projection digest, including markets that are not currently eligible.
+        // Like the rebuild, read the whole payout table without a generation
+        // filter. No activity rows are needed for this commitment.
+        let mut statement = connection.prepare(
+            "SELECT market_id, end_date_unix, payout_status, payout_vector_json
+             FROM clob_payout_evidence_v2 ORDER BY market_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })?;
+        let mut payout_evidence_digest = JsonArrayDigest::new();
+        for row in rows {
+            payout_evidence_digest.push(&row?)?;
+        }
+        Ok(Self {
+            activity_generation: manifest.generation,
+            activity_reference_sha256: manifest.reference_sha256.clone(),
+            activity_aggregate_digest: manifest.aggregate_digest.clone(),
+            activity_manifest_sha256: sha256_bytes(canonical_json(manifest)?.as_bytes()),
+            activity_identity_sha256: sha256_bytes(
+                canonical_json(&(
+                    identity.generation,
+                    &identity.reference_sha256,
+                    identity.fixed_end_unix,
+                    &identity.wallets,
+                ))?
+                .as_bytes(),
+            ),
+            payout_generation: to_u64(payout_generation, "payout generation")?,
+            payout_manifest_sha256: sha256_bytes(payout_manifest.as_bytes()),
+            payout_evidence_digest: payout_evidence_digest.finish(),
+        })
+    }
+}
 
 /// Versioned identity of one fresh activity collection recorded in the
 /// candidate's migration-state singleton (#588). `digest` binds the other
@@ -862,9 +932,12 @@ fn begin_or_resume_fresh_collection(
         incremental::archive_identity(&transaction, manifest.generation, identity)?;
     }
     transaction.execute(
-        "UPDATE cache_v2_migration_state SET fresh_collection_json = ?1, phase = 'schema_sealed',
-         ranker_projection_count = NULL, ranker_projection_digest = NULL,
-         ranker_classifier_version = NULL, updated_at_unix = ?2 WHERE singleton = 1",
+        "UPDATE cache_v2_migration_state
+         SET fresh_collection_json = ?1, phase = 'schema_sealed',
+             ranker_projection_count = NULL, ranker_projection_digest = NULL,
+             ranker_classifier_version = NULL, ranker_projection_inputs_json = NULL,
+             updated_at_unix = ?2
+         WHERE singleton = 1",
         params![canonical_json(&record)?, started_at_unix],
     )?;
     transaction.execute("DELETE FROM ranker_entries_v2", [])?;
@@ -943,7 +1016,11 @@ async fn collect_activity_v2(
             WalletAddress::from_hex(&wallet_hex).map_err(|error| BootstrapError::Invalid {
                 message: format!("frozen universe contains invalid wallet {wallet_hex}: {error}"),
             })?;
-        let complete = fetch_complete_activity(
+        // A venue payload this parser cannot represent (observed: a TRADE row
+        // priced 3.1968021978, outside the unit interval) excludes the wallet
+        // like an unaggregatable history: no page evidence survives, so record
+        // the reason and an explicit failed acquisition without claiming a read.
+        let complete = match fetch_complete_activity(
             fetcher,
             base_url,
             wallet,
@@ -951,9 +1028,30 @@ async fn collect_activity_v2(
             fixed_end_unix,
         )
         .await
-        .map_err(|error| activity_read_failure(&wallet_hex, error))?;
+        {
+            Ok(complete) => complete,
+            Err(error) if excludes_wallet(&error) => {
+                tracing::warn!(
+                    wallet = %wallet_hex,
+                    generation,
+                    %error,
+                    "activity wallet excluded from the generation: venue history cannot be read"
+                );
+                return Ok::<_, BootstrapError>(WalletActivityCompletion {
+                    wallet_hex,
+                    pages: Vec::new(),
+                    aggregates: Vec::new(),
+                    source_row_count: 0,
+                    exclusion_reason: Some(error.to_string()),
+                    fetched_source_row_count: 0,
+                    aggregation_status: AggregationStatus::NotAttempted,
+                });
+            }
+            Err(error) => return Err(activity_read_failure(&wallet_hex, error)),
+        };
+        let mut exclusion_reason: Option<String> = None;
         let fetched_source_row_count = u64::try_from(complete.rows.len()).map_err(|_| BootstrapError::Internal)?;
-        let (aggregates, source_row_count, aggregation_failed) = match complete.buckets() {
+        let (aggregates, source_row_count, aggregation_status) = match complete.buckets() {
             Ok(buckets) => {
                 let mut aggregates = buckets.into_iter().flatten().collect::<Vec<_>>();
                 aggregates.sort_by(|left, right| {
@@ -968,7 +1066,7 @@ async fn collect_activity_v2(
                         message: format!("activity source-row count overflow for {wallet_hex}"),
                     }
                 })?;
-                (aggregates, source_row_count, false)
+                (aggregates, source_row_count, AggregationStatus::Complete)
             }
             // A history the aggregator cannot bucket deterministically (observed:
             // one fill reported as two rows with different venue timestamps)
@@ -977,14 +1075,15 @@ async fn collect_activity_v2(
             // aggregates (`is_excluded_receipt`), so the ranker never sees the
             // wallet, the resume does not refetch it, every other wallet keeps
             // collecting, and the next generation reads the wallet again.
-            Err(ActivityReadError::Aggregate(error)) => {
+            Err(error) if excludes_wallet(&error) => {
                 tracing::warn!(
                     wallet = %wallet_hex,
                     generation,
                     %error,
                     "activity wallet excluded from the generation: history cannot be aggregated deterministically"
                 );
-                (Vec::new(), 0, true)
+                exclusion_reason = Some(error.to_string());
+                (Vec::new(), 0, AggregationStatus::Failed)
             }
             Err(error) => {
                 return Err(BootstrapError::Polymarket {
@@ -999,7 +1098,8 @@ async fn collect_activity_v2(
             aggregates,
             source_row_count,
             fetched_source_row_count,
-            aggregation_failed,
+            aggregation_status,
+            exclusion_reason,
         })
     }))
     .buffer_unordered(MAX_ACTIVITY_WALLET_FETCHES);
@@ -1136,6 +1236,18 @@ pub async fn collect_activity_v2_for_test(
 // venue rate-limited, is the supervised temporary failure (exit 75), the same
 // classification `clob.rs`/`events.rs` use; every completed wallet keeps its
 // durable receipt, so the retry fetches only the remainder.
+// A venue payload this collector cannot represent deterministically excludes
+// one wallet; transport failures and locally generated requests do not (#588).
+fn excludes_wallet(error: &ActivityReadError) -> bool {
+    matches!(
+        error,
+        ActivityReadError::Parse(_)
+            | ActivityReadError::Aggregate(_)
+            | ActivityReadError::Identity(_)
+            | ActivityReadError::RowOutsideBounds { .. }
+    )
+}
+
 fn activity_read_failure(wallet_hex: &str, error: ActivityReadError) -> BootstrapError {
     match error {
         ActivityReadError::Fetch {
@@ -1154,7 +1266,10 @@ fn activity_read_failure(wallet_hex: &str, error: ActivityReadError) -> Bootstra
 
 /// Seal a verified hash-qualified online backup as generation two.
 ///
-/// `PRAGMA quick_check` runs before mutation. A WAL backup is checkpointed
+/// `PRAGMA quick_check` runs before the first migration; a schema-two resume
+/// validates its manifest without a structural scan. Activation checks the
+/// resulting candidate, including any damage introduced during sealing.
+/// A WAL backup is checkpointed
 /// with `wal_checkpoint(TRUNCATE)` and must report `busy=0` and every frame
 /// checkpointed; otherwise migration refuses rather than guessing whether the
 /// main file contains the committed tail.
@@ -1180,7 +1295,6 @@ pub fn migrate_cache_v2(
     let found: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if found == CACHE_SCHEMA_VERSION_V2 {
         ensure_lane_a_v2_schema(&connection)?;
-        quick_check(&connection)?;
         checkpoint_truncate(&connection)?;
         let stored: Option<(String, i64, i64, i64)> = connection
             .query_row(
@@ -1214,7 +1328,7 @@ pub fn migrate_cache_v2(
         ));
     }
     verify_manifest_wal_binding(cache_path, &manifest)?;
-    quick_check(&connection)?;
+    quick_check(&connection, "migration_input", cache_path)?;
     checkpoint_truncate(&connection)?;
     require_reclamation_ready(&connection)?;
     if found != 0 && found != CACHE_SCHEMA_VERSION_V1 {
@@ -1263,7 +1377,6 @@ pub fn migrate_cache_v2(
     )?;
     transaction.pragma_update(None, "user_version", CACHE_SCHEMA_VERSION_V2)?;
     transaction.commit()?;
-    quick_check(&connection)?;
     checkpoint_truncate(&connection)?;
     connection.close().map_err(|(_, error)| error)?;
     sync_file_and_parent(cache_path)?;
@@ -1282,11 +1395,15 @@ struct WalletActivityCompletion {
     wallet_hex: String,
     pages: Vec<ReconciliationPageEvidence>,
     aggregates: Vec<ActivityAggregate>,
+    /// Why this wallet is excluded from the generation, when it is. A read that
+    /// failed while parsing has no page evidence to keep. This reason is also
+    /// the exclusion marker for legacy receipts without acquisition proofs.
+    exclusion_reason: Option<String>,
     /// Rows that entered `aggregates`; zero for a wallet excluded from the
     /// generation, whose `pages` still record the rows the venue returned.
     source_row_count: u64,
     fetched_source_row_count: u64,
-    aggregation_failed: bool,
+    aggregation_status: AggregationStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1301,6 +1418,9 @@ struct ActivityWalletReceiptProof {
     parser_version: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     acquisition: Option<ActivityAcquisition>,
+    /// Omitted for ordinary receipts to preserve their authentic proof bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exclusion_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1315,6 +1435,8 @@ enum ActivityReadMode {
 enum AggregationStatus {
     Complete,
     Failed,
+    /// Acquisition failed before complete page evidence or aggregation existed.
+    NotAttempted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1327,6 +1449,7 @@ enum ActivityDisposition {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ActivityExclusionReason {
+    AcquisitionFailure,
     AggregationFailure,
     CrossBoundaryCollision,
 }
@@ -1363,17 +1486,29 @@ struct ActivityAcquisition {
 impl ActivityWalletReceiptProof {
     fn excluded(&self) -> bool {
         self.acquisition.as_ref().map_or_else(
-            || is_excluded_receipt(self.aggregate_count, &self.pages),
+            || {
+                is_excluded_receipt(
+                    self.aggregate_count,
+                    &self.pages,
+                    self.exclusion_reason.as_deref(),
+                )
+            },
             |proof| proof.disposition == ActivityDisposition::Excluded,
         )
     }
 }
 
-/// A receipt whose pages carried rows that produced no aggregates: the wallet
-/// was excluded from its generation by `collect_activity_v2`. A wallet with no
-/// history has zero aggregates too, but its pages carry no rows.
-fn is_excluded_receipt(aggregate_count: u64, pages: &[ReconciliationPageEvidence]) -> bool {
-    aggregate_count == 0 && pages.iter().any(|page| page.row_count > 0)
+/// A wallet excluded from its generation by `collect_activity_v2`: its receipt
+/// records the reason, or (for receipts written before that column existed)
+/// carries page rows that produced no aggregates. A wallet with no history has
+/// zero aggregates too, but no reason and no page rows.
+fn is_excluded_receipt(
+    aggregate_count: u64,
+    pages: &[ReconciliationPageEvidence],
+    exclusion_reason: Option<&str>,
+) -> bool {
+    exclusion_reason.is_some()
+        || (aggregate_count == 0 && pages.iter().any(|page| page.row_count > 0))
 }
 
 fn retained_receipt_marker() -> Value {
@@ -1570,8 +1705,9 @@ fn commit_activity_wallet_v2(
         "INSERT INTO activity_wallet_coverage_staging_v2
              (generation, wallet_hex, reference_sha256, fixed_end_unix,
               page_evidence_json, ordered_aggregate_digest, source_row_count,
-              aggregate_count, schema_version, parser_version, completed_at_unix)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+              aggregate_count, schema_version, parser_version, completed_at_unix,
+              exclusion_reason)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          ON CONFLICT(generation, wallet_hex) DO UPDATE SET
              reference_sha256 = excluded.reference_sha256,
              fixed_end_unix = excluded.fixed_end_unix,
@@ -1581,7 +1717,8 @@ fn commit_activity_wallet_v2(
              aggregate_count = excluded.aggregate_count,
              schema_version = excluded.schema_version,
              parser_version = excluded.parser_version,
-             completed_at_unix = excluded.completed_at_unix
+             completed_at_unix = excluded.completed_at_unix,
+             exclusion_reason = excluded.exclusion_reason
          WHERE activity_wallet_coverage_staging_v2.reference_sha256 = excluded.reference_sha256
            AND activity_wallet_coverage_staging_v2.fixed_end_unix = excluded.fixed_end_unix
            AND activity_wallet_coverage_staging_v2.page_evidence_json = excluded.page_evidence_json
@@ -1589,7 +1726,9 @@ fn commit_activity_wallet_v2(
            AND activity_wallet_coverage_staging_v2.source_row_count = excluded.source_row_count
            AND activity_wallet_coverage_staging_v2.aggregate_count = excluded.aggregate_count
            AND activity_wallet_coverage_staging_v2.schema_version = excluded.schema_version
-           AND activity_wallet_coverage_staging_v2.parser_version = excluded.parser_version",
+           AND activity_wallet_coverage_staging_v2.parser_version = excluded.parser_version
+           AND COALESCE(activity_wallet_coverage_staging_v2.exclusion_reason, '')
+               = COALESCE(excluded.exclusion_reason, '')",
         params![
             generation_i64,
             completion.wallet_hex,
@@ -1602,6 +1741,7 @@ fn commit_activity_wallet_v2(
             i64::from(ACTIVITY_SCHEMA_VERSION),
             i64::from(ACTIVITY_PARSER_VERSION),
             completed_at_unix,
+            completion.exclusion_reason,
         ],
     )?;
     if changed != 1 {
@@ -1741,6 +1881,21 @@ fn validate_activity_receipts(
     Ok(completed)
 }
 
+// Read-only verification also accepts authentic caches predating #649.
+fn receipt_reason_column(connection: &Connection) -> Result<&'static str, BootstrapError> {
+    Ok(
+        if incremental::has_column(
+            connection,
+            "activity_wallet_coverage_staging_v2",
+            "exclusion_reason",
+        )? {
+            "exclusion_reason"
+        } else {
+            "NULL"
+        },
+    )
+}
+
 // Stream one receipt at a time through the same identity/shape checks for both
 // resume and full content validation. This owner never reads aggregate rows.
 fn visit_activity_receipts(
@@ -1762,10 +1917,11 @@ fn visit_activity_receipts(
     } else {
         "NULL"
     };
+    let reason = receipt_reason_column(connection)?;
     let mut statement = connection.prepare(&format!(
         "SELECT wallet_hex, reference_sha256, fixed_end_unix, page_evidence_json,
                 ordered_aggregate_digest, source_row_count, aggregate_count,
-                schema_version, parser_version, {acquisition}
+                schema_version, parser_version, {acquisition}, {reason}
          FROM activity_wallet_coverage_staging_v2 WHERE generation = ?1 ORDER BY wallet_hex"
     ))?;
     let mut rows = statement.query(params![generation_i64])?;
@@ -1938,7 +2094,7 @@ fn completed_activity_manifest(
     fixed_end_unix: i64,
     wallets: &[String],
 ) -> Result<Option<ActivityCoverageManifestV2>, BootstrapError> {
-    let Some(manifest) = read_manifest(connection, generation)? else {
+    let Some(manifest) = stored_activity_manifest(connection, generation)? else {
         return Ok(None);
     };
     verify_activity_manifest(
@@ -1948,6 +2104,60 @@ fn completed_activity_manifest(
         fixed_end_unix,
         wallets,
     )?;
+    Ok(Some(manifest))
+}
+
+fn stored_activity_manifest(
+    connection: &Connection,
+    generation: u64,
+) -> Result<Option<ActivityCoverageManifestV2>, BootstrapError> {
+    let stored = connection
+        .query_row(
+            "SELECT reference_sha256, wallet_count, receipt_set_digest, aggregate_digest,
+                    source_row_count, source_bounds_json, cursors_json, page_hashes_json,
+                    group_count, schema_version, parser_version, completed_at_unix
+             FROM activity_coverage_manifests_v2 WHERE generation = ?1",
+            params![to_i64(generation, "activity generation")?],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, i64>(11)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some(stored) = stored else {
+        return Ok(None);
+    };
+    let manifest = ActivityCoverageManifestV2 {
+        generation,
+        reference_sha256: stored.0,
+        wallet_count: to_u64(stored.1, "activity wallet count")?,
+        receipt_set_digest: stored.2,
+        aggregate_digest: stored.3,
+        source_row_count: to_u64(stored.4, "activity source-row count")?,
+        source_bounds: serde_json::from_str(&stored.5)?,
+        cursors: serde_json::from_str(&stored.6)?,
+        page_hashes: serde_json::from_str(&stored.7)?,
+        group_count: to_u64(stored.8, "activity group count")?,
+        schema_version: u32::try_from(stored.9).map_err(|_| BootstrapError::Invalid {
+            message: "invalid activity schema version".to_owned(),
+        })?,
+        parser_version: u32::try_from(stored.10).map_err(|_| BootstrapError::Invalid {
+            message: "invalid activity parser version".to_owned(),
+        })?,
+        completed_at_unix: stored.11,
+    };
     Ok(Some(manifest))
 }
 
@@ -2380,12 +2590,10 @@ fn rebuild_ranker_projection(
     Ok((count, digest))
 }
 
-fn ranker_projection_digest(
-    connection: &Connection,
-    activity_generation: u64,
-) -> Result<String, BootstrapError> {
-    let mut statement = connection.prepare(
-        "SELECT ranker.source_trade_id, ranker.activity_generation,
+// Keep the projection as the outer loop even with stale SQLite statistics.
+// Reordering these joins could traverse all activity covered by payout evidence.
+const RANKER_PROJECTION_DIGEST_SQL: &str =
+    "SELECT ranker.source_trade_id, ranker.activity_generation,
                 ranker.classifier_version, groups_v2.wallet_hex,
                 groups_v2.condition_id, groups_v2.asset, groups_v2.outcome_id,
                 groups_v2.side, groups_v2.share_amount_str,
@@ -2393,14 +2601,19 @@ fn ranker_projection_digest(
                 groups_v2.source_usdc_amount_str, groups_v2.source_time_unix,
                 payout.payout_vector_json, payout.end_date_unix
          FROM ranker_entries_v2 ranker
-         JOIN activity_groups_v2 groups_v2
+         CROSS JOIN activity_groups_v2 groups_v2
            ON groups_v2.source_trade_id = ranker.source_trade_id
           AND groups_v2.coverage_generation = ranker.activity_generation
-         JOIN clob_payout_evidence_v2 payout
+         CROSS JOIN clob_payout_evidence_v2 payout
            ON payout.market_id = groups_v2.condition_id
          WHERE ranker.activity_generation = ?1
-         ORDER BY ranker.source_trade_id",
-    )?;
+         ORDER BY ranker.source_trade_id";
+
+fn ranker_projection_digest(
+    connection: &Connection,
+    activity_generation: u64,
+) -> Result<String, BootstrapError> {
+    let mut statement = connection.prepare(RANKER_PROJECTION_DIGEST_SQL)?;
     let rows = statement.query_map(
         params![to_i64(activity_generation, "activity generation")?],
         |row| {
@@ -2429,7 +2642,67 @@ fn ranker_projection_digest(
     Ok(digest.finish())
 }
 
-/// Close and seal a complete v2 side cache, then emit a hash-bound stage record.
+fn verify_reusable_ranker_projection(
+    connection: &Connection,
+    payout_generation: i64,
+    projection_count: Option<i64>,
+    projection_digest: Option<String>,
+) -> Result<(u64, u64, String), BootstrapError> {
+    let (Some(projection_count), Some(projection_digest)) = (projection_count, projection_digest)
+    else {
+        return invalid(
+            "finalized cache omitted its recorded projection count or digest".to_owned(),
+        );
+    };
+    let stored: Option<String> = connection.query_row(
+        "SELECT ranker_projection_inputs_json FROM cache_v2_migration_state WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    let stored = stored.ok_or_else(|| BootstrapError::Invalid {
+        message: "finalized ranker projection input binding is missing".to_owned(),
+    })?;
+    let recorded: RankerProjectionInputs =
+        serde_json::from_str(&stored).map_err(|error| BootstrapError::Invalid {
+            message: format!("finalized ranker projection input binding is invalid: {error}"),
+        })?;
+    let identity = activity_identity(connection)?;
+    let manifest = stored_activity_manifest(connection, identity.generation)?.ok_or_else(|| {
+        BootstrapError::Invalid {
+            message: "finalized cache omitted its activity manifest".to_owned(),
+        }
+    })?;
+    let current =
+        RankerProjectionInputs::read(connection, &manifest, &identity, payout_generation)?;
+    // The durable binding proves activity identity/manifest, payout coverage
+    // and eligibility inputs unchanged; recheck only projected rows and their
+    // joined content. Missing proof, changed inputs or count/digest mismatch
+    // refuses reuse. The caller rebuilds instead when a recorded classifier
+    // version differs from current.
+    if current != recorded {
+        return invalid("finalized ranker projection input binding changed (activity identity/manifest or payout coverage/evidence)".to_owned());
+    }
+    let actual_count = count_rows(connection, "ranker_entries_v2")?;
+    if actual_count != projection_count {
+        return invalid(format!(
+            "finalized ranker projection count mismatch: recorded={projection_count}, actual={actual_count}"
+        ));
+    }
+    let actual_digest = ranker_projection_digest(connection, manifest.generation)?;
+    if actual_digest != projection_digest {
+        return invalid("finalized ranker projection digest mismatch".to_owned());
+    }
+    Ok((
+        manifest.generation,
+        to_u64(actual_count, "ranker projection count")?,
+        actual_digest,
+    ))
+}
+
+/// Finalize a complete v2 side cache and emit a hash-bound stage record.
+/// First finalization and classifier upgrades validate activity and rebuild the
+/// projection. Reuse verifies unchanged inputs and the projection count/digest;
+/// activation validates complete content and structural health before installation.
 pub fn finalize_cache_v2(
     cache_path: &Path,
     stage_record_path: &Path,
@@ -2438,7 +2711,6 @@ pub fn finalize_cache_v2(
     let mut connection = open_existing_rw(cache_path)?;
     require_schema(&connection, CACHE_SCHEMA_VERSION_V2)?;
     ensure_lane_a_v2_schema(&connection)?;
-    quick_check(&connection)?;
     let sealed_generation = required_max(&connection, "sealed_generation_manifests", "generation")?;
     let payout_generation = required_max(
         &connection,
@@ -2447,25 +2719,54 @@ pub fn finalize_cache_v2(
     )?;
     verify_payout_coverage(&connection, payout_generation)?;
     let transaction = connection.transaction()?;
-    let activity_manifest = install_activity_manifest(&transaction, finalized_at_unix)?;
-    let wallets = activity_identity(&transaction)?.wallets;
-    let (ranker_projection_count, ranker_projection_digest) =
-        rebuild_ranker_projection(&transaction, activity_manifest.generation, &wallets)?;
-    transaction.execute(
-        "UPDATE cache_v2_migration_state
-         SET phase = 'finalized', ranker_projection_count = ?1,
-             ranker_projection_digest = ?2, ranker_classifier_version = ?3,
-             updated_at_unix = ?4 WHERE singleton = 1",
-        params![
-            to_i64(ranker_projection_count, "ranker projection count")?,
-            ranker_projection_digest,
-            i64::from(RANKER_CLASSIFIER_VERSION),
-            finalized_at_unix,
-        ],
-    )?;
+    let state: FinalizedProjectionState = transaction
+        .query_row(
+            "SELECT phase, ranker_projection_count, ranker_projection_digest,
+                ranker_classifier_version
+         FROM cache_v2_migration_state WHERE singleton = 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()?
+        .ok_or_else(|| BootstrapError::Invalid {
+            message: "cache omitted its migration state".to_owned(),
+        })?;
+    let (activity_generation, ranker_projection_count, ranker_projection_digest) =
+        if state.0 == "finalized" && state.3 == Some(i64::from(RANKER_CLASSIFIER_VERSION)) {
+            verify_reusable_ranker_projection(&transaction, payout_generation, state.1, state.2)?
+        } else if state.0 == "finalized" && state.3.is_none() {
+            return invalid("finalized ranker projection classifier version is missing".to_owned());
+        } else {
+            let activity_manifest = install_activity_manifest(&transaction, finalized_at_unix)?;
+            let identity = activity_identity(&transaction)?;
+            let (count, digest) = rebuild_ranker_projection(
+                &transaction,
+                activity_manifest.generation,
+                &identity.wallets,
+            )?;
+            let inputs = RankerProjectionInputs::read(
+                &transaction,
+                &activity_manifest,
+                &identity,
+                payout_generation,
+            )?;
+            transaction.execute(
+                "UPDATE cache_v2_migration_state
+                 SET phase = 'finalized', ranker_projection_count = ?1,
+                     ranker_projection_digest = ?2, ranker_classifier_version = ?3,
+                     updated_at_unix = ?4, ranker_projection_inputs_json = ?5 WHERE singleton = 1",
+                params![
+                    to_i64(count, "ranker projection count")?,
+                    digest,
+                    i64::from(RANKER_CLASSIFIER_VERSION),
+                    finalized_at_unix,
+                    canonical_json(&inputs)?,
+                ],
+            )?;
+            (activity_manifest.generation, count, digest)
+        };
     transaction.commit()?;
     checkpoint_truncate(&connection)?;
-    quick_check(&connection)?;
     connection.close().map_err(|(_, error)| error)?;
     reject_nonempty_sidecars(cache_path)?;
     sync_file_and_parent(cache_path)?;
@@ -2475,7 +2776,7 @@ pub fn finalize_cache_v2(
         cache_sha256: sha256_file(cache_path)?,
         schema_version: CACHE_SCHEMA_VERSION_V2,
         sealed_generation: to_u64(sealed_generation, "sealed generation")?,
-        activity_coverage_generation: activity_manifest.generation,
+        activity_coverage_generation: activity_generation,
         payout_coverage_generation: to_u64(payout_generation, "payout generation")?,
         ranker_projection_count,
         ranker_projection_digest,
@@ -2580,7 +2881,7 @@ pub fn stage_cache_cycle_v2(
     } else {
         let current = open_existing_rw(fixed_path)?;
         checkpoint_truncate(&current)?;
-        quick_check(&current)?;
+        quick_check(&current, "staging_fixed", fixed_path)?;
         current.close().map_err(|(_, error)| error)?;
         let fixed_sha256 = sha256_file(fixed_path)?;
         copy_file_atomic_verified(fixed_path, prior_path, Some(&fixed_sha256))?;
@@ -2854,7 +3155,7 @@ pub fn activate_cache_v2_with_handoff(
         let prior_cache_schema = verified_cache_schema(&request.prior_cache_backup_path)?;
         let installed = open_existing_ro(&request.fixed_path)?;
         require_schema(&installed, CACHE_SCHEMA_VERSION_V2)?;
-        quick_check(&installed)?;
+        quick_check(&installed, "activation_missing_side", &request.fixed_path)?;
         verify_finalized_v2_manifests(&installed, ClassifierGeneration::Current)?;
         installed.close().map_err(|(_, error)| error)?;
         reject_nonempty_sidecars(&request.fixed_path)?;
@@ -2881,7 +3182,6 @@ pub fn activate_cache_v2_with_handoff(
 
     let current = open_existing_rw(&request.fixed_path)?;
     checkpoint_truncate(&current)?;
-    quick_check(&current)?;
     let current_version: i64 =
         current.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match current_version {
@@ -2917,7 +3217,11 @@ pub fn activate_cache_v2_with_handoff(
             ));
         }
     } else {
-        preserve_main_and_sidecars(&request.fixed_path, &request.prior_cache_backup_path)?;
+        preserve_main_and_sidecars(
+            &request.fixed_path,
+            &request.prior_cache_backup_path,
+            &prior_cache_sha256,
+        )?;
     }
     if verified_cache_schema(&request.prior_cache_backup_path)? != current_version {
         return invalid("prior-cache backup schema changed during activation".to_owned());
@@ -2930,7 +3234,7 @@ pub fn activate_cache_v2_with_handoff(
     reject_nonempty_activation_sidecars(&request.side_path)?;
     let side = open_existing_ro(&request.side_path)?;
     require_schema(&side, CACHE_SCHEMA_VERSION_V2)?;
-    quick_check(&side)?;
+    quick_check(&side, "activation_candidate", &request.side_path)?;
     verify_finalized_v2_manifests(&side, ClassifierGeneration::Current)?;
     side.close().map_err(|(_, error)| error)?;
     // The read-only validation of a WAL-mode main may itself allocate an SHM index. With the
@@ -3040,6 +3344,11 @@ pub async fn restore_prior_cache(
     {
         return invalid("prior cache does not match its recorded schema/hash".to_owned());
     }
+    // Check the immutable replacement before displacing anything. Post-rename
+    // hash equality transfers this proof without scanning unchanged bytes again.
+    let prior = open_immutable(prior_cache_backup_path)?;
+    quick_check(&prior, "restore_prior", prior_cache_backup_path)?;
+    prior.close().map_err(|(_, error)| error)?;
     require_same_device(
         fixed_path,
         prior_cache_backup_path,
@@ -3048,17 +3357,17 @@ pub async fn restore_prior_cache(
     if fixed_path.is_file() {
         let current = open_existing_rw(fixed_path)?;
         checkpoint_truncate(&current)?;
-        quick_check(&current)?;
         current.close().map_err(|(_, error)| error)?;
+        let displaced_sha256 = sha256_file(fixed_path)?;
         if displaced_cache_backup_path.exists() {
-            if sha256_file(displaced_cache_backup_path)? != sha256_file(fixed_path)? {
+            if sha256_file(displaced_cache_backup_path)? != displaced_sha256 {
                 return invalid(format!(
                     "existing displaced-cache backup differs from the fixed cache: {}",
                     displaced_cache_backup_path.display()
                 ));
             }
         } else {
-            preserve_main_and_sidecars(fixed_path, displaced_cache_backup_path)?;
+            preserve_main_and_sidecars(fixed_path, displaced_cache_backup_path, &displaced_sha256)?;
         }
     }
     remove_sidecars(fixed_path)?;
@@ -3227,13 +3536,26 @@ fn verify_manifest_wal_binding(
 /// agreement and UNIQUE validation are not verified here; on Forge's
 /// production cache (150 GB, 275 million trades, four trade indexes) one full
 /// check exceeded seven hours, which no per-cycle step can afford (#643).
-fn quick_check(connection: &Connection) -> Result<(), BootstrapError> {
-    let result: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
-    if result == "ok" {
-        Ok(())
-    } else {
-        invalid(format!("SQLite quick_check failed: {result}"))
-    }
+fn quick_check(connection: &Connection, role: &str, path: &Path) -> Result<(), BootstrapError> {
+    // Metadata is diagnostic only: a stat failure must not replace the pragma's error.
+    let file_size_bytes = std::fs::metadata(path).ok().map(|metadata| metadata.len());
+    let started = Instant::now();
+    let result = connection.query_row::<String, _, _>("PRAGMA quick_check", [], |row| row.get(0));
+    let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let result = match result {
+        Ok(result) if result == "ok" => Ok(()),
+        Ok(result) => invalid(format!("SQLite quick_check failed: {result}")),
+        Err(error) => Err(error.into()),
+    };
+    tracing::info!(
+        role,
+        path = %path.display(),
+        file_size_bytes,
+        elapsed_ms,
+        success = result.is_ok(),
+        "SQLite quick_check completed"
+    );
+    result
 }
 
 fn ensure_lane_a_v2_schema(connection: &Connection) -> Result<(), BootstrapError> {
@@ -3301,7 +3623,17 @@ fn ensure_lane_a_v2_schema(connection: &Connection) -> Result<(), BootstrapError
         ),
         (
             "cache_v2_migration_state",
+            "ranker_projection_inputs_json",
+            "TEXT NULL",
+        ),
+        (
+            "cache_v2_migration_state",
             "fresh_collection_json",
+            "TEXT NULL",
+        ),
+        (
+            "activity_wallet_coverage_staging_v2",
+            "exclusion_reason",
             "TEXT NULL",
         ),
         ("clob_payout_evidence_v2", "end_date_unix", "INTEGER NULL"),
@@ -3372,7 +3704,8 @@ fn require_schema(connection: &Connection, expected: i64) -> Result<(), Bootstra
 }
 
 /// Schema of a checkpointed, hash-bound main, read in immutable mode so the
-/// check creates no sidecar beside it.
+/// validation creates no sidecar beside it. Schema/manifest validation does not
+/// certify structural health; restore checks its input explicitly before rename.
 fn verified_cache_schema(path: &Path) -> Result<i64, BootstrapError> {
     let connection = open_immutable(path)?;
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -3383,7 +3716,6 @@ fn verified_cache_schema(path: &Path) -> Result<i64, BootstrapError> {
         }
         other => return invalid(format!("prior cache has unsupported schema {other}")),
     }
-    quick_check(&connection)?;
     connection.close().map_err(|(_, error)| error)?;
     Ok(version)
 }
@@ -3818,14 +4150,18 @@ fn remove_sidecars(path: &Path) -> Result<(), BootstrapError> {
     Ok(())
 }
 
-fn preserve_main_and_sidecars(source: &Path, target: &Path) -> Result<(), BootstrapError> {
+fn preserve_main_and_sidecars(
+    source: &Path,
+    target: &Path,
+    expected_main_sha256: &str,
+) -> Result<(), BootstrapError> {
     if target.exists() {
         return invalid(format!(
             "immutable backup target exists: {}",
             target.display()
         ));
     }
-    copy_file_atomic(source, target)?;
+    copy_file_atomic_verified(source, target, Some(expected_main_sha256))?;
     for suffix in ["-wal", "-shm"] {
         let source_sidecar = sidecar_path(source, suffix);
         if source_sidecar.exists() {
@@ -3925,7 +4261,67 @@ fn invalid<T>(message: String) -> Result<T, BootstrapError> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod publication_json_tests {
-    use super::python_canonical_json;
+    use super::{
+        RANKER_PROJECTION_DIGEST_SQL, ensure_lane_a_v2_schema, pending_path_for,
+        preserve_main_and_sidecars, python_canonical_json,
+    };
+
+    #[test]
+    fn projection_digest_looks_up_activity_by_projected_key_with_stale_statistics() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.db");
+        drop(crate::cache::WalletCache::open(&path).unwrap());
+        let connection = rusqlite::Connection::open(&path).unwrap();
+        ensure_lane_a_v2_schema(&connection).unwrap();
+        // Cardinalities can outlive the prior's projection after a fresh
+        // collection. With ordinary inner joins these statistics let SQLite
+        // walk payout markets and their activity before checking the projection.
+        connection
+            .execute_batch(
+                "ANALYZE;
+             DELETE FROM sqlite_stat1;
+             INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+               ('ranker_entries_v2', 'sqlite_autoindex_ranker_entries_v2_1', '1000000 1'),
+               ('activity_groups_v2', 'sqlite_autoindex_activity_groups_v2_1', '100 1'),
+               ('clob_payout_evidence_v2', 'sqlite_autoindex_clob_payout_evidence_v2_1', '10 1');
+             ANALYZE sqlite_schema;",
+            )
+            .unwrap();
+        let plan = connection
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {RANKER_PROJECTION_DIGEST_SQL}"
+            ))
+            .unwrap()
+            .query_map([7], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(plan[0].starts_with("SCAN ranker"), "{plan:?}");
+        assert!(
+            plan.iter()
+                .any(|step| step.starts_with("SEARCH groups_v2")
+                    && step.contains("(source_trade_id=?)")),
+            "activity reads must be keyed by projection rows: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|step| step.starts_with("SCAN groups_v2")),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn backup_hash_mismatch_never_adopts_target_or_retains_pending_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.db");
+        let target = dir.path().join("prior.db");
+        std::fs::write(&source, b"source bytes").unwrap();
+        std::fs::write(pending_path_for(&target), b"interrupted copy").unwrap();
+        let error = preserve_main_and_sidecars(&source, &target, &"0".repeat(64)).unwrap_err();
+        assert!(error.to_string().contains("staged copy hash mismatch"));
+        assert!(!target.exists());
+        assert!(!pending_path_for(&target).exists());
+        assert_eq!(std::fs::read(&source).unwrap(), b"source bytes");
+    }
 
     #[test]
     fn matches_python_json_float_spelling_at_scientific_thresholds() {

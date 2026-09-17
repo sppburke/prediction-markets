@@ -556,10 +556,11 @@ pe-bootstrap cache-finalize-v2 \
 ```
 
 Frozen verification precedes all activity I/O. Each completed wallet commits its aggregates and
-receipt together; restart schedules only missing exact receipts, and finalization requires the
-receipt set to equal the frozen universe before atomically installing the bounded activity manifest,
-retaining that generation's receipt rows (the storage marker is defined in `_GLOSSARY.md`).
-Completion, finalization, activation and restore validate aggregates one wallet at a time with
+receipt together; restart schedules only missing exact receipts. Collection completion validates the
+complete receipt set and aggregate content and installs the bounded activity manifest in the same
+transaction, retaining receipt rows (the storage marker is defined in `_GLOSSARY.md`). This requires
+no payout or classification, so another activity generation can start immediately.
+Completion, first finalization, activation and restore validate aggregates one wallet at a time with
 unchanged aggregate/receipt digests; Rust and Parquet projection verification stream their ordered rows.
 Finalization also verifies payout coverage, builds the Rust ledger/classifier
 projection, and records its count and digest.
@@ -568,13 +569,29 @@ installed yet) validates receipt identity, shape and count constraints without r
 aggregate content; invalid receipts fail before source I/O.
 Because wallet writes are atomic, completed-wallet content corruption (such as a deleted
 group with its receipt intact) is detected at collection completion instead of restart,
-and full content validation remains mandatory at completion and finalization.
+and full content validation remains mandatory at completion and first finalization.
 
 Rank and cut over through the one publication path. This snapshots the current published batch,
 exports and verifies the schema-two Parquet projection, computes the minute-price rerank and exact
 diff, durably prepares the publication request, activates the side cache, then resumes that exact
 request. The targeted price-store write is re-finalized before request preparation so the stage
-hash covers the installed bytes:
+hash covers the installed bytes.
+Refinalization reuses the projection only when the finalized database's saved activity generation,
+reference, aggregate and manifest digests, payout generation/coverage and evidence digest, and
+classifier version are unchanged, and the existing projection's recomputed count and digest match
+the recorded values; missing or changed proof refuses reuse. A different recorded classifier
+version instead runs full activity verification and rebuilds the projection with the current
+classifier. First finalization still validates the complete receipts and activity before building
+the projection.
+Reuse skips that activity-generation verification and reclassification. The payout evidence digest
+streams every evidence row in market-ID order, binding `market_id`, `end_date_unix`, `payout_status`,
+and `payout_vector_json`, including markets currently excluded from the projection. It covers the
+entire payout table because the rebuild's eligibility query has no generation filter. Projection
+digest recomputation walks the projection and looks up its activity rows by source-trade key;
+the join order prevents SQLite from choosing a full activity traversal. It retains payout coverage
+verification, checkpointing, sidecar checks, the full-file hash and the stage-record write. Receipt or activity
+corruption outside the projected values introduced after first finalization is detected by
+activation's unchanged full manifest/content validation, before replacing the fixed cache:
 
 ```bash
 PE_PYTHON="$PE_PYTHON" bash scripts/rank_and_push.sh \
@@ -659,24 +676,24 @@ for wallets with usable predecessor history. New wallets and previous exclusions
 Generation numbers may have gaps; carry always uses the recorded predecessor generation.
 
 Admission preserves activity rows, receipts and historical manifests, clears the derived projection
-and invalidates finalization. Each successful wallet atomically re-stamps its verified predecessor
-rows, strictly inserts delta rows and commits complete-history counts/digest plus acquisition proof.
+and its recorded `ranker_projection_inputs_json` binding and invalidates finalization. Each successful
+wallet atomically re-stamps its verified predecessor rows, strictly inserts delta rows and commits complete-history counts/digest plus acquisition proof.
 The bounded carry batches use the existing wallet/time/ID index and advance by key; all batches stay
 in one wallet transaction. A full read replaces every retained row for that wallet, including an empty
-replacement. Collection installs its completed manifest independently of payout and classification,
-so another activity generation can start immediately. Historical manifests in the mutated candidate
-are commitments, not physical snapshots; retain the immutable prior for restore.
+replacement. Historical manifests in the mutated candidate are commitments, not physical snapshots; retain the immutable prior for restore.
 
 A retry resumes the exact recorded bounds and lists and fetches only wallets without a valid receipt.
 Receipt-only startup validates proof metadata without reading completed wallets' aggregates;
-completion and finalization verify the content. A completed generation returns the same manifest
+completion and first finalization verify the content. A completed generation returns the same manifest
 without source calls or a new clock. Authentic version-1 roots resume without rewriting their
 identity or receipt bytes; their identity is archived when a successor starts. Storage version,
 aggregate and projection digest encodings, and generation-equality consumers remain unchanged.
 
-A wallet with unbucketable activity or a cross-boundary ID collision is excluded from this generation.
+A wallet whose history cannot be parsed, identified, bounded or bucketed, or has a cross-boundary ID
+collision, is excluded from this generation.
 The warning names the wallet and stable reason, and completion reports the excluded count. Its
-receipt retains actual read evidence but certifies empty resulting history; older rows stay untouched
+receipt retains actual read evidence when available; a failed acquisition records an explicit reason
+and no complete page evidence. The receipt certifies empty resulting history; older rows stay untouched
 and produce no current projection entries. Resume skips the exclusion; the next generation includes
 that wallet for a full read. Equal-revision collisions also exclude. Missing predecessor proof,
 foreign-wallet collisions or unreceipted current rows are fatal cache errors.
@@ -696,6 +713,50 @@ retains the shared paced fetcher, bounded reads/channel and single writer from #
 from #645. Exhausted transient source retries still exit `rank_and_push_tempfail_exit`; permanent
 errors stop the cycle. Payout, finalization, activation, restore and exact-request validation retain
 their existing contracts.
+
+**Structural checks (#643 step 2).** Each uninterrupted recurring cycle runs two
+`PRAGMA quick_check` scans (previously eight): the checkpointed fixed main under the
+staging lock, then the finalized candidate immediately before activation. Initial
+schema-one cutover runs three (previously ten), adding the first-migration input check
+because standalone backups have no structural-check provenance; schema-two migration
+resume and both finalizations run none. Missing-side activation recovery runs one per
+attempt (previously two) on the matching-hash installed main, because a missing side
+file does not prove activation already checked it; restore runs one (previously three)
+on the immutable prior after hash/schema validation and before any displacement.
+
+Finalization certifies exact bytes and activity, payout and projection evidence, not
+every SQLite page. Damage outside those reads may now survive migration resume, the
+post-seal step and either finalization, wasting private collection/ranking work before
+activation refuses installation; fault localization is consequently later. Outgoing
+and retained backups keep hash/schema/manifest validation, and fallback backup and
+displaced audit copies are explicitly hash-verified, but may contain preexisting damage:
+the prior's restore-time check decides whether it is eligible for restoration, and
+post-rename hash equality carries that proof without another scan. All checkpoints,
+sidecar rejection, receipt/content digests, locks and publication gates remain in place;
+hash equality proves byte identity, not health. `quick_check` itself does not check
+UNIQUE constraints or index-to-table agreement; no routine full `integrity_check` is added.
+
+With `RUST_LOG=info` (or `pe_bootstrap::cache_migration=info`) in the loop environment,
+each completed check emits one JSON event to stderr, inherited by the loop journal
+(`journalctl --user -u pe-rank-loop`), with `role`, `path`, `file_size_bytes`, integer
+`elapsed_ms` and `success`. Duration measures only the pragma, excluding copying,
+hashing, collection and ranking; interrupted checks have no completion event, so their
+duration is unknown. Staging stdout remains the single report in
+`$OUT_DIR/cache_stage.json`; `$OUT_DIR/cache_build_manifest.json` and
+`$OUT_DIR/cache_stage_record.json` keep their existing hash-bound contracts.
+The supplied 18.5 MB/s measurement projects about 9.5 hours per 630 GB scan, reducing
+recurring structural-check time from about 76 to 19 hours; this is an estimate until
+journal measurements establish actual durations, and establishes no total freshness bound.
+
+Deploy a validated binary and scripts only through `scripts/deploy/forge_pause.sh pause`
+and `restore`, after confirming the recorded paused state, stopped descendants and
+released locks. Resume the same cycle with unchanged fixed/prior/candidate paths and
+bytes, committed WAL, collection generation/end/wallet union/digest, receipts,
+parser/classifier versions, payout target, cycle configuration, activation batch,
+cycle/pending pointers and prepared request; do not restage, reseal, clear receipts or
+advance an unfinished generation. Binary/script rollback uses the same pause/restore
+lifecycle; the structural-check change requires no database migration, freshness override or
+event/replay change.
 
 The zero-argument `rank_and_push.sh` production cycle enters this lane automatically when
 the installed cache is schema two, and for the one-time initial cutover when `.env` sets
@@ -737,6 +798,9 @@ completed prior is never rewritten and a candidate without its prior is refused.
 existing locked prior-hash comparison at activation refuses a fixed cache changed after the
 prior was captured; resume with the recorded candidate and prior, or, only while no request
 has been prepared, abandon the cycle as described under recovery states and start a new one.
+
+After successful publication and pointer clearing, the production candidate lane retains every file of the current cycle (including its prior rollback copy) and deletes only regular files named `wallet_cache.cron-<YYYYMMDDTHHMMSSZ>.{prior,side,displaced}.db` and their `-wal`/`-shm` sidecars for other cycles in the physical cache directory, logging each deletion's size or that nothing was deleted.
+Retention skips while any cycle pointer, pending publication pointer or `.forge_pause.json` record remains, never runs at the prepare boundary, and never deletes the installed cache, its inode aliases, symlinks, paths containing `..` or names outside that exact pattern; repeated runs are safe.
 
 **Initial cutover and acceptance.** Complete any outstanding schema-one cycle and its
 publication first. Create the two aliases, check free space for two additional copies of
@@ -858,11 +922,6 @@ exit-2 failures are not acceptance. Record measured costs and the source timesta
 After operator acceptance, set `PE_RANK_SCHEMA_TWO_CUTOVER=1`, run `bash scripts/rank_and_push.sh` to
 activate/publish the exact pending request, then `bash scripts/deploy/forge_pause.sh restore` to restore
 the recorded supervisor state. Require one real recurring publication before closing the handoff.
-The #643 branch separately owns fewer whole-cache checks, prior retention and second-finalization
-projection reuse. This change only invalidates finalization on admission/replacement and installs
-activity coverage earlier; any #643 reuse must bind the current activity proof, payout coverage and
-classifier, and preserve this cycle's recovery prior. Recheck those integration points on the combined
-revision; do not infer reuse from historical commitments or a pre-mutation artifact hash.
 
 ### Continuous Forge supervisor
 

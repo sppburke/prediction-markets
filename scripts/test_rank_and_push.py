@@ -1679,6 +1679,137 @@ finally:
             self.assertEqual(self._bootstrap_ops(), before)
             self.assertEqual(fixed.read_bytes(), fixed_bytes)
 
+    def test_missing_pointer_recovery_publishes_and_runs_retention_for_both_entries(self):
+        for args in [(), ("--resume-pending",)]:
+            with self.subTest(args=args):
+                self.tearDown(); self.setUp()
+                fixed = self._prepare_incremental_fixture()
+                older = self._seed_old_cache_copies(fixed.parent)
+                prepared = self._run()
+                self.assertEqual(prepared.returncode, 2, prepared.stderr)
+                self._assert_cache_copies(older)
+                pending = self.root / "data/eval-results/rank_and_push.pending"
+                cycle = self.root / Path(pending.read_text().strip()).parent
+                before = self._bootstrap_ops()
+                pending.unlink()
+                with (self.root / ".env").open("a") as handle:
+                    handle.write("PE_RANK_SCHEMA_TWO_CUTOVER=1\n")
+                result = self._run(*args)
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                self.assertIn("RANK_AND_PUSH_RECOVERED_REQUEST=", result.stdout)
+                self.assertEqual(self._bootstrap_ops()[len(before):], ["cache-activate"])
+                accepted = json.loads((cycle / "accepted_cycle_manifest.json").read_text())
+                self.assertEqual(accepted["cache_schema"], 2)
+                self.assertFalse(pending.exists())
+                self.assertFalse((self.root / "data/eval-results/rank_and_push.cycle").exists())
+                self.assertTrue(all(not path.exists() for path in older))
+                self.assertIn("[cache-retention] deleted", result.stdout)
+                self.assertTrue((fixed.parent / f"wallet_cache.{cycle.name}.prior.db").is_file())
+
+    def _seed_old_cache_copies(self, physical):
+        copies = {}
+        for role in ("prior", "side", "displaced"):
+            for suffix in ("", "-wal", "-shm"):
+                path = physical / f"wallet_cache.cron-20000101T000000Z.{role}.db{suffix}"
+                copies[path] = f"old {role}{suffix}".encode()
+                path.write_bytes(copies[path])
+        return copies
+
+    def _assert_cache_copies(self, copies):
+        for path, content in copies.items():
+            self.assertEqual(path.read_bytes(), content, str(path))
+
+    def test_completed_cycle_retention_is_exact_and_repeatable(self):
+        fixed = self._install_candidate_layout(schema=2)
+        self._install_candidate_stub()
+        older = self._seed_old_cache_copies(fixed.parent)
+        kept = {}
+        for name in ("wallet_cache.db.bak", "wallet_cache.cron-old.prior.db",
+                     "wallet_cache.cron-20000101T000000Z.prior.db.pending",
+                     "wallet_cache.cron-20000101T000000Z.prior.db-journal",
+                     "wallet_cache.cron-20000101T000000Z.side.db.lock",
+                     "wallet_cache..prior.db"):
+            path = fixed.parent / name
+            kept[path] = b"unrelated"
+            path.write_bytes(kept[path])
+        outside = self.root / "outside.db"
+        outside.write_bytes(b"outside target")
+        link = fixed.parent / "wallet_cache.cron-20000102T000000Z.prior.db"
+        link.symlink_to(outside)
+        alias = fixed.parent / "wallet_cache.cron-20000102T000000Z.side.db"
+        # Link the installed inode after activation below: it must never be deleted.
+        directory = fixed.parent / "wallet_cache.cron-20000102T000000Z.displaced.db"
+        directory.mkdir()
+        (directory / "keep").write_bytes(b"directory")
+
+        first = self._run(exit_env={"STUB_PUSH_EXIT": "75"})
+        self.assertEqual(first.returncode, 75, first.stderr + first.stdout)
+        self._assert_cache_copies(older)
+        pending = self.root / "data/eval-results/rank_and_push.pending"
+        pointer_bytes = pending.read_bytes()
+        out = self.root / Path(pointer_bytes.decode().strip()).parent
+        for role in ("prior", "side", "displaced"):
+            for suffix in ("", "-wal", "-shm"):
+                if role == "side" and not suffix:
+                    continue  # Activation consumes the candidate main before retention.
+                path = fixed.parent / f"wallet_cache.{out.name}.{role}.db{suffix}"
+                if not path.exists():
+                    path.write_bytes(b"current cycle")
+                kept[path] = path.read_bytes()
+        resumed = self._run("--resume-pending")
+        self.assertEqual(resumed.returncode, 0, resumed.stderr + resumed.stdout)
+        self.assertTrue(all(not path.exists() for path in older))
+        for path, content in older.items():
+            self.assertIn(f"deleted {path} freed_size_bytes={len(content)}", resumed.stdout)
+        self._assert_cache_copies(kept)
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(outside.read_bytes(), b"outside target")
+        self.assertEqual((directory / "keep").read_bytes(), b"directory")
+        self.assertTrue(fixed.is_file())
+
+        os.link(fixed, alias)
+        # Replay the exact completed publication to exercise the cleanup tail twice.
+        pending.write_bytes(pointer_bytes)
+        repeated = self._run("--resume-pending")
+        self.assertEqual(repeated.returncode, 0, repeated.stderr + repeated.stdout)
+        self.assertIn("[cache-retention] nothing deleted", repeated.stdout)
+        self.assertNotIn("[cache-retention] deleted", repeated.stdout)
+        self.assertTrue(alias.samefile(fixed))
+        self._assert_cache_copies(kept)
+        self.assertEqual(outside.read_bytes(), b"outside target")
+
+    def test_retention_holds_all_files_when_recovery_or_pause_records_remain(self):
+        for guard in ("cycle", "pending", "pause", "pause_symlink"):
+            with self.subTest(guard=guard):
+                self.tearDown(); self.setUp()
+                fixed = self._install_candidate_layout(schema=2)
+                self._install_candidate_stub()
+                older = self._seed_old_cache_copies(fixed.parent)
+                env = {}
+                if guard == "cycle":
+                    env["STUB_REPLACE_CYCLE"] = "1"
+                elif guard == "pending":
+                    # Keep the injected exit under __main__: candidate-targets
+                    # imports this module for the real publisher defaults.
+                    # Simulate a newer pointer arriving during successful publication.
+                    publisher = self.root / "scripts/push_ranking_to_supabase.py"
+                    body = publisher.read_text().replace(
+                        'raise SystemExit(int(os.environ.get("STUB_PUSH_EXIT", "0")))',
+                        'Path("data/eval-results/rank_and_push.pending").write_text("changed\\n")\n'
+                        '    raise SystemExit(0)',
+                    )
+                    publisher.write_text(body)
+                else:
+                    pause = self.root / "data/eval-results/.forge_pause.json"
+                    if guard == "pause_symlink":
+                        pause.symlink_to(self.root / "missing-pause-record")
+                    else:
+                        pause.write_text("malformed records hold retention too")
+                result = self._run(exit_env=env)
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                self.assertIn("[cache-retention] nothing deleted: recovery pointer or Forge pause record remains", result.stdout)
+                self._assert_cache_copies(older)
+
     def test_initial_cutover_lane_stages_seals_collects_and_publishes_from_schema_one(self):
         """PASS: with the opt-in, a zero-argument schema-one cycle stages the prior
         and candidate beside the physical file, seals the candidate once, collects
@@ -1751,7 +1882,8 @@ finally:
         self.assertIn("--fresh-generation 2", self._bootstrap_lines("cache-populate-activity-v2")[-1])
         cycles = sorted((self.root / "data/eval-results").glob("cron-*"))
         self.assertEqual(len(cycles), 2)
-        self.assertEqual(len(list((self.root / "phys").glob("wallet_cache.*.prior.db"))), 2)
+        self.assertEqual(len(list((self.root / "phys").glob("wallet_cache.*.prior.db"))), 1)
+        self.assertFalse(prior.exists(), "completed successor must retire the older rollback copy")
         self.assertEqual(list((self.root / "phys").glob("wallet_cache.*.side.db")), [])
         accepted = json.loads((cycles[-1] / "accepted_cycle_manifest.json").read_text())
         self.assertEqual(accepted["source_watermark"]["activity"]["generation"], 2)
@@ -1764,12 +1896,16 @@ finally:
         repository name), and the next zero-argument run skips."""
         fixed = self._install_candidate_layout(schema=2)
         self._install_candidate_stub()
+        older = self._seed_old_cache_copies(fixed.parent)
         first = self._run(exit_env={"STUB_PUSH_EXIT": "75"})
         self.assertEqual(first.returncode, 75, first.stderr + first.stdout)
         pending = self.root / "data/eval-results/rank_and_push.pending"
         self.assertTrue(pending.is_file())
+        self._assert_cache_copies(older)
+        self.assertNotIn("[cache-retention] deleted", first.stdout)
         out = Path(pending.read_text().strip()).parent
-        request = json.loads((self.root / out / "ranking_publish_request.json").read_text())
+        request_bytes = (self.root / out / "ranking_publish_request.json").read_bytes()
+        request = json.loads(request_bytes)
         self.assertEqual(request["cache_activation"]["fixed_path"], str(fixed))
         ops_before = self._bootstrap_ops()
         resumed = self._run("--resume-pending")
@@ -1779,6 +1915,8 @@ finally:
         accepted = json.loads((self.root / out / "accepted_cycle_manifest.json").read_text())
         self.assertEqual(accepted["source_watermark"]["activity"]["generation"], 2)
         self.assertFalse(pending.exists())
+        self.assertTrue(all(not path.exists() for path in older))
+        self.assertEqual((self.root / out / "ranking_publish_request.json").read_bytes(), request_bytes)
         skipped = self._run()
         self.assertEqual(skipped.returncode, 0, skipped.stderr + skipped.stdout)
         self.assertIn("RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1", skipped.stdout)
@@ -1813,6 +1951,7 @@ finally:
 
         second = self._run()
         self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
+        self.assertIn("[cache-retention] nothing deleted: no eligible older cycle files", second.stdout)
         self.assertIn(f"RANK_AND_PUSH_CYCLE_RESUME=data/eval-results/{out}", second.stdout)
         ops = self._bootstrap_ops()
         self.assertEqual(ops.count("cache-stage-v2"), 2)
@@ -1873,6 +2012,7 @@ finally:
         repeated cycle after recovery."""
         fixed = self._install_candidate_layout(schema=1)
         self._install_candidate_stub()
+        older = self._seed_old_cache_copies(fixed.parent)
         (self.root / ".env").write_text(
             "SUPABASE_URL=http://127.0.0.1:9\nSUPABASE_SECRET_KEY=test-secret\n"
             "PE_RANK_SCHEMA_TWO_CUTOVER=prepare\n"
@@ -1882,11 +2022,14 @@ finally:
         self.assertIn("RANK_AND_PUSH_PREPARED_ONLY=", first.stdout)
         pending = self.root / "data/eval-results/rank_and_push.pending"
         self.assertTrue(pending.is_file())
+        self._assert_cache_copies(older)
+        self.assertNotIn("[cache-retention] deleted", first.stdout)
         self.assertNotIn("cache-activate", self._bootstrap_ops())
         with sqlite3.connect(fixed) as connection:
             self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 1)
         out = Path(pending.read_text().strip()).parent
         self.assertFalse((self.root / out / "accepted_cycle_manifest.json").exists())
+        request_bytes = (self.root / out / "ranking_publish_request.json").read_bytes()
         ops_before = self._bootstrap_ops()
 
         # While the value stays `prepare`, neither recovery entry may activate.
@@ -1896,6 +2039,8 @@ finally:
             self.assertIn("holds the prepared request", held.stderr)
             self.assertEqual(self._bootstrap_ops(), ops_before)
             self.assertTrue(pending.is_file())
+            self._assert_cache_copies(older)
+            self.assertEqual((self.root / out / "ranking_publish_request.json").read_bytes(), request_bytes)
         with sqlite3.connect(fixed) as connection:
             self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 1)
 
@@ -1913,6 +2058,8 @@ finally:
         accepted = json.loads((self.root / out / "accepted_cycle_manifest.json").read_text())
         self.assertEqual(accepted["cache_schema"], 2)
         self.assertFalse(pending.exists())
+        self.assertTrue(all(not path.exists() for path in older))
+        self.assertEqual((self.root / out / "ranking_publish_request.json").read_bytes(), request_bytes)
         self.assertFalse((self.root / "data/eval-results/rank_and_push.cycle").exists())
 
         third = self._run()

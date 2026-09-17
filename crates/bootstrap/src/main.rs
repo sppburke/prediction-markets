@@ -18,6 +18,7 @@ use tracing_subscriber::EnvFilter;
 async fn main() {
     tracing_subscriber::fmt()
         .json()
+        .with_writer(std::io::stderr)
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 

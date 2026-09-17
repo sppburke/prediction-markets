@@ -1123,4 +1123,58 @@ if [[ -e "$CYCLE_FILE" || -L "$CYCLE_FILE" ]]; then
     echo "   [recovery] WARN unsafe cycle pointer; leaving it intact" >&2
   fi
 fi
+# Only a published production candidate cycle owns retention. Recovery also reaches
+# this tail using the validated request's physical fixed path. Keep all files while
+# any recovery pointer or pause record survives (including malformed/symlink records).
+if [[ -f "$OUT_DIR/cycle_configuration.json" ]]; then
+  "$PYTHON_BIN" - "$OUT_DIR" "$ACCEPTED_DB" "$CYCLE_FILE" "$PENDING_FILE" <<'PY_RETENTION'
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+
+out, fixed = map(Path, sys.argv[1:3])
+if json.loads((out / "cycle_configuration.json").read_text()).get("cache_lane") != "fresh_v2":
+    raise SystemExit(0)
+
+def nothing(reason):
+    print(f"   [cache-retention] nothing deleted: {reason}")
+    raise SystemExit(0)
+
+# Presence alone holds retention: the pause record has no per-file reference list.
+guards = [*map(Path, sys.argv[3:]), Path("data/eval-results/.forge_pause.json")]
+if any(os.path.lexists(path) for path in guards):
+    nothing("recovery pointer or Forge pause record remains")
+if ".." in out.parts or ".." in fixed.parts:
+    nothing("unsafe cycle or fixed path")
+cycle_pattern = r"cron-[0-9]{8}T[0-9]{6}Z"
+if not re.fullmatch(cycle_pattern, out.name):
+    nothing("unrecognized cycle name")
+fixed = fixed.resolve(strict=True)
+if not fixed.is_file() or out.resolve().parent != Path("data/eval-results").resolve():
+    nothing("unrecognized cycle or fixed file")
+physical = fixed.parent
+pattern = re.compile(r"wallet_cache\.(" + cycle_pattern + r")\.(prior|side|displaced)\.db(?:-wal|-shm)?")
+deleted = 0
+for path in sorted(physical.iterdir()):
+    match = pattern.fullmatch(path.name)
+    if not match or match[1] == out.name:
+        continue
+    metadata = path.lstat()
+    # Never follow a symlink, touch the installed inode, or delete an alias of it.
+    if not stat.S_ISREG(metadata.st_mode) or path.samefile(fixed):
+        continue
+    # Recheck the singleton guards immediately before each unlink as well.
+    if any(os.path.lexists(guard) for guard in guards):
+        print("   [cache-retention] stopped: recovery pointer or Forge pause record appeared")
+        break
+    path.unlink()
+    deleted += 1
+    print(f"   [cache-retention] deleted {path} freed_size_bytes={metadata.st_size}")
+if not deleted:
+    nothing("no eligible older cycle files")
+PY_RETENTION
+fi
 echo "✓ rank_and_push complete — Supabase published."

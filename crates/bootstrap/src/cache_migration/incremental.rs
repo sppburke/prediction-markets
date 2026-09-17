@@ -2,60 +2,6 @@
 
 use super::*;
 
-pub(super) fn read_manifest(
-    connection: &Connection,
-    generation: u64,
-) -> Result<Option<ActivityCoverageManifestV2>, BootstrapError> {
-    let stored = connection
-        .query_row(
-            "SELECT reference_sha256, wallet_count, receipt_set_digest, aggregate_digest,
-                    source_row_count, source_bounds_json, cursors_json, page_hashes_json,
-                    group_count, schema_version, parser_version, completed_at_unix
-             FROM activity_coverage_manifests_v2 WHERE generation = ?1",
-            params![to_i64(generation, "activity generation")?],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, String>(5)?,
-                    row.get::<_, String>(6)?,
-                    row.get::<_, String>(7)?,
-                    row.get::<_, i64>(8)?,
-                    row.get::<_, i64>(9)?,
-                    row.get::<_, i64>(10)?,
-                    row.get::<_, i64>(11)?,
-                ))
-            },
-        )
-        .optional()?;
-    let Some(stored) = stored else {
-        return Ok(None);
-    };
-    let manifest = ActivityCoverageManifestV2 {
-        generation,
-        reference_sha256: stored.0,
-        wallet_count: to_u64(stored.1, "activity wallet count")?,
-        receipt_set_digest: stored.2,
-        aggregate_digest: stored.3,
-        source_row_count: to_u64(stored.4, "activity source-row count")?,
-        source_bounds: serde_json::from_str(&stored.5)?,
-        cursors: serde_json::from_str(&stored.6)?,
-        page_hashes: serde_json::from_str(&stored.7)?,
-        group_count: to_u64(stored.8, "activity group count")?,
-        schema_version: u32::try_from(stored.9).map_err(|_| BootstrapError::Invalid {
-            message: "invalid activity schema version".to_owned(),
-        })?,
-        parser_version: u32::try_from(stored.10).map_err(|_| BootstrapError::Invalid {
-            message: "invalid activity parser version".to_owned(),
-        })?,
-        completed_at_unix: stored.11,
-    };
-    Ok(Some(manifest))
-}
-
 pub(super) fn receipt_marker_v2() -> Value {
     serde_json::json!({"receipt_storage":"activity_wallet_coverage_staging_v2","version":2})
 }
@@ -138,7 +84,7 @@ pub(super) fn record_completed_manifest(
     transaction: &rusqlite::Transaction<'_>,
     manifest: &ActivityCoverageManifestV2,
 ) -> Result<(), BootstrapError> {
-    if let Some(stored) = read_manifest(transaction, manifest.generation)? {
+    if let Some(stored) = stored_activity_manifest(transaction, manifest.generation)? {
         if stored != *manifest {
             return invalid("conflicting completed activity manifest".to_owned());
         }
@@ -205,10 +151,11 @@ impl CollectionProof {
                 generation_identity(connection, base)?.ok_or_else(|| BootstrapError::Invalid {
                     message: "predecessor collection identity is missing".to_owned(),
                 })?;
-            let manifest =
-                read_manifest(connection, base)?.ok_or_else(|| BootstrapError::Invalid {
+            let manifest = stored_activity_manifest(connection, base)?.ok_or_else(|| {
+                BootstrapError::Invalid {
                     message: "predecessor manifest is missing".to_owned(),
-                })?;
+                }
+            })?;
             if record.digest != manifest.reference_sha256
                 || Some(record.fixed_end_unix) != identity.start_exclusive
                 || Some(manifest_link(&manifest, &record)?) != identity.base_manifest_sha256
@@ -326,12 +273,19 @@ impl CollectionProof {
         if acquisition.mode == ActivityReadMode::Incremental && acquisition.predecessor.is_none() {
             return invalid("incremental wallet has no predecessor receipt".to_owned());
         }
-        let rows = validate_pages(
-            &receipt.wallet_hex,
-            &receipt.pages,
-            acquisition.start_exclusive,
-            acquisition.fixed_end_unix,
-        )?;
+        let rows = if acquisition.aggregation_status == AggregationStatus::NotAttempted {
+            if !receipt.pages.is_empty() {
+                return invalid("failed acquisition cannot claim page evidence".to_owned());
+            }
+            0
+        } else {
+            validate_pages(
+                &receipt.wallet_hex,
+                &receipt.pages,
+                acquisition.start_exclusive,
+                acquisition.fixed_end_unix,
+            )?
+        };
         if rows != acquisition.fetched_source_row_count
             || read_digest(&receipt.wallet_hex, &receipt.pages, acquisition)?
                 != acquisition.read_sha256
@@ -361,6 +315,21 @@ impl CollectionProof {
                 }
                 count
             }
+            AggregationStatus::NotAttempted => {
+                if complete
+                    || acquisition.fetched_aggregate_count.is_some()
+                    || acquisition.fetched_aggregate_digest.is_some()
+                    || acquisition.exclusion_reason
+                        != Some(ActivityExclusionReason::AcquisitionFailure)
+                    || receipt
+                        .exclusion_reason
+                        .as_deref()
+                        .is_none_or(str::is_empty)
+                {
+                    return invalid("invalid failed acquisition proof".to_owned());
+                }
+                0
+            }
             AggregationStatus::Failed => {
                 if complete
                     || acquisition.fetched_aggregate_count.is_some()
@@ -375,7 +344,7 @@ impl CollectionProof {
             }
         };
         if complete {
-            if acquisition.exclusion_reason.is_some() {
+            if acquisition.exclusion_reason.is_some() || receipt.exclusion_reason.is_some() {
                 return invalid("complete wallet has exclusion reason".to_owned());
             }
             let (groups, source) = acquisition
@@ -444,8 +413,9 @@ fn verify_historical_receipts(
         } else {
             "NULL"
         };
+        let reason = receipt_reason_column(connection)?;
         let mut statement = connection.prepare(&format!("SELECT wallet_hex, reference_sha256, fixed_end_unix, page_evidence_json,
-            ordered_aggregate_digest, source_row_count, aggregate_count, schema_version, parser_version, {column}
+            ordered_aggregate_digest, source_row_count, aggregate_count, schema_version, parser_version, {column}, {reason}
             FROM activity_wallet_coverage_staging_v2 WHERE generation = ?1 ORDER BY wallet_hex"))?;
         let mut rows = statement.query(params![to_i64(identity.generation, "base generation")?])?;
         while let Some(row) = rows.next()? {
@@ -502,8 +472,9 @@ fn predecessor_receipt(
     } else {
         "NULL"
     };
+    let reason = receipt_reason_column(connection)?;
     let sql = format!("SELECT wallet_hex, reference_sha256, fixed_end_unix, page_evidence_json,
-        ordered_aggregate_digest, source_row_count, aggregate_count, schema_version, parser_version, {acquisition}
+        ordered_aggregate_digest, source_row_count, aggregate_count, schema_version, parser_version, {acquisition}, {reason}
         FROM activity_wallet_coverage_staging_v2 WHERE generation = ?1 AND wallet_hex = ?2");
     let mut statement = connection.prepare_cached(&sql)?;
     let mut rows = statement.query(params![
@@ -537,6 +508,7 @@ pub(super) fn decode_receipt(
             .map_err(|_| BootstrapError::Internal)?,
         parser_version: u32::try_from(row.get::<_, i64>(8)?)
             .map_err(|_| BootstrapError::Internal)?,
+        exclusion_reason: row.get(10)?,
         acquisition: row
             .get::<_, Option<String>>(9)?
             .map(|json| serde_json::from_str(&json))
@@ -551,6 +523,7 @@ pub(super) fn decode_receipt(
                 || p.parser_version != ACTIVITY_PARSER_VERSION
         })
         || (receipt.aggregate_count == 0 && receipt.source_row_count != 0)
+        || (receipt.exclusion_reason.is_some() && receipt.aggregate_count != 0)
         || (version == 2) != receipt.acquisition.is_some()
     {
         return invalid(format!(
@@ -706,15 +679,15 @@ pub(super) fn validate_result(
     receipt: &ActivityWalletReceiptProof,
     rows: &[ActivityAggregate],
 ) -> Result<(), BootstrapError> {
-    let Some(acquisition) = &receipt.acquisition else {
-        return Ok(());
-    };
-    if acquisition.disposition == ActivityDisposition::Excluded {
+    if receipt.excluded() {
         if !rows.is_empty() {
             return invalid("excluded wallet has current-generation rows".to_owned());
         }
         return Ok(());
     }
+    let Some(acquisition) = &receipt.acquisition else {
+        return Ok(());
+    };
     let mut carried = JsonArrayDigest::new();
     let mut fetched = JsonArrayDigest::new();
     let (mut carried_count, mut carried_source, mut fetched_count, mut fetched_source) =
@@ -951,7 +924,8 @@ pub(super) fn commit_incremental_wallet(
         );
     }
     let mode = proof.mode(wallet);
-    let excluded = completion.aggregation_failed || collision;
+    let incomplete = completion.aggregation_status != AggregationStatus::Complete;
+    let excluded = incomplete || collision;
     let predecessor = proof.predecessor(
         &transaction,
         wallet,
@@ -974,17 +948,13 @@ pub(super) fn commit_incremental_wallet(
         mode: mode.clone(),
         start_exclusive: proof.start(wallet),
         fixed_end_unix: identity.fixed_end_unix,
-        aggregation_status: if completion.aggregation_failed {
-            AggregationStatus::Failed
-        } else {
-            AggregationStatus::Complete
-        },
-        fetched_aggregate_digest: if completion.aggregation_failed {
+        aggregation_status: completion.aggregation_status.clone(),
+        fetched_aggregate_digest: if incomplete {
             None
         } else {
             Some(aggregate_digest(&completion.aggregates)?)
         },
-        fetched_aggregate_count: if completion.aggregation_failed {
+        fetched_aggregate_count: if incomplete {
             None
         } else {
             Some(u64::try_from(completion.aggregates.len()).map_err(|_| BootstrapError::Internal)?)
@@ -997,7 +967,9 @@ pub(super) fn commit_incremental_wallet(
         } else {
             ActivityDisposition::Complete
         },
-        exclusion_reason: if completion.aggregation_failed {
+        exclusion_reason: if completion.aggregation_status == AggregationStatus::NotAttempted {
+            Some(ActivityExclusionReason::AcquisitionFailure)
+        } else if incomplete {
             Some(ActivityExclusionReason::AggregationFailure)
         } else if collision {
             Some(ActivityExclusionReason::CrossBoundaryCollision)
@@ -1066,15 +1038,16 @@ pub(super) fn commit_incremental_wallet(
         schema_version: ACTIVITY_SCHEMA_VERSION,
         parser_version: ACTIVITY_PARSER_VERSION,
         acquisition: Some(acquisition),
+        exclusion_reason: completion.exclusion_reason.clone(),
     };
     proof.validate_receipt(&transaction, &receipt)?;
     transaction.execute("INSERT INTO activity_wallet_coverage_staging_v2
         (generation, wallet_hex, reference_sha256, fixed_end_unix, page_evidence_json,
-         ordered_aggregate_digest, source_row_count, aggregate_count, schema_version, parser_version, completed_at_unix, acquisition_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+         ordered_aggregate_digest, source_row_count, aggregate_count, schema_version, parser_version, completed_at_unix, acquisition_json, exclusion_reason)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![generation, wallet, identity.digest, identity.fixed_end_unix, canonical_json(&receipt.pages)?, receipt.ordered_aggregate_digest,
             to_i64(source_rows, "source row count")?, to_i64(count, "aggregate count")?, i64::from(ACTIVITY_SCHEMA_VERSION),
-            i64::from(ACTIVITY_PARSER_VERSION), completed_at, canonical_json(&receipt.acquisition)?])?;
+            i64::from(ACTIVITY_PARSER_VERSION), completed_at, canonical_json(&receipt.acquisition)?, receipt.exclusion_reason])?;
     transaction.commit()?;
     if excluded {
         tracing::warn!(wallet, generation, reason = ?receipt.acquisition.as_ref().and_then(|a| a.exclusion_reason.as_ref()), "activity wallet excluded from generation");
