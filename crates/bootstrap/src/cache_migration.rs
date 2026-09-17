@@ -98,6 +98,9 @@ CREATE TABLE IF NOT EXISTS activity_wallet_coverage_staging_v2 (
     schema_version           INTEGER NOT NULL CHECK(schema_version = 2),
     parser_version           INTEGER NOT NULL CHECK(parser_version = 2),
     completed_at_unix        INTEGER NOT NULL,
+    -- Set when the venue's history for this wallet could not be read
+    -- deterministically; the wallet is excluded from this generation (#588).
+    exclusion_reason         TEXT    NULL,
     PRIMARY KEY (generation, wallet_hex)
 );
 
@@ -675,17 +678,18 @@ fn begin_or_resume_fresh_collection(
             })?;
         }
         let cursors: Value = serde_json::from_str(&cursors)?;
-        let mut retain_excluded = |wallet: String, count, pages: &[ReconciliationPageEvidence]| {
-            if is_excluded_receipt(count, pages) {
-                let wallet = wallet.to_ascii_lowercase();
-                validate_wallet_hex(&wallet)?;
-                wallets.insert(wallet);
-            }
-            Ok::<_, BootstrapError>(())
-        };
+        let mut retain_excluded =
+            |wallet: String, count, pages: &[ReconciliationPageEvidence], reason: Option<&str>| {
+                if is_excluded_receipt(count, pages, reason) {
+                    let wallet = wallet.to_ascii_lowercase();
+                    validate_wallet_hex(&wallet)?;
+                    wallets.insert(wallet);
+                }
+                Ok::<_, BootstrapError>(())
+            };
         if uses_retained_receipts(&cursors)? {
             let mut statement = transaction.prepare(
-                "SELECT wallet_hex, aggregate_count, page_evidence_json
+                "SELECT wallet_hex, aggregate_count, page_evidence_json, exclusion_reason
                  FROM activity_wallet_coverage_staging_v2
                  WHERE generation = ?1 ORDER BY wallet_hex",
             )?;
@@ -693,16 +697,23 @@ fn begin_or_resume_fresh_collection(
             while let Some(row) = rows.next()? {
                 let pages: Vec<ReconciliationPageEvidence> =
                     serde_json::from_str(&row.get::<_, String>(2)?)?;
+                let reason: Option<String> = row.get(3)?;
                 retain_excluded(
                     row.get(0)?,
                     to_u64(row.get(1)?, "activity aggregate count")?,
                     &pages,
+                    reason.as_deref(),
                 )?;
             }
         } else {
             let receipts: Vec<ActivityWalletReceiptProof> = serde_json::from_value(cursors)?;
             for receipt in receipts {
-                retain_excluded(receipt.wallet_hex, receipt.aggregate_count, &receipt.pages)?;
+                retain_excluded(
+                    receipt.wallet_hex,
+                    receipt.aggregate_count,
+                    &receipt.pages,
+                    receipt.exclusion_reason.as_deref(),
+                )?;
             }
         }
     }
@@ -797,7 +808,11 @@ async fn collect_activity_v2(
             WalletAddress::from_hex(&wallet_hex).map_err(|error| BootstrapError::Invalid {
                 message: format!("frozen universe contains invalid wallet {wallet_hex}: {error}"),
             })?;
-        let complete = fetch_complete_activity(
+        // A venue payload this parser cannot represent (observed: a TRADE row
+        // priced 3.1968021978, outside the unit interval) excludes the wallet
+        // like an unaggregatable history: the read failed before any page
+        // evidence survived, so the receipt's reason is the whole record.
+        let complete = match fetch_complete_activity(
             fetcher,
             base_url,
             wallet,
@@ -805,7 +820,26 @@ async fn collect_activity_v2(
             fixed_end_unix,
         )
         .await
-        .map_err(|error| activity_read_failure(&wallet_hex, error))?;
+        {
+            Ok(complete) => complete,
+            Err(error) if excludes_wallet(&error) => {
+                tracing::warn!(
+                    wallet = %wallet_hex,
+                    generation,
+                    %error,
+                    "activity wallet excluded from the generation: venue history cannot be read"
+                );
+                return Ok::<_, BootstrapError>(WalletActivityCompletion {
+                    wallet_hex,
+                    pages: Vec::new(),
+                    aggregates: Vec::new(),
+                    source_row_count: 0,
+                    exclusion_reason: Some(error.to_string()),
+                });
+            }
+            Err(error) => return Err(activity_read_failure(&wallet_hex, error)),
+        };
+        let mut exclusion_reason: Option<String> = None;
         let (aggregates, source_row_count) = match complete.buckets() {
             Ok(buckets) => {
                 let mut aggregates = buckets.into_iter().flatten().collect::<Vec<_>>();
@@ -830,13 +864,14 @@ async fn collect_activity_v2(
             // aggregates (`is_excluded_receipt`), so the ranker never sees the
             // wallet, the resume does not refetch it, every other wallet keeps
             // collecting, and the next generation reads the wallet again.
-            Err(ActivityReadError::Aggregate(error)) => {
+            Err(error) if excludes_wallet(&error) => {
                 tracing::warn!(
                     wallet = %wallet_hex,
                     generation,
                     %error,
                     "activity wallet excluded from the generation: history cannot be aggregated deterministically"
                 );
+                exclusion_reason = Some(error.to_string());
                 (Vec::new(), 0)
             }
             Err(error) => {
@@ -851,6 +886,7 @@ async fn collect_activity_v2(
             pages: complete.pages,
             aggregates,
             source_row_count,
+            exclusion_reason,
         })
     }))
     .buffer_unordered(MAX_ACTIVITY_WALLET_FETCHES);
@@ -953,6 +989,18 @@ async fn collect_activity_v2(
 // venue rate-limited, is the supervised temporary failure (exit 75), the same
 // classification `clob.rs`/`events.rs` use; every completed wallet keeps its
 // durable receipt, so the retry fetches only the remainder.
+// A venue payload this collector cannot represent deterministically excludes
+// one wallet; transport failures and locally generated requests do not (#588).
+fn excludes_wallet(error: &ActivityReadError) -> bool {
+    matches!(
+        error,
+        ActivityReadError::Parse(_)
+            | ActivityReadError::Aggregate(_)
+            | ActivityReadError::Identity(_)
+            | ActivityReadError::RowOutsideBounds { .. }
+    )
+}
+
 fn activity_read_failure(wallet_hex: &str, error: ActivityReadError) -> BootstrapError {
     match error {
         ActivityReadError::Fetch {
@@ -1099,6 +1147,10 @@ struct WalletActivityCompletion {
     wallet_hex: String,
     pages: Vec<ReconciliationPageEvidence>,
     aggregates: Vec<ActivityAggregate>,
+    /// Why this wallet is excluded from the generation, when it is. A read that
+    /// failed while parsing has no page evidence to keep, so the reason is the
+    /// only durable marker of the exclusion.
+    exclusion_reason: Option<String>,
     /// Rows that entered `aggregates`; zero for a wallet excluded from the
     /// generation, whose `pages` still record the rows the venue returned.
     source_row_count: u64,
@@ -1114,13 +1166,23 @@ struct ActivityWalletReceiptProof {
     aggregate_count: u64,
     schema_version: u32,
     parser_version: u32,
+    /// Absent for every ordinary receipt, so a proof's bytes are unchanged
+    /// unless the wallet was excluded (#588).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exclusion_reason: Option<String>,
 }
 
-/// A receipt whose pages carried rows that produced no aggregates: the wallet
-/// was excluded from its generation by `collect_activity_v2`. A wallet with no
-/// history has zero aggregates too, but its pages carry no rows.
-fn is_excluded_receipt(aggregate_count: u64, pages: &[ReconciliationPageEvidence]) -> bool {
-    aggregate_count == 0 && pages.iter().any(|page| page.row_count > 0)
+/// A wallet excluded from its generation by `collect_activity_v2`: its receipt
+/// records the reason, or (for receipts written before that column existed)
+/// carries page rows that produced no aggregates. A wallet with no history has
+/// zero aggregates too, but no reason and no page rows.
+fn is_excluded_receipt(
+    aggregate_count: u64,
+    pages: &[ReconciliationPageEvidence],
+    exclusion_reason: Option<&str>,
+) -> bool {
+    exclusion_reason.is_some()
+        || (aggregate_count == 0 && pages.iter().any(|page| page.row_count > 0))
 }
 
 fn retained_receipt_marker() -> Value {
@@ -1227,7 +1289,11 @@ impl ActivityValidation {
         self.wallet_count = checked_activity_count(self.wallet_count, 1)?;
         self.excluded_count = checked_activity_count(
             self.excluded_count,
-            u64::from(is_excluded_receipt(receipt.aggregate_count, &receipt.pages)),
+            u64::from(is_excluded_receipt(
+                receipt.aggregate_count,
+                &receipt.pages,
+                receipt.exclusion_reason.as_deref(),
+            )),
         )?;
         self.source_row_count = checked_activity_count(self.source_row_count, source_rows)?;
         self.group_count = checked_activity_count(self.group_count, receipt.aggregate_count)?;
@@ -1313,8 +1379,9 @@ fn commit_activity_wallet_v2(
         "INSERT INTO activity_wallet_coverage_staging_v2
              (generation, wallet_hex, reference_sha256, fixed_end_unix,
               page_evidence_json, ordered_aggregate_digest, source_row_count,
-              aggregate_count, schema_version, parser_version, completed_at_unix)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+              aggregate_count, schema_version, parser_version, completed_at_unix,
+              exclusion_reason)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
          ON CONFLICT(generation, wallet_hex) DO UPDATE SET
              reference_sha256 = excluded.reference_sha256,
              fixed_end_unix = excluded.fixed_end_unix,
@@ -1324,7 +1391,8 @@ fn commit_activity_wallet_v2(
              aggregate_count = excluded.aggregate_count,
              schema_version = excluded.schema_version,
              parser_version = excluded.parser_version,
-             completed_at_unix = excluded.completed_at_unix
+             completed_at_unix = excluded.completed_at_unix,
+             exclusion_reason = excluded.exclusion_reason
          WHERE activity_wallet_coverage_staging_v2.reference_sha256 = excluded.reference_sha256
            AND activity_wallet_coverage_staging_v2.fixed_end_unix = excluded.fixed_end_unix
            AND activity_wallet_coverage_staging_v2.page_evidence_json = excluded.page_evidence_json
@@ -1332,7 +1400,9 @@ fn commit_activity_wallet_v2(
            AND activity_wallet_coverage_staging_v2.source_row_count = excluded.source_row_count
            AND activity_wallet_coverage_staging_v2.aggregate_count = excluded.aggregate_count
            AND activity_wallet_coverage_staging_v2.schema_version = excluded.schema_version
-           AND activity_wallet_coverage_staging_v2.parser_version = excluded.parser_version",
+           AND activity_wallet_coverage_staging_v2.parser_version = excluded.parser_version
+           AND COALESCE(activity_wallet_coverage_staging_v2.exclusion_reason, '')
+               = COALESCE(excluded.exclusion_reason, '')",
         params![
             generation_i64,
             completion.wallet_hex,
@@ -1345,6 +1415,7 @@ fn commit_activity_wallet_v2(
             i64::from(ACTIVITY_SCHEMA_VERSION),
             i64::from(ACTIVITY_PARSER_VERSION),
             completed_at_unix,
+            completion.exclusion_reason,
         ],
     )?;
     if changed != 1 {
@@ -1473,7 +1544,7 @@ fn visit_activity_receipts(
     let mut statement = connection.prepare(
         "SELECT wallet_hex, reference_sha256, fixed_end_unix, page_evidence_json,
                 ordered_aggregate_digest, source_row_count, aggregate_count,
-                schema_version, parser_version
+                schema_version, parser_version, exclusion_reason
          FROM activity_wallet_coverage_staging_v2
          WHERE generation = ?1 ORDER BY wallet_hex",
     )?;
@@ -1488,6 +1559,7 @@ fn visit_activity_receipts(
             row.get::<_, i64>(6)?,
             row.get::<_, i64>(7)?,
             row.get::<_, i64>(8)?,
+            row.get::<_, Option<String>>(9)?,
         ))
     })?;
     for row in rows {
@@ -1518,6 +1590,14 @@ fn visit_activity_receipts(
         if aggregate_count == 0 && source_row_count != 0 {
             return invalid(format!("activity receipt aggregate mismatch for {}", row.0));
         }
+        // An excluded wallet contributes no rows; a reason beside aggregates is
+        // contradictory evidence.
+        if row.9.is_some() && aggregate_count != 0 {
+            return invalid(format!(
+                "activity receipt records an exclusion reason with aggregates for {}",
+                row.0
+            ));
+        }
         visit(ActivityWalletReceiptProof {
             wallet_hex: row.0,
             pages,
@@ -1526,6 +1606,7 @@ fn visit_activity_receipts(
             aggregate_count,
             schema_version: ACTIVITY_SCHEMA_VERSION,
             parser_version: ACTIVITY_PARSER_VERSION,
+            exclusion_reason: row.9,
         })?;
     }
     Ok(())
@@ -3050,6 +3131,11 @@ fn ensure_lane_a_v2_schema(connection: &Connection) -> Result<(), BootstrapError
         (
             "cache_v2_migration_state",
             "fresh_collection_json",
+            "TEXT NULL",
+        ),
+        (
+            "activity_wallet_coverage_staging_v2",
+            "exclusion_reason",
             "TEXT NULL",
         ),
         ("clob_payout_evidence_v2", "end_date_unix", "INTEGER NULL"),

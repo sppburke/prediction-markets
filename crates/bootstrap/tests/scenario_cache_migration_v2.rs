@@ -4433,23 +4433,52 @@ fn assert_bounded_activity_cli(path: &std::path::Path, legacy: bool) {
 }
 
 fn stored_receipt_proofs(connection: &Connection, generation: i64) -> Vec<Value> {
-    connection
-        .prepare(
-            "SELECT wallet_hex, page_evidence_json, ordered_aggregate_digest, source_row_count,
-                aggregate_count, schema_version, parser_version
-         FROM activity_wallet_coverage_staging_v2 WHERE generation = ?1 ORDER BY wallet_hex",
+    // Fixtures that build the table from an older snapshot have no reason column.
+    let has_reason: bool = connection
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('activity_wallet_coverage_staging_v2')
+             WHERE name = 'exclusion_reason'",
+            [],
+            |row| row.get::<_, i64>(0),
         )
         .unwrap()
+        > 0;
+    let reason_column = if has_reason {
+        "exclusion_reason"
+    } else {
+        "NULL"
+    };
+    connection
+        .prepare(&format!(
+            "SELECT wallet_hex, page_evidence_json, ordered_aggregate_digest, source_row_count,
+                aggregate_count, schema_version, parser_version, {reason_column}
+         FROM activity_wallet_coverage_staging_v2 WHERE generation = ?1 ORDER BY wallet_hex"
+        ))
+        .unwrap()
         .query_map([generation], |row| {
-            Ok(serde_json::json!({
-                "wallet_hex": row.get::<_, String>(0)?,
-                "pages": serde_json::from_str::<Value>(&row.get::<_, String>(1)?).unwrap(),
-                "ordered_aggregate_digest": row.get::<_, String>(2)?,
-                "source_row_count": row.get::<_, i64>(3)?,
-                "aggregate_count": row.get::<_, i64>(4)?,
-                "schema_version": row.get::<_, i64>(5)?,
-                "parser_version": row.get::<_, i64>(6)?,
-            }))
+            let mut proof = serde_json::Map::new();
+            proof.insert("wallet_hex".to_owned(), Value::String(row.get(0)?));
+            proof.insert(
+                "pages".to_owned(),
+                serde_json::from_str::<Value>(&row.get::<_, String>(1)?).unwrap(),
+            );
+            proof.insert(
+                "ordered_aggregate_digest".to_owned(),
+                Value::String(row.get(2)?),
+            );
+            for (key, index) in [
+                ("source_row_count", 3),
+                ("aggregate_count", 4),
+                ("schema_version", 5),
+                ("parser_version", 6),
+            ] {
+                proof.insert(key.to_owned(), Value::from(row.get::<_, i64>(index)?));
+            }
+            // An ordinary receipt serializes without the field at all.
+            if let Some(reason) = row.get::<_, Option<String>>(7)? {
+                proof.insert("exclusion_reason".to_owned(), Value::String(reason));
+            }
+            Ok(Value::Object(proof))
         })
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
@@ -4688,8 +4717,21 @@ async fn retained_receipts_and_legacy_manifests_fail_closed_on_corruption() {
     finalize_cache_v2(&legacy, &dir.path().join("legacy.json"), FRESH_END + 5).unwrap();
     let connection = Connection::open(&legacy).unwrap();
     // A legacy array requires *no* retained receipts; it cannot hide table damage.
-    connection.execute("INSERT INTO activity_wallet_coverage_staging_v2 VALUES (1, ?1, ?2, ?3, '[]', ?4, 0, 0, 2, 2, ?3)",
-        params![WALLET, fresh_record(&legacy)["digest"].as_str().unwrap(), FRESH_END, whole_json_digest(&Vec::<Value>::new())]).unwrap();
+    connection
+        .execute(
+            "INSERT INTO activity_wallet_coverage_staging_v2
+            (generation, wallet_hex, reference_sha256, fixed_end_unix, page_evidence_json,
+             ordered_aggregate_digest, source_row_count, aggregate_count, schema_version,
+             parser_version, completed_at_unix)
+         VALUES (1, ?1, ?2, ?3, '[]', ?4, 0, 0, 2, 2, ?3)",
+            params![
+                WALLET,
+                fresh_record(&legacy)["digest"].as_str().unwrap(),
+                FRESH_END,
+                whole_json_digest(&Vec::<Value>::new())
+            ],
+        )
+        .unwrap();
     drop(connection);
     let error =
         finalize_cache_v2(&legacy, &dir.path().join("bad-legacy.json"), FRESH_END + 6).unwrap_err();
