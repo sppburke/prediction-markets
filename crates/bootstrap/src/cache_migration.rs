@@ -2789,12 +2789,13 @@ fn verify_manifest_wal_binding(
     }
 }
 
-/// SQLite's quick check: every table and index page is walked once, so a
-/// damaged page fails closed at each lifecycle point. The full
-/// `integrity_check` additionally re-reads a table for every index while
-/// matching index content against rows; on Forge's production cache
-/// (150 GB, 275 million trades, four trade indexes) one such check exceeded
-/// seven hours, which no per-cycle step can afford (issue #643).
+/// SQLite's quick check: a linear-time structural verification (page
+/// allocation and coverage, freelist, malformed records, overflow chains,
+/// rowid ordering) that fails closed at each lifecycle point. It skips the
+/// full `integrity_check`'s per-row index probes, so index-to-row content
+/// agreement and UNIQUE validation are not verified here; on Forge's
+/// production cache (150 GB, 275 million trades, four trade indexes) one full
+/// check exceeded seven hours, which no per-cycle step can afford (#643).
 fn quick_check(connection: &Connection) -> Result<(), BootstrapError> {
     let result: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
     if result == "ok" {
