@@ -814,7 +814,7 @@ fn activity_read_failure(wallet_hex: &str, error: ActivityReadError) -> Bootstra
 
 /// Seal a verified hash-qualified online backup as generation two.
 ///
-/// `PRAGMA integrity_check` runs before mutation. A WAL backup is checkpointed
+/// `PRAGMA quick_check` runs before mutation. A WAL backup is checkpointed
 /// with `wal_checkpoint(TRUNCATE)` and must report `busy=0` and every frame
 /// checkpointed; otherwise migration refuses rather than guessing whether the
 /// main file contains the committed tail.
@@ -840,7 +840,7 @@ pub fn migrate_cache_v2(
     let found: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if found == CACHE_SCHEMA_VERSION_V2 {
         ensure_lane_a_v2_schema(&connection)?;
-        integrity_check(&connection)?;
+        quick_check(&connection)?;
         checkpoint_truncate(&connection)?;
         let stored: Option<(String, i64, i64, i64)> = connection
             .query_row(
@@ -874,7 +874,7 @@ pub fn migrate_cache_v2(
         ));
     }
     verify_manifest_wal_binding(cache_path, &manifest)?;
-    integrity_check(&connection)?;
+    quick_check(&connection)?;
     checkpoint_truncate(&connection)?;
     require_reclamation_ready(&connection)?;
     if found != 0 && found != CACHE_SCHEMA_VERSION_V1 {
@@ -923,7 +923,7 @@ pub fn migrate_cache_v2(
     )?;
     transaction.pragma_update(None, "user_version", CACHE_SCHEMA_VERSION_V2)?;
     transaction.commit()?;
-    integrity_check(&connection)?;
+    quick_check(&connection)?;
     checkpoint_truncate(&connection)?;
     connection.close().map_err(|(_, error)| error)?;
     sync_file_and_parent(cache_path)?;
@@ -2007,7 +2007,7 @@ pub fn finalize_cache_v2(
     let mut connection = open_existing_rw(cache_path)?;
     require_schema(&connection, CACHE_SCHEMA_VERSION_V2)?;
     ensure_lane_a_v2_schema(&connection)?;
-    integrity_check(&connection)?;
+    quick_check(&connection)?;
     let sealed_generation = required_max(&connection, "sealed_generation_manifests", "generation")?;
     let payout_generation = required_max(
         &connection,
@@ -2034,7 +2034,7 @@ pub fn finalize_cache_v2(
     )?;
     transaction.commit()?;
     checkpoint_truncate(&connection)?;
-    integrity_check(&connection)?;
+    quick_check(&connection)?;
     connection.close().map_err(|(_, error)| error)?;
     reject_nonempty_sidecars(cache_path)?;
     sync_file_and_parent(cache_path)?;
@@ -2149,7 +2149,7 @@ pub fn stage_cache_cycle_v2(
     } else {
         let current = open_existing_rw(fixed_path)?;
         checkpoint_truncate(&current)?;
-        integrity_check(&current)?;
+        quick_check(&current)?;
         current.close().map_err(|(_, error)| error)?;
         let fixed_sha256 = sha256_file(fixed_path)?;
         copy_file_atomic_verified(fixed_path, prior_path, Some(&fixed_sha256))?;
@@ -2423,7 +2423,7 @@ pub fn activate_cache_v2_with_handoff(
         let prior_cache_schema = verified_cache_schema(&request.prior_cache_backup_path)?;
         let installed = open_existing_ro(&request.fixed_path)?;
         require_schema(&installed, CACHE_SCHEMA_VERSION_V2)?;
-        integrity_check(&installed)?;
+        quick_check(&installed)?;
         verify_finalized_v2_manifests(&installed, ClassifierGeneration::Current)?;
         installed.close().map_err(|(_, error)| error)?;
         reject_nonempty_sidecars(&request.fixed_path)?;
@@ -2450,7 +2450,7 @@ pub fn activate_cache_v2_with_handoff(
 
     let current = open_existing_rw(&request.fixed_path)?;
     checkpoint_truncate(&current)?;
-    integrity_check(&current)?;
+    quick_check(&current)?;
     let current_version: i64 =
         current.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match current_version {
@@ -2499,7 +2499,7 @@ pub fn activate_cache_v2_with_handoff(
     reject_nonempty_activation_sidecars(&request.side_path)?;
     let side = open_existing_ro(&request.side_path)?;
     require_schema(&side, CACHE_SCHEMA_VERSION_V2)?;
-    integrity_check(&side)?;
+    quick_check(&side)?;
     verify_finalized_v2_manifests(&side, ClassifierGeneration::Current)?;
     side.close().map_err(|(_, error)| error)?;
     // The read-only validation of a WAL-mode main may itself allocate an SHM index. With the
@@ -2617,7 +2617,7 @@ pub async fn restore_prior_cache(
     if fixed_path.is_file() {
         let current = open_existing_rw(fixed_path)?;
         checkpoint_truncate(&current)?;
-        integrity_check(&current)?;
+        quick_check(&current)?;
         current.close().map_err(|(_, error)| error)?;
         if displaced_cache_backup_path.exists() {
             if sha256_file(displaced_cache_backup_path)? != sha256_file(fixed_path)? {
@@ -2789,12 +2789,19 @@ fn verify_manifest_wal_binding(
     }
 }
 
-fn integrity_check(connection: &Connection) -> Result<(), BootstrapError> {
-    let result: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+/// SQLite's quick check: a linear-time structural verification (page
+/// allocation and coverage, freelist, malformed records, overflow chains,
+/// rowid ordering) that fails closed at each lifecycle point. It skips the
+/// full `integrity_check`'s per-row index probes, so index-to-row content
+/// agreement and UNIQUE validation are not verified here; on Forge's
+/// production cache (150 GB, 275 million trades, four trade indexes) one full
+/// check exceeded seven hours, which no per-cycle step can afford (#643).
+fn quick_check(connection: &Connection) -> Result<(), BootstrapError> {
+    let result: String = connection.query_row("PRAGMA quick_check", [], |row| row.get(0))?;
     if result == "ok" {
         Ok(())
     } else {
-        invalid(format!("SQLite integrity_check failed: {result}"))
+        invalid(format!("SQLite quick_check failed: {result}"))
     }
 }
 
@@ -2935,7 +2942,7 @@ fn verified_cache_schema(path: &Path) -> Result<i64, BootstrapError> {
         }
         other => return invalid(format!("prior cache has unsupported schema {other}")),
     }
-    integrity_check(&connection)?;
+    quick_check(&connection)?;
     connection.close().map_err(|(_, error)| error)?;
     Ok(version)
 }

@@ -626,7 +626,7 @@ cache and collects fresh complete activity for the union of current acquisition 
 and every retained history, without a frozen reference:
 
 ```bash
-# Under the cache lock: checkpoint + integrity-check the fixed main, copy it to the
+# Under the cache lock: checkpoint + quick-check the fixed main, copy it to the
 # immutable prior, copy the prior to the candidate (each copy hash-verified before its
 # rename). A schema-one prior also gets its hash-bound build manifest for the initial seal.
 # Every path names a file in an existing directory (the cycle directory beside the fixed
