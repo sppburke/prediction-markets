@@ -2417,6 +2417,465 @@ impl PageFetcher for RecordingFetcher {
     }
 }
 
+// Acquire the lock only after collection startup, inside its first source call.
+// No sleeps or production hooks: the coordinator releases it once every request
+// has actually been polled on the same single-threaded runtime as the collector.
+struct WriteLockedFetcher {
+    side: std::path::PathBuf,
+    lock: Mutex<Option<Connection>>,
+    calls: Mutex<Vec<String>>,
+    requested: tokio::sync::Notify,
+    fail_last_read: bool,
+}
+
+impl WriteLockedFetcher {
+    fn new(side: &std::path::Path, fail_last_read: bool) -> Self {
+        Self {
+            side: side.to_owned(),
+            lock: Mutex::new(None),
+            calls: Mutex::new(Vec::new()),
+            requested: tokio::sync::Notify::new(),
+            fail_last_read,
+        }
+    }
+
+    async fn release_after_requests(&self) {
+        let requested = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while self.calls.lock().unwrap().len() < 4 {
+                self.requested.notified().await;
+            }
+        })
+        .await;
+        // Always release, even on a failed concurrency assertion, so the test
+        // cannot strand the writer behind its real five-second busy timeout.
+        let lock = self.lock.lock().unwrap().take().unwrap();
+        let receipts: i64 = lock
+            .query_row(
+                "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        lock.execute_batch("ROLLBACK").unwrap();
+        requested.expect("reads stopped while the first wallet commit held a write lock");
+        assert_eq!(receipts, 0, "the write lock must prevent all commits");
+        assert_eq!(
+            *self.calls.lock().unwrap(),
+            [WALLET, WALLET_B, WALLET_C, WALLET_D]
+                .map(|wallet| activity_url(wallet, FRESH_END + 100))
+        );
+    }
+}
+
+impl PageFetcher for WriteLockedFetcher {
+    async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+        if url.contains(WALLET) {
+            let connection = Connection::open(&self.side).unwrap();
+            connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+            *self.lock.lock().unwrap() = Some(connection);
+        }
+        self.calls.lock().unwrap().push(url.to_owned());
+        self.requested.notify_one();
+        if self.fail_last_read && url.contains(WALLET_D) {
+            return Err(SourceError::Transient {
+                message: "read failed while wallet commits were held".to_owned(),
+            });
+        }
+        let wallet = [WALLET, WALLET_B, WALLET_C, WALLET_D]
+            .into_iter()
+            .find(|wallet| url.contains(wallet))
+            .unwrap();
+        Ok(activity_rows(wallet, &[FRESH_END + 50], false))
+    }
+}
+
+/// The old inline consumer cannot pass: WALLET returns before any other wallet
+/// is polled, and its synchronous commit blocks on this lock before reads.next().
+/// Here all four requests arrive while the lock is held, then all receipts commit.
+#[tokio::test]
+async fn activity_reads_advance_while_writer_commit_is_locked() {
+    let dir = TempDir::new().unwrap();
+    let side = dir.path().join("side.db");
+    seed_initial_candidate(&side);
+    migrate_cache_v2(&side, &write_build_manifest(&dir, &side)).unwrap();
+    let fetcher = WriteLockedFetcher::new(&side, false);
+    let (result, ()) = tokio::join!(
+        populate_activity_fresh_v2(
+            &side,
+            &fetcher,
+            "https://data.example",
+            1,
+            FRESH_END + 100,
+            FRESH_END + 101,
+        ),
+        fetcher.release_after_requests(),
+    );
+    let manifest = result.unwrap();
+    assert_eq!(manifest.wallet_count, 4);
+    assert_eq!(manifest.group_count, 6);
+    assert_eq!(generation_rows(&side, 1), 6);
+    for wallet in [WALLET, WALLET_B, WALLET_C, WALLET_D] {
+        let rows = if wallet == WALLET { 3 } else { 1 };
+        assert_eq!(
+            receipt(&side, 1, wallet),
+            Some((rows, rows, u64::try_from(rows).unwrap()))
+        );
+    }
+}
+
+/// The read fails with three completions already sent behind a held writer.
+/// Joining drains them, or stops at a later receipt failure with that wallet's
+/// inserts rolled back. In both cases the earlier transient error wins and a
+/// fresh invocation completes by fetching exactly the missing wallets.
+#[tokio::test]
+async fn activity_read_error_joins_writer_and_preserves_first_error() {
+    for fail_writer_during_drain in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let side = dir.path().join("side.db");
+        seed_initial_candidate(&side);
+        migrate_cache_v2(&side, &write_build_manifest(&dir, &side)).unwrap();
+        if fail_writer_during_drain {
+            Connection::open(&side)
+                .unwrap()
+                .execute_batch(&format!(
+                    "CREATE TRIGGER abort_activity_receipt
+                     BEFORE INSERT ON activity_wallet_coverage_staging_v2
+                     WHEN NEW.wallet_hex = '{WALLET_B}'
+                     BEGIN SELECT RAISE(ABORT, 'later writer failure'); END;"
+                ))
+                .unwrap();
+        }
+        let fetcher = WriteLockedFetcher::new(&side, true);
+        let (result, ()) = tokio::join!(
+            populate_activity_fresh_v2(
+                &side,
+                &fetcher,
+                "https://data.example",
+                1,
+                FRESH_END + 100,
+                FRESH_END + 101,
+            ),
+            fetcher.release_after_requests(),
+        );
+        let error = result.unwrap_err();
+        assert!(matches!(
+            error,
+            pe_bootstrap::error::BootstrapError::TransientSource { .. }
+        ));
+        assert_eq!(error.exit_code(), 75);
+        assert!(
+            error
+                .to_string()
+                .contains("read failed while wallet commits were held")
+        );
+        assert_eq!(receipt(&side, 1, WALLET), Some((3, 3, 3)));
+        for wallet in [WALLET_B, WALLET_C] {
+            assert_eq!(
+                receipt(&side, 1, wallet),
+                if fail_writer_during_drain {
+                    None
+                } else {
+                    Some((1, 1, 1))
+                }
+            );
+        }
+        assert_eq!(receipt(&side, 1, WALLET_D), None);
+        assert_eq!(
+            generation_rows(&side, 1),
+            if fail_writer_during_drain { 3 } else { 5 }
+        );
+        assert_eq!(
+            count(&side, "SELECT COUNT(*) FROM activity_coverage_manifests_v2"),
+            0
+        );
+        Connection::open(&side)
+            .unwrap()
+            .execute_batch("DROP TRIGGER IF EXISTS abort_activity_receipt")
+            .unwrap();
+        let resumed = RecordingFetcher::default();
+        let manifest = populate_activity_fresh_v2(
+            &side,
+            &resumed,
+            "https://data.example",
+            1,
+            FRESH_END + 999,
+            FRESH_END + 102,
+        )
+        .await
+        .unwrap();
+        assert_eq!(manifest.wallet_count, 4);
+        let missing = if fail_writer_during_drain {
+            vec![WALLET_B, WALLET_C, WALLET_D]
+        } else {
+            vec![WALLET_D]
+        };
+        assert_eq!(
+            *resumed.calls.lock().unwrap(),
+            missing
+                .into_iter()
+                .map(|wallet| activity_url(wallet, FRESH_END + 100))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+struct PendingActivityReads {
+    started: AtomicUsize,
+    dropped: AtomicUsize,
+}
+
+struct PendingActivityRead<'a>(&'a AtomicUsize);
+
+impl Drop for PendingActivityRead<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl PageFetcher for PendingActivityReads {
+    async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+        self.started.fetch_add(1, Ordering::SeqCst);
+        if url.contains(WALLET) {
+            // Ensure the other three reads are in flight before the writer
+            // can fail. They never answer, so only writer failure can wake us.
+            tokio::task::yield_now().await;
+            return Ok(activity_rows(WALLET, &[], false));
+        }
+        let _pending = PendingActivityRead(&self.dropped);
+        std::future::pending().await
+    }
+}
+
+#[tokio::test]
+async fn activity_writer_error_cancels_pending_reads_and_rolls_back_wallet() {
+    let dir = TempDir::new().unwrap();
+    let side = dir.path().join("side.db");
+    seed_initial_candidate(&side);
+    migrate_cache_v2(&side, &write_build_manifest(&dir, &side)).unwrap();
+    Connection::open(&side)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER abort_activity_receipt
+             BEFORE INSERT ON activity_wallet_coverage_staging_v2
+             BEGIN SELECT RAISE(ABORT, 'writer receipt failure'); END;",
+        )
+        .unwrap();
+    let fetcher = PendingActivityReads {
+        started: AtomicUsize::new(0),
+        dropped: AtomicUsize::new(0),
+    };
+    let error = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        populate_activity_fresh_v2(
+            &side,
+            &fetcher,
+            "https://data.example",
+            1,
+            FRESH_END,
+            FRESH_END + 1,
+        ),
+    )
+    .await
+    .expect("writer failure must interrupt pending reads")
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        pe_bootstrap::error::BootstrapError::Sqlite(_)
+    ));
+    assert!(error.to_string().contains("writer receipt failure"));
+    assert_eq!(error.exit_code(), 1);
+    assert_eq!(fetcher.started.load(Ordering::SeqCst), 4);
+    assert_eq!(fetcher.dropped.load(Ordering::SeqCst), 3);
+    assert_eq!(generation_rows(&side, 1), 0);
+    assert_eq!(
+        count(
+            &side,
+            "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2"
+        ),
+        0
+    );
+    assert_eq!(
+        count(&side, "SELECT COUNT(*) FROM activity_coverage_manifests_v2"),
+        0
+    );
+    // Immediate write access after return also checks that rollback/join released
+    // the connection; there can be no later commit from a detached writer.
+    Connection::open(&side)
+        .unwrap()
+        .execute_batch("BEGIN IMMEDIATE; DROP TRIGGER abort_activity_receipt; COMMIT")
+        .unwrap();
+}
+
+async fn interrupt_fresh_candidate_after_one_receipt(dir: &TempDir, side: &std::path::Path) {
+    seed_initial_candidate(side);
+    migrate_cache_v2(side, &write_build_manifest(dir, side)).unwrap();
+    let error = populate_activity_fresh_v2(
+        side,
+        &InterruptAfterFirst {
+            side: side.to_owned(),
+            generation: 1,
+            first: WALLET_B,
+        },
+        "https://data.example",
+        1,
+        FRESH_END + 100,
+        FRESH_END + 101,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.exit_code(), 75);
+    assert_eq!(receipt(side, 1, WALLET_B), Some((1, 1, 1)));
+    assert_eq!(
+        count(
+            side,
+            "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2"
+        ),
+        1
+    );
+}
+
+#[tokio::test]
+async fn activity_resume_validates_receipt_identity_shape_and_counts_before_source_io() {
+    let dir = TempDir::new().unwrap();
+    let side = dir.path().join("side.db");
+    interrupt_fresh_candidate_after_one_receipt(&dir, &side).await;
+    let connection = Connection::open(&side).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE saved_receipts AS SELECT * FROM activity_wallet_coverage_staging_v2;
+             PRAGMA ignore_check_constraints = ON;",
+        )
+        .unwrap();
+    for change in [
+        format!("wallet_hex = '{WALLET_E}'"),
+        "reference_sha256 = 'wrong reference'".to_owned(),
+        "fixed_end_unix = fixed_end_unix + 1".to_owned(),
+        "schema_version = schema_version + 1".to_owned(),
+        "parser_version = parser_version + 1".to_owned(),
+        "ordered_aggregate_digest = 'not a sha256'".to_owned(),
+        "page_evidence_json = 'malformed json'".to_owned(),
+        "page_evidence_json = '{}'".to_owned(),
+        "page_evidence_json = json_set(page_evidence_json, '$[0].schema_version', 999)".to_owned(),
+        "page_evidence_json = json_set(page_evidence_json, '$[0].parser_version', 999)".to_owned(),
+        "source_row_count = -1".to_owned(),
+        "aggregate_count = -1".to_owned(),
+        "source_row_count = 1.5".to_owned(),
+        "aggregate_count = 9223372036854775808".to_owned(),
+        "aggregate_count = 0".to_owned(), // nonzero source rows cannot describe zero groups
+    ] {
+        connection
+            .execute(
+                &format!("UPDATE activity_wallet_coverage_staging_v2 SET {change}"),
+                [],
+            )
+            .unwrap();
+        let fetcher = RecordingFetcher::default();
+        let error = populate_activity_fresh_v2(
+            &side,
+            &fetcher,
+            "https://data.example",
+            1,
+            FRESH_END + 999,
+            FRESH_END + 102,
+        )
+        .await
+        .expect_err(&change);
+        assert_eq!(error.exit_code(), 1, "{change}: {error}");
+        assert!(
+            fetcher.calls.lock().unwrap().is_empty(),
+            "{change}: {error}"
+        );
+        assert_eq!(generation_rows(&side, 1), 1);
+        assert_eq!(
+            count(&side, "SELECT COUNT(*) FROM activity_coverage_manifests_v2"),
+            0
+        );
+        connection
+            .execute_batch(
+                "DELETE FROM activity_wallet_coverage_staging_v2;
+                 INSERT INTO activity_wallet_coverage_staging_v2 SELECT * FROM saved_receipts;",
+            )
+            .unwrap();
+    }
+    drop(connection);
+    let fetcher = RecordingFetcher::default();
+    let manifest = populate_activity_fresh_v2(
+        &side,
+        &fetcher,
+        "https://data.example",
+        1,
+        FRESH_END + 999,
+        FRESH_END + 103,
+    )
+    .await
+    .unwrap();
+    assert_eq!(manifest.wallet_count, 4);
+    assert_eq!(
+        *fetcher.calls.lock().unwrap(),
+        [WALLET, WALLET_C, WALLET_D].map(|wallet| activity_url(wallet, FRESH_END + 100))
+    );
+}
+
+#[tokio::test]
+async fn activity_resume_defers_completed_wallet_content_corruption_to_completion() {
+    let dir = TempDir::new().unwrap();
+    let side = dir.path().join("side.db");
+    interrupt_fresh_candidate_after_one_receipt(&dir, &side).await;
+    Connection::open(&side)
+        .unwrap()
+        .execute(
+            "DELETE FROM activity_groups_v2 WHERE wallet_hex = ?1",
+            [WALLET_B],
+        )
+        .unwrap();
+    assert_eq!(receipt(&side, 1, WALLET_B), Some((1, 1, 1)));
+    let fetcher = RecordingFetcher::default();
+    let error = populate_activity_fresh_v2(
+        &side,
+        &fetcher,
+        "https://data.example",
+        1,
+        FRESH_END + 999,
+        FRESH_END + 102,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains(&format!(
+        "activity receipt aggregate mismatch for {WALLET_B}"
+    )));
+    // Missing wallets were collected before validation failed; B was skipped
+    // despite its deleted group. The old startup content scan makes no calls.
+    assert_eq!(
+        *fetcher.calls.lock().unwrap(),
+        [WALLET, WALLET_C, WALLET_D].map(|wallet| activity_url(wallet, FRESH_END + 100))
+    );
+    assert_eq!(generation_rows(&side, 1), 7);
+    assert_eq!(
+        count(
+            &side,
+            "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2"
+        ),
+        4
+    );
+    assert_eq!(
+        count(&side, "SELECT COUNT(*) FROM activity_coverage_manifests_v2"),
+        0
+    );
+    install_payout_manifest(&side);
+    let stage = dir.path().join("corrupt-stage.json");
+    let finalization = finalize_cache_v2(&side, &stage, FRESH_END + 103).unwrap_err();
+    assert!(
+        finalization
+            .to_string()
+            .contains("activity receipt aggregate mismatch")
+    );
+    assert!(!stage.exists());
+    assert_eq!(
+        count(&side, "SELECT COUNT(*) FROM activity_coverage_manifests_v2"),
+        0
+    );
+}
+
 #[tokio::test]
 async fn fresh_generation_on_recurring_base_preserves_the_prior_and_resumes_only_missing_wallets() {
     let dir = tempfile::Builder::new()

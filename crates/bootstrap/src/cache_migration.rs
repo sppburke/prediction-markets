@@ -12,6 +12,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr as _;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use futures::{StreamExt as _, stream};
@@ -37,6 +38,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use time::OffsetDateTime;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::cache::{CACHE_SCHEMA_VERSION_V1, CACHE_SCHEMA_VERSION_V2, REQUIRED_TRADES_INDEXES};
 use crate::error::BootstrapError;
@@ -487,7 +489,7 @@ pub async fn populate_activity_v2(
     wallets.sort();
     wallets.dedup();
 
-    let mut connection = open_existing_rw(cache_path)?;
+    let connection = open_existing_rw(cache_path)?;
     require_schema(&connection, CACHE_SCHEMA_VERSION_V2)?;
     bind_frozen_activity_identity(
         &connection,
@@ -504,7 +506,7 @@ pub async fn populate_activity_v2(
     // The legacy reference reads keep their authentic request shape so a
     // resumed legacy collection matches its recorded receipts.
     collect_activity_v2(
-        &mut connection,
+        connection,
         fetcher,
         base_url,
         &identity,
@@ -548,7 +550,7 @@ pub async fn populate_activity_fresh_v2(
         wallets: record.wallets,
     };
     collect_activity_v2(
-        &mut connection,
+        connection,
         fetcher,
         base_url,
         &identity,
@@ -707,7 +709,7 @@ fn fresh_collection_record(
 }
 
 async fn collect_activity_v2(
-    connection: &mut Connection,
+    mut connection: Connection,
     fetcher: &dyn ReconciliationFetcher,
     base_url: &str,
     identity: &ActivityIdentity,
@@ -722,7 +724,7 @@ async fn collect_activity_v2(
     } = identity;
     let (generation, fixed_end_unix) = (*generation, *fixed_end_unix);
     if let Some(manifest) = completed_activity_manifest(
-        connection,
+        &connection,
         generation,
         reference_sha256,
         fixed_end_unix,
@@ -730,15 +732,15 @@ async fn collect_activity_v2(
     )? {
         return Ok(manifest);
     }
-    let completed = validate_activity_staging(
-        connection,
+    // Wallet writes are atomic. An intact receipt now skips its wallet even if
+    // a group was later deleted: completion re-verifies every wallet's content.
+    let completed = validate_activity_receipts(
+        &connection,
         generation,
         reference_sha256,
         fixed_end_unix,
         wallets,
-        false,
-    )?
-    .completed_wallets;
+    )?;
     let missing = wallets
         .iter()
         .filter(|wallet| !completed.contains(*wallet))
@@ -807,20 +809,77 @@ async fn collect_activity_v2(
         })
     }))
     .buffer_unordered(MAX_ACTIVITY_WALLET_FETCHES);
-    futures::pin_mut!(reads);
-    while let Some(completion) = reads.next().await {
-        commit_activity_wallet_v2(
-            connection,
-            generation,
-            reference_sha256,
-            fixed_end_unix,
-            completed_at_unix,
-            &completion?,
-        )?;
+    // One reader batch can queue behind the serial writer. A full queue pauses
+    // polling the bounded reader stream; no wallet completion is dropped on success.
+    let (sender, mut receiver) = mpsc::channel(MAX_ACTIVITY_WALLET_FETCHES);
+    let (finished_sender, mut finished_receiver) = oneshot::channel();
+    // Arbitrate at the point of failure, including a writer failure while the
+    // producer is polling a read. A later drain failure cannot replace it.
+    let first_error = Arc::new(OnceLock::new());
+    let writer_error = Arc::clone(&first_error);
+    let writer_reference = reference_sha256.clone();
+    let writer = std::thread::Builder::new()
+        .name("activity-cache-writer".to_owned())
+        .spawn(move || {
+            while let Some(completion) = receiver.blocking_recv() {
+                if let Err(error) = commit_activity_wallet_v2(
+                    &mut connection,
+                    generation,
+                    &writer_reference,
+                    fixed_end_unix,
+                    completed_at_unix,
+                    &completion,
+                ) {
+                    let _ = writer_error.set(error);
+                    break;
+                }
+            }
+            let _ = finished_sender.send(());
+            connection
+        })?;
+    let writer_finished = {
+        let produce = async {
+            futures::pin_mut!(reads);
+            while let Some(completion) = reads.next().await {
+                match completion {
+                    Ok(completion) => {
+                        if sender.send(completion).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = first_error.set(error);
+                        break;
+                    }
+                }
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = &mut finished_receiver => true,
+            () = produce => false,
+        }
+    };
+    // Stop reads, close the queue and drain accepted wallets after a read error.
+    // Await termination before joining so SQLite cannot block the async runtime.
+    // No return path after spawn may bypass this join: the caller holds the lock.
+    drop(sender);
+    if !writer_finished {
+        let _ = finished_receiver.await;
     }
+    let joined = writer.join();
+    if let Some(error) = Arc::try_unwrap(first_error)
+        .map_err(|_| BootstrapError::Internal)?
+        .into_inner()
+    {
+        return Err(error);
+    }
+    let connection = joined.map_err(|_| BootstrapError::Cache {
+        message: "activity cache writer thread panicked".to_owned(),
+    })?;
 
     let staged = validate_activity_staging(
-        connection,
+        &connection,
         generation,
         reference_sha256,
         fixed_end_unix,
@@ -1211,7 +1270,7 @@ fn insert_activity_aggregate(
         pe_core_types::Side::Buy => "buy",
         pe_core_types::Side::Sell => "sell",
     });
-    let changed = transaction.execute(
+    let mut statement = transaction.prepare_cached(
         "INSERT INTO activity_groups_v2
              (source_trade_id, coverage_generation, semantic_revision, components_json,
               wallet_hex, transaction_hash, activity_type, condition_id, asset, outcome_id,
@@ -1240,28 +1299,28 @@ fn insert_activity_aggregate(
              schema_version = excluded.schema_version,
              parser_version = excluded.parser_version
          WHERE activity_groups_v2.semantic_revision = excluded.semantic_revision",
-        params![
-            source_trade_id.0,
-            generation,
-            aggregate.semantic_revision.as_str(),
-            canonical_json(components)?,
-            expected_wallet,
-            components.transaction_hash,
-            components.activity_type.as_str(),
-            components.condition_id.as_ref().map(ToString::to_string),
-            components.asset.as_ref().map(ToString::to_string),
-            components.outcome.map(|value| i64::from(value.0)),
-            side,
-            to_i64(aggregate.row_count, "activity row count")?,
-            aggregate.share_sum.to_decimal().to_string(),
-            aggregate.price_weighted_share_sum.0.to_string(),
-            aggregate.source_usdc_sum.to_decimal().to_string(),
-            aggregate.source_time.0.unix_timestamp(),
-            i64::from(aggregate.is_combo),
-            i64::from(ACTIVITY_SCHEMA_VERSION),
-            i64::from(ACTIVITY_PARSER_VERSION),
-        ],
     )?;
+    let changed = statement.execute(params![
+        source_trade_id.0,
+        generation,
+        aggregate.semantic_revision.as_str(),
+        canonical_json(components)?,
+        expected_wallet,
+        components.transaction_hash,
+        components.activity_type.as_str(),
+        components.condition_id.as_ref().map(ToString::to_string),
+        components.asset.as_ref().map(ToString::to_string),
+        components.outcome.map(|value| i64::from(value.0)),
+        side,
+        to_i64(aggregate.row_count, "activity row count")?,
+        aggregate.share_sum.to_decimal().to_string(),
+        aggregate.price_weighted_share_sum.0.to_string(),
+        aggregate.source_usdc_sum.to_decimal().to_string(),
+        aggregate.source_time.0.unix_timestamp(),
+        i64::from(aggregate.is_combo),
+        i64::from(ACTIVITY_SCHEMA_VERSION),
+        i64::from(ACTIVITY_PARSER_VERSION),
+    ])?;
     if changed == 1 {
         Ok(())
     } else {
@@ -1272,16 +1331,40 @@ fn insert_activity_aggregate(
     }
 }
 
-fn validate_activity_staging(
+fn validate_activity_receipts(
     connection: &Connection,
     generation: u64,
     reference_sha256: &str,
     fixed_end_unix: i64,
     wallets: &[String],
-    require_complete: bool,
-) -> Result<ValidatedActivityStaging, BootstrapError> {
-    let generation_i64 = to_i64(generation, "activity generation")?;
+) -> Result<BTreeSet<String>, BootstrapError> {
     let expected = wallets.iter().cloned().collect::<BTreeSet<_>>();
+    let mut completed = BTreeSet::new();
+    visit_activity_receipts(
+        connection,
+        generation,
+        reference_sha256,
+        fixed_end_unix,
+        &expected,
+        |receipt| {
+            completed.insert(receipt.wallet_hex);
+            Ok(())
+        },
+    )?;
+    Ok(completed)
+}
+
+// Stream one receipt at a time through the same identity/shape checks for both
+// resume and full content validation. This owner never reads aggregate rows.
+fn visit_activity_receipts(
+    connection: &Connection,
+    generation: u64,
+    reference_sha256: &str,
+    fixed_end_unix: i64,
+    expected: &BTreeSet<String>,
+    mut visit: impl FnMut(ActivityWalletReceiptProof) -> Result<(), BootstrapError>,
+) -> Result<(), BootstrapError> {
+    let generation_i64 = to_i64(generation, "activity generation")?;
     let mut statement = connection.prepare(
         "SELECT wallet_hex, reference_sha256, fixed_end_unix, page_evidence_json,
                 ordered_aggregate_digest, source_row_count, aggregate_count,
@@ -1302,9 +1385,6 @@ fn validate_activity_staging(
             row.get::<_, i64>(8)?,
         ))
     })?;
-    let mut completed_wallets = BTreeSet::new();
-    let mut receipts = Vec::new();
-    let mut all_aggregates = Vec::new();
     for row in rows {
         let row = row?;
         if !expected.contains(&row.0) {
@@ -1328,35 +1408,72 @@ fn validate_activity_staging(
         }) {
             return invalid(format!("activity page version mismatch for {}", row.0));
         }
-        let aggregates = load_activity_aggregates(connection, generation_i64, &row.0)?;
         let aggregate_count = to_u64(row.6, "activity receipt aggregate count")?;
         let source_row_count = to_u64(row.5, "activity receipt source-row count")?;
-        let derived_source_rows = aggregates.iter().try_fold(0_u64, |total, aggregate| {
-            total
-                .checked_add(aggregate.row_count)
-                .ok_or_else(|| BootstrapError::Invalid {
-                    message: format!("activity source-row count overflow for {}", row.0),
-                })
-        })?;
-        if aggregate_count
-            != u64::try_from(aggregates.len()).map_err(|_| BootstrapError::Internal)?
-            || source_row_count != derived_source_rows
-            || aggregate_digest(&aggregates)? != row.4
-        {
+        if aggregate_count == 0 && source_row_count != 0 {
             return invalid(format!("activity receipt aggregate mismatch for {}", row.0));
         }
-        completed_wallets.insert(row.0.clone());
-        receipts.push(ActivityWalletReceiptProof {
-            wallet_hex: row.0.clone(),
+        visit(ActivityWalletReceiptProof {
+            wallet_hex: row.0,
             pages,
             ordered_aggregate_digest: row.4,
             source_row_count,
             aggregate_count,
             schema_version: ACTIVITY_SCHEMA_VERSION,
             parser_version: ACTIVITY_PARSER_VERSION,
-        });
-        all_aggregates.extend(aggregates);
+        })?;
     }
+    Ok(())
+}
+
+fn validate_activity_staging(
+    connection: &Connection,
+    generation: u64,
+    reference_sha256: &str,
+    fixed_end_unix: i64,
+    wallets: &[String],
+    require_complete: bool,
+) -> Result<ValidatedActivityStaging, BootstrapError> {
+    let generation_i64 = to_i64(generation, "activity generation")?;
+    let expected = wallets.iter().cloned().collect::<BTreeSet<_>>();
+    let mut completed_wallets = BTreeSet::new();
+    let mut receipts = Vec::new();
+    let mut all_aggregates = Vec::new();
+    visit_activity_receipts(
+        connection,
+        generation,
+        reference_sha256,
+        fixed_end_unix,
+        &expected,
+        |receipt| {
+            let aggregates =
+                load_activity_aggregates(connection, generation_i64, &receipt.wallet_hex)?;
+            let derived_source_rows = aggregates.iter().try_fold(0_u64, |total, aggregate| {
+                total
+                    .checked_add(aggregate.row_count)
+                    .ok_or_else(|| BootstrapError::Invalid {
+                        message: format!(
+                            "activity source-row count overflow for {}",
+                            receipt.wallet_hex
+                        ),
+                    })
+            })?;
+            if receipt.aggregate_count
+                != u64::try_from(aggregates.len()).map_err(|_| BootstrapError::Internal)?
+                || receipt.source_row_count != derived_source_rows
+                || aggregate_digest(&aggregates)? != receipt.ordered_aggregate_digest
+            {
+                return invalid(format!(
+                    "activity receipt aggregate mismatch for {}",
+                    receipt.wallet_hex
+                ));
+            }
+            completed_wallets.insert(receipt.wallet_hex.clone());
+            receipts.push(receipt);
+            all_aggregates.extend(aggregates);
+            Ok(())
+        },
+    )?;
     if require_complete && completed_wallets != expected {
         let missing = expected
             .difference(&completed_wallets)
