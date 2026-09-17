@@ -16,6 +16,12 @@ const REQUEST_TIMEOUT_SECS: u64 = 10;
 const MAX_RETRIES: u32 = 3;
 /// Enforces ≤ 20 req/s per the Polymarket Data API documented limit (200 req/10s on `/trades`).
 const MIN_INTERVAL_MS: u64 = 50;
+/// Longest HTTP 429 `Retry-After` a complete-activity reader waits out in-line
+/// (`reconciliation_rate_limit_retry_secs`, `docs/_GLOSSARY.md`): the venue answers
+/// an `/activity` page burst with `Retry-After: 1` (#555). Passed to
+/// [`ReqwestFetcher::with_rate_limit_retry_max_secs`] by the service's reconciliation
+/// fetcher and by `pe-bootstrap cache-populate-activity-v2` (#588).
+pub const RECONCILIATION_RATE_LIMIT_RETRY_SECS: u32 = 1;
 
 /// Stable semantic identity for an observed public request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -652,9 +652,10 @@ candidate knows, and an unfinished generation can only be resumed. A retry with 
 `N` keeps the recorded end and wallet list and fetches only wallets without a valid
 receipt; a completed generation returns its manifest without any source call. Fresh reads
 request each wallet's full history (`start=1` on the wire; an omitted `start` returns only
-the venue's recent window). A read that exhausts the fetcher's transient retries or is
-rate-limited by the venue exits `rank_and_push_tempfail_exit` (75) so the supervisor resumes the
-collection. A wallet whose fetched history the aggregator cannot bucket deterministically
+the venue's recent window). A venue `Retry-After` of at most
+`reconciliation_rate_limit_retry_secs` is waited out inside the fetcher's retry budget; a read
+that exhausts the fetcher's transient retries or is still rate-limited exits
+`rank_and_push_tempfail_exit` (75) so the supervisor resumes the collection. A wallet whose fetched history the aggregator cannot bucket deterministically
 (observed: one fill reported as two rows with different venue timestamps) is excluded from the
 generation instead of failing the cycle: the command logs a warning naming the wallet and the
 reason (and the excluded count when the generation completes), its receipt keeps the page
