@@ -100,7 +100,12 @@ jobs:
       - run: cargo test --doc --workspace --all-features
 
       - name: Install Python analytics deps (needed by in-test cross-reader parity, #544)
-        run: python3 -m pip install -r scripts/requirements.txt
+        run: |
+          python3 -m pip install -r scripts/requirements.txt
+          # #648 compares real certified caches through the Parquet exporter.
+          # Install its extension during setup; the Rust scenario disables
+          # automatic extension downloads so the test itself stays offline.
+          python3 -c "import duckdb; c = duckdb.connect(); c.execute('INSTALL sqlite_scanner'); c.close()"
 
       - run: cargo nextest run --workspace --all-features
 

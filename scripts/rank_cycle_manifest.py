@@ -235,6 +235,83 @@ def latest_accepted(root: Path, day_utc: str) -> dict | None:
     return None
 
 
+def _fresh_identity(raw: str | None) -> dict | None:
+    if raw is None:
+        return None
+    identity = json.loads(raw)
+    version = identity.get("version")
+    expected = {"version", "generation", "fixed_end_unix", "wallets", "digest"}
+    if version == 2:
+        expected |= {"base_generation", "base_manifest_sha256", "start_exclusive", "full_read_wallets"}
+    elif version != 1:
+        raise ValueError("unsupported candidate activity identity version")
+    if set(identity) != expected:
+        raise ValueError("malformed candidate activity identity")
+    content = {key: value for key, value in identity.items() if key != "digest"}
+    digest = hashlib.sha256(json.dumps(content, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+    if identity["digest"] != digest:
+        raise ValueError("candidate activity identity digest mismatch")
+    if type(identity["generation"]) is not int or not 0 < identity["generation"] <= 2**63 - 1:
+        raise ValueError("invalid candidate generation")
+    if type(identity["fixed_end_unix"]) is not int or identity["fixed_end_unix"] <= 0:
+        raise ValueError("invalid candidate fixed end")
+    return identity
+
+
+def candidate_targets(prior_path: Path, side_path: Path, *, after_collection=False,
+                      now: int | None = None, max_staleness_hours: int | None = None) -> tuple[int, int, int]:
+    """Select this cycle's initial head or its one linked successor, read-only.
+
+    Rust certifies content and linkage on every collection call. This owner only
+    establishes cycle membership and the restart-safe one-top-up allowance.
+    """
+    with sqlite3.connect(f"file:{prior_path}?mode=ro&immutable=1", uri=True) as prior:
+        schema = int(_one(prior, "PRAGMA user_version") or 0)
+        previous = 0 if schema < 2 else int(_one(prior, "SELECT COALESCE(MAX(generation), 0) FROM activity_coverage_manifests_v2"))
+        initial = previous + 1
+        prior_identity = None
+        if schema == 2 and any(row[1] == "fresh_collection_json" for row in prior.execute("PRAGMA table_info(cache_v2_migration_state)")):
+            prior_identity = _fresh_identity(_one(prior, "SELECT fresh_collection_json FROM cache_v2_migration_state WHERE singleton = 1"))
+        active = _one(prior, "SELECT generation FROM clob_payout_walk_state_v2 WHERE singleton = 1")
+        payout = int(active) if active is not None else int(_one(prior, "SELECT COALESCE(MAX(generation), 0) FROM clob_payout_coverage_manifests_v2")) + 1
+    with sqlite3.connect(f"file:{side_path}?mode=ro", uri=True) as side:
+        head = _fresh_identity(_one(side, "SELECT fresh_collection_json FROM cache_v2_migration_state WHERE singleton = 1"))
+        payout_done = int(_one(side, "SELECT EXISTS(SELECT 1 FROM clob_payout_coverage_manifests_v2 WHERE generation = ?)", (payout,)))
+        if head is None or (head == prior_identity and head["generation"] == previous):
+            if after_collection:
+                raise ValueError("activity collection did not complete this cycle's head")
+            return initial, payout, payout_done
+        generation = head["generation"]
+        top_up_used = generation != initial
+        initial_identity = head
+        if top_up_used:
+            if generation < initial or head.get("version") != 2 or head.get("base_generation") != initial:
+                raise ValueError("candidate head is outside this cycle's single top-up allowance")
+            initial_identity = _fresh_identity(_one(side, "SELECT collection_identity_json FROM activity_coverage_manifests_v2 WHERE generation = ?", (initial,)))
+            if initial_identity is None or initial_identity["generation"] != initial:
+                raise ValueError("top-up omitted this cycle's initial identity")
+        if initial_identity["version"] == 2 and initial_identity["base_generation"] != (previous if prior_identity else None):
+            raise ValueError("initial activity head does not belong to this staged cycle")
+        if after_collection:
+            reference = _one(side, "SELECT reference_sha256 FROM activity_coverage_manifests_v2 WHERE generation = ?", (generation,))
+            if reference != head["digest"]:
+                raise ValueError("activity head has no matching completed manifest")
+            if now is None:
+                import time
+                now = int(time.time())
+            if max_staleness_hours is None:
+                from push_ranking_to_supabase import build_parser
+                max_staleness_hours = build_parser().get_default("max_cache_staleness_hours")
+            age = now - head["fixed_end_unix"]
+            if age < 0:
+                raise ValueError("activity head fixed end is in the future")
+            if age > max_staleness_hours * 3600:
+                if top_up_used:
+                    raise ValueError("activity top-up is stale; preserve the cycle, no second top-up is permitted")
+                generation = initial + 1
+        return generation, payout, payout_done
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -248,11 +325,21 @@ def parse_args():
     compare.add_argument("--db", required=True, type=Path)
     compare.add_argument("--current", required=True, type=Path)
     compare.add_argument("--root", required=True, type=Path)
+    targets = subparsers.add_parser("candidate-targets")
+    targets.add_argument("--prior", type=Path, required=True)
+    targets.add_argument("--side", type=Path, required=True)
+    targets.add_argument("--after-collection", action="store_true")
+    targets.add_argument("--max-staleness-hours", type=int)
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.command == "candidate-targets":
+        for value in candidate_targets(args.prior, args.side, after_collection=args.after_collection,
+                                       max_staleness_hours=args.max_staleness_hours):
+            print(value)
+        return 0
     if args.command == "capture":
         versions = json.loads(args.versions_file.read_text(encoding="utf-8"))
         configuration = json.loads(args.configuration_file.read_text(encoding="utf-8"))
