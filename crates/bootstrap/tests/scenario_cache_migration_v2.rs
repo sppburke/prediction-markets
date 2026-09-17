@@ -695,6 +695,14 @@ urllib.request.urlopen = urlopen
         2
     );
 
+    assert!(
+        count(
+            &fixed,
+            "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2"
+        ) > 0,
+        "restoring a schema-two prior retains its verified receipt rows"
+    );
+
     let displaced_v2 = dir.path().join("wallet_cache.displaced.v2.db");
     let (v1_request, v1_pending) =
         write_pending_publication(&dir, "v1", &consumed_side, &fixed, &fixed, &v1_backup);
@@ -1048,6 +1056,10 @@ async fn v2_activity_population_is_complete_idempotent_and_generation_isolated()
     .unwrap();
     assert_eq!(stage.version, 2);
     assert_eq!(stage.ranker_projection_count, 1);
+    assert_eq!(
+        stage.ranker_projection_digest,
+        reference_projection_digest(&side)
+    );
 
     let cache = WalletCache::open(&side).unwrap();
     let active = cache.activity_aggregates_v2().unwrap();
@@ -1109,8 +1121,8 @@ async fn v2_activity_population_is_complete_idempotent_and_generation_isolated()
                 |row| row.get::<_, i64>(0),
             )
             .unwrap(),
-        0,
-        "activity staging must be deleted atomically with its manifest"
+        1,
+        "finalization retains the generation's receipt evidence"
     );
     assert_eq!(
         cache
@@ -1266,6 +1278,10 @@ async fn retained_classifier_activity_at_version(
         let stage =
             finalize_cache_v2(side, &dir.path().join("initial-stage.json"), fixed_end + 2).unwrap();
         assert_eq!(stage.ranker_projection_count, 2);
+        assert_eq!(
+            stage.ranker_projection_digest,
+            reference_projection_digest(side)
+        );
         assert_eq!(classifier_projection_rows(side), expected);
         let connection = Connection::open(side).unwrap();
         assert_eq!(connection.query_row(
@@ -1281,6 +1297,9 @@ async fn retained_classifier_activity_at_version(
             .unwrap();
     } else {
         finalize_cache_v2(side, &dir.path().join("initial-stage.json"), fixed_end + 2).unwrap();
+    }
+    if classifier_version == 1 {
+        install_legacy_receipt_manifest(side, 7);
     }
     frozen
 }
@@ -1367,6 +1386,7 @@ async fn classifier_v2_rebuilds_retained_activity_without_recollection() {
     connection
         .execute_batch(
             "CREATE TRIGGER abort_projection_rebuild BEFORE INSERT ON ranker_entries_v2
+        WHEN (SELECT COUNT(*) FROM ranker_entries_v2) = 1
         BEGIN SELECT RAISE(ABORT, 'forced classifier rebuild crash'); END;",
         )
         .unwrap();
@@ -1403,6 +1423,10 @@ async fn classifier_v2_rebuilds_retained_activity_without_recollection() {
     assert_eq!(stage.version, 2);
     assert_eq!(stage.ranker_classifier_version, 2);
     assert_eq!(stage.ranker_projection_count, 2);
+    assert_eq!(
+        stage.ranker_projection_digest,
+        reference_projection_digest(&side)
+    );
     assert_eq!(stage.cache_sha256, sha256_file(&side).unwrap());
     let connection = Connection::open(&side).unwrap();
     let rows = connection
@@ -1767,7 +1791,7 @@ async fn classifier_upgrade_activation_preserves_authentic_prior_cache() {
 /// PASS: the activity fan-out reaches but never exceeds 16 in-flight wallets;
 /// a receipt-insert crash rolls back its wallet transaction, restart fetches
 /// only an exactly missing wallet, malformed receipt identity/digest fail, and
-/// manifest installation plus staging deletion is atomic.
+/// manifest installation plus projection/state replacement is atomic.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn activity_wallet_receipts_bound_resume_and_finalize_atomically() {
     let dir = TempDir::new().unwrap();
@@ -1935,8 +1959,9 @@ async fn activity_wallet_receipts_bound_resume_and_finalize_atomically() {
     let connection = Connection::open(&side).unwrap();
     connection
         .execute_batch(
-            "CREATE TRIGGER abort_activity_staging_delete
-             BEFORE DELETE ON activity_wallet_coverage_staging_v2
+            "CREATE TRIGGER abort_activity_final_state
+             BEFORE UPDATE OF phase ON cache_v2_migration_state
+             WHEN NEW.phase = 'finalized'
              BEGIN SELECT RAISE(ABORT, 'forced finalize crash'); END;",
         )
         .unwrap();
@@ -1966,7 +1991,7 @@ async fn activity_wallet_receipts_bound_resume_and_finalize_atomically() {
         17
     );
     connection
-        .execute_batch("DROP TRIGGER abort_activity_staging_delete")
+        .execute_batch("DROP TRIGGER abort_activity_final_state")
         .unwrap();
     drop(connection);
     finalize_cache_v2(&side, &dir.path().join("stage.json"), fixed_end + 7).unwrap();
@@ -1979,7 +2004,7 @@ async fn activity_wallet_receipts_bound_resume_and_finalize_atomically() {
                 |row| row.get::<_, i64>(0),
             )
             .unwrap(),
-        0
+        17
     );
 }
 
@@ -3241,49 +3266,62 @@ async fn fresh_generation_excludes_a_wallet_whose_history_cannot_be_aggregated()
     );
     assert!(count(&side, "SELECT COUNT(*) FROM ranker_entries_v2") > 0);
 
-    // The finalized cache is the next cycle's prior: the excluded wallet is
-    // inactive and retains no history there, and only its excluded receipt
-    // can carry it into the next union.
-    let next = dir.path().join("next.db");
-    std::fs::copy(&side, &next).unwrap();
-    assert_eq!(
-        count(
+    for legacy in [false, true] {
+        // The finalized cache is the next cycle's prior: the excluded wallet is
+        // inactive and retains no history there, and only its excluded receipt
+        // can carry it into the next union.
+        let next = dir.path().join(format!("next-{legacy}.db"));
+        std::fs::copy(&side, &next).unwrap();
+        if legacy {
+            install_legacy_receipt_manifest(&next, 1);
+        }
+        assert_eq!(
+            count(
+                &next,
+                &format!(
+                    "SELECT COUNT(*) FROM active_tradeable_wallets WHERE wallet_hex = '{WALLET_B}'"
+                )
+            ),
+            0
+        );
+        assert_eq!(
+            count(
+                &next,
+                &format!("SELECT COUNT(*) FROM activity_groups_v2 WHERE wallet_hex = '{WALLET_B}'")
+            ),
+            0
+        );
+        let next_end = FRESH_END + 100;
+        let manifest = populate_activity_fresh_v2(
             &next,
-            &format!(
-                "SELECT COUNT(*) FROM active_tradeable_wallets WHERE wallet_hex = '{WALLET_B}'"
-            )
-        ),
-        0
-    );
-    assert_eq!(
-        count(
-            &next,
-            &format!("SELECT COUNT(*) FROM activity_groups_v2 WHERE wallet_hex = '{WALLET_B}'")
-        ),
-        0
-    );
-    let next_end = FRESH_END + 100;
-    let manifest = populate_activity_fresh_v2(
-        &next,
-        &fresh_fetcher(
-            &[WALLET, WALLET_B, WALLET_C, WALLET_D],
+            &fresh_fetcher(
+                &[WALLET, WALLET_B, WALLET_C, WALLET_D],
+                next_end,
+                &[FRESH_END - 1, FRESH_END - 101],
+                false,
+            ),
+            "https://data.example",
+            2,
             next_end,
-            &[FRESH_END - 1, FRESH_END - 101],
-            false,
-        ),
-        "https://data.example",
-        2,
-        next_end,
-        next_end + 1,
-    )
-    .await
-    .unwrap();
-    assert_eq!((manifest.generation, manifest.wallet_count), (2, 4));
-    assert_eq!(
-        fresh_record(&next)["wallets"],
-        serde_json::json!([WALLET, WALLET_B, WALLET_C, WALLET_D])
-    );
-    assert_eq!(receipt(&next, 2, WALLET_B), Some((2, 2, 2)));
+            next_end + 1,
+        )
+        .await
+        .unwrap();
+        assert_eq!((manifest.generation, manifest.wallet_count), (2, 4));
+        assert_eq!(
+            fresh_record(&next)["wallets"],
+            serde_json::json!([WALLET, WALLET_B, WALLET_C, WALLET_D])
+        );
+        assert_eq!(receipt(&next, 2, WALLET_B), Some((2, 2, 2)));
+        assert_eq!(
+            count(
+                &next,
+                "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2 WHERE generation = 1"
+            ),
+            0
+        );
+        assert_eq!(generation_rows(&next, 1), 0);
+    }
 }
 
 #[tokio::test]
@@ -3309,6 +3347,28 @@ async fn fresh_generation_supersedes_a_legacy_frozen_identity_and_refuses_tamper
     .await
     .unwrap_err();
     assert!(older.to_string().contains("must exceed"), "{older}");
+
+    let damaged = dir.path().join("damaged-frozen-receipts.db");
+    std::fs::copy(&side, &damaged).unwrap();
+    Connection::open(&damaged)
+        .unwrap()
+        .execute("DELETE FROM activity_wallet_coverage_staging_v2", [])
+        .unwrap();
+    let refused = populate_activity_fresh_v2(
+        &damaged,
+        &FixtureFetcher::new(HashMap::new()),
+        "https://data.example",
+        8,
+        FRESH_END + 100,
+        FRESH_END + 11,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        refused.to_string().contains("missing frozen wallets"),
+        "{refused}"
+    );
+    assert_eq!(generation_rows(&damaged, 7), generation_rows(&side, 7));
 
     let fresh = RecordingFetcher::default();
     let manifest = populate_activity_fresh_v2(
@@ -4131,4 +4191,430 @@ async fn historical_cache_without_the_fresh_column_keeps_its_legacy_identity() {
         "{fatal}"
     );
     assert_eq!(fatal.exit_code(), 1);
+}
+
+// Compile the private pure commitment owner into this focused binary as well,
+// so parity tests need neither a public test API nor a separate lib-test run.
+#[path = "../src/cache_migration/digests.rs"]
+mod digests;
+
+fn whole_json_digest(value: &impl serde::Serialize) -> String {
+    format!("{:x}", Sha256::digest(serde_json::to_vec(value).unwrap()))
+}
+
+#[test]
+fn streamed_aggregate_digest_matches_whole_typed_vector() {
+    use pe_source_polymarket_public::{ActivityAggregate, SourceActivityGroupId};
+    let observed = time::OffsetDateTime::from_unix_timestamp(FRESH_END).unwrap();
+    let make = |wallet: &str| {
+        let raw = activity_rows(wallet, &[FRESH_END - 1, FRESH_END - 2], false);
+        let mut groups = parse_activity_response(
+            &raw,
+            WalletAddress::from_hex(wallet).unwrap(),
+            &ActivityParseContext {
+                source_id: SourceId("fixture".to_owned()),
+                observed_at: SourceTimestamp(observed),
+                received_at: ReceivedAt(observed),
+                transport: ActivityTransport::Rest,
+            },
+        )
+        .unwrap()
+        .aggregates()
+        .unwrap();
+        // Equal seconds with different keys, exact decimals and escaped text.
+        groups[1].source_time = groups[0].source_time.clone();
+        let mut components = groups[1].group_id.components().clone();
+        components.transaction_hash = "quote\" newline\n slash\\ unicode é".to_owned();
+        groups[1].group_id = SourceActivityGroupId::derive(components).unwrap();
+        groups[1].share_sum =
+            ShareAmount::from_decimal_exact(rust_decimal_macros::dec!(1.250001)).unwrap();
+        groups[1].price_weighted_share_sum.0 = rust_decimal_macros::dec!(0.500000400);
+        groups
+    };
+    let populated_b = make(WALLET_B);
+    let populated_e = make(WALLET_E);
+    let cases: Vec<Vec<(&str, Vec<ActivityAggregate>)>> = vec![
+        vec![],
+        vec![(WALLET, vec![]), (WALLET_C, vec![])], // empty and excluded
+        vec![
+            (WALLET_E, populated_e.clone()),
+            (WALLET_C, vec![]),
+            (WALLET_B, populated_b.clone()),
+            (WALLET_D, vec![]),
+            (WALLET, vec![]),
+        ],
+        vec![
+            (WALLET_E, populated_e),
+            (WALLET_B, populated_b),
+            (WALLET_D, make(WALLET_D)),
+        ],
+    ];
+    let key = |a: &ActivityAggregate| {
+        (
+            a.group_id.components().wallet.to_string(),
+            a.source_time.0.unix_timestamp(),
+            a.group_id.key().0.clone(),
+        )
+    };
+    for wallets in cases {
+        // The old whole-generation computation is retained only as a reference.
+        let mut all = wallets
+            .iter()
+            .flat_map(|(_, groups)| groups.clone())
+            .collect::<Vec<_>>();
+        all.sort_by_key(&key);
+        let mut ordered = wallets.into_iter().collect::<BTreeMap<_, _>>();
+        let mut streamed = digests::JsonArrayDigest::new();
+        for groups in ordered.values_mut() {
+            groups.sort_by_key(&key);
+            let json = serde_json::to_string(groups).unwrap();
+            assert_eq!(
+                whole_json_digest(groups),
+                format!("{:x}", Sha256::digest(json.as_bytes()))
+            );
+            streamed.extend_array(&json).unwrap();
+        }
+        assert_eq!(streamed.finish(), whole_json_digest(&all));
+    }
+}
+
+#[test]
+fn streamed_receipt_digest_matches_whole_value_envelope() {
+    #[derive(serde::Serialize)]
+    struct Receipt {
+        wallet_hex: String,
+        pages: Vec<Value>,
+        ordered_aggregate_digest: String,
+        source_row_count: u64,
+        aggregate_count: u64,
+        schema_version: u32,
+        parser_version: u32,
+    }
+    let receipts = [WALLET, WALLET_B, WALLET_C].map(|wallet| Receipt {
+        wallet_hex: wallet.to_owned(),
+        pages: vec![
+            serde_json::json!({"raw_page_hash": "f".repeat(64), "row_count": 1,
+            "request_cursor": "quote\"\n\\é", "schema_version": 2, "parser_version": 2}),
+        ],
+        ordered_aggregate_digest: "a".repeat(64),
+        source_row_count: 1,
+        aggregate_count: 1,
+        schema_version: 2,
+        parser_version: 2,
+    });
+    for len in 0..=receipts.len() {
+        let reference = "escaped\"\n\\é";
+        let expected = whole_json_digest(&serde_json::json!({
+            "generation": 7, "reference_sha256": reference, "fixed_end_unix": FRESH_END,
+            "receipts": &receipts[..len],
+        }));
+        let mut streamed = digests::ReceiptSetDigest::new(7, reference, FRESH_END).unwrap();
+        for receipt in &receipts[..len] {
+            streamed.push(receipt).unwrap();
+        }
+        assert_eq!(streamed.finish(), expected);
+    }
+}
+
+fn assert_bounded_activity_cli(path: &std::path::Path, legacy: bool) {
+    let output = Command::new(env!("CARGO_BIN_EXE_pe-bootstrap"))
+        .env_clear()
+        .env(
+            "PE_BOOTSTRAP_OUTPUT",
+            path.parent().unwrap().join("watchlist.json"),
+        )
+        .env("RUST_LOG", "off")
+        .args(["cache-populate-activity-v2", "--db"])
+        .arg(path)
+        .args(["--fresh-generation", "1"])
+        .current_dir(path.parent().unwrap())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "status={} stdout={} stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(output.stdout.len() < 1024);
+    assert_eq!(report["wallet_count"], 4);
+    assert_eq!(report["page_hashes"], serde_json::json!([]));
+    if legacy {
+        assert_eq!(report["cursors"], Value::Null);
+    } else {
+        assert_eq!(
+            report["cursors"]["receipt_storage"],
+            "activity_wallet_coverage_staging_v2"
+        );
+    }
+}
+
+fn stored_receipt_proofs(connection: &Connection, generation: i64) -> Vec<Value> {
+    connection
+        .prepare(
+            "SELECT wallet_hex, page_evidence_json, ordered_aggregate_digest, source_row_count,
+                aggregate_count, schema_version, parser_version
+         FROM activity_wallet_coverage_staging_v2 WHERE generation = ?1 ORDER BY wallet_hex",
+        )
+        .unwrap()
+        .query_map([generation], |row| {
+            Ok(serde_json::json!({
+                "wallet_hex": row.get::<_, String>(0)?,
+                "pages": serde_json::from_str::<Value>(&row.get::<_, String>(1)?).unwrap(),
+                "ordered_aggregate_digest": row.get::<_, String>(2)?,
+                "source_row_count": row.get::<_, i64>(3)?,
+                "aggregate_count": row.get::<_, i64>(4)?,
+                "schema_version": row.get::<_, i64>(5)?,
+                "parser_version": row.get::<_, i64>(6)?,
+            }))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+// Install exactly the old stored representation and remove its staging rows.
+// Its receipt digest is independently checked against the original envelope;
+// this fixture does not let the new writer redefine the legacy format.
+fn install_legacy_receipt_manifest(path: &std::path::Path, generation: i64) {
+    let mut connection = Connection::open(path).unwrap();
+    let transaction = connection.transaction().unwrap();
+    let receipts = stored_receipt_proofs(&transaction, generation);
+    let (reference, bounds, digest): (String, String, String) = transaction
+        .query_row(
+            "SELECT reference_sha256, source_bounds_json, receipt_set_digest
+         FROM activity_coverage_manifests_v2 WHERE generation = ?1",
+            [generation],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    let bounds: Value = serde_json::from_str(&bounds).unwrap();
+    assert_eq!(
+        digest,
+        whole_json_digest(&serde_json::json!({
+            "generation": generation, "reference_sha256": reference,
+            "fixed_end_unix": bounds["end_inclusive"], "receipts": receipts,
+        }))
+    );
+    let mut hashes = receipts
+        .iter()
+        .flat_map(|receipt| {
+            receipt["pages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(move |page| {
+                    format!(
+                        "{}:{}",
+                        receipt["wallet_hex"].as_str().unwrap(),
+                        page["raw_page_hash"].as_str().unwrap()
+                    )
+                })
+        })
+        .collect::<Vec<_>>();
+    hashes.sort();
+    transaction.execute("UPDATE activity_coverage_manifests_v2 SET cursors_json = ?1, page_hashes_json = ?2 WHERE generation = ?3",
+        params![serde_json::to_string(&receipts).unwrap(), serde_json::to_string(&hashes).unwrap(), generation]).unwrap();
+    transaction
+        .execute(
+            "DELETE FROM activity_wallet_coverage_staging_v2 WHERE generation = ?1",
+            [generation],
+        )
+        .unwrap();
+    transaction.commit().unwrap();
+}
+
+fn reference_projection_digest(path: &std::path::Path) -> String {
+    let connection = Connection::open(path).unwrap();
+    let names = [
+        "source_trade_id",
+        "activity_generation",
+        "classifier_version",
+        "wallet_hex",
+        "condition_id",
+        "asset",
+        "outcome_id",
+        "side",
+        "share_amount_str",
+        "price_weighted_share_amount_str",
+        "source_usdc_amount_str",
+        "source_time_unix",
+        "payout_vector_json",
+        "end_date_unix",
+    ];
+    let rows = connection.prepare(
+        "SELECT ranker.source_trade_id, ranker.activity_generation, ranker.classifier_version,
+                groups_v2.wallet_hex, groups_v2.condition_id, groups_v2.asset, groups_v2.outcome_id,
+                groups_v2.side, groups_v2.share_amount_str, groups_v2.price_weighted_share_amount_str,
+                groups_v2.source_usdc_amount_str, groups_v2.source_time_unix,
+                payout.payout_vector_json, payout.end_date_unix
+         FROM ranker_entries_v2 ranker JOIN activity_groups_v2 groups_v2
+           ON groups_v2.source_trade_id = ranker.source_trade_id
+          AND groups_v2.coverage_generation = ranker.activity_generation
+         JOIN clob_payout_evidence_v2 payout ON payout.market_id = groups_v2.condition_id
+         ORDER BY ranker.source_trade_id"
+    ).unwrap().query_map([], |row| {
+        let mut value = serde_json::Map::new();
+        for (i, name) in names.iter().enumerate() {
+            value.insert((*name).to_owned(), match i {
+                1 | 2 | 6 | 11 | 13 => Value::from(row.get::<_, i64>(i)?),
+                _ => Value::from(row.get::<_, String>(i)?),
+            });
+        }
+        Ok(Value::Object(value))
+    }).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+    whole_json_digest(&rows)
+}
+
+#[tokio::test]
+async fn retained_receipts_and_legacy_manifests_fail_closed_on_corruption() {
+    let dir = TempDir::new().unwrap();
+    let side = dir.path().join("retained.db");
+    finalize_fresh_initial(&dir, &side).await;
+    let connection = Connection::open(&side).unwrap();
+    let (cursors, hashes, digest): (String, String, String) = connection.query_row(
+        "SELECT cursors_json, page_hashes_json, receipt_set_digest FROM activity_coverage_manifests_v2",
+        [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    ).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&cursors).unwrap(),
+        serde_json::json!({
+            "receipt_storage": "activity_wallet_coverage_staging_v2", "version": 1
+        })
+    );
+    assert_eq!(hashes, "[]");
+    assert!(cursors.len() < 100);
+    let receipts = stored_receipt_proofs(&connection, 1);
+    assert_eq!(receipts.len(), 4);
+    assert_eq!(
+        digest,
+        whole_json_digest(&serde_json::json!({
+            "generation": 1, "reference_sha256": fresh_record(&side)["digest"],
+            "fixed_end_unix": FRESH_END, "receipts": receipts,
+        }))
+    );
+    let projection: String = connection
+        .query_row(
+            "SELECT ranker_projection_digest FROM cache_v2_migration_state",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(projection, reference_projection_digest(&side));
+    drop(connection);
+    assert_bounded_activity_cli(&side, false);
+    // Re-finalization and a completed collection both validate retained rows.
+    finalize_cache_v2(&side, &dir.path().join("again.json"), FRESH_END + 3).unwrap();
+    let no_reads = YieldingFetcher::default();
+    let manifest = populate_activity_fresh_v2(
+        &side,
+        &no_reads,
+        "https://data.example",
+        1,
+        FRESH_END,
+        FRESH_END + 4,
+    )
+    .await
+    .unwrap();
+    assert!(no_reads.calls.lock().unwrap().is_empty());
+    assert!(serde_json::to_string(&manifest).unwrap().len() < 1024);
+    for (name, sql) in [
+        (
+            "missing",
+            "DELETE FROM activity_wallet_coverage_staging_v2 WHERE wallet_hex = '0x2222222222222222222222222222222222222222'",
+        ),
+        (
+            "extra",
+            "UPDATE activity_wallet_coverage_staging_v2 SET wallet_hex = '0x5555555555555555555555555555555555555555' WHERE wallet_hex = '0x2222222222222222222222222222222222222222'",
+        ),
+        (
+            "page",
+            "UPDATE activity_wallet_coverage_staging_v2 SET page_evidence_json = '[]'",
+        ),
+        (
+            "receipt_digest",
+            "UPDATE activity_wallet_coverage_staging_v2 SET ordered_aggregate_digest = printf('%064d', 0)",
+        ),
+        (
+            "receipt_count",
+            "UPDATE activity_wallet_coverage_staging_v2 SET aggregate_count = aggregate_count + 1",
+        ),
+        (
+            "receipt_identity",
+            "UPDATE activity_wallet_coverage_staging_v2 SET fixed_end_unix = fixed_end_unix + 1",
+        ),
+        (
+            "marker",
+            "UPDATE activity_coverage_manifests_v2 SET cursors_json = '{\"receipt_storage\":\"activity_wallet_coverage_staging_v2\",\"version\":2}'",
+        ),
+        (
+            "marker_extra",
+            "UPDATE activity_coverage_manifests_v2 SET cursors_json = '{\"receipt_storage\":\"activity_wallet_coverage_staging_v2\",\"version\":1,\"extra\":true}'",
+        ),
+        (
+            "hashes",
+            "UPDATE activity_coverage_manifests_v2 SET page_hashes_json = '[\"unexpected\"]'",
+        ),
+        (
+            "component",
+            "UPDATE activity_groups_v2 SET components_json = json_set(components_json, '$.transaction_hash', 'changed')",
+        ),
+        (
+            "key",
+            "UPDATE activity_groups_v2 SET source_trade_id = 'g2:' || printf('%064d', 0) WHERE rowid = (SELECT MIN(rowid) FROM activity_groups_v2)",
+        ),
+        (
+            "amount",
+            "UPDATE activity_groups_v2 SET share_amount_str = '9.000001'",
+        ),
+        (
+            "count",
+            "UPDATE activity_groups_v2 SET row_count = row_count + 1",
+        ),
+        (
+            "aggregate_digest",
+            "UPDATE activity_coverage_manifests_v2 SET aggregate_digest = printf('%064d', 0)",
+        ),
+    ] {
+        for legacy in [false, true] {
+            // Marker/receipt-table damage tests apply to the retained representation.
+            if legacy
+                && !["component", "key", "amount", "count", "aggregate_digest"].contains(&name)
+            {
+                continue;
+            }
+            let damaged = dir.path().join(format!("{name}-{legacy}.db"));
+            std::fs::copy(&side, &damaged).unwrap();
+            if legacy {
+                install_legacy_receipt_manifest(&damaged, 1);
+            }
+            Connection::open(&damaged)
+                .unwrap()
+                .execute_batch(sql)
+                .unwrap();
+            assert!(
+                finalize_cache_v2(&damaged, &dir.path().join("bad.json"), FRESH_END + 5).is_err(),
+                "accepted {name} legacy={legacy}"
+            );
+        }
+    }
+    let legacy = dir.path().join("legacy.db");
+    std::fs::copy(&side, &legacy).unwrap();
+    install_legacy_receipt_manifest(&legacy, 1);
+    assert_bounded_activity_cli(&legacy, true);
+    finalize_cache_v2(&legacy, &dir.path().join("legacy.json"), FRESH_END + 5).unwrap();
+    let connection = Connection::open(&legacy).unwrap();
+    // A legacy array requires *no* retained receipts; it cannot hide table damage.
+    connection.execute("INSERT INTO activity_wallet_coverage_staging_v2 VALUES (1, ?1, ?2, ?3, '[]', ?4, 0, 0, 2, 2, ?3)",
+        params![WALLET, fresh_record(&legacy)["digest"].as_str().unwrap(), FRESH_END, whole_json_digest(&Vec::<Value>::new())]).unwrap();
+    drop(connection);
+    let error =
+        finalize_cache_v2(&legacy, &dir.path().join("bad-legacy.json"), FRESH_END + 6).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("legacy activity manifest retained staging receipts")
+    );
 }

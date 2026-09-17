@@ -557,8 +557,11 @@ pe-bootstrap cache-finalize-v2 \
 
 Frozen verification precedes all activity I/O. Each completed wallet commits its aggregates and
 receipt together; restart schedules only missing exact receipts, and finalization requires the
-receipt set to equal the frozen universe before atomically installing the activity manifest and
-deleting staging. Finalization also verifies payout coverage, builds the Rust ledger/classifier
+receipt set to equal the frozen universe before atomically installing the bounded activity manifest,
+retaining that generation's receipt rows (the storage marker is defined in `_GLOSSARY.md`).
+Completion, finalization, activation and restore validate aggregates one wallet at a time with
+unchanged aggregate/receipt digests; Rust and Parquet projection verification stream their ordered rows.
+Finalization also verifies payout coverage, builds the Rust ledger/classifier
 projection, and records its count and digest.
 For frozen and fresh collections, resuming an unfinished collection (no activity manifest
 installed yet) validates receipt identity, shape and count constraints without reading
