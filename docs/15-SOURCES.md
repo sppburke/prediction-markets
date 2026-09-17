@@ -38,6 +38,14 @@
 
 ## Polymarket
 
+> **Short-429 retry budget (#588), Last checked: 2026-09-17; re-verify by
+> 2026-11-16.** The [official rate-limit reference](https://docs.polymarket.com/api-reference/rate-limits)
+> still describes sliding windows and queued throttling. It lists legacy `/trades`
+> at 200 requests/10 seconds and v2 `/activity` at the same limit; it does not
+> separately list legacy `/activity` or promise a one-second `Retry-After`.
+> The short-429 policy remains grounded in the reported Forge responses, with
+> unchanged request pacing and a separate bounded retry budget (see `_GLOSSARY.md`).
+
 > **SUPERSEDED (2026-08-25, issue #530 re-verification): RTDS DOES carry attributed trades.**
 > The 2026-06-03 conclusion below no longer holds for `wss://ws-live-data.polymarket.com`:
 > subscribing `{"action":"subscribe","subscriptions":[{"topic":"activity","type":"trades"}]}`
@@ -178,6 +186,7 @@
 | https://docs.polymarket.com/developers/CLOB/websocket/wss-overview | 2026-06-10 | 2026-08-09 |
 | https://docs.polymarket.com/ | 2026-05-02 | 2026-07-01 |
 | https://docs.polymarket.com/llms.txt | — | — |
+| https://docs.polymarket.com/api-reference/rate-limits | 2026-09-17 | 2026-11-16 |
 | https://docs.polymarket.com/market-data/websocket/overview | 2026-05-02 | 2026-07-01 |
 | https://docs.polymarket.com/market-data/websocket/market-channel | 2026-06-09 | 2026-09-01 |
 | https://docs.polymarket.com/market-data/websocket/user-channel | 2026-06-03 | 2026-09-01 |

@@ -94,10 +94,18 @@ def _load_v2_export_manifest(parquet_dir: str) -> dict:
     path = os.path.join(parquet_dir, V2_EXPORT_MANIFEST)
     with open(path, encoding="utf-8") as source:
         value = json.load(source)
-    if value.get("version") != 1 or set(value.get("tables", {})) != {
+    if value.get("version") not in (1, 2) or set(value.get("tables", {})) != {
         name.removesuffix(".parquet") for name in REQUIRED_V2_PARQUET
     }:
         raise SchemaTwoEngineError("schema-two export manifest has an invalid shape")
+    if value["version"] == 2:
+        projection = value.get("projection", {})
+        if (value.get("activity_scope") != "certified_ranker_entries"
+                or projection.get("activity_generation") is None
+                or not (value["tables"]["activity_groups_v2"].get("count")
+                        == value["tables"]["ranker_entries_v2"].get("count")
+                        == projection.get("count"))):
+            raise SchemaTwoEngineError("schema-two certified activity scope/count mismatch")
     for name in REQUIRED_V2_PARQUET:
         table = name.removesuffix(".parquet")
         expected = value["tables"][table].get("sha256")
@@ -260,6 +268,20 @@ def get_engine(force: str | None = None,
             raise SchemaTwoEngineError(
                 "schema-two export manifest does not match finalized projection state"
             )
+        if export_manifest["version"] == 2:
+            generation = projection["activity_generation"]
+            latest = con.execute(
+                "SELECT MAX(generation) FROM activity_coverage_manifests_v2"
+            ).fetchone()[0]
+            bad = con.execute(
+                "SELECT COUNT(*) FROM ranker_entries_v2 r "
+                "LEFT JOIN activity_groups_v2 g ON g.source_trade_id = r.source_trade_id "
+                "AND g.coverage_generation = r.activity_generation "
+                "WHERE r.activity_generation IS NULL OR r.activity_generation != ? "
+                "OR g.source_trade_id IS NULL", [generation],
+            ).fetchone()[0]
+            if latest != generation or bad:
+                raise SchemaTwoEngineError("schema-two certified activity generation/rows mismatch")
     # Optional CLV view (issue #421 PR4) — registered only when its parquet exists, so the engine
     # stays usable for proxy-CLV / non-CLV runs before the prices-history backfill has run.
     mph_path = os.path.join(parquet_dir, MARKET_PRICE_HISTORY_PARQUET)
