@@ -2695,6 +2695,81 @@ async fn activity_wallet_receipts_bound_resume_and_finalize_atomically() {
     assert_eq!(sha256_file(&populated).unwrap(), before);
 }
 
+/// A projection error that ends the transaction must not let deferred manifest
+/// installation commit independently while content validation finishes.
+#[tokio::test]
+async fn projection_auto_rollback_leaves_manifest_identity_and_state_unchanged() {
+    let dir = TempDir::new().unwrap();
+    let side = dir.path().join("side.db");
+    prepare_fresh_initial(&dir, &side).await;
+    let manifest_sql = "SELECT * FROM activity_coverage_manifests_v2 ORDER BY generation";
+    let identity_sql = "SELECT generation, collection_identity_json
+        FROM activity_coverage_manifests_v2 ORDER BY generation";
+    let expected_manifest = query_values(&side, manifest_sql);
+    let expected_identity = query_values(&side, identity_sql);
+    assert_eq!(
+        count(
+            &side,
+            "SELECT COUNT(*) FROM activity_coverage_manifests_v2 WHERE collection_identity_json IS NOT NULL"
+        ),
+        1
+    );
+    let connection = Connection::open(&side).unwrap();
+    assert_eq!(
+        connection
+            .execute("DELETE FROM activity_coverage_manifests_v2", [])
+            .unwrap(),
+        1
+    );
+    connection
+        .execute_batch(
+            "CREATE TRIGGER rollback_projection BEFORE INSERT ON ranker_entries_v2
+             WHEN (SELECT COUNT(*) FROM ranker_entries_v2) = 1
+             BEGIN SELECT RAISE(ROLLBACK, 'forced transaction-ending projection failure'); END;",
+        )
+        .unwrap();
+    drop(connection);
+    let snapshots = [
+        "SELECT * FROM ranker_entries_v2 ORDER BY source_trade_id",
+        "SELECT * FROM cache_v2_migration_state",
+        manifest_sql,
+        identity_sql,
+    ]
+    .map(|sql| (sql, query_values(&side, sql)));
+    let stage_path = dir.path().join("stage.json");
+    let error = finalize_cache_v2(&side, &stage_path, FRESH_END + 2).unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            pe_bootstrap::error::BootstrapError::Sqlite(rusqlite::Error::SqliteFailure(_, Some(message)))
+                if message == "forced transaction-ending projection failure"
+        ),
+        "{error}"
+    );
+    for (sql, before) in snapshots {
+        assert_eq!(query_values(&side, sql), before, "{sql}");
+    }
+    assert!(!stage_path.exists());
+
+    // The trigger fires only after one successful insert. Retrying without it
+    // must install the original manifest/identity and a nonempty projection.
+    Connection::open(&side)
+        .unwrap()
+        .execute_batch("DROP TRIGGER rollback_projection")
+        .unwrap();
+    let recovered = finalize_cache_v2(&side, &stage_path, FRESH_END + 1).unwrap();
+    assert!(recovered.ranker_projection_count > 1);
+    assert_eq!(query_values(&side, manifest_sql), expected_manifest);
+    assert_eq!(query_values(&side, identity_sql), expected_identity);
+    assert_eq!(
+        count(
+            &side,
+            "SELECT COUNT(*) FROM cache_v2_migration_state WHERE phase = 'finalized'"
+        ),
+        1
+    );
+}
+
 // ── #588: fresh private-generation collection and cycle staging ──────────────
 //
 // PASS: a fresh generation binds the union of current acquisition candidates

@@ -583,7 +583,10 @@ the recorded values; missing or changed proof refuses reuse. A different recorde
 version instead runs full activity verification and rebuilds the projection with the current
 classifier. Each rebuilding finalization loads a wallet once, validates its entire aggregate
 vector, then classifies that same vector; a classifier stopping point never truncates validation.
-Manifest verification/installation, projection replacement and finalized state share one transaction.
+Manifest installation, projection replacement and finalized state commit together. Content
+validation finishes before any deferred projection error is returned; a missing manifest and its
+archived identity are installed only after validation and projection succeed, so a projection error
+that automatically rolls back SQLite's transaction cannot leave either committed independently.
 Reuse skips that activity-generation verification and reclassification. The payout evidence digest
 streams every evidence row in market-ID order, binding `market_id`, `end_date_unix`, `payout_status`,
 and `payout_vector_json`, including markets currently excluded from the projection. It covers the

@@ -2501,11 +2501,11 @@ fn activity_identity(connection: &Connection) -> Result<ActivityIdentity, Bootst
     })
 }
 
-fn install_activity_manifest(
+fn prepare_activity_manifest(
     transaction: &rusqlite::Transaction<'_>,
     finalized_at_unix: i64,
     mut consume: impl FnMut(&str, &[ActivityAggregate]),
-) -> Result<ActivityCoverageManifestV2, BootstrapError> {
+) -> Result<(ActivityCoverageManifestV2, bool), BootstrapError> {
     let ActivityIdentity {
         generation,
         reference_sha256,
@@ -2531,7 +2531,7 @@ fn install_activity_manifest(
             &wallets,
             visit,
         )?;
-        return Ok(manifest);
+        return Ok((manifest, false));
     }
     let mut manifest = validate_activity_staging_with(
         transaction,
@@ -2550,8 +2550,7 @@ fn install_activity_manifest(
     if CollectionProof::load(transaction, generation)?.is_some() {
         manifest.cursors = incremental::receipt_marker_v2();
     }
-    record_completed_manifest(transaction, &manifest)?;
-    Ok(manifest)
+    Ok((manifest, true))
 }
 
 fn rebuild_ranker_projection(
@@ -2587,8 +2586,8 @@ fn rebuild_ranker_projection(
         Ok(projection) => (Some(projection), None),
         Err(error) => (None, Some(error)),
     };
-    let manifest =
-        install_activity_manifest(transaction, finalized_at_unix, |wallet, aggregates| {
+    let (manifest, needs_install) =
+        prepare_activity_manifest(transaction, finalized_at_unix, |wallet, aggregates| {
             if projection_error.is_none()
                 && let Some((payout_markets, quality, insert)) = projection.as_mut()
             {
@@ -2603,10 +2602,15 @@ fn rebuild_ranker_projection(
                 .err();
             }
         })?;
-    // Content/receipt/manifest failures retain precedence over tentative SQL
-    // writes. The caller's transaction rolls back both on any failure.
+    // Content/receipt/manifest validation failures retain precedence over SQL
+    // errors. Return a deferred projection error before installing the manifest:
+    // SQLite may already have rolled back the transaction, so later writes could
+    // otherwise commit independently in autocommit mode.
     if let Some(error) = projection_error {
         return Err(error);
+    }
+    if needs_install {
+        record_completed_manifest(transaction, &manifest)?;
     }
     let digest = ranker_projection_digest(transaction, activity_generation)?;
     let count: i64 =
