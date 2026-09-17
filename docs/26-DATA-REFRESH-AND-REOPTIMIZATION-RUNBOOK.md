@@ -622,8 +622,9 @@ generation because the frozen reference is bound to one generation and end, the 
 list is fixed to the sealed schema-one history, and activity insertion moves matching rows
 between generations inside one database. Recurring classifier-two publication therefore
 builds every cycle in a **private candidate** copied from an **immutable prior** of the fixed
-cache and collects fresh complete activity for the union of current acquisition candidates
-and every retained history, without a frozen reference:
+cache and collects fresh complete activity for the union of current acquisition candidates,
+every retained history and every wallet the prior's newest generation excluded, without a
+frozen reference:
 
 ```bash
 # Under the cache lock: checkpoint + quick-check the fixed main, copy it to the
