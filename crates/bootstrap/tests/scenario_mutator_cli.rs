@@ -348,13 +348,13 @@ fn every_writable_opener_logs_requested_and_effective_cache_tuning_from_env() {
             ],
         );
         assert_eq!(output.status.code(), Some(1), "args={args:?}");
-        let stdout = String::from_utf8(output.stdout).unwrap();
-        let tuning: Vec<serde_json::Value> = stdout
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let tuning: Vec<serde_json::Value> = stderr
             .lines()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
             .filter(|entry| entry["fields"]["message"] == "wallet cache: connection tuning applied")
             .collect();
-        assert_eq!(tuning.len(), 1, "args={args:?}: {stdout}");
+        assert_eq!(tuning.len(), 1, "args={args:?}: {stderr}");
         let fields = &tuning[0]["fields"];
         assert_eq!(fields["requested_cache_kib"], -3 * 1024);
         assert_eq!(fields["effective_cache_kib"], -3 * 1024);
