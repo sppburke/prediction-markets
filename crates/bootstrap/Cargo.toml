@@ -52,7 +52,7 @@ tracing-subscriber = { workspace = true }
 # Archive-artifact assertions open the purge-archive SQLite directly (scenario_purge).
 # `trace` (test builds only, via feature unification): the #538 reclamation tests
 # install a SQL trace to prove which maintenance statement ran.
-rusqlite            = { version = "0.32", features = ["bundled", "trace"] }
+rusqlite            = { version = "0.32", features = ["bundled", "trace", "hooks"] }
 rust_decimal_macros = { workspace = true }
 tempfile            = { workspace = true }
 # `test-util` enables tokio's paused virtual clock (`start_paused`) so the CLOB

@@ -126,6 +126,7 @@ pub(super) fn record_completed_manifest(
 #[derive(Clone)]
 pub(super) struct CollectionProof {
     pub(super) identity: FreshCollectionIdentity,
+    pub(super) bulk_root: bool,
     base: Option<(ActivityCoverageManifestV2, FreshCollectionIdentity)>,
     base_link: Option<String>,
     data_version: i64,
@@ -144,7 +145,14 @@ impl CollectionProof {
             return Ok(None);
         };
         if identity.version == 1 {
+            reject_bulk_root(connection)?;
             return Ok(None);
+        }
+        let bulk_root = connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?
+            == CACHE_SCHEMA_VERSION_BULK_ROOT;
+        if bulk_root {
+            require_bulk_root_state(connection, &identity)?;
         }
         let base = if let Some(base) = identity.base_generation {
             let record =
@@ -187,6 +195,7 @@ impl CollectionProof {
         }
         Ok(Some(Self {
             identity,
+            bulk_root,
             base,
             base_link,
             data_version,
@@ -861,6 +870,11 @@ fn check_collisions(
     proof: &CollectionProof,
     completion: &WalletActivityCompletion,
 ) -> Result<bool, BootstrapError> {
+    // These are the only indexed-identity probes omitted by the private root.
+    // Wallet ownership, data_version, receipts and strict inserts still run.
+    if proof.bulk_root {
+        return Ok(false);
+    }
     let mut collision = false;
     let mut statement = connection.prepare_cached(
         "SELECT wallet_hex, coverage_generation FROM activity_groups_v2 WHERE source_trade_id = ?1",
@@ -900,6 +914,14 @@ pub(super) fn commit_incremental_wallet(
     let wallet = &completion.wallet_hex;
     let identity = &proof.identity;
     let generation = to_i64(identity.generation, "activity generation")?;
+    if proof.bulk_root {
+        let mut ids = BTreeSet::new();
+        for aggregate in &completion.aggregates {
+            if !ids.insert(&aggregate.group_id.key().0) {
+                return invalid("duplicate source_trade_id in bulk-root wallet batch".to_owned());
+            }
+        }
+    }
     let collision = check_collisions(connection, proof, completion)?;
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -1022,7 +1044,8 @@ pub(super) fn commit_incremental_wallet(
             if epoch <= acquisition.start_exclusive || epoch > acquisition.fixed_end_unix {
                 return invalid("fetched aggregate outside acquisition window".to_owned());
             }
-            // The PK was checked above; strict INSERT prevents an equal-revision upsert.
+            // Ordinary uniqueness is immediate. A bulk root proves global
+            // uniqueness when sealing; neither mode permits an upsert.
             insert_activity_aggregate_strict(&transaction, generation, wallet, aggregate)?;
             history.push(aggregate)?;
             count = checked_activity_count(count, 1)?;
@@ -1075,6 +1098,7 @@ pub(super) fn log_writer_settings(connection: &Connection) -> Result<(), Bootstr
         page_size = read("page_size")?,
         cache_size = read("cache_size")?,
         mmap_size = read("mmap_size")?,
+        temp_store = read("temp_store")?,
         sqlite_version = version,
         sqlite_source_id = build,
         "activity writer effective SQLite settings"

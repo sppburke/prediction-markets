@@ -469,7 +469,10 @@ print(1 if configuration.get("cache_lane") == "fresh_v2" else 0)' "$OUT_DIR/cycl
   else
     INSTALLED_SCHEMA="$("$PYTHON_BIN" -c 'import sqlite3, sys
 with sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True) as connection:
-    print(int(connection.execute("PRAGMA user_version").fetchone()[0]))' "$DB")"
+    schema = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    if schema == -2:
+        raise SystemExit("unfinished bulk root; resume cache-populate-activity-v2 --bulk-root before ranking")
+    print(schema)' "$DB")"
     case "${PE_RANK_SCHEMA_TWO_CUTOVER:-0}" in
       0|1|prepare) ;;
       *) echo "FATAL: PE_RANK_SCHEMA_TWO_CUTOVER must be 0, 1, or prepare" >&2; exit 2;;
@@ -555,8 +558,11 @@ require_cutover_inputs() {
 import sqlite3
 import sys
 with sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True) as connection:
-    if int(connection.execute("PRAGMA user_version").fetchone()[0]) != 2:
-        raise SystemExit("schema-two cutover --db is not PRAGMA user_version=2")
+    schema = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    if schema == -2:
+        raise SystemExit("schema-two cutover --db is an unfinished bulk root; resume cache-populate-activity-v2 --bulk-root before cutover")
+    if schema != 2:
+        raise SystemExit(f"schema-two cutover --db has schema {schema}, expected PRAGMA user_version=2")
 PY
   "$PYTHON_BIN" -c 'import duckdb'
   BEFORE_RANKING_JSON="$OUT_DIR/before_ranking.json"
@@ -773,45 +779,65 @@ refresh_candidate_v2() {
 
   local stage_json="$OUT_DIR/cache_stage.json"
   local build_manifest="$OUT_DIR/cache_build_manifest.json"
-  run_refresh_stage "cache-stage" stage_candidate_cache "$prior" "$side" "$build_manifest" "$stage_json"
-  export PE_BOOTSTRAP_CACHE_PATH="$side"
-  local side_schema
-  side_schema="$("$PYTHON_BIN" -c 'import json, sys
-print(int(json.load(open(sys.argv[1], encoding="utf-8"))["side_schema"]))' "$stage_json")"
-  if [[ "$side_schema" != "2" ]]; then
-    # Initial schema-one candidate: seal it once against the hash-bound build
-    # manifest that staging wrote from the verified prior bytes. A sealed
-    # candidate records that manifest's hash itself and is not migrated again.
-    run_refresh_stage "cache-migrate" "$PE_BOOTSTRAP_BIN" cache-migrate-v2 --db "$side" \
-      --manifest "$build_manifest" "${BOOTSTRAP_CONFIG_ARGS[@]}"
+  # Raw version inspection is dispatch only: a fenced resume must not enter
+  # staging, migration, discovery or activation. Rust revalidates bulk admission.
+  local side_schema=""
+  if [[ -e "$side" ]]; then
+    [[ -f "$side" && ! -L "$side" ]] || { echo "FATAL: candidate must be a regular file" >&2; exit 2; }
+    side_schema="$("$PYTHON_BIN" -c 'import sqlite3, sys
+with sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True) as connection:
+    print(int(connection.execute("PRAGMA user_version").fetchone()[0]))' "$side")"
   fi
+  if [[ "$side_schema" == "-2" ]]; then
+    [[ -f "$stage_json" && ! -L "$stage_json" ]] || {
+      echo "FATAL: unfinished bulk root omitted its cycle staging report; preserve and investigate the cycle" >&2; exit 2;
+    }
+    echo "   [bulk-root] resuming the frozen candidate; setup already completed"
+  else
+    run_refresh_stage "cache-stage" stage_candidate_cache "$prior" "$side" "$build_manifest" "$stage_json"
+    side_schema="$("$PYTHON_BIN" -c 'import json, sys
+print(int(json.load(open(sys.argv[1], encoding="utf-8"))["side_schema"]))' "$stage_json")"
+    if [[ "$side_schema" != "2" ]]; then
+      # Initial schema-one candidate: seal it once against the hash-bound build
+      # manifest that staging wrote from the verified prior bytes. A sealed
+      # candidate records that manifest's hash itself and is not migrated again.
+      run_refresh_stage "cache-migrate" "$PE_BOOTSTRAP_BIN" cache-migrate-v2 --db "$side" \
+        --manifest "$build_manifest" "${BOOTSTRAP_CONFIG_ARGS[@]}"
+    fi
 
-  run_refresh_stage "winner-discovery" "$PE_BOOTSTRAP_BIN" winner-discovery --defer-activation "${BOOTSTRAP_CONFIG_ARGS[@]}"
-  run_refresh_stage "activate-next" "$PE_BOOTSTRAP_BIN" activate-next \
-    --batch-id "$ACTIVATION_BATCH_ID" --audit-csv "$ACTIVATION_AUDIT_CSV" \
-    "${BOOTSTRAP_CONFIG_ARGS[@]}"
+    export PE_BOOTSTRAP_CACHE_PATH="$side"
+    run_refresh_stage "winner-discovery" "$PE_BOOTSTRAP_BIN" winner-discovery --defer-activation "${BOOTSTRAP_CONFIG_ARGS[@]}"
+    run_refresh_stage "activate-next" "$PE_BOOTSTRAP_BIN" activate-next \
+      --batch-id "$ACTIVATION_BATCH_ID" --audit-csv "$ACTIVATION_AUDIT_CSV" \
+      "${BOOTSTRAP_CONFIG_ARGS[@]}"
+  fi
+  export PE_BOOTSTRAP_CACHE_PATH="$side"
 
   # Read the recorded candidate head, including an interrupted or manually
   # started top-up. Its persisted base link consumes this cycle's one allowance.
   local -a targets=()
   local target_output
-  target_output="$("$PYTHON_BIN" scripts/rank_cycle_manifest.py candidate-targets --prior "$prior" --side "$side")" || exit $?
+  target_output="$("$PYTHON_BIN" scripts/rank_cycle_manifest.py candidate-targets --prior "$prior" --side "$side" --include-bulk-root)" || exit $?
   mapfile -t targets <<< "$target_output"
-  [[ "${#targets[@]}" -eq 3 ]] || { echo "FATAL: could not derive candidate targets" >&2; exit 2; }
+  [[ "${#targets[@]}" -eq 4 && "${targets[3]}" =~ ^[01]$ ]] || { echo "FATAL: could not derive candidate targets" >&2; exit 2; }
   local activity_target="${targets[0]}"
+  local -a bulk_args=()
+  if [[ "${targets[3]}" == "1" ]]; then
+    bulk_args=(--bulk-root --fixed-db "$FIXED_DB" --prior "$prior")
+  fi
   echo "   [targets] activity generation $activity_target; payout generation ${targets[1]} (complete=${targets[2]})"
   run_refresh_stage "activity" "$PE_BOOTSTRAP_BIN" cache-populate-activity-v2 --db "$side" \
-    --fresh-generation "$activity_target" "${BOOTSTRAP_CONFIG_ARGS[@]}"
+    --fresh-generation "$activity_target" "${bulk_args[@]}" "${BOOTSTRAP_CONFIG_ARGS[@]}"
   local -a freshness_args=()
   [[ -z "$MAX_CACHE_STALENESS_HOURS" ]] || freshness_args+=(--max-staleness-hours "$MAX_CACHE_STALENESS_HOURS")
-  target_output="$("$PYTHON_BIN" scripts/rank_cycle_manifest.py candidate-targets --prior "$prior" --side "$side" --after-collection "${freshness_args[@]}")" || exit $?
+  target_output="$("$PYTHON_BIN" scripts/rank_cycle_manifest.py candidate-targets --prior "$prior" --side "$side" --include-bulk-root --after-collection "${freshness_args[@]}")" || exit $?
   mapfile -t targets <<< "$target_output"
   if [[ "${targets[0]}" != "$activity_target" ]]; then
     activity_target="${targets[0]}"
     run_refresh_stage "activity-top-up" "$PE_BOOTSTRAP_BIN" cache-populate-activity-v2 --db "$side" \
       --fresh-generation "$activity_target" "${BOOTSTRAP_CONFIG_ARGS[@]}"
     # Recheck after the only allowed top-up; a stale successor fails before ranking.
-    target_output="$("$PYTHON_BIN" scripts/rank_cycle_manifest.py candidate-targets --prior "$prior" --side "$side" --after-collection "${freshness_args[@]}")" || exit $?
+    target_output="$("$PYTHON_BIN" scripts/rank_cycle_manifest.py candidate-targets --prior "$prior" --side "$side" --include-bulk-root --after-collection "${freshness_args[@]}")" || exit $?
     mapfile -t targets <<< "$target_output"
     [[ "${targets[0]}" == "$activity_target" ]] || { echo "FATAL: unexpected second activity top-up" >&2; exit 2; }
   fi

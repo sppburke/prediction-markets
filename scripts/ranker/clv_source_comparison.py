@@ -311,7 +311,11 @@ def fetch_clob_series(
 # ── SQLite reads (sample-scoped; use indexes) ─────────────────────────────────────────────────
 def open_cache(path: str) -> sqlite3.Connection:
     """Open the wallet cache read-only (URI mode), so a concurrent writer cannot be blocked."""
-    return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    if int(conn.execute("PRAGMA user_version").fetchone()[0]) == -2:
+        conn.close()
+        raise ValueError("unfinished bulk root (schema -2); resume cache-populate-activity-v2 --bulk-root before any other command")
+    return conn
 
 
 def stratified_sample(conn: sqlite3.Connection, size: int, seed: int) -> pd.DataFrame:

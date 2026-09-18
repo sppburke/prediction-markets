@@ -53,6 +53,9 @@ MIN_ELIGIBLE = 30        # skip windows with too few eligible wallets to be mean
 def load_positions(db_path):
     """Collapse buy trades into resolved (wallet, market, outcome) positions."""
     con = sqlite3.connect(db_path)
+    if int(con.execute("PRAGMA user_version").fetchone()[0]) == -2:
+        con.close()
+        raise ValueError("unfinished bulk root (schema -2); resume cache-populate-activity-v2 --bulk-root before any other command")
     q = """
         SELECT t.wallet_hex,
                SUM(CAST(t.price_str AS REAL) * t.contracts) / SUM(t.contracts) AS vwap,

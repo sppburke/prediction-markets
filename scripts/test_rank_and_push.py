@@ -1428,7 +1428,7 @@ class RankAndPushScenario(unittest.TestCase):
             aggregate_digest TEXT, source_row_count INTEGER, collection_identity_json TEXT);
         CREATE TABLE IF NOT EXISTS activity_groups_v2 (
             wallet_hex TEXT, source_time_unix INTEGER, activity_type TEXT,
-            coverage_generation INTEGER);
+            coverage_generation INTEGER, source_trade_id TEXT);
         CREATE TABLE IF NOT EXISTS clob_payout_walk_state_v2 (
             singleton INTEGER PRIMARY KEY, generation INTEGER);
         CREATE TABLE IF NOT EXISTS clob_payout_coverage_manifests_v2 (
@@ -1439,7 +1439,13 @@ class RankAndPushScenario(unittest.TestCase):
         CREATE TABLE IF NOT EXISTS cache_v2_migration_state (
             singleton INTEGER PRIMARY KEY, ranker_projection_count INTEGER,
             ranker_projection_digest TEXT, ranker_classifier_version INTEGER,
-            fresh_collection_json TEXT);
+            fresh_collection_json TEXT, phase TEXT DEFAULT 'schema_sealed',
+            ranker_projection_inputs_json TEXT);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_activity_groups_v2_source_trade_id
+            ON activity_groups_v2(source_trade_id);
+        CREATE TABLE IF NOT EXISTS activity_wallet_coverage_staging_v2 (generation INTEGER);
+        CREATE TABLE IF NOT EXISTS cache_frozen_payload_verifications (activity_generation INTEGER);
+        CREATE TABLE IF NOT EXISTS ranker_entries_v2 (source_trade_id TEXT);
     """
 
     def _install_candidate_layout(self, *, schema):
@@ -1461,11 +1467,11 @@ class RankAndPushScenario(unittest.TestCase):
                     DROP TABLE trades; DROP TABLE market_resolutions; DROP TABLE source_cursor;
                     INSERT INTO activity_coverage_manifests_v2 (generation, cursors_json, completed_at_unix, reference_sha256, wallet_count, receipt_set_digest, aggregate_digest, source_row_count) VALUES
                         (1, '[]', 20, 'fresh-1', 1, 'bb', 'cc', 1);
-                    INSERT INTO activity_groups_v2 VALUES ('0xabc', 10, 'TRADE', 1);
+                    INSERT INTO activity_groups_v2 (wallet_hex, source_time_unix, activity_type, coverage_generation) VALUES ('0xabc', 10, 'TRADE', 1);
                     INSERT INTO clob_payout_coverage_manifests_v2 VALUES
                         (1, 'end_cursor', 30, '{}', 'dd');
                     INSERT INTO clob_payout_evidence_v2 VALUES (1, 29);
-                    INSERT INTO cache_v2_migration_state VALUES (1, 1, 'ee', 2, NULL);
+                    INSERT INTO cache_v2_migration_state (singleton, ranker_projection_count, ranker_projection_digest, ranker_classifier_version, fresh_collection_json) VALUES (1, 1, 'ee', 2, NULL);
                     """
                 )
         return fixed
@@ -1506,6 +1512,7 @@ class RankAndPushScenario(unittest.TestCase):
             "    prior, side, manifest = opt('--prior'), opt('--side'), opt('--manifest')\n"
             "    if os.path.exists(side):\n"
             "        assert os.path.exists(prior), 'candidate without prior'\n"
+            "        assert schema(side) != -2, 'unfinished bulk root must bypass staging'\n"
             "        print(json.dumps({'prior_path': prior, 'side_path': side, 'prior_schema': schema(prior), 'side_schema': schema(side), 'prior_sha256': None, 'side_sha256': None, 'resumed': True}))\n"
             "        raise SystemExit(0)\n"
             "    if not os.path.exists(prior): shutil.copyfile(db, prior)\n"
@@ -1514,12 +1521,13 @@ class RankAndPushScenario(unittest.TestCase):
             "        json.dump({'manifest_version': 1, 'backup_sha256': sha(prior), 'source_bounds': {}, 'cursors': {}, 'hashes': {}, 'sealed_at_unix': now}, open(manifest, 'w'))\n"
             "    print(json.dumps({'prior_path': prior, 'side_path': side, 'prior_schema': schema(prior), 'side_schema': schema(side), 'prior_sha256': sha(prior), 'side_sha256': sha(side), 'resumed': False}))\n"
             "elif sub == 'cache-migrate-v2':\n"
+            "    assert schema(db) != -2, 'unfinished bulk root must bypass migration'\n"
             "    manifest = json.load(open(opt('--manifest')))\n"
             "    if schema(db) != 2:\n"
             "        assert manifest['backup_sha256'] == sha(db), 'build manifest is not bound to the candidate bytes'\n"
             "        with sqlite3.connect(db) as c:\n"
             "            c.executescript('PRAGMA user_version = 2; DROP TABLE trades; DROP TABLE market_resolutions; DROP TABLE source_cursor;')\n"
-            "            c.execute('INSERT OR IGNORE INTO cache_v2_migration_state VALUES (1, NULL, NULL, NULL, NULL)')\n"
+            "            c.execute('INSERT OR IGNORE INTO cache_v2_migration_state (singleton, ranker_projection_count, ranker_projection_digest, ranker_classifier_version, fresh_collection_json) VALUES (1, NULL, NULL, NULL, NULL)')\n"
             "    print(json.dumps({'resumed': True}))\n"
             "elif sub == 'cache-populate-activity-v2':\n"
             "    generation = int(opt('--fresh-generation'))\n"
@@ -1532,11 +1540,20 @@ class RankAndPushScenario(unittest.TestCase):
             "            recorded = {'version': 2, 'generation': generation, 'fixed_end_unix': end, 'wallets': ['0xabc'], 'base_generation': base, 'base_manifest_sha256': 'a'*64 if base else None, 'start_exclusive': recorded['fixed_end_unix'] if base else 0, 'full_read_wallets': [] if base else ['0xabc']}\n"
             "            recorded['digest'] = hashlib.sha256(json.dumps(recorded, sort_keys=True, separators=(',', ':')).encode()).hexdigest()\n"
             "            c.execute('UPDATE cache_v2_migration_state SET fresh_collection_json = ?, ranker_projection_count = NULL, ranker_projection_digest = NULL, ranker_classifier_version = NULL', (json.dumps(recorded),))\n"
+            "        if '--bulk-root' in a:\n"
+            "            assert generation == 1 and recorded['base_generation'] is None\n"
+            "            assert opt('--fixed-db') and opt('--prior')\n"
+            "            c.execute('DROP INDEX IF EXISTS idx_activity_groups_v2_source_trade_id')\n"
+            "            c.execute('PRAGMA user_version = -2')\n"
+            "        else: assert schema(db) != -2, 'fenced resume needs --bulk-root'\n"
             "        if os.environ.get('STUB_FAIL_ACTIVITY_GENERATION') == str(generation): c.commit(); raise SystemExit(75)\n"
             "        if not c.execute('SELECT 1 FROM activity_coverage_manifests_v2 WHERE generation = ?', (generation,)).fetchone():\n"
             "            c.execute('UPDATE activity_groups_v2 SET coverage_generation = ?', (generation,))\n"
-            "            c.execute('INSERT INTO activity_groups_v2 VALUES (?, ?, ?, ?)', ('0xabc', recorded['fixed_end_unix'], 'TRADE', generation))\n"
+            "            c.execute('INSERT INTO activity_groups_v2 (wallet_hex, source_time_unix, activity_type, coverage_generation) VALUES (?, ?, ?, ?)', ('0xabc', recorded['fixed_end_unix'], 'TRADE', generation))\n"
             "            c.execute('INSERT INTO activity_coverage_manifests_v2 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', (generation, '{}', now, recorded['digest'], 1, 'bb', 'cc', 1, json.dumps(recorded)))\n"
+            "        if '--bulk-root' in a:\n"
+            "            c.execute('CREATE UNIQUE INDEX idx_activity_groups_v2_source_trade_id ON activity_groups_v2(source_trade_id)')\n"
+            "            c.execute('PRAGMA user_version = 2')\n"
             "    print(json.dumps({'generation': generation}))\n"
             "elif sub == 'cache-populate-payout-v2':\n"
             "    with sqlite3.connect(db) as c:\n"
@@ -1585,6 +1602,10 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertEqual(len(lines), 2)
         self.assertIn("--fresh-generation 1", lines[0])
         self.assertIn("--fresh-generation 2", lines[1])
+        self.assertIn("--bulk-root", lines[0])
+        self.assertIn(f"--fixed-db {fixed}", lines[0])
+        self.assertIn("--prior", lines[0])
+        self.assertNotIn("--bulk-root", lines[1])
         self.assertEqual(fixed.read_bytes(), before)
         self.assertTrue((self.root / "data/eval-results/rank_and_push.pending").is_file())
 
@@ -1598,6 +1619,65 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertIn("RANK_AND_PUSH_PREPARED_ONLY=", resumed.stdout)
         self.assertEqual(len(self._bootstrap_lines("cache-populate-activity-v2")), before + 1)
         self.assertIn("--fresh-generation 2", self._bootstrap_lines("cache-populate-activity-v2")[-1])
+        self.assertNotIn("--bulk-root", self._bootstrap_lines("cache-populate-activity-v2")[-1])
+
+    def test_bulk_root_transient_exit_resumes_without_repeating_setup(self):
+        fixed = self._prepare_incremental_fixture()
+        before = fixed.read_bytes()
+        first = self._run(exit_env={"STUB_FAIL_ACTIVITY_GENERATION": "1"})
+        self.assertEqual(first.returncode, 75, first.stderr)
+        side = next(fixed.parent.glob("*.side.db"))
+        with sqlite3.connect(side) as c:
+            self.assertEqual(c.execute("PRAGMA user_version").fetchone()[0], -2)
+        pointer = self.root / "data/eval-results/rank_and_push.cycle"
+        cycle = pointer.read_bytes()
+        operations = self._bootstrap_ops()
+        resumed = self._run()
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        self.assertIn("RANK_AND_PUSH_PREPARED_ONLY=", resumed.stdout)
+        self.assertEqual(pointer.read_bytes(), cycle)
+        self.assertEqual(fixed.read_bytes(), before)
+        self.assertEqual(self._bootstrap_ops()[len(operations):], [
+            "cache-populate-activity-v2", "cache-populate-payout-v2", "cache-finalize-v2", "prices-history",
+            "cache-finalize-v2",
+        ])
+        for line in self._bootstrap_lines("cache-populate-activity-v2"):
+            self.assertIn("--bulk-root", line)
+            self.assertIn("--fresh-generation 1", line)
+
+    def test_interrupted_ordinary_root_with_rows_resumes_without_bulk_flag(self):
+        fixed = self._prepare_incremental_fixture()
+        first = self._run(exit_env={"STUB_FAIL_ACTIVITY_GENERATION": "1"})
+        self.assertEqual(first.returncode, 75, first.stderr)
+        side = next(fixed.parent.glob("*.side.db"))
+        # Represent a pre-existing ordinary indexed root, with its frozen identity.
+        with sqlite3.connect(side) as c:
+            c.executescript("""PRAGMA user_version=2;
+                CREATE UNIQUE INDEX idx_activity_groups_v2_source_trade_id ON activity_groups_v2(source_trade_id);
+                INSERT INTO activity_groups_v2(source_trade_id, coverage_generation) VALUES ('ordinary', 1);""")
+        resumed = self._run()
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        self.assertNotIn("--bulk-root", self._bootstrap_lines("cache-populate-activity-v2")[-1])
+
+    def test_cutover_distinguishes_bulk_recovery_from_schema_mismatch(self):
+        fixed = self._prepare_incremental_fixture()
+        prepared = self._run()
+        self.assertEqual(prepared.returncode, 2, prepared.stderr)
+        out = self.root / (self.root / "data/eval-results/rank_and_push.cycle").read_text().strip()
+        side = next(fixed.parent.glob("*.side.db"))
+        prior = next(fixed.parent.glob("*.prior.db"))
+        (self.root / "data/eval-results/rank_and_push.pending").unlink()
+        for version, message in ((-2, "resume cache-populate-activity-v2 --bulk-root before cutover"),
+                                 (1, "has schema 1, expected PRAGMA user_version=2")):
+            with self.subTest(version=version):
+                with sqlite3.connect(side) as c:
+                    c.execute(f"PRAGMA user_version={version}")
+                result = self._run("--db", str(side), "--out-dir", str(out),
+                    "--skip-discovery", "--skip-backfill", "--skip-rank", "--skip-export",
+                    "--cache-stage-record", str(out / "cache_stage_record.json"),
+                    "--fixed-db", str(fixed), "--prior-cache-backup", str(prior))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(message, result.stderr)
 
     def test_manually_completed_top_up_is_adopted_and_uses_exact_freshness_boundary(self):
         self._prepare_incremental_fixture()
@@ -1868,7 +1948,7 @@ finally:
             "SUPABASE_URL=http://127.0.0.1:9\nSUPABASE_SECRET_KEY=test-secret\n"
         )
         with sqlite3.connect(fixed) as connection:
-            connection.execute("INSERT INTO activity_groups_v2 VALUES ('0xabc', 99, 'TRADE', 1)")
+            connection.execute("INSERT INTO activity_groups_v2 (wallet_hex, source_time_unix, activity_type, coverage_generation) VALUES ('0xabc', 99, 'TRADE', 1)")
         third = self._run()
         self.assertEqual(third.returncode, 0, third.stderr + third.stdout)
         self.assertNotIn("RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1", third.stdout)

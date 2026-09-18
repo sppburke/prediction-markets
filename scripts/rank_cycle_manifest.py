@@ -40,6 +40,8 @@ def snapshot(db_path: Path, day_utc: str, versions: dict, configuration: dict) -
     try:
         connection.execute("BEGIN")
         schema = int(_one(connection, "PRAGMA user_version") or 0)
+        if schema == -2:
+            raise ValueError("unfinished bulk root (schema -2); resume cache-populate-activity-v2 --bulk-root before any other command")
         universe = _wallet_universe(connection)
         if schema >= 2:
             activity_generation = _one(
@@ -258,15 +260,67 @@ def _fresh_identity(raw: str | None) -> dict | None:
     return identity
 
 
+def _bulk_root_eligible(side: sqlite3.Connection, schema: int, head: dict | None,
+                        generation: int) -> bool:
+    """Mirror Rust's begin_or_resume_fresh_collection/require_bulk_root_state.
+
+    This is routing from durable state, not admission proof. Rust still validates
+    paths, identity/content, wallet union, temporary storage and the writer lock.
+    Completed roots use ordinary collection even though Rust permits a bulk retry.
+    """
+    if generation != 1 or schema not in (2, -2):
+        return False
+    if schema == -2:
+        if head is None or head["version"] != 2 or head["generation"] != 1 or head["base_generation"] is not None:
+            return False
+    elif head is not None:
+        # An ordinary collection, even an empty interrupted one, cannot convert.
+        return False
+    state = side.execute("SELECT * FROM cache_v2_migration_state WHERE singleton = 1")
+    row = state.fetchone()
+    if row is None:
+        return False
+    state = dict(zip((column[0] for column in state.description), row))
+    if state["phase"] != "schema_sealed" or any(state.get(column) is not None for column in (
+        "ranker_projection_count", "ranker_projection_digest", "ranker_classifier_version",
+        "ranker_projection_inputs_json",
+    )):
+        return False
+    if not _one(side, """SELECT
+        NOT EXISTS(SELECT 1 FROM activity_coverage_manifests_v2)
+        AND NOT EXISTS(SELECT 1 FROM cache_frozen_payload_verifications)
+        AND NOT EXISTS(SELECT 1 FROM ranker_entries_v2)"""):
+        return False
+    if schema == -2:
+        return True  # Committed wallet rows/receipts are the bulk resume state.
+    return bool(_one(side, """SELECT
+        NOT EXISTS(SELECT 1 FROM activity_groups_v2)
+        AND NOT EXISTS(SELECT 1 FROM activity_wallet_coverage_staging_v2)
+        AND NOT EXISTS(SELECT 1 FROM pragma_table_info('activity_groups_v2') WHERE pk != 0)
+        AND EXISTS(
+            SELECT 1 FROM pragma_index_list('activity_groups_v2') i
+            WHERE i.name = 'idx_activity_groups_v2_source_trade_id'
+              AND i.\"unique\" = 1 AND i.partial = 0
+              AND (SELECT COUNT(*) FROM pragma_index_xinfo(i.name) WHERE key = 1) = 1
+              AND EXISTS(SELECT 1 FROM pragma_index_xinfo(i.name)
+                  WHERE key = 1 AND cid >= 0 AND name = 'source_trade_id'
+                    AND coll = 'BINARY' AND desc = 0))"""))
+
+
 def candidate_targets(prior_path: Path, side_path: Path, *, after_collection=False,
-                      now: int | None = None, max_staleness_hours: int | None = None) -> tuple[int, int, int]:
+                      now: int | None = None, max_staleness_hours: int | None = None,
+                      include_bulk_root=False) -> tuple[int, int, int] | tuple[int, int, int, int]:
     """Select this cycle's initial head or its one linked successor, read-only.
 
     Rust certifies content and linkage on every collection call. This owner only
     establishes cycle membership and the restart-safe one-top-up allowance.
+    The optional fourth integer reports bulk routing; the default three values
+    and their meaning remain unchanged for existing callers.
     """
     with sqlite3.connect(f"file:{prior_path}?mode=ro&immutable=1", uri=True) as prior:
         schema = int(_one(prior, "PRAGMA user_version") or 0)
+        if schema == -2:
+            raise ValueError("unfinished bulk root (schema -2); resume cache-populate-activity-v2 --bulk-root before any other command")
         previous = 0 if schema < 2 else int(_one(prior, "SELECT COALESCE(MAX(generation), 0) FROM activity_coverage_manifests_v2"))
         initial = previous + 1
         prior_identity = None
@@ -275,12 +329,26 @@ def candidate_targets(prior_path: Path, side_path: Path, *, after_collection=Fal
         active = _one(prior, "SELECT generation FROM clob_payout_walk_state_v2 WHERE singleton = 1")
         payout = int(active) if active is not None else int(_one(prior, "SELECT COALESCE(MAX(generation), 0) FROM clob_payout_coverage_manifests_v2")) + 1
     with sqlite3.connect(f"file:{side_path}?mode=ro", uri=True) as side:
+        side.execute("BEGIN")
+        side_schema = int(_one(side, "PRAGMA user_version") or 0)
+        if side_schema == -2 and (not include_bulk_root or after_collection):
+            raise ValueError("unfinished bulk root (schema -2); resume cache-populate-activity-v2 --bulk-root before any other command")
         head = _fresh_identity(_one(side, "SELECT fresh_collection_json FROM cache_v2_migration_state WHERE singleton = 1"))
         payout_done = int(_one(side, "SELECT EXISTS(SELECT 1 FROM clob_payout_coverage_manifests_v2 WHERE generation = ?)", (payout,)))
+
+        def targets(generation):
+            values = (generation, payout, payout_done)
+            if not include_bulk_root:
+                return values
+            bulk = not after_collection and _bulk_root_eligible(side, side_schema, head, generation)
+            if side_schema == -2 and not bulk:
+                raise ValueError("invalid unfinished bulk root; resume cache-populate-activity-v2 --bulk-root to diagnose the candidate")
+            return (*values, int(bulk))
+
         if head is None or (head == prior_identity and head["generation"] == previous):
             if after_collection:
                 raise ValueError("activity collection did not complete this cycle's head")
-            return initial, payout, payout_done
+            return targets(initial)
         generation = head["generation"]
         top_up_used = generation != initial
         initial_identity = head
@@ -309,7 +377,7 @@ def candidate_targets(prior_path: Path, side_path: Path, *, after_collection=Fal
                 if top_up_used:
                     raise ValueError("activity top-up is stale; preserve the cycle, no second top-up is permitted")
                 generation = initial + 1
-        return generation, payout, payout_done
+        return targets(generation)
 
 
 def parse_args():
@@ -330,6 +398,8 @@ def parse_args():
     targets.add_argument("--side", type=Path, required=True)
     targets.add_argument("--after-collection", action="store_true")
     targets.add_argument("--max-staleness-hours", type=int)
+    targets.add_argument("--include-bulk-root", action="store_true",
+                         help="append bulk eligibility (0/1); default output stays three lines")
     return parser.parse_args()
 
 
@@ -337,7 +407,8 @@ def main() -> int:
     args = parse_args()
     if args.command == "candidate-targets":
         for value in candidate_targets(args.prior, args.side, after_collection=args.after_collection,
-                                       max_staleness_hours=args.max_staleness_hours):
+                                       max_staleness_hours=args.max_staleness_hours,
+                                       include_bulk_root=args.include_bulk_root):
             print(value)
         return 0
     if args.command == "capture":

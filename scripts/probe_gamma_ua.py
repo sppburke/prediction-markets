@@ -138,6 +138,9 @@ def load_anchor_ids(db: str, n: int):
     """Pull (resolved_ids, open_ids) from the cache: resolved = recent past resolution with a winner;
     open = future end_date, no resolution row. The first of each is the single-id anchor."""
     conn = sqlite3.connect(db, timeout=60)
+    if int(conn.execute("PRAGMA user_version").fetchone()[0]) == -2:
+        conn.close()
+        raise ValueError("unfinished bulk root (schema -2); resume cache-populate-activity-v2 --bulk-root before any other command")
     conn.execute("PRAGMA busy_timeout=60000;")
     now = int(time.time())
     resolved = [r for (r,) in conn.execute(

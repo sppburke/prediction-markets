@@ -42,7 +42,11 @@ def winner_from(m):
         except: pass
     return None
 
-conn=sqlite3.connect(DB,timeout=120); conn.execute("PRAGMA busy_timeout=120000;")
+conn=sqlite3.connect(DB,timeout=120)
+if int(conn.execute("PRAGMA user_version").fetchone()[0]) == -2:
+    conn.close()
+    raise ValueError("unfinished bulk root (schema -2); resume cache-populate-activity-v2 --bulk-root before any other command")
+conn.execute("PRAGMA busy_timeout=120000;")
 wallets=[l.strip().lower() for l in open(UNIV) if l.startswith("0x")]
 sched={m:e for m,e in conn.execute("SELECT market_id,end_date_unix FROM market_schedules WHERE end_date_unix IS NOT NULL")}
 resolved=set(m for (m,) in conn.execute("SELECT market_id FROM market_resolutions WHERE winning_outcome_id IS NOT NULL"))

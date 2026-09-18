@@ -62,6 +62,9 @@ def fetch_batch(ids, attempt=0):
 
 def main():
     conn = sqlite3.connect(DB, timeout=60)
+    if int(conn.execute("PRAGMA user_version").fetchone()[0]) == -2:
+        conn.close()
+        raise ValueError("unfinished bulk root (schema -2); resume cache-populate-activity-v2 --bulk-root before any other command")
     conn.execute("PRAGMA busy_timeout=60000;")
     log("enumerating resolved markets with no schedule row ...")
     targets = [m for (m,) in conn.execute(

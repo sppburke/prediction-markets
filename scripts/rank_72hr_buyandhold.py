@@ -475,6 +475,8 @@ def main() -> int:
     conn.execute("BEGIN")
     conn.execute("PRAGMA query_only=ON;")
     schema_version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if schema_version == -2:
+        raise ValueError("unfinished bulk root (schema -2); resume cache-populate-activity-v2 --bulk-root before any other command")
 
     if prm.universe_from_trades:
         wallets = load_universe_from_trades(conn, 0, schema_version)

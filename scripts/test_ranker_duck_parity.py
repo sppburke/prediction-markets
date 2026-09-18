@@ -216,12 +216,14 @@ def build_certified_cache(db: str) -> tuple[list[dict], int, str]:
         "activity_generation INTEGER, classifier_version INTEGER)"
     )
     conn.execute(
-        "CREATE TABLE activity_groups_v2 (source_trade_id TEXT PRIMARY KEY, "
+        "CREATE TABLE activity_groups_v2 (source_trade_id TEXT NOT NULL, "
         "coverage_generation INTEGER, wallet_hex TEXT, condition_id TEXT, asset TEXT, "
         "outcome_id INTEGER, side TEXT, share_amount_str TEXT, "
         "price_weighted_share_amount_str TEXT, source_usdc_amount_str TEXT, "
         "source_time_unix INTEGER)"
     )
+    conn.execute("CREATE UNIQUE INDEX idx_activity_groups_v2_source_trade_id "
+                 "ON activity_groups_v2(source_trade_id COLLATE BINARY)")
     conn.execute(
         "CREATE TABLE clob_payout_evidence_v2 (market_id TEXT PRIMARY KEY, "
         "payout_vector_json TEXT, end_date_unix INTEGER, payout_status TEXT)"
@@ -476,7 +478,7 @@ class DuckParityTest(unittest.TestCase):
                                ["EXPLAIN QUERY PLAN " + exp.CERTIFIED_ACTIVITY_SQL]).fetchall()
             details = [r[3] for r in plan]
             self.assertTrue(any("SCAN r" in d for d in details), details)
-            self.assertTrue(any("SEARCH g USING INDEX sqlite_autoindex_activity_groups_v2" in d
+            self.assertTrue(any("SEARCH g USING INDEX idx_activity_groups_v2_source_trade_id" in d
                                 and "source_trade_id=?" in d for d in details), details)
             self.assertFalse(any("SCAN g" in d for d in details), details)
             con.execute("CREATE VIEW reduced AS SELECT * FROM read_parquet("
@@ -977,6 +979,87 @@ class DuckParityTest(unittest.TestCase):
             print(f"{'PASS' if ok else 'FAIL'}: autodetect_falls_back "
                   f"(missing={miss is None}, stale={stale is None}, forced_sqlite={forced is None})")
             self.assertTrue(ok)
+
+
+class BulkRootFence(unittest.TestCase):
+    def test_remaining_cache_openers_refuse_before_queries_or_writes(self):
+        import runpy
+        import backfill_end_dates
+        import clob_vs_polygon_reconciliation as reconciliation
+        import clob_winner_outcome_id_check as winner_check
+        import edge_persistence_walkforward
+        import holdcheck_oos_72hr
+        import holdout_baseline
+        import pnl_decomposition
+        import probe_gamma_ua
+        from ranker.clv_source_comparison import open_cache
+        from latency_shift_rerank import map_pair_tokens
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "bulk.db"
+            empty = Path(tmp) / "empty.txt"
+            empty.write_text("")
+            with sqlite3.connect(db) as connection:
+                connection.executescript("""PRAGMA user_version=-2;
+                    CREATE TABLE token_conditions (condition_id TEXT, outcome_index INTEGER, token_id TEXT);
+                    INSERT INTO token_conditions VALUES ('condition', 0, 'token');""")
+            before = db.read_bytes()
+            readers = (
+                ("token mapping", lambda: map_pair_tokens(str(db), [("condition", "0")])),
+                ("edge persistence", lambda: edge_persistence_walkforward.load_positions(db)),
+                ("holdout", lambda: holdout_baseline.load_resolutions(db)),
+                ("anchor probe", lambda: probe_gamma_ua.load_anchor_ids(str(db), 1)),
+                ("reconciliation", lambda: reconciliation._open_ro(str(db))),
+                ("CLV comparison", lambda: open_cache(str(db))),
+            )
+            for name, read in readers:
+                with self.subTest(boundary=name), self.assertRaisesRegex(ValueError, "resume cache-populate-activity-v2 --bulk-root"):
+                    read()
+            with mock.patch.object(backfill_end_dates, "DB", str(db)), self.assertRaisesRegex(ValueError, "unfinished bulk root"):
+                backfill_end_dates.main()
+            with mock.patch.object(sys, "argv", ["pnl", str(empty), "unused.json", str(db)]), self.assertRaisesRegex(ValueError, "unfinished bulk root"):
+                pnl_decomposition.main()
+            with mock.patch.object(sys, "argv", ["holdcheck", "--db", str(db), "--universe", str(empty)]), self.assertRaisesRegex(ValueError, "unfinished bulk root"):
+                holdcheck_oos_72hr.main()
+            # The historical OOS script executes at import and has a fixed DB path.
+            # Redirect only its connection to the real fenced fixture, not its SQL.
+            connect = sqlite3.connect
+            with mock.patch.object(sqlite3, "connect", side_effect=lambda *a, **k: connect(db)), self.assertRaisesRegex(ValueError, "unfinished bulk root"):
+                runpy.run_path(str(Path(__file__).with_name("oos_gamma.py")))
+            with mock.patch.object(reconciliation, "load_or_fetch", return_value={}), self.assertRaisesRegex(ValueError, "unfinished bulk root"):
+                winner_check.main(["--db", str(db)])
+            self.assertEqual(db.read_bytes(), before)
+
+    def test_bulk_root_refused_by_python_cache_consumers(self):
+        """Private -2 cannot fall through to any schema-one cache consumer."""
+        from partial_backfill_wallets import partial_backfill_wallets
+        from push_ranking_to_supabase import _cache_schema, CacheStaleError
+        from rank_cycle_manifest import snapshot, candidate_targets
+        from audit_wallet_history import load_cache
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "bulk.db"
+            with sqlite3.connect(db) as connection:
+                connection.execute("PRAGMA user_version=-2")
+                for read in (partial_backfill_wallets, _cache_schema):
+                    with self.assertRaisesRegex((ValueError, CacheStaleError), "unfinished bulk root"):
+                        read(connection)
+            for read in (
+                lambda: snapshot(db, "2026-09-17", {}, {}),
+                lambda: candidate_targets(db, db),
+                lambda: load_cache(str(db), W("1"), 1),
+            ):
+                with self.assertRaisesRegex(ValueError, "unfinished bulk root"):
+                    read()
+            # Entry points must refuse before producing a legacy export/rank.
+            import subprocess
+            for script, args in (
+                ("export_trades_parquet.py", ["--out-dir", str(Path(tmp) / "export")]),
+                ("rank_72hr_buyandhold.py", ["--out-dir", str(Path(tmp) / "rank"), "--universe-from-trades"]),
+                ("latency_shift_rerank.py", ["--out-dir", str(Path(tmp) / "rerank"), "--ranked-csv", "unused.csv", "--positions-csv", "unused.csv"]),
+            ):
+                result = subprocess.run([sys.executable, str(Path(__file__).with_name(script)), "--db", str(db), *args], capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("unfinished bulk root", result.stderr)
 
 
 if __name__ == "__main__":

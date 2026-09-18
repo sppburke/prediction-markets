@@ -9,7 +9,10 @@ import sqlite3
 
 def partial_backfill_wallets(connection: sqlite3.Connection,
                              retryable_only: bool = False) -> set[str]:
-    if int(connection.execute("PRAGMA user_version").fetchone()[0]) >= 2:
+    schema = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    if schema == -2:
+        raise ValueError("unfinished bulk root (schema -2); resume cache-populate-activity-v2 --bulk-root before any other command")
+    if schema >= 2:
         return set()
     columns = {row[1] for row in connection.execute("PRAGMA table_info(wallets)")}
     if "backfill_partial" not in columns:

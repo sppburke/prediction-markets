@@ -72,6 +72,9 @@ def main():
 
     # ── authoritative resolution outcomes from the cache ───────────────────
     con = sqlite3.connect(DB)
+    if int(con.execute("PRAGMA user_version").fetchone()[0]) == -2:
+        con.close()
+        raise ValueError("unfinished bulk root (schema -2); resume cache-populate-activity-v2 --bulk-root before any other command")
     res = {m: w for m, w in con.execute(
         "SELECT market_id, winning_outcome_id FROM market_resolutions")}
     con.close()

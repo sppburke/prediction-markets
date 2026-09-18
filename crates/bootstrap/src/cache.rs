@@ -46,6 +46,30 @@ pub const CACHE_SCHEMA_VERSION_V1: i64 = 1;
 /// Trustworthy activity/payout wallet-cache generation introduced by #544.
 pub const CACHE_SCHEMA_VERSION_V2: i64 = 2;
 
+// Negative versions are reserved for private, unfinished layouts, never public
+// migrations. Current WalletCache and migration openers (including archive
+// attachments) enforce this fence; the bulk collector alone may resume it.
+// At d4ac7ef, normal writable opens rejected -2, but read-only coverage and
+// existing-candidate staging did not. Operators must exclude older binaries.
+pub(crate) const CACHE_SCHEMA_VERSION_BULK_ROOT: i64 = -2;
+
+pub(crate) fn reject_bulk_root(connection: &Connection) -> Result<(), BootstrapError> {
+    reject_bulk_root_database(connection, None)
+}
+
+fn reject_bulk_root_database(
+    connection: &Connection,
+    database: Option<rusqlite::DatabaseName<'_>>,
+) -> Result<(), BootstrapError> {
+    let version: i64 = connection.pragma_query_value(database, "user_version", |row| row.get(0))?;
+    if version == CACHE_SCHEMA_VERSION_BULK_ROOT {
+        return Err(BootstrapError::Invalid {
+            message: "cache is an unfinished bulk root (schema -2); resume cache-populate-activity-v2 --bulk-root before any other command".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// Row tuple for [`WalletCache::upsert_wallets_bulk`].
 ///
 /// Fields (in order): `wallet_hex`, `source_bits`, `is_infra`, `dune_first_seen_unix`,
@@ -780,6 +804,7 @@ impl WalletCache {
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
         )?;
         let found: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        reject_bulk_root(&conn)?;
         if found == CACHE_SCHEMA_VERSION_V2 {
             // A v2 cache deliberately has no legacy `trades`,
             // `market_resolutions`, or `source_cursor` table. Running the v1
@@ -1062,6 +1087,7 @@ impl WalletCache {
     /// being created.
     pub fn open_read_only(path: &Path) -> Result<Self, BootstrapError> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        reject_bulk_root(&conn)?;
         Ok(Self { conn })
     }
 
@@ -3678,6 +3704,10 @@ impl WalletCache {
         // Everything between ATTACH and DETACH is bound (never `?`) so the DETACH
         // always runs on this connection; the original error is surfaced after.
         let work = (|| -> Result<(), BootstrapError> {
+            reject_bulk_root_database(
+                &self.conn,
+                Some(rusqlite::DatabaseName::Attached("purge_archive")),
+            )?;
             // Mirrors on first use + the manifest. CTAS is the bootstrap only;
             // steady-state schema safety is the name reconciliation below.
             self.conn.execute_batch(
@@ -4938,6 +4968,94 @@ mod tests {
 
     fn addr(hex: &str) -> WalletAddress {
         WalletAddress::from_hex(hex).unwrap()
+    }
+
+    #[test]
+    fn pre_bulk_root_binary_coverage_and_staging_do_not_enforce_reserved_version() {
+        // Frozen compatibility regression for d4ac7ef. Its read-only opener was
+        // exactly open_with_flags + Self { conn }, with no version check. The
+        // coverage helpers remain unchanged: missing legacy tables become empty
+        // sets. Do not mistake the current opener's refusal for old-binary safety.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("bulk.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "PRAGMA user_version = -2;
+             CREATE TABLE wallets (wallet_hex TEXT, backfill_partial INTEGER,
+                 last_polymarket_fetch_at INTEGER);
+             INSERT INTO wallets VALUES ('wallet', 0, 123);
+             CREATE VIEW active_tradeable_wallets AS SELECT * FROM wallets;
+             CREATE TABLE trades_v1_sealed (market_id TEXT);
+             INSERT INTO trades_v1_sealed VALUES ('unresolved');",
+        )
+        .unwrap();
+        drop(conn);
+        let old_reader = WalletCache {
+            conn: Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap(),
+        };
+        let report = old_reader.coverage_counts().unwrap();
+        assert_eq!(
+            (
+                report.fetch_incomplete,
+                report.missing_resolution,
+                report.missing_schedule
+            ),
+            (0, 0, 0)
+        );
+
+        // d4ac7ef's existing-candidate stage_report propagated candidate_user_version
+        // unchanged. Its migration opener used these flags/timeout, not WalletCache.
+        // This is the historical branch's version-reporting behavior, not a call
+        // to an old executable: the current staging entry point must refuse it.
+        let fixed = dir.path().join("fixed.db");
+        let prior = dir.path().join("prior.db");
+        drop(WalletCache::open(&fixed).unwrap());
+        std::fs::copy(&fixed, &prior).unwrap();
+        let old_stage = (|| -> Result<crate::cache_migration::CacheStageReport, BootstrapError> {
+            // The previous existing-candidate branch checked that both files
+            // existed, then returned this report without requiring schema two.
+            assert!(path.is_file() && prior.is_file());
+            let conn = Connection::open_with_flags(
+                std::fs::canonicalize(&path)?,
+                OpenFlags::SQLITE_OPEN_READ_WRITE,
+            )?;
+            conn.busy_timeout(std::time::Duration::from_secs(5))?;
+            let version = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
+            conn.close().map_err(|(_, error)| error)?;
+            Ok(crate::cache_migration::CacheStageReport {
+                fixed_path: std::fs::canonicalize(&fixed)?,
+                prior_path: std::fs::canonicalize(&prior)?,
+                side_path: std::fs::canonicalize(&path)?,
+                prior_schema: CACHE_SCHEMA_VERSION_V1,
+                side_schema: version,
+                side_sha256: None,
+                prior_sha256: None,
+                resumed: true,
+            })
+        })()
+        .unwrap();
+        assert!(old_stage.resumed);
+        assert_eq!(old_stage.side_schema, -2);
+        assert!(
+            crate::cache_migration::stage_cache_cycle_v2(&fixed, &prior, &path, None)
+                .unwrap_err()
+                .to_string()
+                .contains("unfinished bulk root")
+        );
+        assert!(
+            WalletCache::open_read_only(&path)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("unfinished bulk root")
+        );
+        assert!(
+            WalletCache::open(&path)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("unfinished bulk root")
+        );
     }
 
     fn make_trade(id: &str, wallet: WalletAddress, ts: i64) -> RawTrade {

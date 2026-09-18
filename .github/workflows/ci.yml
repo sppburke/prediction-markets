@@ -142,6 +142,7 @@ jobs:
           python3 scripts/test_audit_wallet_history.py
           python3 scripts/test_clob_reconciliation.py
           python3 scripts/test_rank_and_push.py
+          python3 scripts/test_rank_cycle_manifest.py
           python3 scripts/test_rank_and_push_loop.py
           python3 scripts/test_ranker_duck_parity.py
           python3 scripts/test_latency_shift_ref_oracle.py

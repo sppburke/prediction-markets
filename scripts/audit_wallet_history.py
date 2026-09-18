@@ -240,7 +240,10 @@ def load_cache(db, wallet, cutoff):
     con.row_factory = sqlite3.Row
     try:
         con.execute("BEGIN")
-        if int(con.execute("PRAGMA user_version").fetchone()[0]) >= 2:
+        schema = int(con.execute("PRAGMA user_version").fetchone()[0])
+        if schema == -2:
+            raise ValueError("unfinished bulk root (schema -2); resume cache-populate-activity-v2 --bulk-root before any other command")
+        if schema >= 2:
             raise ValueError("audit requires schema one")
         state = con.execute(
             "SELECT backfill_partial, forward_frontier_unix FROM wallets WHERE wallet_hex = ?",

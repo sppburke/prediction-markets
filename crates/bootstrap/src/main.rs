@@ -4,8 +4,8 @@ use pe_bootstrap::{
     cache_migration::{
         CacheActivationRequest, PriorCacheBinding, SupabasePublicationProbe,
         activate_cache_v2_with_handoff, finalize_cache_v2, migrate_cache_v2,
-        populate_activity_fresh_v2_with_clock, populate_activity_v2, restore_prior_cache,
-        stage_cache_cycle_v2, verify_frozen_payload_v1,
+        populate_activity_bulk_root_v2_with_clock, populate_activity_fresh_v2_with_clock,
+        populate_activity_v2, restore_prior_cache, stage_cache_cycle_v2, verify_frozen_payload_v1,
     },
     config, coverage,
     error::BootstrapError,
@@ -386,6 +386,10 @@ async fn main() {
                             rest.iter()
                                 .any(|a| *a == name || a.starts_with(&format!("{name}=")))
                         };
+                        let bulk_root = flag_present("--bulk-root");
+                        if bulk_root && (!rest.contains(&"--bulk-root") || !flag_present("--fresh-generation")) {
+                            return Err(BootstrapError::Invalid { message: "--bulk-root is a bare flag requiring --fresh-generation 1, --fixed-db and --prior".to_owned() });
+                        }
                         if flag_present("--fresh-generation") {
                             if flag_present("--frozen-payload")
                                 || flag_present("--fixed-end")
@@ -422,15 +426,27 @@ async fn main() {
                                 None if flag_present("--full-read-wallets") => return Err(BootstrapError::Invalid { message: "--full-read-wallets requires a value".to_owned() }),
                                 None => Vec::new(),
                             };
+                            let settled_end = || time::OffsetDateTime::now_utc().unix_timestamp()
+                                .checked_sub(pe_bootstrap::polymarket::ACTIVITY_SETTLE_LAG_SECS)
+                                .ok_or_else(|| BootstrapError::Invalid { message: "settled activity clock underflow".to_owned() });
+                            if bulk_root {
+                                if generation != 1 || flag_present("--full-read-wallets") {
+                                    return Err(BootstrapError::Invalid { message: "--bulk-root requires generation 1 with the complete root wallet union".to_owned() });
+                                }
+                                let (fixed, prior) = fixed_db_arg.as_deref().zip(prior_arg.as_deref())
+                                    .ok_or_else(|| BootstrapError::Invalid { message: "--bulk-root requires --fixed-db and --prior to verify private candidate paths".to_owned() })?;
+                                return populate_activity_bulk_root_v2_with_clock(
+                                    &bootstrap_config.cache_path, fixed, prior, &fetcher,
+                                    &bootstrap_config.polymarket_base_url, settled_end, now,
+                                ).await.and_then(activity_json_report);
+                            }
                             return populate_activity_fresh_v2_with_clock(
                                 &bootstrap_config.cache_path,
                                 &fetcher,
                                 &bootstrap_config.polymarket_base_url,
                                 generation,
                                 &full_reads,
-                                || time::OffsetDateTime::now_utc().unix_timestamp()
-                                    .checked_sub(pe_bootstrap::polymarket::ACTIVITY_SETTLE_LAG_SECS)
-                                    .ok_or_else(|| BootstrapError::Invalid { message: "settled activity clock underflow".to_owned() }),
+                                settled_end,
                                 now,
                             )
                             .await
