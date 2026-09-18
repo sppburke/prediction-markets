@@ -5,7 +5,9 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sqlite3
+import stat
 import tempfile
 from pathlib import Path
 
@@ -237,6 +239,95 @@ def latest_accepted(root: Path, day_utc: str) -> dict | None:
     return None
 
 
+def retire_completed_cycle(root: Path, out: Path | None = None) -> int:
+    """Resume retention under the wrapper's run lock: 0 done, 2 held, 3 absent.
+
+    The durable accepted watermark is written only after verified publication.
+    It and the unchanged request/staging evidence remain the cleanup obligation,
+    including when both pointers and every eligible cache file are already gone.
+    """
+    cycle_pattern = r"cron-[0-9]{8}T[0-9]{6}Z"
+    candidates = [out] if out is not None else sorted(root.glob("cron-*"), reverse=True)
+    for candidate in candidates:
+        if (candidate.is_symlink() or not candidate.is_dir()
+                or ".." in candidate.parts or not re.fullmatch(cycle_pattern, candidate.name)
+                or candidate.resolve().parent != root.resolve()):
+            continue
+        accepted = candidate / "accepted_cycle_manifest.json"
+        if not accepted.is_file() or accepted.is_symlink():
+            continue
+        manifest = json.loads(accepted.read_text(encoding="utf-8"))
+        if (manifest.get("version") == MANIFEST_VERSION
+                and manifest.get("configuration", {}).get("cache_lane") == "fresh_v2"):
+            out = candidate
+            break
+    else:
+        return 3
+
+    guards = [root / name for name in (
+        "rank_and_push.cycle", "rank_and_push.pending", ".forge_pause.json")]
+
+    def held():
+        return any(os.path.lexists(path) for path in guards)
+
+    if held():
+        print("   [cache-retention] nothing deleted: recovery pointer or Forge pause record remains")
+        return 2
+    request_path = out / "ranking_publish_request.json"
+    if not request_path.is_file() or request_path.is_symlink():
+        raise ValueError("completed cycle omitted its regular publication request")
+    from push_ranking_to_supabase import load_publish_request
+
+    request = load_publish_request(str(request_path))
+    activation = request.get("cache_activation")
+    if activation is None:
+        raise ValueError("completed candidate cycle omitted its activation binding")
+    fixed = Path(activation["fixed_path"])
+    side = Path(activation["side_path"])
+    if ".." in fixed.parts or ".." in side.parts:
+        raise ValueError("unsafe completed cycle cache path")
+    fixed = fixed.resolve(strict=True)
+    if (not fixed.is_file() or side.name != f"wallet_cache.{out.name}.side.db"
+            or side.resolve().parent != fixed.parent):
+        raise ValueError("unrecognized completed cycle or fixed file")
+
+    print(f"RANK_AND_PUSH_RETENTION_CYCLE={out}")
+    # Make pointer clearings durable before retiring rollback files.
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    pattern = re.compile(r"wallet_cache\.(" + cycle_pattern + r")\.(prior|side|displaced)\.db(?:-wal|-shm)?")
+    deleted = 0
+    deferred = False
+    for path in sorted(fixed.parent.iterdir()):
+        match = pattern.fullmatch(path.name)
+        if not match or match[1] > out.name:
+            continue
+        metadata = path.lstat()
+        # Never follow a symlink, touch the installed inode, or delete an alias.
+        if not stat.S_ISREG(metadata.st_mode) or path.samefile(fixed):
+            continue
+        if held():
+            print("   [cache-retention] stopped: recovery pointer or Forge pause record appeared")
+            deferred = True
+            break
+        path.unlink()
+        deleted += 1
+        print(f"   [cache-retention] deleted {path} freed_size_bytes={metadata.st_size}")
+    # Unconditional: a previous process may have died after the final unlink,
+    # before syncing it. An empty directory scan is not durability evidence.
+    directory = os.open(fixed.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    if not deleted:
+        print("   [cache-retention] nothing deleted: no eligible cycle files")
+    return 2 if deferred else 0
+
+
 def _fresh_identity(raw: str | None) -> dict | None:
     if raw is None:
         return None
@@ -307,7 +398,23 @@ def _bulk_root_eligible(side: sqlite3.Connection, schema: int, head: dict | None
                     AND coll = 'BINARY' AND desc = 0))"""))
 
 
-def candidate_targets(prior_path: Path, side_path: Path, *, after_collection=False,
+def read_staging_baseline(side_path: Path, expected_sha256: str | None = None) -> dict:
+    """Read the Rust-owned immutable baseline, including while fixed is absent."""
+    raw = side_path.with_suffix(".stage.json").read_bytes()
+    if expected_sha256 is not None and hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise ValueError("stage evidence differs from prepared publication request")
+    evidence = json.loads(raw)
+    if evidence.get("version") != 1 or Path(evidence["side_path"]).resolve() != side_path.resolve():
+        raise ValueError("invalid staging baseline version or candidate binding")
+    digest = evidence.get("source_sha256")
+    if not isinstance(digest, str) or len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+        raise ValueError("invalid staging baseline hash")
+    if Path(evidence["prior_path"]).exists():
+        raise ValueError("cycle has both prior and two-file staging evidence")
+    return evidence
+
+
+def candidate_targets(prior_path: Path | None, side_path: Path, *, after_collection=False,
                       now: int | None = None, max_staleness_hours: int | None = None,
                       include_bulk_root=False) -> tuple[int, int, int] | tuple[int, int, int, int]:
     """Select this cycle's initial head or its one linked successor, read-only.
@@ -317,17 +424,25 @@ def candidate_targets(prior_path: Path, side_path: Path, *, after_collection=Fal
     The optional fourth integer reports bulk routing; the default three values
     and their meaning remain unchanged for existing callers.
     """
-    with sqlite3.connect(f"file:{prior_path}?mode=ro&immutable=1", uri=True) as prior:
-        schema = int(_one(prior, "PRAGMA user_version") or 0)
-        if schema == -2:
-            raise ValueError("unfinished bulk root (schema -2); resume cache-populate-activity-v2 --bulk-root before any other command")
-        previous = 0 if schema < 2 else int(_one(prior, "SELECT COALESCE(MAX(generation), 0) FROM activity_coverage_manifests_v2"))
-        initial = previous + 1
-        prior_identity = None
-        if schema == 2 and any(row[1] == "fresh_collection_json" for row in prior.execute("PRAGMA table_info(cache_v2_migration_state)")):
-            prior_identity = _fresh_identity(_one(prior, "SELECT fresh_collection_json FROM cache_v2_migration_state WHERE singleton = 1"))
-        active = _one(prior, "SELECT generation FROM clob_payout_walk_state_v2 WHERE singleton = 1")
-        payout = int(active) if active is not None else int(_one(prior, "SELECT COALESCE(MAX(generation), 0) FROM clob_payout_coverage_manifests_v2")) + 1
+    if side_path.with_suffix(".stage.json").exists():
+        baseline = read_staging_baseline(side_path)
+        previous = int(baseline["activity_generation"])
+        payout = int(baseline["payout_generation"])
+        prior_identity = _fresh_identity(json.dumps(baseline["fresh_identity"])) if baseline["fresh_identity"] is not None else None
+    else:
+        if prior_path is None:
+            raise ValueError("legacy candidate requires --prior; new candidate requires staging evidence")
+        with sqlite3.connect(f"file:{prior_path}?mode=ro&immutable=1", uri=True) as prior:
+            schema = int(_one(prior, "PRAGMA user_version") or 0)
+            if schema == -2:
+                raise ValueError("unfinished bulk root (schema -2); resume cache-populate-activity-v2 --bulk-root before any other command")
+            previous = 0 if schema < 2 else int(_one(prior, "SELECT COALESCE(MAX(generation), 0) FROM activity_coverage_manifests_v2"))
+            prior_identity = None
+            if schema == 2 and any(row[1] == "fresh_collection_json" for row in prior.execute("PRAGMA table_info(cache_v2_migration_state)")):
+                prior_identity = _fresh_identity(_one(prior, "SELECT fresh_collection_json FROM cache_v2_migration_state WHERE singleton = 1"))
+            active = _one(prior, "SELECT generation FROM clob_payout_walk_state_v2 WHERE singleton = 1")
+            payout = int(active) if active is not None else int(_one(prior, "SELECT COALESCE(MAX(generation), 0) FROM clob_payout_coverage_manifests_v2")) + 1
+    initial = previous + 1
     with sqlite3.connect(f"file:{side_path}?mode=ro", uri=True) as side:
         side.execute("BEGIN")
         side_schema = int(_one(side, "PRAGMA user_version") or 0)
@@ -393,8 +508,11 @@ def parse_args():
     compare.add_argument("--db", required=True, type=Path)
     compare.add_argument("--current", required=True, type=Path)
     compare.add_argument("--root", required=True, type=Path)
+    retire = subparsers.add_parser("retire-completed")
+    retire.add_argument("--root", required=True, type=Path)
+    retire.add_argument("--out-dir", type=Path)
     targets = subparsers.add_parser("candidate-targets")
-    targets.add_argument("--prior", type=Path, required=True)
+    targets.add_argument("--prior", type=Path, help="legacy immutable prior; new cycles read staging evidence")
     targets.add_argument("--side", type=Path, required=True)
     targets.add_argument("--after-collection", action="store_true")
     targets.add_argument("--max-staleness-hours", type=int)
@@ -405,6 +523,8 @@ def parse_args():
 
 def main() -> int:
     args = parse_args()
+    if args.command == "retire-completed":
+        return retire_completed_cycle(args.root, args.out_dir)
     if args.command == "candidate-targets":
         for value in candidate_targets(args.prior, args.side, after_collection=args.after_collection,
                                        max_staleness_hours=args.max_staleness_hours,

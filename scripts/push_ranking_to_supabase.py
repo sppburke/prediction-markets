@@ -408,15 +408,25 @@ def validate_publish_request(request: dict) -> None:
         raise ValueError("publish request entries require wallet_hex")
     if cache_activation is not None:
         required = {"side_path", "fixed_path", "prior_cache_backup_path", "expected_sha256"}
-        if not isinstance(cache_activation, dict) or set(cache_activation) != required:
+        if not isinstance(cache_activation, dict) or set(cache_activation) not in (
+                required, required | {"stage_evidence_sha256"}):
             raise ValueError("publish request cache activation has an invalid shape")
+        required = set(cache_activation)
         if any(not isinstance(cache_activation[key], str) or not cache_activation[key]
                or "\n" in cache_activation[key] or "\t" in cache_activation[key]
                for key in required):
             raise ValueError("publish request cache activation values must be one-line strings")
-        digest = cache_activation["expected_sha256"]
-        if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
-            raise ValueError("publish request cache activation hash is invalid")
+        for key in ("expected_sha256", "stage_evidence_sha256"):
+            if key in cache_activation:
+                digest = cache_activation[key]
+                if len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+                    raise ValueError("publish request cache activation hash is invalid")
+        if "stage_evidence_sha256" in cache_activation:
+            from rank_cycle_manifest import read_staging_baseline
+            baseline = read_staging_baseline(Path(cache_activation["side_path"]), cache_activation["stage_evidence_sha256"])
+            if (Path(baseline["fixed_path"]).resolve() != Path(cache_activation["fixed_path"]).resolve()
+                    or Path(baseline["displaced_path"]).resolve() != Path(cache_activation["prior_cache_backup_path"]).resolve()):
+                raise ValueError("publication request differs from staging paths")
     expected_key = publication_key(batch, entries, cache_activation)
     if request.get("publish_key") != expected_key:
         raise ValueError("publish request content hash mismatch")
@@ -708,6 +718,9 @@ def prepare_publish_request(a: argparse.Namespace, process_now: int) -> dict:
             "prior_cache_backup_path": str(Path(a.prior_cache_backup)),
             "expected_sha256": expected_sha256,
         }
+        evidence_path = Path(a.cache_side_db).with_suffix(".stage.json")
+        if evidence_path.exists():
+            cache_activation["stage_evidence_sha256"] = hashlib.sha256(evidence_path.read_bytes()).hexdigest()
     return build_publish_request(batch, entries, a.keep_batches, cache_activation)
 
 
@@ -829,6 +842,8 @@ def main() -> int:
                     "expected_sha256",
                 ):
                     print(activation[key])
+                if "stage_evidence_sha256" in activation:
+                    print(activation["stage_evidence_sha256"])
             return 0
         except (json.JSONDecodeError, OSError, ValueError) as error:
             print(f"FATAL: invalid publication request: {error}", file=sys.stderr)

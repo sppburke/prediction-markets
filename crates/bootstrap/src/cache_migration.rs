@@ -486,7 +486,8 @@ struct ActivityIdentity {
 /// default recent window (docs/15, checked 2026-09-12).
 const FULL_HISTORY_START_EXCLUSIVE: Option<i64> = Some(0);
 
-/// Byte-exact cycle staging receipt for the fixed cache (#588).
+/// Staging command output. `prior_sha256` is the recorded source hash for both
+/// layouts; only a first stage reports `side_sha256`, before candidate mutation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CacheStageReport {
     pub fixed_path: PathBuf,
@@ -498,6 +499,55 @@ pub struct CacheStageReport {
     pub prior_sha256: Option<String>,
     pub side_sha256: Option<String>,
     pub resumed: bool,
+}
+
+/// Immutable baseline for the two-file layout. Written before candidate allocation.
+/// Its path is derived from the candidate so it survives lost command output.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CacheStageEvidence {
+    version: u32,
+    fixed_path: PathBuf,
+    prior_path: PathBuf,
+    side_path: PathBuf,
+    displaced_path: PathBuf,
+    source_sha256: String,
+    source_size: u64,
+    source_schema: i64,
+    activity_generation: u64,
+    fresh_identity: Option<FreshCollectionIdentity>,
+    payout_generation: u64,
+    build_manifest: Option<CacheV2BuildManifest>,
+}
+
+pub fn cache_stage_evidence_path(side: &Path) -> PathBuf {
+    side.with_extension("stage.json")
+}
+
+fn displaced_path_for(side: &Path) -> Result<PathBuf, BootstrapError> {
+    let name = side
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| BootstrapError::Invalid {
+            message: "candidate has no UTF-8 file name".to_owned(),
+        })?;
+    Ok(side.with_file_name(format!(
+        "{}.displaced.db",
+        name.strip_suffix(".side.db").unwrap_or(name)
+    )))
+}
+
+fn read_stage_evidence(side: &Path) -> Result<CacheStageEvidence, BootstrapError> {
+    let path = cache_stage_evidence_path(side);
+    require_regular_file(&path, "cycle stage evidence")?;
+    let evidence: CacheStageEvidence = serde_json::from_slice(&std::fs::read(&path)?)?;
+    if evidence.version != 1 || evidence.side_path != canonical_intended_path(side)? {
+        return invalid(
+            "cycle stage evidence has unsupported version or candidate binding".to_owned(),
+        );
+    }
+    validate_hex_sha256(&evidence.source_sha256, "staging baseline sha256")?;
+    Ok(evidence)
 }
 
 /// Supplied frozen reference used to rerun the production active filter against
@@ -555,6 +605,7 @@ pub struct CacheActivationRequest {
     pub side_path: PathBuf,
     pub prior_cache_backup_path: PathBuf,
     pub expected_side_sha256: String,
+    pub stage_evidence_sha256: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -593,6 +644,8 @@ struct DurableCacheActivation {
     fixed_path: PathBuf,
     prior_cache_backup_path: PathBuf,
     expected_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stage_evidence_sha256: Option<String>,
 }
 
 /// Authoritative lookup used to decide whether a hash-bound publication was
@@ -799,20 +852,37 @@ pub async fn populate_activity_fresh_v2_with_clock(
 pub async fn populate_activity_bulk_root_v2_with_clock(
     cache_path: &Path,
     fixed_path: &Path,
-    prior_path: &Path,
+    prior_path: Option<&Path>,
     fetcher: &dyn ReconciliationFetcher,
     base_url: &str,
     settled_end: impl FnOnce() -> Result<i64, BootstrapError>,
     completed_at_unix: i64,
 ) -> Result<ActivityCoverageManifestV2, BootstrapError> {
-    for path in [cache_path, fixed_path, prior_path] {
-        require_regular_file(path, "bulk-root cache role")?;
-    }
-    require_distinct_files(&[
+    let mut roles = vec![
         ("private bulk-root candidate", cache_path),
         ("fixed cache", fixed_path),
-        ("immutable prior", prior_path),
-    ])?;
+    ];
+    require_distinct_files(&roles)?;
+    if cache_stage_evidence_path(cache_path).exists() {
+        let evidence = read_stage_evidence(cache_path)?;
+        if evidence.fixed_path != canonical_intended_path(fixed_path)?
+            || evidence.activity_generation != 0
+            || evidence.fresh_identity.is_some()
+            || evidence.prior_path.exists()
+        {
+            return invalid("bulk root differs from its staging baseline".to_owned());
+        }
+    } else {
+        let prior = prior_path.ok_or_else(|| BootstrapError::Invalid {
+            message: "legacy bulk root requires --prior; new root requires staging evidence"
+                .to_owned(),
+        })?;
+        roles.push(("immutable prior", prior));
+    }
+    for (_, path) in &roles {
+        require_regular_file(path, "bulk-root cache role")?;
+    }
+    require_distinct_files(&roles)?;
     // Recheck on every invocation, including resumes: the process environment
     // may have changed since the last wallet receipt was committed.
     require_bulk_root_sqlite_temp_file()?;
@@ -3124,15 +3194,9 @@ pub fn finalize_cache_v2(
     Ok(record)
 }
 
-/// Stage one cycle's immutable prior and private candidate from the fixed
-/// cache as byte-exact copies (#588).
-///
-/// Under the cache mutation lock the fixed main is checkpointed, integrity
-/// checked and closed, then copied to `prior_path` through the private
-/// `.pending` → fsync → rename → parent-sync pattern and hash-verified; the
-/// candidate is created from that prior the same way. A completed prior is
-/// never rewritten and an existing candidate is returned untouched so a retry
-/// resumes the cycle's own copy; a candidate without its prior is refused.
+/// Stage a single verified copy of the checkpointed fixed main. Existing
+/// prior-backed cycles retain their legacy resume behavior. New cycles record
+/// their immutable source binding before copying directly to the candidate.
 pub fn stage_cache_cycle_v2(
     fixed_path: &Path,
     prior_path: &Path,
@@ -3189,8 +3253,27 @@ pub fn stage_cache_cycle_v2(
     if let Some(path) = build_manifest_temp.as_deref() {
         roles.push(("cache build manifest staging file", path));
     }
+    let evidence_path = cache_stage_evidence_path(side_path);
+    let evidence_temp = atomic_write_temp_path(&evidence_path);
+    let displaced = displaced_path_for(side_path)?;
+    roles.extend([
+        ("cycle stage evidence", evidence_path.as_path()),
+        (
+            "cycle stage evidence temporary file",
+            evidence_temp.as_path(),
+        ),
+        ("displaced cache", displaced.as_path()),
+    ]);
     require_distinct_files(&roles)?;
     let _lock = crate::lock::CacheMutationLock::acquire(fixed_path)?;
+    if evidence_path.exists() || !prior_path.exists() {
+        return stage_two_file_cycle(
+            fixed_path,
+            prior_path,
+            side_path,
+            build_manifest_path.as_deref(),
+        );
+    }
     drop(open_existing_ro(fixed_path)?);
     if side_path.exists() {
         require_regular_file(side_path, "private candidate cache")?;
@@ -3202,7 +3285,13 @@ pub fn stage_cache_cycle_v2(
             ));
         }
         require_regular_file(prior_path, "immutable prior cache")?;
-        let report = stage_report(fixed_path, prior_path, side_path, None, true)?;
+        let report = stage_report(
+            fixed_path,
+            prior_path,
+            side_path,
+            Some(sha256_file(prior_path)?),
+            true,
+        )?;
         // An unsealed initial candidate whose manifest went missing gets it
         // back from the immutable prior; a sealed candidate keeps its recorded
         // input hash in `sealed_generation_manifests` and needs no file.
@@ -3214,18 +3303,8 @@ pub fn stage_cache_cycle_v2(
         }
         return Ok(report);
     }
-    let prior_sha256 = if prior_path.exists() {
-        require_regular_file(prior_path, "immutable prior cache")?;
-        sha256_file(prior_path)?
-    } else {
-        let current = open_existing_rw(fixed_path)?;
-        checkpoint_truncate(&current)?;
-        quick_check(&current, "staging_fixed", fixed_path)?;
-        current.close().map_err(|(_, error)| error)?;
-        let fixed_sha256 = sha256_file(fixed_path)?;
-        copy_file_atomic_verified(fixed_path, prior_path, Some(&fixed_sha256))?;
-        fixed_sha256
-    };
+    require_regular_file(prior_path, "immutable prior cache")?;
+    let prior_sha256 = sha256_file(prior_path)?;
     // An initial schema-one candidate is sealed by `cache-migrate-v2` against
     // this authentic hash-bound build manifest; the candidate is a byte copy
     // of the verified prior, so the prior hash is the backup hash. Written
@@ -3240,11 +3319,185 @@ pub fn stage_cache_cycle_v2(
     stage_report(fixed_path, prior_path, side_path, Some(prior_sha256), false)
 }
 
+fn stage_two_file_cycle(
+    fixed: &Path,
+    prior: &Path,
+    side: &Path,
+    manifest_path: Option<&Path>,
+) -> Result<CacheStageReport, BootstrapError> {
+    let evidence_path = cache_stage_evidence_path(side);
+    if prior.exists() {
+        return invalid("cycle has both prior and two-file staging evidence".to_owned());
+    }
+    let resumed = side.exists();
+    let recorded = evidence_path.exists();
+    let evidence = if recorded {
+        let evidence = read_stage_evidence(side)?;
+        if evidence.fixed_path != canonical_intended_path(fixed)?
+            || evidence.prior_path != canonical_intended_path(prior)?
+        {
+            return invalid("cycle staging paths changed".to_owned());
+        }
+        evidence
+    } else {
+        if resumed {
+            return invalid(
+                "private candidate exists without its immutable prior or staging evidence"
+                    .to_owned(),
+            );
+        }
+        let current = open_existing_rw(fixed)?;
+        checkpoint_truncate(&current)?;
+        quick_check(&current, "staging_fixed", fixed)?;
+        current.close().map_err(|(_, error)| error)?;
+        std::fs::File::open(fixed)?.sync_all()?;
+        let source_sha256 = sha256_file(fixed)?;
+        let source_schema = verified_user_version(fixed)?;
+        let baseline = open_immutable(fixed)?;
+        let activity_generation = if source_schema == CACHE_SCHEMA_VERSION_V2 {
+            baseline.query_row(
+                "SELECT COALESCE(MAX(generation), 0) FROM activity_coverage_manifests_v2",
+                [],
+                |row| row.get(0),
+            )?
+        } else {
+            0
+        };
+        let fresh_identity = fresh_collection_record(&baseline)?;
+        let active: Option<u64> = baseline
+            .query_row(
+                "SELECT generation FROM clob_payout_walk_state_v2 WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let payout_generation = match active {
+            Some(generation) => generation,
+            None => baseline.query_row(
+                "SELECT COALESCE(MAX(generation), 0) + 1 FROM clob_payout_coverage_manifests_v2",
+                [],
+                |row| row.get(0),
+            )?,
+        };
+        baseline.close().map_err(|(_, error)| error)?;
+        let evidence = CacheStageEvidence {
+            version: 1,
+            fixed_path: canonical_intended_path(fixed)?,
+            prior_path: canonical_intended_path(prior)?,
+            side_path: canonical_intended_path(side)?,
+            displaced_path: canonical_intended_path(&displaced_path_for(side)?)?,
+            source_sha256: source_sha256.clone(),
+            source_size: std::fs::metadata(fixed)?.len(),
+            source_schema,
+            activity_generation,
+            fresh_identity,
+            payout_generation,
+            build_manifest: if source_schema != CACHE_SCHEMA_VERSION_V2 {
+                Some(build_manifest(fixed, &source_sha256)?)
+            } else {
+                None
+            },
+        };
+        atomic_write_json(&evidence_path, &evidence)?;
+        evidence
+    };
+    if evidence.displaced_path.exists() || restore_marker_path(side).exists() {
+        return invalid(
+            "cycle has activation or restoration state; resume its prepared request".to_owned(),
+        );
+    }
+    if !resumed {
+        refuse_retained_backups(fixed)?;
+        if recorded {
+            let current = open_existing_rw(fixed)?;
+            checkpoint_truncate(&current)?;
+            current.close().map_err(|(_, error)| error)?;
+            if sha256_file(fixed)? != evidence.source_sha256 {
+                return invalid("fixed cache differs from recorded staging baseline".to_owned());
+            }
+        }
+    }
+    let side_schema = if resumed {
+        candidate_user_version(side)?
+    } else {
+        evidence.source_schema
+    };
+    if let Some(path) = manifest_path
+        && side_schema != CACHE_SCHEMA_VERSION_V2
+        && !path.exists()
+        && let Some(manifest) = &evidence.build_manifest
+    {
+        atomic_write_json(path, manifest)?;
+    }
+    if !resumed {
+        copy_file_atomic_verified(fixed, side, Some(&evidence.source_sha256))?;
+    }
+    Ok(CacheStageReport {
+        fixed_path: evidence.fixed_path,
+        prior_path: evidence.prior_path,
+        side_path: evidence.side_path,
+        prior_schema: evidence.source_schema,
+        side_schema,
+        side_sha256: if resumed {
+            None
+        } else {
+            Some(evidence.source_sha256.clone())
+        },
+        prior_sha256: Some(evidence.source_sha256),
+        resumed,
+    })
+}
+
+fn refuse_retained_backups(fixed: &Path) -> Result<(), BootstrapError> {
+    let parent = canonical_intended_path(fixed)?
+        .parent()
+        .ok_or_else(|| BootstrapError::Invalid {
+            message: "fixed cache has no parent".to_owned(),
+        })?
+        .to_path_buf();
+    for entry in std::fs::read_dir(parent)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(rest) = name.strip_prefix("wallet_cache.cron-") else {
+            continue;
+        };
+        let Some(cycle) = rest
+            .strip_suffix(".prior.db")
+            .or_else(|| rest.strip_suffix(".displaced.db"))
+        else {
+            continue;
+        };
+        let bytes = cycle.as_bytes();
+        if bytes.len() == 16
+            && bytes[8] == b'T'
+            && bytes[15] == b'Z'
+            && bytes[..8]
+                .iter()
+                .chain(&bytes[9..15])
+                .all(u8::is_ascii_digit)
+        {
+            return invalid(format!(
+                "previous cycle backup remains; retire after verified publication before staging: {}",
+                entry.path().display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn write_build_manifest(
     prior_path: &Path,
     prior_sha256: &str,
     path: &Path,
 ) -> Result<(), BootstrapError> {
+    atomic_write_json(path, &build_manifest(prior_path, prior_sha256)?)
+}
+
+fn build_manifest(
+    prior_path: &Path,
+    prior_sha256: &str,
+) -> Result<CacheV2BuildManifest, BootstrapError> {
     let prior = open_immutable(prior_path)?;
     let newest_trade: Option<i64> =
         prior.query_row("SELECT MAX(timestamp_unix) FROM trades", [], |row| {
@@ -3263,20 +3516,17 @@ fn write_build_manifest(
         )
         .optional()?;
     prior.close().map_err(|(_, error)| error)?;
-    atomic_write_json(
-        path,
-        &CacheV2BuildManifest {
-            manifest_version: CACHE_BUILD_MANIFEST_VERSION,
-            backup_sha256: prior_sha256.to_owned(),
-            source_bounds: serde_json::json!({
-                "newest_trade_unix": newest_trade,
-                "newest_resolution_fetch_unix": newest_resolution,
-            }),
-            cursors: serde_json::json!({ "clob_closed": clob_cursor }),
-            hashes: BTreeMap::new(),
-            sealed_at_unix: OffsetDateTime::now_utc().unix_timestamp(),
-        },
-    )
+    Ok(CacheV2BuildManifest {
+        manifest_version: CACHE_BUILD_MANIFEST_VERSION,
+        backup_sha256: prior_sha256.to_owned(),
+        source_bounds: serde_json::json!({
+            "newest_trade_unix": newest_trade,
+            "newest_resolution_fetch_unix": newest_resolution,
+        }),
+        cursors: serde_json::json!({ "clob_closed": clob_cursor }),
+        hashes: BTreeMap::new(),
+        sealed_at_unix: OffsetDateTime::now_utc().unix_timestamp(),
+    })
 }
 
 /// Open a checkpointed and closed main for reading exactly as its bytes are.
@@ -3459,7 +3709,7 @@ fn stage_report(
         side_path: std::fs::canonicalize(side_path)?,
         prior_schema,
         side_schema,
-        side_sha256: prior_sha256.clone(),
+        side_sha256: if resumed { None } else { prior_sha256.clone() },
         prior_sha256,
         resumed,
     })
@@ -3481,6 +3731,11 @@ pub fn activate_cache_v2_with_handoff(
     handoff: Option<&ForgeLockHandoff>,
 ) -> Result<CacheActivationReport, BootstrapError> {
     let _locks = ForgeActivationLocks::acquire_with_handoff(&request.fixed_path, handoff)?;
+    if request.stage_evidence_sha256.is_some()
+        || cache_stage_evidence_path(&request.side_path).exists()
+    {
+        return activate_two_file_cycle(request);
+    }
     require_regular_file(&request.fixed_path, "current fixed cache")?;
     validate_hex_sha256(&request.expected_side_sha256, "expected side sha256")?;
     if !request.side_path.exists() {
@@ -3609,6 +3864,173 @@ pub fn activate_cache_v2_with_handoff(
     })
 }
 
+fn bound_stage_evidence(
+    request: &CacheActivationRequest,
+) -> Result<CacheStageEvidence, BootstrapError> {
+    let expected =
+        request
+            .stage_evidence_sha256
+            .as_deref()
+            .ok_or_else(|| BootstrapError::Invalid {
+                message: "two-file activation requires the prepared request's stage evidence hash"
+                    .to_owned(),
+            })?;
+    validate_hex_sha256(expected, "stage evidence sha256")?;
+    if sha256_file(&cache_stage_evidence_path(&request.side_path))? != expected {
+        return invalid("stage evidence differs from prepared publication request".to_owned());
+    }
+    let evidence = read_stage_evidence(&request.side_path)?;
+    if evidence.fixed_path != canonical_intended_path(&request.fixed_path)?
+        || evidence.displaced_path != canonical_intended_path(&request.prior_cache_backup_path)?
+        || evidence.prior_path.exists()
+    {
+        return invalid("prepared request differs from two-file staging paths".to_owned());
+    }
+    require_distinct_files(&[
+        ("fixed cache", &request.fixed_path),
+        ("candidate", &request.side_path),
+        ("displaced cache", &request.prior_cache_backup_path),
+    ])?;
+    require_same_device(
+        &request.fixed_path,
+        &request.side_path,
+        &request.prior_cache_backup_path,
+    )?;
+    Ok(evidence)
+}
+
+fn restore_marker_path(side: &Path) -> PathBuf {
+    side.with_extension("restore.json")
+}
+
+/// The loop/run locks exclude every other orchestrator on this host. Check
+/// vacancy under that ownership, then rename on the same filesystem; no copy fallback.
+fn rename_vacant(source: &Path, target: &Path) -> Result<(), BootstrapError> {
+    match std::fs::symlink_metadata(target) {
+        Ok(_) => {
+            return invalid(format!(
+                "rename destination is occupied: {}",
+                target.display()
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    std::fs::rename(source, target).map_err(map_rename_error)?;
+    sync_parent(target)?;
+    if source.parent() != target.parent() {
+        sync_parent(source)?;
+    }
+    Ok(())
+}
+
+fn require_baseline(path: &Path, evidence: &CacheStageEvidence) -> Result<(), BootstrapError> {
+    require_regular_file(path, "staging baseline cache")?;
+    reject_nonempty_activation_sidecars(path)?;
+    if std::fs::metadata(path)?.len() != evidence.source_size
+        || sha256_file(path)? != evidence.source_sha256
+    {
+        return invalid("fixed cache differs from recorded staging baseline; activation refused before displacement".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_installed_candidate(
+    path: &Path,
+    expected: &str,
+    phase: &str,
+) -> Result<(), BootstrapError> {
+    require_regular_file(path, "version-two candidate cache")?;
+    let connection = open_immutable(path)?;
+    if let Err(error) = reject_nonempty_activation_sidecars(path) {
+        drop(open_existing_ro(path)?);
+        return Err(error);
+    }
+    if sha256_file(path)? != expected {
+        return invalid("version-two side-cache hash changed after finalization".to_owned());
+    }
+    require_schema(&connection, CACHE_SCHEMA_VERSION_V2)?;
+    quick_check(&connection, phase, path)?;
+    verify_finalized_v2_manifests(&connection, ClassifierGeneration::Current)?;
+    connection.close().map_err(|(_, error)| error)?;
+    Ok(())
+}
+
+fn activate_two_file_cycle(
+    request: &CacheActivationRequest,
+) -> Result<CacheActivationReport, BootstrapError> {
+    let evidence = bound_stage_evidence(request)?;
+    if restore_marker_path(&request.side_path).exists() {
+        return invalid("cycle restoration was requested; activation is refused".to_owned());
+    }
+    validate_hex_sha256(&request.expected_side_sha256, "expected side sha256")?;
+    let fixed = &request.fixed_path;
+    let side = &request.side_path;
+    let displaced = &request.prior_cache_backup_path;
+    let resumed = !fixed.exists() || !side.exists();
+    let mut activation_evidence = None;
+    if !side.exists() {
+        require_baseline(displaced, &evidence)?;
+        validate_installed_candidate(
+            fixed,
+            &request.expected_side_sha256,
+            "activation_missing_side",
+        )?;
+        sync_parent(fixed)?;
+    } else {
+        // Validate both generations before the first move, and again on gap recovery.
+        validate_installed_candidate(side, &request.expected_side_sha256, "activation_candidate")?;
+        if fixed.exists() {
+            if displaced.exists() {
+                return invalid("displaced cache destination is occupied".to_owned());
+            }
+            let current = open_existing_rw(fixed)?;
+            checkpoint_truncate(&current)?;
+            match evidence.source_schema {
+                0 | CACHE_SCHEMA_VERSION_V1 => require_reclamation_ready(&current)?,
+                CACHE_SCHEMA_VERSION_V2 => {
+                    verify_finalized_v2_manifests(&current, ClassifierGeneration::Historical)?
+                }
+                other => return invalid(format!("unsupported prior cache schema {other}")),
+            }
+            current.close().map_err(|(_, error)| error)?;
+            // Checkpoint can fold post-stage WAL writes into the main. Compare
+            // against the durable H0, never against a freshly captured baseline.
+            if sha256_file(fixed)? != evidence.source_sha256 {
+                return invalid("fixed cache differs from recorded staging baseline; activation refused before displacement".to_owned());
+            }
+            if evidence.source_schema != CACHE_SCHEMA_VERSION_V2 {
+                let report =
+                    capture_reclamation_evidence(fixed, &eval_results_dir_for_cache(fixed))?;
+                if !report.activation_ready {
+                    return invalid(
+                        "current cache failed the locked reclamation/index activation gate"
+                            .to_owned(),
+                    );
+                }
+                activation_evidence = Some(report);
+            }
+            reject_nonempty_sidecars(fixed)?;
+            std::fs::File::open(fixed)?.sync_all()?;
+            rename_vacant(fixed, displaced)?;
+        } else {
+            require_baseline(displaced, &evidence)?;
+            reject_nonempty_activation_sidecars(fixed)?;
+            sync_parent(displaced)?;
+        }
+        rename_vacant(side, fixed)?;
+    }
+    Ok(CacheActivationReport {
+        installed_path: canonical_intended_path(fixed)?,
+        installed_sha256: request.expected_side_sha256.clone(),
+        prior_cache_backup_path: canonical_intended_path(displaced)?,
+        prior_cache_sha256: evidence.source_sha256,
+        prior_cache_schema: evidence.source_schema,
+        activation_evidence,
+        resumed,
+    })
+}
+
 /// Restore the hash-bound prior cache only when the durable pending request is
 /// intact and authoritative `ranking_batches.publish_key` evidence proves that
 /// exact publication has never been consumed.
@@ -3686,6 +4108,9 @@ pub async fn restore_prior_cache(
                 .to_owned(),
         );
     }
+    if request.cache_activation.stage_evidence_sha256.is_some() {
+        return restore_two_file_cycle(&request, displaced_cache_backup_path, binding);
+    }
     validate_hex_sha256(&binding.sha256, "prior cache sha256")?;
     require_regular_file(prior_cache_backup_path, "prior cache restore main")?;
     if sha256_file(prior_cache_backup_path)? != binding.sha256
@@ -3731,6 +4156,80 @@ pub async fn restore_prior_cache(
     Ok(())
 }
 
+fn restore_two_file_cycle(
+    publication: &DurablePublishRequest,
+    rejected_path: &Path,
+    binding: &PriorCacheBinding,
+) -> Result<(), BootstrapError> {
+    let activation = &publication.cache_activation;
+    let request = CacheActivationRequest {
+        fixed_path: activation.fixed_path.clone(),
+        side_path: activation.side_path.clone(),
+        prior_cache_backup_path: activation.prior_cache_backup_path.clone(),
+        expected_side_sha256: activation.expected_sha256.clone(),
+        stage_evidence_sha256: activation.stage_evidence_sha256.clone(),
+    };
+    let evidence = bound_stage_evidence(&request)?;
+    if canonical_intended_path(rejected_path)? != evidence.side_path
+        || binding.sha256 != evidence.source_sha256
+        || binding.schema_version != evidence.source_schema
+    {
+        return invalid("two-file restore requires the staged baseline and the vacant candidate as rejected-cache destination".to_owned());
+    }
+    let fixed = &request.fixed_path;
+    let old = &request.prior_cache_backup_path;
+    let marker = restore_marker_path(rejected_path);
+    let restoring = marker.exists();
+    if restoring
+        && serde_json::from_slice::<String>(&std::fs::read(&marker)?)? != publication.publish_key
+    {
+        return invalid("restoration marker belongs to another publication".to_owned());
+    }
+    if restoring && !old.exists() {
+        require_baseline(fixed, &evidence)?;
+        validate_installed_candidate(
+            rejected_path,
+            &request.expected_side_sha256,
+            "restore_rejected",
+        )?;
+        sync_parent(fixed)?;
+        return Ok(());
+    }
+    require_baseline(old, &evidence)?;
+    let prior = open_immutable(old)?;
+    quick_check(&prior, "restore_prior", old)?;
+    prior.close().map_err(|(_, error)| error)?;
+    if fixed.exists() {
+        if rejected_path.exists() {
+            return invalid("rejected-cache destination is occupied".to_owned());
+        }
+        let current = open_existing_rw(fixed)?;
+        checkpoint_truncate(&current)?;
+        current.close().map_err(|(_, error)| error)?;
+        if sha256_file(fixed)? != request.expected_side_sha256 {
+            return invalid("fixed cache no longer matches the bound corrected cache".to_owned());
+        }
+        reject_nonempty_sidecars(fixed)?;
+        std::fs::File::open(fixed)?.sync_all()?;
+        atomic_write_json(&marker, &publication.publish_key)?;
+        rename_vacant(fixed, rejected_path)?;
+    } else {
+        if !restoring {
+            return invalid(
+                "absent fixed cache without restoration intent; resume activation".to_owned(),
+            );
+        }
+        validate_installed_candidate(
+            rejected_path,
+            &request.expected_side_sha256,
+            "restore_rejected",
+        )?;
+        reject_nonempty_activation_sidecars(fixed)?;
+        sync_parent(rejected_path)?;
+    }
+    rename_vacant(old, fixed)
+}
+
 fn verified_pending_publication(
     request_path: &Path,
     pending_pointer_path: &Path,
@@ -3739,8 +4238,6 @@ fn verified_pending_publication(
 ) -> Result<DurablePublishRequest, BootstrapError> {
     require_regular_file(request_path, "publication request")?;
     require_regular_file(pending_pointer_path, "pending publication pointer")?;
-    require_regular_file(fixed_path, "corrected fixed cache")?;
-    require_regular_file(prior_cache_backup_path, "prior cache restore main")?;
     let pending = std::fs::read_to_string(pending_pointer_path)?;
     let lines = pending.lines().collect::<Vec<_>>();
     if lines.len() != 1 || lines[0].is_empty() || Path::new(lines[0]).is_absolute() {
@@ -3754,6 +4251,10 @@ fn verified_pending_publication(
     }
 
     let request: DurablePublishRequest = serde_json::from_slice(&std::fs::read(request_path)?)?;
+    if request.cache_activation.stage_evidence_sha256.is_none() {
+        require_regular_file(fixed_path, "corrected fixed cache")?;
+        require_regular_file(prior_cache_backup_path, "prior cache restore main")?;
+    }
     if request.version != 1 || request.entries.is_empty() {
         return invalid("publication request has an unsupported or empty shape".to_owned());
     }
@@ -3773,14 +4274,16 @@ fn verified_pending_publication(
     if sha256_bytes(python_canonical_json(&identity)?.as_bytes()) != request.publish_key {
         return invalid("publication request content hash mismatch".to_owned());
     }
-    if std::fs::canonicalize(&request.cache_activation.fixed_path)?
-        != std::fs::canonicalize(fixed_path)?
-        || std::fs::canonicalize(&request.cache_activation.prior_cache_backup_path)?
-            != std::fs::canonicalize(prior_cache_backup_path)?
+    if canonical_intended_path(&request.cache_activation.fixed_path)?
+        != canonical_intended_path(fixed_path)?
+        || canonical_intended_path(&request.cache_activation.prior_cache_backup_path)?
+            != canonical_intended_path(prior_cache_backup_path)?
     {
         return invalid("publication request is bound to another cache activation".to_owned());
     }
-    if sha256_file(fixed_path)? != request.cache_activation.expected_sha256 {
+    if request.cache_activation.stage_evidence_sha256.is_none()
+        && sha256_file(fixed_path)? != request.cache_activation.expected_sha256
+    {
         return invalid("fixed cache no longer matches the bound corrected cache".to_owned());
     }
     Ok(request)
@@ -4583,6 +5086,7 @@ fn copy_file_atomic_verified(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
+    tracing::info!(source = %source.display(), target = %target.display(), "cache whole-file copy");
     std::fs::copy(source, &pending)?;
     OpenOptions::new()
         .read(true)

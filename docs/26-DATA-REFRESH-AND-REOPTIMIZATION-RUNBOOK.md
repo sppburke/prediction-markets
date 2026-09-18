@@ -633,16 +633,30 @@ PE_PYTHON="$PE_PYTHON" bash scripts/rank_and_push.sh \
 
 `FIXED_PHYSICAL` is the regular file behind `data/wallet_cache.db` (`readlink -f`); activation and
 restore refuse a symbolic link. The exact publication request carries the side path, fixed path,
-generic prior-backup path, and stage hash inside its `publish_key`. If the process stops after preparation, the existing pending
+rollback-backup path and finalized candidate hash inside its `publish_key`. New two-file cycles also
+bind the SHA-256 of the immutable `wallet_cache.<cycle>.side.stage.json` staging evidence;
+legacy requests keep their existing prior-bound tuple. If the process stops after preparation, the existing pending
 pointer resumes idempotent activation before publication; no additional pointer is used. Before
 either first activation or resumed activation, the publisher validates the complete request and
 returns the sole activation tuple consumed by the wrapper. A content-hash mismatch therefore fails
 before any cache mutation. Request and pointer replacement fsync both the new file and containing
-directory. Activation accepts a verified schema-one or schema-two fixed cache and retains one
-generic prior-main backup. Ordinary activation fully validates the installed cache and candidate;
-once the prior backup's hash equals the just-validated fixed main (including a hash-verified new
-copy), it reads and compares the prior's schema immutably without repeating content validation.
-Missing-side recovery and restore retain their existing content checks.
+directory. For a new cycle, activation checkpoints the installed main `F` and requires its hash to
+match staging's recorded `H0`, including any writes previously committed only to WAL. Drift refuses
+before any rename. It validates the candidate `C` against the prepared request, then renames
+`F → D`, fsyncs the directory, renames `C → F`, and fsyncs again. Both destinations must be vacant;
+there is no copy fallback. `D` holds the exact old bytes. A crash in the gap leaves `F` absent and
+`D + C` present. The next activation or pending-publication resume validates `D` against `H0` and
+`C` against the prepared candidate hash before completing `C → F`. Unknown combinations refuse
+without moving or deleting files. Payout and every ordinary writable CLI invocation, including named,
+no-argument and positional-config `all`, refuse an absent database instead of opening it with SQLite
+CREATE. First installation explicitly opts in with `pe-bootstrap --create-cache` (also accepted by
+named `all` and with a positional TOML config path). The flag creates and initializes an absent cache,
+opens an existing regular cache file normally, and refuses other existing path types, including
+symlinks. The supervised wrapper never passes it, and its preceding probes use read-only opens.
+`cache-stage-v2` still provisions verified candidate copies. Legacy activation/restoration retain
+their explicit backup-copy behavior; those paths never initialize an empty installed cache.
+Legacy cycles with an existing prior and no new staging evidence retain their existing activation
+and restoration behavior, including the live cutover cycle. Never convert their evidence or request.
 
 The wrapper remains the one-shot run-lock owner. For activation it passes the inherited run-lock
 descriptor and, under the supervisor, the inherited loop-lock descriptor. `pe-bootstrap` verifies
@@ -651,7 +665,9 @@ always acquires the cache lock. A direct `pe-bootstrap cache-activate` call with
 handoff continues to acquire loop → run → cache itself.
 
 Before the bound corrected batch becomes current, restore that exact prior cache by its recorded
-hash and schema. Preserve the displaced cache for audit:
+hash and schema. For a new cycle set `CACHE_PRIOR_BACKUP` to its `.displaced.db` (`D`) and
+`DISPLACED_CACHE_BACKUP` to its now-vacant `.side.db` (`C`). For a legacy cycle retain the original
+prior and displaced arguments. Preserve the rejected cache for audit:
 
 ```bash
 pe-bootstrap cache-restore-prior \
@@ -670,7 +686,12 @@ fixed/prior activation paths, and the installed corrected-cache hash while holdi
 stack. It then asks authoritative `ranking_batches.publish_key` whether that exact publication was
 ever consumed. A consumed publication, a missing/malformed pointer or request, or unavailable
 authority refuses restoration; recover by rolling forward through the existing pending-publication
-path. There is no operator assertion flag. Schema one retains `auto | duck | sqlite`; schema two
+path. There is no operator assertion flag. New-layout restore records the direction in
+`wallet_cache.<cycle>.side.restore.json`, renames the rejected `F → C`, fsyncs the directory, then
+renames `D → F` and fsyncs again. The same restore command completes an interrupted gap or confirms
+an already completed restore; it copies no cache. Keep the request, pointer, staging evidence and
+restore marker. The marker prevents a pending-publication resume from reinstalling the rejected
+candidate. Stay paused until the recovery is resolved. Schema one retains `auto | duck | sqlite`; schema two
 requires the verified DuckDB snapshot and refuses SQLite.
 
 ### Fresh private-candidate cycles and the scheduled schema-two lane (#588, #648)
@@ -679,15 +700,16 @@ The frozen-payload flow above seals one historical snapshot; it cannot collect a
 generation because the frozen reference is bound to one generation and end, the wallet
 list is fixed to the sealed schema-one history, and activity insertion moves matching rows
 between generations inside one database. Recurring classifier-two publication therefore
-builds every cycle in a **private candidate** copied from an **immutable prior** of the fixed
+builds each new cycle in a **private candidate** copied directly from the checkpointed fixed
 cache and certifies one complete current activity generation for the union of acquisition candidates,
 every retained history and every wallet the prior's newest generation excluded, without a
 frozen reference:
 
 ```bash
-# Under the cache lock: checkpoint + quick-check the fixed main, copy it to the
-# immutable prior, copy the prior to the candidate (each copy hash-verified before its
-# rename). A schema-one prior also gets its hash-bound build manifest for the initial seal.
+# Under the cache lock: checkpoint + quick-check + hash the fixed main, durably record H0
+# and generation targets in SIDE's .stage.json, then make one verified atomic copy to SIDE.
+# --prior reserves the legacy name; no prior file is created for a new cycle.
+# Schema-one input also gets its H0-bound build manifest for the initial seal.
 # Every path names a file in an existing directory (the cycle directory beside the fixed
 # cache): staging never creates directories.
 pe-bootstrap cache-stage-v2 --db "$FIXED_PHYSICAL" --prior "$PRIOR" --side "$SIDE" \
@@ -712,7 +734,10 @@ and its recorded `ranker_projection_inputs_json` binding and invalidates finaliz
 wallet atomically re-stamps its verified predecessor rows, strictly inserts delta rows and commits complete-history counts/digest plus acquisition proof.
 The bounded carry batches use the existing wallet/time/ID index and advance by key; all batches stay
 in one wallet transaction. A full read replaces every retained row for that wallet, including an empty
-replacement. Historical manifests in the mutated candidate are commitments, not physical snapshots; retain the immutable prior for restore.
+replacement. Historical manifests in the mutated candidate are commitments, not physical snapshots.
+Keep staging evidence; activation preserves the old fixed bytes at `D` for eligible restoration.
+A resumed stage returns the original `H0`, leaves candidate progress intact, and never recaptures
+its baseline from a changed installed cache. Legacy cycles continue to use their immutable prior.
 
 A retry resumes the exact recorded bounds and lists and fetches only wallets without a valid receipt.
 Receipt-only startup validates proof metadata without reading completed wallets' aggregates;
@@ -760,8 +785,8 @@ Finalization certifies exact bytes and activity, payout and projection evidence,
 every SQLite page. Damage outside those reads may now survive migration resume, the
 post-seal step and either finalization, wasting private collection/ranking work before
 activation refuses installation; fault localization is consequently later. Outgoing
-and retained backups keep hash/schema/manifest validation, and fallback backup and
-displaced audit copies are explicitly hash-verified, but may contain preexisting damage:
+and retained backups keep hash/schema/manifest validation. New-layout activation and restoration
+move existing files; legacy fallback/audit copies remain hash-verified. Backups may contain preexisting damage:
 the prior's restore-time check decides whether it is eligible for restoration, and
 post-rename hash equality carries that proof without another scan. All checkpoints,
 sidecar rejection, receipt/content digests, locks and publication gates remain in place;
@@ -800,13 +825,13 @@ retired `trades`/`source_cursor` and do not run), followed by the existing cutov
 Parquet export, pass one, targeted `prices-history`, second finalization, candidate
 recapture into `candidate_cycle_manifest.json` (bound into pass two; `cycle_manifest.json`
 keeps the cycle's initial installed-cache watermark), `--prepare-only`, `cache-activate` and
-the exact `--resume-request`. The immutable prior fixes the initial activity generation and payout
-target. The activity owner resumes the candidate's recorded head, including a manually started or
+the exact `--resume-request`. The immutable staging baseline fixes the initial activity generation
+and payout target for new cycles; existing legacy cycles read those values from their prior. The activity owner resumes the candidate's recorded head, including a manually started or
 interrupted successor belonging to this cycle. If the completed initial head's age exceeds the
 publisher's unchanged `max_cache_staleness_hours`, the wrapper admits one linked top-up. Its persisted
 base link consumes that allowance across restarts; a stale top-up stops before ranking and never
 starts another. Actual trade/payout source times still govern preparation after downstream work.
-The payout target is the prior's active walk if present, otherwise its newest completed walk plus one;
+The payout target is the staging baseline's active walk if present, otherwise its newest completed walk plus one;
 a completed target on the candidate is reused. After every successful publication — the fresh path,
 the automatic pending resume and explicit `--resume-pending` — the accepted watermark is captured from the
 request's installed fixed path before the pointers clear, so the next unchanged same-day
@@ -814,8 +839,9 @@ invocation skips before staging.
 
 **Physical layout.** The candidate lane uses the regular physical fixed file
 (`readlink -f data/wallet_cache.db`) and derives per-cycle names beside it from the
-durable cycle directory: `wallet_cache.<cron-UTC>.side.db`, `.prior.db`, and the
-`.displaced.db` name used only by `cache-restore-prior`. The Rust lock owners derive the
+durable cycle directory: `wallet_cache.<cron-UTC>.side.db` (`C`) and `.displaced.db` (`D`).
+The `.prior.db` (`P`) name remains for legacy cycles. The sibling `.side.stage.json` is written
+atomically by Rust before copying; `cache_stage.json` in the run directory is command output. The Rust lock owners derive the
 cache lock and the loop/run lock directory from that physical path, so the physical
 directory must carry two aliases to the repository inodes, checked before any mutation:
 
@@ -824,19 +850,39 @@ directory must carry two aliases to the repository inodes, checked before any mu
 | `<physical dir>/eval-results` | `<repo>/data/eval-results` |
 | `<physical dir>/wallet_cache.db.lock` | `<repo>/data/wallet_cache.db.lock` |
 
-Fixed, prior, candidate and displaced files must be independent regular files on one
-filesystem; staging refuses the same path, a hard link or a symbolic link among them. A
-completed prior is never rewritten and a candidate without its prior is refused. The
-existing locked prior-hash comparison at activation refuses a fixed cache changed after the
-prior was captured; resume with the recorded candidate and prior, or, only while no request
-has been prepared, abandon the cycle as described under recovery states and start a new one.
+Fixed, candidate, and retained backup must be independent regular files on one filesystem.
+The cycle's own evidence selects the layout: new immutable staging evidence means direct-copy
+staging and rename preservation; an existing prior without that evidence means legacy behavior.
+An existing candidate with neither evidence nor prior refuses. Installed drift after staging is
+reported against recorded `H0`; that hash detects drift but cannot reconstruct the original bytes.
 
-After successful publication and pointer clearing, the production candidate lane retains every file of the current cycle (including its prior rollback copy) and deletes only regular files named `wallet_cache.cron-<YYYYMMDDTHHMMSSZ>.{prior,side,displaced}.db` and their `-wal`/`-shm` sidecars for other cycles in the physical cache directory, logging each deletion's size or that nothing was deleted.
-Retention skips while any cycle pointer, pending publication pointer or `.forge_pause.json` record remains, never runs at the prepare boundary, and never deletes the installed cache, its inode aliases, symlinks, paths containing `..` or names outside that exact pattern; repeated runs are safe.
+After verified publication and both pointer clearings, retention deletes the completed cycle's
+`D` (or legacy `P` and `D`) as well as eligible older cycle artifacts. The existing durable
+`accepted_cycle_manifest.json`, written after publication verification, and `ranking_publish_request.json`
+remain the discoverable cleanup obligation, together with the request-bound `.side.stage.json` for
+new-layout cycles. Before admitting another cycle or taking the unchanged-watermark exit, the wrapper
+finds the newest accepted candidate cycle and validates its request and staging binding, then resumes
+retirement. Pointerless `--resume-pending` also completes this cleanup without activating or publishing
+again. The evidence stays as audit history; no new receipt format is introduced. Every completed
+retirement pass synchronizes the physical cache directory, even if an interrupted pass already unlinked
+the last backup. It accepts only regular files named
+`wallet_cache.cron-<YYYYMMDDTHHMMSSZ>.{prior,side,displaced}.db` and their `-wal`/`-shm` sidecars,
+from that cycle or earlier, in the request's physical cache directory. Pending pointer, cycle pointer
+or `.forge_pause.json` presence, including malformed/symlink records, prevents deletion. A pause
+defers cleanup and new-cycle admission; removing it lets the next loop pass finish retirement.
+The installed file, its inode aliases, symlinks, directories, `..` paths and other names remain
+protected. Staging still refuses another candidate allocation while an exact-cycle prior/displaced
+backup remains; never delete a backup to bypass an unresolved publication.
+
+At **830 GB per cache**, two full caches use **about 1.66 TB**, leaving **about 240 GB on a 1.9 TB**
+device. Staging, activation, rename-gap recovery and rollback retain at most those two full mains.
+Keeping the previous backup into the next copy would require 2.49 TB and is refused. The 240 GB
+remainder is shared by WAL, exports, sort scratch, growth, filesystem overhead and other usage;
+this arithmetic does not measure their peak usage.
 
 **Initial cutover and acceptance.** Complete any outstanding schema-one cycle and its
-publication first. Create the two aliases, check free space for two additional copies of
-the fixed file on that filesystem, then set `PE_RANK_SCHEMA_TWO_CUTOVER=prepare` and run
+publication first. Create the two aliases, retire eligible previous backups, and check free space
+for one candidate plus the measured WAL/export/scratch budget on that filesystem, then set `PE_RANK_SCHEMA_TWO_CUTOVER=prepare` and run
 one zero-argument cycle, either under the supervisor or by hand while it is paused with
 `scripts/deploy/forge_pause.sh`. It stages, seals, collects the full union, walks payout,
 finalizes, ranks and prepares the exact request; the publisher's unchanged freshness checks
@@ -853,7 +899,7 @@ paused, `scripts/deploy/forge_pause.sh restore` (it restores the recorded run fl
 state; a plain unit start would exit on the `stop` flag the pause wrote): the
 pending-publication recovery activates and publishes exactly that request. If the publisher
 refuses (stale source times, incomplete coverage), the cycle stops with the installed cache
-untouched and the candidate, prior and log preserved; do not relabel times, narrow
+untouched and the candidate, staging evidence, any legacy prior and log preserved; do not relabel times, narrow
 membership or relax freshness. Require the next real scheduled refresh and publication
 (installed schema two selects the lane automatically) before closing the classifier-two
 handoff.
@@ -862,15 +908,16 @@ handoff.
 `scripts/deploy/forge_pause.sh pause` reports the loop inactive with no cycle descendant and
 no held lock; then confirm `rank_and_push.pending` is absent and the cycle directory holds no
 `ranking_publish_request.json`, remove `rank_and_push.cycle`, and delete only that cycle's
-candidate. The fixed cache was never modified and the prior may be kept as evidence. Once a
+candidate and its staging metadata. Preserve any legacy prior until its own recovery is resolved;
+an outstanding prior will block the next new-layout copy. Once a
 request is prepared, never delete it or start another cycle: the pending pointer resumes
 activation and publication. If the pointer is missing but this cycle has a durable
 `ranking_publish_request.json`, both recovery entries validate that request and reconstruct its pointer
 through the publisher before discovery or collection. Both remain held while cutover is `prepare`.
 After activation but before the publication is consumed,
-`cache-restore-prior` with the cycle's prior and displaced names restores the exact prior
-bytes; the restore renames the prior file onto the fixed path, so the prior name is consumed
-and the supervisor must stay paused until the recovery is resolved. After consumption, roll
+`cache-restore-prior` with backup `D` and rejected destination `C` restores the old bytes by rename
+for a new cycle, including its interrupted gap. A legacy cycle keeps its prior/displaced arguments
+and existing semantics. The supervisor must stay paused until the recovery is resolved. After consumption, roll
 forward. Forge's boot card is failing (#637); the caches, repository and evaluation results
 live on the SSDs, but confirm the host before any cutover and keep the prior until the
 publication is confirmed.
@@ -878,9 +925,10 @@ publication is confirmed.
 ### Fresh bulk root with deferred global uniqueness (#588)
 
 The supervised `rank_and_push.sh` pipeline starts and resumes a qualifying bulk root itself,
-using `cache-populate-activity-v2 --fresh-generation 1 --bulk-root --fixed-db … --prior …`.
-Admission is only for a newly staged and migrated private candidate. The fixed cache, immutable prior and
-candidate must be distinct paths and inodes. The candidate must have no activity rows, receipts,
+using `cache-populate-activity-v2 --fresh-generation 1 --bulk-root --fixed-db …`, adding `--prior …`
+for a legacy cycle. New roots read the immutable staging baseline without a prior. Admission is only
+for a newly staged and migrated private candidate. Fixed, candidate and any legacy prior must be
+distinct paths and inodes. The candidate must have no activity rows, receipts,
 completed activity manifest, frozen-reference verification or finalized projection. Admission freezes
 an ordinary version-2 root identity, with no predecessor and the full wallet union, and atomically
 removes the empty named identity index and sets `PRAGMA user_version=-2`. This negative version is
@@ -934,8 +982,8 @@ loop until this exclusion is established; do not roll back tooling while a bulk 
 
 **Final-build disk admission.** For the supplied estimate of 627 million physical aggregate rows,
 budget approximately **50–60 GB finished index + 50–60 GB WAL + 100 GB sort scratch = 200–220 GB
-additional free space before margin**, beyond the collected candidate, immutable prior, retained
-old cycle, exports and other pipeline files. These are decimal GB estimates from the independent
+additional free space before margin**, beyond the installed cache, collected candidate, exports
+and other pipeline files. Legacy cutover also retains its existing prior; new cycles do not. These are decimal GB estimates from the independent
 layout/I/O analysis, not measurements on Forge. Reusable database pages may reduce index allocation;
 do not count them without measuring. Check database and scratch filesystems separately if different.
 Keep additional operational margin for filesystem overhead, receipts and concurrent disk use.
@@ -1018,6 +1066,7 @@ TASK_RUN="data/eval-results/$TASK_CYCLE"
 mkdir "$TASK_RUN"
 TASK_PRIOR="$(dirname "$TASK_FIXED")/wallet_cache.$TASK_CYCLE.prior.db"
 TASK_SIDE="$(dirname "$TASK_FIXED")/wallet_cache.$TASK_CYCLE.side.db"
+TASK_DISPLACED="$(dirname "$TASK_FIXED")/wallet_cache.$TASK_CYCLE.displaced.db"
 TASK_SCRATCH="/mnt/storage/tmp" # Alternatively, a large SSD-backed directory on /mnt/t7.
 mkdir -p "$TASK_SCRATCH"
 export SQLITE_TMPDIR="$TASK_SCRATCH"
@@ -1035,7 +1084,7 @@ df -B1 "$(dirname "$TASK_FIXED")" "$TASK_SCRATCH"
 # Check the approved cohort against its acquisition/activation evidence here.
 # Keep these exact paths for retries; only this command accepts schema -2.
 "$TASK_BOOTSTRAP" cache-populate-activity-v2 --db "$TASK_SIDE" \
-  --fresh-generation 1 --bulk-root --fixed-db "$TASK_FIXED" --prior "$TASK_PRIOR"
+  --fresh-generation 1 --bulk-root --fixed-db "$TASK_FIXED"
 ```
 
 The last command performs collection **and** mandatory sealing. After successful sealing, continue
@@ -1048,7 +1097,7 @@ with the ordinary linked top-up, payout and finalization; never pass `--bulk-roo
   --stage-record "$TASK_RUN/cache_stage_record.json"
 bash scripts/rank_and_push.sh --db "$TASK_SIDE" --out-dir "$TASK_RUN" \
   --skip-discovery --skip-backfill --cache-stage-record "$TASK_RUN/cache_stage_record.json" \
-  --fixed-db "$TASK_FIXED" --prior-cache-backup "$TASK_PRIOR"
+  --fixed-db "$TASK_FIXED" --prior-cache-backup "$TASK_DISPLACED"
 ```
 
 Require `RANK_AND_PUSH_PREPARED_ONLY=…`, exit 2, the retained exact pending request and unchanged

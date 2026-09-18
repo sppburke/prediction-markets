@@ -92,6 +92,7 @@ async fn main() {
         // `--dump-ledgers /path` for a config file path.
         let rest: Vec<&str> = args[2..].iter().map(|s| s.as_str()).collect();
         let mut strict = false;
+        let mut create_cache = false;
         let mut dry_run = false;
         let mut dump_ledgers_path: Option<std::path::PathBuf> = None;
         let mut stage: Option<&str> = None;
@@ -112,6 +113,7 @@ async fn main() {
         let mut publication_request_arg: Option<std::path::PathBuf> = None;
         let mut pending_pointer_arg: Option<std::path::PathBuf> = None;
         let mut expected_sha256_arg: Option<String> = None;
+        let mut stage_evidence_sha256_arg: Option<String> = None;
         let mut prior_sha256_arg: Option<String> = None;
         let mut prior_schema_arg: Option<i64> = None;
         let mut held_loop_lock_fd_arg: Option<u32> = None;
@@ -131,6 +133,8 @@ async fn main() {
             let a = rest[i];
             if a == "--strict" {
                 strict = true;
+            } else if a == "--create-cache" {
+                create_cache = true;
             } else if a == "--reset-clob-cursor" {
                 reset_clob_cursor = true;
             } else if a == "--dry-run" {
@@ -253,6 +257,12 @@ async fn main() {
                 expected_sha256_arg = Some(rest[i].to_owned());
             } else if let Some(v) = a.strip_prefix("--expected-sha256=") {
                 expected_sha256_arg = Some(v.to_owned());
+            } else if a == "--stage-evidence-sha256" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                stage_evidence_sha256_arg = Some(rest[i].to_owned());
+            } else if let Some(v) = a.strip_prefix("--stage-evidence-sha256=") {
+                stage_evidence_sha256_arg = Some(v.to_owned());
             } else if a == "--prior-sha256" && i + 1 < rest.len() {
                 i += 1;
                 flag_values.insert(rest[i]);
@@ -309,6 +319,11 @@ async fn main() {
                 stage = Some(v);
             }
             i += 1;
+        }
+
+        if create_cache && sub != "all" {
+            tracing::error!("bootstrap: --create-cache is only supported by all");
+            std::process::exit(1);
         }
 
         // TOML path: last non-flag positional not consumed as a flag value.
@@ -388,7 +403,7 @@ async fn main() {
                         };
                         let bulk_root = flag_present("--bulk-root");
                         if bulk_root && (!rest.contains(&"--bulk-root") || !flag_present("--fresh-generation")) {
-                            return Err(BootstrapError::Invalid { message: "--bulk-root is a bare flag requiring --fresh-generation 1, --fixed-db and --prior".to_owned() });
+                            return Err(BootstrapError::Invalid { message: "--bulk-root is a bare flag requiring --fresh-generation 1 and --fixed-db (plus --prior for legacy cycles)".to_owned() });
                         }
                         if flag_present("--fresh-generation") {
                             if flag_present("--frozen-payload")
@@ -433,10 +448,10 @@ async fn main() {
                                 if generation != 1 || flag_present("--full-read-wallets") {
                                     return Err(BootstrapError::Invalid { message: "--bulk-root requires generation 1 with the complete root wallet union".to_owned() });
                                 }
-                                let (fixed, prior) = fixed_db_arg.as_deref().zip(prior_arg.as_deref())
-                                    .ok_or_else(|| BootstrapError::Invalid { message: "--bulk-root requires --fixed-db and --prior to verify private candidate paths".to_owned() })?;
+                                let fixed = fixed_db_arg.as_deref()
+                                    .ok_or_else(|| BootstrapError::Invalid { message: "--bulk-root requires --fixed-db and staging evidence (or legacy --prior) to verify private candidate paths".to_owned() })?;
                                 return populate_activity_bulk_root_v2_with_clock(
-                                    &bootstrap_config.cache_path, fixed, prior, &fetcher,
+                                    &bootstrap_config.cache_path, fixed, prior_arg.as_deref(), &fetcher,
                                     &bootstrap_config.polymarket_base_url, settled_end, now,
                                 ).await.and_then(activity_json_report);
                             }
@@ -503,7 +518,7 @@ async fn main() {
                         let _lock = pe_bootstrap::lock::CacheMutationLock::acquire(
                             &bootstrap_config.cache_path,
                         )?;
-                        let mut cache = WalletCache::open_configured(&bootstrap_config)?;
+                        let mut cache = WalletCache::open_existing_configured(&bootstrap_config)?;
                         pe_bootstrap::populate_clob_payout_v2(&bootstrap_config, &mut cache)
                             .await
                             .and_then(json_report)
@@ -566,6 +581,7 @@ async fn main() {
                                 side_path: bootstrap_config.cache_path.clone(),
                                 prior_cache_backup_path,
                                 expected_side_sha256,
+                                stage_evidence_sha256: stage_evidence_sha256_arg,
                             }, handoff.as_ref())
                             .and_then(json_report)
                         },
@@ -687,7 +703,9 @@ async fn main() {
         // Genuine readers return above through `open_read_only`.
         let _cache_mutation_lock = acquire_cache_lock_or_exit(&bootstrap_config.cache_path, sub);
 
-        let mut cache = match WalletCache::open_configured(&bootstrap_config) {
+        // Ordinary commands require an installed cache so a rename gap remains
+        // vacant. Only `all --create-cache` opts into first-install provisioning.
+        let mut cache = match open_cli_cache(&bootstrap_config, create_cache) {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, "bootstrap: cache open failed");
@@ -1195,7 +1213,12 @@ async fn main() {
     }
 
     // ── No-arg / positional TOML path → default "all" ───────────────────────
-    let config_path = first_arg.map(std::path::PathBuf::from);
+    // Like named `all`, only the exact bare flag permits cache creation.
+    let create_cache = args[1..].iter().any(|arg| arg == "--create-cache");
+    let config_path = args[1..]
+        .iter()
+        .find(|arg| arg.as_str() != "--create-cache")
+        .map(std::path::PathBuf::from);
     let bootstrap_config = match config::load(config_path.as_deref()) {
         Ok(c) => c,
         Err(e) => {
@@ -1207,7 +1230,7 @@ async fn main() {
     // No-arg → run "all" with strict=false (soft-fail default). It follows the
     // same central lock-before-open contract as the named `all` command (#544).
     let _cache_mutation_lock = acquire_cache_lock_or_exit(&bootstrap_config.cache_path, "all");
-    let mut cache = match WalletCache::open_configured(&bootstrap_config) {
+    let mut cache = match open_cli_cache(&bootstrap_config, create_cache) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "bootstrap: cache open failed");
@@ -1216,6 +1239,32 @@ async fn main() {
     };
     let exit = handle_all(&bootstrap_config, &mut cache, false).await;
     std::process::exit(exit);
+}
+
+/// Called with the cache mutation lock held. Provisioning is a CLI-only opt-in;
+/// existing regular files retain the existing-only opener and schema behavior.
+fn open_cli_cache(
+    config: &BootstrapConfig,
+    create_cache: bool,
+) -> Result<WalletCache, BootstrapError> {
+    if create_cache {
+        match std::fs::symlink_metadata(&config.cache_path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => {
+                return Err(BootstrapError::Invalid {
+                    message: format!(
+                        "--create-cache requires an absent path or a regular file: {}",
+                        config.cache_path.display()
+                    ),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return WalletCache::open_configured(config);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    WalletCache::open_existing_configured(config)
 }
 
 fn acquire_cache_lock_or_exit(

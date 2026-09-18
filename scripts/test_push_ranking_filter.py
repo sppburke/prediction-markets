@@ -14,6 +14,7 @@ Run: `python3 scripts/test_push_ranking_filter.py`
 """
 import io
 import json
+import hashlib
 import os
 import sqlite3
 import sys
@@ -492,6 +493,30 @@ class PublishRequestTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "content hash mismatch"):
             pr.validate_publish_request(changed)
         print("PASS: publication key binds the exact cache activation tuple")
+
+    def test_two_file_request_binds_stage_evidence_while_fixed_is_absent(self):
+        """Proves the new binding survives the rename gap and refuses changed H0 evidence."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            side, fixed, displaced = root / "cycle.side.db", root / "fixed.db", root / "cycle.displaced.db"
+            evidence = side.with_suffix(".stage.json")
+            evidence.write_text(json.dumps(dict(version=1, side_path=str(side), fixed_path=str(fixed),
+                                                prior_path=str(root / "cycle.prior.db"), displaced_path=str(displaced),
+                                                source_sha256="a" * 64)))
+            activation = dict(side_path=str(side), fixed_path=str(fixed), prior_cache_backup_path=str(displaced),
+                              expected_sha256="b" * 64, stage_evidence_sha256=hashlib.sha256(evidence.read_bytes()).hexdigest())
+            baseline = self._request()
+            request = pr.build_publish_request(baseline["batch"], baseline["entries"], baseline["keep_batches"], activation)
+            pr.validate_publish_request(request)
+            path = root / "request.json"
+            pr.save_publish_request(str(path), request)
+            with mock.patch.object(sys, "argv", ["push", "--validate-request", str(path)]), mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+                self.assertEqual(pr.main(), 0)
+            self.assertEqual(stdout.getvalue().splitlines(), list(activation.values()))
+            self.assertFalse(fixed.exists())
+            evidence.write_text(evidence.read_text().replace("a" * 64, "c" * 64))
+            with self.assertRaisesRegex(ValueError, "stage evidence differs"):
+                pr.validate_publish_request(request)
 
     def test_validate_request_cli_returns_only_validated_activation_tuple(self):
         activation = {

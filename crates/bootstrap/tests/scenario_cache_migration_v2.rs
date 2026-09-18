@@ -85,12 +85,16 @@ fn write_pending_publication(
 ) -> (std::path::PathBuf, std::path::PathBuf) {
     let request_path = dir.path().join(format!("{name}-request.json"));
     let pending_path = dir.path().join(format!("{name}-pending"));
-    let activation = serde_json::json!({
+    let mut activation = serde_json::json!({
         "side_path": side,
         "fixed_path": fixed,
         "prior_cache_backup_path": prior,
         "expected_sha256": sha256_file(expected_installed).unwrap(),
     });
+    let evidence = pe_bootstrap::cache_migration::cache_stage_evidence_path(side);
+    if evidence.exists() {
+        activation["stage_evidence_sha256"] = Value::String(sha256_file(&evidence).unwrap());
+    }
     let batch = serde_json::json!({"config_hash": null});
     let entries = serde_json::json!([{"rank": 1, "wallet_hex": WALLET}]);
     let identity = serde_json::json!({
@@ -455,6 +459,7 @@ async fn migration_is_resumable_and_activation_installs_only_the_finalized_main(
         sha256_file(&damaged_side).unwrap()
     );
     let refused = activate_cache_v2(&CacheActivationRequest {
+        stage_evidence_sha256: None,
         fixed_path: fixed.clone(),
         side_path: damaged_side.clone(),
         prior_cache_backup_path: damaged_backup.clone(),
@@ -477,6 +482,7 @@ async fn migration_is_resumable_and_activation_installs_only_the_finalized_main(
     assert!(!side.with_extension("db-wal").exists());
 
     let activation_request = CacheActivationRequest {
+        stage_evidence_sha256: None,
         fixed_path: fixed.clone(),
         side_path: side.clone(),
         prior_cache_backup_path: v1_backup.clone(),
@@ -630,6 +636,7 @@ urllib.request.urlopen = urlopen
     let next_hash = sha256_file(&next_side).unwrap();
     let prior_v2 = dir.path().join("wallet_cache.prior.v2.db");
     let v2_to_v2 = activate_cache_v2(&CacheActivationRequest {
+        stage_evidence_sha256: None,
         fixed_path: fixed.clone(),
         side_path: next_side,
         prior_cache_backup_path: prior_v2.clone(),
@@ -958,6 +965,7 @@ fn activation_refuses_a_side_main_changed_after_finalization() {
         .unwrap();
     drop(seed_v1(&fixed, watermark));
     let error = activate_cache_v2(&CacheActivationRequest {
+        stage_evidence_sha256: None,
         fixed_path: fixed.clone(),
         side_path: side,
         prior_cache_backup_path: backup,
@@ -1005,6 +1013,7 @@ async fn activation_rejects_unmanifested_side_wal_before_replacing_fixed_cache()
     assert_eq!(sha256_file(&side).unwrap(), expected);
 
     let error = activate_cache_v2(&CacheActivationRequest {
+        stage_evidence_sha256: None,
         fixed_path: fixed.clone(),
         side_path: side.clone(),
         prior_cache_backup_path: backup,
@@ -2029,6 +2038,7 @@ async fn stale_classifier_projection_cannot_be_certified() {
     // authentic count/digest proof for its empty legacy projection.
     retain_legacy_empty_projection(&side);
     let request = |hash| CacheActivationRequest {
+        stage_evidence_sha256: None,
         fixed_path: fixed.clone(),
         side_path: side.clone(),
         prior_cache_backup_path: dir.path().join(format!("prior-{hash}.db")),
@@ -2114,6 +2124,7 @@ async fn null_classifier_state_cannot_be_certified_with_empty_or_nonempty_projec
             let fixed_hash = sha256_file(&fixed).unwrap();
             let side_hash = sha256_file(&side).unwrap();
             let error = activate_cache_v2(&CacheActivationRequest {
+                stage_evidence_sha256: None,
                 fixed_path: fixed.clone(),
                 side_path: side.clone(),
                 prior_cache_backup_path: dir.path().join("prior.db"),
@@ -2142,6 +2153,7 @@ async fn missing_side_resume_rejects_classifier_one_installed_cache() {
     assert!(!side.exists());
     let fixed_hash = sha256_file(&fixed).unwrap();
     let error = activate_cache_v2(&CacheActivationRequest {
+        stage_evidence_sha256: None,
         fixed_path: fixed.clone(),
         side_path: side.clone(),
         prior_cache_backup_path: prior.clone(),
@@ -2161,6 +2173,7 @@ async fn missing_side_resume_rejects_classifier_one_installed_cache() {
     damage_unused_page(&current);
     let current_hash = sha256_file(&current).unwrap();
     let refused = activate_cache_v2(&CacheActivationRequest {
+        stage_evidence_sha256: None,
         fixed_path: current.clone(),
         side_path: side.clone(),
         prior_cache_backup_path: prior.clone(),
@@ -2242,6 +2255,7 @@ async fn classifier_upgrade_activation_preserves_authentic_prior_cache() {
     let upgraded_projection = classifier_projection_rows(&side);
     assert!(upgraded_projection.iter().all(|row| row.2 == 2));
     let request = CacheActivationRequest {
+        stage_evidence_sha256: None,
         fixed_path: fixed.clone(),
         side_path: side.clone(),
         prior_cache_backup_path: dir.path().join("prior.db"),
@@ -2341,6 +2355,7 @@ async fn classifier_upgrade_activation_preserves_authentic_prior_cache() {
     .unwrap();
     assert_eq!(fresh_stage.ranker_classifier_version, 2);
     let fresh_request = CacheActivationRequest {
+        stage_evidence_sha256: None,
         fixed_path: fixed.clone(),
         side_path: fresh_side,
         prior_cache_backup_path: dir.path().join("fresh-prior.db"),
@@ -3130,6 +3145,7 @@ async fn fresh_generation_on_initial_base_binds_the_union_and_certifies_without_
     let fixed = dir.path().join("fixed.db");
     drop(seed_v1(&fixed, FRESH_END - 100));
     let request = CacheActivationRequest {
+        stage_evidence_sha256: None,
         fixed_path: fixed.clone(),
         side_path: side.clone(),
         prior_cache_backup_path: dir.path().join("prior.db"),
@@ -3308,6 +3324,7 @@ async fn condition_index_is_optional_through_collection_resume_finalize_and_acti
         let fixed = lane.join("fixed.db");
         drop(seed_v1(&fixed, FRESH_END - 100));
         let request = CacheActivationRequest {
+            stage_evidence_sha256: None,
             fixed_path: fixed.clone(),
             side_path: side,
             prior_cache_backup_path: lane.join("prior.db"),
@@ -4085,6 +4102,7 @@ async fn fresh_generation_on_recurring_base_preserves_the_prior_and_resumes_only
     let fixed = dir.path().join("fixed.db");
     std::fs::copy(&prior, &fixed).unwrap();
     let request = CacheActivationRequest {
+        stage_evidence_sha256: None,
         fixed_path: fixed.clone(),
         side_path: side.clone(),
         prior_cache_backup_path: dir.path().join("prior-backup.db"),
@@ -4803,6 +4821,7 @@ async fn legacy_identity_still_requires_its_frozen_verification_row() {
     let fixed = dir.path().join("fixed.db");
     drop(seed_v1(&fixed, FRESH_END - 100));
     let refused = activate_cache_v2(&CacheActivationRequest {
+        stage_evidence_sha256: None,
         fixed_path: fixed,
         side_path: side.clone(),
         prior_cache_backup_path: dir.path().join("prior.db"),
@@ -4819,7 +4838,7 @@ async fn legacy_identity_still_requires_its_frozen_verification_row() {
 }
 
 #[test]
-fn cycle_staging_copies_the_checkpointed_fixed_main_exactly_and_resumes_its_own_candidate() {
+fn legacy_cycle_staging_resumes_its_prior_and_candidate_unchanged() {
     use pe_bootstrap::cache_migration::stage_cache_cycle_v2;
     let dir = TempDir::new().unwrap();
     let fixed = dir.path().join("wallet_cache.db");
@@ -4849,6 +4868,12 @@ fn cycle_staging_copies_the_checkpointed_fixed_main_exactly_and_resumes_its_own_
     assert!(!prior.exists() && !side.exists() && !manifest.exists());
     drop(held);
 
+    // Simulate the live cutover: the old binary already completed its prior copy.
+    wal_owner
+        .raw_conn_for_test()
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    std::fs::copy(&fixed, &prior).unwrap();
     let interrupted = std::path::PathBuf::from(format!("{}.pending", side.display()));
     std::fs::write(&interrupted, b"interrupted private staging").unwrap();
     let staged = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest)).unwrap();
@@ -4970,7 +4995,7 @@ fn cycle_staging_copies_the_checkpointed_fixed_main_exactly_and_resumes_its_own_
     assert_ne!(mutated, fixed_sha256);
     let resumed = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest)).unwrap();
     assert!(resumed.resumed);
-    assert_eq!(resumed.prior_sha256, None);
+    assert_eq!(resumed.prior_sha256.as_deref(), Some(fixed_sha256.as_str()));
     assert_eq!(sha256_file(&side).unwrap(), mutated);
     assert_eq!(sha256_file(&prior).unwrap(), fixed_sha256);
     assert!(!manifest.exists());
@@ -5358,102 +5383,61 @@ fn cycle_staging_honors_a_seal_committed_only_to_the_write_ahead_log() {
 
 #[tokio::test]
 async fn activation_refuses_a_fixed_cache_changed_after_its_prior_was_staged() {
-    use pe_bootstrap::cache_migration::stage_cache_cycle_v2;
-    let dir = tempfile::Builder::new()
-        .prefix("pe-fixed-drift-")
-        .tempdir_in(std::env::current_dir().unwrap())
-        .unwrap();
-    std::fs::create_dir_all(dir.path().join("eval-results")).unwrap();
-    let fixed = dir.path().join("fixed.db");
-    let prior = dir.path().join("fixed.cron-1.prior.db");
-    let side = dir.path().join("fixed.cron-1.side.db");
-    drop(seed_v1(&fixed, FRESH_END - 10));
-    let staged = stage_cache_cycle_v2(&fixed, &prior, &side, None).unwrap();
-    let prior_sha256 = staged.prior_sha256.unwrap();
-
-    // Build a finalized candidate elsewhere and place it at the side path.
-    let candidate = dir.path().join("candidate.db");
-    let side_sha256 = finalize_fresh_initial(&dir, &candidate).await;
-    std::fs::copy(&candidate, &side).unwrap();
-    let request = CacheActivationRequest {
-        fixed_path: fixed.clone(),
-        side_path: side.clone(),
-        prior_cache_backup_path: prior.clone(),
-        expected_side_sha256: side_sha256.clone(),
-    };
-
-    // A fixed cache written after the prior was captured is refused; the
-    // candidate and the staged prior are preserved for the operator.
-    let mut drifting = WalletCache::open(&fixed).unwrap();
-    drifting
-        .upsert_wallets_bulk(&[(WALLET_E.to_owned(), SRC_TRADES, false, None, None, None, 0)])
-        .unwrap();
-    drop(drifting);
-    let refused = activate_cache_v2(&request).unwrap_err();
-    assert!(
-        refused
-            .to_string()
-            .contains("existing prior-cache backup differs from the fixed cache"),
-        "{refused}"
-    );
-    assert!(side.exists());
-    assert_eq!(sha256_file(&prior).unwrap(), prior_sha256);
-    assert_ne!(sha256_file(&fixed).unwrap(), prior_sha256);
-
-    // Restaging from the drifted fixed would need a new cycle: the completed
-    // prior is never rewritten beneath the candidate.
-    let resumed = stage_cache_cycle_v2(&fixed, &prior, &side, None).unwrap();
-    assert!(resumed.resumed);
-    assert_eq!(sha256_file(&prior).unwrap(), prior_sha256);
-
-    // The unchanged control installs the candidate and keeps the prior.
-    let fixed_control = dir.path().join("control.db");
-    let prior_control = dir.path().join("control.cron-1.prior.db");
-    let side_control = dir.path().join("control.cron-1.side.db");
-    drop(seed_v1(&fixed_control, FRESH_END - 10));
-    let control =
-        stage_cache_cycle_v2(&fixed_control, &prior_control, &side_control, None).unwrap();
-    std::fs::copy(&candidate, &side_control).unwrap();
-    let installed = activate_cache_v2(&CacheActivationRequest {
-        fixed_path: fixed_control.clone(),
-        side_path: side_control.clone(),
-        prior_cache_backup_path: prior_control.clone(),
-        expected_side_sha256: side_sha256.clone(),
-    })
-    .unwrap();
-    assert!(!installed.resumed);
-    assert_eq!(installed.prior_cache_sha256, control.prior_sha256.unwrap());
-    assert_eq!(sha256_file(&fixed_control).unwrap(), side_sha256);
-    assert!(!side_control.exists());
-
-    // For schema two too, a backup cannot inherit validation unless its main
-    // equals the validated fixed cache. Corrupt only the backup's content.
-    std::fs::copy(&candidate, &side_control).unwrap();
-    std::fs::copy(&fixed_control, &prior_control).unwrap();
-    Connection::open(&prior_control)
-        .unwrap()
-        .execute(
-            "UPDATE activity_groups_v2 SET share_amount_str = '9.000001'",
-            [],
-        )
-        .unwrap();
-    let changed_prior_hash = sha256_file(&prior_control).unwrap();
-    let error = activate_cache_v2(&CacheActivationRequest {
-        fixed_path: fixed_control.clone(),
-        side_path: side_control.clone(),
-        prior_cache_backup_path: prior_control.clone(),
-        expected_side_sha256: side_sha256.clone(),
-    })
-    .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("existing prior-cache backup differs from the fixed cache"),
-        "{error}"
-    );
-    assert_eq!(sha256_file(&fixed_control).unwrap(), side_sha256);
-    assert_eq!(sha256_file(&side_control).unwrap(), side_sha256);
-    assert_eq!(sha256_file(&prior_control).unwrap(), changed_prior_hash);
+    // Proves H0 detects both main-file and WAL-only drift before either rename.
+    use pe_bootstrap::cache_migration::{cache_stage_evidence_path, stage_cache_cycle_v2};
+    for wal_only in [false, true] {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("eval-results")).unwrap();
+        let fixed = dir.path().join("fixed.db");
+        let prior = dir.path().join("cycle.prior.db");
+        let side = dir.path().join("cycle.side.db");
+        let displaced = dir.path().join("cycle.displaced.db");
+        drop(seed_v1(&fixed, FRESH_END - 10));
+        let staged = stage_cache_cycle_v2(&fixed, &prior, &side, None).unwrap();
+        let h0 = staged.prior_sha256.unwrap();
+        assert!(!prior.exists());
+        let candidate = dir.path().join("candidate.db");
+        let h1 = finalize_fresh_initial(&dir, &candidate).await;
+        std::fs::copy(&candidate, &side).unwrap();
+        let request = CacheActivationRequest {
+            fixed_path: fixed.clone(),
+            side_path: side.clone(),
+            prior_cache_backup_path: displaced.clone(),
+            expected_side_sha256: h1.clone(),
+            stage_evidence_sha256: Some(sha256_file(&cache_stage_evidence_path(&side)).unwrap()),
+        };
+        let mut drifting = WalletCache::open(&fixed).unwrap();
+        drifting
+            .raw_conn_for_test()
+            .execute_batch("PRAGMA wal_autocheckpoint = 0")
+            .unwrap();
+        drifting
+            .upsert_wallets_bulk(&[(WALLET_E.to_owned(), SRC_TRADES, false, None, None, None, 0)])
+            .unwrap();
+        let held = if wal_only {
+            Some(drifting)
+        } else {
+            drop(drifting);
+            None
+        };
+        if wal_only {
+            assert_eq!(sha256_file(&fixed).unwrap(), h0);
+        }
+        let refused = activate_cache_v2(&request).unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("differs from recorded staging baseline"),
+            "{refused}"
+        );
+        assert!(!displaced.exists() && !prior.exists());
+        assert_eq!(sha256_file(&side).unwrap(), h1);
+        assert_ne!(sha256_file(&fixed).unwrap(), h0);
+        let resumed = stage_cache_cycle_v2(&fixed, &prior, &side, None).unwrap();
+        assert_eq!(resumed.prior_sha256.as_deref(), Some(h0.as_str()));
+        assert!(resumed.side_sha256.is_none());
+        drop(held);
+    }
 }
 
 #[tokio::test]
@@ -5498,6 +5482,7 @@ async fn historical_cache_without_the_fresh_column_keeps_its_legacy_identity() {
     let side = dir.path().join("side.db");
     let side_sha256 = finalize_fresh_initial(&dir, &side).await;
     let installed = activate_cache_v2(&CacheActivationRequest {
+        stage_evidence_sha256: None,
         fixed_path: fixed.clone(),
         side_path: side,
         prior_cache_backup_path: dir.path().join("prior.db"),
@@ -6282,6 +6267,7 @@ async fn retained_receipts_and_legacy_manifests_fail_closed_on_corruption() {
             );
             let damaged_hash = sha256_file(&damaged).unwrap();
             let error = activate_cache_v2(&CacheActivationRequest {
+                stage_evidence_sha256: None,
                 fixed_path: fixed.clone(),
                 side_path: damaged.clone(),
                 prior_cache_backup_path: prior.clone(),
@@ -6321,6 +6307,7 @@ async fn retained_receipts_and_legacy_manifests_fail_closed_on_corruption() {
             std::fs::copy(&side, &good_side).unwrap();
             let good_hash = sha256_file(&good_side).unwrap();
             let installed_error = activate_cache_v2(&CacheActivationRequest {
+                stage_evidence_sha256: None,
                 fixed_path: bad_fixed.clone(),
                 side_path: good_side.clone(),
                 prior_cache_backup_path: bad_prior.clone(),
@@ -6360,6 +6347,7 @@ async fn retained_receipts_and_legacy_manifests_fail_closed_on_corruption() {
         finalize_cache_v2(&legacy, &dir.path().join("bad-legacy.json"), FRESH_END + 6).unwrap();
     assert_eq!(stage.cache_sha256, sha256_file(&legacy).unwrap());
     let error = activate_cache_v2(&CacheActivationRequest {
+        stage_evidence_sha256: None,
         fixed_path: fixed.clone(),
         side_path: legacy.clone(),
         prior_cache_backup_path: prior.clone(),
@@ -6392,12 +6380,16 @@ impl std::io::Write for CheckLog {
 
 impl CheckLog {
     fn take(&self) -> Vec<Value> {
+        self.take_named("SQLite quick_check completed")
+    }
+
+    fn take_named(&self, message: &str) -> Vec<Value> {
         let bytes = std::mem::take(&mut *self.0.lock().unwrap());
         String::from_utf8(bytes)
             .unwrap()
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).unwrap())
-            .filter(|event| event["fields"]["message"] == "SQLite quick_check completed")
+            .filter(|event| event["fields"]["message"] == message)
             .collect()
     }
 }
@@ -6428,6 +6420,7 @@ async fn lifecycle_check_counts_and_diagnostics_preserve_json_reports() {
         std::fs::create_dir(dir.path().join("eval-results")).unwrap();
         let fixed = dir.path().join("fixed.db");
         let prior = dir.path().join("prior.db");
+        let displaced = dir.path().join("side.db.displaced.db");
         let side = dir.path().join("side.db");
         let build = dir.path().join("build.json");
         let stage_path = dir.path().join("stage.json");
@@ -6513,9 +6506,15 @@ async fn lifecycle_check_counts_and_diagnostics_preserve_json_reports() {
             "both finalizations must omit structural scans"
         );
         let request = CacheActivationRequest {
+            stage_evidence_sha256: Some(
+                sha256_file(&pe_bootstrap::cache_migration::cache_stage_evidence_path(
+                    &side,
+                ))
+                .unwrap(),
+            ),
             fixed_path: fixed.clone(),
             side_path: side.clone(),
-            prior_cache_backup_path: prior.clone(),
+            prior_cache_backup_path: displaced.clone(),
             expected_side_sha256: stage.cache_sha256,
         };
         let size = side.metadata().unwrap().len();
@@ -6527,12 +6526,12 @@ async fn lifecycle_check_counts_and_diagnostics_preserve_json_reports() {
         assert!(activate_cache_v2(&request).unwrap().resumed);
         assert_check_event(&log.take(), "activation_missing_side", &fixed, size, true);
         let (publish, pending) =
-            write_pending_publication(&dir, "restore", &side, &fixed, &fixed, &prior);
-        let prior_size = prior.metadata().unwrap().len();
+            write_pending_publication(&dir, "restore", &side, &fixed, &fixed, &displaced);
+        let prior_size = displaced.metadata().unwrap().len();
         restore_prior_cache(
             &fixed,
-            &prior,
-            &dir.path().join("displaced.db"),
+            &displaced,
+            &side,
             &PriorCacheBinding {
                 sha256: activation.prior_cache_sha256,
                 schema_version: activation.prior_cache_schema,
@@ -6543,13 +6542,17 @@ async fn lifecycle_check_counts_and_diagnostics_preserve_json_reports() {
         )
         .await
         .unwrap();
-        assert_check_event(&log.take(), "restore_prior", &prior, prior_size, true);
+        assert_check_event(&log.take(), "restore_prior", &displaced, prior_size, true);
         // A failed pragma emits one completion too, and keeps its original error.
         damage_unused_page(&fixed);
         let size = fixed.metadata().unwrap().len();
-        let error =
-            pe_bootstrap::cache_migration::stage_cache_cycle_v2(&fixed, &prior, &side, None)
-                .unwrap_err();
+        let error = pe_bootstrap::cache_migration::stage_cache_cycle_v2(
+            &fixed,
+            &prior,
+            &dir.path().join("next.side.db"),
+            None,
+        )
+        .unwrap_err();
         assert_structural_error(&error);
         assert_check_event(&log.take(), "staging_fixed", &fixed, size, false);
     }
@@ -8809,7 +8812,7 @@ impl BulkRootFixture {
         pe_bootstrap::cache_migration::populate_activity_bulk_root_v2_with_clock(
             &self.side,
             &self.fixed,
-            &self.prior,
+            None,
             source,
             "https://data.example",
             || Ok(FRESH_END),
@@ -8927,7 +8930,7 @@ async fn collect_bulk_root_in_child(
     pe_bootstrap::cache_migration::populate_activity_bulk_root_v2_with_clock(
         &root.join("side.db"),
         &root.join("fixed.db"),
-        &root.join("prior.db"),
+        Some(&root.join("prior.db")),
         source,
         "https://data.example",
         || Ok(FRESH_END),
@@ -9562,7 +9565,17 @@ async fn bulk_root_fence_refuses_other_commands_and_successor_before_clock() {
                 "--fixed-db".to_owned(),
                 fixture.fixed.display().to_string(),
                 "--backup".to_owned(),
-                fixture.prior.display().to_string(),
+                fixture
+                    .dir
+                    .path()
+                    .join("side.db.displaced.db")
+                    .display()
+                    .to_string(),
+                "--stage-evidence-sha256".to_owned(),
+                sha256_file(&pe_bootstrap::cache_migration::cache_stage_evidence_path(
+                    &fixture.side,
+                ))
+                .unwrap(),
                 "--expected-sha256".to_owned(),
                 "0".repeat(64),
             ],
@@ -9715,7 +9728,7 @@ async fn bulk_root_admission_refuses_aliases_existing_roots_and_successors() {
         let error = pe_bootstrap::cache_migration::populate_activity_bulk_root_v2_with_clock(
             &fixture.side,
             fixed,
-            &fixture.prior,
+            Some(&fixture.prior),
             &DatasetFetcher::default(),
             "https://data.example",
             || panic!("aliased candidate must not sample clock"),
@@ -9886,4 +9899,357 @@ async fn bulk_root_skips_only_identity_probes_and_sealed_successor_keeps_both_an
         ),
         0
     );
+}
+
+#[tokio::test]
+async fn two_file_cycles_copy_once_preserve_inodes_and_recover_activation_gap() {
+    // Proves both schemas stage one copy, H0 survives retries, activation never
+    // copies, both rename states resume, and retirement precedes the next copy.
+    use pe_bootstrap::cache_migration::{cache_stage_evidence_path, stage_cache_cycle_v2};
+    use std::os::unix::fs::MetadataExt as _;
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir(dir.path().join("eval-results")).unwrap();
+    let fixed = dir.path().join("wallet_cache.db");
+    drop(seed_v1(&fixed, FRESH_END));
+    let log = CheckLog::default();
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let mains = || {
+        std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .path()
+                    .extension()
+                    .is_some_and(|extension| extension == "db")
+            })
+            .count()
+    };
+    for cycle in 1..=2 {
+        let prior = dir
+            .path()
+            .join(format!("wallet_cache.cron-20260917T00000{cycle}Z.prior.db"));
+        let side = dir
+            .path()
+            .join(format!("wallet_cache.cron-20260917T00000{cycle}Z.side.db"));
+        let displaced = dir.path().join(format!(
+            "wallet_cache.cron-20260917T00000{cycle}Z.displaced.db"
+        ));
+        let build = dir.path().join(format!("build-{cycle}.json"));
+        let h0 = sha256_file(&fixed).unwrap();
+        let old_inode = fixed.metadata().unwrap().ino();
+        let report = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&build)).unwrap();
+        assert_eq!(log.take_named("cache whole-file copy").len(), 1);
+        assert!(!prior.exists());
+        assert_eq!(mains(), 2);
+        assert_eq!(report.prior_sha256.as_deref(), Some(h0.as_str()));
+        let evidence = cache_stage_evidence_path(&side);
+        let evidence_bytes = std::fs::read(&evidence).unwrap();
+        if cycle == 1 {
+            let original_build = std::fs::read(&build).unwrap();
+            std::fs::remove_file(&build).unwrap();
+            stage_cache_cycle_v2(&fixed, &prior, &side, Some(&build)).unwrap();
+            assert_eq!(std::fs::read(&build).unwrap(), original_build);
+            migrate_cache_v2(&side, &build).unwrap();
+            install_payout_manifest(&side);
+        }
+        populate_activity_fresh_v2(
+            &side,
+            &FixtureFetcher::new(HashMap::from([(
+                activity_url(WALLET, FRESH_END + cycle).replace(
+                    "&start=1",
+                    &format!("&start={}", if cycle == 1 { 1 } else { FRESH_END + cycle }),
+                ),
+                b"[]".to_vec(),
+            )])),
+            "https://data.example",
+            u64::try_from(cycle).unwrap(),
+            FRESH_END + cycle,
+            FRESH_END + cycle + 1,
+        )
+        .await
+        .unwrap();
+        let finalized =
+            finalize_cache_v2(&side, &dir.path().join("final.json"), FRESH_END + cycle + 2)
+                .unwrap();
+        let resumed = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&build)).unwrap();
+        assert!(resumed.resumed);
+        assert_eq!(resumed.prior_sha256.as_deref(), Some(h0.as_str()));
+        assert!(resumed.side_sha256.is_none());
+        assert_eq!(std::fs::read(&evidence).unwrap(), evidence_bytes);
+        assert_eq!(sha256_file(&side).unwrap(), finalized.cache_sha256);
+        let new_inode = side.metadata().unwrap().ino();
+        let request = CacheActivationRequest {
+            fixed_path: fixed.clone(),
+            side_path: side.clone(),
+            prior_cache_backup_path: displaced.clone(),
+            expected_side_sha256: finalized.cache_sha256.clone(),
+            stage_evidence_sha256: Some(sha256_file(&evidence).unwrap()),
+        };
+        if cycle == 2 {
+            // Exact durable state after F -> D and directory fsync, before C -> F.
+            std::fs::rename(&fixed, &displaced).unwrap();
+            std::fs::File::open(dir.path()).unwrap().sync_all().unwrap();
+            assert!(!fixed.exists());
+            assert_eq!(mains(), 2);
+            // Unknown D bytes refuse without changing any role.
+            let original = std::fs::read(&displaced).unwrap();
+            std::fs::write(&displaced, b"unknown displaced cache").unwrap();
+            assert!(activate_cache_v2(&request).is_err());
+            assert!(!fixed.exists());
+            assert_eq!(sha256_file(&side).unwrap(), finalized.cache_sha256);
+            assert_eq!(
+                std::fs::read(&displaced).unwrap(),
+                b"unknown displaced cache"
+            );
+            std::fs::write(&displaced, original).unwrap();
+        }
+        activate_cache_v2(&request).unwrap();
+        assert_eq!(mains(), 2);
+        assert!(!side.exists());
+        assert_eq!(fixed.metadata().unwrap().ino(), new_inode);
+        assert_eq!(displaced.metadata().unwrap().ino(), old_inode);
+        assert_eq!(sha256_file(&displaced).unwrap(), h0);
+        assert!(activate_cache_v2(&request).unwrap().resumed);
+        assert!(
+            log.take_named("cache whole-file copy").is_empty(),
+            "activation or resume copied a full file"
+        );
+        let next_side = dir.path().join("next.side.db");
+        let error =
+            stage_cache_cycle_v2(&fixed, &dir.path().join("next.prior.db"), &next_side, None)
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("previous cycle backup remains"),
+            "{error}"
+        );
+        assert!(!next_side.exists());
+        assert_eq!(mains(), 2);
+        // Wrapper scenarios prove publication/pointer guards for this retirement.
+        std::fs::remove_file(&displaced).unwrap();
+        assert_eq!(mains(), 1);
+    }
+}
+
+#[tokio::test]
+async fn two_file_restore_preserves_rejected_inode_and_recovers_its_gap() {
+    // Proves consumed publication refuses, both restore states preserve both
+    // generations, repeat restore is idempotent, and recovery cannot reactivate.
+    use pe_bootstrap::cache_migration::{cache_stage_evidence_path, stage_cache_cycle_v2};
+    use std::os::unix::fs::MetadataExt as _;
+    for interrupted in [false, true] {
+        let dir = tempfile::Builder::new()
+            .prefix("pe-two-file-restore-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
+        std::fs::create_dir(dir.path().join("eval-results")).unwrap();
+        let fixed = dir.path().join("fixed.db");
+        let side = dir.path().join("cycle.side.db");
+        let prior = dir.path().join("cycle.prior.db");
+        let displaced = dir.path().join("cycle.displaced.db");
+        drop(seed_v1(&fixed, FRESH_END));
+        let h0 = sha256_file(&fixed).unwrap();
+        let old_inode = fixed.metadata().unwrap().ino();
+        stage_cache_cycle_v2(&fixed, &prior, &side, None).unwrap();
+        let candidate = dir.path().join("candidate.db");
+        let h1 = finalize_fresh_initial(&dir, &candidate).await;
+        std::fs::rename(&candidate, &side).unwrap();
+        let new_inode = side.metadata().unwrap().ino();
+        let request = CacheActivationRequest {
+            fixed_path: fixed.clone(),
+            side_path: side.clone(),
+            prior_cache_backup_path: displaced.clone(),
+            expected_side_sha256: h1.clone(),
+            stage_evidence_sha256: Some(sha256_file(&cache_stage_evidence_path(&side)).unwrap()),
+        };
+        activate_cache_v2(&request).unwrap();
+        let (publication, pending) =
+            write_pending_publication(&dir, "restore", &side, &fixed, &fixed, &displaced);
+        let binding = PriorCacheBinding {
+            sha256: h0.clone(),
+            schema_version: 1,
+        };
+        let refused = restore_prior_cache(
+            &fixed,
+            &displaced,
+            &side,
+            &binding,
+            &publication,
+            &pending,
+            &FixedPublicationProbe(true),
+        )
+        .await
+        .unwrap_err();
+        assert!(refused.to_string().contains("consumed"));
+        assert_eq!(sha256_file(&fixed).unwrap(), h1);
+        assert_eq!(sha256_file(&displaced).unwrap(), h0);
+        assert!(!side.exists());
+        if interrupted {
+            let request: Value =
+                serde_json::from_slice(&std::fs::read(&publication).unwrap()).unwrap();
+            std::fs::write(
+                side.with_extension("restore.json"),
+                serde_json::to_vec(&request["publish_key"]).unwrap(),
+            )
+            .unwrap();
+            std::fs::rename(&fixed, &side).unwrap();
+            std::fs::File::open(dir.path()).unwrap().sync_all().unwrap();
+            assert!(!fixed.exists());
+            assert!(activate_cache_v2(&request_from_value(&request)).is_err());
+            assert!(!fixed.exists());
+        }
+        let log = CheckLog::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        for _ in 0..2 {
+            restore_prior_cache(
+                &fixed,
+                &displaced,
+                &side,
+                &binding,
+                &publication,
+                &pending,
+                &FixedPublicationProbe(false),
+            )
+            .await
+            .unwrap();
+            assert_eq!(sha256_file(&fixed).unwrap(), h0);
+            assert_eq!(sha256_file(&side).unwrap(), h1);
+            assert_eq!(fixed.metadata().unwrap().ino(), old_inode);
+            assert_eq!(side.metadata().unwrap().ino(), new_inode);
+            assert!(!displaced.exists() && !prior.exists());
+        }
+        assert!(
+            log.take_named("cache whole-file copy").is_empty(),
+            "restoration copied a full file"
+        );
+        assert!(
+            activate_cache_v2(&request)
+                .unwrap_err()
+                .to_string()
+                .contains("restoration was requested")
+        );
+    }
+}
+
+fn request_from_value(request: &Value) -> CacheActivationRequest {
+    let binding = &request["cache_activation"];
+    CacheActivationRequest {
+        fixed_path: binding["fixed_path"].as_str().unwrap().into(),
+        side_path: binding["side_path"].as_str().unwrap().into(),
+        prior_cache_backup_path: binding["prior_cache_backup_path"].as_str().unwrap().into(),
+        expected_side_sha256: binding["expected_sha256"].as_str().unwrap().to_owned(),
+        stage_evidence_sha256: binding["stage_evidence_sha256"].as_str().map(str::to_owned),
+    }
+}
+
+#[tokio::test]
+async fn bulk_root_admits_new_staging_baseline_and_legacy_prior() {
+    // Proves new roots collect with no prior argument/file, while a live legacy
+    // root continues to use its independent immutable prior under this binary.
+    use pe_bootstrap::cache_migration::{
+        cache_stage_evidence_path, populate_activity_bulk_root_v2_with_clock,
+    };
+    for legacy in [false, true] {
+        let fixture = BulkRootFixture::new();
+        if legacy {
+            std::fs::copy(&fixture.fixed, &fixture.prior).unwrap();
+            std::fs::remove_file(cache_stage_evidence_path(&fixture.side)).unwrap();
+        }
+        let source = DatasetFetcher::default();
+        populate_activity_bulk_root_v2_with_clock(
+            &fixture.side,
+            &fixture.fixed,
+            if legacy { Some(&fixture.prior) } else { None },
+            &source,
+            "https://data.example",
+            || Ok(FRESH_END),
+            FRESH_END + 1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(count(&fixture.side, "PRAGMA user_version"), 2);
+        assert_eq!(
+            count(
+                &fixture.side,
+                "SELECT COUNT(*) FROM activity_coverage_manifests_v2"
+            ),
+            1
+        );
+        assert_eq!(fixture.prior.exists(), legacy);
+    }
+}
+
+#[tokio::test]
+async fn legacy_prior_cycle_stages_activates_and_restores_with_original_request_shape() {
+    // Proves a prior already written by the old binary selects the legacy layout
+    // throughout the cycle; its request remains byte-for-byte unchanged.
+    use pe_bootstrap::cache_migration::{cache_stage_evidence_path, stage_cache_cycle_v2};
+    let dir = tempfile::Builder::new()
+        .prefix("pe-legacy-cutover-")
+        .tempdir_in(std::env::current_dir().unwrap())
+        .unwrap();
+    std::fs::create_dir(dir.path().join("eval-results")).unwrap();
+    let fixed = dir.path().join("fixed.db");
+    let prior = dir.path().join("cycle.prior.db");
+    let side = dir.path().join("cycle.side.db");
+    let displaced = dir.path().join("cycle.displaced.db");
+    drop(seed_v1(&fixed, FRESH_END));
+    std::fs::copy(&fixed, &prior).unwrap();
+    let h0 = sha256_file(&prior).unwrap();
+    let staged = stage_cache_cycle_v2(&fixed, &prior, &side, None).unwrap();
+    assert_eq!(staged.prior_sha256.as_deref(), Some(h0.as_str()));
+    assert!(!cache_stage_evidence_path(&side).exists());
+    let candidate = dir.path().join("candidate.db");
+    let h1 = finalize_fresh_initial(&dir, &candidate).await;
+    std::fs::rename(candidate, &side).unwrap();
+    assert!(
+        stage_cache_cycle_v2(&fixed, &prior, &side, None)
+            .unwrap()
+            .resumed
+    );
+    let (publication, pending) =
+        write_pending_publication(&dir, "legacy", &side, &side, &fixed, &prior);
+    let request_bytes = std::fs::read(&publication).unwrap();
+    let publication_value: Value = serde_json::from_slice(&request_bytes).unwrap();
+    assert!(
+        publication_value["cache_activation"]
+            .get("stage_evidence_sha256")
+            .is_none()
+    );
+    let request = request_from_value(&publication_value);
+    activate_cache_v2(&request).unwrap();
+    assert_eq!(sha256_file(&fixed).unwrap(), h1);
+    assert_eq!(sha256_file(&prior).unwrap(), h0);
+    assert!(!side.exists() && !displaced.exists());
+    assert!(activate_cache_v2(&request).unwrap().resumed);
+    restore_prior_cache(
+        &fixed,
+        &prior,
+        &displaced,
+        &PriorCacheBinding {
+            sha256: h0.clone(),
+            schema_version: 1,
+        },
+        &publication,
+        &pending,
+        &FixedPublicationProbe(false),
+    )
+    .await
+    .unwrap();
+    assert_eq!(sha256_file(&fixed).unwrap(), h0);
+    assert_eq!(sha256_file(&displaced).unwrap(), h1);
+    assert!(!prior.exists());
+    assert_eq!(std::fs::read(publication).unwrap(), request_bytes);
 }

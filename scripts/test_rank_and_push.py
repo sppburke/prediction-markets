@@ -209,6 +209,7 @@ class RankAndPushScenario(unittest.TestCase):
             '    if payload.get("publish_key") != expected: raise SystemExit(1)\n'
             '    if activation is not None:\n'
             '        for key in ("side_path", "fixed_path", "prior_cache_backup_path", "expected_sha256"): print(activation[key])\n'
+            '        if "stage_evidence_sha256" in activation: print(activation["stage_evidence_sha256"])\n'
             '    raise SystemExit(0)\n'
             'if "--snapshot-current" in a:\n'
             '    Path(a[a.index("--snapshot-current") + 1]).write_text("[]\\n")\n'
@@ -226,6 +227,9 @@ class RankAndPushScenario(unittest.TestCase):
             '            "expected_sha256": stage["cache_sha256"],\n'
             '        }\n'
             '    identity = {"batch": payload["batch"], "entries": payload["entries"]}\n'
+            '    if "cache_activation" in payload:\n'
+            '        evidence = Path(payload["cache_activation"]["side_path"]).with_suffix(".stage.json")\n'
+            '        if evidence.exists(): payload["cache_activation"]["stage_evidence_sha256"] = hashlib.sha256(evidence.read_bytes()).hexdigest()\n'
             '    if "cache_activation" in payload: identity["cache_activation"] = payload["cache_activation"]\n'
             '    payload["publish_key"] = hashlib.sha256(json.dumps(identity, allow_nan=False, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()).hexdigest()\n'
             '    request.write_text(json.dumps(payload) + "\\n")\n'
@@ -244,7 +248,7 @@ class RankAndPushScenario(unittest.TestCase):
         shutil.copy(WRAPPER.parent / "push_ranking_to_supabase.py", self.root / "scripts" / "publisher_contract.py")
         publisher = self.root / "scripts" / "push_ranking_to_supabase.py"
         body = publisher.read_text()
-        publisher.write_text("from publisher_contract import build_parser, save_pending_pointer\n"
+        publisher.write_text("from publisher_contract import build_parser, save_pending_pointer, load_publish_request\n"
                              + "if __name__ == '__main__':\n"
                              + "".join("    " + line + "\n" for line in body.splitlines()))
 
@@ -1237,6 +1241,18 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertIsNotNone(self._log("push.log"), "purge-free path did not publish")
         print("PASS: production publication performs no purge, reclamation, index rebuild, or checkpoint")
 
+    def test_wrapper_never_opts_into_first_install_cache_creation(self):
+        r = self._run()
+        self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
+        bootstrap_log = self._log("pe_bootstrap.log")
+        self.assertIsNotNone(bootstrap_log)
+        self.assertNotIn("--create-cache", bootstrap_log)
+        # As with the physical-maintenance guard above, inspect all branches,
+        # including the supervisor's resume paths, beyond the executed cycle.
+        for script in (WRAPPER, WRAPPER.with_name("rank_and_push_loop.sh")):
+            self.assertNotIn("--create-cache", script.read_text(), str(script))
+        print("PASS: wrapper and supervisor never opt into first-install cache creation")
+
     def test_skip_purge_remains_a_backward_compatible_noop(self):
         r = self._run("--skip-purge")
         self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
@@ -1476,7 +1492,7 @@ class RankAndPushScenario(unittest.TestCase):
                 )
         return fixed
 
-    def _install_candidate_stub(self):
+    def _install_candidate_stub(self, *, two_file=False):
         """Replace the logging bootstrap stub with one that emulates the cache
         owners' durable effects on the fixture files (copy, seal, collect,
         payout, finalize, activate) so the wrapper's orchestration is exercised
@@ -1498,7 +1514,9 @@ class RankAndPushScenario(unittest.TestCase):
         _write_exec(
             self.root / "scripts" / "_stub_cache_ops.py",
             "#!/usr/bin/env python3\n"
-            "import hashlib, json, os, shutil, sqlite3, sys, time\n"
+            "import hashlib, json, os, re, shutil, sqlite3, sys, time\n"
+            "from pathlib import Path\n"
+            f"TWO_FILE = {two_file!r}\n"
             "a = sys.argv[1:]\n"
             "def opt(name):\n"
             "    return a[a.index(name) + 1] if name in a else None\n"
@@ -1508,7 +1526,30 @@ class RankAndPushScenario(unittest.TestCase):
             "    with sqlite3.connect(path) as c: return int(c.execute('PRAGMA user_version').fetchone()[0])\n"
             "now = int(time.time())\n"
             "sub, db = a[0], opt('--db')\n"
-            "if sub == 'cache-stage-v2':\n"
+            "if sub == 'cache-stage-v2' and TWO_FILE:\n"
+            "    prior, side, manifest = opt('--prior'), opt('--side'), opt('--manifest')\n"
+            "    evidence_path = Path(side).with_suffix('.stage.json')\n"
+            '    resumed = os.path.exists(side)\n'
+            '    if evidence_path.exists():\n'
+            '        evidence = json.loads(evidence_path.read_text())\n'
+            '    else:\n'
+            '        assert not resumed\n'
+            "        with sqlite3.connect('file:' + db + '?mode=ro', uri=True) as c:\n"
+            "            previous = c.execute('SELECT COALESCE(MAX(generation), 0) FROM activity_coverage_manifests_v2').fetchone()[0]\n"
+            "            row = c.execute('SELECT fresh_collection_json FROM cache_v2_migration_state').fetchone()\n"
+            '            identity = json.loads(row[0]) if row and row[0] else None\n'
+            "            active = c.execute('SELECT generation FROM clob_payout_walk_state_v2').fetchone()\n"
+            "            payout = active[0] if active else c.execute('SELECT COALESCE(MAX(generation), 0) + 1 FROM clob_payout_coverage_manifests_v2').fetchone()[0]\n"
+            "        evidence = dict(version=1, fixed_path=db, prior_path=prior, side_path=side, displaced_path=side.replace('.side.db', '.displaced.db'), source_sha256=sha(db), source_size=os.path.getsize(db), source_schema=schema(db), activity_generation=previous, fresh_identity=identity, payout_generation=payout)\n"
+            '        evidence_path.write_text(json.dumps(evidence))\n'
+            '    if not resumed:\n'
+            '        for p in Path(db).parent.iterdir():\n'
+            "            assert not re.fullmatch(r'wallet_cache\\.cron-[0-9]{8}T[0-9]{6}Z\\.(prior|displaced)\\.db', p.name), 'previous cycle backup remains'\n"
+            '        shutil.copyfile(db, side)\n'
+            "    if evidence['source_schema'] != 2 and manifest and not os.path.exists(manifest):\n"
+            "        json.dump({'manifest_version': 1, 'backup_sha256': evidence['source_sha256'], 'source_bounds': {}, 'cursors': {}, 'hashes': {}, 'sealed_at_unix': now}, open(manifest, 'w'))\n"
+            "    print(json.dumps({'prior_path': prior, 'side_path': side, 'prior_schema': evidence['source_schema'], 'side_schema': schema(side), 'prior_sha256': evidence['source_sha256'], 'side_sha256': None if resumed else sha(side), 'resumed': resumed}))\n"
+            "elif sub == 'cache-stage-v2':\n"
             "    prior, side, manifest = opt('--prior'), opt('--side'), opt('--manifest')\n"
             "    if os.path.exists(side):\n"
             "        assert os.path.exists(prior), 'candidate without prior'\n"
@@ -1542,7 +1583,7 @@ class RankAndPushScenario(unittest.TestCase):
             "            c.execute('UPDATE cache_v2_migration_state SET fresh_collection_json = ?, ranker_projection_count = NULL, ranker_projection_digest = NULL, ranker_classifier_version = NULL', (json.dumps(recorded),))\n"
             "        if '--bulk-root' in a:\n"
             "            assert generation == 1 and recorded['base_generation'] is None\n"
-            "            assert opt('--fixed-db') and opt('--prior')\n"
+            "            assert opt('--fixed-db') and (opt('--prior') or Path(db).with_suffix('.stage.json').exists())\n"
             "            c.execute('DROP INDEX IF EXISTS idx_activity_groups_v2_source_trade_id')\n"
             "            c.execute('PRAGMA user_version = -2')\n"
             "        else: assert schema(db) != -2, 'fenced resume needs --bulk-root'\n"
@@ -1571,12 +1612,71 @@ class RankAndPushScenario(unittest.TestCase):
             "    json.dump({'cache_path': os.path.abspath(db), 'cache_sha256': sha(db)}, open(opt('--stage-record'), 'w'))\n"
             "elif sub == 'cache-activate':\n"
             "    fixed, backup = opt('--fixed-db'), opt('--backup')\n"
-            "    if os.path.exists(db):\n"
+            "    evidence_path = Path(db).with_suffix('.stage.json')\n"
+            '    if os.path.exists(db):\n'
             "        assert sha(db) == opt('--expected-sha256'), 'side hash changed after finalization'\n"
-            "        if not os.path.exists(backup): shutil.copyfile(fixed, backup)\n"
-            "        os.replace(db, fixed)\n"
+            '        if evidence_path.exists():\n'
+            "            assert sha(evidence_path) == opt('--stage-evidence-sha256')\n"
+            '            evidence = json.loads(evidence_path.read_text())\n'
+            '            if os.path.exists(fixed):\n'
+            '                assert not os.path.exists(backup)\n'
+            "                assert sha(fixed) == evidence['source_sha256']\n"
+            '                os.rename(fixed, backup)\n'
+            '            else:\n'
+            "                assert sha(backup) == evidence['source_sha256']\n"
+            '            os.rename(db, fixed)\n'
+            '        else:\n'
+            '            if not os.path.exists(backup): shutil.copyfile(fixed, backup)\n'
+            '            os.replace(db, fixed)\n'
             "    print(json.dumps({'installed': fixed}))\n",
         )
+
+    def test_two_file_pending_resume_finishes_activation_gap_before_cache_openers(self):
+        """Proves both loop resume entries reach activation with F absent and preserve exact request bytes."""
+        for args in [(), ("--resume-pending",)]:
+            with self.subTest(args=args):
+                self.tearDown(); self.setUp()
+                fixed = self._prepare_incremental_fixture(two_file=True)
+                prepared = self._run()
+                self.assertEqual(prepared.returncode, 2, prepared.stderr)
+                pending = self.root / "data/eval-results/rank_and_push.pending"
+                request_path = self.root / pending.read_text().strip()
+                request_bytes = request_path.read_bytes()
+                binding = json.loads(request_bytes)["cache_activation"]
+                side, displaced = Path(binding["side_path"]), Path(binding["prior_cache_backup_path"])
+                old_bytes = fixed.read_bytes()
+                fixed.rename(displaced)
+                self.assertFalse(fixed.exists())
+                self.assertEqual(len(list(fixed.parent.glob("*.db"))), 2)
+                before = self._bootstrap_ops()
+                with (self.root / ".env").open("a") as handle:
+                    handle.write("PE_RANK_SCHEMA_TWO_CUTOVER=1\n")
+                resumed = self._run(*args, exit_env={"STUB_PUSH_EXIT": "75"})
+                self.assertEqual(resumed.returncode, 75, resumed.stderr + resumed.stdout)
+                self.assertEqual(self._bootstrap_ops()[len(before):], ["cache-activate"])
+                self.assertFalse(side.exists())
+                self.assertEqual(displaced.read_bytes(), old_bytes)
+                self.assertEqual(request_path.read_bytes(), request_bytes)
+                self.assertIn("--stage-evidence-sha256", self._bootstrap_lines("cache-activate")[-1])
+                self.assertEqual(len(list(fixed.parent.glob("*.db"))), 2)
+                completed = self._run("--resume-pending")
+                self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+                self.assertFalse(displaced.exists())
+                self.assertFalse(pending.exists())
+                self.assertEqual(len(list(fixed.parent.glob("*.db"))), 1)
+
+    def test_two_file_staging_refuses_previous_backup_before_candidate_allocation(self):
+        """Proves skipped retirement blocks another full candidate allocation without deleting evidence."""
+        fixed = self._prepare_incremental_fixture(two_file=True)
+        old = fixed.parent / "wallet_cache.cron-20000101T000000Z.displaced.db"
+        old.write_bytes(b"retained rollback cache")
+        original = fixed.read_bytes()
+        refused = self._run()
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("previous cycle backup remains", refused.stderr)
+        self.assertEqual(old.read_bytes(), b"retained rollback cache")
+        self.assertEqual(fixed.read_bytes(), original)
+        self.assertEqual(list(fixed.parent.glob("*.side.db")), [])
 
     def _bootstrap_ops(self):
         return [line.split()[0] for line in (self._log("pe_bootstrap.log") or "").splitlines()]
@@ -1585,9 +1685,9 @@ class RankAndPushScenario(unittest.TestCase):
         return [line for line in (self._log("pe_bootstrap.log") or "").splitlines()
                 if line.startswith(op + " ")]
 
-    def _prepare_incremental_fixture(self):
+    def _prepare_incremental_fixture(self, *, two_file=False):
         fixed = self._install_candidate_layout(schema=1)
-        self._install_candidate_stub()
+        self._install_candidate_stub(two_file=two_file)
         with (self.root / ".env").open("a") as handle:
             handle.write("PE_RANK_SCHEMA_TWO_CUTOVER=prepare\n")
         return fixed
@@ -1784,7 +1884,7 @@ finally:
                 self.assertFalse((self.root / "data/eval-results/rank_and_push.cycle").exists())
                 self.assertTrue(all(not path.exists() for path in older))
                 self.assertIn("[cache-retention] deleted", result.stdout)
-                self.assertTrue((fixed.parent / f"wallet_cache.{cycle.name}.prior.db").is_file())
+                self.assertFalse((fixed.parent / f"wallet_cache.{cycle.name}.prior.db").exists())
 
     def _seed_old_cache_copies(self, physical):
         copies = {}
@@ -1835,7 +1935,7 @@ finally:
                 path = fixed.parent / f"wallet_cache.{out.name}.{role}.db{suffix}"
                 if not path.exists():
                     path.write_bytes(b"current cycle")
-                kept[path] = path.read_bytes()
+                older[path] = path.read_bytes()
         resumed = self._run("--resume-pending")
         self.assertEqual(resumed.returncode, 0, resumed.stderr + resumed.stdout)
         self.assertTrue(all(not path.exists() for path in older))
@@ -1890,15 +1990,150 @@ finally:
                 self.assertIn("[cache-retention] nothing deleted: recovery pointer or Forge pause record remains", result.stdout)
                 self._assert_cache_copies(older)
 
+    def test_paused_publication_retirement_resumes_before_watermark_and_next_cycle(self):
+        for two_file, args in ((True, ()), (True, ("--resume-pending",)), (False, ())):
+            with self.subTest(two_file=two_file, args=args):
+                self.tearDown(); self.setUp()
+                fixed = self._install_candidate_layout(schema=2)
+                self._install_candidate_stub(two_file=two_file)
+                pause = self.root / "data/eval-results/.forge_pause.json"
+                pause.write_text("presence holds cleanup, including malformed records")
+                published = self._run()
+                self.assertEqual(published.returncode, 0, published.stderr + published.stdout)
+                out = next((self.root / "data/eval-results").glob("cron-*"))
+                request = json.loads((out / "ranking_publish_request.json").read_text())
+                backup = Path(request["cache_activation"]["prior_cache_backup_path"])
+                old_bytes = backup.read_bytes()
+                installed = fixed.read_bytes()
+                evidence = {path: path.read_bytes() for path in (
+                    out / "ranking_publish_request.json", out / "accepted_cycle_manifest.json")}
+                if two_file:
+                    stage = fixed.parent / f"wallet_cache.{out.name}.side.stage.json"
+                    evidence[stage] = stage.read_bytes()
+                ops = self._bootstrap_ops()
+                pushes = self._log("push.log")
+                for name in ("rank_and_push.pending", "rank_and_push.cycle"):
+                    self.assertFalse((out.parent / name).exists())
+
+                held = self._run(*args)
+                self.assertEqual(held.returncode, 0, held.stderr + held.stdout)
+                self.assertIn("Forge pause record remains", held.stdout)
+                self.assertEqual(backup.read_bytes(), old_bytes)
+                self.assertEqual(self._bootstrap_ops(), ops)
+                pause.unlink()
+                resumed = self._run(*args)
+                self.assertEqual(resumed.returncode, 0, resumed.stderr + resumed.stdout)
+                self.assertFalse(backup.exists())
+                self.assertEqual(fixed.read_bytes(), installed)
+                self.assertEqual(self._bootstrap_ops(), ops)
+                self.assertEqual(self._log("push.log"), pushes, "cleanup republished the request")
+                self._assert_cache_copies(evidence)
+                if not args:
+                    self.assertLess(resumed.stdout.index("[cache-retention] deleted"),
+                                    resumed.stdout.index("RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1"))
+
+                # Advance the installed watermark: the following cycle must stage
+                # successfully without the previous rollback copy occupying space.
+                with sqlite3.connect(fixed) as connection:
+                    connection.execute("INSERT INTO activity_groups_v2 (wallet_hex, source_time_unix, activity_type, coverage_generation) VALUES ('0xabc', 99, 'TRADE', 2)")
+                following = self._run()
+                self.assertEqual(following.returncode, 0, following.stderr + following.stdout)
+                self.assertEqual(self._bootstrap_ops()[len(ops)], "cache-stage-v2")
+                self.assertEqual(len(list(out.parent.glob("cron-*"))), 2)
+
+    def test_retirement_interruption_resumes_before_during_and_after_unlink(self):
+        for seam in ("before_unlink", "during_unlinks", "before_sync", "after_sync"):
+            for args in ((), ("--resume-pending",)):
+                with self.subTest(seam=seam, args=args):
+                    self.tearDown(); self.setUp()
+                    fixed = self._install_candidate_layout(schema=2)
+                    self._install_candidate_stub(two_file=True)
+                    pause = self.root / "data/eval-results/.forge_pause.json"
+                    pause.write_text("paused")
+                    published = self._run()
+                    self.assertEqual(published.returncode, 0, published.stderr + published.stdout)
+                    out = next((self.root / "data/eval-results").glob("cron-*"))
+                    backup = fixed.parent / f"wallet_cache.{out.name}.displaced.db"
+                    sidecar = Path(str(backup) + "-wal")
+                    sidecar.write_bytes(b"retained sidecar")
+                    installed = fixed.read_bytes()
+                    evidence = {path: path.read_bytes() for path in (
+                        out / "ranking_publish_request.json", out / "accepted_cycle_manifest.json",
+                        fixed.parent / f"wallet_cache.{out.name}.side.stage.json")}
+                    pause.unlink()
+                    manifest_script = self.root / "scripts/rank_cycle_manifest.py"
+                    original = manifest_script.read_text()
+                    sync_start = "    directory = os.open(fixed.parent, os.O_RDONLY | os.O_DIRECTORY)\n"
+                    sync_end = "    if not deleted:\n"
+                    if seam == "before_unlink":
+                        broken = original.replace("        path.unlink()\n", "        raise SystemExit(75)\n        path.unlink()\n")
+                    elif seam == "during_unlinks":
+                        broken = original.replace("        path.unlink()\n", "        path.unlink()\n        raise SystemExit(75)\n")
+                    elif seam == "before_sync":
+                        broken = original.replace(sync_start, "    raise SystemExit(75)\n" + sync_start)
+                    else:
+                        broken = original.replace(sync_end, "    raise SystemExit(75)\n" + sync_end)
+                    self.assertNotEqual(broken, original)
+                    manifest_script.write_text(broken)
+                    ops = self._bootstrap_ops()
+                    pushes = self._log("push.log")
+                    interrupted = self._run(*args)
+                    self.assertEqual(interrupted.returncode, 75, interrupted.stderr + interrupted.stdout)
+                    self.assertEqual(backup.exists(), seam == "before_unlink")
+                    self.assertEqual(sidecar.exists(), seam in ("before_unlink", "during_unlinks"))
+                    self._assert_cache_copies(evidence)
+
+                    # Observe the real directory fsync on retry, including when
+                    # the previous attempt unlinked every eligible file already.
+                    manifest_script.write_text(original.replace(sync_end,
+                        '    Path("retention_synced").write_text(str(fixed.parent))\n' + sync_end))
+                    resumed = self._run(*args)
+                    self.assertEqual(resumed.returncode, 0, resumed.stderr + resumed.stdout)
+                    self.assertEqual((self.root / "retention_synced").read_text(), str(fixed.parent))
+                    self.assertFalse(backup.exists())
+                    self.assertFalse(sidecar.exists())
+                    self.assertEqual(fixed.read_bytes(), installed)
+                    self._assert_cache_copies(evidence)
+                    self.assertEqual(self._bootstrap_ops(), ops)
+                    self.assertEqual(self._log("push.log"), pushes)
+
+    def test_pointerless_retirement_refuses_changed_request_or_staging_evidence(self):
+        for artifact in ("request", "stage"):
+            with self.subTest(artifact=artifact):
+                self.tearDown(); self.setUp()
+                fixed = self._install_candidate_layout(schema=2)
+                self._install_candidate_stub(two_file=True)
+                pause = self.root / "data/eval-results/.forge_pause.json"
+                pause.write_text("paused")
+                published = self._run()
+                self.assertEqual(published.returncode, 0, published.stderr + published.stdout)
+                out = next((self.root / "data/eval-results").glob("cron-*"))
+                backup = fixed.parent / f"wallet_cache.{out.name}.displaced.db"
+                preserved = {path: path.read_bytes() for path in (fixed, backup)}
+                if artifact == "request":
+                    path = out / "ranking_publish_request.json"
+                    value = json.loads(path.read_text())
+                    value["publish_key"] = "0" * 64
+                else:
+                    path = fixed.parent / f"wallet_cache.{out.name}.side.stage.json"
+                    value = json.loads(path.read_text())
+                    value["source_sha256"] = "0" * 64
+                path.write_text(json.dumps(value))
+                pause.unlink()
+                ops = self._bootstrap_ops()
+                refused = self._run()
+                self.assertNotEqual(refused.returncode, 0)
+                self._assert_cache_copies(preserved)
+                self.assertEqual(self._bootstrap_ops(), ops)
+
     def test_initial_cutover_lane_stages_seals_collects_and_publishes_from_schema_one(self):
-        """PASS: with the opt-in, a zero-argument schema-one cycle stages the prior
-        and candidate beside the physical file, seals the candidate once, collects
+        """PASS: with the opt-in, a zero-argument schema-one cycle stages one candidate without a prior beside the physical file, seals the candidate once, collects
         generation 1 for the union, walks payout, finalizes twice, publishes and
         activates, then the accepted capture reads the installed file and the
         next same-day run skips before staging. FAIL: any legacy refresh stage,
         a second cohort, or a repeated collection."""
         fixed = self._install_candidate_layout(schema=1)
-        self._install_candidate_stub()
+        self._install_candidate_stub(two_file=True)
         (self.root / ".env").write_text(
             "SUPABASE_URL=http://127.0.0.1:9\nSUPABASE_SECRET_KEY=test-secret\n"
             "PE_RANK_SCHEMA_TWO_CUTOVER=1\n"
@@ -1920,9 +2155,10 @@ finally:
         self.assertIn(f"--db {side} --fresh-generation 1", self._bootstrap_lines("cache-populate-activity-v2")[0])
         self.assertIn(f"--db {self.root}/phys/wallet_cache.db --prior {prior} --side {side}", self._bootstrap_lines("cache-stage-v2")[0])
         build = json.loads((out / "cache_build_manifest.json").read_text())
-        self.assertEqual(build["backup_sha256"], __import__("hashlib").sha256(prior.read_bytes()).hexdigest())
+        self.assertEqual(build["backup_sha256"], json.loads(Path(side).with_suffix(".stage.json").read_text())["source_sha256"])
         self.assertFalse(Path(side).exists(), "activation must move the candidate onto the fixed path")
-        self.assertTrue(prior.is_file())
+        self.assertFalse(prior.exists())
+        self.assertFalse(Path(side.replace(".side.db", ".displaced.db")).exists())
         with sqlite3.connect(fixed) as connection:
             self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
         accepted = json.loads((out / "accepted_cycle_manifest.json").read_text())
@@ -1962,7 +2198,7 @@ finally:
         self.assertIn("--fresh-generation 2", self._bootstrap_lines("cache-populate-activity-v2")[-1])
         cycles = sorted((self.root / "data/eval-results").glob("cron-*"))
         self.assertEqual(len(cycles), 2)
-        self.assertEqual(len(list((self.root / "phys").glob("wallet_cache.*.prior.db"))), 1)
+        self.assertEqual(len(list((self.root / "phys").glob("wallet_cache.*.prior.db"))), 0)
         self.assertFalse(prior.exists(), "completed successor must retire the older rollback copy")
         self.assertEqual(list((self.root / "phys").glob("wallet_cache.*.side.db")), [])
         accepted = json.loads((cycles[-1] / "accepted_cycle_manifest.json").read_text())
@@ -2031,7 +2267,7 @@ finally:
 
         second = self._run()
         self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
-        self.assertIn("[cache-retention] nothing deleted: no eligible older cycle files", second.stdout)
+        self.assertIn("[cache-retention] deleted", second.stdout)
         self.assertIn(f"RANK_AND_PUSH_CYCLE_RESUME=data/eval-results/{out}", second.stdout)
         ops = self._bootstrap_ops()
         self.assertEqual(ops.count("cache-stage-v2"), 2)
@@ -2040,7 +2276,7 @@ finally:
         self.assertNotIn("cache-migrate-v2", ops)
         self.assertEqual({line.split()[4] for line in self._bootstrap_lines("cache-populate-activity-v2")}, {"2"})
         self.assertEqual(len(list((self.root / "phys").glob("wallet_cache.*.side.db"))), 0)
-        self.assertEqual(len(list((self.root / "phys").glob("wallet_cache.*.prior.db"))), 1)
+        self.assertEqual(len(list((self.root / "phys").glob("wallet_cache.*.prior.db"))), 0)
         accepted = json.loads((self.root / "data/eval-results" / out / "accepted_cycle_manifest.json").read_text())
         self.assertEqual(accepted["source_watermark"]["activity"]["generation"], 2)
         self.assertEqual(accepted["source_watermark"]["resolution"]["generation"], 4)

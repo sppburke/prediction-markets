@@ -6,7 +6,7 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
-use pe_bootstrap::cache::WalletCache;
+use pe_bootstrap::cache::{CACHE_SCHEMA_VERSION_V1, CACHE_SCHEMA_VERSION_V2, WalletCache};
 use pe_bootstrap::lock::CacheMutationLock;
 use pe_bootstrap::pile::SRC_TRADES;
 use tempfile::TempDir;
@@ -40,6 +40,191 @@ fn upsert(cache: &mut WalletCache, wallet: &str) {
     cache
         .upsert_wallets_bulk(&[(wallet.to_owned(), SRC_TRADES, false, None, None, None, 0)])
         .unwrap();
+}
+
+const CREATE_CACHE_INVOCATIONS: &[&[&str]] = &[
+    &["all", "--create-cache"],
+    &["all", "--create-cache", "bootstrap.toml"],
+    &["--create-cache"],
+    &["bootstrap.toml", "--create-cache"],
+    &["--create-cache", "bootstrap.toml"],
+];
+
+fn run_all_until_legacy_fixture_error(root: &Path, cache_path: &Path, args: &[&str]) {
+    std::fs::write(root.join("bootstrap.toml"), "").unwrap();
+    let legacy_path = root.join("wallet_set.json");
+    // Stop after the real CLI opener initializes the schema, before discovery
+    // can use the network. No library opener may provision the fresh fixture.
+    std::fs::write(&legacy_path, "invalid fixture JSON").unwrap();
+    let output = run_cli_with_env(
+        root,
+        cache_path,
+        args,
+        &[
+            ("RUST_LOG", "info"),
+            (
+                "PE_BOOTSTRAP_WALLET_SET_PATH",
+                legacy_path.to_str().unwrap(),
+            ),
+        ],
+    );
+    assert_eq!(output.status.code(), Some(1), "args={args:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("all: migrate fatal"),
+        "args={args:?}: {stderr}"
+    );
+    assert!(
+        stderr.contains("wallet cache: connection tuning applied"),
+        "args={args:?}: {stderr}"
+    );
+}
+
+#[test]
+fn create_cache_flag_provisions_and_initializes_a_fresh_install_through_cli() {
+    for args in CREATE_CACHE_INVOCATIONS {
+        let dir = TempDir::new().unwrap();
+        let cache_path = dir.path().join("cache.db");
+        assert!(!cache_path.exists());
+        run_all_until_legacy_fixture_error(dir.path(), &cache_path, args);
+
+        // Read-only inspection cannot hide missing CLI provisioning or DDL.
+        let cache = WalletCache::open_read_only(&cache_path).unwrap();
+        assert_eq!(cache.schema_version().unwrap(), CACHE_SCHEMA_VERSION_V1);
+        for table in ["wallets", "trades", "source_cursor", "market_resolutions"] {
+            let count: i64 = cache
+                .raw_conn_for_test()
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 0, "args={args:?}: {table}");
+        }
+    }
+}
+
+#[test]
+fn create_cache_flag_preserves_existing_schema_versions_and_data() {
+    for args in CREATE_CACHE_INVOCATIONS {
+        for version in [CACHE_SCHEMA_VERSION_V1, CACHE_SCHEMA_VERSION_V2] {
+            let dir = TempDir::new().unwrap();
+            let cache_path = dir.path().join("cache.db");
+            let wallet = wallet_hex(0x65);
+            {
+                let mut cache = WalletCache::open(&cache_path).unwrap();
+                upsert(&mut cache, &wallet);
+                if version == CACHE_SCHEMA_VERSION_V2 {
+                    // Model the v2 opener contract: the legacy owners are gone
+                    // and must not be recreated by the provisioning flag.
+                    cache.raw_conn_for_test().execute_batch(
+                        "DROP TABLE trades; DROP TABLE market_resolutions; DROP TABLE source_cursor;",
+                    ).unwrap();
+                    cache
+                        .raw_conn_for_test()
+                        .pragma_update(None, "user_version", version)
+                        .unwrap();
+                }
+            }
+            run_all_until_legacy_fixture_error(dir.path(), &cache_path, args);
+
+            let cache = WalletCache::open_read_only(&cache_path).unwrap();
+            assert_eq!(cache.schema_version().unwrap(), version, "args={args:?}");
+            assert!(cache.conn_for_test_wallet_exists(&wallet), "args={args:?}");
+            let legacy_tables: i64 = cache.raw_conn_for_test().query_row(
+                "SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name IN ('trades', 'market_resolutions', 'source_cursor')",
+                [], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(
+                legacy_tables,
+                if version == CACHE_SCHEMA_VERSION_V1 {
+                    3
+                } else {
+                    0
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn create_cache_flag_requires_the_mutation_lock_before_provisioning() {
+    for args in CREATE_CACHE_INVOCATIONS {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("bootstrap.toml"), "").unwrap();
+        let cache_path = dir.path().join("cache.db");
+        let _holder = CacheMutationLock::acquire(&cache_path).unwrap();
+        let output = run_cli(dir.path(), &cache_path, args);
+        assert_eq!(output.status.code(), Some(1), "args={args:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("cache mutation lock failed"));
+        assert!(!cache_path.exists(), "args={args:?}");
+    }
+}
+
+#[test]
+fn create_cache_flag_refuses_an_existing_directory() {
+    for args in CREATE_CACHE_INVOCATIONS {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("bootstrap.toml"), "").unwrap();
+        let cache_path = dir.path().join("cache.db");
+        std::fs::create_dir(&cache_path).unwrap();
+        let output = run_cli(dir.path(), &cache_path, args);
+        assert_eq!(output.status.code(), Some(1), "args={args:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("requires an absent path or a regular file")
+        );
+        assert!(cache_path.is_dir());
+        assert_eq!(std::fs::read_dir(&cache_path).unwrap().count(), 0);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn create_cache_flag_refuses_existing_and_dangling_symlinks() {
+    for args in CREATE_CACHE_INVOCATIONS {
+        for existing_target in [false, true] {
+            let dir = TempDir::new().unwrap();
+            std::fs::write(dir.path().join("bootstrap.toml"), "").unwrap();
+            let cache_path = dir.path().join("cache.db");
+            let target = dir.path().join("target.db");
+            if existing_target {
+                std::fs::write(&target, b"untouched target").unwrap();
+            }
+            std::os::unix::fs::symlink(&target, &cache_path).unwrap();
+            let output = run_cli(dir.path(), &cache_path, args);
+            assert_eq!(output.status.code(), Some(1), "args={args:?}");
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("requires an absent path or a regular file")
+            );
+            assert_eq!(std::fs::read_link(&cache_path).unwrap(), target);
+            if existing_target {
+                assert_eq!(std::fs::read(&target).unwrap(), b"untouched target");
+            } else {
+                assert!(!target.exists());
+            }
+        }
+    }
+}
+
+#[test]
+fn create_cache_flag_is_rejected_by_other_subcommands() {
+    for sub in [
+        "fetch",
+        "winner-discovery",
+        "cache-populate-payout-v2",
+        "cache-stage-v2",
+    ] {
+        let dir = TempDir::new().unwrap();
+        let cache_path = dir.path().join("cache.db");
+        let output = run_cli(dir.path(), &cache_path, &[sub, "--create-cache"]);
+        assert_eq!(output.status.code(), Some(1), "sub={sub}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("--create-cache is only supported by all")
+        );
+        assert!(!cache_path.exists());
+    }
 }
 
 #[test]
@@ -326,6 +511,8 @@ fn every_writable_opener_logs_requested_and_effective_cache_tuning_from_env() {
     for args in openers {
         let dir = TempDir::new().unwrap();
         let cache_path = dir.path().join("cache.db");
+        // These commands tune an existing cache; provisioning is explicit.
+        WalletCache::open(&cache_path).unwrap();
         let legacy_path = dir.path().join("wallet_set.json");
         // Stop no-argument `all` in the local legacy reader after the open,
         // before wallet discovery can perform any network I/O. The other two
@@ -609,5 +796,69 @@ fn fresh_generation_cli_refuses_malformed_values_and_legacy_flag_mixes() {
         );
         assert!(logged.contains(expected), "{args:?}: {logged}");
         assert!(!cache_path.exists(), "{args:?} created the cache");
+    }
+}
+
+#[test]
+fn non_provisioning_openers_never_create_fixed_cache_in_a_rename_gap() {
+    // Every generic writable dispatch, payout, and the read-only probes refuse
+    // an absent installed path; neither the main nor SQLite sidecars are created.
+    for args in [
+        &[][..],
+        &["bootstrap.toml"],
+        &["all"],
+        &["all", "bootstrap.toml"],
+        // The permissive parser must never turn an unknown or value-style
+        // argument into provisioning permission.
+        &["all", "--create-cach"],
+        &["all", "--create-cache=false"],
+        &["all", "--create-cache=true"],
+        &["bootstrap.toml", "--create-cache=false"],
+        &["fetch"],
+        &["watchlist"],
+        &["schedules"],
+        &["classify-infra"],
+        &["purge"],
+        &["purge-infra"],
+        &[
+            "clear-infra-exclusion",
+            "--wallet",
+            "0x0000000000000000000000000000000000000001",
+        ],
+        &["cache-populate-payout-v2"],
+        &["winner-discovery"],
+        &["activate-next"],
+        &["backfill"],
+        &["events"],
+        &["resolutions"],
+        &["prices-history"],
+        &["recover-reclamation"],
+        &["coverage"],
+        &["reclamation-evidence"],
+    ] {
+        let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("bootstrap.toml"), "").unwrap();
+        let fixed = dir.path().join("wallet_cache.db");
+        let displaced = dir
+            .path()
+            .join("wallet_cache.cron-20260917T000000Z.displaced.db");
+        let candidate = dir
+            .path()
+            .join("wallet_cache.cron-20260917T000000Z.side.db");
+        std::fs::write(&displaced, b"old generation").unwrap();
+        std::fs::write(&candidate, b"candidate generation").unwrap();
+        let output = run_cli(dir.path(), &fixed, args);
+        assert!(!output.status.success(), "{args:?}");
+        let logged = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            logged.contains("unable to open database file"),
+            "{args:?}: {logged}"
+        );
+        assert!(!fixed.exists(), "{args:?} created an empty installed cache");
+        for suffix in ["db-wal", "db-shm", "db-journal"] {
+            assert!(!fixed.with_extension(suffix).exists(), "{args:?}");
+        }
+        assert_eq!(std::fs::read(displaced).unwrap(), b"old generation");
+        assert_eq!(std::fs::read(candidate).unwrap(), b"candidate generation");
     }
 }

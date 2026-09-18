@@ -142,6 +142,35 @@ class CandidateTargetsTest(unittest.TestCase):
         self.assertEqual(self.targets(), (2, 1, 1, 0))
         self.assertEqual(candidate_targets(self.prior, self.side), (2, 1, 1))
 
+    def test_two_file_baseline_routes_bulk_without_prior_and_freezes_successor_targets(self):
+        """Proves new roots need no prior; inherited heads and payout targets use H0-era evidence."""
+        baseline = dict(version=1, side_path=str(self.side), prior_path=str(self.prior),
+                        source_sha256="a" * 64, activity_generation=0,
+                        payout_generation=1, fresh_identity=None)
+        self.prior.unlink()
+        receipt = self.side.with_suffix(".stage.json")
+        receipt.write_text(json.dumps(baseline))
+        self.assertEqual(candidate_targets(None, self.side, include_bulk_root=True), (1, 1, 0, 1))
+        result = subprocess.run([sys.executable, str(Path(__file__).with_name("rank_cycle_manifest.py")),
+                                 "candidate-targets", "--side", str(self.side), "--include-bulk-root"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "1\n1\n0\n1\n")
+        root = identity()
+        baseline.update(activity_generation=1, payout_generation=4, fresh_identity=json.loads(root))
+        receipt.write_text(json.dumps(baseline))
+        with sqlite3.connect(self.side) as c:
+            c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (root,))
+            c.execute("INSERT INTO activity_coverage_manifests_v2(generation) VALUES (1)")
+            c.execute("INSERT INTO clob_payout_coverage_manifests_v2(generation) VALUES (4)")
+        self.assertEqual(candidate_targets(None, self.side, include_bulk_root=True), (2, 4, 1, 0))
+        # A mutated candidate cannot change the baseline or grant a second top-up.
+        with sqlite3.connect(self.side) as c:
+            c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (identity(4, 3),))
+        with self.assertRaisesRegex(ValueError, "single top-up"):
+            candidate_targets(None, self.side)
+        self.assertFalse(self.prior.exists())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
