@@ -3142,6 +3142,223 @@ async fn fresh_generation_on_initial_base_binds_the_union_and_certifies_without_
     assert!(activate_cache_v2(&request).unwrap().resumed);
 }
 
+fn assert_activity_indexes(path: &std::path::Path, legacy_condition_index: bool) {
+    let connection =
+        Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let mut indexes = connection
+        .prepare("PRAGMA index_list(activity_groups_v2)")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let mut expected = vec![
+        (
+            "idx_activity_groups_v2_wallet_time".to_owned(),
+            false,
+            "c".to_owned(),
+        ),
+        (
+            "sqlite_autoindex_activity_groups_v2_1".to_owned(),
+            true,
+            "pk".to_owned(),
+        ),
+    ];
+    if legacy_condition_index {
+        expected.push((
+            "idx_activity_groups_v2_condition".to_owned(),
+            false,
+            "c".to_owned(),
+        ));
+    }
+    indexes.sort();
+    expected.sort();
+    assert_eq!(indexes, expected);
+}
+
+#[tokio::test]
+async fn condition_index_is_optional_through_collection_resume_finalize_and_activation() {
+    // Proves the existing fresh-initial scenario's generation identity, aggregate
+    // digest and projection are identical without the condition index and with
+    // an older binary's index, including interrupted resume. Each cache keeps
+    // its own receipt evidence, finalized bytes and original index inventory.
+    let dir = tempfile::Builder::new()
+        .prefix("pe-condition-index-")
+        .tempdir_in(std::env::current_dir().unwrap())
+        .unwrap();
+    let mut installed_paths = Vec::new();
+    let mut stages = Vec::new();
+    for legacy_condition_index in [false, true] {
+        let lane = dir.path().join(if legacy_condition_index {
+            "legacy-index"
+        } else {
+            "without-index"
+        });
+        std::fs::create_dir_all(lane.join("eval-results")).unwrap();
+        let side = lane.join("side.db");
+        seed_initial_candidate(&side);
+        migrate_cache_v2(&side, &write_build_manifest(&dir, &side)).unwrap();
+        // Assert the new schema's complete inventory before making the legacy fixture.
+        assert_activity_indexes(&side, false);
+        if legacy_condition_index {
+            Connection::open(&side)
+                .unwrap()
+                .execute_batch(
+                    "CREATE INDEX idx_activity_groups_v2_condition
+                     ON activity_groups_v2(condition_id, outcome_id, source_time_unix);",
+                )
+                .unwrap();
+            let error = populate_activity_fresh_v2(
+                &side,
+                &InterruptAfterFirst {
+                    side: side.clone(),
+                    generation: 1,
+                    first: WALLET,
+                },
+                "https://data.example",
+                1,
+                FRESH_END,
+                FRESH_END + 1,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.exit_code(), 75);
+            assert_eq!(generation_rows(&side, 1), 3);
+            assert_eq!(
+                count(
+                    &side,
+                    "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2"
+                ),
+                1
+            );
+            assert_eq!(
+                count(&side, "SELECT COUNT(*) FROM activity_coverage_manifests_v2"),
+                0
+            );
+            assert_activity_indexes(&side, true);
+        }
+        let wallets = if legacy_condition_index {
+            // No fixture for WALLET: resume must reuse its committed receipt.
+            vec![WALLET_B, WALLET_C, WALLET_D]
+        } else {
+            vec![WALLET, WALLET_B, WALLET_C, WALLET_D]
+        };
+        let manifest = populate_activity_fresh_v2(
+            &side,
+            &fresh_fetcher(
+                &wallets,
+                FRESH_END,
+                &[FRESH_END - 1, FRESH_END - 101],
+                false,
+            ),
+            "https://data.example",
+            1,
+            FRESH_END,
+            FRESH_END + 1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(manifest.generation, 1);
+        assert_eq!(manifest.wallet_count, 4);
+        assert_eq!(manifest.group_count, 9);
+        assert_activity_indexes(&side, legacy_condition_index);
+        // Independent reads have different received_at evidence. Preserve each
+        // cache's exact receipts and manifest from completion through activation.
+        let receipt_rows = query_values(
+            &side,
+            "SELECT * FROM activity_wallet_coverage_staging_v2 ORDER BY generation, wallet_hex",
+        );
+        let manifest_rows = query_values(&side, "SELECT * FROM activity_coverage_manifests_v2");
+        assert_eq!(
+            manifest.receipt_set_digest,
+            whole_json_digest(&serde_json::json!({
+                "generation": 1,
+                "reference_sha256": manifest.reference_sha256,
+                "fixed_end_unix": FRESH_END,
+                "receipts": stored_receipt_proofs(&Connection::open(&side).unwrap(), 1),
+            }))
+        );
+        install_fresh_payouts(&side).await;
+        let stage = finalize_cache_v2(&side, &lane.join("stage.json"), FRESH_END + 2).unwrap();
+        assert_eq!(stage.ranker_projection_count, 5);
+        assert_eq!(
+            stage.ranker_projection_digest,
+            reference_projection_digest(&side)
+        );
+        assert_activity_indexes(&side, legacy_condition_index);
+        let completed = populate_activity_fresh_v2(
+            &side,
+            &FixtureFetcher::new(HashMap::new()),
+            "https://data.example",
+            1,
+            FRESH_END + 500,
+            FRESH_END + 3,
+        )
+        .await
+        .unwrap();
+        assert_eq!(completed, manifest);
+        assert_eq!(sha256_file(&side).unwrap(), stage.cache_sha256);
+
+        let fixed = lane.join("fixed.db");
+        drop(seed_v1(&fixed, FRESH_END - 100));
+        let request = CacheActivationRequest {
+            fixed_path: fixed.clone(),
+            side_path: side,
+            prior_cache_backup_path: lane.join("prior.db"),
+            expected_side_sha256: stage.cache_sha256.clone(),
+        };
+        let installed = activate_cache_v2(&request).unwrap();
+        assert!(!installed.resumed);
+        assert_eq!(installed.installed_sha256, stage.cache_sha256);
+        assert!(activate_cache_v2(&request).unwrap().resumed);
+        assert_activity_indexes(&fixed, legacy_condition_index);
+        assert_eq!(
+            query_values(
+                &fixed,
+                "SELECT * FROM activity_wallet_coverage_staging_v2 ORDER BY generation, wallet_hex"
+            ),
+            receipt_rows
+        );
+        assert_eq!(
+            query_values(&fixed, "SELECT * FROM activity_coverage_manifests_v2"),
+            manifest_rows
+        );
+        assert_eq!(sha256_file(&fixed).unwrap(), stage.cache_sha256);
+        installed_paths.push(fixed);
+        stages.push(stage);
+    }
+
+    let [fresh, legacy] = installed_paths.as_slice() else {
+        panic!("both cache layouts must be exercised");
+    };
+    for sql in [
+        "SELECT fresh_collection_json FROM cache_v2_migration_state",
+        // Only receipt_set_digest binds the differing read timestamps; its
+        // encoding and byte preservation are checked independently above.
+        "SELECT generation, reference_sha256, wallet_count, aggregate_digest, source_row_count,
+                source_bounds_json, cursors_json, page_hashes_json, group_count, schema_version,
+                parser_version, completed_at_unix, collection_identity_json
+         FROM activity_coverage_manifests_v2 ORDER BY generation",
+        "SELECT * FROM activity_groups_v2 ORDER BY source_trade_id",
+        "SELECT * FROM ranker_entries_v2 ORDER BY source_trade_id",
+        "SELECT ranker_projection_count, ranker_projection_digest, ranker_classifier_version FROM cache_v2_migration_state",
+    ] {
+        assert_eq!(query_values(fresh, sql), query_values(legacy, sql), "{sql}");
+    }
+    assert_eq!(projected_entries(fresh), projected_entries(legacy));
+    // The stage receipt format and all logical fields also remain identical.
+    let mut legacy_stage = stages[1].clone();
+    legacy_stage.cache_path = stages[0].cache_path.clone();
+    legacy_stage.cache_sha256 = stages[0].cache_sha256.clone();
+    assert_eq!(stages[0], legacy_stage);
+}
+
 struct InterruptAfterFirst {
     side: std::path::PathBuf,
     generation: i64,

@@ -131,10 +131,21 @@ CREATE TABLE IF NOT EXISTS activity_groups_v2 (
     schema_version                  INTEGER NOT NULL CHECK(schema_version = 2),
     parser_version                  INTEGER NOT NULL CHECK(parser_version = 2)
 );
+-- Wallet/time/ID serves collection, resume and ordered wallet reads; the primary
+-- key serves deduplication and projection joins. No production reader selects
+-- activity by condition, so omit its index. On Forge, a 761-second undisturbed
+-- collection sample from /proc/<pid>/io and staging receipts measured 1,535
+-- committed rows/s, 25,188 physical write bytes per roughly 1.1 KB logical row,
+-- 2,506 physical read bytes/row and 38.7 MB/s writes (222.6 GB candidate,
+-- 15.9 GB host memory). The model assumes one randomly placed index leaf per row:
+-- a WAL frame carries a whole 4,096-byte page plus a 24-byte frame header, then
+-- checkpoint writes the page back, or about 8,216 bytes/row for the removed
+-- condition index, about a third of the measured total. This saving is an
+-- estimate, not a measurement, pending a before-and-after comparison of physical
+-- write bytes per committed row on the same collection. The retained primary-key
+-- index still incurs its own write cost.
 CREATE INDEX IF NOT EXISTS idx_activity_groups_v2_wallet_time
     ON activity_groups_v2(wallet_hex, source_time_unix, source_trade_id);
-CREATE INDEX IF NOT EXISTS idx_activity_groups_v2_condition
-    ON activity_groups_v2(condition_id, outcome_id, source_time_unix);
 
 CREATE TABLE IF NOT EXISTS ranker_entries_v2 (
     source_trade_id       TEXT PRIMARY KEY NOT NULL
@@ -4372,45 +4383,55 @@ mod publication_json_tests {
 
     #[test]
     fn projection_digest_looks_up_activity_by_projected_key_with_stale_statistics() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cache.db");
-        drop(crate::cache::WalletCache::open(&path).unwrap());
-        let connection = rusqlite::Connection::open(&path).unwrap();
-        ensure_lane_a_v2_schema(&connection).unwrap();
-        // Cardinalities can outlive the prior's projection after a fresh
-        // collection. With ordinary inner joins these statistics let SQLite
-        // walk payout markets and their activity before checking the projection.
-        connection
-            .execute_batch(
-                "ANALYZE;
+        for with_condition_index in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("cache.db");
+            drop(crate::cache::WalletCache::open(&path).unwrap());
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            ensure_lane_a_v2_schema(&connection).unwrap();
+            if with_condition_index {
+                connection
+                    .execute_batch(
+                        "CREATE INDEX idx_activity_groups_v2_condition
+                         ON activity_groups_v2(condition_id, outcome_id, source_time_unix);",
+                    )
+                    .unwrap();
+            }
+            // Cardinalities can outlive the prior's projection after a fresh
+            // collection. With ordinary inner joins these statistics let SQLite
+            // walk payout markets and their activity before checking the projection,
+            // especially when a legacy cache retains the condition index.
+            connection
+                .execute_batch(
+                    "ANALYZE;
              DELETE FROM sqlite_stat1;
              INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
                ('ranker_entries_v2', 'sqlite_autoindex_ranker_entries_v2_1', '1000000 1'),
                ('activity_groups_v2', 'sqlite_autoindex_activity_groups_v2_1', '100 1'),
                ('clob_payout_evidence_v2', 'sqlite_autoindex_clob_payout_evidence_v2_1', '10 1');
              ANALYZE sqlite_schema;",
-            )
-            .unwrap();
-        let plan = connection
-            .prepare(&format!(
-                "EXPLAIN QUERY PLAN {RANKER_PROJECTION_DIGEST_SQL}"
-            ))
-            .unwrap()
-            .query_map([7], |row| row.get::<_, String>(3))
-            .unwrap()
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        assert!(plan[0].starts_with("SCAN ranker"), "{plan:?}");
-        assert!(
-            plan.iter()
-                .any(|step| step.starts_with("SEARCH groups_v2")
+                )
+                .unwrap();
+            let plan = connection
+                .prepare(&format!(
+                    "EXPLAIN QUERY PLAN {RANKER_PROJECTION_DIGEST_SQL}"
+                ))
+                .unwrap()
+                .query_map([7], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(plan[0].starts_with("SCAN ranker"), "{plan:?}");
+            assert!(
+                plan.iter().any(|step| step.starts_with("SEARCH groups_v2")
                     && step.contains("(source_trade_id=?)")),
-            "activity reads must be keyed by projection rows: {plan:?}"
-        );
-        assert!(
-            !plan.iter().any(|step| step.starts_with("SCAN groups_v2")),
-            "{plan:?}"
-        );
+                "activity reads must be keyed by projection rows: {plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|step| step.starts_with("SCAN groups_v2")),
+                "{plan:?}"
+            );
+        }
     }
 
     #[test]

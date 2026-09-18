@@ -538,6 +538,31 @@ Build and resume the side cache by its hash-bound manifest and explicit `--db` p
 is sealed into `*_v1_sealed` audit tables; version-two consumers read only complete normalized
 activity and CLOB-payout generations, and no API unions the generations.
 
+New `activity_groups_v2` tables retain the `source_trade_id` primary-key index for
+deduplication and projection joins and `idx_activity_groups_v2_wallet_time` for
+collection and ordered wallet reads; the unused condition index was removed from
+schema creation. A 761-second sample from `/proc/<pid>/io` and staging receipts
+while collection ran undisturbed on Forge measured 1,535 committed rows/s,
+25,188 physical write bytes per roughly 1.1 KB logical row, 2,506 physical read
+bytes/row and 38.7 MB/s writes, with a 222.6 GB candidate on a host with 15.9 GB
+of memory. The model assumes one randomly placed index leaf per row: a WAL frame
+carries a whole 4,096-byte page plus a 24-byte frame header and checkpoint writes
+the page back, or about 8,216 bytes/row for the removed condition index, about a
+third of the measured total. This saving is an estimate, not a measurement,
+pending a before-and-after comparison of physical write bytes per committed row
+on the same collection. The retained primary-key index still incurs its own write cost.
+
+Existing condition indexes remain accepted and are never dropped automatically;
+finalized cache bytes must remain unchanged because finalization hashes the physical file.
+Backward reads remain compatible, but do not run an older `cache-migrate-v2`,
+`cache-populate-activity-v2` or `cache-finalize-v2` against a finalized cache created
+without the condition index: these commands recreate the index, rewrite the file
+and invalidate the physical hash bound into its stage record and any prepared
+publication. Keep the artifact unchanged and finish its bound publication with
+the index-free binary. If an older writer is required, resolve any pending
+publication through the recovery procedure below, then use a separate private
+candidate and regenerate its stage record and publication request before activation.
+
 ```bash
 pe-bootstrap cache-migrate-v2 \
   --db "$CACHE_V2_SIDE" --manifest "$CACHE_BUILD_MANIFEST"
