@@ -647,11 +647,14 @@ before any rename. It validates the candidate `C` against the prepared request, 
 there is no copy fallback. `D` holds the exact old bytes. A crash in the gap leaves `F` absent and
 `D + C` present. The next activation or pending-publication resume validates `D` against `H0` and
 `C` against the prepared candidate hash before completing `C → F`. Unknown combinations refuse
-without moving or deleting files. Payout and every generic writable CLI command, including named,
+without moving or deleting files. Payout and every ordinary writable CLI invocation, including named,
 no-argument and positional-config `all`, refuse an absent database instead of opening it with SQLite
-CREATE; the wrapper's preceding probes use read-only opens. `cache-stage-v2` still provisions verified
-candidate copies. Legacy activation/restoration retain their explicit backup-copy behavior; none of
-these paths initializes an empty installed cache.
+CREATE. First installation explicitly opts in with `pe-bootstrap --create-cache` (also accepted by
+named `all` and with a positional TOML config path). The flag creates and initializes an absent cache,
+opens an existing regular cache file normally, and refuses other existing path types, including
+symlinks. The supervised wrapper never passes it, and its preceding probes use read-only opens.
+`cache-stage-v2` still provisions verified candidate copies. Legacy activation/restoration retain
+their explicit backup-copy behavior; those paths never initialize an empty installed cache.
 Legacy cycles with an existing prior and no new staging evidence retain their existing activation
 and restoration behavior, including the live cutover cycle. Never convert their evidence or request.
 

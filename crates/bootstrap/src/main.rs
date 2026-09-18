@@ -92,6 +92,7 @@ async fn main() {
         // `--dump-ledgers /path` for a config file path.
         let rest: Vec<&str> = args[2..].iter().map(|s| s.as_str()).collect();
         let mut strict = false;
+        let mut create_cache = false;
         let mut dry_run = false;
         let mut dump_ledgers_path: Option<std::path::PathBuf> = None;
         let mut stage: Option<&str> = None;
@@ -132,6 +133,8 @@ async fn main() {
             let a = rest[i];
             if a == "--strict" {
                 strict = true;
+            } else if a == "--create-cache" {
+                create_cache = true;
             } else if a == "--reset-clob-cursor" {
                 reset_clob_cursor = true;
             } else if a == "--dry-run" {
@@ -316,6 +319,11 @@ async fn main() {
                 stage = Some(v);
             }
             i += 1;
+        }
+
+        if create_cache && sub != "all" {
+            tracing::error!("bootstrap: --create-cache is only supported by all");
+            std::process::exit(1);
         }
 
         // TOML path: last non-flag positional not consumed as a flag value.
@@ -695,9 +703,9 @@ async fn main() {
         // Genuine readers return above through `open_read_only`.
         let _cache_mutation_lock = acquire_cache_lock_or_exit(&bootstrap_config.cache_path, sub);
 
-        // These commands operate on an installed cache. Only explicit staging
-        // provisions candidate copies; a rename gap must remain vacant.
-        let mut cache = match WalletCache::open_existing_configured(&bootstrap_config) {
+        // Ordinary commands require an installed cache so a rename gap remains
+        // vacant. Only `all --create-cache` opts into first-install provisioning.
+        let mut cache = match open_cli_cache(&bootstrap_config, create_cache) {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, "bootstrap: cache open failed");
@@ -1205,7 +1213,12 @@ async fn main() {
     }
 
     // ── No-arg / positional TOML path → default "all" ───────────────────────
-    let config_path = first_arg.map(std::path::PathBuf::from);
+    // Like named `all`, only the exact bare flag permits cache creation.
+    let create_cache = args[1..].iter().any(|arg| arg == "--create-cache");
+    let config_path = args[1..]
+        .iter()
+        .find(|arg| arg.as_str() != "--create-cache")
+        .map(std::path::PathBuf::from);
     let bootstrap_config = match config::load(config_path.as_deref()) {
         Ok(c) => c,
         Err(e) => {
@@ -1217,7 +1230,7 @@ async fn main() {
     // No-arg → run "all" with strict=false (soft-fail default). It follows the
     // same central lock-before-open contract as the named `all` command (#544).
     let _cache_mutation_lock = acquire_cache_lock_or_exit(&bootstrap_config.cache_path, "all");
-    let mut cache = match WalletCache::open_existing_configured(&bootstrap_config) {
+    let mut cache = match open_cli_cache(&bootstrap_config, create_cache) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "bootstrap: cache open failed");
@@ -1226,6 +1239,32 @@ async fn main() {
     };
     let exit = handle_all(&bootstrap_config, &mut cache, false).await;
     std::process::exit(exit);
+}
+
+/// Called with the cache mutation lock held. Provisioning is a CLI-only opt-in;
+/// existing regular files retain the existing-only opener and schema behavior.
+fn open_cli_cache(
+    config: &BootstrapConfig,
+    create_cache: bool,
+) -> Result<WalletCache, BootstrapError> {
+    if create_cache {
+        match std::fs::symlink_metadata(&config.cache_path) {
+            Ok(metadata) if metadata.is_file() => {}
+            Ok(_) => {
+                return Err(BootstrapError::Invalid {
+                    message: format!(
+                        "--create-cache requires an absent path or a regular file: {}",
+                        config.cache_path.display()
+                    ),
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return WalletCache::open_configured(config);
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    WalletCache::open_existing_configured(config)
 }
 
 fn acquire_cache_lock_or_exit(

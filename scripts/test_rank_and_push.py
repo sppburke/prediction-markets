@@ -1241,6 +1241,18 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertIsNotNone(self._log("push.log"), "purge-free path did not publish")
         print("PASS: production publication performs no purge, reclamation, index rebuild, or checkpoint")
 
+    def test_wrapper_never_opts_into_first_install_cache_creation(self):
+        r = self._run()
+        self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
+        bootstrap_log = self._log("pe_bootstrap.log")
+        self.assertIsNotNone(bootstrap_log)
+        self.assertNotIn("--create-cache", bootstrap_log)
+        # As with the physical-maintenance guard above, inspect all branches,
+        # including the supervisor's resume paths, beyond the executed cycle.
+        for script in (WRAPPER, WRAPPER.with_name("rank_and_push_loop.sh")):
+            self.assertNotIn("--create-cache", script.read_text(), str(script))
+        print("PASS: wrapper and supervisor never opt into first-install cache creation")
+
     def test_skip_purge_remains_a_backward_compatible_noop(self):
         r = self._run("--skip-purge")
         self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")

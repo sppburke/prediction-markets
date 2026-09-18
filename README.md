@@ -22,8 +22,8 @@ cargo install cargo-nextest cargo-deny cargo-audit
 cp .env.example .env
 # Fill in the env-driven inputs; ordinary live credentials use the sealed #508 custody path, not .env
 
-# 3. Run bootstrap (builds the wallet cache and trade history, ~2-4 hours first run)
-cargo run --release --bin pe-bootstrap
+# 3. Provision the cache and run bootstrap (~2-4 hours first run)
+cargo run --release --bin pe-bootstrap -- --create-cache
 
 # 4a. Run backtest (requires completed bootstrap)
 cargo run --release --bin pe-backtest
@@ -31,6 +31,11 @@ cargo run --release --bin pe-backtest
 # 4b. Or run the acceptance gate
 cargo nextest run --workspace --all-features
 ```
+
+`--create-cache` explicitly permits first-install cache creation; omit it on subsequent runs.
+It also works with `all` or a positional TOML config path. An existing regular cache file
+opens normally; other existing path types are refused. Without the flag, bootstrap requires
+an existing cache. The supervised ranking wrapper never passes this flag.
 
 See [`docs/22-ONBOARDING.md`](docs/22-ONBOARDING.md) for the full environment-variable catalogue, startup sequence, and first-run recipes (backtest-only, paper trading, live-tiny).
 
