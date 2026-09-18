@@ -149,7 +149,10 @@ def _wallet_last_trade(con: sqlite3.Connection, wallets_lower: list[str]) -> dic
 
 def _cache_schema(con: sqlite3.Connection) -> int:
     row = con.execute("PRAGMA user_version").fetchone()
-    return 0 if row is None else int(row[0])
+    schema = 0 if row is None else int(row[0])
+    if schema == -2:
+        raise CacheStaleError("unfinished bulk root (schema -2); resume cache-populate-activity-v2 --bulk-root before any other command")
+    return schema
 
 
 def filter_active_rows(rows, db_path, active_window_hours, max_staleness_hours, now):

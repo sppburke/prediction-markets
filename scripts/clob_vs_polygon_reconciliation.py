@@ -282,7 +282,11 @@ def reconcile(conn: sqlite3.Connection, clob_markets: dict[str, int | None]) -> 
 
 
 def _open_ro(db_path: str) -> sqlite3.Connection:
-    return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    if int(conn.execute("PRAGMA user_version").fetchone()[0]) == -2:
+        conn.close()
+        raise ValueError("unfinished bulk root (schema -2); resume cache-populate-activity-v2 --bulk-root before any other command")
+    return conn
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -875,6 +875,189 @@ forward. Forge's boot card is failing (#637); the caches, repository and evaluat
 live on the SSDs, but confirm the host before any cutover and keep the prior until the
 publication is confirmed.
 
+### Fresh bulk root with deferred global uniqueness (#588)
+
+The supervised `rank_and_push.sh` pipeline starts and resumes a qualifying bulk root itself,
+using `cache-populate-activity-v2 --fresh-generation 1 --bulk-root --fixed-db … --prior …`.
+Admission is only for a newly staged and migrated private candidate. The fixed cache, immutable prior and
+candidate must be distinct paths and inodes. The candidate must have no activity rows, receipts,
+completed activity manifest, frozen-reference verification or finalized projection. Admission freezes
+an ordinary version-2 root identity, with no predecessor and the full wallet union, and atomically
+removes the empty named identity index and sets `PRAGMA user_version=-2`. This negative version is
+reserved for the unfinished private layout; it is not an activity/parser/identity version or a
+configuration key. Existing collections are never converted. Historical version-1 identities,
+frozen-reference collections, ordinary collections without the flag, and every successor retain
+immediate indexed uniqueness and their existing acquisition semantics.
+
+New ordinary schemas use `idx_activity_groups_v2_source_trade_id`, a full single-column `BINARY`
+unique index, in place of the automatic primary-key index. Historical primary-key schemas remain
+supported unchanged. Bulk admission changes neither column types, `NOT NULL`/`CHECK` constraints,
+rowids, nor the wallet/time/ID index. Only the two identity collision probes are skipped in the
+admitted bulk state. Before a wallet writes any row, its bounded aggregate batch must contain unique
+IDs. Transaction/data-version checks, strict inserts, wallet-index reads, ordering, atomic receipts
+and exclusions still run.
+
+After the serial writer drains, `collect_activity_v2` builds the named unique index with **plain
+`CREATE UNIQUE INDEX`**, verifies its definition through `index_list`/`index_xinfo`, validates all
+activity content and receipts, records the completed manifest and archived identity, and restores
+`user_version=2` in one transaction. A successful checkpoint/truncate follows. The build therefore
+precedes successor admission and the successor's settled-end clock; no top-up freshness budget is
+spent building the root index. It does not prove that later top-up, payout, ranking and preparation
+fit the unchanged freshness limit.
+
+Global duplicates, an existing index of the same name (even one with the right definition), index
+I/O/build failure, content mismatch or manifest failure stop permanently with exit 1, retain committed
+wallet rows/receipts and leave the generation incomplete behind the fence. No deduplication or
+`IF NOT EXISTS` substitutes for the build. A stop before or during the build rolls back the sealing
+transaction; rerun the **same bulk-root command** to validate/skip retained receipts and retry sealing.
+Do not run migration again, manually set the schema version, delete WAL/SHM, transplant receipts,
+or start a successor. A duplicate failure requires investigation; an unchanged retry fails again.
+Once sealed, repeating the command reads the completed root idempotently. In binaries containing
+the #588 fence and archive fix, `WalletCache` writable/read-only opens, purge archive attachments,
+and guarded migration opens refuse unfinished roots with the recovery instruction. These cover
+coverage, migrate, payout, finalize, activation, staging and ordinary/successor collection; only the
+bulk collector opens the unfinished layout for mutation. The updated Python cache-opening boundaries
+(ranking/export/publication, cycle snapshots, partial-wallet checks, token mapping and the research
+diagnostics) also refuse it. The cycle target helper's explicit `--include-bulk-root` mode and the
+wrapper's pre-staging version probe are read-only routing exceptions, not readiness certification.
+Raw SQLite inspection remains an operator exception, never an alternate mutation owner.
+
+**Required compatibility prerequisite.** Exclude all older binaries and script checkouts from these
+cache paths before admission and throughout collection/sealing. In particular, the previous binary
+at `d4ac7ef` rejects the reserved version through its normal writable `WalletCache` opener, but its
+read-only coverage opener ignores it: missing legacy tables can produce zero gaps and report
+`CLEAN`. Its existing-candidate `cache-stage-v2` path can succeed with `side_schema=-2`. The reserved
+value cannot retroactively protect those entry points. While paused, verify the deployed binary's
+reviewed build/hash and the scripts' revision, pin the supervisor and operator commands to them,
+stop older processes, and disable old cron/unit/manual launch paths. Do not start or restore the
+loop until this exclusion is established; do not roll back tooling while a bulk artifact exists.
+
+**Final-build disk admission.** For the supplied estimate of 627 million physical aggregate rows,
+budget approximately **50–60 GB finished index + 50–60 GB WAL + 100 GB sort scratch = 200–220 GB
+additional free space before margin**, beyond the collected candidate, immutable prior, retained
+old cycle, exports and other pipeline files. These are decimal GB estimates from the independent
+layout/I/O analysis, not measurements on Forge. Reusable database pages may reduce index allocation;
+do not count them without measuring. Check database and scratch filesystems separately if different.
+Keep additional operational margin for filesystem overhead, receipts and concurrent disk use.
+The collector sets connection-local `temp_store=FILE` for the bulk path; select a sufficiently large
+SSD directory with `SQLITE_TMPDIR` before process start. Do not use a RAM-backed `/tmp` for this sort.
+Every bulk-root invocation, including a resume, first forces a small SQLite temporary-table spill on
+a disposable connection before fetching any wallet. Failure is permanent and names SQLite's error,
+the documented temporary-directory order and the sort-scratch requirement. Passing this probe proves
+temporary-file creation and writes at admission; it does not reserve or prove the full disk budget.
+SQLite documents the temporary-file directory selection and index metadata in
+[temporary files](https://www.sqlite.org/tempfiles.html) and
+[index_xinfo](https://www.sqlite.org/pragma.html#pragma_index_xinfo).
+No automatic disk estimator, conversion driver or resource-tuning framework is introduced.
+Capture available bytes, `dbstat` table/index sizes, free pages, WAL peak and build/checkpoint elapsed
+time on Forge; the implementation tests do not establish throughput, duration or production capacity.
+
+**Supervised sequence for a fresh Forge cycle.** Use the existing loop for the initial schema-one
+cutover; installed schema-two caches use ordinary successors. Pause with `forge_pause.sh pause`,
+check `forge_pause.sh status`, establish the compatibility prerequisite above, deploy the validated
+binary and scripts, retain the old candidate/prior/manifests, and keep the persisted `.env` cutover
+setting at `prepare`. If replacing an interrupted cycle, first verify that its recorded acquisition
+configuration and activation audit are available, that no prepared request exists, and that its prior
+still binds the installed cache. Archive only the old cycle pointer as shown in the fallback below
+if a new cycle is required; an existing ordinary root is never converted. Configure SSD scratch and
+verify the final-build headroom above in the supervisor's environment before restoring it with
+`forge_pause.sh restore`. That restores the saved loop state; verify that it was previously running
+and is running again.
+
+The zero-argument wrapper stages/migrates, discovers and activates, then asks
+`candidate-targets --include-bulk-root` for the initial generation and durable eligibility. A new
+root requires schema two, generation one, no existing collection identity, activity rows or receipts,
+the exact named unique index with no primary-key layout, and the unfinalized private state with no
+completed activity manifest, frozen verification or projection. A reserved-state root resumes only
+with its version-two generation-one identity, no predecessor, and that same private state; retained
+wallet rows/receipts are allowed. Rust still owns admission and fails closed. Ordinary interrupted
+roots, completed roots and successors use ordinary collection. After a transient exit 75 the existing
+supervisor re-enters the same cycle, skips staging/migration/discovery/activation for a fenced
+candidate, and resumes bulk collection from its receipts. After sealing, the one allowed top-up
+never receives `--bulk-root`. Payout, finalization and preparation keep their existing gates.
+Exit 2 with `RANK_AND_PUSH_PREPARED_ONLY=…` stops the loop before activation; permanent failures also
+stop it for investigation. Keep `prepare` until operator acceptance of the exact pending request.
+
+**Forge temporary storage (host observation, 2026-09-18).** `SQLITE_TMPDIR` must point to large
+SSD-backed writable storage, such as `/mnt/storage/tmp` or a scratch directory on `/mnt/t7`.
+The default `/var/tmp` is read-only with the root filesystem, and writable `/tmp` is too small.
+The supervisor unit `pe-rank-loop.service` sets no `Environment`, so neither `SQLITE_TMPDIR` nor
+`TMPDIR` is set for its collector. Export `SQLITE_TMPDIR` for every manual invocation/resume as below;
+supervised launches must receive it explicitly in their environment too (a shell export does not
+configure the unit).
+
+**Manual fallback.** Use the following sequence only when supervised collection is unavailable.
+The supervisor stays paused, so every transient exit requires manually rerunning the same bulk
+command with the same paths and scratch environment; it will not resume by itself. This uses a
+new private cycle and the existing preparation entry point. Run each phase only after the preceding
+command succeeds, and pass the reviewed bootstrap TOML too if the old cycle used one. The same
+compatibility prerequisite and disk checks apply.
+
+```bash
+set -euo pipefail
+cd "$HOME/prediction-markets"
+bash scripts/deploy/forge_pause.sh pause
+bash scripts/deploy/forge_pause.sh status
+set -a
+source .env
+set +a
+test "$PE_RANK_SCHEMA_TWO_CUTOVER" = prepare
+test ! -e data/eval-results/rank_and_push.pending
+test ! -L data/eval-results/rank_and_push.pending
+# Archive only the old logical-cycle pointer; retain every old cycle artifact.
+if test -f data/eval-results/rank_and_push.cycle; then
+  TASK_OLD_RUN="$(cat data/eval-results/rank_and_push.cycle)"
+  test ! -e "$TASK_OLD_RUN/ranking_publish_request.json"
+  test ! -e "$TASK_OLD_RUN/bulk-restart.cycle"
+  mv data/eval-results/rank_and_push.cycle "$TASK_OLD_RUN/bulk-restart.cycle"
+fi
+TASK_BOOTSTRAP="${PE_BOOTSTRAP_BIN:-target/release/pe-bootstrap}"
+TASK_FIXED="$(readlink -f data/wallet_cache.db)"
+TASK_CYCLE="cron-$(date -u +%Y%m%dT%H%M%SZ)"
+TASK_RUN="data/eval-results/$TASK_CYCLE"
+mkdir "$TASK_RUN"
+TASK_PRIOR="$(dirname "$TASK_FIXED")/wallet_cache.$TASK_CYCLE.prior.db"
+TASK_SIDE="$(dirname "$TASK_FIXED")/wallet_cache.$TASK_CYCLE.side.db"
+TASK_SCRATCH="/mnt/storage/tmp" # Alternatively, a large SSD-backed directory on /mnt/t7.
+mkdir -p "$TASK_SCRATCH"
+export SQLITE_TMPDIR="$TASK_SCRATCH"
+findmnt -T "$TASK_SCRATCH"
+df -B1 "$(dirname "$TASK_FIXED")" "$TASK_SCRATCH"
+# Verify the headroom above, including collection growth, before proceeding.
+"$TASK_BOOTSTRAP" cache-stage-v2 --db "$TASK_FIXED" --prior "$TASK_PRIOR" \
+  --side "$TASK_SIDE" --manifest "$TASK_RUN/cache_build_manifest.json" \
+  > "$TASK_RUN/cache_stage.json"
+"$TASK_BOOTSTRAP" cache-migrate-v2 --db "$TASK_SIDE" \
+  --manifest "$TASK_RUN/cache_build_manifest.json"
+"$TASK_BOOTSTRAP" winner-discovery --db "$TASK_SIDE" --defer-activation
+"$TASK_BOOTSTRAP" activate-next --db "$TASK_SIDE" --batch-id "$TASK_CYCLE" \
+  --audit-csv "$TASK_RUN/activated_wallets.csv"
+# Check the approved cohort against its acquisition/activation evidence here.
+# Keep these exact paths for retries; only this command accepts schema -2.
+"$TASK_BOOTSTRAP" cache-populate-activity-v2 --db "$TASK_SIDE" \
+  --fresh-generation 1 --bulk-root --fixed-db "$TASK_FIXED" --prior "$TASK_PRIOR"
+```
+
+The last command performs collection **and** mandatory sealing. After successful sealing, continue
+with the ordinary linked top-up, payout and finalization; never pass `--bulk-root` for generation 2:
+
+```bash
+"$TASK_BOOTSTRAP" cache-populate-activity-v2 --db "$TASK_SIDE" --fresh-generation 2
+"$TASK_BOOTSTRAP" cache-populate-payout-v2 --db "$TASK_SIDE"
+"$TASK_BOOTSTRAP" cache-finalize-v2 --db "$TASK_SIDE" \
+  --stage-record "$TASK_RUN/cache_stage_record.json"
+bash scripts/rank_and_push.sh --db "$TASK_SIDE" --out-dir "$TASK_RUN" \
+  --skip-discovery --skip-backfill --cache-stage-record "$TASK_RUN/cache_stage_record.json" \
+  --fixed-db "$TASK_FIXED" --prior-cache-backup "$TASK_PRIOR"
+```
+
+Require `RANK_AND_PUSH_PREPARED_ONLY=…`, exit 2, the retained exact pending request and unchanged
+fixed bytes as the preparation result. Keep the supervisor paused if freshness or any other check
+fails. After operator acceptance, follow the existing exact pending-publication activation and
+`forge_pause.sh restore` procedure above. Do not restore the archived old cycle pointer over a new
+prepared request. Bulk routing adds no automatic conversion or deployment and preserves the
+existing prepare-only activation/publication boundary.
+
 ### Incremental top-up measurement and paused-cycle handoff (#648)
 
 The implementation fixtures prove acquisition/certification equivalence, crash atomicity and consumer

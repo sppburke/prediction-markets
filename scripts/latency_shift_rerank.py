@@ -220,6 +220,9 @@ def map_pair_tokens(db: str, pairs: list[tuple[str, str]]) -> dict[tuple[str, st
     outcome_index; NULL rows skipped, never mispriced). Unmapped pairs are simply
     absent — their positions are not repriceable (honest)."""
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    if int(con.execute("PRAGMA user_version").fetchone()[0]) == -2:
+        con.close()
+        raise ValueError("unfinished bulk root (schema -2); resume cache-populate-activity-v2 --bulk-root before any other command")
     con.execute("PRAGMA busy_timeout=30000;")
     out: dict[tuple[str, str], str] = {}
     markets = sorted({m for m, _ in pairs})
@@ -290,6 +293,8 @@ def main() -> int:
     probe = sqlite3.connect(f"file:{a.db}?mode=ro", uri=True)
     try:
         schema_version = int(probe.execute("PRAGMA user_version").fetchone()[0])
+        if schema_version == -2:
+            raise ValueError("unfinished bulk root (schema -2); resume cache-populate-activity-v2 --bulk-root before any other command")
     finally:
         probe.close()
     if (schema_version >= 2 and not a.emit_targets

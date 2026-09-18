@@ -113,6 +113,9 @@ def load_resolutions(db_path):
     (matches scripts/pnl_decomposition.py, which skips `win is None`).
     """
     con = sqlite3.connect(db_path)
+    if int(con.execute("PRAGMA user_version").fetchone()[0]) == -2:
+        con.close()
+        raise ValueError("unfinished bulk root (schema -2); resume cache-populate-activity-v2 --bulk-root before any other command")
     try:
         rows = con.execute(
             "SELECT market_id, winning_outcome_id, resolved_at_unix "

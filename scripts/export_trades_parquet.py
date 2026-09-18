@@ -272,6 +272,11 @@ def main() -> int:
     p.add_argument("--row-group-size", type=int, default=1_000_000)
     a = p.parse_args()
 
+    with sqlite3.connect(f"file:{os.path.abspath(a.db)}?mode=ro", uri=True) as sqlite:
+        schema = int(sqlite.execute("PRAGMA user_version").fetchone()[0])
+        if schema == -2:
+            raise ValueError("unfinished bulk root (schema -2); resume cache-populate-activity-v2 --bulk-root before any other command")
+
     import duckdb
 
     os.makedirs(a.out_dir, exist_ok=True)
@@ -280,9 +285,6 @@ def main() -> int:
     con.execute("LOAD sqlite_scanner;")
     db_abs = _q(os.path.abspath(a.db))
     con.execute(f"ATTACH '{db_abs}' AS src (TYPE sqlite, READ_ONLY);")
-
-    with sqlite3.connect(f"file:{os.path.abspath(a.db)}?mode=ro", uri=True) as sqlite:
-        schema = int(sqlite.execute("PRAGMA user_version").fetchone()[0])
 
     t0 = time.time()
     if schema >= 2:

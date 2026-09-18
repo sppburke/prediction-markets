@@ -40,6 +40,9 @@ def main():
     TTR=int(a.ttr_hours*3600); SLIP=a.slip
     wallets=[l.strip().lower() for l in open(a.universe) if l.startswith("0x")]
     c=sqlite3.connect(f"file:{a.db}?mode=ro",uri=True)
+    if int(c.execute("PRAGMA user_version").fetchone()[0]) == -2:
+        c.close()
+        raise ValueError("unfinished bulk root (schema -2); resume cache-populate-activity-v2 --bulk-root before any other command")
     log("loading resolutions + schedules ...")
     res={m:(w,r) for m,w,r in c.execute("SELECT market_id,winning_outcome_id,resolved_at_unix FROM market_resolutions WHERE winning_outcome_id IS NOT NULL")}
     sch={m:e for m,e in c.execute("SELECT market_id,end_date_unix FROM market_schedules WHERE end_date_unix IS NOT NULL")}

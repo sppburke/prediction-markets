@@ -881,6 +881,16 @@ exposure has a causal Resolution Final by the seal. Open positions and missing o
 resolutions are not samples. Backtest-versus-paper distribution comparisons, resampling, interim
 looks, extensions, and second windows are not promotion inputs.
 
+### Transient bulk-root storage state (#588)
+
+An unfinished private generation-one activity root with deferred global uniqueness uses reserved
+`PRAGMA user_version=-2`. The collector retains committed wallet rows and receipts behind this
+fence, then builds and verifies the unique identity index and records completion atomically with
+restoring schema two. This is a storage state, not an activity/parser/identity version or config
+key. Fence enforcement requires compatible tooling; see the
+[bulk-root runbook](26-DATA-REFRESH-AND-REOPTIMIZATION-RUNBOOK.md#fresh-bulk-root-with-deferred-global-uniqueness-588)
+for admission, supervised resume, older-binary exclusion and manual recovery.
+
 ### Bootstrap defaults (`pe-bootstrap`)
 
 | Key | Default | Meaning |

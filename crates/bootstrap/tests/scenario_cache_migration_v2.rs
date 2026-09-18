@@ -3165,9 +3165,9 @@ fn assert_activity_indexes(path: &std::path::Path, legacy_condition_index: bool)
             "c".to_owned(),
         ),
         (
-            "sqlite_autoindex_activity_groups_v2_1".to_owned(),
+            "idx_activity_groups_v2_source_trade_id".to_owned(),
             true,
-            "pk".to_owned(),
+            "c".to_owned(),
         ),
     ];
     if legacy_condition_index {
@@ -8761,4 +8761,1129 @@ async fn acquisition_failure_keeps_retained_history_excluded_until_full_recovery
     );
     assert_eq!(full_stage.ranker_projection_count, 3);
     assert_python_consumer_parity(&full, &side);
+}
+
+// Bulk-root scenarios use the real stage/migrate/collect owners. Raw SQLite is
+// used only for fault injection and inspection of deliberately fenced state.
+struct BulkRootFixture {
+    dir: TempDir,
+    fixed: std::path::PathBuf,
+    prior: std::path::PathBuf,
+    side: std::path::PathBuf,
+    build: std::path::PathBuf,
+}
+
+impl BulkRootFixture {
+    fn new() -> Self {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir(dir.path().join("eval-results")).unwrap();
+        let fixed = dir.path().join("fixed.db");
+        let prior = dir.path().join("prior.db");
+        let side = dir.path().join("side.db");
+        let build = dir.path().join("build.json");
+        let mut cache = seed_v1(&fixed, FRESH_END - 10);
+        cache
+            .upsert_wallets_bulk(&[(WALLET_B.to_owned(), SRC_TRADES, false, None, None, None, 0)])
+            .unwrap();
+        cache.conn_for_test_set_active(WALLET_B, 1);
+        drop(cache);
+        pe_bootstrap::cache_migration::stage_cache_cycle_v2(&fixed, &prior, &side, Some(&build))
+            .unwrap();
+        migrate_cache_v2(&side, &build).unwrap();
+        Self {
+            dir,
+            fixed,
+            prior,
+            side,
+            build,
+        }
+    }
+
+    async fn collect(
+        &self,
+        source: &dyn pe_source_polymarket_public::ReconciliationFetcher,
+    ) -> Result<
+        pe_bootstrap::cache_migration::ActivityCoverageManifestV2,
+        pe_bootstrap::error::BootstrapError,
+    > {
+        pe_bootstrap::cache_migration::populate_activity_bulk_root_v2_with_clock(
+            &self.side,
+            &self.fixed,
+            &self.prior,
+            source,
+            "https://data.example",
+            || Ok(FRESH_END),
+            FRESH_END + 1,
+        )
+        .await
+    }
+
+    async fn admit(&self) {
+        self.collect(&FixtureFetcher::new(HashMap::new()))
+            .await
+            .unwrap_err();
+        assert_bulk_incomplete(&self.side, 0, 0);
+    }
+
+    fn cli(&self) -> std::process::Output {
+        Command::new(env!("CARGO_BIN_EXE_pe-bootstrap"))
+            .env_clear()
+            .env(
+                "PE_BOOTSTRAP_OUTPUT",
+                self.dir.path().join("watchlist.json"),
+            )
+            .env("RUST_LOG", "error")
+            .current_dir(self.dir.path())
+            .args(["cache-populate-activity-v2", "--db"])
+            .arg(&self.side)
+            .args(["--fresh-generation", "1", "--bulk-root", "--fixed-db"])
+            .arg(&self.fixed)
+            .arg("--prior")
+            .arg(&self.prior)
+            .output()
+            .unwrap()
+    }
+}
+
+fn bulk_source() -> DatasetFetcher {
+    DatasetFetcher {
+        rows: vec![
+            dataset_row(WALLET, "0xmarket", "a", "BUY", FRESH_END - 1),
+            dataset_row(WALLET_B, "0xmarket", "b", "BUY", FRESH_END),
+        ],
+        ..Default::default()
+    }
+}
+
+fn assert_bulk_incomplete(side: &std::path::Path, rows: i64, receipts: i64) {
+    assert_eq!(count(side, "PRAGMA user_version"), -2);
+    assert_eq!(count(side, "SELECT COUNT(*) FROM activity_groups_v2"), rows);
+    assert_eq!(
+        count(
+            side,
+            "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2"
+        ),
+        receipts
+    );
+    assert_eq!(
+        count(side, "SELECT COUNT(*) FROM activity_coverage_manifests_v2"),
+        0
+    );
+    assert_eq!(
+        count(
+            side,
+            "SELECT COUNT(*) FROM pragma_index_list('activity_groups_v2') WHERE name = 'idx_activity_groups_v2_source_trade_id'"
+        ),
+        0
+    );
+}
+
+// SQLite caches its environment at initialization. Give each case a fresh
+// process instead of mutating the multithreaded test runner's environment.
+#[cfg(target_os = "linux")]
+fn run_sqlite_temp_child(test: &str, fixture: &BulkRootFixture, writable: bool) {
+    use std::os::fd::AsRawFd as _;
+
+    let scratch = fixture.dir.path().join("sqlite-scratch");
+    std::fs::create_dir(&scratch).unwrap();
+    let held_directory = std::fs::File::open(&scratch).unwrap();
+    let sqlite_tmpdir = if writable {
+        scratch
+    } else {
+        // A chmod/read-only directory is skipped by SQLite's access check and
+        // can silently fall back to /tmp. This deleted directory still passes
+        // stat/access through the held fd, but creating a file fails with ENOENT,
+        // even as root. The parent keeps the fd alive while the child runs.
+        std::fs::remove_dir(&scratch).unwrap();
+        std::path::PathBuf::from(format!(
+            "/proc/{}/fd/{}",
+            std::process::id(),
+            held_directory.as_raw_fd()
+        ))
+    };
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([test, "--exact", "--test-threads", "2", "--nocapture"])
+        .env("PE_SQLITE_TEMP_ADMISSION_FIXTURE", fixture.dir.path())
+        .env("SQLITE_TMPDIR", &sqlite_tmpdir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{test}:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    drop(held_directory);
+}
+
+#[cfg(target_os = "linux")]
+async fn collect_bulk_root_in_child(
+    root: &std::path::Path,
+    source: &DatasetFetcher,
+) -> Result<
+    pe_bootstrap::cache_migration::ActivityCoverageManifestV2,
+    pe_bootstrap::error::BootstrapError,
+> {
+    pe_bootstrap::cache_migration::populate_activity_bulk_root_v2_with_clock(
+        &root.join("side.db"),
+        &root.join("fixed.db"),
+        &root.join("prior.db"),
+        source,
+        "https://data.example",
+        || Ok(FRESH_END),
+        FRESH_END + 1,
+    )
+    .await
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn bulk_root_sqlite_temp_failure_precedes_wallet_reads_on_start_and_resume() {
+    if let Some(root) = std::env::var_os("PE_SQLITE_TEMP_ADMISSION_FIXTURE") {
+        let root = std::path::PathBuf::from(root);
+        let side = root.join("side.db");
+        let before = [
+            "SELECT * FROM cache_v2_migration_state",
+            "SELECT * FROM activity_groups_v2 ORDER BY rowid",
+            "SELECT * FROM activity_wallet_coverage_staging_v2 ORDER BY wallet_hex",
+            "SELECT * FROM activity_coverage_manifests_v2",
+            "SELECT * FROM sqlite_schema ORDER BY name",
+            "PRAGMA user_version",
+        ]
+        .map(|sql| (sql, query_values(&side, sql)));
+        let source = bulk_source();
+        let error = collect_bulk_root_in_child(&root, &source)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            pe_bootstrap::error::BootstrapError::Invalid { .. }
+        ));
+        assert_eq!(error.exit_code(), 1);
+        assert_eq!(
+            error.to_string(),
+            "invalid: bulk-root admission requires writable SQLite temporary storage; SQLite temporary-file probe failed: unable to open database file. \
+             SQLite's documented Unix directory order is its temporary-directory override, then SQLITE_TMPDIR, TMPDIR, /var/tmp, /usr/tmp, /tmp, and the current directory. \
+             Set SQLITE_TMPDIR to large SSD-backed writable storage before starting or resuming; the sealing index build needs approximately 100 GB of sort scratch."
+        );
+        assert!(source.calls.lock().unwrap().is_empty());
+        for (sql, values) in before {
+            assert_eq!(values, query_values(&side, sql), "{sql}");
+        }
+        return;
+    }
+    for phase in ["fresh", "resume", "sealed"] {
+        let fixture = BulkRootFixture::new();
+        if phase == "resume" {
+            fixture.admit().await;
+        } else if phase == "sealed" {
+            fixture.collect(&bulk_source()).await.unwrap();
+        }
+        run_sqlite_temp_child(
+            "bulk_root_sqlite_temp_failure_precedes_wallet_reads_on_start_and_resume",
+            &fixture,
+            false,
+        );
+        let expected = if phase == "sealed" { 2 } else { 0 };
+        assert_eq!(
+            count(&fixture.side, "SELECT COUNT(*) FROM activity_groups_v2"),
+            expected
+        );
+        assert_eq!(
+            count(
+                &fixture.side,
+                "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2"
+            ),
+            expected
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn bulk_root_sqlite_temp_writable_admission_leaves_no_probe_files() {
+    if let Some(root) = std::env::var_os("PE_SQLITE_TEMP_ADMISSION_FIXTURE") {
+        let root = std::path::PathBuf::from(root);
+        let source = bulk_source();
+        let manifest = collect_bulk_root_in_child(&root, &source).await.unwrap();
+        assert_eq!(manifest.group_count, 2);
+        assert_eq!(source.calls.lock().unwrap().len(), 2);
+        assert_eq!(count(&root.join("side.db"), "PRAGMA user_version"), 2);
+        assert_eq!(
+            count(
+                &root.join("side.db"),
+                "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'bulk_root_temp_probe'"
+            ),
+            0
+        );
+        let scratch = root.join("sqlite-scratch");
+        assert!(std::fs::read_dir(&scratch).unwrap().next().is_none());
+        // SQLite unlinks temporary files while open on Unix: an empty directory
+        // alone cannot establish cleanup. Check for retained descriptors too,
+        // while the child process (and its SQLite initialization) is still alive.
+        for entry in std::fs::read_dir("/proc/self/fd").unwrap() {
+            if let Ok(target) = std::fs::read_link(entry.unwrap().path()) {
+                assert!(
+                    !target.starts_with(&scratch),
+                    "leaked scratch fd: {target:?}"
+                );
+            }
+        }
+        return;
+    }
+    run_sqlite_temp_child(
+        "bulk_root_sqlite_temp_writable_admission_leaves_no_probe_files",
+        &BulkRootFixture::new(),
+        true,
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn non_bulk_admission_ignores_unwritable_sqlite_temp_storage() {
+    if let Some(root) = std::env::var_os("PE_SQLITE_TEMP_ADMISSION_FIXTURE") {
+        let root = std::path::PathBuf::from(root);
+        let side = root.join("side.db");
+        let source = bulk_source();
+        for generation in [1, 2] {
+            source.calls.lock().unwrap().clear();
+            let manifest = populate_activity_fresh_v2(
+                &side,
+                &source,
+                "https://data.example",
+                generation,
+                FRESH_END + i64::try_from(generation).unwrap(),
+                FRESH_END + 3,
+            )
+            .await
+            .unwrap();
+            assert_eq!(manifest.generation, generation);
+            assert_eq!(manifest.group_count, 2);
+            assert_eq!(source.calls.lock().unwrap().len(), 2);
+        }
+        let dir = TempDir::new().unwrap();
+        let frozen = dataset_candidate(&dir, "frozen.db", &[]);
+        let reference = write_frozen_reference(&dir, FRESH_END - 10, vec![WALLET.to_owned()]);
+        let source = YieldingFetcher::default();
+        let manifest = populate_activity_v2(
+            &frozen,
+            &source,
+            "https://data.example",
+            &reference,
+            FRESH_END,
+            1,
+            FRESH_END + 1,
+        )
+        .await
+        .unwrap();
+        assert_eq!(manifest.group_count, 0);
+        assert_eq!(source.calls.lock().unwrap().len(), 1);
+        assert_eq!(
+            count(
+                &frozen,
+                "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2"
+            ),
+            1
+        );
+        return;
+    }
+    run_sqlite_temp_child(
+        "non_bulk_admission_ignores_unwritable_sqlite_temp_storage",
+        &BulkRootFixture::new(),
+        false,
+    );
+}
+
+#[tokio::test]
+async fn bulk_root_matches_ordinary_receipts_manifests_and_ranker_projection() {
+    // Proves storage optimization changes no logical identity, proof, activity,
+    // classification or exported projection commitment for the same acquisition.
+    let fixture = BulkRootFixture::new();
+    let ordinary = fixture.dir.path().join("ordinary.db");
+    std::fs::copy(&fixture.side, &ordinary).unwrap();
+    let source = bulk_source();
+    let no_reads = FixtureFetcher::new(HashMap::new());
+    fixture.admit().await;
+    populate_activity_fresh_v2(
+        &ordinary,
+        &no_reads,
+        "https://data.example",
+        1,
+        FRESH_END,
+        FRESH_END + 1,
+    )
+    .await
+    .unwrap_err();
+    // Feed identical recorded pages (including a fixed receipt clock) through
+    // both real wallet writers. Independent live reads would legitimately have
+    // different received_at timestamps and therefore different receipt hashes.
+    for wallet in [WALLET, WALLET_B] {
+        let mut read = pe_source_polymarket_public::fetch_complete_activity(
+            &source,
+            "https://data.example",
+            WalletAddress::from_hex(wallet).unwrap(),
+            Some(0),
+            FRESH_END,
+        )
+        .await
+        .unwrap();
+        for page in &mut read.pages {
+            page.received_at =
+                ReceivedAt(time::OffsetDateTime::from_unix_timestamp(FRESH_END + 1).unwrap());
+        }
+        let aggregates = read
+            .buckets()
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        for side in [&fixture.side, &ordinary] {
+            pe_bootstrap::cache_migration::commit_activity_batch_for_test(
+                &mut Connection::open(side).unwrap(),
+                wallet.to_owned(),
+                read.pages.clone(),
+                aggregates.clone(),
+            )
+            .unwrap();
+        }
+    }
+    let expected = populate_activity_fresh_v2(
+        &ordinary,
+        &no_reads,
+        "https://data.example",
+        1,
+        FRESH_END,
+        FRESH_END + 1,
+    )
+    .await
+    .unwrap();
+    let actual = fixture.collect(&no_reads).await.unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(fresh_record(&fixture.side), fresh_record(&ordinary));
+    for sql in [
+        "SELECT * FROM activity_wallet_coverage_staging_v2 ORDER BY wallet_hex",
+        "SELECT * FROM activity_coverage_manifests_v2 ORDER BY generation",
+        "SELECT * FROM activity_groups_v2 ORDER BY wallet_hex, source_time_unix, source_trade_id",
+    ] {
+        assert_eq!(
+            query_values(&fixture.side, sql),
+            query_values(&ordinary, sql),
+            "{sql}"
+        );
+    }
+    for side in [&fixture.side, &ordinary] {
+        dataset_payouts(side, &source.rows).await;
+    }
+    let actual = finalize_cache_v2(
+        &fixture.side,
+        &fixture.dir.path().join("bulk-stage.json"),
+        FRESH_END + 2,
+    )
+    .unwrap();
+    let expected = finalize_cache_v2(
+        &ordinary,
+        &fixture.dir.path().join("ordinary-stage.json"),
+        FRESH_END + 2,
+    )
+    .unwrap();
+    assert_eq!(
+        actual.ranker_projection_count,
+        expected.ranker_projection_count
+    );
+    assert!(actual.ranker_projection_count > 0);
+    assert_eq!(
+        actual.ranker_projection_digest,
+        expected.ranker_projection_digest
+    );
+    assert_eq!(
+        classifier_projection_rows(&fixture.side),
+        classifier_projection_rows(&ordinary)
+    );
+    assert_eq!(
+        projected_entries(&fixture.side),
+        projected_entries(&ordinary)
+    );
+}
+
+#[tokio::test]
+async fn bulk_root_builds_verified_unique_index_before_manifest_and_restores_version() {
+    // Proves the index's full definition is visible inside the manifest insert,
+    // while the public schema version is restored only with the completed seal.
+    let fixture = BulkRootFixture::new();
+    fixture.admit().await;
+    Connection::open(&fixture.side).unwrap().execute_batch(
+        "CREATE TABLE seal_observation (version INTEGER, valid INTEGER);
+         CREATE TRIGGER observe_seal BEFORE INSERT ON activity_coverage_manifests_v2 BEGIN
+           INSERT INTO seal_observation SELECT (SELECT user_version FROM pragma_user_version),
+             EXISTS(SELECT 1 FROM pragma_index_list('activity_groups_v2') i
+               WHERE i.name = 'idx_activity_groups_v2_source_trade_id' AND i.\"unique\" = 1 AND i.partial = 0
+                 AND (SELECT COUNT(*) FROM pragma_index_xinfo(i.name) WHERE key = 1) = 1
+                 AND EXISTS(SELECT 1 FROM pragma_index_xinfo(i.name)
+                   WHERE key = 1 AND name = 'source_trade_id' AND cid >= 0 AND coll = 'BINARY' AND desc = 0));
+           SELECT CASE WHEN (SELECT valid FROM seal_observation) != 1 THEN RAISE(ABORT, 'index not certified before manifest') END;
+         END;"
+    ).unwrap();
+    fixture.collect(&bulk_source()).await.unwrap();
+    assert_eq!(
+        count(&fixture.side, "SELECT version FROM seal_observation"),
+        -2
+    );
+    assert_eq!(
+        count(&fixture.side, "SELECT valid FROM seal_observation"),
+        1
+    );
+    assert_eq!(count(&fixture.side, "PRAGMA user_version"), 2);
+    assert_eq!(
+        count(
+            &fixture.side,
+            "SELECT COUNT(*) FROM activity_coverage_manifests_v2"
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &fixture.side,
+            "SELECT COUNT(*) FROM pragma_index_list('activity_groups_v2') WHERE name = 'idx_activity_groups_v2_source_trade_id' AND \"unique\" = 1"
+        ),
+        1
+    );
+    // A repeated operator invocation is idempotent after a successful seal.
+    fixture
+        .collect(&FixtureFetcher::new(HashMap::new()))
+        .await
+        .unwrap();
+    let output = fixture.cli();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn bulk_root_rejects_duplicate_wallet_batch_before_any_insert() {
+    // Proves duplicates are refused at the writer boundary, before even the
+    // first INSERT (rather than merely being rolled back at completion).
+    let fixture = BulkRootFixture::new();
+    fixture.admit().await;
+    let epoch = time::OffsetDateTime::from_unix_timestamp(FRESH_END).unwrap();
+    let aggregate = parse_activity_response(
+        &serde_json::to_vec(&vec![bulk_source().rows.remove(0)]).unwrap(),
+        WalletAddress::from_hex(WALLET).unwrap(),
+        &ActivityParseContext {
+            source_id: SourceId("fixture".to_owned()),
+            observed_at: SourceTimestamp(epoch),
+            received_at: ReceivedAt(epoch),
+            transport: ActivityTransport::Rest,
+        },
+    )
+    .unwrap()
+    .aggregates()
+    .unwrap()
+    .remove(0);
+    let inserts = Arc::new(AtomicUsize::new(0));
+    let observed = Arc::clone(&inserts);
+    let mut connection = Connection::open(&fixture.side).unwrap();
+    connection.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+        if matches!(
+            context.action,
+            rusqlite::hooks::AuthAction::Insert {
+                table_name: "activity_groups_v2"
+            }
+        ) {
+            observed.fetch_add(1, Ordering::SeqCst);
+        }
+        rusqlite::hooks::Authorization::Allow
+    }));
+    let error = pe_bootstrap::cache_migration::commit_activity_batch_for_test(
+        &mut connection,
+        WALLET.to_owned(),
+        Vec::new(),
+        vec![aggregate.clone(), aggregate],
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("duplicate source_trade_id in bulk-root wallet batch"),
+        "{error}"
+    );
+    assert_eq!(error.exit_code(), 1);
+    assert_eq!(inserts.load(Ordering::SeqCst), 0);
+    drop(connection);
+    assert_bulk_incomplete(&fixture.side, 0, 0);
+}
+
+#[tokio::test]
+async fn bulk_root_cross_wallet_duplicate_is_permanent_and_preserves_receipts() {
+    // Simulate a collector/storage identity defect across wallets. The global
+    // build fails before content certification; nothing is deduplicated or lost.
+    let fixture = BulkRootFixture::new();
+    fixture.admit().await;
+    Connection::open(&fixture.side).unwrap().execute_batch(
+        "CREATE TRIGGER corrupt_bulk_identity AFTER INSERT ON activity_groups_v2
+         WHEN (SELECT COUNT(*) FROM activity_groups_v2) = 2 BEGIN
+           UPDATE activity_groups_v2 SET source_trade_id = (SELECT source_trade_id FROM activity_groups_v2 ORDER BY rowid LIMIT 1);
+         END;"
+    ).unwrap();
+    let error = fixture.collect(&bulk_source()).await.unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unique activity identity index build failed"),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("UNIQUE constraint failed"),
+        "{error}"
+    );
+    assert_eq!(error.exit_code(), 1);
+    assert_bulk_incomplete(&fixture.side, 2, 2);
+    let output = fixture.cli();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("unique activity identity index build failed")
+    );
+    let receipts = query_values(
+        &fixture.side,
+        "SELECT * FROM activity_wallet_coverage_staging_v2 ORDER BY wallet_hex",
+    );
+    let rows = query_values(
+        &fixture.side,
+        "SELECT * FROM activity_groups_v2 ORDER BY wallet_hex",
+    );
+    let no_reads = DatasetFetcher::default();
+    let error = fixture.collect(&no_reads).await.unwrap_err();
+    assert_eq!(error.exit_code(), 1);
+    assert!(no_reads.calls.lock().unwrap().is_empty());
+    assert_eq!(
+        receipts,
+        query_values(
+            &fixture.side,
+            "SELECT * FROM activity_wallet_coverage_staging_v2 ORDER BY wallet_hex"
+        )
+    );
+    assert_eq!(
+        rows,
+        query_values(
+            &fixture.side,
+            "SELECT * FROM activity_groups_v2 ORDER BY wallet_hex"
+        )
+    );
+    let successor = pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
+        &fixture.side,
+        &no_reads,
+        "https://data.example",
+        2,
+        &[],
+        || panic!("successor clock must not run before sealing"),
+        FRESH_END + 3,
+    )
+    .await
+    .unwrap_err();
+    assert!(successor.to_string().contains("unfinished bulk root"));
+}
+
+async fn interrupted_bulk_build(during: bool) {
+    let fixture = BulkRootFixture::new();
+    fixture.admit().await;
+    let source = bulk_source();
+    let building = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = Arc::clone(&building);
+    let connection = Connection::open(&fixture.side).unwrap();
+    connection.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+        if matches!(
+            context.action,
+            rusqlite::hooks::AuthAction::CreateIndex {
+                index_name: "idx_activity_groups_v2_source_trade_id",
+                ..
+            }
+        ) {
+            observed.store(true, Ordering::SeqCst);
+            if !during {
+                return rusqlite::hooks::Authorization::Deny;
+            }
+        }
+        rusqlite::hooks::Authorization::Allow
+    }));
+    let interrupted = Arc::new(AtomicUsize::new(0));
+    if during {
+        let building = Arc::clone(&building);
+        let interrupted = Arc::clone(&interrupted);
+        connection.progress_handler(
+            1,
+            Some(move || {
+                building.load(Ordering::SeqCst) && interrupted.fetch_add(1, Ordering::SeqCst) == 40
+            }),
+        );
+    }
+    let error = pe_bootstrap::cache_migration::collect_activity_v2_for_test(
+        connection,
+        &source,
+        "https://data.example",
+        FRESH_END + 1,
+    )
+    .await
+    .unwrap_err();
+    assert!(building.load(Ordering::SeqCst));
+    assert!(
+        error
+            .to_string()
+            .contains("unique activity identity index build failed"),
+        "{error}"
+    );
+    if during {
+        assert!(interrupted.load(Ordering::SeqCst) > 40);
+        assert!(error.to_string().contains("interrupted"), "{error}");
+    }
+    assert_bulk_incomplete(&fixture.side, 2, 2);
+    let identity = fresh_record(&fixture.side);
+    let receipts = query_values(
+        &fixture.side,
+        "SELECT * FROM activity_wallet_coverage_staging_v2 ORDER BY wallet_hex",
+    );
+    let no_reads = DatasetFetcher::default();
+    let manifest = fixture.collect(&no_reads).await.unwrap();
+    assert!(no_reads.calls.lock().unwrap().is_empty());
+    assert_eq!(manifest.group_count, 2);
+    assert_eq!(count(&fixture.side, "PRAGMA user_version"), 2);
+    assert_eq!(fresh_record(&fixture.side), identity);
+    assert_eq!(
+        receipts,
+        query_values(
+            &fixture.side,
+            "SELECT * FROM activity_wallet_coverage_staging_v2 ORDER BY wallet_hex"
+        )
+    );
+}
+
+#[tokio::test]
+async fn bulk_root_interruption_after_last_wallet_resumes_from_receipts() {
+    // Authorizer stops the build before execution after the writer drained.
+    // Rerun skips every wallet and completes the mandatory seal.
+    interrupted_bulk_build(false).await;
+}
+
+#[tokio::test]
+async fn bulk_root_interruption_during_index_build_rolls_back_and_recovers() {
+    // SQLite's VM progress callback interrupts the actual CREATE UNIQUE INDEX,
+    // proving rollback of the seal and deterministic receipt-only recovery.
+    interrupted_bulk_build(true).await;
+}
+
+#[tokio::test]
+async fn bulk_root_fence_rejects_purge_archive_without_schema_or_row_changes() {
+    let fixture = BulkRootFixture::new();
+    fixture.admit().await;
+    let before_schema = query_values(&fixture.side, "SELECT * FROM sqlite_schema ORDER BY name");
+    let tables = query_values(
+        &fixture.side,
+        "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name",
+    );
+    let contents = || {
+        tables
+            .iter()
+            .map(|row| {
+                let rusqlite::types::Value::Text(name) = &row[0] else {
+                    panic!("non-text table name");
+                };
+                query_values(
+                    &fixture.side,
+                    &format!("SELECT * FROM \"{name}\" ORDER BY rowid"),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let before_rows = contents();
+    let mut source = WalletCache::open(&fixture.fixed).unwrap();
+    let rows = [pe_bootstrap::cache::PurgeRow {
+        wallet_hex: WALLET.to_owned(),
+        reason: pe_bootstrap::cache::PurgeReason::ProvenLoser,
+    }];
+    let error = source
+        .archive_wallets(&rows, &fixture.side, FRESH_END)
+        .unwrap_err();
+    assert!(error.to_string().contains("unfinished bulk root"));
+    assert!(
+        error
+            .to_string()
+            .contains("resume cache-populate-activity-v2 --bulk-root")
+    );
+    assert_eq!(
+        before_schema,
+        query_values(&fixture.side, "SELECT * FROM sqlite_schema ORDER BY name")
+    );
+    assert_eq!(before_rows, contents());
+    assert_bulk_incomplete(&fixture.side, 0, 0);
+    // Failure detached the destination; a subsequent legitimate archive works.
+    let report = source
+        .archive_wallets(&rows, &fixture.dir.path().join("archive.db"), FRESH_END)
+        .unwrap();
+    assert_eq!(report.wallets_archived, 1);
+    assert_eq!(report.trades_archived, 1);
+}
+
+#[tokio::test]
+async fn bulk_root_fence_refuses_other_commands_and_successor_before_clock() {
+    // Proves CLI failures are permanent and explain the private fence, without
+    // mutation, source I/O or a successor end. Both normal cache openers refuse.
+    let fixture = BulkRootFixture::new();
+    fixture.admit().await;
+    assert!(
+        WalletCache::open(&fixture.side)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("unfinished bulk root")
+    );
+    assert!(
+        WalletCache::open_read_only(&fixture.side)
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("unfinished bulk root")
+    );
+    let stage = fixture.dir.path().join("stage.json");
+    let frozen = write_frozen_reference(&fixture.dir, FRESH_END, vec![WALLET.to_owned()]);
+    let before = query_values(&fixture.side, "SELECT * FROM cache_v2_migration_state");
+    for (command, args) in [
+        (
+            "cache-migrate-v2",
+            vec!["--manifest".to_owned(), fixture.build.display().to_string()],
+        ),
+        (
+            "cache-finalize-v2",
+            vec!["--stage-record".to_owned(), stage.display().to_string()],
+        ),
+        (
+            "cache-activate",
+            vec![
+                "--fixed-db".to_owned(),
+                fixture.fixed.display().to_string(),
+                "--backup".to_owned(),
+                fixture.prior.display().to_string(),
+                "--expected-sha256".to_owned(),
+                "0".repeat(64),
+            ],
+        ),
+        (
+            "cache-populate-activity-v2",
+            vec!["--fresh-generation".to_owned(), "2".to_owned()],
+        ),
+        (
+            "cache-populate-activity-v2",
+            vec![
+                "--frozen-payload".to_owned(),
+                frozen.display().to_string(),
+                "--fixed-end".to_owned(),
+                FRESH_END.to_string(),
+                "--generation".to_owned(),
+                "1".to_owned(),
+            ],
+        ),
+        ("cache-populate-payout-v2", vec![]),
+        ("coverage", vec![]),
+        ("activate-next", vec![]),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_pe-bootstrap"))
+            .env_clear()
+            .env(
+                "PE_BOOTSTRAP_OUTPUT",
+                fixture.dir.path().join("watchlist.json"),
+            )
+            .env("RUST_LOG", "error")
+            .current_dir(fixture.dir.path())
+            .arg(command)
+            .arg("--db")
+            .arg(&fixture.side)
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{command}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("unfinished bulk root"),
+            "{command}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let no_reads = DatasetFetcher::default();
+    let error = pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
+        &fixture.side,
+        &no_reads,
+        "https://data.example",
+        2,
+        &[],
+        || panic!("fenced successor sampled a clock"),
+        FRESH_END + 3,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("unfinished bulk root"));
+    assert!(no_reads.calls.lock().unwrap().is_empty());
+    assert_eq!(
+        before,
+        query_values(&fixture.side, "SELECT * FROM cache_v2_migration_state")
+    );
+    assert_bulk_incomplete(&fixture.side, 0, 0);
+    assert!(!stage.exists());
+}
+
+#[tokio::test]
+async fn bulk_root_admission_refuses_aliases_existing_roots_and_successors() {
+    // Proves bulk mode cannot convert an interrupted indexed root, v1 identity,
+    // finalized cache or successor, and cannot select the fixed/prior inode.
+    for existing in ["unfinished", "v1", "completed", "successor", "finalized"] {
+        let fixture = BulkRootFixture::new();
+        let no_reads = FixtureFetcher::new(HashMap::new());
+        let source = bulk_source();
+        if existing == "unfinished" || existing == "v1" {
+            populate_activity_fresh_v2(
+                &fixture.side,
+                &no_reads,
+                "https://data.example",
+                1,
+                FRESH_END,
+                FRESH_END + 1,
+            )
+            .await
+            .unwrap_err();
+            if existing == "v1" {
+                convert_root_to_v1(&fixture.side);
+            }
+        } else {
+            populate_activity_fresh_v2(
+                &fixture.side,
+                &source,
+                "https://data.example",
+                1,
+                FRESH_END,
+                FRESH_END + 1,
+            )
+            .await
+            .unwrap();
+            if existing == "successor" {
+                populate_activity_fresh_v2(
+                    &fixture.side,
+                    &no_reads,
+                    "https://data.example",
+                    2,
+                    FRESH_END + 2,
+                    FRESH_END + 3,
+                )
+                .await
+                .unwrap_err();
+            } else if existing == "finalized" {
+                dataset_payouts(&fixture.side, &source.rows).await;
+                finalize_cache_v2(
+                    &fixture.side,
+                    &fixture.dir.path().join("stage.json"),
+                    FRESH_END + 2,
+                )
+                .unwrap();
+            }
+        }
+        let before = query_values(&fixture.side, "SELECT * FROM cache_v2_migration_state");
+        if existing == "completed" || existing == "finalized" {
+            // Idempotent read of an already sealed root never enters bulk state.
+            fixture.collect(&no_reads).await.unwrap();
+        } else {
+            assert!(
+                fixture
+                    .collect(&no_reads)
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("cannot convert")
+            );
+        }
+        assert_eq!(count(&fixture.side, "PRAGMA user_version"), 2);
+        assert_eq!(
+            before,
+            query_values(&fixture.side, "SELECT * FROM cache_v2_migration_state")
+        );
+    }
+    let fixture = BulkRootFixture::new();
+    let alias = fixture.dir.path().join("alias.db");
+    std::fs::hard_link(&fixture.side, &alias).unwrap();
+    for fixed in [&fixture.side, &alias] {
+        let error = pe_bootstrap::cache_migration::populate_activity_bulk_root_v2_with_clock(
+            &fixture.side,
+            fixed,
+            &fixture.prior,
+            &DatasetFetcher::default(),
+            "https://data.example",
+            || panic!("aliased candidate must not sample clock"),
+            FRESH_END + 1,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("not an independent file"),
+            "{error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn bulk_root_index_name_is_not_accepted_as_definition_or_as_build_proof() {
+    // Proves ordinary admission checks the index definition, and an unfinished
+    // root never accepts any pre-existing name instead of executing its build.
+    for definition in [
+        "CREATE INDEX idx_activity_groups_v2_source_trade_id ON activity_groups_v2(source_trade_id)",
+        "CREATE UNIQUE INDEX idx_activity_groups_v2_source_trade_id ON activity_groups_v2(source_trade_id) WHERE coverage_generation = 1",
+        "CREATE UNIQUE INDEX idx_activity_groups_v2_source_trade_id ON activity_groups_v2(source_trade_id, wallet_hex)",
+        "CREATE UNIQUE INDEX idx_activity_groups_v2_source_trade_id ON activity_groups_v2(lower(source_trade_id))",
+        "CREATE UNIQUE INDEX idx_activity_groups_v2_source_trade_id ON activity_groups_v2(source_trade_id COLLATE NOCASE)",
+        "CREATE UNIQUE INDEX idx_activity_groups_v2_source_trade_id ON activity_groups_v2(wallet_hex)",
+    ] {
+        let fixture = BulkRootFixture::new();
+        let connection = Connection::open(&fixture.side).unwrap();
+        connection
+            .execute_batch("DROP INDEX idx_activity_groups_v2_source_trade_id")
+            .unwrap();
+        connection.execute_batch(definition).unwrap();
+        drop(connection);
+        let error = migrate_cache_v2(&fixture.side, &fixture.build).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("full single-column BINARY unique index"),
+            "{error}"
+        );
+        assert_eq!(
+            count(
+                &fixture.side,
+                "SELECT COUNT(*) FROM activity_coverage_manifests_v2"
+            ),
+            0
+        );
+    }
+    for unique in [false, true] {
+        let fixture = BulkRootFixture::new();
+        fixture.admit().await;
+        Connection::open(&fixture.side).unwrap().execute_batch(&format!(
+            "CREATE {} INDEX idx_activity_groups_v2_source_trade_id ON activity_groups_v2(source_trade_id)",
+            if unique { "UNIQUE" } else { "" },
+        )).unwrap();
+        let error = fixture.collect(&bulk_source()).await.unwrap_err();
+        assert!(error.to_string().contains("already exists"), "{error}");
+        assert_eq!(error.exit_code(), 1);
+        assert_eq!(count(&fixture.side, "PRAGMA user_version"), -2);
+        assert_eq!(
+            count(
+                &fixture.side,
+                "SELECT COUNT(*) FROM activity_coverage_manifests_v2"
+            ),
+            0
+        );
+    }
+}
+
+static BULK_PROBE_SQL: Mutex<Vec<String>> = Mutex::new(Vec::new());
+fn trace_bulk_probes(sql: &str) {
+    if sql.starts_with(
+        "SELECT wallet_hex, coverage_generation FROM activity_groups_v2 WHERE source_trade_id",
+    ) {
+        BULK_PROBE_SQL.lock().unwrap().push(sql.to_owned());
+    }
+}
+
+#[tokio::test]
+async fn bulk_root_skips_only_identity_probes_and_sealed_successor_keeps_both_and_exclusions() {
+    // Real SQL tracing proves zero ID probes while bulk loading and two per
+    // aggregate after sealing. A cross-boundary collision still excludes the
+    // wallet, keeps predecessor rows, and forces a full read in its successor.
+    let fixture = BulkRootFixture::new();
+    fixture.admit().await;
+    let mut connection = Connection::open(&fixture.side).unwrap();
+    connection.trace(Some(trace_bulk_probes));
+    pe_bootstrap::cache_migration::collect_activity_v2_for_test(
+        connection,
+        &bulk_source(),
+        "https://data.example",
+        FRESH_END + 1,
+    )
+    .await
+    .unwrap();
+    assert!(BULK_PROBE_SQL.lock().unwrap().is_empty());
+    let no_reads = FixtureFetcher::new(HashMap::new());
+    populate_activity_fresh_v2(
+        &fixture.side,
+        &no_reads,
+        "https://data.example",
+        2,
+        FRESH_END + 2,
+        FRESH_END + 3,
+    )
+    .await
+    .unwrap_err();
+    let source = DatasetFetcher {
+        rows: vec![
+            dataset_row(WALLET, "0xmarket", "a", "BUY", FRESH_END + 1),
+            dataset_row(WALLET_B, "0xmarket", "delta", "BUY", FRESH_END + 2),
+        ],
+        ..Default::default()
+    };
+    let mut connection = Connection::open(&fixture.side).unwrap();
+    connection.trace(Some(trace_bulk_probes));
+    pe_bootstrap::cache_migration::collect_activity_v2_for_test(
+        connection,
+        &source,
+        "https://data.example",
+        FRESH_END + 3,
+    )
+    .await
+    .unwrap();
+    let probes = std::mem::take(&mut *BULK_PROBE_SQL.lock().unwrap());
+    assert_eq!(probes.len(), 4, "{probes:?}");
+    assert_eq!(receipt(&fixture.side, 2, WALLET).unwrap(), (0, 0, 1));
+    assert_eq!(
+        generation_rows(&fixture.side, 1),
+        1,
+        "excluded predecessor survives"
+    );
+    assert_eq!(
+        generation_rows(&fixture.side, 2),
+        2,
+        "other wallet carries and inserts"
+    );
+    assert_eq!(
+        count(
+            &fixture.side,
+            "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2 WHERE generation = 2 AND json_extract(acquisition_json, '$.exclusion_reason') = 'cross_boundary_collision'"
+        ),
+        1
+    );
+    let recovered = bulk_source();
+    populate_activity_fresh_v2(
+        &fixture.side,
+        &recovered,
+        "https://data.example",
+        3,
+        FRESH_END + 4,
+        FRESH_END + 5,
+    )
+    .await
+    .unwrap();
+    assert!(
+        recovered
+            .calls
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(wallet, start, _)| wallet == WALLET && *start == 1)
+    );
+    assert_eq!(
+        count(
+            &fixture.side,
+            "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2 WHERE generation = 3 AND json_extract(acquisition_json, '$.disposition') = 'excluded'"
+        ),
+        0
+    );
 }

@@ -48,7 +48,10 @@ use incremental::{
     record_completed_manifest,
 };
 
-use crate::cache::{CACHE_SCHEMA_VERSION_V1, CACHE_SCHEMA_VERSION_V2, REQUIRED_TRADES_INDEXES};
+use crate::cache::{
+    CACHE_SCHEMA_VERSION_BULK_ROOT, CACHE_SCHEMA_VERSION_V1, CACHE_SCHEMA_VERSION_V2,
+    REQUIRED_TRADES_INDEXES, reject_bulk_root,
+};
 use crate::error::BootstrapError;
 use crate::lock::{ForgeActivationLocks, ForgeLockHandoff};
 use crate::reclamation_evidence::{
@@ -61,6 +64,8 @@ const FINAL_STAGE_RECORD_VERSION: u32 = 2;
 const RANKER_CLASSIFIER_VERSION: u32 = 2;
 const FRESH_COLLECTION_VERSION: u32 = 1;
 const MAX_ACTIVITY_WALLET_FETCHES: usize = 16;
+const ACTIVITY_ID_INDEX_SQL: &str = "CREATE UNIQUE INDEX idx_activity_groups_v2_source_trade_id
+    ON activity_groups_v2(source_trade_id COLLATE BINARY)";
 
 const V2_SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS sealed_generation_manifests (
@@ -110,7 +115,7 @@ CREATE TABLE IF NOT EXISTS activity_wallet_coverage_staging_v2 (
 );
 
 CREATE TABLE IF NOT EXISTS activity_groups_v2 (
-    source_trade_id                  TEXT    PRIMARY KEY NOT NULL
+    source_trade_id                  TEXT    NOT NULL
         CHECK(substr(source_trade_id, 1, 3) = 'g2:'),
     coverage_generation             INTEGER NOT NULL,
     semantic_revision               TEXT    NOT NULL,
@@ -131,8 +136,8 @@ CREATE TABLE IF NOT EXISTS activity_groups_v2 (
     schema_version                  INTEGER NOT NULL CHECK(schema_version = 2),
     parser_version                  INTEGER NOT NULL CHECK(parser_version = 2)
 );
--- Wallet/time/ID serves collection, resume and ordered wallet reads; the primary
--- key serves deduplication and projection joins. No production reader selects
+-- Wallet/time/ID serves collection, resume and ordered wallet reads; the unique
+-- ID index serves deduplication and projection joins. No production reader selects
 -- activity by condition, so omit its index. On Forge, a 761-second undisturbed
 -- collection sample from /proc/<pid>/io and staging receipts measured 1,535
 -- committed rows/s, 25,188 physical write bytes per roughly 1.1 KB logical row,
@@ -142,8 +147,8 @@ CREATE TABLE IF NOT EXISTS activity_groups_v2 (
 -- checkpoint writes the page back, or about 8,216 bytes/row for the removed
 -- condition index, about a third of the measured total. This saving is an
 -- estimate, not a measurement, pending a before-and-after comparison of physical
--- write bytes per committed row on the same collection. The retained primary-key
--- index still incurs its own write cost.
+-- write bytes per committed row on the same collection. Ordinary collection
+-- retains immediate uniqueness; an explicitly admitted bulk root defers it.
 CREATE INDEX IF NOT EXISTS idx_activity_groups_v2_wallet_time
     ON activity_groups_v2(wallet_hex, source_time_unix, source_trade_id);
 
@@ -766,6 +771,7 @@ pub async fn populate_activity_fresh_v2_with_clock(
         &mut connection,
         generation,
         full_read_wallets,
+        false,
         settled_end,
         completed_at_unix,
     )?;
@@ -786,16 +792,178 @@ pub async fn populate_activity_fresh_v2_with_clock(
     .await
 }
 
+/// Opt in to deferred uniqueness for a newly staged, private generation-one
+/// root. Callers hold the candidate's CacheMutationLock throughout collection.
+/// The fixed/prior roles must be distinct from the candidate, including inode
+/// aliases. This is provisioning, never conversion of an existing collection.
+pub async fn populate_activity_bulk_root_v2_with_clock(
+    cache_path: &Path,
+    fixed_path: &Path,
+    prior_path: &Path,
+    fetcher: &dyn ReconciliationFetcher,
+    base_url: &str,
+    settled_end: impl FnOnce() -> Result<i64, BootstrapError>,
+    completed_at_unix: i64,
+) -> Result<ActivityCoverageManifestV2, BootstrapError> {
+    for path in [cache_path, fixed_path, prior_path] {
+        require_regular_file(path, "bulk-root cache role")?;
+    }
+    require_distinct_files(&[
+        ("private bulk-root candidate", cache_path),
+        ("fixed cache", fixed_path),
+        ("immutable prior", prior_path),
+    ])?;
+    // Recheck on every invocation, including resumes: the process environment
+    // may have changed since the last wallet receipt was committed.
+    require_bulk_root_sqlite_temp_file()?;
+    let mut connection = open_root_collector_rw(cache_path)?;
+    let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if version != CACHE_SCHEMA_VERSION_BULK_ROOT {
+        require_schema(&connection, CACHE_SCHEMA_VERSION_V2)?;
+        ensure_lane_a_v2_schema(&connection)?;
+    }
+    let already_sealed =
+        version == CACHE_SCHEMA_VERSION_V2 && stored_activity_manifest(&connection, 1)?.is_some();
+    let record = begin_or_resume_fresh_collection(
+        &mut connection,
+        1,
+        &[],
+        true,
+        settled_end,
+        completed_at_unix,
+    )?;
+    let identity = ActivityIdentity {
+        generation: record.generation,
+        reference_sha256: record.digest,
+        fixed_end_unix: record.fixed_end_unix,
+        wallets: record.wallets,
+    };
+    let manifest = collect_activity_v2(
+        connection,
+        fetcher,
+        base_url,
+        &identity,
+        FULL_HISTORY_START_EXCLUSIVE,
+        completed_at_unix,
+    )
+    .await?;
+    if already_sealed {
+        // A previous seal may have committed before its checkpoint was
+        // interrupted. A successful bulk-root retry must finish that boundary.
+        let connection = open_existing_rw(cache_path)?;
+        checkpoint_truncate(&connection)?;
+    }
+    Ok(manifest)
+}
+
+fn require_bulk_root_sqlite_temp_file() -> Result<(), BootstrapError> {
+    Connection::open_in_memory()
+        .and_then(|connection| {
+            // TEMP tables remain cached until they spill, even with temp_store=FILE.
+            // 2,048 rows of 4 KiB payload (8 MiB) exceed this TEMP database's
+            // 64 KiB page cache by 128x, forcing actual temporary-file creation
+            // and writes. Only this disposable connection receives the pragmas;
+            // SQLite itself chooses the directory, and closing removes its files.
+            connection.execute_batch(
+                "PRAGMA temp_store=FILE;
+                 PRAGMA temp.page_size=4096;
+                 PRAGMA temp.cache_size=-64;
+                 PRAGMA cache_spill=ON;
+                 CREATE TEMP TABLE bulk_root_temp_probe (payload BLOB NOT NULL);
+                 WITH RECURSIVE rows(n) AS (
+                     VALUES(1) UNION ALL SELECT n + 1 FROM rows WHERE n < 2048
+                 )
+                 INSERT INTO bulk_root_temp_probe SELECT zeroblob(4096) FROM rows;
+                 DROP TABLE bulk_root_temp_probe;",
+            )?;
+            connection.close().map_err(|(_, error)| error)
+        })
+        .map_err(|error| BootstrapError::Invalid {
+            message: format!(
+                "bulk-root admission requires writable SQLite temporary storage; SQLite temporary-file probe failed: {error}. \
+                 SQLite's documented Unix directory order is its temporary-directory override, then SQLITE_TMPDIR, TMPDIR, /var/tmp, /usr/tmp, /tmp, and the current directory. \
+                 Set SQLITE_TMPDIR to large SSD-backed writable storage before starting or resuming; the sealing index build needs approximately 100 GB of sort scratch."
+            ),
+        })
+}
+
+fn require_bulk_root_state(
+    connection: &Connection,
+    identity: &FreshCollectionIdentity,
+) -> Result<(), BootstrapError> {
+    if identity.version != 2 || identity.generation != 1 || identity.base_generation.is_some() {
+        return invalid(
+            "bulk root requires a version-two generation-one identity with no predecessor"
+                .to_owned(),
+        );
+    }
+    let private: bool = connection.query_row(
+        "SELECT phase = 'schema_sealed' AND ranker_projection_count IS NULL
+            AND ranker_projection_digest IS NULL AND ranker_classifier_version IS NULL
+            AND ranker_projection_inputs_json IS NULL
+            AND NOT EXISTS(SELECT 1 FROM activity_coverage_manifests_v2)
+            AND NOT EXISTS(SELECT 1 FROM cache_frozen_payload_verifications)
+            AND NOT EXISTS(SELECT 1 FROM ranker_entries_v2)
+         FROM cache_v2_migration_state WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    if !private {
+        return invalid("bulk root requires an unfinalized private root without completed activity or frozen-reference evidence".to_owned());
+    }
+    Ok(())
+}
+
 fn begin_or_resume_fresh_collection(
     connection: &mut Connection,
     generation: u64,
     selected_full_reads: &[String],
+    bulk_root: bool,
     settled_end: impl FnOnce() -> Result<i64, BootstrapError>,
     started_at_unix: i64,
 ) -> Result<FreshCollectionIdentity, BootstrapError> {
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let recorded = fresh_collection_record(&transaction)?;
+    if bulk_root {
+        let version: i64 =
+            transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version == CACHE_SCHEMA_VERSION_BULK_ROOT && recorded.is_none() {
+            return invalid("unfinished bulk root omitted its collection identity".to_owned());
+        }
+        if let Some(record) = &recorded {
+            if version == CACHE_SCHEMA_VERSION_BULK_ROOT {
+                require_bulk_root_state(&transaction, record)?;
+            } else if record.version != 2
+                || record.generation != 1
+                || record.base_generation.is_some()
+                || stored_activity_manifest(&transaction, 1)?.is_none()
+            {
+                return invalid(
+                    "bulk root cannot convert an existing collection; stage a fresh candidate"
+                        .to_owned(),
+                );
+            }
+        } else {
+            // A fresh migration has a named constraint. Never rebuild an old
+            // primary-key table or convert already collected rows/receipts.
+            let empty: bool = transaction.query_row(
+                "SELECT NOT EXISTS(SELECT 1 FROM activity_groups_v2)
+                    AND NOT EXISTS(SELECT 1 FROM activity_wallet_coverage_staging_v2)
+                    AND NOT EXISTS(SELECT 1 FROM pragma_table_info('activity_groups_v2') WHERE pk != 0)",
+                [], |row| row.get(0),
+            )?;
+            if !empty {
+                return invalid(
+                    "bulk root requires a fresh empty candidate with a named identity index"
+                        .to_owned(),
+                );
+            }
+            verify_activity_identity_index(&transaction, true)?;
+            transaction.execute_batch("DROP INDEX idx_activity_groups_v2_source_trade_id")?;
+            transaction.pragma_update(None, "user_version", CACHE_SCHEMA_VERSION_BULK_ROOT)?;
+        }
+    }
     if let Some(record) = recorded.as_ref()
         && record.generation == generation
     {
@@ -939,6 +1107,9 @@ fn begin_or_resume_fresh_collection(
         base,
         full.into_iter().collect(),
     )?;
+    if bulk_root {
+        require_bulk_root_state(&transaction, &record)?;
+    }
     if let Some((identity, manifest)) = base {
         incremental::archive_identity(&transaction, manifest.generation, identity)?;
     }
@@ -1021,6 +1192,11 @@ async fn collect_activity_v2(
         .collect::<Vec<_>>();
 
     let proof = CollectionProof::load(&connection, generation)?;
+    if proof.as_ref().is_some_and(|proof| proof.bulk_root) {
+        // The final sort is far larger than Forge's memory. SQLITE_TMPDIR is an
+        // operator-selected disk directory; never force this workload into RAM.
+        connection.pragma_update(None, "temp_store", "FILE")?;
+    }
     let proof_ref = proof.as_ref();
     let reads = stream::iter(missing.into_iter().map(|wallet_hex| async move {
         let wallet =
@@ -1193,6 +1369,23 @@ async fn collect_activity_v2(
     // commits after validation, SQLite refuses to promote this stale snapshot
     // to a write transaction instead of certifying changed rows.
     let transaction = connection.transaction()?;
+    let bulk_root = proof.as_ref().is_some_and(|proof| proof.bulk_root);
+    if bulk_root {
+        require_bulk_root_state(
+            &transaction,
+            &proof.as_ref().ok_or(BootstrapError::Internal)?.identity,
+        )?;
+        tracing::info!(
+            generation,
+            "building bulk-root unique activity identity index"
+        );
+        // Never IF NOT EXISTS: successful construction is the global uniqueness
+        // proof. Any failure rolls back only this seal, preserving wallet commits.
+        transaction.execute_batch(ACTIVITY_ID_INDEX_SQL).map_err(|error| BootstrapError::Invalid {
+            message: format!("bulk-root unique activity identity index build failed; rows and receipts retained, generation incomplete: {error}"),
+        })?;
+        verify_activity_identity_index(&transaction, true)?;
+    }
     let staged = validate_activity_staging(
         &transaction,
         generation,
@@ -1218,7 +1411,14 @@ async fn collect_activity_v2(
         manifest.cursors = incremental::receipt_marker_v2();
     }
     record_completed_manifest(&transaction, &manifest)?;
+    if bulk_root {
+        transaction.pragma_update(None, "user_version", CACHE_SCHEMA_VERSION_V2)?;
+    }
     transaction.commit()?;
+    if bulk_root {
+        checkpoint_truncate(&connection)?;
+        tracing::info!(generation, "bulk-root activity sealed and checkpointed");
+    }
     Ok(manifest)
 }
 
@@ -1241,6 +1441,31 @@ pub async fn collect_activity_v2_for_test(
         completed_at_unix,
     )
     .await
+}
+
+/// Feed recorded acquisition evidence to the real wallet boundary, including
+/// deliberately repeated aggregates normally coalesced by the source reader.
+#[cfg(feature = "scenario")]
+pub fn commit_activity_batch_for_test(
+    connection: &mut Connection,
+    wallet_hex: String,
+    pages: Vec<ReconciliationPageEvidence>,
+    aggregates: Vec<ActivityAggregate>,
+) -> Result<(), BootstrapError> {
+    let proof = CollectionProof::load(connection, 1)?.ok_or(BootstrapError::Internal)?;
+    let source_row_count = aggregates.iter().try_fold(0, |count, aggregate| {
+        checked_activity_count(count, aggregate.row_count)
+    })?;
+    let completion = WalletActivityCompletion {
+        wallet_hex,
+        pages,
+        aggregates,
+        source_row_count,
+        fetched_source_row_count: source_row_count,
+        aggregation_status: AggregationStatus::Complete,
+        exclusion_reason: None,
+    };
+    commit_incremental_wallet(connection, &proof, 0, &completion)
 }
 
 // A source read that exhausted the fetcher's transient retries, or that the
@@ -1299,10 +1524,11 @@ pub fn migrate_cache_v2(
         ));
     }
     validate_hex_sha256(&manifest.backup_sha256, "backup_sha256")?;
+    // Refuse the private fence before hashing a potentially very large cache.
+    let mut connection = open_existing_rw(cache_path)?;
     let before_hash = sha256_file(cache_path)?;
     let manifest_sha256 = sha256_bytes(&manifest_bytes);
 
-    let mut connection = open_existing_rw(cache_path)?;
     let found: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if found == CACHE_SCHEMA_VERSION_V2 {
         ensure_lane_a_v2_schema(&connection)?;
@@ -1362,7 +1588,6 @@ pub fn migrate_cache_v2(
          ALTER TABLE market_resolutions RENAME TO market_resolutions_v1_sealed;
          ALTER TABLE source_cursor RENAME TO source_cursor_v1_sealed;",
     )?;
-    transaction.execute_batch(V2_SCHEMA)?;
     ensure_lane_a_v2_schema(&transaction)?;
     transaction.execute(
         "INSERT INTO sealed_generation_manifests
@@ -2966,6 +3191,7 @@ pub fn stage_cache_cycle_v2(
     }
     require_distinct_files(&roles)?;
     let _lock = crate::lock::CacheMutationLock::acquire(fixed_path)?;
+    drop(open_existing_ro(fixed_path)?);
     if side_path.exists() {
         require_regular_file(side_path, "private candidate cache")?;
         if !prior_path.exists() {
@@ -3074,11 +3300,12 @@ fn open_immutable(path: &Path) -> Result<Connection, BootstrapError> {
         }
     }
     uri.push_str("?immutable=1");
-    Connection::open_with_flags(
+    let connection = Connection::open_with_flags(
         uri,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-    )
-    .map_err(BootstrapError::from)
+    )?;
+    reject_bulk_root(&connection)?;
+    Ok(connection)
 }
 
 /// The immutable prior's `user_version`, read without touching the file.
@@ -3283,7 +3510,14 @@ pub fn activate_cache_v2_with_handoff(
         });
     }
     require_regular_file(&request.side_path, "version-two side cache")?;
-    reject_nonempty_activation_sidecars(&request.side_path)?;
+    // Refuse a private main without creating sidecars beside a finalized cache.
+    // If a WAL is present, consult its schema only on the already-refused path
+    // so a WAL-only bulk fence gets the same actionable error.
+    drop(open_immutable(&request.side_path)?);
+    if let Err(error) = reject_nonempty_activation_sidecars(&request.side_path) {
+        drop(open_existing_ro(&request.side_path)?);
+        return Err(error);
+    }
     if sha256_file(&request.side_path)? != request.expected_side_sha256 {
         return invalid("version-two side-cache hash changed after finalization".to_owned());
     }
@@ -3674,7 +3908,16 @@ fn quick_check(connection: &Connection, role: &str, path: &Path) -> Result<(), B
 }
 
 fn ensure_lane_a_v2_schema(connection: &Connection) -> Result<(), BootstrapError> {
+    let activity_exists: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'activity_groups_v2')",
+        [],
+        |row| row.get(0),
+    )?;
     connection.execute_batch(V2_SCHEMA)?;
+    if !activity_exists {
+        connection.execute_batch(ACTIVITY_ID_INDEX_SQL)?;
+    }
+    verify_activity_identity_index(connection, false)?;
     for (table, column, definition) in [
         (
             "activity_coverage_manifests_v2",
@@ -3772,6 +4015,33 @@ fn ensure_lane_a_v2_schema(connection: &Connection) -> Result<(), BootstrapError
     Ok(())
 }
 
+/// Accept the historical primary-key index too, but never mistake a same-name
+/// nonunique, partial, composite, expression, or differently collated index for
+/// the global identity constraint. Creation itself is the bulk content proof.
+fn verify_activity_identity_index(
+    connection: &Connection,
+    named: bool,
+) -> Result<(), BootstrapError> {
+    let valid: bool = connection.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM pragma_index_list('activity_groups_v2') i
+            WHERE i.\"unique\" = 1 AND i.partial = 0
+              AND (?1 = 0 OR i.name = 'idx_activity_groups_v2_source_trade_id')
+              AND (SELECT COUNT(*) FROM pragma_index_xinfo(i.name) WHERE key = 1) = 1
+              AND EXISTS(SELECT 1 FROM pragma_index_xinfo(i.name)
+                  WHERE key = 1 AND cid >= 0 AND name = 'source_trade_id'
+                    AND coll = 'BINARY' AND desc = 0))",
+        [named],
+        |row| row.get(0),
+    )?;
+    if !valid {
+        return invalid(
+            "activity identity requires a full single-column BINARY unique index".to_owned(),
+        );
+    }
+    Ok(())
+}
+
 fn checkpoint_truncate(connection: &Connection) -> Result<(), BootstrapError> {
     let journal_mode: String =
         connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
@@ -3790,6 +4060,13 @@ fn checkpoint_truncate(connection: &Connection) -> Result<(), BootstrapError> {
 }
 
 fn open_existing_rw(path: &Path) -> Result<Connection, BootstrapError> {
+    let connection = open_root_collector_rw(path)?;
+    reject_bulk_root(&connection)?;
+    Ok(connection)
+}
+
+// Only the explicitly admitted root collector may open the private fence.
+fn open_root_collector_rw(path: &Path) -> Result<Connection, BootstrapError> {
     // A canonical absolute path is never read as a SQLite URI (`file:` names).
     let connection = Connection::open_with_flags(
         std::fs::canonicalize(path)?,
@@ -3800,11 +4077,12 @@ fn open_existing_rw(path: &Path) -> Result<Connection, BootstrapError> {
 }
 
 fn open_existing_ro(path: &Path) -> Result<Connection, BootstrapError> {
-    Connection::open_with_flags(
+    let connection = Connection::open_with_flags(
         std::fs::canonicalize(path)?,
         OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .map_err(BootstrapError::from)
+    )?;
+    reject_bulk_root(&connection)?;
+    Ok(connection)
 }
 
 fn require_schema(connection: &Connection, expected: i64) -> Result<(), BootstrapError> {
@@ -4407,7 +4685,7 @@ mod publication_json_tests {
              DELETE FROM sqlite_stat1;
              INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
                ('ranker_entries_v2', 'sqlite_autoindex_ranker_entries_v2_1', '1000000 1'),
-               ('activity_groups_v2', 'sqlite_autoindex_activity_groups_v2_1', '100 1'),
+               ('activity_groups_v2', 'idx_activity_groups_v2_source_trade_id', '100 1'),
                ('clob_payout_evidence_v2', 'sqlite_autoindex_clob_payout_evidence_v2_1', '10 1');
              ANALYZE sqlite_schema;",
                 )
