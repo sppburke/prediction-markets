@@ -647,8 +647,11 @@ before any rename. It validates the candidate `C` against the prepared request, 
 there is no copy fallback. `D` holds the exact old bytes. A crash in the gap leaves `F` absent and
 `D + C` present. The next activation or pending-publication resume validates `D` against `H0` and
 `C` against the prepared candidate hash before completing `C → F`. Unknown combinations refuse
-without moving or deleting files. The supervised writable CLI stages refuse an absent database
-instead of opening it with SQLite CREATE; the wrapper's preceding probes use read-only opens.
+without moving or deleting files. Payout and every generic writable CLI command, including named,
+no-argument and positional-config `all`, refuse an absent database instead of opening it with SQLite
+CREATE; the wrapper's preceding probes use read-only opens. `cache-stage-v2` still provisions verified
+candidate copies. Legacy activation/restoration retain their explicit backup-copy behavior; none of
+these paths initializes an empty installed cache.
 Legacy cycles with an existing prior and no new staging evidence retain their existing activation
 and restoration behavior, including the live cutover cycle. Never convert their evidence or request.
 
@@ -851,15 +854,22 @@ An existing candidate with neither evidence nor prior refuses. Installed drift a
 reported against recorded `H0`; that hash detects drift but cannot reconstruct the original bytes.
 
 After verified publication and both pointer clearings, retention deletes the completed cycle's
-`D` (or legacy `P` and `D`) as well as eligible older cycle artifacts. It accepts only regular files
-named `wallet_cache.cron-<YYYYMMDDTHHMMSSZ>.{prior,side,displaced}.db` and their `-wal`/`-shm`
-sidecars in the physical cache directory and synchronizes directory changes. Pending pointer,
-cycle pointer or `.forge_pause.json` presence, including malformed/symlink records, prevents deletion.
+`D` (or legacy `P` and `D`) as well as eligible older cycle artifacts. The existing durable
+`accepted_cycle_manifest.json`, written after publication verification, and `ranking_publish_request.json`
+remain the discoverable cleanup obligation, together with the request-bound `.side.stage.json` for
+new-layout cycles. Before admitting another cycle or taking the unchanged-watermark exit, the wrapper
+finds the newest accepted candidate cycle and validates its request and staging binding, then resumes
+retirement. Pointerless `--resume-pending` also completes this cleanup without activating or publishing
+again. The evidence stays as audit history; no new receipt format is introduced. Every completed
+retirement pass synchronizes the physical cache directory, even if an interrupted pass already unlinked
+the last backup. It accepts only regular files named
+`wallet_cache.cron-<YYYYMMDDTHHMMSSZ>.{prior,side,displaced}.db` and their `-wal`/`-shm` sidecars,
+from that cycle or earlier, in the request's physical cache directory. Pending pointer, cycle pointer
+or `.forge_pause.json` presence, including malformed/symlink records, prevents deletion. A pause
+defers cleanup and new-cycle admission; removing it lets the next loop pass finish retirement.
 The installed file, its inode aliases, symlinks, directories, `..` paths and other names remain
-protected. Staging refuses another candidate allocation while an exact-cycle prior/displaced backup
-remains. If cleanup was skipped or interrupted, resolve its existing publication/pointer/pause
-evidence and finish the guarded retention step before retrying staging; never delete a backup to
-bypass an unresolved publication.
+protected. Staging still refuses another candidate allocation while an exact-cycle prior/displaced
+backup remains; never delete a backup to bypass an unresolved publication.
 
 At **830 GB per cache**, two full caches use **about 1.66 TB**, leaving **about 240 GB on a 1.9 TB**
 device. Staging, activation, rename-gap recovery and rollback retain at most those two full mains.

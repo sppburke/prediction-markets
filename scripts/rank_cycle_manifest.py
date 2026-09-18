@@ -5,7 +5,9 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sqlite3
+import stat
 import tempfile
 from pathlib import Path
 
@@ -237,6 +239,95 @@ def latest_accepted(root: Path, day_utc: str) -> dict | None:
     return None
 
 
+def retire_completed_cycle(root: Path, out: Path | None = None) -> int:
+    """Resume retention under the wrapper's run lock: 0 done, 2 held, 3 absent.
+
+    The durable accepted watermark is written only after verified publication.
+    It and the unchanged request/staging evidence remain the cleanup obligation,
+    including when both pointers and every eligible cache file are already gone.
+    """
+    cycle_pattern = r"cron-[0-9]{8}T[0-9]{6}Z"
+    candidates = [out] if out is not None else sorted(root.glob("cron-*"), reverse=True)
+    for candidate in candidates:
+        if (candidate.is_symlink() or not candidate.is_dir()
+                or ".." in candidate.parts or not re.fullmatch(cycle_pattern, candidate.name)
+                or candidate.resolve().parent != root.resolve()):
+            continue
+        accepted = candidate / "accepted_cycle_manifest.json"
+        if not accepted.is_file() or accepted.is_symlink():
+            continue
+        manifest = json.loads(accepted.read_text(encoding="utf-8"))
+        if (manifest.get("version") == MANIFEST_VERSION
+                and manifest.get("configuration", {}).get("cache_lane") == "fresh_v2"):
+            out = candidate
+            break
+    else:
+        return 3
+
+    guards = [root / name for name in (
+        "rank_and_push.cycle", "rank_and_push.pending", ".forge_pause.json")]
+
+    def held():
+        return any(os.path.lexists(path) for path in guards)
+
+    if held():
+        print("   [cache-retention] nothing deleted: recovery pointer or Forge pause record remains")
+        return 2
+    request_path = out / "ranking_publish_request.json"
+    if not request_path.is_file() or request_path.is_symlink():
+        raise ValueError("completed cycle omitted its regular publication request")
+    from push_ranking_to_supabase import load_publish_request
+
+    request = load_publish_request(str(request_path))
+    activation = request.get("cache_activation")
+    if activation is None:
+        raise ValueError("completed candidate cycle omitted its activation binding")
+    fixed = Path(activation["fixed_path"])
+    side = Path(activation["side_path"])
+    if ".." in fixed.parts or ".." in side.parts:
+        raise ValueError("unsafe completed cycle cache path")
+    fixed = fixed.resolve(strict=True)
+    if (not fixed.is_file() or side.name != f"wallet_cache.{out.name}.side.db"
+            or side.resolve().parent != fixed.parent):
+        raise ValueError("unrecognized completed cycle or fixed file")
+
+    print(f"RANK_AND_PUSH_RETENTION_CYCLE={out}")
+    # Make pointer clearings durable before retiring rollback files.
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    pattern = re.compile(r"wallet_cache\.(" + cycle_pattern + r")\.(prior|side|displaced)\.db(?:-wal|-shm)?")
+    deleted = 0
+    deferred = False
+    for path in sorted(fixed.parent.iterdir()):
+        match = pattern.fullmatch(path.name)
+        if not match or match[1] > out.name:
+            continue
+        metadata = path.lstat()
+        # Never follow a symlink, touch the installed inode, or delete an alias.
+        if not stat.S_ISREG(metadata.st_mode) or path.samefile(fixed):
+            continue
+        if held():
+            print("   [cache-retention] stopped: recovery pointer or Forge pause record appeared")
+            deferred = True
+            break
+        path.unlink()
+        deleted += 1
+        print(f"   [cache-retention] deleted {path} freed_size_bytes={metadata.st_size}")
+    # Unconditional: a previous process may have died after the final unlink,
+    # before syncing it. An empty directory scan is not durability evidence.
+    directory = os.open(fixed.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+    if not deleted:
+        print("   [cache-retention] nothing deleted: no eligible cycle files")
+    return 2 if deferred else 0
+
+
 def _fresh_identity(raw: str | None) -> dict | None:
     if raw is None:
         return None
@@ -417,6 +508,9 @@ def parse_args():
     compare.add_argument("--db", required=True, type=Path)
     compare.add_argument("--current", required=True, type=Path)
     compare.add_argument("--root", required=True, type=Path)
+    retire = subparsers.add_parser("retire-completed")
+    retire.add_argument("--root", required=True, type=Path)
+    retire.add_argument("--out-dir", type=Path)
     targets = subparsers.add_parser("candidate-targets")
     targets.add_argument("--prior", type=Path, help="legacy immutable prior; new cycles read staging evidence")
     targets.add_argument("--side", type=Path, required=True)
@@ -429,6 +523,8 @@ def parse_args():
 
 def main() -> int:
     args = parse_args()
+    if args.command == "retire-completed":
+        return retire_completed_cycle(args.root, args.out_dir)
     if args.command == "candidate-targets":
         for value in candidate_targets(args.prior, args.side, after_collection=args.after_collection,
                                        max_staleness_hours=args.max_staleness_hours,

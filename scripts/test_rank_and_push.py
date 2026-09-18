@@ -248,7 +248,7 @@ class RankAndPushScenario(unittest.TestCase):
         shutil.copy(WRAPPER.parent / "push_ranking_to_supabase.py", self.root / "scripts" / "publisher_contract.py")
         publisher = self.root / "scripts" / "push_ranking_to_supabase.py"
         body = publisher.read_text()
-        publisher.write_text("from publisher_contract import build_parser, save_pending_pointer\n"
+        publisher.write_text("from publisher_contract import build_parser, save_pending_pointer, load_publish_request\n"
                              + "if __name__ == '__main__':\n"
                              + "".join("    " + line + "\n" for line in body.splitlines()))
 
@@ -1977,6 +1977,142 @@ finally:
                 self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
                 self.assertIn("[cache-retention] nothing deleted: recovery pointer or Forge pause record remains", result.stdout)
                 self._assert_cache_copies(older)
+
+    def test_paused_publication_retirement_resumes_before_watermark_and_next_cycle(self):
+        for two_file, args in ((True, ()), (True, ("--resume-pending",)), (False, ())):
+            with self.subTest(two_file=two_file, args=args):
+                self.tearDown(); self.setUp()
+                fixed = self._install_candidate_layout(schema=2)
+                self._install_candidate_stub(two_file=two_file)
+                pause = self.root / "data/eval-results/.forge_pause.json"
+                pause.write_text("presence holds cleanup, including malformed records")
+                published = self._run()
+                self.assertEqual(published.returncode, 0, published.stderr + published.stdout)
+                out = next((self.root / "data/eval-results").glob("cron-*"))
+                request = json.loads((out / "ranking_publish_request.json").read_text())
+                backup = Path(request["cache_activation"]["prior_cache_backup_path"])
+                old_bytes = backup.read_bytes()
+                installed = fixed.read_bytes()
+                evidence = {path: path.read_bytes() for path in (
+                    out / "ranking_publish_request.json", out / "accepted_cycle_manifest.json")}
+                if two_file:
+                    stage = fixed.parent / f"wallet_cache.{out.name}.side.stage.json"
+                    evidence[stage] = stage.read_bytes()
+                ops = self._bootstrap_ops()
+                pushes = self._log("push.log")
+                for name in ("rank_and_push.pending", "rank_and_push.cycle"):
+                    self.assertFalse((out.parent / name).exists())
+
+                held = self._run(*args)
+                self.assertEqual(held.returncode, 0, held.stderr + held.stdout)
+                self.assertIn("Forge pause record remains", held.stdout)
+                self.assertEqual(backup.read_bytes(), old_bytes)
+                self.assertEqual(self._bootstrap_ops(), ops)
+                pause.unlink()
+                resumed = self._run(*args)
+                self.assertEqual(resumed.returncode, 0, resumed.stderr + resumed.stdout)
+                self.assertFalse(backup.exists())
+                self.assertEqual(fixed.read_bytes(), installed)
+                self.assertEqual(self._bootstrap_ops(), ops)
+                self.assertEqual(self._log("push.log"), pushes, "cleanup republished the request")
+                self._assert_cache_copies(evidence)
+                if not args:
+                    self.assertLess(resumed.stdout.index("[cache-retention] deleted"),
+                                    resumed.stdout.index("RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1"))
+
+                # Advance the installed watermark: the following cycle must stage
+                # successfully without the previous rollback copy occupying space.
+                with sqlite3.connect(fixed) as connection:
+                    connection.execute("INSERT INTO activity_groups_v2 (wallet_hex, source_time_unix, activity_type, coverage_generation) VALUES ('0xabc', 99, 'TRADE', 2)")
+                following = self._run()
+                self.assertEqual(following.returncode, 0, following.stderr + following.stdout)
+                self.assertEqual(self._bootstrap_ops()[len(ops)], "cache-stage-v2")
+                self.assertEqual(len(list(out.parent.glob("cron-*"))), 2)
+
+    def test_retirement_interruption_resumes_before_during_and_after_unlink(self):
+        for seam in ("before_unlink", "during_unlinks", "before_sync", "after_sync"):
+            for args in ((), ("--resume-pending",)):
+                with self.subTest(seam=seam, args=args):
+                    self.tearDown(); self.setUp()
+                    fixed = self._install_candidate_layout(schema=2)
+                    self._install_candidate_stub(two_file=True)
+                    pause = self.root / "data/eval-results/.forge_pause.json"
+                    pause.write_text("paused")
+                    published = self._run()
+                    self.assertEqual(published.returncode, 0, published.stderr + published.stdout)
+                    out = next((self.root / "data/eval-results").glob("cron-*"))
+                    backup = fixed.parent / f"wallet_cache.{out.name}.displaced.db"
+                    sidecar = Path(str(backup) + "-wal")
+                    sidecar.write_bytes(b"retained sidecar")
+                    installed = fixed.read_bytes()
+                    evidence = {path: path.read_bytes() for path in (
+                        out / "ranking_publish_request.json", out / "accepted_cycle_manifest.json",
+                        fixed.parent / f"wallet_cache.{out.name}.side.stage.json")}
+                    pause.unlink()
+                    manifest_script = self.root / "scripts/rank_cycle_manifest.py"
+                    original = manifest_script.read_text()
+                    sync_start = "    directory = os.open(fixed.parent, os.O_RDONLY | os.O_DIRECTORY)\n"
+                    sync_end = "    if not deleted:\n"
+                    if seam == "before_unlink":
+                        broken = original.replace("        path.unlink()\n", "        raise SystemExit(75)\n        path.unlink()\n")
+                    elif seam == "during_unlinks":
+                        broken = original.replace("        path.unlink()\n", "        path.unlink()\n        raise SystemExit(75)\n")
+                    elif seam == "before_sync":
+                        broken = original.replace(sync_start, "    raise SystemExit(75)\n" + sync_start)
+                    else:
+                        broken = original.replace(sync_end, "    raise SystemExit(75)\n" + sync_end)
+                    self.assertNotEqual(broken, original)
+                    manifest_script.write_text(broken)
+                    ops = self._bootstrap_ops()
+                    pushes = self._log("push.log")
+                    interrupted = self._run(*args)
+                    self.assertEqual(interrupted.returncode, 75, interrupted.stderr + interrupted.stdout)
+                    self.assertEqual(backup.exists(), seam == "before_unlink")
+                    self.assertEqual(sidecar.exists(), seam in ("before_unlink", "during_unlinks"))
+                    self._assert_cache_copies(evidence)
+
+                    # Observe the real directory fsync on retry, including when
+                    # the previous attempt unlinked every eligible file already.
+                    manifest_script.write_text(original.replace(sync_end,
+                        '    Path("retention_synced").write_text(str(fixed.parent))\n' + sync_end))
+                    resumed = self._run(*args)
+                    self.assertEqual(resumed.returncode, 0, resumed.stderr + resumed.stdout)
+                    self.assertEqual((self.root / "retention_synced").read_text(), str(fixed.parent))
+                    self.assertFalse(backup.exists())
+                    self.assertFalse(sidecar.exists())
+                    self.assertEqual(fixed.read_bytes(), installed)
+                    self._assert_cache_copies(evidence)
+                    self.assertEqual(self._bootstrap_ops(), ops)
+                    self.assertEqual(self._log("push.log"), pushes)
+
+    def test_pointerless_retirement_refuses_changed_request_or_staging_evidence(self):
+        for artifact in ("request", "stage"):
+            with self.subTest(artifact=artifact):
+                self.tearDown(); self.setUp()
+                fixed = self._install_candidate_layout(schema=2)
+                self._install_candidate_stub(two_file=True)
+                pause = self.root / "data/eval-results/.forge_pause.json"
+                pause.write_text("paused")
+                published = self._run()
+                self.assertEqual(published.returncode, 0, published.stderr + published.stdout)
+                out = next((self.root / "data/eval-results").glob("cron-*"))
+                backup = fixed.parent / f"wallet_cache.{out.name}.displaced.db"
+                preserved = {path: path.read_bytes() for path in (fixed, backup)}
+                if artifact == "request":
+                    path = out / "ranking_publish_request.json"
+                    value = json.loads(path.read_text())
+                    value["publish_key"] = "0" * 64
+                else:
+                    path = fixed.parent / f"wallet_cache.{out.name}.side.stage.json"
+                    value = json.loads(path.read_text())
+                    value["source_sha256"] = "0" * 64
+                path.write_text(json.dumps(value))
+                pause.unlink()
+                ops = self._bootstrap_ops()
+                refused = self._run()
+                self.assertNotEqual(refused.returncode, 0)
+                self._assert_cache_copies(preserved)
+                self.assertEqual(self._bootstrap_ops(), ops)
 
     def test_initial_cutover_lane_stages_seals_collects_and_publishes_from_schema_one(self):
         """PASS: with the opt-in, a zero-argument schema-one cycle stages one candidate without a prior beside the physical file, seals the candidate once, collects

@@ -510,7 +510,7 @@ async fn main() {
                         let _lock = pe_bootstrap::lock::CacheMutationLock::acquire(
                             &bootstrap_config.cache_path,
                         )?;
-                        let mut cache = WalletCache::open_configured(&bootstrap_config)?;
+                        let mut cache = WalletCache::open_existing_configured(&bootstrap_config)?;
                         pe_bootstrap::populate_clob_payout_v2(&bootstrap_config, &mut cache)
                             .await
                             .and_then(json_report)
@@ -695,21 +695,9 @@ async fn main() {
         // Genuine readers return above through `open_read_only`.
         let _cache_mutation_lock = acquire_cache_lock_or_exit(&bootstrap_config.cache_path, sub);
 
-        let opened = if matches!(
-            sub,
-            "winner-discovery"
-                | "activate-next"
-                | "backfill"
-                | "events"
-                | "resolutions"
-                | "prices-history"
-                | "recover-reclamation"
-        ) {
-            WalletCache::open_existing_configured(&bootstrap_config)
-        } else {
-            WalletCache::open_configured(&bootstrap_config)
-        };
-        let mut cache = match opened {
+        // These commands operate on an installed cache. Only explicit staging
+        // provisions candidate copies; a rename gap must remain vacant.
+        let mut cache = match WalletCache::open_existing_configured(&bootstrap_config) {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, "bootstrap: cache open failed");
@@ -1229,7 +1217,7 @@ async fn main() {
     // No-arg → run "all" with strict=false (soft-fail default). It follows the
     // same central lock-before-open contract as the named `all` command (#544).
     let _cache_mutation_lock = acquire_cache_lock_or_exit(&bootstrap_config.cache_path, "all");
-    let mut cache = match WalletCache::open_configured(&bootstrap_config) {
+    let mut cache = match WalletCache::open_existing_configured(&bootstrap_config) {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "bootstrap: cache open failed");

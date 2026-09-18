@@ -326,6 +326,8 @@ fn every_writable_opener_logs_requested_and_effective_cache_tuning_from_env() {
     for args in openers {
         let dir = TempDir::new().unwrap();
         let cache_path = dir.path().join("cache.db");
+        // These commands tune an existing cache; provisioning is explicit.
+        WalletCache::open(&cache_path).unwrap();
         let legacy_path = dir.path().join("wallet_set.json");
         // Stop no-argument `all` in the local legacy reader after the open,
         // before wallet discovery can perform any network I/O. The other two
@@ -613,21 +615,37 @@ fn fresh_generation_cli_refuses_malformed_values_and_legacy_flag_mixes() {
 }
 
 #[test]
-fn supervised_openers_never_create_fixed_cache_in_a_rename_gap() {
-    // Proves the loop's writable dispatches and its read-only probes refuse an
-    // absent installed path; neither the main nor SQLite sidecars are created.
-    for sub in [
-        "winner-discovery",
-        "activate-next",
-        "backfill",
-        "events",
-        "resolutions",
-        "prices-history",
-        "recover-reclamation",
-        "coverage",
-        "reclamation-evidence",
+fn non_provisioning_openers_never_create_fixed_cache_in_a_rename_gap() {
+    // Every generic writable dispatch, payout, and the read-only probes refuse
+    // an absent installed path; neither the main nor SQLite sidecars are created.
+    for args in [
+        &[][..],
+        &["bootstrap.toml"],
+        &["all"],
+        &["fetch"],
+        &["watchlist"],
+        &["schedules"],
+        &["classify-infra"],
+        &["purge"],
+        &["purge-infra"],
+        &[
+            "clear-infra-exclusion",
+            "--wallet",
+            "0x0000000000000000000000000000000000000001",
+        ],
+        &["cache-populate-payout-v2"],
+        &["winner-discovery"],
+        &["activate-next"],
+        &["backfill"],
+        &["events"],
+        &["resolutions"],
+        &["prices-history"],
+        &["recover-reclamation"],
+        &["coverage"],
+        &["reclamation-evidence"],
     ] {
         let dir = TempDir::new().unwrap();
+        std::fs::write(dir.path().join("bootstrap.toml"), "").unwrap();
         let fixed = dir.path().join("wallet_cache.db");
         let displaced = dir
             .path()
@@ -637,11 +655,16 @@ fn supervised_openers_never_create_fixed_cache_in_a_rename_gap() {
             .join("wallet_cache.cron-20260917T000000Z.side.db");
         std::fs::write(&displaced, b"old generation").unwrap();
         std::fs::write(&candidate, b"candidate generation").unwrap();
-        let output = run_cli(dir.path(), &fixed, &[sub]);
-        assert!(!output.status.success(), "{sub}");
-        assert!(!fixed.exists(), "{sub} created an empty installed cache");
+        let output = run_cli(dir.path(), &fixed, args);
+        assert!(!output.status.success(), "{args:?}");
+        let logged = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            logged.contains("unable to open database file"),
+            "{args:?}: {logged}"
+        );
+        assert!(!fixed.exists(), "{args:?} created an empty installed cache");
         for suffix in ["db-wal", "db-shm", "db-journal"] {
-            assert!(!fixed.with_extension(suffix).exists(), "{sub}");
+            assert!(!fixed.with_extension(suffix).exists(), "{args:?}");
         }
         assert_eq!(std::fs::read(displaced).unwrap(), b"old generation");
         assert_eq!(std::fs::read(candidate).unwrap(), b"candidate generation");
