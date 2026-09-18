@@ -14,16 +14,11 @@ use pe_bootstrap::{
 };
 use tracing_subscriber::EnvFilter;
 
-/// Transient-error retries per page for the activity collection. One failing page
-/// ends the whole collector with exit 75 and cancels every unfinished wallet read
-/// (wallets the writer already accepted are kept and skipped on resume), and the
-/// default three retries back off for only about 1.4 s in total (200 ms doubling).
-/// On Forge, connection-level "error sending request" failures ended the bulk root
-/// three times in its first 80 minutes on 2026-09-18. Eight retries give about 51 s
-/// of cumulative backoff; with the 10 s request timeout a persistent failure exits
-/// for the supervisor's retry after about 141 s plus rate-gate waits. Eight is an
-/// initial tuning choice, to be revisited against observed outage durations (#588).
-const ACTIVITY_COLLECTION_TRANSIENT_RETRIES: u32 = 8;
+/// Transient-error retries per page for the activity collection
+/// (`activity_collection_transient_retries` in `docs/_GLOSSARY.md`). One failing page
+/// ends the whole collector with exit 75 and cancels every unfinished wallet read, so
+/// a single request that fails for a few minutes is waited out in place.
+const ACTIVITY_COLLECTION_TRANSIENT_RETRIES: u32 = 16;
 
 #[tokio::main]
 async fn main() {
