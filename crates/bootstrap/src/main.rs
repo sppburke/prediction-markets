@@ -14,6 +14,17 @@ use pe_bootstrap::{
 };
 use tracing_subscriber::EnvFilter;
 
+/// Transient-error retries per page for the activity collection. One failing page
+/// ends the whole collector with exit 75 and cancels every unfinished wallet read
+/// (wallets the writer already accepted are kept and skipped on resume), and the
+/// default three retries back off for only about 1.4 s in total (200 ms doubling).
+/// On Forge, connection-level "error sending request" failures ended the bulk root
+/// three times in its first 80 minutes on 2026-09-18. Eight retries give about 51 s
+/// of cumulative backoff; with the 10 s request timeout a persistent failure exits
+/// for the supervisor's retry after about 141 s plus rate-gate waits. Eight is an
+/// initial tuning choice, to be revisited against observed outage durations (#588).
+const ACTIVITY_COLLECTION_TRANSIENT_RETRIES: u32 = 8;
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -390,7 +401,8 @@ async fn main() {
                         )
                         .with_rate_limit_retry_max_secs(
                             pe_source_polymarket_public::RECONCILIATION_RATE_LIMIT_RETRY_SECS,
-                        );
+                        )
+                        .with_max_retries(ACTIVITY_COLLECTION_TRANSIENT_RETRIES);
                         // Fresh mode (#588): no frozen reference; a newly started
                         // generation is bounded by the same settled read end the
                         // legacy poller uses, and a recorded generation keeps its end.
