@@ -17,8 +17,12 @@ use tracing_subscriber::EnvFilter;
 /// Transient-error retries per page for the activity collection
 /// (`activity_collection_transient_retries` in `docs/_GLOSSARY.md`). One failing page
 /// ends the whole collector with exit 75 and cancels every unfinished wallet read, so
-/// a single request that fails for a few minutes is waited out in place.
+/// a page that fails a few times before the venue has its answer warm is retried in place.
 const ACTIVITY_COLLECTION_TRANSIENT_RETRIES: u32 = 16;
+/// Per-request timeout for the activity collection
+/// (`activity_collection_request_timeout_secs` in `docs/_GLOSSARY.md`). The venue
+/// answers some deep pages of large wallets only after just over ten seconds.
+const ACTIVITY_COLLECTION_REQUEST_TIMEOUT_SECS: u64 = 30;
 
 #[tokio::main]
 async fn main() {
@@ -397,7 +401,8 @@ async fn main() {
                         .with_rate_limit_retry_max_secs(
                             pe_source_polymarket_public::RECONCILIATION_RATE_LIMIT_RETRY_SECS,
                         )
-                        .with_max_retries(ACTIVITY_COLLECTION_TRANSIENT_RETRIES);
+                        .with_max_retries(ACTIVITY_COLLECTION_TRANSIENT_RETRIES)
+                        .with_timeout(ACTIVITY_COLLECTION_REQUEST_TIMEOUT_SECS);
                         // Fresh mode (#588): no frozen reference; a newly started
                         // generation is bounded by the same settled read end the
                         // legacy poller uses, and a recorded generation keeps its end.
