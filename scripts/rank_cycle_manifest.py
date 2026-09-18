@@ -54,19 +54,19 @@ def snapshot(db_path: Path, day_utc: str, versions: dict, configuration: dict) -
                 connection,
                 "SELECT MAX(generation) FROM clob_payout_coverage_manifests_v2",
             )
+            # One pass over the generation instead of two: at the cutover's scale
+            # each full scan of the activity table is roughly half an hour, and
+            # this snapshot runs inside the publication freshness window (#588).
+            activity_count, activity_newest = connection.execute(
+                "SELECT COUNT(*), MAX(CASE WHEN activity_type = 'TRADE' "
+                "THEN source_time_unix END) "
+                "FROM activity_groups_v2 WHERE coverage_generation = ?",
+                (activity_generation,),
+            ).fetchone()
             activity = {
                 "generation": activity_generation,
-                "count": _one(
-                    connection,
-                    "SELECT COUNT(*) FROM activity_groups_v2 WHERE coverage_generation = ?",
-                    (activity_generation,),
-                ),
-                "newest_source_unix": _one(
-                    connection,
-                    "SELECT MAX(source_time_unix) FROM activity_groups_v2 "
-                    "WHERE coverage_generation = ? AND activity_type = 'TRADE'",
-                    (activity_generation,),
-                ),
+                "count": activity_count,
+                "newest_source_unix": activity_newest,
                 "cursor": _one(
                     connection,
                     "SELECT cursors_json FROM activity_coverage_manifests_v2 "

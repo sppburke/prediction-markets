@@ -48,6 +48,13 @@ toml            = { workspace = true }
 tracing         = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+# sha2 0.10 compiles its ARMv8 SHA-256 instruction backend only with `asm`; without
+# it the Raspberry Pi hashes whole cache files in software. Measured on Forge over the
+# same 8 GB: 166 MB/s software, 470 MB/s with the instructions, identical digests
+# (#588). The backend still falls back to software on CPUs without the extension.
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+sha2 = { workspace = true, features = ["asm"] }
+
 [dev-dependencies]
 # Archive-artifact assertions open the purge-archive SQLite directly (scenario_purge).
 # `trace` (test builds only, via feature unification): the #538 reclamation tests
