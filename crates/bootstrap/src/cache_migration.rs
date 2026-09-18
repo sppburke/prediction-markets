@@ -63,10 +63,7 @@ const FROZEN_PAYLOAD_REFERENCE_VERSION: u32 = 1;
 const FINAL_STAGE_RECORD_VERSION: u32 = 2;
 const RANKER_CLASSIFIER_VERSION: u32 = 2;
 const FRESH_COLLECTION_VERSION: u32 = 1;
-/// Wallet reads in flight during activity collection (`activity_collection_wallet_fetches`
-/// in `docs/_GLOSSARY.md`). Each wallet pages serially, so this width sets throughput
-/// until the fetcher's shared rate gate binds; it leaves the gate's budget unchanged.
-const MAX_ACTIVITY_WALLET_FETCHES: usize = 32;
+const MAX_ACTIVITY_WALLET_FETCHES: usize = 16;
 const ACTIVITY_ID_INDEX_SQL: &str = "CREATE UNIQUE INDEX idx_activity_groups_v2_source_trade_id
     ON activity_groups_v2(source_trade_id COLLATE BINARY)";
 
@@ -726,7 +723,7 @@ impl PublicationConsumptionProbe for SupabasePublicationProbe {
 
 /// Populate per-wallet v2 activity checkpoints for one verified frozen universe.
 ///
-/// The frozen reference is revalidated before any source call. Up to thirty-two
+/// The frozen reference is revalidated before any source call. Up to sixteen
 /// wallet reads run concurrently through the caller's one shared fetcher; only
 /// each wallet's aggregate-and-receipt SQLite transaction is serialized here.
 pub async fn populate_activity_v2(
