@@ -307,7 +307,23 @@ def _bulk_root_eligible(side: sqlite3.Connection, schema: int, head: dict | None
                     AND coll = 'BINARY' AND desc = 0))"""))
 
 
-def candidate_targets(prior_path: Path, side_path: Path, *, after_collection=False,
+def read_staging_baseline(side_path: Path, expected_sha256: str | None = None) -> dict:
+    """Read the Rust-owned immutable baseline, including while fixed is absent."""
+    raw = side_path.with_suffix(".stage.json").read_bytes()
+    if expected_sha256 is not None and hashlib.sha256(raw).hexdigest() != expected_sha256:
+        raise ValueError("stage evidence differs from prepared publication request")
+    evidence = json.loads(raw)
+    if evidence.get("version") != 1 or Path(evidence["side_path"]).resolve() != side_path.resolve():
+        raise ValueError("invalid staging baseline version or candidate binding")
+    digest = evidence.get("source_sha256")
+    if not isinstance(digest, str) or len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest):
+        raise ValueError("invalid staging baseline hash")
+    if Path(evidence["prior_path"]).exists():
+        raise ValueError("cycle has both prior and two-file staging evidence")
+    return evidence
+
+
+def candidate_targets(prior_path: Path | None, side_path: Path, *, after_collection=False,
                       now: int | None = None, max_staleness_hours: int | None = None,
                       include_bulk_root=False) -> tuple[int, int, int] | tuple[int, int, int, int]:
     """Select this cycle's initial head or its one linked successor, read-only.
@@ -317,17 +333,25 @@ def candidate_targets(prior_path: Path, side_path: Path, *, after_collection=Fal
     The optional fourth integer reports bulk routing; the default three values
     and their meaning remain unchanged for existing callers.
     """
-    with sqlite3.connect(f"file:{prior_path}?mode=ro&immutable=1", uri=True) as prior:
-        schema = int(_one(prior, "PRAGMA user_version") or 0)
-        if schema == -2:
-            raise ValueError("unfinished bulk root (schema -2); resume cache-populate-activity-v2 --bulk-root before any other command")
-        previous = 0 if schema < 2 else int(_one(prior, "SELECT COALESCE(MAX(generation), 0) FROM activity_coverage_manifests_v2"))
-        initial = previous + 1
-        prior_identity = None
-        if schema == 2 and any(row[1] == "fresh_collection_json" for row in prior.execute("PRAGMA table_info(cache_v2_migration_state)")):
-            prior_identity = _fresh_identity(_one(prior, "SELECT fresh_collection_json FROM cache_v2_migration_state WHERE singleton = 1"))
-        active = _one(prior, "SELECT generation FROM clob_payout_walk_state_v2 WHERE singleton = 1")
-        payout = int(active) if active is not None else int(_one(prior, "SELECT COALESCE(MAX(generation), 0) FROM clob_payout_coverage_manifests_v2")) + 1
+    if side_path.with_suffix(".stage.json").exists():
+        baseline = read_staging_baseline(side_path)
+        previous = int(baseline["activity_generation"])
+        payout = int(baseline["payout_generation"])
+        prior_identity = _fresh_identity(json.dumps(baseline["fresh_identity"])) if baseline["fresh_identity"] is not None else None
+    else:
+        if prior_path is None:
+            raise ValueError("legacy candidate requires --prior; new candidate requires staging evidence")
+        with sqlite3.connect(f"file:{prior_path}?mode=ro&immutable=1", uri=True) as prior:
+            schema = int(_one(prior, "PRAGMA user_version") or 0)
+            if schema == -2:
+                raise ValueError("unfinished bulk root (schema -2); resume cache-populate-activity-v2 --bulk-root before any other command")
+            previous = 0 if schema < 2 else int(_one(prior, "SELECT COALESCE(MAX(generation), 0) FROM activity_coverage_manifests_v2"))
+            prior_identity = None
+            if schema == 2 and any(row[1] == "fresh_collection_json" for row in prior.execute("PRAGMA table_info(cache_v2_migration_state)")):
+                prior_identity = _fresh_identity(_one(prior, "SELECT fresh_collection_json FROM cache_v2_migration_state WHERE singleton = 1"))
+            active = _one(prior, "SELECT generation FROM clob_payout_walk_state_v2 WHERE singleton = 1")
+            payout = int(active) if active is not None else int(_one(prior, "SELECT COALESCE(MAX(generation), 0) FROM clob_payout_coverage_manifests_v2")) + 1
+    initial = previous + 1
     with sqlite3.connect(f"file:{side_path}?mode=ro", uri=True) as side:
         side.execute("BEGIN")
         side_schema = int(_one(side, "PRAGMA user_version") or 0)
@@ -394,7 +418,7 @@ def parse_args():
     compare.add_argument("--current", required=True, type=Path)
     compare.add_argument("--root", required=True, type=Path)
     targets = subparsers.add_parser("candidate-targets")
-    targets.add_argument("--prior", type=Path, required=True)
+    targets.add_argument("--prior", type=Path, help="legacy immutable prior; new cycles read staging evidence")
     targets.add_argument("--side", type=Path, required=True)
     targets.add_argument("--after-collection", action="store_true")
     targets.add_argument("--max-staleness-hours", type=int)

@@ -798,11 +798,30 @@ impl WalletCache {
         Self::open_with_tuning(&config.cache_path, &config.cache_tuning()?)
     }
 
+    /// Open a supervised cycle's existing cache without creating an empty main
+    /// during an interrupted activation or restoration.
+    pub fn open_existing_configured(config: &BootstrapConfig) -> Result<Self, BootstrapError> {
+        Self::open_with_flags(
+            &config.cache_path,
+            &config.cache_tuning()?,
+            OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )
+    }
+
     fn open_with_tuning(path: &Path, tuning: &CacheTuning) -> Result<Self, BootstrapError> {
-        let conn = Connection::open_with_flags(
+        Self::open_with_flags(
             path,
+            tuning,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
-        )?;
+        )
+    }
+
+    fn open_with_flags(
+        path: &Path,
+        tuning: &CacheTuning,
+        flags: OpenFlags,
+    ) -> Result<Self, BootstrapError> {
+        let conn = Connection::open_with_flags(path, flags)?;
         let found: i64 = conn.pragma_query_value(None, "user_version", |row| row.get(0))?;
         reject_bulk_root(&conn)?;
         if found == CACHE_SCHEMA_VERSION_V2 {

@@ -76,8 +76,8 @@
 #
 # Schema-two private-candidate lane (#588): a zero-argument production cycle whose
 # installed cache is already schema two, or whose .env sets PE_RANK_SCHEMA_TWO_CUTOVER=1
-# while it is still schema one, replaces Step 0 with: stage an immutable prior and a
-# private candidate beside the physical fixed file (cache-stage-v2) → migrate the
+# while it is still schema one, replaces Step 0 with: stage one private
+# candidate beside the physical fixed file (cache-stage-v2) → migrate the
 # initial schema-one candidate once (cache-migrate-v2) → discover → activate →
 # collect complete activity for the union of current acquisition candidates and
 # retained histories (cache-populate-activity-v2 --fresh-generation) → payout →
@@ -741,11 +741,12 @@ refresh_data() {
 
 # Schema-two private-candidate lane (#588). Every path is a Rust owner that
 # resumes from its own durable state; the wrapper only derives the cycle's
-# physical names, the prior-derived initial activity/payout targets, and the
+# physical names, the recorded initial activity/payout targets, and the
 # one linked activity top-up recorded on the candidate.
 stage_candidate_cache() {
   "$PE_BOOTSTRAP_BIN" cache-stage-v2 --db "$FIXED_DB" --prior "$1" --side "$2" \
-    --manifest "$3" > "$4"
+    --manifest "$3" > "$4.tmp" || return $?
+  mv -- "$4.tmp" "$4"
 }
 
 refresh_candidate_v2() {
@@ -799,7 +800,7 @@ with sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True) as connection:
 print(int(json.load(open(sys.argv[1], encoding="utf-8"))["side_schema"]))' "$stage_json")"
     if [[ "$side_schema" != "2" ]]; then
       # Initial schema-one candidate: seal it once against the hash-bound build
-      # manifest that staging wrote from the verified prior bytes. A sealed
+      # manifest that staging wrote from the verified source bytes. A sealed
       # candidate records that manifest's hash itself and is not migrated again.
       run_refresh_stage "cache-migrate" "$PE_BOOTSTRAP_BIN" cache-migrate-v2 --db "$side" \
         --manifest "$build_manifest" "${BOOTSTRAP_CONFIG_ARGS[@]}"
@@ -823,7 +824,8 @@ print(int(json.load(open(sys.argv[1], encoding="utf-8"))["side_schema"]))' "$sta
   local activity_target="${targets[0]}"
   local -a bulk_args=()
   if [[ "${targets[3]}" == "1" ]]; then
-    bulk_args=(--bulk-root --fixed-db "$FIXED_DB" --prior "$prior")
+    bulk_args=(--bulk-root --fixed-db "$FIXED_DB")
+    [[ ! -f "$prior" ]] || bulk_args+=(--prior "$prior")
   fi
   echo "   [targets] activity generation $activity_target; payout generation ${targets[1]} (complete=${targets[2]})"
   run_refresh_stage "activity" "$PE_BOOTSTRAP_BIN" cache-populate-activity-v2 --db "$side" \
@@ -851,7 +853,11 @@ print(int(json.load(open(sys.argv[1], encoding="utf-8"))["side_schema"]))' "$sta
   run_refresh_stage "cache-finalize" "$PE_BOOTSTRAP_BIN" cache-finalize-v2 --db "$side" \
     --stage-record "$CACHE_STAGE_RECORD" "${BOOTSTRAP_CONFIG_ARGS[@]}"
   DB="$side"
-  PRIOR_CACHE_BACKUP="$prior"
+  if [[ -f "$prior" ]]; then
+    PRIOR_CACHE_BACKUP="$prior"
+  else
+    PRIOR_CACHE_BACKUP="$phys_dir/wallet_cache.$cycle_name.displaced.db"
+  fi
   CUTOVER_MODE="1"
 }
 
@@ -1027,7 +1033,7 @@ activate_bound_cache() {
     return 0
   fi
   mapfile -t binding <<< "$validation_output"
-  [[ "${#binding[@]}" -eq 4 ]] || {
+  [[ "${#binding[@]}" -eq 4 || "${#binding[@]}" -eq 5 ]] || {
     echo "FATAL: publication request has malformed cache activation evidence" >&2
     return 2
   }
@@ -1053,9 +1059,11 @@ activate_bound_cache() {
     }
     lock_handoff+=(--held-loop-lock-fd 9 --held-loop-lock-pid "$loop_pid")
   fi
+  local -a stage_binding=()
+  [[ "${#binding[@]}" -ne 5 ]] || stage_binding=(--stage-evidence-sha256 "${binding[4]}")
   "$PE_BOOTSTRAP_BIN" cache-activate --db "${binding[0]}" \
     --fixed-db "${binding[1]}" --backup "${binding[2]}" \
-    --expected-sha256 "${binding[3]}" "${lock_handoff[@]}"
+    --expected-sha256 "${binding[3]}" "${stage_binding[@]}" "${lock_handoff[@]}"
 }
 
 push_rc=0
@@ -1182,11 +1190,16 @@ fixed = fixed.resolve(strict=True)
 if not fixed.is_file() or out.resolve().parent != Path("data/eval-results").resolve():
     nothing("unrecognized cycle or fixed file")
 physical = fixed.parent
+pointer_dir = os.open(Path("data/eval-results"), os.O_RDONLY | os.O_DIRECTORY)
+try:
+    os.fsync(pointer_dir)
+finally:
+    os.close(pointer_dir)
 pattern = re.compile(r"wallet_cache\.(" + cycle_pattern + r")\.(prior|side|displaced)\.db(?:-wal|-shm)?")
 deleted = 0
 for path in sorted(physical.iterdir()):
     match = pattern.fullmatch(path.name)
-    if not match or match[1] == out.name:
+    if not match:
         continue
     metadata = path.lstat()
     # Never follow a symlink, touch the installed inode, or delete an alias of it.
@@ -1199,8 +1212,14 @@ for path in sorted(physical.iterdir()):
     path.unlink()
     deleted += 1
     print(f"   [cache-retention] deleted {path} freed_size_bytes={metadata.st_size}")
+if deleted:
+    directory = os.open(physical, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
 if not deleted:
-    nothing("no eligible older cycle files")
+    nothing("no eligible cycle files")
 PY_RETENTION
 fi
 echo "✓ rank_and_push complete — Supabase published."

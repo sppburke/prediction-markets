@@ -112,6 +112,7 @@ async fn main() {
         let mut publication_request_arg: Option<std::path::PathBuf> = None;
         let mut pending_pointer_arg: Option<std::path::PathBuf> = None;
         let mut expected_sha256_arg: Option<String> = None;
+        let mut stage_evidence_sha256_arg: Option<String> = None;
         let mut prior_sha256_arg: Option<String> = None;
         let mut prior_schema_arg: Option<i64> = None;
         let mut held_loop_lock_fd_arg: Option<u32> = None;
@@ -253,6 +254,12 @@ async fn main() {
                 expected_sha256_arg = Some(rest[i].to_owned());
             } else if let Some(v) = a.strip_prefix("--expected-sha256=") {
                 expected_sha256_arg = Some(v.to_owned());
+            } else if a == "--stage-evidence-sha256" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                stage_evidence_sha256_arg = Some(rest[i].to_owned());
+            } else if let Some(v) = a.strip_prefix("--stage-evidence-sha256=") {
+                stage_evidence_sha256_arg = Some(v.to_owned());
             } else if a == "--prior-sha256" && i + 1 < rest.len() {
                 i += 1;
                 flag_values.insert(rest[i]);
@@ -388,7 +395,7 @@ async fn main() {
                         };
                         let bulk_root = flag_present("--bulk-root");
                         if bulk_root && (!rest.contains(&"--bulk-root") || !flag_present("--fresh-generation")) {
-                            return Err(BootstrapError::Invalid { message: "--bulk-root is a bare flag requiring --fresh-generation 1, --fixed-db and --prior".to_owned() });
+                            return Err(BootstrapError::Invalid { message: "--bulk-root is a bare flag requiring --fresh-generation 1 and --fixed-db (plus --prior for legacy cycles)".to_owned() });
                         }
                         if flag_present("--fresh-generation") {
                             if flag_present("--frozen-payload")
@@ -433,10 +440,10 @@ async fn main() {
                                 if generation != 1 || flag_present("--full-read-wallets") {
                                     return Err(BootstrapError::Invalid { message: "--bulk-root requires generation 1 with the complete root wallet union".to_owned() });
                                 }
-                                let (fixed, prior) = fixed_db_arg.as_deref().zip(prior_arg.as_deref())
-                                    .ok_or_else(|| BootstrapError::Invalid { message: "--bulk-root requires --fixed-db and --prior to verify private candidate paths".to_owned() })?;
+                                let fixed = fixed_db_arg.as_deref()
+                                    .ok_or_else(|| BootstrapError::Invalid { message: "--bulk-root requires --fixed-db and staging evidence (or legacy --prior) to verify private candidate paths".to_owned() })?;
                                 return populate_activity_bulk_root_v2_with_clock(
-                                    &bootstrap_config.cache_path, fixed, prior, &fetcher,
+                                    &bootstrap_config.cache_path, fixed, prior_arg.as_deref(), &fetcher,
                                     &bootstrap_config.polymarket_base_url, settled_end, now,
                                 ).await.and_then(activity_json_report);
                             }
@@ -566,6 +573,7 @@ async fn main() {
                                 side_path: bootstrap_config.cache_path.clone(),
                                 prior_cache_backup_path,
                                 expected_side_sha256,
+                                stage_evidence_sha256: stage_evidence_sha256_arg,
                             }, handoff.as_ref())
                             .and_then(json_report)
                         },
@@ -687,7 +695,21 @@ async fn main() {
         // Genuine readers return above through `open_read_only`.
         let _cache_mutation_lock = acquire_cache_lock_or_exit(&bootstrap_config.cache_path, sub);
 
-        let mut cache = match WalletCache::open_configured(&bootstrap_config) {
+        let opened = if matches!(
+            sub,
+            "winner-discovery"
+                | "activate-next"
+                | "backfill"
+                | "events"
+                | "resolutions"
+                | "prices-history"
+                | "recover-reclamation"
+        ) {
+            WalletCache::open_existing_configured(&bootstrap_config)
+        } else {
+            WalletCache::open_configured(&bootstrap_config)
+        };
+        let mut cache = match opened {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, "bootstrap: cache open failed");

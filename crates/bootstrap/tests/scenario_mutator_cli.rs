@@ -611,3 +611,39 @@ fn fresh_generation_cli_refuses_malformed_values_and_legacy_flag_mixes() {
         assert!(!cache_path.exists(), "{args:?} created the cache");
     }
 }
+
+#[test]
+fn supervised_openers_never_create_fixed_cache_in_a_rename_gap() {
+    // Proves the loop's writable dispatches and its read-only probes refuse an
+    // absent installed path; neither the main nor SQLite sidecars are created.
+    for sub in [
+        "winner-discovery",
+        "activate-next",
+        "backfill",
+        "events",
+        "resolutions",
+        "prices-history",
+        "recover-reclamation",
+        "coverage",
+        "reclamation-evidence",
+    ] {
+        let dir = TempDir::new().unwrap();
+        let fixed = dir.path().join("wallet_cache.db");
+        let displaced = dir
+            .path()
+            .join("wallet_cache.cron-20260917T000000Z.displaced.db");
+        let candidate = dir
+            .path()
+            .join("wallet_cache.cron-20260917T000000Z.side.db");
+        std::fs::write(&displaced, b"old generation").unwrap();
+        std::fs::write(&candidate, b"candidate generation").unwrap();
+        let output = run_cli(dir.path(), &fixed, &[sub]);
+        assert!(!output.status.success(), "{sub}");
+        assert!(!fixed.exists(), "{sub} created an empty installed cache");
+        for suffix in ["db-wal", "db-shm", "db-journal"] {
+            assert!(!fixed.with_extension(suffix).exists(), "{sub}");
+        }
+        assert_eq!(std::fs::read(displaced).unwrap(), b"old generation");
+        assert_eq!(std::fs::read(candidate).unwrap(), b"candidate generation");
+    }
+}
