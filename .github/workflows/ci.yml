@@ -37,15 +37,15 @@ jobs:
       # The activation suites' complete inputs, audited for #664: the deploy and paper-reset
       # scripts and SQL they execute or copy, the SQL schemas their hermetic drivers copy, the
       # runbook they check flags against, and this workflow (the financial-era suite executes its
-      # rehearsal dry-run command). --no-renames counts both sides of a rename. Any failure to
-      # compute the diff runs the suites.
+      # rehearsal dry-run command). --no-renames counts both sides of a rename. A missing base or
+      # any failure to compute the diff runs the suites.
       - id: paths
         env:
           EVENT: ${{ github.event_name }}
           BASE: ${{ github.event.pull_request.base.sha }}
         run: |
           activation=true
-          if [[ "$EVENT" == pull_request ]] &&
+          if [[ "$EVENT" == pull_request && -n "$BASE" ]] &&
              changed=$(git diff --no-renames --name-only "$BASE"...HEAD); then
             printf '%s\n' "$changed"
             grep -qE '^(scripts/deploy/|scripts/paper_reset/|scripts/migrate_service_config_545\.sql$|scripts/supabase_paper_state_schema\.sql$|scripts/supabase_multi_account_live_schema\.sql$|docs/35-PE-SERVICE-DEPLOY-RUNBOOK\.md$|\.github/workflows/ci\.yml$)' \
@@ -182,7 +182,8 @@ jobs:
           save-if: "false"
 
       # The complement of the `rust` job's nextest filter: together they run every test once.
-      - run: cargo nextest run -p pe-service --all-features -E 'binary_id(pe-service::scenario_golden_stream_v1) | binary_id(pe-service::scenario_deployed_flow)'
+      # `--workspace --all-features` keeps the gate's unified feature graph for these tests.
+      - run: cargo nextest run --workspace --all-features -E 'binary_id(pe-service::scenario_golden_stream_v1) | binary_id(pe-service::scenario_deployed_flow)'
 
   drift:
     name: Python drift-guard tests
