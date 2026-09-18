@@ -2375,7 +2375,7 @@ async fn classifier_upgrade_activation_preserves_authentic_prior_cache() {
     assert_eq!(std::fs::read(&displaced).unwrap(), upgraded_bytes);
 }
 
-/// PASS: the activity fan-out reaches but never exceeds 16 in-flight wallets;
+/// PASS: the activity fan-out reaches but never exceeds 32 in-flight wallets;
 /// a receipt-insert crash rolls back its wallet transaction, restart fetches
 /// only an exactly missing wallet, malformed receipt identity/digest fail, and
 /// manifest installation plus projection/state replacement is atomic.
@@ -2386,7 +2386,7 @@ async fn activity_wallet_receipts_bound_resume_and_finalize_atomically() {
     let fixed_end = 1_800_000_000_i64;
     let mut cache = seed_v1(&side, fixed_end - 10);
     let mut wallets = vec![WALLET.to_owned()];
-    for ordinal in 2_u64..=17 {
+    for ordinal in 2_u64..=33 {
         let wallet = format!("0x{ordinal:040x}");
         cache
             .upsert_wallets_bulk(&[(wallet.clone(), SRC_TRADES, false, None, None, None, 0)])
@@ -2449,10 +2449,10 @@ async fn activity_wallet_receipts_bound_resume_and_finalize_atomically() {
     )
     .await
     .unwrap();
-    assert_eq!(preview.wallet_count, 17);
+    assert_eq!(preview.wallet_count, 33);
     assert_eq!(preview.group_count, 0);
-    assert_eq!(fetcher.maximum.load(Ordering::SeqCst), 16);
-    assert_eq!(fetcher.calls.lock().unwrap().len(), 17);
+    assert_eq!(fetcher.maximum.load(Ordering::SeqCst), 32);
+    assert_eq!(fetcher.calls.lock().unwrap().len(), 33);
 
     let missing = wallets[7].clone();
     let connection = Connection::open(&side).unwrap();
@@ -2585,7 +2585,7 @@ async fn activity_wallet_receipts_bound_resume_and_finalize_atomically() {
                 |row| row.get::<_, i64>(0),
             )
             .unwrap(),
-        17
+        33
     );
     connection
         .execute_batch("DROP TRIGGER abort_activity_final_state")
@@ -2601,7 +2601,7 @@ async fn activity_wallet_receipts_bound_resume_and_finalize_atomically() {
                 |row| row.get::<_, i64>(0),
             )
             .unwrap(),
-        17
+        33
     );
 
     let populated = dir.path().join("populated.db");
