@@ -56,12 +56,17 @@ end $$;
 SQL
 }
 
+# Build the service once and run the binary: `cargo run` per call recompiled pe-service on every
+# one of this scenario's ten calls in CI, about 27 s each (#664). Select the service binary
+# because this package also owns the live canary.
+pe_service_binary="${CARGO_TARGET_DIR:-$REPO_ROOT/target}/debug/pe-service"
+(cd "$REPO_ROOT" && cargo build -p pe-service --all-features --bin pe-service)
+[[ -f "$pe_service_binary" ]] || die "cargo build did not produce $pe_service_binary"
+
 run_pe_service() {
   (
     cd "$REPO_ROOT"
-    # CI already builds all features; select the service binary because this package also owns
-    # the live canary and therefore cannot use Cargo's bare single-binary shorthand.
-    cargo run -p pe-service --all-features --bin pe-service -- "$@"
+    "$pe_service_binary" "$@"
   )
 }
 
@@ -280,8 +285,6 @@ read -r target_revision artifact_blake3 < <(parse_staged_identity <<< "$staged_i
   die "pe-service staged identity is malformed"
 run_pe_service --verify-staged-identity "$target_revision" "$artifact_blake3" >/dev/null
 run_pe_service --verify-staged-identity "$target_revision" "$artifact_blake3" >/dev/null
-pe_service_binary="${CARGO_TARGET_DIR:-$REPO_ROOT/target}/debug/pe-service"
-[[ -f "$pe_service_binary" ]] || die "cargo run did not produce $pe_service_binary"
 artifact_sha256=$(sha256_file "$pe_service_binary")
 config_sha256=$(sha256_file "$fixture_config")
 environment_sha256=$(sha256_file "$fixture_environment")

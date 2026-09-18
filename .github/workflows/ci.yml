@@ -18,7 +18,41 @@ env:
 # Splitting by owner turns sum() into max(). The two activation suites are already separate
 # scripts, so no sharding logic is needed. Neither suite invokes cargo, so those jobs skip the
 # toolchain, the cargo tools, the build cache and the disk reclaim entirely.
+#
+# Measured again on 2026-09-18 (#664): pull requests waited about 26 min, set by the financial-era
+# suite (25 min) although neither activation suite reads anything under crates/. Pull requests now
+# run the activation suites only when they change a file those suites read (the `changes` job);
+# every push to main runs everything. The two slowest Rust tests run in `rust-slow`, beside the gate.
 jobs:
+  changes:
+    name: changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      activation: ${{ steps.paths.outputs.activation }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # The activation suites' complete inputs, audited for #664: the deploy and paper-reset
+      # scripts and SQL they execute or copy, the SQL schemas their hermetic drivers copy, the
+      # runbook they check flags against, and this workflow (the financial-era suite executes its
+      # rehearsal dry-run command). --no-renames counts both sides of a rename. Any failure to
+      # compute the diff runs the suites.
+      - id: paths
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          activation=true
+          if [[ "$EVENT" == pull_request ]] &&
+             changed=$(git diff --no-renames --name-only "$BASE"...HEAD); then
+            printf '%s\n' "$changed"
+            grep -qE '^(scripts/deploy/|scripts/paper_reset/|scripts/migrate_service_config_545\.sql$|scripts/supabase_paper_state_schema\.sql$|scripts/supabase_multi_account_live_schema\.sql$|docs/35-PE-SERVICE-DEPLOY-RUNBOOK\.md$|\.github/workflows/ci\.yml$)' \
+              <<< "$changed" || activation=false
+          fi
+          echo "activation=$activation" | tee -a "$GITHUB_OUTPUT"
+
   contracts:
     name: agent workflow contracts
     runs-on: ubuntu-latest
@@ -107,13 +141,48 @@ jobs:
           # automatic extension downloads so the test itself stays offline.
           python3 -c "import duckdb; c = duckdb.connect(); c.execute('INSTALL sqlite_scanner'); c.close()"
 
-      - run: cargo nextest run --workspace --all-features
+      # The two slowest tests (about 5 and 3.5 minutes of single-threaded work, #664) run in
+      # the `rust-slow` job in parallel with this one; every other test runs here.
+      - run: cargo nextest run --workspace --all-features -E 'not (binary_id(pe-service::scenario_golden_stream_v1) | binary_id(pe-service::scenario_deployed_flow))'
 
       - run: cargo deny check
 
       - run: cargo audit
 
       - run: cargo metadata --locked --format-version 1 > /dev/null
+
+  rust-slow:
+    name: slow service scenarios
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/share/powershell || true
+          df -h /
+
+      - name: Install pinned toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95.0"
+
+      - name: Install cargo tools
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: gate
+          save-if: "false"
+
+      # The complement of the `rust` job's nextest filter: together they run every test once.
+      - run: cargo nextest run -p pe-service --all-features -E 'binary_id(pe-service::scenario_golden_stream_v1) | binary_id(pe-service::scenario_deployed_flow)'
 
   drift:
     name: Python drift-guard tests
@@ -163,6 +232,8 @@ jobs:
 
   activation-generation:
     name: generation activation scenarios
+    needs: changes
+    if: needs.changes.outputs.activation == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -178,6 +249,8 @@ jobs:
 
   activation-financial:
     name: financial-era activation scenarios
+    needs: changes
+    if: needs.changes.outputs.activation == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
