@@ -167,6 +167,31 @@ pub async fn fetch_complete_activity(
     start: Option<i64>,
     fixed_end: i64,
 ) -> Result<CompleteActivityRead, ActivityReadError> {
+    fetch_complete_activity_with(fetcher, base_url, requested_wallet, start, fixed_end, true).await
+}
+
+/// [`fetch_complete_activity`] for a caller that uses only semantic row fields.
+/// Each row's raw JSON, raw hash and source ID are released as its page parses,
+/// so a multi-million-row history fits in memory (#588); page evidence, row
+/// order and every semantic field are unchanged.
+pub async fn fetch_complete_activity_semantic(
+    fetcher: &dyn ReconciliationFetcher,
+    base_url: &str,
+    requested_wallet: WalletAddress,
+    start: Option<i64>,
+    fixed_end: i64,
+) -> Result<CompleteActivityRead, ActivityReadError> {
+    fetch_complete_activity_with(fetcher, base_url, requested_wallet, start, fixed_end, false).await
+}
+
+async fn fetch_complete_activity_with(
+    fetcher: &dyn ReconciliationFetcher,
+    base_url: &str,
+    requested_wallet: WalletAddress,
+    start: Option<i64>,
+    fixed_end: i64,
+    retain_provenance: bool,
+) -> Result<CompleteActivityRead, ActivityReadError> {
     let mut pending = vec![ActivityRequestBounds {
         start,
         end: fixed_end,
@@ -174,7 +199,15 @@ pub async fn fetch_complete_activity(
     let mut complete = Vec::new();
 
     while let Some(bounds) = pending.pop() {
-        match fetch_activity_segment(fetcher, base_url, requested_wallet, bounds).await? {
+        match fetch_activity_segment(
+            fetcher,
+            base_url,
+            requested_wallet,
+            bounds,
+            retain_provenance,
+        )
+        .await?
+        {
             SegmentResult::Complete(segment) => complete.push(segment),
             SegmentResult::Saturated { boundary, pages } => {
                 complete.push(ActivitySegment {
@@ -228,28 +261,30 @@ pub async fn fetch_complete_activity(
     }
 
     complete.sort_by_key(|segment| (segment.bounds.end, segment.bounds.start));
-    let rows = complete
-        .iter_mut()
-        .flat_map(|segment| std::mem::take(&mut segment.rows))
-        .collect::<Vec<_>>();
-    let mut keyed_rows = rows
-        .into_iter()
-        .map(|row| {
-            Ok((
-                row.source_time.0.unix_timestamp(),
-                row.group_id()?.to_string(),
-                row.semantic_row_encoding()?,
-                row,
-            ))
-        })
-        .collect::<Result<Vec<_>, ActivityReadError>>()?;
-    keyed_rows.sort_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then_with(|| left.1.cmp(&right.1))
-            .then_with(|| left.2.cmp(&right.2))
-    });
-    let rows = keyed_rows.into_iter().map(|(_, _, _, row)| row).collect();
+    // Rows sit inside their segment's bounds and completed segments are
+    // disjoint ascending intervals, so sorting each segment and concatenating
+    // is the global order; sort keys exist for one segment at a time (#588).
+    let mut rows = Vec::with_capacity(complete.iter().map(|segment| segment.rows.len()).sum());
+    for segment in &mut complete {
+        let mut keyed_rows = std::mem::take(&mut segment.rows)
+            .into_iter()
+            .map(|row| {
+                Ok((
+                    row.source_time.0.unix_timestamp(),
+                    row.group_id()?.to_string(),
+                    row.semantic_row_encoding()?,
+                    row,
+                ))
+            })
+            .collect::<Result<Vec<_>, ActivityReadError>>()?;
+        keyed_rows.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.cmp(&right.1))
+                .then_with(|| left.2.cmp(&right.2))
+        });
+        rows.extend(keyed_rows.into_iter().map(|(_, _, _, row)| row));
+    }
     let mut pages = complete
         .into_iter()
         .flat_map(|segment| segment.pages)
@@ -282,6 +317,7 @@ async fn fetch_activity_segment(
     base_url: &str,
     requested_wallet: WalletAddress,
     bounds: ActivityRequestBounds,
+    retain_provenance: bool,
 ) -> Result<SegmentResult, ActivityReadError> {
     let mut rows = Vec::new();
     let mut pages = Vec::new();
@@ -352,7 +388,15 @@ async fn fetch_activity_segment(
             )
             .map_err(ActivityReadError::CanonicalPage)?,
         );
-        rows.extend(page.rows);
+        let mut page_rows = page.rows;
+        if !retain_provenance {
+            for row in &mut page_rows {
+                row.raw_row_json = String::new();
+                row.raw_row_hash = String::new();
+                row.source_id = SourceId(String::new());
+            }
+        }
+        rows.extend(page_rows);
         if row_count < RECONCILIATION_PAGE_LIMIT {
             return Ok(SegmentResult::Complete(ActivitySegment {
                 bounds,

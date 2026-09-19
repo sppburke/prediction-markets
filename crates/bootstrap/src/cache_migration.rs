@@ -31,7 +31,8 @@ use pe_source_polymarket_public::{
 };
 use pe_source_polymarket_public::{
     ActivityReadError, CLOB_RESOLUTION_PARSER_VERSION, CLOB_RESOLUTION_SCHEMA_VERSION,
-    ClobCoverageManifest, ReconciliationFetcher, fetch_complete_activity,
+    ClobCoverageManifest, ReconciliationFetcher, aggregate_activity_rows,
+    fetch_complete_activity_semantic,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
@@ -1280,7 +1281,7 @@ async fn collect_activity_v2(
         // priced 3.1968021978, outside the unit interval) excludes the wallet
         // like an unaggregatable history: no page evidence survives, so record
         // the reason and an explicit failed acquisition without claiming a read.
-        let complete = match fetch_complete_activity(
+        let complete = match fetch_complete_activity_semantic(
             fetcher,
             base_url,
             wallet,
@@ -1311,9 +1312,13 @@ async fn collect_activity_v2(
         };
         let mut exclusion_reason: Option<String> = None;
         let fetched_source_row_count = u64::try_from(complete.rows.len()).map_err(|_| BootstrapError::Internal)?;
-        let (aggregates, source_row_count, aggregation_status) = match complete.buckets() {
-            Ok(buckets) => {
-                let mut aggregates = buckets.into_iter().flatten().collect::<Vec<_>>();
+        // The rows are needed only to aggregate: free them before the aggregate
+        // sort, since a wallet can hold millions of rows (#588).
+        let aggregated = aggregate_activity_rows(&complete.rows).map_err(ActivityReadError::from);
+        let pages = complete.pages;
+        drop(complete.rows);
+        let (aggregates, source_row_count, aggregation_status) = match aggregated {
+            Ok(mut aggregates) => {
                 aggregates.sort_by(|left, right| {
                     left.source_time
                         .0
@@ -1321,12 +1326,7 @@ async fn collect_activity_v2(
                         .cmp(&right.source_time.0.unix_timestamp())
                         .then_with(|| left.group_id.key().0.cmp(&right.group_id.key().0))
                 });
-                let source_row_count = u64::try_from(complete.rows.len()).map_err(|_| {
-                    BootstrapError::Invalid {
-                        message: format!("activity source-row count overflow for {wallet_hex}"),
-                    }
-                })?;
-                (aggregates, source_row_count, AggregationStatus::Complete)
+                (aggregates, fetched_source_row_count, AggregationStatus::Complete)
             }
             // A history the aggregator cannot bucket deterministically (observed:
             // one fill reported as two rows with different venue timestamps)
@@ -1354,7 +1354,7 @@ async fn collect_activity_v2(
         };
         Ok::<_, BootstrapError>(WalletActivityCompletion {
             wallet_hex,
-            pages: complete.pages,
+            pages,
             aggregates,
             source_row_count,
             fetched_source_row_count,
@@ -1917,11 +1917,18 @@ impl ActivityValidation {
         let source_rows = aggregates.iter().try_fold(0_u64, |total, aggregate| {
             checked_activity_count(total, aggregate.row_count)
         })?;
-        let json = canonical_json(&aggregates)?;
+        // One aggregate's JSON at a time feeds both the wallet and generation
+        // commitments; a whole-wallet string would double a large wallet (#588).
+        let mut wallet_digest = JsonArrayDigest::new();
+        for aggregate in aggregates {
+            let json = canonical_json(aggregate)?;
+            wallet_digest.push_json(json.as_bytes());
+            self.aggregates.push_json(json.as_bytes());
+        }
         if receipt.aggregate_count
             != u64::try_from(aggregates.len()).map_err(|_| BootstrapError::Internal)?
             || receipt.source_row_count != source_rows
-            || receipt.ordered_aggregate_digest != sha256_bytes(json.as_bytes())
+            || receipt.ordered_aggregate_digest != wallet_digest.finish()
         {
             return invalid(format!(
                 "activity receipt aggregate mismatch for {}",
@@ -1929,7 +1936,6 @@ impl ActivityValidation {
             ));
         }
         incremental::validate_result(receipt, aggregates)?;
-        self.aggregates.extend_array(&json)?;
         self.receipts.push(receipt)?;
         self.wallet_count = checked_activity_count(self.wallet_count, 1)?;
         self.excluded_count =
@@ -2428,7 +2434,11 @@ fn decode_activity_aggregate(
 }
 
 fn aggregate_digest(aggregates: &[ActivityAggregate]) -> Result<String, BootstrapError> {
-    Ok(sha256_bytes(canonical_json(aggregates)?.as_bytes()))
+    let mut digest = JsonArrayDigest::new();
+    for aggregate in aggregates {
+        digest.push(aggregate)?;
+    }
+    Ok(digest.finish())
 }
 
 fn completed_activity_manifest(

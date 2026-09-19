@@ -72,6 +72,6 @@ pub use reconciliation::{
     POSITION_PROOF_VERSION, POSITIONS_MAX_OFFSET, PositionClassification, PositionReadError,
     RECONCILIATION_PAGE_LIMIT, ReconciliationFetcher, ReconciliationPageEvidence,
     ReconciliationPageFetcher, canonical_page_hash, fetch_complete_activity,
-    fetch_complete_positions,
+    fetch_complete_activity_semantic, fetch_complete_positions,
 };
 pub mod canary;

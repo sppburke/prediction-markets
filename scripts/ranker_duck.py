@@ -147,6 +147,20 @@ def engine_settings(force: str | None = None,
     return force, parquet_dir, max_age_hours
 
 
+def limit_memory(con, spill_dir: str) -> str:
+    """Bound a DuckDB connection's memory and give it a disk spill directory.
+
+    Unconfigured, DuckDB takes 80% of physical RAM and spills to `.tmp`, which
+    leaves Forge no room for anything else. `PE_RANKER_DUCKDB_MEMORY_LIMIT`
+    (default 8GB) is shared by the ranker and the Parquet export (#588).
+    """
+    mem = os.environ.get("PE_RANKER_DUCKDB_MEMORY_LIMIT", "8GB")
+    con.execute(f"SET memory_limit='{_q(mem)}';")
+    os.makedirs(spill_dir, exist_ok=True)
+    con.execute(f"SET temp_directory='{_q(spill_dir)}';")
+    return mem
+
+
 def get_engine(force: str | None = None,
                parquet_dir: str | None = None,
                max_age_hours: float | None = None,
@@ -203,8 +217,7 @@ def get_engine(force: str | None = None,
             return None
 
     con = duckdb.connect()
-    mem = os.environ.get("PE_RANKER_DUCKDB_MEMORY_LIMIT", "8GB")
-    con.execute(f"SET memory_limit='{_q(mem)}';")
+    mem = limit_memory(con, os.path.join(parquet_dir, ".duckdb_tmp"))
     # This read-layer never depends on DuckDB row order (results go straight to pandas; pass-2
     # sorts tapes explicitly), so disable insertion-order preservation — it lets the big
     # first-buy GROUP BY spill to disk instead of OOM-ing (#387).
@@ -225,9 +238,6 @@ def get_engine(force: str | None = None,
             n_threads = 4
         con.execute(f"SET threads={n_threads};")
         threads_desc = str(n_threads)
-    tmp = os.path.join(parquet_dir, ".duckdb_tmp")
-    os.makedirs(tmp, exist_ok=True)
-    con.execute(f"SET temp_directory='{_q(tmp)}';")
     # Views over the Parquet snapshot — typed by the export (BIGINT/VARCHAR), so
     # outcome_id/contracts are BIGINT and price_str is VARCHAR, matching the contract.
     base_views = (

@@ -34,6 +34,9 @@ import sqlite3
 import sys
 import time
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ranker_duck  # noqa: E402
+
 # The three schema-one tables the ranker reads. Order is irrelevant (independent files).
 # `market_schedules` now also carries `start_date_unix` (issue #421 PR4); it rides along free via
 # `SELECT *`, so no change is needed here for that column.
@@ -281,6 +284,7 @@ def main() -> int:
 
     os.makedirs(a.out_dir, exist_ok=True)
     con = duckdb.connect()
+    ranker_duck.limit_memory(con, os.path.join(a.out_dir, ".duckdb_tmp"))
     con.execute("INSTALL sqlite_scanner;")
     con.execute("LOAD sqlite_scanner;")
     db_abs = _q(os.path.abspath(a.db))
