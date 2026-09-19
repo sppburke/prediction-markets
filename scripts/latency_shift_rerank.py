@@ -137,10 +137,29 @@ def load_candidates(ranked_csv: str, floor_tstat: float) -> set[str]:
     return out
 
 
-def load_all_position_wallets(positions_csv: str) -> set[str]:
-    """Schema two bypasses every pass-one statistical/leader-price gate."""
+def load_survivable_wallets(positions_csv: str, a: argparse.Namespace) -> tuple[dict[str, int], set[str]]:
+    """Schema two: each position wallet's position count, and the wallets that can pass
+    the survival gates.
+
+    No pass-one statistic or leader price gates a wallet. A position is repriced only if
+    `min_ttr_secs <= ttr_secs - shift < ttr_max_secs`, which no price changes, so that
+    count bounds the wallet's repriced count; a wallet whose bound fails `nf > 1`,
+    `nf >= min_trl` or `nf / n_total >= min_fill_rate` cannot survive at any price (#588).
+    """
+    total: dict[str, int] = {}
+    feasible: dict[str, int] = {}
     with open(positions_csv, newline="", encoding="utf-8") as source:
-        return {row["wallet"] for row in csv.DictReader(source) if row.get("wallet")}
+        for row in csv.DictReader(source):
+            w = row.get("wallet")
+            if not w:
+                continue
+            total[w] = total.get(w, 0) + 1
+            if a.min_ttr_secs <= int(row["ttr_secs"]) - a.latency_shift_secs < a.ttr_max_secs:
+                feasible[w] = feasible.get(w, 0) + 1
+    return total, {
+        w for w, n in total.items()
+        if (h := feasible.get(w, 0)) > 1 and h >= a.min_trl and h / n >= a.min_fill_rate
+    }
 
 
 def write_before_after_diff(path: str, before_path: str, rows: list[dict],
@@ -299,17 +318,20 @@ def main() -> int:
         probe.close()
     if (schema_version >= 2 and not a.emit_targets
             and (not a.before_ranking_json or not a.cycle_manifest_file
-                 or not a.cache_stage_record)):
-        log("FATAL: schema two requires cycle-start ranking and cache manifests")
+                 or not a.cache_stage_record or a.as_of is None)):
+        # An explicit anchor keeps decay independent of which wallets are evaluated.
+        log("FATAL: schema two requires cycle-start ranking, cache manifests and --as-of")
         return 1
     slip = a.slip_cents / 100.0
-    cand = (
-        load_all_position_wallets(a.positions_csv)
-        if schema_version >= 2
-        else load_candidates(a.ranked_csv, a.floor_tstat)
-    )
-    log(f"pass-1 edge-floor candidates: {len(cand)} wallets")
-    if not cand:
+    if schema_version >= 2:
+        universe, cand = load_survivable_wallets(a.positions_csv, a)
+        log(f"survivable position wallets: {len(cand)} of {len(universe)}; the rest "
+            f"cannot meet the survival gates at any price and are not evaluated")
+    else:
+        cand = load_candidates(a.ranked_csv, a.floor_tstat)
+        universe = dict.fromkeys(cand, 0)
+        log(f"pass-1 edge-floor candidates: {len(cand)} wallets")
+    if not universe:
         log("no candidates; nothing to re-rank")
         return 76 if schema_version < 2 else 1
 
@@ -324,12 +346,16 @@ def main() -> int:
             return 1
         for r in rd:
             w = r["wallet"]
+            if w not in universe:
+                continue
+            # Every universe row claims its pair's slot, so evaluated pairs keep the
+            # order, and wallets the accumulation order, of evaluating them all (#588).
+            pair = by_mo.setdefault((r["market_id"], r["outcome_id"]), [])
             if w not in cand:
                 continue
-            key = (r["market_id"], r["outcome_id"])
             # The positions file's `price` column (the leader's entry) is retained in
             # the file format but not loaded: repricing uses only the reference sample.
-            by_mo.setdefault(key, []).append({
+            pair.append({
                 "wallet": w,
                 "entry_ts": int(r["entry_ts"]),
                 "ttr_secs": int(r["ttr_secs"]),
@@ -337,6 +363,7 @@ def main() -> int:
                 "payoff": float(r["payoff"]),
             })
             npos += 1
+    by_mo = {key: positions for key, positions in by_mo.items() if positions}
     log(f"candidate positions: {npos} across {len(by_mo)} (market,outcome) pairs")
 
     conn = sqlite3.connect(f"file:{a.db}?mode=ro", uri=True)
@@ -518,6 +545,12 @@ def main() -> int:
             "eligible": eligible,
             "survives": survives,
         })
+    # Wallets that cannot survive keep a row, so the ranked universe is every position
+    # wallet; their statistics were not computed.
+    rows += [{"wallet": w, "n_total": n, "n_filled": "", "fill_rate": "", "active_months": "",
+              "mean_net_ls": "", "tstat_net_ls": "", "n_eff": "", "hit_rate": "",
+              "eligible": False, "survives": False}
+             for w, n in universe.items() if w not in cand]
     rows.sort(key=lambda r: (r["survives"], r["tstat_net_ls"] if r["tstat_net_ls"] != "" else -9),
               reverse=True)
 
@@ -622,7 +655,7 @@ def main() -> int:
     with open(basket_path, "w") as f:
         f.write(f"# latency_shift_basket — Δ={shift}s slip={slip} floor_t={a.floor_tstat} "
                 f"half_life={a.half_life_days}d min_coverage={a.min_fill_rate} "
-                f"candidates={len(cand)} survivors={len(survivors)}\n")
+                f"candidates={len(universe)} survivors={len(survivors)}\n")
         for r in basket:
             f.write(r["wallet"] + "\n")
     if staleness:

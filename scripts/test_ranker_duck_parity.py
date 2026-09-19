@@ -373,7 +373,8 @@ def assert_certified_full_incremental_equivalence(full: str, incremental: str) -
                 last = publisher._wallet_last_trade(sqlite, all_wallets)
                 newest = publisher._newest_trade_unix(sqlite)
             engine = ranker_duck.get_engine(force="duck", parquet_dir=pq, max_age_hours=0, schema_version=2)
-            positions = ranker_duck.duck_extract_positions_v2(engine, wallets, 0, 2**62)
+            positions = pd.concat(ranker_duck.duck_extract_positions_v2(engine, wallets, 0, 2**62),
+                                  ignore_index=True)
             engine.close()
             watermark = cycle.snapshot(Path(db), "2027-01-15", {}, {})["source_watermark"]["activity"]
             results.append((wallets, last, newest, positions, projection, watermark))
@@ -412,11 +413,15 @@ class DuckParityTest(unittest.TestCase):
                     )
                     row["end_date_unix"] = row["source_time_unix"] + 3600
                     row["price_weighted_share_amount_str"] = "0.125000000000" if ordinal == 1 else "0.500000000000"
+                    if ordinal == 3:
+                        # A wallet needs two evaluable entries to be ranked at all (#588).
+                        row["wallet_hex"] = W("a")
                     conn.execute(
                         "UPDATE activity_groups_v2 SET condition_id=?, asset=?, source_time_unix=?, "
-                        "price_weighted_share_amount_str=? WHERE source_trade_id=?",
+                        "price_weighted_share_amount_str=?, wallet_hex=? WHERE source_trade_id=?",
                         tuple(row[k] for k in ("condition_id", "asset", "source_time_unix",
-                                              "price_weighted_share_amount_str", "source_trade_id")),
+                                              "price_weighted_share_amount_str", "wallet_hex",
+                                              "source_trade_id")),
                     )
                     conn.execute("INSERT INTO clob_payout_evidence_v2 VALUES (?,?,?,?,?,?)",
                                  (row["condition_id"], row["payout_vector_json"], row["end_date_unix"],
@@ -604,7 +609,7 @@ class DuckParityTest(unittest.TestCase):
                 self.assertEqual(engine.execute("SELECT COUNT(*) FROM activity_groups_v2").fetchone()[0], 0)
                 self.assertEqual(engine.execute("SELECT MAX(generation) FROM activity_coverage_manifests_v2")
                                  .fetchone()[0], 7)
-                self.assertTrue(ranker_duck.duck_extract_positions_v2(engine, [], 0, 2**62).empty)
+                self.assertEqual(list(ranker_duck.duck_extract_positions_v2(engine, [], 0, 2**62)), [])
             finally:
                 engine.close()
 
@@ -682,7 +687,7 @@ class DuckParityTest(unittest.TestCase):
             engine = ranker_duck.get_engine(
                 force="auto", parquet_dir=pq, max_age_hours=0, schema_version=2
             )
-            frame = ranker_duck.duck_extract_positions_v2(
+            [frame] = ranker_duck.duck_extract_positions_v2(
                 engine, [W("a")], entry - 1, entry + 1
             )
             self.assertEqual(len(frame), 1)

@@ -550,6 +550,10 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertIn("--emit-targets", rerank[0])
         self.assertNotIn("--emit-targets", rerank[1])
         self.assertIn("--git-sha", rerank[1])
+        # 2a applies 2c's survival bounds, so both evaluate the same wallets (#588).
+        emit, full = rerank[0].split(), rerank[1].split()
+        for flag in ("--min-trl", "--min-ttr-secs", "--ttr-max-secs"):
+            self.assertEqual(emit[emit.index(flag) + 1], full[full.index(flag) + 1], flag)
         boot = self._log("pe_bootstrap.log") or ""
         self.assertIn("prices-history --targets-csv", boot)
         self.assertEqual((self._log("targets_seen.log") or "").strip(), "present",

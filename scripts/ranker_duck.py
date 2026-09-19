@@ -558,17 +558,25 @@ def duck_extract_positions(con, wallets, win_start, win_end, ttr_lo, ttr_secs,
 
 
 def duck_extract_positions_v2(con, wallets, win_start, win_end):
-    """Return every structurally valid Rust-classified schema-two first buy.
+    """Yield every structurally valid Rust-classified schema-two first buy.
 
     No leader-price, scheduled-horizon, price-band, or statistical filter is
     applied here. Those eligibility decisions belong to pass two after the
-    minute-price approximation is selected.
+    minute-price approximation is selected. Rows arrive in (wallet, time,
+    trade id) order as bounded DataFrame chunks: the full window is tens of
+    millions of rows, several times the host's memory as one frame. The join
+    is staged to Parquet in the spill directory and sorted from there, because
+    one query that joins and sorts 34 M rows exceeds the memory limit (#588).
     """
     import pandas as pd
 
     con.register(
         "universe",
         pd.DataFrame({"wallet_hex": pd.Series(list(wallets), dtype=object)}),
+    )
+    staged = os.path.join(
+        con.execute("SELECT current_setting('temp_directory')").fetchone()[0],
+        "positions_v2.parquet",
     )
     try:
         bad = con.execute(
@@ -591,8 +599,8 @@ def duck_extract_positions_v2(con, wallets, win_start, win_end):
             raise RuntimeError(
                 f"schema-two projection contains {bad} structurally invalid row(s)"
             )
-        return con.execute(
-            "SELECT g.wallet_hex AS wallet, g.condition_id AS market_id, "
+        con.execute(
+            "COPY (SELECT g.wallet_hex AS wallet, g.condition_id AS market_id, "
             "g.outcome_id, g.source_time_unix AS entry_ts, "
             "CAST(p.end_date_unix - g.source_time_unix AS BIGINT) AS ttr_secs, "
             "CAST(TRY_CAST(g.price_weighted_share_amount_str AS DECIMAL(38,12)) / "
@@ -600,15 +608,22 @@ def duck_extract_positions_v2(con, wallets, win_start, win_end):
             "g.share_amount_str AS contracts, "
             "CAST(json_extract_string(p.payout_vector_json, "
             "'$[' || CAST(g.outcome_id AS VARCHAR) || ']') AS DOUBLE) AS payoff, "
-            "p.end_date_unix AS resolved_at "
+            "p.end_date_unix AS resolved_at, r.source_trade_id "
             "FROM ranker_entries_v2 r "
             "JOIN activity_groups_v2 g ON g.source_trade_id = r.source_trade_id "
             "AND g.coverage_generation = r.activity_generation "
             "JOIN clob_payout_evidence_v2 p ON p.market_id = g.condition_id "
             "JOIN universe u ON u.wallet_hex = g.wallet_hex "
-            "WHERE g.source_time_unix >= ? AND g.source_time_unix < ? "
-            "ORDER BY g.wallet_hex, g.source_time_unix, r.source_trade_id",
-            [win_start, win_end],
-        ).df()
+            f"WHERE g.source_time_unix >= {int(win_start)} AND g.source_time_unix < {int(win_end)}) "
+            f"TO '{_q(staged)}' (FORMAT PARQUET)"
+        )
+        result = con.execute(
+            f"SELECT * EXCLUDE (source_trade_id) FROM read_parquet('{_q(staged)}') "
+            "ORDER BY wallet, entry_ts, source_trade_id"
+        )
+        while not (chunk := result.fetch_df_chunk(64)).empty:
+            yield chunk
     finally:
         con.unregister("universe")
+        if os.path.exists(staged):
+            os.remove(staged)

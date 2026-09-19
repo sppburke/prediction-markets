@@ -10,12 +10,14 @@ from __future__ import annotations
 
 import csv
 import json
+import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = Path(__file__).with_name("latency_shift_rerank.py")
 
@@ -323,7 +325,7 @@ class RefOracleScenario(unittest.TestCase):
         stage = self.root / "cache-stage.json"
         stage.write_text('{"cache_sha256":"aa"}\n')
         args = (
-            "--min-ttr-secs", "60", "--ttr-max-secs", "3600",
+            "--as-of", "1100000", "--min-ttr-secs", "60", "--ttr-max-secs", "3600",
             "--price-min", "0.15", "--price-max", "0.85",
             "--before-ranking-json", str(before),
             "--cycle-manifest-file", str(cycle),
@@ -355,6 +357,137 @@ class RefOracleScenario(unittest.TestCase):
             hashlib.sha256(first).hexdigest(),
         )
         print("PASS: schema-two horizon/band edges and before/after diff are deterministic")
+
+    def test_schema_two_evaluates_only_survivable_wallets_exactly(self):
+        """PASS: skipping price work for wallets that cannot survive keeps every evaluated
+        wallet's ranked row, tie order and repriced outcomes exact (#588)."""
+        sys.path.insert(0, str(SCRIPT.parent))
+        import latency_shift_rerank as lsr
+
+        x, k1, k2 = ("0x" + c * 40 for c in "0ab")
+        # (wallet, pair, entry offset, ttr, venue sample price or None). X enters pairs 1
+        # and 6 first with no horizon-feasible position; K1 and K2 tie, and K2 ranks first
+        # only because pair 1, which X opens, comes first. K2's pair-6 sample is X's, stale.
+        rows = [(x, 1, 0, 30, "0.5"), (x, 6, 0, 30, "0.5")]
+        rows += [(k1, p, 100, 3600, px) for p, px in zip((2, 3, 4, 5), ("0.31", "0.41", "0.51", "0.61"))]
+        rows += [(k2, p, 400, 3600, px) for p, px in zip((1, 3, 4, 5), ("0.31", "0.41", "0.51", "0.61"))]
+        rows.append((k2, 6, 500, 3600, None))
+        venue: dict[str, list[tuple[int, str]]] = {}
+        spans: dict[str, list[int]] = {}
+        with open(self.positions, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(POSITIONS_HEADER)
+            for wallet, pair, offset, ttr, price in rows:
+                entry = pair * 1_000_000 + offset
+                writer.writerow([wallet, f"0xm{pair}", 0, entry, ttr, 0.5, "1.000000", 1.0,
+                                 0, 0, entry + ttr])
+                spans.setdefault(f"T{pair}", []).append(entry)
+                if price is not None:
+                    venue.setdefault(f"T{pair}", []).append((entry + SHIFT, price))
+        con = sqlite3.connect(self.db)
+        con.execute("PRAGMA user_version=2")
+        for token in spans:
+            con.execute("INSERT INTO token_conditions VALUES (?, ?, 1, 0)", (token, "0xm" + token[1:]))
+        con.commit()
+        con.close()
+
+        def store(name, windows):
+            db = self.root / name
+            shutil.copy(self.db, db)
+            con = sqlite3.connect(db)
+            for token, lo, hi in windows:
+                con.execute("INSERT INTO ranker_price_pages VALUES (?, ?, ?, 1, 'complete', 1, "
+                            "'00', 'test', 1, 1, 1, 1, 'url')", (token, lo, hi))
+                con.executemany("INSERT OR IGNORE INTO ranker_price_points VALUES (?, ?, ?, 1)",
+                                [(token, t, px) for t, px in venue.get(token, []) if lo <= t <= hi])
+            con.commit()
+            con.close()
+            return db
+
+        before = self.root / "before.json"
+        before.write_text("[]")
+        cycle = self.root / "cycle.json"
+        cycle.write_text('{"cache_schema":2}\n')
+        stage = self.root / "cache-stage.json"
+        stage.write_text('{"cache_sha256":"aa"}\n')
+        survivable = lsr.load_survivable_wallets
+
+        def everyone(path, a):
+            universe, _ = survivable(path, a)
+            return universe, set(universe)
+
+        def run(db, name, *extra, prune=True, anchor=("--as-of", "7000000")):
+            out = self.root / name
+            argv = [str(SCRIPT), "--db", str(db), "--ranked-csv", str(self.ranked),
+                    "--positions-csv", str(self.positions), "--out-dir", str(out),
+                    "--latency-shift-secs", str(SHIFT), "--fill-window-secs", str(WINDOW),
+                    "--half-life-days", "0", "--min-trl", "2", "--min-active-months", "0",
+                    "--min-avg-per-month", "0", "--floor-tstat", "2.0",
+                    "--pipeline-versions-file", str(self.versions),
+                    "--before-ranking-json", str(before), "--cycle-manifest-file", str(cycle),
+                    "--cache-stage-record", str(stage), *anchor, *extra]
+            with mock.patch.object(sys, "argv", argv), \
+                    mock.patch.object(lsr, "load_survivable_wallets", survivable if prune else everyone):
+                return lsr.main(), out
+
+        def read(path):
+            with open(path, newline="") as source:
+                return list(csv.DictReader(source))
+
+        # The pruned cycle's store holds only what its own 2a targets fetched.
+        targets = self.root / "targets.csv"
+        self.assertEqual(run(self.db, "emit", "--emit-targets", str(targets))[0], 0)
+        windows = [(r["token_id"], int(r["start_ts"]), int(r["end_ts"])) for r in read(targets)]
+        self.assertEqual([w for w in windows if w[0] == "T1"],
+                         [("T1", 1_000_400 + SHIFT - WINDOW - 1, 1_000_400 + SHIFT + 1)])
+        pruned_db = store("pruned.db", windows)
+        full_db = store("full.db", [(t, min(e) + SHIFT - WINDOW - 1, max(e) + SHIFT + 1)
+                                    for t, e in spans.items()])
+        (rc, pruned), (rc_full, full) = run(pruned_db, "pruned"), run(full_db, "full", prune=False)
+        self.assertEqual((rc, rc_full), (0, 0))
+        ranked, ranked_full = (read(o / "latency_shift_ranked.csv") for o in (pruned, full))
+        self.assertEqual([r["wallet"] for r in ranked], [k2, k1, x])
+        self.assertEqual(ranked[0]["tstat_net_ls"], ranked[1]["tstat_net_ls"])
+        self.assertEqual(ranked[:2], ranked_full[:2])
+        self.assertEqual(ranked[2], {"wallet": x, "n_total": "2", "n_filled": "", "fill_rate": "",
+                                     "active_months": "", "mean_net_ls": "", "tstat_net_ls": "",
+                                     "n_eff": "", "hit_rate": "", "eligible": "False",
+                                     "survives": "False"})
+        outcomes, outcomes_full = (read(o / "oracle_outcomes.csv") for o in (pruned, full))
+        outcomes_full = [r for r in outcomes_full if r["wallet"] != x]
+        self.assertEqual(len(outcomes), len(outcomes_full))
+        unpriced = {"stale", "no_sample", "future_only"}
+        for row, row_full in zip(outcomes, outcomes_full):
+            if row["outcome"] != row_full["outcome"]:
+                self.assertTrue({row["outcome"], row_full["outcome"]} <= unpriced, row)
+                row, row_full = dict(row, outcome=""), dict(row_full, outcome="")
+            self.assertEqual(row, row_full)
+        self.assertEqual([(r["market_id"], r["outcome"]) for r in read(pruned / "oracle_outcomes.csv")
+                          if r["outcome"] != "repriced"], [("0xm6", "no_sample")])
+
+        # An evaluated wallet's missing window still fails closed.
+        con = sqlite3.connect(pruned_db)
+        con.execute("DELETE FROM ranker_price_pages WHERE token_id = 'T2'")
+        con.commit()
+        con.close()
+        self.assertEqual(run(pruned_db, "uncovered")[0], 75)
+        # With no survivable wallet, every position wallet still gets a publishable row.
+        rc, out = run(pruned_db, "none", "--min-trl", "99")
+        self.assertEqual(rc, 0)
+        self.assertEqual(sorted((r["wallet"], r["survives"], r["tstat_net_ls"])
+                                for r in read(out / "latency_shift_ranked.csv")),
+                         [(w, "False", "") for w in (x, k1, k2)])
+        import push_ranking_to_supabase as publisher
+        with mock.patch.object(sys, "argv", ["push", "--ranked-csv", str(out / "latency_shift_ranked.csv"),
+                                             "--manifest-file", str(out / "oracle_manifest.json")]):
+            request = publisher.prepare_publish_request(publisher.build_parser().parse_args(), 0)
+        self.assertEqual(request["batch"]["universe_size"], 3)
+        self.assertEqual(sorted((e["wallet_hex"], e["survives"], e["ls_tstat"], e["n_trades"], e["fill_rate"])
+                                for e in request["entries"]),
+                         [(w, False, None, None, None) for w in (x, k1, k2)])
+        # Scoring without an explicit anchor is refused.
+        self.assertEqual(run(pruned_db, "unanchored", anchor=())[0], 1)
+        print("PASS: schema two evaluates only survivable wallets, exactly as evaluating all")
 
     def test_nonpositive_fill_window_is_fatal(self):
         # #536 review M2: staleness bound 0 would admit every stale sample; reject

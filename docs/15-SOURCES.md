@@ -235,7 +235,7 @@
 | https://clob.polymarket.com/markets/{condition_id} | 2026-09-01 | 2026-10-31 |
 | https://clob.polymarket.com/book?token_id={tokenId} | 2026-07-18 | 2026-09-16 |
 | https://clob.polymarket.com/prices-history?market={tokenId} | 2026-09-01 | 2026-10-31 |
-| https://clob.polymarket.com/prices-history?market={tokenId}&startTs={start}&endTs={cutoff}&fidelity=1 | 2026-09-05 | 2026-11-04 |
+| https://clob.polymarket.com/prices-history?market={tokenId}&startTs={start}&endTs={cutoff}&fidelity=1 | 2026-09-18 | 2026-11-17 |
 | https://docs.polymarket.com/api-reference/markets/get-prices-history | 2026-09-01 | 2026-10-31 |
 | https://gamma-api.polymarket.com/markets?condition_ids={id}&include_tag=true | 2026-07-18 | 2026-09-16 |
 | https://gamma-api.polymarket.com/markets?clob_token_ids={token}&closed=true | 2026-09-02 | 2026-11-01 |
