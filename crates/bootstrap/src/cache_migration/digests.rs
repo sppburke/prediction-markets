@@ -23,22 +23,8 @@ impl JsonArrayDigest {
         Ok(())
     }
 
-    // The caller serialized a typed wallet Vec once for both its receipt and
-    // this commitment. Empty wallets must not introduce a separator.
-    pub(super) fn extend_array(&mut self, json: &str) -> serde_json::Result<()> {
-        let interior = json
-            .strip_prefix('[')
-            .and_then(|s| s.strip_suffix(']'))
-            .ok_or_else(|| {
-                <serde_json::Error as serde::ser::Error>::custom("expected serialized array")
-            })?;
-        if !interior.is_empty() {
-            self.push_json(interior.as_bytes());
-        }
-        Ok(())
-    }
-
-    fn push_json(&mut self, json: &[u8]) {
+    // One element's already-serialized canonical JSON.
+    pub(super) fn push_json(&mut self, json: &[u8]) {
         if self.populated {
             self.hash.update(b",");
         }

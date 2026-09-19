@@ -10,7 +10,8 @@ use pe_source_polymarket_public::{
     ACTIVITY_MAX_OFFSET, ActivityAssetMapping, ActivityParseContext, ActivityReadError,
     ActivityTransport, FixtureFetcher, PolymarketEndpoint, PositionClassification,
     PositionPartition, PositionReadError, RECONCILIATION_PAGE_LIMIT, VerifiedTokenIdentity,
-    fetch_complete_activity, fetch_complete_positions, parse_activity_response,
+    aggregate_activity_rows, fetch_complete_activity, fetch_complete_activity_semantic,
+    fetch_complete_positions, parse_activity_response,
 };
 use rust_decimal::Decimal;
 use serde_json::{Value, json};
@@ -1120,4 +1121,125 @@ async fn saturated_split_against_the_inclusive_live_api_returns_each_row_exactly
     assert_eq!(timestamps.iter().filter(|ts| **ts == 10).count(), 1);
     assert_eq!(timestamps.iter().filter(|ts| **ts == 50).count(), 5_499);
     assert_eq!(timestamps.iter().filter(|ts| **ts == 51).count(), 2);
+}
+
+#[tokio::test]
+async fn semantic_read_matches_the_default_read_without_row_provenance() {
+    // The bulk collector's read (#588): a saturated split, so several segments
+    // and a discarded probe, read with and without per-row provenance.
+    let mut rows = vec![activity_row(
+        10,
+        "0xold".to_owned(),
+        "asset-old".to_owned(),
+        0,
+    )];
+    for index in 0..5_499_u32 {
+        rows.push(activity_row(
+            50,
+            format!("0xsat{index:04}"),
+            format!("asset-sat-{index}"),
+            0,
+        ));
+    }
+    rows.push(activity_row(
+        51,
+        "0xafter".to_owned(),
+        "asset-after".to_owned(),
+        1,
+    ));
+    let api = InclusiveActivityApi::new(rows);
+    let full = fetch_complete_activity(&api, BASE, wallet(), None, 100)
+        .await
+        .unwrap();
+    let semantic = fetch_complete_activity_semantic(&api, BASE, wallet(), None, 100)
+        .await
+        .unwrap();
+
+    // Receipt clocks are sampled per read; every other evidence field is equal.
+    let evidence = |pages: &[pe_source_polymarket_public::ReconciliationPageEvidence]| {
+        pages
+            .iter()
+            .map(|page| {
+                (
+                    page.request_url.clone(),
+                    page.bounds,
+                    page.offset,
+                    page.row_count,
+                    page.canonical_page_hash.clone(),
+                    page.raw_page_hash.clone(),
+                    page.schema_version,
+                    page.parser_version,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(evidence(&semantic.pages), evidence(&full.pages));
+    let semantics = |read: &pe_source_polymarket_public::CompleteActivityRead| {
+        read.rows
+            .iter()
+            .map(|row| {
+                (
+                    row.group_id().unwrap(),
+                    row.semantic_row_encoding().unwrap(),
+                    row.source_usdc_amount,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(semantics(&semantic), semantics(&full));
+    // Segment-local sorting still yields the global (second, group, encoding) order.
+    let keys = semantic
+        .rows
+        .iter()
+        .map(|row| {
+            (
+                row.source_time.0.unix_timestamp(),
+                row.group_id().unwrap().to_string(),
+                row.semantic_row_encoding().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(keys.is_sorted());
+    assert_eq!(semantic.buckets().unwrap(), full.buckets().unwrap());
+    // The collector aggregates directly and sorts; `buckets()` only partitions.
+    let order = |left: &pe_source_polymarket_public::ActivityAggregate,
+                 right: &pe_source_polymarket_public::ActivityAggregate| {
+        left.source_time
+            .0
+            .unix_timestamp()
+            .cmp(&right.source_time.0.unix_timestamp())
+            .then_with(|| left.group_id.key().0.cmp(&right.group_id.key().0))
+    };
+    let mut direct = aggregate_activity_rows(&semantic.rows).unwrap();
+    direct.sort_by(order);
+    let mut bucketed = full
+        .buckets()
+        .unwrap()
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    bucketed.sort_by(order);
+    assert_eq!(direct, bucketed);
+
+    // One fill reported at two venue seconds: the same exclusion text either way.
+    let mixed = InclusiveActivityApi::new(vec![
+        activity_row(20, "0xsplit".to_owned(), "asset-split".to_owned(), 0),
+        activity_row(22, "0xsplit".to_owned(), "asset-split".to_owned(), 0),
+    ]);
+    let read = fetch_complete_activity_semantic(&mixed, BASE, wallet(), None, 100)
+        .await
+        .unwrap();
+    let bucketed = read.buckets().unwrap_err().to_string();
+    let direct = aggregate_activity_rows(&read.rows)
+        .map_err(ActivityReadError::from)
+        .unwrap_err()
+        .to_string();
+    assert_eq!(direct, bucketed);
+    assert!(direct.contains("mixed source timestamps"), "{direct}");
+    assert!(full.rows.iter().all(|row| {
+        !row.raw_row_json.is_empty() && !row.raw_row_hash.is_empty() && !row.source_id.0.is_empty()
+    }));
+    assert!(semantic.rows.iter().all(|row| {
+        row.raw_row_json.is_empty() && row.raw_row_hash.is_empty() && row.source_id.0.is_empty()
+    }));
 }

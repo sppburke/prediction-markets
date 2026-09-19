@@ -5594,15 +5594,18 @@ fn streamed_aggregate_digest_matches_whole_typed_vector() {
             .collect::<Vec<_>>();
         all.sort_by_key(&key);
         let mut ordered = wallets.into_iter().collect::<BTreeMap<_, _>>();
+        // Validation streams each aggregate's JSON into the wallet and the
+        // generation commitments, never holding a whole wallet's JSON (#588).
         let mut streamed = digests::JsonArrayDigest::new();
         for groups in ordered.values_mut() {
             groups.sort_by_key(&key);
-            let json = serde_json::to_string(groups).unwrap();
-            assert_eq!(
-                whole_json_digest(groups),
-                format!("{:x}", Sha256::digest(json.as_bytes()))
-            );
-            streamed.extend_array(&json).unwrap();
+            let mut wallet = digests::JsonArrayDigest::new();
+            for group in groups.iter() {
+                let json = serde_json::to_string(group).unwrap();
+                wallet.push_json(json.as_bytes());
+                streamed.push_json(json.as_bytes());
+            }
+            assert_eq!(wallet.finish(), whole_json_digest(groups));
         }
         assert_eq!(streamed.finish(), whole_json_digest(&all));
     }
