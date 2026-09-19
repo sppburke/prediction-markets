@@ -309,6 +309,20 @@ def greedy_max_group_sharpe(sumg: np.ndarray, npos: np.ndarray, target_n: int,
     return selected
 
 
+def wallet_groups(chunks):
+    """Each wallet's rows from wallet-ordered DataFrame chunks, across chunk boundaries."""
+    wallet, rows = None, []
+    for chunk in chunks:
+        for row in chunk.itertuples(index=False):
+            if row.wallet != wallet:
+                if rows:
+                    yield wallet, rows
+                wallet, rows = row.wallet, []
+            rows.append(row)
+    if rows:
+        yield wallet, rows
+
+
 def process_wallet_positions(w, positions, prm, writer, summaries, floor_pos):
     """Score one wallet's QUALIFYING first-buy positions and emit its CSV rows +
     summary + floor entry. Shared by the SQLite and DuckDB extraction paths so
@@ -523,35 +537,42 @@ def main() -> int:
         # SQL over the Parquet snapshot; the SHARED Python tail scores every wallet, so
         # eff/gross/net + weighted_stats are byte-identical to the SQLite path.
         log("extraction engine: DuckDB (Parquet read-layer, #375)")
-        if schema_version >= 2:
-            # Rust has already proved the first-entry semantics. Pass every
-            # structurally valid projected buy to the reference-price pass;
-            # leader price, horizon, band, and pass-one statistics are not gates.
-            df = ranker_duck.duck_extract_positions_v2(
-                engine, wallets, prm.win_start, prm.win_end
-            )
-        else:
-            ttr_lo = max(prm.min_ttr_secs, 1)
-            df = ranker_duck.duck_extract_positions(
-                engine, wallets, prm.win_start, prm.win_end, ttr_lo, prm.ttr_secs,
-                prm.scheduled_only, prm.price_min, prm.price_max,
-            )
-        diag["wallets_seen"] = len(wallets)
-        diag["qualified"] = len(df)
-        # Stable per-wallet order so summation is deterministic run-to-run; the stats
-        # are order-invariant beyond sub-ULP FP (absorbed by the parity rtol).
-        df = df.sort_values(["wallet", "entry_ts"], kind="stable")
-        for w, grp in df.groupby("wallet", sort=True):
-            positions = [{
+        def position(row):
+            return {
                 "market_id": row.market_id, "outcome_id": int(row.outcome_id),
                 "entry_ts": int(row.entry_ts), "ttr": int(row.ttr_secs),
                 "price": float(row.price),
                 "contracts": (str(row.contracts) if schema_version >= 2
                               else int(row.contracts)),
                 "payoff": float(row.payoff), "resolved_at": int(row.resolved_at),
-            } for row in grp.itertuples(index=False)]
-            total_qualified += process_wallet_positions(
-                w, positions, prm, writer, summaries, floor_pos)
+            }
+
+        diag["wallets_seen"] = len(wallets)
+        if schema_version >= 2:
+            # Rust has already proved the first-entry semantics. Pass every
+            # structurally valid projected buy to the reference-price pass;
+            # leader price, horizon, band, and pass-one statistics are not gates.
+            # The query streams in (wallet, time, trade id) order, so one wallet
+            # is resident at a time and no sort is needed.
+            for w, rows in wallet_groups(ranker_duck.duck_extract_positions_v2(
+                    engine, wallets, prm.win_start, prm.win_end)):
+                diag["qualified"] += len(rows)
+                total_qualified += process_wallet_positions(
+                    w, [position(row) for row in rows], prm, writer, summaries, floor_pos)
+        else:
+            ttr_lo = max(prm.min_ttr_secs, 1)
+            df = ranker_duck.duck_extract_positions(
+                engine, wallets, prm.win_start, prm.win_end, ttr_lo, prm.ttr_secs,
+                prm.scheduled_only, prm.price_min, prm.price_max,
+            )
+            diag["qualified"] = len(df)
+            # Stable per-wallet order so summation is deterministic run-to-run; the stats
+            # are order-invariant beyond sub-ULP FP (absorbed by the parity rtol).
+            df = df.sort_values(["wallet", "entry_ts"], kind="stable")
+            for w, grp in df.groupby("wallet", sort=True):
+                positions = [position(row) for row in grp.itertuples(index=False)]
+                total_qualified += process_wallet_positions(
+                    w, positions, prm, writer, summaries, floor_pos)
     else:
         log("extraction engine: SQLite (per-wallet inline scan)")
         for i, w in enumerate(wallets):

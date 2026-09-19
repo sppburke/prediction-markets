@@ -938,6 +938,7 @@ if [[ "$SKIP_RANK" == "0" ]]; then
     --db "$DB" --ranked-csv "$RANKED_CSV" --positions-csv "$POSITIONS_CSV" \
     --out-dir "$OUT_DIR" \
     --latency-shift-secs "$LATENCY_SHIFT_SECS" --fill-window-secs "$FILL_WINDOW_SECS" \
+    --min-trl "$MIN_TRL" --min-ttr-secs 60 --ttr-max-secs "$TTR_MAX_SECS" \
     --floor-tstat "$FLOOR_TSTAT" --emit-targets "$TARGETS_CSV"
 
   echo "── Stage 2b/3: targeted reference fetch into the ranker price store (#536) ────"

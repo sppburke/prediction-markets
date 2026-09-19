@@ -429,7 +429,9 @@ market still missing a terminal row. The subcommand runs the full
 universe (`--universe-from-trades` —
 have-data ⇒ in-universe; the ranker's own eligibility filters decide the cohort, so
 there is no curated pre-gate); **Stage 2** rerank in three sub-stages (#536): **2a**
-emit the per-token reference fetch windows for the candidate positions; **2b**
+emit the per-token reference fetch windows for the candidate positions (on schema two, the
+positions of every wallet whose horizon-feasible count can still meet the survival gates; other
+wallets are ranked non-surviving without price work, #588); **2b**
 `pe-bootstrap prices-history --targets-csv` fetches only the uncovered remainder of
 minute reference prices into the isolated ranker price store (write-once + range
 algebra ⇒ resumable; transient page failures are a partial and pass-2's

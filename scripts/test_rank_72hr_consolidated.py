@@ -440,5 +440,41 @@ class PurgeDecisionCsvContractTest(unittest.TestCase):
             print("PASS: purge decision-CSV header contract intact")
 
 
+class WalletGroupsStreamingTest(unittest.TestCase):
+    """Streamed schema-two chunks group exactly as the former sort-and-groupby did (#588)."""
+
+    def test_streamed_groups_match_sorted_groupby(self) -> None:
+        import duckdb
+        import pandas as pd
+
+        rng = np.random.default_rng(588)
+        n = 5_000  # spans DuckDB's 2,048-row vectors, so wallets cross chunk boundaries
+        shuffled = pd.DataFrame({
+            "wallet": pd.Series(["0x" + format(int(w), "040x") for w in rng.integers(0, 40, n)],
+                                dtype=object),
+            "entry_ts": rng.integers(0, 50, n),  # dense, so timestamps tie within a wallet
+            "trade_id": pd.Series(["g2:" + format(i, "064x") for i in rng.permutation(n)],
+                                  dtype=object),
+        })
+        con = duckdb.connect()
+        con.register("t", shuffled)
+        ordered = con.execute("SELECT * FROM t ORDER BY wallet, entry_ts, trade_id").df()
+        expected = [(w, list(g.itertuples(index=False))) for w, g in
+                    ordered.sort_values(["wallet", "entry_ts"], kind="stable")
+                    .groupby("wallet", sort=True)]
+        result = con.execute("SELECT * FROM t ORDER BY wallet, entry_ts, trade_id")
+
+        def vectors():
+            while not (chunk := result.fetch_df_chunk(1)).empty:
+                yield chunk
+
+        self.assertEqual(list(rk.wallet_groups(vectors())), expected)
+        for size in (1, 7, 2_048):
+            chunks = [ordered.iloc[i:i + size] for i in range(0, n, size)]
+            self.assertEqual(list(rk.wallet_groups(chunks)), expected, size)
+        self.assertEqual(list(rk.wallet_groups([])), [])
+        self.assertEqual(list(rk.wallet_groups([ordered.iloc[:0]])), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
