@@ -41,6 +41,7 @@ use sha2::{Digest as _, Sha256};
 use time::OffsetDateTime;
 use tokio::sync::{mpsc, oneshot};
 
+mod aggregate_scan;
 mod digests;
 mod incremental;
 use digests::{JsonArrayDigest, ReceiptSetDigest};
@@ -1899,43 +1900,38 @@ impl ActivityValidation {
         })
     }
 
+    /// Reads the wallet's stored aggregates across the host's cores and hands
+    /// each retained aggregate to `retain`; a caller that only certifies the
+    /// generation keeps none of them.
     fn visit(
         &mut self,
+        scan: &mut aggregate_scan::Scan,
         connection: &Connection,
         generation: i64,
         receipt: &ActivityWalletReceiptProof,
+        mut retain: impl FnMut(ActivityAggregate),
     ) -> Result<(), BootstrapError> {
-        let aggregates = load_activity_aggregates(connection, generation, &receipt.wallet_hex)?;
-        self.visit_loaded(receipt, &aggregates)
+        let mut wallet = WalletCommitments::new(receipt, &mut self.aggregates);
+        let unserializable = scan.for_each(
+            connection,
+            generation,
+            &receipt.wallet_hex,
+            |aggregate, json| {
+                wallet.push(&aggregate, json);
+                retain(aggregate);
+                Ok(())
+            },
+        )?;
+        wallet.hold(unserializable);
+        let source_rows = wallet.finish()?;
+        self.record(receipt, source_rows)
     }
 
-    fn visit_loaded(
+    fn record(
         &mut self,
         receipt: &ActivityWalletReceiptProof,
-        aggregates: &[ActivityAggregate],
+        source_rows: u64,
     ) -> Result<(), BootstrapError> {
-        let source_rows = aggregates.iter().try_fold(0_u64, |total, aggregate| {
-            checked_activity_count(total, aggregate.row_count)
-        })?;
-        // One aggregate's JSON at a time feeds both the wallet and generation
-        // commitments; a whole-wallet string would double a large wallet (#588).
-        let mut wallet_digest = JsonArrayDigest::new();
-        for aggregate in aggregates {
-            let json = canonical_json(aggregate)?;
-            wallet_digest.push_json(json.as_bytes());
-            self.aggregates.push_json(json.as_bytes());
-        }
-        if receipt.aggregate_count
-            != u64::try_from(aggregates.len()).map_err(|_| BootstrapError::Internal)?
-            || receipt.source_row_count != source_rows
-            || receipt.ordered_aggregate_digest != wallet_digest.finish()
-        {
-            return invalid(format!(
-                "activity receipt aggregate mismatch for {}",
-                receipt.wallet_hex
-            ));
-        }
-        incremental::validate_result(receipt, aggregates)?;
         self.receipts.push(receipt)?;
         self.wallet_count = checked_activity_count(self.wallet_count, 1)?;
         self.excluded_count =
@@ -1954,6 +1950,99 @@ impl ActivityValidation {
             aggregate_digest: self.aggregates.finish(),
             receipt_set_digest: self.receipts.finish(),
         }
+    }
+}
+
+/// One wallet's commitments, fed one aggregate at a time.
+///
+/// A single serialization feeds the wallet digest, the generation digest and
+/// the acquisition partition, and no whole-wallet JSON is ever resident
+/// (#588, #670). `finish` reports failures in the order a whole-slice pass
+/// reported them.
+struct WalletCommitments<'wallet> {
+    receipt: &'wallet ActivityWalletReceiptProof,
+    generation: &'wallet mut JsonArrayDigest,
+    wallet: JsonArrayDigest,
+    partition: incremental::AcquisitionPartition<'wallet>,
+    count: u64,
+    source_rows: u64,
+    overflow: Option<BootstrapError>,
+    unserializable: Option<BootstrapError>,
+}
+
+impl<'wallet> WalletCommitments<'wallet> {
+    fn new(
+        receipt: &'wallet ActivityWalletReceiptProof,
+        generation: &'wallet mut JsonArrayDigest,
+    ) -> Self {
+        Self {
+            receipt,
+            generation,
+            wallet: JsonArrayDigest::new(),
+            partition: incremental::AcquisitionPartition::new(receipt),
+            count: 0,
+            source_rows: 0,
+            overflow: None,
+            unserializable: None,
+        }
+    }
+
+    /// `json` is absent only for a row the scan could not serialize, and for
+    /// the rows after it: the whole-wallet count still precedes that failure.
+    fn push(&mut self, aggregate: &ActivityAggregate, json: Option<&[u8]>) {
+        match (
+            checked_activity_count(self.count, 1),
+            checked_activity_count(self.source_rows, aggregate.row_count),
+        ) {
+            (Ok(count), Ok(source_rows)) => {
+                self.count = count;
+                self.source_rows = source_rows;
+            }
+            (Err(error), _) | (_, Err(error)) => {
+                self.overflow = self.overflow.take().or(Some(error))
+            }
+        }
+        if let Some(json) = json {
+            self.wallet.push_json(json);
+            self.generation.push_json(json);
+            self.partition.push(aggregate, json);
+        }
+    }
+
+    fn hold(&mut self, unserializable: Option<BootstrapError>) {
+        self.unserializable = unserializable;
+    }
+
+    fn finish(self) -> Result<u64, BootstrapError> {
+        let Self {
+            receipt,
+            wallet,
+            partition,
+            count,
+            source_rows,
+            overflow,
+            unserializable,
+            generation: _,
+        } = self;
+        // The order a whole-wallet pass reported in: it counted the wallet,
+        // then serialized it, then compared its receipt.
+        if let Some(overflow) = overflow {
+            return Err(overflow);
+        }
+        if let Some(unserializable) = unserializable {
+            return Err(unserializable);
+        }
+        if receipt.aggregate_count != count
+            || receipt.source_row_count != source_rows
+            || receipt.ordered_aggregate_digest != wallet.finish()
+        {
+            return invalid(format!(
+                "activity receipt aggregate mismatch for {}",
+                receipt.wallet_hex
+            ));
+        }
+        partition.finish()?;
+        Ok(source_rows)
     }
 }
 
@@ -2276,20 +2365,19 @@ fn validate_activity_staging(
     fixed_end_unix: i64,
     wallets: &[String],
 ) -> Result<ValidatedActivityStaging, BootstrapError> {
-    validate_activity_staging_with(
-        connection,
-        generation,
-        reference_sha256,
-        fixed_end_unix,
-        wallets,
-        |validation, receipt| {
-            validation.visit(
-                connection,
-                to_i64(generation, "activity generation")?,
-                receipt,
-            )
-        },
-    )
+    let generation_i64 = to_i64(generation, "activity generation")?;
+    aggregate_scan::scoped(|scan| {
+        validate_activity_staging_with(
+            connection,
+            generation,
+            reference_sha256,
+            fixed_end_unix,
+            wallets,
+            |validation, receipt| {
+                validation.visit(scan, connection, generation_i64, receipt, |_| {})
+            },
+        )
+    })
 }
 
 fn validate_activity_staging_with(
@@ -2329,36 +2417,6 @@ fn validate_activity_staging_with(
         return invalid("activity generation contains unreceipted rows".to_owned());
     }
     Ok(validation.finish())
-}
-
-fn load_activity_aggregates(
-    connection: &Connection,
-    generation: i64,
-    wallet_hex: &str,
-) -> Result<Vec<ActivityAggregate>, BootstrapError> {
-    let mut statement = connection.prepare(
-        "SELECT source_trade_id, semantic_revision, components_json, row_count,
-                share_amount_str, price_weighted_share_amount_str, source_usdc_amount_str,
-                source_time_unix, is_combo
-         FROM activity_groups_v2
-         WHERE coverage_generation = ?1 AND wallet_hex = ?2
-         ORDER BY source_time_unix, source_trade_id",
-    )?;
-    let rows = statement.query_map(params![generation, wallet_hex], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, i64>(3)?,
-            row.get::<_, String>(4)?,
-            row.get::<_, String>(5)?,
-            row.get::<_, String>(6)?,
-            row.get::<_, i64>(7)?,
-            row.get::<_, i64>(8)?,
-        ))
-    })?;
-    rows.map(|row| decode_activity_aggregate(row?, wallet_hex))
-        .collect()
 }
 
 type StoredActivityRow = (
@@ -2522,20 +2580,17 @@ fn verify_activity_manifest(
     fixed_end_unix: i64,
     wallets: &[String],
 ) -> Result<(), BootstrapError> {
-    verify_activity_manifest_with(
-        connection,
-        manifest,
-        reference_sha256,
-        fixed_end_unix,
-        wallets,
-        |validation, receipt| {
-            validation.visit(
-                connection,
-                to_i64(manifest.generation, "activity generation")?,
-                receipt,
-            )
-        },
-    )
+    let generation = to_i64(manifest.generation, "activity generation")?;
+    aggregate_scan::scoped(|scan| {
+        verify_activity_manifest_with(
+            connection,
+            manifest,
+            reference_sha256,
+            fixed_end_unix,
+            wallets,
+            |validation, receipt| validation.visit(scan, connection, generation, receipt, |_| {}),
+        )
+    })
 }
 
 fn verify_activity_manifest_with(
@@ -2832,44 +2887,47 @@ fn prepare_activity_manifest(
         wallets,
     } = activity_identity(transaction)?;
     let generation_i64 = to_i64(generation, "activity generation")?;
-    let visit = |validation: &mut ActivityValidation, receipt: &ActivityWalletReceiptProof| {
-        let aggregates =
-            load_activity_aggregates(transaction, generation_i64, &receipt.wallet_hex)?;
-        // Classification may stop at an unusable second; content validation must
-        // cover the entire wallet, including everything after that stopping point.
-        validation.visit_loaded(receipt, &aggregates)?;
-        consume(&receipt.wallet_hex, &aggregates);
-        Ok(())
-    };
-    if let Some(manifest) = stored_activity_manifest(transaction, generation)? {
-        verify_activity_manifest_with(
+    aggregate_scan::scoped(|scan| {
+        let visit = |validation: &mut ActivityValidation, receipt: &ActivityWalletReceiptProof| {
+            let mut aggregates = Vec::new();
+            // Classification may stop at an unusable second; content validation must
+            // cover the entire wallet, including everything after that stopping point.
+            validation.visit(scan, transaction, generation_i64, receipt, |aggregate| {
+                aggregates.push(aggregate);
+            })?;
+            consume(&receipt.wallet_hex, &aggregates);
+            Ok(())
+        };
+        if let Some(manifest) = stored_activity_manifest(transaction, generation)? {
+            verify_activity_manifest_with(
+                transaction,
+                &manifest,
+                &reference_sha256,
+                fixed_end_unix,
+                &wallets,
+                visit,
+            )?;
+            return Ok((manifest, false));
+        }
+        let mut manifest = validate_activity_staging_with(
             transaction,
-            &manifest,
+            generation,
             &reference_sha256,
             fixed_end_unix,
             &wallets,
             visit,
-        )?;
-        return Ok((manifest, false));
-    }
-    let mut manifest = validate_activity_staging_with(
-        transaction,
-        generation,
-        &reference_sha256,
-        fixed_end_unix,
-        &wallets,
-        visit,
-    )?
-    .into_manifest(
-        generation,
-        reference_sha256,
-        fixed_end_unix,
-        finalized_at_unix,
-    );
-    if CollectionProof::load(transaction, generation)?.is_some() {
-        manifest.cursors = incremental::receipt_marker_v2();
-    }
-    Ok((manifest, true))
+        )?
+        .into_manifest(
+            generation,
+            reference_sha256,
+            fixed_end_unix,
+            finalized_at_unix,
+        );
+        if CollectionProof::load(transaction, generation)?.is_some() {
+            manifest.cursors = incremental::receipt_marker_v2();
+        }
+        Ok((manifest, true))
+    })
 }
 
 fn rebuild_ranker_projection(
@@ -5256,5 +5314,244 @@ mod publication_json_tests {
             python_canonical_json(&value).unwrap(),
             r#"{"integer":1,"large":1e+16,"ordinary":0.0001,"small":1.23e-05,"whole_float":1.0}"#
         );
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "a broken fixture must fail its test")]
+mod activity_fixtures {
+    use pe_core_types::{ReceivedAt, SourceId, SourceTimestamp, WalletAddress};
+    use pe_source_polymarket_public::{
+        ActivityParseContext, ActivityTransport, aggregate_activity_rows, parse_activity_response,
+    };
+    use rusqlite::Connection;
+    use serde_json::json;
+    use time::OffsetDateTime;
+
+    use super::{
+        ActivityAggregate, ActivityWalletReceiptProof, V2_SCHEMA, aggregate_digest,
+        insert_activity_aggregate_mode,
+    };
+
+    pub(super) const GENERATION: i64 = 1;
+    pub(super) const FIRST_SECOND: i64 = 1_788_000_000;
+
+    pub(super) fn wallet_hex(index: u8) -> String {
+        format!("0x{}", format!("{index:02x}").repeat(20))
+    }
+
+    fn built(wallet: &str, count: usize, second: impl Fn(usize) -> i64) -> Vec<ActivityAggregate> {
+        if count == 0 {
+            return Vec::new();
+        }
+        let rows = (0..count)
+            .map(|index| {
+                json!({
+                    "proxyWallet": wallet,
+                    "timestamp": second(index),
+                    "conditionId": format!("0xcondition{index}"),
+                    "type": "TRADE",
+                    "size": format!("1.{:06}", index % 1_000_000),
+                    "usdcSize": format!("0.{:06}", index % 1_000_000),
+                    "transactionHash": format!("0xtransaction{index}"),
+                    "price": "0.5",
+                    "asset": "123",
+                    "side": if index % 2 == 0 { "BUY" } else { "SELL" },
+                    "outcomeIndex": 0,
+                    "outcome": "Yes",
+                })
+            })
+            .collect::<Vec<_>>();
+        let parsed = parse_activity_response(
+            &serde_json::to_vec(&rows).unwrap(),
+            WalletAddress::from_hex(wallet).unwrap(),
+            &ActivityParseContext {
+                source_id: SourceId("polymarket-data-api".to_owned()),
+                observed_at: SourceTimestamp(
+                    OffsetDateTime::from_unix_timestamp(FIRST_SECOND + 10_000_000).unwrap(),
+                ),
+                received_at: ReceivedAt(
+                    OffsetDateTime::from_unix_timestamp(FIRST_SECOND + 10_000_001).unwrap(),
+                ),
+                transport: ActivityTransport::Rest,
+            },
+        )
+        .unwrap()
+        .rows;
+        aggregate_activity_rows(&parsed).unwrap()
+    }
+
+    pub(super) fn built_aggregates(wallet: &str, count: usize) -> Vec<ActivityAggregate> {
+        built(wallet, count, |index| {
+            FIRST_SECOND + i64::try_from(index).unwrap()
+        })
+    }
+
+    /// Every row shares one second, so stored order falls to the identity and
+    /// equal seconds necessarily straddle a batch boundary.
+    pub(super) fn same_second_aggregates(wallet: &str, count: usize) -> Vec<ActivityAggregate> {
+        built(wallet, count, |_| FIRST_SECOND)
+    }
+
+    pub(super) fn seed(
+        connection: &mut Connection,
+        wallet: &str,
+        aggregates: &[ActivityAggregate],
+    ) {
+        let transaction = connection.transaction().unwrap();
+        for aggregate in aggregates {
+            insert_activity_aggregate_mode(&transaction, GENERATION, wallet, aggregate, true)
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+    }
+
+    pub(super) fn seeded(sizes: &[usize]) -> (Connection, Vec<String>) {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(V2_SCHEMA).unwrap();
+        let wallets = (0..sizes.len())
+            .map(|index| wallet_hex(u8::try_from(index).unwrap()))
+            .collect::<Vec<_>>();
+        for (wallet, size) in wallets.iter().zip(sizes) {
+            seed(&mut connection, wallet, &built_aggregates(wallet, *size));
+        }
+        (connection, wallets)
+    }
+
+    /// A receipt that agrees with `aggregates` and certifies history through
+    /// `fixed_end_unix`.
+    pub(super) fn complete_receipt(
+        wallet: &str,
+        aggregates: &[ActivityAggregate],
+        fixed_end_unix: i64,
+    ) -> ActivityWalletReceiptProof {
+        let digest = aggregate_digest(aggregates).unwrap();
+        let source_rows: u64 = aggregates.iter().map(|aggregate| aggregate.row_count).sum();
+        serde_json::from_value(json!({
+            "wallet_hex": wallet,
+            "pages": [],
+            "ordered_aggregate_digest": digest,
+            "source_row_count": source_rows,
+            "aggregate_count": aggregates.len(),
+            "schema_version": 2,
+            "parser_version": 2,
+            "acquisition": {
+                "version": 2,
+                "mode": "full",
+                "start_exclusive": 0,
+                "fixed_end_unix": fixed_end_unix,
+                "aggregation_status": "complete",
+                "fetched_aggregate_digest": digest,
+                "fetched_aggregate_count": aggregates.len(),
+                "fetched_source_row_count": source_rows,
+                "read_sha256": "0".repeat(64),
+                "predecessor": null,
+                "disposition": "complete",
+                "exclusion_reason": null
+            }
+        }))
+        .unwrap()
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "a broken fixture must fail its test")]
+mod wallet_commitment_tests {
+    use super::activity_fixtures::{FIRST_SECOND, built_aggregates, complete_receipt, wallet_hex};
+    use super::*;
+
+    fn feed(
+        receipt: &ActivityWalletReceiptProof,
+        aggregates: &[ActivityAggregate],
+    ) -> Result<u64, BootstrapError> {
+        let mut generation = JsonArrayDigest::new();
+        let mut commitments = WalletCommitments::new(receipt, &mut generation);
+        for aggregate in aggregates {
+            commitments.push(
+                aggregate,
+                Some(canonical_json(aggregate).unwrap().as_bytes()),
+            );
+        }
+        commitments.finish()
+    }
+
+    #[test]
+    fn a_receipt_that_disagrees_is_reported_before_a_row_outside_the_window() {
+        let wallet = wallet_hex(0);
+        let aggregates = built_aggregates(&wallet, 4);
+        // The certified window excludes the last row, and the receipt disagrees;
+        // the receipt comparison owns the failure, as a whole-slice pass does.
+        let mut receipt = complete_receipt(&wallet, &aggregates, FIRST_SECOND + 2);
+        receipt.ordered_aggregate_digest = "0".repeat(64);
+        let error = feed(&receipt, &aggregates).unwrap_err().to_string();
+        assert!(
+            error.contains("activity receipt aggregate mismatch"),
+            "reported {error}"
+        );
+    }
+
+    #[test]
+    fn a_row_outside_the_window_fails_a_receipt_that_agrees() {
+        let wallet = wallet_hex(0);
+        let aggregates = built_aggregates(&wallet, 4);
+        let receipt = complete_receipt(&wallet, &aggregates, FIRST_SECOND + 2);
+        let error = feed(&receipt, &aggregates).unwrap_err().to_string();
+        assert!(
+            error.contains("complete activity row outside certified history"),
+            "reported {error}"
+        );
+    }
+
+    #[test]
+    fn an_unserializable_row_is_reported_before_the_receipt_comparison() {
+        let wallet = wallet_hex(0);
+        let aggregates = built_aggregates(&wallet, 4);
+        // The receipt disagrees too; serialization came first in the phased read.
+        let mut receipt = complete_receipt(&wallet, &aggregates, FIRST_SECOND + 100);
+        receipt.ordered_aggregate_digest = "0".repeat(64);
+        let mut generation = JsonArrayDigest::new();
+        let mut commitments = WalletCommitments::new(&receipt, &mut generation);
+        for aggregate in &aggregates {
+            commitments.push(aggregate, None);
+        }
+        commitments.hold(Some(BootstrapError::Invalid {
+            message: "row is not serializable".to_owned(),
+        }));
+        let error = commitments.finish().unwrap_err().to_string();
+        assert!(
+            error.contains("row is not serializable"),
+            "reported {error}"
+        );
+    }
+
+    #[test]
+    fn a_count_overflow_is_reported_before_an_unserializable_row() {
+        let wallet = wallet_hex(0);
+        let mut aggregates = built_aggregates(&wallet, 3);
+        let receipt = complete_receipt(&wallet, &aggregates, FIRST_SECOND + 100);
+        aggregates[0].row_count = u64::MAX;
+        aggregates[1].row_count = u64::MAX;
+        let mut generation = JsonArrayDigest::new();
+        let mut commitments = WalletCommitments::new(&receipt, &mut generation);
+        for aggregate in &aggregates {
+            commitments.push(aggregate, None);
+        }
+        commitments.hold(Some(BootstrapError::Invalid {
+            message: "row is not serializable".to_owned(),
+        }));
+        let error = commitments.finish().unwrap_err().to_string();
+        assert!(
+            error.contains("activity count overflow"),
+            "reported {error}"
+        );
+    }
+
+    #[test]
+    fn an_agreeing_wallet_reports_its_source_rows() {
+        let wallet = wallet_hex(0);
+        let aggregates = built_aggregates(&wallet, 4);
+        let receipt = complete_receipt(&wallet, &aggregates, FIRST_SECOND + 100);
+        let expected: u64 = aggregates.iter().map(|aggregate| aggregate.row_count).sum();
+        assert_eq!(feed(&receipt, &aggregates).unwrap(), expected);
     }
 }
