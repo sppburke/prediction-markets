@@ -684,39 +684,123 @@ pub(super) fn verify_archived_identity(
     Ok(())
 }
 
-pub(super) fn validate_result(
-    receipt: &ActivityWalletReceiptProof,
-    rows: &[ActivityAggregate],
-) -> Result<(), BootstrapError> {
-    if receipt.excluded() {
-        if !rows.is_empty() {
-            return invalid("excluded wallet has current-generation rows".to_owned());
+/// One wallet's acquisition partition, fed one row at a time.
+///
+/// A row's failure is held rather than returned so that `finish` reports the
+/// same failure, for the same wallet, that a whole-slice pass reports: the
+/// caller's receipt comparison still comes first, and the first offending row
+/// still wins over every later one.
+pub(super) struct AcquisitionPartition<'receipt> {
+    receipt: &'receipt ActivityWalletReceiptProof,
+    acquisition: Option<&'receipt ActivityAcquisition>,
+    rows_seen: bool,
+    carried: JsonArrayDigest,
+    fetched: JsonArrayDigest,
+    carried_count: u64,
+    carried_source: u64,
+    fetched_count: u64,
+    fetched_source: u64,
+    failure: Option<BootstrapError>,
+}
+
+impl<'receipt> AcquisitionPartition<'receipt> {
+    pub(super) fn new(receipt: &'receipt ActivityWalletReceiptProof) -> Self {
+        Self {
+            receipt,
+            acquisition: if receipt.excluded() {
+                None
+            } else {
+                receipt.acquisition.as_ref()
+            },
+            rows_seen: false,
+            carried: JsonArrayDigest::new(),
+            fetched: JsonArrayDigest::new(),
+            carried_count: 0,
+            carried_source: 0,
+            fetched_count: 0,
+            fetched_source: 0,
+            failure: None,
         }
-        return Ok(());
     }
-    let Some(acquisition) = &receipt.acquisition else {
-        return Ok(());
-    };
-    let mut carried = JsonArrayDigest::new();
-    let mut fetched = JsonArrayDigest::new();
-    let (mut carried_count, mut carried_source, mut fetched_count, mut fetched_source) =
-        (0, 0, 0, 0);
-    for row in rows {
+
+    /// `json` is the row's canonical JSON, already serialized for the wallet
+    /// and generation commitments.
+    pub(super) fn push(&mut self, row: &ActivityAggregate, json: &[u8]) {
+        self.rows_seen = true;
+        if self.failure.is_some() {
+            return;
+        }
+        let Some(acquisition) = self.acquisition else {
+            return;
+        };
         let epoch = row.source_time.0.unix_timestamp();
         if epoch <= 0 || epoch > acquisition.fixed_end_unix {
-            return invalid("complete activity row outside certified history".to_owned());
+            self.failure = Some(BootstrapError::Invalid {
+                message: "complete activity row outside certified history".to_owned(),
+            });
+            return;
         }
-        if acquisition.mode == ActivityReadMode::Incremental && epoch <= acquisition.start_exclusive
+        let (digest, count, source) = if acquisition.mode == ActivityReadMode::Incremental
+            && epoch <= acquisition.start_exclusive
         {
-            carried.push(row)?;
-            carried_count = checked_activity_count(carried_count, 1)?;
-            carried_source = checked_activity_count(carried_source, row.row_count)?;
+            (
+                &mut self.carried,
+                &mut self.carried_count,
+                &mut self.carried_source,
+            )
         } else {
-            fetched.push(row)?;
-            fetched_count = checked_activity_count(fetched_count, 1)?;
-            fetched_source = checked_activity_count(fetched_source, row.row_count)?;
+            (
+                &mut self.fetched,
+                &mut self.fetched_count,
+                &mut self.fetched_source,
+            )
+        };
+        digest.push_json(json);
+        match (
+            checked_activity_count(*count, 1),
+            checked_activity_count(*source, row.row_count),
+        ) {
+            (Ok(rows), Ok(source_rows)) => {
+                *count = rows;
+                *source = source_rows;
+            }
+            (Err(error), _) | (_, Err(error)) => self.failure = Some(error),
         }
     }
+
+    pub(super) fn finish(self) -> Result<(), BootstrapError> {
+        if self.receipt.excluded() {
+            if self.rows_seen {
+                return invalid("excluded wallet has current-generation rows".to_owned());
+            }
+            return Ok(());
+        }
+        let Some(acquisition) = self.acquisition else {
+            return Ok(());
+        };
+        if let Some(failure) = self.failure {
+            return Err(failure);
+        }
+        let (carried, fetched) = (self.carried, self.fetched);
+        let (carried_count, carried_source) = (self.carried_count, self.carried_source);
+        let (fetched_count, fetched_source) = (self.fetched_count, self.fetched_source);
+        validate_partitions(
+            acquisition,
+            carried,
+            fetched,
+            (carried_count, carried_source),
+            (fetched_count, fetched_source),
+        )
+    }
+}
+
+fn validate_partitions(
+    acquisition: &ActivityAcquisition,
+    carried: JsonArrayDigest,
+    fetched: JsonArrayDigest,
+    (carried_count, carried_source): (u64, u64),
+    (fetched_count, fetched_source): (u64, u64),
+) -> Result<(), BootstrapError> {
     if let Some(base) = acquisition.predecessor.as_ref().filter(|base| base.carried) {
         if carried.finish() != base.ordered_aggregate_digest
             || carried_count != base.aggregate_count
@@ -801,8 +885,10 @@ fn verify_and_carry_wallet(
             if row.source_time.0.unix_timestamp() <= 0 || row.source_time.0.unix_timestamp() > end {
                 return invalid("carried activity outside predecessor window".to_owned());
             }
-            digest.push(row)?;
-            history.push(row)?;
+            // One serialization feeds both commitments (#670).
+            let json = canonical_json(row)?;
+            digest.push_json(json.as_bytes());
+            history.push_json(json.as_bytes());
             count = checked_activity_count(count, 1)?;
             source_rows = checked_activity_count(source_rows, row.row_count)?;
         }
