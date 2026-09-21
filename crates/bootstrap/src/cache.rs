@@ -3235,7 +3235,7 @@ impl WalletCache {
         )?;
         let evidence_count = checked_i64(
             u64::try_from(evidence_count).map_err(|_| BootstrapError::Cache {
-                message: "clob payout evidence count is negative".to_owned(),
+                message: "clob payout evidence count does not fit".to_owned(),
             })?,
             "clob payout evidence count",
         )?;
@@ -4970,24 +4970,6 @@ fn insert_rows(
 /// migrations: the issue #149 `source` column on `market_resolutions`/`market_schedules` (every
 /// pre-migration row was Gamma-written, so `'gamma'` is the correct retroactive tag), and the issue
 /// #421 PR4 `start_date_unix` column on `market_schedules`.
-/// The payout walk's own additive columns, applied by every opener that can
-/// reach the walk: schema one migrates below, schema two returns before it, and
-/// the cutover candidate is migrated by its own schema owner (#672).
-pub(crate) fn ensure_clob_payout_counts(conn: &Connection) -> Result<(), BootstrapError> {
-    add_column_if_missing(
-        conn,
-        "clob_payout_walk_state_v2",
-        "distinct_markets",
-        "INTEGER NOT NULL DEFAULT 0",
-    )?;
-    add_column_if_missing(
-        conn,
-        "clob_payout_coverage_manifests_v2",
-        "evidence_count",
-        "INTEGER NULL",
-    )
-}
-
 fn add_column_if_missing(
     conn: &Connection,
     table: &str,
@@ -5007,6 +4989,51 @@ fn add_column_if_missing(
         conn.execute_batch(&sql)?;
     }
     Ok(())
+}
+
+/// The payout walk's own additive columns, applied by every opener that can
+/// reach the walk: the schema-one opener, the schema-two early return that
+/// `cache-populate-payout-v2` uses, and the schema-two schema owner (#672).
+///
+/// A walk interrupted before the counter existed kept its staged rows but would
+/// start counting from zero, so the completion could no longer tell a repeat
+/// from a loss in that prefix. Such a walk is discarded and restarts from page
+/// one; installed evidence from earlier generations is untouched.
+pub(crate) fn ensure_clob_payout_counts(conn: &Connection) -> Result<(), BootstrapError> {
+    let counter_missing = !column_exists(conn, "clob_payout_walk_state_v2", "distinct_markets")?;
+    add_column_if_missing(
+        conn,
+        "clob_payout_walk_state_v2",
+        "distinct_markets",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        conn,
+        "clob_payout_coverage_manifests_v2",
+        "evidence_count",
+        "INTEGER NULL",
+    )?;
+    if counter_missing {
+        conn.execute_batch(
+            "BEGIN IMMEDIATE; \
+             DELETE FROM clob_payout_evidence_staging_v2; \
+             DELETE FROM clob_payout_walk_pages_v2; \
+             DELETE FROM clob_payout_walk_state_v2; \
+             COMMIT;",
+        )?;
+    }
+    Ok(())
+}
+
+fn column_exists(conn: &Connection, table: &str, col: &str) -> Result<bool, BootstrapError> {
+    Ok(conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+            params![table, col],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0)
 }
 
 fn normalize_stored_cursor(cursor: Option<String>) -> Option<String> {
@@ -6915,6 +6942,55 @@ mod tests {
     /// PASS: the statement `commit_clob_payout_generation` runs cannot be prepared against the
     /// legacy shape, both tables carry exactly one `end_date_unix` column after a reopen, and the
     /// statement prepares from then on.
+    /// PASS: a walk interrupted before the counter existed is discarded when the
+    /// counter is installed, so it restarts from page one instead of counting
+    /// from zero over surviving staged rows (#672).
+    /// FAIL: the stale walk resumes and its uncounted prefix can be lost unseen.
+    #[test]
+    fn clob_payout_count_migration_discards_an_interrupted_pre_counter_walk() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cache.db");
+        {
+            let mut cache = WalletCache::open(&path).unwrap();
+            let state = cache
+                .begin_or_resume_clob_payout_walk_v2(1_800_000_000)
+                .unwrap();
+            cache
+                .conn
+                .execute(
+                    "INSERT INTO clob_payout_evidence_staging_v2 \
+                     (generation, market_id, is_50_50_outcome, payout_status, payout_vector_json, \
+                      closed, tokens_json, raw_page_sha256, page_ordinal, schema_version, \
+                      parser_version, fetched_at_unix, origin) \
+                     VALUES (?1, '0xa', NULL, 'unresolved_open', NULL, 1, '[]', ?2, 0, 2, 2, \
+                             1800000010, 'clob_closed_walk_v2')",
+                    params![i64::try_from(state.generation).unwrap(), "d".repeat(64)],
+                )
+                .unwrap();
+            // The walk as an older binary left it: staged rows, no counter.
+            cache
+                .conn
+                .execute_batch(
+                    "ALTER TABLE clob_payout_walk_state_v2 DROP COLUMN distinct_markets;",
+                )
+                .unwrap();
+        }
+        let cache = WalletCache::open(&path).unwrap();
+        for table in [
+            "clob_payout_walk_state_v2",
+            "clob_payout_evidence_staging_v2",
+            "clob_payout_walk_pages_v2",
+        ] {
+            let rows: i64 = cache
+                .conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(rows, 0, "{table} must be discarded with the stale walk");
+        }
+    }
+
     /// PASS: a schema-two candidate that predates the payout count columns has
     /// them restored when the payout command opens it, although that opener
     /// returns before the schema-one migrations (#672).
