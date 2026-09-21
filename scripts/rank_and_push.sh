@@ -874,7 +874,20 @@ print(int(json.load(open(sys.argv[1], encoding="utf-8"))["side_schema"]))' "$sta
   run_refresh_stage "cache-finalize" "$PE_BOOTSTRAP_BIN" cache-finalize-v2 --db "$side" \
     --stage-record "$CACHE_STAGE_RECORD" "${BOOTSTRAP_CONFIG_ARGS[@]}"
   DB="$side"
+  # The prior stands in as the installed cache's backup only when it is that
+  # file's byte copy, which activation proves by hash; the initial cutover
+  # stages its candidate from exactly such a copy. A prior of another schema —
+  # a recovered schema-two candidate over a schema-one installed cache — is
+  # not, so activation displaces the installed cache beside it instead.
+  local prior_schema="" fixed_schema=""
   if [[ -f "$prior" ]]; then
+    prior_schema="$("$PYTHON_BIN" -c 'import json, sys
+print(int(json.load(open(sys.argv[1], encoding="utf-8"))["prior_schema"]))' "$stage_json")"
+    fixed_schema="$("$PYTHON_BIN" -c 'import sqlite3, sys
+with sqlite3.connect(f"file:{sys.argv[1]}?mode=ro", uri=True) as connection:
+    print(int(connection.execute("PRAGMA user_version").fetchone()[0]))' "$FIXED_DB")"
+  fi
+  if [[ -f "$prior" && "$prior_schema" == "$fixed_schema" ]]; then
     PRIOR_CACHE_BACKUP="$prior"
   else
     PRIOR_CACHE_BACKUP="$phys_dir/wallet_cache.$cycle_name.displaced.db"
