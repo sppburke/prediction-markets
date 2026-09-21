@@ -274,6 +274,9 @@ CREATE TABLE IF NOT EXISTS market_liquidity (
 -- It is intentionally separate from legacy `market_resolutions` and
 -- `source_cursor`: neither legacy rows nor their cursor can satisfy these
 -- non-null coverage-generation/origin constraints or seed the v2 walk state.
+-- `evidence_count` records the rows the completion copied into
+-- clob_payout_evidence_v2; NULL marks coverage written before that accounting,
+-- which cannot be verified (#672).
 CREATE TABLE IF NOT EXISTS clob_payout_coverage_manifests_v2 (
     generation                  INTEGER PRIMARY KEY NOT NULL,
     manifest_json               TEXT    NOT NULL,
@@ -291,7 +294,8 @@ CREATE TABLE IF NOT EXISTS clob_payout_coverage_manifests_v2 (
     terminal_page_sha256        TEXT    NOT NULL,
     schema_version              INTEGER NOT NULL CHECK (schema_version = 2),
     parser_version              INTEGER NOT NULL CHECK (parser_version = 2),
-    completed_at_unix           INTEGER NOT NULL
+    completed_at_unix           INTEGER NOT NULL,
+    evidence_count              INTEGER NULL
 );
 
 CREATE TABLE IF NOT EXISTS clob_payout_evidence_v2 (
@@ -324,12 +328,17 @@ CREATE TABLE IF NOT EXISTS clob_payout_evidence_v2 (
 
 -- One active v2 walk. `next_cursor` is independently derived from v2 page
 -- commits; it is never copied from `source_cursor.clob_closed`.
+-- `distinct_markets` counts the markets staged so far. Pages may repeat a market
+-- and may carry entries with no market id, so it is the only count the completed
+-- copy can be proven against (#672). Comments stay outside the parenthesised
+-- definition, which SQLite re-parses when a column is dropped.
 CREATE TABLE IF NOT EXISTS clob_payout_walk_state_v2 (
     singleton          INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
     generation         INTEGER NOT NULL,
     next_cursor        TEXT    NULL,
     next_page_ordinal  INTEGER NOT NULL,
-    started_at_unix    INTEGER NOT NULL
+    started_at_unix    INTEGER NOT NULL,
+    distinct_markets   INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS clob_payout_walk_pages_v2 (
@@ -831,6 +840,10 @@ impl WalletCache {
             // defeat sealing, so v2 opens only the already-installed schema.
             conn.execute_batch(WRITABLE_PRAGMAS)?;
             Self::apply_connection_tuning(&conn, tuning)?;
+            // `cache-populate-payout-v2` opens a schema-two candidate straight
+            // through here, so its additive columns cannot wait for the legacy
+            // migrations below (#672).
+            ensure_clob_payout_counts(&conn)?;
             return Ok(Self { conn });
         }
         if found != 0 && found != CACHE_SCHEMA_VERSION_V1 {
@@ -894,6 +907,7 @@ impl WalletCache {
         // subcommand backfills them; an unfetched market remaining NULL is the honest "unknown
         // creation time" sentinel (no downstream gate treats NULL as eligible).
         add_column_if_missing(&conn, "market_schedules", "start_date_unix", "INTEGER NULL")?;
+        ensure_clob_payout_counts(&conn)?;
         // Migration (issue #429): add `outcome_index` (0-based positional outcome
         // ordinal: 0=YES,1=NO for binary) to `token_conditions` so the trades /
         // price-series join can map `trades.outcome_id` → token. Existing rows
@@ -2895,6 +2909,18 @@ impl WalletCache {
     ) -> Result<ClobPayoutWalkStateV2, BootstrapError> {
         let generation_i64 = checked_i64(generation, "clob payout generation")?;
         let page_ordinal_i64 = checked_i64(page.ordinal, "clob payout page ordinal")?;
+        // The page proof counts what the response carried, so a short slice would
+        // otherwise stage fewer markets than the manifest later claims (#672).
+        if u64::try_from(evidence.len()).unwrap_or(u64::MAX) != page.market_count {
+            return Err(BootstrapError::Cache {
+                message: format!(
+                    "clob payout page {} carries {} markets but counts {}",
+                    page.ordinal,
+                    evidence.len(),
+                    page.market_count
+                ),
+            });
+        }
         let mut stored_rows = Vec::with_capacity(evidence.len());
         for item in evidence {
             let Some(market_id) = item
@@ -2977,7 +3003,12 @@ impl WalletCache {
                 )?,
             ],
         )?;
+        let mut staged_markets: i64 = 0;
         {
+            let mut staged = tx.prepare(
+                "SELECT EXISTS(SELECT 1 FROM clob_payout_evidence_staging_v2 \
+                 WHERE generation = ?1 AND market_id = ?2)",
+            )?;
             let mut statement = tx.prepare(
                 "INSERT INTO clob_payout_evidence_staging_v2 \
                  (generation, market_id, end_date_unix, is_50_50_outcome, payout_status, \
@@ -3009,6 +3040,13 @@ impl WalletCache {
                 tokens,
             ) in stored_rows
             {
+                // A market the venue repeats — within a page or across pages —
+                // updates its staged row instead of adding one.
+                let repeated: i64 =
+                    staged.query_row(params![generation_i64, &market_id], |row| row.get(0))?;
+                if repeated == 0 {
+                    staged_markets = staged_markets.saturating_add(1);
+                }
                 statement.execute(params![
                     generation_i64,
                     market_id,
@@ -3034,10 +3072,12 @@ impl WalletCache {
                 })?;
         tx.execute(
             "UPDATE clob_payout_walk_state_v2 \
-             SET next_cursor = ?1, next_page_ordinal = ?2 WHERE singleton = 1",
+             SET next_cursor = ?1, next_page_ordinal = ?2, \
+                 distinct_markets = distinct_markets + ?3 WHERE singleton = 1",
             params![
                 normalize_stored_cursor(page.returned_next_cursor.clone()),
                 checked_i64(next_page_ordinal, "clob payout next page ordinal")?,
+                staged_markets,
             ],
         )?;
         tx.commit()?;
@@ -3125,11 +3165,12 @@ impl WalletCache {
         };
         let generation = checked_i64(manifest.generation, "clob payout generation")?;
         let tx = self.conn.transaction()?;
-        let active_generation = tx
+        let (active_generation, staged_markets) = tx
             .query_row(
-                "SELECT generation FROM clob_payout_walk_state_v2 WHERE singleton = 1",
+                "SELECT generation, distinct_markets FROM clob_payout_walk_state_v2 \
+                 WHERE singleton = 1",
                 [],
-                |row| row.get::<_, i64>(0),
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
             )
             .optional()?
             .ok_or_else(|| BootstrapError::Cache {
@@ -3178,7 +3219,10 @@ impl WalletCache {
             ],
         )?;
         tx.execute("DELETE FROM clob_payout_evidence_v2", [])?;
-        tx.execute(
+        // Staging collapses a market the venue returned on more than one page, so the
+        // rows copied here are the distinct markets this walk covered (#672). Coverage
+        // records that count, because the manifest's per-page sum counts repeats twice.
+        let evidence_count = tx.execute(
             "INSERT INTO clob_payout_evidence_v2 \
              (market_id, end_date_unix, is_50_50_outcome, payout_status, payout_vector_json, closed, \
               tokens_json, raw_page_sha256, coverage_generation, page_ordinal, \
@@ -3188,6 +3232,25 @@ impl WalletCache {
                     parser_version, fetched_at_unix, origin \
              FROM clob_payout_evidence_staging_v2 WHERE generation = ?1",
             params![generation],
+        )?;
+        let evidence_count = checked_i64(
+            u64::try_from(evidence_count).map_err(|_| BootstrapError::Cache {
+                message: "clob payout evidence count does not fit".to_owned(),
+            })?,
+            "clob payout evidence count",
+        )?;
+        // Every distinct market the walk staged must survive into the evidence
+        // table; anything lost between staging and this copy fails the walk (#672).
+        if evidence_count != staged_markets {
+            return Err(BootstrapError::Cache {
+                message: format!(
+                    "clob payout completion copied {evidence_count} markets but staged {staged_markets}"
+                ),
+            });
+        }
+        tx.execute(
+            "UPDATE clob_payout_coverage_manifests_v2 SET evidence_count = ?2 WHERE generation = ?1",
+            params![generation, evidence_count],
         )?;
         tx.execute(
             "DELETE FROM clob_payout_evidence_staging_v2 WHERE generation = ?1",
@@ -4926,6 +4989,51 @@ fn add_column_if_missing(
         conn.execute_batch(&sql)?;
     }
     Ok(())
+}
+
+/// The payout walk's own additive columns, applied by every opener that can
+/// reach the walk: the schema-one opener, the schema-two early return that
+/// `cache-populate-payout-v2` uses, and the schema-two schema owner (#672).
+///
+/// A walk interrupted before the counter existed kept its staged rows but would
+/// start counting from zero, so the completion could no longer tell a repeat
+/// from a loss in that prefix. Such a walk is discarded and restarts from page
+/// one; installed evidence from earlier generations is untouched.
+pub(crate) fn ensure_clob_payout_counts(conn: &Connection) -> Result<(), BootstrapError> {
+    let counter_missing = !column_exists(conn, "clob_payout_walk_state_v2", "distinct_markets")?;
+    add_column_if_missing(
+        conn,
+        "clob_payout_walk_state_v2",
+        "distinct_markets",
+        "INTEGER NOT NULL DEFAULT 0",
+    )?;
+    add_column_if_missing(
+        conn,
+        "clob_payout_coverage_manifests_v2",
+        "evidence_count",
+        "INTEGER NULL",
+    )?;
+    if counter_missing {
+        conn.execute_batch(
+            "BEGIN IMMEDIATE; \
+             DELETE FROM clob_payout_evidence_staging_v2; \
+             DELETE FROM clob_payout_walk_pages_v2; \
+             DELETE FROM clob_payout_walk_state_v2; \
+             COMMIT;",
+        )?;
+    }
+    Ok(())
+}
+
+fn column_exists(conn: &Connection, table: &str, col: &str) -> Result<bool, BootstrapError> {
+    Ok(conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+            params![table, col],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0)
+        > 0)
 }
 
 fn normalize_stored_cursor(cursor: Option<String>) -> Option<String> {
@@ -6834,6 +6942,91 @@ mod tests {
     /// PASS: the statement `commit_clob_payout_generation` runs cannot be prepared against the
     /// legacy shape, both tables carry exactly one `end_date_unix` column after a reopen, and the
     /// statement prepares from then on.
+    /// PASS: a walk interrupted before the counter existed is discarded when the
+    /// counter is installed, so it restarts from page one instead of counting
+    /// from zero over surviving staged rows (#672).
+    /// FAIL: the stale walk resumes and its uncounted prefix can be lost unseen.
+    #[test]
+    fn clob_payout_count_migration_discards_an_interrupted_pre_counter_walk() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cache.db");
+        {
+            let mut cache = WalletCache::open(&path).unwrap();
+            let state = cache
+                .begin_or_resume_clob_payout_walk_v2(1_800_000_000)
+                .unwrap();
+            cache
+                .conn
+                .execute(
+                    "INSERT INTO clob_payout_evidence_staging_v2 \
+                     (generation, market_id, is_50_50_outcome, payout_status, payout_vector_json, \
+                      closed, tokens_json, raw_page_sha256, page_ordinal, schema_version, \
+                      parser_version, fetched_at_unix, origin) \
+                     VALUES (?1, '0xa', NULL, 'unresolved_open', NULL, 1, '[]', ?2, 0, 2, 2, \
+                             1800000010, 'clob_closed_walk_v2')",
+                    params![i64::try_from(state.generation).unwrap(), "d".repeat(64)],
+                )
+                .unwrap();
+            // The walk as an older binary left it: staged rows, no counter.
+            cache
+                .conn
+                .execute_batch(
+                    "ALTER TABLE clob_payout_walk_state_v2 DROP COLUMN distinct_markets;",
+                )
+                .unwrap();
+        }
+        let cache = WalletCache::open(&path).unwrap();
+        for table in [
+            "clob_payout_walk_state_v2",
+            "clob_payout_evidence_staging_v2",
+            "clob_payout_walk_pages_v2",
+        ] {
+            let rows: i64 = cache
+                .conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(rows, 0, "{table} must be discarded with the stale walk");
+        }
+    }
+
+    /// PASS: a schema-two candidate that predates the payout count columns has
+    /// them restored when the payout command opens it, although that opener
+    /// returns before the schema-one migrations (#672).
+    /// FAIL: the columns stay absent and the walk cannot record its counts.
+    #[test]
+    fn clob_payout_count_migration_reaches_a_schema_two_candidate() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cache.db");
+        {
+            let cache = WalletCache::open(&path).unwrap();
+            cache
+                .conn
+                .execute_batch(&format!(
+                    "ALTER TABLE clob_payout_walk_state_v2 DROP COLUMN distinct_markets; \
+                     ALTER TABLE clob_payout_coverage_manifests_v2 DROP COLUMN evidence_count; \
+                     PRAGMA user_version = {CACHE_SCHEMA_VERSION_V2};"
+                ))
+                .unwrap();
+        }
+        let cache = WalletCache::open(&path).unwrap();
+        for (table, column) in [
+            ("clob_payout_walk_state_v2", "distinct_markets"),
+            ("clob_payout_coverage_manifests_v2", "evidence_count"),
+        ] {
+            let present: i64 = cache
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+                    params![table, column],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(present, 1, "{table}.{column} must be migrated");
+        }
+    }
+
     /// FAIL: the column is still absent after the reopen, or the statement still cannot prepare.
     #[test]
     fn clob_payout_end_date_migration_repairs_pre_566_tables() {

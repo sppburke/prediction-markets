@@ -4491,6 +4491,8 @@ fn ensure_lane_a_v2_schema(connection: &Connection) -> Result<(), BootstrapError
     if !activity_exists {
         connection.execute_batch(ACTIVITY_ID_INDEX_SQL)?;
     }
+    // A candidate migrated before these columns existed still has to walk payouts.
+    crate::cache::ensure_clob_payout_counts(connection)?;
     verify_activity_identity_index(connection, false)?;
     for (table, column, definition) in [
         (
@@ -4794,13 +4796,26 @@ fn verify_finalized_v2_manifests(
 }
 
 fn verify_payout_coverage(connection: &Connection, generation: i64) -> Result<(), BootstrapError> {
-    let (manifest_json, market_count, schema_version, parser_version): (String, i64, i64, i64) =
-        connection.query_row(
-            "SELECT manifest_json, market_count, schema_version, parser_version
+    let (manifest_json, market_count, schema_version, parser_version, committed_count): (
+        String,
+        i64,
+        i64,
+        i64,
+        Option<i64>,
+    ) = connection.query_row(
+        "SELECT manifest_json, market_count, schema_version, parser_version, evidence_count
              FROM clob_payout_coverage_manifests_v2 WHERE generation = ?1",
-            params![generation],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )?;
+        params![generation],
+        |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        },
+    )?;
     let manifest: ClobCoverageManifest = serde_json::from_str(&manifest_json)?;
     let rebuilt = ClobCoverageManifest::complete(manifest.generation, manifest.pages.clone())
         .map_err(|error| BootstrapError::Invalid {
@@ -4818,14 +4833,33 @@ fn verify_payout_coverage(connection: &Connection, generation: i64) -> Result<()
             "CLOB payout coverage manifest does not match its stored generation".to_owned(),
         );
     }
+    // A market the venue returns on two pages is summed twice by the manifest and
+    // stored once by the evidence table, so coverage is proven against the rows the
+    // commit actually wrote rather than against that sum (#672).
+    let Some(committed_count) = committed_count else {
+        return invalid(
+            "CLOB payout coverage predates committed-evidence accounting; re-run the payout walk"
+                .to_owned(),
+        );
+    };
+    // Collapsing repeats can only lower the count, never raise it, and only a walk
+    // that saw nothing may commit nothing.
+    if committed_count < 0
+        || committed_count > market_count
+        || (committed_count == 0 && market_count > 0)
+    {
+        return invalid(format!(
+            "CLOB payout coverage committed an impossible row count: committed={committed_count}, manifest={market_count}"
+        ));
+    }
     let evidence_count: i64 = connection.query_row(
         "SELECT COUNT(*) FROM clob_payout_evidence_v2 WHERE coverage_generation = ?1",
         params![generation],
         |row| row.get(0),
     )?;
-    if evidence_count != market_count {
+    if evidence_count != committed_count {
         return invalid(format!(
-            "CLOB payout coverage is incomplete: manifest={market_count}, evidence={evidence_count}"
+            "CLOB payout coverage is incomplete: committed={committed_count}, evidence={evidence_count}"
         ));
     }
     Ok(())

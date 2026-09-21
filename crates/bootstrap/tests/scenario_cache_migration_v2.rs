@@ -289,9 +289,10 @@ fn install_payout_manifest(path: &std::path::Path) {
                  (generation, manifest_json, walked_start_cursor, walked_end_cursor,
                   page_count, market_count, closed_market_count, resolved_payout_count,
                   unresolved_payout_count, explicit_fifty_fifty_count, terminal_kind,
-                  terminal_page_sha256, schema_version, parser_version, completed_at_unix)
+                  terminal_page_sha256, schema_version, parser_version, completed_at_unix,
+                  evidence_count)
              VALUES (1, ?1, NULL, 'LTE=', 1, 0, 0, 0, 0, 0, 'end_cursor',
-                     ?2, ?3, ?4, 1800000020)",
+                     ?2, ?3, ?4, 1800000020, 0)",
             params![
                 serde_json::to_string(&manifest).unwrap(),
                 "a".repeat(64),
@@ -1786,6 +1787,20 @@ async fn refinalization_refuses_changed_or_missing_projection_proof() {
             "payout_evidence",
             "DELETE FROM clob_payout_evidence_v2 WHERE market_id = '0xlater-a'",
             "CLOB payout coverage is incomplete",
+        ),
+        (
+            // Coverage written before the committed-evidence count existed cannot be
+            // verified, so it must be rejected rather than accepted (#672).
+            "payout_committed_absent",
+            "UPDATE clob_payout_coverage_manifests_v2 SET evidence_count = NULL",
+            "predates committed-evidence accounting",
+        ),
+        (
+            // Collapsing repeated markets can only lower the committed count; a count
+            // above the walk's own total is impossible.
+            "payout_committed_excess",
+            "UPDATE clob_payout_coverage_manifests_v2 SET evidence_count = market_count + 1",
+            "impossible row count",
         ),
         (
             "payout_market",
