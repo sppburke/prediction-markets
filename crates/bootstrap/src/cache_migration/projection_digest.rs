@@ -29,7 +29,7 @@ const TEXT_COLUMNS: usize = COLUMNS - INT_COLUMNS.len();
 /// One batch of projection rows, packed into two buffers.
 struct RawBatch {
     text: String,
-    text_ends: Vec<u32>,
+    text_ends: Vec<usize>,
     ints: Vec<i64>,
     rows: usize,
 }
@@ -69,8 +69,7 @@ impl RawBatch {
                 self.ints.push(row.get(column)?);
             } else {
                 self.text.push_str(text_column(row, column)?);
-                self.text_ends
-                    .push(u32::try_from(self.text.len()).map_err(|_| BootstrapError::Internal)?);
+                self.text_ends.push(self.text.len());
             }
         }
         Ok(())
@@ -84,7 +83,7 @@ impl RawBatch {
 /// A batch's rows as canonical JSON, packed behind one buffer.
 struct EncodedBatch {
     json: Vec<u8>,
-    json_ends: Vec<u32>,
+    json_ends: Vec<usize>,
 }
 
 /// Builds the same object the serial loop built, key for key, and serializes it
@@ -97,7 +96,7 @@ fn encode_batch(batch: &RawBatch) -> Result<EncodedBatch, BootstrapError> {
     for row in 0..batch.rows {
         let mut text: [&str; TEXT_COLUMNS] = [""; TEXT_COLUMNS];
         for field in &mut text {
-            let end = batch.text_ends[text_index] as usize;
+            let end = batch.text_ends[text_index];
             *field = &batch.text[text_cursor..end];
             text_cursor = end;
             text_index += 1;
@@ -120,7 +119,7 @@ fn encode_batch(batch: &RawBatch) -> Result<EncodedBatch, BootstrapError> {
             "end_date_unix": ints[4],
         });
         serde_json::to_writer(&mut json, &value)?;
-        json_ends.push(u32::try_from(json.len()).map_err(|_| BootstrapError::Internal)?);
+        json_ends.push(json.len());
     }
     Ok(EncodedBatch { json, json_ends })
 }
@@ -229,7 +228,6 @@ fn stream(
         };
         let mut start = 0_usize;
         for end in batch.json_ends {
-            let end = end as usize;
             digest.push_json(&batch.json[start..end]);
             start = end;
         }
@@ -401,8 +399,32 @@ mod tests {
     fn the_parallel_digest_equals_the_serial_one_across_batch_boundaries() {
         // Every size straddles or fills a batch differently; zero covers an
         // empty projection, whose digest is the empty array's.
-        for projected in [0, 1, BATCH_ROWS - 1, BATCH_ROWS, BATCH_ROWS + 1, 2_000] {
+        // 5,000 rows is ten batches, past the six a three-worker pool may hold.
+        for projected in [
+            0,
+            1,
+            BATCH_ROWS - 1,
+            BATCH_ROWS,
+            BATCH_ROWS + 1,
+            2_000,
+            5_000,
+        ] {
             let (_dir, connection) = projected_cache(projected.max(1), projected);
+            if projected > 0 {
+                // Bytes the serializer must escape, and integers at their extremes.
+                connection
+                    .execute_batch(
+                        "UPDATE activity_groups_v2 SET share_amount_str = 'a\"b\\c\u{1}d' \
+                             WHERE rowid % 7 = 0;
+                         UPDATE activity_groups_v2 SET asset = 'x\u{e9}\u{1f4b0}\u{2028}y' \
+                             WHERE rowid % 11 = 0;
+                         UPDATE activity_groups_v2 SET source_time_unix = 9223372036854775807 \
+                             WHERE rowid % 13 = 0;
+                         UPDATE activity_groups_v2 SET outcome_id = -9223372036854775808 \
+                             WHERE rowid % 17 = 0;",
+                    )
+                    .unwrap();
+            }
             let expected = serial_digest(&connection).unwrap();
             for workers in WORKER_COUNTS {
                 let actual = compute_with(workers, &connection, 1).unwrap();
