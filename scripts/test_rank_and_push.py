@@ -966,6 +966,43 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertEqual(manifest["versions"]["clob_resolution_schema"], 2)
         self.assertEqual(manifest["versions"]["ranker"], 1)
 
+    def test_recovered_schema_two_prior_displaces_the_schema_one_installed_cache(self):
+        """PASS: a legacy cycle whose immutable prior is a recovered schema-two
+        candidate beside the schema-one installed cache collects the prior's
+        next generation, binds the displaced path as the installed cache's
+        backup, and activation preserves the installed bytes there. FAIL: the
+        prior named as the backup, which activation refuses because its bytes
+        are not the installed cache's."""
+        fixed = self._install_candidate_layout(schema=1)
+        self._install_candidate_stub()
+        (self.root / ".env").write_text(
+            "SUPABASE_URL=http://127.0.0.1:9\nSUPABASE_SECRET_KEY=test-secret\n"
+            "PE_RANK_SCHEMA_TWO_CUTOVER=1\n"
+        )
+        result = self._run(exit_env={"STUB_PRIOR_SCHEMA": "2"})
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        out = next((self.root / "data/eval-results").glob("cron-*"))
+        prior = self.root / "phys" / f"wallet_cache.{out.name}.prior.db"
+        displaced = self.root / "phys" / f"wallet_cache.{out.name}.displaced.db"
+        self.assertEqual(
+            self._bootstrap_ops(),
+            ["cache-stage-v2", "winner-discovery", "activate-next", "cache-populate-activity-v2",
+             "cache-populate-payout-v2", "cache-finalize-v2", "prices-history", "cache-finalize-v2",
+             "cache-activate"],
+            "a schema-two prior is not sealed again",
+        )
+        self.assertIn("--fresh-generation 2", self._bootstrap_lines("cache-populate-activity-v2")[0])
+        self.assertIn(f"--backup {displaced}", self._bootstrap_lines("cache-activate")[0])
+        request = json.loads((out / "ranking_publish_request.json").read_text())
+        self.assertEqual(request["cache_activation"]["prior_cache_backup_path"], str(displaced))
+        self.assertEqual(request["cache_activation"]["fixed_path"], str(fixed))
+        with sqlite3.connect(fixed) as connection:
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 2)
+        accepted = json.loads((out / "accepted_cycle_manifest.json").read_text())
+        self.assertEqual(accepted["source_watermark"]["activity"]["generation"], 2)
+        self.assertFalse(prior.exists(), "retirement removes the recovered prior")
+        self.assertFalse(displaced.exists(), "retirement removes the displaced installed cache")
+
     def test_installed_schema_two_cache_runs_the_candidate_lane_and_captures_its_generation(self):
         """An installed schema-two cache runs the private-candidate lane; the
         accepted capture reads only the newly completed generation of the
@@ -1560,7 +1597,17 @@ class RankAndPushScenario(unittest.TestCase):
             "        assert schema(side) != -2, 'unfinished bulk root must bypass staging'\n"
             "        print(json.dumps({'prior_path': prior, 'side_path': side, 'prior_schema': schema(prior), 'side_schema': schema(side), 'prior_sha256': None, 'side_sha256': None, 'resumed': True}))\n"
             "        raise SystemExit(0)\n"
-            "    if not os.path.exists(prior): shutil.copyfile(db, prior)\n"
+            "    if not os.path.exists(prior):\n"
+            "        shutil.copyfile(db, prior)\n"
+            "        if os.environ.get('STUB_PRIOR_SCHEMA') == '2':\n"
+            "            with sqlite3.connect(prior) as c:\n"
+            "                c.executescript('PRAGMA user_version = 2; DROP TABLE trades; DROP TABLE market_resolutions; DROP TABLE source_cursor;')\n"
+            "                recorded = {'version': 2, 'generation': 1, 'fixed_end_unix': now - int(os.environ.get('STUB_PRIOR_AGE', '100000')), 'wallets': ['0xabc'], 'base_generation': None, 'base_manifest_sha256': None, 'start_exclusive': 0, 'full_read_wallets': ['0xabc']}\n"
+            "                recorded['digest'] = hashlib.sha256(json.dumps(recorded, sort_keys=True, separators=(',', ':')).encode()).hexdigest()\n"
+            "                c.execute('INSERT INTO activity_groups_v2 (wallet_hex, source_time_unix, activity_type, coverage_generation) VALUES (?, ?, ?, ?)', ('0xabc', recorded['fixed_end_unix'], 'TRADE', 1))\n"
+            "                c.execute('INSERT INTO activity_coverage_manifests_v2 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', (1, '{}', now, recorded['digest'], 1, 'bb', 'cc', 1, json.dumps(recorded)))\n"
+            "                c.execute('INSERT OR IGNORE INTO cache_v2_migration_state (singleton, ranker_projection_count, ranker_projection_digest, ranker_classifier_version, fresh_collection_json) VALUES (1, NULL, NULL, NULL, NULL)')\n"
+            "                c.execute('UPDATE cache_v2_migration_state SET fresh_collection_json = ?', (json.dumps(recorded),))\n"
             "    shutil.copyfile(prior, side)\n"
             "    if schema(prior) != 2 and manifest and not os.path.exists(manifest):\n"
             "        json.dump({'manifest_version': 1, 'backup_sha256': sha(prior), 'source_bounds': {}, 'cursors': {}, 'hashes': {}, 'sealed_at_unix': now}, open(manifest, 'w'))\n"
@@ -1630,7 +1677,8 @@ class RankAndPushScenario(unittest.TestCase):
             "                assert sha(backup) == evidence['source_sha256']\n"
             '            os.rename(db, fixed)\n'
             '        else:\n'
-            '            if not os.path.exists(backup): shutil.copyfile(fixed, backup)\n'
+            '            if os.path.exists(backup): assert sha(backup) == sha(fixed), "existing prior-cache backup differs from the fixed cache"\n'
+            '            else: shutil.copyfile(fixed, backup)\n'
             '            os.replace(db, fixed)\n'
             "    print(json.dumps({'installed': fixed}))\n",
         )
