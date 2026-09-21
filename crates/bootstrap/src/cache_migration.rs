@@ -44,6 +44,7 @@ use tokio::sync::{mpsc, oneshot};
 mod aggregate_scan;
 mod digests;
 mod incremental;
+mod projection_digest;
 use digests::{JsonArrayDigest, ReceiptSetDigest};
 use incremental::{
     CollectionProof, commit_incremental_wallet, generation_identity, manifest_link,
@@ -3096,33 +3097,7 @@ fn ranker_projection_digest(
     connection: &Connection,
     activity_generation: u64,
 ) -> Result<String, BootstrapError> {
-    let mut statement = connection.prepare(RANKER_PROJECTION_DIGEST_SQL)?;
-    let rows = statement.query_map(
-        params![to_i64(activity_generation, "activity generation")?],
-        |row| {
-            Ok(serde_json::json!({
-                "source_trade_id": row.get::<_, String>(0)?,
-                "activity_generation": row.get::<_, i64>(1)?,
-                "classifier_version": row.get::<_, i64>(2)?,
-                "wallet_hex": row.get::<_, String>(3)?,
-                "condition_id": row.get::<_, String>(4)?,
-                "asset": row.get::<_, String>(5)?,
-                "outcome_id": row.get::<_, i64>(6)?,
-                "side": row.get::<_, String>(7)?,
-                "share_amount_str": row.get::<_, String>(8)?,
-                "price_weighted_share_amount_str": row.get::<_, String>(9)?,
-                "source_usdc_amount_str": row.get::<_, String>(10)?,
-                "source_time_unix": row.get::<_, i64>(11)?,
-                "payout_vector_json": row.get::<_, String>(12)?,
-                "end_date_unix": row.get::<_, i64>(13)?,
-            }))
-        },
-    )?;
-    let mut digest = JsonArrayDigest::new();
-    for row in rows {
-        digest.push(&row?)?;
-    }
-    Ok(digest.finish())
+    projection_digest::compute(connection, activity_generation)
 }
 
 fn verify_reusable_ranker_projection(

@@ -114,7 +114,10 @@ struct DecodedBatch {
     serialization_failure: Option<BootstrapError>,
 }
 
-fn text_column<'row>(row: &'row Row<'_>, column: usize) -> Result<&'row str, BootstrapError> {
+pub(super) fn text_column<'row>(
+    row: &'row Row<'_>,
+    column: usize,
+) -> Result<&'row str, BootstrapError> {
     if let ValueRef::Text(bytes) = row.get_ref(column)?
         && let Ok(text) = std::str::from_utf8(bytes)
     {
