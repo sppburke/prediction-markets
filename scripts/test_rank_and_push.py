@@ -1664,6 +1664,8 @@ class RankAndPushScenario(unittest.TestCase):
             "elif sub == 'cache-activate':\n"
             "    fixed, backup = opt('--fixed-db'), opt('--backup')\n"
             "    evidence_path = Path(db).with_suffix('.stage.json')\n"
+            "    record = opt('--final-stage-record')\n"
+            "    if record: assert json.load(open(record))['cache_sha256'] == opt('--expected-sha256'), 'final-stage record describes other bytes'\n"
             '    if os.path.exists(db):\n'
             "        assert sha(db) == opt('--expected-sha256'), 'side hash changed after finalization'\n"
             '        if evidence_path.exists():\n'
@@ -1703,6 +1705,10 @@ class RankAndPushScenario(unittest.TestCase):
                 before = self._bootstrap_ops()
                 with (self.root / ".env").open("a") as handle:
                     handle.write("PE_RANK_SCHEMA_TWO_CUTOVER=1\n")
+                record = request_path.parent / "cache_stage_record.json"
+                self.assertTrue(record.is_file())
+                if args:
+                    record.unlink()  # a resume without the record recomputes the digest
                 resumed = self._run(*args, exit_env={"STUB_PUSH_EXIT": "75"})
                 self.assertEqual(resumed.returncode, 75, resumed.stderr + resumed.stdout)
                 self.assertEqual(self._bootstrap_ops()[len(before):], ["cache-activate"])
@@ -1710,9 +1716,16 @@ class RankAndPushScenario(unittest.TestCase):
                 self.assertEqual(displaced.read_bytes(), old_bytes)
                 self.assertEqual(request_path.read_bytes(), request_bytes)
                 self.assertIn("--stage-evidence-sha256", self._bootstrap_lines("cache-activate")[-1])
+                self.assertEqual(
+                    "--final-stage-record" in self._bootstrap_lines("cache-activate")[-1], not args
+                )
                 self.assertEqual(len(list(fixed.parent.glob("*.db"))), 2)
+                activations = len(self._bootstrap_lines("cache-activate"))
                 completed = self._run("--resume-pending")
                 self.assertEqual(completed.returncode, 0, completed.stderr + completed.stdout)
+                final = self._bootstrap_lines("cache-activate")
+                self.assertGreater(len(final), activations)
+                self.assertEqual("--final-stage-record" in final[-1], not args)
                 self.assertFalse(displaced.exists())
                 self.assertFalse(pending.exists())
                 self.assertEqual(len(list(fixed.parent.glob("*.db"))), 1)
@@ -2205,6 +2218,10 @@ finally:
         side = f"{self.root}/phys/wallet_cache.{cycle}.side.db"
         prior = self.root / "phys" / f"wallet_cache.{cycle}.prior.db"
         self.assertIn(f"--db {side} --fresh-generation 1", self._bootstrap_lines("cache-populate-activity-v2")[0])
+        self.assertIn(
+            f"--final-stage-record data/eval-results/{cycle}/cache_stage_record.json",
+            self._bootstrap_lines("cache-activate")[0],
+        )
         self.assertIn(f"--db {self.root}/phys/wallet_cache.db --prior {prior} --side {side}", self._bootstrap_lines("cache-stage-v2")[0])
         build = json.loads((out / "cache_build_manifest.json").read_text())
         self.assertEqual(build["backup_sha256"], json.loads(Path(side).with_suffix(".stage.json").read_text())["source_sha256"])

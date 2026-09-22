@@ -1096,9 +1096,16 @@ activate_bound_cache() {
   fi
   local -a stage_binding=()
   [[ "${#binding[@]}" -ne 5 ]] || stage_binding=(--stage-evidence-sha256 "${binding[4]}")
+  # The finalization record that hashed the candidate proves its projection
+  # digest, so activation need not recompute it (#682). Without the record,
+  # activation recomputes as before.
+  local -a record_binding=()
+  local final_record="${CACHE_STAGE_RECORD:-$OUT_DIR/cache_stage_record.json}"
+  [[ ! -f "$final_record" ]] || record_binding=(--final-stage-record "$final_record")
   "$PE_BOOTSTRAP_BIN" cache-activate --db "${binding[0]}" \
     --fixed-db "${binding[1]}" --backup "${binding[2]}" \
-    --expected-sha256 "${binding[3]}" "${stage_binding[@]}" "${lock_handoff[@]}"
+    --expected-sha256 "${binding[3]}" "${stage_binding[@]}" "${record_binding[@]}" \
+    "${lock_handoff[@]}"
 }
 
 push_rc=0
