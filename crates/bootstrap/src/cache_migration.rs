@@ -990,6 +990,31 @@ fn require_bulk_root_state(
     Ok(())
 }
 
+/// Every distinct `wallet_hex` in `table`, as stored. Seeks the wallet-led
+/// index from each key to its successor instead of walking every entry:
+/// `SELECT DISTINCT` reads the whole index (about 62 GB of scattered pages
+/// on Forge, an hour), while this touches one path per wallet.
+fn distinct_wallets(
+    connection: &Connection,
+    table: &str,
+) -> Result<BTreeSet<String>, BootstrapError> {
+    let mut first = connection.prepare(&format!(
+        "SELECT wallet_hex FROM {table} ORDER BY wallet_hex LIMIT 1"
+    ))?;
+    let mut next = connection.prepare(&format!(
+        "SELECT wallet_hex FROM {table} WHERE wallet_hex > ?1 ORDER BY wallet_hex LIMIT 1"
+    ))?;
+    let mut wallets = BTreeSet::new();
+    let mut cursor: Option<String> = first.query_row([], |row| row.get(0)).optional()?;
+    while let Some(wallet) = cursor {
+        cursor = next
+            .query_row(params![&wallet], |row| row.get(0))
+            .optional()?;
+        wallets.insert(wallet);
+    }
+    Ok(wallets)
+}
+
 fn begin_or_resume_fresh_collection(
     connection: &mut Connection,
     generation: u64,
@@ -1105,22 +1130,23 @@ fn begin_or_resume_fresh_collection(
         None
     };
 
+    let retained = distinct_wallets(
+        &transaction,
+        if prior.is_some() {
+            "activity_groups_v2"
+        } else {
+            "trades_v1_sealed"
+        },
+    )?;
+    let active = transaction
+        .prepare("SELECT wallet_hex FROM active_tradeable_wallets")?
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
     let mut wallets = BTreeSet::new();
-    let retained_sql = if prior.is_some() {
-        "SELECT DISTINCT wallet_hex FROM activity_groups_v2"
-    } else {
-        "SELECT DISTINCT wallet_hex FROM trades_v1_sealed"
-    };
-    for sql in [
-        "SELECT wallet_hex FROM active_tradeable_wallets",
-        retained_sql,
-    ] {
-        let mut statement = transaction.prepare(sql)?;
-        for wallet in statement.query_map([], |row| row.get::<_, String>(0))? {
-            let wallet = wallet?.to_ascii_lowercase();
-            validate_wallet_hex(&wallet)?;
-            wallets.insert(wallet);
-        }
+    for wallet in active.iter().chain(&retained) {
+        let wallet = wallet.to_ascii_lowercase();
+        validate_wallet_hex(&wallet)?;
+        wallets.insert(wallet);
     }
     let mut prior_wallets = BTreeSet::new();
     let mut full = BTreeSet::new();
@@ -1152,14 +1178,8 @@ fn begin_or_resume_fresh_collection(
         }
     }
     // Retained history without a receipt is corruption, never a new-wallet exception.
-    if recorded.is_some() {
-        let mut statement =
-            transaction.prepare("SELECT DISTINCT wallet_hex FROM activity_groups_v2")?;
-        for wallet in statement.query_map([], |row| row.get::<_, String>(0))? {
-            if !prior_wallets.contains(&wallet?) {
-                return invalid("retained wallet has no predecessor proof".to_owned());
-            }
-        }
+    if recorded.is_some() && !retained.is_subset(&prior_wallets) {
+        return invalid("retained wallet has no predecessor proof".to_owned());
     }
     for wallet in selected_full_reads {
         validate_wallet_hex(wallet)?;
@@ -5562,5 +5582,100 @@ mod wallet_commitment_tests {
         let receipt = complete_receipt(&wallet, &aggregates, FIRST_SECOND + 100);
         let expected: u64 = aggregates.iter().map(|aggregate| aggregate.row_count).sum();
         assert_eq!(feed(&receipt, &aggregates).unwrap(), expected);
+    }
+}
+
+#[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "a broken fixture must fail its test")]
+mod distinct_wallet_tests {
+    use std::collections::BTreeSet;
+
+    use rusqlite::Connection;
+    use tempfile::TempDir;
+
+    use super::{V2_SCHEMA, distinct_wallets};
+
+    /// Both real tables with their wallet-led indexes: the schema-one opener
+    /// creates `trades`, sealing renames it, the schema-two owner adds the
+    /// activity table.
+    fn both_tables() -> (TempDir, Connection) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("cache.db");
+        drop(crate::cache::WalletCache::open(&path).unwrap());
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(V2_SCHEMA).unwrap();
+        connection
+            .execute_batch("ALTER TABLE trades RENAME TO trades_v1_sealed")
+            .unwrap();
+        (dir, connection)
+    }
+
+    const TABLES: [(&str, &str); 2] = [
+        (
+            "activity_groups_v2",
+            "INSERT INTO activity_groups_v2 (source_trade_id, coverage_generation,
+                 semantic_revision, components_json, wallet_hex, transaction_hash,
+                 activity_type, row_count, share_amount_str, price_weighted_share_amount_str,
+                 source_usdc_amount_str, source_time_unix, is_combo, schema_version,
+                 parser_version)
+             VALUES ('g2:' || ?1, 1, 'r', '{}', ?2, 't', 'TRADE', 1, '1', '1', '1', ?1, 0, 2, 2)",
+        ),
+        (
+            "trades_v1_sealed",
+            "INSERT INTO trades_v1_sealed (source_trade_id, wallet_hex, market_id, outcome_id,
+                 side, price_str, contracts, timestamp_unix)
+             VALUES ('t' || ?1, ?2, 'm', 0, 'buy', '0.5', 1, ?1)",
+        ),
+    ];
+
+    fn insert(connection: &Connection, sql: &str, wallet: &str, ordinal: usize) {
+        connection
+            .execute(sql, rusqlite::params![ordinal as i64, wallet])
+            .unwrap();
+    }
+
+    #[test]
+    fn seeking_matches_distinct_on_both_tables_for_every_key_shape() {
+        // Duplicates, adjacent keys, both cases, the empty string and non-hex
+        // text: each is a distinct stored value under the index's BINARY order.
+        let keys = [
+            "0xaaaa", "0xaaaa", "0xaaab", "0xAAAB", "", "zz", "0xaaaa0", "0x",
+        ];
+        for (table, sql) in TABLES {
+            let (_dir, connection) = both_tables();
+            assert!(distinct_wallets(&connection, table).unwrap().is_empty());
+            insert(&connection, sql, "0xaaaa", 0);
+            assert_eq!(
+                distinct_wallets(&connection, table).unwrap(),
+                BTreeSet::from(["0xaaaa".to_owned()])
+            );
+            for (ordinal, key) in keys.iter().enumerate() {
+                insert(&connection, sql, key, ordinal + 1);
+            }
+            let expected: BTreeSet<String> = connection
+                .prepare(&format!("SELECT DISTINCT wallet_hex FROM {table}"))
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(expected.len(), 7, "{expected:?}");
+            assert_eq!(distinct_wallets(&connection, table).unwrap(), expected);
+            let plan: Vec<String> = connection
+                .prepare(&format!(
+                    "EXPLAIN QUERY PLAN SELECT wallet_hex FROM {table}
+                     WHERE wallet_hex > 'x' ORDER BY wallet_hex LIMIT 1"
+                ))
+                .unwrap()
+                .query_map([], |row| row.get(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert!(
+                plan.iter()
+                    .any(|step| step.starts_with("SEARCH") && step.contains("COVERING INDEX")),
+                "{table}: {plan:?}"
+            );
+        }
     }
 }
