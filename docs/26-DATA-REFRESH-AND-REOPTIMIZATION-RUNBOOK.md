@@ -753,7 +753,7 @@ collision, is excluded from this generation.
 The warning names the wallet and stable reason, and completion reports the excluded count. Its
 receipt retains actual read evidence when available; a failed acquisition records an explicit reason
 and no complete page evidence. The receipt certifies empty resulting history; older rows stay untouched
-and produce no current projection entries. Resume skips the exclusion; the next generation includes
+and produce no current projection entries. With `bootstrap_polymarket_wallet_timeout_secs` set, a wallet whose acquisition cannot complete within that budget — recoverable failures are retried in place under it — is excluded the same way with a recorded reason (#681). Resume skips the exclusion; the next generation includes
 that wallet for a full read. Equal-revision collisions also exclude. Missing predecessor proof,
 foreign-wallet collisions or unreceipted current rows are fatal cache errors.
 

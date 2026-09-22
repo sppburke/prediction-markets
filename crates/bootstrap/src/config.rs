@@ -149,8 +149,12 @@ pub struct BootstrapConfig {
     /// `walk_wallet` call in `tokio::time::timeout`. Wallets that
     /// trip the timeout are soft-failed (added to `FetchOutcome::failed`) so
     /// the post-fetch pipeline still runs and the old `last_polymarket_fetch_at`
-    /// is preserved. The partial marker makes active, non-infra wallets due again. Canonical default in
-    /// `docs/_GLOSSARY.md` "Bootstrap defaults" section.
+    /// is preserved. The partial marker makes active, non-infra wallets due again.
+    /// The schema-two collector (`cache-populate-activity-v2`) applies the same
+    /// budget to each wallet's acquisition: recoverable read failures are
+    /// retried in place under it, and expiry records the wallet's exclusion
+    /// for the generation instead of holding the collection open (#681).
+    /// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults" section.
     /// `PE_BOOTSTRAP_POLYMARKET_WALLET_TIMEOUT_SECS` overrides.
     #[serde(
         default = "default_polymarket_wallet_timeout_secs",

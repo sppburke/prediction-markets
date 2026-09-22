@@ -12,12 +12,15 @@ use pe_bootstrap::{
     fetch, fetch_resolutions_and_schedules, infra_probe, migrate, pile, purge,
     reclamation_evidence, run_schedule_backfill, watchlist_phase, winner_discovery,
 };
+use std::time::Duration;
 use tracing_subscriber::EnvFilter;
 
 /// Transient-error retries per page for the activity collection
 /// (`activity_collection_transient_retries` in `docs/_GLOSSARY.md`). One failing page
 /// ends the whole collector with exit 75 and cancels every unfinished wallet read, so
 /// a page that fails a few times before the venue has its answer warm is retried in place.
+/// With a wallet budget configured, an exhausted page instead retries that wallet's
+/// read under the budget and excludes it when the budget expires (#681).
 const ACTIVITY_COLLECTION_TRANSIENT_RETRIES: u32 = 16;
 /// Per-request timeout for the activity collection
 /// (`activity_collection_request_timeout_secs` in `docs/_GLOSSARY.md`). The venue
@@ -403,6 +406,9 @@ async fn main() {
                         )
                         .with_max_retries(ACTIVITY_COLLECTION_TRANSIENT_RETRIES)
                         .with_timeout(ACTIVITY_COLLECTION_REQUEST_TIMEOUT_SECS);
+                        // `0` disables the per-wallet acquisition budget (#681).
+                        let wallet_budget = (bootstrap_config.polymarket_wallet_timeout_secs != 0)
+                            .then(|| Duration::from_secs(bootstrap_config.polymarket_wallet_timeout_secs));
                         // Fresh mode (#588): no frozen reference; a newly started
                         // generation is bounded by the same settled read end the
                         // legacy poller uses, and a recorded generation keeps its end.
@@ -465,6 +471,7 @@ async fn main() {
                                 return populate_activity_bulk_root_v2_with_clock(
                                     &bootstrap_config.cache_path, fixed, prior_arg.as_deref(), &fetcher,
                                     &bootstrap_config.polymarket_base_url, settled_end, now,
+                                    wallet_budget,
                                 ).await.and_then(activity_json_report);
                             }
                             return populate_activity_fresh_v2_with_clock(
@@ -475,6 +482,7 @@ async fn main() {
                                 &full_reads,
                                 settled_end,
                                 now,
+                                wallet_budget,
                             )
                             .await
                             .and_then(activity_json_report);

@@ -3702,6 +3702,224 @@ impl PageFetcher for PendingActivityReads {
     }
 }
 
+/// One wallet's read misbehaves; every other wallet answers its fixture page.
+struct BudgetedReads {
+    target: &'static str,
+    behaviour: TargetBehaviour,
+    attempts: AtomicUsize,
+    dropped: AtomicUsize,
+    release: tokio::sync::Notify,
+}
+enum TargetBehaviour {
+    Hang,
+    RateLimited { retry_after_secs: u32 },
+}
+impl BudgetedReads {
+    fn new(target: &'static str, behaviour: TargetBehaviour) -> Self {
+        Self {
+            target,
+            behaviour,
+            attempts: AtomicUsize::new(0),
+            dropped: AtomicUsize::new(0),
+            release: tokio::sync::Notify::new(),
+        }
+    }
+}
+impl PageFetcher for BudgetedReads {
+    async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+        if !url.contains(self.target) {
+            let wallet = [WALLET, WALLET_B, WALLET_C, WALLET_D]
+                .into_iter()
+                .find(|wallet| url.contains(wallet))
+                .unwrap();
+            return Ok(activity_rows(wallet, &[], false));
+        }
+        self.attempts.fetch_add(1, Ordering::SeqCst);
+        match self.behaviour {
+            TargetBehaviour::RateLimited { retry_after_secs } => {
+                Err(SourceError::RateLimited { retry_after_secs })
+            }
+            TargetBehaviour::Hang => {
+                let _pending = PendingActivityRead(&self.dropped);
+                self.release.notified().await;
+                Ok(activity_rows(self.target, &[], false))
+            }
+        }
+    }
+}
+fn budgeted_candidate(dir: &TempDir) -> std::path::PathBuf {
+    let side = dir.path().join("side.db");
+    seed_initial_candidate(&side);
+    migrate_cache_v2(&side, &write_build_manifest(dir, &side)).unwrap();
+    side
+}
+fn excluded_receipt(side: &std::path::Path, wallet: &str) -> (Option<String>, i64, i64) {
+    Connection::open(side)
+        .unwrap()
+        .query_row(
+            "SELECT exclusion_reason, aggregate_count, source_row_count
+             FROM activity_wallet_coverage_staging_v2 WHERE generation = 1 AND wallet_hex = ?1",
+            [wallet],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+}
+#[tokio::test(start_paused = true)]
+async fn wallet_budget_excludes_a_read_the_venue_never_answers_and_completes_the_rest() {
+    let dir = TempDir::new().unwrap();
+    let side = budgeted_candidate(&dir);
+    let fetcher = BudgetedReads::new(WALLET_B, TargetBehaviour::Hang);
+    let manifest = pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
+        &side,
+        &fetcher,
+        "https://data.example",
+        1,
+        &[],
+        || Ok(FRESH_END),
+        FRESH_END + 1,
+        Some(std::time::Duration::from_secs(1)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(manifest.generation, 1);
+    assert_eq!(
+        fetcher.dropped.load(Ordering::SeqCst),
+        1,
+        "the pending read is cancelled"
+    );
+    assert_eq!(
+        excluded_receipt(&side, WALLET_B),
+        (
+            Some("acquisition budget of 1 s exhausted after 1 attempt(s)".to_owned()),
+            0,
+            0
+        )
+    );
+    let failed = stored_receipt_proofs(&Connection::open(&side).unwrap(), 1)
+        .into_iter()
+        .find(|proof| proof["wallet_hex"] == WALLET_B)
+        .unwrap();
+    assert_eq!(failed["acquisition"]["aggregation_status"], "not_attempted");
+    assert_eq!(
+        failed["acquisition"]["exclusion_reason"],
+        "acquisition_failure"
+    );
+    assert_eq!(failed["acquisition"]["fetched_source_row_count"], 0);
+    assert_eq!(
+        count(
+            &side,
+            "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2
+             WHERE generation = 1 AND exclusion_reason IS NULL"
+        ),
+        3,
+        "every other wallet completes"
+    );
+}
+#[tokio::test(start_paused = true)]
+async fn wallet_budget_retries_a_rate_limited_read_in_place_then_excludes_it() {
+    // Under a 100 s budget the wait is the venue's `Retry-After` or 30 s,
+    // whichever is longer: attempts at 0, 30, 60 and 90 s for a 1 s answer,
+    // at 0, 45 and 90 s for a 45 s answer.
+    for (retry_after_secs, attempts) in [(1, 4), (45, 3)] {
+        let dir = TempDir::new().unwrap();
+        let side = budgeted_candidate(&dir);
+        let fetcher =
+            BudgetedReads::new(WALLET_B, TargetBehaviour::RateLimited { retry_after_secs });
+        pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
+            &side,
+            &fetcher,
+            "https://data.example",
+            1,
+            &[],
+            || Ok(FRESH_END),
+            FRESH_END + 1,
+            Some(std::time::Duration::from_secs(100)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fetcher.attempts.load(Ordering::SeqCst),
+            attempts,
+            "retry_after {retry_after_secs}"
+        );
+        let (reason, aggregates, rows) = excluded_receipt(&side, WALLET_B);
+        let reason = reason.unwrap();
+        assert!(
+            reason.starts_with(&format!(
+                "acquisition budget of 100 s exhausted after {attempts} attempt(s): "
+            )),
+            "{reason}"
+        );
+        assert_eq!((aggregates, rows), (0, 0));
+    }
+    // Without a budget the same failure still ends the run for a supervised retry.
+    let dir = TempDir::new().unwrap();
+    let side = budgeted_candidate(&dir);
+    let fetcher = BudgetedReads::new(
+        WALLET_B,
+        TargetBehaviour::RateLimited {
+            retry_after_secs: 1,
+        },
+    );
+    let error = pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
+        &side,
+        &fetcher,
+        "https://data.example",
+        1,
+        &[],
+        || Ok(FRESH_END),
+        FRESH_END + 1,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            pe_bootstrap::error::BootstrapError::TransientSource { .. }
+        ),
+        "{error}"
+    );
+    assert_eq!(fetcher.attempts.load(Ordering::SeqCst), 1);
+}
+#[tokio::test(start_paused = true)]
+async fn without_a_wallet_budget_a_pending_read_waits_and_completes_when_released() {
+    let dir = TempDir::new().unwrap();
+    let side = budgeted_candidate(&dir);
+    let fetcher = BudgetedReads::new(WALLET_B, TargetBehaviour::Hang);
+    let mut run = std::pin::pin!(
+        pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
+            &side,
+            &fetcher,
+            "https://data.example",
+            1,
+            &[],
+            || Ok(FRESH_END),
+            FRESH_END + 1,
+            None,
+        )
+    );
+    tokio::select! {
+        biased;
+        _ = &mut run => panic!("a pending read completed without a budget or a release"),
+        () = tokio::time::sleep(std::time::Duration::from_secs(3600)) => {}
+    }
+    assert_eq!(
+        fetcher.dropped.load(Ordering::SeqCst),
+        0,
+        "still pending, not cancelled"
+    );
+    fetcher.release.notify_one();
+    run.await.unwrap();
+    assert_eq!(
+        count(
+            &side,
+            "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2
+             WHERE generation = 1 AND exclusion_reason IS NULL"
+        ),
+        4
+    );
+}
 #[tokio::test]
 async fn activity_writer_error_cancels_pending_reads_and_rolls_back_wallet() {
     let dir = TempDir::new().unwrap();
@@ -6853,6 +7071,7 @@ async fn incremental_full_read_equivalence_through_aggregation_certification_and
             Ok(e2)
         },
         e2 + 1,
+        None,
     )
     .await
     .unwrap();
@@ -7162,6 +7381,7 @@ async fn incremental_collision_exclusion_then_full_replacement_and_empty_replace
         &[WALLET.to_owned()],
         || Ok(FRESH_END + 6),
         FRESH_END + 7,
+        None,
     )
     .await
     .unwrap();
@@ -7230,6 +7450,7 @@ async fn incremental_revision_before_boundary_requires_explicit_full_read() {
         &[WALLET.to_owned()],
         || Ok(FRESH_END + 4),
         FRESH_END + 5,
+        None,
     )
     .await
     .unwrap();
@@ -7620,7 +7841,8 @@ async fn incremental_versions_windows_and_predecessor_corruption_fail_before_sou
                 sampled.fetch_add(1, Ordering::SeqCst);
                 Ok(FRESH_END + 10)
             },
-            FRESH_END + 11
+            FRESH_END + 11,
+            None,
         )
         .await
         .is_err()
@@ -7676,6 +7898,7 @@ async fn retained_wallet_without_a_predecessor_receipt_refuses_a_successor_befor
             Ok(FRESH_END + 100)
         },
         FRESH_END + 2,
+        None,
     )
     .await
     .unwrap_err();
@@ -7967,6 +8190,7 @@ async fn incremental_full_replacement_rolls_back_deletion_and_keeps_failed_histo
             &[],
             || Ok(FRESH_END + 99),
             FRESH_END + 4,
+            None,
         )
     };
     assert!(
@@ -7977,7 +8201,8 @@ async fn incremental_full_replacement_rolls_back_deletion_and_keeps_failed_histo
             7,
             &[WALLET.to_owned()],
             || Ok(FRESH_END + 2),
-            FRESH_END + 3
+            FRESH_END + 3,
+            None,
         )
         .await
         .is_err()
@@ -8230,7 +8455,8 @@ async fn incremental_admission_rejects_invalid_bounds_generation_and_full_read_s
                 generation,
                 &full,
                 || Ok(end),
-                FRESH_END
+                FRESH_END,
+                None,
             )
             .await
             .is_err(),
@@ -8904,6 +9130,7 @@ impl BulkRootFixture {
             "https://data.example",
             || Ok(FRESH_END),
             FRESH_END + 1,
+            None,
         )
         .await
     }
@@ -9022,6 +9249,7 @@ async fn collect_bulk_root_in_child(
         "https://data.example",
         || Ok(FRESH_END),
         FRESH_END + 1,
+        None,
     )
     .await
 }
@@ -9469,6 +9697,7 @@ async fn bulk_root_cross_wallet_duplicate_is_permanent_and_preserves_receipts() 
         &[],
         || panic!("successor clock must not run before sealing"),
         FRESH_END + 3,
+        None,
     )
     .await
     .unwrap_err();
@@ -9721,6 +9950,7 @@ async fn bulk_root_fence_refuses_other_commands_and_successor_before_clock() {
         &[],
         || panic!("fenced successor sampled a clock"),
         FRESH_END + 3,
+        None,
     )
     .await
     .unwrap_err();
@@ -9820,6 +10050,7 @@ async fn bulk_root_admission_refuses_aliases_existing_roots_and_successors() {
             "https://data.example",
             || panic!("aliased candidate must not sample clock"),
             FRESH_END + 1,
+            None,
         )
         .await
         .unwrap_err();
@@ -10263,6 +10494,7 @@ async fn bulk_root_admits_new_staging_baseline_and_legacy_prior() {
             "https://data.example",
             || Ok(FRESH_END),
             FRESH_END + 1,
+            None,
         )
         .await
         .unwrap();
