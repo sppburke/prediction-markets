@@ -777,6 +777,7 @@ pub async fn populate_activity_v2(
         &identity,
         None,
         completed_at_unix,
+        None,
     )
     .await
 }
@@ -808,12 +809,17 @@ pub async fn populate_activity_fresh_v2(
         &[],
         || Ok(new_generation_end_unix),
         completed_at_unix,
+        None,
     )
     .await
 }
 
 /// Freeze the settled end only after predecessor certification and union discovery.
 /// A supplied clock also makes the acquisition boundary deterministic in fixtures.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the collector's universe, clock and wallet budget are explicit call-site inputs"
+)]
 pub async fn populate_activity_fresh_v2_with_clock(
     cache_path: &Path,
     fetcher: &dyn ReconciliationFetcher,
@@ -822,6 +828,7 @@ pub async fn populate_activity_fresh_v2_with_clock(
     full_read_wallets: &[String],
     settled_end: impl FnOnce() -> Result<i64, BootstrapError>,
     completed_at_unix: i64,
+    wallet_budget: Option<Duration>,
 ) -> Result<ActivityCoverageManifestV2, BootstrapError> {
     let mut connection = open_existing_rw(cache_path)?;
     require_schema(&connection, CACHE_SCHEMA_VERSION_V2)?;
@@ -847,6 +854,7 @@ pub async fn populate_activity_fresh_v2_with_clock(
         &identity,
         FULL_HISTORY_START_EXCLUSIVE,
         completed_at_unix,
+        wallet_budget,
     )
     .await
 }
@@ -855,6 +863,10 @@ pub async fn populate_activity_fresh_v2_with_clock(
 /// root. Callers hold the candidate's CacheMutationLock throughout collection.
 /// The fixed/prior roles must be distinct from the candidate, including inode
 /// aliases. This is provisioning, never conversion of an existing collection.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the collector's universe, clock and wallet budget are explicit call-site inputs"
+)]
 pub async fn populate_activity_bulk_root_v2_with_clock(
     cache_path: &Path,
     fixed_path: &Path,
@@ -863,6 +875,7 @@ pub async fn populate_activity_bulk_root_v2_with_clock(
     base_url: &str,
     settled_end: impl FnOnce() -> Result<i64, BootstrapError>,
     completed_at_unix: i64,
+    wallet_budget: Option<Duration>,
 ) -> Result<ActivityCoverageManifestV2, BootstrapError> {
     let mut roles = vec![
         ("private bulk-root candidate", cache_path),
@@ -921,6 +934,7 @@ pub async fn populate_activity_bulk_root_v2_with_clock(
         &identity,
         FULL_HISTORY_START_EXCLUSIVE,
         completed_at_unix,
+        wallet_budget,
     )
     .await?;
     if already_sealed {
@@ -1255,6 +1269,7 @@ async fn collect_activity_v2(
     identity: &ActivityIdentity,
     history_start_exclusive: Option<i64>,
     completed_at_unix: i64,
+    wallet_budget: Option<Duration>,
 ) -> Result<ActivityCoverageManifestV2, BootstrapError> {
     let ActivityIdentity {
         generation,
@@ -1303,34 +1318,74 @@ async fn collect_activity_v2(
         // priced 3.1968021978, outside the unit interval) excludes the wallet
         // like an unaggregatable history: no page evidence survives, so record
         // the reason and an explicit failed acquisition without claiming a read.
-        let complete = match fetch_complete_activity_semantic(
-            fetcher,
-            base_url,
-            wallet,
-            proof_ref.map_or(history_start_exclusive, |proof| Some(proof.start(&wallet_hex))),
-            fixed_end_unix,
-        )
-        .await
-        {
-            Ok(complete) => complete,
-            Err(error) if excludes_wallet(&error) => {
-                tracing::warn!(
-                    wallet = %wallet_hex,
-                    generation,
-                    %error,
-                    "activity wallet excluded from the generation: venue history cannot be read"
-                );
-                return Ok::<_, BootstrapError>(WalletActivityCompletion {
-                    wallet_hex,
-                    pages: Vec::new(),
-                    aggregates: Vec::new(),
-                    source_row_count: 0,
-                    exclusion_reason: Some(error.to_string()),
-                    fetched_source_row_count: 0,
-                    aggregation_status: AggregationStatus::NotAttempted,
-                });
+        let start_exclusive =
+            proof_ref.map_or(history_start_exclusive, |proof| Some(proof.start(&wallet_hex)));
+        // An enabled budget is one non-resetting deadline over the whole
+        // acquisition, started when this read is first polled: recoverable
+        // failures are retried in place under it, and expiry records the
+        // exclusion instead of holding the generation open (#681).
+        let deadline = wallet_budget.map(|budget| tokio::time::Instant::now() + budget);
+        let mut attempts = 0u32;
+        let mut last_failure = None;
+        let complete = loop {
+            attempts += 1;
+            let read = fetch_complete_activity_semantic(
+                fetcher,
+                base_url,
+                wallet,
+                start_exclusive,
+                fixed_end_unix,
+            );
+            let outcome = match deadline {
+                Some(deadline) => tokio::time::timeout_at(deadline, read).await,
+                None => Ok(read.await),
+            };
+            match outcome {
+                Ok(Ok(complete)) => break complete,
+                Ok(Err(error)) if excludes_wallet(&error) => {
+                    tracing::warn!(
+                        wallet = %wallet_hex,
+                        generation,
+                        %error,
+                        "activity wallet excluded from the generation: venue history cannot be read"
+                    );
+                    return Ok::<_, BootstrapError>(excluded_completion(wallet_hex, error.to_string()));
+                }
+                Ok(Err(error)) => {
+                    let Some((deadline, wait)) = deadline.zip(recoverable_retry_wait(&error)) else {
+                        return Err(activity_read_failure(&wallet_hex, error));
+                    };
+                    tracing::warn!(
+                        wallet = %wallet_hex,
+                        generation,
+                        attempts,
+                        %error,
+                        "activity read failed; retrying within the wallet budget"
+                    );
+                    last_failure = Some(error.to_string());
+                    if tokio::time::timeout_at(deadline, tokio::time::sleep(wait))
+                        .await
+                        .is_ok()
+                    {
+                        continue;
+                    }
+                }
+                Err(_elapsed) => {}
             }
-            Err(error) => return Err(activity_read_failure(&wallet_hex, error)),
+            let reason = format!(
+                "acquisition budget of {} s exhausted after {attempts} attempt(s){}",
+                wallet_budget.map_or(0, |budget| budget.as_secs()),
+                last_failure
+                    .as_deref()
+                    .map_or_else(String::new, |failure| format!(": {failure}")),
+            );
+            tracing::warn!(
+                wallet = %wallet_hex,
+                generation,
+                %reason,
+                "activity wallet excluded from the generation: acquisition budget exhausted"
+            );
+            return Ok(excluded_completion(wallet_hex, reason));
         };
         let mut exclusion_reason: Option<String> = None;
         let fetched_source_row_count = u64::try_from(complete.rows.len()).map_err(|_| BootstrapError::Internal)?;
@@ -1534,6 +1589,7 @@ pub async fn collect_activity_v2_for_test(
         &identity,
         FULL_HISTORY_START_EXCLUSIVE,
         completed_at_unix,
+        None,
     )
     .await
 }
@@ -1569,6 +1625,8 @@ pub fn commit_activity_batch_for_test(
 // durable receipt, so the retry fetches only the remainder.
 // A venue payload this collector cannot represent deterministically excludes
 // one wallet; transport failures and locally generated requests do not (#588).
+// An enabled wallet budget additionally excludes a wallet whose acquisition
+// cannot complete in time, after retrying recoverable failures in place (#681).
 fn excludes_wallet(error: &ActivityReadError) -> bool {
     matches!(
         error,
@@ -1577,6 +1635,43 @@ fn excludes_wallet(error: &ActivityReadError) -> bool {
             | ActivityReadError::Identity(_)
             | ActivityReadError::RowOutsideBounds { .. }
     )
+}
+
+/// The receipt of a wallet excluded from the generation: no page evidence, no
+/// aggregates, an explicit failed acquisition carrying the reason.
+fn excluded_completion(wallet_hex: String, reason: String) -> WalletActivityCompletion {
+    WalletActivityCompletion {
+        wallet_hex,
+        pages: Vec::new(),
+        aggregates: Vec::new(),
+        source_row_count: 0,
+        exclusion_reason: Some(reason),
+        fetched_source_row_count: 0,
+        aggregation_status: AggregationStatus::NotAttempted,
+    }
+}
+
+/// Seconds between in-place retries of a recoverable read failure under a
+/// wallet budget when the venue names no `Retry-After`, or names a shorter one
+/// (`activity_recoverable_retry_secs` in `docs/_GLOSSARY.md`).
+const ACTIVITY_RECOVERABLE_RETRY_SECS: u64 = 30;
+
+/// How long to wait before retrying a failure the collector may retry within
+/// a wallet budget — the same set `activity_read_failure` otherwise ends the
+/// run with; `None` for every other failure.
+fn recoverable_retry_wait(error: &ActivityReadError) -> Option<Duration> {
+    let secs = match error {
+        ActivityReadError::Fetch {
+            source: SourceError::RateLimited { retry_after_secs },
+            ..
+        } => u64::from(*retry_after_secs).max(ACTIVITY_RECOVERABLE_RETRY_SECS),
+        ActivityReadError::Fetch {
+            source: SourceError::Transient { .. },
+            ..
+        } => ACTIVITY_RECOVERABLE_RETRY_SECS,
+        _ => return None,
+    };
+    Some(Duration::from_secs(secs))
 }
 
 fn activity_read_failure(wallet_hex: &str, error: ActivityReadError) -> BootstrapError {
