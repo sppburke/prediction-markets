@@ -127,6 +127,7 @@ async fn main() {
         let mut pending_pointer_arg: Option<std::path::PathBuf> = None;
         let mut expected_sha256_arg: Option<String> = None;
         let mut stage_evidence_sha256_arg: Option<String> = None;
+        let mut final_stage_record_arg: Option<std::path::PathBuf> = None;
         let mut prior_sha256_arg: Option<String> = None;
         let mut prior_schema_arg: Option<i64> = None;
         let mut held_loop_lock_fd_arg: Option<u32> = None;
@@ -276,6 +277,12 @@ async fn main() {
                 stage_evidence_sha256_arg = Some(rest[i].to_owned());
             } else if let Some(v) = a.strip_prefix("--stage-evidence-sha256=") {
                 stage_evidence_sha256_arg = Some(v.to_owned());
+            } else if a == "--final-stage-record" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                final_stage_record_arg = Some(std::path::PathBuf::from(rest[i]));
+            } else if let Some(v) = a.strip_prefix("--final-stage-record=") {
+                final_stage_record_arg = Some(std::path::PathBuf::from(v));
             } else if a == "--prior-sha256" && i + 1 < rest.len() {
                 i += 1;
                 flag_values.insert(rest[i]);
@@ -602,7 +609,7 @@ async fn main() {
                                 prior_cache_backup_path,
                                 expected_side_sha256,
                                 stage_evidence_sha256: stage_evidence_sha256_arg,
-                            }, handoff.as_ref())
+                            }, handoff.as_ref(), final_stage_record_arg.as_deref())
                             .and_then(json_report)
                         },
                     ),

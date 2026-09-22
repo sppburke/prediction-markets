@@ -666,6 +666,13 @@ each descriptor's inode, PID stamp, and live kernel contention before skipping o
 always acquires the cache lock. A direct `pe-bootstrap cache-activate` call without that verified
 handoff continues to acquire loop → run → cache itself.
 
+The wrapper also passes the cycle's final-stage record (`--final-stage-record`). The finalizer wrote
+it after computing or verifying the candidate's projection digest over exactly the bytes it hashed, so
+activation compares the candidate's stored projection summary with the record instead of recomputing
+the digest; it refuses a record of another format, schema, path or hash. Every other check — activity
+content and receipts, payout coverage, projection count and classifier agreement, and the outgoing
+cache's full verification — still runs. Without the record, activation recomputes the digest (#682).
+
 Before the bound corrected batch becomes current, restore that exact prior cache by its recorded
 hash and schema. For a new cycle set `CACHE_PRIOR_BACKUP` to its `.displaced.db` (`D`) and
 `DISPLACED_CACHE_BACKUP` to its now-vacant `.side.db` (`C`). For a legacy cycle retain the original

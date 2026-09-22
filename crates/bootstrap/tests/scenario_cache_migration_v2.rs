@@ -21,8 +21,9 @@ use pe_bootstrap::cache::{RankerPageStatus, RankerPricePage, WalletCache};
 use pe_bootstrap::cache_migration::{
     CacheActivationRequest, CacheFinalStageRecord, CacheV2BuildManifest, FrozenCacheFreshness,
     FrozenPayloadReference, PriorCacheBinding, PublicationConsumptionProbe, activate_cache_v2,
-    finalize_cache_v2, migrate_cache_v2, populate_activity_fresh_v2, populate_activity_v2,
-    restore_prior_cache, sha256_file, verify_frozen_payload_v1,
+    activate_cache_v2_with_handoff, finalize_cache_v2, migrate_cache_v2,
+    populate_activity_fresh_v2, populate_activity_v2, restore_prior_cache, sha256_file,
+    verify_frozen_payload_v1,
 };
 use pe_bootstrap::clob::ClobFetcher;
 use pe_bootstrap::pile::SRC_TRADES;
@@ -2039,6 +2040,150 @@ async fn classifier_v2_rebuilds_retained_activity_without_recollection() {
     drop(connection);
     assert_eq!(retained_activity_rows(&side), retained);
     assert_no_activity_recollection(&side, &frozen).await;
+}
+
+/// PASS: a final-stage record proves only the candidate's projection digest.
+/// A projection-only change with a refreshed caller hash is refused when the
+/// digest is recomputed, and accepted with a deliberately forged record that
+/// vouches for those bytes — which proves the traversal is skipped and that the
+/// record, a trusted finalizer output, is the digest's only proof. Records of
+/// another format, schema, path or hash are refused, and the missing-side resume
+/// accepts the same record after the rename. FAIL: any of these differ.
+#[tokio::test]
+async fn activation_takes_the_projection_digest_from_the_final_stage_record_only() {
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join("eval-results")).unwrap();
+    let side = dir.path().join("side.db");
+    retained_classifier_activity(&dir, &side).await;
+    let genuine = finalize_cache_v2(
+        &side,
+        &dir.path().join("genuine-stage.json"),
+        CLASSIFIER_FIXED_END + 3,
+    )
+    .unwrap();
+    Connection::open(&side)
+        .unwrap()
+        .execute(
+            "UPDATE ranker_entries_v2 SET source_trade_id = 'g2:' || printf('%064d', 0)
+             WHERE source_trade_id = (SELECT MIN(source_trade_id) FROM ranker_entries_v2)",
+            [],
+        )
+        .unwrap();
+    let changed = sha256_file(&side).unwrap();
+    let fixed = dir.path().join("wallet_cache.db");
+    drop(seed_v1(&fixed, CLASSIFIER_FIXED_END - 10));
+    let request = CacheActivationRequest {
+        stage_evidence_sha256: None,
+        fixed_path: fixed.clone(),
+        side_path: side.clone(),
+        prior_cache_backup_path: dir.path().join("prior.db"),
+        expected_side_sha256: changed.clone(),
+    };
+    let recomputed = activate_cache_v2(&request).unwrap_err();
+    assert!(
+        recomputed
+            .to_string()
+            .contains("frozen/activity/ranker proof"),
+        "{recomputed}"
+    );
+    // The refused read-only verification changes nothing but leaves its SQLite
+    // index beside the side; clear it so the next attempt starts from the
+    // finalized files only.
+    assert_eq!(sha256_file(&side).unwrap(), changed);
+    let clear_sidecars = || {
+        let wal = dir.path().join("side.db-wal");
+        assert!(std::fs::metadata(&wal).map_or(true, |meta| meta.len() == 0));
+        for sidecar in [wal, dir.path().join("side.db-shm")] {
+            match std::fs::remove_file(&sidecar) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                    panic!("{}: {error}", sidecar.display())
+                }
+                _ => {}
+            }
+        }
+    };
+    clear_sidecars();
+    let write_record = |name: &str, record: &CacheFinalStageRecord| {
+        let path = dir.path().join(name);
+        std::fs::write(&path, serde_json::to_vec(record).unwrap()).unwrap();
+        path
+    };
+    let forged = CacheFinalStageRecord {
+        cache_sha256: changed.clone(),
+        ..genuine.clone()
+    };
+    for (name, record) in [
+        (
+            "old-format",
+            CacheFinalStageRecord {
+                version: 1,
+                ..forged.clone()
+            },
+        ),
+        (
+            "schema-one",
+            CacheFinalStageRecord {
+                schema_version: 1,
+                ..forged.clone()
+            },
+        ),
+        (
+            "other-path",
+            CacheFinalStageRecord {
+                cache_path: dir.path().join("other.db"),
+                ..forged.clone()
+            },
+        ),
+        ("other-bytes", genuine.clone()),
+    ] {
+        let path = write_record(&format!("{name}.json"), &record);
+        let refused = activate_cache_v2_with_handoff(&request, None, Some(&path)).unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("does not describe the activation candidate"),
+            "{name}: {refused}"
+        );
+    }
+    let forged_path = write_record("forged.json", &forged);
+    // The record proves only the candidate: an outgoing schema-two cache with
+    // the same projection-only change is still recomputed and refused before
+    // anything is installed.
+    let outgoing = dir.path().join("outgoing.db");
+    std::fs::copy(&side, &outgoing).unwrap();
+    let refused = activate_cache_v2_with_handoff(
+        &CacheActivationRequest {
+            fixed_path: outgoing.clone(),
+            prior_cache_backup_path: dir.path().join("outgoing-prior.db"),
+            ..request.clone()
+        },
+        None,
+        Some(&forged_path),
+    )
+    .unwrap_err();
+    assert!(
+        refused.to_string().contains("frozen/activity/ranker proof"),
+        "{refused}"
+    );
+    assert_eq!(sha256_file(&outgoing).unwrap(), changed);
+    assert_eq!(sha256_file(&side).unwrap(), changed);
+    assert!(!dir.path().join("outgoing-prior.db").exists());
+    clear_sidecars();
+    let installed = activate_cache_v2_with_handoff(&request, None, Some(&forged_path)).unwrap();
+    assert!(!installed.resumed);
+    assert_eq!(installed.installed_sha256, changed);
+    assert!(!side.exists());
+    // The side is now installed at the fixed path: the missing-side resume
+    // accepts the same record, still bound to the original side path, and
+    // without it recomputes and refuses.
+    let resumed = activate_cache_v2_with_handoff(&request, None, Some(&forged_path)).unwrap();
+    assert!(resumed.resumed);
+    assert!(
+        activate_cache_v2(&request)
+            .unwrap_err()
+            .to_string()
+            .contains("frozen/activity/ranker proof")
+    );
 }
 
 #[tokio::test]
@@ -6460,6 +6605,7 @@ async fn retained_receipts_and_legacy_manifests_fail_closed_on_corruption() {
             assert_eq!(sha256_file(&before_first).unwrap(), first_hash);
 
             let damaged = dir.path().join(format!("{name}-{legacy}.db"));
+            let stage_path = dir.path().join(format!("again-{name}-{legacy}.json"));
             let finalized = if legacy {
                 dir.path().join("legacy.db")
             } else {
@@ -6485,13 +6631,12 @@ async fn retained_receipts_and_legacy_manifests_fail_closed_on_corruption() {
             ]
             .contains(&name)
             {
-                let stage_path = dir.path().join(format!("again-{name}-{legacy}.json"));
                 let stage = finalize_cache_v2(&damaged, &stage_path, FRESH_END + 5)
                     .unwrap_or_else(|error| panic!("{name} legacy={legacy}: {error}"));
                 assert_eq!(stage.cache_sha256, sha256_file(&damaged).unwrap());
                 assert_eq!(stage.ranker_projection_digest, projection);
                 let recorded: CacheFinalStageRecord =
-                    serde_json::from_slice(&std::fs::read(stage_path).unwrap()).unwrap();
+                    serde_json::from_slice(&std::fs::read(&stage_path).unwrap()).unwrap();
                 assert_eq!(recorded, stage);
             }
             assert_eq!(
@@ -6502,13 +6647,20 @@ async fn retained_receipts_and_legacy_manifests_fail_closed_on_corruption() {
                 "ok"
             );
             let damaged_hash = sha256_file(&damaged).unwrap();
-            let error = activate_cache_v2(&CacheActivationRequest {
-                stage_evidence_sha256: None,
-                fixed_path: fixed.clone(),
-                side_path: damaged.clone(),
-                prior_cache_backup_path: prior.clone(),
-                expected_side_sha256: damaged_hash.clone(),
-            })
+            // Where genuine re-finalization recorded these bytes, activation gets
+            // that record: it proves only the projection digest, so every content
+            // check above still refuses (#682).
+            let error = activate_cache_v2_with_handoff(
+                &CacheActivationRequest {
+                    stage_evidence_sha256: None,
+                    fixed_path: fixed.clone(),
+                    side_path: damaged.clone(),
+                    prior_cache_backup_path: prior.clone(),
+                    expected_side_sha256: damaged_hash.clone(),
+                },
+                None,
+                stage_path.exists().then_some(stage_path.as_path()),
+            )
             .unwrap_err();
             assert!(
                 matches!(error, pe_bootstrap::error::BootstrapError::Invalid { .. }),
@@ -6541,14 +6693,23 @@ async fn retained_receipts_and_legacy_manifests_fail_closed_on_corruption() {
             std::fs::copy(&damaged, &bad_fixed).unwrap();
             std::fs::copy(&damaged, &bad_prior).unwrap();
             std::fs::copy(&side, &good_side).unwrap();
-            let good_hash = sha256_file(&good_side).unwrap();
-            let installed_error = activate_cache_v2(&CacheActivationRequest {
-                stage_evidence_sha256: None,
-                fixed_path: bad_fixed.clone(),
-                side_path: good_side.clone(),
-                prior_cache_backup_path: bad_prior.clone(),
-                expected_side_sha256: good_hash.clone(),
-            })
+            // A valid candidate record never excuses the outgoing cache's own
+            // Historical validation, which still recomputes its digest.
+            let good_record = dir.path().join(format!("candidate-{name}-{legacy}.json"));
+            let good_hash = finalize_cache_v2(&good_side, &good_record, FRESH_END + 5)
+                .unwrap()
+                .cache_sha256;
+            let installed_error = activate_cache_v2_with_handoff(
+                &CacheActivationRequest {
+                    stage_evidence_sha256: None,
+                    fixed_path: bad_fixed.clone(),
+                    side_path: good_side.clone(),
+                    prior_cache_backup_path: bad_prior.clone(),
+                    expected_side_sha256: good_hash.clone(),
+                },
+                None,
+                Some(&good_record),
+            )
             .unwrap_err();
             assert_eq!(
                 installed_error.to_string(),
@@ -10328,13 +10489,21 @@ async fn two_file_cycles_copy_once_preserve_inodes_and_recover_activation_gap() 
             );
             std::fs::write(&displaced, original).unwrap();
         }
-        activate_cache_v2(&request).unwrap();
+        // The second cycle, which crosses the rename gap, activates and resumes
+        // with its finalization record proving the projection digest (#682).
+        let record = dir.path().join("final.json");
+        let record = (cycle == 2).then_some(record.as_path());
+        activate_cache_v2_with_handoff(&request, None, record).unwrap();
         assert_eq!(mains(), 2);
         assert!(!side.exists());
         assert_eq!(fixed.metadata().unwrap().ino(), new_inode);
         assert_eq!(displaced.metadata().unwrap().ino(), old_inode);
         assert_eq!(sha256_file(&displaced).unwrap(), h0);
-        assert!(activate_cache_v2(&request).unwrap().resumed);
+        assert!(
+            activate_cache_v2_with_handoff(&request, None, record)
+                .unwrap()
+                .resumed
+        );
         assert!(
             log.take_named("cache whole-file copy").is_empty(),
             "activation or resume copied a full file"

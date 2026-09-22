@@ -3881,21 +3881,28 @@ fn stage_report(
 pub fn activate_cache_v2(
     request: &CacheActivationRequest,
 ) -> Result<CacheActivationReport, BootstrapError> {
-    activate_cache_v2_with_handoff(request, None)
+    activate_cache_v2_with_handoff(request, None, None)
 }
 
 /// Install a finalized cache while accepting a verified shell lock handoff.
 /// Direct callers use [`activate_cache_v2`] and retain the full Rust-owned
-/// loop/run/cache lock stack.
+/// loop/run/cache lock stack. `final_stage_record` is the finalization record
+/// that hashed the candidate; with it, the candidate's stored projection digest
+/// is proven by that record instead of being recomputed (#682).
 pub fn activate_cache_v2_with_handoff(
     request: &CacheActivationRequest,
     handoff: Option<&ForgeLockHandoff>,
+    final_stage_record: Option<&Path>,
 ) -> Result<CacheActivationReport, BootstrapError> {
     let _locks = ForgeActivationLocks::acquire_with_handoff(&request.fixed_path, handoff)?;
+    let proof = final_stage_proof(final_stage_record, request)?;
+    let projection = proof
+        .as_ref()
+        .map_or(ProjectionDigest::Recompute, ProjectionDigest::Recorded);
     if request.stage_evidence_sha256.is_some()
         || cache_stage_evidence_path(&request.side_path).exists()
     {
-        return activate_two_file_cycle(request);
+        return activate_two_file_cycle(request, projection);
     }
     require_regular_file(&request.fixed_path, "current fixed cache")?;
     validate_hex_sha256(&request.expected_side_sha256, "expected side sha256")?;
@@ -3912,7 +3919,7 @@ pub fn activate_cache_v2_with_handoff(
         let installed = open_existing_ro(&request.fixed_path)?;
         require_schema(&installed, CACHE_SCHEMA_VERSION_V2)?;
         quick_check(&installed, "activation_missing_side", &request.fixed_path)?;
-        verify_finalized_v2_manifests(&installed, ClassifierGeneration::Current)?;
+        verify_finalized_v2_manifests(&installed, ClassifierGeneration::Current, projection)?;
         installed.close().map_err(|(_, error)| error)?;
         reject_nonempty_sidecars(&request.fixed_path)?;
         return Ok(CacheActivationReport {
@@ -3949,9 +3956,11 @@ pub fn activate_cache_v2_with_handoff(
         current.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match current_version {
         0 | CACHE_SCHEMA_VERSION_V1 => require_reclamation_ready(&current)?,
-        CACHE_SCHEMA_VERSION_V2 => {
-            verify_finalized_v2_manifests(&current, ClassifierGeneration::Historical)?
-        }
+        CACHE_SCHEMA_VERSION_V2 => verify_finalized_v2_manifests(
+            &current,
+            ClassifierGeneration::Historical,
+            ProjectionDigest::Recompute,
+        )?,
         other => return invalid(format!("unsupported prior cache schema {other}")),
     }
     current.close().map_err(|(_, error)| error)?;
@@ -4000,7 +4009,7 @@ pub fn activate_cache_v2_with_handoff(
     let side = open_existing_ro(&request.side_path)?;
     require_schema(&side, CACHE_SCHEMA_VERSION_V2)?;
     quick_check(&side, "activation_candidate", &request.side_path)?;
-    verify_finalized_v2_manifests(&side, ClassifierGeneration::Current)?;
+    verify_finalized_v2_manifests(&side, ClassifierGeneration::Current, projection)?;
     side.close().map_err(|(_, error)| error)?;
     // The read-only validation of a WAL-mode main may itself allocate an SHM index. With the
     // pre-open sidecar rejection above complete, only nonempty WAL frames can add durable state;
@@ -4100,6 +4109,7 @@ fn validate_installed_candidate(
     path: &Path,
     expected: &str,
     phase: &str,
+    projection: ProjectionDigest<'_>,
 ) -> Result<(), BootstrapError> {
     require_regular_file(path, "version-two candidate cache")?;
     let connection = open_immutable(path)?;
@@ -4112,13 +4122,14 @@ fn validate_installed_candidate(
     }
     require_schema(&connection, CACHE_SCHEMA_VERSION_V2)?;
     quick_check(&connection, phase, path)?;
-    verify_finalized_v2_manifests(&connection, ClassifierGeneration::Current)?;
+    verify_finalized_v2_manifests(&connection, ClassifierGeneration::Current, projection)?;
     connection.close().map_err(|(_, error)| error)?;
     Ok(())
 }
 
 fn activate_two_file_cycle(
     request: &CacheActivationRequest,
+    projection: ProjectionDigest<'_>,
 ) -> Result<CacheActivationReport, BootstrapError> {
     let evidence = bound_stage_evidence(request)?;
     if restore_marker_path(&request.side_path).exists() {
@@ -4136,11 +4147,17 @@ fn activate_two_file_cycle(
             fixed,
             &request.expected_side_sha256,
             "activation_missing_side",
+            projection,
         )?;
         sync_parent(fixed)?;
     } else {
         // Validate both generations before the first move, and again on gap recovery.
-        validate_installed_candidate(side, &request.expected_side_sha256, "activation_candidate")?;
+        validate_installed_candidate(
+            side,
+            &request.expected_side_sha256,
+            "activation_candidate",
+            projection,
+        )?;
         if fixed.exists() {
             if displaced.exists() {
                 return invalid("displaced cache destination is occupied".to_owned());
@@ -4149,9 +4166,11 @@ fn activate_two_file_cycle(
             checkpoint_truncate(&current)?;
             match evidence.source_schema {
                 0 | CACHE_SCHEMA_VERSION_V1 => require_reclamation_ready(&current)?,
-                CACHE_SCHEMA_VERSION_V2 => {
-                    verify_finalized_v2_manifests(&current, ClassifierGeneration::Historical)?
-                }
+                CACHE_SCHEMA_VERSION_V2 => verify_finalized_v2_manifests(
+                    &current,
+                    ClassifierGeneration::Historical,
+                    ProjectionDigest::Recompute,
+                )?,
                 other => return invalid(format!("unsupported prior cache schema {other}")),
             }
             current.close().map_err(|(_, error)| error)?;
@@ -4352,6 +4371,7 @@ fn restore_two_file_cycle(
             rejected_path,
             &request.expected_side_sha256,
             "restore_rejected",
+            ProjectionDigest::Recompute,
         )?;
         sync_parent(fixed)?;
         return Ok(());
@@ -4384,6 +4404,7 @@ fn restore_two_file_cycle(
             rejected_path,
             &request.expected_side_sha256,
             "restore_rejected",
+            ProjectionDigest::Recompute,
         )?;
         reject_nonempty_activation_sidecars(fixed)?;
         sync_parent(rejected_path)?;
@@ -4770,9 +4791,11 @@ fn verified_cache_schema(path: &Path) -> Result<i64, BootstrapError> {
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match version {
         0 | CACHE_SCHEMA_VERSION_V1 => {}
-        CACHE_SCHEMA_VERSION_V2 => {
-            verify_finalized_v2_manifests(&connection, ClassifierGeneration::Historical)?
-        }
+        CACHE_SCHEMA_VERSION_V2 => verify_finalized_v2_manifests(
+            &connection,
+            ClassifierGeneration::Historical,
+            ProjectionDigest::Recompute,
+        )?,
         other => return invalid(format!("prior cache has unsupported schema {other}")),
     }
     connection.close().map_err(|(_, error)| error)?;
@@ -4812,9 +4835,45 @@ enum ClassifierGeneration {
     Historical,
 }
 
+/// How a finalized cache's stored projection digest is proven.
+#[derive(Clone, Copy)]
+enum ProjectionDigest<'a> {
+    /// Recompute the digest over every projected row and compare.
+    Recompute,
+    /// The finalization record that hashed exactly these bytes computed or
+    /// verified the digest; only the stored summary is compared with it.
+    Recorded(&'a CacheFinalStageRecord),
+}
+
+/// The finalization record proving an activation candidate's projection digest.
+/// Refused unless it is the current format, describes a schema-two cache at the
+/// request's side path (also after that file was renamed onto the fixed path),
+/// and hashed exactly the expected bytes.
+fn final_stage_proof(
+    path: Option<&Path>,
+    request: &CacheActivationRequest,
+) -> Result<Option<CacheFinalStageRecord>, BootstrapError> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let record: CacheFinalStageRecord = serde_json::from_slice(&std::fs::read(path)?)?;
+    if record.version != FINAL_STAGE_RECORD_VERSION
+        || record.schema_version != CACHE_SCHEMA_VERSION_V2
+        || record.cache_path != canonical_intended_path(&request.side_path)?
+        || record.cache_sha256 != request.expected_side_sha256
+    {
+        return invalid(format!(
+            "final-stage record {} does not describe the activation candidate",
+            path.display()
+        ));
+    }
+    Ok(Some(record))
+}
+
 fn verify_finalized_v2_manifests(
     connection: &Connection,
     generation: ClassifierGeneration,
+    projection: ProjectionDigest<'_>,
 ) -> Result<(), BootstrapError> {
     if required_max(connection, "sealed_generation_manifests", "generation")? != 1 {
         return invalid("installed cache has an invalid sealed generation".to_owned());
@@ -4860,7 +4919,24 @@ fn verify_finalized_v2_manifests(
         params![to_i64(activity_generation, "activity generation")?],
         |row| row.get(0),
     )?;
-    let actual_projection_digest = ranker_projection_digest(connection, activity_generation)?;
+    let digest_matches = match projection {
+        ProjectionDigest::Recompute => {
+            projection_digest.as_deref()
+                == Some(ranker_projection_digest(connection, activity_generation)?.as_str())
+        }
+        ProjectionDigest::Recorded(record) => {
+            let stored = projection_digest
+                .as_deref()
+                .ok_or_else(|| BootstrapError::Invalid {
+                    message: "installed cache omitted its ranker projection digest".to_owned(),
+                })?;
+            validate_hex_sha256(stored, "stored ranker projection digest")?;
+            stored == record.ranker_projection_digest
+                && u64::try_from(actual_projection_count).ok()
+                    == Some(record.ranker_projection_count)
+                && classifier_version == Some(i64::from(record.ranker_classifier_version))
+        }
+    };
     let classifier_matches = match generation {
         ClassifierGeneration::Current => {
             classifier_version == Some(i64::from(RANKER_CLASSIFIER_VERSION))
@@ -4874,7 +4950,7 @@ fn verify_finalized_v2_manifests(
     )?;
     if phase != "finalized"
         || projection_count != Some(actual_projection_count)
-        || projection_digest.as_deref() != Some(actual_projection_digest.as_str())
+        || !digest_matches
         || !classifier_matches
         || mismatched_rows
     {
