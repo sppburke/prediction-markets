@@ -7630,6 +7630,75 @@ async fn incremental_versions_windows_and_predecessor_corruption_fail_before_sou
 }
 
 #[tokio::test]
+async fn retained_wallet_without_a_predecessor_receipt_refuses_a_successor_before_the_clock() {
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "orphan.db", &[]);
+    let source = DatasetFetcher {
+        rows: vec![dataset_row(WALLET, "0xmarket", "base", "BUY", FRESH_END)],
+        ..Default::default()
+    };
+    populate_activity_fresh_v2(
+        &side,
+        &source,
+        "https://data.example",
+        1,
+        FRESH_END,
+        FRESH_END + 1,
+    )
+    .await
+    .unwrap();
+    // A row for a wallet the completed predecessor never receipted, stamped
+    // with an older generation: the generation-filtered traversal and its
+    // count cannot see it, so only the wallet enumeration can.
+    Connection::open(&side)
+        .unwrap()
+        .execute(
+            "INSERT INTO activity_groups_v2
+             SELECT 'g2:orphan', 0, semantic_revision, components_json, ?1, transaction_hash,
+                    activity_type, condition_id, asset, outcome_id, side, row_count,
+                    share_amount_str, price_weighted_share_amount_str, source_usdc_amount_str,
+                    source_time_unix, is_combo, schema_version, parser_version
+             FROM activity_groups_v2 LIMIT 1",
+            [WALLET_B],
+        )
+        .unwrap();
+    let calls_before = source.calls.lock().unwrap().len();
+    let identity_before = fresh_record(&side);
+    let sampled = AtomicUsize::new(0);
+    let refused = pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
+        &side,
+        &source,
+        "https://data.example",
+        2,
+        &[],
+        || {
+            sampled.fetch_add(1, Ordering::SeqCst);
+            Ok(FRESH_END + 100)
+        },
+        FRESH_END + 2,
+    )
+    .await
+    .unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("retained wallet has no predecessor proof"),
+        "{refused}"
+    );
+    assert_eq!(
+        sampled.load(Ordering::SeqCst),
+        0,
+        "the clock is not sampled"
+    );
+    assert_eq!(
+        source.calls.lock().unwrap().len(),
+        calls_before,
+        "no source call"
+    );
+    assert_eq!(fresh_record(&side), identity_before, "identity unchanged");
+}
+
+#[tokio::test]
 async fn incremental_receipt_resume_validates_new_metadata_without_loading_completed_rows() {
     let dir = TempDir::new().unwrap();
     let base = dataset_candidate(&dir, "receipt-proof.db", &[]);
