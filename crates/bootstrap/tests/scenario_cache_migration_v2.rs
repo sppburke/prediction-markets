@@ -2186,6 +2186,46 @@ async fn activation_takes_the_projection_digest_from_the_final_stage_record_only
     );
 }
 
+/// PASS: re-finalization takes the write lock before it reads, so it cannot
+/// start while another writer holds the lock, and the committed projection its
+/// readers verify cannot change under it; once the lock is free it verifies the
+/// same count and digest. FAIL: it proceeds under another writer's lock.
+#[tokio::test]
+async fn refinalization_takes_the_write_lock_before_verifying_the_committed_projection() {
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join("eval-results")).unwrap();
+    let side = dir.path().join("side.db");
+    retained_classifier_activity(&dir, &side).await;
+    let first = finalize_cache_v2(
+        &side,
+        &dir.path().join("first.json"),
+        CLASSIFIER_FIXED_END + 3,
+    )
+    .unwrap();
+    let writer = Connection::open(&side).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let blocked = dir.path().join("blocked.json");
+    let refused = finalize_cache_v2(&side, &blocked, CLASSIFIER_FIXED_END + 4).unwrap_err();
+    assert!(
+        refused.to_string().contains("database is locked"),
+        "{refused}"
+    );
+    assert!(!blocked.exists());
+    writer.execute_batch("ROLLBACK").unwrap();
+    drop(writer);
+    let again = finalize_cache_v2(
+        &side,
+        &dir.path().join("again.json"),
+        CLASSIFIER_FIXED_END + 4,
+    )
+    .unwrap();
+    assert_eq!(again.ranker_projection_count, first.ranker_projection_count);
+    assert_eq!(
+        again.ranker_projection_digest,
+        first.ranker_projection_digest
+    );
+}
+
 #[tokio::test]
 async fn stale_classifier_projection_cannot_be_certified() {
     let dir = TempDir::new().unwrap();

@@ -606,7 +606,10 @@ hash covers the installed bytes.
 Refinalization reuses the projection only when the finalized database's saved activity generation,
 reference, aggregate and manifest digests, payout generation/coverage and evidence digest, and
 classifier version are unchanged, and the existing projection's recomputed count and digest match
-the recorded values; missing or changed proof refuses reuse. A different recorded classifier
+the recorded values; missing or changed proof refuses reuse. Refinalization holds the write lock
+without writing and recomputes that digest over the committed projection from eight read-only
+connections, one key range each, hashed in key order, so the bytes are the serial read's while its
+random activity reads overlap (#675). A different recorded classifier
 version instead runs full activity verification and rebuilds the projection with the current
 classifier. Each rebuilding finalization loads a wallet once, validates its entire aggregate
 vector, then classifies that same vector; a classifier stopping point never truncates validation.
