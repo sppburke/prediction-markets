@@ -64,7 +64,7 @@ use crate::reclamation_evidence::{
 const CACHE_BUILD_MANIFEST_VERSION: u32 = 1;
 const FROZEN_PAYLOAD_REFERENCE_VERSION: u32 = 1;
 const FINAL_STAGE_RECORD_VERSION: u32 = 2;
-const RANKER_CLASSIFIER_VERSION: u32 = 2;
+const RANKER_CLASSIFIER_VERSION: u32 = 3;
 const FRESH_COLLECTION_VERSION: u32 = 1;
 /// Wallet reads in flight during activity collection (`activity_collection_wallet_fetches`
 /// in `docs/_GLOSSARY.md`). Each wallet pages serially, so this width sets throughput
@@ -3143,18 +3143,25 @@ fn project_loaded_wallet(
         {
             break;
         }
-        let decisions = match classify_complete_historical_second(
+        let (decisions, first_entries) = match classify_complete_historical_second(
             &ledger,
             wallet,
             &mutations,
             quality,
             &|market: &MarketId| history.contains(&market.to_string()),
         ) {
-            Ok(SecondVerdict::OrderIndependent { decisions, .. }) => decisions,
+            Ok(SecondVerdict::OrderIndependent {
+                decisions,
+                first_entries,
+                ..
+            }) => (decisions, first_entries),
             Ok(SecondVerdict::OrderDependent { .. }) | Err(_) => break,
         };
         for decision in decisions {
+            // The live copy path refuses an entry whose action depends on the
+            // order of its second's mutations (bucket_commit.rs).
             if decision.entry != EntryClassification::Admitted
+                || decision.action_order_dependent
                 || decision.amount == ShareAmount::ZERO
                 || !payout_markets.contains(&decision.market_id.to_string())
             {
@@ -3179,11 +3186,13 @@ fn project_loaded_wallet(
         if ledger.apply_all_or_none(&mutations).is_err() {
             break;
         }
-        for mutation in &mutations {
-            for key in mutation.touched_keys() {
-                history.insert(key.market().to_string());
-            }
-        }
+        // As on the live path, only a first entry consumes its market's history;
+        // sells, splits, merges and redemptions do not (docs/_GLOSSARY.md).
+        history.extend(
+            first_entries
+                .into_iter()
+                .map(|(market, _)| market.to_string()),
+        );
     }
     Ok(())
 }
@@ -3976,6 +3985,13 @@ pub fn activate_cache_v2_with_handoff(
     final_stage_record: Option<&Path>,
 ) -> Result<CacheActivationReport, BootstrapError> {
     let _locks = ForgeActivationLocks::acquire_with_handoff(&request.fixed_path, handoff)?;
+    let _candidate_lock = request
+        .side_path
+        .exists()
+        .then(|| crate::lock::CacheMutationLock::acquire(&request.side_path))
+        .transpose()?;
+    release_reader_sidecars(&request.side_path)?;
+    release_reader_sidecars(&request.fixed_path)?;
     let proof = final_stage_proof(final_stage_record, request)?;
     let projection = proof
         .as_ref()
@@ -5036,7 +5052,8 @@ fn verify_finalized_v2_manifests(
         ClassifierGeneration::Current => {
             classifier_version == Some(i64::from(RANKER_CLASSIFIER_VERSION))
         }
-        ClassifierGeneration::Historical => matches!(classifier_version, Some(1 | 2)),
+        // Explicit, so a revert of the current version still accepts version three.
+        ClassifierGeneration::Historical => matches!(classifier_version, Some(1..=3)),
     };
     let mismatched_rows: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM ranker_entries_v2 WHERE classifier_version IS NOT ?1)",
@@ -5383,6 +5400,23 @@ fn reject_nonempty_sidecars(path: &Path) -> Result<(), BootstrapError> {
     let shared_memory = sidecar_path(path, "-shm");
     if shared_memory.exists() {
         std::fs::remove_file(shared_memory)?;
+    }
+    Ok(())
+}
+
+/// Read-only readers of a finalized cache (the ranking scripts) leave SQLite's
+/// shared-memory index and an empty WAL, which only a last closing writer removes.
+/// The caller holds `path`'s mutation lock, so no writer can add frames: with none,
+/// a writer's open and close lets SQLite remove both. A WAL with frames, or a
+/// reader still holding the file, leaves them for the strict checks to refuse.
+fn release_reader_sidecars(path: &Path) -> Result<(), BootstrapError> {
+    let wal = sidecar_path(path, "-wal");
+    let frames = wal.is_file() && std::fs::metadata(&wal)?.len() != 0;
+    if path.exists() && !frames && (wal.exists() || sidecar_path(path, "-shm").exists()) {
+        drop(open_immutable(path)?);
+        open_existing_rw(path)?
+            .close()
+            .map_err(|(_, error)| error)?;
     }
     Ok(())
 }

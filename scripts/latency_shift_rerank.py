@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Pass 2: latency-shifted re-rank of the buy-and-hold edge-floor candidates (#536).
+"""Pass 2: latency-shifted re-rank of the ranking candidates (#536): pass one's edge-floor
+wallets on schema one; on schema two, every wallet whose in-horizon positions can still meet
+the survival gates (#588).
 
 The pass-1 ranker (`rank_72hr_buyandhold.py`) scores each first-buy at the LEADER's
 entry price. When we copy, we observe the leader's trade ~Δ seconds late and enter at
@@ -8,7 +10,11 @@ CLOB minute historical-price reference: the LATEST sample at-or-before `entry+Δ
 (at-or-before per repository precedent — forward selection would be look-ahead),
 staleness bounded by the window, strictly before actual resolution. Positions with no
 fresh-enough sample are NOT REPRICED and count against the wallet's repricing
-coverage (the `fill_rate` wire column, name retained for compatibility). The prior
+coverage (the `fill_rate` wire column, name retained for compatibility). For schema
+two, coverage is judged over the copy scope only: `n_total` counts the wallet's
+positions whose shifted scheduled horizon qualifies (no price changes that), and
+coverage is repriced / (that count minus positions a reference price proves out of
+band). A position outside the horizon needs no reference window. The prior
 print-tape proxy was retired at the #536 owner-gated cutover: it measured a
 wallet-sampled trade tape (side-blind, up to 120s late) instead of the market's
 state at our entry; the pinned batch-70 experiment on the issue quantified the
@@ -54,7 +60,7 @@ from ranker_decay import (
 # the lookup rule or repricing semantics; the fetch side's parser identity is
 # `pe_bootstrap::prices_history::RANKER_PRICE_PARSER_VERSION` (mirrored here).
 ORACLE_NAME = "clob-minute-reference"
-ORACLE_VERSION = 2
+ORACLE_VERSION = 3
 ORACLE_FIDELITY_MINUTES = 1
 ORACLE_PARSER_VERSION = 1
 
@@ -137,29 +143,28 @@ def load_candidates(ranked_csv: str, floor_tstat: float) -> set[str]:
     return out
 
 
-def load_survivable_wallets(positions_csv: str, a: argparse.Namespace) -> tuple[dict[str, int], set[str]]:
-    """Schema two: each position wallet's position count, and the wallets that can pass
-    the survival gates.
+def in_horizon(ttr_secs: int, a: argparse.Namespace) -> bool:
+    """Schema two's copy scope before any price: the shifted scheduled horizon."""
+    return a.min_ttr_secs <= ttr_secs - a.latency_shift_secs < a.ttr_max_secs
 
-    No pass-one statistic or leader price gates a wallet. A position is repriced only if
-    `min_ttr_secs <= ttr_secs - shift < ttr_max_secs`, which no price changes, so that
-    count bounds the wallet's repriced count; a wallet whose bound fails `nf > 1`,
-    `nf >= min_trl` or `nf / n_total >= min_fill_rate` cannot survive at any price (#588).
+
+def load_survivable_wallets(positions_csv: str, a: argparse.Namespace) -> tuple[dict[str, int], set[str]]:
+    """Schema two: each position wallet's in-horizon position count, and the wallets
+    that can pass the survival gates.
+
+    No pass-one statistic or leader price gates a wallet. Only an in-horizon position
+    can be repriced, so that count bounds the wallet's repriced count; a wallet whose
+    bound fails `nf > 1` or `nf >= min_trl` cannot survive at any price (#588).
+    Coverage gives no bound: a price can only shrink its denominator.
     """
-    total: dict[str, int] = {}
-    feasible: dict[str, int] = {}
+    scope: dict[str, int] = {}
     with open(positions_csv, newline="", encoding="utf-8") as source:
         for row in csv.DictReader(source):
             w = row.get("wallet")
             if not w:
                 continue
-            total[w] = total.get(w, 0) + 1
-            if a.min_ttr_secs <= int(row["ttr_secs"]) - a.latency_shift_secs < a.ttr_max_secs:
-                feasible[w] = feasible.get(w, 0) + 1
-    return total, {
-        w for w, n in total.items()
-        if (h := feasible.get(w, 0)) > 1 and h >= a.min_trl and h / n >= a.min_fill_rate
-    }
+            scope[w] = scope.get(w, 0) + in_horizon(int(row["ttr_secs"]), a)
+    return scope, {w for w, h in scope.items() if h > 1 and h >= a.min_trl}
 
 
 def write_before_after_diff(path: str, before_path: str, rows: list[dict],
@@ -361,6 +366,7 @@ def main() -> int:
                 "ttr_secs": int(r["ttr_secs"]),
                 "resolved_at": int(r["resolved_at"]),
                 "payoff": float(r["payoff"]),
+                "in_scope": schema_version < 2 or in_horizon(int(r["ttr_secs"]), a),
             })
             npos += 1
     by_mo = {key: positions for key, positions in by_mo.items() if positions}
@@ -384,8 +390,10 @@ def main() -> int:
                 tok = token_of.get(key)
                 if tok is None:
                     continue
-                per_token.setdefault(tok, []).extend(
-                    pair_windows(positions, a.latency_shift_secs, a.fill_window_secs))
+                scoped = [p for p in positions if p["in_scope"]]
+                if scoped:
+                    per_token.setdefault(tok, []).extend(
+                        pair_windows(scoped, a.latency_shift_secs, a.fill_window_secs))
             for tok in sorted(per_token):
                 for lo, hi in merge_ranges(per_token[tok]):
                     tf.write(f"{tok},{lo},{hi}\n")
@@ -409,8 +417,9 @@ def main() -> int:
         tok = token_of.get(key)
         if tok is None:
             continue  # unmapped: honestly not repriceable, no coverage requirement
-        needed = pair_windows(positions, shift, fill_window)
-        if subtract_ranges(needed, page_cov.get(tok, [])):
+        scoped = [p for p in positions if p["in_scope"]]
+        if scoped and subtract_ranges(pair_windows(scoped, shift, fill_window),
+                                      page_cov.get(tok, [])):
             uncovered_pairs += 1
     if uncovered_pairs:
         log(f"TEMPFAIL(75): {uncovered_pairs} pair(s) have un-terminal reference "
@@ -423,7 +432,8 @@ def main() -> int:
     net_ls: dict[str, list[float]] = {}
     entry_ts_ls: dict[str, list[int]] = {}
     months: dict[str, set] = {}
-    n_total: dict[str, int] = {}
+    n_total: dict[str, int] = {}        # in-scope positions (every position for schema one)
+    n_band: dict[str, int] = {}         # in-scope positions a reference price puts out of band
     n_filled: dict[str, int] = {}       # repriced count (wire column n_filled/n_trades)
     payoffs: dict[str, list[float]] = {}
     staleness: list[float] = []
@@ -451,6 +461,10 @@ def main() -> int:
             px_arr = [px for _, px in rows_pts]
         for pos in positions:
             w = pos["wallet"]
+            if not pos["in_scope"]:
+                outcomes.writerow([w, mid, oid, tok or "", pos["entry_ts"], pos["payoff"],
+                                   pos["resolved_at"], "", "", "scheduled_horizon"])
+                continue
             n_total[w] = n_total.get(w, 0) + 1
             target = pos["entry_ts"] + shift
             # Latest sample at-or-before entry+Δ (no look-ahead), staleness bounded,
@@ -476,16 +490,12 @@ def main() -> int:
                     if fill_price is None or not (0.0 < fill_price < 1.0):
                         reason = "invalid_price"
                     else:
-                        shifted_ttr = pos["ttr_secs"] - shift
                         eff = min(fill_price + slip, 0.999)
                         if schema_version >= 2 and not (
-                            a.min_ttr_secs <= shifted_ttr < a.ttr_max_secs
-                        ):
-                            reason = "scheduled_horizon"
-                        elif schema_version >= 2 and not (
                             a.price_min <= eff < a.price_max
                         ):
                             reason = "price_band"
+                            n_band[w] = n_band.get(w, 0) + 1
                         else:
                             net = (pos["payoff"] - eff) / eff
                             net_ls.setdefault(w, []).append(net)
@@ -525,7 +535,8 @@ def main() -> int:
         nets = net_ls.get(w, [])
         ets = entry_ts_ls.get(w, [])
         am = len(months.get(w, set()))
-        fr = nf / n_total[w] if n_total[w] else 0.0
+        scope = n_total[w] - n_band.get(w, 0)
+        fr = nf / scope if scope else 0.0
         mean, _, n_eff, t = weighted_stats(nets, decay_weights(ets, as_of, a.half_life_days))
         hr = statistics.fmean(payoffs.get(w, [])) if payoffs.get(w) else float("nan")
         eligible = (
@@ -546,11 +557,13 @@ def main() -> int:
             "survives": survives,
         })
     # Wallets that cannot survive keep a row, so the ranked universe is every position
-    # wallet; their statistics were not computed.
+    # wallet; their statistics were not computed. For schema two that includes a
+    # wallet with no in-scope position, and `n_total` is its in-horizon count.
     rows += [{"wallet": w, "n_total": n, "n_filled": "", "fill_rate": "", "active_months": "",
               "mean_net_ls": "", "tstat_net_ls": "", "n_eff": "", "hit_rate": "",
               "eligible": False, "survives": False}
-             for w, n in universe.items() if w not in cand]
+             for w, n in universe.items()
+             if w not in n_total and (w not in cand or schema_version >= 2)]
     rows.sort(key=lambda r: (r["survives"], r["tstat_net_ls"] if r["tstat_net_ls"] != "" else -9),
               reverse=True)
 
