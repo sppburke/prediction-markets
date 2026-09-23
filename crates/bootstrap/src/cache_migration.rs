@@ -3191,8 +3191,9 @@ fn project_loaded_wallet(
 
 // Keep the projection as the outer loop even with stale SQLite statistics.
 // Reordering these joins could traverse all activity covered by payout evidence.
-const RANKER_PROJECTION_DIGEST_SQL: &str =
-    "SELECT ranker.source_trade_id, ranker.activity_generation,
+macro_rules! ranker_projection_digest_select {
+    () => {
+        "SELECT ranker.source_trade_id, ranker.activity_generation,
                 ranker.classifier_version, groups_v2.wallet_hex,
                 groups_v2.condition_id, groups_v2.asset, groups_v2.outcome_id,
                 groups_v2.side, groups_v2.share_amount_str,
@@ -3205,8 +3206,35 @@ const RANKER_PROJECTION_DIGEST_SQL: &str =
           AND groups_v2.coverage_generation = ranker.activity_generation
          CROSS JOIN clob_payout_evidence_v2 payout
            ON payout.market_id = groups_v2.condition_id
-         WHERE ranker.activity_generation = ?1
-         ORDER BY ranker.source_trade_id";
+         WHERE ranker.activity_generation = ?1"
+    };
+}
+const RANKER_PROJECTION_DIGEST_SQL: &str = concat!(
+    ranker_projection_digest_select!(),
+    "
+         ORDER BY ranker.source_trade_id"
+);
+/// The same rows, joins and order, restricted to the key range `[?2, ?3)`, to
+/// keys below `?2`, or to keys from `?2` on. The two open ends keep every key a
+/// full read would see, including any that bypassed the table's check.
+const RANKER_PROJECTION_RANGE_SQL: &str = concat!(
+    ranker_projection_digest_select!(),
+    "
+           AND ranker.source_trade_id >= ?2 AND ranker.source_trade_id < ?3
+         ORDER BY ranker.source_trade_id"
+);
+const RANKER_PROJECTION_BELOW_SQL: &str = concat!(
+    ranker_projection_digest_select!(),
+    "
+           AND ranker.source_trade_id < ?2
+         ORDER BY ranker.source_trade_id"
+);
+const RANKER_PROJECTION_FROM_SQL: &str = concat!(
+    ranker_projection_digest_select!(),
+    "
+           AND ranker.source_trade_id >= ?2
+         ORDER BY ranker.source_trade_id"
+);
 
 fn ranker_projection_digest(
     connection: &Connection,
@@ -3217,6 +3245,7 @@ fn ranker_projection_digest(
 
 fn verify_reusable_ranker_projection(
     connection: &Connection,
+    cache_path: &Path,
     payout_generation: i64,
     projection_count: Option<i64>,
     projection_digest: Option<String>,
@@ -3261,7 +3290,9 @@ fn verify_reusable_ranker_projection(
             "finalized ranker projection count mismatch: recorded={projection_count}, actual={actual_count}"
         ));
     }
-    let actual_digest = ranker_projection_digest(connection, manifest.generation)?;
+    // The caller holds the write lock and has written nothing, so the committed
+    // projection other connections read is exactly this transaction's.
+    let actual_digest = projection_digest::compute_committed(cache_path, manifest.generation)?;
     if actual_digest != projection_digest {
         return invalid("finalized ranker projection digest mismatch".to_owned());
     }
@@ -3291,7 +3322,10 @@ pub fn finalize_cache_v2(
         "generation",
     )?;
     verify_payout_coverage(&connection, payout_generation)?;
-    let transaction = connection.transaction()?;
+    // The write lock is held from the start: re-finalization verifies the
+    // committed projection from other connections, which must see this state.
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let state: FinalizedProjectionState = transaction
         .query_row(
             "SELECT phase, ranker_projection_count, ranker_projection_digest,
@@ -3306,7 +3340,13 @@ pub fn finalize_cache_v2(
         })?;
     let (activity_generation, ranker_projection_count, ranker_projection_digest) =
         if state.0 == "finalized" && state.3 == Some(i64::from(RANKER_CLASSIFIER_VERSION)) {
-            verify_reusable_ranker_projection(&transaction, payout_generation, state.1, state.2)?
+            verify_reusable_ranker_projection(
+                &transaction,
+                cache_path,
+                payout_generation,
+                state.1,
+                state.2,
+            )?
         } else if state.0 == "finalized" && state.3.is_none() {
             return invalid("finalized ranker projection classifier version is missing".to_owned());
         } else {
@@ -5430,7 +5470,8 @@ fn invalid<T>(message: String) -> Result<T, BootstrapError> {
 #[allow(clippy::unwrap_used)]
 mod publication_json_tests {
     use super::{
-        RANKER_PROJECTION_DIGEST_SQL, ensure_lane_a_v2_schema, pending_path_for,
+        RANKER_PROJECTION_BELOW_SQL, RANKER_PROJECTION_DIGEST_SQL, RANKER_PROJECTION_FROM_SQL,
+        RANKER_PROJECTION_RANGE_SQL, ensure_lane_a_v2_schema, pending_path_for,
         preserve_main_and_sidecars, python_canonical_json,
     };
 
@@ -5484,6 +5525,48 @@ mod publication_json_tests {
                 !plan.iter().any(|step| step.starts_with("SCAN groups_v2")),
                 "{plan:?}"
             );
+            // A committed digest's key ranges are range searches of the
+            // projection's key, with the same keyed activity reads.
+            for (sql, bound) in [
+                (
+                    RANKER_PROJECTION_RANGE_SQL,
+                    "(source_trade_id>? AND source_trade_id<?)",
+                ),
+                (RANKER_PROJECTION_BELOW_SQL, "(source_trade_id<?)"),
+                (RANKER_PROJECTION_FROM_SQL, "(source_trade_id>?)"),
+            ] {
+                let mut statement = connection
+                    .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                    .unwrap();
+                let parameters: Vec<rusqlite::types::Value> = [
+                    rusqlite::types::Value::Integer(7),
+                    rusqlite::types::Value::Text("g2:001".to_owned()),
+                    rusqlite::types::Value::Text("g2:002".to_owned()),
+                ]
+                .into_iter()
+                .take(statement.parameter_count())
+                .collect();
+                let plan = statement
+                    .query_map(rusqlite::params_from_iter(parameters), |row| {
+                        row.get::<_, String>(3)
+                    })
+                    .unwrap()
+                    .collect::<Result<Vec<_>, _>>()
+                    .unwrap();
+                assert!(
+                    plan[0].starts_with("SEARCH ranker") && plan[0].contains(bound),
+                    "{plan:?}"
+                );
+                assert!(
+                    plan.iter().any(|step| step.starts_with("SEARCH groups_v2")
+                        && step.contains("(source_trade_id=?)")),
+                    "{plan:?}"
+                );
+                assert!(
+                    !plan.iter().any(|step| step.contains("TEMP B-TREE")),
+                    "{plan:?}"
+                );
+            }
         }
     }
 
