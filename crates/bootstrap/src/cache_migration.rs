@@ -3050,7 +3050,7 @@ fn rebuild_ranker_projection(
     transaction: &rusqlite::Transaction<'_>,
     activity_generation: u64,
     finalized_at_unix: i64,
-) -> Result<(ActivityCoverageManifestV2, u64, String), BootstrapError> {
+) -> Result<(ActivityCoverageManifestV2, u64), BootstrapError> {
     let generation = to_i64(activity_generation, "activity generation")?;
     let projection = (|| -> Result<_, BootstrapError> {
         let payout_markets = transaction
@@ -3105,13 +3105,12 @@ fn rebuild_ranker_projection(
     if needs_install {
         record_completed_manifest(transaction, &manifest)?;
     }
-    let digest = ranker_projection_digest(transaction, activity_generation)?;
     let count: i64 =
         transaction.query_row("SELECT COUNT(*) FROM ranker_entries_v2", [], |row| {
             row.get(0)
         })?;
     let count = to_u64(count, "ranker projection count")?;
-    Ok((manifest, count, digest))
+    Ok((manifest, count))
 }
 
 // Aggregates retain the loader's (source_time_unix, source_trade_id) order.
@@ -3313,6 +3312,10 @@ pub fn finalize_cache_v2(
     finalized_at_unix: i64,
 ) -> Result<CacheFinalStageRecord, BootstrapError> {
     let mut connection = open_existing_rw(cache_path)?;
+    // A rebuild inserts every projection row. With SQLite's default page cache
+    // the key index's pages are evicted and rewritten per insert; 1 GiB cut
+    // insert CPU 56% and finalization CPU 22% locally, same digest.
+    connection.pragma_update(None, "cache_size", -1_048_576_i64)?;
     require_schema(&connection, CACHE_SCHEMA_VERSION_V2)?;
     ensure_lane_a_v2_schema(&connection)?;
     let sealed_generation = required_max(&connection, "sealed_generation_manifests", "generation")?;
@@ -3340,19 +3343,38 @@ pub fn finalize_cache_v2(
         })?;
     let (activity_generation, ranker_projection_count, ranker_projection_digest) =
         if state.0 == "finalized" && state.3 == Some(i64::from(RANKER_CLASSIFIER_VERSION)) {
-            verify_reusable_ranker_projection(
+            let reused = verify_reusable_ranker_projection(
                 &transaction,
                 cache_path,
                 payout_generation,
                 state.1,
                 state.2,
-            )?
+            )?;
+            transaction.commit()?;
+            reused
         } else if state.0 == "finalized" && state.3.is_none() {
             return invalid("finalized ranker projection classifier version is missing".to_owned());
         } else {
             let identity = activity_identity(&transaction)?;
-            let (activity_manifest, count, digest) =
+            let (activity_manifest, count) =
                 rebuild_ranker_projection(&transaction, identity.generation, finalized_at_unix)?;
+            // Commit the rebuilt projection unfinalized, so its digest can be read
+            // from other connections; a failure after this leaves only an
+            // unfinalized projection, which the next finalization rebuilds.
+            transaction.execute(
+                "UPDATE cache_v2_migration_state
+             SET phase = CASE WHEN phase = 'finalized' THEN 'schema_sealed' ELSE phase END,
+                 ranker_projection_count = NULL, ranker_projection_digest = NULL,
+                 ranker_classifier_version = NULL, ranker_projection_inputs_json = NULL,
+                 updated_at_unix = ?1 WHERE singleton = 1",
+                params![finalized_at_unix],
+            )?;
+            let baseline: i64 =
+                transaction.pragma_query_value(None, "data_version", |row| row.get(0))?;
+            transaction.commit()?;
+            let transaction = relock_unchanged(&mut connection, baseline)?;
+            let digest =
+                projection_digest::compute_committed(cache_path, activity_manifest.generation)?;
             let inputs = RankerProjectionInputs::read(
                 &transaction,
                 &activity_manifest,
@@ -3372,9 +3394,9 @@ pub fn finalize_cache_v2(
                     canonical_json(&inputs)?,
                 ],
             )?;
+            transaction.commit()?;
             (activity_manifest.generation, count, digest)
         };
-    transaction.commit()?;
     checkpoint_truncate(&connection)?;
     connection.close().map_err(|(_, error)| error)?;
     reject_nonempty_sidecars(cache_path)?;
@@ -3393,6 +3415,25 @@ pub fn finalize_cache_v2(
     };
     atomic_write_json(stage_record_path, &record)?;
     Ok(record)
+}
+
+/// Takes the write lock again after this connection's commit, refusing if any
+/// other connection committed since `baseline`, which this connection read
+/// while it still held the lock (its own commits never change the value).
+fn relock_unchanged(
+    connection: &mut Connection,
+    baseline: i64,
+) -> Result<rusqlite::Transaction<'_>, BootstrapError> {
+    let transaction =
+        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let current: i64 = transaction.pragma_query_value(None, "data_version", |row| row.get(0))?;
+    if current != baseline {
+        return invalid(
+            "another connection wrote the cache between rebuilding and certifying its projection"
+                .to_owned(),
+        );
+    }
+    Ok(transaction)
 }
 
 /// Stage a single verified copy of the checkpointed fixed main. Existing
@@ -4202,15 +4243,22 @@ fn activate_two_file_cycle(
             if displaced.exists() {
                 return invalid("displaced cache destination is occupied".to_owned());
             }
-            let current = open_existing_rw(fixed)?;
+            let mut current = open_existing_rw(fixed)?;
             checkpoint_truncate(&current)?;
             match evidence.source_schema {
                 0 | CACHE_SCHEMA_VERSION_V1 => require_reclamation_ready(&current)?,
-                CACHE_SCHEMA_VERSION_V2 => verify_finalized_v2_manifests(
-                    &current,
-                    ClassifierGeneration::Historical,
-                    ProjectionDigest::Recompute,
-                )?,
+                CACHE_SCHEMA_VERSION_V2 => {
+                    // Hold the write lock, writing nothing, so the digest's
+                    // readers see exactly this committed state.
+                    let hold = current
+                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                    verify_finalized_v2_manifests(
+                        &hold,
+                        ClassifierGeneration::Historical,
+                        ProjectionDigest::Committed(fixed),
+                    )?;
+                    hold.rollback()?;
+                }
                 other => return invalid(format!("unsupported prior cache schema {other}")),
             }
             current.close().map_err(|(_, error)| error)?;
@@ -4883,6 +4931,9 @@ enum ProjectionDigest<'a> {
     /// The finalization record that hashed exactly these bytes computed or
     /// verified the digest; only the stored summary is compared with it.
     Recorded(&'a CacheFinalStageRecord),
+    /// Recompute it from readers on their own connections to this file; the
+    /// caller holds the write lock and has written nothing.
+    Committed(&'a Path),
 }
 
 /// The finalization record proving an activation candidate's projection digest.
@@ -4963,6 +5014,10 @@ fn verify_finalized_v2_manifests(
         ProjectionDigest::Recompute => {
             projection_digest.as_deref()
                 == Some(ranker_projection_digest(connection, activity_generation)?.as_str())
+        }
+        ProjectionDigest::Committed(path) => {
+            projection_digest.as_deref()
+                == Some(projection_digest::compute_committed(path, activity_generation)?.as_str())
         }
         ProjectionDigest::Recorded(record) => {
             let stored = projection_digest
@@ -5930,6 +5985,38 @@ mod distinct_wallet_tests {
                     .any(|step| step.starts_with("SEARCH") && step.contains("COVERING INDEX")),
                 "{table}: {plan:?}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod relock_tests {
+    use super::relock_unchanged;
+    use rusqlite::{Connection, TransactionBehavior};
+
+    #[test]
+    fn another_connections_commit_is_refused_and_the_own_commit_is_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.db");
+        let mut own = Connection::open(&path).unwrap();
+        own.execute_batch("PRAGMA journal_mode = WAL; CREATE TABLE t(x);")
+            .unwrap();
+        let other = Connection::open(&path).unwrap();
+        for interleaved in [false, true] {
+            let transaction = own
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .unwrap();
+            transaction.execute("INSERT INTO t VALUES (1)", []).unwrap();
+            let baseline: i64 = transaction
+                .pragma_query_value(None, "data_version", |row| row.get(0))
+                .unwrap();
+            transaction.commit().unwrap();
+            if interleaved {
+                other.execute("INSERT INTO t VALUES (2)", []).unwrap();
+            }
+            let relocked = relock_unchanged(&mut own, baseline);
+            assert_eq!(relocked.is_err(), interleaved);
         }
     }
 }

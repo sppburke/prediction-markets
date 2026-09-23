@@ -1993,6 +1993,58 @@ async fn classifier_v2_rebuilds_retained_activity_without_recollection() {
     connection
         .execute_batch("DROP TRIGGER abort_projection_rebuild")
         .unwrap();
+    // A failure after the rebuilt projection commits, while its digest is being
+    // certified (#675), downgrades the old finalized state instead of leaving
+    // it beside rows it does not describe; the retry then finalizes.
+    let phase = |connection: &Connection| {
+        connection
+            .query_row(
+                "SELECT phase, ranker_projection_count, ranker_projection_digest,
+                        ranker_classifier_version, ranker_projection_inputs_json,
+                        (SELECT COUNT(*) FROM ranker_entries_v2)
+                 FROM cache_v2_migration_state",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .unwrap()
+    };
+    assert_eq!(phase(&connection).0, "finalized");
+    connection
+        .execute_batch(
+            "CREATE TRIGGER abort_certification BEFORE UPDATE OF phase ON cache_v2_migration_state
+        WHEN NEW.phase = 'finalized'
+        BEGIN SELECT RAISE(ABORT, 'forced certification crash'); END;",
+        )
+        .unwrap();
+    let certification = finalize_cache_v2(
+        &side,
+        &dir.path().join("failed-certification-stage.json"),
+        CLASSIFIER_FIXED_END + 3,
+    )
+    .unwrap_err();
+    assert!(
+        certification
+            .to_string()
+            .contains("forced certification crash"),
+        "{certification}"
+    );
+    assert!(!dir.path().join("failed-certification-stage.json").exists());
+    assert_eq!(
+        phase(&connection),
+        ("schema_sealed".to_owned(), None, None, None, None, 2)
+    );
+    connection
+        .execute_batch("DROP TRIGGER abort_certification")
+        .unwrap();
     drop(connection);
     assert_eq!(retained_activity_rows(&side), retained);
     let stage = finalize_cache_v2(
@@ -2224,6 +2276,85 @@ async fn refinalization_takes_the_write_lock_before_verifying_the_committed_proj
         again.ranker_projection_digest,
         first.ranker_projection_digest
     );
+}
+
+/// PASS: a two-file activation whose outgoing schema-two cache is still at F
+/// verifies its nonempty projection digest (#675). A projection-only change
+/// that keeps the count, and a projection row no digest reader can decode, are
+/// each refused with the outgoing bytes and every file role unchanged, and
+/// another connection takes the write lock at once afterwards; the unchanged
+/// cache then activates. FAIL: otherwise. (Which connections read, and how long
+/// the lock is held, are not observable here.)
+#[tokio::test]
+async fn outgoing_schema_two_projection_is_verified_from_committed_readers() {
+    use pe_bootstrap::cache_migration::{cache_stage_evidence_path, stage_cache_cycle_v2};
+    let dir = TempDir::new().unwrap();
+    std::fs::create_dir_all(dir.path().join("eval-results")).unwrap();
+    let fixed = dir.path().join("wallet_cache.db");
+    retained_classifier_activity(&dir, &fixed).await;
+    let installed = finalize_cache_v2(
+        &fixed,
+        &dir.path().join("installed.json"),
+        CLASSIFIER_FIXED_END + 3,
+    )
+    .unwrap();
+    assert_eq!(installed.ranker_projection_count, 2);
+    let cycle = "wallet_cache.cron-20260917T000001Z";
+    let prior = dir.path().join(format!("{cycle}.prior.db"));
+    let side = dir.path().join(format!("{cycle}.side.db"));
+    let displaced = dir.path().join(format!("{cycle}.displaced.db"));
+    let h0 = sha256_file(&fixed).unwrap();
+    stage_cache_cycle_v2(
+        &fixed,
+        &prior,
+        &side,
+        Some(&dir.path().join("stage-build.json")),
+    )
+    .unwrap();
+    let record = dir.path().join("final.json");
+    let finalized = finalize_cache_v2(&side, &record, CLASSIFIER_FIXED_END + 4).unwrap();
+    let request = CacheActivationRequest {
+        fixed_path: fixed.clone(),
+        side_path: side.clone(),
+        prior_cache_backup_path: displaced.clone(),
+        expected_side_sha256: finalized.cache_sha256.clone(),
+        stage_evidence_sha256: Some(sha256_file(&cache_stage_evidence_path(&side)).unwrap()),
+    };
+    let original = std::fs::read(&fixed).unwrap();
+    for (damage, refusal) in [
+        (
+            "UPDATE ranker_entries_v2 SET source_trade_id = 'g2:' || printf('%064d', 0)
+             WHERE source_trade_id = (SELECT MIN(source_trade_id) FROM ranker_entries_v2)",
+            "frozen/activity/ranker proof",
+        ),
+        (
+            "UPDATE ranker_entries_v2 SET classifier_version = 'reader-failure'
+             WHERE source_trade_id = (SELECT MIN(source_trade_id) FROM ranker_entries_v2)",
+            "Invalid column type Text",
+        ),
+    ] {
+        Connection::open(&fixed)
+            .unwrap()
+            .execute(damage, [])
+            .unwrap();
+        let damaged = sha256_file(&fixed).unwrap();
+        let refused = activate_cache_v2_with_handoff(&request, None, Some(&record)).unwrap_err();
+        assert!(refused.to_string().contains(refusal), "{refused}");
+        let probe = Connection::open(&fixed).unwrap();
+        probe.busy_timeout(std::time::Duration::ZERO).unwrap();
+        probe.execute_batch("BEGIN IMMEDIATE; ROLLBACK;").unwrap();
+        drop(probe);
+        assert_eq!(sha256_file(&fixed).unwrap(), damaged);
+        assert_eq!(sha256_file(&side).unwrap(), finalized.cache_sha256);
+        assert!(!displaced.exists());
+        std::fs::write(&fixed, &original).unwrap();
+        assert_eq!(sha256_file(&fixed).unwrap(), h0);
+    }
+    let report = activate_cache_v2_with_handoff(&request, None, Some(&record)).unwrap();
+    assert!(!report.resumed);
+    assert_eq!(report.installed_sha256, finalized.cache_sha256);
+    assert_eq!(sha256_file(&displaced).unwrap(), h0);
+    assert!(!side.exists());
 }
 
 #[tokio::test]
@@ -2843,15 +2974,44 @@ async fn activity_wallet_receipts_bound_resume_and_finalize_atomically() {
         ]
         .map(|sql| (sql, query_values(&failed, sql)));
         let stage_path = dir.path().join(format!("atomic-{name}.json"));
-        let error = finalize_cache_v2(&failed, &stage_path, FRESH_END + 2).unwrap_err();
+        // The rebuild commits before its digest is certified (#675). A failure
+        // while rebuilding changes nothing; a failure after that leaves the
+        // rebuilt projection and installed manifest, never a finalized state,
+        // and the retry at the same time finalizes exactly as a clean run.
+        let attempt = if name == "state" {
+            FRESH_END + 1
+        } else {
+            FRESH_END + 2
+        };
+        let error = finalize_cache_v2(&failed, &stage_path, attempt).unwrap_err();
         assert!(
             error
                 .to_string()
                 .contains(&format!("forced partial {name} failure")),
             "{error}"
         );
-        for (sql, before) in snapshots {
-            assert_eq!(query_values(&failed, sql), before, "{name}: {sql}");
+        if name == "state" {
+            let (phase, digest, projected): (String, Option<String>, i64) =
+                Connection::open(&failed)
+                    .unwrap()
+                    .query_row(
+                        "SELECT phase, ranker_projection_digest,
+                            (SELECT COUNT(*) FROM ranker_entries_v2)
+                     FROM cache_v2_migration_state",
+                        [],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .unwrap();
+            assert_ne!(phase, "finalized");
+            assert_eq!(digest, None);
+            assert_eq!(
+                u64::try_from(projected).unwrap(),
+                expected.ranker_projection_count
+            );
+        } else {
+            for (sql, before) in snapshots {
+                assert_eq!(query_values(&failed, sql), before, "{name}: {sql}");
+            }
         }
         assert!(!stage_path.exists());
         Connection::open(&failed)
@@ -10450,7 +10610,7 @@ async fn two_file_cycles_copy_once_preserve_inodes_and_recover_activation_gap() 
             })
             .count()
     };
-    for cycle in 1..=2 {
+    for cycle in 1..=3 {
         let prior = dir
             .path()
             .join(format!("wallet_cache.cron-20260917T00000{cycle}Z.prior.db"));
@@ -10529,10 +10689,55 @@ async fn two_file_cycles_copy_once_preserve_inodes_and_recover_activation_gap() 
             );
             std::fs::write(&displaced, original).unwrap();
         }
-        // The second cycle, which crosses the rename gap, activates and resumes
-        // with its finalization record proving the projection digest (#682).
+        if cycle == 3 {
+            // The outgoing cache is schema two and still at F: its projection
+            // digest is recomputed from readers on their own connections under
+            // a held write lock (#675). Another writer refuses activation before
+            // any role changes, and a stored digest the recomputation does not
+            // reproduce is refused (this fixture's projection is empty).
+            let unchanged = || {
+                assert_eq!(sha256_file(&fixed).unwrap(), h0);
+                assert_eq!(sha256_file(&side).unwrap(), finalized.cache_sha256);
+                assert!(!displaced.exists());
+            };
+            let writer = Connection::open(&fixed).unwrap();
+            writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+            // Its checkpoint, just before the hold, already reports the lock.
+            let locked = activate_cache_v2(&request).unwrap_err();
+            assert!(locked.to_string().contains("busy=1"), "{locked}");
+            writer.execute_batch("ROLLBACK").unwrap();
+            drop(writer);
+            unchanged();
+            let original = std::fs::read(&fixed).unwrap();
+            Connection::open(&fixed)
+                .unwrap()
+                .execute(
+                    "UPDATE cache_v2_migration_state
+                     SET ranker_projection_digest = printf('%064d', 0)",
+                    [],
+                )
+                .unwrap();
+            let changed = activate_cache_v2(&request).unwrap_err();
+            assert!(
+                changed.to_string().contains("frozen/activity/ranker proof"),
+                "{changed}"
+            );
+            std::fs::write(&fixed, original).unwrap();
+            for sidecar in ["-wal", "-shm"] {
+                let path = dir.path().join(format!("wallet_cache.db{sidecar}"));
+                match std::fs::remove_file(&path) {
+                    Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                        panic!("{}: {error}", path.display())
+                    }
+                    _ => {}
+                }
+            }
+            unchanged();
+        }
+        // Later cycles activate and resume with their finalization record
+        // proving the candidate's projection digest (#682).
         let record = dir.path().join("final.json");
-        let record = (cycle == 2).then_some(record.as_path());
+        let record = (cycle >= 2).then_some(record.as_path());
         activate_cache_v2_with_handoff(&request, None, record).unwrap();
         assert_eq!(mains(), 2);
         assert!(!side.exists());

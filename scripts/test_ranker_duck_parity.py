@@ -338,8 +338,14 @@ def _export_certified_cache(db: str, pq: str, expected_wallets: set[str] | None 
         if expected_wallets is not None:
             # Retained excluded history remains audit data in activity_groups_v2;
             # neither the source nor exported ranker projection may admit it.
-            for prefix in ("src", "exported"):
-                wallets = {row["wallet_hex"] for row in exp._projection_rows(con, prefix)}
+            with sqlite3.connect(db) as source:
+                source_wallets = {wallet for (wallet,) in source.execute(
+                    "SELECT g.wallet_hex FROM ranker_entries_v2 r JOIN activity_groups_v2 g "
+                    "ON g.source_trade_id = r.source_trade_id "
+                    "AND g.coverage_generation = r.activity_generation "
+                    "JOIN clob_payout_evidence_v2 p ON p.market_id = g.condition_id")}
+            exported_wallets = {row["wallet_hex"] for row in exp._projection_rows(con)}
+            for prefix, wallets in (("src", source_wallets), ("exported", exported_wallets)):
                 assert wallets == expected_wallets, (prefix, wallets, expected_wallets)
         return projection
     finally:
@@ -610,13 +616,15 @@ class DuckParityTest(unittest.TestCase):
                              "WHERE source_trade_id=?", (rows[0]["source_trade_id"],))
             with self.assertRaisesRegex(duckdb.InvalidInputException, "invalid SQLite INTEGER"):
                 export(db, pq)
+            # The failing range's worker fails the export; no shard or partial file remains.
+            self.assertEqual(sorted(Path(pq).glob("activity_groups_v2.parquet.tmp*")), [])
             with sqlite3.connect(db) as conn:
                 conn.execute("UPDATE activity_groups_v2 SET source_time_unix=? WHERE source_trade_id=?",
                              (rows[0]["source_time_unix"], rows[0]["source_trade_id"]))
             with sqlite3.connect(db) as conn:
                 conn.execute("UPDATE activity_groups_v2 SET share_amount_str='2.0' WHERE source_trade_id=?",
                              (rows[0]["source_trade_id"],))
-            with self.assertRaisesRegex(ValueError, "SQLite projection count/digest"):
+            with self.assertRaisesRegex(ValueError, "Parquet projection count/digest"):
                 export(db, pq)
             for mutation in ("UPDATE activity_groups_v2 SET coverage_generation=99 WHERE source_trade_id=?",
                              "DELETE FROM activity_groups_v2 WHERE source_trade_id=?"):
@@ -624,6 +632,53 @@ class DuckParityTest(unittest.TestCase):
                     conn.execute(mutation, (rows[0]["source_trade_id"],))
                 with self.assertRaisesRegex(ValueError, "Parquet count"):
                     export(db, pq)
+
+    @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
+    def test_certified_activity_copy_holds_every_key_range_exactly_once(self):
+        # Keys in every copy range, on each bound, and past both open ends copy
+        # exactly as the single certified query copies them; shards are removed.
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "v2.db")
+            build_certified_cache(db)
+            extra = ["a", "g2:0", "g2:2", "g2:3", "g2:4", "g2:7", "g2:8", "g2:9", "g2:a",
+                     "g2:b", "g2:c", "g2:d", "g2:e", "g2:f", "g3:"]
+            with sqlite3.connect(db) as conn:
+                (generation,) = conn.execute("SELECT activity_generation FROM ranker_entries_v2 LIMIT 1").fetchone()
+                # The exact split values themselves, then longer keys in every range.
+                bounds = [bound for bound in exp.ACTIVITY_RANGE_BOUNDS if bound]
+                keys_added = bounds + [f"{prefix}{index:064x}" for index, prefix in enumerate(extra)]
+                for key in keys_added:
+                    conn.execute("INSERT INTO ranker_entries_v2 VALUES (?, ?, 2)", (key, generation))
+                    conn.execute("CREATE TEMP TABLE copied AS SELECT * FROM activity_groups_v2 "
+                                 "WHERE coverage_generation = ? LIMIT 1", (generation,))
+                    conn.execute("UPDATE copied SET source_trade_id = ?", (key,))
+                    conn.execute("INSERT INTO activity_groups_v2 SELECT * FROM copied")
+                    conn.execute("DROP TABLE copied")
+            con = duckdb.connect()
+            try:
+                con.execute("LOAD sqlite_scanner")
+                con.execute(f"ATTACH '{exp._q(db)}' AS src (TYPE sqlite, READ_ONLY)")
+                one, many = str(Path(tmp) / "one.parquet"), str(Path(tmp) / "many.parquet")
+                single = exp._typed_sqlite_query(con, exp.CERTIFIED_ACTIVITY_SQL,
+                                                 "SELECT * FROM src.activity_groups_v2")
+                con.execute(f"COPY ({single}) TO '{exp._q(one)}' (FORMAT PARQUET)")
+                exp._copy_certified_activity(con, many, 100)
+                read = "SELECT * FROM read_parquet('{}') ORDER BY source_trade_id"
+                copied = con.execute(read.format(many)).fetchall()
+                self.assertEqual(copied, con.execute(read.format(one)).fetchall())
+                self.assertEqual(con.execute(f"DESCRIBE {read.format(many)}").fetchall(),
+                                 con.execute(f"DESCRIBE {read.format(one)}").fetchall())
+                # A merge that cannot write fails the copy and removes its shards.
+                blocked = Path(tmp) / "blocked.parquet"
+                blocked.mkdir()
+                with self.assertRaises(duckdb.Error):
+                    exp._copy_certified_activity(con, str(blocked), 100)
+                self.assertEqual(sorted(Path(tmp).glob("blocked.parquet.*")), [])
+                keys = {row[0] for row in copied}
+                self.assertTrue(set(keys_added) <= keys)
+                self.assertEqual(sorted(Path(tmp).glob("many.parquet.*")), [])
+            finally:
+                con.close()
 
     @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
     def test_empty_certified_projection_preserves_schema_and_coverage(self):
@@ -659,17 +714,17 @@ class DuckParityTest(unittest.TestCase):
             pq = str(Path(tmp) / "pq")
             rows, entry, marker = build_certified_cache(db)
 
-            batch_sizes = {"src": [], "exported": []}
+            batch_sizes = []
             original_rows = exp._projection_rows
 
             class BoundedCursor:
-                def __init__(self, cursor, relation):
-                    self.cursor, self.relation = cursor, relation
+                def __init__(self, cursor):
+                    self.cursor = cursor
 
                 def fetchmany(self, size):
                     self.assert_size(size)
                     batch = self.cursor.fetchmany(size)
-                    batch_sizes[self.relation].append(len(batch))
+                    batch_sizes.append(len(batch))
                     return batch
 
                 @staticmethod
@@ -681,8 +736,8 @@ class DuckParityTest(unittest.TestCase):
                     raise AssertionError("projection must never fetchall")
 
             class BoundedConnection:
-                def __init__(self, con, relation):
-                    self.con, self.relation = con, relation
+                def __init__(self, con):
+                    self.con = con
 
                 def execute(self, query):
                     cursor = self.con.execute(query)
@@ -690,10 +745,10 @@ class DuckParityTest(unittest.TestCase):
                     # actual projection data must stream through fetchmany.
                     if query.startswith("DESCRIBE "):
                         return cursor
-                    return BoundedCursor(cursor, self.relation)
+                    return BoundedCursor(cursor)
 
-            def bounded_rows(con, relation):
-                return original_rows(BoundedConnection(con, relation), relation)
+            def bounded_rows(con):
+                return original_rows(BoundedConnection(con))
 
             import rank_cycle_manifest
             # Both persisted encodings are copied opaquely; new markers keep
@@ -712,7 +767,9 @@ class DuckParityTest(unittest.TestCase):
                 watermark = rank_cycle_manifest.snapshot(Path(db), "2026-02-05", {}, {})
                 self.assertEqual(watermark["source_watermark"]["activity"]["cursor"], cursors)
                 self.assertLess(len(json.dumps(watermark)), 2500)
-            self.assertEqual(batch_sizes, {"src": [2, 2, 1, 0] * 2, "exported": [2, 2, 1, 0] * 2})
+            # Only the exported copy is read: it is certified against the
+            # finalized digest, and SQLite is not traversed a second time.
+            self.assertEqual(batch_sizes, [2, 2, 1, 0] * 2)
             with self.assertRaises(ranker_duck.SchemaTwoEngineError):
                 ranker_duck.get_engine(force="sqlite", parquet_dir=pq, schema_version=2)
             engine = ranker_duck.get_engine(

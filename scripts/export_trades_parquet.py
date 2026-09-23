@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Iterable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 import os
 import sqlite3
 import sys
@@ -108,17 +109,62 @@ def _typed_sqlite_query(con, query: str, typed_query: str) -> str:
     return f"SELECT {', '.join(columns)} FROM sqlite_query('src', '{_q(query)}')"
 
 
+# The certified activity copy is one random activity lookup per projection row,
+# bound by reads in flight, not encoding (Forge's disk: 2,108 random reads/s
+# alone, 11,058 with eight in flight). One query keeps one read in flight, and
+# UNION ALL inside one COPY does too, so eight cursors each copy one key range of
+# `ranker_entries_v2.source_trade_id` (`g2:` + hex; the outer ranges are open, so
+# every key is copied exactly once) into a shard, merged into one file.
+ACTIVITY_RANGE_BOUNDS = (None, "g2:2", "g2:4", "g2:6", "g2:8", "g2:a", "g2:c", "g2:e", None)
+# Row groups bound each writer's buffering while eight write at once.
+ACTIVITY_SHARD_ROW_GROUP = 131_072
+
+
+def _certified_activity_ranges() -> list[str]:
+    ranges = []
+    for lower, upper in zip(ACTIVITY_RANGE_BOUNDS, ACTIVITY_RANGE_BOUNDS[1:]):
+        bounds = [f"r.source_trade_id >= '{lower}'"] if lower else []
+        bounds += [f"r.source_trade_id < '{upper}'"] if upper else []
+        ranges.append(f"{CERTIFIED_ACTIVITY_SQL} AND {' AND '.join(bounds)}")
+    return ranges
+
+
+def _copy_certified_activity(con, tmp: str, row_group_size: int) -> None:
+    queries = [_typed_sqlite_query(con, sql, "SELECT * FROM src.activity_groups_v2")
+               for sql in _certified_activity_ranges()]
+    shards = [f"{tmp}.{index}" for index in range(len(queries))]
+
+    def copy(index: int) -> None:
+        cursor = con.cursor()
+        try:
+            cursor.execute(f"COPY ({queries[index]}) TO '{_q(shards[index])}' "
+                           f"(FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE {ACTIVITY_SHARD_ROW_GROUP});")
+        finally:
+            cursor.close()
+
+    try:
+        with ThreadPoolExecutor(max_workers=len(shards)) as pool:
+            list(pool.map(copy, range(len(shards))))
+        paths = ", ".join(f"'{_q(shard)}'" for shard in shards)
+        con.execute(f"COPY (SELECT * FROM read_parquet([{paths}])) TO '{_q(tmp)}' "
+                    f"(FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE {int(row_group_size)});")
+    finally:
+        for shard in shards:
+            if os.path.exists(shard):
+                os.remove(shard)
+
+
 def _export_table(con, out_dir: str, tbl: str, row_group_size: int) -> int:
     """Atomically export `src.{tbl}` to `{out_dir}/{tbl}.parquet` (zstd) via tmp + os.replace."""
     final = os.path.join(out_dir, f"{tbl}.parquet")
     tmp = final + ".tmp"
-    query = f"SELECT * FROM src.{tbl}"
     if tbl == "activity_groups_v2":
-        query = _typed_sqlite_query(con, CERTIFIED_ACTIVITY_SQL, query)
-    con.execute(
-        f"COPY ({query}) TO '{_q(tmp)}' "
-        f"(FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE {int(row_group_size)});"
-    )
+        _copy_certified_activity(con, tmp, row_group_size)
+    else:
+        con.execute(
+            f"COPY (SELECT * FROM src.{tbl}) TO '{_q(tmp)}' "
+            f"(FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE {int(row_group_size)});"
+        )
     os.replace(tmp, final)
     n = con.execute(f"SELECT COUNT(*) FROM read_parquet('{_q(final)}')").fetchone()[0]
     count_table = "ranker_entries_v2" if tbl == "activity_groups_v2" else tbl
@@ -130,9 +176,9 @@ def _export_table(con, out_dir: str, tbl: str, row_group_size: int) -> int:
     return int(n)
 
 
-def _projection_rows(con, relation_prefix: str) -> Iterator[dict]:
-    """Canonical joined schema-two rows, matching Rust's projection digest."""
-    prefix = f"{relation_prefix}." if relation_prefix else ""
+def _projection_rows(con) -> Iterator[dict]:
+    """Canonical joined rows of the exported schema-two projection, matching Rust's digest."""
+    prefix = "exported."
     query = (
         f"SELECT ranker.source_trade_id, ranker.activity_generation, "
         f"ranker.classifier_version, groups_v2.wallet_hex, "
@@ -149,10 +195,6 @@ def _projection_rows(con, relation_prefix: str) -> Iterator[dict]:
         "AND groups_v2.coverage_generation = ranker.activity_generation "
         "ORDER BY ranker.source_trade_id"
     )
-    if relation_prefix == "src":
-        # Keep source verification proportional to the projection too, rather
-        # than letting DuckDB scan the full attached activity table for its join.
-        query = _typed_sqlite_query(con, query.replace("src.", ""), query)
     cursor = con.execute(query)
     names = (
         "source_trade_id", "activity_generation", "classifier_version",
@@ -192,7 +234,12 @@ def _file_sha256(path: str) -> str:
 
 
 def _verify_v2_projection(con, out_dir: str) -> dict:
-    """Verify SQLite authority and the exported logical projection agree exactly."""
+    """Certify the exported logical projection against the finalized count and digest.
+
+    This does not assert that SQLite stays unchanged afterwards: the normal
+    fresh-cutover ranking path re-finalizes before request preparation, and a
+    pending request's replay relies on activation's bound-artifact checks.
+    """
     state = con.execute(
         "SELECT phase, ranker_projection_count, ranker_projection_digest, "
         "ranker_classifier_version FROM src.cache_v2_migration_state "
@@ -209,11 +256,8 @@ def _verify_v2_projection(con, out_dir: str) -> dict:
         [generation],
     ).fetchone()[0]:
         raise ValueError("schema-two projection activity generation mismatch")
-    source_count, source_digest = _projection_digest(_projection_rows(con, "src"))
     expected_count = int(state[1]) if state[1] is not None else -1
     expected_digest = str(state[2]) if state[2] is not None else ""
-    if source_count != expected_count or source_digest != expected_digest:
-        raise ValueError("schema-two SQLite projection count/digest does not match final state")
 
     con.execute("CREATE SCHEMA IF NOT EXISTS exported")
     for table in V2_TABLES:
@@ -222,9 +266,8 @@ def _verify_v2_projection(con, out_dir: str) -> dict:
             f"CREATE OR REPLACE VIEW exported.{table} AS "
             f"SELECT * FROM read_parquet('{path}')"
         )
-    exported_count, exported_digest = _projection_digest(_projection_rows(con, "exported"))
-    # `_projection_rows` addresses `exported.<table>`; DuckDB schemas are used here
-    # so that the exact same join text verifies the Parquet side.
+    exported_count, exported_digest = _projection_digest(_projection_rows(con))
+    # `_projection_rows` reads the Parquet files through these `exported.<table>` views.
     if exported_count != expected_count or exported_digest != expected_digest:
         raise ValueError("schema-two Parquet projection count/digest mismatch")
     log(

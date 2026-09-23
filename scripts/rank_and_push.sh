@@ -909,14 +909,15 @@ fi
 # ── Step 0a: Parquet snapshot for the DuckDB read-layer (#375) ────────────────────────────
 # Full atomic rewrite from the just-refreshed cache (so the snapshot is fresh for this run).
 # Skipped when ranking is skipped, export is skipped, or the engine is forced to sqlite. In
-# auto mode an export failure (e.g. duckdb not installed) is non-fatal — get_engine() then
-# returns None and both passes fall back to SQLite; with --engine duck it is fatal.
+# auto mode a schema-one export failure (e.g. duckdb not installed) is non-fatal — get_engine()
+# then returns None and both passes fall back to SQLite. With --engine duck, or in the schema-two
+# cutover, which has no SQLite fallback, it is fatal: an older export must never be ranked.
 if [[ "$SKIP_RANK" == "0" && "$SKIP_EXPORT" == "0" && "$ENGINE" != "sqlite" ]]; then
   echo "── Step 0a: export Parquet snapshot ($PARQUET_DIR) for the DuckDB read-layer ──"
   if "$PYTHON_BIN" scripts/export_trades_parquet.py --db "$DB" --out-dir "$PARQUET_DIR"; then
     echo "   export ok"
-  elif [[ "$ENGINE" == "duck" ]]; then
-    echo "FATAL: --engine duck but the Parquet export failed" >&2; exit 1
+  elif [[ "$ENGINE" == "duck" || "$CUTOVER_MODE" == "1" ]]; then
+    echo "FATAL: the Parquet export failed (engine=$ENGINE, cutover=$CUTOVER_MODE)" >&2; exit 1
   else
     echo "   WARN: Parquet export failed (engine=auto) — ranker will use SQLite" >&2
   fi

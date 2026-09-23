@@ -601,8 +601,12 @@ and full content validation remains mandatory at completion and first finalizati
 Rank and cut over through the one publication path. This snapshots the current published batch,
 exports and verifies the schema-two Parquet projection, computes the minute-price rerank and exact
 diff, durably prepares the publication request, activates the side cache, then resumes that exact
-request. The targeted price-store write is re-finalized before request preparation so the stage
-hash covers the installed bytes.
+request. The export copies the certified activity rows with eight DuckDB cursors, one key range
+each, merged into one file, and certifies the exported projection against the finalized count and
+digest; it does not re-read SQLite's projection or assert that SQLite stays unchanged afterwards. An
+export failure stops a schema-two cutover run. The normal fresh-cutover path re-finalizes after the
+targeted price-store write and before request preparation, so the stage hash covers the installed
+bytes; a pending request's replay relies on activation's bound-artifact checks.
 Refinalization reuses the projection only when the finalized database's saved activity generation,
 reference, aggregate and manifest digests, payout generation/coverage and evidence digest, and
 classifier version are unchanged, and the existing projection's recomputed count and digest match
@@ -613,7 +617,11 @@ random activity reads overlap (#675). A different recorded classifier
 version instead runs full activity verification and rebuilds the projection with the current
 classifier. Each rebuilding finalization loads a wallet once, validates its entire aggregate
 vector, then classifies that same vector; a classifier stopping point never truncates validation.
-Manifest installation, projection replacement and finalized state commit together. Content
+Manifest installation and projection replacement commit together with a cleared, unfinalized state;
+the finalized state commits in a second transaction, after the digest is computed over the committed
+projection by the same eight readers, under a re-taken write lock that refuses if any other
+connection committed in between. A failure before the first commit changes nothing; one after it
+leaves only an unfinalized projection, which the next finalization rebuilds. Content
 validation finishes before any deferred projection error is returned; a missing manifest and its
 archived identity are installed only after validation and projection succeed, so a projection error
 that automatically rolls back SQLite's transaction cannot leave either committed independently.
@@ -675,6 +683,8 @@ activation compares the candidate's stored projection summary with the record in
 the digest; it refuses a record of another format, schema, path or hash. Every other check — activity
 content and receipts, payout coverage, projection count and classifier agreement, and the outgoing
 cache's full verification — still runs. Without the record, activation recomputes the digest (#682).
+A schema-two outgoing cache recomputes its digest from the same eight read-only readers while
+activation holds its write lock without writing (#675).
 
 Before the bound corrected batch becomes current, restore that exact prior cache by its recorded
 hash and schema. For a new cycle set `CACHE_PRIOR_BACKUP` to its `.displaced.db` (`D`) and
