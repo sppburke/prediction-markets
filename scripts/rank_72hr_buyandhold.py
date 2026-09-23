@@ -209,28 +209,36 @@ def load_universe(path: str, limit: int) -> list[str]:
     return wallets
 
 
-def load_universe_from_trades(conn: sqlite3.Connection, limit: int,
-                              schema_version: int = 1) -> list[str]:
-    """Universe = every distinct wallet_hex in `trades` (have-trade-data => in-universe,
-    issue #370). Same validation as load_universe (0x-prefixed, length 42, lowercased);
+def _valid_wallets(values) -> list[str]:
+    """Same validation as load_universe (0x-prefixed, length 42, lowercased);
     malformed rows are dropped. The ranker's own filters then decide the cohort."""
     wallets: list[str] = []
-    query = (
-        "SELECT DISTINCT g.wallet_hex FROM ranker_entries_v2 r "
-        "JOIN activity_groups_v2 g ON g.source_trade_id = r.source_trade_id "
-        "AND g.coverage_generation = r.activity_generation"
-        if schema_version >= 2
-        else "SELECT DISTINCT wallet_hex FROM trades"
-    )
-    for (wh,) in conn.execute(query):
+    for (wh,) in values:
         if wh is None:
             continue
         s = str(wh).strip()
         if s.startswith("0x") and len(s) == 42:
             wallets.append(s.lower())
+    return wallets
+
+
+def load_universe_from_trades(conn: sqlite3.Connection, limit: int) -> list[str]:
+    """Universe = every distinct wallet_hex in `trades` (have-trade-data => in-universe,
+    issue #370)."""
+    wallets = _valid_wallets(conn.execute("SELECT DISTINCT wallet_hex FROM trades"))
     if limit > 0:
         wallets = wallets[:limit]
     return wallets
+
+
+def load_universe_from_export(engine) -> list[str]:
+    """Schema two: the certified projection's wallets, joined in the verified export
+    (older exports carry full activity history, so the join, not the file, decides)."""
+    return _valid_wallets(engine.execute(
+        "SELECT DISTINCT g.wallet_hex FROM ranker_entries_v2 r "
+        "JOIN activity_groups_v2 g ON g.source_trade_id = r.source_trade_id "
+        "AND g.coverage_generation = r.activity_generation "
+        "ORDER BY g.wallet_hex").fetchall())
 
 
 def exclude_partial_backfills(conn: sqlite3.Connection, wallets: list[str],
@@ -492,8 +500,13 @@ def main() -> int:
     if schema_version == -2:
         raise ValueError("unfinished bulk root (schema -2); resume cache-populate-activity-v2 --bulk-root before any other command")
 
+    # Schema two ranks only the verified export, so open it first and take the
+    # universe from it; SQLite would find the same wallets by scanning every
+    # activity row, and the export's age bound is checked here, not hours later.
+    engine = ranker_duck.get_engine(schema_version=schema_version) if schema_version >= 2 else None
     if prm.universe_from_trades:
-        wallets = load_universe_from_trades(conn, 0, schema_version)
+        wallets = (load_universe_from_export(engine) if schema_version >= 2
+                   else load_universe_from_trades(conn, 0))
         universe_label = "trades-distinct"
         log(f"universe: {len(wallets)} wallets (all distinct trade wallets, #370)")
     else:
@@ -513,7 +526,8 @@ def main() -> int:
     # Pick the extraction engine (DuckDB Parquet read-layer or SQLite fallback, #375).
     # Market maps (resolutions + schedules) are only needed by the SQLite path; the
     # DuckDB path joins them in SQL over the Parquet snapshot.
-    engine = ranker_duck.get_engine(schema_version=schema_version)
+    if schema_version < 2:
+        engine = ranker_duck.get_engine(schema_version=schema_version)
     res, sched = (None, None) if engine is not None else load_market_maps(conn)
 
     decay = "flat (no decay)" if prm.half_life_days <= 0 else f"half_life={prm.half_life_days}d"

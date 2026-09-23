@@ -41,6 +41,7 @@ import sqlite3
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -155,14 +156,14 @@ def build_parity_cache(path: str) -> None:
     conn.close()
 
 
-def run_pass1(db: str, out_dir: str, engine: str, parquet_dir: str) -> int:
+def run_pass1(db: str, out_dir: str, engine: str, parquet_dir: str, max_age_hours: str = "0") -> int:
     argv = ["rank_72hr_buyandhold.py", "--db", db, "--out-dir", out_dir,
             "--universe-from-trades",
             "--win-start", WIN_START_ISO, "--win-end", WIN_END_ISO, "--as-of", AS_OF_ISO,
             "--min-avg-per-month", "1", "--min-active-months", "2",
             "--target-n", "5", "--floor-tstat", "0.0", "--scheduled-only"]
     env = {"PE_RANKER_ENGINE": engine, "PE_RANKER_PARQUET_DIR": parquet_dir,
-           "PE_RANKER_PARQUET_MAX_AGE_HOURS": "0"}
+           "PE_RANKER_PARQUET_MAX_AGE_HOURS": max_age_hours}
     with mock.patch.dict(os.environ, env), mock.patch.object(sys, "argv", argv):
         return rk.main()
 
@@ -348,8 +349,11 @@ def _export_certified_cache(db: str, pq: str, expected_wallets: set[str] | None 
 def assert_certified_export_wallets(db: str, expected_wallets: set[str]) -> None:
     with tempfile.TemporaryDirectory() as pq:
         _export_certified_cache(db, pq, expected_wallets)
-    with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as sqlite:
-        assert set(rk.load_universe_from_trades(sqlite, 0, 2)) == expected_wallets
+        engine = ranker_duck.get_engine(force="duck", parquet_dir=pq, max_age_hours=0, schema_version=2)
+        try:
+            assert set(rk.load_universe_from_export(engine)) == expected_wallets
+        finally:
+            engine.close()
 
 
 def assert_certified_full_incremental_equivalence(full: str, incremental: str) -> None:
@@ -367,12 +371,12 @@ def assert_certified_full_incremental_equivalence(full: str, incremental: str) -
         for index, db in enumerate((full, incremental)):
             pq = str(Path(tmp) / str(index))
             projection = _export_certified_cache(db, pq)
+            engine = ranker_duck.get_engine(force="duck", parquet_dir=pq, max_age_hours=0, schema_version=2)
+            wallets = rk.load_universe_from_export(engine)
             with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as sqlite:
-                wallets = sorted(rk.load_universe_from_trades(sqlite, 0, 2))
                 all_wallets = [row[0] for row in sqlite.execute("SELECT DISTINCT wallet_hex FROM activity_groups_v2")]
                 last = publisher._wallet_last_trade(sqlite, all_wallets)
                 newest = publisher._newest_trade_unix(sqlite)
-            engine = ranker_duck.get_engine(force="duck", parquet_dir=pq, max_age_hours=0, schema_version=2)
             positions = pd.concat(ranker_duck.duck_extract_positions_v2(engine, wallets, 0, 2**62),
                                   ignore_index=True)
             engine.close()
@@ -440,6 +444,7 @@ class DuckParityTest(unittest.TestCase):
                     (10, W("a"), "sell", "condition", 7),
                     (11, W("b"), "buy", "unresolved", 7),
                     (12, W("e"), "buy", "condition", 1),
+                    (13, W("0"), "buy", "condition", 1),
                 ):
                     conn.execute("INSERT INTO activity_groups_v2 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                                  (f"g2:{ordinal:064x}", generation, wallet, market, None, None,
@@ -541,7 +546,33 @@ class DuckParityTest(unittest.TestCase):
                              {W("a"): now - 10, W("b"): now - 11})
             with sqlite3.connect(db) as conn:
                 self.assertEqual(publisher._newest_trade_unix(conn), now - 10)
-                self.assertEqual(set(rk.load_universe_from_trades(conn, 0, 2)), {W("a"), W("b")})
+            # The universe is the certified projection's wallets under either
+            # export shape; full history's uncertified wallets, even one that
+            # sorts first, never enter it.
+            for snapshot in (full, subset):
+                engine = ranker_duck.get_engine(force="duck", parquet_dir=str(snapshot),
+                                                max_age_hours=0, schema_version=2)
+                try:
+                    self.assertEqual(rk.load_universe_from_export(engine), [W("a"), W("b")])
+                finally:
+                    engine.close()
+
+    @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
+    def test_schema_two_pass_one_checks_the_snapshot_before_building_its_universe(self):
+        # The snapshot's age bound is enforced when pass one starts, before any
+        # universe is built, and no SQLite universe query runs at all.
+        with tempfile.TemporaryDirectory() as tmp:
+            db, pq = str(Path(tmp) / "v2.db"), str(Path(tmp) / "pq")
+            build_certified_cache(db)
+            export(db, pq)
+            stale = time.time() - 5 * 3600
+            os.utime(Path(pq) / "ranker_entries_v2.parquet", (stale, stale))
+            with mock.patch.object(rk, "load_universe_from_export",
+                                   side_effect=AssertionError("universe before the snapshot check")), \
+                 mock.patch.object(rk, "load_universe_from_trades",
+                                   side_effect=AssertionError("SQLite universe for schema two")):
+                with self.assertRaisesRegex(ranker_duck.SchemaTwoEngineError, "stale"):
+                    run_pass1(db, str(Path(tmp) / "out"), "auto", pq, max_age_hours="4")
 
     @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
     def test_subset_export_and_reader_fail_closed(self):
