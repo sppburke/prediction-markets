@@ -240,7 +240,7 @@ class RefOracleScenario(unittest.TestCase):
                 manifest = json.loads((out / "oracle_manifest.json").read_text())
                 self.assertEqual(manifest["as_of"], entries[-1])
                 self.assertEqual(manifest["half_life_days"], half_life)
-                self.assertEqual(manifest["oracle_version"], 2)
+                self.assertEqual(manifest["oracle_version"], 3)
         self.assertEqual(len(outcomes), 2)
         self.assertEqual(outcomes[0], outcomes[1])
         print("PASS: twenty covered/repriced constant returns have no score and never survive")
@@ -280,8 +280,8 @@ class RefOracleScenario(unittest.TestCase):
         self.assertEqual(man["versions"]["activity_schema"], 2)
         self.assertEqual(man["versions"]["clob_resolution_parser"], 2)
         self.assertEqual(man["versions"]["clob_resolution_schema"], 2)
-        self.assertEqual(man["versions"]["ranker"], 2)
-        self.assertEqual(man["oracle_version"], 2)
+        self.assertEqual(man["versions"]["ranker"], 3)
+        self.assertEqual(man["oracle_version"], 3)
         self.assertEqual(man["versions"]["configuration"], 1)
         print("PASS: outcomes artifact + manifest regenerate and bind the published aggregates")
 
@@ -295,9 +295,10 @@ class RefOracleScenario(unittest.TestCase):
         cases = [
             (1_000_000, 62, "0.14"),       # shifted horizon=60, effective=.15: include
             (1_010_000, 3599, "0.839"),    # shifted horizon=3597, effective=.849: include
-            (1_020_000, 3599, "0.84"),     # effective=.85: exclude
-            (1_030_000, 61, "0.50"),       # shifted horizon=59: exclude
-            (1_040_000, 3602, "0.50"),     # shifted horizon=max: exclude
+            (1_020_000, 3599, "0.84"),     # effective=.85: out of band, out of coverage
+            (1_025_000, 3599, None),       # in horizon, stale sample: counts against coverage
+            (1_030_000, 61, "0.50"),       # shifted horizon=59: out of scope, needs no page
+            (1_040_000, 3602, "0.50"),     # shifted horizon=max: out of scope, needs no page
         ]
         with open(self.positions, "w", newline="") as f:
             writer = csv.writer(f)
@@ -307,12 +308,14 @@ class RefOracleScenario(unittest.TestCase):
                                  0, 0, entry + ttr])
         con = sqlite3.connect(self.db)
         for entry, _ttr, price in cases:
-            con.execute("INSERT INTO ranker_price_points VALUES ('TOK', ?, ?, 1)",
-                        (entry + SHIFT, price))
+            if price is not None:
+                con.execute("INSERT INTO ranker_price_points VALUES ('TOK', ?, ?, 1)",
+                            (entry + SHIFT, price))
+        # The page covers only the in-horizon positions' windows.
         con.execute(
             "INSERT INTO ranker_price_pages VALUES ('TOK', ?, ?, 1, 'complete', 5, "
             "'00', 'test', 1, 1, 1, 1, 'url')",
-            (cases[0][0] + SHIFT - WINDOW - 1, cases[-1][0] + SHIFT + 1),
+            (cases[0][0] + SHIFT - WINDOW - 1, cases[3][0] + SHIFT + 1),
         )
         con.commit()
         con.close()
@@ -337,17 +340,22 @@ class RefOracleScenario(unittest.TestCase):
             reasons = [row["outcome"] for row in csv.DictReader(source)]
         self.assertEqual(
             reasons,
-            ["repriced", "repriced", "price_band", "scheduled_horizon",
+            ["repriced", "repriced", "price_band", "stale", "scheduled_horizon",
              "scheduled_horizon"],
         )
+        with open(out / "latency_shift_ranked.csv", newline="") as source:
+            row = next(r for r in csv.DictReader(source) if r["wallet"] == W1)
+        # In-horizon count 4; coverage 2 repriced / (4 - 1 out of band).
+        self.assertEqual((row["n_total"], row["n_filled"], row["fill_rate"]),
+                         ("4", "2", "0.6667"))
         first = (out / "before_after_diff.json").read_bytes()
         result, out = self.run_pass2(*args)
         self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         self.assertEqual(first, (out / "before_after_diff.json").read_bytes())
         manifest = json.loads((out / "oracle_manifest.json").read_text())
         import hashlib
-        self.assertEqual(manifest["oracle_version"], 2)
-        self.assertEqual(manifest["versions"]["ranker"], 2)
+        self.assertEqual(manifest["oracle_version"], 3)
+        self.assertEqual(manifest["versions"]["ranker"], 3)
         for name, key in (("latency_shift_ranked.csv", "latency_shift_ranked_sha256"),
                           ("oracle_outcomes.csv", "oracle_outcomes_sha256")):
             self.assertEqual(manifest["outputs"][key],
@@ -448,8 +456,9 @@ class RefOracleScenario(unittest.TestCase):
         ranked, ranked_full = (read(o / "latency_shift_ranked.csv") for o in (pruned, full))
         self.assertEqual([r["wallet"] for r in ranked], [k2, k1, x])
         self.assertEqual(ranked[0]["tstat_net_ls"], ranked[1]["tstat_net_ls"])
-        self.assertEqual(ranked[:2], ranked_full[:2])
-        self.assertEqual(ranked[2], {"wallet": x, "n_total": "2", "n_filled": "", "fill_rate": "",
+        self.assertEqual(ranked, ranked_full)
+        # X has no in-horizon position: it keeps a row whose in-scope count is zero.
+        self.assertEqual(ranked[2], {"wallet": x, "n_total": "0", "n_filled": "", "fill_rate": "",
                                      "active_months": "", "mean_net_ls": "", "tstat_net_ls": "",
                                      "n_eff": "", "hit_rate": "", "eligible": "False",
                                      "survives": "False"})

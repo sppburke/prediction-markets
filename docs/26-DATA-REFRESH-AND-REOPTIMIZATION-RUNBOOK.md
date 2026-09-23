@@ -430,8 +430,11 @@ universe (`--universe-from-trades` —
 have-data ⇒ in-universe; the ranker's own eligibility filters decide the cohort, so
 there is no curated pre-gate); **Stage 2** rerank in three sub-stages (#536): **2a**
 emit the per-token reference fetch windows for the candidate positions (on schema two, the
-positions of every wallet whose horizon-feasible count can still meet the survival gates; other
-wallets are ranked non-surviving without price work, #588); **2b**
+in-horizon positions of every wallet with at least MinTRL of them; other wallets are ranked
+non-surviving without price work, #588). Schema two judges repricing coverage over the copy scope:
+positions outside the shifted horizon need no reference window and do not count, and a position
+whose slippage-adjusted reference price is outside the band leaves the denominator, while a missing or stale sample
+still counts against the wallet; **2b**
 `pe-bootstrap prices-history --targets-csv` fetches only the uncovered remainder of
 minute reference prices into the isolated ranker price store (write-once + range
 algebra ⇒ resumable; transient page failures are a partial and pass-2's
@@ -615,7 +618,10 @@ without writing and recomputes that digest over the committed projection from ei
 connections, one key range each, hashed in key order, so the bytes are the serial read's while its
 random activity reads overlap (#675). A different recorded classifier
 version instead runs full activity verification and rebuilds the projection with the current
-classifier. Each rebuilding finalization loads a wallet once, validates its entire aggregate
+classifier. Classifier version three admits what the live copy path takes: a market's entry history is
+consumed only by a first entry (not by a sell, split, merge or redemption), and an entry whose
+action depends on the order of its second is not projected. An activation accepts an installed
+cache of classifier version one to three. Each rebuilding finalization loads a wallet once, validates its entire aggregate
 vector, then classifies that same vector; a classifier stopping point never truncates validation.
 Manifest installation and projection replacement commit together with a cleared, unfinalized state;
 the finalized state commits in a second transaction, after the digest is computed over the committed
