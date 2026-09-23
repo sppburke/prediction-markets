@@ -1,13 +1,14 @@
 //! Hashes the ranker projection in committed order using more than one core.
 //!
 //! The digest joins every projection row back to its activity group and payout
-//! and hashes one sorted-key JSON object per row (#675). A first finalization's
-//! join must read the caller's own uncommitted transaction, so it stays on the
-//! calling thread; building and serializing each row's object moves to workers,
-//! and the calling thread feeds the unchanged hasher in query order, so the
-//! committed bytes do not change.
+//! and hashes one sorted-key JSON object per row (#675). Through the caller's
+//! own connection, which may hold a transaction, the join stays on the calling
+//! thread; building and serializing each row's object moves to workers, and the
+//! calling thread feeds the unchanged hasher in query order, so the committed
+//! bytes do not change.
 //!
-//! A committed projection can also be read from other connections. There the
+//! A committed projection — at finalization, re-finalization and an outgoing
+//! activation — is read from other connections instead. There the
 //! join's random reads, one in flight at a time, are the bound (2,108 reads/s on
 //! Forge's disk against 11,058 with eight in flight, measured 2026-09-23), so
 //! readers on their own connections each take a key range and the caller hashes

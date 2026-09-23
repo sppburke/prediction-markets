@@ -1730,6 +1730,15 @@ class RankAndPushScenario(unittest.TestCase):
                 self.assertFalse(pending.exists())
                 self.assertEqual(len(list(fixed.parent.glob("*.db"))), 1)
 
+    def test_schema_two_export_failure_stops_before_ranking(self):
+        """Proves a failed schema-two export never ranks whatever older export remains."""
+        self._prepare_incremental_fixture(two_file=True)
+        failed = self._run(exit_env={"STUB_EXIT_export": "1"})
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertIn("FATAL: the Parquet export failed", failed.stderr)
+        self.assertTrue(self._log("export.log"))
+        self.assertFalse(self._log("rank.log"))
+
     def test_two_file_staging_refuses_previous_backup_before_candidate_allocation(self):
         """Proves skipped retirement blocks another full candidate allocation without deleting evidence."""
         fixed = self._prepare_incremental_fixture(two_file=True)
