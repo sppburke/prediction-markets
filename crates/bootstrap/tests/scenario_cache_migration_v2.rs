@@ -2433,6 +2433,7 @@ async fn outgoing_schema_two_projection_is_verified_from_committed_readers() {
         &prior,
         &side,
         Some(&dir.path().join("stage-build.json")),
+        None,
     )
     .unwrap();
     let record = dir.path().join("final.json");
@@ -5594,7 +5595,7 @@ fn legacy_cycle_staging_resumes_its_prior_and_candidate_unchanged() {
     let damaged_hash = sha256_file(&damaged).unwrap();
     let manifest = dir.path().join("cache_build_manifest.json");
     assert_structural_error(
-        &stage_cache_cycle_v2(&damaged, &prior, &side, Some(&manifest)).unwrap_err(),
+        &stage_cache_cycle_v2(&damaged, &prior, &side, Some(&manifest), None).unwrap_err(),
     );
     assert_eq!(sha256_file(&damaged).unwrap(), damaged_hash);
     assert!(!prior.exists() && !side.exists() && !manifest.exists());
@@ -5604,7 +5605,7 @@ fn legacy_cycle_staging_resumes_its_prior_and_candidate_unchanged() {
 
     let manifest = dir.path().join("cache_build_manifest.json");
     let held = pe_bootstrap::lock::CacheMutationLock::acquire(&fixed).unwrap();
-    let locked = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest)).unwrap_err();
+    let locked = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest), None).unwrap_err();
     assert!(
         locked.to_string().contains("cache mutation lock"),
         "{locked}"
@@ -5620,7 +5621,7 @@ fn legacy_cycle_staging_resumes_its_prior_and_candidate_unchanged() {
     std::fs::copy(&fixed, &prior).unwrap();
     let interrupted = std::path::PathBuf::from(format!("{}.pending", side.display()));
     std::fs::write(&interrupted, b"interrupted private staging").unwrap();
-    let staged = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest)).unwrap();
+    let staged = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest), None).unwrap();
     drop(wal_owner);
     assert!(!staged.resumed);
     assert_eq!(staged.prior_schema, 1);
@@ -5644,6 +5645,7 @@ fn legacy_cycle_staging_resumes_its_prior_and_candidate_unchanged() {
         &doubled(&prior),
         &doubled(&side),
         Some(&doubled(&manifest)),
+        None,
     )
     .unwrap();
     assert!(respelled.resumed);
@@ -5669,7 +5671,7 @@ fn legacy_cycle_staging_resumes_its_prior_and_candidate_unchanged() {
     // A manifest lost before the seal is recreated from the immutable prior
     // and still seals the candidate.
     std::fs::remove_file(&manifest).unwrap();
-    let recovered = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest)).unwrap();
+    let recovered = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest), None).unwrap();
     assert!(recovered.resumed);
     let rebuilt: CacheV2BuildManifest =
         serde_json::from_slice(&std::fs::read(&manifest).unwrap()).unwrap();
@@ -5703,7 +5705,7 @@ fn legacy_cycle_staging_resumes_its_prior_and_candidate_unchanged() {
     .unwrap();
     assert_eq!(count(&probe, "SELECT COUNT(*) FROM trades"), 2);
     std::fs::remove_file(&manifest).unwrap();
-    let ignoring = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest)).unwrap();
+    let ignoring = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest), None).unwrap();
     assert!(ignoring.resumed);
     assert_eq!(ignoring.prior_schema, 1);
     let from_main: CacheV2BuildManifest =
@@ -5720,7 +5722,7 @@ fn legacy_cycle_staging_resumes_its_prior_and_candidate_unchanged() {
     // reports the sealed schema and does not fabricate a manifest that the
     // seal could no longer verify.
     std::fs::remove_file(&manifest).unwrap();
-    let sealed = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest)).unwrap();
+    let sealed = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest), None).unwrap();
     assert!(sealed.resumed);
     assert_eq!(sealed.side_schema, 2);
     assert!(!manifest.exists());
@@ -5737,7 +5739,7 @@ fn legacy_cycle_staging_resumes_its_prior_and_candidate_unchanged() {
     drop(candidate);
     let mutated = sha256_file(&side).unwrap();
     assert_ne!(mutated, fixed_sha256);
-    let resumed = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest)).unwrap();
+    let resumed = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest), None).unwrap();
     assert!(resumed.resumed);
     assert_eq!(resumed.prior_sha256.as_deref(), Some(fixed_sha256.as_str()));
     assert_eq!(sha256_file(&side).unwrap(), mutated);
@@ -5746,7 +5748,7 @@ fn legacy_cycle_staging_resumes_its_prior_and_candidate_unchanged() {
 
     // A candidate without its prior is not a resumable cycle.
     std::fs::remove_file(&prior).unwrap();
-    let orphan = stage_cache_cycle_v2(&fixed, &prior, &side, None).unwrap_err();
+    let orphan = stage_cache_cycle_v2(&fixed, &prior, &side, None, None).unwrap_err();
     assert!(
         orphan.to_string().contains("without its immutable prior"),
         "{orphan}"
@@ -5756,23 +5758,35 @@ fn legacy_cycle_staging_resumes_its_prior_and_candidate_unchanged() {
     // The three roles must be independent files: same path, a hard link and
     // a symbolic link are refused before anything is copied.
     let fixed_sha256_now = sha256_file(&fixed).unwrap();
-    let same = stage_cache_cycle_v2(&fixed, &fixed, &side, None).unwrap_err();
+    let same = stage_cache_cycle_v2(&fixed, &fixed, &side, None, None).unwrap_err();
     assert!(
         same.to_string().contains("not an independent file"),
         "{same}"
     );
     let linked = dir.path().join("wallet_cache.cron-2.prior.db");
     std::fs::hard_link(&fixed, &linked).unwrap();
-    let hard = stage_cache_cycle_v2(&fixed, &linked, &dir.path().join("cron-2.side.db"), None)
-        .unwrap_err();
+    let hard = stage_cache_cycle_v2(
+        &fixed,
+        &linked,
+        &dir.path().join("cron-2.side.db"),
+        None,
+        None,
+    )
+    .unwrap_err();
     assert!(
         hard.to_string().contains("not an independent file"),
         "{hard}"
     );
     let symlinked = dir.path().join("wallet_cache.cron-3.prior.db");
     std::os::unix::fs::symlink(&fixed, &symlinked).unwrap();
-    let soft = stage_cache_cycle_v2(&fixed, &symlinked, &dir.path().join("cron-3.side.db"), None)
-        .unwrap_err();
+    let soft = stage_cache_cycle_v2(
+        &fixed,
+        &symlinked,
+        &dir.path().join("cron-3.side.db"),
+        None,
+        None,
+    )
+    .unwrap_err();
     assert!(
         soft.to_string().contains("not an independent file"),
         "{soft}"
@@ -5782,7 +5796,7 @@ fn legacy_cycle_staging_resumes_its_prior_and_candidate_unchanged() {
     let colliding_prior = dir.path().join("cron-4.side.db.pending");
     let colliding_side = dir.path().join("cron-4.side.db");
     let pending_role =
-        stage_cache_cycle_v2(&fixed, &colliding_prior, &colliding_side, None).unwrap_err();
+        stage_cache_cycle_v2(&fixed, &colliding_prior, &colliding_side, None, None).unwrap_err();
     assert!(
         pending_role.to_string().contains("not an independent file"),
         "{pending_role}"
@@ -5793,6 +5807,7 @@ fn legacy_cycle_staging_resumes_its_prior_and_candidate_unchanged() {
         &fixed_named_as_pending,
         &dir.path().join("cron-5.prior.db"),
         &dir.path().join("cron-5.side.db"),
+        None,
         None,
     )
     .unwrap_err();
@@ -5815,6 +5830,7 @@ fn legacy_cycle_staging_resumes_its_prior_and_candidate_unchanged() {
         &dir.path().join("cron-6.prior.db"),
         &dir.path().join("cron-6.side.db"),
         Some(&manifest_as_pending),
+        None,
     )
     .unwrap_err();
     assert!(
@@ -5839,6 +5855,7 @@ fn legacy_cycle_staging_resumes_its_prior_and_candidate_unchanged() {
             &dir.path().join("cron-7.prior.db"),
             &dir.path().join("cron-7.side.db"),
             Some(&manifest),
+            None,
         )
         .unwrap_err();
         assert!(
@@ -5861,6 +5878,7 @@ fn legacy_cycle_staging_resumes_its_prior_and_candidate_unchanged() {
         &dir.path().join("cron-8.prior.db"),
         &dir.path().join("cron-8.side.db"),
         Some(&manifest_on_role),
+        None,
     )
     .unwrap_err();
     assert!(
@@ -5878,6 +5896,7 @@ fn legacy_cycle_staging_resumes_its_prior_and_candidate_unchanged() {
         &dir.path().join("cron-10.prior.db"),
         &dir.path().join("cron-10.side.db"),
         Some(&manifest_through_link),
+        None,
     )
     .unwrap_err();
     assert!(
@@ -5897,6 +5916,7 @@ fn legacy_cycle_staging_resumes_its_prior_and_candidate_unchanged() {
         &dir.path().join("cron-11.prior.db"),
         &dir.path().join("cron-11.side.db"),
         Some(&dangling_manifest),
+        None,
     )
     .unwrap_err();
     assert!(
@@ -5916,6 +5936,7 @@ fn legacy_cycle_staging_resumes_its_prior_and_candidate_unchanged() {
             &dir.path().join("cron-12.prior.db"),
             &dir.path().join("cron-12.side.db"),
             Some(&spelled),
+            None,
         )
         .unwrap_err();
         assert!(
@@ -5937,6 +5958,7 @@ fn legacy_cycle_staging_resumes_its_prior_and_candidate_unchanged() {
         &dir.path().join("cron-13.prior.db"),
         &temp_named_side,
         Some(&dir.path().join("build.json")),
+        None,
     )
     .unwrap_err();
     assert!(
@@ -5954,6 +5976,7 @@ fn legacy_cycle_staging_resumes_its_prior_and_candidate_unchanged() {
         &sidecar_named_prior,
         &dir.path().join("cron-14.side.db"),
         Some(&dir.path().join("build.json")),
+        None,
     )
     .unwrap_err();
     assert!(
@@ -5970,6 +5993,7 @@ fn legacy_cycle_staging_resumes_its_prior_and_candidate_unchanged() {
         &journal_named_prior,
         &dir.path().join("cron-15.side.db"),
         Some(&dir.path().join("build.json")),
+        None,
     )
     .unwrap_err();
     assert!(
@@ -5998,8 +6022,14 @@ fn cycle_staging_checks_the_lock_file_name_before_taking_the_lock() {
     let before = std::fs::read(&lock).ok();
     // Taking the lock creates and rewrites the lock file, so a role named
     // like it is refused before the lock is taken.
-    let refused =
-        stage_cache_cycle_v2(&fixed, &lock, &dir.path().join("cron-1.side.db"), None).unwrap_err();
+    let refused = stage_cache_cycle_v2(
+        &fixed,
+        &lock,
+        &dir.path().join("cron-1.side.db"),
+        None,
+        None,
+    )
+    .unwrap_err();
     assert!(
         refused.to_string().contains("not an independent file"),
         "{refused}"
@@ -6010,7 +6040,7 @@ fn cycle_staging_checks_the_lock_file_name_before_taking_the_lock() {
     // named like it is refused as well.
     let side = dir.path().join("cron-1.side.db");
     let side_lock = pe_bootstrap::lock::lock_path_for(&side);
-    let refused_side = stage_cache_cycle_v2(&fixed, &side_lock, &side, None).unwrap_err();
+    let refused_side = stage_cache_cycle_v2(&fixed, &side_lock, &side, None, None).unwrap_err();
     assert!(
         refused_side.to_string().contains("not an independent file"),
         "{refused_side}"
@@ -6036,6 +6066,7 @@ fn cycle_staging_checks_the_lock_file_name_before_taking_the_lock() {
         &phys.join("cron-2.prior.db"),
         &phys.join("cron-2.side.db"),
         None,
+        None,
     )
     .unwrap();
     assert!(!staged.resumed);
@@ -6056,6 +6087,7 @@ fn cycle_staging_checks_the_lock_file_name_before_taking_the_lock() {
         &other.join("cron-3.prior.db"),
         &other.join("cron-3.side.db"),
         None,
+        None,
     )
     .unwrap_err();
     assert!(
@@ -6075,7 +6107,7 @@ fn cycle_staging_honors_a_seal_committed_only_to_the_write_ahead_log() {
     let side = dir.path().join("wallet_cache.cron-1.side.db");
     let manifest = dir.path().join("cache_build_manifest.json");
     drop(seed_v1(&fixed, FRESH_END - 10));
-    let staged = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest)).unwrap();
+    let staged = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest), None).unwrap();
     assert_eq!(staged.side_schema, 1);
     // A seal whose `user_version` commit sits in the write-ahead log while the
     // main header still says one (interrupted before its checkpoint) must be
@@ -6085,7 +6117,7 @@ fn cycle_staging_honors_a_seal_committed_only_to_the_write_ahead_log() {
         .execute_batch("PRAGMA journal_mode = WAL; PRAGMA user_version = 2;")
         .unwrap();
     std::fs::remove_file(&manifest).unwrap();
-    let resumed = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest)).unwrap();
+    let resumed = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest), None).unwrap();
     assert!(resumed.resumed);
     assert_eq!(resumed.side_schema, 2);
     assert!(!manifest.exists());
@@ -6100,7 +6132,7 @@ fn cycle_staging_honors_a_seal_committed_only_to_the_write_ahead_log() {
         .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
         .unwrap();
     assert_eq!(side.with_extension("db-wal").metadata().unwrap().len(), 0);
-    let held = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest)).unwrap();
+    let held = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&manifest), None).unwrap();
     assert_eq!(held.side_schema, 2);
     assert!(side.with_extension("db-shm").exists());
     let changed = sealing
@@ -6137,7 +6169,7 @@ async fn activation_refuses_a_fixed_cache_changed_after_its_prior_was_staged() {
         let side = dir.path().join("cycle.side.db");
         let displaced = dir.path().join("cycle.displaced.db");
         drop(seed_v1(&fixed, FRESH_END - 10));
-        let staged = stage_cache_cycle_v2(&fixed, &prior, &side, None).unwrap();
+        let staged = stage_cache_cycle_v2(&fixed, &prior, &side, None, None).unwrap();
         let h0 = staged.prior_sha256.unwrap();
         assert!(!prior.exists());
         let candidate = dir.path().join("candidate.db");
@@ -6177,7 +6209,7 @@ async fn activation_refuses_a_fixed_cache_changed_after_its_prior_was_staged() {
         assert!(!displaced.exists() && !prior.exists());
         assert_eq!(sha256_file(&side).unwrap(), h1);
         assert_ne!(sha256_file(&fixed).unwrap(), h0);
-        let resumed = stage_cache_cycle_v2(&fixed, &prior, &side, None).unwrap();
+        let resumed = stage_cache_cycle_v2(&fixed, &prior, &side, None, None).unwrap();
         assert_eq!(resumed.prior_sha256.as_deref(), Some(h0.as_str()));
         assert!(resumed.side_sha256.is_none());
         drop(held);
@@ -7241,8 +7273,14 @@ async fn lifecycle_check_counts_and_diagnostics_preserve_json_reports() {
             .with_writer(move || writer.clone())
             .finish();
         let _guard = tracing::subscriber::set_default(subscriber);
-        pe_bootstrap::cache_migration::stage_cache_cycle_v2(&fixed, &prior, &side, Some(&build))
-            .unwrap();
+        pe_bootstrap::cache_migration::stage_cache_cycle_v2(
+            &fixed,
+            &prior,
+            &side,
+            Some(&build),
+            None,
+        )
+        .unwrap();
         assert!(log.take().is_empty(), "staging resume must not rescan");
         if initial_schema == 1 {
             let size = side.metadata().unwrap().len();
@@ -7319,10 +7357,96 @@ async fn lifecycle_check_counts_and_diagnostics_preserve_json_reports() {
             &prior,
             &dir.path().join("next.side.db"),
             None,
+            None,
         )
         .unwrap_err();
         assert_structural_error(&error);
         assert_check_event(&log.take(), "staging_fixed", &fixed, size, false);
+        // An accepted request that installed exactly these bytes spares staging the
+        // re-check (#643): the damaged bytes pass only then. Anything less keeps it.
+        let damaged = sha256_file(&fixed).unwrap();
+        let cycle = "cron-20260923T000000Z";
+        let accepted = dir.path().join(cycle);
+        std::fs::create_dir(&accepted).unwrap();
+        let request = accepted.join("ranking_publish_request.json");
+        let marker = accepted.join("accepted_cycle_manifest.json");
+        let moved = dir.path().join(format!("wallet_cache.{cycle}.side.db"));
+        let elsewhere = dir.path().join("elsewhere.db");
+        let other_cycle = dir
+            .path()
+            .join("wallet_cache.cron-20260922T000000Z.side.db");
+        let other = "0".repeat(64);
+        let write_request =
+            |fixed_path: &std::path::Path, side_path: &std::path::Path, sha256: &str| {
+                std::fs::write(
+                    &request,
+                    serde_json::json!({"cache_activation": {"fixed_path": fixed_path,
+                    "side_path": side_path, "expected_sha256": sha256}})
+                    .to_string(),
+                )
+                .unwrap();
+            };
+        for (fixed_path, side_path, sha256, is_accepted, linked) in [
+            (&fixed, &moved, &damaged, false, false),
+            (&fixed, &moved, &other, true, false),
+            (&elsewhere, &moved, &damaged, true, false),
+            (&fixed, &other_cycle, &damaged, true, false),
+            (&fixed, &moved, &damaged, true, true),
+        ] {
+            write_request(fixed_path, side_path, sha256);
+            if is_accepted {
+                std::fs::write(&marker, "{}").unwrap();
+            } else if marker.exists() {
+                std::fs::remove_file(&marker).unwrap();
+            }
+            if linked {
+                std::fs::hard_link(&fixed, &moved).unwrap();
+            }
+            let error = pe_bootstrap::cache_migration::stage_cache_cycle_v2(
+                &fixed,
+                &prior,
+                &dir.path().join("next.side.db"),
+                None,
+                Some(&request),
+            )
+            .unwrap_err();
+            assert_structural_error(&error);
+            assert_check_event(&log.take(), "staging_fixed", &fixed, size, false);
+            if linked {
+                std::fs::remove_file(&moved).unwrap();
+            }
+        }
+        write_request(&fixed, &moved, &damaged);
+        let staged = Command::new(env!("CARGO_BIN_EXE_pe-bootstrap"))
+            .arg("cache-stage-v2")
+            .arg("--db")
+            .arg(&fixed)
+            .arg("--prior")
+            .arg(&prior)
+            .arg("--side")
+            .arg(dir.path().join("next.side.db"))
+            .arg("--installed-request")
+            .arg(&request)
+            .env("RUST_LOG", "info")
+            .env("PE_BOOTSTRAP_OUTPUT", dir.path().join("watchlist.json"))
+            .output()
+            .unwrap();
+        assert!(
+            staged.status.success(),
+            "{}",
+            String::from_utf8_lossy(&staged.stderr)
+        );
+        let messages: Vec<Value> = String::from_utf8(staged.stderr)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap()["fields"]["message"].clone())
+            .collect();
+        assert!(!messages.contains(&Value::from("SQLite quick_check completed")));
+        assert!(messages.contains(&Value::from(
+            "staging_fixed quick_check skipped: an accepted activation installed these bytes"
+        )));
+        let report: Value = serde_json::from_slice(&staged.stdout).unwrap();
+        assert_eq!(report["resumed"], false);
     }
 }
 
@@ -9637,8 +9761,14 @@ impl BulkRootFixture {
             .unwrap();
         cache.conn_for_test_set_active(WALLET_B, 1);
         drop(cache);
-        pe_bootstrap::cache_migration::stage_cache_cycle_v2(&fixed, &prior, &side, Some(&build))
-            .unwrap();
+        pe_bootstrap::cache_migration::stage_cache_cycle_v2(
+            &fixed,
+            &prior,
+            &side,
+            Some(&build),
+            None,
+        )
+        .unwrap();
         migrate_cache_v2(&side, &build).unwrap();
         Self {
             dir,
@@ -10796,7 +10926,7 @@ async fn two_file_cycles_copy_once_preserve_inodes_and_recover_activation_gap() 
         let build = dir.path().join(format!("build-{cycle}.json"));
         let h0 = sha256_file(&fixed).unwrap();
         let old_inode = fixed.metadata().unwrap().ino();
-        let report = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&build)).unwrap();
+        let report = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&build), None).unwrap();
         assert_eq!(log.take_named("cache whole-file copy").len(), 1);
         assert!(!prior.exists());
         assert_eq!(mains(), 2);
@@ -10806,7 +10936,7 @@ async fn two_file_cycles_copy_once_preserve_inodes_and_recover_activation_gap() 
         if cycle == 1 {
             let original_build = std::fs::read(&build).unwrap();
             std::fs::remove_file(&build).unwrap();
-            stage_cache_cycle_v2(&fixed, &prior, &side, Some(&build)).unwrap();
+            stage_cache_cycle_v2(&fixed, &prior, &side, Some(&build), None).unwrap();
             assert_eq!(std::fs::read(&build).unwrap(), original_build);
             migrate_cache_v2(&side, &build).unwrap();
             install_payout_manifest(&side);
@@ -10830,7 +10960,7 @@ async fn two_file_cycles_copy_once_preserve_inodes_and_recover_activation_gap() 
         let finalized =
             finalize_cache_v2(&side, &dir.path().join("final.json"), FRESH_END + cycle + 2)
                 .unwrap();
-        let resumed = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&build)).unwrap();
+        let resumed = stage_cache_cycle_v2(&fixed, &prior, &side, Some(&build), None).unwrap();
         assert!(resumed.resumed);
         assert_eq!(resumed.prior_sha256.as_deref(), Some(h0.as_str()));
         assert!(resumed.side_sha256.is_none());
@@ -10927,9 +11057,14 @@ async fn two_file_cycles_copy_once_preserve_inodes_and_recover_activation_gap() 
             "activation or resume copied a full file"
         );
         let next_side = dir.path().join("next.side.db");
-        let error =
-            stage_cache_cycle_v2(&fixed, &dir.path().join("next.prior.db"), &next_side, None)
-                .unwrap_err();
+        let error = stage_cache_cycle_v2(
+            &fixed,
+            &dir.path().join("next.prior.db"),
+            &next_side,
+            None,
+            None,
+        )
+        .unwrap_err();
         assert!(
             error.to_string().contains("previous cycle backup remains"),
             "{error}"
@@ -10961,7 +11096,7 @@ async fn two_file_restore_preserves_rejected_inode_and_recovers_its_gap() {
         drop(seed_v1(&fixed, FRESH_END));
         let h0 = sha256_file(&fixed).unwrap();
         let old_inode = fixed.metadata().unwrap().ino();
-        stage_cache_cycle_v2(&fixed, &prior, &side, None).unwrap();
+        stage_cache_cycle_v2(&fixed, &prior, &side, None, None).unwrap();
         let candidate = dir.path().join("candidate.db");
         let h1 = finalize_fresh_initial(&dir, &candidate).await;
         std::fs::rename(&candidate, &side).unwrap();
@@ -11114,14 +11249,14 @@ async fn legacy_prior_cycle_stages_activates_and_restores_with_original_request_
     drop(seed_v1(&fixed, FRESH_END));
     std::fs::copy(&fixed, &prior).unwrap();
     let h0 = sha256_file(&prior).unwrap();
-    let staged = stage_cache_cycle_v2(&fixed, &prior, &side, None).unwrap();
+    let staged = stage_cache_cycle_v2(&fixed, &prior, &side, None, None).unwrap();
     assert_eq!(staged.prior_sha256.as_deref(), Some(h0.as_str()));
     assert!(!cache_stage_evidence_path(&side).exists());
     let candidate = dir.path().join("candidate.db");
     let h1 = finalize_fresh_initial(&dir, &candidate).await;
     std::fs::rename(candidate, &side).unwrap();
     assert!(
-        stage_cache_cycle_v2(&fixed, &prior, &side, None)
+        stage_cache_cycle_v2(&fixed, &prior, &side, None, None)
             .unwrap()
             .resumed
     );

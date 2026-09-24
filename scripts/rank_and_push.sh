@@ -765,8 +765,14 @@ refresh_data() {
 # physical names, the recorded initial activity/payout targets, and the
 # one linked activity top-up recorded on the candidate.
 stage_candidate_cache() {
+  # The newest accepted cycle's request lets staging skip re-checking the fixed
+  # cache when its activation installed exactly these bytes (#643).
+  local -a installed=()
+  local request
+  request="$("$PYTHON_BIN" scripts/rank_cycle_manifest.py installed-request --root data/eval-results)" || return $?
+  [[ -z "$request" ]] || installed=(--installed-request "$request")
   "$PE_BOOTSTRAP_BIN" cache-stage-v2 --db "$FIXED_DB" --prior "$1" --side "$2" \
-    --manifest "$3" > "$4.tmp" || return $?
+    --manifest "$3" "${installed[@]}" > "$4.tmp" || return $?
   mv -- "$4.tmp" "$4"
 }
 

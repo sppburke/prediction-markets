@@ -239,18 +239,16 @@ def latest_accepted(root: Path, day_utc: str) -> dict | None:
     return None
 
 
-def retire_completed_cycle(root: Path, out: Path | None = None) -> int:
-    """Resume retention under the wrapper's run lock: 0 done, 2 held, 3 absent.
+CYCLE_PATTERN = r"cron-[0-9]{8}T[0-9]{6}Z"
 
-    The durable accepted watermark is written only after verified publication.
-    It and the unchanged request/staging evidence remain the cleanup obligation,
-    including when both pointers and every eligible cache file are already gone.
-    """
-    cycle_pattern = r"cron-[0-9]{8}T[0-9]{6}Z"
+
+def accepted_candidate_cycle(root: Path, out: Path | None = None) -> Path | None:
+    """The named, else the newest, cycle whose verified candidate-lane publication
+    wrote its accepted watermark (written only after that publication)."""
     candidates = [out] if out is not None else sorted(root.glob("cron-*"), reverse=True)
     for candidate in candidates:
         if (candidate.is_symlink() or not candidate.is_dir()
-                or ".." in candidate.parts or not re.fullmatch(cycle_pattern, candidate.name)
+                or ".." in candidate.parts or not re.fullmatch(CYCLE_PATTERN, candidate.name)
                 or candidate.resolve().parent != root.resolve()):
             continue
         accepted = candidate / "accepted_cycle_manifest.json"
@@ -259,9 +257,19 @@ def retire_completed_cycle(root: Path, out: Path | None = None) -> int:
         manifest = json.loads(accepted.read_text(encoding="utf-8"))
         if (manifest.get("version") == MANIFEST_VERSION
                 and manifest.get("configuration", {}).get("cache_lane") == "fresh_v2"):
-            out = candidate
-            break
-    else:
+            return candidate
+    return None
+
+
+def retire_completed_cycle(root: Path, out: Path | None = None) -> int:
+    """Resume retention under the wrapper's run lock: 0 done, 2 held, 3 absent.
+
+    The durable accepted watermark is written only after verified publication.
+    It and the unchanged request/staging evidence remain the cleanup obligation,
+    including when both pointers and every eligible cache file are already gone.
+    """
+    out = accepted_candidate_cycle(root, out)
+    if out is None:
         return 3
 
     guards = [root / name for name in (
@@ -298,7 +306,7 @@ def retire_completed_cycle(root: Path, out: Path | None = None) -> int:
         os.fsync(directory)
     finally:
         os.close(directory)
-    pattern = re.compile(r"wallet_cache\.(" + cycle_pattern + r")\.(prior|side|displaced)\.db(?:-wal|-shm)?")
+    pattern = re.compile(r"wallet_cache\.(" + CYCLE_PATTERN + r")\.(prior|side|displaced)\.db(?:-wal|-shm)?")
     deleted = 0
     deferred = False
     for path in sorted(fixed.parent.iterdir()):
@@ -511,6 +519,9 @@ def parse_args():
     retire = subparsers.add_parser("retire-completed")
     retire.add_argument("--root", required=True, type=Path)
     retire.add_argument("--out-dir", type=Path)
+    installed = subparsers.add_parser("installed-request",
+                                      help="print the newest accepted candidate cycle's request, if any")
+    installed.add_argument("--root", required=True, type=Path)
     targets = subparsers.add_parser("candidate-targets")
     targets.add_argument("--prior", type=Path, help="legacy immutable prior; new cycles read staging evidence")
     targets.add_argument("--side", type=Path, required=True)
@@ -525,6 +536,11 @@ def main() -> int:
     args = parse_args()
     if args.command == "retire-completed":
         return retire_completed_cycle(args.root, args.out_dir)
+    if args.command == "installed-request":
+        cycle = accepted_candidate_cycle(args.root)
+        if cycle is not None and (cycle / "ranking_publish_request.json").is_file():
+            print(cycle / "ranking_publish_request.json")
+        return 0
     if args.command == "candidate-targets":
         for value in candidate_targets(args.prior, args.side, after_collection=args.after_collection,
                                        max_staleness_hours=args.max_staleness_hours,

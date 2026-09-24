@@ -799,7 +799,7 @@ from #645. Exhausted transient source retries still exit `rank_and_push_tempfail
 errors stop the cycle. Payout, finalization, activation, restore and exact-request validation retain
 their existing contracts.
 
-**Structural checks (#643 step 2).** Each uninterrupted recurring cycle runs two
+**Structural checks (#643 step 2).** Each uninterrupted recurring cycle runs at most two
 `PRAGMA quick_check` scans (previously eight): the checkpointed fixed main under the
 staging lock, then the finalized candidate immediately before activation. Initial
 schema-one cutover runs three (previously ten), adding the first-migration input check
@@ -808,6 +808,16 @@ resume and both finalizations run none. Missing-side activation recovery runs on
 attempt (previously two) on the matching-hash installed main, because a missing side
 file does not prove activation already checked it; restore runs one (previously three)
 on the immutable prior after hash/schema validation and before any displacement.
+Staging skips its scan when the newest accepted candidate-lane cycle's own request
+(`rank_cycle_manifest.py installed-request`, the cycle retention selects) installed exactly
+the checkpointed fixed main: its `cache_activation` names this fixed path, a candidate
+named `wallet_cache.<that cycle>.side.db` that has since been moved, and an expected hash
+equal to the fixed main's, and `accepted_cycle_manifest.json` (written only after verified
+publication, which follows a successful activation) sits beside it. That activation scanned
+those bytes before installing them, so a cycle whose fixed main is its predecessor's
+untouched candidate runs one scan, at activation, instead of two; any other fixed main is
+scanned at staging as before. At 590 GB one scan takes about 10 h (17 MB/s of 4 KB reads
+on Forge, measured 2026-09-23).
 
 Finalization certifies exact bytes and activity, payout and projection evidence, not
 every SQLite page. Damage outside those reads may now survive migration resume, the

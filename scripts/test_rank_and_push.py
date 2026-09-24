@@ -42,6 +42,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -1029,6 +1030,38 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertEqual(manifest["versions"]["activity_parser"], 2)
         self.assertEqual(manifest["versions"]["clob_resolution_schema"], 2)
         self.assertEqual(manifest["versions"]["ranker"], 1)
+
+    def test_next_cycle_staging_receives_the_accepted_request(self):
+        """PASS: the first candidate cycle stages without a request; once it is
+        published, the next cycle's staging gets that accepted cycle's request, so
+        it can skip re-checking the fixed cache its activation installed (#643).
+        FAIL: a request before any acceptance, or none afterwards."""
+        self._install_candidate_layout(schema=2)
+        self._install_candidate_stub()
+        first = self._run()
+        self.assertEqual(first.returncode, 0, first.stderr + first.stdout)
+        out = next((self.root / "data/eval-results").glob("cron-*"))
+        self.assertNotIn("--installed-request", self._bootstrap_lines("cache-stage-v2")[0])
+        # A later day, so the unchanged-watermark exit does not end the next cycle.
+        accepted = out / "accepted_cycle_manifest.json"
+        value = json.loads(accepted.read_text())
+        value["day_utc"] = "2000-01-01"
+        accepted.write_text(json.dumps(value))
+        # A newer accepted cycle outside the candidate lane never wins selection.
+        other = self.root / "data/eval-results/cron-29990101T000000Z"
+        other.mkdir()
+        (other / "ranking_publish_request.json").write_text("{}")
+        (other / "accepted_cycle_manifest.json").write_text(
+            json.dumps({**value, "configuration": {**value["configuration"], "cache_lane": "legacy"}})
+        )
+        # Cycle directories are named to the second; start the next one in a new second.
+        time.sleep(1.05 - time.time() % 1)
+        second = self._run()
+        self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
+        self.assertIn(
+            f"--installed-request data/eval-results/{out.name}/ranking_publish_request.json",
+            self._bootstrap_lines("cache-stage-v2")[1],
+        )
 
     def test_schema_two_prepares_then_activates_then_resumes_exact_request(self):
         """The corrected batch request is durable before cache activation and the
