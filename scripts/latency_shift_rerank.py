@@ -258,17 +258,17 @@ def map_pair_tokens(db: str, pairs: list[tuple[str, str]]) -> dict[tuple[str, st
         chunk = markets[i:i + 800]
         ph = ",".join("?" * len(chunk))
         if schema >= 2:
-            rows = [(cid, str(index), token.get("token_id"))
+            rows = [(cid, str(index), token["token_id"])
                     for cid, tokens in con.execute(
                         f"SELECT market_id, tokens_json FROM clob_payout_evidence_v2 "
                         f"WHERE market_id IN ({ph})", chunk)
-                    for index, token in enumerate(json.loads(tokens))]
+                    for index, token in enumerate(json.loads(tokens)) if token.get("token_id")]
         else:
             rows = [(cid, str(int(oi)), tid) for cid, oi, tid in con.execute(
                 f"SELECT condition_id, outcome_index, token_id FROM token_conditions "
                 f"WHERE condition_id IN ({ph}) AND outcome_index IS NOT NULL", chunk)]
         for cid, oi, tid in rows:
-            if (cid, oi) in want and tid:
+            if (cid, oi) in want:
                 out[(cid, oi)] = tid
     con.close()
     return out

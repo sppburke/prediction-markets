@@ -1232,7 +1232,7 @@ async fn redemption_pause_and_verified_identity_shape_the_projection() {
     let dir = TempDir::new().unwrap();
     let side = dir.path().join("side.db");
     let fixed_end = 1_800_000_000_i64;
-    let mut cache = seed_v1(&side, fixed_end - 800_000);
+    let mut cache = seed_v1(&side, fixed_end - 1_500_000);
     for wallet in [WALLET_B, WALLET_C, WALLET_D, WALLET_E, WALLET_F] {
         cache
             .upsert_wallets_bulk(&[(wallet.to_owned(), SRC_TRADES, false, None, None, None, 0)])
@@ -1250,6 +1250,7 @@ async fn redemption_pause_and_verified_identity_shape_the_projection() {
         "0xa-redeemed",
         "0xa-redeemed2",
         "0xa-mid",
+        "0xa-extended",
         "0xa-boundary",
         "0xa-after",
         "0xa-final",
@@ -1268,6 +1269,8 @@ async fn redemption_pause_and_verified_identity_shape_the_projection() {
         "0xk",
         "0xk2",
         "0xl",
+        "0xr",
+        "0xr-after",
     ];
     let token = |market: &str, outcome: usize| {
         let index = markets.iter().position(|m| *m == market).unwrap() + 1;
@@ -1309,14 +1312,14 @@ async fn redemption_pause_and_verified_identity_shape_the_projection() {
         row
     };
     let (ta, tb, tc, td, te, tf) = (
-        fixed_end - 700_000,
+        fixed_end - 1_300_000,
         fixed_end - 690_000,
         fixed_end - 680_000,
         fixed_end - 670_000,
         fixed_end - 660_000,
         fixed_end - 650_000,
     );
-    let restart = ta + 5_100;
+    let restart = ta + 2_100 + PAUSE + 100;
     let activity = [
         (
             WALLET,
@@ -1327,11 +1330,13 @@ async fn redemption_pause_and_verified_identity_shape_the_projection() {
                 buy(WALLET, "0xa-same", ta + 100, "0xa3"),
                 // (i) a buy in an ordinary paused second is recorded.
                 buy(WALLET, "0xa-paused", ta + 1_100, "0xa4"),
-                // (d) another condition's redemption extends the pause.
+                // (d) another condition's redemption extends the pause: past the first
+                // pause but inside the second, nothing is projected; past both, it is.
                 zero_redeem(WALLET, Some("0xa-redeemed2"), ta + 2_100, "0xa5"),
+                buy(WALLET, "0xa-mid", ta + 100 + PAUSE + 1, "0xa7"),
+                buy(WALLET, "0xa-extended", ta + 2_100 + PAUSE + 1, "0xa14"),
                 // (j) redeeming the same condition again restarts it, without a stop.
                 zero_redeem(WALLET, Some("0xa-redeemed"), restart, "0xa6"),
-                buy(WALLET, "0xa-mid", ta + 100 + PAUSE + 1, "0xa7"),
                 // (a) the boundary second is paused, the next one is not.
                 buy(WALLET, "0xa-boundary", restart + PAUSE, "0xa8"),
                 buy(WALLET, "0xa-after", restart + PAUSE + 1, "0xa9"),
@@ -1456,6 +1461,25 @@ async fn redemption_pause_and_verified_identity_shape_the_projection() {
                     tf + 50,
                     "0xf6",
                 ),
+                // A redemption of the No token stamped Yes: verified, it spends the No
+                // balance; stamped, it would underflow Yes and stop the wallet.
+                trade(
+                    WALLET_F,
+                    "0xr",
+                    &token("0xr", 1),
+                    1,
+                    "BUY",
+                    "1",
+                    tf + 60,
+                    "0xf7",
+                ),
+                serde_json::json!({
+                    "proxyWallet": WALLET_F, "type": "REDEEM", "conditionId": "0xr",
+                    "asset": token("0xr", 1), "outcome": "Yes", "side": "", "size": "1",
+                    "usdcSize": "1", "price": "1", "timestamp": tf + 70,
+                    "transactionHash": "0xf8", "outcomeIndex": "0",
+                }),
+                buy(WALLET_F, "0xr-after", tf + 80, "0xf9"),
             ],
         ),
     ];
@@ -1522,6 +1546,7 @@ async fn redemption_pause_and_verified_identity_shape_the_projection() {
     };
     let expected = [
         (WALLET, "0xa1"),
+        (WALLET, "0xa14"),
         (WALLET, "0xa9"),
         (WALLET_B, "0xb1"),
         (WALLET_B, "0xb4"),
@@ -1529,10 +1554,12 @@ async fn redemption_pause_and_verified_identity_shape_the_projection() {
         (WALLET_E, "0xe6"),
         (WALLET_F, "0xf4"),
         (WALLET_F, "0xf6"),
+        (WALLET_F, "0xf7"),
+        (WALLET_F, "0xf9"),
     ]
     .map(|(wallet, tx)| (wallet.to_owned(), tx.to_owned()));
     assert_eq!(projected, expected);
-    assert_eq!(stage.ranker_projection_count, 8);
+    assert_eq!(stage.ranker_projection_count, 11);
     assert_eq!(stage.ranker_classifier_version, 4);
 }
 
@@ -2265,6 +2292,20 @@ async fn refinalization_refuses_changed_or_missing_projection_proof() {
         (
             "payout_vector",
             "UPDATE clob_payout_evidence_v2 SET payout_vector_json = '[\"0\",\"1\"]'
+             WHERE market_id = '0xlater-a'",
+            "input binding changed",
+        ),
+        (
+            // Classifier four reads each market's token order and its venue page.
+            "payout_tokens",
+            "UPDATE clob_payout_evidence_v2 SET tokens_json = json_array(
+                 json_extract(tokens_json, '$[1]'), json_extract(tokens_json, '$[0]'))
+             WHERE market_id = '0xlater-a'",
+            "input binding changed",
+        ),
+        (
+            "payout_page",
+            "UPDATE clob_payout_evidence_v2 SET raw_page_sha256 = printf('%064d', 0)
              WHERE market_id = '0xlater-a'",
             "input binding changed",
         ),

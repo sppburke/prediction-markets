@@ -268,7 +268,8 @@ impl RankerProjectionInputs {
         // Like the rebuild, read the whole payout table without a generation
         // filter. No activity rows are needed for this commitment.
         let mut statement = connection.prepare(
-            "SELECT market_id, end_date_unix, payout_status, payout_vector_json, tokens_json
+            "SELECT market_id, end_date_unix, payout_status, payout_vector_json, tokens_json,
+                    raw_page_sha256
              FROM clob_payout_evidence_v2 ORDER BY market_id",
         )?;
         let rows = statement.query_map([], |row| {
@@ -278,6 +279,7 @@ impl RankerProjectionInputs {
                 row.get::<_, String>(2)?,
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
             ))
         })?;
         let mut payout_evidence_digest = JsonArrayDigest::new();
