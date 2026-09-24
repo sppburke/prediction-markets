@@ -209,6 +209,15 @@ def whole_projection_digest(rows: list[dict]) -> str:
     return hashlib.sha256(json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
+ESCAPED_ASSET = 'token"\n\\'
+
+
+def payout_tokens(asset: str, outcome: int) -> str:
+    """A binary market's payout token list with `asset` at index `outcome`."""
+    return json.dumps([{"token_id": asset if index == outcome else f"{asset}-other"}
+                       for index in range(2)])
+
+
 def build_certified_cache(db: str) -> tuple[list[dict], int, str]:
     conn = sqlite3.connect(db)
     conn.execute("PRAGMA user_version=2")
@@ -227,7 +236,7 @@ def build_certified_cache(db: str) -> tuple[list[dict], int, str]:
                  "ON activity_groups_v2(source_trade_id COLLATE BINARY)")
     conn.execute(
         "CREATE TABLE clob_payout_evidence_v2 (market_id TEXT PRIMARY KEY, "
-        "payout_vector_json TEXT, end_date_unix INTEGER, payout_status TEXT)"
+        "payout_vector_json TEXT, end_date_unix INTEGER, payout_status TEXT, tokens_json TEXT)"
     )
     conn.execute(
         "CREATE TABLE activity_coverage_manifests_v2 (generation INTEGER PRIMARY KEY, "
@@ -254,8 +263,9 @@ def build_certified_cache(db: str) -> tuple[list[dict], int, str]:
          "0.500000000000", "0.490000", entry),
     )
     conn.execute(
-        "INSERT INTO clob_payout_evidence_v2 VALUES (?,?,?,?)",
-        ("condition", '[\"0.5\",\"0.5\"]', entry + 3600, "resolved"),
+        "INSERT INTO clob_payout_evidence_v2 VALUES (?,?,?,?,?)",
+        ("condition", '[\"0.5\",\"0.5\"]', entry + 3600, "resolved",
+         json.dumps([{"token_id": ESCAPED_ASSET}, {"token_id": "token"}])),
     )
     marker = json.dumps({"receipt_storage": "activity_wallet_coverage_staging_v2", "version": 1},
                         sort_keys=True, separators=(",", ":"))
@@ -277,12 +287,12 @@ def build_certified_cache(db: str) -> tuple[list[dict], int, str]:
     # three batches on both SQLite and the exported Parquet relation.
     for ordinal in (4, 3, 2, 1):
         row = {**rows[0], "source_trade_id": f"g2:{ordinal:064x}",
-               "wallet_hex": W("b"), "asset": 'token"\n\\'}
+               "wallet_hex": W("b"), "asset": ESCAPED_ASSET, "outcome_id": 0}
         rows.append(row)
         conn.execute("INSERT INTO ranker_entries_v2 VALUES (?,?,?)",
                      (row["source_trade_id"], 7, 1))
         conn.execute("INSERT INTO activity_groups_v2 VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                     (row["source_trade_id"], 7, W("b"), "condition", row["asset"], 1,
+                     (row["source_trade_id"], 7, W("b"), "condition", row["asset"], 0,
                       "buy", "1.250000", "0.500000000000", "0.490000", entry))
     rows.sort(key=lambda row: row["source_trade_id"])
     conn.execute("INSERT INTO cache_v2_migration_state VALUES (?,?,?,?,?)",
@@ -433,9 +443,9 @@ class DuckParityTest(unittest.TestCase):
                                               "price_weighted_share_amount_str", "wallet_hex",
                                               "source_trade_id")),
                     )
-                    conn.execute("INSERT INTO clob_payout_evidence_v2 VALUES (?,?,?,?,?,?)",
+                    conn.execute("INSERT INTO clob_payout_evidence_v2 VALUES (?,?,?,?,?,?,?)",
                                  (row["condition_id"], row["payout_vector_json"], row["end_date_unix"],
-                                  "resolved", 8, now))
+                                  "resolved", payout_tokens(row["asset"], row["outcome_id"]), 8, now))
                     conn.execute("INSERT INTO token_conditions VALUES (?,?,?,?)",
                                  (row["asset"], row["condition_id"], now, row["outcome_id"]))
                     conn.execute("INSERT INTO ranker_price_pages VALUES (?,?,?,1,'complete',1,"
@@ -783,6 +793,41 @@ class DuckParityTest(unittest.TestCase):
             self.assertAlmostEqual(float(frame.iloc[0]["price"]), 0.4)
             self.assertAlmostEqual(float(frame.iloc[0]["payoff"]), 0.5)
             print("PASS: schema-two projection verified; SQLite refused; half payout exact")
+
+    @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
+    def test_schema_two_scores_the_traded_token(self) -> None:
+        """PASS: a position whose stored outcome index disagrees with its traded
+        token takes the token's place in the payout evidence, for both outcome
+        and payoff; an asset missing from its market's tokens is a structurally
+        invalid projected row (#690). FAIL: the stored index is scored, or the
+        missing asset is silently dropped."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "v2.db")
+            rows, entry, _ = build_certified_cache(db)
+            # Wallet a bought "token", stored as outcome 1, but the evidence lists
+            # it first and outcome 0 won.
+            for row in rows:
+                row["payout_vector_json"] = '["1","0"]'
+            with sqlite3.connect(db) as conn:
+                conn.execute("UPDATE cache_v2_migration_state SET ranker_projection_digest = ?",
+                             (whole_projection_digest(rows),))
+                conn.execute("UPDATE clob_payout_evidence_v2 SET payout_vector_json = ?, tokens_json = ?",
+                             ('["1","0"]', json.dumps([{"token_id": "token"}, {"token_id": ESCAPED_ASSET}])))
+            pq = str(Path(tmp) / "scored")
+            export(db, pq)
+            engine = ranker_duck.get_engine(force="auto", parquet_dir=pq, max_age_hours=0, schema_version=2)
+            [frame] = ranker_duck.duck_extract_positions_v2(engine, [W("a")], entry - 1, entry + 1)
+            self.assertEqual(int(frame.iloc[0]["outcome_id"]), 0)
+            self.assertAlmostEqual(float(frame.iloc[0]["payoff"]), 1.0)
+            with sqlite3.connect(db) as conn:
+                conn.execute("UPDATE clob_payout_evidence_v2 SET tokens_json = ?",
+                             (json.dumps([{"token_id": "elsewhere"}, {"token_id": ESCAPED_ASSET}]),))
+            pq = str(Path(tmp) / "unmatched")
+            export(db, pq)
+            engine = ranker_duck.get_engine(force="auto", parquet_dir=pq, max_age_hours=0, schema_version=2)
+            with self.assertRaisesRegex(RuntimeError, "structurally invalid"):
+                list(ranker_duck.duck_extract_positions_v2(engine, [W("a")], entry - 1, entry + 1))
+            print("PASS: pass one scores the traded token; an unmatched asset is invalid")
 
     def test_v2_repaired_payouts_do_not_change_v1_ranking_or_survivors(self) -> None:
         """#544 boundary: stored repaired payouts are replay evidence only.

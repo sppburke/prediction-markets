@@ -66,6 +66,37 @@ ENTRIES = [1_000_000, 1_050_000, 1_100_000]  # three first-buys, market 0xm outc
 RESOLVED_AT = 1_200_000
 
 
+def schema_two_tokens(con, yes_tokens: dict[str, str]) -> None:
+    """Schema two maps outcomes through each market's payout evidence token list;
+    outcome 0 of every market here is its given token."""
+    con.execute("CREATE TABLE clob_payout_evidence_v2 (market_id TEXT PRIMARY KEY, tokens_json TEXT NOT NULL)")
+    for market, token in yes_tokens.items():
+        con.execute("INSERT INTO clob_payout_evidence_v2 VALUES (?, ?)",
+                    (market, json.dumps([{"token_id": token}, {"token_id": token + "-no"}])))
+
+
+class TokenAuthority(unittest.TestCase):
+    def test_schema_two_maps_through_payout_evidence(self):
+        """PASS: schema two takes a pair's token from the payout evidence even when
+        token_conditions holds a stale order; schema one keeps token_conditions (#690)."""
+        from latency_shift_rerank import map_pair_tokens
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "tokens.db")
+            con = sqlite3.connect(db)
+            con.executescript(FIXTURE_DDL)
+            con.execute("INSERT INTO token_conditions VALUES ('STALE', '0xm', 1, 0)")
+            schema_two_tokens(con, {"0xm": "TOK"})
+            pairs = [("0xm", "0"), ("0xm", "1")]
+            con.execute("PRAGMA user_version=1")
+            con.commit()
+            self.assertEqual(map_pair_tokens(db, pairs), {("0xm", "0"): "STALE"})
+            con.execute("PRAGMA user_version=2")
+            con.commit()
+            con.close()
+            self.assertEqual(map_pair_tokens(db, pairs), {("0xm", "0"): "TOK", ("0xm", "1"): "TOK-no"})
+
+
 class RefOracleScenario(unittest.TestCase):
     def setUp(self):
         self.dir = tempfile.TemporaryDirectory()
@@ -290,6 +321,7 @@ class RefOracleScenario(unittest.TestCase):
         +1-cent repricing, and binds a deterministic before/after diff."""
         con = sqlite3.connect(self.db)
         con.execute("PRAGMA user_version=2")
+        schema_two_tokens(con, {"0xm": "TOK"})
         con.commit()
         con.close()
         cases = [
@@ -394,8 +426,7 @@ class RefOracleScenario(unittest.TestCase):
                     venue.setdefault(f"T{pair}", []).append((entry + SHIFT, price))
         con = sqlite3.connect(self.db)
         con.execute("PRAGMA user_version=2")
-        for token in spans:
-            con.execute("INSERT INTO token_conditions VALUES (?, ?, 1, 0)", (token, "0xm" + token[1:]))
+        schema_two_tokens(con, {"0xm" + token[1:]: token for token in spans})
         con.commit()
         con.close()
 

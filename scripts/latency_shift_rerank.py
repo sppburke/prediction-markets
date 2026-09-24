@@ -240,11 +240,14 @@ def sha256_file(path: str) -> str:
 # ─── Reference-oracle helpers (#536) ─────────────────────────────────────────────
 
 def map_pair_tokens(db: str, pairs: list[tuple[str, str]]) -> dict[tuple[str, str], str]:
-    """(market_id, outcome_id) → CLOB token_id via token_conditions (positional
-    outcome_index; NULL rows skipped, never mispriced). Unmapped pairs are simply
-    absent — their positions are not repriceable (honest)."""
+    """(market_id, outcome_id) → CLOB token_id. Schema two reads each market's payout
+    evidence token list, whose order pass one's outcome and the payout vector follow
+    (#690); schema one reads token_conditions (positional outcome_index; NULL rows
+    skipped, never mispriced). Unmapped pairs are simply absent — their positions are
+    not repriceable (honest)."""
     con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
-    if int(con.execute("PRAGMA user_version").fetchone()[0]) == -2:
+    schema = int(con.execute("PRAGMA user_version").fetchone()[0])
+    if schema == -2:
         con.close()
         raise ValueError("unfinished bulk root (schema -2); resume cache-populate-activity-v2 --bulk-root before any other command")
     con.execute("PRAGMA busy_timeout=30000;")
@@ -254,12 +257,19 @@ def map_pair_tokens(db: str, pairs: list[tuple[str, str]]) -> dict[tuple[str, st
     for i in range(0, len(markets), 800):
         chunk = markets[i:i + 800]
         ph = ",".join("?" * len(chunk))
-        for cid, oi, tid in con.execute(
+        if schema >= 2:
+            rows = [(cid, str(index), token.get("token_id"))
+                    for cid, tokens in con.execute(
+                        f"SELECT market_id, tokens_json FROM clob_payout_evidence_v2 "
+                        f"WHERE market_id IN ({ph})", chunk)
+                    for index, token in enumerate(json.loads(tokens))]
+        else:
+            rows = [(cid, str(int(oi)), tid) for cid, oi, tid in con.execute(
                 f"SELECT condition_id, outcome_index, token_id FROM token_conditions "
-                f"WHERE condition_id IN ({ph}) AND outcome_index IS NOT NULL", chunk):
-            key = (cid, str(int(oi)))
-            if key in want:
-                out[key] = tid
+                f"WHERE condition_id IN ({ph}) AND outcome_index IS NOT NULL", chunk)]
+        for cid, oi, tid in rows:
+            if (cid, oi) in want and tid:
+                out[(cid, oi)] = tid
     con.close()
     return out
 

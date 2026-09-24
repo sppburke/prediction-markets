@@ -618,10 +618,9 @@ without writing and recomputes that digest over the committed projection from ei
 connections, one key range each, hashed in key order, so the bytes are the serial read's while its
 random activity reads overlap (#675). A different recorded classifier
 version instead runs full activity verification and rebuilds the projection with the current
-classifier. Classifier version three admits what the live copy path takes: a market's entry history is
-consumed only by a first entry (not by a sell, split, merge or redemption), and an entry whose
-action depends on the order of its second is not projected. An activation accepts an installed
-cache of classifier version one to three. Each rebuilding finalization loads a wallet once, validates its entire aggregate
+classifier. The current classifier version and its entry rules are `ranker_classifier_version` and
+`ranker_redeem_pause_secs` in `_GLOSSARY.md`. An activation accepts an installed cache of classifier
+version one to four. Each rebuilding finalization loads a wallet once, validates its entire aggregate
 vector, then classifies that same vector; a classifier stopping point never truncates validation.
 Manifest installation and projection replacement commit together with a cleared, unfinalized state;
 the finalized state commits in a second transaction, after the digest is computed over the committed
@@ -851,7 +850,10 @@ parser/classifier versions, payout target, cycle configuration, activation batch
 cycle/pending pointers and prepared request; do not restage, reseal, clear receipts or
 advance an unfinished generation. Binary/script rollback uses the same pause/restore
 lifecycle; the structural-check change requires no database migration, freshness override or
-event/replay change.
+event/replay change. A classifier-version change may be installed into a paused cycle that has
+no `cache_stage_record.json`, no `ranking_publish_request.json` and no `rank_and_push.pending`:
+collection start cleared the projection, so the cycle's first finalization rebuilds it at the new
+version.
 
 The zero-argument `rank_and_push.sh` production cycle enters this lane automatically when
 the installed cache is schema two, and for the one-time initial cutover when `.env` sets
