@@ -3453,6 +3453,7 @@ pub fn stage_cache_cycle_v2(
     prior_path: &Path,
     side_path: &Path,
     build_manifest_path: Option<&Path>,
+    installed_request: Option<&Path>,
 ) -> Result<CacheStageReport, BootstrapError> {
     require_regular_file(fixed_path, "current fixed cache")?;
     require_same_device(fixed_path, prior_path, side_path)?;
@@ -3523,6 +3524,7 @@ pub fn stage_cache_cycle_v2(
             prior_path,
             side_path,
             build_manifest_path.as_deref(),
+            installed_request,
         );
     }
     drop(open_existing_ro(fixed_path)?);
@@ -3570,11 +3572,56 @@ pub fn stage_cache_cycle_v2(
     stage_report(fixed_path, prior_path, side_path, Some(prior_sha256), false)
 }
 
+/// Whether an accepted publication request installed exactly these bytes at
+/// `fixed`. Its activation ran the whole-cache check on them before moving the
+/// candidate into place, so staging need not repeat it (#643). The request must be
+/// its cycle's own (its candidate is `wallet_cache.<cycle>.side.db`), the wrapper
+/// writes `accepted_cycle_manifest.json` beside it only after verified publication,
+/// which follows a successful activation, and the candidate must have been moved.
+fn installed_by(
+    request: Option<&Path>,
+    fixed: &Path,
+    sha256: &str,
+) -> Result<bool, BootstrapError> {
+    #[derive(Deserialize)]
+    struct Request {
+        cache_activation: Option<Activation>,
+    }
+    #[derive(Deserialize)]
+    struct Activation {
+        fixed_path: PathBuf,
+        side_path: PathBuf,
+        expected_sha256: String,
+    }
+    let Some(path) = request else {
+        return Ok(false);
+    };
+    let Request {
+        cache_activation: Some(activation),
+    } = serde_json::from_slice(&std::fs::read(path)?)?
+    else {
+        return Ok(false);
+    };
+    let cycle = path.parent().and_then(Path::file_name);
+    let own_candidate = cycle.is_some_and(|cycle| {
+        activation.side_path.file_name()
+            == Some(format!("wallet_cache.{}.side.db", cycle.to_string_lossy()).as_ref())
+    });
+    Ok(own_candidate
+        && !activation.side_path.exists()
+        && path
+            .with_file_name("accepted_cycle_manifest.json")
+            .is_file()
+        && activation.expected_sha256 == sha256
+        && canonical_intended_path(&activation.fixed_path)? == canonical_intended_path(fixed)?)
+}
+
 fn stage_two_file_cycle(
     fixed: &Path,
     prior: &Path,
     side: &Path,
     manifest_path: Option<&Path>,
+    installed_request: Option<&Path>,
 ) -> Result<CacheStageReport, BootstrapError> {
     let evidence_path = cache_stage_evidence_path(side);
     if prior.exists() {
@@ -3599,10 +3646,18 @@ fn stage_two_file_cycle(
         }
         let current = open_existing_rw(fixed)?;
         checkpoint_truncate(&current)?;
-        quick_check(&current, "staging_fixed", fixed)?;
-        current.close().map_err(|(_, error)| error)?;
         std::fs::File::open(fixed)?.sync_all()?;
         let source_sha256 = sha256_file(fixed)?;
+        if installed_by(installed_request, fixed, &source_sha256)? {
+            tracing::info!(
+                path = %fixed.display(),
+                sha256 = %source_sha256,
+                "staging_fixed quick_check skipped: an accepted activation installed these bytes"
+            );
+        } else {
+            quick_check(&current, "staging_fixed", fixed)?;
+        }
+        current.close().map_err(|(_, error)| error)?;
         let source_schema = verified_user_version(fixed)?;
         let baseline = open_immutable(fixed)?;
         let activity_generation = if source_schema == CACHE_SCHEMA_VERSION_V2 {

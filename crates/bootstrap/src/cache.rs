@@ -5164,7 +5164,7 @@ mod tests {
         assert!(old_stage.resumed);
         assert_eq!(old_stage.side_schema, -2);
         assert!(
-            crate::cache_migration::stage_cache_cycle_v2(&fixed, &prior, &path, None)
+            crate::cache_migration::stage_cache_cycle_v2(&fixed, &prior, &path, None, None)
                 .unwrap_err()
                 .to_string()
                 .contains("unfinished bulk root")
