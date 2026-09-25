@@ -530,6 +530,11 @@ async fn migration_is_resumable_and_activation_installs_only_the_finalized_main(
         scripts.join("partial_backfill_wallets.py"),
     )
     .unwrap();
+    std::fs::write(
+        scripts.join("rank_cycle_manifest.py"),
+        "import sys\nif sys.argv[1] == 'installed-request': print('')\n",
+    )
+    .unwrap();
     std::fs::copy(
         repository.join("scripts/push_ranking_to_supabase.py"),
         scripts.join("push_ranking_to_supabase.py"),
@@ -2676,7 +2681,8 @@ async fn activation_takes_the_projection_digest_from_the_final_stage_record_only
         ("other-bytes", genuine.clone()),
     ] {
         let path = write_record(&format!("{name}.json"), &record);
-        let refused = activate_cache_v2_with_handoff(&request, None, Some(&path)).unwrap_err();
+        let refused =
+            activate_cache_v2_with_handoff(&request, None, Some(&path), None).unwrap_err();
         assert!(
             refused
                 .to_string()
@@ -2698,6 +2704,7 @@ async fn activation_takes_the_projection_digest_from_the_final_stage_record_only
         },
         None,
         Some(&forged_path),
+        None,
     )
     .unwrap_err();
     assert!(
@@ -2708,14 +2715,15 @@ async fn activation_takes_the_projection_digest_from_the_final_stage_record_only
     assert_eq!(sha256_file(&side).unwrap(), changed);
     assert!(!dir.path().join("outgoing-prior.db").exists());
     clear_sidecars();
-    let installed = activate_cache_v2_with_handoff(&request, None, Some(&forged_path)).unwrap();
+    let installed =
+        activate_cache_v2_with_handoff(&request, None, Some(&forged_path), None).unwrap();
     assert!(!installed.resumed);
     assert_eq!(installed.installed_sha256, changed);
     assert!(!side.exists());
     // The side is now installed at the fixed path: the missing-side resume
     // accepts the same record, still bound to the original side path, and
     // without it recomputes and refuses.
-    let resumed = activate_cache_v2_with_handoff(&request, None, Some(&forged_path)).unwrap();
+    let resumed = activate_cache_v2_with_handoff(&request, None, Some(&forged_path), None).unwrap();
     assert!(resumed.resumed);
     assert!(
         activate_cache_v2(&request)
@@ -2763,6 +2771,129 @@ async fn refinalization_takes_the_write_lock_before_verifying_the_committed_proj
         again.ranker_projection_digest,
         first.ranker_projection_digest
     );
+}
+
+/// PASS: a two-file activation whose outgoing schema-two cache is still at F
+/// skips activity content only when an accepted request binds its staged H0.
+#[tokio::test]
+async fn accepted_outgoing_activity_skips_verification_but_h0_still_binds_activation() {
+    use pe_bootstrap::cache_migration::{cache_stage_evidence_path, stage_cache_cycle_v2};
+    for changed_after_stage in [false, true] {
+        let dir = TempDir::new().unwrap();
+        std::fs::create_dir_all(dir.path().join("eval-results")).unwrap();
+        let fixed = dir.path().join("wallet_cache.db");
+        prepare_fresh_initial(&dir, &fixed).await;
+        finalize_cache_v2(&fixed, &dir.path().join("installed.json"), FRESH_END + 2).unwrap();
+        let pristine = dir.path().join("pristine.db");
+        std::fs::copy(&fixed, &pristine).unwrap();
+        let connection = Connection::open(&fixed).unwrap();
+        connection
+            .execute(
+                "UPDATE activity_groups_v2 SET share_amount_str = '9.000001'
+             WHERE wallet_hex = '0x2222222222222222222222222222222222222222'",
+                [],
+            )
+            .unwrap();
+        drop(connection);
+        let h0 = sha256_file(&fixed).unwrap();
+        let accepted_cycle = "cron-20260923T000000Z";
+        let accepted = dir.path().join(accepted_cycle);
+        std::fs::create_dir(&accepted).unwrap();
+        let installed_request = accepted.join("ranking_publish_request.json");
+        std::fs::write(
+            &installed_request,
+            serde_json::json!({"cache_activation": {
+                "fixed_path": fixed,
+                "side_path": dir.path().join(format!("wallet_cache.{accepted_cycle}.side.db")),
+                "expected_sha256": h0,
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(accepted.join("accepted_cycle_manifest.json"), "{}").unwrap();
+        let cycle = "cron-20260924T000000Z";
+        let prior = dir.path().join(format!("wallet_cache.{cycle}.prior.db"));
+        let side = dir.path().join(format!("wallet_cache.{cycle}.side.db"));
+        let displaced = dir
+            .path()
+            .join(format!("wallet_cache.{cycle}.displaced.db"));
+        stage_cache_cycle_v2(&fixed, &prior, &side, None, Some(&installed_request)).unwrap();
+        // The candidate is finalized independently of the damaged outgoing main.
+        std::fs::copy(&pristine, &side).unwrap();
+        let record = dir.path().join("candidate.json");
+        let finalized = finalize_cache_v2(&side, &record, FRESH_END + 3).unwrap();
+        let request = CacheActivationRequest {
+            fixed_path: fixed.clone(),
+            side_path: side.clone(),
+            prior_cache_backup_path: displaced.clone(),
+            expected_side_sha256: finalized.cache_sha256.clone(),
+            stage_evidence_sha256: Some(sha256_file(&cache_stage_evidence_path(&side)).unwrap()),
+        };
+        if changed_after_stage {
+            Connection::open(&fixed)
+                .unwrap()
+                .execute(
+                    "UPDATE activity_groups_v2 SET share_amount_str = '9.000002'
+                 WHERE wallet_hex = '0x2222222222222222222222222222222222222222'",
+                    [],
+                )
+                .unwrap();
+            let error = activate_cache_v2_with_handoff(
+                &request,
+                None,
+                Some(&record),
+                Some(&installed_request),
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("differs from recorded staging baseline"),
+                "{error}"
+            );
+        } else {
+            let error =
+                activate_cache_v2_with_handoff(&request, None, Some(&record), None).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("activity receipt aggregate mismatch"),
+                "{error}"
+            );
+            let activated = Command::new(env!("CARGO_BIN_EXE_pe-bootstrap"))
+                .arg("cache-activate")
+                .arg("--db")
+                .arg(&side)
+                .arg("--fixed-db")
+                .arg(&fixed)
+                .arg("--backup")
+                .arg(&displaced)
+                .arg("--expected-sha256")
+                .arg(&finalized.cache_sha256)
+                .arg("--stage-evidence-sha256")
+                .arg(request.stage_evidence_sha256.as_deref().unwrap())
+                .arg("--final-stage-record")
+                .arg(&record)
+                .arg("--installed-request")
+                .arg(&installed_request)
+                .env("RUST_LOG", "info")
+                .env("PE_BOOTSTRAP_OUTPUT", dir.path().join("watchlist.json"))
+                .output()
+                .unwrap();
+            assert!(
+                activated.status.success(),
+                "{}",
+                String::from_utf8_lossy(&activated.stderr)
+            );
+            assert!(String::from_utf8_lossy(&activated.stderr).contains(
+                "activation outgoing activity verification skipped: an accepted activation installed these bytes"
+            ));
+        }
+        assert_eq!(
+            sha256_file(&displaced).ok(),
+            (!changed_after_stage).then_some(h0)
+        );
+    }
 }
 
 /// PASS: a two-file activation whose outgoing schema-two cache is still at F
@@ -2826,7 +2957,8 @@ async fn outgoing_schema_two_projection_is_verified_from_committed_readers() {
             .execute(damage, [])
             .unwrap();
         let damaged = sha256_file(&fixed).unwrap();
-        let refused = activate_cache_v2_with_handoff(&request, None, Some(&record)).unwrap_err();
+        let refused =
+            activate_cache_v2_with_handoff(&request, None, Some(&record), None).unwrap_err();
         assert!(refused.to_string().contains(refusal), "{refused}");
         let probe = Connection::open(&fixed).unwrap();
         probe.busy_timeout(std::time::Duration::ZERO).unwrap();
@@ -2854,7 +2986,7 @@ async fn outgoing_schema_two_projection_is_verified_from_committed_readers() {
     };
     // A candidate writer holding its lock keeps activation out entirely.
     let writer = pe_bootstrap::lock::CacheMutationLock::acquire(&side).unwrap();
-    let refused = activate_cache_v2_with_handoff(&request, None, Some(&record)).unwrap_err();
+    let refused = activate_cache_v2_with_handoff(&request, None, Some(&record), None).unwrap_err();
     assert!(
         refused.to_string().contains("cache mutation lock"),
         "{refused}"
@@ -2866,7 +2998,7 @@ async fn outgoing_schema_two_projection_is_verified_from_committed_readers() {
         .unwrap();
     assert!(dir.path().join(format!("{cycle}.side.db-shm")).exists());
     assert!(dir.path().join("wallet_cache.db-shm").exists());
-    let refused = activate_cache_v2_with_handoff(&request, None, Some(&record)).unwrap_err();
+    let refused = activate_cache_v2_with_handoff(&request, None, Some(&record), None).unwrap_err();
     assert!(
         refused.to_string().contains("activation sidecar remains"),
         "{refused}"
@@ -2875,7 +3007,7 @@ async fn outgoing_schema_two_projection_is_verified_from_committed_readers() {
     assert!(!displaced.exists());
     drop(held);
     assert!(dir.path().join(format!("{cycle}.side.db-shm")).exists());
-    let report = activate_cache_v2_with_handoff(&request, None, Some(&record)).unwrap();
+    let report = activate_cache_v2_with_handoff(&request, None, Some(&record), None).unwrap();
     assert!(!report.resumed);
     assert_eq!(report.installed_sha256, finalized.cache_sha256);
     assert_eq!(sha256_file(&displaced).unwrap(), h0);
@@ -7494,6 +7626,7 @@ async fn retained_receipts_and_legacy_manifests_fail_closed_on_corruption() {
                 },
                 None,
                 stage_path.exists().then_some(stage_path.as_path()),
+                None,
             )
             .unwrap_err();
             assert!(
@@ -7543,6 +7676,7 @@ async fn retained_receipts_and_legacy_manifests_fail_closed_on_corruption() {
                 },
                 None,
                 Some(&good_record),
+                None,
             )
             .unwrap_err();
             assert_eq!(
@@ -11472,14 +11606,14 @@ async fn two_file_cycles_copy_once_preserve_inodes_and_recover_activation_gap() 
         // proving the candidate's projection digest (#682).
         let record = dir.path().join("final.json");
         let record = (cycle >= 2).then_some(record.as_path());
-        activate_cache_v2_with_handoff(&request, None, record).unwrap();
+        activate_cache_v2_with_handoff(&request, None, record, None).unwrap();
         assert_eq!(mains(), 2);
         assert!(!side.exists());
         assert_eq!(fixed.metadata().unwrap().ino(), new_inode);
         assert_eq!(displaced.metadata().unwrap().ino(), old_inode);
         assert_eq!(sha256_file(&displaced).unwrap(), h0);
         assert!(
-            activate_cache_v2_with_handoff(&request, None, record)
+            activate_cache_v2_with_handoff(&request, None, record, None)
                 .unwrap()
                 .resumed
         );

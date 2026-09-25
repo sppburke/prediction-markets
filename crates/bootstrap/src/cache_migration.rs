@@ -3159,9 +3159,9 @@ fn project_loaded_wallet(
     // touches, so each second runs against those balances alone; cloning the
     // wallet's whole map every second is quadratic in its history.
     let mut positions = HashMap::new();
-    let mut history = BTreeSet::<String>::new();
+    let mut history = HashSet::<String>::new();
     // Conditions whose balances only a live anchor could restore.
-    let mut redeemed = BTreeSet::<String>::new();
+    let mut redeemed = HashSet::<String>::new();
     let mut paused_until = i64::MIN;
     for aggregates in aggregates.chunk_by(|a, b| a.source_time == b.source_time) {
         let Some(epoch) = aggregates
@@ -4148,18 +4148,20 @@ fn stage_report(
 pub fn activate_cache_v2(
     request: &CacheActivationRequest,
 ) -> Result<CacheActivationReport, BootstrapError> {
-    activate_cache_v2_with_handoff(request, None, None)
+    activate_cache_v2_with_handoff(request, None, None, None)
 }
 
 /// Install a finalized cache while accepting a verified shell lock handoff.
 /// Direct callers use [`activate_cache_v2`] and retain the full Rust-owned
 /// loop/run/cache lock stack. `final_stage_record` is the finalization record
 /// that hashed the candidate; with it, the candidate's stored projection digest
-/// is proven by that record instead of being recomputed (#682).
+/// is proven by that record instead of being recomputed (#682). An accepted
+/// `installed_request` proves the outgoing cache's activity on its staged bytes.
 pub fn activate_cache_v2_with_handoff(
     request: &CacheActivationRequest,
     handoff: Option<&ForgeLockHandoff>,
     final_stage_record: Option<&Path>,
+    installed_request: Option<&Path>,
 ) -> Result<CacheActivationReport, BootstrapError> {
     let _locks = ForgeActivationLocks::acquire_with_handoff(&request.fixed_path, handoff)?;
     let _candidate_lock = request
@@ -4176,7 +4178,7 @@ pub fn activate_cache_v2_with_handoff(
     if request.stage_evidence_sha256.is_some()
         || cache_stage_evidence_path(&request.side_path).exists()
     {
-        return activate_two_file_cycle(request, projection);
+        return activate_two_file_cycle(request, projection, installed_request);
     }
     require_regular_file(&request.fixed_path, "current fixed cache")?;
     validate_hex_sha256(&request.expected_side_sha256, "expected side sha256")?;
@@ -4193,7 +4195,12 @@ pub fn activate_cache_v2_with_handoff(
         let installed = open_existing_ro(&request.fixed_path)?;
         require_schema(&installed, CACHE_SCHEMA_VERSION_V2)?;
         quick_check(&installed, "activation_missing_side", &request.fixed_path)?;
-        verify_finalized_v2_manifests(&installed, ClassifierGeneration::Current, projection)?;
+        verify_finalized_v2_manifests(
+            &installed,
+            ClassifierGeneration::Current,
+            projection,
+            false,
+        )?;
         installed.close().map_err(|(_, error)| error)?;
         reject_nonempty_sidecars(&request.fixed_path)?;
         return Ok(CacheActivationReport {
@@ -4234,6 +4241,7 @@ pub fn activate_cache_v2_with_handoff(
             &current,
             ClassifierGeneration::Historical,
             ProjectionDigest::Recompute,
+            false,
         )?,
         other => return invalid(format!("unsupported prior cache schema {other}")),
     }
@@ -4283,7 +4291,7 @@ pub fn activate_cache_v2_with_handoff(
     let side = open_existing_ro(&request.side_path)?;
     require_schema(&side, CACHE_SCHEMA_VERSION_V2)?;
     quick_check(&side, "activation_candidate", &request.side_path)?;
-    verify_finalized_v2_manifests(&side, ClassifierGeneration::Current, projection)?;
+    verify_finalized_v2_manifests(&side, ClassifierGeneration::Current, projection, false)?;
     side.close().map_err(|(_, error)| error)?;
     // The read-only validation of a WAL-mode main may itself allocate an SHM index. With the
     // pre-open sidecar rejection above complete, only nonempty WAL frames can add durable state;
@@ -4396,7 +4404,12 @@ fn validate_installed_candidate(
     }
     require_schema(&connection, CACHE_SCHEMA_VERSION_V2)?;
     quick_check(&connection, phase, path)?;
-    verify_finalized_v2_manifests(&connection, ClassifierGeneration::Current, projection)?;
+    verify_finalized_v2_manifests(
+        &connection,
+        ClassifierGeneration::Current,
+        projection,
+        false,
+    )?;
     connection.close().map_err(|(_, error)| error)?;
     Ok(())
 }
@@ -4404,6 +4417,7 @@ fn validate_installed_candidate(
 fn activate_two_file_cycle(
     request: &CacheActivationRequest,
     projection: ProjectionDigest<'_>,
+    installed_request: Option<&Path>,
 ) -> Result<CacheActivationReport, BootstrapError> {
     let evidence = bound_stage_evidence(request)?;
     if restore_marker_path(&request.side_path).exists() {
@@ -4445,10 +4459,20 @@ fn activate_two_file_cycle(
                     // readers see exactly this committed state.
                     let hold = current
                         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                    let activity_proven =
+                        installed_by(installed_request, fixed, &evidence.source_sha256)?;
+                    if activity_proven {
+                        tracing::info!(
+                            path = %fixed.display(),
+                            sha256 = %evidence.source_sha256,
+                            "activation outgoing activity verification skipped: an accepted activation installed these bytes"
+                        );
+                    }
                     verify_finalized_v2_manifests(
                         &hold,
                         ClassifierGeneration::Historical,
                         ProjectionDigest::Committed(fixed),
+                        activity_proven,
                     )?;
                     hold.rollback()?;
                 }
@@ -5076,6 +5100,7 @@ fn verified_cache_schema(path: &Path) -> Result<i64, BootstrapError> {
             &connection,
             ClassifierGeneration::Historical,
             ProjectionDigest::Recompute,
+            false,
         )?,
         other => return invalid(format!("prior cache has unsupported schema {other}")),
     }
@@ -5158,6 +5183,7 @@ fn verify_finalized_v2_manifests(
     connection: &Connection,
     generation: ClassifierGeneration,
     projection: ProjectionDigest<'_>,
+    activity_proven: bool,
 ) -> Result<(), BootstrapError> {
     if required_max(connection, "sealed_generation_manifests", "generation")? != 1 {
         return invalid("installed cache has an invalid sealed generation".to_owned());
@@ -5170,13 +5196,17 @@ fn verify_finalized_v2_manifests(
         fixed_end_unix,
         wallets,
     } = activity_identity(connection)?;
-    completed_activity_manifest(
-        connection,
-        activity_generation,
-        &reference_sha256,
-        fixed_end_unix,
-        &wallets,
-    )?
+    if activity_proven {
+        stored_activity_manifest(connection, activity_generation)?
+    } else {
+        completed_activity_manifest(
+            connection,
+            activity_generation,
+            &reference_sha256,
+            fixed_end_unix,
+            &wallets,
+        )?
+    }
     .ok_or_else(|| BootstrapError::Invalid {
         message: "installed cache has no matching activity manifest".to_owned(),
     })?;

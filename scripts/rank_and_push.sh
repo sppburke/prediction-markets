@@ -383,11 +383,18 @@ CYCLE_TMP=""
 PIPELINE_VERSIONS_TMP=""
 CYCLE_CONFIG_TMP=""
 CURRENT_CYCLE_TMP=""
+CAPTURE_PID=""
 cleanup_rank_and_push() {
+  local status=$?
+  if [[ -n "$CAPTURE_PID" ]]; then
+    kill "$CAPTURE_PID" 2>/dev/null || true
+    wait "$CAPTURE_PID" 2>/dev/null || true
+  fi
   [[ -z "$CYCLE_TMP" ]] || rm -f "$CYCLE_TMP"
   [[ -z "$PIPELINE_VERSIONS_TMP" ]] || rm -f "$PIPELINE_VERSIONS_TMP"
   [[ -z "$CYCLE_CONFIG_TMP" ]] || rm -f "$CYCLE_CONFIG_TMP"
   [[ -z "$CURRENT_CYCLE_TMP" ]] || rm -f "$CURRENT_CYCLE_TMP"
+  return "$status"
 }
 trap cleanup_rank_and_push EXIT
 
@@ -764,15 +771,19 @@ refresh_data() {
 # resumes from its own durable state; the wrapper only derives the cycle's
 # physical names, the recorded initial activity/payout targets, and the
 # one linked activity top-up recorded on the candidate.
+installed_request_args() {
+  local request
+  request="$("$PYTHON_BIN" scripts/rank_cycle_manifest.py installed-request --root data/eval-results)" || return $?
+  INSTALLED_REQUEST_ARGS=()
+  [[ -z "$request" ]] || INSTALLED_REQUEST_ARGS=(--installed-request "$request")
+}
+
 stage_candidate_cache() {
   # The newest accepted cycle's request lets staging skip re-checking the fixed
   # cache when its activation installed exactly these bytes (#643).
-  local -a installed=()
-  local request
-  request="$("$PYTHON_BIN" scripts/rank_cycle_manifest.py installed-request --root data/eval-results)" || return $?
-  [[ -z "$request" ]] || installed=(--installed-request "$request")
+  installed_request_args || return $?
   "$PE_BOOTSTRAP_BIN" cache-stage-v2 --db "$FIXED_DB" --prior "$1" --side "$2" \
-    --manifest "$3" "${installed[@]}" > "$4.tmp" || return $?
+    --manifest "$3" "${INSTALLED_REQUEST_ARGS[@]}" > "$4.tmp" || return $?
   mv -- "$4.tmp" "$4"
 }
 
@@ -910,6 +921,13 @@ else
 fi
 if [[ "$CUTOVER_MODE" == "1" ]]; then
   require_cutover_inputs
+  if [[ "$SKIP_RANK" == "0" ]]; then
+    "$PYTHON_BIN" scripts/rank_cycle_manifest.py capture --db "$DB" \
+      --day-utc "$(date -u +%Y-%m-%d)" --versions-file "$PIPELINE_VERSIONS_FILE" \
+      --configuration-file "$OUT_DIR/cycle_configuration.json" \
+      --output "$OUT_DIR/candidate_cycle_manifest.json" &
+    CAPTURE_PID=$!
+  fi
 fi
 
 # ── Step 0a: Parquet snapshot for the DuckDB read-layer (#375) ────────────────────────────
@@ -962,6 +980,12 @@ if [[ "$SKIP_RANK" == "0" ]]; then
     --floor-tstat "$FLOOR_TSTAT" --emit-targets "$TARGETS_CSV"
 
   echo "── Stage 2b/3: targeted reference fetch into the ranker price store (#536) ────"
+  if [[ -n "$CAPTURE_PID" ]]; then
+    capture_status=0
+    wait "$CAPTURE_PID" || capture_status=$?
+    CAPTURE_PID=""
+    [[ "$capture_status" -eq 0 ]] || exit "$capture_status"
+  fi
   # Write-once + range algebra => resumable; transient page failures return partial
   # (exit 2, WARN + continue) and pass-2's terminal-coverage gate then exits 75 so the
   # supervisor retries the cycle — a partially fetched cycle can never publish.
@@ -970,15 +994,11 @@ if [[ "$SKIP_RANK" == "0" ]]; then
     --targets-csv "$TARGETS_CSV" "${BOOTSTRAP_CONFIG_ARGS[@]}"
   if [[ "$CUTOVER_MODE" == "1" ]]; then
     # The price store lives in the same SQLite file. Re-finalize after its
-    # targeted writes so activation is bound to the exact ranked cache bytes,
-    # and capture the finalized candidate separately from the cycle's initial
-    # installed-cache watermark.
+    # targeted writes so activation is bound to the exact ranked cache bytes.
+    # The candidate snapshot already captured the finalized inputs alongside
+    # export and ranking; the fetch changes only the price store.
     "$PE_BOOTSTRAP_BIN" cache-finalize-v2 --db "$DB" \
       --stage-record "$CACHE_STAGE_RECORD" "${BOOTSTRAP_CONFIG_ARGS[@]}"
-    "$PYTHON_BIN" scripts/rank_cycle_manifest.py capture --db "$DB" \
-      --day-utc "$(date -u +%Y-%m-%d)" --versions-file "$PIPELINE_VERSIONS_FILE" \
-      --configuration-file "$OUT_DIR/cycle_configuration.json" \
-      --output "$OUT_DIR/candidate_cycle_manifest.json"
   fi
 
   echo "── Stage 2c/3: pass-2 reference-oracle rerank (adds hit_rate) ─────────────────"
@@ -1109,9 +1129,11 @@ activate_bound_cache() {
   local -a record_binding=()
   local final_record="${CACHE_STAGE_RECORD:-$OUT_DIR/cache_stage_record.json}"
   [[ ! -f "$final_record" ]] || record_binding=(--final-stage-record "$final_record")
+  installed_request_args || return $?
   "$PE_BOOTSTRAP_BIN" cache-activate --db "${binding[0]}" \
     --fixed-db "${binding[1]}" --backup "${binding[2]}" \
     --expected-sha256 "${binding[3]}" "${stage_binding[@]}" "${record_binding[@]}" \
+    "${INSTALLED_REQUEST_ARGS[@]}" \
     "${lock_handoff[@]}"
 }
 
