@@ -12,7 +12,9 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr as _;
+use std::sync::mpsc::{Receiver, sync_channel};
 use std::sync::{Arc, OnceLock};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use futures::{StreamExt as _, stream};
@@ -3001,7 +3003,7 @@ fn activity_identity(connection: &Connection) -> Result<ActivityIdentity, Bootst
 fn prepare_activity_manifest(
     transaction: &rusqlite::Transaction<'_>,
     finalized_at_unix: i64,
-    mut consume: impl FnMut(&str, &[ActivityAggregate]),
+    mut consume: impl FnMut(&str, Vec<ActivityAggregate>),
 ) -> Result<(ActivityCoverageManifestV2, bool), BootstrapError> {
     let ActivityIdentity {
         generation,
@@ -3018,7 +3020,7 @@ fn prepare_activity_manifest(
             validation.visit(scan, transaction, generation_i64, receipt, |aggregate| {
                 aggregates.push(aggregate);
             })?;
-            consume(&receipt.wallet_hex, &aggregates);
+            consume(&receipt.wallet_hex, aggregates);
             Ok(())
         };
         if let Some(manifest) = stored_activity_manifest(transaction, generation)? {
@@ -3100,22 +3102,62 @@ fn rebuild_ranker_projection(
         Ok(projection) => (Some(projection), None),
         Err(error) => (None, Some(error)),
     };
-    let (manifest, needs_install) =
-        prepare_activity_manifest(transaction, finalized_at_unix, |wallet, aggregates| {
-            if projection_error.is_none()
-                && let Some((payout_markets, quality, insert)) = projection.as_mut()
-            {
-                projection_error = project_loaded_wallet(
-                    wallet,
-                    aggregates,
-                    generation,
-                    payout_markets,
-                    *quality,
-                    insert,
-                )
-                .err();
-            }
-        })?;
+    let prepared = thread::scope(|scope| {
+        let Some((payout_markets, quality, insert)) = projection.as_mut() else {
+            return prepare_activity_manifest(transaction, finalized_at_unix, |_, _| {});
+        };
+        let (send_input, input) = sync_channel::<(String, Vec<ActivityAggregate>)>(1);
+        let (send_output, output) = sync_channel::<Result<Vec<String>, BootstrapError>>(1);
+        let payout_markets: &PayoutTokens = payout_markets;
+        let quality = *quality;
+        if let Err(error) = thread::Builder::new()
+            .name("projection-classify".to_owned())
+            .spawn_scoped(scope, move || {
+                while let Ok((wallet, aggregates)) = input.recv() {
+                    if send_output
+                        .send(classify_loaded_wallet(
+                            &wallet,
+                            &aggregates,
+                            payout_markets,
+                            quality,
+                        ))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+        {
+            projection_error = Some(error.into());
+        }
+        let mut pending = false;
+        // Validate wallet k+1 while the worker classifies k, then insert k's
+        // ids before handing off k+1 so projection order stays unchanged.
+        let prepared =
+            prepare_activity_manifest(transaction, finalized_at_unix, |wallet, aggregates| {
+                if projection_error.is_some() {
+                    return;
+                }
+                if pending {
+                    projection_error = insert_classified_wallet(&output, insert, generation).err();
+                    pending = false;
+                }
+                if projection_error.is_none() {
+                    if send_input.send((wallet.to_owned(), aggregates)).is_ok() {
+                        pending = true;
+                    } else {
+                        projection_error = Some(BootstrapError::Internal);
+                    }
+                }
+            });
+        drop(send_input);
+        if prepared.is_ok() && pending && projection_error.is_none() {
+            projection_error = insert_classified_wallet(&output, insert, generation).err();
+        }
+        for _ in output {}
+        prepared
+    });
+    let (manifest, needs_install) = prepared?;
     // Content/receipt/manifest validation failures retain precedence over SQL
     // errors. Return a deferred projection error before installing the manifest:
     // SQLite may already have rolled back the transaction, so later writes could
@@ -3138,20 +3180,34 @@ fn rebuild_ranker_projection(
 // venue page that lists them.
 type PayoutTokens = BTreeMap<String, (Vec<String>, String)>;
 
+fn insert_classified_wallet(
+    output: &Receiver<Result<Vec<String>, BootstrapError>>,
+    insert: &mut rusqlite::Statement<'_>,
+    generation: i64,
+) -> Result<(), BootstrapError> {
+    let ids = output.recv().map_err(|_| BootstrapError::Internal)??;
+    for id in ids {
+        insert.execute(params![
+            id,
+            generation,
+            i64::from(RANKER_CLASSIFIER_VERSION)
+        ])?;
+    }
+    Ok(())
+}
+
 // Aggregates retain the loader's (source_time_unix, source_trade_id) order.
 // Borrow contiguous seconds so classification uses the validated vector itself.
 //
 // After a redemption that needs a position anchor, live copies nothing until the
 // anchor arrives; history holds no anchors, so the projection admits nothing for
 // RANKER_REDEEM_PAUSE_SECS, the owner-accepted stand-in (#690).
-fn project_loaded_wallet(
+fn classify_loaded_wallet(
     wallet_hex: &str,
     aggregates: &[ActivityAggregate],
-    generation: i64,
     payout_markets: &PayoutTokens,
     quality: ReconstructionQuality,
-    insert: &mut rusqlite::Statement<'_>,
-) -> Result<(), BootstrapError> {
+) -> Result<Vec<String>, BootstrapError> {
     let wallet = WalletAddress::from_hex(wallet_hex).map_err(|error| BootstrapError::Invalid {
         message: format!("frozen universe contains invalid wallet {wallet_hex}: {error}"),
     })?;
@@ -3163,6 +3219,7 @@ fn project_loaded_wallet(
     // Conditions whose balances only a live anchor could restore.
     let mut redeemed = HashSet::<String>::new();
     let mut paused_until = i64::MIN;
+    let mut admitted_ids = Vec::new();
     for aggregates in aggregates.chunk_by(|a, b| a.source_time == b.source_time) {
         let Some(epoch) = aggregates
             .first()
@@ -3243,11 +3300,7 @@ fn project_loaded_wallet(
             });
             if complete_identifiers {
                 validate_g2_id(&decision.source_trade_id.0)?;
-                insert.execute(params![
-                    decision.source_trade_id.0,
-                    generation,
-                    i64::from(RANKER_CLASSIFIER_VERSION)
-                ])?;
+                admitted_ids.push(decision.source_trade_id.0.clone());
             }
         }
         if ledger.apply_all_or_none(&mutations).is_err() {
@@ -3276,7 +3329,7 @@ fn project_loaded_wallet(
             paused_until = epoch.saturating_add(RANKER_REDEEM_PAUSE_SECS);
         }
     }
-    Ok(())
+    Ok(admitted_ids)
 }
 
 // As live does with token metadata, rebind a trade or redemption to its asset's
