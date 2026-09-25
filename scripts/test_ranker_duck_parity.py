@@ -644,6 +644,27 @@ class DuckParityTest(unittest.TestCase):
                     export(db, pq)
 
     @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
+    def test_attached_types_come_from_the_catalog(self):
+        # The catalog reports exactly what a bind would, without the bind's index read.
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "v2.db")
+            build_certified_cache(db)
+            con = duckdb.connect()
+            try:
+                con.execute("LOAD sqlite_scanner")
+                con.execute(f"ATTACH '{exp._q(db)}' AS src (TYPE sqlite, READ_ONLY)")
+                for table in exp.V2_TABLES:
+                    described = [(name, dtype) for name, dtype, *_ in
+                                 con.execute(f"DESCRIBE SELECT * FROM src.{table}").fetchall()]
+                    self.assertEqual(exp._attached_columns(con, table), described)
+                with self.assertRaisesRegex(ValueError, "missing required table absent"):
+                    exp._attached_columns(con, "absent")
+                with self.assertRaisesRegex(ValueError, "unsupported SQLite export type x: DOUBLE"):
+                    exp._typed_sqlite_query("SELECT 1", [("x", "DOUBLE")])
+            finally:
+                con.close()
+
+    @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
     def test_certified_activity_copy_holds_every_key_range_exactly_once(self):
         # Keys in every copy range, on each bound, and past both open ends copy
         # exactly as the single certified query copies them; shards are removed.
@@ -669,8 +690,8 @@ class DuckParityTest(unittest.TestCase):
                 con.execute("LOAD sqlite_scanner")
                 con.execute(f"ATTACH '{exp._q(db)}' AS src (TYPE sqlite, READ_ONLY)")
                 one, many = str(Path(tmp) / "one.parquet"), str(Path(tmp) / "many.parquet")
-                single = exp._typed_sqlite_query(con, exp.CERTIFIED_ACTIVITY_SQL,
-                                                 "SELECT * FROM src.activity_groups_v2")
+                single = exp._typed_sqlite_query(exp.CERTIFIED_ACTIVITY_SQL,
+                                                 exp._attached_columns(con, "activity_groups_v2"))
                 con.execute(f"COPY ({single}) TO '{exp._q(one)}' (FORMAT PARQUET)")
                 exp._copy_certified_activity(con, many, 100)
                 read = "SELECT * FROM read_parquet('{}') ORDER BY source_trade_id"
