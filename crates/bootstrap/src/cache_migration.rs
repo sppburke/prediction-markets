@@ -4505,6 +4505,10 @@ fn activate_two_file_cycle(
             }
             let mut current = open_existing_rw(fixed)?;
             checkpoint_truncate(&current)?;
+            // An accepted activation already verified the activity at H0; the
+            // H0 comparison below binds that proof to these bytes (#692).
+            let activity_proven = evidence.source_schema == CACHE_SCHEMA_VERSION_V2
+                && installed_by(installed_request, fixed, &evidence.source_sha256)?;
             match evidence.source_schema {
                 0 | CACHE_SCHEMA_VERSION_V1 => require_reclamation_ready(&current)?,
                 CACHE_SCHEMA_VERSION_V2 => {
@@ -4512,15 +4516,6 @@ fn activate_two_file_cycle(
                     // readers see exactly this committed state.
                     let hold = current
                         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                    let activity_proven =
-                        installed_by(installed_request, fixed, &evidence.source_sha256)?;
-                    if activity_proven {
-                        tracing::info!(
-                            path = %fixed.display(),
-                            sha256 = %evidence.source_sha256,
-                            "activation outgoing activity verification skipped: an accepted activation installed these bytes"
-                        );
-                    }
                     verify_finalized_v2_manifests(
                         &hold,
                         ClassifierGeneration::Historical,
@@ -4536,6 +4531,13 @@ fn activate_two_file_cycle(
             // against the durable H0, never against a freshly captured baseline.
             if sha256_file(fixed)? != evidence.source_sha256 {
                 return invalid("fixed cache differs from recorded staging baseline; activation refused before displacement".to_owned());
+            }
+            if activity_proven {
+                tracing::info!(
+                    path = %fixed.display(),
+                    sha256 = %evidence.source_sha256,
+                    "activation outgoing activity verification skipped: an accepted activation installed these bytes"
+                );
             }
             if evidence.source_schema != CACHE_SCHEMA_VERSION_V2 {
                 let report =
