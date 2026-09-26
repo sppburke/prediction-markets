@@ -12,6 +12,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use pe_core_types::WalletAddress;
 use pe_paper_state::PaperStateDb;
+use pe_trader_index::Watchlist;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::OffsetDateTime;
@@ -23,6 +24,99 @@ use tracing::{info, warn};
 use crate::live_watchlist::LiveWatchlist;
 use crate::runtime_config::MAX_ACTIVE_WATCHLIST_SIZE;
 use crate::supabase_reader::{self, SupabaseError};
+
+#[derive(Debug, Error)]
+pub enum BootScoreRefreshError {
+    #[error("boot watchlist score refresh failed: {0}")]
+    Fetch(#[from] SupabaseError),
+    #[error("source producer start gate closed after boot score refresh")]
+    ProducerGateClosed,
+}
+
+/// Fetch and apply the same survivor-score batch at boot and on the periodic cadence.
+/// The writer lock keeps this score update serialized with membership publication.
+async fn refresh_scores_once(
+    live: &LiveWatchlist,
+    client: &reqwest::Client,
+    base_url: &str,
+    anon_key: &str,
+    secret_key: &str,
+    writer_lock: &Mutex<()>,
+) -> Result<(usize, usize), SupabaseError> {
+    let fresh = fetch_score_batch(client, base_url, anon_key, secret_key).await?;
+    let fetched = fresh.entries.len();
+    let live_total = {
+        let _writer = writer_lock.lock().await;
+        live.apply_refresh(&fresh)
+    };
+    Ok((fetched, live_total))
+}
+
+async fn fetch_score_batch(
+    client: &reqwest::Client,
+    base_url: &str,
+    anon_key: &str,
+    secret_key: &str,
+) -> Result<Watchlist, SupabaseError> {
+    let (fresh, _) = supabase_reader::fetch(
+        client,
+        base_url,
+        anon_key,
+        secret_key,
+        MAX_ACTIVE_WATCHLIST_SIZE,
+    )
+    .await?;
+    Ok(fresh)
+}
+
+/// Establish a current score for every boot-live wallet before producers can read it.
+/// `apply_refresh` deliberately retains the replayed score of a wallet the current batch omits,
+/// so boot removes such a wallet from live only. It stays structural; the next ranked change
+/// decides its membership and can re-admit it with a current score.
+pub async fn boot_refresh_scores_and_release(
+    live: &LiveWatchlist,
+    client: &reqwest::Client,
+    base_url: &str,
+    anon_key: &str,
+    secret_key: &str,
+    writer_lock: &Mutex<()>,
+    producer_start: &watch::Sender<bool>,
+) -> Result<(), BootScoreRefreshError> {
+    let fresh = fetch_score_batch(client, base_url, anon_key, secret_key).await?;
+    apply_boot_scores_and_release(live, &fresh, writer_lock, producer_start).await
+}
+
+async fn apply_boot_scores_and_release(
+    live: &LiveWatchlist,
+    fresh: &Watchlist,
+    writer_lock: &Mutex<()>,
+    producer_start: &watch::Sender<bool>,
+) -> Result<(), BootScoreRefreshError> {
+    let _writer = writer_lock.lock().await;
+    let fetched_wallets = fresh
+        .entries
+        .iter()
+        .map(|entry| entry.wallet)
+        .collect::<HashSet<_>>();
+    let unscored = live
+        .snapshot()
+        .entries
+        .iter()
+        .map(|entry| entry.wallet)
+        .filter(|wallet| !fetched_wallets.contains(wallet))
+        .collect::<HashSet<_>>();
+    if !unscored.is_empty() {
+        warn!(
+            wallets = unscored.len(),
+            "boot score refresh: wallets absent from the current batch leave live until a ranked change"
+        );
+        live.remove_fenced(&unscored);
+    }
+    live.apply_refresh(fresh);
+    producer_start
+        .send(true)
+        .map_err(|_| BootScoreRefreshError::ProducerGateClosed)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ProjectionEntry {
@@ -449,25 +543,20 @@ pub async fn run_supabase_refresh_loop(
             _ = ticker.tick() => {
                 let mut next_projection = retry_projection;
                 if refresh_enabled {
-                    let fetch_limit = MAX_ACTIVE_WATCHLIST_SIZE;
-                    match supabase_reader::fetch(
+                    match refresh_scores_once(
+                        &live,
                         &client,
                         &base_url,
                         &anon_key,
                         &secret_key,
-                        fetch_limit,
+                        &writer_lock,
                     ).await {
-                        Ok((fresh, _last_trade)) => {
-                            let fetched = fresh.entries.len();
-                            let live_total = {
-                                let _writer = writer_lock.lock().await;
-                                live.apply_refresh(&fresh)
-                            };
+                        Ok((fetched, live_total)) => {
                             // Consume the generation emitted by `apply_refresh`: this branch
                             // already schedules that newest snapshot and must not project it twice.
                             dirty.borrow_and_update();
                             next_projection = true;
-                            info!(fetch_limit, fetched, live_total, "live watchlist refreshed from supabase");
+                            info!(fetch_limit = MAX_ACTIVE_WATCHLIST_SIZE, fetched, live_total, "live watchlist refreshed from supabase");
                         }
                         Err(error) => {
                             warn!(%error, "supabase refresh failed; keeping current watchlist");
@@ -488,6 +577,97 @@ pub type RefreshError = SupabaseError;
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    use pe_core_types::{BasisPoints, ReconstructionQuality, SourceTimestamp};
+    use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
+
+    fn boot_live(wallet: WalletAddress, win_rate_bps: i32) -> LiveWatchlist {
+        LiveWatchlist::new(Watchlist {
+            entries: vec![WatchlistEntry {
+                wallet,
+                tier: WatchlistTier::Active,
+                leader_score_bps: BasisPoints(100),
+                lcb_5pct_bps: BasisPoints(0),
+                win_rate_bps: BasisPoints(win_rate_bps),
+                closed_trades_in_window: 0,
+                reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+            }],
+            snapshot_at: SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
+            active_count: 1,
+            incubator_count: 0,
+        })
+    }
+
+    #[tokio::test]
+    async fn boot_reentry_score_is_current_before_first_producer_read() {
+        let wallet = WalletAddress([41; 20]);
+        // A live-only reentry used a newer score, while replay still starts from the old entry.
+        let prior_live = boot_live(wallet, 6_000);
+        prior_live.remove_fenced(&HashSet::from([wallet]));
+        let mut reentry = boot_live(wallet, 8_500).snapshot().entries[0].clone();
+        reentry.leader_score_bps = BasisPoints(900);
+        prior_live.replace(&HashSet::new(), &[reentry], 1);
+        assert_eq!(
+            prior_live.snapshot().entries[0].win_rate_bps,
+            BasisPoints(8_500)
+        );
+        let restarted = boot_live(wallet, 6_000);
+        let fresh = boot_live(wallet, 8_500).snapshot();
+        let (start, mut ready) = watch::channel(false);
+        let producer_live = restarted.clone();
+        let producer = tokio::spawn(async move {
+            ready.wait_for(|started| *started).await.unwrap();
+            producer_live.snapshot().entries[0].win_rate_bps
+        });
+        tokio::task::yield_now().await;
+        assert!(!producer.is_finished());
+        apply_boot_scores_and_release(&restarted, &fresh, &Mutex::new(()), &start)
+            .await
+            .unwrap();
+        assert_eq!(producer.await.unwrap(), BasisPoints(8_500));
+    }
+
+    #[tokio::test]
+    async fn failing_boot_score_fetch_does_not_release_producers() {
+        let live = boot_live(WalletAddress([42; 20]), 6_000);
+        let (start, ready) = watch::channel(false);
+        let result = boot_refresh_scores_and_release(
+            &live,
+            &reqwest::Client::new(),
+            "not a URL",
+            "anon",
+            "",
+            &Mutex::new(()),
+            &start,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(BootScoreRefreshError::Fetch(SupabaseError::Transport(_)))
+        ));
+        assert!(!*ready.borrow());
+        assert_eq!(live.snapshot().entries[0].win_rate_bps, BasisPoints(6_000));
+    }
+
+    #[tokio::test]
+    async fn boot_batch_missing_live_wallet_leaves_live_only() {
+        let wallet = WalletAddress([43; 20]);
+        let live = boot_live(wallet, 6_000);
+        let structural = live.structural_membership();
+        let fresh = boot_live(WalletAddress([44; 20]), 8_500).snapshot();
+        let (start, ready) = watch::channel(false);
+        apply_boot_scores_and_release(&live, &fresh, &Mutex::new(()), &start)
+            .await
+            .unwrap();
+        assert!(*ready.borrow());
+        assert!(
+            live.snapshot()
+                .entries
+                .iter()
+                .all(|entry| entry.wallet != wallet)
+        );
+        assert_eq!(live.structural_membership(), structural);
+    }
 
     #[test]
     fn rpc_payload_has_score_owner_fields() {

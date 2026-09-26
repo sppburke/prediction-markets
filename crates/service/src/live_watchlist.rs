@@ -244,7 +244,8 @@ impl LiveWatchlist {
         total
     }
 
-    /// Remove a monotonic durable-fence set without admitting replacements.
+    /// Remove wallets from the live projection only (durable fences, boot ineligibility or a
+    /// missing boot score) without admitting replacements; structural membership is unchanged.
     /// Caller holds the structural writer lock (#544).
     pub fn remove_fenced(&self, fenced: &HashSet<WalletAddress>) -> usize {
         if fenced.is_empty() {

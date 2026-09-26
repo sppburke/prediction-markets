@@ -57,7 +57,9 @@ use pe_service::runtime_config::{
 use pe_service::snapshot_worker::{SnapshotHandle, run_snapshot_worker};
 use pe_service::supabase_backfill::backfill_supabase;
 use pe_service::supabase_reader;
-use pe_service::supabase_refresh::{WatchlistProjectionStatus, run_supabase_refresh_loop};
+use pe_service::supabase_refresh::{
+    WatchlistProjectionStatus, boot_refresh_scores_and_release, run_supabase_refresh_loop,
+};
 use pe_service::supabase_sink::{SinkHandle, SupabaseWriter, run_sink};
 use pe_service::supabase_state::{
     SourceEvidence, SupabaseStateClient, reconcile_active_financial_frames,
@@ -1492,9 +1494,19 @@ async fn main() -> Result<()> {
             .map_err(anyhow::Error::msg)
             .context("synchronize boot risk halt release")?;
     }
-    producer_start_tx
-        .send(true)
-        .map_err(|_| anyhow::anyhow!("source producer start gate closed"))?;
+    // Replayed membership can carry a score from an earlier ranking batch, including after a
+    // live-only reentry. Refresh every boot-live score before any source producer can read it.
+    boot_refresh_scores_and_release(
+        &live_watchlist,
+        &ranking_client,
+        &cfg.supabase_url,
+        &cfg.supabase_anon_key,
+        &cfg.supabase_secret_key,
+        &watchlist_writer_lock,
+        &producer_start_tx,
+    )
+    .await
+    .context("establish current boot watchlist scores before releasing producers")?;
 
     // Cumulative authoritative-RPC counter for status.json — grabbed before `supabase_state`
     // is moved into the resolution task below; `None` when not in authoritative mode.

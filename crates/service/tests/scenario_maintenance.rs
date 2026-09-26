@@ -42,6 +42,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pe_core_types::{BasisPoints, ReconstructionQuality, SourceTimestamp, WalletAddress};
 use pe_paper_state::{AnchorInstallRecord, PaperStateDb, WalletHistoryStatusRecord};
@@ -63,7 +64,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tempfile::TempDir;
 use time::OffsetDateTime;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 fn capacity(target: usize) -> (AppliedWatchlistCapacity, WatchlistCapacityEpoch) {
     let applied = AppliedWatchlistCapacity::new(target);
@@ -75,6 +76,15 @@ fn membership_preparer(
     live: LiveWatchlist,
     paper_state: Arc<PaperStateDb>,
     writer_lock: Arc<Mutex<()>>,
+) -> AdmissionPreparer {
+    membership_preparer_counted(live, paper_state, writer_lock, None)
+}
+
+fn membership_preparer_counted(
+    live: LiveWatchlist,
+    paper_state: Arc<PaperStateDb>,
+    writer_lock: Arc<Mutex<()>>,
+    publications: Option<Arc<AtomicUsize>>,
 ) -> AdmissionPreparer {
     let (control, mut commands) = mpsc::channel(1);
     let control_paper = paper_state.clone();
@@ -113,6 +123,9 @@ fn membership_preparer(
                 change.capacity,
             );
             checks.commit_capacity();
+            if let Some(publications) = &publications {
+                publications.fetch_add(1, Ordering::SeqCst);
+            }
             acknowledged
                 .send(Ok(pe_event_log::AppendReceipt {
                     sequence: pe_core_types::EventSeq(1),
@@ -283,12 +296,39 @@ async fn rerank_dropped_wallet_cannot_reenter_after_preparation() {
     let live = LiveWatchlist::new(watchlist(vec![entry(retained, 200), entry(dropped, 100)]));
     live.remove_fenced(&HashSet::from([dropped]));
     let lock = Arc::new(Mutex::new(()));
+    let (control, mut commands) = mpsc::channel(1);
+    let (preparing, prepared) = oneshot::channel();
+    let (release, released) = oneshot::channel();
+    let relay = tokio::spawn(async move {
+        if let Some(OrchestratorControl::PrepareAdmissions {
+            wallets,
+            acknowledged,
+        }) = commands.recv().await
+        {
+            assert_eq!(wallets, vec![dropped]);
+            preparing.send(()).unwrap();
+            released.await.unwrap();
+            acknowledged.send(()).unwrap();
+        } else {
+            panic!("expected reentry preparation");
+        }
+    });
+    let reentry_preparer = AdmissionPreparer::new(control, Arc::clone(&db));
+    let reentry =
+        tokio::spawn(async move { reentry_preparer.prepare_live_reentries(&[dropped]).await });
+    prepared.await.unwrap();
+    let publications = Arc::new(AtomicUsize::new(0));
     let (applied, epoch) = capacity(2);
     let (size, removed) = apply_full_rerank_swap(
         &live,
         &db,
         &lock,
-        &membership_preparer(live.clone(), Arc::clone(&db), lock.clone()),
+        &membership_preparer_counted(
+            live.clone(),
+            Arc::clone(&db),
+            lock.clone(),
+            Some(Arc::clone(&publications)),
+        ),
         MembershipPublication {
             reason: MembershipReason::FullRerank,
             ranking_batch_id: Some(85),
@@ -298,14 +338,22 @@ async fn rerank_dropped_wallet_cannot_reenter_after_preparation() {
         epoch,
         &[entry(retained, 300)],
         &HashMap::new(),
-        &[dropped],
+        &[],
     )
     .await
     .unwrap();
     assert_eq!(size, 1);
     assert_eq!(removed, vec![dropped]);
+    release.send(()).unwrap();
+    let prepared = reentry.await.unwrap();
+    assert_eq!(prepared, vec![dropped]);
+    let _writer = lock.lock().await;
+    scenario_apply_live_reentries(&live, &db, &prepared, &[entry(dropped, 900)], 2);
     assert_eq!(live.structural_membership(), HashSet::from([retained]));
+    assert_eq!(live.snapshot().entries.len(), 1);
     assert_eq!(live.snapshot().entries[0].wallet, retained);
+    assert_eq!(publications.load(Ordering::SeqCst), 1);
+    relay.await.unwrap();
 }
 
 #[tokio::test]

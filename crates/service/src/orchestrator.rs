@@ -280,6 +280,13 @@ pub struct ScenarioHooks {
     pub fail_next_halt_append: std::sync::atomic::AtomicBool,
     /// Stop after the accepted checkpoint, before any new FinancialPrepared is durable.
     pub fail_next_prepared_append: std::sync::atomic::AtomicBool,
+    /// Pause after a synchronized membership append, before either in-memory set is changed.
+    pub pause_after_membership_append: std::sync::Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
 }
 
 pub struct Orchestrator<
@@ -1449,6 +1456,18 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     .collect::<Vec<_>>();
                 let receipt = self.append_paper_record(&change.clone().into_record());
                 if receipt.is_ok() {
+                    #[cfg(feature = "scenario")]
+                    if let Some(hooks) = &self.scenario_hooks {
+                        let pause = hooks
+                            .pause_after_membership_append
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .take();
+                        if let Some((entered, release)) = pause {
+                            let _ = entered.send(());
+                            let _ = release.await;
+                        }
+                    }
                     self.live_watchlist
                         .commit_structural_change(&change.removed, &change.added);
                     self.live_watchlist.replace(&removed, &additions, capacity);
