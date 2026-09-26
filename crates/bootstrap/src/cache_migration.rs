@@ -12,7 +12,9 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr as _;
+use std::sync::mpsc::{Receiver, sync_channel};
 use std::sync::{Arc, OnceLock};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use futures::{StreamExt as _, stream};
@@ -3001,7 +3003,7 @@ fn activity_identity(connection: &Connection) -> Result<ActivityIdentity, Bootst
 fn prepare_activity_manifest(
     transaction: &rusqlite::Transaction<'_>,
     finalized_at_unix: i64,
-    mut consume: impl FnMut(&str, &[ActivityAggregate]),
+    mut consume: impl FnMut(&str, Vec<ActivityAggregate>),
 ) -> Result<(ActivityCoverageManifestV2, bool), BootstrapError> {
     let ActivityIdentity {
         generation,
@@ -3018,7 +3020,7 @@ fn prepare_activity_manifest(
             validation.visit(scan, transaction, generation_i64, receipt, |aggregate| {
                 aggregates.push(aggregate);
             })?;
-            consume(&receipt.wallet_hex, &aggregates);
+            consume(&receipt.wallet_hex, aggregates);
             Ok(())
         };
         if let Some(manifest) = stored_activity_manifest(transaction, generation)? {
@@ -3100,22 +3102,62 @@ fn rebuild_ranker_projection(
         Ok(projection) => (Some(projection), None),
         Err(error) => (None, Some(error)),
     };
-    let (manifest, needs_install) =
-        prepare_activity_manifest(transaction, finalized_at_unix, |wallet, aggregates| {
-            if projection_error.is_none()
-                && let Some((payout_markets, quality, insert)) = projection.as_mut()
-            {
-                projection_error = project_loaded_wallet(
-                    wallet,
-                    aggregates,
-                    generation,
-                    payout_markets,
-                    *quality,
-                    insert,
-                )
-                .err();
-            }
-        })?;
+    let prepared = thread::scope(|scope| {
+        let Some((payout_markets, quality, insert)) = projection.as_mut() else {
+            return prepare_activity_manifest(transaction, finalized_at_unix, |_, _| {});
+        };
+        let (send_input, input) = sync_channel::<(String, Vec<ActivityAggregate>)>(1);
+        let (send_output, output) = sync_channel::<Result<Vec<String>, BootstrapError>>(1);
+        let payout_markets: &PayoutTokens = payout_markets;
+        let quality = *quality;
+        if let Err(error) = thread::Builder::new()
+            .name("projection-classify".to_owned())
+            .spawn_scoped(scope, move || {
+                while let Ok((wallet, aggregates)) = input.recv() {
+                    if send_output
+                        .send(classify_loaded_wallet(
+                            &wallet,
+                            &aggregates,
+                            payout_markets,
+                            quality,
+                        ))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            })
+        {
+            projection_error = Some(error.into());
+        }
+        let mut pending = false;
+        // Validate wallet k+1 while the worker classifies k, then insert k's
+        // ids before handing off k+1 so projection order stays unchanged.
+        let prepared =
+            prepare_activity_manifest(transaction, finalized_at_unix, |wallet, aggregates| {
+                if projection_error.is_some() {
+                    return;
+                }
+                if pending {
+                    projection_error = insert_classified_wallet(&output, insert, generation).err();
+                    pending = false;
+                }
+                if projection_error.is_none() {
+                    if send_input.send((wallet.to_owned(), aggregates)).is_ok() {
+                        pending = true;
+                    } else {
+                        projection_error = Some(BootstrapError::Internal);
+                    }
+                }
+            });
+        drop(send_input);
+        if prepared.is_ok() && pending && projection_error.is_none() {
+            projection_error = insert_classified_wallet(&output, insert, generation).err();
+        }
+        for _ in output {}
+        prepared
+    });
+    let (manifest, needs_install) = prepared?;
     // Content/receipt/manifest validation failures retain precedence over SQL
     // errors. Return a deferred projection error before installing the manifest:
     // SQLite may already have rolled back the transaction, so later writes could
@@ -3138,20 +3180,34 @@ fn rebuild_ranker_projection(
 // venue page that lists them.
 type PayoutTokens = BTreeMap<String, (Vec<String>, String)>;
 
+fn insert_classified_wallet(
+    output: &Receiver<Result<Vec<String>, BootstrapError>>,
+    insert: &mut rusqlite::Statement<'_>,
+    generation: i64,
+) -> Result<(), BootstrapError> {
+    let ids = output.recv().map_err(|_| BootstrapError::Internal)??;
+    for id in ids {
+        insert.execute(params![
+            id,
+            generation,
+            i64::from(RANKER_CLASSIFIER_VERSION)
+        ])?;
+    }
+    Ok(())
+}
+
 // Aggregates retain the loader's (source_time_unix, source_trade_id) order.
 // Borrow contiguous seconds so classification uses the validated vector itself.
 //
 // After a redemption that needs a position anchor, live copies nothing until the
 // anchor arrives; history holds no anchors, so the projection admits nothing for
 // RANKER_REDEEM_PAUSE_SECS, the owner-accepted stand-in (#690).
-fn project_loaded_wallet(
+fn classify_loaded_wallet(
     wallet_hex: &str,
     aggregates: &[ActivityAggregate],
-    generation: i64,
     payout_markets: &PayoutTokens,
     quality: ReconstructionQuality,
-    insert: &mut rusqlite::Statement<'_>,
-) -> Result<(), BootstrapError> {
+) -> Result<Vec<String>, BootstrapError> {
     let wallet = WalletAddress::from_hex(wallet_hex).map_err(|error| BootstrapError::Invalid {
         message: format!("frozen universe contains invalid wallet {wallet_hex}: {error}"),
     })?;
@@ -3159,10 +3215,11 @@ fn project_loaded_wallet(
     // touches, so each second runs against those balances alone; cloning the
     // wallet's whole map every second is quadratic in its history.
     let mut positions = HashMap::new();
-    let mut history = BTreeSet::<String>::new();
+    let mut history = HashSet::<String>::new();
     // Conditions whose balances only a live anchor could restore.
-    let mut redeemed = BTreeSet::<String>::new();
+    let mut redeemed = HashSet::<String>::new();
     let mut paused_until = i64::MIN;
+    let mut admitted_ids = Vec::new();
     for aggregates in aggregates.chunk_by(|a, b| a.source_time == b.source_time) {
         let Some(epoch) = aggregates
             .first()
@@ -3243,11 +3300,7 @@ fn project_loaded_wallet(
             });
             if complete_identifiers {
                 validate_g2_id(&decision.source_trade_id.0)?;
-                insert.execute(params![
-                    decision.source_trade_id.0,
-                    generation,
-                    i64::from(RANKER_CLASSIFIER_VERSION)
-                ])?;
+                admitted_ids.push(decision.source_trade_id.0.clone());
             }
         }
         if ledger.apply_all_or_none(&mutations).is_err() {
@@ -3276,7 +3329,7 @@ fn project_loaded_wallet(
             paused_until = epoch.saturating_add(RANKER_REDEEM_PAUSE_SECS);
         }
     }
-    Ok(())
+    Ok(admitted_ids)
 }
 
 // As live does with token metadata, rebind a trade or redemption to its asset's
@@ -4148,18 +4201,20 @@ fn stage_report(
 pub fn activate_cache_v2(
     request: &CacheActivationRequest,
 ) -> Result<CacheActivationReport, BootstrapError> {
-    activate_cache_v2_with_handoff(request, None, None)
+    activate_cache_v2_with_handoff(request, None, None, None)
 }
 
 /// Install a finalized cache while accepting a verified shell lock handoff.
 /// Direct callers use [`activate_cache_v2`] and retain the full Rust-owned
 /// loop/run/cache lock stack. `final_stage_record` is the finalization record
 /// that hashed the candidate; with it, the candidate's stored projection digest
-/// is proven by that record instead of being recomputed (#682).
+/// is proven by that record instead of being recomputed (#682). An accepted
+/// `installed_request` proves the outgoing cache's activity on its staged bytes.
 pub fn activate_cache_v2_with_handoff(
     request: &CacheActivationRequest,
     handoff: Option<&ForgeLockHandoff>,
     final_stage_record: Option<&Path>,
+    installed_request: Option<&Path>,
 ) -> Result<CacheActivationReport, BootstrapError> {
     let _locks = ForgeActivationLocks::acquire_with_handoff(&request.fixed_path, handoff)?;
     let _candidate_lock = request
@@ -4176,7 +4231,7 @@ pub fn activate_cache_v2_with_handoff(
     if request.stage_evidence_sha256.is_some()
         || cache_stage_evidence_path(&request.side_path).exists()
     {
-        return activate_two_file_cycle(request, projection);
+        return activate_two_file_cycle(request, projection, installed_request);
     }
     require_regular_file(&request.fixed_path, "current fixed cache")?;
     validate_hex_sha256(&request.expected_side_sha256, "expected side sha256")?;
@@ -4193,7 +4248,12 @@ pub fn activate_cache_v2_with_handoff(
         let installed = open_existing_ro(&request.fixed_path)?;
         require_schema(&installed, CACHE_SCHEMA_VERSION_V2)?;
         quick_check(&installed, "activation_missing_side", &request.fixed_path)?;
-        verify_finalized_v2_manifests(&installed, ClassifierGeneration::Current, projection)?;
+        verify_finalized_v2_manifests(
+            &installed,
+            ClassifierGeneration::Current,
+            projection,
+            false,
+        )?;
         installed.close().map_err(|(_, error)| error)?;
         reject_nonempty_sidecars(&request.fixed_path)?;
         return Ok(CacheActivationReport {
@@ -4234,6 +4294,7 @@ pub fn activate_cache_v2_with_handoff(
             &current,
             ClassifierGeneration::Historical,
             ProjectionDigest::Recompute,
+            false,
         )?,
         other => return invalid(format!("unsupported prior cache schema {other}")),
     }
@@ -4283,7 +4344,7 @@ pub fn activate_cache_v2_with_handoff(
     let side = open_existing_ro(&request.side_path)?;
     require_schema(&side, CACHE_SCHEMA_VERSION_V2)?;
     quick_check(&side, "activation_candidate", &request.side_path)?;
-    verify_finalized_v2_manifests(&side, ClassifierGeneration::Current, projection)?;
+    verify_finalized_v2_manifests(&side, ClassifierGeneration::Current, projection, false)?;
     side.close().map_err(|(_, error)| error)?;
     // The read-only validation of a WAL-mode main may itself allocate an SHM index. With the
     // pre-open sidecar rejection above complete, only nonempty WAL frames can add durable state;
@@ -4396,7 +4457,12 @@ fn validate_installed_candidate(
     }
     require_schema(&connection, CACHE_SCHEMA_VERSION_V2)?;
     quick_check(&connection, phase, path)?;
-    verify_finalized_v2_manifests(&connection, ClassifierGeneration::Current, projection)?;
+    verify_finalized_v2_manifests(
+        &connection,
+        ClassifierGeneration::Current,
+        projection,
+        false,
+    )?;
     connection.close().map_err(|(_, error)| error)?;
     Ok(())
 }
@@ -4404,6 +4470,7 @@ fn validate_installed_candidate(
 fn activate_two_file_cycle(
     request: &CacheActivationRequest,
     projection: ProjectionDigest<'_>,
+    installed_request: Option<&Path>,
 ) -> Result<CacheActivationReport, BootstrapError> {
     let evidence = bound_stage_evidence(request)?;
     if restore_marker_path(&request.side_path).exists() {
@@ -4438,6 +4505,10 @@ fn activate_two_file_cycle(
             }
             let mut current = open_existing_rw(fixed)?;
             checkpoint_truncate(&current)?;
+            // An accepted activation already verified the activity at H0; the
+            // H0 comparison below binds that proof to these bytes (#692).
+            let activity_proven = evidence.source_schema == CACHE_SCHEMA_VERSION_V2
+                && installed_by(installed_request, fixed, &evidence.source_sha256)?;
             match evidence.source_schema {
                 0 | CACHE_SCHEMA_VERSION_V1 => require_reclamation_ready(&current)?,
                 CACHE_SCHEMA_VERSION_V2 => {
@@ -4449,6 +4520,7 @@ fn activate_two_file_cycle(
                         &hold,
                         ClassifierGeneration::Historical,
                         ProjectionDigest::Committed(fixed),
+                        activity_proven,
                     )?;
                     hold.rollback()?;
                 }
@@ -4459,6 +4531,13 @@ fn activate_two_file_cycle(
             // against the durable H0, never against a freshly captured baseline.
             if sha256_file(fixed)? != evidence.source_sha256 {
                 return invalid("fixed cache differs from recorded staging baseline; activation refused before displacement".to_owned());
+            }
+            if activity_proven {
+                tracing::info!(
+                    path = %fixed.display(),
+                    sha256 = %evidence.source_sha256,
+                    "activation outgoing activity verification skipped: an accepted activation installed these bytes"
+                );
             }
             if evidence.source_schema != CACHE_SCHEMA_VERSION_V2 {
                 let report =
@@ -5076,6 +5155,7 @@ fn verified_cache_schema(path: &Path) -> Result<i64, BootstrapError> {
             &connection,
             ClassifierGeneration::Historical,
             ProjectionDigest::Recompute,
+            false,
         )?,
         other => return invalid(format!("prior cache has unsupported schema {other}")),
     }
@@ -5158,6 +5238,7 @@ fn verify_finalized_v2_manifests(
     connection: &Connection,
     generation: ClassifierGeneration,
     projection: ProjectionDigest<'_>,
+    activity_proven: bool,
 ) -> Result<(), BootstrapError> {
     if required_max(connection, "sealed_generation_manifests", "generation")? != 1 {
         return invalid("installed cache has an invalid sealed generation".to_owned());
@@ -5170,13 +5251,17 @@ fn verify_finalized_v2_manifests(
         fixed_end_unix,
         wallets,
     } = activity_identity(connection)?;
-    completed_activity_manifest(
-        connection,
-        activity_generation,
-        &reference_sha256,
-        fixed_end_unix,
-        &wallets,
-    )?
+    if activity_proven {
+        stored_activity_manifest(connection, activity_generation)?
+    } else {
+        completed_activity_manifest(
+            connection,
+            activity_generation,
+            &reference_sha256,
+            fixed_end_unix,
+            &wallets,
+        )?
+    }
     .ok_or_else(|| BootstrapError::Invalid {
         message: "installed cache has no matching activity manifest".to_owned(),
     })?;

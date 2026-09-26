@@ -617,7 +617,7 @@ async fn main() {
                                 prior_cache_backup_path,
                                 expected_side_sha256,
                                 stage_evidence_sha256: stage_evidence_sha256_arg,
-                            }, handoff.as_ref(), final_stage_record_arg.as_deref())
+                            }, handoff.as_ref(), final_stage_record_arg.as_deref(), installed_request_arg.as_deref())
                             .and_then(json_report)
                         },
                     ),

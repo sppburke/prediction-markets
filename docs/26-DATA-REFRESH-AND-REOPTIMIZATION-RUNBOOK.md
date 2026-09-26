@@ -685,11 +685,14 @@ handoff continues to acquire loop → run → cache itself.
 The wrapper also passes the cycle's final-stage record (`--final-stage-record`). The finalizer wrote
 it after computing or verifying the candidate's projection digest over exactly the bytes it hashed, so
 activation compares the candidate's stored projection summary with the record instead of recomputing
-the digest; it refuses a record of another format, schema, path or hash. Every other check — activity
-content and receipts, payout coverage, projection count and classifier agreement, and the outgoing
-cache's full verification — still runs. Without the record, activation recomputes the digest (#682).
-A schema-two outgoing cache recomputes its digest from the same eight read-only readers while
-activation holds its write lock without writing (#675).
+the digest; it refuses a record of another format, schema, path or hash. Candidate activity
+content and receipts, payout coverage, projection count and classifier agreement still run.
+For a schema-two outgoing cache, the wrapper passes the newest accepted candidate-lane request.
+When that cycle's accepted activation installed exactly the outgoing fixed main at staging's H0,
+activation skips its activity-manifest verification; otherwise it runs in full. The outgoing
+projection digest is always recomputed from the same eight read-only readers while activation
+holds its write lock without writing (#675). Without the final-stage record, activation also
+recomputes the candidate's digest (#682).
 
 Before the bound corrected batch becomes current, restore that exact prior cache by its recorded
 hash and schema. For a new cycle set `CACHE_PRIOR_BACKUP` to its `.displaced.db` (`D`) and
@@ -822,11 +825,13 @@ Finalization certifies exact bytes and activity, payout and projection evidence,
 every SQLite page. Damage outside those reads may now survive migration resume, the
 post-seal step and either finalization, wasting private collection/ranking work before
 activation refuses installation; fault localization is consequently later. Outgoing
-and retained backups keep hash/schema/manifest validation. New-layout activation and restoration
-move existing files; legacy fallback/audit copies remain hash-verified. Backups may contain preexisting damage:
+and retained backups keep hash and schema validation. Activation skips the outgoing
+activity-manifest verification only when an accepted activation installed exactly those H0 bytes;
+otherwise it runs in full. New-layout activation and restoration move existing files;
+legacy fallback/audit copies remain hash-verified. Backups may contain preexisting damage:
 the prior's restore-time check decides whether it is eligible for restoration, and
 post-rename hash equality carries that proof without another scan. All checkpoints,
-sidecar rejection, receipt/content digests, locks and publication gates remain in place;
+sidecar rejection, candidate receipt/content digests, locks and publication gates remain in place;
 hash equality proves byte identity, not health. `quick_check` itself does not check
 UNIQUE constraints or index-to-table agreement; no routine full `integrity_check` is added.
 
@@ -862,10 +867,11 @@ the installed cache is schema two, and for the one-time initial cutover when `.e
 opt-in changes and an outstanding legacy cycle completes under its original contract. In
 the lane, Step 0 is the sequence above (legacy `backfill`, `events` and `resolutions` read
 retired `trades`/`source_cursor` and do not run), followed by the existing cutover path:
-Parquet export, pass one, targeted `prices-history`, second finalization, candidate
-recapture into `candidate_cycle_manifest.json` (bound into pass two; `cycle_manifest.json`
-keeps the cycle's initial installed-cache watermark), `--prepare-only`, `cache-activate` and
-the exact `--resume-request`. The immutable staging baseline fixes the initial activity generation
+candidate capture into `candidate_cycle_manifest.json` alongside Parquet export, pass one and
+target emission, then targeted `prices-history` and second finalization. Pass two binds that
+capture; `cycle_manifest.json` keeps the cycle's initial installed-cache watermark. Then come
+`--prepare-only`, `cache-activate` and the exact `--resume-request`. The candidate snapshot stamps
+the UTC day when capture starts. The immutable staging baseline fixes the initial activity generation
 and payout target for new cycles; existing legacy cycles read those values from their prior. The activity owner resumes the candidate's recorded head, including a manually started or
 interrupted successor belonging to this cycle. If the completed initial head's age exceeds the
 publisher's unchanged `max_cache_staleness_hours`, the wrapper admits one linked top-up. Its persisted

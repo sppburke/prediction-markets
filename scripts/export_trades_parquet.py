@@ -86,16 +86,33 @@ def _table_exists(con, tbl: str) -> bool:
         return False
 
 
-def _typed_sqlite_query(con, query: str, typed_query: str) -> str:
+def _attached_columns(con, table: str) -> list[tuple[str, str]]:
+    """The attached SQLite table's ordered (name, type) list, from DuckDB's catalog.
+
+    Binding an attached table, even DESCRIBE or LIMIT 0, reads its smallest index
+    to count rows: minutes per bind on Forge's activity table (#692). The catalog
+    reports the same names, order and types without reading it.
+    """
+    columns = con.execute(
+        "SELECT column_name, data_type FROM duckdb_columns() "
+        "WHERE database_name = 'src' AND table_name = ? ORDER BY column_index",
+        [table],
+    ).fetchall()
+    if not columns:
+        raise ValueError(f"schema-two cache is missing required table {table}")
+    return columns
+
+
+def _typed_sqlite_query(query: str, attached: list[tuple[str, str]]) -> str:
     """Run SQL inside SQLite, restoring sqlite_scanner's BIGINT/VARCHAR types.
 
-    sqlite_query returns every column as VARCHAR, including integers. DESCRIBE
-    binds the equivalent attached-table query without scanning its source rows.
-    Reject fractional integer text before CAST (DuckDB otherwise rounds it),
-    and never use TRY_CAST: malformed integers must fail the export.
+    sqlite_query returns every column as VARCHAR, including integers; `attached`
+    is the table's catalog types (`_attached_columns`). Reject fractional integer
+    text before CAST (DuckDB otherwise rounds it), and never use TRY_CAST:
+    malformed integers must fail the export.
     """
     columns = []
-    for name, dtype, *_ in con.execute(f"DESCRIBE {typed_query}").fetchall():
+    for name, dtype in attached:
         if dtype not in ("BIGINT", "VARCHAR"):
             raise ValueError(f"unsupported SQLite export type {name}: {dtype}")
         quoted = '"' + name.replace('"', '""') + '"'
@@ -130,8 +147,8 @@ def _certified_activity_ranges() -> list[str]:
 
 
 def _copy_certified_activity(con, tmp: str, row_group_size: int) -> None:
-    queries = [_typed_sqlite_query(con, sql, "SELECT * FROM src.activity_groups_v2")
-               for sql in _certified_activity_ranges()]
+    attached = _attached_columns(con, "activity_groups_v2")
+    queries = [_typed_sqlite_query(sql, attached) for sql in _certified_activity_ranges()]
     shards = [f"{tmp}.{index}" for index in range(len(queries))]
 
     def copy(index: int) -> None:
@@ -337,8 +354,7 @@ def main() -> int:
     if schema >= 2:
         counts = {}
         for tbl in V2_TABLES:
-            if not _table_exists(con, tbl):
-                raise ValueError(f"schema-two cache is missing required table {tbl}")
+            _attached_columns(con, tbl)
             counts[tbl] = _export_table(con, a.out_dir, tbl, a.row_group_size)
         projection = _verify_v2_projection(con, a.out_dir)
         _write_v2_export_manifest(a.out_dir, counts, projection)

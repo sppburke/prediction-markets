@@ -1062,6 +1062,10 @@ class RankAndPushScenario(unittest.TestCase):
             f"--installed-request data/eval-results/{out.name}/ranking_publish_request.json",
             self._bootstrap_lines("cache-stage-v2")[1],
         )
+        self.assertIn(
+            f"--installed-request data/eval-results/{out.name}/ranking_publish_request.json",
+            self._bootstrap_lines("cache-activate")[1],
+        )
 
     def test_schema_two_prepares_then_activates_then_resumes_exact_request(self):
         """The corrected batch request is durable before cache activation and the
@@ -1798,6 +1802,87 @@ class RankAndPushScenario(unittest.TestCase):
         with (self.root / ".env").open("a") as handle:
             handle.write("PE_RANK_SCHEMA_TWO_CUTOVER=prepare\n")
         return fixed
+
+    def _install_candidate_capture_probe(self):
+        manifest = self.root / "scripts/rank_cycle_manifest.py"
+        manifest.rename(self.root / "scripts/_rank_cycle_manifest_real.py")
+        _write_exec(manifest, """#!/usr/bin/env python3
+import os, signal, subprocess, sys, time
+from pathlib import Path
+from _rank_cycle_manifest_real import *
+a = sys.argv[1:]
+if a and a[0] == 'capture' and '--output' in a and 'candidate_cycle_manifest' in a[a.index('--output') + 1]:
+    Path('capture_started').write_text(str(os.getpid()))
+    output = Path(a[a.index('--output') + 1])
+    if not (output.parent / 'cache_stage_record.json').is_file() or not (output.parent / 'cycle_configuration.json').is_file():
+        raise SystemExit(97)
+    mode = os.environ.get('STUB_CAPTURE_MODE', 'normal')
+    if mode == 'fail':
+        raise SystemExit(47)
+    if mode == 'block':
+        def stopped(_signal, _frame):
+            Path('capture_reaped').write_text('yes')
+            raise SystemExit(0)
+        signal.signal(signal.SIGTERM, stopped)
+        while True: time.sleep(0.01)
+    deadline = time.monotonic() + 5
+    while not (output.parent / 'oracle_targets.csv').is_file():
+        if time.monotonic() > deadline: raise SystemExit(96)
+        time.sleep(0.01)
+    result = subprocess.run([sys.executable, 'scripts/_rank_cycle_manifest_real.py', *a])
+    if result.returncode == 0: Path('capture_done').write_text('yes')
+    raise SystemExit(result.returncode)
+raise SystemExit(subprocess.run([sys.executable, 'scripts/_rank_cycle_manifest_real.py', *a]).returncode)
+""")
+        export = self.root / "scripts/export_trades_parquet.py"
+        body = export.read_text()
+        body = body.replace(
+            "import os, sys\n",
+            "import os, sys, time\nfrom pathlib import Path\n"
+            "deadline = time.monotonic() + 5\n"
+            "while not Path('capture_started').is_file():\n"
+            "    if time.monotonic() > deadline: raise SystemExit(95)\n"
+            "    time.sleep(0.01)\n",
+            1,
+        )
+        _write_exec(export, body)
+        bootstrap = self.root / "target/release/pe-bootstrap"
+        body = bootstrap.read_text().replace(
+            'if [[ "$1" == "prices-history" ]]; then\n',
+            'if [[ "$1" == "prices-history" ]]; then\n'
+            '  [[ -f capture_done ]] || exit 94\n',
+            1,
+        )
+        _write_exec(bootstrap, body)
+
+    def test_candidate_capture_overlaps_export_and_targets_then_finishes_before_fetch(self):
+        self._prepare_incremental_fixture(two_file=True)
+        self._install_candidate_capture_probe()
+        result = self._run()
+        self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
+        self.assertTrue((self.root / "capture_started").is_file())
+        self.assertTrue(self._log("export.log"))
+        self.assertTrue(self._log("rank.log"))
+        self.assertTrue((self.root / "capture_done").is_file())
+        self.assertIn("prices-history", self._bootstrap_ops())
+
+    def test_candidate_capture_failure_stops_before_price_fetch(self):
+        self._prepare_incremental_fixture(two_file=True)
+        self._install_candidate_capture_probe()
+        result = self._run(exit_env={"STUB_CAPTURE_MODE": "fail"})
+        self.assertEqual(result.returncode, 47, result.stderr + result.stdout)
+        self.assertTrue((self.root / "capture_started").is_file())
+        self.assertNotIn("prices-history", self._bootstrap_ops())
+
+    def test_export_failure_reaps_background_candidate_capture(self):
+        self._prepare_incremental_fixture(two_file=True)
+        self._install_candidate_capture_probe()
+        result = self._run(exit_env={"STUB_CAPTURE_MODE": "block", "STUB_EXIT_export": "1"})
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertTrue((self.root / "capture_reaped").is_file())
+        pid = int((self.root / "capture_started").read_text())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
 
     def test_stale_initial_head_gets_one_top_up_then_prepares(self):
         fixed = self._prepare_incremental_fixture()
