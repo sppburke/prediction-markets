@@ -2949,8 +2949,7 @@ mod paper_log_tests {
             .unwrap()
             .is_none()
         );
-        // Ordinary pre-Start boot selects from the observed survivor batch first, then
-        // removes durable fences from live without changing selected structural membership.
+        // Ordinary pre-Start boot filters durable fences before applying the cap.
         let fenced = WalletAddress([2; 20]);
         let benched = WalletAddress([3; 20]);
         let (selected, _) = crate::supabase_reader::select_membership(
@@ -2960,14 +2959,14 @@ mod paper_log_tests {
                 watchlist_entry(benched, 300),
             ]),
             HashMap::new(),
-            &HashSet::new(),
+            &HashSet::from([fenced]),
             2,
         );
         let pre_start_live = LiveWatchlist::new(selected);
         pre_start_live.remove_fenced(&HashSet::from([fenced]));
         assert_eq!(
             pre_start_live.structural_membership(),
-            HashSet::from([initial, fenced])
+            HashSet::from([initial, benched])
         );
         assert_eq!(
             pre_start_live
@@ -2976,7 +2975,7 @@ mod paper_log_tests {
                 .iter()
                 .map(|entry| entry.wallet)
                 .collect::<Vec<_>>(),
-            vec![initial]
+            vec![initial, benched]
         );
     }
 

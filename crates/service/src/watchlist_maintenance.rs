@@ -29,7 +29,8 @@
 //! [`MembershipMode`] selects who owns MEMBERSHIP between ranking batches:
 //!
 //! * [`MembershipMode::Knockout`] (legacy default) — hold-until-knockout: the ranking push
-//!   never changes membership; only the knockout+backfill above does.
+//!   never changes structural membership; knockout+backfill does. A batch transition can
+//!   restore a prepared structural wallet that was excluded from live at boot.
 //! * [`MembershipMode::FullRerank`] — the ranker owns membership at every batch: on a batch
 //!   TRANSITION the newest `latest_ranking` top-`cap` wholesale-REPLACES the live set
 //!   ([`apply_full_rerank_swap`]) — wallets re-earn their slot each push (run28 `docs/33` §5:
@@ -46,8 +47,8 @@
 //! has validated against durable reconciled history and the monotonic fence set. The publication
 //! lock repeats those checks; the causal positions bracket extends the same serialized attempt.
 //!
-//! The full-rerank read is pinned to the batch identifier that triggered the transition, so the
-//! rows applied and the marker committed always name one batch.
+//! Both modes pin transition reads to the batch identifier that triggered them, so the rows
+//! applied and the marker committed always name one batch.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -80,7 +81,7 @@ use crate::watchlist_admission::AdmissionPreparer;
 /// the maintenance loop is built once at startup, so changing the mode needs a restart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MembershipMode {
-    /// Hold-until-knockout (legacy): membership changes only via knockout + bench backfill.
+    /// Hold-until-knockout (legacy): structural membership changes only via knockout + backfill.
     #[default]
     Knockout,
     /// The newest ranking batch's top-`cap` replaces the live set on every batch transition.
@@ -957,21 +958,70 @@ async fn maintenance_tick(
 
     // 1. Ranking-batch step — UNCONDITIONAL, never coupled to local DB read health (the
     // legacy tick ran it first; a review finding on the first draft caught the reorder).
-    // Knockout mode: a fresh batch only clears the evicted-set so re-promoted wallets can
-    // return. FullRerank mode: a batch TRANSITION hands membership to the ranker —
+    // Knockout mode: a fresh batch clears the evicted-set and can restore prepared,
+    // structural wallets that are absent from live. FullRerank mode: a batch TRANSITION
+    // hands membership to the ranker —
     // wholesale swap to the new top-`cap`; the marker only advances on a successful swap
     // so a failed fetch retries next tick. Audit stats for dropped wallets are best-effort
     // decoration: a list_fills failure degrades the audit rows, never blocks the swap.
     match supabase_reader::fetch_latest_batch_id(client, base_url, anon_key, secret_key).await {
         Ok(latest) => match cfg.membership_mode {
             MembershipMode::Knockout => {
-                if latest.is_some() && latest != sync.marker {
-                    if sync.marker.is_some() {
-                        evicted.clear();
+                if let Some(batch_id) = latest
+                    && latest != sync.marker
+                {
+                    match supabase_reader::fetch_batch(
+                        client,
+                        base_url,
+                        anon_key,
+                        secret_key,
+                        batch_id,
+                        MAX_ACTIVE_WATCHLIST_SIZE,
+                    )
+                    .await
+                    {
+                        Ok((incoming, incoming_last_trade)) => match paper_state.wallet_fences() {
+                            Ok(records) => {
+                                let fenced =
+                                    records.into_iter().map(|record| record.wallet).collect();
+                                let (incoming, _) = supabase_reader::select_membership(
+                                    incoming,
+                                    incoming_last_trade,
+                                    &fenced,
+                                    cap,
+                                );
+                                let candidates =
+                                    planned_live_reentries(live, &incoming.entries, cap);
+                                let reentries = preparer.prepare_live_reentries(&candidates).await;
+                                let _writer = writer_lock.lock().await;
+                                if applied_capacity.load() == capacity_epoch {
+                                    apply_live_reentries(
+                                        live,
+                                        paper_state,
+                                        &reentries,
+                                        &incoming.entries,
+                                        cap,
+                                    );
+                                    if sync.marker.is_some() {
+                                        evicted.clear();
+                                    }
+                                    sync.marker = Some(batch_id);
+                                } else {
+                                    warn!(
+                                        batch_id,
+                                        "knockout: capacity changed during live reentry preparation; retrying batch"
+                                    );
+                                }
+                            }
+                            Err(error) => warn!(%error, batch_id,
+                                    "knockout: fence read failed; keeping batch marker for retry"),
+                        },
+                        Err(error) => warn!(%error, batch_id,
+                            "knockout: pinned batch fetch failed; keeping batch marker for retry"),
                     }
-                    sync.marker = latest;
                 }
-                // Knockout membership is never batch-applied, so there is nothing to re-sync.
+                // Knockout structural membership is never batch-applied, so there is no
+                // capacity-driven re-sync.
                 sync.capacity_generation = capacity_epoch.generation;
             }
             MembershipMode::FullRerank => {
@@ -2034,6 +2084,7 @@ mod tests {
             client: reqwest::Client,
             base_url: String,
             controls: Arc<StdMutex<ControlLog>>,
+            membership_publications: Arc<AtomicUsize>,
             _source_task: tokio::task::JoinHandle<()>,
             _source_triggers: mpsc::Receiver<ReconciliationTrigger>,
             _temp: TempDir,
@@ -2081,6 +2132,8 @@ mod tests {
             let (control_tx, mut control_rx) = mpsc::channel(2);
             let controls: Arc<StdMutex<ControlLog>> = Arc::new(StdMutex::new(Vec::new()));
             let (control_live, control_log) = (live.clone(), Arc::clone(&controls));
+            let membership_publications = Arc::new(AtomicUsize::new(0));
+            let publication_count = Arc::clone(&membership_publications);
             let fake_paper_state = Arc::clone(&paper_state);
             let verifier_source_log = source_log.clone();
             let state_path = temp.path().join("paper.db");
@@ -2145,6 +2198,7 @@ mod tests {
                             checks,
                             acknowledged,
                         } => {
+                            publication_count.fetch_add(1, Ordering::SeqCst);
                             if let Err(error) = checks.recheck_and_seed(
                                 &fake_paper_state,
                                 &control_live,
@@ -2221,6 +2275,7 @@ mod tests {
                 client: reqwest::Client::new(),
                 base_url,
                 controls,
+                membership_publications,
                 _source_task: source_task,
                 _source_triggers: source_triggers,
                 _temp: temp,
@@ -2395,6 +2450,43 @@ mod tests {
             assert_eq!(h.controls(), vec![(set(&[b]), set(&[a]))]);
             assert_eq!(members(&h.live), set(&[b]));
             assert_eq!(marker, Some(2));
+        }
+
+        #[tokio::test]
+        async fn knockout_batch_restores_structural_wallets_missing_from_live() {
+            let (deferred, present, newer) = (wallet(1), wallet(2), wallet(3));
+            for empty_after_boot in [false, true] {
+                let mut fake = Fake::new(Some(2));
+                fake.ranking_entries = vec![row(2, 1, deferred), row(2, 2, present)];
+                // The moving view has already advanced. Reentry must use batch 2's score.
+                fake.latest_ranking = vec![row(3, 1, newer)];
+                let h = harness(fake, &[deferred, present]).await;
+                let removed = if empty_after_boot {
+                    set(&[deferred, present])
+                } else {
+                    set(&[deferred])
+                };
+                h.live.remove_fenced(&removed);
+                assert_eq!(h.live.structural_membership(), set(&[deferred, present]));
+                assert_eq!(members(&h.live).is_empty(), empty_after_boot);
+                let (mut evicted, mut marker) = (HashSet::new(), Some(1));
+
+                h.tick(MembershipMode::Knockout, &mut evicted, &mut marker)
+                    .await;
+
+                assert_eq!(marker, Some(2));
+                assert_eq!(members(&h.live), set(&[deferred, present]));
+                assert_eq!(h.live.structural_membership(), set(&[deferred, present]));
+                let snapshot = h.live.snapshot();
+                let restored = snapshot
+                    .entries
+                    .iter()
+                    .find(|entry| entry.wallet == deferred)
+                    .unwrap();
+                assert_eq!(restored.leader_score_bps.0, 2_000);
+                assert_eq!(h.membership_publications.load(Ordering::SeqCst), 0);
+                assert_eq!(h.controls().len(), if empty_after_boot { 2 } else { 1 });
+            }
         }
 
         #[tokio::test]
