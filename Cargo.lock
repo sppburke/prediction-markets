@@ -3833,6 +3833,7 @@ dependencies = [
  "rusqlite",
  "rust_decimal",
  "rust_decimal_macros",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",

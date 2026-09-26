@@ -168,6 +168,7 @@ pub struct MembershipPublication {
 pub struct MembershipCommit {
     pub seeds: Vec<(WalletAddress, i64)>,
     pub capacity: Option<MembershipCapacityCheck>,
+    pub reentries: Vec<WalletAddress>,
 }
 
 #[derive(Debug)]
@@ -209,20 +210,16 @@ impl MembershipCommit {
             _ => {}
         }
         recheck_admissions(paper_state, &change.added)?;
-        let current = live.snapshot();
+        let current = live.structural_membership();
         let (removed, added) = match change.reason {
             MembershipReason::FullRerank | MembershipReason::CapacityChange => {
-                ranked_membership_change(&current.entries, replacements, change.capacity)
+                ranked_membership_change_set(&current, replacements, change.capacity)
             }
             _ => {
                 let removed: HashSet<_> = change.removed.iter().copied().collect();
                 let added =
-                    planned_admissions(&current.entries, &removed, replacements, change.capacity);
-                let removed = current
-                    .entries
-                    .iter()
-                    .filter_map(|entry| removed.contains(&entry.wallet).then_some(entry.wallet))
-                    .collect();
+                    planned_admission_wallets(&current, &removed, replacements, change.capacity);
+                let removed = current.intersection(&removed).copied().collect();
                 (removed, added)
             }
         };
@@ -279,6 +276,77 @@ fn recheck_admissions(
         }
     }
     Ok(())
+}
+
+pub(crate) fn planned_live_reentries(
+    live: &LiveWatchlist,
+    incoming: &[WatchlistEntry],
+    cap: usize,
+) -> Vec<WalletAddress> {
+    let structural = live.structural_membership();
+    let present = live
+        .snapshot()
+        .entries
+        .iter()
+        .map(|entry| entry.wallet)
+        .collect::<HashSet<_>>();
+    incoming
+        .iter()
+        .take(cap)
+        .filter(|entry| structural.contains(&entry.wallet) && !present.contains(&entry.wallet))
+        .map(|entry| entry.wallet)
+        .collect()
+}
+
+/// Caller holds the shared writer lock. Each wallet uses the entry in the applied batch;
+/// failed or superseded admissions remain outside live membership.
+pub(crate) fn apply_live_reentries(
+    live: &LiveWatchlist,
+    paper_state: &PaperStateDb,
+    prepared: &[WalletAddress],
+    applied_entries: &[WatchlistEntry],
+    cap: usize,
+) {
+    let structural = live.structural_membership();
+    let mut present = live
+        .snapshot()
+        .entries
+        .iter()
+        .map(|entry| entry.wallet)
+        .collect::<HashSet<_>>();
+    let prepared = prepared.iter().copied().collect::<HashSet<_>>();
+    let mut admitted = Vec::new();
+    for entry in applied_entries.iter().take(cap) {
+        if present.len() >= cap {
+            break;
+        }
+        let wallet = entry.wallet;
+        if !prepared.contains(&wallet) || !structural.contains(&wallet) || present.contains(&wallet)
+        {
+            continue;
+        }
+        if let Err(error) = recheck_admissions(paper_state, &[wallet]) {
+            warn!(%wallet, %error, "live-only reentry failed locked eligibility check");
+            continue;
+        }
+        present.insert(wallet);
+        admitted.push(entry.clone());
+    }
+    if !admitted.is_empty() {
+        live.replace(&HashSet::new(), &admitted, cap);
+    }
+}
+
+/// Mirror the locked live-only projection step in an external scenario publisher.
+#[cfg(feature = "scenario")]
+pub fn scenario_apply_live_reentries(
+    live: &LiveWatchlist,
+    paper_state: &PaperStateDb,
+    prepared: &[WalletAddress],
+    applied_entries: &[WatchlistEntry],
+    cap: usize,
+) {
+    apply_live_reentries(live, paper_state, prepared, applied_entries, cap);
 }
 
 fn recheck_publication_evidence(
@@ -490,16 +558,6 @@ fn knockout_causal_input(
     ))
 }
 
-fn planned_admissions(
-    current: &[WatchlistEntry],
-    removed: &HashSet<WalletAddress>,
-    candidates: &[WatchlistEntry],
-    cap: usize,
-) -> Vec<WalletAddress> {
-    let current = current.iter().map(|entry| entry.wallet).collect();
-    planned_admission_wallets(&current, removed, candidates, cap)
-}
-
 /// Pure wallet-identity owner for knockout/backfill admission selection. Qualification reuses
 /// this function against receipt-bound candidate rows.
 pub(crate) fn planned_admission_wallets(
@@ -536,8 +594,9 @@ pub(crate) fn planned_admission_wallets(
 /// this admission set under the writer lock, and the preparer installs exactly this set before
 /// the lock is taken, so the two can never disagree. Duplicate wallets and an incoming slice
 /// longer than `cap` (neither is produced by the `limit`-bounded ranking reads) resolve the same
-/// way on both sides because [`planned_admissions`] and [`LiveWatchlist::replace`] share the
+/// way on both sides because [`planned_admission_wallets`] and [`LiveWatchlist::replace`] share the
 /// same walk.
+#[cfg(test)]
 pub(crate) fn ranked_membership_change(
     current: &[WatchlistEntry],
     incoming: &[WatchlistEntry],
@@ -545,6 +604,16 @@ pub(crate) fn ranked_membership_change(
 ) -> (Vec<WalletAddress>, Vec<WalletAddress>) {
     let current_wallets: Vec<WalletAddress> = current.iter().map(|entry| entry.wallet).collect();
     ranked_membership_change_wallets(&current_wallets, incoming, cap)
+}
+
+pub(crate) fn ranked_membership_change_set(
+    current: &HashSet<WalletAddress>,
+    incoming: &[WatchlistEntry],
+    cap: usize,
+) -> (Vec<WalletAddress>, Vec<WalletAddress>) {
+    let mut wallets = current.iter().copied().collect::<Vec<_>>();
+    wallets.sort_unstable_by_key(|wallet| wallet.0);
+    ranked_membership_change_wallets(&wallets, incoming, cap)
 }
 
 /// Wallet-identity core of [`ranked_membership_change`]: the runtime passes its live entries,
@@ -612,26 +681,17 @@ pub async fn apply_evictions_and_backfill(
         return Err(stale_capacity_error(expected_capacity, applied));
     }
     remove_loaded_fences(live, paper_state)?;
-    let current = live.snapshot();
-    let admissions = planned_admissions(
-        &current.entries,
-        removed,
-        candidates,
-        expected_capacity.target,
-    );
-    let current_wallets = current
-        .entries
-        .iter()
-        .map(|entry| entry.wallet)
-        .collect::<HashSet<_>>();
+    let current = live.structural_membership();
+    let admissions =
+        planned_admission_wallets(&current, removed, candidates, expected_capacity.target);
     let mut actual_removed = removed
         .iter()
-        .filter(|wallet| current_wallets.contains(wallet))
+        .filter(|wallet| current.contains(wallet))
         .copied()
         .collect::<Vec<_>>();
     actual_removed.sort_unstable_by_key(|wallet| wallet.0);
     if actual_removed.is_empty() && admissions.is_empty() {
-        return Ok(current.entries.len());
+        return Ok(live.snapshot().entries.len());
     }
     let seeds = admission_seeds(&admissions, candidate_last_trade)?;
     drop(_guard);
@@ -652,6 +712,7 @@ pub async fn apply_evictions_and_backfill(
                     applied: applied_capacity.clone(),
                     expected: expected_capacity,
                 }),
+                reentries: Vec::new(),
             },
         )
         .await
@@ -675,15 +736,17 @@ pub(crate) async fn apply_ranked_membership_locked(
     cap: usize,
     writer_guard: MutexGuard<'_, ()>,
     capacity: Option<MembershipCapacityCheck>,
+    reentries: &[WalletAddress],
 ) -> Result<(usize, Vec<WalletAddress>), MembershipApplyError> {
     remove_loaded_fences(live, paper_state)?;
-    let current = live.snapshot();
-    let (dropped, admissions) = ranked_membership_change(&current.entries, incoming, cap);
+    let current = live.structural_membership();
+    let (dropped, admissions) = ranked_membership_change_set(&current, incoming, cap);
     if dropped.is_empty()
         && admissions.is_empty()
         && publication.reason != MembershipReason::CapacityChange
     {
-        return Ok((current.entries.len(), dropped));
+        apply_live_reentries(live, paper_state, reentries, incoming, cap);
+        return Ok((live.snapshot().entries.len(), dropped));
     }
     let seeds = admission_seeds(&admissions, incoming_last_trade)?;
     drop(writer_guard);
@@ -698,7 +761,11 @@ pub(crate) async fn apply_ranked_membership_locked(
                 evidence: publication.evidence,
             },
             incoming.to_vec(),
-            MembershipCommit { seeds, capacity },
+            MembershipCommit {
+                seeds,
+                capacity,
+                reentries: reentries.to_vec(),
+            },
         )
         .await
         .map_err(|error| MembershipApplyError::Publication(error.to_string()))?;
@@ -719,6 +786,7 @@ pub async fn apply_full_rerank_swap(
     expected_capacity: WatchlistCapacityEpoch,
     incoming: &[WatchlistEntry],
     incoming_last_trade: &HashMap<WalletAddress, i64>,
+    reentries: &[WalletAddress],
 ) -> Result<(usize, Vec<WalletAddress>), MembershipApplyError> {
     let _guard = writer_lock.lock().await;
     let applied = applied_capacity.load();
@@ -738,6 +806,7 @@ pub async fn apply_full_rerank_swap(
             applied: applied_capacity.clone(),
             expected: expected_capacity,
         }),
+        reentries,
     )
     .await
 }
@@ -940,8 +1009,8 @@ async fn maintenance_tick(
                                     &fenced,
                                     cap,
                                 );
-                            let (_, additions) = ranked_membership_change(
-                                &live.snapshot().entries,
+                            let (_, additions) = ranked_membership_change_set(
+                                &live.structural_membership(),
                                 &incoming.entries,
                                 cap,
                             );
@@ -950,6 +1019,10 @@ async fn maintenance_tick(
                                     "full_rerank: admission preparation failed; keeping membership and batch marker for retry");
                                 break 'replacement;
                             }
+                            let reentry_candidates =
+                                planned_live_reentries(live, &incoming.entries, cap);
+                            let reentries =
+                                preparer.prepare_live_reentries(&reentry_candidates).await;
                             let ranking_receipt = match preparer
                                 .record_ranking_membership(Some(batch_id), incoming.entries.clone())
                                 .await
@@ -997,6 +1070,7 @@ async fn maintenance_tick(
                                 capacity_epoch,
                                 &incoming.entries,
                                 &incoming_last_trade,
+                                &reentries,
                             )
                             .await
                             {
@@ -1101,7 +1175,8 @@ async fn maintenance_tick(
 
     // 4. Decide evictions. Nothing to do only when there are no evictions and the set is full.
     let evictions = decide_evictions(&live_snapshot, &stats.by_wallet, &cursors, cfg, now_unix);
-    if evictions.is_empty() && live_wallets.len() >= cap {
+    let structural_wallets = live.structural_membership();
+    if evictions.is_empty() && structural_wallets.len() >= cap {
         return;
     }
 
@@ -1113,12 +1188,12 @@ async fn maintenance_tick(
     }
 
     // 6. Fetch bench candidates for freed slots, excluding (live ∪ evicted), then atomic replace.
-    let survivors = live_wallets.len().saturating_sub(evictions.len());
+    let survivors = structural_wallets.len().saturating_sub(evictions.len());
     let freed = cap.saturating_sub(survivors);
     let (candidates, candidate_last_trade) = if let Some(batch_id) = sync.marker
         && freed > 0
     {
-        let exclude: Vec<WalletAddress> = live_wallets
+        let exclude: Vec<WalletAddress> = structural_wallets
             .iter()
             .copied()
             .chain(next_evicted.iter().copied())
@@ -1177,7 +1252,7 @@ async fn maintenance_tick(
     // epoch. Prepare exactly those wallets first (#542); on failure apply the decided evictions
     // with no backfill and let the next tick retry the freed slots.
     let removed: HashSet<WalletAddress> = next_evicted.iter().copied().collect();
-    let planned = planned_admissions(&live_snapshot.entries, &removed, &candidates, cap);
+    let planned = planned_admission_wallets(&structural_wallets, &removed, &candidates, cap);
     let (candidates, candidate_last_trade) = match preparer.prepare(&planned).await {
         Ok(()) => (candidates, candidate_last_trade),
         Err(error) => {
@@ -1187,7 +1262,7 @@ async fn maintenance_tick(
         }
     };
     let published_admissions =
-        planned_admissions(&live_snapshot.entries, &removed, &candidates, cap);
+        planned_admission_wallets(&structural_wallets, &removed, &candidates, cap);
 
     let Some(knockout_inputs) = evictions
         .iter()
@@ -1708,6 +1783,33 @@ mod tests {
     }
 
     #[test]
+    fn incident_shape_rerank_uses_all_structural_wallets() {
+        let wallet = |byte| WalletAddress([byte; 20]);
+        let entry = |wallet| WatchlistEntry {
+            wallet,
+            tier: pe_trader_index::WatchlistTier::Active,
+            leader_score_bps: pe_core_types::BasisPoints(100),
+            lcb_5pct_bps: pe_core_types::BasisPoints(100),
+            win_rate_bps: pe_core_types::BasisPoints(6_000),
+            closed_trades_in_window: 0,
+            reconstruction_quality: pe_core_types::ReconstructionQuality::new(100).unwrap(),
+        };
+        let structural = (1..=19).map(wallet).collect::<HashSet<_>>();
+        let live = (1..=13).map(wallet).collect::<HashSet<_>>();
+        let incoming = (20..=28)
+            .map(|byte| entry(wallet(byte)))
+            .collect::<Vec<_>>();
+        let (removed, added) = ranked_membership_change_set(&structural, &incoming, 100);
+        assert_eq!(removed.iter().copied().collect::<HashSet<_>>(), structural);
+        assert_eq!(added.len(), 9);
+        assert_eq!(live.len(), 13);
+        assert!(
+            planned_admission_wallets(&structural, &HashSet::new(), &[entry(wallet(19))], 100)
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn too_few_trades_not_spared_by_inactivity() {
         // A would-be winner with < min_trades is NOT a proven winner → evicted at 72h.
         let thin = stats(9, dec!(5), Some(dec!(0.20)), Some(dec!(0.40)));
@@ -2067,19 +2169,27 @@ mod tests {
                                 crate::qualification::verify_published_membership_change(
                                     &change.clone().into_record(),
                                     &verifier_source_log,
-                                    &control_live
-                                        .snapshot()
-                                        .entries
-                                        .iter()
-                                        .map(|entry| entry.wallet)
-                                        .collect(),
+                                    &control_live.structural_membership(),
                                 )
                             {
                                 acknowledged.send(Err(error.to_string())).unwrap();
                                 continue;
                             }
-                            let removed = change.removed.into_iter().collect::<HashSet<_>>();
-                            control_live.replace(&removed, &replacements, change.capacity);
+                            let removed = change.removed.iter().copied().collect::<HashSet<_>>();
+                            let additions = replacements
+                                .iter()
+                                .filter(|entry| change.added.contains(&entry.wallet))
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            control_live.commit_structural_change(&change.removed, &change.added);
+                            control_live.replace(&removed, &additions, change.capacity);
+                            apply_live_reentries(
+                                &control_live,
+                                &fake_paper_state,
+                                &checks.reentries,
+                                &replacements,
+                                change.capacity,
+                            );
                             checks.commit_capacity();
                             acknowledged
                                 .send(Ok(pe_event_log::AppendReceipt {

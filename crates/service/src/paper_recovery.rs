@@ -800,6 +800,104 @@ pub enum MembershipReplayError {
         "MembershipChanged source artifact disagrees with its reconstructed membership at sequence {sequence}"
     )]
     ReconstructionMismatch { sequence: u64 },
+    #[error("historical membership repair rejected: {0}")]
+    HistoricalException(#[from] HistoricalMembershipExceptionError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum HistoricalMembershipExceptionError {
+    #[error("paper frame identity or shape differs from the pinned sequence 28 record")]
+    Identity,
+    #[error("pinned sequence 28 repair wallet {0} is absent")]
+    MissingWallet(WalletAddress),
+    #[error("pinned sequence 28 repair wallet encoding is invalid: {0}")]
+    WalletEncoding(String),
+}
+
+pub(crate) struct HistoricalMembershipPin<'a> {
+    pub(crate) activation_id: &'a str,
+    pub(crate) sequence: u64,
+    pub(crate) this_hash: &'a str,
+    pub(crate) raw_payload_hash: &'a str,
+    pub(crate) wallets: [&'a str; 6],
+}
+
+const HISTORICAL_MEMBERSHIP_PIN: HistoricalMembershipPin<'static> = HistoricalMembershipPin {
+    activation_id: "act-557-62ed205-2",
+    sequence: 28,
+    this_hash: "d76e36115b72ef6b842c425f8bb082522a65ea85c0187a0d8d8c2591a6ea2b5b",
+    raw_payload_hash: "f472fd1aabb73cabc61f3f2baabf1d559a07165b115d05391b06dd20b7e228db",
+    wallets: [
+        "0x3925c4477052d34dc440068286ae693b728242fc",
+        "0x803a112b5eb1404eea463b26a2318cfcb3b9219e",
+        "0xb26dfe6953c9814f03b7f16ac4c717305b4673f7",
+        "0xf25de1a7357bbe92adf84ea58eff101375789d7a",
+        "0x27f738fe203827445690339104aae35b20bc44b0",
+        "0x40604cb1f958c03bea0b18aa43e4cb0d62f33ec3",
+    ],
+};
+
+pub(crate) fn repair_historical_membership(
+    activation_id: &str,
+    frame: &ScannedPaperFrame,
+    present: &mut HashSet<WalletAddress>,
+) -> Result<bool, HistoricalMembershipExceptionError> {
+    repair_historical_membership_with_pin(activation_id, frame, present, &HISTORICAL_MEMBERSHIP_PIN)
+}
+
+pub(crate) fn repair_historical_membership_with_pin(
+    activation_id: &str,
+    frame: &ScannedPaperFrame,
+    present: &mut HashSet<WalletAddress>,
+    pin: &HistoricalMembershipPin<'_>,
+) -> Result<bool, HistoricalMembershipExceptionError> {
+    let frame_hash = frame.receipt.this_hash.to_hex();
+    let payload_hash = frame.envelope.raw_payload_hash.to_hex();
+    if !(activation_id == pin.activation_id && frame.receipt.sequence.0 == pin.sequence)
+        && frame_hash.as_str() != pin.this_hash
+        && payload_hash.as_str() != pin.raw_payload_hash
+    {
+        return Ok(false);
+    }
+    let shape_matches_payload = match &frame.frame {
+        PaperLogFrame::Record(record) => {
+            serde_json::from_slice::<PaperLogRecord>(&frame.envelope.payload)
+                .is_ok_and(|decoded| decoded == *record)
+        }
+        PaperLogFrame::LegacyFill => false,
+    };
+    if activation_id != pin.activation_id
+        || frame.receipt.sequence.0 != pin.sequence
+        || frame_hash.as_str() != pin.this_hash
+        || payload_hash.as_str() != pin.raw_payload_hash
+        || !shape_matches_payload
+        || !matches!(
+            frame.frame,
+            PaperLogFrame::Record(PaperLogRecord::MembershipChanged {
+                reason: MembershipReason::FullRerank,
+                ..
+            })
+        )
+    {
+        return Err(HistoricalMembershipExceptionError::Identity);
+    }
+    let wallets = pin.wallets.map(|wallet| {
+        WalletAddress::from_hex(wallet)
+            .map_err(|error| HistoricalMembershipExceptionError::WalletEncoding(error.to_string()))
+    });
+    let wallets = wallets.into_iter().collect::<Result<Vec<_>, _>>()?;
+    if wallets.iter().copied().collect::<HashSet<_>>().len() != wallets.len() {
+        return Err(HistoricalMembershipExceptionError::Identity);
+    }
+    for wallet in &wallets {
+        if !present.contains(wallet) {
+            return Err(HistoricalMembershipExceptionError::MissingWallet(*wallet));
+        }
+    }
+    for wallet in wallets {
+        present.remove(&wallet);
+    }
+    Ok(true)
 }
 
 /// The structurally applied watchlist generation rebuilt from the durable paper prefix.
@@ -896,6 +994,16 @@ fn replay_membership_from(
         )
         .then_some(frame.receipt.sequence.0)
     }) else {
+        if start.activation_id == HISTORICAL_MEMBERSHIP_PIN.activation_id
+            && era
+                .frames
+                .iter()
+                .any(|frame| frame.receipt.sequence.0 >= HISTORICAL_MEMBERSHIP_PIN.sequence)
+        {
+            return Err(MembershipReplayError::HistoricalException(
+                HistoricalMembershipExceptionError::Identity,
+            ));
+        }
         return Ok(Some(ReplayedMembership {
             watchlist: watchlist_with_entries(start_batch, entries),
             last_ranking_batch_id,
@@ -915,6 +1023,9 @@ fn replay_membership_from(
     };
 
     for frame in &era.frames {
+        if repair_historical_membership(&start.activation_id, frame, &mut present)? {
+            entries.retain(|entry| present.contains(&entry.wallet));
+        }
         let PaperLogFrame::Record(
             record @ PaperLogRecord::MembershipChanged {
                 removed,
@@ -1898,6 +2009,88 @@ mod paper_log_tests {
         assert_eq!(frames[1].receipt.sequence, EventSeq(1));
     }
 
+    #[test]
+    fn historical_membership_exception_requires_exact_frame_and_six_wallets() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("synthetic-paper.log");
+        let mut writer = Writer::open(&path).unwrap();
+        let hex: [String; 6] =
+            std::array::from_fn(|index| format!("0x{}", format!("{:02x}", index + 1).repeat(20)));
+        let wallets = hex
+            .iter()
+            .map(|value| WalletAddress::from_hex(value).unwrap())
+            .collect::<Vec<_>>();
+        append(
+            &mut writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &PaperLogRecord::QualificationStarted(Box::new(start("test-activation"))),
+        );
+        append(
+            &mut writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &PaperLogRecord::MembershipChanged {
+                reason: MembershipReason::FullRerank,
+                removed: wallets.clone(),
+                added: Vec::new(),
+                capacity: 6,
+                ranking_batch_id: Some(7),
+                evidence: serde_json::json!({}),
+            },
+        );
+        let frames = scan_paper_log(&path).unwrap();
+        let frame = &frames[1];
+        let frame_hash = frame.receipt.this_hash.to_hex().to_string();
+        let payload_hash = frame.envelope.raw_payload_hash.to_hex().to_string();
+        let pin = HistoricalMembershipPin {
+            activation_id: "test-activation",
+            sequence: frame.receipt.sequence.0,
+            this_hash: &frame_hash,
+            raw_payload_hash: &payload_hash,
+            wallets: hex.each_ref().map(String::as_str),
+        };
+        let original = wallets.iter().copied().collect::<HashSet<_>>();
+        let mut present = original.clone();
+        assert!(
+            repair_historical_membership_with_pin("test-activation", frame, &mut present, &pin)
+                .unwrap()
+        );
+        assert!(present.is_empty());
+
+        let mut missing = original.clone();
+        missing.remove(&wallets[0]);
+        assert!(matches!(
+            repair_historical_membership_with_pin("test-activation", frame, &mut missing, &pin),
+            Err(HistoricalMembershipExceptionError::MissingWallet(_))
+        ));
+        assert_eq!(missing.len(), 5);
+        let mut moved = frame.clone();
+        moved.receipt.sequence = EventSeq(frame.receipt.sequence.0 + 1);
+        let mut wrong_hash = frame.clone();
+        wrong_hash.receipt.this_hash = blake3::hash(b"wrong frame");
+        let mut wrong_payload = frame.clone();
+        wrong_payload.envelope.raw_payload_hash = blake3::hash(b"wrong payload");
+        let mut wrong_shape = frame.clone();
+        if let PaperLogFrame::Record(PaperLogRecord::MembershipChanged { reason, .. }) =
+            &mut wrong_shape.frame
+        {
+            *reason = MembershipReason::CapacityChange;
+        }
+        for (era, candidate) in [
+            ("wrong-activation", frame),
+            ("test-activation", &moved),
+            ("test-activation", &wrong_hash),
+            ("test-activation", &wrong_payload),
+            ("test-activation", &wrong_shape),
+        ] {
+            let mut present = original.clone();
+            assert!(matches!(
+                repair_historical_membership_with_pin(era, candidate, &mut present, &pin),
+                Err(HistoricalMembershipExceptionError::Identity)
+            ));
+            assert_eq!(present, original);
+        }
+    }
+
     /// PASS: restart replays records built by all three production evidence constructors from
     /// their source-log artifacts and restores the exact final structural membership;
     /// FAIL: any production evidence variant is unreadable or replay consults moving ranking.
@@ -2076,13 +2269,13 @@ mod paper_log_tests {
         assert_eq!(replayed.watchlist.entries[0].wallet, first);
     }
 
-    fn spawn_membership_orchestrator(
+    fn membership_orchestrator(
         live: LiveWatchlist,
         paper_writer: Writer,
         paper_state: Arc<PaperStateDb>,
         control_rx: mpsc::Receiver<crate::orchestrator_control::OrchestratorControl>,
-    ) -> tokio::task::JoinHandle<()> {
-        let orchestrator = Orchestrator::new(
+    ) -> Orchestrator<FixtureFetcher, FixtureClobBookFetcher> {
+        Orchestrator::new(
             live.clone(),
             OrchestratorConfig {
                 bankroll: dec!(100),
@@ -2112,13 +2305,23 @@ mod paper_log_tests {
             None,
             Arc::new(FixtureClobBookFetcher::new(HashMap::new())),
         )
-        .unwrap();
-        tokio::spawn(orchestrator.run(std::future::pending::<()>()))
+        .unwrap()
     }
 
-    /// PASS: a structural change published by the runtime orchestrator and replayed from that
-    /// same paper log produces byte-for-byte-equivalent watchlist entries;
-    /// FAIL: runtime and boot differ in survivor fields, ordering, deduplication, or capping.
+    fn spawn_membership_orchestrator(
+        live: LiveWatchlist,
+        paper_writer: Writer,
+        paper_state: Arc<PaperStateDb>,
+        control_rx: mpsc::Receiver<crate::orchestrator_control::OrchestratorControl>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(
+            membership_orchestrator(live, paper_writer, paper_state, control_rx)
+                .run(std::future::pending::<()>()),
+        )
+    }
+
+    /// PASS: runtime publishes from structural membership even when boot deferred a wallet;
+    /// restart restores the structural entry while live remains its eligible projection.
     #[tokio::test]
     async fn structural_membership_runtime_and_boot_replay_exact_entries() {
         let dir = tempdir().unwrap();
@@ -2135,6 +2338,7 @@ mod paper_log_tests {
             watchlist_entry(removed_wallet, 300),
         ];
         let live = LiveWatchlist::new(watchlist(initial_entries.clone()));
+        live.remove_fenced(&HashSet::from([second]));
 
         let mut started = start("activation");
         started.membership = vec![first, second, third, removed_wallet];
@@ -2190,9 +2394,26 @@ mod paper_log_tests {
         let replayed = replay_membership(&era, watchlist(initial_entries), &source_path)
             .unwrap()
             .unwrap();
-        assert_eq!(
-            serde_json::to_vec(&replayed.watchlist.entries).unwrap(),
-            serde_json::to_vec(&runtime_entries).unwrap()
+        assert_eq!(replayed.watchlist.entries.len(), 3);
+        assert_eq!(live.structural_membership().len(), 3);
+        assert!(
+            replayed
+                .watchlist
+                .entries
+                .iter()
+                .any(|entry| entry.wallet == second)
+        );
+        assert_eq!(runtime_entries.len(), 2);
+        assert!(!runtime_entries.iter().any(|entry| entry.wallet == second));
+        let restarted = LiveWatchlist::new(replayed.watchlist);
+        restarted.remove_fenced(&HashSet::from([second]));
+        assert!(restarted.structural_membership().contains(&second));
+        assert!(
+            !restarted
+                .snapshot()
+                .entries
+                .iter()
+                .any(|entry| entry.wallet == second)
         );
     }
 
@@ -2494,6 +2715,132 @@ mod paper_log_tests {
         assert_eq!(replayed.last_ranking_batch_id, 7);
         assert_eq!(replayed.watchlist.entries.len(), 1);
         assert_eq!(replayed.watchlist.entries[0].wallet, initial);
+
+        let pre_start = paper_era(Vec::new());
+        assert!(
+            replay_membership(
+                &pre_start,
+                watchlist(vec![watchlist_entry(initial, 500)]),
+                &dir.path().join("source.log"),
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn structural_membership_crash_after_append_replays_record() {
+        let dir = tempdir().unwrap();
+        let paper_path = dir.path().join("paper.log");
+        let source_path = dir.path().join("source.log");
+        let initial = wallet();
+        let mut paper_writer = Writer::open(&paper_path).unwrap();
+        append(
+            &mut paper_writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &PaperLogRecord::QualificationStarted(Box::new(start("activation"))),
+        );
+        let mut source_writer = Writer::open(&source_path).unwrap();
+        let ranking_receipt = append_membership_artifact(
+            &mut source_writer,
+            RANKING_MEMBERSHIP_SOURCE_ID,
+            &RankingMembershipArtifact {
+                batch_id: Some(8),
+                entries: Vec::new(),
+            },
+        );
+        drop(source_writer);
+        append(
+            &mut paper_writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &PaperLogRecord::MembershipChanged {
+                reason: MembershipReason::FullRerank,
+                removed: vec![initial],
+                added: Vec::new(),
+                capacity: 1,
+                ranking_batch_id: Some(8),
+                evidence: SealedMembershipEvidence::full_rerank(ranking_receipt, Vec::new())
+                    .unwrap(),
+            },
+        );
+        drop(paper_writer);
+        let replayed = replay_membership(
+            &paper_era(scan_paper_log(&paper_path).unwrap()),
+            watchlist(vec![watchlist_entry(initial, 500)]),
+            &source_path,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(replayed.watchlist.entries.is_empty());
+        assert_eq!(replayed.last_ranking_batch_id, 8);
+    }
+
+    #[test]
+    fn pinned_era_rejects_sequence_28_without_membership_record() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("paper.log");
+        let mut writer = Writer::open(&path).unwrap();
+        append(
+            &mut writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &PaperLogRecord::QualificationStarted(Box::new(start(
+                HISTORICAL_MEMBERSHIP_PIN.activation_id,
+            ))),
+        );
+        drop(writer);
+        let mut era = paper_era(scan_paper_log(&path).unwrap());
+        era.frames[0].receipt.sequence = EventSeq(HISTORICAL_MEMBERSHIP_PIN.sequence);
+        assert!(matches!(
+            replay_membership(
+                &era,
+                watchlist(vec![watchlist_entry(wallet(), 500)]),
+                &dir.path().join("source.log"),
+            ),
+            Err(MembershipReplayError::HistoricalException(
+                HistoricalMembershipExceptionError::Identity
+            ))
+        ));
+    }
+
+    #[cfg(feature = "scenario")]
+    #[tokio::test]
+    async fn membership_sync_uncertainty_stops_without_publishing_either_set() {
+        let dir = tempdir().unwrap();
+        let initial = wallet();
+        let live = LiveWatchlist::new(watchlist(vec![watchlist_entry(initial, 500)]));
+        let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let mut writer = Writer::open(dir.path().join("paper.log")).unwrap();
+        append(
+            &mut writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &PaperLogRecord::QualificationStarted(Box::new(start("activation"))),
+        );
+        writer.scenario_fail_next_sync();
+        let (tx, rx) = mpsc::channel(1);
+        let orchestrator = membership_orchestrator(live.clone(), writer, paper_state.clone(), rx);
+        let runtime = tokio::spawn(orchestrator.run_coordinated(std::future::pending::<()>()));
+        let preparer = AdmissionPreparer::new(tx, paper_state);
+        let result = preparer
+            .publish_membership(
+                MembershipChange {
+                    reason: MembershipReason::FullRerank,
+                    removed: vec![initial],
+                    added: Vec::new(),
+                    capacity: 1,
+                    ranking_batch_id: Some(8),
+                    evidence: serde_json::json!({"scenario":"sync-uncertain"}),
+                },
+                Vec::new(),
+                Default::default(),
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(live.structural_membership(), HashSet::from([initial]));
+        assert_eq!(live.snapshot().entries.len(), 1);
+        assert!(matches!(
+            runtime.await.unwrap(),
+            Err(crate::orchestrator::OrchestratorRunError::PaperDurabilityUncertain)
+        ));
     }
 
     /// PASS: Start cannot be rebuilt when its durable wallet is absent from the pinned batch;

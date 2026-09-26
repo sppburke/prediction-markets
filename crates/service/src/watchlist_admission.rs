@@ -6,6 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::StreamExt;
 use pe_core_types::{ReceivedAt, SourceId, SourceTimestamp, WalletAddress};
 use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn};
 use pe_paper_state::{PaperStateDb, WalletCoverage};
@@ -23,8 +24,8 @@ use crate::paper_recovery::{
     RankingMembershipArtifact, SealedKnockoutEvidence,
 };
 use crate::position_seeder::{
-    AnchorInstall, CausalPositionError, CausalPositionValidator, ValidationPurpose,
-    is_deferred_causal_position_error,
+    AnchorInstall, BRACKET_CONCURRENCY, CausalPositionError, CausalPositionValidator,
+    ValidationPurpose, is_deferred_causal_position_error,
 };
 use crate::watchlist_maintenance::MembershipCommit;
 
@@ -161,6 +162,39 @@ impl AdmissionPreparer {
         }
         self.prepare_locked(additions).await?;
         self.check_prerequisites(additions)
+    }
+
+    /// One ranked-step attempt for live-only deferred wallets. A failure of one bracket does
+    /// not hold back another wallet selected in the same batch.
+    pub async fn prepare_live_reentries(&self, wallets: &[WalletAddress]) -> Vec<WalletAddress> {
+        let _attempt = self.inner.attempt.lock().await;
+        let mut outcomes = futures::stream::iter(wallets.iter().copied().enumerate())
+            .map(|(index, wallet)| async move {
+                let result = async {
+                    self.check_fences(&[wallet])?;
+                    if self.inner.validator.is_none() {
+                        self.check_prerequisites(&[wallet])?;
+                    }
+                    self.prepare_locked(&[wallet]).await?;
+                    self.check_prerequisites(&[wallet])
+                }
+                .await;
+                (index, wallet, result)
+            })
+            .buffer_unordered(BRACKET_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        outcomes.sort_by_key(|(index, _, _)| *index);
+        outcomes
+            .into_iter()
+            .filter_map(|(_, wallet, result)| match result {
+                Ok(()) => Some(wallet),
+                Err(error) => {
+                    warn!(%wallet, %error, "live-only reentry deferred");
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Recheck, seed, synchronize one structural record, then publish its exact entries.
@@ -457,9 +491,10 @@ impl AdmissionPreparer {
         use crate::paper_recovery::SealedMembershipEvidence;
         use crate::watchlist_maintenance::{
             MembershipApplyError, MembershipPublication, apply_ranked_membership_locked,
-            ranked_membership_change,
+            ranked_membership_change_set,
         };
-        let (_, additions) = ranked_membership_change(&live.snapshot().entries, &entries, cap);
+        let (_, additions) =
+            ranked_membership_change_set(&live.structural_membership(), &entries, cap);
         let ranking = self
             .record_ranking_membership(Some(546), entries.clone())
             .await
@@ -485,6 +520,7 @@ impl AdmissionPreparer {
             cap,
             _writer,
             None,
+            &[],
         )
         .await?;
         Ok(())

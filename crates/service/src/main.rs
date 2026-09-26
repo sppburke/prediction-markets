@@ -311,6 +311,30 @@ async fn main() -> Result<()> {
     let log_guards =
         pe_service::logging::setup(&cfg.jsonl_log_path, "info", cfg.log_retention_days)?;
     info!("pe-service starting");
+    let nofile = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+    if nofile.current != nofile.maximum {
+        rustix::process::setrlimit(
+            rustix::process::Resource::Nofile,
+            rustix::process::Rlimit {
+                current: nofile.maximum,
+                maximum: nofile.maximum,
+            },
+        )
+        .context("raise NOFILE soft limit to hard limit")?;
+    }
+    let effective_nofile = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+    info!(
+        initial_soft = ?nofile.current,
+        hard = ?nofile.maximum,
+        effective_soft = ?effective_nofile.current,
+        "NOFILE descriptor limit"
+    );
+    anyhow::ensure!(
+        effective_nofile.current == effective_nofile.maximum,
+        "NOFILE soft limit {:?} remains below hard limit {:?}",
+        effective_nofile.current,
+        effective_nofile.maximum
+    );
     info!(
         active_risk_halt_count,
         "active paper risk causes rebuilt from the verified prefix"
@@ -712,6 +736,8 @@ async fn main() -> Result<()> {
     } else {
         (initial_watchlist, bootstrap_last_trade)
     };
+    // This is the structural generation: post-Start replay above, or the selected pre-Start
+    // batch after fences. LiveWatchlist snapshots it before the boot bracket filters live.
     let live_watchlist =
         LiveWatchlist::new_with_projection(initial_watchlist, projection_dirty.clone());
     live_watchlist.remove_fenced(&fenced);

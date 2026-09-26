@@ -23,7 +23,7 @@ use crate::supabase_reader::{self, SupabaseError};
 use crate::watchlist_admission::{AdmissionError, AdmissionPreparer};
 use crate::watchlist_maintenance::{
     MembershipApplyError, MembershipCapacityCheck, MembershipPublication,
-    apply_ranked_membership_locked, ranked_membership_change,
+    apply_ranked_membership_locked, planned_live_reentries, ranked_membership_change_set,
 };
 
 /// Failure surface for one capacity transition. Every variant is fail-soft to the caller.
@@ -114,9 +114,17 @@ impl SupabaseWatchlistCapacity {
         }
         validate_unique_ranking(&incoming.entries)?;
 
-        let (_, additions) =
-            ranked_membership_change(&self.live.snapshot().entries, &incoming.entries, target);
+        let (_, additions) = ranked_membership_change_set(
+            &self.live.structural_membership(),
+            &incoming.entries,
+            target,
+        );
         self.preparer.prepare(&additions).await?;
+        let reentry_candidates = planned_live_reentries(&self.live, &incoming.entries, target);
+        let reentries = self
+            .preparer
+            .prepare_live_reentries(&reentry_candidates)
+            .await;
         let admission_receipts = self.preparer.record_admission_proofs(&additions).await?;
         let prepared: HashSet<WalletAddress> = additions.iter().copied().collect();
 
@@ -128,8 +136,11 @@ impl SupabaseWatchlistCapacity {
         // publish are recomputed against current membership: a wallet that was live when the
         // additions were planned but has since been evicted by maintenance is a genuine new
         // admission that was never prepared; the worker retries and prepares it next round.
-        let (_, required) =
-            ranked_membership_change(&self.live.snapshot().entries, &incoming.entries, target);
+        let (_, required) = ranked_membership_change_set(
+            &self.live.structural_membership(),
+            &incoming.entries,
+            target,
+        );
         let missing_ready = required
             .iter()
             .filter(|wallet| !prepared.contains(wallet))
@@ -166,6 +177,7 @@ impl SupabaseWatchlistCapacity {
                 desired: self.desired_capacity.clone(),
                 request,
             }),
+            &reentries,
         )
         .await?;
 
@@ -483,9 +495,12 @@ mod tests {
                                 .push(wallets);
                             attempts += 1;
                             if attempts == 1 {
+                                // Model a durable structural eviction before this capacity
+                                // attempt's locked recheck, not a live-only boot deferral.
                                 let removed: HashSet<WalletAddress> =
                                     [departing].into_iter().collect();
                                 live.replace(&removed, &[], 2);
+                                live.commit_structural_change(&[departing], &[]);
                             }
                             acknowledged.send(()).unwrap();
                         }
@@ -509,19 +524,27 @@ mod tests {
                                 crate::qualification::verify_published_membership_change(
                                     &change.clone().into_record(),
                                     &verifier_source_log,
-                                    &live
-                                        .snapshot()
-                                        .entries
-                                        .iter()
-                                        .map(|entry| entry.wallet)
-                                        .collect(),
+                                    &live.structural_membership(),
                                 )
                             {
                                 acknowledged.send(Err(error.to_string())).unwrap();
                                 continue;
                             }
-                            let removed = change.removed.into_iter().collect::<HashSet<_>>();
-                            live.replace(&removed, &replacements, change.capacity);
+                            let removed = change.removed.iter().copied().collect::<HashSet<_>>();
+                            let additions = replacements
+                                .iter()
+                                .filter(|entry| change.added.contains(&entry.wallet))
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            live.commit_structural_change(&change.removed, &change.added);
+                            live.replace(&removed, &additions, change.capacity);
+                            crate::watchlist_maintenance::apply_live_reentries(
+                                &live,
+                                &fake_paper_state,
+                                &checks.reentries,
+                                &replacements,
+                                change.capacity,
+                            );
                             checks.commit_capacity();
                             acknowledged
                                 .send(Ok(pe_event_log::AppendReceipt {
@@ -566,6 +589,7 @@ mod tests {
         // The retry plans against the current set, so `departing` is now a prepared addition.
         assert_eq!(applier.apply(request).await.unwrap(), 3);
         assert_eq!(live.snapshot().entries.len(), 3);
+        assert_eq!(live.structural_membership().len(), 3);
         assert_eq!(applied.load(), request);
         assert_eq!(
             *prepared_sets
@@ -719,18 +743,26 @@ mod tests {
                         if let Err(error) = crate::qualification::verify_published_membership_change(
                             &change.clone().into_record(),
                             &verifier_source_log,
-                            &live_at_control
-                                .snapshot()
-                                .entries
-                                .iter()
-                                .map(|entry| entry.wallet)
-                                .collect(),
+                            &live_at_control.structural_membership(),
                         ) {
                             acknowledged.send(Err(error.to_string())).unwrap();
                             continue;
                         }
-                        let removed = change.removed.into_iter().collect::<HashSet<_>>();
-                        live_at_control.replace(&removed, &replacements, change.capacity);
+                        let removed = change.removed.iter().copied().collect::<HashSet<_>>();
+                        let additions = replacements
+                            .iter()
+                            .filter(|entry| change.added.contains(&entry.wallet))
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        live_at_control.commit_structural_change(&change.removed, &change.added);
+                        live_at_control.replace(&removed, &additions, change.capacity);
+                        crate::watchlist_maintenance::apply_live_reentries(
+                            &live_at_control,
+                            &fake_paper_state,
+                            &checks.reentries,
+                            &replacements,
+                            change.capacity,
+                        );
                         checks.commit_capacity();
                         acknowledged
                             .send(Ok(pe_event_log::AppendReceipt {
@@ -783,6 +815,7 @@ mod tests {
         assert_eq!(apply.await.unwrap().unwrap(), 2);
         control.await.unwrap();
         assert_eq!(live.snapshot().entries.len(), 2);
+        assert_eq!(live.structural_membership().len(), 2);
         assert_eq!(applied.load(), request);
         assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(

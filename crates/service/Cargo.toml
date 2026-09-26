@@ -20,7 +20,7 @@ path = "src/lib.rs"
 [features]
 # Deterministic scenario seams (in-process activity websocket peers, orchestrator age clock and
 # one-shot faults); enables the source crate's matching seam so both exist only in scenario builds.
-scenario = ["pe-source-polymarket-public/scenario"]
+scenario = ["pe-source-polymarket-public/scenario", "pe-event-log/scenario"]
 
 [lints]
 workspace = true
@@ -53,6 +53,7 @@ futures         = { workspace = true }
 toml            = { workspace = true }
 reqwest         = { workspace = true }
 rust_decimal    = { workspace = true }
+rustix          = { version = "1.1.4", features = ["process"] }
 serde           = { workspace = true }
 serde_json      = { workspace = true }
 thiserror       = { workspace = true }

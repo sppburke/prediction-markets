@@ -48,6 +48,8 @@ pub struct Writer {
     last_hash: Hash,
     cursor: u64,
     poison_reason: Option<PoisonReason>,
+    #[cfg(feature = "scenario")]
+    fail_next_sync_for_scenario: bool,
 }
 
 impl fmt::Debug for Writer {
@@ -256,7 +258,15 @@ impl Writer {
             last_hash,
             cursor,
             poison_reason: None,
+            #[cfg(feature = "scenario")]
+            fail_next_sync_for_scenario: false,
         }
+    }
+
+    /// Inject one synchronization failure after a frame's bytes have been flushed.
+    #[cfg(feature = "scenario")]
+    pub fn scenario_fail_next_sync(&mut self) {
+        self.fail_next_sync_for_scenario = true;
     }
 
     /// Reason this writer can no longer prove its durable byte state.
@@ -347,6 +357,13 @@ impl Writer {
     /// Flush and issue `fsync`. A failure permanently poisons the writer.
     pub fn sync(&mut self) -> Result<(), LogError> {
         self.flush()?;
+        #[cfg(feature = "scenario")]
+        if std::mem::take(&mut self.fail_next_sync_for_scenario) {
+            self.poison_reason = Some(PoisonReason::Synchronize);
+            return Err(LogError::Io(std::io::Error::other(
+                "injected synchronization uncertainty",
+            )));
+        }
         if let Err(error) = self.inner.get_ref().sync_all() {
             self.poison_reason = Some(PoisonReason::Synchronize);
             return Err(LogError::Io(error));
@@ -460,6 +477,8 @@ mod tests {
             last_hash: Hash::from_bytes([0; 32]),
             cursor: 0,
             poison_reason: None,
+            #[cfg(feature = "scenario")]
+            fail_next_sync_for_scenario: false,
         }
     }
 
