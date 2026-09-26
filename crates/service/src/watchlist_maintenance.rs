@@ -282,7 +282,6 @@ fn recheck_admissions(
 pub(crate) fn planned_live_reentries(
     live: &LiveWatchlist,
     incoming: &[WatchlistEntry],
-    cap: usize,
 ) -> Vec<WalletAddress> {
     let structural = live.structural_membership();
     let present = live
@@ -291,9 +290,10 @@ pub(crate) fn planned_live_reentries(
         .iter()
         .map(|entry| entry.wallet)
         .collect::<HashSet<_>>();
+    // Scan every incoming survivor: in knockout mode a structural wallet can rank below the
+    // cap. Candidates are structural, so bounded by capacity; the locked apply bounds live.
     incoming
         .iter()
-        .take(cap)
         .filter(|entry| structural.contains(&entry.wallet) && !present.contains(&entry.wallet))
         .map(|entry| entry.wallet)
         .collect()
@@ -317,7 +317,7 @@ pub(crate) fn apply_live_reentries(
         .collect::<HashSet<_>>();
     let prepared = prepared.iter().copied().collect::<HashSet<_>>();
     let mut admitted = Vec::new();
-    for entry in applied_entries.iter().take(cap) {
+    for entry in applied_entries {
         if present.len() >= cap {
             break;
         }
@@ -984,14 +984,15 @@ async fn maintenance_tick(
                             Ok(records) => {
                                 let fenced =
                                     records.into_iter().map(|record| record.wallet).collect();
+                                // Fence-filter only: knockout membership is not the batch's
+                                // top-`cap`, so a structural wallet may rank below it.
                                 let (incoming, _) = supabase_reader::select_membership(
                                     incoming,
                                     incoming_last_trade,
                                     &fenced,
-                                    cap,
+                                    MAX_ACTIVE_WATCHLIST_SIZE,
                                 );
-                                let candidates =
-                                    planned_live_reentries(live, &incoming.entries, cap);
+                                let candidates = planned_live_reentries(live, &incoming.entries);
                                 let reentries = preparer.prepare_live_reentries(&candidates).await;
                                 let _writer = writer_lock.lock().await;
                                 if applied_capacity.load() == capacity_epoch {
@@ -1070,7 +1071,7 @@ async fn maintenance_tick(
                                 break 'replacement;
                             }
                             let reentry_candidates =
-                                planned_live_reentries(live, &incoming.entries, cap);
+                                planned_live_reentries(live, &incoming.entries);
                             let reentries =
                                 preparer.prepare_live_reentries(&reentry_candidates).await;
                             let ranking_receipt = match preparer
@@ -1947,6 +1948,7 @@ mod tests {
             latest_ranking: Vec<serde_json::Value>,
             history_ok: bool,
             failure: Option<&'static str>,
+            entries_fail: bool,
             activity_hits: Arc<AtomicUsize>,
             position_hits: Arc<AtomicUsize>,
         }
@@ -1959,6 +1961,7 @@ mod tests {
                     latest_ranking: Vec::new(),
                     history_ok: true,
                     failure: None,
+                    entries_fail: false,
                     activity_hits: Arc::new(AtomicUsize::new(0)),
                     position_hits: Arc::new(AtomicUsize::new(0)),
                 }
@@ -2020,14 +2023,17 @@ mod tests {
                 async fn entries(
                     State(fake): State<Fake>,
                     Query(q): Query<HashMap<String, String>>,
-                ) -> Json<Vec<serde_json::Value>> {
+                ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+                    if fake.entries_fail {
+                        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                    }
                     let pinned = q
                         .get("batch_id")
                         .and_then(|v| v.strip_prefix("eq."))
                         .and_then(|v| v.parse::<i64>().ok())
                         .expect("pinned read must carry batch_id=eq.N");
                     assert!(pinned >= 0);
-                    Json(selected(&fake.ranking_entries, &q))
+                    Ok(Json(selected(&fake.ranking_entries, &q)))
                 }
                 async fn latest(
                     State(fake): State<Fake>,
@@ -2487,6 +2493,54 @@ mod tests {
                 assert_eq!(h.membership_publications.load(Ordering::SeqCst), 0);
                 assert_eq!(h.controls().len(), if empty_after_boot { 2 } else { 1 });
             }
+        }
+
+        #[tokio::test]
+        async fn knockout_batch_restores_structural_wallet_ranked_below_the_cap() {
+            let (a, b, deferred) = (wallet(1), wallet(2), wallet(3));
+            let (x, y, z) = (wallet(7), wallet(8), wallet(9));
+            let mut fake = Fake::new(Some(2));
+            // `deferred` ranks fourth, below CAP = 3; knockout membership is not the top-CAP.
+            fake.ranking_entries = vec![
+                row(2, 1, x),
+                row(2, 2, y),
+                row(2, 3, z),
+                row(2, 4, deferred),
+            ];
+            let h = harness(fake, &[a, b, deferred]).await;
+            h.live.remove_fenced(&set(&[deferred]));
+            let (mut evicted, mut marker) = (HashSet::new(), Some(1));
+
+            h.tick(MembershipMode::Knockout, &mut evicted, &mut marker)
+                .await;
+
+            assert_eq!(marker, Some(2));
+            assert_eq!(members(&h.live), set(&[a, b, deferred]));
+            assert_eq!(h.live.structural_membership(), set(&[a, b, deferred]));
+            assert_eq!(h.membership_publications.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn knockout_batch_read_failure_keeps_marker_and_eviction_memory() {
+            let (a, deferred, knocked_out) = (wallet(1), wallet(2), wallet(9));
+            let mut fake = Fake::new(Some(2));
+            fake.ranking_entries = vec![row(2, 1, deferred)];
+            fake.entries_fail = true;
+            let h = harness(fake, &[a, deferred]).await;
+            h.live.remove_fenced(&set(&[deferred]));
+            let (mut evicted, mut marker) = (set(&[knocked_out]), Some(1));
+
+            h.tick(MembershipMode::Knockout, &mut evicted, &mut marker)
+                .await;
+
+            assert_eq!(
+                marker,
+                Some(1),
+                "a failed pinned read retries the transition"
+            );
+            assert!(evicted.contains(&knocked_out));
+            assert_eq!(members(&h.live), set(&[a]));
+            assert_eq!(h.live.structural_membership(), set(&[a, deferred]));
         }
 
         #[tokio::test]

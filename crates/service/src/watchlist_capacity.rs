@@ -120,7 +120,7 @@ impl SupabaseWatchlistCapacity {
             target,
         );
         self.preparer.prepare(&additions).await?;
-        let reentry_candidates = planned_live_reentries(&self.live, &incoming.entries, target);
+        let reentry_candidates = planned_live_reentries(&self.live, &incoming.entries);
         let reentries = self
             .preparer
             .prepare_live_reentries(&reentry_candidates)
