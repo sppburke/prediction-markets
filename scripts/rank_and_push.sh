@@ -432,8 +432,22 @@ validate_cycle_pointer() {
   printf '%s' "$cycle_dir"
 }
 
-# Resume pointerless, verified retirement before any new cycle or unchanged-day
-# exit. The durable accepted watermark plus request/staging evidence owns this
+write_lane_record() {
+  "$PYTHON_BIN" - "$1" "$2" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, "scripts")
+from rank_cycle_manifest import MANIFEST_VERSION, atomic_write
+
+configuration = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+atomic_write(Path(sys.argv[2]), {"version": MANIFEST_VERSION, "configuration": configuration})
+PY
+}
+
+# Resume pointerless, verified retirement before any new cycle or legacy unchanged-day
+# exit. The durable accepted record plus request/staging evidence owns this
 # obligation; a pause defers the pass without admitting another candidate.
 if [[ "$PRODUCTION_CYCLE" == "1" && ! -e "$CYCLE_FILE" && ! -L "$CYCLE_FILE" &&
       ! -e "$PENDING_FILE" && ! -L "$PENDING_FILE" ]]; then
@@ -533,16 +547,20 @@ with open(sys.argv[1], "w", encoding="utf-8") as handle:
     json.dump(configuration, handle, sort_keys=True)
     handle.write("\n")
 PY
-    CYCLE_DAY_UTC="$(date -u +%Y-%m-%d)"
-    "$PYTHON_BIN" scripts/rank_cycle_manifest.py capture \
-      --db "$DB" --day-utc "$CYCLE_DAY_UTC" \
-      --versions-file "$PIPELINE_VERSIONS_TMP" \
-      --configuration-file "$CYCLE_CONFIG_TMP" --output "$CURRENT_CYCLE_TMP"
-    # Schema-one partial active wallets force a retry even at an unchanged watermark.
-    if "$PYTHON_BIN" scripts/rank_cycle_manifest.py unchanged \
-      --db "$DB" --current "$CURRENT_CYCLE_TMP" --root data/eval-results; then
-      echo "RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1"
-      exit 0
+    if [[ "$INSTALLED_SCHEMA" == "2" ]]; then
+      write_lane_record "$CYCLE_CONFIG_TMP" "$CURRENT_CYCLE_TMP"
+    else
+      CYCLE_DAY_UTC="$(date -u +%Y-%m-%d)"
+      "$PYTHON_BIN" scripts/rank_cycle_manifest.py capture \
+        --db "$DB" --day-utc "$CYCLE_DAY_UTC" \
+        --versions-file "$PIPELINE_VERSIONS_TMP" \
+        --configuration-file "$CYCLE_CONFIG_TMP" --output "$CURRENT_CYCLE_TMP"
+      # Schema-one partial active wallets force a retry even at an unchanged watermark.
+      if "$PYTHON_BIN" scripts/rank_cycle_manifest.py unchanged \
+        --db "$DB" --current "$CURRENT_CYCLE_TMP" --root data/eval-results; then
+        echo "RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1"
+        exit 0
+      fi
     fi
     OUT_DIR="data/eval-results/cron-$(date -u +%Y%m%dT%H%M%SZ)"
     mkdir -p "$OUT_DIR"
@@ -1099,8 +1117,7 @@ activate_bound_cache() {
     echo "FATAL: publication request has malformed cache activation evidence" >&2
     return 2
   }
-  # The request's fixed path is the installed cache the accepted watermark
-  # must be captured from on every entry, including recovery.
+  # Legacy acceptance captures this installed path, including on recovery.
   ACCEPTED_DB="${binding[1]}"
   if [[ "${PE_RANK_SCHEMA_TWO_CUTOVER:-0}" == "prepare" ]]; then
     echo "RANK_AND_PUSH_PREPARED_ONLY=$request_path"
@@ -1170,17 +1187,21 @@ fi
 echo "✓ Supabase exact batch published and verified. pe-service picks it up within one refresh interval."
 
 if [[ -f "$OUT_DIR/cycle_configuration.json" ]]; then
-  # The accepted watermark is captured from the installed cache only after the
-  # exact publication succeeds — on the fresh path and on either recovery entry
-  # (automatic or --resume-pending), since activation may have replaced the
-  # fixed file. A later same-day zero-argument invocation compares against this
-  # post-refresh state before discovery or any other cache mutation.
-  "$PE_BOOTSTRAP_BIN" pipeline-versions > "$OUT_DIR/pipeline_versions.json"
-  "$PYTHON_BIN" scripts/rank_cycle_manifest.py capture \
-    --db "$ACCEPTED_DB" --day-utc "$(date -u +%Y-%m-%d)" \
-    --versions-file "$OUT_DIR/pipeline_versions.json" \
-    --configuration-file "$OUT_DIR/cycle_configuration.json" \
-    --output "$OUT_DIR/accepted_cycle_manifest.json"
+  # Publication acceptance records the fresh lane without scanning the installed
+  # cache. Legacy cycles retain the full post-publication watermark for their gate.
+  ACCEPTED_FRESH_LANE="$("$PYTHON_BIN" -c 'import json, sys
+configuration = json.load(open(sys.argv[1], encoding="utf-8"))
+print(1 if configuration.get("cache_lane") == "fresh_v2" else 0)' "$OUT_DIR/cycle_configuration.json")"
+  if [[ "$ACCEPTED_FRESH_LANE" == "1" ]]; then
+    write_lane_record "$OUT_DIR/cycle_configuration.json" "$OUT_DIR/accepted_cycle_manifest.json"
+  else
+    "$PE_BOOTSTRAP_BIN" pipeline-versions > "$OUT_DIR/pipeline_versions.json"
+    "$PYTHON_BIN" scripts/rank_cycle_manifest.py capture \
+      --db "$ACCEPTED_DB" --day-utc "$(date -u +%Y-%m-%d)" \
+      --versions-file "$OUT_DIR/pipeline_versions.json" \
+      --configuration-file "$OUT_DIR/cycle_configuration.json" \
+      --output "$OUT_DIR/accepted_cycle_manifest.json"
+  fi
 fi
 
 # Compare-and-clear: never erase a different/newer recovery request. The request JSON
@@ -1228,7 +1249,7 @@ if [[ -e "$CYCLE_FILE" || -L "$CYCLE_FILE" ]]; then
     echo "   [recovery] WARN unsafe cycle pointer; leaving it intact" >&2
   fi
 fi
-# The accepted watermark and request remain discoverable after pointer clearing.
+# The accepted record and request remain discoverable after pointer clearing.
 if [[ -f "$OUT_DIR/cycle_configuration.json" ]]; then
   retention_rc=0
   "$PYTHON_BIN" scripts/rank_cycle_manifest.py retire-completed \

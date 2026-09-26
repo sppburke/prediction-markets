@@ -32,7 +32,7 @@ cargo build --release -p pe-bootstrap
   large table — into the system temp directory, NOT beside the cache. On a host whose
   root filesystem is a different (smaller, or failure-prone) device than the cache
   volume, point `SQLITE_TMPDIR` at a writable directory on the CACHE volume, e.g.
-  `SQLITE_TMPDIR=/mnt/storage/tmp` in `.env` (the wrapper exports its whole `.env` to
+  `SQLITE_TMPDIR=/mnt/t7/sqlite-tmp` in `.env` on Forge (the wrapper exports its whole `.env` to
   every stage). Proven necessary on 2026-08-27: forge's root SD card remounted
   read-only during a historical operator-authorized purge. Because the default temp dir
   lived there, that bulk purge's `VACUUM` and index rebuild both failed while the deletes
@@ -444,8 +444,9 @@ latest reference sample at-or-before `entry+Δ` (adds `hit_rate`, writes the
 per-position `oracle_outcomes.csv` and the versioned `oracle_manifest.json` whose
 canonical hash the push stores as `ranking_batches.config_hash`); **Stage 3** record
 the exact publication request, atomically publish it through the idempotent
-`publish_ranking_batch` RPC, verify that exact batch is `latest_ranking`, and capture the
-accepted cycle manifest used by the next unchanged-watermark check. No post-publication deletion,
+`publish_ranking_batch` RPC, verify that exact batch is `latest_ranking`, and write the
+accepted cycle record. The legacy lane captures a full watermark for its unchanged-day check;
+the fresh lane writes its configuration without scanning the installed cache. No post-publication deletion,
 reclamation, index rebuild, or checkpoint stage exists (#544).
 
 
@@ -874,7 +875,10 @@ the lane, Step 0 is the sequence above (legacy `backfill`, `events` and `resolut
 retired `trades`/`source_cursor` and do not run), followed by the existing cutover path:
 candidate capture into `candidate_cycle_manifest.json` alongside Parquet export, pass one and
 target emission, then targeted `prices-history` and second finalization. Pass two binds that
-capture; `cycle_manifest.json` keeps the cycle's initial installed-cache watermark. Then come
+capture. An initial schema-one cutover keeps its full initial `cycle_manifest.json` capture and
+same-day gate; recurring cycles started on installed schema two write a two-field lane record
+(`version`, `configuration`) instead. The new-cycle `pipeline-versions` output remains available
+to candidate capture and the publisher. Then come
 `--prepare-only`, `cache-activate` and the exact `--resume-request`. The candidate snapshot stamps
 the UTC day when capture starts. The immutable staging baseline fixes the initial activity generation
 and payout target for new cycles; existing legacy cycles read those values from their prior. The activity owner resumes the candidate's recorded head, including a manually started or
@@ -883,10 +887,10 @@ publisher's unchanged `max_cache_staleness_hours`, the wrapper admits one linked
 base link consumes that allowance across restarts; a stale top-up stops before ranking and never
 starts another. Actual trade/payout source times still govern preparation after downstream work.
 The payout target is the staging baseline's active walk if present, otherwise its newest completed walk plus one;
-a completed target on the candidate is reused. After every successful publication — the fresh path,
-the automatic pending resume and explicit `--resume-pending` — the accepted watermark is captured from the
-request's installed fixed path before the pointers clear, so the next unchanged same-day
-invocation skips before staging.
+a completed target on the candidate is reused. After every successful fresh-lane publication — the
+ordinary path, automatic pending resume or explicit `--resume-pending` — the accepted two-field
+lane record is written before the pointers clear. Recurring schema-two cycles therefore start
+again on the same UTC day; the legacy lane retains the full accepted capture and unchanged-day gate.
 
 **Physical layout.** The candidate lane uses the regular physical fixed file
 (`readlink -f data/wallet_cache.db`) and derives per-cycle names beside it from the
@@ -901,6 +905,30 @@ directory must carry two aliases to the repository inodes, checked before any mu
 | `<physical dir>/eval-results` | `<repo>/data/eval-results` |
 | `<physical dir>/wallet_cache.db.lock` | `<repo>/data/wallet_cache.db.lock` |
 
+**Forge drive layout (observed 2026-09-25).** `/mnt/t7` is the Samsung T7 Shield SSD
+(`sdb`): it holds the cache, `/mnt/t7/parquet` and DuckDB spill, and
+`SQLITE_TMPDIR=/mnt/t7/sqlite-tmp`. `/mnt/storage` is a SanDisk Ultra USB flash stick
+(`sda`, `0781:5581`): the live checkout through `~/prediction-markets`, `target/`,
+`.venv`, `data/eval-results`, the cache lock, `cargo-home`, `rustup`, `pm-next` and build
+targets, the bind-mounted journal, and backups (pre-move cache, purge archive, `pe545`,
+SD backup, and stale `data/parquet`) are still there. The cache moved to T7 on
+2026-09-13; the checkout and run state have not moved yet.
+
+| Measured read | USB stick | T7 SSD |
+|---|---:|---:|
+| Random 4 KiB reads/s, depth 1 / 4 / 8 / 16 / 32 | 1,929 / 2,105 / 2,101 / 2,101 / 2,104 | 2,280 / 7,501 / 11,425 / 15,343 / 18,003 |
+| Sequential read | 160 MB/s | 384 MB/s |
+
+Activation renames cache files and refuses different devices, so fixed, candidate and
+backup cache files stay together on T7. Moving the checkout and run state to T7 is a
+reliability step: those stages use little I/O (~6 minutes per cycle; 14 MB written to
+the stick in a sampled minute). Do it with no cycle in flight because the activation
+batch identity hashes the resolved run-directory path. The two cache-directory aliases
+above currently point from T7 back to the stick and must continue to resolve to the
+checkout's `data/` files. The SD root is `emergency_ro`, so the home link cannot be
+repointed until #637; startup still resolves through the stick's path entry. Coreutils
+`mv` 9.7 supports `--exchange` for an atomic stick-side path swap.
+
 Fixed, candidate, and retained backup must be independent regular files on one filesystem.
 The cycle's own evidence selects the layout: new immutable staging evidence means direct-copy
 staging and rename preservation; an existing prior without that evidence means legacy behavior.
@@ -909,9 +937,10 @@ reported against recorded `H0`; that hash detects drift but cannot reconstruct t
 
 After verified publication and both pointer clearings, retention deletes the completed cycle's
 `D` (or legacy `P` and `D`) as well as eligible older cycle artifacts. The existing durable
-`accepted_cycle_manifest.json`, written after publication verification, and `ranking_publish_request.json`
+`accepted_cycle_manifest.json`, written after publication verification as a full legacy capture or
+fresh-lane lane record, and `ranking_publish_request.json`
 remain the discoverable cleanup obligation, together with the request-bound `.side.stage.json` for
-new-layout cycles. Before admitting another cycle or taking the unchanged-watermark exit, the wrapper
+new-layout cycles. Before admitting another cycle or taking the legacy unchanged-watermark exit, the wrapper
 finds the newest accepted candidate cycle and validates its request and staging binding, then resumes
 retirement. Pointerless `--resume-pending` also completes this cleanup without activating or publishing
 again. The evidence stays as audit history; no new receipt format is introduced. Every completed
@@ -969,8 +998,8 @@ After activation but before the publication is consumed,
 `cache-restore-prior` with backup `D` and rejected destination `C` restores the old bytes by rename
 for a new cycle, including its interrupted gap. A legacy cycle keeps its prior/displaced arguments
 and existing semantics. The supervisor must stay paused until the recovery is resolved. After consumption, roll
-forward. Forge's boot card is failing (#637); the caches, repository and evaluation results
-live on the SSDs, but confirm the host before any cutover and keep the prior until the
+forward. Forge's boot card is failing (#637); the cache is on T7 while the repository and
+evaluation results remain on the USB stick. Confirm the host before any cutover and keep the prior until the
 publication is confirmed.
 
 ### Fresh bulk root with deferred global uniqueness (#588)
@@ -1078,12 +1107,12 @@ Exit 2 with `RANK_AND_PUSH_PREPARED_ONLY=…` stops the loop before activation; 
 stop it for investigation. Keep `prepare` until operator acceptance of the exact pending request.
 
 **Forge temporary storage (host observation, 2026-09-18).** `SQLITE_TMPDIR` must point to large
-SSD-backed writable storage, such as `/mnt/storage/tmp` or a scratch directory on `/mnt/t7`.
+SSD-backed writable storage; the live setting is `/mnt/t7/sqlite-tmp`. `/mnt/storage/tmp`
+is on the USB stick.
 The default `/var/tmp` is read-only with the root filesystem, and writable `/tmp` is too small.
-The supervisor unit `pe-rank-loop.service` sets no `Environment`, so neither `SQLITE_TMPDIR` nor
-`TMPDIR` is set for its collector. Export `SQLITE_TMPDIR` for every manual invocation/resume as below;
-supervised launches must receive it explicitly in their environment too (a shell export does not
-configure the unit).
+The supervisor unit `pe-rank-loop.service` sets no `Environment`, but the wrapper exports
+its whole `.env`, including `SQLITE_TMPDIR`, to the collector. Export it for manual
+invocations/resumes as below.
 
 **Manual fallback.** Use the following sequence only when supervised collection is unavailable.
 The supervisor stays paused, so every transient exit requires manually rerunning the same bulk
@@ -1118,7 +1147,7 @@ mkdir "$TASK_RUN"
 TASK_PRIOR="$(dirname "$TASK_FIXED")/wallet_cache.$TASK_CYCLE.prior.db"
 TASK_SIDE="$(dirname "$TASK_FIXED")/wallet_cache.$TASK_CYCLE.side.db"
 TASK_DISPLACED="$(dirname "$TASK_FIXED")/wallet_cache.$TASK_CYCLE.displaced.db"
-TASK_SCRATCH="/mnt/storage/tmp" # Alternatively, a large SSD-backed directory on /mnt/t7.
+TASK_SCRATCH="/mnt/t7/sqlite-tmp"
 mkdir -p "$TASK_SCRATCH"
 export SQLITE_TMPDIR="$TASK_SCRATCH"
 findmnt -T "$TASK_SCRATCH"
@@ -1388,11 +1417,13 @@ inside one PostgreSQL transaction, so a failed request exposes neither a partial
 epoch nor a duplicate epoch. If code rollback is required, stop the loop and
 restore the prior checkout; the additive schema can remain in place.
 
-Before allocating a new production run, the wrapper captures the current daily source watermark,
-pipeline versions, and configuration. If they exactly match a prior accepted cycle, it prints
-`RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1` and exits successfully before discovery, refresh,
-export, rank, or publication. An existing publication pointer takes precedence over the cycle
-pointer, and either pointer takes precedence over this new-cycle check.
+Before allocating a new legacy schema-one production run, the wrapper captures the current
+daily source watermark, pipeline versions, and configuration. If they exactly match a prior
+full accepted capture, it prints `RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1` and exits
+successfully before discovery, refresh, export, rank, or publication. An initial schema-one
+cutover keeps this gate. Installed schema-two runs write a two-field lane record and start a
+new cycle even on the same UTC day. An existing publication pointer takes precedence over the
+cycle pointer, and either pointer takes precedence over this new-cycle check.
 
 `pe-service` on the VPS picks up the new `latest_ranking` on its next refresh
 (score-update-only). MEMBERSHIP follows `watchlist_membership_mode` (`_GLOSSARY.md`):
@@ -1447,8 +1478,8 @@ directory and preserves the cycle's deterministic activation identity. During
 an incomplete production publication,
 `data/eval-results/rank_and_push.pending` contains one repository-relative path
 to that request and takes recovery precedence over the broader cycle pointer.
-Both are compare-and-cleared only after exact publication verification and accepted-watermark
-capture. Retire superseded artifacts to
+Both are compare-and-cleared only after exact publication verification and an accepted
+record (full legacy capture or fresh-lane lane record). Retire superseded artifacts to
 `data/archive/`; never delete eval outputs — they are the audit trail for what
 was published to `latest_ranking` and when.
 
