@@ -4252,10 +4252,12 @@ async fn queued_bucket_before_membership(invalidate_admission: bool) {
             format!("newly admitted wallet {newcomer} lacks a current causal position validation");
         assert_eq!(result.as_ref().unwrap_err(), &expected);
         assert_eq!(h.live.snapshot().entries[0].wallet, incumbent);
+        assert_eq!(h.live.structural_membership(), HashSet::from([incumbent]));
         assert!(membership_records.is_empty());
     } else {
         let receipt = result.as_ref().unwrap();
         assert_eq!(h.live.snapshot().entries[0].wallet, newcomer);
+        assert_eq!(h.live.structural_membership(), HashSet::from([newcomer]));
         assert!(paper.cursor(&newcomer).unwrap().is_some());
         assert_eq!(membership_records.len(), 1);
         assert_eq!(membership_records[0].0, receipt.sequence);
@@ -4332,6 +4334,7 @@ async fn membership_handler_rechecks_capacity_and_commits_epoch_before_ack() {
                 h.initial.entries.clone(),
                 MembershipCommit {
                     seeds: Vec::new(),
+                    reentries: Vec::new(),
                     capacity: Some(MembershipCapacityCheck::Transition {
                         applied: applied.clone(),
                         desired: desired.clone(),
@@ -4366,6 +4369,7 @@ async fn membership_handler_rechecks_capacity_and_commits_epoch_before_ack() {
             Vec::new(),
             MembershipCommit {
                 seeds: Vec::new(),
+                reentries: Vec::new(),
                 capacity: Some(MembershipCapacityCheck::Unchanged {
                     applied: applied.clone(),
                     expected: original,

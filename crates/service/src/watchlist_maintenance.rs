@@ -29,7 +29,8 @@
 //! [`MembershipMode`] selects who owns MEMBERSHIP between ranking batches:
 //!
 //! * [`MembershipMode::Knockout`] (legacy default) — hold-until-knockout: the ranking push
-//!   never changes membership; only the knockout+backfill above does.
+//!   never changes structural membership; knockout+backfill does. A batch transition can
+//!   restore a prepared structural wallet that was excluded from live at boot.
 //! * [`MembershipMode::FullRerank`] — the ranker owns membership at every batch: on a batch
 //!   TRANSITION the newest `latest_ranking` top-`cap` wholesale-REPLACES the live set
 //!   ([`apply_full_rerank_swap`]) — wallets re-earn their slot each push (run28 `docs/33` §5:
@@ -46,8 +47,8 @@
 //! has validated against durable reconciled history and the monotonic fence set. The publication
 //! lock repeats those checks; the causal positions bracket extends the same serialized attempt.
 //!
-//! The full-rerank read is pinned to the batch identifier that triggered the transition, so the
-//! rows applied and the marker committed always name one batch.
+//! Both modes pin transition reads to the batch identifier that triggered them, so the rows
+//! applied and the marker committed always name one batch.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -80,7 +81,7 @@ use crate::watchlist_admission::AdmissionPreparer;
 /// the maintenance loop is built once at startup, so changing the mode needs a restart.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MembershipMode {
-    /// Hold-until-knockout (legacy): membership changes only via knockout + bench backfill.
+    /// Hold-until-knockout (legacy): structural membership changes only via knockout + backfill.
     #[default]
     Knockout,
     /// The newest ranking batch's top-`cap` replaces the live set on every batch transition.
@@ -168,6 +169,7 @@ pub struct MembershipPublication {
 pub struct MembershipCommit {
     pub seeds: Vec<(WalletAddress, i64)>,
     pub capacity: Option<MembershipCapacityCheck>,
+    pub reentries: Vec<WalletAddress>,
 }
 
 #[derive(Debug)]
@@ -209,20 +211,16 @@ impl MembershipCommit {
             _ => {}
         }
         recheck_admissions(paper_state, &change.added)?;
-        let current = live.snapshot();
+        let current = live.structural_membership();
         let (removed, added) = match change.reason {
             MembershipReason::FullRerank | MembershipReason::CapacityChange => {
-                ranked_membership_change(&current.entries, replacements, change.capacity)
+                ranked_membership_change_set(&current, replacements, change.capacity)
             }
             _ => {
                 let removed: HashSet<_> = change.removed.iter().copied().collect();
                 let added =
-                    planned_admissions(&current.entries, &removed, replacements, change.capacity);
-                let removed = current
-                    .entries
-                    .iter()
-                    .filter_map(|entry| removed.contains(&entry.wallet).then_some(entry.wallet))
-                    .collect();
+                    planned_admission_wallets(&current, &removed, replacements, change.capacity);
+                let removed = current.intersection(&removed).copied().collect();
                 (removed, added)
             }
         };
@@ -279,6 +277,77 @@ fn recheck_admissions(
         }
     }
     Ok(())
+}
+
+pub(crate) fn planned_live_reentries(
+    live: &LiveWatchlist,
+    incoming: &[WatchlistEntry],
+) -> Vec<WalletAddress> {
+    let structural = live.structural_membership();
+    let present = live
+        .snapshot()
+        .entries
+        .iter()
+        .map(|entry| entry.wallet)
+        .collect::<HashSet<_>>();
+    // Scan every incoming survivor: in knockout mode a structural wallet can rank below the
+    // cap. Candidates are structural, so bounded by capacity; the locked apply bounds live.
+    incoming
+        .iter()
+        .filter(|entry| structural.contains(&entry.wallet) && !present.contains(&entry.wallet))
+        .map(|entry| entry.wallet)
+        .collect()
+}
+
+/// Caller holds the shared writer lock. Each wallet uses the entry in the applied batch;
+/// failed or superseded admissions remain outside live membership.
+pub(crate) fn apply_live_reentries(
+    live: &LiveWatchlist,
+    paper_state: &PaperStateDb,
+    prepared: &[WalletAddress],
+    applied_entries: &[WatchlistEntry],
+    cap: usize,
+) {
+    let structural = live.structural_membership();
+    let mut present = live
+        .snapshot()
+        .entries
+        .iter()
+        .map(|entry| entry.wallet)
+        .collect::<HashSet<_>>();
+    let prepared = prepared.iter().copied().collect::<HashSet<_>>();
+    let mut admitted = Vec::new();
+    for entry in applied_entries {
+        if present.len() >= cap {
+            break;
+        }
+        let wallet = entry.wallet;
+        if !prepared.contains(&wallet) || !structural.contains(&wallet) || present.contains(&wallet)
+        {
+            continue;
+        }
+        if let Err(error) = recheck_admissions(paper_state, &[wallet]) {
+            warn!(%wallet, %error, "live-only reentry failed locked eligibility check");
+            continue;
+        }
+        present.insert(wallet);
+        admitted.push(entry.clone());
+    }
+    if !admitted.is_empty() {
+        live.replace(&HashSet::new(), &admitted, cap);
+    }
+}
+
+/// Mirror the locked live-only projection step in an external scenario publisher.
+#[cfg(feature = "scenario")]
+pub fn scenario_apply_live_reentries(
+    live: &LiveWatchlist,
+    paper_state: &PaperStateDb,
+    prepared: &[WalletAddress],
+    applied_entries: &[WatchlistEntry],
+    cap: usize,
+) {
+    apply_live_reentries(live, paper_state, prepared, applied_entries, cap);
 }
 
 fn recheck_publication_evidence(
@@ -490,16 +559,6 @@ fn knockout_causal_input(
     ))
 }
 
-fn planned_admissions(
-    current: &[WatchlistEntry],
-    removed: &HashSet<WalletAddress>,
-    candidates: &[WatchlistEntry],
-    cap: usize,
-) -> Vec<WalletAddress> {
-    let current = current.iter().map(|entry| entry.wallet).collect();
-    planned_admission_wallets(&current, removed, candidates, cap)
-}
-
 /// Pure wallet-identity owner for knockout/backfill admission selection. Qualification reuses
 /// this function against receipt-bound candidate rows.
 pub(crate) fn planned_admission_wallets(
@@ -536,8 +595,9 @@ pub(crate) fn planned_admission_wallets(
 /// this admission set under the writer lock, and the preparer installs exactly this set before
 /// the lock is taken, so the two can never disagree. Duplicate wallets and an incoming slice
 /// longer than `cap` (neither is produced by the `limit`-bounded ranking reads) resolve the same
-/// way on both sides because [`planned_admissions`] and [`LiveWatchlist::replace`] share the
+/// way on both sides because [`planned_admission_wallets`] and [`LiveWatchlist::replace`] share the
 /// same walk.
+#[cfg(test)]
 pub(crate) fn ranked_membership_change(
     current: &[WatchlistEntry],
     incoming: &[WatchlistEntry],
@@ -545,6 +605,16 @@ pub(crate) fn ranked_membership_change(
 ) -> (Vec<WalletAddress>, Vec<WalletAddress>) {
     let current_wallets: Vec<WalletAddress> = current.iter().map(|entry| entry.wallet).collect();
     ranked_membership_change_wallets(&current_wallets, incoming, cap)
+}
+
+pub(crate) fn ranked_membership_change_set(
+    current: &HashSet<WalletAddress>,
+    incoming: &[WatchlistEntry],
+    cap: usize,
+) -> (Vec<WalletAddress>, Vec<WalletAddress>) {
+    let mut wallets = current.iter().copied().collect::<Vec<_>>();
+    wallets.sort_unstable_by_key(|wallet| wallet.0);
+    ranked_membership_change_wallets(&wallets, incoming, cap)
 }
 
 /// Wallet-identity core of [`ranked_membership_change`]: the runtime passes its live entries,
@@ -612,26 +682,17 @@ pub async fn apply_evictions_and_backfill(
         return Err(stale_capacity_error(expected_capacity, applied));
     }
     remove_loaded_fences(live, paper_state)?;
-    let current = live.snapshot();
-    let admissions = planned_admissions(
-        &current.entries,
-        removed,
-        candidates,
-        expected_capacity.target,
-    );
-    let current_wallets = current
-        .entries
-        .iter()
-        .map(|entry| entry.wallet)
-        .collect::<HashSet<_>>();
+    let current = live.structural_membership();
+    let admissions =
+        planned_admission_wallets(&current, removed, candidates, expected_capacity.target);
     let mut actual_removed = removed
         .iter()
-        .filter(|wallet| current_wallets.contains(wallet))
+        .filter(|wallet| current.contains(wallet))
         .copied()
         .collect::<Vec<_>>();
     actual_removed.sort_unstable_by_key(|wallet| wallet.0);
     if actual_removed.is_empty() && admissions.is_empty() {
-        return Ok(current.entries.len());
+        return Ok(live.snapshot().entries.len());
     }
     let seeds = admission_seeds(&admissions, candidate_last_trade)?;
     drop(_guard);
@@ -652,6 +713,7 @@ pub async fn apply_evictions_and_backfill(
                     applied: applied_capacity.clone(),
                     expected: expected_capacity,
                 }),
+                reentries: Vec::new(),
             },
         )
         .await
@@ -675,15 +737,17 @@ pub(crate) async fn apply_ranked_membership_locked(
     cap: usize,
     writer_guard: MutexGuard<'_, ()>,
     capacity: Option<MembershipCapacityCheck>,
+    reentries: &[WalletAddress],
 ) -> Result<(usize, Vec<WalletAddress>), MembershipApplyError> {
     remove_loaded_fences(live, paper_state)?;
-    let current = live.snapshot();
-    let (dropped, admissions) = ranked_membership_change(&current.entries, incoming, cap);
+    let current = live.structural_membership();
+    let (dropped, admissions) = ranked_membership_change_set(&current, incoming, cap);
     if dropped.is_empty()
         && admissions.is_empty()
         && publication.reason != MembershipReason::CapacityChange
     {
-        return Ok((current.entries.len(), dropped));
+        apply_live_reentries(live, paper_state, reentries, incoming, cap);
+        return Ok((live.snapshot().entries.len(), dropped));
     }
     let seeds = admission_seeds(&admissions, incoming_last_trade)?;
     drop(writer_guard);
@@ -698,7 +762,11 @@ pub(crate) async fn apply_ranked_membership_locked(
                 evidence: publication.evidence,
             },
             incoming.to_vec(),
-            MembershipCommit { seeds, capacity },
+            MembershipCommit {
+                seeds,
+                capacity,
+                reentries: reentries.to_vec(),
+            },
         )
         .await
         .map_err(|error| MembershipApplyError::Publication(error.to_string()))?;
@@ -719,6 +787,7 @@ pub async fn apply_full_rerank_swap(
     expected_capacity: WatchlistCapacityEpoch,
     incoming: &[WatchlistEntry],
     incoming_last_trade: &HashMap<WalletAddress, i64>,
+    reentries: &[WalletAddress],
 ) -> Result<(usize, Vec<WalletAddress>), MembershipApplyError> {
     let _guard = writer_lock.lock().await;
     let applied = applied_capacity.load();
@@ -738,6 +807,7 @@ pub async fn apply_full_rerank_swap(
             applied: applied_capacity.clone(),
             expected: expected_capacity,
         }),
+        reentries,
     )
     .await
 }
@@ -888,21 +958,71 @@ async fn maintenance_tick(
 
     // 1. Ranking-batch step — UNCONDITIONAL, never coupled to local DB read health (the
     // legacy tick ran it first; a review finding on the first draft caught the reorder).
-    // Knockout mode: a fresh batch only clears the evicted-set so re-promoted wallets can
-    // return. FullRerank mode: a batch TRANSITION hands membership to the ranker —
+    // Knockout mode: a fresh batch clears the evicted-set and can restore prepared,
+    // structural wallets that are absent from live. FullRerank mode: a batch TRANSITION
+    // hands membership to the ranker —
     // wholesale swap to the new top-`cap`; the marker only advances on a successful swap
     // so a failed fetch retries next tick. Audit stats for dropped wallets are best-effort
     // decoration: a list_fills failure degrades the audit rows, never blocks the swap.
     match supabase_reader::fetch_latest_batch_id(client, base_url, anon_key, secret_key).await {
         Ok(latest) => match cfg.membership_mode {
             MembershipMode::Knockout => {
-                if latest.is_some() && latest != sync.marker {
-                    if sync.marker.is_some() {
-                        evicted.clear();
+                if let Some(batch_id) = latest
+                    && latest != sync.marker
+                {
+                    match supabase_reader::fetch_batch(
+                        client,
+                        base_url,
+                        anon_key,
+                        secret_key,
+                        batch_id,
+                        MAX_ACTIVE_WATCHLIST_SIZE,
+                    )
+                    .await
+                    {
+                        Ok((incoming, incoming_last_trade)) => match paper_state.wallet_fences() {
+                            Ok(records) => {
+                                let fenced =
+                                    records.into_iter().map(|record| record.wallet).collect();
+                                // Fence-filter only: knockout membership is not the batch's
+                                // top-`cap`, so a structural wallet may rank below it.
+                                let (incoming, _) = supabase_reader::select_membership(
+                                    incoming,
+                                    incoming_last_trade,
+                                    &fenced,
+                                    MAX_ACTIVE_WATCHLIST_SIZE,
+                                );
+                                let candidates = planned_live_reentries(live, &incoming.entries);
+                                let reentries = preparer.prepare_live_reentries(&candidates).await;
+                                let _writer = writer_lock.lock().await;
+                                if applied_capacity.load() == capacity_epoch {
+                                    apply_live_reentries(
+                                        live,
+                                        paper_state,
+                                        &reentries,
+                                        &incoming.entries,
+                                        cap,
+                                    );
+                                    if sync.marker.is_some() {
+                                        evicted.clear();
+                                    }
+                                    sync.marker = Some(batch_id);
+                                } else {
+                                    warn!(
+                                        batch_id,
+                                        "knockout: capacity changed during live reentry preparation; retrying batch"
+                                    );
+                                }
+                            }
+                            Err(error) => warn!(%error, batch_id,
+                                    "knockout: fence read failed; keeping batch marker for retry"),
+                        },
+                        Err(error) => warn!(%error, batch_id,
+                            "knockout: pinned batch fetch failed; keeping batch marker for retry"),
                     }
-                    sync.marker = latest;
                 }
-                // Knockout membership is never batch-applied, so there is nothing to re-sync.
+                // Knockout structural membership is never batch-applied, so there is no
+                // capacity-driven re-sync.
                 sync.capacity_generation = capacity_epoch.generation;
             }
             MembershipMode::FullRerank => {
@@ -940,8 +1060,8 @@ async fn maintenance_tick(
                                     &fenced,
                                     cap,
                                 );
-                            let (_, additions) = ranked_membership_change(
-                                &live.snapshot().entries,
+                            let (_, additions) = ranked_membership_change_set(
+                                &live.structural_membership(),
                                 &incoming.entries,
                                 cap,
                             );
@@ -950,6 +1070,10 @@ async fn maintenance_tick(
                                     "full_rerank: admission preparation failed; keeping membership and batch marker for retry");
                                 break 'replacement;
                             }
+                            let reentry_candidates =
+                                planned_live_reentries(live, &incoming.entries);
+                            let reentries =
+                                preparer.prepare_live_reentries(&reentry_candidates).await;
                             let ranking_receipt = match preparer
                                 .record_ranking_membership(Some(batch_id), incoming.entries.clone())
                                 .await
@@ -997,6 +1121,7 @@ async fn maintenance_tick(
                                 capacity_epoch,
                                 &incoming.entries,
                                 &incoming_last_trade,
+                                &reentries,
                             )
                             .await
                             {
@@ -1101,7 +1226,8 @@ async fn maintenance_tick(
 
     // 4. Decide evictions. Nothing to do only when there are no evictions and the set is full.
     let evictions = decide_evictions(&live_snapshot, &stats.by_wallet, &cursors, cfg, now_unix);
-    if evictions.is_empty() && live_wallets.len() >= cap {
+    let structural_wallets = live.structural_membership();
+    if evictions.is_empty() && structural_wallets.len() >= cap {
         return;
     }
 
@@ -1113,12 +1239,12 @@ async fn maintenance_tick(
     }
 
     // 6. Fetch bench candidates for freed slots, excluding (live ∪ evicted), then atomic replace.
-    let survivors = live_wallets.len().saturating_sub(evictions.len());
+    let survivors = structural_wallets.len().saturating_sub(evictions.len());
     let freed = cap.saturating_sub(survivors);
     let (candidates, candidate_last_trade) = if let Some(batch_id) = sync.marker
         && freed > 0
     {
-        let exclude: Vec<WalletAddress> = live_wallets
+        let exclude: Vec<WalletAddress> = structural_wallets
             .iter()
             .copied()
             .chain(next_evicted.iter().copied())
@@ -1177,7 +1303,7 @@ async fn maintenance_tick(
     // epoch. Prepare exactly those wallets first (#542); on failure apply the decided evictions
     // with no backfill and let the next tick retry the freed slots.
     let removed: HashSet<WalletAddress> = next_evicted.iter().copied().collect();
-    let planned = planned_admissions(&live_snapshot.entries, &removed, &candidates, cap);
+    let planned = planned_admission_wallets(&structural_wallets, &removed, &candidates, cap);
     let (candidates, candidate_last_trade) = match preparer.prepare(&planned).await {
         Ok(()) => (candidates, candidate_last_trade),
         Err(error) => {
@@ -1187,7 +1313,7 @@ async fn maintenance_tick(
         }
     };
     let published_admissions =
-        planned_admissions(&live_snapshot.entries, &removed, &candidates, cap);
+        planned_admission_wallets(&structural_wallets, &removed, &candidates, cap);
 
     let Some(knockout_inputs) = evictions
         .iter()
@@ -1708,6 +1834,33 @@ mod tests {
     }
 
     #[test]
+    fn incident_shape_rerank_uses_all_structural_wallets() {
+        let wallet = |byte| WalletAddress([byte; 20]);
+        let entry = |wallet| WatchlistEntry {
+            wallet,
+            tier: pe_trader_index::WatchlistTier::Active,
+            leader_score_bps: pe_core_types::BasisPoints(100),
+            lcb_5pct_bps: pe_core_types::BasisPoints(100),
+            win_rate_bps: pe_core_types::BasisPoints(6_000),
+            closed_trades_in_window: 0,
+            reconstruction_quality: pe_core_types::ReconstructionQuality::new(100).unwrap(),
+        };
+        let structural = (1..=19).map(wallet).collect::<HashSet<_>>();
+        let live = (1..=13).map(wallet).collect::<HashSet<_>>();
+        let incoming = (20..=28)
+            .map(|byte| entry(wallet(byte)))
+            .collect::<Vec<_>>();
+        let (removed, added) = ranked_membership_change_set(&structural, &incoming, 100);
+        assert_eq!(removed.iter().copied().collect::<HashSet<_>>(), structural);
+        assert_eq!(added.len(), 9);
+        assert_eq!(live.len(), 13);
+        assert!(
+            planned_admission_wallets(&structural, &HashSet::new(), &[entry(wallet(19))], 100)
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn too_few_trades_not_spared_by_inactivity() {
         // A would-be winner with < min_trades is NOT a proven winner → evicted at 72h.
         let thin = stats(9, dec!(5), Some(dec!(0.20)), Some(dec!(0.40)));
@@ -1795,6 +1948,7 @@ mod tests {
             latest_ranking: Vec<serde_json::Value>,
             history_ok: bool,
             failure: Option<&'static str>,
+            entries_fail: bool,
             activity_hits: Arc<AtomicUsize>,
             position_hits: Arc<AtomicUsize>,
         }
@@ -1807,6 +1961,7 @@ mod tests {
                     latest_ranking: Vec::new(),
                     history_ok: true,
                     failure: None,
+                    entries_fail: false,
                     activity_hits: Arc::new(AtomicUsize::new(0)),
                     position_hits: Arc::new(AtomicUsize::new(0)),
                 }
@@ -1868,14 +2023,17 @@ mod tests {
                 async fn entries(
                     State(fake): State<Fake>,
                     Query(q): Query<HashMap<String, String>>,
-                ) -> Json<Vec<serde_json::Value>> {
+                ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+                    if fake.entries_fail {
+                        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                    }
                     let pinned = q
                         .get("batch_id")
                         .and_then(|v| v.strip_prefix("eq."))
                         .and_then(|v| v.parse::<i64>().ok())
                         .expect("pinned read must carry batch_id=eq.N");
                     assert!(pinned >= 0);
-                    Json(selected(&fake.ranking_entries, &q))
+                    Ok(Json(selected(&fake.ranking_entries, &q)))
                 }
                 async fn latest(
                     State(fake): State<Fake>,
@@ -1932,6 +2090,7 @@ mod tests {
             client: reqwest::Client,
             base_url: String,
             controls: Arc<StdMutex<ControlLog>>,
+            membership_publications: Arc<AtomicUsize>,
             _source_task: tokio::task::JoinHandle<()>,
             _source_triggers: mpsc::Receiver<ReconciliationTrigger>,
             _temp: TempDir,
@@ -1979,6 +2138,8 @@ mod tests {
             let (control_tx, mut control_rx) = mpsc::channel(2);
             let controls: Arc<StdMutex<ControlLog>> = Arc::new(StdMutex::new(Vec::new()));
             let (control_live, control_log) = (live.clone(), Arc::clone(&controls));
+            let membership_publications = Arc::new(AtomicUsize::new(0));
+            let publication_count = Arc::clone(&membership_publications);
             let fake_paper_state = Arc::clone(&paper_state);
             let verifier_source_log = source_log.clone();
             let state_path = temp.path().join("paper.db");
@@ -2043,6 +2204,7 @@ mod tests {
                             checks,
                             acknowledged,
                         } => {
+                            publication_count.fetch_add(1, Ordering::SeqCst);
                             if let Err(error) = checks.recheck_and_seed(
                                 &fake_paper_state,
                                 &control_live,
@@ -2067,19 +2229,27 @@ mod tests {
                                 crate::qualification::verify_published_membership_change(
                                     &change.clone().into_record(),
                                     &verifier_source_log,
-                                    &control_live
-                                        .snapshot()
-                                        .entries
-                                        .iter()
-                                        .map(|entry| entry.wallet)
-                                        .collect(),
+                                    &control_live.structural_membership(),
                                 )
                             {
                                 acknowledged.send(Err(error.to_string())).unwrap();
                                 continue;
                             }
-                            let removed = change.removed.into_iter().collect::<HashSet<_>>();
-                            control_live.replace(&removed, &replacements, change.capacity);
+                            let removed = change.removed.iter().copied().collect::<HashSet<_>>();
+                            let additions = replacements
+                                .iter()
+                                .filter(|entry| change.added.contains(&entry.wallet))
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            control_live.commit_structural_change(&change.removed, &change.added);
+                            control_live.replace(&removed, &additions, change.capacity);
+                            apply_live_reentries(
+                                &control_live,
+                                &fake_paper_state,
+                                &checks.reentries,
+                                &replacements,
+                                change.capacity,
+                            );
                             checks.commit_capacity();
                             acknowledged
                                 .send(Ok(pe_event_log::AppendReceipt {
@@ -2111,6 +2281,7 @@ mod tests {
                 client: reqwest::Client::new(),
                 base_url,
                 controls,
+                membership_publications,
                 _source_task: source_task,
                 _source_triggers: source_triggers,
                 _temp: temp,
@@ -2285,6 +2456,91 @@ mod tests {
             assert_eq!(h.controls(), vec![(set(&[b]), set(&[a]))]);
             assert_eq!(members(&h.live), set(&[b]));
             assert_eq!(marker, Some(2));
+        }
+
+        #[tokio::test]
+        async fn knockout_batch_restores_structural_wallets_missing_from_live() {
+            let (deferred, present, newer) = (wallet(1), wallet(2), wallet(3));
+            for empty_after_boot in [false, true] {
+                let mut fake = Fake::new(Some(2));
+                fake.ranking_entries = vec![row(2, 1, deferred), row(2, 2, present)];
+                // The moving view has already advanced. Reentry must use batch 2's score.
+                fake.latest_ranking = vec![row(3, 1, newer)];
+                let h = harness(fake, &[deferred, present]).await;
+                let removed = if empty_after_boot {
+                    set(&[deferred, present])
+                } else {
+                    set(&[deferred])
+                };
+                h.live.remove_fenced(&removed);
+                assert_eq!(h.live.structural_membership(), set(&[deferred, present]));
+                assert_eq!(members(&h.live).is_empty(), empty_after_boot);
+                let (mut evicted, mut marker) = (HashSet::new(), Some(1));
+
+                h.tick(MembershipMode::Knockout, &mut evicted, &mut marker)
+                    .await;
+
+                assert_eq!(marker, Some(2));
+                assert_eq!(members(&h.live), set(&[deferred, present]));
+                assert_eq!(h.live.structural_membership(), set(&[deferred, present]));
+                let snapshot = h.live.snapshot();
+                let restored = snapshot
+                    .entries
+                    .iter()
+                    .find(|entry| entry.wallet == deferred)
+                    .unwrap();
+                assert_eq!(restored.leader_score_bps.0, 2_000);
+                assert_eq!(h.membership_publications.load(Ordering::SeqCst), 0);
+                assert_eq!(h.controls().len(), if empty_after_boot { 2 } else { 1 });
+            }
+        }
+
+        #[tokio::test]
+        async fn knockout_batch_restores_structural_wallet_ranked_below_the_cap() {
+            let (a, b, deferred) = (wallet(1), wallet(2), wallet(3));
+            let (x, y, z) = (wallet(7), wallet(8), wallet(9));
+            let mut fake = Fake::new(Some(2));
+            // `deferred` ranks fourth, below CAP = 3; knockout membership is not the top-CAP.
+            fake.ranking_entries = vec![
+                row(2, 1, x),
+                row(2, 2, y),
+                row(2, 3, z),
+                row(2, 4, deferred),
+            ];
+            let h = harness(fake, &[a, b, deferred]).await;
+            h.live.remove_fenced(&set(&[deferred]));
+            let (mut evicted, mut marker) = (HashSet::new(), Some(1));
+
+            h.tick(MembershipMode::Knockout, &mut evicted, &mut marker)
+                .await;
+
+            assert_eq!(marker, Some(2));
+            assert_eq!(members(&h.live), set(&[a, b, deferred]));
+            assert_eq!(h.live.structural_membership(), set(&[a, b, deferred]));
+            assert_eq!(h.membership_publications.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn knockout_batch_read_failure_keeps_marker_and_eviction_memory() {
+            let (a, deferred, knocked_out) = (wallet(1), wallet(2), wallet(9));
+            let mut fake = Fake::new(Some(2));
+            fake.ranking_entries = vec![row(2, 1, deferred)];
+            fake.entries_fail = true;
+            let h = harness(fake, &[a, deferred]).await;
+            h.live.remove_fenced(&set(&[deferred]));
+            let (mut evicted, mut marker) = (set(&[knocked_out]), Some(1));
+
+            h.tick(MembershipMode::Knockout, &mut evicted, &mut marker)
+                .await;
+
+            assert_eq!(
+                marker,
+                Some(1),
+                "a failed pinned read retries the transition"
+            );
+            assert!(evicted.contains(&knocked_out));
+            assert_eq!(members(&h.live), set(&[a]));
+            assert_eq!(h.live.structural_membership(), set(&[a, deferred]));
         }
 
         #[tokio::test]

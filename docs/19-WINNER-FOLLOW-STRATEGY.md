@@ -425,7 +425,7 @@ rule, and version compatibility are canonical in the glossary's
 [`copy_latency_budget_secs`](_GLOSSARY.md#polymarket-public-source-pollingconfig) and
 [continuation contract](_GLOSSARY.md#continuation-and-commitment-compatibility-588).
 
-**Fail posture (gate B history unknown).** Missing or incomplete reconciled history fails closed: the wallet cannot be published into membership, and any attempted entry receives the typed `wallet_history_incomplete` disposition. Version-two paper-state records are the authority. The captured legacy history file is a one-time migration input only: a valid import is a conservative seed and remains incomplete until a reconciled-history proof is durably recorded (#544).
+**Fail posture (gate B history unknown).** Missing or incomplete reconciled history fails closed: the wallet cannot be published into live membership, and any attempted entry receives the typed `wallet_history_incomplete` disposition. Version-two paper-state records are the authority. The captured legacy history file is a one-time migration input only: a valid import is a conservative seed and remains incomplete until a reconciled-history proof is durably recorded (#544).
 
 “History complete” means complete over attributable rows: rows whose asset no configured metadata authority can verify are recorded `raw_only` and cannot contribute a market to first-entry history.
 

@@ -57,7 +57,9 @@ use pe_service::runtime_config::{
 use pe_service::snapshot_worker::{SnapshotHandle, run_snapshot_worker};
 use pe_service::supabase_backfill::backfill_supabase;
 use pe_service::supabase_reader;
-use pe_service::supabase_refresh::{WatchlistProjectionStatus, run_supabase_refresh_loop};
+use pe_service::supabase_refresh::{
+    WatchlistProjectionStatus, boot_refresh_scores_and_release, run_supabase_refresh_loop,
+};
 use pe_service::supabase_sink::{SinkHandle, SupabaseWriter, run_sink};
 use pe_service::supabase_state::{
     SourceEvidence, SupabaseStateClient, reconcile_active_financial_frames,
@@ -311,6 +313,30 @@ async fn main() -> Result<()> {
     let log_guards =
         pe_service::logging::setup(&cfg.jsonl_log_path, "info", cfg.log_retention_days)?;
     info!("pe-service starting");
+    let nofile = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+    if nofile.current != nofile.maximum {
+        rustix::process::setrlimit(
+            rustix::process::Resource::Nofile,
+            rustix::process::Rlimit {
+                current: nofile.maximum,
+                maximum: nofile.maximum,
+            },
+        )
+        .context("raise NOFILE soft limit to hard limit")?;
+    }
+    let effective_nofile = rustix::process::getrlimit(rustix::process::Resource::Nofile);
+    info!(
+        initial_soft = ?nofile.current,
+        hard = ?nofile.maximum,
+        effective_soft = ?effective_nofile.current,
+        "NOFILE descriptor limit"
+    );
+    anyhow::ensure!(
+        effective_nofile.current == effective_nofile.maximum,
+        "NOFILE soft limit {:?} remains below hard limit {:?}",
+        effective_nofile.current,
+        effective_nofile.maximum
+    );
     info!(
         active_risk_halt_count,
         "active paper risk causes rebuilt from the verified prefix"
@@ -712,6 +738,8 @@ async fn main() -> Result<()> {
     } else {
         (initial_watchlist, bootstrap_last_trade)
     };
+    // This is the structural generation: post-Start replay above, or the selected pre-Start
+    // batch after fences. LiveWatchlist snapshots it before the boot bracket filters live.
     let live_watchlist =
         LiveWatchlist::new_with_projection(initial_watchlist, projection_dirty.clone());
     live_watchlist.remove_fenced(&fenced);
@@ -1466,9 +1494,19 @@ async fn main() -> Result<()> {
             .map_err(anyhow::Error::msg)
             .context("synchronize boot risk halt release")?;
     }
-    producer_start_tx
-        .send(true)
-        .map_err(|_| anyhow::anyhow!("source producer start gate closed"))?;
+    // Replayed membership can carry a score from an earlier ranking batch, including after a
+    // live-only reentry. Refresh every boot-live score before any source producer can read it.
+    boot_refresh_scores_and_release(
+        &live_watchlist,
+        &ranking_client,
+        &cfg.supabase_url,
+        &cfg.supabase_anon_key,
+        &cfg.supabase_secret_key,
+        &watchlist_writer_lock,
+        &producer_start_tx,
+    )
+    .await
+    .context("establish current boot watchlist scores before releasing producers")?;
 
     // Cumulative authoritative-RPC counter for status.json — grabbed before `supabase_state`
     // is moved into the resolution task below; `None` when not in authoritative mode.

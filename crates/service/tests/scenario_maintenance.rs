@@ -42,6 +42,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use pe_core_types::{BasisPoints, ReconstructionQuality, SourceTimestamp, WalletAddress};
 use pe_paper_state::{AnchorInstallRecord, PaperStateDb, WalletHistoryStatusRecord};
@@ -56,13 +57,14 @@ use pe_service::watchlist_admission::AdmissionPreparer;
 use pe_service::watchlist_maintenance::{
     KnockoutReason, MaintenanceConfig, MembershipMode, MembershipPublication,
     apply_evictions_and_backfill, apply_full_rerank_swap, decide_evictions,
+    scenario_apply_live_reentries,
 };
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tempfile::TempDir;
 use time::OffsetDateTime;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 fn capacity(target: usize) -> (AppliedWatchlistCapacity, WatchlistCapacityEpoch) {
     let applied = AppliedWatchlistCapacity::new(target);
@@ -74,6 +76,15 @@ fn membership_preparer(
     live: LiveWatchlist,
     paper_state: Arc<PaperStateDb>,
     writer_lock: Arc<Mutex<()>>,
+) -> AdmissionPreparer {
+    membership_preparer_counted(live, paper_state, writer_lock, None)
+}
+
+fn membership_preparer_counted(
+    live: LiveWatchlist,
+    paper_state: Arc<PaperStateDb>,
+    writer_lock: Arc<Mutex<()>>,
+    publications: Option<Arc<AtomicUsize>>,
 ) -> AdmissionPreparer {
     let (control, mut commands) = mpsc::channel(1);
     let control_paper = paper_state.clone();
@@ -96,9 +107,25 @@ fn membership_preparer(
                 continue;
             }
 
-            let removed = change.removed.into_iter().collect::<HashSet<_>>();
-            live.replace(&removed, &replacements, change.capacity);
+            let removed = change.removed.iter().copied().collect::<HashSet<_>>();
+            let additions = replacements
+                .iter()
+                .filter(|entry| change.added.contains(&entry.wallet))
+                .cloned()
+                .collect::<Vec<_>>();
+            live.scenario_commit_structural_change(&change.removed, &change.added);
+            live.replace(&removed, &additions, change.capacity);
+            scenario_apply_live_reentries(
+                &live,
+                &control_paper,
+                &checks.reentries,
+                &replacements,
+                change.capacity,
+            );
             checks.commit_capacity();
+            if let Some(publications) = &publications {
+                publications.fetch_add(1, Ordering::SeqCst);
+            }
             acknowledged
                 .send(Ok(pe_event_log::AppendReceipt {
                     sequence: pe_core_types::EventSeq(1),
@@ -212,6 +239,176 @@ fn install_anchor(db: &PaperStateDb, wallet: WalletAddress, cursor: i64) {
         recorded_at_unix: cursor,
     }])
     .unwrap();
+}
+
+#[tokio::test]
+async fn ranked_noop_reenters_deferred_wallet_with_current_score() {
+    let (_dir, db) = temp_db();
+    let retained = wallet(41);
+    install_anchor(&db, retained, NOW - 10);
+    let live = LiveWatchlist::new(watchlist(vec![entry(retained, 100)]));
+    live.remove_fenced(&HashSet::from([retained]));
+    let lock = Arc::new(Mutex::new(()));
+    let (control, mut commands) = mpsc::channel(1);
+    let preparer = AdmissionPreparer::new(control, Arc::clone(&db));
+    let (applied, epoch) = capacity(1);
+    let mut ranked_entry = entry(retained, 900);
+    ranked_entry.win_rate_bps = BasisPoints(8_500);
+    let incoming = vec![ranked_entry];
+    let (size, dropped) = apply_full_rerank_swap(
+        &live,
+        &db,
+        &lock,
+        &preparer,
+        MembershipPublication {
+            reason: MembershipReason::FullRerank,
+            ranking_batch_id: Some(84),
+            evidence: serde_json::json!({"scenario":"no-structural-change"}),
+        },
+        &applied,
+        epoch,
+        &incoming,
+        &HashMap::new(),
+        &[retained],
+    )
+    .await
+    .unwrap();
+    assert_eq!(size, 1);
+    assert!(dropped.is_empty());
+    assert_eq!(live.structural_membership(), HashSet::from([retained]));
+    assert_eq!(
+        live.snapshot().entries[0].leader_score_bps,
+        BasisPoints(900)
+    );
+    assert_eq!(live.snapshot().entries[0].win_rate_bps, BasisPoints(8_500));
+    assert!(matches!(
+        commands.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
+async fn rerank_dropped_wallet_cannot_reenter_after_preparation() {
+    let (_dir, db) = temp_db();
+    let retained = wallet(44);
+    let dropped = wallet(45);
+    install_anchor(&db, dropped, NOW - 10);
+    let live = LiveWatchlist::new(watchlist(vec![entry(retained, 200), entry(dropped, 100)]));
+    live.remove_fenced(&HashSet::from([dropped]));
+    let lock = Arc::new(Mutex::new(()));
+    let (control, mut commands) = mpsc::channel(1);
+    let (preparing, prepared) = oneshot::channel();
+    let (release, released) = oneshot::channel();
+    let relay = tokio::spawn(async move {
+        if let Some(OrchestratorControl::PrepareAdmissions {
+            wallets,
+            acknowledged,
+        }) = commands.recv().await
+        {
+            assert_eq!(wallets, vec![dropped]);
+            preparing.send(()).unwrap();
+            released.await.unwrap();
+            acknowledged.send(()).unwrap();
+        } else {
+            panic!("expected reentry preparation");
+        }
+    });
+    let reentry_preparer = AdmissionPreparer::new(control, Arc::clone(&db));
+    let reentry =
+        tokio::spawn(async move { reentry_preparer.prepare_live_reentries(&[dropped]).await });
+    prepared.await.unwrap();
+    let publications = Arc::new(AtomicUsize::new(0));
+    let (applied, epoch) = capacity(2);
+    let (size, removed) = apply_full_rerank_swap(
+        &live,
+        &db,
+        &lock,
+        &membership_preparer_counted(
+            live.clone(),
+            Arc::clone(&db),
+            lock.clone(),
+            Some(Arc::clone(&publications)),
+        ),
+        MembershipPublication {
+            reason: MembershipReason::FullRerank,
+            ranking_batch_id: Some(85),
+            evidence: serde_json::json!({"scenario":"dropped-during-reentry"}),
+        },
+        &applied,
+        epoch,
+        &[entry(retained, 300)],
+        &HashMap::new(),
+        &[],
+    )
+    .await
+    .unwrap();
+    assert_eq!(size, 1);
+    assert_eq!(removed, vec![dropped]);
+    release.send(()).unwrap();
+    let prepared = reentry.await.unwrap();
+    assert_eq!(prepared, vec![dropped]);
+    let _writer = lock.lock().await;
+    scenario_apply_live_reentries(&live, &db, &prepared, &[entry(dropped, 900)], 2);
+    assert_eq!(live.structural_membership(), HashSet::from([retained]));
+    assert_eq!(live.snapshot().entries.len(), 1);
+    assert_eq!(live.snapshot().entries[0].wallet, retained);
+    assert_eq!(publications.load(Ordering::SeqCst), 1);
+    relay.await.unwrap();
+}
+
+#[tokio::test]
+async fn ranked_reentry_attempts_are_independent_and_recheck_current_membership() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+    let ready = wallet(42);
+    let deferred = wallet(43);
+    db.record_reconciled_history_status(&WalletHistoryStatusRecord {
+        wallet: ready,
+        complete: true,
+        proof_json: "{}".to_owned(),
+        updated_at_unix: NOW,
+    })
+    .unwrap();
+    install_anchor(&db, ready, NOW - 10);
+    let live = LiveWatchlist::new(watchlist(vec![entry(ready, 100), entry(deferred, 100)]));
+    live.remove_fenced(&HashSet::from([ready, deferred]));
+    let (control, mut commands) = mpsc::channel(2);
+    let relay = tokio::spawn(async move {
+        while let Some(command) = commands.recv().await {
+            if let OrchestratorControl::PrepareAdmissions {
+                wallets,
+                acknowledged,
+            } = command
+            {
+                assert_eq!(wallets, vec![ready]);
+                acknowledged.send(()).unwrap();
+            }
+        }
+    });
+    let preparer = AdmissionPreparer::new(control, Arc::clone(&db));
+    let prepared = preparer.prepare_live_reentries(&[deferred, ready]).await;
+    assert_eq!(prepared, vec![ready]);
+    let incoming = vec![entry(ready, 900), entry(deferred, 800)];
+    scenario_apply_live_reentries(&live, &db, &prepared, &incoming, 2);
+    assert_eq!(live.snapshot().entries.len(), 1);
+    assert_eq!(
+        live.snapshot().entries[0].leader_score_bps,
+        BasisPoints(900)
+    );
+    assert_eq!(
+        live.structural_membership(),
+        HashSet::from([ready, deferred])
+    );
+
+    live.remove_fenced(&HashSet::from([ready]));
+    scenario_apply_live_reentries(&live, &db, &prepared, &[], 2);
+    assert!(live.snapshot().entries.is_empty());
+    live.scenario_commit_structural_change(&[ready], &[]);
+    scenario_apply_live_reentries(&live, &db, &prepared, &incoming, 2);
+    assert!(live.snapshot().entries.is_empty());
+    assert_eq!(live.structural_membership(), HashSet::from([deferred]));
+    drop(preparer);
+    relay.await.unwrap();
 }
 
 // ── proven-winner-spared-under-72h ──────────────────────────────────────────────
@@ -645,6 +842,7 @@ async fn full_rerank_swap_wholesale() {
         epoch,
         &incoming,
         &incoming_last_trade,
+        &[],
     )
     .await
     .unwrap();
@@ -657,6 +855,7 @@ async fn full_rerank_swap_wholesale() {
         HashSet::from([b, d]),
         "membership must be exactly the incoming set"
     );
+    assert_eq!(live.structural_membership(), HashSet::from([b, d]));
     let dropped_set: HashSet<WalletAddress> = dropped.into_iter().collect();
     assert_eq!(
         dropped_set,
@@ -703,6 +902,7 @@ async fn full_rerank_swap_identity_noop() {
         epoch,
         &incoming,
         &side,
+        &[],
     )
     .await
     .unwrap();
@@ -751,6 +951,7 @@ async fn runtime_capacity_grows_and_shrinks_without_restart() {
         grow_epoch,
         &top_100,
         &side,
+        &[],
     )
     .await
     .unwrap();
@@ -772,6 +973,7 @@ async fn runtime_capacity_grows_and_shrinks_without_restart() {
         shrink_epoch,
         &top_75,
         &side,
+        &[],
     )
     .await
     .unwrap();
@@ -819,6 +1021,7 @@ async fn stale_capacity_epoch_cannot_undo_a_newer_membership() {
         stale_50,
         &top_50,
         &side,
+        &[],
     )
     .await
     .unwrap_err();
@@ -840,6 +1043,7 @@ async fn stale_capacity_epoch_cannot_undo_a_newer_membership() {
         stale_50,
         &top_50,
         &side,
+        &[],
     )
     .await
     .unwrap_err();
@@ -871,6 +1075,7 @@ async fn missing_admission_cursor_leaves_membership_unchanged() {
         epoch,
         &incoming,
         &HashMap::new(),
+        &[],
     )
     .await
     .unwrap_err();
@@ -977,6 +1182,7 @@ async fn full_rerank_swap_on_a_batch_with_no_survivors_empties_the_live_set() {
         epoch,
         &[],
         &HashMap::new(),
+        &[],
     )
     .await
     .unwrap();

@@ -847,6 +847,12 @@ async fn verify_qualification(
         .enumerate()
     {
         let frame_index = start_index + 1 + offset;
+        crate::paper_recovery::repair_historical_membership(
+            &start.activation_id,
+            frame,
+            &mut membership,
+        )
+        .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
         let PaperLogFrame::Record(record) = &frame.frame else {
             return insufficient("legacy paper fill exists after QualificationStarted");
         };
@@ -13411,7 +13417,11 @@ mod tests {
     }
     #[test]
     fn membership_tampering_is_rejected() {
-        use crate::paper_recovery::{RankingMembershipArtifact, SealedMembershipEvidence};
+        use crate::paper_recovery::{
+            HistoricalMembershipPin, PAPER_LOG_SCHEMA_VERSION, PaperLogRecord,
+            RankingMembershipArtifact, SealedMembershipEvidence,
+            repair_historical_membership_with_pin, scan_paper_log,
+        };
         use crate::watchlist_admission::RANKING_MEMBERSHIP_SOURCE_ID;
         let wallet = WalletAddress([91; 20]);
         let other = WalletAddress([92; 20]);
@@ -13498,6 +13508,60 @@ mod tests {
             );
             assert_eq!(result.is_ok(), mutation == "none", "{mutation}: {result:?}");
         }
+
+        let dir = tempfile::tempdir().unwrap();
+        let paper_path = dir.path().join("synthetic-paper.log");
+        let hex: [String; 6] = std::array::from_fn(|index| {
+            WalletAddress([u8::try_from(index + 1).unwrap(); 20]).to_string()
+        });
+        let repair_wallets = hex
+            .iter()
+            .map(|value| WalletAddress::from_hex(value).unwrap())
+            .collect::<Vec<_>>();
+        let retained = WalletAddress([7; 20]);
+        let record = PaperLogRecord::MembershipChanged {
+            reason: MembershipReason::FullRerank,
+            removed: vec![retained],
+            added: Vec::new(),
+            capacity: 7,
+            ranking_batch_id: Some(7),
+            evidence: serde_json::json!({}),
+        };
+        let mut paper_writer = Writer::open(&paper_path).unwrap();
+        paper_writer
+            .append_synced(EnvelopeIn {
+                source_id: SourceId("pe-service.paper".to_owned()),
+                schema_version: PAPER_LOG_SCHEMA_VERSION,
+                parser_version: 1,
+                observed_at: SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
+                received_at: ReceivedAt(OffsetDateTime::UNIX_EPOCH),
+                content_type: ContentType::Json,
+                payload: serde_json::to_vec(&record).unwrap(),
+            })
+            .unwrap();
+        drop(paper_writer);
+        let frame = scan_paper_log(&paper_path).unwrap().remove(0);
+        let frame_hash = frame.receipt.this_hash.to_hex().to_string();
+        let payload_hash = frame.envelope.raw_payload_hash.to_hex().to_string();
+        let pin = HistoricalMembershipPin {
+            activation_id: "synthetic",
+            sequence: frame.receipt.sequence.0,
+            this_hash: &frame_hash,
+            raw_payload_hash: &payload_hash,
+            wallets: hex.each_ref().map(String::as_str),
+        };
+        let mut membership = repair_wallets.into_iter().chain([retained]).collect();
+        assert!(
+            repair_historical_membership_with_pin("synthetic", &frame, &mut membership, &pin,)
+                .unwrap()
+        );
+        assert_eq!(membership, HashSet::from([retained]));
+        let mut tampered = membership.clone();
+        tampered.remove(&retained);
+        assert!(
+            repair_historical_membership_with_pin("synthetic", &frame, &mut tampered, &pin,)
+                .is_err()
+        );
     }
 
     /// PASS: row-only checks admit a structurally valid terminal, while source-backed replay

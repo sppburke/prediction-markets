@@ -911,8 +911,9 @@ comparisons decide what remains; never guess from memory.
    the reviewed revision; `status.json.applied_config_hash` equals
    `runtime_config.applied_hash`; every critical task is running with no sticky failure; and
    `ExecStart`, `WorkingDirectory`, and the
-   `.env` / `service.toml` hashes equal step 3; clean boot (no config-parse error, watchlist seeded from
-   `latest_ranking`, `service_config poll loop started`, no poll failures; since #542 an admitting
+   `.env` / `service.toml` hashes equal step 3; clean boot (no config-parse error, pre-Start watchlist selected from
+   `latest_ranking` or post-Start structural membership replayed from the Start-bound paper log,
+   then fenced and deferred wallets excluded from live; `service_config poll loop started`, no poll failures; since #542 an admitting
    swap or backfill is preceded by `hot-watchlist admission state prepared`).
    **With `polymarket_activity_ws_enabled=true` (#530/#546)**: two consecutive `status.json`
    publications, each paired immediately with `/health/ready`, must show all three

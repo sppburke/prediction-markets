@@ -14,7 +14,7 @@
 //! maintenance tick in [`crate::watchlist_maintenance`] (issue #350 WS1 PR-D).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use arc_swap::ArcSwap;
 use pe_core_types::WalletAddress;
@@ -81,24 +81,63 @@ pub(crate) fn replace_entries(
 #[derive(Clone)]
 pub struct LiveWatchlist {
     inner: Arc<ArcSwap<Watchlist>>,
+    structural: Arc<RwLock<HashSet<WalletAddress>>>,
     projection_dirty: Option<ProjectionDirty>,
 }
 
 impl LiveWatchlist {
     /// Build a live watchlist seeded with `initial`.
     pub fn new(initial: Watchlist) -> Self {
+        let structural = initial.entries.iter().map(|entry| entry.wallet).collect();
         Self {
             inner: Arc::new(ArcSwap::from_pointee(initial)),
+            structural: Arc::new(RwLock::new(structural)),
             projection_dirty: None,
         }
     }
 
     /// Production constructor that attaches the sole bounded projection signal.
     pub fn new_with_projection(initial: Watchlist, projection_dirty: ProjectionDirty) -> Self {
+        let structural = initial.entries.iter().map(|entry| entry.wallet).collect();
         Self {
             inner: Arc::new(ArcSwap::from_pointee(initial)),
+            structural: Arc::new(RwLock::new(structural)),
             projection_dirty: Some(projection_dirty),
         }
+    }
+
+    /// Boot seeds this before fence and bracket filtering. The orchestrator is the runtime
+    /// writer, after its synchronized membership append succeeds.
+    pub fn structural_membership(&self) -> HashSet<WalletAddress> {
+        self.structural
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn commit_structural_change(
+        &self,
+        removed: &[WalletAddress],
+        added: &[WalletAddress],
+    ) {
+        let mut current = self
+            .structural
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for wallet in removed {
+            current.remove(wallet);
+        }
+        current.extend(added.iter().copied());
+    }
+
+    /// Mirror a successful paper append in an external scenario publisher.
+    #[cfg(feature = "scenario")]
+    pub fn scenario_commit_structural_change(
+        &self,
+        removed: &[WalletAddress],
+        added: &[WalletAddress],
+    ) {
+        self.commit_structural_change(removed, added);
     }
 
     /// Cheap, consistent snapshot of the current watchlist (one atomic load).
@@ -205,7 +244,8 @@ impl LiveWatchlist {
         total
     }
 
-    /// Remove a monotonic durable-fence set without admitting replacements.
+    /// Remove wallets from the live projection only (durable fences, boot ineligibility or a
+    /// missing boot score) without admitting replacements; structural membership is unchanged.
     /// Caller holds the structural writer lock (#544).
     pub fn remove_fenced(&self, fenced: &HashSet<WalletAddress>) -> usize {
         if fenced.is_empty() {
@@ -291,6 +331,28 @@ mod tests {
         let snap = live.snapshot();
         assert_eq!(snap.entries.len(), 1);
         assert_eq!(find_win_rate(&snap, wallet(1)), Some(5000));
+    }
+
+    #[test]
+    fn live_filter_does_not_change_replay_membership() {
+        let first = wallet(1);
+        let deferred = wallet(2);
+        let live = LiveWatchlist::new(watchlist(vec![
+            entry(first, 100, 5000),
+            entry(deferred, 90, 5000),
+        ]));
+        live.remove_fenced(&HashSet::from([deferred]));
+        assert_eq!(live.snapshot().entries.len(), 1);
+        assert_eq!(
+            live.structural_membership(),
+            HashSet::from([first, deferred])
+        );
+        live.commit_structural_change(&[first], &[wallet(3)]);
+        assert_eq!(
+            live.structural_membership(),
+            HashSet::from([deferred, wallet(3)])
+        );
+        assert_eq!(live.snapshot().entries.len(), 1);
     }
 
     #[test]

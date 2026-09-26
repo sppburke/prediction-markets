@@ -1874,8 +1874,9 @@ pub(crate) async fn golden_source_stream_replays_exact_economic_core() {
         .store(anchor_cutoff, std::sync::atomic::Ordering::SeqCst);
     let book_fetcher = Arc::new(GoldenBookFetcher::default());
     let (control_tx, control_rx) = mpsc::channel(4);
+    let live = LiveWatchlist::new(golden_watchlist(&wallets));
     let mut orchestrator = Orchestrator::new_with_authority(
-        LiveWatchlist::new(golden_watchlist(&wallets)),
+        live.clone(),
         OrchestratorConfig {
             bankroll: STARTING_BANKROLL,
             mode: ExecutionMode::Paper,
@@ -2429,6 +2430,14 @@ pub(crate) async fn golden_source_stream_replays_exact_economic_core() {
                 .unwrap();
             let receipt = acknowledgement.await.unwrap().unwrap();
             membership_publication = Some((receipt, change));
+            assert!(!live.structural_membership().contains(&wallets[1]));
+            assert!(
+                !live
+                    .snapshot()
+                    .entries
+                    .iter()
+                    .any(|entry| entry.wallet == wallets[1])
+            );
         }
     }
 
@@ -3443,6 +3452,10 @@ impl BracketFinancialHarness {
                 .map(|entry| entry.wallet)
                 .collect::<Vec<_>>(),
             wallets
+        );
+        assert_eq!(
+            self.live.structural_membership(),
+            wallets.iter().copied().collect()
         );
     }
 

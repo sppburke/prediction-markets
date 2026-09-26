@@ -9,6 +9,9 @@ publish.workspace = true
 name = "pe_event_log"
 path = "src/lib.rs"
 
+[features]
+scenario = []
+
 [lints]
 workspace = true
 
