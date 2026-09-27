@@ -1035,9 +1035,12 @@ class RankAndPushScenario(unittest.TestCase):
         time.sleep(1.05 - time.time() % 1)
         second = self._run()
         self.assertEqual(second.returncode, 0, second.stderr + second.stdout)
+        cycles = sorted((self.root / "data/eval-results").glob("cron-*"))
+        if len({cycle.name[len("cron-"):len("cron-YYYYMMDD")] for cycle in cycles}) != 1:
+            self.skipTest("the runs straddled UTC midnight, so same-day behavior is unproven")
         self.assertIn("RANK_AND_PUSH_CYCLE_CREATED=", second.stdout)
         self.assertNotIn("RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1", second.stdout)
-        cycles = sorted((self.root / "data/eval-results").glob("cron-*"))
+        self.assertNotIn("scripts/rank_cycle_manifest.py unchanged", self._log("python_invocations.log"))
         self.assertEqual(len(cycles), 2)
         self._assert_lane_record(cycles[-1] / "cycle_manifest.json")
         self._assert_lane_record(cycles[-1] / "accepted_cycle_manifest.json")
@@ -2431,6 +2434,8 @@ finally:
         self._assert_lane_record(out / "accepted_cycle_manifest.json")
         self.assertTrue((out / "candidate_cycle_manifest.json").is_file())
         self.assertEqual(json.loads((out / "cycle_manifest.json").read_text())["cache_schema"], 1)
+        self.assertIn("scripts/rank_cycle_manifest.py unchanged", self._log("python_invocations.log"),
+                      "the one-time cutover keeps the unchanged-day gate")
         self.assertIn(f"--cycle-manifest-file data/eval-results/{cycle}/candidate_cycle_manifest.json", self._log("rerank.log"))
         self.assertFalse((self.root / "data/eval-results/rank_and_push.pending").exists())
         self.assertFalse((self.root / "data/eval-results/rank_and_push.cycle").exists())
