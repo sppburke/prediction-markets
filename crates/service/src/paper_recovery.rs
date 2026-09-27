@@ -275,7 +275,7 @@ pub(crate) struct MembershipPositionValidationProof {
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum MembershipProofError {
+pub enum MembershipProofError {
     #[error("paper state: {0}")]
     PaperState(#[from] pe_paper_state::PaperStateError),
     #[error("membership proof JSON: {0}")]
@@ -308,7 +308,55 @@ pub(crate) enum MembershipProofError {
     DigestMismatch,
 }
 
+impl MembershipProofError {
+    pub(crate) fn class(&self) -> crate::position_seeder::FailureClass {
+        use crate::position_seeder::FailureClass;
+        match self {
+            Self::ReanchorRequired(_)
+            | Self::AnchorCoverageMismatch(_)
+            | Self::ValidationAnchorMismatch(_) => FailureClass::WalletTransient,
+            Self::MissingHistory(_)
+            | Self::MissingCoverage(_)
+            | Self::MissingAnchor(_)
+            | Self::MissingValidation(_) => FailureClass::WalletPersistent,
+            Self::PaperState(_)
+            | Self::Json(_)
+            | Self::DuplicateWallet(_)
+            | Self::MembershipMismatch
+            | Self::ProofWalletMismatch
+            | Self::NonCanonicalBinding
+            | Self::UnsupportedVersion(_)
+            | Self::DigestMismatch => FailureClass::Shared,
+        }
+    }
+
+    pub(crate) fn kind(&self) -> &'static str {
+        match self {
+            Self::PaperState(_) => "proof.paper_state",
+            Self::Json(_) => "proof.json",
+            Self::DuplicateWallet(_) => "proof.duplicate_wallet",
+            Self::MissingHistory(_) => "proof.missing_history",
+            Self::MissingCoverage(_) => "proof.missing_coverage",
+            Self::ReanchorRequired(_) => "proof.reanchor_required",
+            Self::MissingAnchor(_) => "proof.missing_anchor",
+            Self::AnchorCoverageMismatch(_) => "proof.anchor_coverage_mismatch",
+            Self::MissingValidation(_) => "proof.missing_validation",
+            Self::ValidationAnchorMismatch(_) => "proof.validation_anchor_mismatch",
+            Self::MembershipMismatch => "proof.membership_mismatch",
+            Self::ProofWalletMismatch => "proof.wallet_mismatch",
+            Self::NonCanonicalBinding => "proof.noncanonical_binding",
+            Self::UnsupportedVersion(_) => "proof.unsupported_version",
+            Self::DigestMismatch => "proof.digest_mismatch",
+        }
+    }
+}
+
 impl MembershipProofManifest {
+    pub(crate) fn digest(&self) -> Result<String, MembershipProofError> {
+        Ok(blake3::hash(&serde_json::to_vec(self)?)
+            .to_hex()
+            .to_string())
+    }
     pub(crate) fn capture(
         state: &PaperStateDb,
         membership: &[WalletAddress],
@@ -450,9 +498,7 @@ impl MembershipProofBinding {
     pub(crate) fn encode(
         manifest: MembershipProofManifest,
     ) -> Result<String, MembershipProofError> {
-        let proof_hash = blake3::hash(&serde_json::to_vec(&manifest)?)
-            .to_hex()
-            .to_string();
+        let proof_hash = manifest.digest()?;
         Ok(serde_json::to_string(&Self {
             version: Self::VERSION,
             proof_hash,
@@ -905,6 +951,7 @@ pub(crate) fn repair_historical_membership_with_pin(
 pub struct ReplayedMembership {
     pub watchlist: Watchlist,
     pub last_ranking_batch_id: i64,
+    pub post_start_record_replayed: bool,
 }
 
 fn watchlist_with_entries(mut watchlist: Watchlist, entries: Vec<WatchlistEntry>) -> Watchlist {
@@ -1007,6 +1054,7 @@ fn replay_membership_from(
         return Ok(Some(ReplayedMembership {
             watchlist: watchlist_with_entries(start_batch, entries),
             last_ranking_batch_id,
+            post_start_record_replayed: false,
         }));
     };
     let scanned_source;
@@ -1084,6 +1132,7 @@ fn replay_membership_from(
     Ok(Some(ReplayedMembership {
         watchlist: watchlist_with_entries(start_batch, entries),
         last_ranking_batch_id,
+        post_start_record_replayed: true,
     }))
 }
 
@@ -2265,6 +2314,7 @@ mod paper_log_tests {
             serde_json::to_vec(&replayed.watchlist.entries).unwrap()
         );
         assert_eq!(replayed.last_ranking_batch_id, 8);
+        assert!(replayed.post_start_record_replayed);
         assert_eq!(replayed.watchlist.entries.len(), 1);
         assert_eq!(replayed.watchlist.entries[0].wallet, first);
     }
@@ -2363,6 +2413,14 @@ mod paper_log_tests {
                 entries: replacements.clone(),
             },
         );
+        let uncited = serde_json::json!({"version":1,"context":{"kind":"full_rerank","batch_id":8},"deferrals":[],"outcome":{"type":"no_change"}});
+        for _ in 0..2 {
+            append_membership_artifact(
+                &mut source_writer,
+                crate::watchlist_admission::MEMBERSHIP_DEFERRAL_SOURCE_ID,
+                &uncited,
+            );
+        }
         drop(source_writer);
         let change = MembershipChange {
             reason: MembershipReason::FullRerank,
@@ -2383,7 +2441,17 @@ mod paper_log_tests {
         );
         let preparer = AdmissionPreparer::new(control_tx, paper_state);
         preparer
-            .publish_membership(change, replacements, Default::default())
+            .publish_membership(
+                change,
+                replacements,
+                crate::watchlist_maintenance::MembershipCommit {
+                    binding: crate::watchlist_maintenance::PublicationBinding {
+                        structural: live.structural_membership(),
+                        digests: Vec::new(),
+                    },
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         drop(preparer);
@@ -2537,6 +2605,20 @@ mod paper_log_tests {
         let (tx, rx) = mpsc::channel(1);
         let runtime = spawn_membership_orchestrator(live.clone(), paper_writer, state.clone(), rx);
         let preparer = AdmissionPreparer::new(tx, state.clone());
+        let captured = additions
+            .iter()
+            .map(|wallet| {
+                (
+                    *wallet,
+                    MembershipProofManifest::capture(&state, &[*wallet]).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let binding = crate::watchlist_maintenance::PublicationBinding::capture(
+            live.structural_membership(),
+            &captured,
+        )
+        .unwrap();
         preparer
             .publish_membership(
                 MembershipChange {
@@ -2552,7 +2634,10 @@ mod paper_log_tests {
                     .unwrap(),
                 },
                 ranked,
-                Default::default(),
+                crate::watchlist_maintenance::MembershipCommit {
+                    binding,
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -2593,6 +2678,10 @@ mod paper_log_tests {
             MembershipPublication {
                 reason: MembershipReason::KnockoutInactivity,
                 ranking_batch_id: Some(9),
+                binding: crate::watchlist_maintenance::PublicationBinding {
+                    structural: live.structural_membership(),
+                    digests: Vec::new(),
+                },
                 evidence: SealedMembershipEvidence::knockout_backfill(
                     vec![SealedKnockoutEvidence {
                         wallet: initial[0],
@@ -2729,6 +2818,16 @@ mod paper_log_tests {
                 spawn_membership_orchestrator(live.clone(), paper_writer, state.clone(), rx);
             let preparer =
                 AdmissionPreparer::new(tx, state.clone()).with_source_log(source.clone());
+            let admission_deferrals = if legacy {
+                Vec::new()
+            } else {
+                let outcome = preparer.prepare(&[excluded, selected]).await.unwrap();
+                assert_eq!(outcome.admitted, vec![selected]);
+                assert_eq!(outcome.deferred.len(), 1);
+                assert_eq!(outcome.deferred[0].wallet, excluded);
+                assert_eq!(outcome.deferred[0].kind, "fence.active");
+                outcome.deferred
+            };
             let ranking = if legacy {
                 let at = OffsetDateTime::from_unix_timestamp(10).unwrap();
                 source
@@ -2752,7 +2851,14 @@ mod paper_log_tests {
                     .await
                     .unwrap()
             };
-            let admissions = preparer.record_admission_proofs(&[selected]).await.unwrap();
+            let (proofs, proof_deferrals) = preparer.capture_proofs(&[selected]).unwrap();
+            assert!(proof_deferrals.is_empty());
+            let binding = crate::watchlist_maintenance::PublicationBinding::capture(
+                live.structural_membership(),
+                &proofs,
+            )
+            .unwrap();
+            let admissions = preparer.record_admission_proofs(&proofs).await.unwrap();
             assert_eq!(admissions.len(), 1);
             let evictions = preparer
                 .record_knockout_inputs(vec![(
@@ -2778,23 +2884,28 @@ mod paper_log_tests {
                 admissions.clone(),
             )
             .unwrap();
-            if legacy {
+            let paper_receipt = if legacy {
                 // Historical artifact retains the full overfetch even though only one slot opens.
-                preparer
-                    .publish_membership(
-                        MembershipChange {
-                            reason: MembershipReason::KnockoutInactivity,
-                            removed: vec![initial],
-                            added: vec![selected],
-                            capacity: 1,
-                            ranking_batch_id: Some(8),
-                            evidence,
-                        },
-                        candidates.clone(),
-                        Default::default(),
-                    )
-                    .await
-                    .unwrap();
+                Some(
+                    preparer
+                        .publish_membership(
+                            MembershipChange {
+                                reason: MembershipReason::KnockoutInactivity,
+                                removed: vec![initial],
+                                added: vec![selected],
+                                capacity: 1,
+                                ranking_batch_id: Some(8),
+                                evidence,
+                            },
+                            candidates.clone(),
+                            crate::watchlist_maintenance::MembershipCommit {
+                                binding: binding.clone(),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .unwrap(),
+                )
             } else {
                 let capacity = AppliedWatchlistCapacity::new(1);
                 apply_evictions_and_backfill(
@@ -2806,6 +2917,7 @@ mod paper_log_tests {
                         reason: MembershipReason::KnockoutInactivity,
                         ranking_batch_id: Some(8),
                         evidence,
+                        binding,
                     },
                     &capacity,
                     capacity.load(),
@@ -2814,7 +2926,19 @@ mod paper_log_tests {
                     &HashMap::from([(selected, 10)]),
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .1
+            };
+            if !legacy {
+                preparer
+                    .record_deferrals(
+                        crate::watchlist_admission::DeferralContext::Knockout { batch_id: 8 },
+                        admission_deferrals,
+                        crate::watchlist_admission::DeferralOutcome::Published {
+                            paper_seq: paper_receipt.unwrap().sequence.0,
+                        },
+                    )
+                    .await;
             }
             let era = paper_era(scan_paper_log(&paper_path).unwrap());
             let replayed =
@@ -2830,6 +2954,56 @@ mod paper_log_tests {
             let indexed = crate::qualification::PublishedMembershipSource::from_index(
                 crate::risk_inputs::SourceReceiptIndex::replay(&source_path).unwrap(),
             );
+            let source_view =
+                crate::qualification::PublishedMembershipSource::scan(&source_path).unwrap();
+            let changed = era
+                .frames
+                .iter()
+                .find_map(|frame| match &frame.frame {
+                    PaperLogFrame::Record(record @ PaperLogRecord::MembershipChanged { .. }) => {
+                        Some(record)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(
+                serde_json::to_vec(
+                    &crate::qualification::replay_published_membership_change(
+                        changed,
+                        &source_view,
+                        &HashSet::from([initial]),
+                    )
+                    .unwrap(),
+                )
+                .unwrap(),
+                serde_json::to_vec(&candidates).unwrap()
+            );
+            assert_eq!(
+                replay_membership_from(
+                    &era,
+                    watchlist(initial_entries.clone()),
+                    MembershipReplaySource::Published(&source_view),
+                )
+                .unwrap()
+                .unwrap()
+                .watchlist
+                .entries[0]
+                    .wallet,
+                selected
+            );
+            if !legacy {
+                let audits = pe_event_log::Reader::replay(&source_path)
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .filter(|(_, frame)| frame.source_id.0 == "pe-service.watchlist-deferral")
+                    .map(|(_, frame)| {
+                        serde_json::from_slice::<serde_json::Value>(&frame.payload).unwrap()
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(audits.len(), 1);
+                assert_eq!(audits[0]["outcome"]["type"], "published");
+                assert_eq!(audits[0]["deferrals"][0]["wallet"], excluded.to_string());
+            }
             assert_eq!(
                 serde_json::to_vec(
                     &replay_membership_with_source(
@@ -2905,6 +3079,990 @@ mod paper_log_tests {
                     "legacy={legacy} {change}: {error}"
                 );
             }
+            if !legacy {
+                // A shared backfill abort publishes the independently decided eviction with
+                // no ranking or admission receipt. The caller's shared-failure branch is
+                // exercised in watchlist_maintenance; this is its durable paper shape.
+                let evictions = preparer
+                    .record_knockout_inputs(vec![(
+                        MembershipReason::KnockoutInactivity,
+                        KnockoutCausalArtifact {
+                            wallet: selected,
+                            evaluated_at_unix: 259_200,
+                            last_trade_unix: Some(0),
+                            inactivity_threshold_secs: 259_200,
+                            inactivity_hard_cap_secs: 604_800,
+                            demotion_min_trades: 10,
+                            demotion_cb_alpha: dec!(0.10),
+                            demotion_pnl_window_secs: 2_592_000,
+                            fills: Vec::new(),
+                            settlements: Vec::new(),
+                        },
+                    )])
+                    .await
+                    .unwrap();
+                let evidence =
+                    SealedMembershipEvidence::knockout_backfill(evictions, None, Vec::new())
+                        .unwrap();
+                let capacity = AppliedWatchlistCapacity::new(1);
+                let binding = crate::watchlist_maintenance::PublicationBinding::capture(
+                    live.structural_membership(),
+                    &[],
+                )
+                .unwrap();
+                let (_, receipt) = apply_evictions_and_backfill(
+                    &live,
+                    &state,
+                    &tokio::sync::Mutex::new(()),
+                    &preparer,
+                    MembershipPublication {
+                        reason: MembershipReason::KnockoutInactivity,
+                        ranking_batch_id: Some(8),
+                        evidence,
+                        binding,
+                    },
+                    &capacity,
+                    capacity.load(),
+                    &HashSet::from([selected]),
+                    &[],
+                    &HashMap::new(),
+                )
+                .await
+                .unwrap();
+                assert!(receipt.is_some());
+                let era = paper_era(scan_paper_log(&paper_path).unwrap());
+                let source_view =
+                    crate::qualification::PublishedMembershipSource::scan(&source_path).unwrap();
+                let replayed = replay_membership_from(
+                    &era,
+                    watchlist(initial_entries.clone()),
+                    MembershipReplaySource::Published(&source_view),
+                )
+                .unwrap()
+                .unwrap();
+                assert!(replayed.watchlist.entries.is_empty());
+                let last = era
+                    .frames
+                    .iter()
+                    .filter_map(|frame| match &frame.frame {
+                        PaperLogFrame::Record(
+                            record @ PaperLogRecord::MembershipChanged { .. },
+                        ) => Some(record),
+                        _ => None,
+                    })
+                    .next_back()
+                    .unwrap();
+                assert!(
+                    crate::qualification::replay_published_membership_change(
+                        last,
+                        &source_view,
+                        &HashSet::from([selected]),
+                    )
+                    .unwrap()
+                    .is_empty()
+                );
+            }
+            drop(preparer);
+            runtime.await.unwrap();
+            drop(source);
+            ingest.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn locked_wallet_and_proof_rejections_replan_with_real_qualified_receipts() {
+        use crate::activity_ingest::{ActivityIngest, SourceLogHandle};
+        use crate::source_event_sink::SourceEventSink;
+        use crate::watchlist_maintenance::{
+            MembershipCommit, PublicationBinding, PublishError, WalletPublishCause,
+        };
+
+        for failure in [
+            WalletPublishCause::FencedAdmission,
+            WalletPublishCause::IncompleteHistory,
+            WalletPublishCause::ProofChanged,
+        ] {
+            let dir = tempdir().unwrap();
+            let paper_path = dir.path().join("paper.log");
+            let source_path = dir.path().join("source.log");
+            let (incumbent, blocked, replacement) =
+                (wallet(), WalletAddress([82; 20]), WalletAddress([83; 20]));
+            let initial = watchlist(vec![watchlist_entry(incumbent, 500)]);
+            let live = LiveWatchlist::new(initial.clone());
+            let mut paper_writer = Writer::open(&paper_path).unwrap();
+            append(
+                &mut paper_writer,
+                PAPER_LOG_SCHEMA_VERSION,
+                &PaperLogRecord::QualificationStarted(Box::new(start("locked-wallet"))),
+            );
+            let state_path = dir.path().join("paper.db");
+            let state = Arc::new(PaperStateDb::open(&state_path).unwrap());
+            for wallet in [blocked, replacement] {
+                state
+                    .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
+                        wallet,
+                        complete: true,
+                        proof_json: "{}".to_owned(),
+                        updated_at_unix: 10,
+                    })
+                    .unwrap();
+                state.set_cursor(&wallet, 10).unwrap();
+                state
+                    .install_anchors(&[pe_paper_state::AnchorInstallRecord {
+                        history_status: None,
+                        wallet,
+                        balances: Vec::new(),
+                        activity_cutoff_unix: 10,
+                        anchored_at_unix: 10,
+                        ledger_hash_after: "empty".to_owned(),
+                        positions_proof_hash: "empty".to_owned(),
+                        activity_bounds_json: "[]".to_owned(),
+                        source_log_generation: "locked-wallet".to_owned(),
+                        proof_json: "{}".to_owned(),
+                        recorded_at_unix: 10,
+                    }])
+                    .unwrap();
+            }
+            let (source, source_rx) = SourceLogHandle::channel(4);
+            let (trigger, _triggers) = mpsc::channel(1);
+            let ingest = tokio::spawn(
+                ActivityIngest::poll_only(
+                    SourceEventSink::open(&source_path).unwrap(),
+                    source_rx,
+                    trigger,
+                    new_shared_health(false),
+                )
+                .run(),
+            );
+            let (tx, rx) = mpsc::channel(1);
+            let runtime =
+                spawn_membership_orchestrator(live.clone(), paper_writer, state.clone(), rx);
+            let preparer =
+                AdmissionPreparer::new(tx, state.clone()).with_source_log(source.clone());
+            let outcome = preparer.prepare(&[blocked, replacement]).await.unwrap();
+            assert_eq!(outcome.admitted, vec![blocked, replacement]);
+
+            let (first_proofs, deferred) = preparer.capture_proofs(&[blocked]).unwrap();
+            assert!(deferred.is_empty());
+            let first_binding =
+                PublicationBinding::capture(live.structural_membership(), &first_proofs).unwrap();
+            let first_rank = preparer
+                .record_ranking_membership(Some(8), vec![watchlist_entry(blocked, 900)])
+                .await
+                .unwrap();
+            let first_admissions = preparer
+                .record_admission_proofs(&first_proofs)
+                .await
+                .unwrap();
+            let stale_proof_receipt = first_admissions[0].receipt;
+            let first_evidence =
+                SealedMembershipEvidence::full_rerank(first_rank, first_admissions).unwrap();
+            let connection = rusqlite::Connection::open(&state_path).unwrap();
+            match failure {
+                WalletPublishCause::FencedAdmission => {
+                    connection.execute("INSERT INTO wallet_fences (wallet_hex, source_trade_id, cause, proof_json, fenced_at_unix) VALUES (?1, 'test', 'invalid_mapping', '{}', 1)", [blocked.to_string()]).unwrap();
+                }
+                WalletPublishCause::IncompleteHistory => {
+                    connection.execute("UPDATE wallet_history_status_v2 SET complete = 0 WHERE wallet_hex = ?1", [blocked.to_string()]).unwrap();
+                }
+                WalletPublishCause::ProofChanged => {
+                    let anchor = state.position_anchors(&blocked).unwrap().pop().unwrap();
+                    let validation = state.position_validation(&blocked).unwrap().unwrap();
+                    state
+                        .install_anchors(&[pe_paper_state::AnchorInstallRecord {
+                            history_status: None,
+                            wallet: blocked,
+                            balances: Vec::new(),
+                            activity_cutoff_unix: anchor.activity_cutoff_unix,
+                            anchored_at_unix: anchor.anchored_at_unix + 1,
+                            ledger_hash_after: anchor.ledger_hash_after,
+                            positions_proof_hash: validation.positions_proof_hash,
+                            activity_bounds_json: validation.activity_bounds_json,
+                            source_log_generation: validation.source_log_generation,
+                            proof_json: anchor.proof_json,
+                            recorded_at_unix: validation.recorded_at_unix + 1,
+                        }])
+                        .unwrap();
+                }
+                WalletPublishCause::UnvalidatedPosition => unreachable!(),
+            }
+            let first = preparer
+                .publish_membership(
+                    MembershipChange {
+                        reason: MembershipReason::FullRerank,
+                        removed: vec![incumbent],
+                        added: vec![blocked],
+                        capacity: 1,
+                        ranking_batch_id: Some(8),
+                        evidence: first_evidence,
+                    },
+                    vec![watchlist_entry(blocked, 900)],
+                    MembershipCommit {
+                        binding: first_binding,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert!(
+                matches!(first, Err(PublishError::Wallet { wallet, cause }) if wallet == blocked && cause == failure)
+            );
+            assert_eq!(live.structural_membership(), HashSet::from([incumbent]));
+            assert_eq!(
+                paper_era(scan_paper_log(&paper_path).unwrap())
+                    .frames
+                    .iter()
+                    .filter(|frame| matches!(
+                        &frame.frame,
+                        PaperLogFrame::Record(PaperLogRecord::MembershipChanged { .. })
+                    ))
+                    .count(),
+                0
+            );
+
+            let selected = if failure == WalletPublishCause::ProofChanged {
+                blocked
+            } else {
+                replacement
+            };
+            let (proofs, deferred) = preparer.capture_proofs(&[selected]).unwrap();
+            assert!(deferred.is_empty());
+            let binding =
+                PublicationBinding::capture(live.structural_membership(), &proofs).unwrap();
+            if failure == WalletPublishCause::ProofChanged {
+                let current =
+                    PublicationBinding::capture(live.structural_membership(), &proofs).unwrap();
+                assert_eq!(binding.digests, current.digests);
+            }
+            let ranking = preparer
+                .record_ranking_membership(Some(8), vec![watchlist_entry(selected, 800)])
+                .await
+                .unwrap();
+            let admissions = preparer.record_admission_proofs(&proofs).await.unwrap();
+            let accepted_proof_receipt = admissions[0].receipt;
+            if failure == WalletPublishCause::ProofChanged {
+                assert_ne!(stale_proof_receipt, accepted_proof_receipt);
+            }
+            let receipt = preparer
+                .publish_membership(
+                    MembershipChange {
+                        reason: MembershipReason::FullRerank,
+                        removed: vec![incumbent],
+                        added: vec![selected],
+                        capacity: 1,
+                        ranking_batch_id: Some(8),
+                        evidence: SealedMembershipEvidence::full_rerank(ranking, admissions)
+                            .unwrap(),
+                    },
+                    vec![watchlist_entry(selected, 800)],
+                    MembershipCommit {
+                        binding,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let era = paper_era(scan_paper_log(&paper_path).unwrap());
+            let records = era
+                .frames
+                .iter()
+                .filter_map(|frame| match &frame.frame {
+                    PaperLogFrame::Record(record @ PaperLogRecord::MembershipChanged { .. }) => {
+                        Some((frame.receipt, record))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(records.len(), 1);
+            assert_eq!(records[0].0.sequence, receipt.sequence);
+            if failure == WalletPublishCause::ProofChanged {
+                let serialized = serde_json::to_string(records[0].1).unwrap();
+                assert!(
+                    serialized.contains(&accepted_proof_receipt.this_hash.to_hex().to_string())
+                );
+                assert!(!serialized.contains(&stale_proof_receipt.this_hash.to_hex().to_string()));
+            }
+            let source_view =
+                crate::qualification::PublishedMembershipSource::scan(&source_path).unwrap();
+            assert_eq!(
+                crate::qualification::replay_published_membership_change(
+                    records[0].1,
+                    &source_view,
+                    &HashSet::from([incumbent]),
+                )
+                .unwrap()
+                .iter()
+                .map(|entry| entry.wallet)
+                .collect::<Vec<_>>(),
+                vec![selected]
+            );
+            let replayed = replay_membership_from(
+                &era,
+                initial,
+                MembershipReplaySource::Published(&source_view),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(replayed.watchlist.entries[0].wallet, selected);
+            drop(preparer);
+            runtime.await.unwrap();
+            drop(source);
+            ingest.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn real_knockout_commit_stales_prepared_rerank_then_qualified_retry_publishes() {
+        use crate::activity_ingest::{ActivityIngest, SourceLogHandle};
+        use crate::source_event_sink::SourceEventSink;
+        use crate::watchlist_maintenance::{MembershipCommit, PublicationBinding, PublishError};
+
+        let dir = tempdir().unwrap();
+        let paper_path = dir.path().join("paper.log");
+        let source_path = dir.path().join("source.log");
+        let (incumbent, candidate) = (wallet(), WalletAddress([86; 20]));
+        let initial = watchlist(vec![watchlist_entry(incumbent, 500)]);
+        let live = LiveWatchlist::new(initial.clone());
+        let mut paper_writer = Writer::open(&paper_path).unwrap();
+        append(
+            &mut paper_writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &PaperLogRecord::QualificationStarted(Box::new(start("stale-knockout"))),
+        );
+        let state = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        state
+            .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
+                wallet: candidate,
+                complete: true,
+                proof_json: "{}".to_owned(),
+                updated_at_unix: 10,
+            })
+            .unwrap();
+        state.set_cursor(&candidate, 10).unwrap();
+        state
+            .install_anchors(&[pe_paper_state::AnchorInstallRecord {
+                history_status: None,
+                wallet: candidate,
+                balances: Vec::new(),
+                activity_cutoff_unix: 10,
+                anchored_at_unix: 10,
+                ledger_hash_after: "empty".to_owned(),
+                positions_proof_hash: "empty".to_owned(),
+                activity_bounds_json: "[]".to_owned(),
+                source_log_generation: "stale-knockout".to_owned(),
+                proof_json: "{}".to_owned(),
+                recorded_at_unix: 10,
+            }])
+            .unwrap();
+        let (source, source_rx) = SourceLogHandle::channel(4);
+        let (trigger, _triggers) = mpsc::channel(1);
+        let ingest = tokio::spawn(
+            ActivityIngest::poll_only(
+                SourceEventSink::open(&source_path).unwrap(),
+                source_rx,
+                trigger,
+                new_shared_health(false),
+            )
+            .run(),
+        );
+        let (tx, rx) = mpsc::channel(1);
+        let runtime = spawn_membership_orchestrator(live.clone(), paper_writer, state.clone(), rx);
+        let preparer = AdmissionPreparer::new(tx, state).with_source_log(source.clone());
+        assert_eq!(
+            preparer.prepare(&[candidate]).await.unwrap().admitted,
+            vec![candidate]
+        );
+        let (proofs, deferred) = preparer.capture_proofs(&[candidate]).unwrap();
+        assert!(deferred.is_empty());
+        let stale_binding =
+            PublicationBinding::capture(live.structural_membership(), &proofs).unwrap();
+        let stale_ranking = preparer
+            .record_ranking_membership(Some(9), vec![watchlist_entry(candidate, 800)])
+            .await
+            .unwrap();
+        let stale_admissions = preparer.record_admission_proofs(&proofs).await.unwrap();
+        let stale_evidence =
+            SealedMembershipEvidence::full_rerank(stale_ranking, stale_admissions).unwrap();
+
+        let evictions = preparer
+            .record_knockout_inputs(vec![(
+                MembershipReason::KnockoutInactivity,
+                KnockoutCausalArtifact {
+                    wallet: incumbent,
+                    evaluated_at_unix: 259_200,
+                    last_trade_unix: Some(0),
+                    inactivity_threshold_secs: 259_200,
+                    inactivity_hard_cap_secs: 604_800,
+                    demotion_min_trades: 10,
+                    demotion_cb_alpha: dec!(0.10),
+                    demotion_pnl_window_secs: 2_592_000,
+                    fills: Vec::new(),
+                    settlements: Vec::new(),
+                },
+            )])
+            .await
+            .unwrap();
+        preparer
+            .publish_membership(
+                MembershipChange {
+                    reason: MembershipReason::KnockoutInactivity,
+                    removed: vec![incumbent],
+                    added: Vec::new(),
+                    capacity: 1,
+                    ranking_batch_id: Some(8),
+                    evidence: SealedMembershipEvidence::knockout_backfill(
+                        evictions,
+                        None,
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                },
+                Vec::new(),
+                MembershipCommit {
+                    binding: PublicationBinding::capture(live.structural_membership(), &[])
+                        .unwrap(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let first_era = paper_era(scan_paper_log(&paper_path).unwrap());
+        let source_view =
+            crate::qualification::PublishedMembershipSource::scan(&source_path).unwrap();
+        let first_record = first_era
+            .frames
+            .iter()
+            .find_map(|frame| match &frame.frame {
+                PaperLogFrame::Record(record @ PaperLogRecord::MembershipChanged { .. }) => {
+                    Some(record)
+                }
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            crate::qualification::replay_published_membership_change(
+                first_record,
+                &source_view,
+                &HashSet::from([incumbent]),
+            )
+            .unwrap()
+            .is_empty()
+        );
+        assert!(
+            replay_membership_from(
+                &first_era,
+                initial.clone(),
+                MembershipReplaySource::Published(&source_view),
+            )
+            .unwrap()
+            .unwrap()
+            .watchlist
+            .entries
+            .is_empty()
+        );
+
+        let stale = preparer
+            .publish_membership(
+                MembershipChange {
+                    reason: MembershipReason::FullRerank,
+                    removed: vec![incumbent],
+                    added: vec![candidate],
+                    capacity: 1,
+                    ranking_batch_id: Some(9),
+                    evidence: stale_evidence,
+                },
+                vec![watchlist_entry(candidate, 800)],
+                MembershipCommit {
+                    binding: stale_binding,
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(matches!(stale, Err(PublishError::StaleStructure)));
+        assert_eq!(
+            paper_era(scan_paper_log(&paper_path).unwrap())
+                .frames
+                .iter()
+                .filter(|frame| matches!(
+                    &frame.frame,
+                    PaperLogFrame::Record(PaperLogRecord::MembershipChanged { .. })
+                ))
+                .count(),
+            1
+        );
+
+        let retry_ranking = preparer
+            .record_ranking_membership(Some(9), vec![watchlist_entry(candidate, 800)])
+            .await
+            .unwrap();
+        let retry_admissions = preparer.record_admission_proofs(&proofs).await.unwrap();
+        preparer
+            .publish_membership(
+                MembershipChange {
+                    reason: MembershipReason::FullRerank,
+                    removed: Vec::new(),
+                    added: vec![candidate],
+                    capacity: 1,
+                    ranking_batch_id: Some(9),
+                    evidence: SealedMembershipEvidence::full_rerank(
+                        retry_ranking,
+                        retry_admissions,
+                    )
+                    .unwrap(),
+                },
+                vec![watchlist_entry(candidate, 800)],
+                MembershipCommit {
+                    binding: PublicationBinding::capture(live.structural_membership(), &proofs)
+                        .unwrap(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let era = paper_era(scan_paper_log(&paper_path).unwrap());
+        let source_view =
+            crate::qualification::PublishedMembershipSource::scan(&source_path).unwrap();
+        assert_eq!(
+            pe_event_log::Reader::replay(&source_path)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|(_, frame)| frame.source_id.0 == "pe-service.watchlist-deferral")
+                .count(),
+            0
+        );
+        let records = era
+            .frames
+            .iter()
+            .filter_map(|frame| match &frame.frame {
+                PaperLogFrame::Record(record @ PaperLogRecord::MembershipChanged { .. }) => {
+                    Some(record)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0], first_record);
+        assert_eq!(
+            crate::qualification::replay_published_membership_change(
+                records[1],
+                &source_view,
+                &HashSet::new(),
+            )
+            .unwrap()
+            .iter()
+            .map(|entry| entry.wallet)
+            .collect::<Vec<_>>(),
+            vec![candidate]
+        );
+        let replayed = replay_membership_from(
+            &era,
+            initial,
+            MembershipReplaySource::Published(&source_view),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(replayed.watchlist.entries[0].wallet, candidate);
+        drop(preparer);
+        runtime.await.unwrap();
+        drop(source);
+        ingest.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn real_filtered_rerank_and_partial_capacity_replay_selected_proofs() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        use crate::activity_ingest::{ActivityIngest, SourceLogHandle};
+        use crate::asset_identity::AssetIdentityResolver;
+        use crate::position_seeder::CausalPositionValidator;
+        use crate::source_event_sink::SourceEventSink;
+        use crate::watchlist_admission::{DeferralContext, DeferralOutcome};
+        use crate::watchlist_maintenance::{MembershipCommit, PublicationBinding};
+        use pe_source_core::SourceError;
+        use pe_source_polymarket_public::{GAMMA_BATCH_SIZE, PageFetcher, ReconciliationFetcher};
+
+        struct MappingFetcher {
+            deferred: WalletAddress,
+        }
+
+        impl PageFetcher for MappingFetcher {
+            async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+                if url.contains("/activity?") {
+                    return Ok(b"[]".to_vec());
+                }
+                if url.contains("/positions?") {
+                    if url.contains(&self.deferred.to_string()) {
+                        return serde_json::to_vec(&vec![serde_json::json!({
+                            "proxyWallet": self.deferred,
+                            "asset": "asset-unmapped",
+                            "conditionId": format!("0x{}", "a".repeat(40)),
+                            "size": "1",
+                            "outcomeIndex": 0
+                        })])
+                        .map_err(|error| SourceError::Fatal {
+                            message: error.to_string(),
+                        });
+                    }
+                    return Ok(b"[]".to_vec());
+                }
+                Err(SourceError::Fatal {
+                    message: format!("unexpected admission fixture URL: {url}"),
+                })
+            }
+        }
+
+        for full_rerank in [true, false] {
+            let dir = tempdir().unwrap();
+            let paper_path = dir.path().join("paper.log");
+            let source_path = dir.path().join("source.log");
+            let (incumbent, deferred) = (wallet(), WalletAddress([71; 20]));
+            let selected = [
+                WalletAddress([72; 20]),
+                WalletAddress([73; 20]),
+                WalletAddress([74; 20]),
+                WalletAddress([75; 20]),
+            ];
+            let initial = watchlist(vec![watchlist_entry(incumbent, 500)]);
+            let live = LiveWatchlist::new(initial.clone());
+            let mut paper_writer = Writer::open(&paper_path).unwrap();
+            append(
+                &mut paper_writer,
+                PAPER_LOG_SCHEMA_VERSION,
+                &PaperLogRecord::QualificationStarted(Box::new(start("partial-capacity"))),
+            );
+            let state = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+            for wallet in selected {
+                state
+                    .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
+                        wallet,
+                        complete: true,
+                        proof_json: "{}".to_owned(),
+                        updated_at_unix: 10,
+                    })
+                    .unwrap();
+                state.set_cursor(&wallet, 10).unwrap();
+                state
+                    .install_anchors(&[pe_paper_state::AnchorInstallRecord {
+                        history_status: None,
+                        wallet,
+                        balances: Vec::new(),
+                        activity_cutoff_unix: 10,
+                        anchored_at_unix: 10,
+                        ledger_hash_after: "empty".to_owned(),
+                        positions_proof_hash: "empty".to_owned(),
+                        activity_bounds_json: "[]".to_owned(),
+                        source_log_generation: "capacity".to_owned(),
+                        proof_json: "{}".to_owned(),
+                        recorded_at_unix: 10,
+                    }])
+                    .unwrap();
+            }
+            if full_rerank {
+                state
+                    .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
+                        wallet: deferred,
+                        complete: true,
+                        proof_json: "{}".to_owned(),
+                        updated_at_unix: 10,
+                    })
+                    .unwrap();
+            }
+            let (source, source_rx) = SourceLogHandle::channel(4);
+            let (trigger, _triggers) = mpsc::channel(1);
+            let audit_recovered = Arc::new(AtomicBool::new(false));
+            let ingest = if full_rerank {
+                tokio::spawn(
+                    ActivityIngest::poll_only(
+                        SourceEventSink::open(&source_path).unwrap(),
+                        source_rx,
+                        trigger,
+                        new_shared_health(false),
+                    )
+                    .run(),
+                )
+            } else {
+                let path = source_path.clone();
+                let recovered = Arc::clone(&audit_recovered);
+                tokio::spawn(async move {
+                    let mut sink = SourceEventSink::open(path).unwrap();
+                    let mut source_rx = source_rx;
+                    while let Some((envelope, acknowledged)) = source_rx.recv_for_test().await {
+                        if envelope.source_id.0
+                            == crate::watchlist_admission::MEMBERSHIP_DEFERRAL_SOURCE_ID
+                        {
+                            sink.fail_next_append();
+                        }
+                        match sink.append_durable(envelope) {
+                            Ok(receipt) => {
+                                let _ = acknowledged.send(receipt);
+                            }
+                            Err(_) => {
+                                assert!(sink.try_reopen());
+                                recovered.store(true, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                })
+            };
+            let (tx, rx) = mpsc::channel(1);
+            let runtime =
+                spawn_membership_orchestrator(live.clone(), paper_writer, state.clone(), rx);
+            let preparer = if full_rerank {
+                let fetcher: Arc<dyn ReconciliationFetcher> = Arc::new(MappingFetcher { deferred });
+                let identity_sink = Arc::new(tokio::sync::Mutex::new(
+                    SourceEventSink::open(dir.path().join("identity-source.log")).unwrap(),
+                ));
+                let identity = Arc::new(AssetIdentityResolver::new(
+                    Arc::clone(&fetcher),
+                    "https://example.test".to_owned(),
+                    GAMMA_BATCH_SIZE,
+                    identity_sink,
+                ));
+                let validator = CausalPositionValidator::new(
+                    fetcher,
+                    "https://example.test",
+                    "membership-replay-test",
+                    identity,
+                )
+                .with_clock(Arc::new(|| 100));
+                AdmissionPreparer::with_validator(tx, state, validator)
+            } else {
+                AdmissionPreparer::new(tx, state)
+            }
+            .with_source_log(source.clone());
+            let outcome = preparer
+                .prepare(&[deferred, selected[0], selected[1], selected[2], selected[3]])
+                .await
+                .unwrap();
+            assert_eq!(outcome.admitted, selected.to_vec());
+            assert_eq!(outcome.deferred.len(), 1);
+            assert_eq!(outcome.deferred[0].wallet, deferred);
+            assert_eq!(
+                outcome.deferred[0].kind,
+                if full_rerank {
+                    "positions.missing_activity_mapping"
+                } else {
+                    "history.missing"
+                }
+            );
+
+            let published = std::iter::once(watchlist_entry(incumbent, 500))
+                .chain(selected.into_iter().enumerate().map(|(index, wallet)| {
+                    watchlist_entry(wallet, 400 - i32::try_from(index).unwrap() * 10)
+                }))
+                .collect::<Vec<_>>();
+            if full_rerank {
+                let bench = watchlist(
+                    std::iter::once(watchlist_entry(incumbent, 500))
+                        .chain(std::iter::once(watchlist_entry(deferred, 450)))
+                        .chain(selected.into_iter().enumerate().map(|(index, wallet)| {
+                            watchlist_entry(wallet, 400 - i32::try_from(index).unwrap() * 10)
+                        }))
+                        .collect(),
+                );
+                let (first, _) = crate::supabase_reader::select_membership(
+                    bench.clone(),
+                    HashMap::new(),
+                    &HashSet::new(),
+                    5,
+                );
+                assert_eq!(
+                    first
+                        .entries
+                        .iter()
+                        .map(|entry| entry.wallet)
+                        .collect::<Vec<_>>(),
+                    vec![incumbent, deferred, selected[0], selected[1], selected[2]]
+                );
+                let (filtered, _) = crate::supabase_reader::select_membership(
+                    bench,
+                    HashMap::new(),
+                    &HashSet::from([deferred]),
+                    5,
+                );
+                assert_eq!(
+                    serde_json::to_vec(&filtered.entries).unwrap(),
+                    serde_json::to_vec(&published).unwrap()
+                );
+            }
+            let (proofs, proof_deferrals) = preparer.capture_proofs(&selected).unwrap();
+            assert!(proof_deferrals.is_empty());
+            let binding =
+                PublicationBinding::capture(live.structural_membership(), &proofs).unwrap();
+            let admissions = preparer.record_admission_proofs(&proofs).await.unwrap();
+            assert_eq!(admissions.len(), 4);
+            assert_eq!(
+                admissions
+                    .iter()
+                    .map(|proof| proof.wallet)
+                    .collect::<Vec<_>>(),
+                selected.to_vec()
+            );
+            let evidence = if full_rerank {
+                let ranking = preparer
+                    .record_ranking_membership(Some(8), published.clone())
+                    .await
+                    .unwrap();
+                SealedMembershipEvidence::full_rerank(ranking, admissions).unwrap()
+            } else {
+                let config = preparer
+                    .record_capacity_config(2, 6, published.clone())
+                    .await
+                    .unwrap();
+                SealedMembershipEvidence::capacity_change(2, config, admissions).unwrap()
+            };
+            let receipt = preparer
+                .publish_membership(
+                    MembershipChange {
+                        reason: if full_rerank {
+                            MembershipReason::FullRerank
+                        } else {
+                            MembershipReason::CapacityChange
+                        },
+                        removed: Vec::new(),
+                        added: selected.to_vec(),
+                        capacity: if full_rerank { 5 } else { 6 },
+                        ranking_batch_id: full_rerank.then_some(8),
+                        evidence,
+                    },
+                    published.clone(),
+                    MembershipCommit {
+                        binding,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            preparer
+                .record_deferrals(
+                    if full_rerank {
+                        DeferralContext::FullRerank { batch_id: 8 }
+                    } else {
+                        DeferralContext::Capacity {
+                            generation: 2,
+                            target: 6,
+                        }
+                    },
+                    outcome.deferred,
+                    DeferralOutcome::Published {
+                        paper_seq: receipt.sequence.0,
+                    },
+                )
+                .await;
+            // An audit retry can leave a duplicate source frame; neither reader cites it.
+            if full_rerank {
+                preparer
+                    .record_deferrals(
+                        DeferralContext::FullRerank { batch_id: 8 },
+                        vec![crate::watchlist_admission::Deferral {
+                            wallet: deferred,
+                            stage: "validation",
+                            class: crate::position_seeder::FailureClass::WalletPersistent,
+                            kind: "positions.missing_activity_mapping",
+                            message: "fixture duplicate audit".to_owned(),
+                        }],
+                        DeferralOutcome::Published {
+                            paper_seq: receipt.sequence.0,
+                        },
+                    )
+                    .await;
+            }
+            assert_eq!(
+                live.structural_membership(),
+                HashSet::from([
+                    incumbent,
+                    selected[0],
+                    selected[1],
+                    selected[2],
+                    selected[3]
+                ])
+            );
+
+            let era = paper_era(scan_paper_log(&paper_path).unwrap());
+            let published_records = era
+                .frames
+                .iter()
+                .filter_map(|frame| match &frame.frame {
+                    PaperLogFrame::Record(record @ PaperLogRecord::MembershipChanged { .. }) => {
+                        Some(record)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(published_records.len(), 1);
+            let source_view =
+                crate::qualification::PublishedMembershipSource::scan(&source_path).unwrap();
+            assert_eq!(
+                serde_json::to_vec(
+                    &crate::qualification::replay_published_membership_change(
+                        published_records[0],
+                        &source_view,
+                        &HashSet::from([incumbent]),
+                    )
+                    .unwrap()
+                )
+                .unwrap(),
+                serde_json::to_vec(&published).unwrap()
+            );
+            let replayed = replay_membership_from(
+                &era,
+                initial,
+                MembershipReplaySource::Published(&source_view),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                serde_json::to_vec(&replayed.watchlist.entries).unwrap(),
+                serde_json::to_vec(&published).unwrap()
+            );
+            assert_eq!(
+                replayed.last_ranking_batch_id,
+                if full_rerank { 8 } else { 7 }
+            );
+            assert!(replayed.post_start_record_replayed);
+            let source_frames = pe_event_log::Reader::replay(&source_path)
+                .unwrap()
+                .filter_map(Result::ok)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                source_frames
+                    .iter()
+                    .filter(|(_, frame)| frame.source_id.0 == "pe-service.watchlist-deferral")
+                    .count(),
+                if full_rerank { 2 } else { 0 }
+            );
+            if !full_rerank {
+                assert!(audit_recovered.load(Ordering::SeqCst));
+            }
+            if full_rerank {
+                let audit = source_frames
+                    .iter()
+                    .find(|(_, frame)| frame.source_id.0 == "pe-service.watchlist-deferral")
+                    .map(|(_, frame)| {
+                        serde_json::from_slice::<serde_json::Value>(&frame.payload).unwrap()
+                    })
+                    .unwrap();
+                assert_eq!(audit["outcome"]["type"], "published");
+                assert_eq!(audit["outcome"]["paper_seq"], receipt.sequence.0);
+                assert_eq!(audit["deferrals"][0]["wallet"], deferred.to_string());
+                assert_eq!(
+                    audit["deferrals"][0]["kind"],
+                    "positions.missing_activity_mapping"
+                );
+            }
+            let admission_wallets = source_frames
+                .into_iter()
+                .filter(|(_, frame)| frame.source_id.0 == "pe-service.watchlist-admission")
+                .map(|(_, frame)| {
+                    serde_json::from_slice::<serde_json::Value>(&frame.payload).unwrap()["wallet"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                admission_wallets,
+                selected.map(|wallet| wallet.to_string()).to_vec()
+            );
             drop(preparer);
             runtime.await.unwrap();
             drop(source);
@@ -2936,6 +4094,7 @@ mod paper_log_tests {
         .unwrap()
         .unwrap();
         assert_eq!(replayed.last_ranking_batch_id, 7);
+        assert!(!replayed.post_start_record_replayed);
         assert_eq!(replayed.watchlist.entries.len(), 1);
         assert_eq!(replayed.watchlist.entries[0].wallet, initial);
 
@@ -2979,6 +4138,84 @@ mod paper_log_tests {
         );
     }
 
+    #[test]
+    fn empty_post_start_generation_replays_with_explicit_boot_origin() {
+        let dir = tempdir().unwrap();
+        let paper_path = dir.path().join("paper.log");
+        let source_path = dir.path().join("source.log");
+        let initial = wallet();
+        let mut started = start("empty-post-start");
+        started.membership = vec![initial];
+        started.ranking_batch_id = 7;
+        let mut paper_writer = Writer::open(&paper_path).unwrap();
+        append(
+            &mut paper_writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &PaperLogRecord::QualificationStarted(Box::new(started)),
+        );
+        let mut source_writer = Writer::open(&source_path).unwrap();
+        let ranking = append_membership_artifact(
+            &mut source_writer,
+            RANKING_MEMBERSHIP_SOURCE_ID,
+            &RankingMembershipArtifact {
+                batch_id: Some(8),
+                entries: Vec::new(),
+            },
+        );
+        drop(source_writer);
+        let change = MembershipChange {
+            reason: MembershipReason::FullRerank,
+            removed: vec![initial],
+            added: Vec::new(),
+            capacity: 1,
+            ranking_batch_id: Some(8),
+            evidence: SealedMembershipEvidence::full_rerank(ranking, Vec::new()).unwrap(),
+        };
+        append(
+            &mut paper_writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &change.into_record(),
+        );
+        drop(paper_writer);
+        let era = paper_era(scan_paper_log(&paper_path).unwrap());
+        let source = crate::qualification::PublishedMembershipSource::scan(&source_path).unwrap();
+        let replayed = replay_membership_from(
+            &era,
+            watchlist(vec![watchlist_entry(initial, 100)]),
+            MembershipReplaySource::Published(&source),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(replayed.post_start_record_replayed);
+        assert!(replayed.watchlist.entries.is_empty());
+        assert_eq!(replayed.last_ranking_batch_id, 8);
+    }
+
+    #[test]
+    fn empty_start_pinned_generation_has_no_post_start_origin() {
+        let dir = tempdir().unwrap();
+        let paper_path = dir.path().join("paper.log");
+        let mut started = start("empty-start-pinned");
+        started.membership.clear();
+        let mut writer = Writer::open(&paper_path).unwrap();
+        append(
+            &mut writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &PaperLogRecord::QualificationStarted(Box::new(started)),
+        );
+        drop(writer);
+        let era = paper_era(scan_paper_log(&paper_path).unwrap());
+        let replayed = replay_membership_from(
+            &era,
+            watchlist(Vec::new()),
+            MembershipReplaySource::SourceLog(&dir.path().join("source.log")),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(replayed.watchlist.entries.is_empty());
+        assert!(!replayed.post_start_record_replayed);
+    }
+
     #[cfg(feature = "scenario")]
     #[tokio::test]
     async fn structural_membership_crash_after_append_replays_record() {
@@ -3017,6 +4254,10 @@ mod paper_log_tests {
         *hooks.pause_after_membership_append.lock().unwrap() = Some((entered_tx, release_rx));
         orchestrator.set_scenario_hooks(hooks);
         let runtime = tokio::spawn(orchestrator.run(std::future::pending::<()>()));
+        let binding = crate::watchlist_maintenance::PublicationBinding {
+            structural: live.structural_membership(),
+            digests: Vec::new(),
+        };
         let preparer = AdmissionPreparer::new(tx, state);
         let publication = tokio::spawn(async move {
             preparer
@@ -3034,7 +4275,10 @@ mod paper_log_tests {
                         .unwrap(),
                     },
                     vec![watchlist_entry(initial, 900)],
-                    Default::default(),
+                    crate::watchlist_maintenance::MembershipCommit {
+                        binding,
+                        ..Default::default()
+                    },
                 )
                 .await
         });
@@ -3108,6 +4352,10 @@ mod paper_log_tests {
         let (tx, rx) = mpsc::channel(1);
         let orchestrator = membership_orchestrator(live.clone(), writer, paper_state.clone(), rx);
         let runtime = tokio::spawn(orchestrator.run_coordinated(std::future::pending::<()>()));
+        let binding = crate::watchlist_maintenance::PublicationBinding {
+            structural: live.structural_membership(),
+            digests: Vec::new(),
+        };
         let preparer = AdmissionPreparer::new(tx, paper_state);
         let result = preparer
             .publish_membership(
@@ -3120,7 +4368,10 @@ mod paper_log_tests {
                     evidence: serde_json::json!({"scenario":"sync-uncertain"}),
                 },
                 Vec::new(),
-                Default::default(),
+                crate::watchlist_maintenance::MembershipCommit {
+                    binding,
+                    ..Default::default()
+                },
             )
             .await;
         assert!(result.is_err());

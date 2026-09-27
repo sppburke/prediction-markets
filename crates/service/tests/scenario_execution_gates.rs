@@ -40,7 +40,7 @@ use pe_service::health::new_shared_health;
 use pe_service::live_watchlist::LiveWatchlist;
 use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
-use pe_service::watchlist_admission::{AdmissionError, AdmissionPreparer};
+use pe_service::watchlist_admission::AdmissionPreparer;
 use pe_source_polymarket_public::FixtureFetcher;
 use pe_strategy_winner_follow::{
     ExecutionMode, PerTradeCap, SizingMode, WinnerFollowConfig, WinnerFollowStrategy,
@@ -375,10 +375,10 @@ async fn incomplete_history_blocks_admission_preparation() {
     let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap());
     let (control_tx, _control_rx) = mpsc::channel(1);
     let preparer = AdmissionPreparer::new(control_tx, paper_state);
-    assert!(matches!(
-        preparer.prepare(&[leader_wallet()]).await,
-        Err(AdmissionError::MissingHistory { missing: 1 })
-    ));
+    let outcome = preparer.prepare(&[leader_wallet()]).await.unwrap();
+    assert!(outcome.admitted.is_empty());
+    assert_eq!(outcome.deferred.len(), 1);
+    assert_eq!(outcome.deferred[0].kind, "history.missing");
     println!("PASS: incomplete durable history blocks admission preparation");
 }
 

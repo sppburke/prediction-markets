@@ -1400,15 +1400,18 @@ top-N; membership converges at the deploy restart itself, because boot validates
 set from the same filtered read. Every post-boot addition on either path is prepared first
 (#542/#544): its prior-market history is complete and its current positions pass the
 five-step causal bracket before the orchestrator records the validation and the wallet is
-published (log line `hot-watchlist admission state prepared`, then `full re-rank membership
-swap applied` / `maintenance tick applied`); a preparation failure publishes no additions
-and the tick retries. `active_watchlist_size` is
+published. A typed wallet failure defers that wallet and replans from the remaining ranked
+survivors; each published structural change is one atomic record with proofs for its additions.
+Shared failures keep full-rerank and capacity unchanged for their next retry, while knockout
+may publish decided evictions without a failed backfill. `active_watchlist_size` is
 Supabase-authoritative (default 100, valid `1..=200`) and is polled every 30 seconds. A
 grow fetches the requested top-N and validates all newly admitted wallets' prior-market
 history and current positions before the atomic validation/membership swap; a shrink uses
-the same atomic membership swap. Invalid values, Supabase failures, or incomplete admission preparation keep
-the last-known-good target and membership, then retry independently on the
-capacity worker's next 30-second retry. Check
+the same atomic membership swap. Typed wallet deferrals allow a nonempty partial capacity result
+to apply the requested cap. A zero-member result remains pending with no membership record;
+invalid values, Supabase failures, and other shared errors keep the last-known-good target and
+membership. Pending or failed requests retry independently on the capacity worker's next
+30-second retry. Check
 `status.json`: `watchlist_size` is actual membership and `watchlist_target_size` is the
 last safely applied runtime cap. The additive optional `live` block reports
 `pending_dispatch_seeds`, `ready_dispatch_seeds`, `fetched_at_unix` (last successful accounts

@@ -13,17 +13,19 @@ use std::sync::Arc;
 use pe_core_types::WalletAddress;
 use pe_paper_state::PaperStateDb;
 use tokio::sync::{Mutex, watch};
-use tracing::info;
+use tracing::{error, info, warn};
 
 use crate::config_poller::{CapacityRequest, WatchlistCapacityApplier};
 use crate::live_watchlist::LiveWatchlist;
 use crate::paper_recovery::{MembershipReason, SealedMembershipEvidence};
 use crate::runtime_config::{AppliedWatchlistCapacity, MAX_ACTIVE_WATCHLIST_SIZE};
 use crate::supabase_reader::{self, SupabaseError};
-use crate::watchlist_admission::{AdmissionError, AdmissionPreparer};
+use crate::watchlist_admission::{
+    AdmissionError, AdmissionPreparer, Deferral, DeferralContext, DeferralOutcome,
+};
 use crate::watchlist_maintenance::{
     MembershipApplyError, MembershipCapacityCheck, MembershipPublication,
-    apply_ranked_membership_locked, planned_live_reentries, ranked_membership_change_set,
+    apply_ranked_membership_locked, planned_live_reentries,
 };
 
 /// Failure surface for one capacity transition. Every variant is fail-soft to the caller.
@@ -39,12 +41,12 @@ enum CapacityError {
     Admission(#[from] AdmissionError),
     #[error("capacity request was superseded before membership commit")]
     Superseded,
-    #[error("{missing} newly admitted wallet(s) were not admission-ready at commit")]
-    UnpreparedAdmission { missing: usize },
     #[error("apply ranked membership: {0}")]
     Membership(#[from] MembershipApplyError),
     #[error("encode capacity membership evidence: {0}")]
     Evidence(#[from] serde_json::Error),
+    #[error("capacity admission planning: {0}")]
+    Planning(String),
 }
 
 /// Production capacity applier used by the 30-second `service_config` poller.
@@ -100,96 +102,264 @@ impl SupabaseWatchlistCapacity {
             MAX_ACTIVE_WATCHLIST_SIZE,
         )
         .await?;
-        let fenced = self
+        let fenced: HashSet<WalletAddress> = self
             .paper_state
             .wallet_fences()
             .map_err(MembershipApplyError::from)?
             .into_iter()
             .map(|record| record.wallet)
             .collect();
-        let (incoming, incoming_last_trade) =
-            supabase_reader::select_membership(incoming, incoming_last_trade, &fenced, target);
-        if incoming.entries.is_empty() {
-            return Err(CapacityError::EmptyRanking { target });
-        }
         validate_unique_ranking(&incoming.entries)?;
-
-        let (_, additions) = ranked_membership_change_set(
-            &self.live.structural_membership(),
-            &incoming.entries,
-            target,
-        );
-        self.preparer.prepare(&additions).await?;
-        let reentry_candidates = planned_live_reentries(&self.live, &incoming.entries);
-        let reentries = self
-            .preparer
-            .prepare_live_reentries(&reentry_candidates)
-            .await;
-        let admission_receipts = self.preparer.record_admission_proofs(&additions).await?;
-        let prepared: HashSet<WalletAddress> = additions.iter().copied().collect();
-
-        let _writer = self.writer_lock.lock().await;
-        if *self.desired_capacity.borrow() != request {
-            return Err(CapacityError::Superseded);
+        let mut excluded = fenced;
+        let mut prepared = HashSet::new();
+        let mut recaptured = HashSet::new();
+        let mut deferrals = Vec::new();
+        loop {
+            let plan = match crate::watchlist_maintenance::plan_membership(
+                &self.live,
+                &self.preparer,
+                &incoming,
+                &incoming_last_trade,
+                excluded.clone(),
+                target,
+                target,
+                None,
+                &mut prepared,
+            )
+            .await
+            {
+                Ok(plan) => plan,
+                Err(abort) => {
+                    deferrals.extend(abort.deferrals);
+                    error!(generation = request.generation, target, kind = abort.kind, cause = %abort.message, "capacity: shared admission failure");
+                    self.preparer
+                        .record_deferrals(
+                            DeferralContext::Capacity {
+                                generation: request.generation,
+                                target,
+                            },
+                            deferrals,
+                            DeferralOutcome::AbortedShared { kind: abort.kind },
+                        )
+                        .await;
+                    return Err(CapacityError::Planning(abort.message));
+                }
+            };
+            for deferral in &plan.deferrals {
+                excluded.insert(deferral.wallet);
+            }
+            deferrals.extend(plan.deferrals);
+            if plan.entries.is_empty() {
+                warn!(
+                    generation = request.generation,
+                    target,
+                    deferred = deferrals.len(),
+                    "capacity: zero eligible wallets; request pending"
+                );
+                self.preparer
+                    .record_deferrals(
+                        DeferralContext::Capacity {
+                            generation: request.generation,
+                            target,
+                        },
+                        deferrals,
+                        DeferralOutcome::PendingCapacity,
+                    )
+                    .await;
+                return Err(CapacityError::EmptyRanking { target });
+            }
+            let reentry_candidates = planned_live_reentries(&self.live, &plan.entries);
+            let reentries = match self
+                .preparer
+                .prepare_live_reentries(&reentry_candidates)
+                .await
+            {
+                Ok(reentries) => reentries,
+                Err(error) => {
+                    error!(generation = request.generation, target, kind = error.kind(), %error, "capacity: shared live reentry failure");
+                    self.preparer
+                        .record_deferrals(
+                            DeferralContext::Capacity {
+                                generation: request.generation,
+                                target,
+                            },
+                            deferrals,
+                            DeferralOutcome::AbortedShared { kind: error.kind() },
+                        )
+                        .await;
+                    return Err(CapacityError::Admission(error));
+                }
+            };
+            let admissions = match self.preparer.record_admission_proofs(&plan.proofs).await {
+                Ok(receipts) => receipts,
+                Err(error) => {
+                    error!(generation = request.generation, target, kind = error.kind(), %error, "capacity: admission artifact failure");
+                    self.preparer
+                        .record_deferrals(
+                            DeferralContext::Capacity {
+                                generation: request.generation,
+                                target,
+                            },
+                            deferrals,
+                            DeferralOutcome::AbortedShared { kind: error.kind() },
+                        )
+                        .await;
+                    return Err(CapacityError::Admission(error));
+                }
+            };
+            let writer = self.writer_lock.lock().await;
+            if *self.desired_capacity.borrow() != request {
+                drop(writer);
+                self.preparer
+                    .record_deferrals(
+                        DeferralContext::Capacity {
+                            generation: request.generation,
+                            target,
+                        },
+                        deferrals,
+                        DeferralOutcome::AbortedShared {
+                            kind: "publication.capacity_superseded",
+                        },
+                    )
+                    .await;
+                return Err(CapacityError::Superseded);
+            }
+            let config_receipt = match self
+                .preparer
+                .record_capacity_config(request.generation, target, plan.entries.clone())
+                .await
+            {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    drop(writer);
+                    self.preparer
+                        .record_deferrals(
+                            DeferralContext::Capacity {
+                                generation: request.generation,
+                                target,
+                            },
+                            deferrals,
+                            DeferralOutcome::AbortedShared { kind: error.kind() },
+                        )
+                        .await;
+                    return Err(CapacityError::Admission(error));
+                }
+            };
+            let evidence = match SealedMembershipEvidence::capacity_change(
+                request.generation,
+                config_receipt,
+                admissions,
+            ) {
+                Ok(evidence) => evidence,
+                Err(error) => {
+                    drop(writer);
+                    self.preparer
+                        .record_deferrals(
+                            DeferralContext::Capacity {
+                                generation: request.generation,
+                                target,
+                            },
+                            deferrals,
+                            DeferralOutcome::AbortedShared {
+                                kind: "evidence.encoding",
+                            },
+                        )
+                        .await;
+                    return Err(CapacityError::Evidence(error));
+                }
+            };
+            match apply_ranked_membership_locked(
+                &self.live,
+                &self.paper_state,
+                &self.preparer,
+                MembershipPublication {
+                    reason: MembershipReason::CapacityChange,
+                    ranking_batch_id: None,
+                    evidence,
+                    binding: plan.binding,
+                },
+                &plan.entries,
+                &plan.last_trade,
+                target,
+                writer,
+                Some(MembershipCapacityCheck::Transition {
+                    applied: self.applied_capacity.clone(),
+                    desired: self.desired_capacity.clone(),
+                    request,
+                }),
+                &reentries,
+            )
+            .await
+            {
+                Ok((actual, dropped, receipt)) => {
+                    let outcome = receipt.map_or(DeferralOutcome::NoChange, |receipt| {
+                        DeferralOutcome::Published {
+                            paper_seq: receipt.sequence.0,
+                        }
+                    });
+                    info!(
+                        generation = request.generation,
+                        target,
+                        admitted = plan.additions.len(),
+                        deferred = deferrals.len(),
+                        dropped = dropped.len(),
+                        actual,
+                        "runtime watchlist membership resized"
+                    );
+                    self.preparer
+                        .record_deferrals(
+                            DeferralContext::Capacity {
+                                generation: request.generation,
+                                target,
+                            },
+                            deferrals,
+                            outcome,
+                        )
+                        .await;
+                    return Ok(actual);
+                }
+                Err(MembershipApplyError::Publication(
+                    crate::watchlist_maintenance::PublishError::Wallet {
+                        wallet,
+                        cause: crate::watchlist_maintenance::WalletPublishCause::ProofChanged,
+                    },
+                )) if recaptured.insert(wallet) => continue,
+                Err(error) if error.class() != crate::position_seeder::FailureClass::Shared => {
+                    if let Some((wallet, kind)) = error.deferrable_wallet() {
+                        excluded.insert(wallet);
+                        deferrals.push(Deferral {
+                            wallet,
+                            stage: "publication",
+                            class: error.class(),
+                            kind,
+                            message: error.to_string(),
+                        });
+                        continue;
+                    }
+                    return Err(CapacityError::Membership(error));
+                }
+                Err(MembershipApplyError::Publication(
+                    crate::watchlist_maintenance::PublishError::UncertainAppend(message),
+                )) => {
+                    error!(generation = request.generation, target, %message, "capacity: paper append outcome uncertain");
+                    return Err(CapacityError::Planning(message));
+                }
+                Err(error) => {
+                    error!(generation = request.generation, target, kind = error.kind(), %error, "capacity: shared publication failure");
+                    self.preparer
+                        .record_deferrals(
+                            DeferralContext::Capacity {
+                                generation: request.generation,
+                                target,
+                            },
+                            deferrals,
+                            DeferralOutcome::AbortedShared { kind: error.kind() },
+                        )
+                        .await;
+                    return Err(CapacityError::Membership(error));
+                }
+            }
         }
-        // Readiness is proven only by THIS attempt (#542). The admissions the locked apply will
-        // publish are recomputed against current membership: a wallet that was live when the
-        // additions were planned but has since been evicted by maintenance is a genuine new
-        // admission that was never prepared; the worker retries and prepares it next round.
-        let (_, required) = ranked_membership_change_set(
-            &self.live.structural_membership(),
-            &incoming.entries,
-            target,
-        );
-        let missing_ready = required
-            .iter()
-            .filter(|wallet| !prepared.contains(wallet))
-            .count();
-        if missing_ready > 0 {
-            return Err(CapacityError::UnpreparedAdmission {
-                missing: missing_ready,
-            });
-        }
-        let config_receipt = self
-            .preparer
-            .record_capacity_config(request.generation, request.target, incoming.entries.clone())
-            .await?;
-        let evidence = SealedMembershipEvidence::capacity_change(
-            request.generation,
-            config_receipt,
-            admission_receipts,
-        )?;
-        let (actual, dropped) = apply_ranked_membership_locked(
-            &self.live,
-            &self.paper_state,
-            &self.preparer,
-            MembershipPublication {
-                reason: MembershipReason::CapacityChange,
-                ranking_batch_id: None,
-                evidence,
-            },
-            &incoming.entries,
-            &incoming_last_trade,
-            target,
-            _writer,
-            Some(MembershipCapacityCheck::Transition {
-                applied: self.applied_capacity.clone(),
-                desired: self.desired_capacity.clone(),
-                request,
-            }),
-            &reentries,
-        )
-        .await?;
-
-        info!(
-            target,
-            fetched = incoming.entries.len(),
-            admitted = additions.len(),
-            dropped = dropped.len(),
-            actual,
-            "runtime watchlist membership resized"
-        );
-        Ok(actual)
     }
 }
 
@@ -264,6 +434,32 @@ mod tests {
     use tempfile::TempDir;
     use tokio::sync::Notify;
     use tokio::sync::mpsc;
+    use tracing_subscriber::fmt::MakeWriter;
+
+    #[derive(Clone)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
 
     struct TestSourceLog {
         handle: SourceLogHandle,
@@ -357,7 +553,7 @@ mod tests {
                 sequence: pe_core_types::EventSeq(1),
                 this_hash: blake3::hash(b"capacity-round-trip"),
             })
-            .map_err(|error| error.to_string());
+            .map_err(|error| crate::watchlist_maintenance::PublishError::Shared(error.to_string()));
             acknowledged.send(result).unwrap();
         });
         let preparer = AdmissionPreparer::new(control_tx, paper_state)
@@ -412,8 +608,8 @@ mod tests {
     async fn wallet_evicted_during_preparation_is_not_readmitted_unprepared() {
         // Capacity plans against a live set {existing, departing} and prepares only the
         // newcomer. While that preparation is in flight, maintenance evicts `departing`. The
-        // final readiness check must see `departing` as an unprepared admission and refuse to
-        // publish; the worker's next attempt then plans it as an addition and prepares it.
+        // locked structural binding must refuse this stale plan; the worker's next attempt
+        // then plans `departing` as an addition and prepares it.
         let existing = WalletAddress([1; 20]);
         let departing = WalletAddress([2; 20]);
         let newcomer = WalletAddress([3; 20]);
@@ -516,7 +712,7 @@ mod tests {
                                 &change,
                                 &replacements,
                             ) {
-                                acknowledged.send(Err(error.to_string())).unwrap();
+                                acknowledged.send(Err(error.into_publish())).unwrap();
                                 continue;
                             }
 
@@ -527,7 +723,11 @@ mod tests {
                                     &live.structural_membership(),
                                 )
                             {
-                                acknowledged.send(Err(error.to_string())).unwrap();
+                                acknowledged
+                                    .send(Err(crate::watchlist_maintenance::PublishError::Shared(
+                                        error.to_string(),
+                                    )))
+                                    .unwrap();
                                 continue;
                             }
                             let removed = change.removed.iter().copied().collect::<HashSet<_>>();
@@ -536,6 +736,20 @@ mod tests {
                                 .filter(|entry| change.added.contains(&entry.wallet))
                                 .cloned()
                                 .collect::<Vec<_>>();
+                            let prepared_on_retry = prepared_sets
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .iter()
+                                .skip(1)
+                                .flat_map(|wallets| wallets.iter().copied())
+                                .collect::<HashSet<_>>();
+                            assert!(
+                                change
+                                    .added
+                                    .iter()
+                                    .all(|wallet| prepared_on_retry.contains(wallet)),
+                                "every published addition must be prepared after the stale attempt"
+                            );
                             live.commit_structural_change(&change.removed, &change.added);
                             live.replace(&removed, &additions, change.capacity);
                             crate::watchlist_maintenance::apply_live_reentries(
@@ -576,8 +790,8 @@ mod tests {
 
         let first = applier.apply(request).await.unwrap_err();
         assert!(
-            first.contains("not admission-ready"),
-            "expected an unprepared-admission refusal, got: {first}"
+            first.contains("prepared structural wallet set changed"),
+            "expected a stale-structure refusal, got: {first}"
         );
         assert_eq!(
             live.snapshot().entries.len(),
@@ -586,7 +800,8 @@ mod tests {
         );
         assert_eq!(applied.load().target, 2, "applied target must be unchanged");
 
-        // The retry plans against the current set, so `departing` is now a prepared addition.
+        // The retry plans against the current set. In the validator-free path, each new
+        // addition is sent as its own preparation command within that fresh attempt.
         assert_eq!(applier.apply(request).await.unwrap(), 3);
         assert_eq!(live.snapshot().entries.len(), 3);
         assert_eq!(live.structural_membership().len(), 3);
@@ -595,7 +810,7 @@ mod tests {
             *prepared_sets
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
-            vec![vec![newcomer], vec![departing, newcomer]]
+            vec![vec![newcomer], vec![departing], vec![newcomer]]
         );
         control.abort();
         source_log.task.abort();
@@ -603,7 +818,308 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_transition_prepares_and_acks_before_membership_publication() {
+    async fn locked_wallet_rejection_replans_capacity_with_next_ranked_wallet() {
+        let (existing, blocked, survivor) = (
+            WalletAddress([11; 20]),
+            WalletAddress([12; 20]),
+            WalletAddress([13; 20]),
+        );
+        let ranking = [existing, blocked, survivor]
+            .iter()
+            .map(|wallet| {
+                serde_json::json!({
+                    "wallet_hex": wallet.to_string(), "hit_rate": "0.6", "ls_tstat": "2",
+                    "n_trades": 10, "last_trade_unix": 1_700_000_100_i64
+                })
+            })
+            .collect::<Vec<_>>();
+        let app = Router::new().route(
+            "/rest/v1/latest_ranking",
+            get(move || {
+                let ranking = ranking.clone();
+                async move { Json(ranking) }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let temp = TempDir::new().unwrap();
+        let source_log = test_source_log(&temp);
+        let paper_state = Arc::new(PaperStateDb::open(&temp.path().join("paper.db")).unwrap());
+        for wallet in [blocked, survivor] {
+            paper_state
+                .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
+                    wallet,
+                    complete: true,
+                    proof_json: "{}".to_owned(),
+                    updated_at_unix: 1,
+                })
+                .unwrap();
+        }
+        let live = LiveWatchlist::new(watchlist(vec![entry(existing)]));
+        let writer_lock = Arc::new(Mutex::new(()));
+        let applied = AppliedWatchlistCapacity::new(1);
+        let (requests, desired) = capacity_request_channel(1, writer_lock.clone());
+        let request = requests.request(2).await;
+        let (control_tx, mut control_rx) = mpsc::channel(2);
+        let prepared = Arc::new(std::sync::Mutex::new(Vec::<WalletAddress>::new()));
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let control = {
+            let live = live.clone();
+            let state = Arc::clone(&paper_state);
+            let prepared = Arc::clone(&prepared);
+            let attempts = Arc::clone(&attempts);
+            let source_path = source_log.path.clone();
+            let state_path = temp.path().join("paper.db");
+            tokio::spawn(async move {
+                while let Some(command) = control_rx.recv().await {
+                    match command {
+                        OrchestratorControl::PrepareAdmissions {
+                            wallets,
+                            acknowledged,
+                        } => {
+                            fake_install_anchors(&state, &wallets, 1_700_000_100);
+                            prepared.lock().unwrap().extend(wallets);
+                            acknowledged.send(()).unwrap();
+                        }
+                        OrchestratorControl::PublishMembership {
+                            change,
+                            replacements,
+                            checks,
+                            acknowledged,
+                        } => {
+                            if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                                assert_eq!(change.added, vec![blocked]);
+                                rusqlite::Connection::open(&state_path)
+                                    .unwrap()
+                                    .execute("INSERT INTO wallet_fences (wallet_hex, source_trade_id, cause, proof_json, fenced_at_unix) VALUES (?1, 'test', 'invalid_mapping', '{}', 1)", [blocked.to_string()])
+                                    .unwrap();
+                                let error = checks
+                                    .recheck_and_seed(&state, &live, &change, &replacements)
+                                    .unwrap_err();
+                                assert!(matches!(
+                                    &error,
+                                    crate::watchlist_maintenance::MembershipApplyError::FencedAdmission { wallet }
+                                        if *wallet == blocked
+                                ));
+                                acknowledged.send(Err(error.into_publish())).unwrap();
+                                continue;
+                            }
+                            assert_eq!(change.added, vec![survivor]);
+                            checks
+                                .recheck_and_seed(&state, &live, &change, &replacements)
+                                .unwrap();
+                            crate::qualification::verify_published_membership_change(
+                                &change.clone().into_record(),
+                                &source_path,
+                                &live.structural_membership(),
+                            )
+                            .unwrap();
+                            let removed = change.removed.iter().copied().collect::<HashSet<_>>();
+                            live.commit_structural_change(&change.removed, &change.added);
+                            live.replace(&removed, &replacements, change.capacity);
+                            checks.commit_capacity();
+                            acknowledged
+                                .send(Ok(pe_event_log::AppendReceipt {
+                                    sequence: pe_core_types::EventSeq(1),
+                                    this_hash: blake3::hash(b"capacity-wallet-replan"),
+                                }))
+                                .unwrap();
+                        }
+                        _ => panic!("capacity replan sent an unrelated control command"),
+                    }
+                }
+            })
+        };
+        let applier = SupabaseWatchlistCapacity::new(
+            live.clone(),
+            Arc::clone(&paper_state),
+            writer_lock,
+            applied.clone(),
+            desired,
+            AdmissionPreparer::new(control_tx, paper_state)
+                .with_source_log(source_log.handle.clone()),
+            reqwest::Client::new(),
+            format!("http://{address}"),
+            "anon".to_owned(),
+            String::new(),
+        );
+        assert_eq!(applier.apply(request).await.unwrap(), 2);
+        assert_eq!(
+            live.structural_membership(),
+            HashSet::from([existing, survivor])
+        );
+        assert_eq!(applied.load(), request);
+        assert_eq!(*prepared.lock().unwrap(), vec![blocked, survivor]);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+        let audits = pe_event_log::Reader::replay(&source_log.path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|(_, frame)| {
+                frame.source_id.0 == crate::watchlist_admission::MEMBERSHIP_DEFERRAL_SOURCE_ID
+            })
+            .map(|(_, frame)| serde_json::from_slice::<serde_json::Value>(&frame.payload).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0]["deferrals"][0]["kind"], "publication.fenced");
+        control.abort();
+        source_log.task.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn shared_live_reentry_failure_keeps_capacity_request_unapplied() {
+        let retained = WalletAddress([14; 20]);
+        let app = Router::new().route(
+            "/rest/v1/latest_ranking",
+            get(move || async move {
+                Json(vec![serde_json::json!({
+                    "wallet_hex": retained.to_string(), "hit_rate": "0.6", "ls_tstat": "2",
+                    "n_trades": 10, "last_trade_unix": 1_700_000_100_i64
+                })])
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let temp = TempDir::new().unwrap();
+        let source_log = test_source_log(&temp);
+        let state = Arc::new(PaperStateDb::open(&temp.path().join("paper.db")).unwrap());
+        state
+            .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
+                wallet: retained,
+                complete: true,
+                proof_json: "{}".to_owned(),
+                updated_at_unix: 1,
+            })
+            .unwrap();
+        let live = LiveWatchlist::new(watchlist(vec![entry(retained)]));
+        live.remove_fenced(&HashSet::from([retained]));
+        let writer_lock = Arc::new(Mutex::new(()));
+        let applied = AppliedWatchlistCapacity::new(1);
+        let before = applied.load();
+        let (requests, desired) = capacity_request_channel(1, Arc::clone(&writer_lock));
+        let request = requests.request(2).await;
+        let (tx, mut rx) = mpsc::channel(1);
+        let rejected = tokio::spawn(async move {
+            let Some(OrchestratorControl::PrepareAdmissions {
+                wallets,
+                acknowledged,
+            }) = rx.recv().await
+            else {
+                panic!("capacity live reentry did not request preparation");
+            };
+            assert_eq!(wallets, vec![retained]);
+            drop(acknowledged);
+            assert!(
+                rx.try_recv().is_err(),
+                "shared failure must stop before publication"
+            );
+        });
+        let applier = SupabaseWatchlistCapacity::new(
+            live.clone(),
+            Arc::clone(&state),
+            writer_lock,
+            applied.clone(),
+            desired,
+            AdmissionPreparer::new(tx, state).with_source_log(source_log.handle.clone()),
+            reqwest::Client::new(),
+            format!("http://{address}"),
+            "anon".to_owned(),
+            String::new(),
+        );
+        assert!(applier.apply_inner(request).await.is_err());
+        rejected.await.unwrap();
+        assert_eq!(applied.load(), before);
+        assert_eq!(live.structural_membership(), HashSet::from([retained]));
+        assert!(live.snapshot().entries.is_empty());
+        assert_eq!(
+            pe_event_log::Reader::replay(&source_log.path)
+                .unwrap()
+                .count(),
+            0
+        );
+        source_log.task.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn desired_request_superseded_during_capacity_read_publishes_nothing() {
+        let existing = WalletAddress([15; 20]);
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let app = Router::new().route(
+            "/rest/v1/latest_ranking",
+            get({
+                let entered = Arc::clone(&entered);
+                let release = Arc::clone(&release);
+                move || {
+                    let entered = Arc::clone(&entered);
+                    let release = Arc::clone(&release);
+                    async move {
+                        entered.notify_one();
+                        release.notified().await;
+                        Json(vec![serde_json::json!({
+                            "wallet_hex": existing.to_string(), "hit_rate": "0.6", "ls_tstat": "2",
+                            "n_trades": 10, "last_trade_unix": 1_700_000_100_i64
+                        })])
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let temp = TempDir::new().unwrap();
+        let source_log = test_source_log(&temp);
+        let state = Arc::new(PaperStateDb::open(&temp.path().join("paper.db")).unwrap());
+        let live = LiveWatchlist::new(watchlist(vec![entry(existing)]));
+        let writer_lock = Arc::new(Mutex::new(()));
+        let applied = AppliedWatchlistCapacity::new(1);
+        let before = applied.load();
+        let (requests, desired) = capacity_request_channel(1, Arc::clone(&writer_lock));
+        let request = requests.request(2).await;
+        let (tx, mut rx) = mpsc::channel(1);
+        let applier = SupabaseWatchlistCapacity::new(
+            live.clone(),
+            Arc::clone(&state),
+            writer_lock,
+            applied.clone(),
+            desired,
+            AdmissionPreparer::new(tx, state).with_source_log(source_log.handle.clone()),
+            reqwest::Client::new(),
+            format!("http://{address}"),
+            "anon".to_owned(),
+            String::new(),
+        );
+        let apply = tokio::spawn(async move { applier.apply_inner(request).await });
+        entered.notified().await;
+        let newer = requests.request(3).await;
+        release.notify_one();
+
+        assert!(matches!(
+            apply.await.unwrap(),
+            Err(CapacityError::Superseded)
+        ));
+        assert_eq!(applied.load(), before);
+        assert_eq!(live.structural_membership(), HashSet::from([existing]));
+        assert!(
+            rx.try_recv().is_err(),
+            "superseded attempt sent a control command"
+        );
+        assert_eq!(
+            pe_event_log::Reader::replay(&source_log.path)
+                .unwrap()
+                .count(),
+            0
+        );
+        assert_eq!(newer.target, 3);
+        source_log.task.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn partial_capacity_transition_prepares_and_acks_before_publication() {
         let existing = WalletAddress([1; 20]);
         let newcomer = WalletAddress([2; 20]);
         let fenced = WalletAddress([3; 20]);
@@ -693,7 +1209,7 @@ mod tests {
         let writer_lock = Arc::new(Mutex::new(()));
         let applied = AppliedWatchlistCapacity::new(1);
         let (requests, desired_rx) = capacity_request_channel(1, Arc::clone(&writer_lock));
-        let request = requests.request(2).await;
+        let request = requests.request(3).await;
 
         let (control_tx, mut control_rx) = mpsc::channel(1);
         let prepared = Arc::new(Notify::new());
@@ -736,7 +1252,7 @@ mod tests {
                             &change,
                             &replacements,
                         ) {
-                            acknowledged.send(Err(error.to_string())).unwrap();
+                            acknowledged.send(Err(error.into_publish())).unwrap();
                             continue;
                         }
 
@@ -745,7 +1261,11 @@ mod tests {
                             &verifier_source_log,
                             &live_at_control.structural_membership(),
                         ) {
-                            acknowledged.send(Err(error.to_string())).unwrap();
+                            acknowledged
+                                .send(Err(crate::watchlist_maintenance::PublishError::Shared(
+                                    error.to_string(),
+                                )))
+                                .unwrap();
                             continue;
                         }
                         let removed = change.removed.iter().copied().collect::<HashSet<_>>();
@@ -815,6 +1335,7 @@ mod tests {
         assert_eq!(apply.await.unwrap().unwrap(), 2);
         control.await.unwrap();
         assert_eq!(live.snapshot().entries.len(), 2);
+        assert!(live.snapshot().entries.len() < request.target);
         assert_eq!(live.structural_membership().len(), 2);
         assert_eq!(applied.load(), request);
         assert_eq!(fetches.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -885,6 +1406,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let temp = TempDir::new().unwrap();
+        let source_log = test_source_log(&temp);
         let paper_state = Arc::new(PaperStateDb::open(&temp.path().join("paper.db")).unwrap());
         let conn = rusqlite::Connection::open(temp.path().join("paper.db")).unwrap();
         conn.execute("INSERT INTO wallet_fences (wallet_hex, source_trade_id, cause, proof_json, fenced_at_unix) VALUES (?1, 'test', 'invalid_mapping', '{}', 1)", [fenced.to_string()]).unwrap();
@@ -901,16 +1423,44 @@ mod tests {
             writer_lock,
             applied.clone(),
             desired,
-            AdmissionPreparer::new(tx, paper_state.clone()),
+            AdmissionPreparer::new(tx, paper_state.clone())
+                .with_source_log(source_log.handle.clone()),
             reqwest::Client::new(),
             format!("http://{address}"),
             "anon".to_owned(),
             String::new(),
         );
+        let log_bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_writer(CapturedLogs(Arc::clone(&log_bytes)))
+            .finish();
+        let subscriber_guard = tracing::subscriber::set_default(subscriber);
+        let result = applier.apply_inner(request).await;
+        drop(subscriber_guard);
         assert!(matches!(
-            applier.apply_inner(request).await,
+            result,
             Err(CapacityError::EmptyRanking { target: 2 })
         ));
+        let captured = String::from_utf8(
+            log_bytes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        )
+        .unwrap();
+        let events = captured
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["target"] == "pe_service::watchlist_capacity")
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 1, "captured logs: {captured}");
+        assert_eq!(events[0]["level"], "WARN");
+        assert_eq!(
+            events[0]["fields"]["message"],
+            "capacity: zero eligible wallets; request pending"
+        );
+        assert_eq!(events[0]["fields"]["deferred"], 0);
         assert_eq!(applied.load(), before);
         assert_eq!(
             live.snapshot()
@@ -931,6 +1481,81 @@ mod tests {
             rx.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
+        assert_eq!(
+            pe_event_log::Reader::replay(&source_log.path)
+                .unwrap()
+                .count(),
+            0,
+            "zero result without wallet deferrals must not request an audit"
+        );
+        source_log.task.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn zero_capacity_after_wallet_deferral_is_pending_and_audited() {
+        let (existing, missing) = (WalletAddress([61; 20]), WalletAddress([62; 20]));
+        let app = Router::new().route(
+            "/rest/v1/latest_ranking",
+            get(move || async move {
+                Json(vec![serde_json::json!({
+                    "wallet_hex": missing.to_string(), "hit_rate": "0.6", "ls_tstat": "2",
+                    "n_trades": 10, "last_trade_unix": 1_700_000_100_i64
+                })])
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let temp = TempDir::new().unwrap();
+        let source_log = test_source_log(&temp);
+        let paper_state = Arc::new(PaperStateDb::open(&temp.path().join("paper.db")).unwrap());
+        let live = LiveWatchlist::new(watchlist(vec![entry(existing)]));
+        let writer_lock = Arc::new(Mutex::new(()));
+        let applied = AppliedWatchlistCapacity::new(1);
+        let before = applied.load();
+        let (requests, desired) = capacity_request_channel(1, writer_lock.clone());
+        let request = requests.request(2).await;
+        let (tx, mut rx) = mpsc::channel(1);
+        let preparer = AdmissionPreparer::new(tx, paper_state.clone())
+            .with_source_log(source_log.handle.clone());
+        let applier = SupabaseWatchlistCapacity::new(
+            live.clone(),
+            paper_state,
+            writer_lock,
+            applied.clone(),
+            desired,
+            preparer,
+            reqwest::Client::new(),
+            format!("http://{address}"),
+            "anon".to_owned(),
+            String::new(),
+        );
+        assert!(matches!(
+            applier.apply_inner(request).await,
+            Err(CapacityError::EmptyRanking { target: 2 })
+        ));
+        assert_eq!(applied.load(), before);
+        assert_eq!(live.structural_membership(), HashSet::from([existing]));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let frames = pe_event_log::Reader::replay(&source_log.path)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let audits = frames
+            .iter()
+            .filter(|(_, frame)| {
+                frame.source_id.0 == crate::watchlist_admission::MEMBERSHIP_DEFERRAL_SOURCE_ID
+            })
+            .map(|(_, frame)| serde_json::from_slice::<serde_json::Value>(&frame.payload).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0]["outcome"]["type"], "pending_capacity");
+        assert_eq!(audits[0]["deferrals"][0]["kind"], "history.missing");
+        source_log.task.abort();
         server.abort();
     }
 }

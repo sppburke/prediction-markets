@@ -915,6 +915,9 @@ comparisons decide what remains; never guess from memory.
    `latest_ranking` or post-Start structural membership replayed from the Start-bound paper log,
    then fenced and deferred wallets excluded from live; `service_config poll loop started`, no poll failures; since #542 an admitting
    swap or backfill is preceded by `hot-watchlist admission state prepared`).
+   An empty replayed post-Start generation is valid and boots with zero live wallets; an empty
+   pre-Start or Start-pinned Supabase read still refuses boot. Check that an empty generation
+   follows a synchronized post-Start `MembershipChanged` record before treating it as expected.
    **With `polymarket_activity_ws_enabled=true` (#530/#546)**: two consecutive `status.json`
    publications, each paired immediately with `/health/ready`, must show all three
    `source_health.ws_readers` records, `ws_live_reader_count >= 2`, `ws_sink_poisoned=false`,
@@ -1089,7 +1092,15 @@ earlier promotion review can arm an account.
 
 ## Rollback
 
-The same swap, reversed, plus one restart — triggered by any missing reader record, fewer than two
+**#595 paper-service compatibility boundary:** preserve state and fix forward for this rollout
+until boot compatibility with the previous executable is proved. A filtered membership record
+retains the existing paper format, but this rollout has no old-binary boot rehearsal. The first
+empty post-Start membership record is a hard forward-only boundary: the previous executable
+refuses that empty generation at boot. Keep the prior binary backup for forensics; do not reverse
+the swap on a restart loop after this boundary.
+
+For releases without a forward-only compatibility boundary, the same swap, reversed, plus one
+restart is triggered by any missing reader record, fewer than two
 live readers on the second bounded check, sink poison, a restart loop, an unexplained financial-state
 change, or a hash mismatch.
 

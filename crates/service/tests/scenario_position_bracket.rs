@@ -14,7 +14,7 @@ use pe_core_types::{
     SourceTimestamp, VenueMarketId, WalletAddress,
 };
 use pe_event_log::Reader;
-use pe_paper_state::{PaperStateDb, WalletHistoryStatusRecord};
+use pe_paper_state::{AnchorInstallRecord, PaperStateDb, WalletHistoryStatusRecord};
 use pe_position_ledger::PositionLedger;
 use pe_service::asset_identity::AssetIdentityResolver;
 use pe_service::bucket_commit::{BucketCommitEngine, BucketDecisionContext};
@@ -1253,7 +1253,6 @@ async fn direct_bracket_uses_three_full_history_walks_and_step_three_cutoff() {
         .validate_direct(&[wallet], &mut engine, &paper)
         .await
         .unwrap();
-
     assert_eq!(accepted[0].cutoff, 101);
     assert_full_history_proof(&accepted[0].proof.document);
     let activity_urls = fetcher
@@ -1396,11 +1395,11 @@ async fn runtime_control_bracket_uses_three_full_history_walks() {
             &paper,
             pe_service::position_seeder::ValidationPurpose::CatchUp,
         )
-        .await
-        .unwrap();
-
-    assert_eq!(accepted[0].cutoff, 101);
-    assert_full_history_proof(&accepted[0].proof.document);
+        .await;
+    assert!(accepted.shared.is_none());
+    assert!(accepted.deferred.is_empty());
+    assert_eq!(accepted.accepted[0].cutoff, 101);
+    assert_full_history_proof(&accepted.accepted[0].proof.document);
     let activity_urls = fetcher
         .urls()
         .into_iter()
@@ -2467,14 +2466,13 @@ async fn mixed_activity_combo_classification_defers_with_named_asset() {
     let preparer =
         AdmissionPreparer::with_validator(control_tx, Arc::clone(&paper), validator(responses));
 
-    let error = preparer.prepare(&[wallet]).await.unwrap_err();
-    assert!(matches!(
-        error,
-        AdmissionError::PositionValidation(CausalPositionError::Positions {
-            source: PositionReadError::MixedActivityClassification { asset },
-            ..
-        }) if asset == crate::asset(1)
-    ));
+    let outcome = preparer.prepare(&[wallet]).await.unwrap();
+    assert!(outcome.admitted.is_empty());
+    assert_eq!(outcome.deferred.len(), 1);
+    assert_eq!(
+        outcome.deferred[0].class,
+        pe_service::position_seeder::FailureClass::WalletPersistent
+    );
     assert!(paper.position_validation(&wallet).unwrap().is_none());
     drop(preparer);
     actor.await.unwrap();
@@ -2695,10 +2693,9 @@ async fn periodic_refresh_skips_an_existing_fence_but_genuine_admission_stays_fa
         preparer.prepare_if_due(wallet, END, 1).await.unwrap(),
         AnchorRefreshOutcome::Skipped
     );
-    assert!(matches!(
-        preparer.prepare(&[wallet]).await.unwrap_err(),
-        AdmissionError::Fenced { fenced: 1 }
-    ));
+    let outcome = preparer.prepare(&[wallet]).await.unwrap();
+    assert!(outcome.admitted.is_empty());
+    assert_eq!(outcome.deferred[0].kind, "fence.active");
 }
 
 #[tokio::test]
@@ -3186,11 +3183,26 @@ async fn paper_state_transaction_error_remains_boot_fatal_without_swapping() {
 }
 
 #[tokio::test]
-async fn multi_wallet_prepare_preserves_typed_deferral_and_installs_none() {
-    let healthy = wallet(0x6b);
+async fn five_wallet_prepare_defers_mapping_failure_and_preserves_accepted_order() {
+    let healthy = [wallet(0x6b), wallet(0x6f), wallet(0x71)];
     let deferred = wallet(0x6c);
+    let raced = wallet(0x70);
     let (_dir, paper, engine) = fresh(&[]);
-    let mut responses = stable_responses(&[(healthy, 1, "1.000000")]);
+    let mut responses = stable_responses(&healthy.map(|wallet| (wallet, 1, "1.000000")));
+    let raced_activity =
+        serde_json::to_vec(&vec![activity(raced, 1, "1.000000", "0xraced", 10)]).unwrap();
+    responses.insert(activity_url(raced), vec![raced_activity; 6]);
+    responses.insert(
+        position_url(raced, PositionPartition::NotRedeemable),
+        ["1", "2", "3", "4"]
+            .into_iter()
+            .map(|amount| serde_json::to_vec(&vec![position(raced, 1, amount)]).unwrap())
+            .collect(),
+    );
+    responses.insert(
+        position_url(raced, PositionPartition::Redeemable),
+        vec![b"[]".to_vec(); 4],
+    );
     responses.insert(
         activity_url(deferred),
         vec![b"[]".to_vec(), b"[]".to_vec(), b"[]".to_vec()],
@@ -3205,22 +3217,272 @@ async fn multi_wallet_prepare_preserves_typed_deferral_and_installs_none() {
     );
     let (control_tx, control_rx) = mpsc::channel(2);
     let actor = spawn_control_actor(control_rx, engine, Arc::clone(&paper));
-    let preparer =
-        AdmissionPreparer::with_validator(control_tx, Arc::clone(&paper), validator(responses));
-    let error = preparer.prepare(&[healthy, deferred]).await.unwrap_err();
+    let fetcher = Arc::new(QueueFetcher::new(responses));
+    let preparer = AdmissionPreparer::with_validator(
+        control_tx,
+        Arc::clone(&paper),
+        validator_from_fetcher(Arc::clone(&fetcher)),
+    );
+    let outcome = preparer
+        .prepare(&[healthy[0], deferred, raced, healthy[1], healthy[2]])
+        .await
+        .unwrap();
+    assert_eq!(outcome.admitted, healthy);
+    assert_eq!(outcome.deferred.len(), 2);
+    assert_eq!(outcome.deferred[0].wallet, deferred);
+    assert_eq!(
+        outcome.deferred[0].kind,
+        "positions.missing_activity_mapping"
+    );
+    assert_eq!(outcome.deferred[1].wallet, raced);
+    assert_eq!(outcome.deferred[1].kind, "validation.position_revision");
+    for wallet in healthy {
+        assert!(!paper.position_anchors(&wallet).unwrap().is_empty());
+        assert!(paper.wallet_history_complete(&wallet).unwrap());
+    }
+    assert!(paper.position_anchors(&deferred).unwrap().is_empty());
+    assert!(!paper.wallet_history_complete(&deferred).unwrap());
+    assert!(paper.position_anchors(&raced).unwrap().is_empty());
+    let urls = fetcher.urls();
+    for wallet in [healthy[0], deferred, raced, healthy[1], healthy[2]] {
+        let activity = activity_url(wallet);
+        assert_eq!(
+            urls.iter()
+                .filter(|url| url.as_str() == activity.as_str())
+                .count(),
+            if wallet == deferred {
+                1
+            } else if wallet == raced {
+                6
+            } else {
+                3
+            },
+            "wallet {wallet} was bracketed more than once"
+        );
+    }
+    let raced_positions = position_url(raced, PositionPartition::NotRedeemable);
+    assert_eq!(
+        urls.iter()
+            .filter(|url| url.as_str() == raced_positions.as_str())
+            .count(),
+        4,
+        "the raced wallet was retried more than once"
+    );
+    drop(preparer);
+    actor.await.unwrap();
+}
+
+#[tokio::test]
+async fn anchor_install_ledger_race_defers_one_wallet_and_durability_aborts() {
+    for durability in [false, true] {
+        let (raced, healthy) = (wallet(0x72), wallet(0x73));
+        let (_dir, paper, mut engine) = fresh(&[]);
+        let (control_tx, mut control_rx) = mpsc::channel(2);
+        let actor_paper = Arc::clone(&paper);
+        let actor = tokio::spawn(async move {
+            let mut install_calls = Vec::new();
+            while let Some(command) = control_rx.recv().await {
+                match command {
+                    OrchestratorControl::PrepareAdmissions { acknowledged, .. } => {
+                        acknowledged.send(()).unwrap();
+                    }
+                    OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
+                        captured
+                            .send(
+                                ledger_capture(engine.ledger(), &actor_paper, wallet)
+                                    .map_err(|error| error.to_string()),
+                            )
+                            .unwrap();
+                    }
+                    OrchestratorControl::CommitActivityBucket {
+                        aggregates,
+                        context,
+                        committed,
+                    } => {
+                        committed
+                            .send(
+                                engine
+                                    .commit(aggregates, context.as_ref(), zero_basis())
+                                    .map_err(|error| error.to_string()),
+                            )
+                            .unwrap();
+                    }
+                    OrchestratorControl::InstallAnchors {
+                        installs,
+                        acknowledged,
+                    } => {
+                        install_calls.push(
+                            installs
+                                .iter()
+                                .map(|install| install.wallet)
+                                .collect::<Vec<_>>(),
+                        );
+                        let result = if durability {
+                            Err(pe_service::bucket_commit::AnchorInstallError::Durability(
+                                "injected persistence failure".to_owned(),
+                            ))
+                        } else if install_calls.len() == 1 {
+                            Err(
+                                pe_service::bucket_commit::AnchorInstallError::LedgerHashChanged {
+                                    wallet: raced,
+                                },
+                            )
+                        } else {
+                            engine.install_anchors(&installs)
+                        };
+                        acknowledged.send(result).unwrap();
+                    }
+                    _ => unreachable!("admission test sent an unrelated control command"),
+                }
+            }
+            install_calls
+        });
+        let preparer = AdmissionPreparer::with_validator(
+            control_tx,
+            Arc::clone(&paper),
+            validator(stable_responses(&[(raced, 1, "1"), (healthy, 2, "1")])),
+        );
+        if durability {
+            let abort = preparer.prepare(&[raced, healthy]).await.unwrap_err();
+            assert!(matches!(abort.cause, AdmissionError::ValidationInstall(_)));
+            assert!(abort.deferred.is_empty());
+            assert!(paper.position_anchors(&raced).unwrap().is_empty());
+            assert!(paper.position_anchors(&healthy).unwrap().is_empty());
+        } else {
+            let outcome = preparer.prepare(&[raced, healthy]).await.unwrap();
+            assert_eq!(outcome.admitted, vec![healthy]);
+            assert_eq!(outcome.deferred.len(), 1);
+            assert_eq!(outcome.deferred[0].wallet, raced);
+            assert_eq!(outcome.deferred[0].kind, "anchor.ledger_hash_changed");
+            assert!(paper.position_anchors(&raced).unwrap().is_empty());
+            assert_eq!(paper.position_anchors(&healthy).unwrap().len(), 1);
+        }
+        drop(preparer);
+        assert_eq!(
+            actor.await.unwrap(),
+            if durability {
+                vec![vec![raced, healthy]]
+            } else {
+                vec![vec![raced, healthy], vec![healthy]]
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn wallet_deferral_survives_a_shared_transient_prepare_abort() {
+    struct TransientOne {
+        inner: QueueFetcher,
+        url: String,
+    }
+
+    impl PageFetcher for TransientOne {
+        async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+            if url == self.url {
+                return Err(SourceError::Transient {
+                    message: "exhausted fixture".to_owned(),
+                });
+            }
+            self.inner.fetch_page(url).await
+        }
+    }
+
+    let deferred = wallet(0x6d);
+    let shared = wallet(0x6e);
+    let (_dir, paper, engine) = fresh(&[]);
+    let mut responses = HashMap::new();
+    responses.insert(
+        activity_url(deferred),
+        vec![b"[]".to_vec(), b"[]".to_vec(), b"[]".to_vec()],
+    );
+    responses.insert(
+        position_url(deferred, PositionPartition::NotRedeemable),
+        vec![serde_json::to_vec(&vec![position(deferred, 2, "1")]).unwrap()],
+    );
+    responses.insert(
+        position_url(deferred, PositionPartition::Redeemable),
+        vec![b"[]".to_vec()],
+    );
+    let fetcher: Arc<dyn ReconciliationFetcher> = Arc::new(TransientOne {
+        inner: QueueFetcher::new(responses),
+        url: activity_url(shared),
+    });
+    let (control_tx, control_rx) = mpsc::channel(2);
+    let actor = spawn_control_actor(control_rx, engine, Arc::clone(&paper));
+    let preparer = AdmissionPreparer::with_validator(
+        control_tx,
+        Arc::clone(&paper),
+        validator_from_reconciliation(fetcher),
+    );
+    let abort = preparer.prepare(&[deferred, shared]).await.unwrap_err();
     assert!(matches!(
-        error,
-        AdmissionError::PositionValidation(CausalPositionError::Positions {
-            source: PositionReadError::MissingActivityMapping { .. },
+        abort.cause,
+        AdmissionError::PositionValidation(CausalPositionError::Activity {
+            source: ActivityReadError::Fetch {
+                source: SourceError::Transient { .. },
+                ..
+            },
             ..
         })
     ));
-    assert!(paper.position_anchors(&healthy).unwrap().is_empty());
+    assert_eq!(abort.deferred.len(), 1);
+    assert_eq!(abort.deferred[0].wallet, deferred);
+    assert_eq!(abort.deferred[0].kind, "positions.missing_activity_mapping");
     assert!(paper.position_anchors(&deferred).unwrap().is_empty());
-    assert!(!paper.wallet_history_complete(&healthy).unwrap());
-    assert!(!paper.wallet_history_complete(&deferred).unwrap());
     drop(preparer);
     actor.await.unwrap();
+}
+
+#[tokio::test]
+async fn each_source_error_variant_aborts_admission_preparation() {
+    struct RejectingFetcher {
+        variant: u8,
+    }
+
+    impl PageFetcher for RejectingFetcher {
+        async fn fetch_page(&self, _url: &str) -> Result<Vec<u8>, SourceError> {
+            Err(match self.variant {
+                0 => SourceError::Transient {
+                    message: "exhausted fixture".to_owned(),
+                },
+                1 => SourceError::RateLimited {
+                    retry_after_secs: 1,
+                },
+                2 => SourceError::Fatal {
+                    message: "invalid fixture".to_owned(),
+                },
+                _ => unreachable!(),
+            })
+        }
+    }
+
+    for variant in 0..3 {
+        let candidate = wallet(0x6e);
+        let (_dir, paper, engine) = fresh(&[]);
+        let (control_tx, control_rx) = mpsc::channel(2);
+        let actor = spawn_control_actor(control_rx, engine, Arc::clone(&paper));
+        let fetcher: Arc<dyn ReconciliationFetcher> = Arc::new(RejectingFetcher { variant });
+        let preparer = AdmissionPreparer::with_validator(
+            control_tx,
+            Arc::clone(&paper),
+            validator_from_reconciliation(fetcher),
+        );
+        let abort = preparer.prepare(&[candidate]).await.unwrap_err();
+        assert!(
+            matches!(
+                &abort.cause,
+                AdmissionError::PositionValidation(CausalPositionError::Activity {
+                    source: ActivityReadError::Fetch { .. },
+                    ..
+                })
+            ),
+            "variant {variant} did not abort preparation: {abort:?}"
+        );
+        assert!(abort.deferred.is_empty());
+        assert!(paper.position_anchors(&candidate).unwrap().is_empty());
+        drop(preparer);
+        actor.await.unwrap();
+    }
 }
 
 #[tokio::test]
@@ -3527,7 +3789,10 @@ async fn runtime_completion_case(
         conn.execute_batch(&format!("CREATE TRIGGER fail_history BEFORE {operation} ON wallet_history_status_v2 BEGIN SELECT RAISE(FAIL, 'completion fault'); END;")).unwrap();
         assert!(matches!(
             preparer.prepare(&[newcomer]).await,
-            Err(AdmissionError::ValidationInstall(_))
+            Err(pe_service::watchlist_admission::AdmissionAbort {
+                cause: AdmissionError::ValidationInstall(_),
+                ..
+            })
         ));
         assert_eq!(paper.wallet_history_status(&newcomer).unwrap(), before);
         assert!(paper.position_anchors(&newcomer).unwrap().is_empty());
@@ -3915,7 +4180,7 @@ async fn runtime_empty_history_and_positions_refuses_without_initializing_cursor
     let preparer = AdmissionPreparer::with_validator(tx, paper.clone(), validator(responses));
     let error = preparer.prepare(&[wallet]).await.unwrap_err();
     assert!(
-        matches!(&error, AdmissionError::ValidationInstall(message) if message.contains("requires an existing wallet cursor"))
+        matches!(&error.cause, AdmissionError::ValidationInstall(message) if message.contains("requires an existing wallet cursor"))
     );
     assert!(paper.cursor(&wallet).unwrap().is_none());
     assert!(paper.wallet_history_status(&wallet).unwrap().is_none());
@@ -4125,13 +4390,16 @@ async fn runtime_rejected_brackets_do_not_complete_history() {
             }
         });
         let preparer = AdmissionPreparer::with_validator(tx, paper.clone(), validator);
-        let error = preparer.prepare(&[wallet]).await.unwrap_err();
+        let result = preparer.prepare(&[wallet]).await;
         match kind {
             "partial" => {
                 assert!(matches!(
-                    error,
-                    AdmissionError::PositionValidation(CausalPositionError::Activity {
-                        source: ActivityReadError::Fetch { .. },
+                    result,
+                    Err(pe_service::watchlist_admission::AdmissionAbort {
+                        cause: AdmissionError::PositionValidation(CausalPositionError::Activity {
+                            source: ActivityReadError::Fetch { .. },
+                            ..
+                        }),
                         ..
                     })
                 ));
@@ -4142,24 +4410,21 @@ async fn runtime_rejected_brackets_do_not_complete_history() {
                 );
             }
             "failed" => assert!(matches!(
-                error,
-                AdmissionError::PositionValidation(CausalPositionError::Activity {
-                    source: ActivityReadError::Fetch { .. },
+                result,
+                Err(pe_service::watchlist_admission::AdmissionAbort {
+                    cause: AdmissionError::PositionValidation(CausalPositionError::Activity {
+                        source: ActivityReadError::Fetch { .. },
+                        ..
+                    }),
                     ..
                 })
             )),
-            "deferred" => assert!(matches!(
-                error,
-                AdmissionError::PositionValidation(CausalPositionError::PositionRevision { .. })
-            )),
+            "deferred" => assert_eq!(result.unwrap().deferred.len(), 1),
             "fenced" => {
-                assert!(matches!(error, AdmissionError::Fenced { fenced: 1 }));
+                assert_eq!(result.unwrap().deferred[0].kind, "fence.active");
                 assert!(fetcher.urls().is_empty());
             }
-            _ => assert!(
-                matches!(error, AdmissionError::ValidationRejected(_)),
-                "{kind}: {error}"
-            ),
+            _ => assert_eq!(result.unwrap().deferred.len(), 1, "{kind}"),
         }
         assert!(
             paper.wallet_history_status(&wallet).unwrap().is_none(),
@@ -4248,9 +4513,9 @@ async fn queued_bucket_before_membership(invalidate_admission: bool) {
         .filter(|(_, envelope)| envelope.payload == expected_record)
         .collect::<Vec<_>>();
     if invalidate_admission {
-        let expected =
-            format!("newly admitted wallet {newcomer} lacks a current causal position validation");
-        assert_eq!(result.as_ref().unwrap_err(), &expected);
+        assert!(
+            matches!(result.as_ref().unwrap_err(), pe_service::watchlist_maintenance::PublishError::Wallet { wallet, cause: pe_service::watchlist_maintenance::WalletPublishCause::UnvalidatedPosition } if *wallet == newcomer)
+        );
         assert_eq!(h.live.snapshot().entries[0].wallet, incumbent);
         assert_eq!(h.live.structural_membership(), HashSet::from([incumbent]));
         assert!(membership_records.is_empty());
@@ -4265,9 +4530,9 @@ async fn queued_bucket_before_membership(invalidate_admission: bool) {
     maintenance_ack.send(result).unwrap();
     let result = publication.await.unwrap();
     if invalidate_admission {
-        assert!(result.unwrap_err().to_string().contains(
-            "orchestrator rejected structural membership publication: newly admitted wallet"
-        ));
+        assert!(
+            matches!(result.unwrap_err(), pe_service::watchlist_maintenance::MembershipApplyError::Publication(pe_service::watchlist_maintenance::PublishError::Wallet { wallet, cause: pe_service::watchlist_maintenance::WalletPublishCause::UnvalidatedPosition }) if wallet == newcomer)
+        );
     } else {
         result.unwrap();
     }
@@ -4305,7 +4570,9 @@ async fn membership_handler_rechecks_capacity_and_commits_epoch_before_ack() {
     use pe_service::config_poller::capacity_request_channel;
     use pe_service::paper_recovery::{MembershipChange, MembershipReason};
     use pe_service::runtime_config::AppliedWatchlistCapacity;
-    use pe_service::watchlist_maintenance::{MembershipCapacityCheck, MembershipCommit};
+    use pe_service::watchlist_maintenance::{
+        MembershipCapacityCheck, MembershipCommit, PublicationBinding, PublishError,
+    };
 
     let incumbent = wallet(0x93);
     let (dir, paper, mut engine) = fresh(&[incumbent]);
@@ -4340,14 +4607,15 @@ async fn membership_handler_rechecks_capacity_and_commits_epoch_before_ack() {
                         desired: desired.clone(),
                         request: attempted,
                     }),
+                    binding: PublicationBinding {
+                        structural: h.live.structural_membership(),
+                        digests: Vec::new(),
+                    },
                 },
             )
             .await;
         if attempted == request {
-            assert!(
-                matches!(&result, Err(AdmissionError::PublicationRejected(message))
-                if message.contains("capacity request was superseded before membership commit"))
-            );
+            assert!(matches!(&result, Err(PublishError::CapacitySuperseded)));
             assert_eq!(applied.load(), original);
             assert_eq!(record_count(), before);
         } else {
@@ -4374,13 +4642,14 @@ async fn membership_handler_rechecks_capacity_and_commits_epoch_before_ack() {
                     applied: applied.clone(),
                     expected: original,
                 }),
+                binding: PublicationBinding {
+                    structural: h.live.structural_membership(),
+                    digests: Vec::new(),
+                },
             },
         )
         .await;
-    assert!(
-        matches!(result, Err(AdmissionError::PublicationRejected(message))
-        if message.contains("stale watchlist capacity plan"))
-    );
+    assert!(matches!(result, Err(PublishError::StaleCapacity)));
     assert_eq!(
         serde_json::to_value(&h.live.snapshot().entries).unwrap(),
         serde_json::to_value(&h.initial.entries).unwrap(),
@@ -4420,12 +4689,7 @@ async fn fence_after_prepare_invalidates_selected_vector() {
         .await
         .unwrap_err();
     assert!(
-        matches!(
-            &error,
-            pe_service::watchlist_maintenance::MembershipApplyError::Publication(_)
-        ) && error.to_string().contains(&format!(
-            "newly admitted wallet {selected} is durably fenced"
-        ))
+        matches!(error, pe_service::watchlist_maintenance::MembershipApplyError::Publication(pe_service::watchlist_maintenance::PublishError::Wallet { wallet, cause: pe_service::watchlist_maintenance::WalletPublishCause::FencedAdmission }) if wallet == selected)
     );
     assert_eq!(h.live.snapshot().entries[0].wallet, incumbent);
     let mut bench = h.initial.clone();
@@ -4443,6 +4707,278 @@ async fn fence_after_prepare_invalidates_selected_vector() {
         .await
         .unwrap();
     assert_eq!(h.live.snapshot().entries[0].wallet, survivor);
+    drop(preparer);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn proof_changed_at_locked_publication_recaptures_cited_manifest() {
+    use pe_service::paper_recovery::{
+        PaperLogRecord, paper_era, replay_membership, scan_paper_log,
+    };
+    use pe_service::watchlist_maintenance::{
+        MembershipApplyError, PublishError, WalletPublishCause,
+    };
+
+    let (incumbent, selected) = (wallet(0x96), wallet(0x97));
+    let (dir, paper, mut engine) = fresh(&[incumbent]);
+    install_empty_anchor(&mut engine, &paper, incumbent, 0);
+    drop(engine);
+    let h = golden::BracketFinancialHarness::new(dir.path(), paper.clone(), &[incumbent]).await;
+    let preparer = financial_preparer(
+        &h,
+        &paper,
+        Arc::new(QueueFetcher::new(stable_responses(&[(selected, 1, "1")]))),
+    );
+    assert_eq!(
+        preparer.prepare(&[selected]).await.unwrap().admitted,
+        vec![selected]
+    );
+
+    let (relay_tx, mut relay_rx) = mpsc::channel(1);
+    let publisher =
+        AdmissionPreparer::new(relay_tx, paper.clone()).with_source_log(h.source.clone());
+    let first = publisher.clone();
+    let live = h.live.clone();
+    let writer_lock = h.writer_lock.clone();
+    let first_try = tokio::spawn(async move {
+        first
+            .scenario_publish_ranking(
+                &live,
+                &writer_lock,
+                golden::BracketFinancialHarness::entries(&[selected]),
+                &HashMap::from([(selected, 10)]),
+                1,
+            )
+            .await
+    });
+    let publication = relay_rx.recv().await.unwrap();
+    let anchor = paper.position_anchors(&selected).unwrap().pop().unwrap();
+    let validation = paper.position_validation(&selected).unwrap().unwrap();
+    paper
+        .install_anchors(&[AnchorInstallRecord {
+            history_status: None,
+            wallet: selected,
+            balances: Vec::new(),
+            activity_cutoff_unix: anchor.activity_cutoff_unix,
+            anchored_at_unix: anchor.anchored_at_unix + 1,
+            ledger_hash_after: anchor.ledger_hash_after,
+            positions_proof_hash: validation.positions_proof_hash,
+            activity_bounds_json: validation.activity_bounds_json,
+            source_log_generation: validation.source_log_generation,
+            proof_json: anchor.proof_json,
+            recorded_at_unix: validation.recorded_at_unix + 1,
+        }])
+        .unwrap();
+    h.control.send(publication).await.unwrap();
+    assert!(
+        matches!(first_try.await.unwrap(), Err(MembershipApplyError::Publication(PublishError::Wallet { wallet, cause: WalletPublishCause::ProofChanged })) if wallet == selected)
+    );
+    assert_eq!(h.live.structural_membership(), HashSet::from([incumbent]));
+
+    let second = publisher.clone();
+    let live = h.live.clone();
+    let writer_lock = h.writer_lock.clone();
+    let second_try = tokio::spawn(async move {
+        second
+            .scenario_publish_ranking(
+                &live,
+                &writer_lock,
+                golden::BracketFinancialHarness::entries(&[selected]),
+                &HashMap::from([(selected, 10)]),
+                1,
+            )
+            .await
+    });
+    let recaptured_publication = relay_rx.recv().await.unwrap();
+    if let OrchestratorControl::PublishMembership { checks, .. } = &recaptured_publication {
+        let current = pe_service::watchlist_maintenance::PublicationBinding::for_additions(
+            h.live.structural_membership(),
+            &paper,
+            &[selected],
+        )
+        .unwrap();
+        assert_eq!(checks.binding.digests, current.digests);
+    } else {
+        unreachable!("recaptured attempt sent a non-publication command");
+    }
+    h.control.send(recaptured_publication).await.unwrap();
+    second_try.await.unwrap().unwrap();
+    let admissions = Reader::replay(&h.source_path)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .into_iter()
+        .filter(|(_, frame)| frame.source_id.0 == "pe-service.watchlist-admission")
+        .map(|(_, frame)| frame.this_hash)
+        .collect::<Vec<_>>();
+    assert_eq!(admissions.len(), 2);
+    let records = Reader::replay(&h.paper_path)
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+        .into_iter()
+        .filter_map(|(_, frame)| serde_json::from_slice::<PaperLogRecord>(&frame.payload).ok())
+        .filter_map(|record| match record {
+            PaperLogRecord::MembershipChanged { evidence, .. } => Some(evidence),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 1);
+    assert!(
+        serde_json::to_string(&records[0])
+            .unwrap()
+            .contains(&admissions[1].to_hex().to_string())
+    );
+    let era = paper_era(scan_paper_log(&h.paper_path).unwrap());
+    let replayed = replay_membership(&era, h.initial.clone(), &h.source_path)
+        .unwrap()
+        .unwrap();
+    assert_eq!(replayed.watchlist.entries[0].wallet, selected);
+    drop(preparer);
+    drop(publisher);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn locked_structural_change_rejects_prepared_publication_and_retry_replays() {
+    use pe_service::paper_recovery::{paper_era, replay_membership, scan_paper_log};
+    use pe_service::watchlist_maintenance::{MembershipApplyError, PublishError};
+
+    let (incumbent, selected) = (wallet(0x98), wallet(0x99));
+    let (dir, paper, mut engine) = fresh(&[incumbent]);
+    install_empty_anchor(&mut engine, &paper, incumbent, 0);
+    drop(engine);
+    let h = golden::BracketFinancialHarness::new(dir.path(), paper.clone(), &[incumbent]).await;
+    let preparer = financial_preparer(
+        &h,
+        &paper,
+        Arc::new(QueueFetcher::new(stable_responses(&[(selected, 1, "1")]))),
+    );
+    assert_eq!(
+        preparer.prepare(&[selected]).await.unwrap().admitted,
+        vec![selected]
+    );
+    let (relay_tx, mut relay_rx) = mpsc::channel(1);
+    let publisher = AdmissionPreparer::new(relay_tx, paper).with_source_log(h.source.clone());
+    let first = publisher.clone();
+    let live = h.live.clone();
+    let writer_lock = h.writer_lock.clone();
+    let pending = tokio::spawn(async move {
+        first
+            .scenario_publish_ranking(
+                &live,
+                &writer_lock,
+                golden::BracketFinancialHarness::entries(&[selected]),
+                &HashMap::from([(selected, 10)]),
+                1,
+            )
+            .await
+    });
+    let message = relay_rx.recv().await.unwrap();
+    h.live.scenario_commit_structural_change(&[incumbent], &[]);
+    h.control.send(message).await.unwrap();
+    assert!(matches!(
+        pending.await.unwrap(),
+        Err(MembershipApplyError::Publication(
+            PublishError::StaleStructure
+        ))
+    ));
+    assert_eq!(
+        Reader::replay(&h.paper_path)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|(_, frame)| {
+                serde_json::from_slice::<pe_service::paper_recovery::PaperLogRecord>(&frame.payload)
+                    .is_ok_and(|record| {
+                        matches!(
+                            record,
+                            pe_service::paper_recovery::PaperLogRecord::MembershipChanged { .. }
+                        )
+                    })
+            })
+            .count(),
+        0
+    );
+
+    h.live.scenario_commit_structural_change(&[], &[incumbent]);
+    let second = publisher.clone();
+    let live = h.live.clone();
+    let writer_lock = h.writer_lock.clone();
+    let retry = tokio::spawn(async move {
+        second
+            .scenario_publish_ranking(
+                &live,
+                &writer_lock,
+                golden::BracketFinancialHarness::entries(&[selected]),
+                &HashMap::from([(selected, 10)]),
+                1,
+            )
+            .await
+    });
+    h.control
+        .send(relay_rx.recv().await.unwrap())
+        .await
+        .unwrap();
+    retry.await.unwrap().unwrap();
+    let era = paper_era(scan_paper_log(&h.paper_path).unwrap());
+    let replayed = replay_membership(&era, h.initial.clone(), &h.source_path)
+        .unwrap()
+        .unwrap();
+    assert_eq!(replayed.watchlist.entries[0].wallet, selected);
+    drop(preparer);
+    drop(publisher);
+    h.shutdown().await;
+}
+
+#[tokio::test]
+async fn locked_history_loss_is_a_typed_wallet_rejection() {
+    use pe_service::watchlist_maintenance::{
+        MembershipApplyError, PublishError, WalletPublishCause,
+    };
+
+    let (incumbent, selected) = (wallet(0x9a), wallet(0x9b));
+    let (dir, paper, mut engine) = fresh(&[incumbent]);
+    install_empty_anchor(&mut engine, &paper, incumbent, 0);
+    drop(engine);
+    let h = golden::BracketFinancialHarness::new(dir.path(), paper.clone(), &[incumbent]).await;
+    let preparer = financial_preparer(
+        &h,
+        &paper,
+        Arc::new(QueueFetcher::new(stable_responses(&[(selected, 1, "1")]))),
+    );
+    assert_eq!(
+        preparer.prepare(&[selected]).await.unwrap().admitted,
+        vec![selected]
+    );
+    let (relay_tx, mut relay_rx) = mpsc::channel(1);
+    let publisher = AdmissionPreparer::new(relay_tx, paper).with_source_log(h.source.clone());
+    let live = h.live.clone();
+    let writer_lock = h.writer_lock.clone();
+    let pending = tokio::spawn(async move {
+        publisher
+            .scenario_publish_ranking(
+                &live,
+                &writer_lock,
+                golden::BracketFinancialHarness::entries(&[selected]),
+                &HashMap::from([(selected, 10)]),
+                1,
+            )
+            .await
+    });
+    let message = relay_rx.recv().await.unwrap();
+    rusqlite::Connection::open(dir.path().join("paper.db"))
+        .unwrap()
+        .execute(
+            "UPDATE wallet_history_status_v2 SET complete = 0 WHERE wallet_hex = ?1",
+            [selected.to_string()],
+        )
+        .unwrap();
+    h.control.send(message).await.unwrap();
+    assert!(
+        matches!(pending.await.unwrap(), Err(MembershipApplyError::Publication(PublishError::Wallet { wallet, cause: WalletPublishCause::IncompleteHistory })) if wallet == selected)
+    );
+    assert_eq!(h.live.structural_membership(), HashSet::from([incumbent]));
     drop(preparer);
     h.shutdown().await;
 }

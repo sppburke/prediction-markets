@@ -446,10 +446,11 @@ async fn main() -> Result<()> {
     // invalidating) the boot generation.
     let initial_watchlist_size = live_runtime_config.snapshot().active_watchlist_size;
     let ranking_client = reqwest::Client::new();
-    let (initial_watchlist, bootstrap_last_trade, boot_batch_marker): (
+    let (initial_watchlist, bootstrap_last_trade, boot_batch_marker, post_start_record_replayed): (
         Watchlist,
         HashMap<_, _>,
         Option<i64>,
+        bool,
     ) = if let Some((_, start)) = &financial_start_record {
         let (start_batch, mut start_last_trade) = supabase_reader::fetch_batch(
             &ranking_client,
@@ -481,6 +482,7 @@ async fn main() -> Result<()> {
             replayed.watchlist,
             start_last_trade,
             Some(replayed.last_ranking_batch_id),
+            replayed.post_start_record_replayed,
         )
     } else {
         // Bind the fresh survivor bench to the marker before loading the active state.
@@ -503,7 +505,7 @@ async fn main() -> Result<()> {
         )
         .await
         .context("bootstrap watchlist from Supabase (the sole pre-Start wallet source)")?;
-        (watchlist, last_trade, Some(marker))
+        (watchlist, last_trade, Some(marker), false)
     };
     info!(
         active = initial_watchlist.active_count,
@@ -513,13 +515,15 @@ async fn main() -> Result<()> {
         "watchlist membership rebuilt"
     );
 
-    // Fail fast if the selected Supabase batch returned no durable members — there is no fallback
-    // source (#370). Both the pre-Start batch read and the Start-pinned read are survivor-filtered
-    // (#518), so a batch with no surviving rows fails closed rather than running an empty set.
+    // Pre-Start and Start-pinned survivor-filtered reads require a nonempty membership.
+    // A synchronized post-Start record may instead establish an intentionally empty generation.
     anyhow::ensure!(
-        !initial_watchlist.entries.is_empty(),
+        post_start_record_replayed || !initial_watchlist.entries.is_empty(),
         "no wallets to copy: the boot membership generation contains no SURVIVING rows"
     );
+    if initial_watchlist.entries.is_empty() {
+        warn!("replayed post-Start membership is empty; booting with zero live wallets");
+    }
 
     let (projection_dirty, projection_dirty_rx) = projection_dirty_channel();
     let projection_status = WatchlistProjectionStatus::default();
@@ -876,9 +880,12 @@ async fn main() -> Result<()> {
         .collect();
     live_watchlist.remove_fenced(&not_accepted);
     anyhow::ensure!(
-        !live_watchlist.snapshot().entries.is_empty(),
+        post_start_record_replayed || !live_watchlist.snapshot().entries.is_empty(),
         "no wallets eligible after durable fence/history/acceptance filtering"
     );
+    if live_watchlist.snapshot().entries.is_empty() {
+        warn!("replayed post-Start membership has zero eligible live wallets");
+    }
 
     if migration_boot.session.is_some() {
         let activation_obligations =
