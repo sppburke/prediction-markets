@@ -47,6 +47,8 @@ mod aggregate_scan;
 mod digests;
 mod incremental;
 mod projection_digest;
+#[cfg(target_os = "linux")]
+mod walk_prefetch;
 use digests::{JsonArrayDigest, ReceiptSetDigest};
 use incremental::{
     CollectionProof, commit_incremental_wallet, generation_identity, manifest_link,
@@ -4812,13 +4814,60 @@ fn quick_check(connection: &Connection, role: &str, path: &Path) -> Result<(), B
     // Metadata is diagnostic only: a stat failure must not replace the pragma's error.
     let file_size_bytes = std::fs::metadata(path).ok().map(|metadata| metadata.len());
     let started = Instant::now();
-    let result = connection.query_row::<String, _, _>("PRAGMA quick_check", [], |row| row.get(0));
+    #[cfg(target_os = "linux")]
+    let (result, prefetch) = if role == "activation_candidate" {
+        walk_prefetch::quick_check(connection, path)
+    } else {
+        (
+            connection.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0)),
+            None,
+        )
+    };
+    #[cfg(not(target_os = "linux"))]
+    let result = connection.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0));
     let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
     let result = match result {
         Ok(result) if result == "ok" => Ok(()),
         Ok(result) => invalid(format!("SQLite quick_check failed: {result}")),
         Err(error) => Err(error.into()),
     };
+    #[cfg(target_os = "linux")]
+    if role == "activation_candidate" {
+        let prefetch =
+            prefetch.unwrap_or_else(|| walk_prefetch::Outcome::unavailable("worker did not start"));
+        if let Some(error) = prefetch.error() {
+            tracing::info!(
+                role,
+                path = %path.display(),
+                file_size_bytes,
+                elapsed_ms,
+                success = result.is_ok(),
+                prefetch = prefetch.status(),
+                prefetch_error = error,
+                "SQLite quick_check completed"
+            );
+        } else {
+            tracing::info!(
+                role,
+                path = %path.display(),
+                file_size_bytes,
+                elapsed_ms,
+                success = result.is_ok(),
+                prefetch = prefetch.status(),
+                "SQLite quick_check completed"
+            );
+        }
+    } else {
+        tracing::info!(
+            role,
+            path = %path.display(),
+            file_size_bytes,
+            elapsed_ms,
+            success = result.is_ok(),
+            "SQLite quick_check completed"
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
     tracing::info!(
         role,
         path = %path.display(),

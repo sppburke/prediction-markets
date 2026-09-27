@@ -819,8 +819,9 @@ equal to the fixed main's, and `accepted_cycle_manifest.json` (written only afte
 publication, which follows a successful activation) sits beside it. That activation scanned
 those bytes before installing them, so a cycle whose fixed main is its predecessor's
 untouched candidate runs one scan, at activation, instead of two; any other fixed main is
-scanned at staging as before. At 590 GB one scan takes about 10 h (17 MB/s of 4 KB reads
-on Forge, measured 2026-09-23).
+scanned at staging as before. At 590 GB the measured plain-check baseline took about
+10 h (17 MB/s of 4 KB reads on Forge, 2026-09-23). The activation candidate now starts
+the walk-order prefetch described in [#694](https://github.com/sppburke/prediction-markets/issues/694).
 
 Finalization certifies exact bytes and activity, payout and projection evidence, not
 every SQLite page. Damage outside those reads may now survive migration resume, the
@@ -839,14 +840,17 @@ UNIQUE constraints or index-to-table agreement; no routine full `integrity_check
 With `RUST_LOG=info` (or `pe_bootstrap::cache_migration=info`) in the loop environment,
 each completed check emits one JSON event to stderr, inherited by the loop journal
 (`journalctl --user -u pe-rank-loop`), with `role`, `path`, `file_size_bytes`, integer
-`elapsed_ms` and `success`. Duration measures only the pragma, excluding copying,
-hashing, collection and ranking; interrupted checks have no completion event, so their
-duration is unknown. Staging stdout remains the single report in
+`elapsed_ms` and `success`. The activation candidate's event also carries
+`prefetch` (`done`, `cancelled`, or `unavailable`); an unavailable event includes
+the advice error. Its duration includes prefetch setup, the pragma, and the worker
+join. Other roles measure only the pragma. A check returning an error still emits
+an event with `success = false`; only a killed process emits none. Duration excludes
+copying, hashing, collection and ranking. Staging stdout remains the single report in
 `$OUT_DIR/cache_stage.json`; `$OUT_DIR/cache_build_manifest.json` and
 `$OUT_DIR/cache_stage_record.json` keep their existing hash-bound contracts.
-The supplied 18.5 MB/s measurement projects about 9.5 hours per 630 GB scan, reducing
-recurring structural-check time from about 76 to 19 hours; this is an estimate until
-journal measurements establish actual durations, and establishes no total freshness bound.
+The plain-check timing is a measured baseline. [#694](https://github.com/sppburke/prediction-markets/issues/694)
+records the local prefetch measurement; the first Forge activation-candidate check
+will establish its host duration. Neither establishes a total freshness bound.
 
 Deploy a validated binary and scripts only through `scripts/deploy/forge_pause.sh pause`
 and `restore`, after confirming the recorded paused state, stopped descendants and
