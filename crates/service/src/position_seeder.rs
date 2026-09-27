@@ -640,8 +640,8 @@ impl CausalPositionValidator {
         )
     }
 
-    /// Deterministic bracket clock for hermetic scenario tests.
-    #[cfg(feature = "scenario")]
+    /// Deterministic bracket clock for hermetic unit and scenario tests.
+    #[cfg(any(test, feature = "scenario"))]
     #[must_use]
     pub fn with_clock(mut self, now: Arc<dyn Fn() -> i64 + Send + Sync>) -> Self {
         self.now = now;
