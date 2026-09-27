@@ -98,6 +98,42 @@ pub fn validate_live_market(
     observed_at_unix: i64,
     freshness_window_secs: u64,
 ) -> Result<LiveMarketEvidence, LiveMarketError> {
+    validate_market(
+        gamma_raw,
+        clob_raw,
+        expected_condition,
+        observed_at_unix,
+        freshness_window_secs,
+        true,
+    )
+}
+
+/// Paper uses the same market evidence and rules while allowing delayed matching.
+pub fn validate_paper_market(
+    gamma_raw: &[u8],
+    clob_raw: &[u8],
+    expected_condition: &PolymarketConditionId,
+    observed_at_unix: i64,
+    freshness_window_secs: u64,
+) -> Result<LiveMarketEvidence, LiveMarketError> {
+    validate_market(
+        gamma_raw,
+        clob_raw,
+        expected_condition,
+        observed_at_unix,
+        freshness_window_secs,
+        false,
+    )
+}
+
+fn validate_market(
+    gamma_raw: &[u8],
+    clob_raw: &[u8],
+    expected_condition: &PolymarketConditionId,
+    observed_at_unix: i64,
+    freshness_window_secs: u64,
+    require_immediate_matching: bool,
+) -> Result<LiveMarketEvidence, LiveMarketError> {
     let gamma_markets: Vec<GammaMarket> =
         serde_json::from_slice(gamma_raw).map_err(|error| LiveMarketError::Json {
             origin: "Gamma",
@@ -115,7 +151,7 @@ pub fn validate_live_market(
         message: error.to_string(),
     })?;
 
-    validate_state(&gamma, &clob)?;
+    validate_state(&gamma, &clob, require_immediate_matching)?;
     if clob.condition_id.as_deref() != Some(expected_condition.0.as_str()) {
         return Err(LiveMarketError::SourceDisagreement);
     }
@@ -197,7 +233,11 @@ pub fn validate_live_market(
     })
 }
 
-fn validate_state(gamma: &GammaMarket, clob: &ClobMarket) -> Result<(), LiveMarketError> {
+fn validate_state(
+    gamma: &GammaMarket,
+    clob: &ClobMarket,
+    require_immediate_matching: bool,
+) -> Result<(), LiveMarketError> {
     if gamma.active != Some(true) || clob.active != Some(true) {
         return Err(LiveMarketError::Inactive);
     }
@@ -209,6 +249,9 @@ fn validate_state(gamma: &GammaMarket, clob: &ClobMarket) -> Result<(), LiveMark
     }
     if gamma.enable_order_book != Some(true) || clob.enable_order_book != Some(true) {
         return Err(LiveMarketError::OrderBookDisabled);
+    }
+    if !require_immediate_matching {
+        return Ok(());
     }
     // The long CLOB market is the delay authority. Gamma's `secondsDelay` is nullable and usually
     // absent (Gamma OpenAPI; docs/15-SOURCES.md 2026-09-15), so it may only corroborate: a
@@ -417,6 +460,69 @@ mod tests {
                 validate(&gamma, &clob).map(|_| ()),
                 expected,
                 "gamma {gamma_delay:?} clob {clob_delay:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn paper_delay_policy_only_skips_delay_refusal() {
+        for (gamma_delay, clob_delay, live_error) in [
+            (Some(0), Some(1), LiveMarketError::NonzeroDelay),
+            (None, None, LiveMarketError::MissingDelay),
+            (Some(1), Some(0), LiveMarketError::NonzeroDelay),
+        ] {
+            let mut gamma = gamma(false);
+            let mut clob = clob(false);
+            match gamma_delay {
+                Some(delay) => gamma[0]["secondsDelay"] = json!(delay),
+                None => {
+                    gamma[0].as_object_mut().unwrap().remove("secondsDelay");
+                }
+            }
+            match clob_delay {
+                Some(delay) => clob["seconds_delay"] = json!(delay),
+                None => {
+                    clob.as_object_mut().unwrap().remove("seconds_delay");
+                }
+            }
+            let gamma_raw = serde_json::to_vec(&gamma).unwrap();
+            let clob_raw = serde_json::to_vec(&clob).unwrap();
+            assert_eq!(validate(&gamma, &clob), Err(live_error));
+            assert!(validate_paper_market(&gamma_raw, &clob_raw, &condition(), 1_000, 30).is_ok());
+            let mut inactive = gamma.clone();
+            inactive[0]["active"] = json!(false);
+            assert_eq!(
+                validate_paper_market(
+                    &serde_json::to_vec(&inactive).unwrap(),
+                    &clob_raw,
+                    &condition(),
+                    1_000,
+                    30
+                ),
+                Err(LiveMarketError::Inactive)
+            );
+            let mut closed = clob.clone();
+            closed["closed"] = json!(true);
+            assert_eq!(
+                validate_paper_market(
+                    &gamma_raw,
+                    &serde_json::to_vec(&closed).unwrap(),
+                    &condition(),
+                    1_000,
+                    30
+                ),
+                Err(LiveMarketError::Closed)
+            );
+            clob["minimum_tick_size"] = json!("0.02");
+            assert_eq!(
+                validate_paper_market(
+                    &gamma_raw,
+                    &serde_json::to_vec(&clob).unwrap(),
+                    &condition(),
+                    1_000,
+                    30
+                ),
+                Err(LiveMarketError::SourceDisagreement)
             );
         }
     }

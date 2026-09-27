@@ -65,7 +65,7 @@ pub fn check_start_baseline_bankroll(
 
 pub const PAPER_LOG_SCHEMA_VERSION: u32 = 2;
 /// Current paper financial meaning. A changed value seals the active qualification before use.
-pub const FINANCIAL_SEMANTIC_VERSION: u32 = 1;
+pub const FINANCIAL_SEMANTIC_VERSION: u32 = 2;
 
 /// Schema-one price provenance retained only by the service's legacy decoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]

@@ -64,7 +64,7 @@ pub use gamma_markets::{
 };
 pub use live_admission::{
     LIVE_MARKET_PARSER_VERSION, LIVE_MARKET_SCHEMA_VERSION, LiveMarketError, LiveMarketEvidence,
-    validate_live_market,
+    validate_live_market, validate_paper_market,
 };
 pub use reconciliation::{
     ACTIVITY_MAX_OFFSET, ActivityAssetIdentity, ActivityAssetMapping, ActivityReadError,

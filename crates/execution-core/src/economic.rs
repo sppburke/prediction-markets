@@ -17,6 +17,7 @@ use crate::live_journal::{
 };
 
 pub const ECONOMIC_PREPARED_VERSION: u16 = 1;
+pub const PAPER_ECONOMIC_PREPARED_VERSION: u16 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -162,6 +163,13 @@ pub enum EconomicError {
 }
 
 impl EconomicPrepared {
+    /// Paper semantic 2 uses the shared composer and binds its distinct wire in the core hash.
+    pub fn compose_paper(inputs: EconomicInputs<'_>) -> Result<Self, EconomicError> {
+        let mut prepared = Self::compose(inputs)?;
+        prepared.version = PAPER_ECONOMIC_PREPARED_VERSION;
+        Ok(prepared)
+    }
+
     /// Compose the canonical economic record exactly once from already-acquired evidence.
     pub fn compose(inputs: EconomicInputs<'_>) -> Result<Self, EconomicError> {
         let evaluated_risk = match evaluate_risk(&inputs.risk.snapshot) {
@@ -459,6 +467,26 @@ mod tests {
         assert_eq!(prepared.risk.price_receipts, vec![receipt(5), receipt(6)]);
         assert_eq!(prepared.risk.evaluated_at_unix_ms, 1_800_000_000_000);
         assert!(prepared.fee.reserve >= prepared.fee.expected_fee);
+    }
+
+    #[test]
+    fn paper_wire_two_binds_a_distinct_core_hash_without_changing_live_default() {
+        let admission = admission();
+        let plan = plan();
+        let live = EconomicPrepared::compose(inputs(&admission, &plan)).unwrap();
+        let mut paper_inputs = inputs(&admission, &plan);
+        paper_inputs.chase_ceiling = Price::ONE;
+        let paper = EconomicPrepared::compose_paper(paper_inputs).unwrap();
+        assert_eq!(live.version, ECONOMIC_PREPARED_VERSION);
+        assert_eq!(paper.version, PAPER_ECONOMIC_PREPARED_VERSION);
+        assert_eq!(paper.balance.chase_ceiling, Price::ONE);
+        assert_eq!(live.sizing, paper.sizing);
+        assert_eq!(live.fee, paper.fee);
+        assert_ne!(live.core_hash().unwrap(), paper.core_hash().unwrap());
+        assert_eq!(
+            live,
+            EconomicPrepared::compose(inputs(&admission, &plan)).unwrap()
+        );
     }
 
     #[test]

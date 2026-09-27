@@ -37,7 +37,7 @@ use pe_resolver_card::{
 use pe_source_polymarket_public::{
     GAMMA_BATCH_LIMIT_PARAM, GAMMA_MARKETS_PARSER_VERSION, GAMMA_MARKETS_SCHEMA_VERSION,
     GAMMA_MARKETS_SOURCE_ID, LIVE_MARKET_PARSER_VERSION, LIVE_MARKET_SCHEMA_VERSION,
-    validate_live_market,
+    validate_live_market, validate_paper_market,
 };
 use pe_venue_polymarket::{
     CLOB_V2_HOST, CanaryV2Client, CanaryV2Credentials, CustodyKind, PreparedSubmission,
@@ -880,6 +880,23 @@ impl LiveAdmissionBuilder {
         condition_id: &pe_core_types::PolymarketConditionId,
         now: OffsetDateTime,
     ) -> Result<LiveAdmissionArtifact, LiveVenueAdapterError> {
+        self.build_with_policy(condition_id, now, false).await
+    }
+
+    pub async fn build_paper(
+        &self,
+        condition_id: &pe_core_types::PolymarketConditionId,
+        now: OffsetDateTime,
+    ) -> Result<LiveAdmissionArtifact, LiveVenueAdapterError> {
+        self.build_with_policy(condition_id, now, true).await
+    }
+
+    async fn build_with_policy(
+        &self,
+        condition_id: &pe_core_types::PolymarketConditionId,
+        now: OffsetDateTime,
+        paper: bool,
+    ) -> Result<LiveAdmissionArtifact, LiveVenueAdapterError> {
         let gamma_url = format!(
             "{}/markets?condition_ids={}&limit={GAMMA_BATCH_LIMIT_PARAM}&include_tag=true",
             self.gamma_base_url, condition_id.0
@@ -908,7 +925,12 @@ impl LiveAdmissionBuilder {
         );
         let (gamma_raw, gamma_receipt, gamma_received_at) = gamma?;
         let (clob_raw, clob_long_receipt, clob_long_received_at) = clob_long?;
-        let mut market = validate_live_market(
+        let validator = if paper {
+            validate_paper_market
+        } else {
+            validate_live_market
+        };
+        let mut market = validator(
             &gamma_raw,
             &clob_raw,
             condition_id,
@@ -934,9 +956,8 @@ impl LiveAdmissionBuilder {
                 "compact and long CLOB market rules disagree".to_owned(),
             ));
         }
-        // validate_live_market admits only active=true, closed=false evidence from BOTH
-        // payloads. Therefore the same observed payloads prove the entry settlement status is
-        // unresolved; any resolved/ambiguous shape was already rejected above.
+        // Both validators require active=true, closed=false evidence from both payloads, so
+        // the entry settlement is unresolved; resolved/ambiguous evidence was rejected above.
         let settlement = VenueSettlementRecord {
             schema_version: VENUE_SETTLEMENT_SCHEMA_VERSION,
             condition_id: condition_id.clone(),
@@ -1351,6 +1372,89 @@ mod tests {
             return StatusCode::NOT_FOUND.into_response();
         };
         (StatusCode::OK, axum::Json(body)).into_response()
+    }
+
+    async fn delayed_admission_fixture(
+        axum::extract::State(delay): axum::extract::State<Option<i64>>,
+        uri: Uri,
+    ) -> Response {
+        let path = uri.path().to_owned();
+        let original = admission_and_book_fixture(uri).await;
+        let bytes = axum::body::to_bytes(original.into_body(), 1_000_000)
+            .await
+            .unwrap();
+        let mut body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        if path.strip_prefix("/markets/") == Some(ADMISSION_CONDITION) {
+            match delay {
+                Some(seconds) => body["seconds_delay"] = json!(seconds),
+                None => {
+                    body.as_object_mut().unwrap().remove("seconds_delay");
+                }
+            }
+        }
+        (StatusCode::OK, axum::Json(body)).into_response()
+    }
+
+    #[tokio::test]
+    async fn paper_builder_records_identical_receipts_for_delayed_live_refusal() {
+        for delay in [Some(2), None] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                axum::serve(
+                    listener,
+                    Router::new()
+                        .fallback(get(delayed_admission_fixture))
+                        .with_state(delay),
+                )
+                .await
+                .unwrap();
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("source.log");
+            let sink = crate::source_event_sink::SourceEventSink::open(&path).unwrap();
+            let (source_log, source_rx) = crate::activity_ingest::SourceLogHandle::channel(8);
+            let (trigger_tx, _trigger_rx) = tokio::sync::mpsc::channel(1);
+            let coordinator = tokio::spawn(
+                crate::activity_ingest::ActivityIngest::poll_only(
+                    sink,
+                    source_rx,
+                    trigger_tx,
+                    crate::health::new_shared_health_with_ws(false, true, 90),
+                )
+                .run(),
+            );
+            let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+            let builder =
+                LiveAdmissionBuilder::new(reqwest::Client::new(), base.clone(), base, source_log)
+                    .with_clock(std::sync::Arc::new(move || now));
+            let condition = pe_core_types::PolymarketConditionId(ADMISSION_CONDITION.to_owned());
+            assert!(matches!(
+                builder.build(&condition, now).await,
+                Err(LiveVenueAdapterError::MarketValidation(_))
+            ));
+            let paper = builder.build_paper(&condition, now).await.unwrap();
+            assert_eq!(paper.market.condition_id, condition);
+            let frames = Reader::replay(&path)
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>();
+            assert_eq!(frames.len(), 6);
+            for source_id in [
+                GAMMA_MARKETS_SOURCE_ID,
+                CLOB_LONG_MARKET_SOURCE_ID,
+                CLOB_COMPACT_MARKET_SOURCE_ID,
+            ] {
+                let matching = frames
+                    .iter()
+                    .filter(|frame| frame.1.source_id.0 == source_id)
+                    .collect::<Vec<_>>();
+                assert_eq!(matching.len(), 2);
+                assert_eq!(matching[0].1.payload, matching[1].1.payload);
+            }
+            coordinator.abort();
+            server.abort();
+        }
     }
 
     /// PASS: Gamma-long, CLOB-long, compact, and the consumed book each append exactly once and

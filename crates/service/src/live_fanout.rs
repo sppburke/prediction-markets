@@ -52,6 +52,7 @@ use pe_source_polymarket_public::{
     GAMMA_MARKETS_SOURCE_ID, LIVE_MARKET_PARSER_VERSION, LIVE_MARKET_SCHEMA_VERSION,
     PositionClassification, ReconciliationFetcher, fetch_complete_positions,
     parse_activity_trade_observation, parse_clob_market, validate_live_market,
+    validate_paper_market,
 };
 use pe_strategy_winner_follow::{
     ExecutionMode, SizingMode, WinnerFollowError, WinnerFollowStrategy,
@@ -3004,7 +3005,7 @@ impl SourceBackedEconomicReplay {
         risk: RiskAudit,
         applied_configuration_hash: String,
     ) -> Result<EconomicPrepared, EconomicReplayError> {
-        let recomposed = EconomicPrepared::compose(EconomicInputs {
+        let inputs = EconomicInputs {
             market: economic.market.clone(),
             admission: &self.admission,
             plan: &self.sized.ladder,
@@ -3020,12 +3021,18 @@ impl SourceBackedEconomicReplay {
             band_floor: economic.balance.band_floor,
             band_ceiling_exclusive: economic.balance.band_ceiling_exclusive,
             applied_configuration_hash,
-        })
-        .map_err(|error| {
-            economic_replay_error(format!(
-                "EconomicPrepared canonical composition failed: {error}"
-            ))
-        })?;
+        };
+        let recomposed =
+            if economic.version == pe_execution_core::economic::PAPER_ECONOMIC_PREPARED_VERSION {
+                EconomicPrepared::compose_paper(inputs)
+            } else {
+                EconomicPrepared::compose(inputs)
+            }
+            .map_err(|error| {
+                economic_replay_error(format!(
+                    "EconomicPrepared canonical composition failed: {error}"
+                ))
+            })?;
         let recomposed_hash = recomposed.core_hash().map_err(|error| {
             economic_replay_error(format!("recomposed economic core hash failed: {error}"))
         })?;
@@ -3193,7 +3200,7 @@ fn validate_live_observation_trade(
         ));
     }
 
-    if binding.continuation.version() != 5
+    if !matches!(binding.continuation.version(), 5 | 6)
         && selected.source_id == crate::activity_ingest::ACTIVITY_WS_SOURCE_ID
     {
         let websocket = parse_activity_trade_observation(&selected.payload).map_err(|error| {
@@ -3406,6 +3413,13 @@ where
             "current live economic admission has no observation evidence",
         ));
     }
+    if live_binding.is_some()
+        && economic.version != pe_execution_core::economic::ECONOMIC_PREPARED_VERSION
+    {
+        return Err(economic_replay_error(
+            "live economic wire version is invalid",
+        ));
+    }
     if let Some(observation) = &economic.observation {
         validate_economic_observation(
             economic,
@@ -3478,7 +3492,14 @@ where
             "economic admission clock or freshness contract is invalid",
         ));
     }
-    let market = validate_live_market(
+    let validator = if live_binding.is_none()
+        && economic.version == pe_execution_core::economic::PAPER_ECONOMIC_PREPARED_VERSION
+    {
+        validate_paper_market
+    } else {
+        validate_live_market
+    };
+    let market = validator(
         &gamma.payload,
         &clob_long.payload,
         &economic.market.condition_id,
@@ -9350,6 +9371,91 @@ mod tests {
         )
     }
 
+    #[test]
+    fn paper_source_replay_accepts_delayed_receipts_while_live_remains_strict() {
+        for delay in [Some(2), None] {
+            let mut economic = finality_prepared().economic.clone();
+            economic.admission.market.observed_at_unix = 20;
+            economic.admission.settlement.observed_at_unix = 20;
+            economic.risk.snapshot.per_trade_cap_bps = 10_000;
+            let mut payloads = economic_source_payloads(&economic.market.condition_id.0);
+            let mut gamma: serde_json::Value = serde_json::from_slice(&payloads[0]).unwrap();
+            let mut clob: serde_json::Value = serde_json::from_slice(&payloads[1]).unwrap();
+            match delay {
+                Some(seconds) => {
+                    gamma[0]["secondsDelay"] = serde_json::json!(seconds);
+                    clob["seconds_delay"] = serde_json::json!(seconds);
+                }
+                None => {
+                    gamma[0].as_object_mut().unwrap().remove("secondsDelay");
+                    clob.as_object_mut().unwrap().remove("seconds_delay");
+                }
+            }
+            payloads[0] = serde_json::to_vec(&gamma).unwrap();
+            payloads[1] = serde_json::to_vec(&clob).unwrap();
+            economic.admission.settlement.raw_evidence_hash =
+                blake3::hash(&payloads[1]).to_hex().to_string();
+            let receipts = [
+                economic.admission.receipts.gamma,
+                economic.admission.receipts.clob_long,
+                economic.admission.receipts.clob_compact,
+                economic.book_receipt,
+            ];
+            let sources = receipts
+                .into_iter()
+                .zip([
+                    GAMMA_MARKETS_SOURCE_ID,
+                    CLOB_LONG_MARKET_SOURCE_ID,
+                    CLOB_COMPACT_MARKET_SOURCE_ID,
+                    CLOB_BOOK_SOURCE_ID,
+                ])
+                .zip(payloads)
+                .map(|((receipt, source_id), payload)| {
+                    (
+                        receipt,
+                        RecordedEconomicSource {
+                            payload,
+                            received_unix_ms: 20_100,
+                            source_id: source_id.to_owned(),
+                            schema_version: 1,
+                            parser_version: 1,
+                            content_type: ContentType::Json,
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            let replay = |economic: &EconomicPrepared| {
+                replay_source_backed_economic(
+                    economic,
+                    21_000,
+                    CollateralAmount::from_atomic(10_000_000),
+                    |receipt| {
+                        sources
+                            .iter()
+                            .find(|(candidate, _)| *candidate == receipt)
+                            .map(|(_, source)| source.clone())
+                            .ok_or_else(|| {
+                                EconomicReplayError("fixture receipt missing".to_owned())
+                            })
+                    },
+                )
+            };
+            assert!(replay(&economic).is_err());
+            economic.version = pe_execution_core::economic::PAPER_ECONOMIC_PREPARED_VERSION;
+            economic.balance.chase_ceiling = Price::ONE;
+            let replayed = replay(&economic).unwrap();
+            let recomposed = replayed
+                .recompose(
+                    &economic,
+                    economic.risk.clone(),
+                    economic.applied_configuration_hash.clone(),
+                )
+                .unwrap();
+            assert_eq!(recomposed.version, economic.version);
+            assert_eq!(recomposed.balance.chase_ceiling, Price::ONE);
+        }
+    }
+
     /// PASS: the source-backed owner used by live and qualification replay accepts receipt clocks
     /// within one UTC second and derives that second for both market and settlement evidence.
     #[test]
@@ -9587,7 +9693,7 @@ mod tests {
             Vec<pe_source_polymarket_public::ReconciliationPageEvidence>,
         >(continuation.facts.decision_inputs["pages"].clone())
         .unwrap();
-        let encode = if continuation.version() == 5 {
+        let encode = if matches!(continuation.version(), 5 | 6) {
             crate::bucket_commit::activity_read_commitment_payload
         } else {
             crate::bucket_commit::activity_read_commitment_payload_v1
@@ -10191,11 +10297,11 @@ mod tests {
     /// FAIL: strict live replay accepts a mutable continuation that redefines its committed read.
     #[test]
     fn strict_live_economic_rejects_read_commitment_substitution() {
-        for version in [4, 5] {
+        for version in [4, 5, 6] {
             let (prepared, account_id, mut sources, mut continuation) =
                 saturated_observation_replay_fixture(false, false);
             let old_sources = sources.clone();
-            if version == 5 {
+            if version >= 5 {
                 let mut facts = continuation.facts.clone();
                 facts.paper_freshness_policy = Some(crate::bucket_commit::PaperFreshnessPolicy {
                     activity_ws_enabled: false,
@@ -10209,6 +10315,9 @@ mod tests {
                         .read_commitment
                         .map(crate::bucket_commit::ActivityReadCommitmentReceipt::BindingsV2),
                 );
+                if version == 6 {
+                    continuation = continuation.current_paper();
+                }
                 let replacement = read_commitment_source(&continuation);
                 *sources
                     .iter_mut()
@@ -10322,6 +10431,57 @@ mod tests {
             .1
             .payload = payload;
         replay_observation_fixture(&prepared, &account_id, &sources, &current).unwrap();
+        let current_six = current.current_paper();
+        assert_eq!(current_six.version(), 6);
+        let bound_clock = current_six
+            .verify_stream_binding(
+                &current_six.facts.source_trade_id,
+                receipt,
+                &mut |candidate| {
+                    let source = sources
+                        .iter()
+                        .find(|(known, _)| *known == candidate)
+                        .map(|(_, source)| source)
+                        .ok_or("missing source receipt")?;
+                    let received_at = source_time_from_millis(source.received_unix_ms)
+                        .map_err(|_| "invalid receipt clock")?;
+                    Ok::<_, &'static str>(crate::bucket_commit::CompleteActivityPage {
+                        payload: source.payload.clone(),
+                        observed_at: SourceTimestamp(received_at),
+                        received_at: ReceivedAt(received_at),
+                        source_id: source.source_id.clone(),
+                        schema_version: source.schema_version,
+                        parser_version: source.parser_version,
+                        content_type: source.content_type.clone(),
+                    })
+                },
+            )
+            .unwrap();
+        assert_eq!(bound_clock.0.unix_timestamp(), 17);
+        let dir = tempdir().unwrap();
+        let journal_path = dir.path().join("version-six-live.journal");
+        let journal = LiveJournal::open(&journal_path).unwrap();
+        let journal_at = OffsetDateTime::from_unix_timestamp(20).unwrap();
+        append_approved_admission(&journal, &account_id, &prepared, journal_at);
+        journal
+            .append(
+                account_id.clone(),
+                journal_at,
+                LiveJournalPayload::OrderPrepared(prepared),
+            )
+            .unwrap();
+        let events = replay_account(&journal_path, &account_id).unwrap();
+        let LiveJournalPayload::OrderPrepared(replayed) = &events[1].payload else {
+            panic!("version-six fixture lost its live Prepared record");
+        };
+        replay_observation_fixture(replayed, &account_id, &sources, &current_six)
+            .unwrap()
+            .recompose(
+                &replayed.economic,
+                replayed.economic.risk.clone(),
+                replayed.identity.config_hash.clone(),
+            )
+            .unwrap();
     }
 
     /// PASS: actual synchronized replacement receipts and rehashed binding preimages reach the
@@ -10502,20 +10662,27 @@ mod tests {
                     source.payload
                 );
             }
-            let result =
-                replay_observation_fixture(&prepared, &account_id, &sources, &continuation);
-            if change == "valid" {
-                result
-                    .unwrap()
-                    .recompose(
-                        &prepared.economic,
-                        prepared.economic.risk.clone(),
-                        prepared.identity.config_hash.clone(),
-                    )
-                    .unwrap();
-            } else {
-                let error = result.err().unwrap().to_string();
-                assert!(error.contains(expected), "{change}: {error}");
+            let current = continuation.clone().current_paper();
+            for continuation in [&continuation, &current] {
+                let result =
+                    replay_observation_fixture(&prepared, &account_id, &sources, continuation);
+                if change == "valid" {
+                    result
+                        .unwrap()
+                        .recompose(
+                            &prepared.economic,
+                            prepared.economic.risk.clone(),
+                            prepared.identity.config_hash.clone(),
+                        )
+                        .unwrap();
+                } else {
+                    let error = result.err().unwrap().to_string();
+                    assert!(
+                        error.contains(expected),
+                        "version {} {change}: {error}",
+                        continuation.version()
+                    );
+                }
             }
         }
     }
@@ -18319,6 +18486,79 @@ mod tests {
         })
         .unwrap();
         db.flip_dispatch_ready(id, "fill").unwrap();
+    }
+
+    /// PASS: a paper-reachable delayed market remains a typed strict-live refusal; the target
+    /// records the live terminal disposition and no order POST fact is produced.
+    #[tokio::test]
+    async fn delayed_paper_target_gets_strict_live_terminal_disposition_without_post() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        stage(&db, "delayed-paper-target", 1_800_000_000, &["acct"]);
+        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let state = fanout_state(
+            &dir,
+            Arc::clone(&db),
+            armed_snapshot("acct"),
+            "http://127.0.0.1:9",
+            None,
+        );
+        let gamma = include_bytes!("../tests/fixtures/golden_stream_v1/gamma_long.json");
+        let mut clob: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "../tests/fixtures/golden_stream_v1/clob_long.json"
+        ))
+        .unwrap();
+        clob["seconds_delay"] = serde_json::json!(2);
+        let clob = serde_json::to_vec(&clob).unwrap();
+        let condition = PolymarketConditionId(
+            serde_json::from_slice::<serde_json::Value>(gamma).unwrap()[0]["conditionId"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        );
+        assert!(
+            pe_source_polymarket_public::validate_paper_market(
+                gamma,
+                &clob,
+                &condition,
+                now.unix_timestamp(),
+                60,
+            )
+            .is_ok()
+        );
+        let refusal = pe_source_polymarket_public::validate_live_market(
+            gamma,
+            &clob,
+            &condition,
+            now.unix_timestamp(),
+            60,
+        )
+        .unwrap_err();
+        assert_eq!(
+            refusal,
+            pe_source_polymarket_public::LiveMarketError::NonzeroDelay
+        );
+        let error = LiveVenueAdapterError::MarketValidation(refusal.to_string());
+        let target = db
+            .dispatch_targets("delayed-paper-target")
+            .unwrap()
+            .remove(0);
+        terminalize(&state, &target, admission_terminal_reason(&error), now).unwrap();
+        let terminal = db
+            .dispatch_targets("delayed-paper-target")
+            .unwrap()
+            .remove(0);
+        assert_eq!(terminal.state, "terminal");
+        assert_eq!(
+            terminal.terminal_reason.as_deref(),
+            Some("market_evidence_invalid")
+        );
+        assert!(
+            replay_account(&state.config.journal_path, &AccountId::new("acct").unwrap())
+                .unwrap()
+                .iter()
+                .all(|event| !matches!(event.payload, LiveJournalPayload::OrderPosted(_)))
+        );
     }
 
     /// PASS: a schema-one pending seed without observation evidence fails before target dispatch;

@@ -472,6 +472,7 @@ from effective membership/projection and cannot copy; there is no delete owner f
 | 3 | Historical activity schema 2 / parser 2 | None | Receipt-bearing historical activity; legacy complete-second proof. |
 | 4 | Activity-page schema 3 / parser 2 | Envelope schema 1 / parser 1 / payload 1 / domain `prediction-edge/activity-read-commitment/v1` | Legacy complete-second proof. |
 | 5 | Activity-page schema 3 / parser 2 | Envelope schema 2 / parser 1 / payload 2 / domain `prediction-edge/activity-read-commitment/v2`, with observation bindings | Frozen `PaperFreshnessPolicy`, repaired complete-second proof, and precise final paper Prepared freshness clock. |
+| 6 | Same source and commitment contract as 5 | Same payload-2 commitment and authenticated observation bindings as 5 | Paper financial semantic 2: delay-tolerant paper admission, current-book ladder without a leader-price ceiling, signed ladder intent limit, and economic wire 2. Checkpoint and terminal-evidence wire numbers remain unchanged. |
 
 The first durable payload-2 commitment is itself a compatibility-boundary write: the poller
 appends it before bucket application and boot authenticates it, so a reader without the v2
@@ -487,6 +488,15 @@ history target, semantic revision, page occurrence, and any identity correction.
 the canonical history epoch and financial operation identity remain unchanged. The final
 `DecisionClockEvidence` retains `unix_millis` plus `submillisecond_nanos` for exact replay of the
 strict budget comparison.
+
+Pre-Start continuation 2 retains its field-free semantic-0 evidence bytes and legacy hash.
+Start-bound continuations 2–5 retain semantic 1 and their recorded price and admission policy.
+Continuation 6 binds semantic 2 in checkpoint and terminal evidence; a pre-economic no-fill
+contains no economic record. The paper caller selects economic wire 2 and hashes that exact wire;
+the shared composer and ordinary live retain economic wire 1. A later fresh-generation seal can
+select continuation-6 receipt proof under the same source-prefix rules as continuation 5.
+The isolated live-wrapper qualification check compares its wire-1 economic value with the same
+recorded paper fields expressed as wire 1; the paper wire-2 core hash remains separately bound.
 
 **History-only bracket disposition.** `history_only_bracket` (`HISTORY_ONLY_BRACKET`) records an
 admitted first entry whose copying a causal bracket suppresses. It is an applied activity
@@ -546,8 +556,13 @@ the exact hot or removal sets stops `scripts/migrate_service_config_544.sql` bef
 
 | Key | Default | Meaning |
 |---|---:|---|
-| `max_fill_price` | `0.85` | Hot decimal value. The signed ladder's worst accepted tick must be below this ceiling after the no-chase and price-impact ceilings. `0` disables this band edge, not the mandatory book gate. |
+| `max_fill_price` | `0.85` | Hot decimal value. The signed ladder's worst accepted tick must be strictly below this ceiling. Paper semantic 2 uses the best-ask price-impact ceiling without a leader-price ceiling; ordinary live retains its leader-price ceiling. `0` disables this band edge, not the mandatory book gate. |
 | `min_fill_price` | `0.15` | Hot decimal value, added at the 2026-07-03 run28 cutover. Skip a BUY copy whose resolved fill basis is `<` this so selection and deployment share the entry band. The boundary itself fills (strict `<` skip). `0` disables this band edge, not the mandatory book gate. |
+
+Paper semantic 2 admits otherwise valid markets with positive or absent matching delay. Ordinary
+live re-reads each staged target through strict admission and refuses either delay before an order
+request. Both paths retain state, token mapping, minimum size, tick, freshness, and compact-fee
+checks. The isolated V2 canary keeps its separate admission and price contract.
 
 ### Live wallet source (Supabase ranking handoff, issue #339)
 
@@ -835,6 +850,12 @@ Two flags are first-class:
 Both are read by `risk-engine` as part of its pure inputs. As of issue #398 (Decision #2) they are **admin-mutable at runtime** via the Supabase `service_config` table (the single-email-gated admin panel), default-deny, with each edit audit-logged in `service_config.updated_by`/`updated_at` and applied on the next ≤30s config poll. This reverses the prior "signed config change only" rule. `kelly_fraction_above_default_human_approved` is re-checked against the mode ceiling on every poll in `runtime_config::parse_config`, so an above-ceiling override without the flag is cleared rather than applied.
 
 ### Paper-to-live-tiny qualification — quantified
+
+These thresholds classify a sealed **paper measurement report**. The semantic-2 cutover seals an
+unsealed semantic-1 Start once with `InsufficientEvidence` before paper producers resume. An
+existing seal remains; paper decisions, fills, and daily marks continue, but automatic completion
+and `--qualify` cannot create another seal or report in that generation. A fresh generation is
+required for a later qualification measurement. No second Start, transition, or anchor is created.
 
 The one sealed observed paper system is eligible for a single manual promotion review only when
 ALL of:

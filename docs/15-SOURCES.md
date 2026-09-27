@@ -219,11 +219,11 @@
 | https://docs.polymarket.com/api-reference/service/get-data-freshness | 2026-09-10 | 2026-11-09 |
 | https://docs.polymarket.com/api-reference/data-api/migrating-from-v1 | 2026-09-10 | 2026-11-09 |
 | https://clob.polymarket.com/markets?closed=true | 2026-09-01 | 2026-10-31 |
-| https://docs.polymarket.com/api-reference/markets/list-markets | 2026-07-18 | 2026-09-16 |
+| https://docs.polymarket.com/api-reference/markets/list-markets | 2026-09-27 | 2026-11-26 |
 | https://docs.polymarket.com/api-reference/events/list-events | 2026-07-28 | 2026-09-26 |
-| https://docs.polymarket.com/api-reference/markets/get-market-by-id | 2026-07-18 | 2026-09-16 |
-| https://docs.polymarket.com/api-reference/markets/get-clob-market-info | 2026-09-15 | 2026-11-14 |
-| https://docs.polymarket.com/api-reference/market-data/get-order-book | 2026-07-18 | 2026-09-16 |
+| https://docs.polymarket.com/api-reference/markets/get-market-by-id | 2026-09-27 | 2026-11-26 |
+| https://docs.polymarket.com/api-reference/markets/get-clob-market-info | 2026-09-27 | 2026-11-26 |
+| https://docs.polymarket.com/api-reference/market-data/get-order-book | 2026-09-27 | 2026-11-26 |
 | https://docs.polymarket.com/api-reference/trade/get-user-orders | 2026-07-17 | 2026-09-15 |
 | https://docs.polymarket.com/api-reference/trade/get-trades | 2026-07-17 | 2026-09-15 |
 | https://docs.polymarket.com/api-reference/core/get-current-positions-for-a-user | 2026-09-03 | 2026-11-01 |
@@ -308,6 +308,13 @@ Treat as research inspiration; not a production decision input unless an authori
 | https://crowdintel.xyz/docs | 2026-05-02 | 2026-07-01 |
 
 ## Last research pass
+
+- 2026-09-27: For the paper fill-rule change, re-read the official Gamma list/get market response
+  schemas (`secondsDelay` is nullable), compact CLOB market info (tokens, minimum size/tick,
+  `mbf`/`tbf` and `fd`), and `/book` response (string ask price and size). This was a docs-only
+  check; no live endpoint was probed. The official long-CLOB OpenAPI YAML could not be rendered
+  by the documentation reader, so its `seconds_delay` authority retains the 2026-09-15 check
+  above. No venue wire contract or runtime fee policy was changed by this research pass.
 
 - 2026-09-15: Re-verified the Polymarket market-admission wire for issue #638 against the official
   Gamma and CLOB OpenAPI documents (`/api-spec/gamma-openapi.yaml`, `/api-spec/clob-openapi.yaml`)

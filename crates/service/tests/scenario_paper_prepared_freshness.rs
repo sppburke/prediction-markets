@@ -1,10 +1,12 @@
-//! Continuation-five freshness through the poller, source coordinator, and paper owner.
+//! Continuation-six freshness through the poller, source coordinator, and paper owner.
 #![cfg(feature = "scenario")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 mod support;
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -14,7 +16,14 @@ use pe_core_types::{
     ReconstructionQuality, SourceId, SourceTimestamp, SourceTradeId, WalletAddress,
 };
 use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, Writer};
-use pe_execution_core::{AdmissionReceipts, LiveAdmissionArtifact};
+use pe_execution_core::{
+    AdmissionReceipts, CredentialBindingIdentity, FrozenLiveTarget, LiveAdmissionArtifact,
+    LiveControlMode, LiveExecutedAmounts, LiveExecutor, LiveJournal, LiveJournalPayload,
+    LiveModeSnapshot, LiveOrderIdentity, LiveOrderOutcome, LiveOrderRequest, LiveOrderVenue,
+    LivePostClassification, LivePostParseError, LivePrepareResult, LiveVenueAccountReadError,
+    LiveVenueAccountState, LiveVenuePrepareRequest, LiveVenuePrepared, LiveVenueReconciliation,
+    LiveVenueReconciliationError,
+};
 use pe_paper_state::{
     DecisionPendingRow, DecisionPendingState, PaperStateDb, WalletHistoryStatusRecord,
 };
@@ -50,10 +59,10 @@ use pe_service::supabase_state::{
     reconcile_active_financial_frames,
 };
 use pe_service::trade_poller::{ReconciliationObligations, TradePoller, TradePollerConfig};
-use pe_source_polymarket_public::{GAMMA_BATCH_SIZE, validate_live_market};
+use pe_source_polymarket_public::{GAMMA_BATCH_SIZE, validate_live_market, validate_paper_market};
 use pe_strategy_winner_follow::{ExecutionMode, PerTradeCap, SizingMode, WinnerFollowStrategy};
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
-use pe_venue_polymarket::parse_compact_market;
+use pe_venue_polymarket::{AskLevel, LadderPlan, PreparedPolymarketBuy, parse_compact_market};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde_json::{Value, json};
@@ -253,7 +262,7 @@ impl Harness {
             .unwrap(),
             schema_version: 3,
             parser_version: 1,
-            financial_semantic_version: 1,
+            financial_semantic_version: pe_service::paper_recovery::FINANCIAL_SEMANTIC_VERSION,
         }));
         let mut writer = Writer::open(dir.path().join("paper.log")).unwrap();
         let start = writer
@@ -332,6 +341,14 @@ impl Harness {
             .unwrap()
     }
     async fn record(&self, ordinal: u32) -> Recorded {
+        self.record_with_rule(ordinal, None).await
+    }
+
+    async fn record_with_rule(
+        &self,
+        ordinal: u32,
+        paper_rule: Option<(Decimal, Decimal, Option<i64>)>,
+    ) -> Recorded {
         let condition = format!("0x{ordinal:064x}");
         let token = (ordinal * 2 + 11).to_string();
         let other = (ordinal * 2 + 12).to_string();
@@ -344,6 +361,16 @@ impl Harness {
         activity[0]["conditionId"] = condition.clone().into();
         activity[0]["asset"] = token.clone().into();
         activity[0]["transactionHash"] = format!("0x{:064x}", ordinal + 100).into();
+        if let Some((leader, _, _)) = paper_rule {
+            let source_shares = if leader == dec!(0.5799999992) {
+                dec!(1250)
+            } else {
+                dec!(5)
+            };
+            activity[0]["price"] = leader.normalize().to_string().into();
+            activity[0]["size"] = source_shares.to_string().into();
+            activity[0]["usdcSize"] = (leader * source_shares).normalize().to_string().into();
+        }
         let mut gamma: Value =
             serde_json::from_slice(include_bytes!("fixtures/golden_stream_v1/gamma_long.json"))
                 .unwrap();
@@ -368,6 +395,14 @@ impl Harness {
         long["tokens"][1]["token_id"] = other.clone().into();
         long["maker_base_fee"] = 1000.into();
         long["taker_base_fee"] = 1000.into();
+        if let Some((_, _, delay)) = paper_rule {
+            match delay {
+                Some(seconds) => long["seconds_delay"] = seconds.into(),
+                None => {
+                    long.as_object_mut().unwrap().remove("seconds_delay");
+                }
+            }
+        }
         let mut compact: Value = serde_json::from_slice(include_bytes!(
             "fixtures/golden_stream_v1/clob_compact.json"
         ))
@@ -381,6 +416,9 @@ impl Harness {
             serde_json::from_slice(include_bytes!("fixtures/golden_stream_v1/book.json")).unwrap();
         book["market"] = condition.clone().into();
         book["asset_id"] = token.clone().into();
+        if let Some((_, ask, _)) = paper_rule {
+            book["asks"] = json!([{"price": ask.normalize().to_string(), "size": "100"}]);
+        }
         let activity = serde_json::to_vec(&activity).unwrap();
         let gamma = serde_json::to_vec(&gamma).unwrap();
         let long = serde_json::to_vec(&long).unwrap();
@@ -395,7 +433,12 @@ impl Harness {
         };
         let book_receipt = self.append("polymarket.clob.book", &book).await;
         let condition = PolymarketConditionId(condition);
-        let market = validate_live_market(&gamma, &long, &condition, EPOCH, 60).unwrap();
+        let market = if paper_rule.is_some() {
+            validate_paper_market(&gamma, &long, &condition, EPOCH, 60)
+        } else {
+            validate_live_market(&gamma, &long, &condition, EPOCH, 60)
+        }
+        .unwrap();
         let fee_schedule =
             parse_compact_market(&compact, &condition, &market.ordered_outcome_token_ids)
                 .unwrap()
@@ -823,7 +866,7 @@ fn assert_bound_clocks(h: &Harness, recorded: &Recorded, stream_epoch: i64) {
     let row = h.terminal(recorded);
     let continuation =
         pe_service::bucket_commit::DecisionContinuationV3::from_durable(&row).unwrap();
-    assert_eq!(continuation.version(), 5);
+    assert_eq!(continuation.version(), 6);
     assert_eq!(continuation.facts.source_epoch, recorded.epoch);
     assert_eq!(
         continuation
@@ -925,7 +968,7 @@ async fn bound_source_clock_expires_shared_dispatch_on_first_pass_and_restart() 
                 .unwrap()
                 .push_back(recorded.admission.clone());
             gate.blocked.store(true, Ordering::SeqCst);
-            h.start(false); // The committed generation-five policy remains enabled.
+            h.start(false); // The committed generation-six policy remains enabled.
             tokio::time::timeout(std::time::Duration::from_secs(5), gate.started.notified())
                 .await
                 .unwrap();
@@ -1119,6 +1162,392 @@ async fn cold_portfolio_prices_expire_before_new_prepared_and_release_live_targe
         h.paper.dispatch_targets(&staged[0].dispatch_id).unwrap(),
         targets
     );
+}
+
+/// PASS: recorded lifted asks fill above the frozen leader price and replay with either delay shape.
+#[tokio::test]
+async fn recorded_ask_above_leader_fills_with_both_paper_delay_policies() {
+    for (ordinal, leader, ask, delay) in [
+        (1, dec!(0.71), dec!(0.73), Some(2)),
+        (1, dec!(0.5799999992), dec!(0.58), None),
+    ] {
+        let mut h = Harness::new().await;
+        h.probability = pe_core_types::Probability::new(dec!(0.9)).unwrap();
+        let recorded = h
+            .record_with_rule(ordinal, Some((leader, ask, delay)))
+            .await;
+        let gamma = source_envelope(&h, recorded.admission.receipts.gamma).payload;
+        let clob = source_envelope(&h, recorded.admission.receipts.clob_long).payload;
+        assert!(
+            validate_live_market(
+                &gamma,
+                &clob,
+                &recorded.admission.market.condition_id,
+                EPOCH,
+                60,
+            )
+            .is_err()
+        );
+        h.arm();
+        h.attempt(&recorded, at());
+        h.start(true);
+        h.poll(&recorded).await;
+        let row = h.terminal(&recorded);
+        assert_eq!(row.terminal_disposition.as_deref(), Some("fill"));
+        let staged = h.paper.unfinalized_ready_dispatch_seeds().unwrap();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(
+            h.paper
+                .dispatch_targets(&staged[0].dispatch_id)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            pe_service::bucket_commit::DecisionContinuationV3::from_durable(&row)
+                .unwrap()
+                .version(),
+            6
+        );
+        let frames = scan_paper_log(&h.dir.path().join("paper.log")).unwrap();
+        let economic = frames
+            .iter()
+            .find_map(|frame| match &frame.frame {
+                PaperLogFrame::Record(PaperLogRecord::FinancialPrepared {
+                    payload: pe_service::paper_recovery::FinancialPayload::Fill { economic, .. },
+                    ..
+                }) => Some(economic),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(economic.version, 2);
+        assert_eq!(economic.balance.chase_ceiling, pe_core_types::Price::ONE);
+        assert_eq!(
+            economic.ladder.best_ask,
+            pe_core_types::Price::new(ask).unwrap()
+        );
+        assert_eq!(
+            economic.ladder.limit_price,
+            pe_core_types::Price::new(ask).unwrap()
+        );
+        assert_ne!(
+            economic.ladder.limit_price,
+            pe_core_types::Price::new(leader).unwrap()
+        );
+        let report = h.qualify_one_fill().await;
+        assert!(report.replay.exact, "{:?}", report.reasons);
+        assert_eq!(report.replay.fills, 1);
+    }
+}
+
+struct StagedLiveVenue {
+    posts: AtomicBool,
+}
+
+impl LiveOrderVenue for StagedLiveVenue {
+    type Submission = ();
+
+    fn prepare<'a>(
+        &'a self,
+        request: LiveVenuePrepareRequest,
+    ) -> pe_execution_core::LiveVenuePrepareFuture<'a, Self::Submission> {
+        Box::pin(async move {
+            Ok(LiveVenuePrepared::new(
+                PreparedPolymarketBuy {
+                    condition_id: request.condition_id,
+                    outcome_id: request.outcome_id,
+                    token_id: request.token_id,
+                    maker: "fixture-maker".to_owned(),
+                    signer: "fixture-signer".to_owned(),
+                    funder: "fixture-funder".to_owned(),
+                    verifying_contract: "fixture-spender".to_owned(),
+                    spender: "fixture-spender".to_owned(),
+                    exchange_domain_version: 2,
+                    neg_risk: request.neg_risk,
+                    side: "BUY".to_owned(),
+                    salt: "705".to_owned(),
+                    timestamp_ms: 1,
+                    expiration: "0".to_owned(),
+                    maker_collateral: request.maximum_collateral,
+                    taker_shares: request.shares,
+                    limit_price: request.limit_price,
+                    minimum_tick_size: request.tick_size,
+                    signature_type: 3,
+                    order_type: "FOK".to_owned(),
+                    post_only: false,
+                    defer_exec: false,
+                    metadata: "0x00".to_owned(),
+                    builder: "0x00".to_owned(),
+                    order_hash: "fixture-order-hash".to_owned(),
+                    post_body_hash: "fixture-body-hash".to_owned(),
+                    sdk_version: "fixture".to_owned(),
+                    sdk_archive_sha256: "fixture".to_owned(),
+                    metadata_hashes: request.metadata_hashes,
+                    worst_case_debit: request.maximum_collateral,
+                },
+                (),
+            ))
+        })
+    }
+
+    fn post_once<'a>(&'a self, _: Self::Submission) -> pe_execution_core::LivePostFuture<'a> {
+        Box::pin(async move {
+            assert!(!self.posts.swap(true, Ordering::SeqCst));
+            Ok(pe_core_types::RawHttpResponse {
+                source_id: "polymarket-clob-v2".to_owned(),
+                endpoint_kind: "order-post".to_owned(),
+                method: "POST".to_owned(),
+                path: "/order".to_owned(),
+                ordered_query: Vec::new(),
+                status: 200,
+                headers: Vec::new(),
+                body: br#"{"success":true,"orderID":"fixture-venue-order","makingAmount":"2.5","takingAmount":"5"}"#.to_vec(),
+                attempt_ordinal: 1,
+                source_at: None,
+                observed_at: at(),
+                received_at: at(),
+                schema_version: 1,
+                parser_version: 1,
+                adapter_version: "fixture".to_owned(),
+            })
+        })
+    }
+
+    fn classify_post_response(
+        &self,
+        _: &pe_core_types::RawHttpResponse,
+    ) -> Result<LivePostClassification, LivePostParseError> {
+        Ok(LivePostClassification::Matched {
+            venue_order_id: "fixture-venue-order".to_owned(),
+            executed: LiveExecutedAmounts {
+                making_amount: dec!(2.5),
+                taking_amount: dec!(5),
+            },
+            transaction_hashes: vec![format!("0x{}", "11".repeat(32))],
+        })
+    }
+
+    fn reconcile_and_cancel_by_order_hash<'a>(
+        &'a self,
+        _: &'a str,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<LiveVenueReconciliation, LiveVenueReconciliationError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async { panic!("a classified POST must not reconcile") })
+    }
+
+    fn read_balance_and_allowance<'a>(
+        &'a self,
+        _: bool,
+    ) -> Pin<
+        Box<
+            dyn Future<Output = Result<LiveVenueAccountState, LiveVenueAccountReadError>>
+                + Send
+                + 'a,
+        >,
+    > {
+        Box::pin(async {
+            let cash = CollateralAmount::from_decimal_exact(CASH).unwrap();
+            Ok(LiveVenueAccountState {
+                observed_at: at(),
+                closed_only: false,
+                geoblocked: false,
+                selected_spender: "fixture-spender".to_owned(),
+                collateral_balance: cash,
+                allowance: cash,
+                reconciled_free_collateral: cash,
+                schema_version: 1,
+                parser_version: 1,
+                evidence: Vec::new(),
+                request_descriptor_hashes: Vec::new(),
+            })
+        })
+    }
+}
+
+/// PASS: a semantic-2 delayed paper fill stages an armed target. A fresh strict zero-delay
+/// market reaches the existing live executor's single POST; the same delayed market has a typed
+/// strict refusal before a POST. The version-6 websocket/REST source clock is bound in the paper
+/// continuation and the resulting live journal replays its admission, preparation and POST.
+#[tokio::test]
+async fn version_six_staged_target_strict_live_admission_submits_and_replays() {
+    let mut h = Harness::new().await;
+    h.probability = pe_core_types::Probability::new(dec!(0.9)).unwrap();
+    let recorded = h
+        .record_with_rule(1, Some((dec!(0.50), dec!(0.50), Some(2))))
+        .await;
+    h.arm();
+    h.attempt(&recorded, at());
+    h.start(true);
+    h.poll_source(&recorded, Some(EPOCH - 1), at()).await;
+    let row = h.terminal(&recorded);
+    assert_eq!(row.terminal_disposition.as_deref(), Some("fill"));
+    assert_bound_clocks(&h, &recorded, EPOCH - 1);
+    let report = h.qualify_one_fill().await;
+    assert!(report.replay.exact, "{:?}", report.reasons);
+    let continuation =
+        pe_service::bucket_commit::DecisionContinuationV3::from_durable(&row).unwrap();
+    assert_eq!(continuation.version(), 6);
+    let staged = h.paper.unfinalized_ready_dispatch_seeds().unwrap();
+    assert_eq!(staged.len(), 1);
+    let target = h.paper.dispatch_targets(&staged[0].dispatch_id).unwrap();
+    assert_eq!(target.len(), 1);
+    assert_eq!(target[0].account_id, "stored-target");
+    assert_eq!(target[0].credential_bundle_version, 7);
+
+    let gamma = source_envelope(&h, recorded.admission.receipts.gamma).payload;
+    let delayed = source_envelope(&h, recorded.admission.receipts.clob_long).payload;
+    let condition = &recorded.admission.market.condition_id;
+    let venue = StagedLiveVenue {
+        posts: AtomicBool::new(false),
+    };
+    assert_eq!(
+        validate_live_market(&gamma, &delayed, condition, EPOCH, 60),
+        Err(pe_source_polymarket_public::LiveMarketError::NonzeroDelay)
+    );
+    assert!(
+        !venue.posts.load(Ordering::SeqCst),
+        "strict refusal precedes POST"
+    );
+    let mut strict_long: Value = serde_json::from_slice(&delayed).unwrap();
+    strict_long["seconds_delay"] = 0.into();
+    let strict_long = serde_json::to_vec(&strict_long).unwrap();
+    let strict_market = validate_live_market(&gamma, &strict_long, condition, EPOCH, 60).unwrap();
+    let compact = source_envelope(&h, recorded.admission.receipts.clob_compact).payload;
+    let admission = LiveAdmissionArtifact {
+        market: strict_market,
+        fee_schedule: recorded.admission.fee_schedule,
+        receipts: AdmissionReceipts {
+            gamma: h.append("polymarket.gamma.markets", &gamma).await,
+            clob_long: h.append("polymarket.clob.markets", &strict_long).await,
+            clob_compact: h.append("polymarket.clob.compact-market", &compact).await,
+        },
+        settlement: VenueSettlementRecord {
+            raw_evidence_hash: blake3::hash(&strict_long).to_hex().to_string(),
+            ..recorded.admission.settlement.clone()
+        },
+    };
+    let paper_economic = scan_paper_log(&h.dir.path().join("paper.log"))
+        .unwrap()
+        .into_iter()
+        .find_map(|frame| match frame.frame {
+            PaperLogFrame::Record(PaperLogRecord::FinancialPrepared {
+                payload: pe_service::paper_recovery::FinancialPayload::Fill { economic, .. },
+                ..
+            }) => Some(economic),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(paper_economic.version, 2);
+    let mut economic = paper_economic.clone();
+    economic.version = pe_execution_core::ECONOMIC_PREPARED_VERSION;
+    economic.admission = pe_execution_core::LiveAdmissionArtifactAudit::new(
+        &admission.market,
+        &admission.settlement,
+        admission.fee_schedule,
+        admission.receipts,
+    );
+    economic.balance.chase_ceiling = pe_core_types::Price::new(dec!(0.50)).unwrap();
+    economic.balance.price_impact_cap_bps = 100;
+    assert_eq!(economic.observation, paper_economic.observation);
+    let ladder = LadderPlan {
+        used_asks: economic
+            .ladder
+            .used_asks
+            .iter()
+            .map(|ask| AskLevel {
+                price: ask.price,
+                shares: ask.shares,
+            })
+            .collect(),
+        best_ask: economic.ladder.best_ask,
+        limit_price: economic.ladder.limit_price,
+        shares: economic.ladder.minimum_shares,
+        worst_case_debit: economic.ladder.principal,
+    };
+    let account_id = AccountId::new("stored-target").unwrap();
+    let binding = CredentialBindingIdentity {
+        version: 7,
+        key_id: "stored-key".to_owned(),
+    };
+    let identity = LiveOrderIdentity {
+        dispatch_id: staged[0].dispatch_id.clone(),
+        idempotency_key: LiveOrderIdentity::idempotency_key_for(
+            &staged[0].dispatch_id,
+            &account_id,
+        ),
+        quote_id: "fresh-strict-live-quote".to_owned(),
+        config_hash: economic.applied_configuration_hash.clone(),
+        decision_hash: row.semantic_revision.clone(),
+        evidence_hashes: vec![admission.settlement.raw_evidence_hash.clone()],
+        fill_projection: Some(Box::new(pe_execution_core::LiveFillProjectionIdentity {
+            leader_wallet: wallet().to_string(),
+            source_trade_id: Some(recorded.id.0.clone()),
+            market_id: economic.market.market_id.clone(),
+            outcome_id: i64::from(u16::from(economic.market.outcome_index)),
+            side: "buy".to_owned(),
+        })),
+        schema_version: 1,
+        parser_version: 1,
+    };
+    let request = LiveOrderRequest {
+        target: FrozenLiveTarget {
+            account_id: account_id.clone(),
+            credential_binding: binding.clone(),
+        },
+        current_credential_binding: binding,
+        mode: LiveModeSnapshot {
+            requested: LiveControlMode::LiveTiny,
+            effective: LiveControlMode::LiveTiny,
+        },
+        identity,
+        condition_id: condition.clone(),
+        outcome_id: pe_core_types::OutcomeId(0),
+        token_id: admission.market.ordered_outcome_token_ids[0].clone(),
+        admission,
+        ladder,
+        economic,
+    };
+    let path = h.dir.path().join("live_journal.log");
+    let journal = LiveJournal::open(&path).unwrap();
+    let executor = LiveExecutor::new(&venue, &journal);
+    let prepared = match executor.prepare_with_clock(request, at).await.unwrap() {
+        LivePrepareResult::Prepared(prepared) => prepared,
+        LivePrepareResult::Terminal(outcome) => {
+            panic!("fresh strict live target refused: {outcome:?}")
+        }
+    };
+    assert!(matches!(
+        executor.submit_with_clock(prepared, at).await.unwrap(),
+        LiveOrderOutcome::Matched { .. }
+    ));
+    assert!(venue.posts.load(Ordering::SeqCst));
+    let events = pe_execution_core::live_journal::replay_account(&path, &account_id).unwrap();
+    assert!(matches!(
+        events.as_slice(),
+        [
+            pe_execution_core::LiveJournalEvent {
+                payload: LiveJournalPayload::AdmissionEvaluated(_),
+                ..
+            },
+            pe_execution_core::LiveJournalEvent {
+                payload: LiveJournalPayload::OrderPrepared(_),
+                ..
+            },
+            pe_execution_core::LiveJournalEvent {
+                payload: LiveJournalPayload::OrderPosted(_),
+                ..
+            },
+            pe_execution_core::LiveJournalEvent {
+                payload: LiveJournalPayload::OrderReconciled(_),
+                ..
+            },
+        ]
+    ));
 }
 
 /// PASS: exactly two seconds fills; one nanosecond later expires, with the predicate's exact clock.
@@ -1393,7 +1822,7 @@ async fn durable_prepared_recovers_after_copy_budget() {
 
 /// PASS: malformed policy or exact clock, duplicates, and contradictory terminal shapes reject even with fresh row hashes.
 #[tokio::test]
-async fn continuation_five_policy_and_clock_shape_rejects_invalid_evidence() {
+async fn continuation_six_policy_and_clock_shape_rejects_invalid_evidence() {
     let mut h = Harness::new().await;
     let recorded = h.record(1).await;
     h.arm();
@@ -1571,8 +2000,13 @@ fn stage_legacy_decision(h: &Harness) -> DecisionPendingRow {
         "authority": {"kind": "not_read", "outcome": "dispatch_staged_before_fill_authority", "bankroll": null},
         "terminal": {"disposition": "dispatch_staged", "reason": "live_targets_staged", "fill": null, "dispatch_id": dispatch_id}
     })).unwrap();
-    let json =
-        serde_json::to_string(&DecisionPostBoundaryEvidence::from_body(body).unwrap()).unwrap();
+    let mut historical = DecisionPostBoundaryEvidence::from_body(body).unwrap();
+    historical.financial_semantic_version = 1;
+    historical.document_blake3 =
+        blake3::hash(&serde_json::to_vec(&(1u32, &historical.body)).unwrap())
+            .to_hex()
+            .to_string();
+    let json = serde_json::to_string(&historical).unwrap();
     let seed = pe_paper_state::DispatchSeedRecord {
         dispatch_id: dispatch_id.to_owned(),
         signal_json: json!({"signal": {"leader": wallet(), "observed_at": "2023-11-14T22:13:20Z"}})
@@ -1655,7 +2089,7 @@ async fn generation_four_staging_terminal_and_replay_remain_unchanged() {
 /// PASS: either boot order yields one paper terminal and one seed flip, preserving frozen
 /// targets and staging evidence, for fresh fill and aged expiry; legacy rows remain unchanged.
 #[tokio::test]
-async fn staged_generation_five_crash_between_staging_and_outcome_converges_once() {
+async fn staged_generation_six_crash_between_staging_and_outcome_converges_once() {
     for recovery_first in [true, false] {
         for expired in [false, true] {
             let mut h = Harness::new().await;
