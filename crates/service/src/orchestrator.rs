@@ -1444,7 +1444,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     &change,
                     &replacements,
                 ) {
-                    let _ = acknowledged.send(Err(error.to_string()));
+                    let _ = acknowledged.send(Err(error.into_publish()));
                     return;
                 }
                 let removed = change.removed.iter().copied().collect::<HashSet<_>>();
@@ -1482,7 +1482,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 } else {
                     self.intake_stopped = true;
                 }
-                let result = receipt;
+                let result =
+                    receipt.map_err(crate::watchlist_maintenance::PublishError::UncertainAppend);
                 let _ = acknowledged.send(result);
             }
             OrchestratorControl::RiskHaltChange {

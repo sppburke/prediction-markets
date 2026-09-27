@@ -1229,12 +1229,18 @@ async fn pre_start_boot_membership_case(case: PreStartBootCase) {
 /// that ignored the markers, so these cases boot the binary itself with `--exit-after-anchors`,
 /// which runs past both guards, the Start seed and the frame reconciliation before exiting.
 ///
-/// The two successful cases share ONE genuine Prepared fill, laid down exactly as the runtime
+/// The successful fill cases share ONE genuine Prepared fill, laid down exactly as the runtime
 /// leaves it before the authority answers (the causal source frame, then the Prepared frame —
 /// `orchestrator.rs` synchronizes Prepared BEFORE calling the authority). They differ only in how
 /// far past that point the crash happened, so the admitted "authority ahead" state is not merely
 /// tolerated: the boot has to recover it.
 enum PostStartBootCase {
+    /// A synchronized full rerank removes the Start wallet and boots an empty generation.
+    EmptyPostStart,
+    /// A post-Start capacity record keeps structure, then the boot fence filter empties live.
+    FilteredPostStart,
+    /// An empty Start membership without a post-Start structural record remains refused.
+    EmptyStartPinned,
     /// Crashed after the authority applied the fill and before the local projection: the store
     /// still carries the baseline, the authority no longer does. Both must be admitted, and the
     /// boot must then recover the fill locally and append its Final.
@@ -1325,7 +1331,14 @@ async fn post_start_boot_bankroll_case(case: PostStartBootCase) {
         .to_owned();
     let paths = install_generation(paths);
     let wallet = WalletAddress::from_hex(WALLET).unwrap();
-    let start = append_paper_record(&paths.paper_log, &start_record());
+    let mut started = start_record();
+    if matches!(case, PostStartBootCase::EmptyStartPinned) {
+        let PaperLogRecord::QualificationStarted(ref mut start) = started else {
+            unreachable!()
+        };
+        start.membership.clear();
+    }
+    let start = append_paper_record(&paths.paper_log, &started);
     let paper = PaperStateDb::open(&paths.fixed_main).unwrap();
     // A reusable anchor keeps the boot bracket off the network: the case is about the bankroll
     // gate, not the venue walk, and `--exit-after-anchors` exits right after the reuse census.
@@ -1458,8 +1471,96 @@ async fn post_start_boot_bankroll_case(case: PostStartBootCase) {
             }
             Some(prepared)
         }
-        PostStartBootCase::LocalWrongBaseline | PostStartBootCase::AuthorityWrongBaseline => None,
+        PostStartBootCase::EmptyPostStart
+        | PostStartBootCase::FilteredPostStart
+        | PostStartBootCase::EmptyStartPinned
+        | PostStartBootCase::LocalWrongBaseline
+        | PostStartBootCase::AuthorityWrongBaseline => None,
     };
+    if matches!(
+        case,
+        PostStartBootCase::EmptyPostStart
+            | PostStartBootCase::FilteredPostStart
+            | PostStartBootCase::EmptyStartPinned
+    ) {
+        authority_progress = serde_json::json!({
+            "bankroll_str": "10",
+            "last_prepared_seq": null
+        });
+    }
+    if matches!(case, PostStartBootCase::EmptyPostStart) {
+        let ranking = append(
+            &paths.source_log,
+            envelope(
+                "pe-service.watchlist-ranking",
+                1,
+                1,
+                &serde_json::to_vec(&serde_json::json!({
+                    "batch_id": 573,
+                    "entries": []
+                }))
+                .unwrap(),
+                NOW_UNIX,
+            ),
+        );
+        append_paper_record(
+            &paths.paper_log,
+            &pe_service::paper_recovery::MembershipChange {
+                reason: pe_service::paper_recovery::MembershipReason::FullRerank,
+                removed: vec![wallet],
+                added: Vec::new(),
+                capacity: 1,
+                ranking_batch_id: Some(573),
+                evidence: serde_json::json!({
+                    "kind": "full_rerank",
+                    "ranking_receipt": ranking,
+                    "admission_receipts": []
+                }),
+            }
+            .into_record(),
+        );
+    }
+    if matches!(case, PostStartBootCase::FilteredPostStart) {
+        let config = append(
+            &paths.source_log,
+            envelope(
+                "pe-service.watchlist-capacity-config",
+                1,
+                1,
+                &serde_json::to_vec(&serde_json::json!({
+                    "generation": 2,
+                    "target": 1,
+                    "published_entries": start_batch().entries
+                }))
+                .unwrap(),
+                NOW_UNIX,
+            ),
+        );
+        append_paper_record(
+            &paths.paper_log,
+            &pe_service::paper_recovery::MembershipChange {
+                reason: pe_service::paper_recovery::MembershipReason::CapacityChange,
+                removed: Vec::new(),
+                added: Vec::new(),
+                capacity: 1,
+                ranking_batch_id: None,
+                evidence: serde_json::json!({
+                    "kind": "capacity_change",
+                    "generation": 2,
+                    "config_receipt": config,
+                    "admission_receipts": []
+                }),
+            }
+            .into_record(),
+        );
+        rusqlite::Connection::open(&paths.fixed_main)
+            .unwrap()
+            .execute(
+                "INSERT INTO wallet_fences (wallet_hex, source_trade_id, cause, proof_json, fenced_at_unix) VALUES (?1, 'fixture', 'invalid_mapping', '{}', 1)",
+                [wallet.to_string()],
+            )
+            .unwrap();
+    }
     drop(paper);
 
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -1528,6 +1629,51 @@ async fn post_start_boot_bankroll_case(case: PostStartBootCase) {
             .count()
     };
     match case {
+        PostStartBootCase::EmptyPostStart => {
+            assert!(output.status.success(), "{stderr}");
+            assert!(
+                stderr.contains("replayed post-Start membership is empty"),
+                "{stderr}"
+            );
+            assert!(seeded, "empty post-Start boot did not reach the Start seed");
+            assert!(!committed);
+            let era = paper_era(scan_paper_log(&paths.paper_log).unwrap());
+            let replayed = replay_membership(&era, start_batch(), &paths.source_log)
+                .unwrap()
+                .unwrap();
+            assert!(replayed.post_start_record_replayed);
+            assert!(replayed.watchlist.entries.is_empty());
+        }
+        PostStartBootCase::FilteredPostStart => {
+            assert!(output.status.success(), "{stderr}");
+            assert!(
+                stderr.contains("replayed post-Start membership has zero eligible live wallets"),
+                "{stderr}"
+            );
+            assert!(seeded);
+            let era = paper_era(scan_paper_log(&paths.paper_log).unwrap());
+            let replayed = replay_membership(&era, start_batch(), &paths.source_log)
+                .unwrap()
+                .unwrap();
+            assert!(replayed.post_start_record_replayed);
+            assert_eq!(replayed.watchlist.entries.len(), 1);
+        }
+        PostStartBootCase::EmptyStartPinned => {
+            assert!(!output.status.success(), "{stderr}");
+            assert!(
+                stderr.contains(
+                    "no wallets to copy: the boot membership generation contains no SURVIVING rows"
+                ),
+                "{stderr}"
+            );
+            assert!(!seeded);
+            let era = paper_era(scan_paper_log(&paths.paper_log).unwrap());
+            let replayed = replay_membership(&era, start_batch(), &paths.source_log)
+                .unwrap()
+                .unwrap();
+            assert!(!replayed.post_start_record_replayed);
+            assert!(replayed.watchlist.entries.is_empty());
+        }
         PostStartBootCase::AuthorityAheadLocalUntouched | PostStartBootCase::BothTraded => {
             assert!(output.status.success(), "{stderr}");
             assert!(seeded, "the boot must reach the Start seed: {hit:?}");
@@ -1578,6 +1724,21 @@ async fn post_start_boot_bankroll_case(case: PostStartBootCase) {
 #[tokio::test]
 async fn post_start_boot_admits_an_authority_that_applied_a_fill_before_the_local_projection() {
     post_start_boot_bankroll_case(PostStartBootCase::AuthorityAheadLocalUntouched).await;
+}
+
+#[tokio::test]
+async fn empty_post_start_membership_passes_both_real_binary_boot_guards() {
+    post_start_boot_bankroll_case(PostStartBootCase::EmptyPostStart).await;
+}
+
+#[tokio::test]
+async fn filtered_post_start_membership_passes_real_binary_boot_live_guard() {
+    post_start_boot_bankroll_case(PostStartBootCase::FilteredPostStart).await;
+}
+
+#[tokio::test]
+async fn empty_start_pinned_membership_is_refused_by_real_binary_boot() {
+    post_start_boot_bankroll_case(PostStartBootCase::EmptyStartPinned).await;
 }
 
 #[tokio::test]

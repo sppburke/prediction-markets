@@ -620,6 +620,10 @@ The followed-wallet set is refreshed from Supabase `latest_ranking`, filtered to
 `survives` verdict. Score-only refresh stays on its existing locked path and never changes structural
 membership. Capacity, full-rerank, and knockout changes recheck their prepared evidence under the
 structural writer lock, synchronize one `MembershipChanged` record, then publish its exact snapshot.
+Typed wallet-specific admission failures defer the affected wallets and replan from the same
+ranked bench; a shared failure leaves full-rerank and capacity unchanged, while independently
+decided knockout evictions may publish without backfill. Every added wallet has a cited immutable
+admission proof, and the writer lock checks the prepared structural set and proof digests.
 Boot replays the initial membership and later structural records before producers, then applies the
 separate monotonic wallet fences. `wallet_lifecycle_events` remains a best-effort projection, not an
 authority. No membership table or scheduler exists.

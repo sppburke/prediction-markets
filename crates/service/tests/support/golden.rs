@@ -75,6 +75,7 @@ use pe_service::supabase_state::{
     SupabaseStateTrait,
 };
 use pe_service::trade_poller::{ACTIVITY_POLL_PAGE_SCHEMA_VERSION, ACTIVITY_POLL_SOURCE_ID};
+use pe_service::watchlist_maintenance::{MembershipCommit, PublicationBinding};
 use pe_source_polymarket_public::{
     BinaryPayoutVector, CLOB_RESOLUTION_PARSER_VERSION, CLOB_RESOLUTION_SCHEMA_VERSION,
     LIVE_MARKET_PARSER_VERSION, LIVE_MARKET_SCHEMA_VERSION, PageFetcher, validate_live_market,
@@ -2423,7 +2424,15 @@ pub(crate) async fn golden_source_stream_replays_exact_economic_core() {
                 .send(OrchestratorControl::PublishMembership {
                     change: change.clone(),
                     replacements,
-                    checks: Default::default(),
+                    // Bind to the structural set this change was planned against, as
+                    // production publication does (#595); it adds no wallet proofs.
+                    checks: Box::new(MembershipCommit {
+                        binding: PublicationBinding {
+                            structural: live.structural_membership(),
+                            digests: Vec::new(),
+                        },
+                        ..Default::default()
+                    }),
                     acknowledged,
                 })
                 .await

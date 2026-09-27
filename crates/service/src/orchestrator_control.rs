@@ -69,8 +69,9 @@ pub enum OrchestratorControl {
     PublishMembership {
         change: MembershipChange,
         replacements: Vec<WatchlistEntry>,
-        checks: MembershipCommit,
-        acknowledged: oneshot::Sender<Result<AppendReceipt, String>>,
+        checks: Box<MembershipCommit>,
+        acknowledged:
+            oneshot::Sender<Result<AppendReceipt, crate::watchlist_maintenance::PublishError>>,
     },
     /// Append one risk-cause edge before acknowledging it to the producer.
     RiskHaltChange {

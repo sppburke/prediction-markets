@@ -166,6 +166,344 @@ pub enum CausalPositionError {
     ReconstructionQuality,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureClass {
+    WalletTransient,
+    WalletPersistent,
+    Shared,
+}
+
+fn classify_source(error: &SourceError) -> FailureClass {
+    match error {
+        SourceError::Transient { .. }
+        | SourceError::RateLimited { .. }
+        | SourceError::Fatal { .. } => FailureClass::Shared,
+    }
+}
+
+fn classify_activity_read(error: &pe_source_polymarket_public::ActivityReadError) -> FailureClass {
+    use pe_source_polymarket_public::ActivityReadError;
+    use pe_source_polymarket_public::activity::{
+        ActivityAggregationError, ActivityIdentityError, ActivityParseError,
+        ActivityValidationError,
+    };
+    match error {
+        ActivityReadError::Fetch { source, .. } => classify_source(source),
+        ActivityReadError::Parse(ActivityParseError::InvalidRow { source, .. }) => match source {
+            ActivityValidationError::InvalidActivityType { .. }
+            | ActivityValidationError::EmptyField { .. }
+            | ActivityValidationError::InvalidSide { .. }
+            | ActivityValidationError::InvalidPrice { .. }
+            | ActivityValidationError::InvalidShareAmount { .. }
+            | ActivityValidationError::InvalidCollateralAmount { .. }
+            | ActivityValidationError::InvalidConditionOutcomeMapping
+            | ActivityValidationError::InvalidTimestampValue { .. }
+            | ActivityValidationError::LegacyProjectionOutOfRange => FailureClass::WalletPersistent,
+            ActivityValidationError::Identity
+            | ActivityValidationError::MissingField { .. }
+            | ActivityValidationError::InvalidTimestamp(_) => FailureClass::Shared,
+        },
+        ActivityReadError::Parse(
+            ActivityParseError::Json { .. } | ActivityParseError::WindowInvalidated(_),
+        ) => FailureClass::Shared,
+        ActivityReadError::Aggregate(source) => match source {
+            ActivityAggregationError::Identity(inner) => match inner {
+                ActivityIdentityError::ComponentTooLong
+                | ActivityIdentityError::ComponentMismatch { .. } => FailureClass::Shared,
+            },
+            ActivityAggregationError::CausalAmbiguity { .. }
+            | ActivityAggregationError::MixedComboState { .. }
+            | ActivityAggregationError::EmptyGroup { .. }
+            | ActivityAggregationError::AmountOverflow { .. }
+            | ActivityAggregationError::PriceWeightedSumOverflow { .. }
+            | ActivityAggregationError::ZeroShareSum { .. }
+            | ActivityAggregationError::InvalidWeightedPrice { .. } => FailureClass::Shared,
+        },
+        ActivityReadError::Identity(source) => match source {
+            ActivityIdentityError::ComponentTooLong
+            | ActivityIdentityError::ComponentMismatch { .. } => FailureClass::Shared,
+        },
+        ActivityReadError::SaturatedTerminalSecond { .. } => FailureClass::WalletPersistent,
+        ActivityReadError::InvalidOffset { .. }
+        | ActivityReadError::RowOutsideBounds { .. }
+        | ActivityReadError::InvalidSplit { .. }
+        | ActivityReadError::CanonicalPage(_)
+        | ActivityReadError::RowCountOverflow
+        | ActivityReadError::PageTooLarge { .. } => FailureClass::Shared,
+    }
+}
+
+fn classify_position_read(error: &pe_source_polymarket_public::PositionReadError) -> FailureClass {
+    use pe_source_polymarket_public::PositionReadError;
+    match error {
+        PositionReadError::Fetch { source, .. } => classify_source(source),
+        PositionReadError::InvalidAmount { .. }
+        | PositionReadError::MissingActivityMapping { .. }
+        | PositionReadError::ConflictingActivityMapping { .. }
+        | PositionReadError::MixedActivityClassification { .. }
+        | PositionReadError::ConflictingOutcomeMapping { .. }
+        | PositionReadError::DuplicateAsset { .. }
+        | PositionReadError::SaturatedTerminalPage { .. } => FailureClass::WalletPersistent,
+        PositionReadError::MetadataUnresolved { .. }
+        | PositionReadError::ProofComponentTooLong
+        | PositionReadError::PageTooLarge { .. }
+        | PositionReadError::Json(_)
+        | PositionReadError::MissingField { .. }
+        | PositionReadError::InvalidWallet { .. }
+        | PositionReadError::WalletMismatch { .. }
+        | PositionReadError::CanonicalPage(_)
+        | PositionReadError::RowCountOverflow => FailureClass::Shared,
+    }
+}
+
+impl CausalPositionError {
+    pub fn class(&self) -> FailureClass {
+        match self {
+            Self::Activity { source, .. } => classify_activity_read(source),
+            Self::Positions { source, .. } => classify_position_read(source),
+            Self::Identity { source, .. } => classify_source(source),
+            Self::Fenced { .. } | Self::DuplicateOutcome { .. } => FailureClass::WalletPersistent,
+            Self::InterveningActivity { .. }
+            | Self::PositionRevision { .. }
+            | Self::LedgerRevision { .. } => FailureClass::WalletTransient,
+            Self::AnchorInstall(error) => error.class(),
+            Self::ProofEncoding(_)
+            | Self::BucketCommit { .. }
+            | Self::NonMonotonicActivityBounds { .. }
+            | Self::ControlClosed
+            | Self::AcknowledgementClosed
+            | Self::ProofComponentTooLong
+            | Self::PaperState(_)
+            | Self::ReconstructionQuality => FailureClass::Shared,
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        use pe_source_polymarket_public::activity::{ActivityParseError, ActivityValidationError};
+        use pe_source_polymarket_public::{ActivityReadError, PositionReadError};
+        match self {
+            Self::Activity {
+                source:
+                    ActivityReadError::Fetch {
+                        source: SourceError::Transient { .. },
+                        ..
+                    },
+                ..
+            }
+            | Self::Positions {
+                source:
+                    PositionReadError::Fetch {
+                        source: SourceError::Transient { .. },
+                        ..
+                    },
+                ..
+            }
+            | Self::Identity {
+                source: SourceError::Transient { .. },
+                ..
+            } => "source.transient",
+            Self::Activity {
+                source:
+                    ActivityReadError::Fetch {
+                        source: SourceError::RateLimited { .. },
+                        ..
+                    },
+                ..
+            }
+            | Self::Positions {
+                source:
+                    PositionReadError::Fetch {
+                        source: SourceError::RateLimited { .. },
+                        ..
+                    },
+                ..
+            }
+            | Self::Identity {
+                source: SourceError::RateLimited { .. },
+                ..
+            } => "source.rate_limited",
+            Self::Activity {
+                source:
+                    ActivityReadError::Fetch {
+                        source: SourceError::Fatal { .. },
+                        ..
+                    },
+                ..
+            }
+            | Self::Positions {
+                source:
+                    PositionReadError::Fetch {
+                        source: SourceError::Fatal { .. },
+                        ..
+                    },
+                ..
+            }
+            | Self::Identity {
+                source: SourceError::Fatal { .. },
+                ..
+            } => "source.fatal",
+            Self::Activity {
+                source: ActivityReadError::Parse(ActivityParseError::InvalidRow { source, .. }),
+                ..
+            } => match source {
+                ActivityValidationError::InvalidActivityType { .. } => {
+                    "activity.invalid_activity_type"
+                }
+                ActivityValidationError::Identity => "activity.identity",
+                ActivityValidationError::MissingField { .. } => "activity.missing_field",
+                ActivityValidationError::EmptyField { .. } => "activity.empty_field",
+                ActivityValidationError::InvalidSide { .. } => "activity.invalid_side",
+                ActivityValidationError::InvalidPrice { .. } => "activity.invalid_price",
+                ActivityValidationError::InvalidShareAmount { .. } => {
+                    "activity.invalid_share_amount"
+                }
+                ActivityValidationError::InvalidCollateralAmount { .. } => {
+                    "activity.invalid_collateral_amount"
+                }
+                ActivityValidationError::InvalidConditionOutcomeMapping => {
+                    "activity.invalid_condition_outcome_mapping"
+                }
+                ActivityValidationError::InvalidTimestamp(_) => "activity.invalid_timestamp",
+                ActivityValidationError::InvalidTimestampValue { .. } => {
+                    "activity.invalid_timestamp_value"
+                }
+                ActivityValidationError::LegacyProjectionOutOfRange => {
+                    "activity.legacy_projection_out_of_range"
+                }
+            },
+            Self::Activity {
+                source: ActivityReadError::Parse(ActivityParseError::Json { .. }),
+                ..
+            } => "activity.json",
+            Self::Activity {
+                source: ActivityReadError::Parse(ActivityParseError::WindowInvalidated(_)),
+                ..
+            } => "activity.window_invalidated",
+            Self::Activity {
+                source: ActivityReadError::Aggregate(_),
+                ..
+            } => "activity.aggregate",
+            Self::Activity {
+                source: ActivityReadError::Identity(_),
+                ..
+            } => "activity.identity",
+            Self::Activity {
+                source: ActivityReadError::InvalidOffset { .. },
+                ..
+            } => "activity.invalid_offset",
+            Self::Activity {
+                source: ActivityReadError::RowOutsideBounds { .. },
+                ..
+            } => "activity.row_outside_bounds",
+            Self::Activity {
+                source: ActivityReadError::InvalidSplit { .. },
+                ..
+            } => "activity.invalid_split",
+            Self::Activity {
+                source: ActivityReadError::SaturatedTerminalSecond { .. },
+                ..
+            } => "activity.saturated_terminal_second",
+            Self::Activity {
+                source: ActivityReadError::CanonicalPage(_),
+                ..
+            } => "activity.canonical_page",
+            Self::Activity {
+                source: ActivityReadError::RowCountOverflow,
+                ..
+            } => "activity.row_count_overflow",
+            Self::Activity {
+                source: ActivityReadError::PageTooLarge { .. },
+                ..
+            } => "activity.page_too_large",
+            Self::Positions {
+                source: PositionReadError::Json(_),
+                ..
+            } => "positions.json",
+            Self::Positions {
+                source: PositionReadError::MissingField { .. },
+                ..
+            } => "positions.missing_field",
+            Self::Positions {
+                source: PositionReadError::InvalidWallet { .. },
+                ..
+            } => "positions.invalid_wallet",
+            Self::Positions {
+                source: PositionReadError::WalletMismatch { .. },
+                ..
+            } => "positions.wallet_mismatch",
+            Self::Positions {
+                source: PositionReadError::InvalidAmount { .. },
+                ..
+            } => "positions.invalid_amount",
+            Self::Positions {
+                source: PositionReadError::MissingActivityMapping { .. },
+                ..
+            } => "positions.missing_activity_mapping",
+            Self::Positions {
+                source: PositionReadError::ConflictingActivityMapping { .. },
+                ..
+            } => "positions.conflicting_activity_mapping",
+            Self::Positions {
+                source: PositionReadError::MixedActivityClassification { .. },
+                ..
+            } => "positions.mixed_activity_classification",
+            Self::Positions {
+                source: PositionReadError::MetadataUnresolved { .. },
+                ..
+            } => "positions.metadata_unresolved",
+            Self::Positions {
+                source: PositionReadError::ConflictingOutcomeMapping { .. },
+                ..
+            } => "positions.conflicting_outcome_mapping",
+            Self::Positions {
+                source: PositionReadError::DuplicateAsset { .. },
+                ..
+            } => "positions.duplicate_asset",
+            Self::Positions {
+                source: PositionReadError::SaturatedTerminalPage { .. },
+                ..
+            } => "positions.saturated_terminal_page",
+            Self::Positions {
+                source: PositionReadError::CanonicalPage(_),
+                ..
+            } => "positions.canonical_page",
+            Self::Positions {
+                source: PositionReadError::ProofComponentTooLong,
+                ..
+            } => "positions.proof_component_too_long",
+            Self::Positions {
+                source: PositionReadError::RowCountOverflow,
+                ..
+            } => "positions.row_count_overflow",
+            Self::Positions {
+                source: PositionReadError::PageTooLarge { .. },
+                ..
+            } => "positions.page_too_large",
+            Self::ProofEncoding(_) => "validation.proof_encoding",
+            Self::BucketCommit { .. } => "validation.bucket_commit",
+            Self::Fenced { .. } => "validation.fenced",
+            Self::InterveningActivity { .. } => "validation.intervening_activity",
+            Self::PositionRevision { .. } => "validation.position_revision",
+            Self::LedgerRevision { .. } => "validation.ledger_revision",
+            Self::NonMonotonicActivityBounds { .. } => "validation.nonmonotonic_activity_bounds",
+            Self::ControlClosed => "validation.control_closed",
+            Self::AcknowledgementClosed => "validation.acknowledgement_closed",
+            Self::DuplicateOutcome { .. } => "validation.duplicate_outcome",
+            Self::ProofComponentTooLong => "validation.proof_component_too_long",
+            Self::PaperState(_) => "validation.paper_state",
+            Self::AnchorInstall(error) => error.kind(),
+            Self::ReconstructionQuality => "validation.reconstruction_quality",
+        }
+    }
+}
+
+pub struct ValidationOutcomes {
+    pub accepted: Vec<AnchorInstall>,
+    pub deferred: Vec<(WalletAddress, CausalPositionError)>,
+    pub shared: Option<CausalPositionError>,
+}
+
 /// Exact per-wallet source outcomes that retry without fencing or failing boot.
 ///
 /// A venue history the activity row parser refuses (issue #594: rehearsal attempt 9 aborted the
@@ -334,7 +672,7 @@ impl CausalPositionValidator {
         control_tx: &mpsc::Sender<OrchestratorControl>,
         paper_state: &PaperStateDb,
         purpose: ValidationPurpose,
-    ) -> Result<Vec<AnchorInstall>, CausalPositionError> {
+    ) -> ValidationOutcomes {
         let mut completed = futures::stream::iter(wallets.iter().copied().enumerate())
             .map(|(index, wallet)| async move {
                 (
@@ -347,11 +685,23 @@ impl CausalPositionValidator {
             .collect::<Vec<_>>()
             .await;
         completed.sort_by_key(|(index, _)| *index);
-        let mut accepted = Vec::with_capacity(completed.len());
-        for (_, result) in completed {
-            accepted.push(result?);
+        let mut outcomes = ValidationOutcomes {
+            accepted: Vec::with_capacity(completed.len()),
+            deferred: Vec::new(),
+            shared: None,
+        };
+        for (index, result) in completed {
+            match result {
+                Ok(install) => outcomes.accepted.push(install),
+                Err(error) if error.class() == FailureClass::Shared => {
+                    if outcomes.shared.is_none() {
+                        outcomes.shared = Some(error);
+                    }
+                }
+                Err(error) => outcomes.deferred.push((wallets[index], error)),
+            }
         }
-        Ok(accepted)
+        outcomes
     }
 
     /// Boot-time form used before producers start. The same bucket engine is
@@ -1239,9 +1589,215 @@ pub fn parse_positions_strict(
 mod tests {
     use super::*;
     use crate::source_event_sink::SourceEventSink;
+    use pe_source_polymarket_public::activity::{ActivityParseError, ActivityValidationError};
     use pe_source_polymarket_public::{
-        ActivityParseContext, ActivityTransport, aggregate_activity_rows, parse_activity_response,
+        ActivityParseContext, ActivityReadError, ActivityTransport, PositionPartition,
+        PositionReadError, aggregate_activity_rows, parse_activity_response,
     };
+
+    #[test]
+    fn admission_failure_classes_follow_typed_origins() {
+        let wallet = WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        let source = |index| match index {
+            0 => SourceError::Transient {
+                message: "exhausted".to_owned(),
+            },
+            1 => SourceError::RateLimited {
+                retry_after_secs: 1,
+            },
+            2 => SourceError::Fatal {
+                message: "opaque".to_owned(),
+            },
+            _ => unreachable!(),
+        };
+        for index in 0..3 {
+            assert_eq!(
+                CausalPositionError::Activity {
+                    wallet,
+                    source: ActivityReadError::Fetch {
+                        url: String::new(),
+                        source: source(index)
+                    }
+                }
+                .class(),
+                FailureClass::Shared
+            );
+            assert_eq!(
+                CausalPositionError::Positions {
+                    wallet,
+                    source: PositionReadError::Fetch {
+                        url: String::new(),
+                        source: source(index)
+                    }
+                }
+                .class(),
+                FailureClass::Shared
+            );
+            assert_eq!(
+                CausalPositionError::Identity {
+                    wallet,
+                    source: source(index)
+                }
+                .class(),
+                FailureClass::Shared
+            );
+        }
+        assert_eq!(
+            classify_position_read(&PositionReadError::MissingActivityMapping {
+                asset: "a".to_owned()
+            }),
+            FailureClass::WalletPersistent
+        );
+        assert_eq!(
+            classify_position_read(&PositionReadError::MetadataUnresolved {
+                asset: "a".to_owned(),
+                reason: String::new()
+            }),
+            FailureClass::Shared
+        );
+        assert_eq!(
+            classify_position_read(&PositionReadError::PageTooLarge {
+                row_count: 2,
+                limit: 1
+            }),
+            FailureClass::Shared
+        );
+        assert_eq!(
+            classify_position_read(&PositionReadError::SaturatedTerminalPage {
+                partition: PositionPartition::Redeemable,
+                offset: 0
+            }),
+            FailureClass::WalletPersistent
+        );
+        assert_eq!(
+            classify_position_read(&PositionReadError::ProofComponentTooLong),
+            FailureClass::Shared
+        );
+        assert_eq!(
+            classify_activity_read(&ActivityReadError::InvalidSplit {
+                start: None,
+                end: 1,
+                boundary: 1
+            }),
+            FailureClass::Shared
+        );
+        assert_eq!(
+            classify_activity_read(&ActivityReadError::RowOutsideBounds {
+                timestamp: 1,
+                start: None,
+                end: 0
+            }),
+            FailureClass::Shared
+        );
+        assert_eq!(
+            classify_activity_read(&ActivityReadError::PageTooLarge {
+                row_count: 2,
+                limit: 1
+            }),
+            FailureClass::Shared
+        );
+        assert_eq!(
+            classify_activity_read(&ActivityReadError::SaturatedTerminalSecond {
+                end: 1,
+                offset: 0
+            }),
+            FailureClass::WalletPersistent
+        );
+        assert_eq!(
+            classify_activity_read(&ActivityReadError::Parse(ActivityParseError::InvalidRow {
+                row_index: 0,
+                source: ActivityValidationError::InvalidPrice {
+                    value: rust_decimal::Decimal::ONE,
+                    reason: String::new()
+                }
+            })),
+            FailureClass::WalletPersistent
+        );
+        assert_eq!(
+            classify_activity_read(&ActivityReadError::Parse(ActivityParseError::InvalidRow {
+                row_index: 0,
+                source: ActivityValidationError::MissingField { field: "price" }
+            })),
+            FailureClass::Shared
+        );
+        assert_eq!(
+            classify_activity_read(&ActivityReadError::Parse(ActivityParseError::Json {
+                message: String::new()
+            })),
+            FailureClass::Shared
+        );
+        assert_eq!(
+            classify_position_read(&PositionReadError::WalletMismatch {
+                row_index: 0,
+                requested_wallet: wallet,
+                payload_wallet: WalletAddress::from_hex(
+                    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                )
+                .unwrap()
+            }),
+            FailureClass::Shared
+        );
+        assert_eq!(
+            CausalPositionError::NonMonotonicActivityBounds {
+                wallet,
+                previous: 1,
+                next: 0
+            }
+            .class(),
+            FailureClass::Shared
+        );
+        assert_eq!(
+            CausalPositionError::ProofComponentTooLong.class(),
+            FailureClass::Shared
+        );
+        assert_eq!(
+            crate::bucket_commit::AnchorInstallError::CutoffRegression {
+                wallet,
+                stored: 2,
+                candidate: 1
+            }
+            .class(),
+            FailureClass::WalletTransient
+        );
+        assert_eq!(
+            crate::bucket_commit::AnchorInstallError::LedgerHashChanged { wallet }.class(),
+            FailureClass::WalletTransient
+        );
+        assert_eq!(
+            crate::bucket_commit::AnchorInstallError::Durability("failed".to_owned()).class(),
+            FailureClass::Shared
+        );
+        use crate::watchlist_maintenance::{
+            MembershipApplyError, PublishError, WalletPublishCause,
+        };
+        for (cause, class) in [
+            (
+                WalletPublishCause::FencedAdmission,
+                FailureClass::WalletPersistent,
+            ),
+            (
+                WalletPublishCause::IncompleteHistory,
+                FailureClass::WalletPersistent,
+            ),
+            (
+                WalletPublishCause::UnvalidatedPosition,
+                FailureClass::WalletTransient,
+            ),
+            (
+                WalletPublishCause::ProofChanged,
+                FailureClass::WalletTransient,
+            ),
+        ] {
+            assert_eq!(
+                MembershipApplyError::Publication(PublishError::Wallet { wallet, cause }).class(),
+                class
+            );
+        }
+        assert_eq!(
+            crate::watchlist_admission::AdmissionError::ControlClosed.class(),
+            FailureClass::Shared
+        );
+    }
 
     struct EmptyFetcher;
 

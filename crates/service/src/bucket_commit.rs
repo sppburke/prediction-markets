@@ -2535,6 +2535,45 @@ pub enum AnchorInstallError {
     Durability(String),
 }
 
+impl AnchorInstallError {
+    pub fn class(&self) -> crate::position_seeder::FailureClass {
+        use crate::position_seeder::FailureClass;
+        match self {
+            Self::Fenced { .. } => FailureClass::WalletPersistent,
+            Self::LedgerHashChanged { .. }
+            | Self::CursorChanged { .. }
+            | Self::AnchorSeqChanged { .. }
+            | Self::CoverageGenerationChanged { .. }
+            | Self::CutoffRegression { .. } => FailureClass::WalletTransient,
+            Self::Durability(_) => FailureClass::Shared,
+        }
+    }
+
+    pub fn wallet(&self) -> Option<WalletAddress> {
+        match self {
+            Self::Fenced { wallet }
+            | Self::LedgerHashChanged { wallet }
+            | Self::CursorChanged { wallet }
+            | Self::AnchorSeqChanged { wallet }
+            | Self::CoverageGenerationChanged { wallet }
+            | Self::CutoffRegression { wallet, .. } => Some(*wallet),
+            Self::Durability(_) => None,
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Fenced { .. } => "anchor.fenced",
+            Self::LedgerHashChanged { .. } => "anchor.ledger_hash_changed",
+            Self::CursorChanged { .. } => "anchor.cursor_changed",
+            Self::AnchorSeqChanged { .. } => "anchor.anchor_seq_changed",
+            Self::CoverageGenerationChanged { .. } => "anchor.coverage_generation_changed",
+            Self::CutoffRegression { .. } => "anchor.cutoff_regression",
+            Self::Durability(_) => "anchor.durability",
+        }
+    }
+}
+
 impl From<pe_paper_state::PaperStateError> for AnchorInstallError {
     fn from(error: pe_paper_state::PaperStateError) -> Self {
         Self::Durability(format!("paper-state: {error}"))

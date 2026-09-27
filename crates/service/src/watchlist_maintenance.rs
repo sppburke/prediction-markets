@@ -55,13 +55,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pe_core_types::WalletAddress;
+use pe_event_log::AppendReceipt;
 use pe_paper_pnl::ResolutionStore;
 use pe_paper_state::{FillRow, PaperStateDb, PaperStateError};
 use pe_trader_index::{Watchlist, WatchlistEntry};
 use rust_decimal::Decimal;
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, MutexGuard, watch};
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::demotion_stat::{WalletEdgeStats, wallet_edge_stats};
 use crate::live_watchlist::LiveWatchlist;
@@ -152,7 +153,222 @@ pub enum MembershipApplyError {
     #[error("membership evidence receipts differ from the writer-locked wallet mutation")]
     EvidenceMutation,
     #[error("publish synchronized membership: {0}")]
-    Publication(String),
+    Publication(PublishError),
+    #[error("prepared structural wallet set changed before publication")]
+    StaleStructure,
+    #[error("capacity request was superseded before publication")]
+    CapacitySuperseded,
+    #[error("membership proof changed for wallet {wallet}")]
+    ProofChanged { wallet: WalletAddress },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalletPublishCause {
+    FencedAdmission,
+    IncompleteHistory,
+    UnvalidatedPosition,
+    ProofChanged,
+}
+
+impl WalletPublishCause {
+    pub fn class(self) -> crate::position_seeder::FailureClass {
+        use crate::position_seeder::FailureClass;
+        match self {
+            Self::FencedAdmission | Self::IncompleteHistory => FailureClass::WalletPersistent,
+            Self::UnvalidatedPosition | Self::ProofChanged => FailureClass::WalletTransient,
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum PublishError {
+    #[error("wallet {wallet} publication rejected: {cause:?}")]
+    Wallet {
+        wallet: WalletAddress,
+        cause: WalletPublishCause,
+    },
+    #[error("prepared structural wallet set changed")]
+    StaleStructure,
+    #[error("applied capacity changed")]
+    StaleCapacity,
+    #[error("desired capacity request was superseded")]
+    CapacitySuperseded,
+    #[error("synchronized paper append uncertain: {0}")]
+    UncertainAppend(String),
+    #[error("membership publication failed: {0}")]
+    Shared(String),
+}
+
+impl PublishError {
+    pub fn class(&self) -> crate::position_seeder::FailureClass {
+        use crate::position_seeder::FailureClass;
+        match self {
+            Self::Wallet { cause, .. } => cause.class(),
+            Self::StaleStructure
+            | Self::StaleCapacity
+            | Self::CapacitySuperseded
+            | Self::UncertainAppend(_)
+            | Self::Shared(_) => FailureClass::Shared,
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Wallet {
+                cause: WalletPublishCause::FencedAdmission,
+                ..
+            } => "publication.fenced",
+            Self::Wallet {
+                cause: WalletPublishCause::IncompleteHistory,
+                ..
+            } => "publication.incomplete_history",
+            Self::Wallet {
+                cause: WalletPublishCause::UnvalidatedPosition,
+                ..
+            } => "publication.unvalidated_position",
+            Self::Wallet {
+                cause: WalletPublishCause::ProofChanged,
+                ..
+            } => "publication.proof_changed",
+            Self::StaleStructure => "publication.stale_structure",
+            Self::StaleCapacity => "publication.stale_capacity",
+            Self::CapacitySuperseded => "publication.capacity_superseded",
+            Self::UncertainAppend(_) => "publication.uncertain_append",
+            Self::Shared(_) => "publication.shared",
+        }
+    }
+}
+
+impl MembershipApplyError {
+    pub fn class(&self) -> crate::position_seeder::FailureClass {
+        use crate::position_seeder::FailureClass;
+        match self {
+            Self::MissingCursor { .. }
+            | Self::FencedAdmission { .. }
+            | Self::IncompleteHistory { .. } => FailureClass::WalletPersistent,
+            Self::UnvalidatedPosition { .. } | Self::ProofChanged { .. } => {
+                FailureClass::WalletTransient
+            }
+            Self::Publication(error) => error.class(),
+            Self::StaleCapacity { .. }
+            | Self::StaleStructure
+            | Self::CapacitySuperseded
+            | Self::Cursor(_)
+            | Self::EvidenceMutation => FailureClass::Shared,
+        }
+    }
+
+    pub fn into_publish(self) -> PublishError {
+        match self {
+            Self::FencedAdmission { wallet } => PublishError::Wallet {
+                wallet,
+                cause: WalletPublishCause::FencedAdmission,
+            },
+            Self::IncompleteHistory { wallet } => PublishError::Wallet {
+                wallet,
+                cause: WalletPublishCause::IncompleteHistory,
+            },
+            Self::UnvalidatedPosition { wallet } => PublishError::Wallet {
+                wallet,
+                cause: WalletPublishCause::UnvalidatedPosition,
+            },
+            Self::ProofChanged { wallet } => PublishError::Wallet {
+                wallet,
+                cause: WalletPublishCause::ProofChanged,
+            },
+            Self::StaleStructure => PublishError::StaleStructure,
+            Self::StaleCapacity { .. } => PublishError::StaleCapacity,
+            Self::CapacitySuperseded => PublishError::CapacitySuperseded,
+            Self::Publication(error) => error,
+            Self::MissingCursor { .. } | Self::Cursor(_) | Self::EvidenceMutation => {
+                PublishError::Shared(self.to_string())
+            }
+        }
+    }
+
+    pub fn deferrable_wallet(&self) -> Option<(WalletAddress, &'static str)> {
+        match self {
+            Self::MissingCursor { wallet } => Some((*wallet, "seed.missing_cursor")),
+            Self::FencedAdmission { wallet } => Some((*wallet, "publication.fenced")),
+            Self::IncompleteHistory { wallet } => Some((*wallet, "publication.incomplete_history")),
+            Self::UnvalidatedPosition { wallet } => {
+                Some((*wallet, "publication.unvalidated_position"))
+            }
+            Self::ProofChanged { wallet } => Some((*wallet, "publication.proof_changed")),
+            Self::Publication(error @ PublishError::Wallet { wallet, .. }) => {
+                Some((*wallet, error.kind()))
+            }
+            Self::Publication(
+                PublishError::StaleStructure
+                | PublishError::StaleCapacity
+                | PublishError::CapacitySuperseded
+                | PublishError::UncertainAppend(_)
+                | PublishError::Shared(_),
+            )
+            | Self::StaleCapacity { .. }
+            | Self::StaleStructure
+            | Self::CapacitySuperseded
+            | Self::Cursor(_)
+            | Self::EvidenceMutation => None,
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Publication(error) => error.kind(),
+            Self::StaleCapacity { .. } => "publication.stale_capacity",
+            Self::StaleStructure => "publication.stale_structure",
+            Self::CapacitySuperseded => "publication.capacity_superseded",
+            Self::MissingCursor { .. } => "seed.missing_cursor",
+            Self::Cursor(_) => "seed.paper_state",
+            Self::FencedAdmission { .. } => "publication.fenced",
+            Self::IncompleteHistory { .. } => "publication.incomplete_history",
+            Self::UnvalidatedPosition { .. } => "publication.unvalidated_position",
+            Self::ProofChanged { .. } => "publication.proof_changed",
+            Self::EvidenceMutation => "publication.evidence_mutation",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PublicationBinding {
+    pub structural: HashSet<WalletAddress>,
+    pub digests: Vec<(WalletAddress, String)>,
+}
+
+impl PublicationBinding {
+    pub(crate) fn capture(
+        structural: HashSet<WalletAddress>,
+        proofs: &[(
+            WalletAddress,
+            crate::paper_recovery::MembershipProofManifest,
+        )],
+    ) -> Result<Self, crate::paper_recovery::MembershipProofError> {
+        let mut digests = Vec::with_capacity(proofs.len());
+        for (wallet, proof) in proofs {
+            digests.push((*wallet, proof.digest()?));
+        }
+        Ok(Self {
+            structural,
+            digests,
+        })
+    }
+
+    #[cfg(feature = "scenario")]
+    pub fn for_additions(
+        structural: HashSet<WalletAddress>,
+        state: &PaperStateDb,
+        additions: &[WalletAddress],
+    ) -> Result<Self, crate::paper_recovery::MembershipProofError> {
+        let mut proofs = Vec::with_capacity(additions.len());
+        for wallet in additions {
+            proofs.push((
+                *wallet,
+                crate::paper_recovery::MembershipProofManifest::capture(state, &[*wallet])?,
+            ));
+        }
+        Self::capture(structural, &proofs)
+    }
 }
 
 /// Durable context for one structural publication. Exact removed/added sets and capacity are
@@ -162,6 +378,7 @@ pub struct MembershipPublication {
     pub reason: MembershipReason,
     pub ranking_batch_id: Option<i64>,
     pub evidence: serde_json::Value,
+    pub binding: PublicationBinding,
 }
 
 /// Process-local checks carried to the single-owner publication boundary; never serialized.
@@ -170,6 +387,7 @@ pub struct MembershipCommit {
     pub seeds: Vec<(WalletAddress, i64)>,
     pub capacity: Option<MembershipCapacityCheck>,
     pub reentries: Vec<WalletAddress>,
+    pub binding: PublicationBinding,
 }
 
 #[derive(Debug)]
@@ -204,11 +422,47 @@ impl MembershipCommit {
             Some(MembershipCapacityCheck::Transition {
                 desired, request, ..
             }) if *desired.borrow() != *request => {
-                return Err(MembershipApplyError::Publication(
-                    "capacity request was superseded before membership commit".to_owned(),
-                ));
+                return Err(MembershipApplyError::CapacitySuperseded);
             }
             _ => {}
+        }
+        if live.structural_membership() != self.binding.structural {
+            return Err(MembershipApplyError::StaleStructure);
+        }
+        let added: HashSet<_> = change.added.iter().copied().collect();
+        let bound: HashSet<_> = self
+            .binding
+            .digests
+            .iter()
+            .map(|(wallet, _)| *wallet)
+            .collect();
+        if change.added.len() != self.binding.digests.len() || added != bound {
+            return Err(MembershipApplyError::EvidenceMutation);
+        }
+        for (wallet, digest) in &self.binding.digests {
+            let current =
+                crate::paper_recovery::MembershipProofManifest::capture(paper_state, &[*wallet]);
+            match current {
+                Ok(current)
+                    if current.digest().map_err(|error| {
+                        MembershipApplyError::Publication(PublishError::Shared(error.to_string()))
+                    })? == *digest => {}
+                Ok(_) => return Err(MembershipApplyError::ProofChanged { wallet: *wallet }),
+                Err(crate::paper_recovery::MembershipProofError::MissingHistory(_)) => {
+                    return Err(MembershipApplyError::IncompleteHistory { wallet: *wallet });
+                }
+                Err(crate::paper_recovery::MembershipProofError::MissingValidation(_)) => {
+                    return Err(MembershipApplyError::UnvalidatedPosition { wallet: *wallet });
+                }
+                Err(error) if error.class() != crate::position_seeder::FailureClass::Shared => {
+                    return Err(MembershipApplyError::ProofChanged { wallet: *wallet });
+                }
+                Err(error) => {
+                    return Err(MembershipApplyError::Publication(PublishError::Shared(
+                        error.to_string(),
+                    )));
+                }
+            }
         }
         recheck_admissions(paper_state, &change.added)?;
         let current = live.structural_membership();
@@ -642,7 +896,7 @@ pub(crate) fn ranked_membership_change_wallets(
     (dropped, admissions)
 }
 
-fn admission_seeds(
+pub(crate) fn admission_seeds(
     admissions: &[WalletAddress],
     last_trade: &HashMap<WalletAddress, i64>,
 ) -> Result<Vec<(WalletAddress, i64)>, MembershipApplyError> {
@@ -656,6 +910,149 @@ fn admission_seeds(
                 .ok_or(MembershipApplyError::MissingCursor { wallet: *wallet })
         })
         .collect()
+}
+
+pub(crate) struct PlannedMembership {
+    pub entries: Vec<WatchlistEntry>,
+    pub last_trade: HashMap<WalletAddress, i64>,
+    pub additions: Vec<WalletAddress>,
+    pub proofs: Vec<(
+        WalletAddress,
+        crate::paper_recovery::MembershipProofManifest,
+    )>,
+    pub binding: PublicationBinding,
+    pub deferrals: Vec<crate::watchlist_admission::Deferral>,
+}
+
+pub(crate) struct PlanningAbort {
+    pub kind: &'static str,
+    pub message: String,
+    pub deferrals: Vec<crate::watchlist_admission::Deferral>,
+}
+
+async fn audit_knockout_abort(
+    preparer: &AdmissionPreparer,
+    batch_id: Option<i64>,
+    deferrals: Vec<crate::watchlist_admission::Deferral>,
+    kind: &'static str,
+) {
+    if let Some(batch_id) = batch_id {
+        preparer
+            .record_deferrals(
+                crate::watchlist_admission::DeferralContext::Knockout { batch_id },
+                deferrals,
+                crate::watchlist_admission::DeferralOutcome::AbortedShared { kind },
+            )
+            .await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn plan_membership(
+    live: &LiveWatchlist,
+    preparer: &AdmissionPreparer,
+    candidates: &Watchlist,
+    last_trade: &HashMap<WalletAddress, i64>,
+    mut excluded: HashSet<WalletAddress>,
+    selection_cap: usize,
+    membership_cap: usize,
+    removed: Option<&HashSet<WalletAddress>>,
+    prepared: &mut HashSet<WalletAddress>,
+) -> Result<PlannedMembership, PlanningAbort> {
+    let mut deferrals = Vec::new();
+    for _ in 0..=candidates.entries.len() {
+        let (selected, selected_last_trade) = supabase_reader::select_membership(
+            candidates.clone(),
+            last_trade.clone(),
+            &excluded,
+            selection_cap,
+        );
+        let structural = live.structural_membership();
+        let additions = match removed {
+            Some(removed) => {
+                planned_admission_wallets(&structural, removed, &selected.entries, membership_cap)
+            }
+            None => ranked_membership_change_set(&structural, &selected.entries, membership_cap).1,
+        };
+        let new = additions
+            .iter()
+            .filter(|wallet| !prepared.contains(*wallet))
+            .copied()
+            .collect::<Vec<_>>();
+        let mut changed = false;
+        for wallet in &additions {
+            if !selected_last_trade.contains_key(wallet) {
+                changed |= excluded.insert(*wallet);
+                deferrals.push(crate::watchlist_admission::Deferral {
+                    wallet: *wallet,
+                    stage: "seed",
+                    class: crate::position_seeder::FailureClass::WalletPersistent,
+                    kind: "seed.missing_cursor",
+                    message: format!("missing last_trade_unix for {wallet}"),
+                });
+            }
+        }
+        if changed {
+            continue;
+        }
+        match preparer.prepare_ranked(&new, &selected_last_trade).await {
+            Ok(outcome) => {
+                prepared.extend(outcome.admitted);
+                for deferral in outcome.deferred {
+                    changed |= excluded.insert(deferral.wallet);
+                    deferrals.push(deferral);
+                }
+            }
+            Err(abort) => {
+                deferrals.extend(abort.deferred);
+                return Err(PlanningAbort {
+                    kind: abort.cause.kind(),
+                    message: abort.cause.to_string(),
+                    deferrals,
+                });
+            }
+        }
+        if changed {
+            continue;
+        }
+        let (proofs, proof_deferrals) = match preparer.capture_proofs(&additions) {
+            Ok(result) => result,
+            Err(abort) => {
+                deferrals.extend(abort.deferred);
+                return Err(PlanningAbort {
+                    kind: abort.cause.kind(),
+                    message: abort.cause.to_string(),
+                    deferrals,
+                });
+            }
+        };
+        for deferral in proof_deferrals {
+            changed |= excluded.insert(deferral.wallet);
+            deferrals.push(deferral);
+        }
+        if changed {
+            continue;
+        }
+        let binding =
+            PublicationBinding::capture(structural, &proofs).map_err(|error| PlanningAbort {
+                kind: "proof.digest",
+                message: error.to_string(),
+                deferrals: std::mem::take(&mut deferrals),
+            })?;
+        return Ok(PlannedMembership {
+            entries: selected.entries,
+            last_trade: selected_last_trade,
+            additions,
+            proofs,
+            binding,
+            deferrals,
+        });
+    }
+    Err(PlanningAbort {
+        kind: "planning.bound",
+        message: "wallet exclusion loop exceeded candidate bound".to_owned(),
+        deferrals,
+    })
 }
 
 /// Apply the decided evictions and backfill freed slots atomically under the writer lock.
@@ -675,7 +1072,7 @@ pub async fn apply_evictions_and_backfill(
     removed: &HashSet<WalletAddress>,
     candidates: &[WatchlistEntry],
     candidate_last_trade: &HashMap<WalletAddress, i64>,
-) -> Result<usize, MembershipApplyError> {
+) -> Result<(usize, Option<AppendReceipt>), MembershipApplyError> {
     let _guard = writer_lock.lock().await;
     let applied = applied_capacity.load();
     if applied != expected_capacity {
@@ -692,11 +1089,11 @@ pub async fn apply_evictions_and_backfill(
         .collect::<Vec<_>>();
     actual_removed.sort_unstable_by_key(|wallet| wallet.0);
     if actual_removed.is_empty() && admissions.is_empty() {
-        return Ok(live.snapshot().entries.len());
+        return Ok((live.snapshot().entries.len(), None));
     }
     let seeds = admission_seeds(&admissions, candidate_last_trade)?;
     drop(_guard);
-    publisher
+    let receipt = publisher
         .publish_membership(
             MembershipChange {
                 reason: publication.reason,
@@ -714,11 +1111,12 @@ pub async fn apply_evictions_and_backfill(
                     expected: expected_capacity,
                 }),
                 reentries: Vec::new(),
+                binding: publication.binding,
             },
         )
         .await
-        .map_err(|error| MembershipApplyError::Publication(error.to_string()))?;
-    Ok(live.snapshot().entries.len())
+        .map_err(MembershipApplyError::Publication)?;
+    Ok((live.snapshot().entries.len(), Some(receipt)))
 }
 
 /// Compute an exact ranked membership under the caller's structural-writer mutex, then release
@@ -738,7 +1136,7 @@ pub(crate) async fn apply_ranked_membership_locked(
     writer_guard: MutexGuard<'_, ()>,
     capacity: Option<MembershipCapacityCheck>,
     reentries: &[WalletAddress],
-) -> Result<(usize, Vec<WalletAddress>), MembershipApplyError> {
+) -> Result<(usize, Vec<WalletAddress>, Option<AppendReceipt>), MembershipApplyError> {
     remove_loaded_fences(live, paper_state)?;
     let current = live.structural_membership();
     let (dropped, admissions) = ranked_membership_change_set(&current, incoming, cap);
@@ -747,11 +1145,11 @@ pub(crate) async fn apply_ranked_membership_locked(
         && publication.reason != MembershipReason::CapacityChange
     {
         apply_live_reentries(live, paper_state, reentries, incoming, cap);
-        return Ok((live.snapshot().entries.len(), dropped));
+        return Ok((live.snapshot().entries.len(), dropped, None));
     }
     let seeds = admission_seeds(&admissions, incoming_last_trade)?;
     drop(writer_guard);
-    publisher
+    let receipt = publisher
         .publish_membership(
             MembershipChange {
                 reason: publication.reason,
@@ -766,12 +1164,13 @@ pub(crate) async fn apply_ranked_membership_locked(
                 seeds,
                 capacity,
                 reentries: reentries.to_vec(),
+                binding: publication.binding,
             },
         )
         .await
-        .map_err(|error| MembershipApplyError::Publication(error.to_string()))?;
+        .map_err(MembershipApplyError::Publication)?;
     let total = live.snapshot().entries.len();
-    Ok((total, dropped))
+    Ok((total, dropped, Some(receipt)))
 }
 
 /// Wholesale membership rotation for [`MembershipMode::FullRerank`]. The operation is rejected
@@ -788,7 +1187,7 @@ pub async fn apply_full_rerank_swap(
     incoming: &[WatchlistEntry],
     incoming_last_trade: &HashMap<WalletAddress, i64>,
     reentries: &[WalletAddress],
-) -> Result<(usize, Vec<WalletAddress>), MembershipApplyError> {
+) -> Result<(usize, Vec<WalletAddress>, Option<AppendReceipt>), MembershipApplyError> {
     let _guard = writer_lock.lock().await;
     let applied = applied_capacity.load();
     if applied != expected_capacity {
@@ -823,6 +1222,7 @@ pub async fn apply_full_rerank_swap(
 struct BatchSync {
     marker: Option<i64>,
     capacity_generation: u64,
+    knockout_deferred: HashSet<WalletAddress>,
 }
 
 /// Run the maintenance tick loop until the process exits.
@@ -866,6 +1266,7 @@ pub async fn run_maintenance_loop(
     let mut sync = BatchSync {
         marker: initial_batch_marker,
         capacity_generation: applied_capacity.load().generation,
+        knockout_deferred: HashSet::new(),
     };
     loop {
         tokio::time::sleep(interval).await;
@@ -993,7 +1394,16 @@ async fn maintenance_tick(
                                     MAX_ACTIVE_WATCHLIST_SIZE,
                                 );
                                 let candidates = planned_live_reentries(live, &incoming.entries);
-                                let reentries = preparer.prepare_live_reentries(&candidates).await;
+                                let reentries = match preparer
+                                    .prepare_live_reentries(&candidates)
+                                    .await
+                                {
+                                    Ok(reentries) => reentries,
+                                    Err(error) => {
+                                        error!(batch_id, kind = error.kind(), %error, "knockout: shared live reentry failure; retaining batch marker");
+                                        return;
+                                    }
+                                };
                                 let _writer = writer_lock.lock().await;
                                 if applied_capacity.load() == capacity_epoch {
                                     apply_live_reentries(
@@ -1006,6 +1416,7 @@ async fn maintenance_tick(
                                     if sync.marker.is_some() {
                                         evicted.clear();
                                     }
+                                    sync.knockout_deferred.clear();
                                     sync.marker = Some(batch_id);
                                 } else {
                                     warn!(
@@ -1044,7 +1455,7 @@ async fn maintenance_tick(
                     .await
                     {
                         Ok((incoming, incoming_last_trade)) => 'replacement: {
-                            let fenced = match paper_state.wallet_fences() {
+                            let fenced: HashSet<WalletAddress> = match paper_state.wallet_fences() {
                                 Ok(records) => {
                                     records.into_iter().map(|record| record.wallet).collect()
                                 }
@@ -1053,85 +1464,170 @@ async fn maintenance_tick(
                                     break 'replacement;
                                 }
                             };
-                            let (incoming, incoming_last_trade) =
-                                supabase_reader::select_membership(
-                                    incoming,
-                                    incoming_last_trade,
-                                    &fenced,
+                            let mut excluded = fenced;
+                            let mut prepared = HashSet::new();
+                            let mut recaptured = HashSet::new();
+                            let mut deferrals = Vec::new();
+                            let (incoming, additions, live_total, dropped, paper_receipt) = loop {
+                                let plan = match plan_membership(
+                                    live,
+                                    preparer,
+                                    &incoming,
+                                    &incoming_last_trade,
+                                    excluded.clone(),
                                     cap,
-                                );
-                            let (_, additions) = ranked_membership_change_set(
-                                &live.structural_membership(),
-                                &incoming.entries,
-                                cap,
-                            );
-                            if let Err(error) = preparer.prepare(&additions).await {
-                                warn!(%error, batch_id,
-                                    "full_rerank: admission preparation failed; keeping membership and batch marker for retry");
-                                break 'replacement;
-                            }
-                            let reentry_candidates =
-                                planned_live_reentries(live, &incoming.entries);
-                            let reentries =
-                                preparer.prepare_live_reentries(&reentry_candidates).await;
-                            let ranking_receipt = match preparer
-                                .record_ranking_membership(Some(batch_id), incoming.entries.clone())
+                                    cap,
+                                    None,
+                                    &mut prepared,
+                                )
                                 .await
-                            {
-                                Ok(receipt) => receipt,
-                                Err(error) => {
-                                    warn!(%error,
-                                        "full_rerank: ranking evidence recording failed; keeping membership and batch marker for retry");
-                                    break 'replacement;
+                                {
+                                    Ok(plan) => plan,
+                                    Err(abort) => {
+                                        deferrals.extend(abort.deferrals);
+                                        error!(batch_id, kind = abort.kind, cause = %abort.message, "full_rerank: shared admission failure");
+                                        preparer.record_deferrals(crate::watchlist_admission::DeferralContext::FullRerank { batch_id }, deferrals, crate::watchlist_admission::DeferralOutcome::AbortedShared { kind: abort.kind }).await;
+                                        break 'replacement;
+                                    }
+                                };
+                                for deferral in &plan.deferrals {
+                                    excluded.insert(deferral.wallet);
                                 }
-                            };
-                            let admission_receipts = match preparer
-                                .record_admission_proofs(&additions)
+                                deferrals.extend(plan.deferrals);
+                                let reentry_candidates =
+                                    planned_live_reentries(live, &plan.entries);
+                                let reentries = match preparer
+                                    .prepare_live_reentries(&reentry_candidates)
+                                    .await
+                                {
+                                    Ok(reentries) => reentries,
+                                    Err(error) => {
+                                        error!(batch_id, kind = error.kind(), %error, "full_rerank: shared live reentry failure");
+                                        preparer.record_deferrals(crate::watchlist_admission::DeferralContext::FullRerank { batch_id }, deferrals, crate::watchlist_admission::DeferralOutcome::AbortedShared { kind: error.kind() }).await;
+                                        break 'replacement;
+                                    }
+                                };
+                                let ranking_receipt = match preparer
+                                    .record_ranking_membership(Some(batch_id), plan.entries.clone())
+                                    .await
+                                {
+                                    Ok(receipt) => receipt,
+                                    Err(error) => {
+                                        error!(batch_id, kind = error.kind(), %error, "full_rerank: ranking artifact failed");
+                                        preparer.record_deferrals(crate::watchlist_admission::DeferralContext::FullRerank { batch_id }, deferrals, crate::watchlist_admission::DeferralOutcome::AbortedShared { kind: error.kind() }).await;
+                                        break 'replacement;
+                                    }
+                                };
+                                let admission_receipts = match preparer
+                                    .record_admission_proofs(&plan.proofs)
+                                    .await
+                                {
+                                    Ok(receipts) => receipts,
+                                    Err(error) => {
+                                        error!(batch_id, kind = error.kind(), %error, "full_rerank: admission artifact failed");
+                                        preparer.record_deferrals(crate::watchlist_admission::DeferralContext::FullRerank { batch_id }, deferrals, crate::watchlist_admission::DeferralOutcome::AbortedShared { kind: error.kind() }).await;
+                                        break 'replacement;
+                                    }
+                                };
+                                let evidence = match SealedMembershipEvidence::full_rerank(
+                                    ranking_receipt,
+                                    admission_receipts,
+                                ) {
+                                    Ok(evidence) => evidence,
+                                    Err(error) => {
+                                        error!(batch_id, %error, "full_rerank: membership evidence failed");
+                                        preparer.record_deferrals(crate::watchlist_admission::DeferralContext::FullRerank { batch_id }, deferrals, crate::watchlist_admission::DeferralOutcome::AbortedShared { kind: "evidence.encoding" }).await;
+                                        break 'replacement;
+                                    }
+                                };
+                                match apply_full_rerank_swap(
+                                    live,
+                                    paper_state,
+                                    writer_lock,
+                                    preparer,
+                                    MembershipPublication {
+                                        reason: MembershipReason::FullRerank,
+                                        ranking_batch_id: Some(batch_id),
+                                        evidence,
+                                        binding: plan.binding,
+                                    },
+                                    applied_capacity,
+                                    capacity_epoch,
+                                    &plan.entries,
+                                    &plan.last_trade,
+                                    &reentries,
+                                )
                                 .await
-                            {
-                                Ok(receipts) => receipts,
-                                Err(error) => {
-                                    warn!(%error,
-                                        "full_rerank: admission evidence recording failed; keeping membership and batch marker for retry");
-                                    break 'replacement;
+                                {
+                                    Ok((live_total, dropped, receipt)) => {
+                                        let mut selected = incoming.clone();
+                                        selected.entries = plan.entries;
+                                        break (
+                                            selected,
+                                            plan.additions,
+                                            live_total,
+                                            dropped,
+                                            receipt,
+                                        );
+                                    }
+                                    Err(MembershipApplyError::Publication(
+                                        PublishError::Wallet {
+                                            wallet,
+                                            cause: WalletPublishCause::ProofChanged,
+                                        },
+                                    )) if recaptured.insert(wallet) => continue,
+                                    Err(error)
+                                        if error.class()
+                                            != crate::position_seeder::FailureClass::Shared =>
+                                    {
+                                        if let Some((wallet, kind)) = error.deferrable_wallet() {
+                                            excluded.insert(wallet);
+                                            deferrals.push(crate::watchlist_admission::Deferral {
+                                                wallet,
+                                                stage: "publication",
+                                                class: error.class(),
+                                                kind,
+                                                message: error.to_string(),
+                                            });
+                                            continue;
+                                        }
+                                        error!(batch_id, %error, "full_rerank: unlocated wallet failure");
+                                        break 'replacement;
+                                    }
+                                    Err(MembershipApplyError::Publication(
+                                        PublishError::UncertainAppend(message),
+                                    )) => {
+                                        error!(batch_id, %message, "full_rerank: paper append outcome uncertain");
+                                        break 'replacement;
+                                    }
+                                    Err(error) => {
+                                        error!(batch_id, kind = error.kind(), %error, "full_rerank: shared publication failure");
+                                        preparer.record_deferrals(crate::watchlist_admission::DeferralContext::FullRerank { batch_id }, deferrals, crate::watchlist_admission::DeferralOutcome::AbortedShared { kind: error.kind() }).await;
+                                        break 'replacement;
+                                    }
                                 }
                             };
-                            let evidence = match SealedMembershipEvidence::full_rerank(
-                                ranking_receipt,
-                                admission_receipts,
-                            ) {
-                                Ok(evidence) => evidence,
-                                Err(error) => {
-                                    warn!(%error,
-                                        "full_rerank: membership evidence encoding failed; keeping membership and batch marker for retry");
-                                    break 'replacement;
-                                }
-                            };
-                            let (live_total, dropped) = match apply_full_rerank_swap(
-                                live,
-                                paper_state,
-                                writer_lock,
-                                preparer,
-                                MembershipPublication {
-                                    reason: MembershipReason::FullRerank,
-                                    ranking_batch_id: Some(batch_id),
-                                    evidence,
+                            let outcome = paper_receipt.map_or(
+                                crate::watchlist_admission::DeferralOutcome::NoChange,
+                                |receipt| crate::watchlist_admission::DeferralOutcome::Published {
+                                    paper_seq: receipt.sequence.0,
                                 },
-                                applied_capacity,
-                                capacity_epoch,
-                                &incoming.entries,
-                                &incoming_last_trade,
-                                &reentries,
-                            )
-                            .await
-                            {
-                                Ok(applied) => applied,
-                                Err(error) => {
-                                    warn!(%error,
-                                        "full_rerank: structural apply failed; keeping membership and batch marker for retry");
-                                    break 'replacement;
-                                }
-                            };
+                            );
+                            info!(
+                                batch_id,
+                                admitted = additions.len(),
+                                deferred = deferrals.len(),
+                                "full_rerank: admission attempt completed"
+                            );
+                            preparer
+                                .record_deferrals(
+                                    crate::watchlist_admission::DeferralContext::FullRerank {
+                                        batch_id,
+                                    },
+                                    deferrals,
+                                    outcome,
+                                )
+                                .await;
                             let audit_stats = load_edge_stats(paper_state, cfg, now_unix);
                             for w in &dropped {
                                 let s = audit_stats
@@ -1241,14 +1737,27 @@ async fn maintenance_tick(
     // 6. Fetch bench candidates for freed slots, excluding (live ∪ evicted), then atomic replace.
     let survivors = structural_wallets.len().saturating_sub(evictions.len());
     let freed = cap.saturating_sub(survivors);
+    let mut backfill_excluded: HashSet<WalletAddress> = structural_wallets
+        .iter()
+        .copied()
+        .chain(next_evicted.iter().copied())
+        .chain(sync.knockout_deferred.iter().copied())
+        .collect();
+    match paper_state.wallet_fences() {
+        Ok(records) => backfill_excluded.extend(records.into_iter().map(|record| record.wallet)),
+        Err(error) => {
+            warn!(%error, "maintenance: fence read failed; keeping membership for retry");
+            return;
+        }
+    }
+    let mut empty_candidates = (*live.snapshot()).clone();
+    empty_candidates.entries.clear();
+    empty_candidates.active_count = 0;
+    empty_candidates.incubator_count = 0;
     let (candidates, candidate_last_trade) = if let Some(batch_id) = sync.marker
         && freed > 0
     {
-        let exclude: Vec<WalletAddress> = structural_wallets
-            .iter()
-            .copied()
-            .chain(next_evicted.iter().copied())
-            .collect();
+        let exclude: Vec<WalletAddress> = backfill_excluded.iter().copied().collect();
         match supabase_reader::fetch_candidates(
             client,
             base_url,
@@ -1264,16 +1773,6 @@ async fn maintenance_tick(
             // The candidate last-trade side-map (#357) seeds each admitted wallet's poll cursor
             // (its inactivity clock) from the wallet's real last trade in the apply step.
             Ok((w, candidate_last_trade)) => {
-                let mut excluded: HashSet<_> = exclude.into_iter().collect();
-                match paper_state.wallet_fences() {
-                    Ok(records) => excluded.extend(records.into_iter().map(|record| record.wallet)),
-                    Err(error) => {
-                        warn!(%error, "maintenance: fence read failed; keeping membership for retry");
-                        return;
-                    }
-                }
-                let (w, candidate_last_trade) =
-                    supabase_reader::select_membership(w, candidate_last_trade, &excluded, freed);
                 if w.entries.is_empty() {
                     // Expected steady state after #518: the bench is survivor-filtered, and
                     // every survivor is already live, so there is normally nobody left to
@@ -1287,33 +1786,24 @@ async fn maintenance_tick(
                          bench rows outside the live set, or the bench predates last_trade_unix)"
                     );
                 }
-                (w.entries, candidate_last_trade)
+                (w, candidate_last_trade)
             }
             Err(e) => {
                 warn!(error = %e, "maintenance: candidate fetch failed; evicting without backfill");
-                (Vec::new(), HashMap::new())
+                (empty_candidates.clone(), HashMap::new())
             }
         }
     } else {
-        (Vec::new(), HashMap::new())
+        (empty_candidates.clone(), HashMap::new())
     };
 
-    // The freed slots are filled from `candidates` by `planned_admissions`, which is a pure
-    // function of the same inputs the writer-locked apply re-reads under the unchanged capacity
-    // epoch. Prepare exactly those wallets first (#542); on failure apply the decided evictions
-    // with no backfill and let the next tick retry the freed slots.
+    // Keep the complete fetched bench so a deferred leading wallet can be replaced by the next
+    // survivor. A shared backfill failure preserves the independently decided evictions.
     let removed: HashSet<WalletAddress> = next_evicted.iter().copied().collect();
-    let planned = planned_admission_wallets(&structural_wallets, &removed, &candidates, cap);
-    let (candidates, candidate_last_trade) = match preparer.prepare(&planned).await {
-        Ok(()) => (candidates, candidate_last_trade),
-        Err(error) => {
-            warn!(%error,
-                "maintenance: admission preparation failed; evicting without backfill");
-            (Vec::new(), HashMap::new())
-        }
-    };
-    let published_admissions =
-        planned_admission_wallets(&structural_wallets, &removed, &candidates, cap);
+    let mut prepared = HashSet::new();
+    let mut recaptured = HashSet::new();
+    let mut deferrals = Vec::new();
+    let mut backfill_shared = false;
 
     let Some(knockout_inputs) = evictions
         .iter()
@@ -1335,81 +1825,172 @@ async fn maintenance_tick(
             return;
         }
     };
-    let ranking_receipt = if candidates.is_empty() {
-        None
-    } else {
-        match preparer
-            .record_ranking_membership(sync.marker, candidates.clone())
-            .await
+    let empty_last_trade = HashMap::new();
+    let (live_total, paper_receipt, admitted) = loop {
+        let source = if backfill_shared {
+            &empty_candidates
+        } else {
+            &candidates
+        };
+        let source_last_trade = if backfill_shared {
+            &empty_last_trade
+        } else {
+            &candidate_last_trade
+        };
+        let plan = match plan_membership(
+            live,
+            preparer,
+            source,
+            source_last_trade,
+            backfill_excluded.clone(),
+            freed,
+            cap,
+            Some(&removed),
+            &mut prepared,
+        )
+        .await
         {
-            Ok(receipt) => Some(receipt),
+            Ok(plan) => plan,
+            Err(abort) if !backfill_shared => {
+                sync.knockout_deferred
+                    .extend(abort.deferrals.iter().map(|deferral| deferral.wallet));
+                deferrals.extend(abort.deferrals);
+                error!(kind = abort.kind, cause = %abort.message, "maintenance: shared backfill failure; publishing evictions only");
+                backfill_shared = true;
+                continue;
+            }
+            Err(abort) => {
+                error!(kind = abort.kind, cause = %abort.message, "maintenance: eviction-only planning failed");
+                sync.knockout_deferred
+                    .extend(abort.deferrals.iter().map(|deferral| deferral.wallet));
+                deferrals.extend(abort.deferrals);
+                audit_knockout_abort(preparer, sync.marker, deferrals, abort.kind).await;
+                return;
+            }
+        };
+        for deferral in &plan.deferrals {
+            backfill_excluded.insert(deferral.wallet);
+            sync.knockout_deferred.insert(deferral.wallet);
+        }
+        deferrals.extend(plan.deferrals);
+        let ranking_receipt = if plan.entries.is_empty() {
+            None
+        } else {
+            match preparer
+                .record_ranking_membership(sync.marker, plan.entries.clone())
+                .await
+            {
+                Ok(receipt) => Some(receipt),
+                Err(error) => {
+                    warn!(%error, "maintenance: knockout ranking artifact failed");
+                    audit_knockout_abort(preparer, sync.marker, deferrals, error.kind()).await;
+                    return;
+                }
+            }
+        };
+        let admission_receipts = match preparer.record_admission_proofs(&plan.proofs).await {
+            Ok(receipts) => receipts,
             Err(error) => {
-                warn!(%error,
-                    "maintenance: knockout ranking evidence recording failed; keeping membership and eviction memory");
+                warn!(%error, "maintenance: knockout admission artifact failed");
+                audit_knockout_abort(preparer, sync.marker, deferrals, error.kind()).await;
+                return;
+            }
+        };
+        let evidence = match SealedMembershipEvidence::knockout_backfill(
+            knockout_evictions.clone(),
+            ranking_receipt,
+            admission_receipts,
+        ) {
+            Ok(evidence) => evidence,
+            Err(error) => {
+                warn!(%error, "maintenance: knockout evidence encoding failed");
+                audit_knockout_abort(preparer, sync.marker, deferrals, "evidence.encoding").await;
+                return;
+            }
+        };
+        let reason = evictions
+            .iter()
+            .map(|eviction| eviction.reason)
+            .find(|reason| *reason == KnockoutReason::Underperformance)
+            .or_else(|| {
+                evictions
+                    .iter()
+                    .map(|eviction| eviction.reason)
+                    .find(|reason| *reason == KnockoutReason::InactivityHardCap)
+            })
+            .or_else(|| evictions.first().map(|eviction| eviction.reason))
+            .map_or(MembershipReason::KnockoutInactivity, Into::into);
+        match apply_evictions_and_backfill(
+            live,
+            paper_state,
+            writer_lock,
+            preparer,
+            MembershipPublication {
+                reason,
+                ranking_batch_id: sync.marker,
+                evidence,
+                binding: plan.binding,
+            },
+            applied_capacity,
+            capacity_epoch,
+            &removed,
+            &plan.entries,
+            &plan.last_trade,
+        )
+        .await
+        {
+            Ok((total, receipt)) => break (total, receipt, plan.additions.len()),
+            Err(MembershipApplyError::Publication(PublishError::Wallet {
+                wallet,
+                cause: WalletPublishCause::ProofChanged,
+            })) if recaptured.insert(wallet) => continue,
+            Err(error) if error.class() != crate::position_seeder::FailureClass::Shared => {
+                if let Some((wallet, kind)) = error.deferrable_wallet() {
+                    backfill_excluded.insert(wallet);
+                    sync.knockout_deferred.insert(wallet);
+                    deferrals.push(crate::watchlist_admission::Deferral {
+                        wallet,
+                        stage: "publication",
+                        class: error.class(),
+                        kind,
+                        message: error.to_string(),
+                    });
+                    continue;
+                }
+                warn!(%error, "maintenance: unlocated wallet publication failure");
+                audit_knockout_abort(preparer, sync.marker, deferrals, error.kind()).await;
+                return;
+            }
+            Err(MembershipApplyError::Publication(PublishError::UncertainAppend(message))) => {
+                error!(%message, "maintenance: paper append outcome uncertain");
+                return;
+            }
+            Err(error) => {
+                error!(kind = error.kind(), %error, "maintenance: shared publication failure");
+                audit_knockout_abort(preparer, sync.marker, deferrals, error.kind()).await;
                 return;
             }
         }
     };
-    let admission_receipts = match preparer
-        .record_admission_proofs(&published_admissions)
-        .await
-    {
-        Ok(receipts) => receipts,
-        Err(error) => {
-            warn!(%error,
-                "maintenance: knockout admission evidence recording failed; keeping membership and eviction memory");
-            return;
-        }
-    };
-    let evidence = match SealedMembershipEvidence::knockout_backfill(
-        knockout_evictions,
-        ranking_receipt,
-        admission_receipts,
-    ) {
-        Ok(evidence) => evidence,
-        Err(error) => {
-            warn!(%error,
-                "maintenance: knockout evidence encoding failed; keeping membership and eviction memory");
-            return;
-        }
-    };
-
-    let live_total = match apply_evictions_and_backfill(
-        live,
-        paper_state,
-        writer_lock,
-        preparer,
-        MembershipPublication {
-            reason: evictions
-                .iter()
-                .map(|eviction| eviction.reason)
-                .find(|reason| *reason == KnockoutReason::Underperformance)
-                .or_else(|| {
-                    evictions
-                        .iter()
-                        .map(|eviction| eviction.reason)
-                        .find(|reason| *reason == KnockoutReason::InactivityHardCap)
-                })
-                .or_else(|| evictions.first().map(|eviction| eviction.reason))
-                .map_or(MembershipReason::KnockoutInactivity, Into::into),
-            ranking_batch_id: sync.marker,
-            evidence,
+    let outcome = paper_receipt.map_or(
+        crate::watchlist_admission::DeferralOutcome::NoChange,
+        |receipt| crate::watchlist_admission::DeferralOutcome::Published {
+            paper_seq: receipt.sequence.0,
         },
-        applied_capacity,
-        capacity_epoch,
-        &removed,
-        &candidates,
-        &candidate_last_trade,
-    )
-    .await
-    {
-        Ok(total) => total,
-        Err(error) => {
-            warn!(%error,
-                "maintenance: structural apply failed; keeping membership and eviction memory");
-            return;
+    );
+    info!(batch_id = ?sync.marker, admitted, deferred = deferrals.len(), "maintenance: knockout admission attempt completed");
+    if let Some(batch_id) = sync.marker {
+        for deferral in &deferrals {
+            sync.knockout_deferred.insert(deferral.wallet);
         }
-    };
+        preparer
+            .record_deferrals(
+                crate::watchlist_admission::DeferralContext::Knockout { batch_id },
+                deferrals,
+                outcome,
+            )
+            .await;
+    }
     *evicted = next_evicted;
 
     // 7. Best-effort lifecycle audit rows for each eviction this tick.
@@ -1591,7 +2172,7 @@ mod tests {
                 sequence: pe_core_types::EventSeq(1),
                 this_hash: blake3::hash(b"membership-round-trip"),
             })
-            .map_err(|error| error.to_string());
+            .map_err(|error| PublishError::Shared(error.to_string()));
             acknowledged.send(result).unwrap();
         });
         AdmissionPreparer::new(control_tx, paper_state)
@@ -1877,23 +2458,53 @@ mod tests {
     #[allow(clippy::panic)]
     mod tick {
         use std::sync::Mutex as StdMutex;
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 
         use axum::extract::{Query, State};
         use axum::http::StatusCode;
         use axum::{Json, Router, routing::get};
         use pe_core_types::{BasisPoints, ReconstructionQuality, SourceTimestamp};
+        use pe_source_core::SourceError;
+        use pe_source_polymarket_public::{GAMMA_BATCH_SIZE, PageFetcher, ReconciliationFetcher};
         use pe_trader_index::WatchlistTier;
         use tempfile::TempDir;
         use tokio::sync::mpsc;
+        use tracing_subscriber::fmt::MakeWriter;
 
         use super::*;
         use crate::activity_ingest::{ActivityIngest, ReconciliationTrigger, SourceLogHandle};
+        use crate::asset_identity::AssetIdentityResolver;
         use crate::health::new_shared_health_with_ws;
         use crate::orchestrator_control::OrchestratorControl;
+        use crate::position_seeder::CausalPositionValidator;
         use crate::source_event_sink::SourceEventSink;
 
         const CAP: usize = 3;
+
+        #[derive(Clone)]
+        struct CapturedLogs(Arc<StdMutex<Vec<u8>>>);
+
+        impl std::io::Write for CapturedLogs {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl<'a> MakeWriter<'a> for CapturedLogs {
+            type Writer = Self;
+
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
 
         fn wallet(byte: u8) -> WalletAddress {
             WalletAddress([byte; 20])
@@ -1943,27 +2554,33 @@ mod tests {
         /// query the pinned read sends; candidate queries also enforce exclusions and freshness.
         #[derive(Clone)]
         struct Fake {
-            latest_batch: Option<i64>,
+            latest_batch: Arc<AtomicI64>,
             ranking_entries: Vec<serde_json::Value>,
             latest_ranking: Vec<serde_json::Value>,
             history_ok: bool,
+            history_missing: HashSet<WalletAddress>,
             failure: Option<&'static str>,
             entries_fail: bool,
             activity_hits: Arc<AtomicUsize>,
             position_hits: Arc<AtomicUsize>,
+            ranking_hits: Arc<AtomicUsize>,
+            pinned_ranking_hits: Arc<AtomicUsize>,
         }
 
         impl Fake {
             fn new(latest_batch: Option<i64>) -> Self {
                 Self {
-                    latest_batch,
+                    latest_batch: Arc::new(AtomicI64::new(latest_batch.unwrap_or(-1))),
                     ranking_entries: Vec::new(),
                     latest_ranking: Vec::new(),
                     history_ok: true,
+                    history_missing: HashSet::new(),
                     failure: None,
                     entries_fail: false,
                     activity_hits: Arc::new(AtomicUsize::new(0)),
                     position_hits: Arc::new(AtomicUsize::new(0)),
+                    ranking_hits: Arc::new(AtomicUsize::new(0)),
+                    pinned_ranking_hits: Arc::new(AtomicUsize::new(0)),
                 }
             }
 
@@ -2015,15 +2632,19 @@ mod tests {
                     selected
                 }
                 async fn batches(State(fake): State<Fake>) -> Json<serde_json::Value> {
-                    Json(match fake.latest_batch {
-                        Some(id) => serde_json::json!([{ "batch_id": id }]),
-                        None => serde_json::json!([]),
+                    Json(match fake.latest_batch.load(Ordering::SeqCst) {
+                        -1 => serde_json::json!([]),
+                        id => serde_json::json!([{ "batch_id": id }]),
                     })
                 }
                 async fn entries(
                     State(fake): State<Fake>,
                     Query(q): Query<HashMap<String, String>>,
                 ) -> Result<Json<Vec<serde_json::Value>>, StatusCode> {
+                    fake.ranking_hits.fetch_add(1, Ordering::SeqCst);
+                    if !q.contains_key("last_trade_unix") {
+                        fake.pinned_ranking_hits.fetch_add(1, Ordering::SeqCst);
+                    }
                     if fake.entries_fail {
                         return Err(StatusCode::INTERNAL_SERVER_ERROR);
                     }
@@ -2085,12 +2706,15 @@ mod tests {
             live: LiveWatchlist,
             paper_state: Arc<PaperStateDb>,
             preparer: crate::watchlist_admission::AdmissionPreparer,
+            control_tx: mpsc::Sender<OrchestratorControl>,
+            source_handle: SourceLogHandle,
             applied: AppliedWatchlistCapacity,
             writer_lock: Mutex<()>,
             client: reqwest::Client,
             base_url: String,
             controls: Arc<StdMutex<ControlLog>>,
             membership_publications: Arc<AtomicUsize>,
+            published_batches: Arc<StdMutex<Vec<Option<i64>>>>,
             _source_task: tokio::task::JoinHandle<()>,
             _source_triggers: mpsc::Receiver<ReconciliationTrigger>,
             _temp: TempDir,
@@ -2107,7 +2731,10 @@ mod tests {
                 .chain(fake.latest_ranking.iter())
                 .filter_map(|row| row.get("wallet_hex").and_then(serde_json::Value::as_str))
                 .filter_map(|hex| WalletAddress::from_hex(hex).ok())
-                .filter(|wallet| fake.history_ok || initial.contains(wallet))
+                .filter(|wallet| {
+                    (fake.history_ok || initial.contains(wallet))
+                        && !fake.history_missing.contains(wallet)
+                })
                 .collect();
             let failure = fake.failure;
             let base_url = fake.serve().await;
@@ -2140,16 +2767,27 @@ mod tests {
             let (control_live, control_log) = (live.clone(), Arc::clone(&controls));
             let membership_publications = Arc::new(AtomicUsize::new(0));
             let publication_count = Arc::clone(&membership_publications);
+            let published_batches = Arc::new(StdMutex::new(Vec::new()));
+            let publication_batches = Arc::clone(&published_batches);
             let fake_paper_state = Arc::clone(&paper_state);
             let verifier_source_log = source_log.clone();
             let state_path = temp.path().join("paper.db");
             std::mem::drop(tokio::spawn(async move {
+                let mut engine = crate::bucket_commit::BucketCommitEngine::load(
+                    Arc::clone(&fake_paper_state),
+                    pe_position_ledger::PositionLedger::new(),
+                )
+                .unwrap();
                 while let Some(message) = control_rx.recv().await {
                     match message {
                         OrchestratorControl::PrepareAdmissions {
                             wallets,
                             acknowledged,
                         } => {
+                            if failure == Some("shared_prepare") {
+                                drop(acknowledged);
+                                continue;
+                            }
                             // Mirror the real orchestrator's successful acceptance: a
                             // prepared wallet gains a current causal position validation,
                             // or the publication recheck would (correctly) reject it. The
@@ -2180,9 +2818,26 @@ mod tests {
                                 })
                                 .collect();
                             fake_paper_state.install_anchors(&installs).unwrap();
-                            if failure == Some("artifact") {
+                            if failure == Some("artifact")
+                                || (failure == Some("proof_mixed")
+                                    && control_log
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .is_empty())
+                            {
                                 let conn = rusqlite::Connection::open(&state_path).unwrap();
                                 conn.execute("DELETE FROM position_validations", [])
+                                    .unwrap();
+                            }
+                            if failure == Some("proof_mixed")
+                                && !control_log
+                                    .lock()
+                                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                    .is_empty()
+                            {
+                                rusqlite::Connection::open(&state_path)
+                                    .unwrap()
+                                    .execute("UPDATE wallet_history_status_v2 SET proof_json = CAST(X'FF' AS TEXT) WHERE wallet_hex = ?1", [wallets[0].to_string()])
                                     .unwrap();
                             }
                             control_log
@@ -2191,12 +2846,42 @@ mod tests {
                                 .push((wallets.into_iter().collect(), members(&control_live)));
                             acknowledged.send(()).unwrap();
                         }
-                        OrchestratorControl::CommitActivityBucket { .. } => {
-                            panic!("maintenance sent an activity bucket")
+                        OrchestratorControl::CommitActivityBucket {
+                            aggregates,
+                            context,
+                            committed,
+                        } => {
+                            let result = engine
+                                .commit(
+                                    aggregates,
+                                    context.as_ref(),
+                                    crate::bucket_commit::FrozenDecisionBasis {
+                                        win_rate_p: pe_core_types::Probability::ZERO,
+                                        bankroll: Decimal::ZERO,
+                                    },
+                                )
+                                .map_err(|error| error.to_string());
+                            committed.send(result).unwrap();
                         }
-                        OrchestratorControl::InstallAnchors { .. }
-                        | OrchestratorControl::CaptureAdmissionLedger { .. } => {
-                            panic!("legacy admission test sent a causal-bracket command")
+                        OrchestratorControl::InstallAnchors {
+                            installs,
+                            acknowledged,
+                        } => {
+                            acknowledged
+                                .send(engine.install_anchors(&installs))
+                                .unwrap();
+                        }
+                        OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
+                            captured
+                                .send(
+                                    crate::position_seeder::ledger_capture(
+                                        engine.ledger(),
+                                        &fake_paper_state,
+                                        wallet,
+                                    )
+                                    .map_err(|error| error.to_string()),
+                                )
+                                .unwrap();
                         }
                         OrchestratorControl::PublishMembership {
                             change,
@@ -2204,14 +2889,68 @@ mod tests {
                             checks,
                             acknowledged,
                         } => {
-                            publication_count.fetch_add(1, Ordering::SeqCst);
+                            let publication_attempt =
+                                publication_count.fetch_add(1, Ordering::SeqCst);
+                            publication_batches
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .push(change.ranking_batch_id);
+                            if failure == Some("locked_fence")
+                                && publication_attempt == 0
+                                && let Some(wallet) = change.added.first()
+                            {
+                                rusqlite::Connection::open(&state_path)
+                                    .unwrap()
+                                    .execute(
+                                        "INSERT INTO wallet_fences (wallet_hex, source_trade_id, cause, proof_json, fenced_at_unix) VALUES (?1, 'test', 'invalid_mapping', '{}', 1)",
+                                        [wallet.to_string()],
+                                    )
+                                    .unwrap();
+                            }
+                            if failure == Some("locked_history")
+                                && publication_attempt == 0
+                                && let Some(wallet) = change.added.first()
+                            {
+                                rusqlite::Connection::open(&state_path)
+                                    .unwrap()
+                                    .execute(
+                                        "UPDATE wallet_history_status_v2 SET complete = 0 WHERE wallet_hex = ?1",
+                                        [wallet.to_string()],
+                                    )
+                                    .unwrap();
+                            }
+                            if failure == Some("proof_twice")
+                                && let Some(wallet) = change.added.first()
+                            {
+                                rusqlite::Connection::open(&state_path).unwrap()
+                                    .execute("UPDATE position_validations SET recorded_at_unix = recorded_at_unix + 1 WHERE wallet_hex = ?1", [wallet.to_string()]).unwrap();
+                            }
+                            if failure == Some("locked_knockout") && publication_attempt == 0 {
+                                let incumbent =
+                                    *control_live.structural_membership().iter().next().unwrap();
+                                control_live.commit_structural_change(&[incumbent], &[]);
+                                control_live.replace(
+                                    &HashSet::from([incumbent]),
+                                    &[],
+                                    change.capacity,
+                                );
+                            }
                             if let Err(error) = checks.recheck_and_seed(
                                 &fake_paper_state,
                                 &control_live,
                                 &change,
                                 &replacements,
                             ) {
-                                acknowledged.send(Err(error.to_string())).unwrap();
+                                acknowledged.send(Err(error.into_publish())).unwrap();
+                                continue;
+                            }
+
+                            if failure == Some("uncertain_append") {
+                                acknowledged
+                                    .send(Err(PublishError::UncertainAppend(
+                                        "injected synchronized append failure".to_owned(),
+                                    )))
+                                    .unwrap();
                                 continue;
                             }
 
@@ -2219,9 +2958,9 @@ mod tests {
                                 && change.reason == MembershipReason::FullRerank
                             {
                                 acknowledged
-                                    .send(
-                                        Err("injected replacement publication failure".to_owned()),
-                                    )
+                                    .send(Err(PublishError::Shared(
+                                        "injected replacement publication failure".to_owned(),
+                                    )))
                                     .unwrap();
                                 continue;
                             }
@@ -2232,7 +2971,9 @@ mod tests {
                                     &control_live.structural_membership(),
                                 )
                             {
-                                acknowledged.send(Err(error.to_string())).unwrap();
+                                acknowledged
+                                    .send(Err(PublishError::Shared(error.to_string())))
+                                    .unwrap();
                                 continue;
                             }
                             let removed = change.removed.iter().copied().collect::<HashSet<_>>();
@@ -2268,20 +3009,23 @@ mod tests {
                 }
             }));
             let preparer = crate::watchlist_admission::AdmissionPreparer::new(
-                control_tx,
+                control_tx.clone(),
                 Arc::clone(&paper_state),
             )
-            .with_source_log(source_handle);
+            .with_source_log(source_handle.clone());
             Harness {
                 live,
                 paper_state,
                 preparer,
+                control_tx,
+                source_handle,
                 applied: AppliedWatchlistCapacity::new(CAP),
                 writer_lock: Mutex::new(()),
                 client: reqwest::Client::new(),
                 base_url,
                 controls,
                 membership_publications,
+                published_batches,
                 _source_task: source_task,
                 _source_triggers: source_triggers,
                 _temp: temp,
@@ -2289,6 +3033,53 @@ mod tests {
         }
 
         impl Harness {
+            async fn tick_with_preparer(
+                &self,
+                preparer: &crate::watchlist_admission::AdmissionPreparer,
+                mode: MembershipMode,
+                evicted: &mut HashSet<WalletAddress>,
+                marker: &mut Option<i64>,
+            ) {
+                let mut sync = BatchSync {
+                    marker: *marker,
+                    capacity_generation: self.applied.load().generation,
+                    knockout_deferred: HashSet::new(),
+                };
+                self.tick_synced_with_preparer(preparer, mode, evicted, &mut sync)
+                    .await;
+                *marker = sync.marker;
+            }
+
+            async fn tick_synced_with_preparer(
+                &self,
+                preparer: &crate::watchlist_admission::AdmissionPreparer,
+                mode: MembershipMode,
+                evicted: &mut HashSet<WalletAddress>,
+                sync: &mut BatchSync,
+            ) {
+                let cfg = MaintenanceConfig {
+                    membership_mode: mode,
+                    ..cfg()
+                };
+                maintenance_tick(
+                    &self.live,
+                    &self.paper_state,
+                    &self.client,
+                    &self.base_url,
+                    "anon",
+                    "",
+                    &self.writer_lock,
+                    &self.applied,
+                    preparer,
+                    &cfg,
+                    self.applied.load(),
+                    evicted,
+                    sync,
+                    NOW,
+                )
+                .await;
+            }
+
             async fn tick(
                 &self,
                 mode: MembershipMode,
@@ -2298,6 +3089,7 @@ mod tests {
                 let mut sync = BatchSync {
                     marker: *marker,
                     capacity_generation: self.applied.load().generation,
+                    knockout_deferred: HashSet::new(),
                 };
                 self.tick_synced(mode, evicted, &mut sync).await;
                 *marker = sync.marker;
@@ -2340,6 +3132,82 @@ mod tests {
             }
         }
 
+        struct FailingPositionFetcher {
+            missing_mapping: Option<WalletAddress>,
+            shared: HashSet<WalletAddress>,
+        }
+
+        impl PageFetcher for FailingPositionFetcher {
+            async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+                if self
+                    .shared
+                    .iter()
+                    .any(|wallet| url.contains(&wallet.to_string()))
+                {
+                    return Err(SourceError::Transient {
+                        message: "exhausted venue fixture".to_owned(),
+                    });
+                }
+                if url.contains("/activity?") {
+                    return Ok(b"[]".to_vec());
+                }
+                if url.contains("/positions?") {
+                    if self
+                        .missing_mapping
+                        .is_some_and(|wallet| url.contains(&wallet.to_string()))
+                    {
+                        return serde_json::to_vec(&vec![serde_json::json!({
+                            "proxyWallet": self.missing_mapping.unwrap(),
+                            "asset": "asset-unmapped",
+                            "conditionId": format!("0x{}", "a".repeat(40)),
+                            "size": "1",
+                            "outcomeIndex": 0
+                        })])
+                        .map_err(|error| SourceError::Fatal {
+                            message: error.to_string(),
+                        });
+                    }
+                    return Ok(b"[]".to_vec());
+                }
+                Err(SourceError::Fatal {
+                    message: format!("unexpected fixture URL: {url}"),
+                })
+            }
+        }
+
+        fn validator_preparer(
+            h: &Harness,
+            missing_mapping: Option<WalletAddress>,
+            shared: HashSet<WalletAddress>,
+        ) -> crate::watchlist_admission::AdmissionPreparer {
+            let fetcher: Arc<dyn ReconciliationFetcher> = Arc::new(FailingPositionFetcher {
+                missing_mapping,
+                shared,
+            });
+            let identity_sink = Arc::new(tokio::sync::Mutex::new(
+                SourceEventSink::open(h._temp.path().join("identity-source.log")).unwrap(),
+            ));
+            let identity = Arc::new(AssetIdentityResolver::new(
+                Arc::clone(&fetcher),
+                "https://example.test".to_owned(),
+                GAMMA_BATCH_SIZE,
+                identity_sink,
+            ));
+            let validator = CausalPositionValidator::new(
+                fetcher,
+                "https://example.test",
+                "maintenance-validation-test",
+                identity,
+            )
+            .with_clock(Arc::new(|| NOW));
+            crate::watchlist_admission::AdmissionPreparer::with_validator(
+                h.control_tx.clone(),
+                Arc::clone(&h.paper_state),
+                validator,
+            )
+            .with_source_log(h.source_handle.clone())
+        }
+
         fn set(wallets: &[WalletAddress]) -> HashSet<WalletAddress> {
             wallets.iter().copied().collect()
         }
@@ -2367,7 +3235,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn full_rerank_preparation_failure_keeps_membership_and_marker() {
+        async fn full_rerank_wallet_deferral_applies_ranked_removal() {
             let (a, b) = (wallet(1), wallet(2));
             let mut fake = Fake::new(Some(2));
             fake.ranking_entries = vec![row(2, 1, b)];
@@ -2380,14 +3248,457 @@ mod tests {
                 .await;
 
             assert!(h.controls().is_empty());
-            assert_eq!(
-                members(&h.live),
-                set(&[a]),
-                "unprepared wallet was published"
+            assert!(
+                members(&h.live).is_empty(),
+                "ranked-out wallet was retained"
             );
-            assert_eq!(marker, Some(1), "marker advanced past an unapplied batch");
+            assert_eq!(marker, Some(2), "published removal did not advance marker");
             assert_eq!(position_hits.load(Ordering::SeqCst), 0);
             assert_eq!(h.paper_state.cursor(&b).unwrap(), None);
+            let audits = pe_event_log::Reader::replay(h._temp.path().join("source.log"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|(_, frame)| {
+                    frame.source_id.0 == crate::watchlist_admission::MEMBERSHIP_DEFERRAL_SOURCE_ID
+                })
+                .map(|(_, frame)| {
+                    serde_json::from_slice::<serde_json::Value>(&frame.payload).unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(audits.len(), 1);
+            assert_eq!(audits[0]["deferrals"][0]["wallet"], b.to_string());
+            assert_eq!(audits[0]["outcome"]["type"], "published");
+        }
+
+        #[tokio::test]
+        async fn full_rerank_deferral_fills_cap_from_next_survivor_and_records_audit() {
+            let (old, blocked, first, second, third) =
+                (wallet(41), wallet(42), wallet(43), wallet(44), wallet(45));
+            let mut fake = Fake::new(Some(2));
+            fake.ranking_entries = vec![
+                row(2, 1, blocked),
+                row(2, 2, first),
+                row(2, 3, second),
+                row(2, 4, third),
+            ];
+            fake.history_missing.insert(blocked);
+            let h = harness(fake, &[old]).await;
+            let (mut evicted, mut marker) = (HashSet::new(), Some(1));
+            h.tick(MembershipMode::FullRerank, &mut evicted, &mut marker)
+                .await;
+            assert_eq!(marker, Some(2));
+            assert_eq!(members(&h.live), set(&[first, second, third]));
+            assert_eq!(
+                h.controls()
+                    .iter()
+                    .map(|(wallets, _)| wallets.clone())
+                    .collect::<Vec<_>>(),
+                vec![set(&[first]), set(&[second]), set(&[third])]
+            );
+            assert_eq!(h.membership_publications.load(Ordering::SeqCst), 1);
+            let audits = pe_event_log::Reader::replay(h._temp.path().join("source.log"))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .into_iter()
+                .filter(|(_, frame)| {
+                    frame.source_id.0 == crate::watchlist_admission::MEMBERSHIP_DEFERRAL_SOURCE_ID
+                })
+                .map(|(_, frame)| {
+                    serde_json::from_slice::<serde_json::Value>(&frame.payload).unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(audits.len(), 1);
+            assert_eq!(audits[0]["deferrals"][0]["kind"], "history.missing");
+            assert_eq!(audits[0]["deferrals"][0]["wallet"], blocked.to_string());
+            assert_eq!(audits[0]["outcome"]["type"], "published");
+        }
+
+        #[tokio::test]
+        async fn successive_deferrals_near_cap_prepare_carried_wallet_once() {
+            let (incumbent, first, blocked_a, blocked_b, second, third) = (
+                wallet(89),
+                wallet(90),
+                wallet(91),
+                wallet(92),
+                wallet(93),
+                wallet(94),
+            );
+            let mut fake = Fake::new(Some(2));
+            fake.ranking_entries = vec![
+                row(2, 1, first),
+                row(2, 2, blocked_a),
+                row(2, 3, blocked_b),
+                row(2, 4, second),
+                row(2, 5, third),
+            ];
+            fake.history_missing.extend([blocked_a, blocked_b]);
+            let h = harness(fake, &[incumbent]).await;
+            let (mut evicted, mut marker) = (HashSet::new(), Some(1));
+
+            h.tick(MembershipMode::FullRerank, &mut evicted, &mut marker)
+                .await;
+            assert_eq!(marker, Some(2));
+            assert_eq!(members(&h.live), set(&[first, second, third]));
+            let prepared = h.controls();
+            assert_eq!(
+                prepared
+                    .iter()
+                    .map(|(wallets, _)| wallets.clone())
+                    .collect::<Vec<_>>(),
+                vec![set(&[first]), set(&[second]), set(&[third])]
+            );
+            let audits = pe_event_log::Reader::replay(h._temp.path().join("source.log"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|(_, frame)| {
+                    frame.source_id.0 == crate::watchlist_admission::MEMBERSHIP_DEFERRAL_SOURCE_ID
+                })
+                .map(|(_, frame)| {
+                    serde_json::from_slice::<serde_json::Value>(&frame.payload).unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(audits.len(), 1);
+            assert_eq!(audits[0]["deferrals"].as_array().unwrap().len(), 2);
+        }
+
+        #[tokio::test]
+        async fn next_ranking_batch_retries_a_previously_deferred_wallet() {
+            let (old, deferred, survivor) = (wallet(46), wallet(47), wallet(48));
+            let mut fake = Fake::new(Some(2));
+            fake.ranking_entries = vec![
+                row(2, 1, deferred),
+                row(2, 2, survivor),
+                row(3, 1, deferred),
+                row(3, 2, survivor),
+            ];
+            fake.history_missing.insert(deferred);
+            let latest_batch = Arc::clone(&fake.latest_batch);
+            let h = harness(fake, &[old]).await;
+            let (mut evicted, mut marker) = (HashSet::new(), Some(1));
+
+            h.tick(MembershipMode::FullRerank, &mut evicted, &mut marker)
+                .await;
+            assert_eq!(marker, Some(2));
+            assert_eq!(members(&h.live), set(&[survivor]));
+            assert_eq!(h.controls().len(), 1);
+
+            h.paper_state
+                .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
+                    wallet: deferred,
+                    complete: true,
+                    proof_json: "{}".to_owned(),
+                    updated_at_unix: NOW,
+                })
+                .unwrap();
+            latest_batch.store(3, Ordering::SeqCst);
+            h.tick(MembershipMode::FullRerank, &mut evicted, &mut marker)
+                .await;
+            assert_eq!(marker, Some(3));
+            assert_eq!(members(&h.live), set(&[deferred, survivor]));
+            assert_eq!(
+                h.controls()
+                    .iter()
+                    .map(|(wallets, _)| wallets.clone())
+                    .collect::<Vec<_>>(),
+                vec![set(&[survivor]), set(&[deferred])]
+            );
+        }
+
+        #[tokio::test]
+        async fn knockout_deferral_uses_next_ranked_candidate_for_freed_slot() {
+            let (idle, kept_a, kept_b, blocked, replacement) =
+                (wallet(51), wallet(52), wallet(53), wallet(54), wallet(55));
+            let mut fake = Fake::new(Some(1));
+            fake.ranking_entries = vec![row(1, 1, blocked), row(1, 2, replacement)];
+            fake.history_missing.insert(blocked);
+            let h = harness(fake, &[idle, kept_a, kept_b]).await;
+            h.paper_state.set_cursor(&idle, NOW - 300_000).unwrap();
+            h.paper_state.set_cursor(&kept_a, NOW - 1).unwrap();
+            h.paper_state.set_cursor(&kept_b, NOW - 1).unwrap();
+            let mut evicted = HashSet::new();
+            let mut sync = BatchSync {
+                marker: Some(1),
+                capacity_generation: h.applied.load().generation,
+                knockout_deferred: HashSet::new(),
+            };
+            h.tick_synced(MembershipMode::Knockout, &mut evicted, &mut sync)
+                .await;
+            assert_eq!(members(&h.live), set(&[kept_a, kept_b, replacement]));
+            assert_eq!(h.paper_state.cursor(&replacement).unwrap(), Some(NOW - 60));
+            assert_eq!(h.paper_state.cursor(&blocked).unwrap(), None);
+            assert!(evicted.contains(&idle));
+            assert!(sync.knockout_deferred.contains(&blocked));
+            assert_eq!(
+                h.controls()
+                    .iter()
+                    .map(|(wallets, _)| wallets.clone())
+                    .collect::<Vec<_>>(),
+                vec![set(&[replacement])]
+            );
+        }
+
+        #[tokio::test]
+        async fn knockout_mapping_deferral_uses_next_candidate_once_per_batch() {
+            let (idle, kept_a, kept_b, blocked, replacement) =
+                (wallet(66), wallet(67), wallet(68), wallet(69), wallet(70));
+            let mut fake = Fake::new(Some(1));
+            fake.ranking_entries = vec![row(1, 1, blocked), row(1, 2, replacement)];
+            let h = harness(fake, &[idle, kept_a, kept_b]).await;
+            h.paper_state.set_cursor(&idle, NOW - 300_000).unwrap();
+            let preparer = validator_preparer(&h, Some(blocked), HashSet::new());
+            let mut evicted = HashSet::new();
+            let mut sync = BatchSync {
+                marker: Some(1),
+                capacity_generation: h.applied.load().generation,
+                knockout_deferred: HashSet::new(),
+            };
+
+            h.tick_synced_with_preparer(
+                &preparer,
+                MembershipMode::Knockout,
+                &mut evicted,
+                &mut sync,
+            )
+            .await;
+            assert_eq!(members(&h.live), set(&[kept_a, kept_b, replacement]));
+            assert_eq!(h.paper_state.cursor(&replacement).unwrap(), Some(NOW - 60));
+            assert!(evicted.contains(&idle));
+            assert!(sync.knockout_deferred.contains(&blocked));
+            assert_eq!(h.membership_publications.load(Ordering::SeqCst), 1);
+            let audits = || {
+                pe_event_log::Reader::replay(h._temp.path().join("source.log"))
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .filter(|(_, frame)| {
+                        frame.source_id.0
+                            == crate::watchlist_admission::MEMBERSHIP_DEFERRAL_SOURCE_ID
+                    })
+                    .map(|(_, frame)| {
+                        serde_json::from_slice::<serde_json::Value>(&frame.payload).unwrap()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(audits().len(), 1);
+            assert_eq!(
+                audits()[0]["deferrals"][0]["kind"],
+                "positions.missing_activity_mapping"
+            );
+
+            h.tick_synced_with_preparer(
+                &preparer,
+                MembershipMode::Knockout,
+                &mut evicted,
+                &mut sync,
+            )
+            .await;
+            assert_eq!(members(&h.live), set(&[kept_a, kept_b, replacement]));
+            assert_eq!(h.membership_publications.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                audits().len(),
+                1,
+                "deferred wallet was retried in the same batch"
+            );
+        }
+
+        #[tokio::test]
+        async fn locked_wallet_rejection_replans_full_rerank_and_knockout() {
+            let (incumbent, blocked, replacement) = (wallet(61), wallet(62), wallet(63));
+            for failure in ["locked_fence", "locked_history"] {
+                for mode in [MembershipMode::FullRerank, MembershipMode::Knockout] {
+                    let batch = if mode == MembershipMode::FullRerank {
+                        2
+                    } else {
+                        1
+                    };
+                    let mut fake = Fake::new(Some(batch));
+                    fake.ranking_entries = vec![row(batch, 1, blocked), row(batch, 2, replacement)];
+                    fake.failure = Some(failure);
+                    let h = harness(fake, &[incumbent]).await;
+                    if mode == MembershipMode::Knockout {
+                        h.paper_state.set_cursor(&incumbent, NOW - 300_000).unwrap();
+                    }
+                    let (mut evicted, mut marker) = (HashSet::new(), Some(1));
+                    h.tick(mode, &mut evicted, &mut marker).await;
+                    assert_eq!(members(&h.live), set(&[replacement]));
+                    assert_eq!(h.membership_publications.load(Ordering::SeqCst), 2);
+                    if failure == "locked_fence" {
+                        assert!(h.paper_state.is_wallet_fenced(&blocked).unwrap());
+                    } else {
+                        assert!(!h.paper_state.wallet_history_complete(&blocked).unwrap());
+                    }
+                    assert_eq!(marker, Some(batch));
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn locked_knockout_shape_stales_rerank_and_next_tick_retries_batch() {
+            let (incumbent, candidate) = (wallet(84), wallet(85));
+            let mut fake = Fake::new(Some(2));
+            fake.ranking_entries = vec![row(2, 1, candidate)];
+            fake.failure = Some("locked_knockout");
+            let h = harness(fake, &[incumbent]).await;
+            let (mut evicted, mut marker) = (HashSet::new(), Some(1));
+
+            h.tick(MembershipMode::FullRerank, &mut evicted, &mut marker)
+                .await;
+            assert_eq!(marker, Some(1), "stale attempt advanced the batch marker");
+            assert!(h.live.structural_membership().is_empty());
+            assert_eq!(h.membership_publications.load(Ordering::SeqCst), 1);
+
+            h.tick(MembershipMode::FullRerank, &mut evicted, &mut marker)
+                .await;
+            assert_eq!(marker, Some(2));
+            assert_eq!(members(&h.live), set(&[candidate]));
+            assert_eq!(h.membership_publications.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                h.published_batches
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .as_slice(),
+                &[Some(2), Some(2)]
+            );
+        }
+
+        #[tokio::test]
+        async fn uncertain_paper_append_requests_no_deferral_audit_from_either_caller() {
+            let (incumbent, candidate) = (wallet(87), wallet(88));
+            for mode in [MembershipMode::FullRerank, MembershipMode::Knockout] {
+                let batch = if mode == MembershipMode::FullRerank {
+                    2
+                } else {
+                    1
+                };
+                let mut fake = Fake::new(Some(batch));
+                fake.ranking_entries = vec![row(batch, 1, candidate)];
+                fake.failure = Some("uncertain_append");
+                let h = harness(fake, &[incumbent]).await;
+                if mode == MembershipMode::Knockout {
+                    h.paper_state.set_cursor(&incumbent, NOW - 300_000).unwrap();
+                }
+                let (mut evicted, mut marker) = (HashSet::new(), Some(1));
+                h.tick(mode, &mut evicted, &mut marker).await;
+                assert_eq!(marker, Some(1));
+                assert_eq!(members(&h.live), set(&[incumbent]));
+                assert_eq!(h.membership_publications.load(Ordering::SeqCst), 1);
+                assert_eq!(
+                    pe_event_log::Reader::replay(h._temp.path().join("source.log"))
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .filter(|(_, frame)| {
+                            frame.source_id.0
+                                == crate::watchlist_admission::MEMBERSHIP_DEFERRAL_SOURCE_ID
+                        })
+                        .count(),
+                    0,
+                    "{mode:?} requested an audit after an uncertain paper append"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn shared_preparation_preserves_rerank_but_knockout_publishes_eviction_only() {
+            let (incumbent, replacement) = (wallet(56), wallet(57));
+            let mut rerank_fake = Fake::new(Some(2));
+            rerank_fake.ranking_entries = vec![row(2, 1, replacement)];
+            rerank_fake.failure = Some("shared_prepare");
+            let rerank = harness(rerank_fake, &[incumbent]).await;
+            let (mut evicted, mut marker) = (HashSet::new(), Some(1));
+            rerank
+                .tick(MembershipMode::FullRerank, &mut evicted, &mut marker)
+                .await;
+            assert_eq!(members(&rerank.live), set(&[incumbent]));
+            assert_eq!(marker, Some(1));
+            assert_eq!(rerank.membership_publications.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                pe_event_log::Reader::replay(rerank._temp.path().join("source.log"))
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .filter(|(_, frame)| {
+                        frame.source_id.0
+                            == crate::watchlist_admission::MEMBERSHIP_DEFERRAL_SOURCE_ID
+                    })
+                    .count(),
+                0
+            );
+
+            let mut knockout_fake = Fake::new(Some(1));
+            knockout_fake.ranking_entries = vec![row(1, 1, replacement)];
+            knockout_fake.failure = Some("shared_prepare");
+            let knockout = harness(knockout_fake, &[incumbent]).await;
+            knockout
+                .paper_state
+                .set_cursor(&incumbent, NOW - 300_000)
+                .unwrap();
+            let (mut evicted, mut marker) = (HashSet::new(), Some(1));
+            knockout
+                .tick(MembershipMode::Knockout, &mut evicted, &mut marker)
+                .await;
+            assert!(members(&knockout.live).is_empty());
+            assert!(evicted.contains(&incumbent));
+            let audit_count =
+                pe_event_log::Reader::replay(knockout._temp.path().join("source.log"))
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .filter(|(_, frame)| {
+                        frame.source_id.0
+                            == crate::watchlist_admission::MEMBERSHIP_DEFERRAL_SOURCE_ID
+                    })
+                    .count();
+            assert_eq!(audit_count, 0);
+        }
+
+        #[tokio::test]
+        async fn shared_live_reentry_keeps_both_batch_transitions_pending() {
+            let retained = wallet(58);
+            for mode in [MembershipMode::FullRerank, MembershipMode::Knockout] {
+                let mut fake = Fake::new(Some(2));
+                fake.ranking_entries = vec![row(2, 1, retained)];
+                fake.failure = Some("shared_prepare");
+                let h = harness(fake, &[retained]).await;
+                h.live.remove_fenced(&set(&[retained]));
+                let (mut evicted, mut marker) = (HashSet::new(), Some(1));
+                h.tick(mode, &mut evicted, &mut marker).await;
+                assert_eq!(marker, Some(1));
+                assert_eq!(h.live.structural_membership(), set(&[retained]));
+                assert_eq!(h.membership_publications.load(Ordering::SeqCst), 0);
+            }
+        }
+
+        #[tokio::test]
+        async fn second_locked_proof_change_defers_wallet_without_repreparing() {
+            let (incumbent, candidate) = (wallet(59), wallet(60));
+            let mut fake = Fake::new(Some(2));
+            fake.ranking_entries = vec![row(2, 1, candidate)];
+            fake.failure = Some("proof_twice");
+            let h = harness(fake, &[incumbent]).await;
+            let (mut evicted, mut marker) = (HashSet::new(), Some(1));
+            h.tick(MembershipMode::FullRerank, &mut evicted, &mut marker)
+                .await;
+            assert_eq!(marker, Some(2));
+            assert!(members(&h.live).is_empty());
+            assert_eq!(
+                h.controls().len(),
+                1,
+                "carried-forward wallet was prepared twice"
+            );
+            assert_eq!(h.membership_publications.load(Ordering::SeqCst), 3);
+            let audits = pe_event_log::Reader::replay(h._temp.path().join("source.log"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|(_, frame)| {
+                    frame.source_id.0 == crate::watchlist_admission::MEMBERSHIP_DEFERRAL_SOURCE_ID
+                })
+                .map(|(_, frame)| {
+                    serde_json::from_slice::<serde_json::Value>(&frame.payload).unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(audits.len(), 1);
+            assert_eq!(
+                audits[0]["deferrals"][0]["kind"],
+                "publication.proof_changed"
+            );
         }
 
         #[tokio::test]
@@ -2409,6 +3720,65 @@ mod tests {
             assert_eq!(marker, Some(2));
             assert_eq!(activity_hits.load(Ordering::SeqCst), 0);
             assert_eq!(position_hits.load(Ordering::SeqCst), 0);
+        }
+
+        #[tokio::test]
+        async fn filtered_noop_is_retried_after_restart_without_a_structural_record() {
+            let retained = wallet(64);
+            let mut fake = Fake::new(Some(2));
+            fake.ranking_entries = vec![row(2, 1, retained)];
+            let ranking_hits = Arc::clone(&fake.pinned_ranking_hits);
+            let h = harness(fake, &[retained]).await;
+            let (mut evicted, mut marker) = (HashSet::new(), Some(1));
+
+            h.tick(MembershipMode::FullRerank, &mut evicted, &mut marker)
+                .await;
+            assert_eq!(marker, Some(2));
+            assert_eq!(ranking_hits.load(Ordering::SeqCst), 1);
+            assert_eq!(h.membership_publications.load(Ordering::SeqCst), 0);
+            assert_eq!(members(&h.live), set(&[retained]));
+
+            // Boot reconstructs the last recorded marker, not this process's no-op marker.
+            marker = Some(1);
+            h.tick(MembershipMode::FullRerank, &mut evicted, &mut marker)
+                .await;
+            assert_eq!(marker, Some(2));
+            assert_eq!(ranking_hits.load(Ordering::SeqCst), 2);
+            assert_eq!(h.membership_publications.load(Ordering::SeqCst), 0);
+            assert_eq!(members(&h.live), set(&[retained]));
+        }
+
+        #[tokio::test]
+        async fn knockout_after_filtered_noop_persists_batch_marker_for_restart() {
+            let retained = wallet(65);
+            let mut fake = Fake::new(Some(2));
+            fake.ranking_entries = vec![row(2, 1, retained)];
+            let ranking_hits = Arc::clone(&fake.pinned_ranking_hits);
+            let h = harness(fake, &[retained]).await;
+            let (mut evicted, mut marker) = (HashSet::new(), Some(1));
+
+            h.tick(MembershipMode::FullRerank, &mut evicted, &mut marker)
+                .await;
+            assert_eq!(marker, Some(2));
+            assert_eq!(h.membership_publications.load(Ordering::SeqCst), 0);
+            h.paper_state.set_cursor(&retained, NOW - 300_000).unwrap();
+            h.tick(MembershipMode::Knockout, &mut evicted, &mut marker)
+                .await;
+            assert!(members(&h.live).is_empty());
+            assert_eq!(
+                *h.published_batches
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+                vec![Some(2)]
+            );
+
+            let before_restart = ranking_hits.load(Ordering::SeqCst);
+            marker = Some(2); // The knockout record is the boot-replayed marker.
+            h.tick(MembershipMode::FullRerank, &mut evicted, &mut marker)
+                .await;
+            assert_eq!(ranking_hits.load(Ordering::SeqCst), before_restart);
+            assert_eq!(h.membership_publications.load(Ordering::SeqCst), 1);
+            assert_eq!(marker, Some(2));
         }
 
         #[tokio::test]
@@ -2617,6 +3987,7 @@ mod tests {
             let mut sync = BatchSync {
                 marker: Some(2),
                 capacity_generation: 0,
+                knockout_deferred: HashSet::new(),
             };
             h.applied.store(WatchlistCapacityEpoch {
                 generation: 7,
@@ -2662,6 +4033,7 @@ mod tests {
             let mut sync = BatchSync {
                 marker: Some(1),
                 capacity_generation: 0,
+                knockout_deferred: HashSet::new(),
             };
             h.applied.store(WatchlistCapacityEpoch {
                 generation: 7,
@@ -2701,12 +4073,11 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn failed_full_rerank_still_applies_due_demotion() {
-            for failure in ["preparation", "artifact", "structural"] {
+        async fn shared_full_rerank_failure_still_applies_due_demotion() {
+            for failure in ["structural"] {
                 let (idle, candidate) = (wallet(21), wallet(22));
                 let mut fake = Fake::new(Some(2));
                 fake.ranking_entries = vec![row(2, 1, candidate)];
-                fake.history_ok = failure != "preparation";
                 fake.failure = Some(failure);
                 let h = harness(fake, &[idle]).await;
                 h.paper_state.set_cursor(&idle, NOW - 300_000).unwrap();
@@ -2726,6 +4097,222 @@ mod tests {
                 );
                 assert!(!evicted.contains(&candidate));
             }
+        }
+
+        #[tokio::test]
+        async fn missing_validation_defers_candidate_and_publishes_ranked_removal() {
+            let (old, candidate) = (wallet(24), wallet(25));
+            let mut fake = Fake::new(Some(2));
+            fake.ranking_entries = vec![row(2, 1, candidate)];
+            fake.failure = Some("artifact");
+            let h = harness(fake, &[old]).await;
+            let (mut evicted, mut marker) = (HashSet::new(), Some(1));
+
+            h.tick(MembershipMode::FullRerank, &mut evicted, &mut marker)
+                .await;
+
+            assert!(members(&h.live).is_empty());
+            assert_eq!(marker, Some(2));
+            assert_eq!(h.membership_publications.load(Ordering::SeqCst), 1);
+            let audits = pe_event_log::Reader::replay(h._temp.path().join("source.log"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|(_, frame)| {
+                    frame.source_id.0 == crate::watchlist_admission::MEMBERSHIP_DEFERRAL_SOURCE_ID
+                })
+                .map(|(_, frame)| {
+                    serde_json::from_slice::<serde_json::Value>(&frame.payload).unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(audits.len(), 1);
+            assert_eq!(audits[0]["deferrals"][0]["wallet"], candidate.to_string());
+            assert_eq!(
+                audits[0]["deferrals"][0]["kind"],
+                "proof.missing_validation"
+            );
+            assert_eq!(audits[0]["outcome"]["type"], "published");
+        }
+
+        #[tokio::test]
+        async fn proof_preflight_shared_abort_audits_prior_wallet_without_admission_artifacts() {
+            let (old, missing, bad_read) = (wallet(26), wallet(27), wallet(28));
+            let mut fake = Fake::new(Some(2));
+            fake.ranking_entries = vec![row(2, 1, missing), row(2, 2, bad_read)];
+            fake.failure = Some("proof_mixed");
+            let h = harness(fake, &[old]).await;
+            let (mut evicted, mut marker) = (HashSet::new(), Some(1));
+
+            h.tick(MembershipMode::FullRerank, &mut evicted, &mut marker)
+                .await;
+
+            assert_eq!(marker, Some(1));
+            assert_eq!(members(&h.live), set(&[old]));
+            assert_eq!(h.membership_publications.load(Ordering::SeqCst), 0);
+            let frames = pe_event_log::Reader::replay(h._temp.path().join("source.log"))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(frames.iter().all(|(_, frame)| {
+                frame.source_id.0 != crate::watchlist_admission::MEMBERSHIP_ADMISSION_SOURCE_ID
+            }));
+            let audits = frames
+                .iter()
+                .filter(|(_, frame)| {
+                    frame.source_id.0 == crate::watchlist_admission::MEMBERSHIP_DEFERRAL_SOURCE_ID
+                })
+                .map(|(_, frame)| {
+                    serde_json::from_slice::<serde_json::Value>(&frame.payload).unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(audits.len(), 1);
+            assert_eq!(audits[0]["outcome"]["type"], "aborted_shared");
+            assert_eq!(audits[0]["deferrals"][0]["wallet"], missing.to_string());
+            assert_eq!(
+                audits[0]["deferrals"][0]["kind"],
+                "proof.missing_validation"
+            );
+        }
+
+        #[tokio::test]
+        async fn mixed_wallet_and_shared_preparation_abort_keeps_marker_and_audits_wallet() {
+            let (old, missing, shared) = (wallet(29), wallet(30), wallet(31));
+            let mut fake = Fake::new(Some(2));
+            fake.ranking_entries = vec![row(2, 1, missing), row(2, 2, shared)];
+            fake.history_missing.insert(missing);
+            fake.failure = Some("shared_prepare");
+            let h = harness(fake, &[old]).await;
+            let (mut evicted, mut marker) = (HashSet::new(), Some(1));
+
+            h.tick(MembershipMode::FullRerank, &mut evicted, &mut marker)
+                .await;
+
+            assert_eq!(marker, Some(1));
+            assert_eq!(members(&h.live), set(&[old]));
+            assert_eq!(h.membership_publications.load(Ordering::SeqCst), 0);
+            let audits = pe_event_log::Reader::replay(h._temp.path().join("source.log"))
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|(_, frame)| {
+                    frame.source_id.0 == crate::watchlist_admission::MEMBERSHIP_DEFERRAL_SOURCE_ID
+                })
+                .map(|(_, frame)| {
+                    serde_json::from_slice::<serde_json::Value>(&frame.payload).unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(audits.len(), 1);
+            assert_eq!(audits[0]["outcome"]["type"], "aborted_shared");
+            assert_eq!(audits[0]["deferrals"][0]["wallet"], missing.to_string());
+            assert_eq!(audits[0]["deferrals"][0]["kind"], "history.missing");
+        }
+
+        #[tokio::test]
+        async fn mapping_deferral_and_shared_venue_failure_abort_actual_rerank_tick() {
+            let (old, missing, shared) = (wallet(32), wallet(33), wallet(34));
+            let mut fake = Fake::new(Some(2));
+            fake.ranking_entries = vec![row(2, 1, missing), row(2, 2, shared)];
+            let h = harness(fake, &[old]).await;
+            let preparer = validator_preparer(&h, Some(missing), set(&[shared]));
+            let (mut evicted, mut marker) = (HashSet::new(), Some(1));
+
+            h.tick_with_preparer(
+                &preparer,
+                MembershipMode::FullRerank,
+                &mut evicted,
+                &mut marker,
+            )
+            .await;
+
+            assert_eq!(marker, Some(1));
+            assert_eq!(members(&h.live), set(&[old]));
+            assert_eq!(h.membership_publications.load(Ordering::SeqCst), 0);
+            let frames = pe_event_log::Reader::replay(h._temp.path().join("source.log"))
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert!(frames.iter().all(|(_, frame)| {
+                frame.source_id.0 != crate::watchlist_admission::MEMBERSHIP_ADMISSION_SOURCE_ID
+            }));
+            let audits = frames
+                .iter()
+                .filter(|(_, frame)| {
+                    frame.source_id.0 == crate::watchlist_admission::MEMBERSHIP_DEFERRAL_SOURCE_ID
+                })
+                .map(|(_, frame)| {
+                    serde_json::from_slice::<serde_json::Value>(&frame.payload).unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(audits.len(), 1);
+            assert_eq!(audits[0]["outcome"]["type"], "aborted_shared");
+            assert_eq!(audits[0]["deferrals"][0]["wallet"], missing.to_string());
+            assert_eq!(
+                audits[0]["deferrals"][0]["kind"],
+                "positions.missing_activity_mapping"
+            );
+        }
+
+        #[tokio::test]
+        async fn shared_venue_outage_keeps_membership_and_emits_no_deferral_audit() {
+            let (old, first, second) = (wallet(35), wallet(36), wallet(37));
+            let mut fake = Fake::new(Some(2));
+            fake.ranking_entries = vec![row(2, 1, first), row(2, 2, second)];
+            let h = harness(fake, &[old]).await;
+            let preparer = validator_preparer(&h, None, set(&[first, second]));
+            let (mut evicted, mut marker) = (HashSet::new(), Some(1));
+            let log_bytes = Arc::new(StdMutex::new(Vec::new()));
+            let subscriber = tracing_subscriber::fmt()
+                .json()
+                .with_max_level(tracing::Level::ERROR)
+                .with_writer(CapturedLogs(Arc::clone(&log_bytes)))
+                .finish();
+            let subscriber_guard = tracing::subscriber::set_default(subscriber);
+
+            h.tick_with_preparer(
+                &preparer,
+                MembershipMode::FullRerank,
+                &mut evicted,
+                &mut marker,
+            )
+            .await;
+            drop(subscriber_guard);
+
+            assert_eq!(marker, Some(1));
+            assert_eq!(members(&h.live), set(&[old]));
+            assert_eq!(h.membership_publications.load(Ordering::SeqCst), 0);
+            let captured = String::from_utf8(
+                log_bytes
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone(),
+            )
+            .unwrap();
+            let errors = captured
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|event| {
+                    event["target"] == "pe_service::watchlist_maintenance"
+                        && event["fields"]["message"] == "full_rerank: shared admission failure"
+                        && event["fields"]["kind"] == "source.transient"
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(errors.len(), 1, "captured logs: {captured}");
+            assert_eq!(errors[0]["level"], "ERROR");
+            assert_eq!(errors[0]["fields"]["batch_id"], 2);
+            assert!(
+                errors[0]["fields"]["cause"]
+                    .as_str()
+                    .is_some_and(|cause| cause.contains("exhausted venue fixture"))
+            );
+            assert_eq!(
+                pe_event_log::Reader::replay(h._temp.path().join("source.log"))
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .filter(|(_, frame)| {
+                        frame.source_id.0
+                            == crate::watchlist_admission::MEMBERSHIP_DEFERRAL_SOURCE_ID
+                    })
+                    .count(),
+                0
+            );
         }
 
         #[tokio::test]
