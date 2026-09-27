@@ -48,6 +48,9 @@ toml            = { workspace = true }
 tracing         = { workspace = true }
 tracing-subscriber = { workspace = true }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.4", features = ["fs"] }
+
 # sha2 0.10 compiles its ARMv8 SHA-256 instruction backend only with `asm`; without
 # it the Raspberry Pi hashes whole cache files in software. Measured on Forge over the
 # same 8 GB: 166 MB/s software, 470 MB/s with the instructions, identical digests

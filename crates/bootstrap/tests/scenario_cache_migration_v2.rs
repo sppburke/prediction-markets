@@ -7342,6 +7342,15 @@ fn assert_check_event(
     assert_eq!(fields["file_size_bytes"], size);
     assert!(fields["elapsed_ms"].as_u64().is_some(), "{fields}");
     assert_eq!(fields["success"], success);
+    if cfg!(target_os = "linux") && role == "activation_candidate" {
+        assert!(
+            matches!(fields["prefetch"].as_str(), Some("done" | "cancelled")),
+            "{fields}"
+        );
+    } else {
+        assert!(fields.get("prefetch").is_none(), "{fields}");
+        assert!(fields.get("prefetch_error").is_none(), "{fields}");
+    }
 }
 
 #[tokio::test]
