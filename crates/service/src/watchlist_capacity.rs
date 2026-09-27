@@ -149,25 +149,6 @@ impl SupabaseWatchlistCapacity {
                 excluded.insert(deferral.wallet);
             }
             deferrals.extend(plan.deferrals);
-            if plan.entries.is_empty() {
-                warn!(
-                    generation = request.generation,
-                    target,
-                    deferred = deferrals.len(),
-                    "capacity: zero eligible wallets; request pending"
-                );
-                self.preparer
-                    .record_deferrals(
-                        DeferralContext::Capacity {
-                            generation: request.generation,
-                            target,
-                        },
-                        deferrals,
-                        DeferralOutcome::PendingCapacity,
-                    )
-                    .await;
-                return Err(CapacityError::EmptyRanking { target });
-            }
             let reentry_candidates = planned_live_reentries(&self.live, &plan.entries);
             let reentries = match self
                 .preparer
@@ -190,6 +171,26 @@ impl SupabaseWatchlistCapacity {
                     return Err(CapacityError::Admission(error));
                 }
             };
+            // Every entry that needs no live-only reentry is live already or a proved addition.
+            if plan.entries.len() - reentry_candidates.len() + reentries.len() == 0 {
+                warn!(
+                    generation = request.generation,
+                    target,
+                    deferred = deferrals.len(),
+                    "capacity: zero eligible wallets; request pending"
+                );
+                self.preparer
+                    .record_deferrals(
+                        DeferralContext::Capacity {
+                            generation: request.generation,
+                            target,
+                        },
+                        deferrals,
+                        DeferralOutcome::PendingCapacity,
+                    )
+                    .await;
+                return Err(CapacityError::EmptyRanking { target });
+            }
             let admissions = match self.preparer.record_admission_proofs(&plan.proofs).await {
                 Ok(receipts) => receipts,
                 Err(error) => {
@@ -1555,6 +1556,74 @@ mod tests {
         assert_eq!(audits.len(), 1);
         assert_eq!(audits[0]["outcome"]["type"], "pending_capacity");
         assert_eq!(audits[0]["deferrals"][0]["kind"], "history.missing");
+        source_log.task.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn zero_live_result_after_reentry_deferral_is_pending() {
+        // A structural wallet outside the live set (a boot exclusion) is the only survivor, and
+        // its live-only reentry defers: publishing would commit the epoch with no live wallet.
+        let excluded = WalletAddress([63; 20]);
+        let app = Router::new().route(
+            "/rest/v1/latest_ranking",
+            get(move || async move {
+                Json(vec![serde_json::json!({
+                    "wallet_hex": excluded.to_string(), "hit_rate": "0.6", "ls_tstat": "2",
+                    "n_trades": 10, "last_trade_unix": 1_700_000_100_i64
+                })])
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let temp = TempDir::new().unwrap();
+        let source_log = test_source_log(&temp);
+        let paper_state = Arc::new(PaperStateDb::open(&temp.path().join("paper.db")).unwrap());
+        let live = LiveWatchlist::new(watchlist(vec![entry(excluded)]));
+        live.remove_fenced(&HashSet::from([excluded]));
+        assert!(live.snapshot().entries.is_empty());
+        let writer_lock = Arc::new(Mutex::new(()));
+        let applied = AppliedWatchlistCapacity::new(1);
+        let before = applied.load();
+        let (requests, desired) = capacity_request_channel(1, writer_lock.clone());
+        let request = requests.request(2).await;
+        let (tx, mut rx) = mpsc::channel(1);
+        let preparer = AdmissionPreparer::new(tx, paper_state.clone())
+            .with_source_log(source_log.handle.clone());
+        let applier = SupabaseWatchlistCapacity::new(
+            live.clone(),
+            paper_state,
+            writer_lock,
+            applied.clone(),
+            desired,
+            preparer,
+            reqwest::Client::new(),
+            format!("http://{address}"),
+            "anon".to_owned(),
+            String::new(),
+        );
+        let outcome = tokio::select! {
+            outcome = applier.apply_inner(request) => outcome,
+            _ = rx.recv() => panic!("a zero live result must stay pending, not publish"),
+        };
+        assert!(matches!(
+            outcome,
+            Err(CapacityError::EmptyRanking { target: 2 })
+        ));
+        assert_eq!(applied.load(), before);
+        assert_eq!(live.structural_membership(), HashSet::from([excluded]));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            pe_event_log::Reader::replay(&source_log.path)
+                .unwrap()
+                .count(),
+            0,
+            "a pending result writes no capacity config and no audit"
+        );
         source_log.task.abort();
         server.abort();
     }
