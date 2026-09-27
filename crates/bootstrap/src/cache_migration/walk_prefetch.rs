@@ -123,13 +123,13 @@ impl Drop for StopOnDrop<'_> {
 pub(super) fn quick_check(
     connection: &Connection,
     path: &Path,
-) -> (rusqlite::Result<String>, Option<Outcome>) {
+) -> (rusqlite::Result<String>, Outcome) {
     let setup = match Setup::new(connection, path) {
         Ok(setup) => setup,
         Err(error) => {
             return (
                 connection.query_row("PRAGMA quick_check", [], |row| row.get(0)),
-                Some(Outcome::Unavailable(error)),
+                Outcome::Unavailable(error),
             );
         }
     };
@@ -149,7 +149,7 @@ pub(super) fn quick_check(
             },
             Err(error) => Outcome::unavailable(format!("spawn prefetch worker: {error}")),
         };
-        (result, Some(outcome))
+        (result, outcome)
     })
 }
 

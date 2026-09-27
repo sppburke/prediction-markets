@@ -4816,7 +4816,8 @@ fn quick_check(connection: &Connection, role: &str, path: &Path) -> Result<(), B
     let started = Instant::now();
     #[cfg(target_os = "linux")]
     let (result, prefetch) = if role == "activation_candidate" {
-        walk_prefetch::quick_check(connection, path)
+        let (result, prefetch) = walk_prefetch::quick_check(connection, path);
+        (result, Some(prefetch))
     } else {
         (
             connection.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0)),
@@ -4832,9 +4833,7 @@ fn quick_check(connection: &Connection, role: &str, path: &Path) -> Result<(), B
         Err(error) => Err(error.into()),
     };
     #[cfg(target_os = "linux")]
-    if role == "activation_candidate" {
-        let prefetch =
-            prefetch.unwrap_or_else(|| walk_prefetch::Outcome::unavailable("worker did not start"));
+    if let Some(prefetch) = prefetch {
         if let Some(error) = prefetch.error() {
             tracing::info!(
                 role,
