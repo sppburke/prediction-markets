@@ -446,8 +446,9 @@ canonical hash the push stores as `ranking_batches.config_hash`); **Stage 3** re
 the exact publication request, atomically publish it through the idempotent
 `publish_ranking_batch` RPC, verify that exact batch is `latest_ranking`, and write the
 accepted cycle record. The legacy lane captures a full watermark for its unchanged-day check;
-the fresh lane writes its configuration without scanning the installed cache. No post-publication deletion,
-reclamation, index rebuild, or checkpoint stage exists (#544).
+the fresh lane writes its configuration without scanning the installed cache. Completed-cycle
+retention deletes eligible old cycle cache files; there is no SQLite reclamation, index rebuild,
+or checkpoint stage (#544).
 
 
 **Oracle rollback (#536):** reverting the ranker code alone does NOT restore the
@@ -905,30 +906,6 @@ directory must carry two aliases to the repository inodes, checked before any mu
 | `<physical dir>/eval-results` | `<repo>/data/eval-results` |
 | `<physical dir>/wallet_cache.db.lock` | `<repo>/data/wallet_cache.db.lock` |
 
-**Forge drive layout (observed 2026-09-25).** `/mnt/t7` is the Samsung T7 Shield SSD
-(`sdb`): it holds the cache, `/mnt/t7/parquet` and DuckDB spill, and
-`SQLITE_TMPDIR=/mnt/t7/sqlite-tmp`. `/mnt/storage` is a SanDisk Ultra USB flash stick
-(`sda`, `0781:5581`): the live checkout through `~/prediction-markets`, `target/`,
-`.venv`, `data/eval-results`, the cache lock, `cargo-home`, `rustup`, `pm-next` and build
-targets, the bind-mounted journal, and backups (pre-move cache, purge archive, `pe545`,
-SD backup, and stale `data/parquet`) are still there. The cache moved to T7 on
-2026-09-13; the checkout and run state have not moved yet.
-
-| Measured read | USB stick | T7 SSD |
-|---|---:|---:|
-| Random 4 KiB reads/s, depth 1 / 4 / 8 / 16 / 32 | 1,929 / 2,105 / 2,101 / 2,101 / 2,104 | 2,280 / 7,501 / 11,425 / 15,343 / 18,003 |
-| Sequential read | 160 MB/s | 384 MB/s |
-
-Activation renames cache files and refuses different devices, so fixed, candidate and
-backup cache files stay together on T7. Moving the checkout and run state to T7 is a
-reliability step: those stages use little I/O (~6 minutes per cycle; 14 MB written to
-the stick in a sampled minute). Do it with no cycle in flight because the activation
-batch identity hashes the resolved run-directory path. The two cache-directory aliases
-above currently point from T7 back to the stick and must continue to resolve to the
-checkout's `data/` files. The SD root is `emergency_ro`, so the home link cannot be
-repointed until #637; startup still resolves through the stick's path entry. Coreutils
-`mv` 9.7 supports `--exchange` for an atomic stick-side path swap.
-
 Fixed, candidate, and retained backup must be independent regular files on one filesystem.
 The cycle's own evidence selects the layout: new immutable staging evidence means direct-copy
 staging and rename preservation; an existing prior without that evidence means legacy behavior.
@@ -998,9 +975,7 @@ After activation but before the publication is consumed,
 `cache-restore-prior` with backup `D` and rejected destination `C` restores the old bytes by rename
 for a new cycle, including its interrupted gap. A legacy cycle keeps its prior/displaced arguments
 and existing semantics. The supervisor must stay paused until the recovery is resolved. After consumption, roll
-forward. Forge's boot card is failing (#637); the cache is on T7 while the repository and
-evaluation results remain on the USB stick. Confirm the host before any cutover and keep the prior until the
-publication is confirmed.
+forward. Confirm the host paths before cutover and keep the prior until publication is confirmed.
 
 ### Fresh bulk root with deferred global uniqueness (#588)
 
@@ -1434,8 +1409,9 @@ from `ranking_entries` pinned to the triggering `batch_id`, never from the movin
 the applied rows and the committed marker name one batch, #542). Every read is
 gated on the ranker's `survives` verdict (#518), so the published batch is a bench and
 `active_watchlist_size` caps the survivors admitted from it rather than selecting a raw
-top-N; membership converges at the deploy restart itself, because boot validates the live
-set from the same filtered read. Every post-boot addition on either path is prepared first
+top-N. A financial Start boots from the replayed Start-bound structural membership;
+a newer published batch is applied on a maintenance tick, subject to live admission filters.
+Every post-boot addition on either path is prepared first
 (#542/#544): its prior-market history is complete and its current positions pass the
 five-step causal bracket before the orchestrator records the validation and the wallet is
 published. A typed wallet failure defers that wallet and replans from the remaining ranked

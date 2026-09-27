@@ -539,8 +539,9 @@ keys = [
     "fill_window_secs", "top_n",
 ]
 configuration = dict(zip(keys, sys.argv[2:-1], strict=True))
-# The lane is part of the daily watermark identity: switching lanes is a
-# configuration change, not an unchanged day. Legacy bytes stay identical.
+# The lane is part of cycle configuration: switching lanes changes the legacy
+# watermark identity. Cycles created with schema two installed skip the
+# unchanged-day gate; the one-time cutover keeps it.
 if sys.argv[-1] == "1":
     configuration["cache_lane"] = "fresh_v2"
 with open(sys.argv[1], "w", encoding="utf-8") as handle:

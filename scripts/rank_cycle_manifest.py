@@ -244,7 +244,7 @@ CYCLE_PATTERN = r"cron-[0-9]{8}T[0-9]{6}Z"
 
 def accepted_candidate_cycle(root: Path, out: Path | None = None) -> Path | None:
     """The named, else the newest, cycle whose verified candidate-lane publication
-    wrote its accepted watermark (written only after that publication)."""
+    wrote its accepted record (written only after that publication)."""
     candidates = [out] if out is not None else sorted(root.glob("cron-*"), reverse=True)
     for candidate in candidates:
         if (candidate.is_symlink() or not candidate.is_dir()
@@ -264,7 +264,7 @@ def accepted_candidate_cycle(root: Path, out: Path | None = None) -> Path | None
 def retire_completed_cycle(root: Path, out: Path | None = None) -> int:
     """Resume retention under the wrapper's run lock: 0 done, 2 held, 3 absent.
 
-    The durable accepted watermark is written only after verified publication.
+    The durable accepted record is written only after verified publication.
     It and the unchanged request/staging evidence remain the cleanup obligation,
     including when both pointers and every eligible cache file are already gone.
     """

@@ -293,14 +293,6 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertEqual(record["configuration"]["cache_lane"], "fresh_v2")
         return record
 
-    def _install_prior_wrapper(self):
-        # #694's rollback target is the wrapper at the exact parent of this change.
-        prior = subprocess.check_output(
-            ["git", "show", "063a0f8:scripts/rank_and_push.sh"],
-            cwd=WRAPPER.parent.parent,
-        )
-        self.wrapper.write_bytes(prior)
-
     # ── scenarios ────────────────────────────────────────────────────────────────────
     def test_zero_arg_clean_path_uses_repository_python(self):
         poison_dir = self.root / "poison-bin"
@@ -1127,47 +1119,6 @@ class RankAndPushScenario(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), json.loads(accepted.read_text())["fingerprint_sha256"])
-
-    def test_prior_wrapper_resumes_a_new_lane_record_cycle(self):
-        self._install_candidate_layout(schema=2)
-        self._install_candidate_stub()
-        interrupted = self._run(exit_env={"STUB_EXIT_cache_finalize_v2": "75"})
-        self.assertEqual(interrupted.returncode, 75, interrupted.stderr + interrupted.stdout)
-        cycle = self.root / Path((self.root / "data/eval-results/rank_and_push.cycle").read_text().strip())
-        self._assert_lane_record(cycle / "cycle_manifest.json")
-        self._install_prior_wrapper()
-        resumed = self._run()
-        self.assertEqual(resumed.returncode, 0, resumed.stderr + resumed.stdout)
-        self.assertIn(f"RANK_AND_PUSH_CYCLE_RESUME=data/eval-results/{cycle.name}", resumed.stdout)
-        accepted = json.loads((cycle / "accepted_cycle_manifest.json").read_text())
-        self.assertIn("day_utc", accepted)
-        self.assertEqual(accepted["configuration"]["cache_lane"], "fresh_v2")
-
-    def test_prior_wrapper_starts_after_lane_record_then_gates_its_own_capture(self):
-        for prior_day in (False, True):
-            with self.subTest(prior_day=prior_day):
-                self.tearDown(); self.setUp()
-                self._install_candidate_layout(schema=2)
-                self._install_candidate_stub()
-                env = None
-                if prior_day:
-                    bin_dir = self.root / "fake-bin"
-                    bin_dir.mkdir()
-                    _write_exec(bin_dir / "date", '#!/usr/bin/env bash\nexec /bin/date -u -d yesterday "$2"\n')
-                    env = {"PATH": f"{bin_dir}:{os.environ['PATH']}"}
-                published = self._run(exit_env=env)
-                self.assertEqual(published.returncode, 0, published.stderr + published.stdout)
-                cycle = next((self.root / "data/eval-results").glob("cron-*"))
-                self._assert_lane_record(cycle / "accepted_cycle_manifest.json")
-                self._install_prior_wrapper()
-                time.sleep(1.05 - time.time() % 1)
-                first_old = self._run()
-                self.assertEqual(first_old.returncode, 0, first_old.stderr + first_old.stdout)
-                self.assertIn("RANK_AND_PUSH_CYCLE_CREATED=", first_old.stdout)
-                self.assertNotIn("RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1", first_old.stdout)
-                second_old = self._run()
-                self.assertEqual(second_old.returncode, 0, second_old.stderr + second_old.stdout)
-                self.assertIn("RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1", second_old.stdout)
 
     def test_schema_two_prepares_then_activates_then_resumes_exact_request(self):
         """The corrected batch request is durable before cache activation and the
@@ -2283,7 +2234,7 @@ finally:
                 self.assertIn("[cache-retention] nothing deleted: recovery pointer or Forge pause record remains", result.stdout)
                 self._assert_cache_copies(older)
 
-    def test_paused_publication_retirement_resumes_before_watermark_and_next_cycle(self):
+    def test_paused_publication_retirement_resumes_before_next_cycle(self):
         for two_file, args in ((True, ()), (True, ("--resume-pending",)), (False, ())):
             with self.subTest(two_file=two_file, args=args):
                 self.tearDown(); self.setUp()
@@ -2313,6 +2264,7 @@ finally:
                 self.assertIn("Forge pause record remains", held.stdout)
                 self.assertEqual(backup.read_bytes(), old_bytes)
                 self.assertEqual(self._bootstrap_ops(), ops)
+                self.assertEqual(self._log("push.log"), pushes)
                 pause.unlink()
                 resumed = self._run(*args)
                 self.assertEqual(resumed.returncode, 0, resumed.stderr + resumed.stdout)
@@ -2324,6 +2276,13 @@ finally:
                     self.assertNotIn("RANK_AND_PUSH_UNCHANGED_DAILY_WATERMARK=1", resumed.stdout)
                     self.assertEqual(self._bootstrap_ops()[len(ops)], "cache-stage-v2")
                     self.assertEqual(len(list(out.parent.glob("cron-*"))), 2)
+                    successor = next(path for path in out.parent.glob("cron-*") if path != out)
+                    successor_request = json.loads((successor / "ranking_publish_request.json").read_text())
+                    self.assertNotEqual(successor_request["publish_key"], request["publish_key"])
+                    new_pushes = (self._log("push.log") or "")[len(pushes or ""):].splitlines()
+                    self.assertTrue(new_pushes)
+                    self.assertTrue(all(str((out / "ranking_publish_request.json").relative_to(self.root))
+                                        not in line for line in new_pushes))
                 else:
                     self.assertEqual(fixed.read_bytes(), installed)
                     self.assertEqual(self._bootstrap_ops(), ops)
@@ -2389,6 +2348,14 @@ finally:
                                         resumed.stdout.index("RANK_AND_PUSH_CYCLE_CREATED="))
                         self.assertEqual(self._bootstrap_ops()[len(ops)], "cache-stage-v2")
                         self.assertEqual(len(list(out.parent.glob("cron-*"))), 2)
+                        successor = next(path for path in out.parent.glob("cron-*") if path != out)
+                        retired_request = json.loads((out / "ranking_publish_request.json").read_text())
+                        successor_request = json.loads((successor / "ranking_publish_request.json").read_text())
+                        self.assertNotEqual(successor_request["publish_key"], retired_request["publish_key"])
+                        new_pushes = (self._log("push.log") or "")[len(pushes or ""):].splitlines()
+                        self.assertTrue(new_pushes)
+                        self.assertTrue(all(str((out / "ranking_publish_request.json").relative_to(self.root))
+                                            not in line for line in new_pushes))
                     else:
                         self.assertEqual(fixed.read_bytes(), installed)
                         self.assertEqual(self._bootstrap_ops(), ops)
@@ -2608,10 +2575,10 @@ finally:
         """PASS: with PE_RANK_SCHEMA_TWO_CUTOVER=prepare the lane stops after
         exact request preparation with the pending pointer retained and the
         installed cache untouched; the next zero-argument run resumes that
-        request (activate, publish), captures the accepted watermark from the
-        request's fixed path, clears the pointers, and a further run skips.
+        request (activate, publish), writes an accepted lane record, clears the
+        pointers, and a further zero-argument run starts a successor cycle.
         FAIL: activation before the boundary, recollection on recovery, or a
-        repeated cycle after recovery."""
+        missing successor cycle after recovery."""
         fixed = self._install_candidate_layout(schema=1)
         self._install_candidate_stub()
         older = self._seed_old_cache_copies(fixed.parent)
