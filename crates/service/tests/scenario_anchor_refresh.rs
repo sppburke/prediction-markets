@@ -15,6 +15,7 @@ use pe_position_ledger::PositionLedger;
 use pe_service::activity_ingest::{ActivityIngest, SourceLogHandle};
 use pe_service::asset_identity::AssetIdentityResolver;
 use pe_service::bucket_commit::{AnchorInstallError, BucketCommitEngine, FrozenDecisionBasis};
+use pe_service::health::SharedHealth;
 use pe_service::health::new_shared_health_with_ws;
 use pe_service::live_watchlist::LiveWatchlist;
 use pe_service::orchestrator_control::OrchestratorControl;
@@ -22,7 +23,8 @@ use pe_service::position_seeder::{CausalPositionValidator, ledger_capture};
 use pe_service::runtime_config::{LiveRuntimeConfig, RuntimeConfig};
 use pe_service::source_event_sink::SourceEventSink;
 use pe_service::trade_poller::{
-    ReconciliationObligations, TradePoller, TradePollerConfig, TradePollerOwnerError,
+    PollerProgress, ReconciliationObligations, TradePoller, TradePollerConfig,
+    TradePollerOwnerError,
 };
 use pe_service::watchlist_admission::{AdmissionPreparer, AnchorRefreshOutcome};
 use pe_source_core::SourceError;
@@ -264,6 +266,7 @@ struct PollerHarness {
     ingest: tokio::task::JoinHandle<()>,
     actor: tokio::task::JoinHandle<()>,
     preparer: Arc<AdmissionPreparer>,
+    health: SharedHealth,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -288,6 +291,9 @@ fn poller_harness(
         installed,
         shutdown,
         poll_fetcher,
+        None,
+        false,
+        1,
     )
 }
 
@@ -302,6 +308,9 @@ fn poller_harness_with_fetcher(
     installed: Arc<Mutex<Vec<(WalletAddress, usize)>>>,
     shutdown: Option<oneshot::Sender<()>>,
     poll_fetcher: Arc<PollFetcher>,
+    hold_admission: Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>,
+    activity_ws_enabled: bool,
+    poll_interval_secs: u64,
 ) -> PollerHarness {
     if fail_install_transaction {
         rusqlite::Connection::open(dir.path().join("paper.db"))
@@ -334,6 +343,7 @@ fn poller_harness_with_fetcher(
         let mut engine =
             BucketCommitEngine::load(Arc::clone(&actor_paper), PositionLedger::new()).unwrap();
         let mut shutdown = shutdown;
+        let mut hold_admission = hold_admission;
         while let Some(command) = control_rx.recv().await {
             match command {
                 OrchestratorControl::PrepareAdmissions { acknowledged, .. } => {
@@ -362,6 +372,10 @@ fn poller_harness_with_fetcher(
                     );
                 }
                 OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
+                    if let Some((entered, release)) = hold_admission.take() {
+                        let _ = entered.send(());
+                        let _ = release.await;
+                    }
                     let _ = captured.send(
                         ledger_capture(engine.ledger(), &actor_paper, wallet)
                             .map_err(|error| error.to_string()),
@@ -406,8 +420,8 @@ fn poller_harness_with_fetcher(
     let poller = TradePoller::new(
         TradePollerConfig {
             base_url: BASE.to_owned(),
-            poll_interval_secs: 1,
-            activity_ws_enabled: false,
+            poll_interval_secs,
+            activity_ws_enabled,
             copy_latency_budget_secs: 2,
         },
         live_watchlist(wallets),
@@ -417,7 +431,7 @@ fn poller_harness_with_fetcher(
         trigger_rx,
         control_tx,
         paper,
-        health,
+        health.clone(),
         SignalConfig::default(),
         LiveRuntimeConfig::new(RuntimeConfig::from_service_config(
             &pe_service::config::ServiceConfig::default(),
@@ -434,6 +448,7 @@ fn poller_harness_with_fetcher(
         ingest,
         actor,
         preparer,
+        health,
     }
 }
 
@@ -599,14 +614,11 @@ async fn contended_mutex_rereads_fresh_anchor_before_refreshing() {
         tokio::spawn(async move { preparer.prepare(&[blocker]).await })
     };
     received_rx.await.unwrap();
-    let mut second = {
-        let preparer = Arc::clone(&preparer);
-        tokio::spawn(async move { preparer.prepare_if_due(target, NOW, 3_600).await })
-    };
-    assert!(
-        tokio::time::timeout(Duration::from_millis(10), &mut second)
-            .await
-            .is_err()
+    let busy = preparer.prepare_if_due(target, NOW, 3_600);
+    assert_eq!(
+        futures::FutureExt::now_or_never(busy).unwrap().unwrap(),
+        AnchorRefreshOutcome::Skipped,
+        "the held admission must not wait for its acknowledgement"
     );
 
     paper.set_cursor(&target, 10).unwrap();
@@ -629,11 +641,126 @@ async fn contended_mutex_rereads_fresh_anchor_before_refreshing() {
 
     first.await.unwrap().unwrap();
     assert_eq!(
-        second.await.unwrap().unwrap(),
+        preparer.prepare_if_due(target, NOW, 3_600).await.unwrap(),
         AnchorRefreshOutcome::Skipped
     );
     drop(preparer);
     actor.await.unwrap();
+}
+
+/// PASS: a held admission does not stall successful backstop rounds or force urgent reads;
+/// the skipped due wallet anchors after the admission releases.
+/// FAIL: poll health stays blocked, the wallet is read urgently, or its anchor is lost.
+#[tokio::test(start_paused = true)]
+async fn held_admission_keeps_backstop_health_fresh_without_urgent_refresh_reads() {
+    let blocker = wallet(0x36);
+    let target = wallet(0x37);
+    let (dir, paper) = paper(&[blocker, target]);
+    let installed = Arc::new(Mutex::new(Vec::new()));
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    let harness = poller_harness_with_fetcher(
+        &dir,
+        Arc::clone(&paper),
+        &[target],
+        stable_bracket_responses(&[blocker, target]),
+        5,
+        false,
+        Arc::clone(&installed),
+        None,
+        Arc::new(PollFetcher::empty_pages(6)),
+        Some((entered_tx, release_rx)),
+        true,
+        60,
+    );
+    let PollerHarness {
+        poller,
+        ingest,
+        actor,
+        preparer,
+        poll_fetcher,
+        health,
+    } = harness;
+    let admission = {
+        let preparer = Arc::clone(&preparer);
+        tokio::spawn(async move { preparer.prepare(&[blocker]).await })
+    };
+    entered_rx.await.unwrap();
+    let now = OffsetDateTime::from_unix_timestamp(NOW).unwrap();
+    {
+        let mut state = health.lock().unwrap();
+        state.poll_error_streak = 3;
+        assert!(state.copy_admission_blocked(now, tokio::time::Instant::now()));
+    }
+    assert_eq!(
+        futures::FutureExt::now_or_never(preparer.prepare_if_due(target, NOW, 3_600))
+            .unwrap()
+            .unwrap(),
+        AnchorRefreshOutcome::Skipped
+    );
+
+    let (progress_tx, mut progress_rx) = mpsc::channel(16);
+    let (stop_tx, stop_rx) = oneshot::channel();
+    let poller_task = tokio::spawn(async move {
+        poller
+            .with_progress(progress_tx)
+            .run_until(async {
+                let _ = stop_rx.await;
+            })
+            .await
+    });
+    let mut started = Vec::new();
+    while let Some(progress) = progress_rx.recv().await {
+        match progress {
+            PollerProgress::Started { wallet, urgent, .. } => started.push((wallet, urgent)),
+            PollerProgress::RoundCompleted => break,
+            PollerProgress::Completed { .. } => {}
+        }
+    }
+    assert_eq!(started, vec![(target, false)]);
+    assert_eq!(poll_fetcher.calls.load(Ordering::SeqCst), 1);
+    assert!(paper.position_anchors(&target).unwrap().is_empty());
+    {
+        let state = health.lock().unwrap();
+        assert_eq!(state.poll_last_round_at, Some(now));
+        assert_eq!(state.polymarket_last_event_at, Some(now));
+        assert!(!state.copy_admission_blocked(now, tokio::time::Instant::now()));
+    }
+    tokio::time::advance(Duration::from_secs(2)).await;
+    assert_eq!(poll_fetcher.calls.load(Ordering::SeqCst), 1);
+
+    tokio::time::advance(Duration::from_secs(60)).await;
+    let mut started = Vec::new();
+    while let Some(progress) = progress_rx.recv().await {
+        match progress {
+            PollerProgress::Started { wallet, urgent, .. } => started.push((wallet, urgent)),
+            PollerProgress::RoundCompleted => break,
+            PollerProgress::Completed { .. } => {}
+        }
+    }
+    assert_eq!(started, vec![(target, false)]);
+    assert_eq!(poll_fetcher.calls.load(Ordering::SeqCst), 2);
+    assert!(paper.position_anchors(&target).unwrap().is_empty());
+
+    release_tx.send(()).unwrap();
+    admission.await.unwrap().unwrap();
+    tokio::time::advance(Duration::from_secs(60)).await;
+    while let Some(progress) = progress_rx.recv().await {
+        if matches!(progress, PollerProgress::RoundCompleted) {
+            break;
+        }
+    }
+    assert_eq!(paper.position_anchors(&target).unwrap().len(), 1);
+    assert!(
+        installed
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(wallet, _)| *wallet == target)
+    );
+    let _ = stop_tx.send(());
+    assert!(poller_task.await.unwrap().is_ok());
+    finish_harness(ingest, actor, preparer).await;
 }
 
 #[tokio::test(start_paused = true)]
@@ -683,6 +810,7 @@ async fn deferred_refresh_continues_the_poller() {
         actor,
         preparer,
         poll_fetcher,
+        ..
     } = harness;
     let (progress, mut completed) = mpsc::channel(8);
     assert!(
@@ -806,6 +934,9 @@ async fn shutdown_mid_round_cancels_the_round_and_exits_cleanly() {
         installed,
         None,
         Arc::new(PollFetcher::parked(started_tx)),
+        None,
+        false,
+        1,
     );
     let PollerHarness {
         poller,
@@ -813,6 +944,7 @@ async fn shutdown_mid_round_cancels_the_round_and_exits_cleanly() {
         actor,
         preparer,
         poll_fetcher: _,
+        ..
     } = harness;
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     tokio::spawn(async move {

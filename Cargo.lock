@@ -3813,6 +3813,8 @@ dependencies = [
  "blake3",
  "figment",
  "futures",
+ "hyper",
+ "hyper-util",
  "pe-copy-signal-engine",
  "pe-core-types",
  "pe-event-log",

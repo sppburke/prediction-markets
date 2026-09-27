@@ -734,7 +734,9 @@ impl AdmissionPreparer {
         refresh_secs: u64,
     ) -> Result<AnchorRefreshOutcome, AdmissionError> {
         let preparer = &self.inner;
-        let _attempt = preparer.attempt.lock().await;
+        let Ok(_attempt) = preparer.attempt.try_lock() else {
+            return Ok(AnchorRefreshOutcome::Skipped);
+        };
         let coverage = preparer.paper_state.wallet_coverage(&wallet)?;
         if !anchor_refresh_due(&coverage, now_unix, refresh_secs) {
             return Ok(AnchorRefreshOutcome::Skipped);

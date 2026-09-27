@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod http_server;
+
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::PathBuf;
@@ -1709,11 +1711,17 @@ async fn main() -> Result<()> {
     info!(bind = %cfg.bind, "pe-service listening");
     let http_shutdown = shutdown.subscribe();
     supervisor.spawn(TaskName::HttpServer, async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(http_shutdown.wait_for(ShutdownPhase::StopHttp))
-            .await
-            .map(|()| TaskExit::CleanShutdown)
-            .map_err(TaskFailure::typed)
+        http_server::serve(
+            listener,
+            app,
+            http_shutdown.wait_for(ShutdownPhase::StopHttp),
+            #[cfg(test)]
+            None,
+            #[cfg(test)]
+            None,
+        )
+        .await;
+        Ok(TaskExit::CleanShutdown)
     });
 
     let initial_failure = loop {
