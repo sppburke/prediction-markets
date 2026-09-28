@@ -397,7 +397,7 @@ impl RestartFixture {
             .unwrap(),
             schema_version: 3,
             parser_version: 1,
-            financial_semantic_version: 1,
+            financial_semantic_version: pe_service::paper_recovery::FINANCIAL_SEMANTIC_VERSION,
         };
         let mut paper_writer = Writer::open(dir.path().join("paper.log")).unwrap();
         let mut start_envelope = envelope(
@@ -530,7 +530,7 @@ impl RestartFixture {
             DecisionContinuationV3::from_durable(&row)
                 .unwrap()
                 .version(),
-            5
+            6
         );
         let checkpoint: Value = serde_json::from_str(&row.post_commit_inputs_json).unwrap();
         assert_eq!(

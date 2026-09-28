@@ -382,11 +382,18 @@ impl QualificationReport {
 
 /// Run the sealed verifier and atomically replace the requested report file.
 ///
-/// Evidence failures are data: they produce an `InsufficientEvidence` report. Only inability to
-/// encode or write that report is returned as an operational error.
+/// Evidence failures produce an `InsufficientEvidence` report. A known older Start is rejected
+/// before report replacement; encoding and write failures are also returned as errors.
 pub async fn run_qualify(
     options: &QualifyOptions,
 ) -> Result<(QualificationVerdict, String), QualificationError> {
+    // A former current-generation Start cannot publish another report after the paper cutover,
+    // even when a later paper-log frame is unreadable.
+    if first_start_semantic(&options.paper_log)
+        .is_some_and(|semantic| semantic != FINANCIAL_SEMANTIC_VERSION)
+    {
+        return insufficient("QualificationStarted predates the current paper financial semantic");
+    }
     let report = match verify_qualification(options).await {
         Ok(report) => report,
         Err(error) => QualificationReport::insufficient(&options.seal_hash, error.to_string()),
@@ -396,6 +403,24 @@ pub async fn run_qualify(
     let hash = blake3::hash(&bytes).to_hex().to_string();
     write_report(&options.output, &bytes)?;
     Ok((report.verdict, hash))
+}
+
+/// The financial semantic of the first `QualificationStarted` in the paper log's verified prefix,
+/// so a torn tail after the Start cannot hide it. `None` when no Start is readable.
+fn first_start_semantic(paper_log: &Path) -> Option<u32> {
+    let verified = Scanner::inspect(paper_log).ok()?.verified_tail;
+    let mut semantic = None;
+    Scanner::walk_prefix(&verified, &mut |_, envelope: &EventEnvelope| {
+        if semantic.is_none()
+            && envelope.schema_version == PAPER_LOG_SCHEMA_VERSION
+            && let Ok(PaperLogRecord::QualificationStarted(start)) =
+                serde_json::from_slice(&envelope.payload)
+        {
+            semantic = Some(start.financial_semantic_version);
+        }
+    })
+    .ok()?;
+    semantic
 }
 
 fn write_report(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
@@ -594,7 +619,7 @@ fn decision_observation_from_source(
         }
     }
     if let Some(websocket_receipt) = continuation.observed_source_receipt {
-        if continuation.version() != 5 {
+        if !matches!(continuation.version(), 5 | 6) {
             let observation = decision_source_receipt(source, websocket_receipt)?;
             let activity = parse_activity_trade_observation(&observation.payload).map_err(|_| {
             QualificationError::InsufficientEvidence(format!(
@@ -1589,8 +1614,24 @@ fn verify_live_wrappers(
                         "live economic core hash failed for decision {source_trade_id}: {error}"
                     ))
                 })?;
-                if wrapper.economic != paper.economic
-                    || economic_core_hash != paper.economic_core_hash
+                let mut expected_live_economic = paper.economic.clone();
+                if expected_live_economic.version
+                    == pe_execution_core::economic::PAPER_ECONOMIC_PREPARED_VERSION
+                {
+                    expected_live_economic.version =
+                        pe_execution_core::economic::ECONOMIC_PREPARED_VERSION;
+                }
+                let expected_live_core_hash =
+                    expected_live_economic.core_hash().map_err(|error| {
+                        QualificationError::InsufficientEvidence(format!(
+                            "expected live economic core hash failed for decision {source_trade_id}: {error}"
+                        ))
+                    })?;
+                if wrapper.economic != expected_live_economic
+                    || economic_core_hash != expected_live_core_hash
+                    || (paper.economic.version
+                        == pe_execution_core::economic::PAPER_ECONOMIC_PREPARED_VERSION
+                        && economic_core_hash == paper.economic_core_hash)
                 {
                     return insufficient(format!(
                         "live wrapper economic core differs from paper Prepared decision {source_trade_id}"
@@ -2043,12 +2084,12 @@ fn decision_rows_from_sealed_source(
     // receipts to the durable history identity before requiring group dispositions.
     let current_reads = if history.iter().any(|row| {
         DecisionContinuationV3::from_durable(row)
-            .is_ok_and(|continuation| continuation.version() == 5)
+            .is_ok_and(|continuation| matches!(continuation.version(), 5 | 6))
     }) {
         let reads = complete_activity_read_scopes(&history, sealed_sequence, source)?;
         let mut targets = HashMap::new();
         for read in &reads {
-            if read.continuation.version() != 5 {
+            if !matches!(read.continuation.version(), 5 | 6) {
                 continue;
             }
             let receipt = read.continuation.read_commitment.ok_or_else(|| {
@@ -2100,7 +2141,7 @@ fn decision_rows_from_sealed_source(
                 terminal_rows.get(&(source_trade_id.clone(), group.semantic_revision.clone()));
             let receipt_bearing = row
                 .and_then(|row| DecisionContinuationV3::from_durable(row).ok())
-                .is_some_and(|continuation| matches!(continuation.version(), 3..=5));
+                .is_some_and(|continuation| matches!(continuation.version(), 3..=6));
             if !receipt_bearing {
                 return insufficient(format!(
                     "source-log trade {source_trade_id} has no reconstructable receipt-bearing decision"
@@ -2454,7 +2495,7 @@ fn decision_keys_from_source_observations(
             let Some(receipt) = *receipt else {
                 continue;
             };
-            if read.continuation.version() != 5 {
+            if !matches!(read.continuation.version(), 5 | 6) {
                 let observation = source.observation(receipt)?;
                 let activity =
                     parse_activity_trade_observation(&observation.payload).map_err(|_| {
@@ -3382,7 +3423,7 @@ fn verify_complete_second_action(
     expected: &[AppliedEffect],
 ) -> Result<(), QualificationError> {
     let frozen = &continuation.facts;
-    let classify = if continuation.version() == 5 {
+    let classify = if matches!(continuation.version(), 5 | 6) {
         classify_complete_second
     } else {
         pe_position_ledger::classify_complete_second_legacy
@@ -4241,7 +4282,17 @@ fn qualification_completion_inner(
     era: &crate::paper_recovery::PaperEra,
     completed_prepared: Option<&HashSet<EventSeq>>,
 ) -> Option<QualificationCompletion> {
-    era.start.as_ref()?;
+    let (_, started) = era.start.as_ref()?;
+    if started.financial_semantic_version != FINANCIAL_SEMANTIC_VERSION
+        || era.frames.iter().any(|frame| {
+            matches!(
+                &frame.frame,
+                PaperLogFrame::Record(PaperLogRecord::QualificationSealed(_))
+            )
+        })
+    {
+        return None;
+    }
 
     let mut waiting_for_anchor_mark = true;
     let mut anchor_sequence = None;
@@ -4458,6 +4509,12 @@ async fn bind_final_receipts(
             || decision_observations.get(&continuation.source_trade_id) != Some(&fill.observation)
             || continuation.applied_configuration_hash != fill.economic.applied_configuration_hash
             || continuation.applied_configuration_hash != started.hot_config_hash
+            || fill.economic.version
+                != if decision.continuation.version() == 6 {
+                    2
+                } else {
+                    1
+                }
             || u32::from(fill.economic.version) != started.financial_semantic_version
         {
             return insufficient(
@@ -4493,9 +4550,14 @@ fn verify_winner_follow_fill_decision(
     let (signal, mode) = verify_winner_follow_economic_policy(continuation, economic)?;
     let intent =
         pe_strategy_winner_follow::WinnerFollowStrategy::new(configuration.winner_follow_config())
-            .evaluate_at_price(
+            .evaluate_at_price_with_limit(
                 &signal,
                 economic.sizing.all_in_price,
+                if continuation.version() == 6 {
+                    economic.ladder.limit_price
+                } else {
+                    signal.leader_price
+                },
                 frozen.frozen_basis.win_rate_p,
                 economic.risk.snapshot.clone(),
                 frozen.frozen_basis.bankroll,
@@ -4512,7 +4574,12 @@ fn verify_winner_follow_fill_decision(
     if intent.market_id != frozen.market_id
         || intent.outcome_id != frozen.outcome_id
         || intent.side != frozen.side
-        || intent.limit_price != frozen.price
+        || intent.limit_price
+            != if continuation.version() == 6 {
+                economic.ladder.limit_price
+            } else {
+                frozen.price
+            }
         || intent.idempotency_key
             != pe_strategy_winner_follow::evaluate::build_idempotency_key_parts(
                 &TraderId(frozen.wallet).to_string(),
@@ -4573,7 +4640,13 @@ fn verify_winner_follow_economic_policy(
         || economic.balance.price_impact_cap_bps != configuration.price_impact_cap_bps
         || economic.balance.band_floor != band_floor
         || economic.balance.band_ceiling_exclusive != band_ceiling_exclusive
-        || economic.balance.chase_ceiling != signal.leader_price
+        || economic.balance.chase_ceiling
+            != if continuation.version() == 6 {
+                Price::ONE
+            } else {
+                signal.leader_price
+            }
+        || economic.version != if continuation.version() == 6 { 2 } else { 1 }
     {
         return insufficient(format!(
             "decision {} EconomicPrepared execution policy differs from its frozen configuration and signal",
@@ -4604,8 +4677,12 @@ fn verify_winner_follow_intent_plan(
     };
     if !allocation_matches
         || economic.sizing.minimum_shares != economic.ladder.minimum_shares
-        || intent.limit_price != economic.balance.chase_ceiling
-        || economic.ladder.limit_price > intent.limit_price
+        || if economic.version == 2 {
+            intent.limit_price != economic.ladder.limit_price
+        } else {
+            intent.limit_price != economic.balance.chase_ceiling
+                || economic.ladder.limit_price > intent.limit_price
+        }
     {
         return insufficient(format!(
             "decision {source_trade_id} Winner-Follow allocation or limit differs from its sized economic plan"
@@ -4768,9 +4845,14 @@ async fn verify_winner_follow_decline_decision(
             match pe_strategy_winner_follow::WinnerFollowStrategy::new(
                 frozen.applied_configuration.winner_follow_config(),
             )
-            .evaluate_at_price(
+            .evaluate_at_price_with_limit(
                 &signal,
                 reconstructed.sizing.all_in_price,
+                if continuation.version() == 6 {
+                    reconstructed.ladder.limit_price
+                } else {
+                    signal.leader_price
+                },
                 frozen.frozen_basis.win_rate_p,
                 reconstructed.risk.snapshot,
                 frozen.frozen_basis.bankroll,
@@ -5565,7 +5647,7 @@ fn verify_paper_prepared_freshness(
     decision: &crate::decision_replay::ReplayedDecision,
     source: &BTreeMap<u64, SourceObservation>,
 ) -> Result<(), QualificationError> {
-    if decision.continuation.version() != 5 {
+    if !matches!(decision.continuation.version(), 5 | 6) {
         return Ok(());
     }
     if decision.post_boundary.body.terminal.reason == "paper_stale_before_prepared"
@@ -5786,6 +5868,69 @@ mod tests {
                 .iter()
                 .any(|reason| reason.contains("live journal is required"))
         );
+    }
+
+    #[tokio::test]
+    async fn semantic_one_start_refuses_qualify_before_replacing_report() {
+        let temp = tempfile::tempdir().unwrap();
+        let paper_log = temp.path().join("paper.log");
+        let mut writer = Writer::open(&paper_log).unwrap();
+        writer
+            .append_synced(start_envelope(&started("old"), 100).unwrap())
+            .unwrap();
+        drop(writer);
+        let output = temp.path().join("report.json");
+        fs::write(&output, b"existing report\n").unwrap();
+        let options = QualifyOptions {
+            paper_log,
+            source_log: temp.path().join("missing-source.log"),
+            live_journal: None,
+            paper_state: temp.path().join("missing-paper.db"),
+            seal_hash: "old-seal".to_owned(),
+            output: output.clone(),
+        };
+        assert!(matches!(
+            run_qualify(&options).await,
+            Err(QualificationError::InsufficientEvidence(_))
+        ));
+        assert_eq!(fs::read(output).unwrap(), b"existing report\n");
+    }
+
+    #[tokio::test]
+    async fn semantic_one_start_before_unreadable_frame_keeps_existing_report() {
+        let temp = tempfile::tempdir().unwrap();
+        let paper_log = temp.path().join("paper.log");
+        let mut writer = Writer::open(&paper_log).unwrap();
+        writer
+            .append_synced(start_envelope(&started("old"), 100).unwrap())
+            .unwrap();
+        writer
+            .append_synced(start_envelope(&started("torn"), 101).unwrap())
+            .unwrap();
+        drop(writer);
+        // A torn write: the second frame loses its last bytes.
+        let torn_len = fs::metadata(&paper_log).unwrap().len() - 3;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&paper_log)
+            .unwrap()
+            .set_len(torn_len)
+            .unwrap();
+        let output = temp.path().join("report.json");
+        fs::write(&output, b"existing report\n").unwrap();
+        let options = QualifyOptions {
+            paper_log,
+            source_log: temp.path().join("missing-source.log"),
+            live_journal: None,
+            paper_state: temp.path().join("missing-paper.db"),
+            seal_hash: "old-seal".to_owned(),
+            output: output.clone(),
+        };
+        assert!(matches!(
+            run_qualify(&options).await,
+            Err(QualificationError::InsufficientEvidence(_))
+        ));
+        assert_eq!(fs::read(output).unwrap(), b"existing report\n");
     }
 
     /// PASS: qualification delegates source-id, schema-version, and parser-version rejection to
@@ -6052,7 +6197,7 @@ mod tests {
         let terminal = crate::decision_replay::TerminalDispositionEvidence::no_copy("fixture");
         let terminal_disposition = terminal.disposition.clone();
         let post_commit_inputs_json =
-            crate::decision_replay::DecisionEvidenceAccumulator::new(&continuation.facts)
+            crate::decision_replay::DecisionEvidenceAccumulator::historical(&continuation.facts)
                 .render(
                     crate::decision_replay::AuthorityEvidence::not_read("fixture"),
                     terminal,
@@ -6754,7 +6899,7 @@ mod tests {
         );
         let terminal_disposition = terminal.disposition.clone();
         let post_commit_inputs_json =
-            crate::decision_replay::DecisionEvidenceAccumulator::new(&continuation.facts)
+            crate::decision_replay::DecisionEvidenceAccumulator::historical(&continuation.facts)
                 .render(
                     crate::decision_replay::AuthorityEvidence::not_read("strategy_declined"),
                     terminal,
@@ -7093,6 +7238,51 @@ mod tests {
                 &intent,
                 &economic,
                 &continuation.facts.source_trade_id,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn semantic_two_replay_requires_neutral_chase_and_exact_signed_limit() {
+        let (mut continuation, mut economic) = winner_follow_policy_fixture();
+        let mut encoded = serde_json::to_value(&continuation).unwrap();
+        encoded["version"] = serde_json::json!(6);
+        continuation = serde_json::from_value(encoded).unwrap();
+        continuation.facts.price = Price::new(dec!(0.49)).unwrap();
+        economic.version = 2;
+        economic.balance.chase_ceiling = Price::ONE;
+        let (signal, mode) =
+            verify_winner_follow_economic_policy(&continuation, &economic).unwrap();
+        let strategy = pe_strategy_winner_follow::WinnerFollowStrategy::new(
+            continuation
+                .facts
+                .applied_configuration
+                .winner_follow_config(),
+        );
+        let intent = strategy
+            .evaluate_at_price_with_limit(
+                &signal,
+                economic.sizing.all_in_price,
+                economic.ladder.limit_price,
+                continuation.facts.frozen_basis.win_rate_p,
+                economic.risk.snapshot.clone(),
+                continuation.facts.frozen_basis.bankroll,
+                mode,
+            )
+            .unwrap();
+        assert_ne!(intent.limit_price, signal.leader_price);
+        verify_winner_follow_intent_plan(&intent, &economic, &continuation.facts.source_trade_id)
+            .unwrap();
+        economic.balance.chase_ceiling = signal.leader_price;
+        assert!(verify_winner_follow_economic_policy(&continuation, &economic).is_err());
+        economic.balance.chase_ceiling = Price::ONE;
+        economic.ladder.limit_price = Price::new(dec!(0.51)).unwrap();
+        assert!(
+            verify_winner_follow_intent_plan(
+                &intent,
+                &economic,
+                &continuation.facts.source_trade_id
             )
             .is_err()
         );
@@ -7669,7 +7859,8 @@ mod tests {
         );
         assert!(serde_json::from_value::<WinnerFollowDecisionInputs>(duplicate).is_err());
         let post_commit_inputs_json = serde_json::to_string(
-            &crate::decision_replay::DecisionPostBoundaryEvidence::from_body(body).unwrap(),
+            &crate::decision_replay::DecisionPostBoundaryEvidence::from_body_with_semantic(body, 1)
+                .unwrap(),
         )
         .unwrap();
         let frozen_inputs_json = serde_json::to_string(&decision.continuation).unwrap();
@@ -7759,7 +7950,8 @@ mod tests {
         .expect("receipt-backed fixture must contain evaluated inputs");
         economic.risk.snapshot.leader_exposure_bps = BasisPoints::ZERO;
         row.post_commit_inputs_json = serde_json::to_string(
-            &crate::decision_replay::DecisionPostBoundaryEvidence::from_body(body).unwrap(),
+            &crate::decision_replay::DecisionPostBoundaryEvidence::from_body_with_semantic(body, 1)
+                .unwrap(),
         )
         .unwrap();
         let recomputed = replay_decision_pending(&row).unwrap();
@@ -7816,7 +8008,8 @@ mod tests {
             },
         };
         row.post_commit_inputs_json = serde_json::to_string(
-            &crate::decision_replay::DecisionPostBoundaryEvidence::from_body(body).unwrap(),
+            &crate::decision_replay::DecisionPostBoundaryEvidence::from_body_with_semantic(body, 1)
+                .unwrap(),
         )
         .unwrap();
         let recomputed = replay_decision_pending(&row).unwrap();
@@ -7891,7 +8084,8 @@ mod tests {
             },
         };
         row.post_commit_inputs_json = serde_json::to_string(
-            &crate::decision_replay::DecisionPostBoundaryEvidence::from_body(body).unwrap(),
+            &crate::decision_replay::DecisionPostBoundaryEvidence::from_body_with_semantic(body, 1)
+                .unwrap(),
         )
         .unwrap();
         let replayed = replay_decision_pending(&row).unwrap();
@@ -7963,7 +8157,8 @@ mod tests {
             },
         };
         row.post_commit_inputs_json = serde_json::to_string(
-            &crate::decision_replay::DecisionPostBoundaryEvidence::from_body(body).unwrap(),
+            &crate::decision_replay::DecisionPostBoundaryEvidence::from_body_with_semantic(body, 1)
+                .unwrap(),
         )
         .unwrap();
         let replayed = replay_decision_pending(&row).unwrap();
@@ -9444,6 +9639,7 @@ mod tests {
     #[test]
     fn initial_membership_label_is_not_proof() {
         let mut start = started("config");
+        start.financial_semantic_version = FINANCIAL_SEMANTIC_VERSION;
         start.membership.clear();
         start.membership_proofs_hash = "not-a-proof".to_owned();
         assert!(matches!(
@@ -9487,6 +9683,7 @@ mod tests {
             }])
             .unwrap();
         let mut start = started("config");
+        start.financial_semantic_version = FINANCIAL_SEMANTIC_VERSION;
         start.membership = vec![wallet];
         start.membership_proofs_hash = derive_membership_proofs_hash(&state, &[wallet]).unwrap();
 
@@ -9735,7 +9932,8 @@ mod tests {
     /// financial state does not complete the close threshold.
     #[test]
     fn post_cutoff_resolution_does_not_complete_qualification() {
-        let start = started("hot");
+        let mut start = started("hot");
+        start.financial_semantic_version = FINANCIAL_SEMANTIC_VERSION;
         let start_receipt = test_receipt(1);
         let mut frames = vec![test_frame(
             1,
@@ -10159,6 +10357,7 @@ mod tests {
         let state = PaperStateDb::open(&paper_state).unwrap();
         drop(pe_execution_core::LiveJournal::open(&live_journal).unwrap());
         let mut start = started("hot");
+        start.financial_semantic_version = FINANCIAL_SEMANTIC_VERSION;
         let decision_wallet = start.membership[0];
         start.membership.clear();
         start.membership_proofs_hash = derive_membership_proofs_hash(&state, &[]).unwrap();
@@ -10298,7 +10497,7 @@ mod tests {
         let terminal = crate::decision_replay::TerminalDispositionEvidence::no_copy("post_seal");
         let terminal_disposition = terminal.disposition.clone();
         let post_commit_inputs_json =
-            crate::decision_replay::DecisionEvidenceAccumulator::new(&continuation)
+            crate::decision_replay::DecisionEvidenceAccumulator::historical(&continuation)
                 .render(
                     crate::decision_replay::AuthorityEvidence::not_read("post_seal"),
                     terminal,
@@ -12411,13 +12610,16 @@ mod tests {
                 )
                 .unwrap();
         }
-        for generation in [3, 4, 5] {
+        for generation in [3, 4, 5, 6] {
             let committed = generation >= 4;
             for pre_start_ws in [false, true] {
                 let (mut continuation, mut observations) =
                     single_read_fixture(2, "0xfirst", "BUY", committed);
-                if generation == 5 {
+                if generation >= 5 {
                     commit_read_fixture_v2(&mut continuation, &mut observations);
+                    if generation == 6 {
+                        continuation = continuation.current_paper();
+                    }
                 }
                 if pre_start_ws {
                     let payload = serde_json::to_vec(&serde_json::json!({"topic":"activity","type":"trades","payload": {
@@ -13636,8 +13838,11 @@ mod tests {
             } else {
                 AuthorityEvidence::commit_fill_v2("applied", dec!(99))
             };
-            decision.post_boundary =
-                DecisionPostBoundaryEvidence::from_body(decision.post_boundary.body).unwrap();
+            decision.post_boundary = DecisionPostBoundaryEvidence::from_body_with_semantic(
+                decision.post_boundary.body,
+                1,
+            )
+            .unwrap();
             let mut row = state
                 .decision_pending_for(&current.facts.source_trade_id)
                 .unwrap()
@@ -13664,8 +13869,11 @@ mod tests {
                     let mut contradictory = decision.clone();
                     contradictory.post_boundary.body.authority = authority;
                     contradictory.post_boundary =
-                        DecisionPostBoundaryEvidence::from_body(contradictory.post_boundary.body)
-                            .unwrap();
+                        DecisionPostBoundaryEvidence::from_body_with_semantic(
+                            contradictory.post_boundary.body,
+                            1,
+                        )
+                        .unwrap();
                     let mut rehashed_row = row.clone();
                     rehashed_row.post_commit_inputs_json =
                         serde_json::to_string(&contradictory.post_boundary).unwrap();
@@ -13687,13 +13895,19 @@ mod tests {
                     },
                 )
                 .unwrap();
-                decision.post_boundary =
-                    DecisionPostBoundaryEvidence::from_body(decision.post_boundary.body).unwrap();
+                decision.post_boundary = DecisionPostBoundaryEvidence::from_body_with_semantic(
+                    decision.post_boundary.body,
+                    1,
+                )
+                .unwrap();
                 assert!(verify_paper_prepared_freshness(&decision, &source).is_err());
             } else {
                 decision.post_boundary.body.clocks[0].submillisecond_nanos = Some(1);
-                decision.post_boundary =
-                    DecisionPostBoundaryEvidence::from_body(decision.post_boundary.body).unwrap();
+                decision.post_boundary = DecisionPostBoundaryEvidence::from_body_with_semantic(
+                    decision.post_boundary.body,
+                    1,
+                )
+                .unwrap();
                 verify_paper_prepared_freshness(&decision, &source).unwrap();
             }
         }

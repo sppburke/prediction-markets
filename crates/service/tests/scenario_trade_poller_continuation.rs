@@ -610,7 +610,7 @@ async fn poller_multipage_commitment_survives_restart() {
     let rows = paper.open_decision_pending().unwrap();
     assert_eq!(rows.len(), 1);
     let continuation = DecisionContinuationV3::from_durable(&rows[0]).unwrap();
-    assert_eq!(continuation.version(), 5);
+    assert_eq!(continuation.version(), 6);
     assert_eq!(continuation.read_commitment, Some(commitment));
     assert_eq!(continuation.page_occurrences.len(), pages.len());
     for (_, context, _) in &commits {
@@ -1769,7 +1769,7 @@ async fn corrected_identity_binding_replays_from_raw_metadata() {
     );
     let continuation =
         pe_service::bucket_commit::DecisionContinuationV3::from_durable(&rows[0]).unwrap();
-    assert_eq!(continuation.version(), 5);
+    assert_eq!(continuation.version(), 6);
     let index = pe_service::risk_inputs::SourceReceiptIndex::replay(&dir.path().join("source.log"))
         .unwrap();
     let observation = continuation

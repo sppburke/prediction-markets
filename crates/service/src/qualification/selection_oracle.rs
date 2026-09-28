@@ -104,7 +104,7 @@ fn materialize_selection_source(
                 continuation.facts.decision_inputs["pages"].clone(),
             )
             .unwrap();
-            observation.payload = if continuation.version() == 5 {
+            observation.payload = if matches!(continuation.version(), 5 | 6) {
                 let mut commitment: crate::bucket_commit::ActivityReadCommitment =
                     serde_json::from_slice(&observation.payload).unwrap();
                 let bindings = commitment.bindings.as_mut().unwrap();

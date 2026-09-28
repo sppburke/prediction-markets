@@ -860,6 +860,37 @@ mod tests {
     }
 
     #[test]
+    fn paper_best_ask_accepts_recorded_leader_ceiling_refusals() {
+        for (leader, ask, depth) in [
+            (dec!(0.71), dec!(0.73), dec!(47)),
+            (dec!(0.5799999992), dec!(0.58), dec!(48.94)),
+        ] {
+            let asks = [level(ask, depth)];
+            let budget = CollateralAmount::from_decimal_exact(dec!(25)).unwrap();
+            let impact = price(ask * dec!(1.01));
+            let plan = |chase| {
+                plan_sized_buy(
+                    &asks,
+                    CompactFeeSchedule::Zero,
+                    BuySizing::Dollar { budget },
+                    &[budget],
+                    ShareAmount::from_whole(5).unwrap(),
+                    price(dec!(0.01)),
+                    price(dec!(0.15)),
+                    price(dec!(0.85)),
+                    chase,
+                    impact,
+                )
+            };
+            assert!(plan(price(leader)).is_err());
+            let paper = plan(Price::ONE).unwrap();
+            assert_eq!(paper.ladder.best_ask, price(ask));
+            assert_eq!(paper.ladder.limit_price, price(ask));
+            assert!(paper.ladder.limit_price < price(dec!(0.85)));
+        }
+    }
+
+    #[test]
     fn production_dollar_shape_keeps_walked_ask_below_the_signed_ratio() {
         let budget = CollateralAmount::from_decimal_exact(dec!(25)).unwrap();
         let plan = plan_sized_buy(

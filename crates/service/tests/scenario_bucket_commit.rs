@@ -1409,26 +1409,29 @@ fn different_markets_create_independent_pending_deliveries_and_restart_does_not_
             decline: None,
             final_receipt: None,
         };
-        let evidence = DecisionPostBoundaryEvidence::from_body(DecisionPostBoundaryEvidenceBody {
-            version: pe_service::decision_replay::POST_BOUNDARY_EVIDENCE_VERSION,
-            owners: vec!["source_log".to_owned(), "paper_log".to_owned()],
-            source_trade_id: pending.source_trade_id.clone(),
-            applied_configuration_hash: frozen.facts.applied_configuration_hash.clone(),
-            market_end: None,
-            market_price: None,
-            book: None,
-            clocks: vec![DecisionClockEvidence {
-                purpose: "terminal_transition".to_owned(),
-                unix_millis: 301_000,
-                submillisecond_nanos: None,
-            }],
-            authority: AuthorityEvidence {
-                kind: "not_read".to_owned(),
-                outcome: "test_terminal".to_owned(),
-                bankroll: None,
+        let evidence = DecisionPostBoundaryEvidence::from_body_for_continuation(
+            DecisionPostBoundaryEvidenceBody {
+                version: pe_service::decision_replay::POST_BOUNDARY_EVIDENCE_VERSION,
+                owners: vec!["source_log".to_owned(), "paper_log".to_owned()],
+                source_trade_id: pending.source_trade_id.clone(),
+                applied_configuration_hash: frozen.facts.applied_configuration_hash.clone(),
+                market_end: None,
+                market_price: None,
+                book: None,
+                clocks: vec![DecisionClockEvidence {
+                    purpose: "terminal_transition".to_owned(),
+                    unix_millis: 301_000,
+                    submillisecond_nanos: None,
+                }],
+                authority: AuthorityEvidence {
+                    kind: "not_read".to_owned(),
+                    outcome: "test_terminal".to_owned(),
+                    bankroll: None,
+                },
+                terminal,
             },
-            terminal,
-        })
+            &frozen,
+        )
         .unwrap();
         restarted
             .close_decision_pending(
@@ -1479,26 +1482,29 @@ fn terminal_decision_pending_retains_financial_final_receipt() {
     };
     let terminal = TerminalDispositionEvidence::final_fill(final_receipt);
     assert!(terminal.fill.is_none());
-    let evidence = DecisionPostBoundaryEvidence::from_body(DecisionPostBoundaryEvidenceBody {
-        version: pe_service::decision_replay::TERMINAL_EVIDENCE_VERSION,
-        owners: vec!["source_log".to_owned(), "paper_log".to_owned()],
-        source_trade_id: pending.source_trade_id.clone(),
-        applied_configuration_hash: frozen.facts.applied_configuration_hash,
-        market_end: None,
-        market_price: None,
-        book: None,
-        clocks: vec![DecisionClockEvidence {
-            purpose: "financial_final".to_owned(),
-            unix_millis: 302_001,
-            submillisecond_nanos: None,
-        }],
-        authority: AuthorityEvidence {
-            kind: "commit_fill_v2".to_owned(),
-            outcome: "applied".to_owned(),
-            bankroll: Some("9".to_owned()),
+    let evidence = DecisionPostBoundaryEvidence::from_body_for_continuation(
+        DecisionPostBoundaryEvidenceBody {
+            version: pe_service::decision_replay::TERMINAL_EVIDENCE_VERSION,
+            owners: vec!["source_log".to_owned(), "paper_log".to_owned()],
+            source_trade_id: pending.source_trade_id.clone(),
+            applied_configuration_hash: frozen.facts.applied_configuration_hash.clone(),
+            market_end: None,
+            market_price: None,
+            book: None,
+            clocks: vec![DecisionClockEvidence {
+                purpose: "financial_final".to_owned(),
+                unix_millis: 302_001,
+                submillisecond_nanos: None,
+            }],
+            authority: AuthorityEvidence {
+                kind: "commit_fill_v2".to_owned(),
+                outcome: "applied".to_owned(),
+                bankroll: Some("9".to_owned()),
+            },
+            terminal,
         },
-        terminal,
-    })
+        &frozen,
+    )
     .unwrap();
     paper
         .close_decision_pending(
@@ -2762,19 +2768,103 @@ async fn boot_validation_rejects_fact_altered_row_before_any_resume() {
     );
 }
 
-/// PASS: reopened real-log continuations each reach one terminal transition; a second restart
-/// changes no terminal rows, bucket effects, history, or balances. FAIL: any row is lost or reapplied.
+/// PASS: open continuation-5 rows under a semantic-1 Start resume before the semantic-2 seal;
+/// a second restart changes no seal, terminal rows, bucket effects, history, or balances.
 #[tokio::test]
 async fn valid_pending_restart_resumes_once() {
     let (dir, paper, mut engine) = fresh_anchored();
-    let (read, commitment) = committed_source_read(
-        &dir,
-        &[
-            position_row("TRADE", "0xrestart-a", MARKET_A, 0, "BUY", "2", "0.4", 910),
-            position_row("TRADE", "0xrestart-b", MARKET_B, 0, "BUY", "3", "0.6", 910),
-        ],
-    );
-    commit_open_source_read(&mut engine, &read, commitment, HashMap::new());
+    let source_path = dir.path().join("source.log");
+    let paper_path = dir.path().join("paper.log");
+    drop(pe_event_log::Writer::open(&source_path).unwrap());
+    let mut paper_writer = pe_event_log::Writer::open(&paper_path).unwrap();
+    drop(pe_execution_core::LiveJournal::open(dir.path().join("live_journal.log")).unwrap());
+    let hot_hash = pe_service::runtime_config::RuntimeConfig::from_service_config(
+        &pe_service::config::ServiceConfig::default(),
+    )
+    .canonical_hash();
+    let at = time::OffsetDateTime::from_unix_timestamp(900).unwrap();
+    let start = pe_service::paper_recovery::QualificationStarted {
+        starting_bankroll: pe_core_types::CollateralAmount::from_decimal_exact(
+            rust_decimal::Decimal::from(1_000),
+        )
+        .unwrap(),
+        paper_prefix: pe_service::paper_recovery::TailBinding::from(
+            &pe_event_log::Scanner::verify(&paper_path).unwrap(),
+        ),
+        source_prefix: pe_service::paper_recovery::TailBinding::from(
+            &pe_event_log::Scanner::verify(&source_path).unwrap(),
+        ),
+        live_prefix: pe_service::paper_recovery::TailBinding {
+            physical_tail: 0,
+            last_sequence: None,
+            last_hash: "00".repeat(32),
+        },
+        artifact_blake3: "scenario".to_owned(),
+        static_config_hash: "scenario".to_owned(),
+        hot_config_hash: hot_hash.clone(),
+        generation: "scenario".to_owned(),
+        activation_id: "scenario".to_owned(),
+        ranking_batch_id: 1,
+        membership: vec![wallet()],
+        membership_proofs_hash: "scenario".to_owned(),
+        schema_version: pe_service::paper_recovery::PAPER_LOG_SCHEMA_VERSION,
+        parser_version: 1,
+        financial_semantic_version: 1,
+    };
+    let start_receipt = paper_writer
+        .append_synced(pe_event_log::EnvelopeIn {
+            source_id: pe_core_types::SourceId("pe-service.qualification".to_owned()),
+            schema_version: pe_service::paper_recovery::PAPER_LOG_SCHEMA_VERSION,
+            parser_version: 1,
+            observed_at: pe_core_types::SourceTimestamp(at),
+            received_at: pe_core_types::ReceivedAt(at),
+            content_type: pe_event_log::ContentType::Json,
+            payload: serde_json::to_vec(
+                &pe_service::paper_recovery::PaperLogRecord::QualificationStarted(Box::new(start)),
+            )
+            .unwrap(),
+        })
+        .unwrap();
+    drop(paper_writer);
+    paper
+        .reset_financial_era(
+            start_receipt,
+            pe_core_types::CollateralAmount::from_decimal_exact(rust_decimal::Decimal::from(1_000))
+                .unwrap(),
+        )
+        .unwrap();
+    let rows = [
+        position_row("TRADE", "0xrestart-a", MARKET_A, 0, "BUY", "2", "0.4", 910),
+        position_row("TRADE", "0xrestart-b", MARKET_B, 0, "BUY", "3", "0.6", 910),
+    ];
+    let payload = serde_json::to_vec(
+        &rows
+            .iter()
+            .flat_map(|group| group.rows.iter())
+            .collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let mut writer = pe_event_log::Writer::open(&source_path).unwrap();
+    let (read, commitment) =
+        support::append_committed_read_v2(&mut writer, wallet(), &payload, 920, 921);
+    drop(writer);
+    let mut context = context(910, true);
+    context.decision_inputs_json = read.decision_inputs_json;
+    context.page_occurrences = vec![read.page];
+    context.read_commitment =
+        Some(pe_service::bucket_commit::ActivityReadCommitmentReceipt::BindingsV2(commitment));
+    let committed = engine
+        .commit_with_freshness_policy(
+            read.aggregates,
+            &context,
+            zero_basis(),
+            Some(pe_service::bucket_commit::PaperFreshnessPolicy {
+                activity_ws_enabled: true,
+                copy_latency_budget_secs: 30,
+            }),
+        )
+        .unwrap();
+    assert_eq!(committed.pending.len(), 2);
     let positions = paper.leader_positions().unwrap();
     let history = paper.gate_history().unwrap();
     let groups = paper.activity_groups_after(&wallet(), 0).unwrap();
@@ -2782,7 +2872,28 @@ async fn valid_pending_restart_resumes_once() {
     drop(engine);
     drop(paper);
     let state_path = dir.path().join("paper.db");
-    let paper_path = dir.path().join("paper.log");
+    // All rows in one complete activity read share a generation. Emulate the open
+    // continuation-5 read left by the preceding binary at cutover.
+    let legacy_rows = PaperStateDb::open(&state_path)
+        .unwrap()
+        .open_decision_pending()
+        .unwrap();
+    assert_eq!(legacy_rows.len(), 2);
+    let connection = rusqlite::Connection::open(&state_path).unwrap();
+    for legacy in legacy_rows {
+        let mut historical: Value = serde_json::from_str(&legacy.frozen_inputs_json).unwrap();
+        assert_eq!(historical["version"], json!(6));
+        historical["version"] = json!(5);
+        assert_eq!(
+            connection
+                .execute(
+                    "UPDATE decision_pending SET frozen_inputs_json = ?1 WHERE source_trade_id = ?2",
+                    rusqlite::params![historical.to_string(), legacy.source_trade_id.0],
+                )
+                .unwrap(),
+            1
+        );
+    }
     let mut terminal = Vec::new();
     for restart in 0..2 {
         let paper = Arc::new(PaperStateDb::open(&state_path).unwrap());
@@ -2794,13 +2905,43 @@ async fn valid_pending_restart_resumes_once() {
             if restart == 0 { 2 } else { 0 }
         );
         let (_control, receiver) = tokio::sync::mpsc::channel(4);
-        let mut orchestrator = support::continuation_orchestrator(
+        let mut orchestrator = support::continuation_orchestrator_with_authority(
             Arc::clone(&paper),
             &paper_path,
             wallet(),
             receiver,
-            support::continuation_hooks(930),
+            support::continuation_hooks(950),
+            Some(pe_service::supabase_state::SupabaseStateClient::new(
+                reqwest::Client::new(),
+                "https://offline.invalid",
+                "scenario-anon",
+                "scenario-secret",
+            )),
+        )
+        .with_source_receipt_index(index.clone());
+        let (source_log, _source_rx) = pe_service::activity_ingest::SourceLogHandle::channel(1);
+        let http = reqwest::Client::new();
+        let admission = pe_service::live_venue_adapter::LiveAdmissionBuilder::new(
+            http.clone(),
+            "https://offline.invalid",
+            "https://offline.invalid",
+            source_log.clone(),
         );
+        let marks = Arc::new(pe_service::mark_prices::HistoricalMarkAdapter::new(
+            http,
+            "https://offline.invalid",
+            source_log,
+        ));
+        orchestrator
+            .configure_financial_log_paths(
+                paper_path.clone(),
+                source_path.clone(),
+                admission,
+                marks,
+                index,
+            )
+            .unwrap();
+        orchestrator.seal_before_resume(&hot_hash, 2).await.unwrap();
         orchestrator
             .resume_pending_before_producers()
             .await
@@ -2814,16 +2955,30 @@ async fn valid_pending_restart_resumes_once() {
         assert_eq!(rows.len(), 2);
         for row in &rows {
             assert_eq!(row.state, DecisionPendingState::Terminal);
+            let replayed = replay_decision_pending(row).unwrap();
             assert_eq!(
-                replay_decision_pending(row)
-                    .unwrap()
-                    .post_boundary
-                    .body
-                    .terminal
-                    .reason,
-                "financial_era_not_started"
+                replayed.post_boundary.body.terminal.reason,
+                "stale_fallback_past_copy_budget"
             );
+            assert_eq!(replayed.continuation.version(), 5);
+            assert_eq!(replayed.post_boundary.financial_semantic_version, 1);
         }
+        let seals = pe_service::paper_recovery::scan_paper_log(&paper_path)
+            .unwrap()
+            .into_iter()
+            .filter_map(|frame| match frame.frame {
+                pe_service::paper_recovery::PaperLogFrame::Record(
+                    pe_service::paper_recovery::PaperLogRecord::QualificationSealed(seal),
+                ) => Some(seal),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(seals.len(), 1);
+        assert!(matches!(
+            &seals[0].reason,
+            pe_service::paper_recovery::SealReason::InsufficientEvidence(reason)
+                if reason.contains("financial semantic version changed")
+        ));
         if restart == 0 {
             terminal = rows;
         } else {

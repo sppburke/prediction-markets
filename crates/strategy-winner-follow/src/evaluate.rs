@@ -179,6 +179,29 @@ impl WinnerFollowStrategy {
         bankroll: Decimal,
         mode: ExecutionMode,
     ) -> Result<OrderIntent, WinnerFollowError> {
+        self.evaluate_at_price_with_limit(
+            signal,
+            all_in_kelly_price,
+            signal.leader_price,
+            p,
+            snapshot,
+            bankroll,
+            mode,
+        )
+    }
+
+    /// Paper evaluates the same strategy gates while signing the venue planner's exact limit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn evaluate_at_price_with_limit(
+        &self,
+        signal: &LeaderSignal,
+        all_in_kelly_price: Price,
+        limit_price: Price,
+        p: Probability,
+        snapshot: RiskSnapshot,
+        bankroll: Decimal,
+        mode: ExecutionMode,
+    ) -> Result<OrderIntent, WinnerFollowError> {
         // 1. Flip gate.
         if signal.action == LeaderAction::Flip && !self.config.flip_human_approved {
             return Err(WinnerFollowError::FlipNotApproved);
@@ -234,7 +257,7 @@ impl WinnerFollowStrategy {
         }
 
         // 7. Build OrderIntent.
-        Ok(build_order_intent(signal, contracts, signal.leader_price))
+        Ok(build_order_intent(signal, contracts, limit_price))
     }
 
     /// Resolve the configured Kelly fraction for one execution mode.

@@ -1472,6 +1472,13 @@ async fn main() -> Result<()> {
             source_receipts,
         )
         .context("configure active financial protocol")?;
+        orch.seal_before_resume(
+            &initial_runtime_config.canonical_hash(),
+            pe_service::paper_recovery::FINANCIAL_SEMANTIC_VERSION,
+        )
+        .await
+        .map_err(anyhow::Error::msg)
+        .context("synchronize boot qualification seal before paper recovery")?;
     }
     orch.resume_pending_before_producers()
         .await
@@ -1483,17 +1490,6 @@ async fn main() -> Result<()> {
             .map(|()| TaskExit::CleanShutdown)
             .map_err(TaskFailure::typed)
     });
-    if let Some(handle) = qualification_seal.as_ref() {
-        handle
-            .apply(
-                initial_runtime_config.canonical_hash(),
-                pe_service::paper_recovery::FINANCIAL_SEMANTIC_VERSION,
-            )
-            .await
-            .map_err(|error| {
-                anyhow::anyhow!("synchronize boot qualification seal check: {error}")
-            })?;
-    }
     if let (Some(handle), Some(release_hash)) =
         (risk_halt_release.as_ref(), initial_release_hash.as_deref())
     {

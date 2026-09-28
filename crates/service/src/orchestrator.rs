@@ -668,6 +668,54 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         )
     }
 
+    /// Boot must settle and seal the old qualification before resuming paper decisions.
+    pub async fn seal_before_resume(
+        &mut self,
+        proposed_economic_hash: &str,
+        proposed_financial_semantic_version: u32,
+    ) -> Result<(), String> {
+        self.reconcile_oldest_financial_prepared().await?;
+        let (paper_log_path, _) = self
+            .financial_log_paths
+            .as_ref()
+            .ok_or_else(|| "qualification seal check is unavailable before Start".to_owned())?;
+        let era = crate::paper_recovery::paper_era(
+            crate::paper_recovery::scan_paper_log(paper_log_path)
+                .map_err(|error| error.to_string())?,
+        );
+        let seal_needed = era.start.as_ref().is_some_and(|(_, start)| {
+            Self::qualification_seal_reason(
+                start,
+                proposed_economic_hash,
+                proposed_financial_semantic_version,
+            )
+            .is_some()
+        }) && !era.frames.iter().any(|frame| {
+            matches!(
+                &frame.frame,
+                PaperLogFrame::Record(PaperLogRecord::QualificationSealed(_))
+            )
+        });
+        if seal_needed && !self.pending_boot.is_empty() {
+            // The seal digest requires terminal decisions. Finish only the preceding
+            // generation's frozen continuations before sealing; no new source producer is
+            // running yet, and continuation 6 may never be decided under an unsealed Start.
+            if self
+                .pending_continuations
+                .values()
+                .any(|continuation| continuation.version() >= 6)
+            {
+                return Err(
+                    "current-semantic continuation is open before qualification seal".to_owned(),
+                );
+            }
+            self.resume_pending_before_producers()
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        self.apply_seal_check(proposed_economic_hash, proposed_financial_semantic_version)
+    }
+
     /// Converge the verified oldest paper Prepared before any successor financial control.
     /// The shared recovery routine owns frozen-request reconstruction and appends at most the
     /// missing Final; no control-specific cursor or retry state is maintained here.
@@ -1078,6 +1126,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
     fn compose_active_paper_economic(
         &self,
         signal: &LeaderSignal,
+        semantic2: bool,
         admission: &pe_execution_core::LiveAdmissionArtifact,
         plan: &LadderPlan,
         book_receipt: pe_event_log::AppendReceipt,
@@ -1122,7 +1171,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 probability,
             },
         };
-        pe_execution_core::EconomicPrepared::compose(pe_execution_core::EconomicInputs {
+        let inputs = pe_execution_core::EconomicInputs {
             market: pe_execution_core::MarketSelection {
                 condition_id: pe_core_types::PolymarketConditionId(signal.market_id.to_string()),
                 outcome_index,
@@ -1140,11 +1189,20 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             risk,
             cash_before,
             price_impact_cap_bps: self.price_impact_cap_bps,
-            chase_ceiling: signal.leader_price,
+            chase_ceiling: if semantic2 {
+                Price::ONE
+            } else {
+                signal.leader_price
+            },
             band_floor,
             band_ceiling_exclusive,
             applied_configuration_hash,
-        })
+        };
+        if semantic2 {
+            pe_execution_core::EconomicPrepared::compose_paper(inputs)
+        } else {
+            pe_execution_core::EconomicPrepared::compose(inputs)
+        }
         .map_err(|error| error.to_string())
     }
 
@@ -1509,13 +1567,12 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 proposed_financial_semantic_version,
                 acknowledged,
             } => {
-                let result = match self.reconcile_oldest_financial_prepared().await {
-                    Ok(()) => self.apply_seal_check(
+                let result = self
+                    .seal_before_resume(
                         &proposed_economic_hash,
                         proposed_financial_semantic_version,
-                    ),
-                    Err(error) => Err(error),
-                };
+                    )
+                    .await;
                 let _ = acknowledged.send(result);
             }
         }
@@ -1941,6 +1998,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
     async fn plan_impact_gate(
         &self,
         signal: &LeaderSignal,
+        semantic2: bool,
         probability: Probability,
         sizing_bankroll: Decimal,
         admission: &pe_execution_core::LiveAdmissionArtifact,
@@ -2173,7 +2231,11 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             minimum_tick_size,
             minimum_price,
             maximum_price_exclusive,
-            signal.leader_price,
+            if semantic2 {
+                Price::ONE
+            } else {
+                signal.leader_price
+            },
             ceiling,
         ) {
             Ok(sized) => {
@@ -2366,7 +2428,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 "scenario fault: dispatch seed staging failed; abandoning the trade unseen");
             return Err(());
         }
-        let checkpoint = continuation_version == 5;
+        let checkpoint = matches!(continuation_version, 5 | 6);
         let pending = if checkpoint {
             if let Some(evidence) = evidence.as_mut() {
                 evidence.record_staged_dispatch(dispatch_id.clone());
@@ -2518,10 +2580,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         };
         let mut decision_evidence = pending
             .as_ref()
-            .map(|continuation| DecisionEvidenceAccumulator::new(&continuation.facts));
+            .map(DecisionEvidenceAccumulator::for_continuation);
         if pending
             .as_ref()
-            .is_some_and(|continuation| continuation.version() == 5)
+            .is_some_and(|continuation| matches!(continuation.version(), 5 | 6))
         {
             let restored = self
                 .paper_state
@@ -2855,14 +2917,22 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .and_then(|hooks| hooks.admission_artifacts.lock().ok()?.pop_front());
         #[cfg(not(feature = "scenario"))]
         let scenario_admission = None;
+        let semantic2 = pending
+            .as_ref()
+            .is_some_and(|continuation| continuation.version() == 6);
         let admission = if let Some(admission) = scenario_admission {
             admission
         } else {
             match &self.admission_builder {
-                Some(builder) => match builder
-                    .build(&condition_id, OffsetDateTime::now_utc())
-                    .await
-                {
+                Some(builder) => match if semantic2 {
+                    builder
+                        .build_paper(&condition_id, OffsetDateTime::now_utc())
+                        .await
+                } else {
+                    builder
+                        .build(&condition_id, OffsetDateTime::now_utc())
+                        .await
+                } {
                     Ok(admission) => admission,
                     Err(error) => {
                         info!(%error, market = %signal.market_id, "market admission failed closed");
@@ -3016,7 +3086,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             },
         };
         let gate_evidence = match self
-            .plan_impact_gate(&signal, p, sizing_bankroll, &admission)
+            .plan_impact_gate(&signal, semantic2, p, sizing_bankroll, &admission)
             .await
         {
             Ok(outcome) => outcome,
@@ -3339,6 +3409,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         let applied_configuration_hash = applied_runtime.canonical_hash();
         let economic = match self.compose_active_paper_economic(
             &signal,
+            semantic2,
             &admission,
             plan,
             book_receipt,
@@ -3355,9 +3426,14 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 return;
             }
         };
-        match self.strategy.evaluate_at_price(
+        match self.strategy.evaluate_at_price_with_limit(
             &signal,
             economic.sizing.all_in_price,
+            if semantic2 {
+                plan.limit_price
+            } else {
+                signal.leader_price
+            },
             p,
             economic.risk.snapshot.clone(),
             sizing_bankroll,
@@ -3384,7 +3460,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             Ok(intent) => {
                 if pending
                     .as_ref()
-                    .is_none_or(|continuation| continuation.version() != 5)
+                    .is_none_or(|continuation| !matches!(continuation.version(), 5 | 6))
                 {
                     let execution_at = OffsetDateTime::now_utc();
                     record_clock(&mut decision_evidence, "paper_dispatch", execution_at);
@@ -4075,21 +4151,28 @@ mod tests {
     }
 
     fn started_seal_fixture(hot_config_hash: &str) -> StartedSealFixture {
+        started_seal_fixture_with_semantic(hot_config_hash, FINANCIAL_SEMANTIC_VERSION)
+    }
+
+    fn started_seal_fixture_with_semantic(
+        hot_config_hash: &str,
+        financial_semantic_version: u32,
+    ) -> StartedSealFixture {
         let dir = tempfile::tempdir().unwrap();
         let paper_path = dir.path().join("paper.log");
         let source_path = dir.path().join("source.log");
         drop(Writer::open(&source_path).unwrap());
         drop(pe_execution_core::LiveJournal::open(dir.path().join("live_journal.log")).unwrap());
         let mut paper_writer = Writer::open(&paper_path).unwrap();
-        let start = append_paper(
-            &mut paper_writer,
-            &qualification_start(
-                TailBinding::from(&Scanner::verify(&paper_path).unwrap()),
-                TailBinding::from(&Scanner::verify(&source_path).unwrap()),
-                hot_config_hash,
-            ),
-            SEAL_START_UNIX,
+        let mut started = qualification_start(
+            TailBinding::from(&Scanner::verify(&paper_path).unwrap()),
+            TailBinding::from(&Scanner::verify(&source_path).unwrap()),
+            hot_config_hash,
         );
+        if let PaperLogRecord::QualificationStarted(start) = &mut started {
+            start.financial_semantic_version = financial_semantic_version;
+        }
+        let start = append_paper(&mut paper_writer, &started, SEAL_START_UNIX);
         let state = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
         state
             .reset_financial_era(
@@ -4455,6 +4538,56 @@ mod tests {
             runtime_source_evidence(configured),
             SourceEvidence::Log(path) if path == configured
         ));
+    }
+
+    #[tokio::test]
+    async fn boot_semantic_seal_is_durable_and_idempotent_before_resume() {
+        let StartedSealFixture {
+            _dir,
+            paper_path,
+            source_path,
+            state,
+            paper_writer,
+            ..
+        } = started_seal_fixture_with_semantic("start-hash", 1);
+        let source_receipts = SourceReceiptIndex::replay(&source_path).unwrap();
+        let mut orchestrator = test_orchestrator(
+            paper_path.clone(),
+            source_path.clone(),
+            paper_writer,
+            Arc::clone(&state),
+            source_receipts,
+        );
+        orchestrator
+            .seal_before_resume("start-hash", FINANCIAL_SEMANTIC_VERSION)
+            .await
+            .unwrap();
+        let seals = sealed_records(&paper_path);
+        assert_eq!(seals.len(), 1);
+        assert!(matches!(
+            seals[0].reason,
+            SealReason::InsufficientEvidence(_)
+        ));
+        orchestrator
+            .seal_before_resume("start-hash", FINANCIAL_SEMANTIC_VERSION)
+            .await
+            .unwrap();
+        assert_eq!(sealed_records(&paper_path), seals);
+        drop(orchestrator);
+        let paper_writer = Writer::open(&paper_path).unwrap();
+        let source_receipts = SourceReceiptIndex::replay(&source_path).unwrap();
+        let mut restarted = test_orchestrator(
+            paper_path.clone(),
+            source_path,
+            paper_writer,
+            state,
+            source_receipts,
+        );
+        restarted
+            .seal_before_resume("start-hash", FINANCIAL_SEMANTIC_VERSION)
+            .await
+            .unwrap();
+        assert_eq!(sealed_records(&paper_path), seals);
     }
 
     /// PASS: configuration drift seals exactly the receipt-index tail supplied by `SealCheck`.

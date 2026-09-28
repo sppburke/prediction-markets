@@ -783,6 +783,52 @@ unit starts the process again. Forge's independent ranking loop (`pe-rank-loop`,
 [`deploy/systemd/README.md`](../deploy/systemd/README.md)) is not in the copy path: its reboot pauses
 new ranking publication only.
 
+## #705 paper financial-semantic-2 cutover
+
+This release changes paper measurement, not the ordinary-live price or admission contract. It does
+not change whether live can be switched on: until the owner-commanded live-control change ships,
+live mode already requires a passing qualification report (`live_mode.rs` `qualification_outcome`)
+and none exists, so this release may deploy before or with that change. This section adds no
+arming instruction.
+
+Under the deployment lock, stop intake and confirm source, paper, and live-journal quiescence.
+Record the configured SQLite, source-log, and paper-log paths, plus the derived live-journal path
+(`paper_log.parent()/live_journal.log`, as in `main.rs::live_journal_path`). Capture private copies
+of all four and record **each original path and each copy hash**. Recheck sizes and hashes after
+the copy. Bind these exact path-and-hash entries to the seal and crash-recovery rehearsal; an
+earlier online snapshot is not the stopped cutover snapshot.
+
+Run a fresh generation-scoped open-continuation census on the stopped copies with the reviewed
+binary's `--validate-open-continuations` and record the count of **old** paper continuations; boot
+finishes them under their frozen semantics before it writes the seal (verify in the boot log). Check the paper log for unmatched `FinancialPrepared`; allow the existing recovery
+to converge it under recorded economics, then stop and repeat the four-artifact capture and
+census. Require no unmatched Prepared before the seal. Record open positions and reconcile the
+financial authority; zero old positions is not required. Inventory Start and seals. For an
+unsealed Start, reconcile its hot hash to the applied `Financial15` snapshot and status hash so
+the first seal's cause is the semantic change. Investigate any unexpected mismatch or seal.
+
+At the locked cut, record the **applied** `price_impact_cap_bps`, `min_fill_price`, and
+`max_fill_price` and the canonical applied hash, then reconcile the hash to status. This release
+requires the owner-approved 100 bps, 0.15, and 0.85 applied values; defaults do not prove them.
+Rehearse boot sealing before paper recovery and producer release, including a crash after the
+seal and a restart from the four captured artifacts. The first seal remains unique and durable;
+paper decisions and daily marks continue. An existing seal remains unchanged and this generation
+produces no new qualification report. A seal-write failure keeps producers stopped.
+
+Deploy the reviewed binary in the locked cut. Verify installed and running bytes, the new or
+preserved seal, readiness, applied hash, and identifier-bound `seen_trades`, `fills`, and
+`dispatch_seeds` uniqueness using the procedure below. Report daily timely continuations, paper
+fills, paper returns, and typed no-fill reasons. For each first semantic-2 fill, reconcile one
+`FinancialFinal`, one unique `fills` row, and its recorded book; separate returns of earlier
+positions. Fee, horizon, band, depth, and Prepared-staleness refusals have separate causes.
+
+The first durable cutover seal is a forward-only reader boundary. A continuation-6 or
+economic-wire-2 write independently requires a reader supporting both paper semantics. Before
+either boundary, a reviewed binary reversal is possible only after confirming no new-format
+paper work was written. On uncertain seal or record durability, keep intake stopped, preserve
+all records, and recover forward with a compatible reader. Never rewrite records to manufacture
+rollback.
+
 ## Procedure
 
 Every step is bound to the embedded full Git revision plus exact binary bytes (#544). The binary

@@ -297,7 +297,7 @@ pub fn post_snapshot_invalid_continuation(
             pe_service::bucket_commit::DecisionContinuationV3::from_durable(&row)
                 .unwrap()
                 .version(),
-            5
+            6
         );
         let index = pe_service::risk_inputs::SourceReceiptIndex::replay(source_path).unwrap();
         assert_eq!(
@@ -538,6 +538,20 @@ pub fn continuation_orchestrator(
     pe_source_polymarket_public::FixtureFetcher,
     pe_service::clob_book::FixtureClobBookFetcher,
 > {
+    continuation_orchestrator_with_authority(paper, paper_path, wallet, control_rx, hooks, None)
+}
+
+pub fn continuation_orchestrator_with_authority(
+    paper: Arc<pe_paper_state::PaperStateDb>,
+    paper_path: &std::path::Path,
+    wallet: WalletAddress,
+    control_rx: mpsc::Receiver<OrchestratorControl>,
+    hooks: Arc<pe_service::orchestrator::ScenarioHooks>,
+    authority: Option<pe_service::supabase_state::SupabaseStateClient>,
+) -> pe_service::orchestrator::Orchestrator<
+    pe_source_polymarket_public::FixtureFetcher,
+    pe_service::clob_book::FixtureClobBookFetcher,
+> {
     use pe_core_types::{BasisPoints, SourceTimestamp};
     use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
     use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
@@ -586,7 +600,7 @@ pub fn continuation_orchestrator(
         control_rx,
         None,
         None,
-        None,
+        authority,
         Arc::new(pe_service::clob_book::FixtureClobBookFetcher::new(
             HashMap::new(),
         )),
@@ -717,7 +731,7 @@ pub async fn qualify_source_census(
         ),
         schema_version: PAPER_LOG_SCHEMA_VERSION,
         parser_version: 1,
-        financial_semantic_version: 1,
+        financial_semantic_version: pe_service::paper_recovery::FINANCIAL_SEMANTIC_VERSION,
     };
     let envelope = |record: PaperLogRecord| {
         let timestamp = time::OffsetDateTime::from_unix_timestamp(now_unix).unwrap();

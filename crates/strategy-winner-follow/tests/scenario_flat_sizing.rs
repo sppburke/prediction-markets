@@ -172,6 +172,37 @@ fn scenario_evaluate_at_price_sizes_at_current_keeps_leader_limit() {
     );
 }
 
+#[test]
+fn paper_explicit_limit_preserves_live_strategy_bytes() {
+    let signal = make_signal_at_price(0xFA, LeaderAction::Entry, price(dec!(0.71)));
+    let strategy = WinnerFollowStrategy::new(flat_config(dec!(100)));
+    let live = strategy
+        .evaluate_at_price(
+            &signal,
+            price(dec!(0.73)),
+            p_high(),
+            clean_snapshot(),
+            dec!(10_000),
+            ExecutionMode::LiveTiny,
+        )
+        .expect("live intent");
+    let paper = strategy
+        .evaluate_at_price_with_limit(
+            &signal,
+            price(dec!(0.73)),
+            price(dec!(0.73)),
+            p_high(),
+            clean_snapshot(),
+            dec!(10_000),
+            ExecutionMode::Paper,
+        )
+        .expect("paper intent");
+    assert_eq!(live.limit_price, signal.leader_price);
+    assert_eq!(paper.limit_price, price(dec!(0.73)));
+    assert_eq!(live.contracts, paper.contracts);
+    assert_eq!(live.idempotency_key, paper.idempotency_key);
+}
+
 // ─── scenario F2 ─────────────────────────────────────────────────────────────
 
 /// flat=$100, price=$0.01 → floor(100/0.01)=10 000 contracts.

@@ -109,6 +109,12 @@ The paper-to-live-tiny gate is the one-system sealed qualification defined in
 It requires exact replay, positive lower-bound complete-day growth, bounded drawdown, the canonical
 observation minima and delay, followed by one manual review. Historical simulator-comparison
 language is not a promotion contract.
+The thresholds classify a sealed paper measurement report. Paper semantic 2 prices from the
+current ask ladder inside the applied impact cap and fill-price band and permits matching delay;
+ordinary live retains a leader-price ceiling and strict fresh admission. The isolated V2 canary
+has a separate contract. This cutover seals the current semantic-1 qualification insufficient
+while paper fills and return measurement continue; a later fresh generation is needed for another
+qualification report.
 
 ## Strategy trait
 

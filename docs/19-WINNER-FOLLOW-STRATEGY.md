@@ -434,7 +434,11 @@ A rejected copy-scope gate logs the typed reason and commits a no-fill (the lead
 **Current economic sizing (#545).** Production and replay consume the same `EconomicPrepared` value:
 market/admission receipts, signed ladder, exact sizing, compact fee and reserve, risk decision,
 balance proof, applied configuration hash, and source observation. The signal's leader execution is
-audit evidence and the no-chase ceiling; it cannot substitute for current-book evidence.
+frozen audit evidence and cannot substitute for current-book evidence. Paper semantic 2 walks the
+current ask ladder up to the applied best-ask impact cap, inside `[min_fill_price, max_fill_price)`,
+and signs the ladder's tick-aligned limit without a leader-price ceiling. Paper admission permits
+positive or absent matching delay. Ordinary live retains its leader-price ceiling and strict delay
+check on a fresh target-specific admission read. The isolated V2 canary has its own contract.
 
 ## Strategy-level trade gates
 
@@ -486,7 +490,8 @@ simulation.rs gates (backtest only, lines 457-518)
 1. Submit limit orders, not market orders, unless `prefer_market_order = true` AND the market passes the "very liquid" gate (`_GLOSSARY.md`).
 2. Use the idempotency key above so duplicate signals cannot double-enter.
 3. Cancel if the order is not filled within `order_validity_seconds`.
-4. Do not chase beyond `max_slippage_from_leader_bps`.
+4. Apply `max_slippage_from_leader_bps` to ordinary live; paper semantic 2 uses its recorded
+   best-ask impact cap and fill-price band instead.
 5. Recheck risk after partial fills.
 6. Reconcile against venue state before the next order.
 7. Current production Winner-Follow ignores all SELL/Trim/Exit signals and holds copied BUYs to resolution. Any future exit-following profile must require matching inventory and `action_confidence_ppm ≥ exit_high_confidence_threshold_ppm`.
@@ -593,6 +598,9 @@ post-Start mark. Underperformance or inactivity membership demotion moves the an
 valid mark; rank rotation and capacity change do not. Paper continues after the seal. A changed
 financial semantic or canonical economic hash seals insufficient before publication. An unrelated
 build with identical semantics does not reset the era.
+The gate classifies a paper measurement report. The semantic-2 paper cutover seals the existing
+semantic-1 Start `InsufficientEvidence` once and continues paper measurement without a second
+current-generation report. A later fresh generation can start its own qualification lifecycle.
 
 ## Promotion and demotion criteria
 

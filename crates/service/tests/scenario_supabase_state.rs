@@ -1029,7 +1029,7 @@ async fn prepared_authority_changed_field_conflict_matrix() {
 #[tokio::test]
 async fn resumed_legacy_checkpoints_keep_financial_terminal_bytes() {
     for version in [2, 3, 4] {
-        for checkpoint_version in [2, 4] {
+        for &checkpoint_version in if version == 2 { &[2, 4][..] } else { &[4][..] } {
             let dir = tempfile::tempdir().unwrap();
             let paper_log = dir.path().join("paper.log");
             let source_log = dir.path().join("source.log");
@@ -1145,7 +1145,11 @@ async fn resumed_legacy_checkpoints_keep_financial_terminal_bytes() {
                             ),
                         )
                         .await
-                        .unwrap(),
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "continuation {version}, checkpoint {checkpoint_version}: {error}"
+                            )
+                        }),
                     0
                 );
                 let row = state

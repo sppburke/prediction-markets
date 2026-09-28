@@ -2271,7 +2271,9 @@ pub(crate) async fn golden_source_stream_replays_exact_economic_core() {
             })
             .unwrap();
             assert!(live_economic.observation.is_some());
-            assert_eq!(
+            assert_eq!(live_economic.version, 1);
+            assert_eq!(first_economic.version, 2);
+            assert_ne!(
                 live_economic.core_hash().unwrap(),
                 first_economic.core_hash().unwrap()
             );
@@ -2344,11 +2346,9 @@ pub(crate) async fn golden_source_stream_replays_exact_economic_core() {
                 }
             };
             let live_audit: &LiveOrderPreparedAudit = live_prepared.audit();
-            assert_eq!(live_audit.economic, *first_economic);
-            assert_eq!(
-                live_audit.economic.core_hash().unwrap(),
-                first_economic.core_hash().unwrap()
-            );
+            let mut expected_live_economic = first_economic.clone();
+            expected_live_economic.version = 1;
+            assert_eq!(live_audit.economic, expected_live_economic);
             sealed_live_wrapper = Some(serde_json::to_vec(live_audit).unwrap());
         }
         let (marked, mark_acknowledgement) = oneshot::channel();
@@ -2467,7 +2467,21 @@ pub(crate) async fn golden_source_stream_replays_exact_economic_core() {
     coordinator.await.unwrap();
     assert!(paper.open_decision_pending().unwrap().is_empty());
     let sealed_era = paper_era(scan_paper_log(&paper_path).unwrap());
-    let completion = qualification_completion(&sealed_era).unwrap();
+    let before_seal = paper_era(
+        sealed_era
+            .frames
+            .iter()
+            .take_while(|frame| {
+                !matches!(
+                    frame.frame,
+                    PaperLogFrame::Record(PaperLogRecord::QualificationSealed(_))
+                )
+            })
+            .cloned()
+            .collect(),
+    );
+    let completion = qualification_completion(&before_seal).unwrap();
+    assert!(qualification_completion(&sealed_era).is_none());
     assert_eq!(completion.complete_days, QUALIFICATION_DAYS);
     assert_eq!(completion.causal_closes, TOTAL_FILLS);
     let halt_transitions = sealed_era
@@ -2547,7 +2561,7 @@ pub(crate) async fn golden_source_stream_replays_exact_economic_core() {
     assert!(decision_rows.iter().all(|row| {
         replay_decision_pending(row).is_ok_and(|decision| {
             decision.continuation.facts.gate_result == "admitted"
-                && decision.continuation.version() == 5
+                && decision.continuation.version() == 6
                 && decision.continuation.read_commitment.is_some()
                 && decision.continuation.facts.provenance == TradeProvenance::ActivityWs
                 && decision.post_boundary.body.terminal.final_receipt.is_some()
@@ -2763,9 +2777,11 @@ pub(crate) async fn golden_source_stream_replays_exact_economic_core() {
         live_fact.source_trade_id,
         first_operation.source_trade_id.0.as_str()
     );
+    let mut expected_live_economic = first_economic.clone();
+    expected_live_economic.version = 1;
     assert_eq!(
         live_fact.economic_core_hash,
-        first_economic.core_hash().unwrap()
+        expected_live_economic.core_hash().unwrap()
     );
     assert_eq!(
         live_fact.paper_wrapper_hash,
@@ -3598,7 +3614,7 @@ impl BracketFinancialHarness {
             .unwrap();
         assert_eq!(row.state, pe_paper_state::DecisionPendingState::Terminal);
         let replay = replay_decision_pending(&row).unwrap();
-        assert_eq!(replay.continuation.version(), 5);
+        assert_eq!(replay.continuation.version(), 6);
         assert_eq!(row.updated_at_unix, self.terminal_at.unix_timestamp());
         assert_eq!(
             replay
