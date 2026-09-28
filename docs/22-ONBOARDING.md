@@ -103,7 +103,7 @@ Variables are grouped by binary. Required fields are marked **[req]**.
 
 #### Live credential custody
 
-Ordinary `pe-service` has a #508 per-account live path that ships dark until armed. Its credentials
+Ordinary `pe-service` has a #508 per-account live path that starts with modes off until the owner requests live_tiny. Its credentials
 are age-sealed per-account bundles in Supabase; only the service-scoped age identity arrives through
 systemd `LoadCredential=`. They are not environment variables. The isolated V2 canary keeps its own
 root-owned systemd credentials and remains inactive. See
@@ -160,7 +160,8 @@ cargo run --release --bin pe-service
 # Monitor: RUST_LOG=info logs every signal and its paper outcome.
 ```
 
-Paper mode is the default for `leader_follow` after fresh bootstrap (see `docs/19-WINNER-FOLLOW-STRATEGY.md` "Promotion ladder"). Promotion to live-tiny requires a manual review and passing the walk-forward gate.
+Paper mode is the default for `leader_follow` after fresh bootstrap. The owner uses **Request mode**
+for ordinary live accounts; paper qualification and walk-forward reports measure performance.
 
 ### Recipe C — Install the inactive canary
 

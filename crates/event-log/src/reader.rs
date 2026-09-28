@@ -98,6 +98,10 @@ impl ReplayIter {
         let file = File::open(path)?;
         let mut reader = BufReader::new(file);
         verify_file_header(path, &mut reader)?;
+        #[cfg(feature = "scan-metrics")]
+        if poll_interval.is_none() {
+            crate::scan_metrics::record(&std::fs::canonicalize(path)?);
+        }
         Ok(Self {
             reader,
             state: ScanState::after_header(),

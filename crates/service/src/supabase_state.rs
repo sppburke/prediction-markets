@@ -1508,7 +1508,7 @@ fn source_receipt_received_at(
                 })?
             else {
                 return Err(SupabaseStateError::Corrupt(
-                    "fill source receipt is absent from the source log".to_owned(),
+                    "fill source receipt is absent from the source receipt index".to_owned(),
                 ));
             };
             if indexed_receipt.this_hash != receipt.this_hash {
@@ -2010,11 +2010,19 @@ mod tests {
                     .to_string(),
                 "corrupt supabase value: fill source receipt hash differs from its envelope"
             );
+            let expected_absent = match evidence {
+                SourceEvidence::Log(_) => {
+                    "corrupt supabase value: fill source receipt is absent from the source log"
+                }
+                SourceEvidence::Index(_) => {
+                    "corrupt supabase value: fill source receipt is absent from the source receipt index"
+                }
+            };
             assert_eq!(
                 source_receipt_received_at(evidence, absent)
                     .unwrap_err()
                     .to_string(),
-                "corrupt supabase value: fill source receipt is absent from the source log"
+                expected_absent
             );
         }
     }

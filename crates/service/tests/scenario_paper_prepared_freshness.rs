@@ -15,7 +15,7 @@ use pe_core_types::{
     AccountId, BasisPoints, CollateralAmount, EventSeq, PolymarketConditionId, ReceivedAt,
     ReconstructionQuality, SourceId, SourceTimestamp, SourceTradeId, WalletAddress,
 };
-use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, Writer};
+use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, Reader, Scanner, Writer};
 use pe_execution_core::{
     AdmissionReceipts, CredentialBindingIdentity, FrozenLiveTarget, LiveAdmissionArtifact,
     LiveControlMode, LiveExecutedAmounts, LiveExecutor, LiveJournal, LiveJournalPayload,
@@ -47,7 +47,8 @@ use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{Orchestrator, OrchestratorConfig, ScenarioHooks};
 use pe_service::orchestrator_control::OrchestratorControl;
 use pe_service::paper_recovery::{
-    CanonicalFillResult, PaperLogFrame, PaperLogRecord, QualificationStarted, TailBinding,
+    CanonicalFillResult, CanonicalResolutionResult, ExpectedAuthority, FinancialPayload,
+    FinancialResult, PaperLogFrame, PaperLogRecord, QualificationStarted, TailBinding,
     build_leader_ledger, scan_paper_log,
 };
 use pe_service::risk_inputs::SourceReceiptIndex;
@@ -499,6 +500,15 @@ impl Harness {
                 entry_gate_config: CopyEntryGateConfig,
                 runtime_config: None,
                 live_accounts: Some(self.live.clone()),
+                live_journal: Some(
+                    Arc::new(
+                        pe_execution_core::LiveJournal::open(
+                            self.dir.path().join("live_journal.log"),
+                        )
+                        .unwrap(),
+                    )
+                    .into(),
+                ),
                 activity_ws_enabled: enabled,
                 copy_latency_budget_secs: self.copy_budget_secs,
                 watchlist_writer_lock: None,
@@ -687,6 +697,9 @@ impl Harness {
                 credential_binding: Some((7, "stored-key".to_owned())),
             }],
             fetched_at_unix: Some(EPOCH),
+            control_available: true,
+            generation: 1,
+            credential_metadata_available: true,
         });
     }
 
@@ -902,12 +915,12 @@ fn assert_bound_clocks(h: &Harness, recorded: &Recorded, stream_epoch: i64) {
 #[tokio::test]
 async fn bound_source_clock_reconstruction_failure_stops_before_admission() {
     let mut h = Harness::new().await;
+    // An index of the configured log taken before the page is appended lacks its receipt.
+    let stale = SourceReceiptIndex::replay(&h.dir.path().join("source.log")).unwrap();
     let recorded = h.record(1).await;
     h.freeze(&recorded, true).await;
     let open = h.terminal(&recorded);
-    let empty_path = h.dir.path().join("empty-source.log");
-    drop(SourceEventSink::open(&empty_path).unwrap());
-    h.index = SourceReceiptIndex::replay(&empty_path).unwrap();
+    h.index = stale;
     h.attempt(&recorded, at());
     h.arm();
     h.start(true);
@@ -1255,6 +1268,328 @@ async fn recorded_ask_above_leader_fills_with_both_paper_delay_policies() {
     }
 }
 
+/// The real bucket continuation, financial Final, and priced daily mark do not walk the source log.
+#[tokio::test]
+async fn paper_fill_and_daily_mark_do_not_scan_source_log() {
+    let mut h = Harness::new().await;
+    h.probability = pe_core_types::Probability::new(dec!(0.9)).unwrap();
+    let recorded = h
+        .record_with_rule(1, Some((dec!(0.50), dec!(0.50), Some(2))))
+        .await;
+    h.arm();
+    h.attempt(&recorded, at());
+    h.start(true);
+    let source_path = h.dir.path().join("source.log");
+    let before = pe_event_log::scan_metrics::count(&source_path).unwrap();
+    h.poll(&recorded).await;
+    assert_eq!(
+        h.terminal(&recorded).terminal_disposition.as_deref(),
+        Some("fill")
+    );
+    assert_eq!(
+        pe_event_log::scan_metrics::count(&source_path).unwrap(),
+        before
+    );
+    let report = h.qualify_one_fill().await;
+    assert!(report.replay.exact, "{:?}", report.reasons);
+}
+
+/// A priced S1 mark remains verifiable when its position resolves before the completion seal.
+#[tokio::test]
+async fn priced_mark_resolved_before_completion_seal_verifies() {
+    let mut h = Harness::new().await;
+    h.probability = pe_core_types::Probability::new(dec!(0.9)).unwrap();
+    let recorded = h
+        .record_with_rule(1, Some((dec!(0.50), dec!(0.50), Some(2))))
+        .await;
+    h.arm();
+    h.attempt(&recorded, at());
+    h.start(true);
+    h.poll(&recorded).await;
+    assert_eq!(
+        h.terminal(&recorded).terminal_disposition.as_deref(),
+        Some("fill")
+    );
+    assert!(h.qualify_one_fill().await.replay.exact);
+
+    let paper_path = h.dir.path().join("paper.log");
+    let source_path = h.dir.path().join("source.log");
+    let cutoff = EPOCH - EPOCH.rem_euclid(86_400) + 86_400;
+    let frames = scan_paper_log(&paper_path).unwrap();
+    let (fill_prepared, economic) = frames
+        .iter()
+        .find_map(|frame| match &frame.frame {
+            PaperLogFrame::Record(PaperLogRecord::FinancialPrepared {
+                payload: FinancialPayload::Fill { economic, .. },
+                ..
+            }) => Some((frame.receipt, economic.clone())),
+            _ => None,
+        })
+        .unwrap();
+    let mark = frames
+        .iter()
+        .find_map(|frame| match &frame.frame {
+            PaperLogFrame::Record(PaperLogRecord::PortfolioMark(mark)) => Some(mark),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(mark.financial_prefix_seq, Some(fill_prepared.sequence));
+    assert_eq!(mark.prices.len(), 1);
+    assert!(mark.prices[0].receipt.is_some());
+
+    let seal_offset = Reader::replay_with_offsets(&paper_path)
+        .unwrap()
+        .find_map(|frame| {
+            let (offset, _, envelope) = frame.unwrap();
+            let record: PaperLogRecord = serde_json::from_slice(&envelope.payload).unwrap();
+            matches!(record, PaperLogRecord::QualificationSealed(_)).then_some(offset)
+        })
+        .unwrap();
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&paper_path)
+        .unwrap();
+    file.set_len(seal_offset).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+
+    let resolved_at = OffsetDateTime::from_unix_timestamp(cutoff + 1).unwrap();
+    let resolution_receipt = h
+        .source
+        .append(EnvelopeIn {
+            source_id: SourceId("polymarket.clob.market".to_owned()),
+            schema_version: pe_source_polymarket_public::CLOB_RESOLUTION_SCHEMA_VERSION,
+            parser_version: pe_source_polymarket_public::CLOB_RESOLUTION_PARSER_VERSION,
+            observed_at: SourceTimestamp(resolved_at),
+            received_at: ReceivedAt(resolved_at),
+            content_type: ContentType::Json,
+            payload: serde_json::to_vec(&json!({
+                "condition_id": economic.market.condition_id.0.clone(),
+                "closed": true,
+                "is_50_50_outcome": false,
+                "tokens": [
+                    {"token_id": economic.market.token_id.0.clone(), "outcome": "Yes", "price": 1, "winner": true},
+                    {"token_id": economic.admission.market.ordered_outcome_token_ids[1].0.clone(), "outcome": "No", "price": 0, "winner": false}
+                ]
+            }))
+            .unwrap(),
+        })
+        .await
+        .unwrap();
+    let start = h.authority.inner.lock().unwrap().start;
+    let payout_json = "[\"1\",\"0\"]";
+    let mut writer = Writer::open(&paper_path).unwrap();
+    let prepared = writer
+        .append_synced(EnvelopeIn {
+            source_id: SourceId("pe-service.paper".to_owned()),
+            schema_version: 2,
+            parser_version: 1,
+            observed_at: SourceTimestamp(resolved_at),
+            received_at: ReceivedAt(resolved_at),
+            content_type: ContentType::Json,
+            payload: serde_json::to_vec(&PaperLogRecord::FinancialPrepared {
+                expected_authority: ExpectedAuthority {
+                    qualification_start_receipt: start,
+                    prior_completed_prepared_sequence: Some(fill_prepared.sequence),
+                },
+                payload: FinancialPayload::Resolution {
+                    condition_id: economic.market.condition_id.clone(),
+                    payout_by_outcome_index_json: payout_json.to_owned(),
+                    resolution_source_receipt: resolution_receipt,
+                },
+            })
+            .unwrap(),
+        })
+        .unwrap();
+    let credit =
+        CollateralAmount::from_decimal_exact(economic.sizing.expected_shares.to_decimal()).unwrap();
+    let bankroll = h.paper.bankroll().unwrap().unwrap() + credit.to_decimal();
+    h.paper
+        .apply_financial_resolution(
+            start,
+            Some(fill_prepared.sequence),
+            prepared.sequence,
+            &pe_core_types::MarketId(pe_core_types::VenueMarketId(
+                economic.market.market_id.clone(),
+            )),
+            payout_json,
+            resolution_receipt,
+            cutoff + 1,
+            credit,
+            bankroll,
+        )
+        .unwrap();
+    writer
+        .append_synced(EnvelopeIn {
+            source_id: SourceId("pe-service.paper".to_owned()),
+            schema_version: 2,
+            parser_version: 1,
+            observed_at: SourceTimestamp(resolved_at),
+            received_at: ReceivedAt(resolved_at),
+            content_type: ContentType::Json,
+            payload: serde_json::to_vec(&PaperLogRecord::FinancialFinal {
+                prepared_receipt: prepared,
+                result: FinancialResult::Resolution {
+                    canonical: CanonicalResolutionResult {
+                        outcome: "applied".to_owned(),
+                        bankroll,
+                        applied_prepared_seq: prepared.sequence,
+                        credit,
+                        settled_at_unix: cutoff + 1,
+                    },
+                },
+            })
+            .unwrap(),
+        })
+        .unwrap();
+    let source_prefix = TailBinding::from(&Scanner::verify(&source_path).unwrap());
+    let financial_prefix = TailBinding::from(&Scanner::verify(&paper_path).unwrap());
+    let keys = h
+        .paper
+        .decision_pending_history()
+        .unwrap()
+        .into_iter()
+        .map(|row| (row.source_trade_id, row.semantic_revision))
+        .collect::<Vec<_>>();
+    let digest = h
+        .paper
+        .seal_decision_evidence_for_source_prefix(&keys, &keys, source_prefix.last_sequence)
+        .unwrap();
+    let seal = pe_service::paper_recovery::QualificationSealed {
+        start_receipt: start,
+        source_prefix,
+        financial_prefix,
+        live_prefix: TailBinding::from(
+            &pe_execution_core::LiveJournal::verified_tail(h.dir.path().join("live_journal.log"))
+                .unwrap(),
+        ),
+        decision_evidence_digest: blake3::hash(&digest).to_hex().to_string(),
+        sealed_cutoff_unix: cutoff,
+        reason: pe_service::paper_recovery::SealReason::Complete,
+    };
+    let seal_receipt = writer
+        .append_synced(EnvelopeIn {
+            source_id: SourceId("pe-service.paper".to_owned()),
+            schema_version: 2,
+            parser_version: 1,
+            observed_at: SourceTimestamp(resolved_at),
+            received_at: ReceivedAt(resolved_at),
+            content_type: ContentType::Json,
+            payload: serde_json::to_vec(&PaperLogRecord::QualificationSealed(Box::new(seal)))
+                .unwrap(),
+        })
+        .unwrap();
+    drop(writer);
+    let options = pe_service::qualification::QualifyOptions {
+        paper_log: paper_path,
+        source_log: source_path,
+        live_journal: Some(h.dir.path().join("live_journal.log")),
+        paper_state: h.dir.path().join("paper.db"),
+        seal_hash: seal_receipt.this_hash.to_hex().to_string(),
+        output: h.dir.path().join("resolved-qualification.json"),
+    };
+    pe_service::qualification::run_qualify(&options)
+        .await
+        .unwrap();
+    let report: pe_service::qualification::QualificationReport =
+        serde_json::from_slice(&std::fs::read(options.output).unwrap()).unwrap();
+    assert!(report.replay.exact, "{:?}", report.reasons);
+}
+
+#[tokio::test]
+async fn priced_completion_seal_rejects_altered_price_and_receipt() {
+    let mut h = Harness::new().await;
+    h.probability = pe_core_types::Probability::new(dec!(0.9)).unwrap();
+    let recorded = h
+        .record_with_rule(1, Some((dec!(0.50), dec!(0.50), Some(2))))
+        .await;
+    h.arm();
+    h.attempt(&recorded, at());
+    h.start(true);
+    h.poll(&recorded).await;
+    assert_eq!(
+        h.terminal(&recorded).terminal_disposition.as_deref(),
+        Some("fill")
+    );
+    assert!(h.qualify_one_fill().await.replay.exact);
+
+    let original = h.dir.path().join("paper.log");
+    let frames = Reader::replay(&original)
+        .unwrap()
+        .map(|frame| frame.unwrap().1)
+        .collect::<Vec<_>>();
+    for alter_price in [true, false] {
+        let name = if alter_price {
+            "wrong-price"
+        } else {
+            "wrong-receipt"
+        };
+        let paper_log = h.dir.path().join(format!("{name}.log"));
+        let output = h.dir.path().join(format!("{name}.json"));
+        let mut writer = Writer::open(&paper_log).unwrap();
+        let mut seal_receipt = None;
+        for envelope in &frames {
+            let mut record: PaperLogRecord = serde_json::from_slice(&envelope.payload).unwrap();
+            match &mut record {
+                PaperLogRecord::PortfolioMark(mark) => {
+                    assert_eq!(mark.prices.len(), 1);
+                    if alter_price {
+                        mark.prices[0].price = Some(pe_core_types::Price::new(dec!(0.51)).unwrap());
+                    } else {
+                        mark.prices[0].receipt.as_mut().unwrap().this_hash =
+                            blake3::hash(b"wrong receipt");
+                    }
+                }
+                PaperLogRecord::QualificationSealed(seal) => {
+                    seal.financial_prefix =
+                        TailBinding::from(&Scanner::verify(&paper_log).unwrap());
+                }
+                _ => {}
+            }
+            let appended = writer
+                .append_synced(EnvelopeIn {
+                    source_id: envelope.source_id.clone(),
+                    schema_version: envelope.schema_version,
+                    parser_version: envelope.parser_version,
+                    observed_at: envelope.observed_at.clone(),
+                    received_at: envelope.received_at.clone(),
+                    content_type: envelope.content_type.clone(),
+                    payload: serde_json::to_vec(&record).unwrap(),
+                })
+                .unwrap();
+            if matches!(record, PaperLogRecord::QualificationSealed(_)) {
+                seal_receipt = Some(appended);
+            }
+        }
+        drop(writer);
+        let options = pe_service::qualification::QualifyOptions {
+            paper_log,
+            source_log: h.dir.path().join("source.log"),
+            live_journal: Some(h.dir.path().join("live_journal.log")),
+            paper_state: h.dir.path().join("paper.db"),
+            seal_hash: seal_receipt.unwrap().this_hash.to_hex().to_string(),
+            output: output.clone(),
+        };
+        pe_service::qualification::run_qualify(&options)
+            .await
+            .unwrap();
+        let report: pe_service::qualification::QualificationReport =
+            serde_json::from_slice(&std::fs::read(output).unwrap()).unwrap();
+        assert_eq!(
+            report.verdict,
+            pe_service::qualification::QualificationVerdict::InsufficientEvidence
+        );
+        assert!(
+            report
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("PortfolioMark")),
+            "{:?}",
+            report.reasons
+        );
+    }
+}
+
 struct StagedLiveVenue {
     posts: AtomicBool,
 }
@@ -1381,6 +1716,193 @@ impl LiveOrderVenue for StagedLiveVenue {
                 request_descriptor_hashes: Vec::new(),
             })
         })
+    }
+}
+
+/// PASS: one orchestrator staging transaction freezes all three selected targets in the
+/// recorded order, with one journal reference shared by the seed and paper decision.
+#[tokio::test]
+async fn owner_mode_stages_one_record_for_three_ordered_accounts() {
+    let mut h = Harness::new().await;
+    h.probability = pe_core_types::Probability::new(dec!(0.9)).unwrap();
+    let recorded = h
+        .record_with_rule(1, Some((dec!(0.50), dec!(0.50), Some(2))))
+        .await;
+    h.arm();
+    let mut snapshot = h.live.snapshot().as_ref().clone();
+    let mut lower = snapshot.accounts[0].clone();
+    lower.account_id = AccountId::new("lower").unwrap();
+    lower.is_primary = false;
+    lower.enabled = false;
+    lower.execution_order = 1;
+    lower.credential_binding = Some((8, "lower-key".to_owned()));
+    let mut higher = lower.clone();
+    higher.account_id = AccountId::new("higher").unwrap();
+    higher.execution_order = 2;
+    higher.credential_binding = Some((9, "higher-key".to_owned()));
+    snapshot.accounts.extend([lower, higher]);
+    h.live.store(snapshot);
+
+    h.attempt(&recorded, at());
+    h.start(true);
+    h.poll_source(&recorded, Some(EPOCH - 1), at()).await;
+    h.barrier().await;
+    let seeds = h.paper.unfinalized_ready_dispatch_seeds().unwrap();
+    assert_eq!(seeds.len(), 1, "{:?}", h.terminal(&recorded));
+    let seed = &seeds[0];
+    let targets = h.paper.dispatch_targets(&seed.dispatch_id).unwrap();
+    assert_eq!(targets.len(), 3);
+    assert_eq!(
+        targets
+            .iter()
+            .map(|target| target.account_id.as_str())
+            .collect::<Vec<_>>(),
+        ["stored-target", "lower", "higher"]
+    );
+    assert_eq!(
+        targets
+            .iter()
+            .map(|target| target.exec_rank)
+            .collect::<Vec<_>>(),
+        [0, 1, 2]
+    );
+    let seq = serde_json::from_str::<Value>(&seed.signal_json).unwrap()["control_journal_seq"]
+        .as_u64()
+        .unwrap();
+    let journal_path = h.dir.path().join("live_journal.log");
+    let recorded_control = pe_execution_core::live_journal::staged_dispatch_control_at(
+        &journal_path,
+        seq,
+        &seed.dispatch_id,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(recorded_control.targets.len(), 3);
+    for (recorded_target, target) in recorded_control.targets.iter().zip(&targets) {
+        assert_eq!(recorded_target.account_id.as_str(), target.account_id);
+        assert_eq!(
+            recorded_target.exec_rank,
+            u64::try_from(target.exec_rank).unwrap()
+        );
+        assert_eq!(
+            recorded_target.frozen_binding.version,
+            target.credential_bundle_version
+        );
+        assert_eq!(
+            recorded_target.frozen_binding.key_id,
+            target.credential_key_id
+        );
+        assert_eq!(
+            recorded_target.observed_credential_key_id,
+            target.credential_key_id
+        );
+    }
+    let staged_count = pe_execution_core::live_journal::replay_account(
+        &journal_path,
+        &AccountId::new("stored-target").unwrap(),
+    )
+    .unwrap()
+    .into_iter()
+    .filter(|event| {
+        matches!(
+            event.payload,
+            pe_execution_core::LiveJournalPayload::StagedDispatchControl(_)
+        )
+    })
+    .count();
+    assert_eq!(staged_count, 1);
+    let decision = h.terminal(&recorded);
+    assert_eq!(
+        pe_service::decision_replay::replay_decision_pending_with_control(
+            &decision,
+            &journal_path,
+        )
+        .unwrap()
+        .post_boundary
+        .body
+        .terminal
+        .dispatch_control_journal_seq,
+        Some(seq)
+    );
+    h.stop().await;
+}
+
+/// PASS: a failure after the selected-target append leaves one replayable orphan attempt and
+/// no committed seed or target that could be dispatched.
+#[tokio::test]
+async fn selected_target_append_before_failed_seed_write_is_uncommitted() {
+    let mut h = Harness::new().await;
+    h.probability = pe_core_types::Probability::new(dec!(0.9)).unwrap();
+    let recorded = h
+        .record_with_rule(1, Some((dec!(0.50), dec!(0.50), Some(2))))
+        .await;
+    h.arm();
+    h.hooks.fail_next_stage_seed.store(true, Ordering::SeqCst);
+    h.attempt(&recorded, at());
+    h.start(true);
+    h.poll_source(&recorded, Some(EPOCH - 1), at()).await;
+    assert!(h.task.take().unwrap().await.unwrap().is_err());
+    assert!(h.paper.pending_dispatch_seeds().unwrap().is_empty());
+    assert!(
+        h.paper
+            .unfinalized_ready_dispatch_seeds()
+            .unwrap()
+            .is_empty()
+    );
+    let journal_path = h.dir.path().join("live_journal.log");
+    let attempts = pe_execution_core::live_journal::replay_account(
+        &journal_path,
+        &AccountId::new("stored-target").unwrap(),
+    )
+    .unwrap()
+    .into_iter()
+    .filter(|event| {
+        matches!(
+            event.payload,
+            pe_execution_core::LiveJournalPayload::StagedDispatchControl(_)
+        )
+    })
+    .count();
+    assert_eq!(attempts, 1);
+}
+
+#[tokio::test]
+async fn live_mode_without_verified_binding_stages_no_control_record() {
+    for metadata_unavailable in [false, true] {
+        let mut h = Harness::new().await;
+        h.probability = pe_core_types::Probability::new(dec!(0.9)).unwrap();
+        let recorded = h
+            .record_with_rule(1, Some((dec!(0.50), dec!(0.50), Some(2))))
+            .await;
+        h.arm();
+        let mut snapshot = h.live.snapshot().as_ref().clone();
+        if metadata_unavailable {
+            snapshot.credential_metadata_available = false;
+        } else {
+            snapshot.accounts[0].credential_binding = None;
+        }
+        h.live.store(snapshot);
+        h.attempt(&recorded, at());
+        h.start(true);
+        h.poll_source(&recorded, Some(EPOCH - 1), at()).await;
+        h.barrier().await;
+        assert!(h.paper.pending_dispatch_seeds().unwrap().is_empty());
+        assert!(
+            h.paper
+                .unfinalized_ready_dispatch_seeds()
+                .unwrap()
+                .is_empty()
+        );
+        let events = pe_execution_core::live_journal::replay_account(
+            h.dir.path().join("live_journal.log"),
+            &AccountId::new("stored-target").unwrap(),
+        )
+        .unwrap();
+        assert!(!events.iter().any(|event| matches!(
+            event.payload,
+            pe_execution_core::LiveJournalPayload::StagedDispatchControl(_)
+        )));
+        h.stop().await;
     }
 }
 
@@ -1545,6 +2067,10 @@ async fn version_six_staged_target_strict_live_admission_submits_and_replays() {
     assert!(matches!(
         events.as_slice(),
         [
+            pe_execution_core::LiveJournalEvent {
+                payload: LiveJournalPayload::StagedDispatchControl(_),
+                ..
+            },
             pe_execution_core::LiveJournalEvent {
                 payload: LiveJournalPayload::AdmissionEvaluated(_),
                 ..
@@ -2702,6 +3228,8 @@ async fn admission_response(
 
 impl Harness {
     async fn qualify_one_fill(&mut self) -> pe_service::qualification::QualificationReport {
+        let source_path = self.dir.path().join("source.log");
+        let scans_before_mark = pe_event_log::scan_metrics::count(&source_path).unwrap();
         let cutoff = EPOCH - EPOCH.rem_euclid(86_400) + 86_400;
         let timestamp = OffsetDateTime::from_unix_timestamp(cutoff).unwrap();
         let boundary = self
@@ -2755,6 +3283,27 @@ impl Harness {
             .await
             .unwrap();
         receiver.await.unwrap().unwrap();
+        assert_eq!(
+            pe_event_log::scan_metrics::count(&source_path).unwrap(),
+            scans_before_mark
+        );
+        let mark = scan_paper_log(&self.dir.path().join("paper.log"))
+            .unwrap()
+            .into_iter()
+            .find_map(|frame| match frame.frame {
+                PaperLogFrame::Record(PaperLogRecord::PortfolioMark(mark)) => Some(mark),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(mark.prices.len(), 1);
+        assert!(mark.prices[0].receipt.is_some());
+        let mut verified_mark = *mark.clone();
+        verified_mark.source_tail =
+            TailBinding::from(&pe_event_log::Scanner::verify(&source_path).unwrap());
+        assert_eq!(
+            serde_json::to_vec(&*mark).unwrap(),
+            serde_json::to_vec(&verified_mark).unwrap()
+        );
         self.stop().await;
         let paper_path = self.dir.path().join("paper.log");
         let source_path = self.dir.path().join("source.log");

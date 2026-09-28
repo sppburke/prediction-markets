@@ -1891,6 +1891,7 @@ pub(crate) async fn golden_source_stream_replays_exact_economic_core() {
             entry_gate_config: CopyEntryGateConfig,
             runtime_config: None,
             live_accounts: None,
+            live_journal: None,
             activity_ws_enabled: false,
             copy_latency_budget_secs: 2,
             watchlist_writer_lock: None,
@@ -3040,6 +3041,9 @@ impl BracketFinancialHarness {
                 entry_gate_config: CopyEntryGateConfig,
                 runtime_config: None,
                 live_accounts: deployed.then(|| accounts.clone()),
+                live_journal: deployed.then(|| {
+                    Arc::new(pe_execution_core::LiveJournal::open(&live_path).unwrap()).into()
+                }),
                 activity_ws_enabled: deployed,
                 copy_latency_budget_secs: 2,
                 watchlist_writer_lock: Some(writer_lock.clone()),
@@ -3833,6 +3837,9 @@ pub(crate) async fn deployed_flow_replays_exactly_and_qualifies() {
                             credential_binding: Some((7, "stored-key".to_owned())),
                         }],
                         fetched_at_unix: Some(expiry_epoch),
+                        control_available: true,
+                        generation: 1,
+                        credential_metadata_available: true,
                     });
                 h.record_entry_admission(&expired, expiry_epoch).await;
                 let start = OffsetDateTime::from_unix_timestamp(expiry_epoch).unwrap();

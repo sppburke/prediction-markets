@@ -44,7 +44,10 @@ use pe_service::paper_recovery::{
     FinancialResult, PAPER_LOG_SCHEMA_VERSION, PaperFillOperationIdentity, PaperLogFrame,
     PaperLogRecord, QualificationStarted, TailBinding, paper_era, scan_paper_log,
 };
-use pe_service::risk_inputs::{SourceReceiptIndex, completed_prepared_before_boundary};
+use pe_service::risk_inputs::{
+    SourceReceiptIndex, completed_prepared_before_boundary,
+    completed_prepared_before_boundary_indexed,
+};
 use pe_service::supabase_state::SupabaseStateClient;
 use pe_service::trade_poller::{
     ACTIVITY_POLL_SOURCE_ID, DAILY_BOUNDARY_SOURCE_ID, PendingBoundary,
@@ -298,6 +301,7 @@ async fn run_real_boundary(
             entry_gate_config: CopyEntryGateConfig,
             runtime_config: None,
             live_accounts: None,
+            live_journal: None,
             activity_ws_enabled: false,
             copy_latency_budget_secs: 2,
             watchlist_writer_lock: None,
@@ -422,6 +426,16 @@ async fn quiet_boundary_records_no_causal_prepared_prefix() {
         marks[0].boundary_receipt,
     )
     .unwrap();
+    assert_eq!(
+        completed_prepared_before_boundary_indexed(
+            &era,
+            &SourceReceiptIndex::replay(&source_path).unwrap(),
+            CUTOFF_UNIX,
+            marks[0].boundary_receipt,
+        )
+        .unwrap(),
+        completed
+    );
     assert!(completed.is_empty());
     let offline = PaperStateDb::open_read_only(&state_path)
         .unwrap()
@@ -650,6 +664,16 @@ async fn acknowledged_pre_cutoff_websocket_fill_survives_late_final_and_replay()
     let completed =
         completed_prepared_before_boundary(&era, &source_path, CUTOFF_UNIX, boundary).unwrap();
     assert_eq!(
+        completed_prepared_before_boundary_indexed(
+            &era,
+            &SourceReceiptIndex::replay(&source_path).unwrap(),
+            CUTOFF_UNIX,
+            boundary,
+        )
+        .unwrap(),
+        completed
+    );
+    assert_eq!(
         completed,
         HashSet::from([prepared.sequence, resolution_prepared.sequence])
     );
@@ -683,6 +707,16 @@ async fn acknowledged_pre_cutoff_websocket_fill_survives_late_final_and_replay()
     let offline_completed =
         completed_prepared_before_boundary(&offline_era, &source_path, CUTOFF_UNIX, boundary)
             .unwrap();
+    assert_eq!(
+        completed_prepared_before_boundary_indexed(
+            &offline_era,
+            &SourceReceiptIndex::replay(&source_path).unwrap(),
+            CUTOFF_UNIX,
+            boundary,
+        )
+        .unwrap(),
+        offline_completed
+    );
     let mut offline_sequences = offline_completed.iter().copied().collect::<Vec<_>>();
     offline_sequences.sort_by_key(|sequence| sequence.0);
     let offline = PaperStateDb::open_read_only(&state_path)

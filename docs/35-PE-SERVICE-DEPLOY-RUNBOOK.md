@@ -671,7 +671,7 @@ pe-service --qualify \
 ```
 
 It emits canonical compact JSON plus one trailing newline and reports its BLAKE3 hash. Only a sealed
-`Pass` under `_GLOSSARY.md` permits the one subsequent manual paper-to-live-tiny review.
+`Pass` under `_GLOSSARY.md` records paper-measurement evidence; it does not arm ordinary live mode.
 
 ### #565 open-continuation census before deployment
 
@@ -786,10 +786,10 @@ new ranking publication only.
 ## #705 paper financial-semantic-2 cutover
 
 This release changes paper measurement, not the ordinary-live price or admission contract. It does
-not change whether live can be switched on: until the owner-commanded live-control change ships,
-live mode already requires a passing qualification report (`live_mode.rs` `qualification_outcome`)
-and none exists, so this release may deploy before or with that change. This section adds no
-arming instruction.
+not change whether live can be switched on. In the pre-live-control binary, the legacy evaluator
+still requires a passing qualification report; after the owner-commanded live-control change,
+the owner's requested mode alone controls arming. This paper change may deploy before or with
+that change. This section adds no arming instruction.
 
 Under the deployment lock, stop intake and confirm source, paper, and live-journal quiescence.
 Record the configured SQLite, source-log, and paper-log paths, plus the derived live-journal path
@@ -1129,17 +1129,31 @@ the gate row and restart the current binary, or restore the old binary and only 
 gate-row value. Each reversal uses the current `value, updated_at` tokens and must return exactly one
 row.
 
-## #508 Phase D ordinary-live installation and arming
+## #508 Phase D ordinary-live installation and owner mode request
 
-### D1 — ship dark
+### D1 — install the service
 
 Install the service-scoped age identity at a root-owned path with mode `0600`. Install the committed
 `pe-service` drop-in that maps it as `LoadCredential=pe-age-identity:<identity-path>`, then run
 `systemctl daemon-reload` and verify the effective unit with `systemctl cat pe-service`. Deploy the
-Phase-D binary in that same swap/restart operation. Its first boot records the arming fence, so no
-earlier promotion review can arm an account.
+Phase-D binary in that same swap/restart operation. Verify the running service advertises
+`live_control_contract: "owner_requested_mode_v1"` on `/health/ready` before attributing the new
+mode behavior to it. The marker also appears on an unhealthy 503 response.
+An account already requesting `live_tiny` can become effective when this service starts; deployment
+does not wait for an additional arming action. Inventory existing requested and effective modes
+before the swap.
 
-### Arm one account
+### D2 — owner mode request
+
+The owner can request `live_tiny` with **Request mode** at any time, including before service
+deployment or order setup. The request is the sole account-mode command. Observe the audited
+effective-mode transition after the updated service starts; request `off` to disarm. Observe
+`status.json` mode state, control availability and age, and credential-binding readiness.
+
+### D3 — set up orders
+
+These steps let orders succeed once the owner requests live mode; none is a prerequisite for the
+request or for the effective-mode transition.
 
 1. Rotate the account credentials through the panel; plaintext must never enter `.env`, Supabase,
    logs, or shell history.
@@ -1149,11 +1163,9 @@ earlier promotion review can arm an account.
    for both V2 collateral adapters. Approval mutation remains an external operator action.
 4. For EOA custody, provision a small POL gas balance. EOA transport remains deferred pending the
    wallet-kind inventory; ordinary-live v1 uses Relayer transport only.
-5. After the Phase-D first boot, record the promotion review and its evidence in the panel.
-6. Request `live_tiny` in the panel. Requested mode is not authority; wait for the service's audited
-   effective-mode transition.
-7. Observe the account admission audit and `status.json` live block. Any failed fence keeps the
-   account dark; do not bypass it with direct table writes.
+
+Credential, venue, financial, resolver, source, risk, and redemption checks apply per order and
+do not change the owner's requested mode.
 
 ## Rollback
 
@@ -1164,10 +1176,11 @@ empty post-Start membership record is a hard forward-only boundary: the previous
 refuses that empty generation at boot. Keep the prior binary backup for forensics; do not reverse
 the swap on a restart loop after this boundary.
 
-For releases without a forward-only compatibility boundary, the same swap, reversed, plus one
-restart is triggered by any missing reader record, fewer than two
-live readers on the second bounded check, sink poison, a restart loop, an unexplained financial-state
-change, or a hash mismatch.
+For earlier releases without a forward-only compatibility boundary, the same swap, reversed,
+plus one restart is triggered by any missing reader record, fewer than two live readers on the
+second bounded check, sink poison, a restart loop, an unexplained financial-state change, or a
+hash mismatch. After L13 control journal records are written, recover service faults forward
+with an L13-compatible binary while preserving modes and all durable dispatch and journal work.
 
 **Compatibility prerequisite (#565):** reverse to a pre-#565 executable only while no synchronized
 schema-3 reconciliation page has become durable in the source log (the first successor poll page
@@ -1193,12 +1206,18 @@ Preserve all old source records, recorded effects, fences, financial records, an
 artifacts. Continuation 5 and terminal-evidence version 5 are distinct contracts; use the
 [glossary compatibility table](_GLOSSARY.md#continuation-and-commitment-compatibility-588).
 
-```bash
-cp -p target/release/pe-service.bak-<prior-sha12> /tmp/pe-service.rollback.<prior-sha12>
-mv -T --no-copy /tmp/pe-service.rollback.<prior-sha12> target/release/pe-service && sync -f target/release/pe-service
-sha256sum target/release/pe-service                          # = prior
-```
+For this live-control cutover, deploy SQL, then site, then service. An old service can still be
+running after SQL or site deployment; the site identifies its legacy readiness contract. A new
+service identifies the owner-requested contract through the readiness marker. Once L13 records
+exist, do not restore a pre-L13 service binary. Preserve requested and effective modes and recover
+with a compatible binary that reads the new journal records.
 
-Revert any config deltas the old binary does not understand (unknown `service_config` keys are
-ignored by old binaries — safe to leave), then `ssh -t … 'sudo systemctl restart pe-service'` and
-verify per step 6. There is no schema, database, ranker, or host rollback.
+Before the cutover, use read-only queries and local journal inspection to record deployed account
+requested/effective modes, callable RPC signatures and grants, account events, open dispatch
+targets, retained paper decisions, and live-journal recovery work. Recheck after each phase:
+
+| Observed phase | Check |
+|---|---|
+| SQL only | The locked mode RPC accepts only a proposal matching the current owner request. The old site's non-null `enabled` settings save and retired review actions fail visibly without changing mode or events. **Request mode** remains available. |
+| SQL and site | The new site labels stored `enabled` as history, leaves **Request mode** visible, and identifies an unmarked legacy readiness response as the old service. Check an unavailable readiness response separately. |
+| SQL, site, and service | The marked readiness body identifies the owner-requested contract on 200 and 503. Compare requested and effective modes, control availability, and retained dispatch/journal work against the inventory; an existing `live_tiny` request may reconcile immediately. |

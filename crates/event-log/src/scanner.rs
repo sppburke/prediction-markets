@@ -357,6 +357,8 @@ pub(crate) fn walk_locked<'a>(
 ) -> Result<(ScanOutcome, PrefixVerdict), LogError> {
     let request = request.into();
     let resolved_path = std::fs::canonicalize(path)?;
+    #[cfg(feature = "scan-metrics")]
+    crate::scan_metrics::record(&resolved_path);
     let mut reader = BufReader::new(file);
     verify_file_header(path, &mut reader)?;
     let mut state = ScanState::after_header();

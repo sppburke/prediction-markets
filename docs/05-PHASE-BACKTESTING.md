@@ -4,7 +4,7 @@
 > See [`_GLOSSARY.md`](_GLOSSARY.md) for configuration defaults, including
 > `kelly_p_prior_alpha_default`, `kelly_p_prior_beta_default`, and
 > `kelly_p_k_per_market_default`. Backtests remain research and regression evidence; the production
-> promotion contract is the sealed observed-paper gate, not a paper-versus-simulator comparison.
+> sealed observed-paper report measures paper performance; it does not control live mode.
 
 ## Objective
 
@@ -238,4 +238,5 @@ Winner-Follow backtesting must be **walk-forward** and **follower-realistic**. A
 
 ### Acceptance gate
 
-Winner-Follow can enter live-tiny only if the gates in `19-WINNER-FOLLOW-STRATEGY.md` ("Promotion ladder") and `_GLOSSARY.md` ("Promotion criteria — quantified") all pass for the leader-follow strategy.
+Backtest and paper gates measure strategy performance. The owner's requested mode controls ordinary
+live mode; order admission applies its separate checks.

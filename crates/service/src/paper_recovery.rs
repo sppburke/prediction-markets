@@ -1240,6 +1240,8 @@ impl ScannedPaperFrame {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PaperLogScanError {
+    #[error("source receipt index belongs to a different source log")]
+    SourceIndexPathMismatch,
     #[error("paper log read failed: {0}")]
     EventLog(#[from] pe_event_log::LogError),
     #[error("paper log schema {schema_version} is unsupported at sequence {sequence}")]
@@ -1640,6 +1642,7 @@ mod paper_log_tests {
                 entry_gate_config: CopyEntryGateConfig,
                 runtime_config: None,
                 live_accounts: None,
+                live_journal: None,
             },
             WinnerFollowStrategy::new(WinnerFollowConfig::default()),
             Writer::open(dir.path().join("paper.log")).unwrap(),
@@ -2342,6 +2345,7 @@ mod paper_log_tests {
                 entry_gate_config: CopyEntryGateConfig,
                 runtime_config: None,
                 live_accounts: None,
+                live_journal: None,
             },
             WinnerFollowStrategy::new(WinnerFollowConfig::default()),
             paper_writer,

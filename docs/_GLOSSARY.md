@@ -406,7 +406,7 @@ Campaign financial limits and eligibility are canonical in
 
 | Key | Canonical value | Meaning |
 |---|---:|---|
-| `live_armed_accounts_max` | 2 | v1 maximum simultaneously armed accounts. The service refuses a third; raising this requires re-validating the production p95 latency and sustained CLOB request budgets. |
+| `site_service_ready_timeout_secs` | 2 | Server-side admin-page read of the configured loopback `PE_SERVICE_READY_URL` readiness endpoint. A timeout reports the service as unreachable; Request mode remains visible. |
 | `live_accounts_stale_after_secs` | 120 | Accounts-snapshot freshness bound (#514): 4 × `config_poll_interval_secs`, the polled-source block threshold (see Source freshness defaults). While the last successful accounts poll is older than this (or never happened, or is future-dated), the service stages no new dispatch aggregates, pauses `pending` targets, and writes no effective-mode transitions; in-flight order recovery and redemption reconciliation are deliberately not gated. Module const `live_accounts::LIVE_ACCOUNTS_STALE_AFTER_SECS`. |
 | `account_id` | `[a-z0-9_-]{1,32}` | Immutable lowercase account slug grammar, enforced by `core-types::AccountId` and `accounts.account_id`. |
 | `live_price_impact_cap_bps_default` | 100 | Per-account default in `accounts.live_price_impact_cap_bps`; the database accepts `1..=10_000`. This is distinct from the shared paper `price_impact_cap_bps_default`. |
@@ -847,7 +847,7 @@ Two flags are first-class:
 
 Both are read by `risk-engine` as part of its pure inputs. As of issue #398 (Decision #2) they are **admin-mutable at runtime** via the Supabase `service_config` table (the single-email-gated admin panel), default-deny, with each edit audit-logged in `service_config.updated_by`/`updated_at` and applied on the next ≤30s config poll. This reverses the prior "signed config change only" rule. `kelly_fraction_above_default_human_approved` is re-checked against the mode ceiling on every poll in `runtime_config::parse_config`, so an above-ceiling override without the flag is cleared rather than applied.
 
-### Paper-to-live-tiny qualification — quantified
+### Paper qualification measurement — quantified
 
 These thresholds classify a sealed **paper measurement report**. The semantic-2 cutover first
 completes verified open continuations 2–5 under their frozen semantic-1 policy, then seals an
@@ -856,8 +856,7 @@ existing seal remains; paper decisions, fills, and daily marks continue, but aut
 and `--qualify` cannot create another seal or report in that generation. A fresh generation is
 required for a later qualification measurement. No second Start, transition, or anchor is created.
 
-The one sealed observed paper system is eligible for a single manual promotion review only when
-ALL of:
+The sealed observed paper system receives a `Pass` measurement only when ALL of:
 
 | Comparison | Threshold |
 |---|---|
@@ -866,12 +865,12 @@ ALL of:
 | Nonnegative peak-to-trough paper drawdown | strictly less than 0.10 |
 | Observation after the current anchor | ≥ 30 complete UTC days AND ≥ 90 closed copied trades |
 | Paper copy delay | nearest-rank p95 ≤ 2,000 ms |
-| Manual approval | one review after a `Pass` report |
 
 Quiet days count. The initial partial day does not. An underperformance or inactivity membership
 demotion moves the anchor to the next valid mark and resets the promotion growth, drawdown, close,
 delay, and no-demotion vectors. Normal ranker rotation, capacity change, and score refresh do not.
-There is no extension, interim look, second window, or automatic promotion.
+There is no extension, interim look, or second window. The report does not arm or disarm ordinary
+live mode; the owner's requested mode alone does that.
 
 ### Demotion criteria
 
@@ -905,7 +904,7 @@ Otherwise the engine submits limit orders.
 A closed copy is one unique successful Fill Final after the current qualification anchor whose
 exposure has a causal Resolution Final by the seal. Open positions and missing or noncausal
 resolutions are not samples. Backtest-versus-paper distribution comparisons, resampling, interim
-looks, extensions, and second windows are not promotion inputs.
+looks, extensions, and second windows are not inputs to this paper measurement.
 
 ### Transient bulk-root storage state (#588)
 

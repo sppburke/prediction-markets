@@ -233,7 +233,10 @@ pub fn reconstruct_redemption_attempts(
             | LiveJournalPayload::AccountPortfolioMarked(_)
             | LiveJournalPayload::CredentialBindingMismatch { .. }
             | LiveJournalPayload::ModeTransitionApplied(_)
-            | LiveJournalPayload::LegacyV1(_) => {}
+            | LiveJournalPayload::LegacyV1(_)
+            | LiveJournalPayload::StagedDispatchControl(_)
+            | LiveJournalPayload::PendingTargetControl(_)
+            | LiveJournalPayload::ApprovedRecoveryControlPause(_) => {}
         }
     }
     attempts

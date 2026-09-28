@@ -238,6 +238,41 @@ pub fn completed_prepared_before_boundary(
     cutoff_unix: i64,
     boundary_receipt: AppendReceipt,
 ) -> Result<HashSet<EventSeq>, RiskInputsUnavailable> {
+    completed_prepared_before_boundary_with(era, cutoff_unix, boundary_receipt, |receipts| {
+        source_receipt_index(source_log_path, receipts.into_iter())
+    })
+}
+
+/// Runtime variant using the installed source receipt index for the same causal cutoff.
+pub fn completed_prepared_before_boundary_indexed(
+    era: &PaperEra,
+    source_receipts: &SourceReceiptIndex,
+    cutoff_unix: i64,
+    boundary_receipt: AppendReceipt,
+) -> Result<HashSet<EventSeq>, RiskInputsUnavailable> {
+    completed_prepared_before_boundary_with(era, cutoff_unix, boundary_receipt, |receipts| {
+        let mut received = BTreeMap::new();
+        for receipt in receipts {
+            let Some((indexed, millis)) = source_receipts.receipt_at(receipt.sequence)? else {
+                return Err(RiskInputsUnavailable::PriceMissing);
+            };
+            if indexed != receipt {
+                return Err(RiskInputsUnavailable::PriceConflict);
+            }
+            received.insert(receipt.sequence, (indexed, millis));
+        }
+        Ok(received)
+    })
+}
+
+fn completed_prepared_before_boundary_with(
+    era: &PaperEra,
+    cutoff_unix: i64,
+    boundary_receipt: AppendReceipt,
+    resolve: impl FnOnce(
+        Vec<AppendReceipt>,
+    ) -> Result<BTreeMap<EventSeq, (AppendReceipt, i64)>, RiskInputsUnavailable>,
+) -> Result<HashSet<EventSeq>, RiskInputsUnavailable> {
     let cutoff_ms = cutoff_unix
         .checked_mul(1_000)
         .ok_or(RiskInputsUnavailable::Overflow)?;
@@ -277,8 +312,7 @@ pub fn completed_prepared_before_boundary(
             causal.push((prepared_receipt.sequence, source_receipt));
         }
     }
-    let received_millis =
-        source_receipt_index(source_log_path, causal.iter().map(|(_, receipt)| *receipt))?;
+    let received_millis = resolve(causal.iter().map(|(_, receipt)| *receipt).collect())?;
     causal
         .into_iter()
         .filter_map(|(prepared_sequence, receipt)| {
@@ -838,6 +872,10 @@ impl SourceReceiptIndexStaging {
 }
 
 impl SourceReceiptIndex {
+    pub(crate) fn canonical_path(&self) -> Option<&Path> {
+        self.source_log_path.as_deref().map(PathBuf::as_path)
+    }
+
     /// Start an externally driven source-receipt projection bound to the canonical log path (#572).
     pub(crate) fn staging(
         source_log_path: &Path,
@@ -897,6 +935,49 @@ impl SourceReceiptIndex {
             last_sequence,
             last_hash,
         })
+    }
+
+    /// Capture the indexed tail and its final frame from the same projection state.
+    pub(crate) fn tail_with_last_frame(
+        &self,
+    ) -> Result<(LogTailBinding, u64, AppendReceipt, blake3::Hash), RiskInputsUnavailable> {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let path = self
+            .source_log_path
+            .as_ref()
+            .ok_or(RiskInputsUnavailable::PriceMissing)?;
+        let last = state
+            .frames
+            .last()
+            .ok_or(RiskInputsUnavailable::PriceMissing)?;
+        let byte_offset = last
+            .byte_offset
+            .ok_or(RiskInputsUnavailable::PriceMissing)?;
+        let physical_tail = state
+            .next_byte_offset
+            .ok_or(RiskInputsUnavailable::PriceMissing)?;
+        let previous_hash = state
+            .frames
+            .iter()
+            .rev()
+            .nth(1)
+            .map_or(blake3::Hash::from_bytes([0; 32]), |frame| {
+                frame.receipt.this_hash
+            });
+        Ok((
+            LogTailBinding {
+                path: path.as_ref().clone(),
+                physical_tail,
+                last_sequence: Some(last.receipt.sequence),
+                last_hash: last.receipt.this_hash,
+            },
+            byte_offset,
+            last.receipt,
+            previous_hash,
+        ))
     }
 
     /// Extend the projection with an append that the source-log owner has already synchronized.
@@ -1981,6 +2062,132 @@ mod tests {
         assert_eq!(maintained, from_scratch);
         assert_eq!(maintained.latest.sample_count, 1);
         assert_eq!(maintained.latest.p95_ms, Some(2_000));
+    }
+
+    #[test]
+    fn indexed_completed_prepared_matches_log_cutoff_and_boundary() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let mut writer = Writer::open(&source_path).unwrap();
+        let before = writer
+            .append_synced(source_input(9_999, b"before"))
+            .unwrap();
+        let at_cutoff = writer
+            .append_synced(source_input(10_000, b"at cutoff"))
+            .unwrap();
+        let boundary = writer
+            .append_synced(source_input(10_000, b"boundary"))
+            .unwrap();
+        let after_boundary = writer
+            .append_synced(source_input(9_998, b"late frame"))
+            .unwrap();
+        drop(writer);
+        let index = SourceReceiptIndex::replay(&source_path).unwrap();
+        let make_pair = |sequence: u64, source_receipt: AppendReceipt| {
+            let prepared = frame(
+                sequence,
+                10_001,
+                PaperLogRecord::FinancialPrepared {
+                    expected_authority: crate::paper_recovery::ExpectedAuthority {
+                        qualification_start_receipt: receipt(0, 0),
+                        prior_completed_prepared_sequence: None,
+                    },
+                    payload: FinancialPayload::Fill {
+                        operation: crate::paper_recovery::PaperFillOperationIdentity {
+                            leader_wallet: WalletAddress::from_hex(
+                                "0x1111111111111111111111111111111111111111",
+                            )
+                            .unwrap(),
+                            source_trade_id: pe_core_types::SourceTradeId(format!(
+                                "trade-{sequence}"
+                            )),
+                            observed_at_bucket: 9_999,
+                        },
+                        economic: latency_economic(source_receipt, receipt(0, 0)),
+                    },
+                },
+            );
+            let final_frame = frame(
+                sequence + 1,
+                10_002,
+                PaperLogRecord::FinancialFinal {
+                    prepared_receipt: prepared.receipt,
+                    result: FinancialResult::Fill {
+                        canonical: crate::paper_recovery::CanonicalFillResult {
+                            outcome: "applied".to_owned(),
+                            bankroll: dec!(99),
+                            applied_prepared_seq: prepared.receipt.sequence,
+                            quantity: ShareAmount::from_whole(2).unwrap(),
+                            principal: CollateralAmount::from_decimal_exact(dec!(1)).unwrap(),
+                            fee: CollateralAmount::ZERO,
+                            fill_price: Price::new(dec!(0.5)).unwrap(),
+                        },
+                    },
+                },
+            );
+            [prepared, final_frame]
+        };
+        let era = PaperEra {
+            start: None,
+            frames: [
+                make_pair(1, before),
+                make_pair(3, at_cutoff),
+                make_pair(5, after_boundary),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
+        };
+        let from_log =
+            completed_prepared_before_boundary(&era, &source_path, 10_000, boundary).unwrap();
+        let from_index =
+            completed_prepared_before_boundary_indexed(&era, &index, 10_000, boundary).unwrap();
+        assert_eq!(from_index, from_log);
+        assert_eq!(from_index, HashSet::from([EventSeq(1)]));
+
+        let missing_index = SourceReceiptIndex::replay(&source_path).unwrap();
+        missing_index
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .frames
+            .clear();
+        assert_eq!(
+            completed_prepared_before_boundary_indexed(&era, &missing_index, 10_000, boundary),
+            Err(RiskInputsUnavailable::PriceMissing)
+        );
+        let mut wrong_hash_era = PaperEra {
+            start: None,
+            frames: era.frames.clone(),
+        };
+        if let PaperLogFrame::Record(PaperLogRecord::FinancialPrepared {
+            payload: FinancialPayload::Fill { economic, .. },
+            ..
+        }) = &mut wrong_hash_era.frames[0].frame
+        {
+            economic
+                .observation
+                .as_mut()
+                .unwrap()
+                .source_receipt
+                .this_hash = blake3::Hash::from_bytes([99; 32]);
+        }
+        assert_eq!(
+            completed_prepared_before_boundary_indexed(&wrong_hash_era, &index, 10_000, boundary),
+            Err(RiskInputsUnavailable::PriceConflict)
+        );
+    }
+
+    #[test]
+    fn empty_index_has_no_confirmable_mark_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        drop(Writer::open(&source_path).unwrap());
+        let index = SourceReceiptIndex::replay(&source_path).unwrap();
+        assert!(matches!(
+            index.tail_with_last_frame(),
+            Err(RiskInputsUnavailable::PriceMissing)
+        ));
     }
 
     /// PASS: an empty externally observed projection becomes the same path-bound index as replay,

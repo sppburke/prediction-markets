@@ -275,11 +275,6 @@ pub struct PolymarketLiveVenue {
     account_binding: LiveAccountBindingAudit,
 }
 
-pub(crate) struct BoundLiveVenueAccountState {
-    pub state: LiveVenueAccountState,
-    pub binding: LiveAccountBindingAudit,
-}
-
 impl PolymarketLiveVenue {
     pub async fn from_credentials(
         credentials: &LiveAccountCredentials,
@@ -354,45 +349,6 @@ impl PolymarketLiveVenue {
             request_descriptor_hashes,
             &self.account_binding,
         )
-    }
-
-    pub(crate) async fn account_states(
-        &self,
-    ) -> Result<(BoundLiveVenueAccountState, BoundLiveVenueAccountState), LiveVenueAccountReadError>
-    {
-        let deadline =
-            tokio::time::Instant::now() + Duration::from_secs(RECONCILIATION_TIMEOUT_SECS);
-        let (evidence, _) = self.client.account_probe_raw(deadline).await;
-        let request_descriptor_hashes =
-            bind_account_read_attempts(&evidence, &self.account_binding).map_err(|()| {
-                account_read_error(
-                    LiveAccountReadFailure::Protocol,
-                    evidence.clone(),
-                    Vec::new(),
-                )
-            })?;
-        let standard = parse_account_state(
-            evidence.clone(),
-            false,
-            request_descriptor_hashes.clone(),
-            &self.account_binding,
-        )?;
-        let neg_risk = parse_account_state(
-            evidence,
-            true,
-            request_descriptor_hashes,
-            &self.account_binding,
-        )?;
-        Ok((
-            BoundLiveVenueAccountState {
-                state: standard,
-                binding: self.account_binding.clone(),
-            },
-            BoundLiveVenueAccountState {
-                state: neg_risk,
-                binding: self.account_binding.clone(),
-            },
-        ))
     }
 }
 
