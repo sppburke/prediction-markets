@@ -858,10 +858,12 @@ parser/classifier versions, payout target, cycle configuration, activation batch
 cycle/pending pointers and prepared request; do not restage, reseal, clear receipts or
 advance an unfinished generation. Binary/script rollback uses the same pause/restore
 lifecycle; the structural-check change requires no database migration, freshness override or
-event/replay change. A classifier-version change may be installed into a paused cycle that has
-no `cache_stage_record.json`, no `ranking_publish_request.json` and no `rank_and_push.pending`:
-collection start cleared the projection, so the cycle's first finalization rebuilds it at the new
-version.
+event/replay change. Install a classifier-version change only at a clean publication boundary
+with no cycle in progress (`paused_complete`, no `rank_and_push.cycle`, no `cache_stage_record.json`,
+no `ranking_publish_request.json` and no `rank_and_push.pending`): a resumed cycle keeps its frozen
+manifest and pipeline versions, so installing into one would mix the old classifier's provenance
+with the new classifier's projection. The next cycle's first finalization rebuilds the projection
+at the new version.
 
 The zero-argument `rank_and_push.sh` production cycle enters this lane automatically when
 the installed cache is schema two, and for the one-time initial cutover when `.env` sets
