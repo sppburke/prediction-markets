@@ -228,6 +228,8 @@ pub struct LiveStatusBlock {
     /// Unix time of the last SUCCESSFUL accounts poll; `null` before one succeeds (#514).
     /// A strictly advancing value across two snapshots proves the poll is decoding.
     pub fetched_at_unix: Option<i64>,
+    pub control_available: bool,
+    pub control_age_secs: Option<i64>,
     /// Whether the accounts snapshot is stale (never-successful, too old, or
     /// future-dated); while `true` the service stages no new live work (#514).
     pub stale: bool,
@@ -243,6 +245,7 @@ pub struct LiveAccountStatus {
     pub requested_live_mode: String,
     pub effective_live_mode: String,
     pub armed: bool,
+    pub credential_binding_ready: bool,
 }
 
 /// Build a snapshot from the (cheap) live counters. Deterministic given its scalar inputs —
@@ -303,6 +306,10 @@ pub fn build_snapshot(
                 .map(|v| v.len())
                 .unwrap_or(0),
             fetched_at_unix: snapshot.fetched_at_unix,
+            control_available: snapshot.control_available,
+            control_age_secs: snapshot
+                .fetched_at_unix
+                .and_then(|fetched| now_unix.checked_sub(fetched)),
             stale: !snapshot.is_fresh(now_unix),
             accounts: snapshot
                 .accounts
@@ -314,6 +321,8 @@ pub fn build_snapshot(
                     requested_live_mode: a.requested_live_mode.clone(),
                     effective_live_mode: a.effective_live_mode.clone(),
                     armed: a.is_armed(),
+                    credential_binding_ready: snapshot.credential_metadata_available
+                        && a.credential_binding.is_some(),
                 })
                 .collect(),
         }),

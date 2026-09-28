@@ -2,7 +2,7 @@
 
 > See [`_BASELINE.md`](_BASELINE.md) for the Rust-only implementation rule and common acceptance gate.
 > See [`_GLOSSARY.md`](_GLOSSARY.md) for production latency budget and rate-limit defaults.
-> See [`19-WINNER-FOLLOW-STRATEGY.md`](19-WINNER-FOLLOW-STRATEGY.md) for canonical risk caps and promotion ladders.
+> See [`19-WINNER-FOLLOW-STRATEGY.md`](19-WINNER-FOLLOW-STRATEGY.md) for canonical risk caps and owner-requested live mode.
 > See [`20-AWS-GIT-OPERATIONS.md`](20-AWS-GIT-OPERATIONS.md) for the canonical AWS deployment architecture (region, VPC, RDS engine).
 
 ## Objective
@@ -50,10 +50,10 @@ replay-cli                         Rust CLI
 2. **shadow:** run models/strategies without orders.
 3. **paper:** route intents to fake/sandbox venue.
 4. **live-tiny:** live orders with strict caps from `19-`.
-5. **scaled-live:** only after metrics prove stability per the promotion criteria in `_GLOSSARY.md`.
+5. **scaled-live:** deferred until a distinct financial contract is defined.
 
 The bounded Polymarket V2 Winner-Follow canary is an isolated role, not a deployment mode or a
-promotion stage. Its dedicated inactive system unit and operational boundary are documented in
+ordinary mode control. Its dedicated inactive system unit and operational boundary are documented in
 [`36-POLYMARKET-V2-CANARY-RUNBOOK.md`](36-POLYMARKET-V2-CANARY-RUNBOOK.md).
 
 ## Health endpoints

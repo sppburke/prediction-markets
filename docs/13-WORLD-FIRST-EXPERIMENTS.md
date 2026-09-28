@@ -48,4 +48,5 @@ Trace source delay, parser delay, bus delay, model delay, strategy delay, routin
 
 ## Promotion rule
 
-An experiment cannot become live until source legality, resolver fixtures, replay corpus, shadow-mode metrics, false-positive modes, and live-tiny risk limits are complete. Promotion gates for Winner-Follow sub-experiments use `_GLOSSARY.md` "Promotion criteria — quantified".
+The owner requests ordinary live mode. Source, resolver, venue, financial, and risk checks govern
+each order. Experiment reports and shadow-mode metrics remain research evidence and do not arm mode.

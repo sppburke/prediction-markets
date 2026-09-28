@@ -20,7 +20,11 @@ use account controls.
    AUTH_URL=https://<your-domain>
    SUPABASE_SERVICE_ROLE_KEY=...   # server-only; account authz/reads + admin RPCs
    PE_AGE_RECIPIENT=age1...        # public recipient only; never the private identity
+   PE_SERVICE_READY_URL=http://127.0.0.1:8080/health/ready  # server-only loopback service readiness URL
    ```
+
+The accounts admin page reads `PE_SERVICE_READY_URL` without caching and times out after 2 seconds.
+It shows the running service contract separately from readiness; Request mode stays available.
 
 ## Credential recipient configuration (#508 Decision 9)
 

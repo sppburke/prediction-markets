@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use pe_core_types::{
@@ -453,6 +453,173 @@ pub enum LiveOrderPreparationFailure {
     PrePostLadderExpired,
     PrePostAdmissionExpired,
     PrePostMarkUnavailable,
+    PrePostNotArmed,
+    PrePostControlUnavailable,
+}
+
+impl LiveOrderPreparationFailure {
+    /// The one terminal projection for a recorded preparation failure. Historical
+    /// records without control evidence retain their original recovery reason.
+    #[must_use]
+    pub const fn terminal_reason(self, has_control: bool) -> &'static str {
+        match self {
+            Self::RecoveryCredentialChanged => "recovery_credential_changed",
+            Self::RecoveryAdmissionExpired if has_control => "recovery_account_not_armed",
+            Self::RecoveryAdmissionExpired => "recovery_admission_expired",
+            Self::PrePostRiskDayChanged | Self::PrePostRiskPriceExpired => {
+                "recovery_risk_evidence_expired"
+            }
+            Self::PrePostLadderExpired => "recovery_ladder_expired",
+            Self::PrePostNotArmed => "not_armed",
+            Self::PrePostControlUnavailable => "control_unavailable",
+            Self::Venue
+            | Self::PreparedAuditMismatch
+            | Self::PrePostAdmissionExpired
+            | Self::PrePostMarkUnavailable => "rejected",
+        }
+    }
+}
+
+/// Values observed for one control decision. No raw account or credential response is retained.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveControlAvailability {
+    Fresh,
+    FailedRead,
+    Stale,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveControlObservation {
+    pub decided_at_unix: i64,
+    pub last_successful_read_unix: Option<i64>,
+    pub stale_after_secs: i64,
+    pub availability: LiveControlAvailability,
+    pub account_present: bool,
+    pub requested_mode: Option<LiveControlMode>,
+    pub effective_mode: Option<LiveControlMode>,
+    pub credential_version_available: bool,
+    pub bundle_version: Option<i64>,
+}
+
+impl LiveControlObservation {
+    #[must_use]
+    pub fn valid_shape(&self) -> bool {
+        if self.stale_after_secs <= 0
+            || self.account_present != self.requested_mode.is_some()
+            || self.account_present != self.effective_mode.is_some()
+            || (!self.account_present
+                && (self.bundle_version.is_some() || self.credential_version_available))
+            || (!self.credential_version_available && self.bundle_version.is_some())
+        {
+            return false;
+        }
+        let fresh_time = self
+            .last_successful_read_unix
+            .and_then(|read| self.decided_at_unix.checked_sub(read))
+            .is_some_and(|age| (0..self.stale_after_secs).contains(&age));
+        match self.availability {
+            LiveControlAvailability::Fresh => fresh_time,
+            LiveControlAvailability::FailedRead => fresh_time,
+            LiveControlAvailability::Stale => !fresh_time,
+        }
+    }
+
+    #[must_use]
+    pub fn permits_mode(&self) -> bool {
+        self.valid_shape()
+            && self.availability == LiveControlAvailability::Fresh
+            && self.requested_mode == Some(LiveControlMode::LiveTiny)
+            && self.effective_mode == Some(LiveControlMode::LiveTiny)
+    }
+
+    #[must_use]
+    pub fn not_armed(&self) -> bool {
+        self.valid_shape()
+            && self.availability == LiveControlAvailability::Fresh
+            && !self.permits_mode()
+    }
+
+    #[must_use]
+    pub fn unavailable(&self) -> bool {
+        self.valid_shape() && self.availability != LiveControlAvailability::Fresh
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveStagedTargetControlAudit {
+    pub account_id: AccountId,
+    pub exec_rank: u64,
+    pub is_primary: bool,
+    pub execution_order: i64,
+    pub control: LiveControlObservation,
+    pub observed_credential_key_id: String,
+    pub frozen_binding: CredentialBindingIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveStagedDispatchControlAudit {
+    pub dispatch_id: String,
+    pub targets: Vec<LiveStagedTargetControlAudit>,
+}
+
+impl LiveStagedDispatchControlAudit {
+    #[must_use]
+    pub fn valid(&self) -> bool {
+        !self.dispatch_id.is_empty()
+            && !self.targets.is_empty()
+            && self.targets.iter().enumerate().all(|(rank, target)| {
+                u64::try_from(rank).ok() == Some(target.exec_rank)
+                    && target.control.permits_mode()
+                    && target.control.credential_version_available
+                    && target.control.bundle_version == Some(target.frozen_binding.version)
+                    && target.observed_credential_key_id == target.frozen_binding.key_id
+            })
+            && self.targets.windows(2).all(|pair| {
+                let left = &pair[0];
+                let right = &pair[1];
+                (
+                    !left.is_primary,
+                    left.execution_order,
+                    left.account_id.as_str(),
+                ) < (
+                    !right.is_primary,
+                    right.execution_order,
+                    right.account_id.as_str(),
+                )
+            })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LiveTargetControlOutcome {
+    Pause,
+    NotArmed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LiveTargetControlAudit {
+    pub dispatch_id: String,
+    pub account_id: AccountId,
+    pub exec_rank: u64,
+    pub control: LiveControlObservation,
+    pub outcome: LiveTargetControlOutcome,
+}
+
+impl LiveTargetControlAudit {
+    #[must_use]
+    pub fn valid(&self) -> bool {
+        !self.dispatch_id.is_empty()
+            && match self.outcome {
+                LiveTargetControlOutcome::Pause => self.control.unavailable(),
+                LiveTargetControlOutcome::NotArmed => self.control.not_armed(),
+            }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -460,6 +627,8 @@ pub enum LiveOrderPreparationFailure {
 pub struct LiveOrderPreparationFailedAudit {
     pub identity: LiveOrderIdentity,
     pub failure: LiveOrderPreparationFailure,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control: Option<LiveControlObservation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -780,6 +949,9 @@ pub struct LegacyV1Payload(serde_json::Value);
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "payload")]
 pub enum LiveJournalPayload {
+    StagedDispatchControl(Box<LiveStagedDispatchControlAudit>),
+    PendingTargetControl(Box<LiveTargetControlAudit>),
+    ApprovedRecoveryControlPause(Box<LiveTargetControlAudit>),
     AdmissionEvaluated(Box<LiveAdmissionEvaluationAudit>),
     OrderPreparationFailed(Box<LiveOrderPreparationFailedAudit>),
     OrderPrepared(Box<LiveOrderPreparedAudit>),
@@ -856,7 +1028,7 @@ pub struct TerminalAdmissionRecoveryEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TerminalAdmissionRecoveryOutcome {
     Refused(LiveAdmissionRefusal),
-    PreparationFailed(LiveOrderPreparationFailure),
+    PreparationFailed(Box<LiveOrderPreparationFailedAudit>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -870,6 +1042,8 @@ pub struct LiveRecoveryInventory {
 
 #[derive(Debug, thiserror::Error)]
 pub enum LiveJournalError {
+    #[error("recorded live control outcome contradicts its observation")]
+    InvalidControlEvidence,
     #[error("live journal path is a symlink or is not mode 0600")]
     InsecurePermissions,
     #[error("live journal file operation failed: {0}")]
@@ -899,6 +1073,7 @@ struct LiveJournalInner {
 
 /// Synchronized owner of the single ordinary-live journal stream.
 pub struct LiveJournal {
+    path: PathBuf,
     inner: Mutex<LiveJournalInner>,
 }
 
@@ -928,8 +1103,14 @@ impl LiveJournal {
         let next_seq =
             u64::try_from(events.len()).map_err(|_| LiveJournalError::SequenceMismatch)?;
         Ok(Self {
+            path: path.to_path_buf(),
             inner: Mutex::new(LiveJournalInner { writer, next_seq }),
         })
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Native payload replay plus the shared physical scanner's exact tail binding (#544).
@@ -1017,6 +1198,27 @@ pub fn replay_account(
             .filter(|event| &event.account_id == account_id)
             .collect()
     })
+}
+
+/// Resolve a committed seed's sequence reference against the fully validated journal.
+/// An append followed by a failed SQLite staging transaction remains an unreferenced
+/// attempt and is deliberately not returned for a different dispatch.
+pub fn staged_dispatch_control_at(
+    path: impl AsRef<Path>,
+    seq: u64,
+    dispatch_id: &str,
+) -> Result<Option<LiveStagedDispatchControlAudit>, LiveJournalError> {
+    Ok(replay_all(path)?
+        .into_iter()
+        .find(|event| event.seq == seq)
+        .and_then(|event| match event.payload {
+            LiveJournalPayload::StagedDispatchControl(audit)
+                if audit.dispatch_id == dispatch_id =>
+            {
+                Some(*audit)
+            }
+            _ => None,
+        }))
 }
 
 /// Replay one account and bind that projection to its final event in the verified journal scan.
@@ -1976,7 +2178,7 @@ where
                     account_id: event.account_id,
                     journal_seq: event.seq,
                     identity: failed.identity.clone(),
-                    outcome: TerminalAdmissionRecoveryOutcome::PreparationFailed(failed.failure),
+                    outcome: TerminalAdmissionRecoveryOutcome::PreparationFailed(failed),
                 });
             }
             LiveJournalPayload::AccountPortfolioMarked(mark) => {
@@ -2109,7 +2311,10 @@ where
                 )?;
                 order.terminal = true;
             }
-            LiveJournalPayload::RedemptionRequested(_)
+            LiveJournalPayload::StagedDispatchControl(_)
+            | LiveJournalPayload::PendingTargetControl(_)
+            | LiveJournalPayload::ApprovedRecoveryControlPause(_)
+            | LiveJournalPayload::RedemptionRequested(_)
             | LiveJournalPayload::RedemptionTransactionIdentified(_)
             | LiveJournalPayload::RedemptionReceiptTransition(_)
             | LiveJournalPayload::ResolutionFinalized(_)
@@ -2323,7 +2528,8 @@ mod legacy_v1 {
     }
 }
 
-fn replay_all(path: impl AsRef<Path>) -> Result<Vec<LiveJournalEvent>, LiveJournalError> {
+/// Replay and validate the complete account-tagged journal once for bulk reference checks.
+pub fn replay_all(path: impl AsRef<Path>) -> Result<Vec<LiveJournalEvent>, LiveJournalError> {
     replay_all_with_receipts(path)
         .map(|events| events.into_iter().map(|(event, _receipt)| event).collect())
 }
@@ -2363,6 +2569,7 @@ fn replay_with_receipts(
         if seq.0 != expected || event.seq != expected || event.timestamp != envelope.observed_at.0 {
             return Err(LiveJournalError::SequenceMismatch);
         }
+        validate_control_event(&event)?;
         events.push((
             event,
             AppendReceipt {
@@ -2377,6 +2584,62 @@ fn replay_with_receipts(
         return Err(LiveJournalError::SequenceMismatch);
     }
     Ok(events)
+}
+
+fn validate_control_event(event: &LiveJournalEvent) -> Result<(), LiveJournalError> {
+    let valid = match &event.payload {
+        LiveJournalPayload::StagedDispatchControl(staged) => {
+            staged.valid()
+                && staged
+                    .targets
+                    .first()
+                    .is_some_and(|first| first.account_id == event.account_id)
+                && staged.targets.iter().all(|target| {
+                    target.control.decided_at_unix == event.timestamp.unix_timestamp()
+                })
+        }
+        LiveJournalPayload::PendingTargetControl(target) => {
+            target.valid()
+                && target.account_id == event.account_id
+                && target.control.decided_at_unix == event.timestamp.unix_timestamp()
+        }
+        LiveJournalPayload::ApprovedRecoveryControlPause(target) => {
+            target.valid()
+                && target.outcome == LiveTargetControlOutcome::Pause
+                && target.account_id == event.account_id
+                && target.control.decided_at_unix == event.timestamp.unix_timestamp()
+        }
+        LiveJournalPayload::OrderPreparationFailed(failed) => {
+            (match failed.failure {
+                LiveOrderPreparationFailure::PrePostNotArmed => failed
+                    .control
+                    .as_ref()
+                    .is_some_and(LiveControlObservation::not_armed),
+                LiveOrderPreparationFailure::PrePostControlUnavailable => failed
+                    .control
+                    .as_ref()
+                    .is_some_and(LiveControlObservation::unavailable),
+                LiveOrderPreparationFailure::RecoveryAdmissionExpired
+                    if failed.control.is_some() =>
+                {
+                    failed
+                        .control
+                        .as_ref()
+                        .is_some_and(LiveControlObservation::not_armed)
+                }
+                _ => failed.control.is_none(),
+            }) && failed
+                .control
+                .as_ref()
+                .is_none_or(|control| control.decided_at_unix == event.timestamp.unix_timestamp())
+        }
+        _ => true,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(LiveJournalError::InvalidControlEvidence)
+    }
 }
 
 pub(crate) fn hash_serializable<T: Serialize + ?Sized>(
@@ -2428,6 +2691,104 @@ mod tests {
     use time::macros::datetime;
 
     use super::*;
+
+    #[test]
+    fn recorded_control_outcomes_validate_clock_mode_and_binding() {
+        let observed = LiveControlObservation {
+            decided_at_unix: 1_000,
+            last_successful_read_unix: Some(999),
+            stale_after_secs: 120,
+            availability: LiveControlAvailability::Fresh,
+            account_present: true,
+            requested_mode: Some(LiveControlMode::LiveTiny),
+            effective_mode: Some(LiveControlMode::LiveTiny),
+            credential_version_available: true,
+            bundle_version: Some(7),
+        };
+        let binding = CredentialBindingIdentity {
+            version: 7,
+            key_id: "key-a".to_owned(),
+        };
+        let first = LiveStagedTargetControlAudit {
+            account_id: AccountId::new("primary").unwrap(),
+            exec_rank: 0,
+            is_primary: true,
+            execution_order: 9,
+            control: observed.clone(),
+            observed_credential_key_id: "key-a".to_owned(),
+            frozen_binding: binding.clone(),
+        };
+        let second = LiveStagedTargetControlAudit {
+            account_id: AccountId::new("secondary").unwrap(),
+            exec_rank: 1,
+            is_primary: false,
+            execution_order: 0,
+            control: observed.clone(),
+            observed_credential_key_id: "key-a".to_owned(),
+            frozen_binding: binding,
+        };
+        let staged = LiveStagedDispatchControlAudit {
+            dispatch_id: "dispatch".to_owned(),
+            targets: vec![first, second],
+        };
+        assert!(staged.valid());
+        let mut key_mismatch = staged.clone();
+        key_mismatch.targets[1].frozen_binding.key_id = "key-b".to_owned();
+        assert!(
+            !key_mismatch.valid(),
+            "same version with a different key must fail replay"
+        );
+        let mut bad_rank = staged.clone();
+        bad_rank.targets[1].exec_rank = 2;
+        assert!(!bad_rank.valid());
+        let mut future = observed.clone();
+        future.last_successful_read_unix = Some(1_001);
+        assert!(!future.valid_shape());
+        future.availability = LiveControlAvailability::Stale;
+        assert!(future.unavailable());
+        let mut failed_read = observed.clone();
+        failed_read.availability = LiveControlAvailability::FailedRead;
+        failed_read.credential_version_available = false;
+        failed_read.bundle_version = None;
+        assert!(
+            failed_read.unavailable(),
+            "failed read wins over a still-fresh last success"
+        );
+        failed_read.last_successful_read_unix = None;
+        assert!(!failed_read.valid_shape(), "never-read snapshots are stale");
+        let mut absent = observed;
+        absent.account_present = false;
+        absent.requested_mode = None;
+        absent.effective_mode = None;
+        absent.credential_version_available = false;
+        absent.bundle_version = None;
+        assert!(absent.not_armed());
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("live.log");
+        let journal = LiveJournal::open(&path).unwrap();
+        let event = journal
+            .append(
+                AccountId::new("primary").unwrap(),
+                OffsetDateTime::from_unix_timestamp(1_000).unwrap(),
+                LiveJournalPayload::StagedDispatchControl(Box::new(staged.clone())),
+            )
+            .unwrap();
+        assert_eq!(
+            staged_dispatch_control_at(&path, event.seq, "dispatch").unwrap(),
+            Some(staged)
+        );
+        assert!(
+            staged_dispatch_control_at(&path, event.seq, "other")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            staged_dispatch_control_at(&path, event.seq + 1, "dispatch")
+                .unwrap()
+                .is_none()
+        );
+    }
     use crate::economic::{
         BalanceAudit, ECONOMIC_PREPARED_VERSION, EconomicPrepared, FeeAudit, MarketSelection,
         RiskAudit, RiskDecisionAudit, SizingAudit, SizingModeAudit,
@@ -3068,6 +3429,7 @@ mod tests {
                         LiveOrderPreparationFailedAudit {
                             identity: prepared.identity.clone(),
                             failure: LiveOrderPreparationFailure::RecoveryAdmissionExpired,
+                            control: None,
                         },
                     )),
                 )
@@ -3078,9 +3440,8 @@ mod tests {
             assert_eq!(recovered.terminal_admissions.len(), 1, "{seam}");
             assert!(matches!(
                 recovered.terminal_admissions[0].outcome,
-                TerminalAdmissionRecoveryOutcome::PreparationFailed(
-                    LiveOrderPreparationFailure::RecoveryAdmissionExpired
-                )
+                TerminalAdmissionRecoveryOutcome::PreparationFailed(ref audit)
+                    if audit.failure == LiveOrderPreparationFailure::RecoveryAdmissionExpired
             ));
         }
     }
@@ -3408,6 +3769,7 @@ mod tests {
                     LiveOrderPreparationFailedAudit {
                         identity: identity("d0"),
                         failure: LiveOrderPreparationFailure::Venue,
+                        control: None,
                     },
                 )),
             )
@@ -3420,6 +3782,7 @@ mod tests {
                     LiveOrderPreparationFailedAudit {
                         identity: identity("d1"),
                         failure: LiveOrderPreparationFailure::Venue,
+                        control: None,
                     },
                 )),
             )
@@ -3432,6 +3795,7 @@ mod tests {
                     LiveOrderPreparationFailedAudit {
                         identity: identity("d2"),
                         failure: LiveOrderPreparationFailure::PreparedAuditMismatch,
+                        control: None,
                     },
                 )),
             )
@@ -3444,6 +3808,7 @@ mod tests {
                     LiveOrderPreparationFailedAudit {
                         identity: identity("d3"),
                         failure: LiveOrderPreparationFailure::Venue,
+                        control: None,
                     },
                 )),
             )
@@ -3842,6 +4207,7 @@ mod tests {
                     LiveOrderPreparationFailedAudit {
                         identity: identity("d0"),
                         failure: LiveOrderPreparationFailure::Venue,
+                        control: None,
                     },
                 )),
             )
@@ -3867,6 +4233,7 @@ mod tests {
                     LiveOrderPreparationFailedAudit {
                         identity: identity("d0"),
                         failure: LiveOrderPreparationFailure::Venue,
+                        control: None,
                     },
                 )),
             )

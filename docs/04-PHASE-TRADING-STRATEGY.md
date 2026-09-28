@@ -2,7 +2,7 @@
 
 > See [`_BASELINE.md`](_BASELINE.md) for the Rust-only implementation rule and common acceptance gate.
 > See [`_GLOSSARY.md`](_GLOSSARY.md) for type aliases, latency budget, and configuration defaults.
-> See [`19-WINNER-FOLLOW-STRATEGY.md`](19-WINNER-FOLLOW-STRATEGY.md) for canonical risk caps, Kelly fractions, eligibility thresholds, mode definitions, and promotion ladders. **All Winner-Follow numeric values in this file are pointers to that file.**
+> See [`19-WINNER-FOLLOW-STRATEGY.md`](19-WINNER-FOLLOW-STRATEGY.md) for canonical risk caps, Kelly fractions, eligibility thresholds, mode definitions, and paper measurement. **All Winner-Follow numeric values in this file are pointers to that file.**
 
 ## Objective
 
@@ -102,13 +102,11 @@ pub struct WinnerFollowStrategy {
 }
 ```
 
-### Promotion path
+### Paper measurement
 
-The paper-to-live-tiny gate is the one-system sealed qualification defined in
-`19-WINNER-FOLLOW-STRATEGY.md` and `_GLOSSARY.md` ("Paper-to-live-tiny qualification — quantified").
-It requires exact replay, positive lower-bound complete-day growth, bounded drawdown, the canonical
-observation minima and delay, followed by one manual review. Historical simulator-comparison
-language is not a promotion contract.
+The sealed qualification in `19-WINNER-FOLLOW-STRATEGY.md` and `_GLOSSARY.md` measures paper
+performance. The owner's requested mode controls ordinary live mode; order admission keeps its
+credential, source, resolver, venue, financial, and risk checks.
 The thresholds classify a sealed paper measurement report. Paper semantic 2 prices from the
 current ask ladder inside the applied impact cap and fill-price band and permits matching delay;
 ordinary live retains a leader-price ceiling and strict fresh admission. The isolated V2 canary
