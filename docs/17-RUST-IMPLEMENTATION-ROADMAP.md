@@ -59,7 +59,8 @@ Replay CLI, fill models, fake exchanges, reports (`BacktestReport` + `WinnerFoll
 
 ## Phase 10 — Production shadow/live-tiny
 
-Record-only, shadow, paper, live-tiny, scaling rules. Promotion gates per `_GLOSSARY.md` and `19-`.
+Record-only, shadow, paper, live-tiny, and scaling rules. Owner-requested mode controls ordinary
+live mode; paper qualification measures performance.
 
 ## Recommended first live candidate
 

@@ -1,13 +1,10 @@
 //! Live account contexts (#508): the 30-second Supabase poll of the `accounts` control
-//! table (+ credential-binding metadata) into an `ArcSwap` snapshot the orchestrator reads
+//! table into an `ArcSwap` snapshot the orchestrator reads
 //! per event.
 //!
 //! Accounts are LIVE-ONLY identities (Decision 1): nothing here touches the shared paper
-//! book. The snapshot orders armed targets primary-first, then `(execution_order,
-//! account_id)` (Decision 4), and enforces the v1 `live_armed_accounts_max = 2` bound
-//! (`_GLOSSARY.md`) as defense-in-depth — the effective-mode machine refuses to arm a
-//! third account, and this snapshot additionally refuses to TARGET one if the control
-//! table ever carries more. An account whose slug fails the Rust [`AccountId`] grammar is
+//! book. The snapshot orders targets primary-first, then `(execution_order,
+//! account_id)`. An account whose slug fails the Rust [`AccountId`] grammar is
 //! excluded loudly (fail closed for that account; the SQL `CHECK` should make this
 //! unreachable). With no armed accounts the snapshot is empty and the copy path behaves
 //! exactly as the Phase-A baseline (no dispatch seeds are staged).
@@ -17,15 +14,14 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use pe_core_types::AccountId;
+use pe_execution_core::LiveControlMode;
+use pe_execution_core::live_journal::{LiveControlAvailability, LiveControlObservation};
 use serde::Deserialize;
 use tracing::{error, info, warn};
 
+use crate::live_mode::{ModeDecision, evaluate_mode};
+use crate::live_projections::LiveProjectionWriter;
 use crate::supabase_reader::{SupabaseError, auth_token};
-
-/// v1 bound on simultaneously armed live accounts (#508 Decision 4). Canonical:
-/// `_GLOSSARY.md` `live_armed_accounts_max`. Bounded by the p95 ≤ 2.0 s end-to-end and
-/// CLOB ≤ 5 req/s budgets; raising it requires re-validating those budgets.
-pub const LIVE_ARMED_ACCOUNTS_MAX: usize = 2;
 
 /// Most attempts a single poll tick may make (#620); [`live_accounts_attempt_plan`] lowers it when
 /// the interval cannot pay for them. Supabase returns intermittent gateway 504s in short bursts;
@@ -47,9 +43,8 @@ const LIVE_ACCOUNTS_POLL_BUDGET_PERCENT: u32 = 80;
 /// below something that could answer.
 const LIVE_ACCOUNTS_MIN_REQUEST_TIMEOUT: Duration = Duration::from_millis(250);
 
-/// Requests one attempt issues: `accounts` then `account_credentials`. The timeout is applied to
-/// each of them, so the budget has to be divided by both the attempts and these.
-const LIVE_ACCOUNTS_REQUESTS_PER_ATTEMPT: u32 = 2;
+/// Control and metadata are fetched independently. Each control attempt makes one request.
+const LIVE_ACCOUNTS_REQUESTS_PER_ATTEMPT: u32 = 1;
 
 /// Snapshot staleness bound (#514): 4 × the 30 s accounts poll cadence
 /// ([`crate::config_poller::CONFIG_POLL_INTERVAL_SECS`]), the `_GLOSSARY.md` polled-source
@@ -96,16 +91,15 @@ pub struct AccountContext {
     pub custody_wallet_address: Option<String>,
     pub custody_wallet_kind: Option<String>,
     /// Credential binding frozen into dispatch targets (Decision 10); `None` when no
-    /// sealed bundle exists yet (the account can never arm without one).
+    /// sealed bundle has been verified for this control generation.
     pub credential_binding: Option<(i64, String)>,
 }
 
 impl AccountContext {
-    /// Armed = the service's own effective transition reached `live_tiny` AND the
-    /// account is enabled AND a credential binding exists to freeze into targets.
+    /// Mode state only. Credential binding readiness is a separate observation.
     #[must_use]
     pub fn is_armed(&self) -> bool {
-        self.enabled && self.effective_live_mode == "live_tiny" && self.credential_binding.is_some()
+        self.requested_live_mode == "live_tiny" && self.effective_live_mode == "live_tiny"
     }
 }
 
@@ -117,9 +111,49 @@ pub struct LiveAccountsSnapshot {
     /// `None` = never successful (the `Default` posture when the boot fetch fails), which
     /// is always stale (#514).
     pub fetched_at_unix: Option<i64>,
+    /// A failed read marks control unavailable, even while the last success is recent.
+    pub control_available: bool,
+    /// Increments on each successful control publication. Metadata from an older
+    /// generation cannot install bindings into this snapshot.
+    pub generation: u64,
+    /// A failed metadata read is distinct from a confirmed empty credential table.
+    pub credential_metadata_available: bool,
 }
 
 impl LiveAccountsSnapshot {
+    #[must_use]
+    pub fn control_observation(
+        &self,
+        account: Option<&AccountContext>,
+        now_unix: i64,
+    ) -> LiveControlObservation {
+        let read_is_recent = self.fetched_at_unix.is_some_and(|fetched| {
+            now_unix
+                .checked_sub(fetched)
+                .is_some_and(|age| (0..LIVE_ACCOUNTS_STALE_AFTER_SECS).contains(&age))
+        });
+        let availability = if !read_is_recent {
+            LiveControlAvailability::Stale
+        } else if !self.control_available {
+            LiveControlAvailability::FailedRead
+        } else {
+            LiveControlAvailability::Fresh
+        };
+        LiveControlObservation {
+            decided_at_unix: now_unix,
+            last_successful_read_unix: self.fetched_at_unix,
+            stale_after_secs: LIVE_ACCOUNTS_STALE_AFTER_SECS,
+            availability,
+            account_present: account.is_some(),
+            requested_mode: account.map(|row| mode_value(&row.requested_live_mode)),
+            effective_mode: account.map(|row| mode_value(&row.effective_live_mode)),
+            credential_version_available: account.is_some() && self.credential_metadata_available,
+            bundle_version: account
+                .filter(|_| self.credential_metadata_available)
+                .and_then(|row| row.credential_binding.as_ref().map(|binding| binding.0)),
+        }
+    }
+
     /// Validate raw rows into a snapshot. Invalid slugs are excluded loudly; ordering is
     /// primary first, then `(execution_order, account_id)` (Decision 4).
     #[must_use]
@@ -159,6 +193,9 @@ impl LiveAccountsSnapshot {
         Self {
             accounts,
             fetched_at_unix: None,
+            control_available: true,
+            generation: 0,
+            credential_metadata_available: !creds.is_empty(),
         }
     }
 
@@ -169,30 +206,27 @@ impl LiveAccountsSnapshot {
     /// do NOT gate on freshness: suppressing them would be the worse harm.
     #[must_use]
     pub fn is_fresh(&self, now_unix: i64) -> bool {
-        self.fetched_at_unix.is_some_and(|fetched| {
-            now_unix
-                .checked_sub(fetched)
-                .is_some_and(|age| (0..LIVE_ACCOUNTS_STALE_AFTER_SECS).contains(&age))
-        })
+        self.control_available
+            && self.fetched_at_unix.is_some_and(|fetched| {
+                now_unix
+                    .checked_sub(fetched)
+                    .is_some_and(|age| (0..LIVE_ACCOUNTS_STALE_AFTER_SECS).contains(&age))
+            })
     }
 
     /// The armed dispatch targets in frozen execution order: primary first, then
-    /// `(execution_order, account_id)`. Truncated to [`LIVE_ARMED_ACCOUNTS_MAX`] with a
-    /// loud error if the control table ever carries more (defense-in-depth; the mode
-    /// machine refuses to arm a third).
+    /// `(execution_order, account_id)`.
     #[must_use]
     pub fn armed_targets(&self) -> Vec<&AccountContext> {
-        let mut armed: Vec<&AccountContext> =
-            self.accounts.iter().filter(|a| a.is_armed()).collect();
-        if armed.len() > LIVE_ARMED_ACCOUNTS_MAX {
-            error!(
-                armed = armed.len(),
-                max = LIVE_ARMED_ACCOUNTS_MAX,
-                "live accounts: more armed accounts than the v1 bound; refusing the excess"
-            );
-            armed.truncate(LIVE_ARMED_ACCOUNTS_MAX);
-        }
-        armed
+        self.accounts.iter().filter(|a| a.is_armed()).collect()
+    }
+}
+
+fn mode_value(value: &str) -> LiveControlMode {
+    if value == "live_tiny" {
+        LiveControlMode::LiveTiny
+    } else {
+        LiveControlMode::Off
     }
 }
 
@@ -200,6 +234,7 @@ impl LiveAccountsSnapshot {
 #[derive(Clone)]
 pub struct LiveAccounts {
     inner: Arc<ArcSwap<LiveAccountsSnapshot>>,
+    publication: Arc<std::sync::Mutex<()>>,
 }
 
 impl LiveAccounts {
@@ -207,6 +242,7 @@ impl LiveAccounts {
     pub fn new(initial: LiveAccountsSnapshot) -> Self {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(initial)),
+            publication: Arc::new(std::sync::Mutex::new(())),
         }
     }
 
@@ -217,7 +253,54 @@ impl LiveAccounts {
     }
 
     pub fn store(&self, snapshot: LiveAccountsSnapshot) {
+        let _guard = self
+            .publication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.inner.store(Arc::new(snapshot));
+    }
+
+    /// Order control publication against the in-process pre-POST submitted transition.
+    pub fn publication_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.publication
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn apply_metadata(
+        &self,
+        generation: u64,
+        result: Result<Vec<CredentialMetaRow>, SupabaseError>,
+    ) {
+        let _guard = self.publication_guard();
+        let current = self.snapshot();
+        if current.generation != generation {
+            return;
+        }
+        let mut next = current.as_ref().clone();
+        match result {
+            Ok(rows) => {
+                next.credential_metadata_available = true;
+                for account in &mut next.accounts {
+                    account.credential_binding = rows
+                        .iter()
+                        .find(|row| row.account_id == account.account_id.as_str())
+                        .map(|row| (row.bundle_version, row.key_id.clone()));
+                }
+            }
+            Err(error) => {
+                warn!(%error, "live credential metadata unavailable");
+                next.credential_metadata_available = false;
+            }
+        }
+        self.inner.store(Arc::new(next));
+    }
+
+    fn mark_control_unavailable(&self) {
+        let _guard = self.publication_guard();
+        let mut next = self.snapshot().as_ref().clone();
+        next.control_available = false;
+        self.inner.store(Arc::new(next));
     }
 }
 
@@ -239,7 +322,7 @@ fn credentials_url(base_url: &str) -> String {
     )
 }
 
-/// Fetch the `accounts` control rows + credential metadata (service-role; PostgREST).
+/// Fetch only `accounts` control rows (service-role; PostgREST).
 /// A fetch failure keeps the last-known-good snapshot (the caller logs and retries on
 /// the next poll — the #398 config-poller posture).
 pub async fn fetch_live_accounts(
@@ -263,11 +346,25 @@ async fn fetch_live_accounts_within(
 ) -> Result<LiveAccountsSnapshot, SupabaseError> {
     let token = auth_token(anon_key, secret_key);
     let rows: Vec<AccountRow> = fetch_json(client, &accounts_url(base_url), token, timeout).await?;
-    let creds: Vec<CredentialMetaRow> =
-        fetch_json(client, &credentials_url(base_url), token, timeout).await?;
-    let mut snapshot = LiveAccountsSnapshot::from_rows(rows, &creds);
+    let mut snapshot = LiveAccountsSnapshot::from_rows(rows, &[]);
     snapshot.fetched_at_unix = Some(time::OffsetDateTime::now_utc().unix_timestamp());
     Ok(snapshot)
+}
+
+async fn fetch_credential_metadata_within(
+    client: &reqwest::Client,
+    base_url: &str,
+    anon_key: &str,
+    secret_key: &str,
+    timeout: Duration,
+) -> Result<Vec<CredentialMetaRow>, SupabaseError> {
+    fetch_json(
+        client,
+        &credentials_url(base_url),
+        auth_token(anon_key, secret_key),
+        Some(timeout),
+    )
+    .await
 }
 
 async fn fetch_json<T: serde::de::DeserializeOwned>(
@@ -397,15 +494,90 @@ pub async fn run_live_accounts_poller(
     interval_secs: u64,
 ) {
     let interval = Duration::from_secs(interval_secs.max(1));
+    let projection = LiveProjectionWriter::new(client.clone(), &base_url, &anon_key, &secret_key);
     let mut ticker = tokio::time::interval(interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut generation = live.snapshot().generation;
+    let mut cursor = 0_usize;
     loop {
         ticker.tick().await;
         match poll_live_accounts_once(&client, &base_url, &anon_key, &secret_key, interval).await {
-            Ok(snapshot) => live.store(snapshot),
-            Err(e) => warn!(error = %e, "live accounts poll failed; keeping last-known-good"),
+            Ok(mut snapshot) => {
+                generation = generation.saturating_add(1);
+                snapshot.generation = generation;
+                // Publishing the control result is independent of metadata and mode RPCs.
+                let candidate = next_mode_candidate(&snapshot, &mut cursor);
+                live.store(snapshot);
+                let metadata_live = live.clone();
+                let metadata_client = client.clone();
+                let metadata_url = base_url.clone();
+                let metadata_anon = anon_key.clone();
+                let metadata_secret = secret_key.clone();
+                tokio::spawn(async move {
+                    let result = fetch_credential_metadata_within(
+                        &metadata_client,
+                        &metadata_url,
+                        &metadata_anon,
+                        &metadata_secret,
+                        interval / 2,
+                    )
+                    .await;
+                    metadata_live.apply_metadata(generation, result);
+                });
+                if let Some(account) = candidate {
+                    let projection = projection.clone();
+                    tokio::spawn(async move {
+                        if let ModeDecision::SetEffective { mode, reason } = evaluate_mode(
+                            &account.requested_live_mode,
+                            &account.effective_live_mode,
+                        ) {
+                            match tokio::time::timeout(
+                                interval / 2,
+                                projection.set_effective_mode(
+                                    account.account_id.as_str(),
+                                    mode,
+                                    reason,
+                                ),
+                            )
+                            .await
+                            {
+                                Ok(Ok(())) => {}
+                                Ok(Err(error)) => {
+                                    warn!(account_id = %account.account_id, %error, "effective mode write failed")
+                                }
+                                Err(_) => {
+                                    warn!(account_id = %account.account_id, "effective mode write timed out")
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+            Err(e) => {
+                live.mark_control_unavailable();
+                warn!(error = %e, "live accounts control poll failed; last-good rows are display only");
+            }
         }
     }
+}
+
+fn next_mode_candidate(
+    snapshot: &LiveAccountsSnapshot,
+    cursor: &mut usize,
+) -> Option<AccountContext> {
+    let len = snapshot.accounts.len();
+    if len == 0 {
+        return None;
+    }
+    let found = (0..len)
+        .map(|offset| (*cursor + offset) % len)
+        .find(|index| {
+            let account = &snapshot.accounts[*index];
+            evaluate_mode(&account.requested_live_mode, &account.effective_live_mode)
+                != ModeDecision::Keep
+        });
+    *cursor = found.map_or((*cursor + 1) % len, |index| (index + 1) % len);
+    found.map(|index| snapshot.accounts[index].clone())
 }
 
 #[cfg(test)]
@@ -460,13 +632,13 @@ mod tests {
             .map(|a| a.account_id.as_str())
             .collect();
         assert_eq!(order, vec!["primary-acct", "beta", "alpha", "zeta"]);
-        // Armed targets respect the same order but the v1 bound truncates to 2.
+        // Armed targets retain the full deterministic order.
         let targets: Vec<&str> = snap
             .armed_targets()
             .iter()
             .map(|a| a.account_id.as_str())
             .collect();
-        assert_eq!(targets, vec!["primary-acct", "beta"]);
+        assert_eq!(targets, vec!["primary-acct", "beta", "alpha", "zeta"]);
     }
 
     #[test]
@@ -501,15 +673,133 @@ mod tests {
         // Never-successful (the failed-boot-fetch posture) is stale.
         assert!(!snap.is_fresh(1_000));
         snap.fetched_at_unix = Some(1_000);
+        snap.control_available = true;
         assert!(snap.is_fresh(1_000));
         assert!(snap.is_fresh(1_000 + LIVE_ACCOUNTS_STALE_AFTER_SECS - 1));
         // Exactly the threshold is stale (age ≥ bound).
         assert!(!snap.is_fresh(1_000 + LIVE_ACCOUNTS_STALE_AFTER_SECS));
         // A future timestamp fails closed.
         assert!(!snap.is_fresh(999));
+        snap.control_available = false;
+        assert!(!snap.is_fresh(1_001));
+        snap.control_available = true;
         // A later successful poll clears staleness.
         snap.fetched_at_unix = Some(2_000);
         assert!(snap.is_fresh(2_000 + LIVE_ACCOUNTS_STALE_AFTER_SECS - 1));
+    }
+
+    #[test]
+    fn control_outcomes_separate_failed_read_stale_and_binding_metadata() {
+        let mut snap = LiveAccountsSnapshot::from_rows(
+            vec![row("acct", false, false, 0, "live_tiny")],
+            &[cred("acct")],
+        );
+        snap.credential_metadata_available = false;
+        let account = &snap.accounts[0];
+        assert!(account.is_armed());
+        assert_eq!(
+            snap.control_observation(Some(account), 1_000).availability,
+            LiveControlAvailability::Stale,
+        );
+        snap.fetched_at_unix = Some(1_000);
+        let account = &snap.accounts[0];
+        let fresh = snap.control_observation(Some(account), 1_001);
+        assert_eq!(fresh.availability, LiveControlAvailability::Fresh);
+        assert!(!fresh.credential_version_available);
+        assert_eq!(fresh.bundle_version, None);
+        snap.control_available = false;
+        assert_eq!(
+            snap.control_observation(Some(account), 1_001).availability,
+            LiveControlAvailability::FailedRead,
+        );
+        assert_eq!(
+            snap.control_observation(Some(account), 999).availability,
+            LiveControlAvailability::Stale,
+        );
+        assert_eq!(
+            snap.control_observation(None, 1_001).availability,
+            LiveControlAvailability::FailedRead,
+        );
+        snap.control_available = true;
+        snap.credential_metadata_available = true;
+        let verified = snap.control_observation(Some(account), 1_001);
+        assert!(verified.permits_mode());
+        assert_eq!(verified.bundle_version, Some(1));
+    }
+
+    #[test]
+    fn mode_cursor_advances_across_all_accounts_after_each_attempt() {
+        let mut snapshot = LiveAccountsSnapshot::from_rows(
+            vec![
+                row("one", false, false, 0, "live_tiny"),
+                row("two", false, false, 1, "live_tiny"),
+                row("three", false, false, 2, "live_tiny"),
+            ],
+            &[],
+        );
+        for account in &mut snapshot.accounts {
+            account.effective_live_mode = "off".to_owned();
+        }
+        let mut cursor = 0;
+        let attempted: Vec<String> = (0..6)
+            .filter_map(|_| next_mode_candidate(&snapshot, &mut cursor))
+            .map(|account| account.account_id.as_str().to_owned())
+            .collect();
+        assert_eq!(attempted, ["one", "two", "three", "one", "two", "three"]);
+    }
+
+    #[test]
+    fn delayed_metadata_cannot_replace_newer_control_generation_or_version() {
+        let mut initial =
+            LiveAccountsSnapshot::from_rows(vec![row("acct", true, false, 0, "live_tiny")], &[]);
+        initial.generation = 1;
+        let live = LiveAccounts::new(initial);
+        live.apply_metadata(
+            1,
+            Ok(vec![CredentialMetaRow {
+                account_id: "acct".to_owned(),
+                bundle_version: 1,
+                key_id: "old".to_owned(),
+            }]),
+        );
+        let mut newer =
+            LiveAccountsSnapshot::from_rows(vec![row("acct", true, false, 0, "live_tiny")], &[]);
+        newer.generation = 2;
+        live.store(newer);
+        live.apply_metadata(
+            1,
+            Ok(vec![CredentialMetaRow {
+                account_id: "acct".to_owned(),
+                bundle_version: 1,
+                key_id: "old".to_owned(),
+            }]),
+        );
+        assert_eq!(live.snapshot().accounts[0].credential_binding, None);
+        live.apply_metadata(
+            2,
+            Ok(vec![CredentialMetaRow {
+                account_id: "acct".to_owned(),
+                bundle_version: 2,
+                key_id: "new".to_owned(),
+            }]),
+        );
+        assert_eq!(
+            live.snapshot().accounts[0].credential_binding,
+            Some((2, "new".to_owned()))
+        );
+        live.apply_metadata(2, Err(SupabaseError::Status(503)));
+        let unavailable = live.snapshot();
+        assert!(!unavailable.credential_metadata_available);
+        assert_eq!(
+            unavailable.accounts[0].credential_binding,
+            Some((2, "new".to_owned()))
+        );
+        assert_eq!(
+            unavailable
+                .control_observation(Some(&unavailable.accounts[0]), 1_000)
+                .bundle_version,
+            None
+        );
     }
 
     #[test]
@@ -667,7 +957,7 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
-        // 5 s buys three attempts at 500 ms each — six times shorter than the 3 s stall.
+        // 5 s buys three bounded attempts, each shorter than the 3 s stall.
         let polled = poll_live_accounts_once(
             &reqwest::Client::new(),
             &format!("http://{address}"),
@@ -686,6 +976,197 @@ mod tests {
             3,
             "expected two retries inside the tick"
         );
+        server.abort();
+    }
+
+    /// A hanging credential metadata response and a hanging effective-mode RPC cannot
+    /// hold the control read cadence or starve another account's mode proposal.
+    #[tokio::test]
+    async fn control_poller_progresses_while_metadata_and_mode_rpc_hang() {
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mode_attempts = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let read_counter = reads.clone();
+        let mode_log = mode_attempts.clone();
+        let app = axum::Router::new()
+            .route(
+                "/rest/v1/accounts",
+                axum::routing::get(move || {
+                    let reads = read_counter.clone();
+                    async move {
+                        reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        axum::Json(serde_json::json!([
+                            {
+                                "account_id": "one", "is_primary": true, "enabled": false,
+                                "execution_order": 0, "requested_live_mode": "live_tiny",
+                                "effective_live_mode": "off", "live_price_impact_cap_bps": 100,
+                                "custody_wallet_address": null, "custody_wallet_kind": null
+                            },
+                            {
+                                "account_id": "two", "is_primary": false, "enabled": false,
+                                "execution_order": 1, "requested_live_mode": "live_tiny",
+                                "effective_live_mode": "off", "live_price_impact_cap_bps": 100,
+                                "custody_wallet_address": null, "custody_wallet_kind": null
+                            }
+                        ]))
+                    }
+                }),
+            )
+            .route(
+                "/rest/v1/account_credentials",
+                axum::routing::get(|| async {
+                    std::future::pending::<axum::Json<serde_json::Value>>().await
+                }),
+            )
+            .route(
+                "/rest/v1/rpc/account_set_effective_mode",
+                axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let mode_log = mode_log.clone();
+                    async move {
+                        if let Some(account_id) =
+                            body.get("p_account_id").and_then(serde_json::Value::as_str)
+                        {
+                            mode_log.lock().unwrap().push(account_id.to_owned());
+                        }
+                        std::future::pending::<axum::http::StatusCode>().await
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let live = LiveAccounts::new(LiveAccountsSnapshot::default());
+        let poller = tokio::spawn(run_live_accounts_poller(
+            live.clone(),
+            reqwest::Client::new(),
+            format!("http://{address}"),
+            "publishable-key".to_owned(),
+            String::new(),
+            1,
+        ));
+        tokio::time::timeout(Duration::from_secs(6), async {
+            loop {
+                if live.snapshot().generation >= 3 && mode_attempts.lock().unwrap().len() >= 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(reads.load(std::sync::atomic::Ordering::SeqCst) >= 3);
+        assert!(live.snapshot().control_available);
+        assert!(!live.snapshot().credential_metadata_available);
+        assert_eq!(&mode_attempts.lock().unwrap()[..2], ["one", "two"]);
+        poller.abort();
+        server.abort();
+    }
+
+    /// The server commits the first proposal but loses its response. A restarted poller
+    /// rereads effective mode before making another proposal, then applies a later `off`.
+    #[tokio::test]
+    async fn lost_effective_response_and_restart_reconcile_latest_owner_request() {
+        let modes = Arc::new(std::sync::Mutex::new((
+            "live_tiny".to_owned(),
+            "off".to_owned(),
+        )));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let read_modes = modes.clone();
+        let write_modes = modes.clone();
+        let write_calls = calls.clone();
+        let app = axum::Router::new()
+            .route(
+                "/rest/v1/accounts",
+                axum::routing::get(move || {
+                    let modes = read_modes.clone();
+                    async move {
+                        let (requested, effective) = modes.lock().unwrap().clone();
+                        axum::Json(serde_json::json!([{
+                            "account_id": "acct", "is_primary": true, "enabled": false,
+                            "execution_order": 0, "requested_live_mode": requested,
+                            "effective_live_mode": effective, "live_price_impact_cap_bps": 100,
+                            "custody_wallet_address": null, "custody_wallet_kind": null
+                        }]))
+                    }
+                }),
+            )
+            .route(
+                "/rest/v1/account_credentials",
+                axum::routing::get(|| async { axum::Json(serde_json::json!([])) }),
+            )
+            .route(
+                "/rest/v1/rpc/account_set_effective_mode",
+                axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let modes = write_modes.clone();
+                    let calls = write_calls.clone();
+                    async move {
+                        let proposed = body
+                            .get("p_effective_mode")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or_default();
+                        {
+                            let mut modes = modes.lock().unwrap();
+                            if proposed == modes.0 {
+                                modes.1 = proposed.to_owned();
+                            }
+                        }
+                        let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if call == 0 {
+                            std::future::pending::<axum::http::StatusCode>().await
+                        } else {
+                            axum::http::StatusCode::OK
+                        }
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let url = format!("http://{address}");
+        let first = LiveAccounts::new(LiveAccountsSnapshot::default());
+        let first_poller = tokio::spawn(run_live_accounts_poller(
+            first,
+            reqwest::Client::new(),
+            url.clone(),
+            "key".to_owned(),
+            String::new(),
+            1,
+        ));
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        first_poller.abort();
+        let restarted = LiveAccounts::new(LiveAccountsSnapshot::default());
+        let restarted_poller = tokio::spawn(run_live_accounts_poller(
+            restarted.clone(),
+            reqwest::Client::new(),
+            url,
+            "key".to_owned(),
+            String::new(),
+            1,
+        ));
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while restarted.snapshot().generation < 2 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(restarted.snapshot().accounts[0].is_armed());
+        modes.lock().unwrap().0 = "off".to_owned();
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while modes.lock().unwrap().1 != "off" {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        restarted_poller.abort();
         server.abort();
     }
 
@@ -785,7 +1266,7 @@ mod tests {
     }
 
     #[test]
-    fn unarmed_disabled_credentialless_and_invalid_accounts_never_target() {
+    fn owner_mode_arms_independent_of_enabled_and_credentials() {
         let snap = LiveAccountsSnapshot::from_rows(
             vec![
                 row("off-mode", false, true, 0, "off"),
@@ -795,7 +1276,12 @@ mod tests {
             ],
             &[cred("off-mode"), cred("disabled"), cred("BadSlug")],
         );
-        assert!(snap.armed_targets().is_empty());
+        let targets: Vec<&str> = snap
+            .armed_targets()
+            .iter()
+            .map(|account| account.account_id.as_str())
+            .collect();
+        assert_eq!(targets, vec!["disabled", "no-creds"]);
         // The invalid slug is excluded from the snapshot entirely (Rust-layer rejection).
         assert_eq!(snap.accounts.len(), 3);
     }

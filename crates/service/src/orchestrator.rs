@@ -245,6 +245,7 @@ pub struct OrchestratorConfig {
     /// live targets stage a dispatch aggregate. `None` (tests / Supabase off) = zero
     /// targets = the Phase-A baseline path (no seeds).
     pub live_accounts: Option<crate::live_accounts::LiveAccounts>,
+    pub live_journal: Option<Arc<pe_execution_core::LiveJournal>>,
     /// #530: websocket-primary mode. Gates the stale-fallback no-copy rule and the
     /// dual-unhealthy admission block; `false` keeps poll-only behavior byte-identical.
     pub activity_ws_enabled: bool,
@@ -343,6 +344,7 @@ pub struct Orchestrator<
     // Live account contexts (#508): armed targets stage dispatch aggregates. `None` in
     // tests / when Supabase is off — zero targets, Phase-A baseline behavior.
     live_accounts: Option<crate::live_accounts::LiveAccounts>,
+    live_journal: Option<Arc<pe_execution_core::LiveJournal>>,
     /// Set at the first uncertain paper sync boundary. Dropping the receiver
     /// then backpressures/stops every producer; supervisor owns process exit.
     intake_stopped: bool,
@@ -1759,6 +1761,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             book_fetcher,
             price_impact_cap_bps: config.price_impact_cap_bps,
             live_accounts: config.live_accounts,
+            live_journal: config.live_journal,
             intake_stopped: false,
             watchlist_writer_lock: config.watchlist_writer_lock,
             pending_boot,
@@ -2372,6 +2375,27 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         let Some(live) = self.live_accounts.as_ref() else {
             return Ok(None);
         };
+        let dispatch_id = pe_strategy_winner_follow::build_idempotency_key(signal);
+        match self.paper_state.dispatch_seed(&dispatch_id) {
+            Ok(Some(seed)) => {
+                let journal_seq = serde_json::from_str::<serde_json::Value>(&seed.signal_json)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("control_journal_seq")
+                            .and_then(serde_json::Value::as_u64)
+                    });
+                if let Some(evidence) = evidence.as_mut() {
+                    evidence.record_staged_dispatch(dispatch_id.clone(), journal_seq);
+                }
+                return Ok(Some(dispatch_id));
+            }
+            Ok(None) => {}
+            Err(error) => {
+                error!(%error, "read existing dispatch seed before staging failed");
+                return Err(());
+            }
+        }
         let snapshot = live.snapshot();
         // #514: no NEW live aggregates while blind — a stale/never-successful accounts
         // snapshot stages nothing. Paper execution proceeds unchanged; in-flight recovery
@@ -2387,12 +2411,17 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             );
             return Ok(None);
         }
-        let armed = snapshot.armed_targets();
-        if armed.is_empty() {
+        let selected = snapshot
+            .armed_targets()
+            .into_iter()
+            .filter(|account| {
+                snapshot.credential_metadata_available && account.credential_binding.is_some()
+            })
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
             return Ok(None);
         }
-        let dispatch_id = pe_strategy_winner_follow::build_idempotency_key(signal);
-        let targets = armed
+        let targets = selected
             .iter()
             .filter_map(|account| {
                 account
@@ -2405,6 +2434,60 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     })
             })
             .collect::<Vec<_>>();
+        #[cfg(feature = "scenario")]
+        let staged_at = self.financial_now();
+        #[cfg(not(feature = "scenario"))]
+        let staged_at = OffsetDateTime::now_utc();
+        let Some(journal) = self.live_journal.as_ref() else {
+            error!(dispatch_id = %dispatch_id, "live journal is unavailable for dispatch staging");
+            return Err(());
+        };
+        let selected_audit = selected
+            .iter()
+            .enumerate()
+            .map(|(rank, account)| {
+                let (version, key_id) = account.credential_binding.as_ref().ok_or(())?;
+                Ok(
+                    pe_execution_core::live_journal::LiveStagedTargetControlAudit {
+                        account_id: account.account_id.clone(),
+                        exec_rank: u64::try_from(rank).map_err(|_| ())?,
+                        is_primary: account.is_primary,
+                        execution_order: account.execution_order,
+                        control: snapshot
+                            .control_observation(Some(account), staged_at.unix_timestamp()),
+                        observed_credential_key_id: key_id.clone(),
+                        frozen_binding: pe_execution_core::CredentialBindingIdentity {
+                            version: *version,
+                            key_id: key_id.clone(),
+                        },
+                    },
+                )
+            })
+            .collect::<Result<Vec<_>, ()>>()?;
+        let staged_audit = pe_execution_core::live_journal::LiveStagedDispatchControlAudit {
+            dispatch_id: dispatch_id.clone(),
+            targets: selected_audit,
+        };
+        if !staged_audit.valid() {
+            error!(dispatch_id = %dispatch_id, "selected-target control record is invalid");
+            return Err(());
+        }
+        let Some(first_account) = staged_audit
+            .targets
+            .first()
+            .map(|target| target.account_id.clone())
+        else {
+            return Ok(None);
+        };
+        let staged_event = journal.append(
+            first_account, staged_at,
+            pe_execution_core::LiveJournalPayload::StagedDispatchControl(Box::new(staged_audit)),
+        ).map_err(|error| {
+            error!(%error, dispatch_id = %dispatch_id, "journal selected targets before staging failed");
+        })?;
+        if let Some(evidence) = evidence.as_mut() {
+            evidence.record_staged_dispatch(dispatch_id.clone(), Some(staged_event.seq));
+        }
         // The frozen signal + decision identity: redelivery replays THIS, never current config.
         let frozen = serde_json::json!({
             "schema_version": 1,
@@ -2412,8 +2495,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             "observation": observation,
             "price_impact_cap_bps": self.price_impact_cap_bps,
             "mode": format!("{:?}", self.mode),
+            "control_journal_seq": staged_event.seq,
         });
-        let staged_at = OffsetDateTime::now_utc();
         record_clock(evidence, "dispatch_seed_created", staged_at);
         let record = pe_paper_state::DispatchSeedRecord {
             dispatch_id: dispatch_id.clone(),
@@ -2430,9 +2513,6 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         }
         let checkpoint = matches!(continuation_version, 5 | 6);
         let pending = if checkpoint {
-            if let Some(evidence) = evidence.as_mut() {
-                evidence.record_staged_dispatch(dispatch_id.clone());
-            }
             evidence
                 .as_ref()
                 .map(|evidence| {
@@ -4247,6 +4327,7 @@ mod tests {
                 entry_gate_config: CopyEntryGateConfig,
                 runtime_config: None,
                 live_accounts: None,
+                live_journal: None,
                 activity_ws_enabled: false,
                 copy_latency_budget_secs: 2,
                 watchlist_writer_lock: None,

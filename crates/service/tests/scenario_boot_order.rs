@@ -577,6 +577,9 @@ impl RestartFixture {
                     credential_binding: Some((7, "stored-key".to_owned())),
                 }],
                 fetched_at_unix: Some(EPOCH),
+                control_available: true,
+                generation: 1,
+                credential_metadata_available: true,
             }
         } else {
             LiveAccountsSnapshot::default()
@@ -605,6 +608,10 @@ impl RestartFixture {
                 entry_gate_config: CopyEntryGateConfig,
                 runtime_config: None,
                 live_accounts: Some(live),
+                live_journal: Some(Arc::new(
+                    pe_execution_core::LiveJournal::open(self.dir.path().join("live_journal.log"))
+                        .unwrap(),
+                )),
                 activity_ws_enabled: true,
                 copy_latency_budget_secs: 2,
                 watchlist_writer_lock: None,

@@ -1420,8 +1420,10 @@ membership. Pending or failed requests retry independently on the capacity worke
 last safely applied runtime cap. The additive optional `live` block reports
 `pending_dispatch_seeds`, `ready_dispatch_seeds`, `fetched_at_unix` (last successful accounts
 poll; `null` before one succeeds), `stale` (`true` past `live_accounts_stale_after_secs` —
-no new live work is staged while stale, #514), and per-account `account_id, is_primary, enabled,
-requested_live_mode, effective_live_mode, armed` (#508). Installing this runtime-capacity support
+no new live work is staged while stale, #514), `control_available` and `control_age_secs`,
+and per-account `account_id, is_primary, enabled` (historical only), `requested_live_mode,
+effective_live_mode, armed, credential_binding_ready`. `armed` means both observed modes are
+`live_tiny`; control availability and credential readiness are separate order observations. Installing this runtime-capacity support
 requires one normal `pe-service` restart; subsequent valid `service_config` edits hot-swap without
 a restart.
 Run28 fixed `k=25` and did not sweep watchlist width. The earlier top-50 paper experiment

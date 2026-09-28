@@ -3,7 +3,7 @@
 > See `_BASELINE.md` for the Rust-only implementation rule, toolchain pin, lints, and common acceptance gate.
 > See `_GLOSSARY.md` for vocabulary (wallet/trader/leader/candidate), type aliases, latency budget, rate limits, and configuration defaults.
 
-**This file is the canonical source of truth for Winner-Follow risk caps, Kelly fractions, eligibility thresholds, execution modes, and the promotion ladder.** Other files reference this file rather than restating these values.
+**This file is the canonical source of truth for Winner-Follow risk caps, Kelly fractions, eligibility thresholds, execution modes, and paper measurement.** Other files reference this file rather than restating these values.
 
 ## Objective
 
@@ -365,7 +365,7 @@ All values in basis points (1 bp = 0.01 %). Comments show the percent equivalent
 #   durable paper/live evidence, and completed-prior-hour latency samples.
 
 [winner_follow.modes]
-leader_follow                = "live_tiny"   # paper -> live_tiny -> promoted (see promotion criteria below)
+leader_follow                = "live_tiny"   # ordinary live mode; promoted remains deferred
 
 [winner_follow.kelly]
 fraction_backtest_sanity     = 0.10
@@ -546,25 +546,18 @@ installation and later authority boundaries.
 Ordinary `pe-service` has per-account modes `off | live_tiny`. `promoted` is deferred because it
 has no distinct financial contract under the current cap policy (the reviewed production row is
 `unlimited`; `ModeDefault` resolves 25 bps for LiveTiny and 100 bps for Promoted only when that row
-is selected); the promotion ladder below remains canonical for when a distinct promoted contract is
-introduced. The account grammar,
-armed-account bound, per-account price-impact default, dispatch retention, and redemption surfacing
+is selected); a distinct promoted contract remains deferred. The account grammar,
+per-account price-impact default, dispatch retention, and redemption surfacing
 threshold live only in `_GLOSSARY.md`.
 
-The panel requests a mode, but the service is the sole writer of effective mode through the atomic
-`account_set_effective_mode` control RPC. Arming requires a decryptable, correctly bound credential
-bundle; venue state not `closed_only`; passing geoblock evidence; sufficient balance and allowance
-for both V2 exchange spenders; a loaded `Pass` qualification report bound to the current seal,
-economic configuration hash, and financial semantic version; and an unrevoked post-`Pass` review
-newer than the executor's first-boot arming fence that binds both that seal and the BLAKE3 of the
-exact loaded report bytes. The `promotion_reviewed.evidence_ref` format is
-`<seal_blake3>:<qualification_report_blake3>` (two lowercase 64-hex digests). A legacy seal-only or
-otherwise unbound review is invalid.
-Requested mode alone never authorizes an order. Invalid credentials, missing or mismatched
-qualification evidence, a missing/revoked/mismatched review, or `closed_only` demote an armed
-account; transient probe failure refuses orders without demotion. A pending, ambiguous, or failed
-redemption is the non-demoting exception: it closes that account's new-BUY admission until
-confirmation.
+The owner uses **Request mode** to set `requested_live_mode`. The service reconciles
+`effective_live_mode` to that request through the locked `account_set_effective_mode` RPC.
+An account is armed when both observed modes are `live_tiny`, regardless of historical `enabled`,
+account count, qualification, review, credentials, or venue probes. A fresh `requested=off` control
+snapshot stops new staging and first POSTs for work not yet submitted. Credentials, source, resolver,
+venue, financial, risk, redemption, and idempotency checks remain separate order checks; a failed
+order check does not demote the requested mode. A pending, ambiguous, or failed redemption closes
+new-BUY admission for that account until confirmation.
 
 Venue settlement is payoff authority (Decision 11). Ordinary live admission composes an automated
 `VenueSettlementRecord` from resolver evidence with fresh market evidence: condition, outcome, and
@@ -581,7 +574,7 @@ be durable, with frozen ordered account targets and credential bindings. The see
 `pending_paper -> ready` atomically with a typed paper outcome. That outcome records sequencing and
 recovery state only: paper fills and paper-only skips never gate an otherwise admitted live target.
 
-## Paper-to-live-tiny qualification
+## Paper qualification measurement
 
 ```
 historical reconstruction
@@ -589,8 +582,6 @@ historical reconstruction
   -> one corrected financial era records exact paper decisions and economics
   -> the first eligible mark synchronizes QualificationSealed
   -> network-free exact replay emits Pass, Fail, or InsufficientEvidence
-  -> ordinary service loads and hashes that seal-bound Pass report via --qualification-report=<path>
-  -> one later manual review bound to the same seal and exact report BLAKE3 may authorize live-tiny
 ```
 
 The exact quantitative gate is owned by `_GLOSSARY.md`. The observation begins at the first valid
@@ -602,15 +593,15 @@ The gate classifies a paper measurement report. The semantic-2 paper cutover sea
 semantic-1 Start `InsufficientEvidence` once and continues paper measurement without a second
 current-generation report. A later fresh generation can start its own qualification lifecycle.
 
-## Promotion and demotion criteria
+## Paper measurement criteria
 
-See `_GLOSSARY.md` for the quantified gate ("Paper-to-live-tiny qualification — quantified") and
+See `_GLOSSARY.md` for the quantified paper measurement and
 typed qualification-anchor semantics.
 
 ## Backtest acceptance
 
-Backtest acceptance remains useful before paper observation, but it is not a production promotion
-comparison. The production verifier requires:
+Backtest acceptance remains useful before paper observation, but it does not control live mode.
+The paper verifier requires:
 
 - exact equality with recorded classification, ladder, fee, risk, accounting, marks, membership,
   financial Finals, and the seal;
@@ -619,8 +610,8 @@ comparison. The production verifier requires:
 
 ## Live monitoring
 
-Typed maintenance demotions remain automatic. They reset qualification only for underperformance or
-inactivity reasons. Promotion remains manual and is possible only after a sealed `Pass` report.
+Typed maintenance changes can reset the paper measurement anchor for underperformance or
+inactivity. They do not change the owner's requested live mode.
 
 ## Watchlist refresh
 

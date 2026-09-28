@@ -82,7 +82,6 @@ function CreateAccount({ first }: { first: boolean }) {
 
 function AccountControls({ row }: { row: AccountAdminRow }) {
   const [loginEmail, setLoginEmail] = useState(row.login_email ?? "");
-  const [enabled, setEnabled] = useState(row.enabled);
   const [executionOrder, setExecutionOrder] = useState(String(row.execution_order));
   const [sizingMode, setSizingMode] = useState(row.live_sizing_mode ?? "");
   const [dollar, setDollar] = useState(String(row.live_sizing_dollar_usd ?? ""));
@@ -91,8 +90,6 @@ function AccountControls({ row }: { row: AccountAdminRow }) {
   const [requestedMode, setRequestedMode] = useState<"off" | "live_tiny">(
     row.requested_live_mode,
   );
-  const [reason, setReason] = useState("");
-  const [evidenceRef, setEvidenceRef] = useState("");
   const [keyId, setKeyId] = useState(row.credentials?.key_id ?? "");
   const [credentialJson, setCredentialJson] = useState("{}");
   const [status, setStatus] = useState<string | null>(null);
@@ -158,6 +155,7 @@ function AccountControls({ row }: { row: AccountAdminRow }) {
           <p className="text-xs text-muted">
             effective {row.effective_live_mode} · requested {row.requested_live_mode}
           </p>
+          <p className="text-xs text-muted">Historical enabled: {String(row.enabled)} (no mode authority)</p>
         </div>
         <div className="text-right text-xs text-muted">
           {row.credentials ? (
@@ -197,14 +195,6 @@ function AccountControls({ row }: { row: AccountAdminRow }) {
       </div>
 
       <div className="grid gap-3 border-t border-border pt-3 sm:grid-cols-2 lg:grid-cols-4">
-        <label className="flex items-center gap-2 text-muted">
-          <input
-            type="checkbox"
-            checked={enabled}
-            onChange={(event) => setEnabled(event.target.checked)}
-          />
-          execution enabled
-        </label>
         <label className="grid gap-1 text-muted">
           execution order
           <input
@@ -266,7 +256,6 @@ function AccountControls({ row }: { row: AccountAdminRow }) {
             mutate(
               {
                 action: "live_settings",
-                enabled,
                 execution_order: Number(executionOrder),
                 live_sizing_mode: sizingMode === "" ? null : sizingMode,
                 live_sizing_dollar_usd: dollar === "" ? null : dollar,
@@ -305,51 +294,6 @@ function AccountControls({ row }: { row: AccountAdminRow }) {
           }
         >
           Request mode
-        </button>
-      </div>
-
-      <div className="grid gap-3 border-t border-border pt-3 lg:grid-cols-[1fr_1fr_auto_auto]">
-        <label className="grid gap-1 text-muted">
-          review reason
-          <input
-            className={inputClass}
-            value={reason}
-            onChange={(event) => setReason(event.target.value)}
-          />
-        </label>
-        <label className="grid gap-1 text-muted">
-          evidence ref
-          <input
-            className={inputClass}
-            value={evidenceRef}
-            onChange={(event) => setEvidenceRef(event.target.value)}
-          />
-        </label>
-        <button
-          type="button"
-          className={`${buttonClass} self-end`}
-          disabled={busy}
-          onClick={() =>
-            mutate(
-              { action: "promotion_review", reason, evidence_ref: evidenceRef },
-              "promotion review recorded",
-            )
-          }
-        >
-          Record review
-        </button>
-        <button
-          type="button"
-          className={`${buttonClass} self-end`}
-          disabled={busy}
-          onClick={() =>
-            mutate(
-              { action: "revoke_promotion_review", reason },
-              "promotion review revoked",
-            )
-          }
-        >
-          Revoke review
         </button>
       </div>
 

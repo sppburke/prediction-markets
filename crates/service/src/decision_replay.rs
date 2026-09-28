@@ -179,6 +179,8 @@ pub struct TerminalDispositionEvidence {
     pub fill: Option<RecordedFillEvidence>,
     pub dispatch_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_control_journal_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decline: Option<WinnerFollowDeclineEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_receipt: Option<AppendReceipt>,
@@ -191,6 +193,7 @@ impl TerminalDispositionEvidence {
             reason: reason.to_owned(),
             fill: None,
             dispatch_id: None,
+            dispatch_control_journal_seq: None,
             decline: None,
             final_receipt: None,
         }
@@ -202,6 +205,7 @@ impl TerminalDispositionEvidence {
             reason: reason.to_owned(),
             fill: None,
             dispatch_id: None,
+            dispatch_control_journal_seq: None,
             decline: None,
             final_receipt: None,
         }
@@ -213,6 +217,7 @@ impl TerminalDispositionEvidence {
             reason: "market_settled".to_owned(),
             fill: None,
             dispatch_id: None,
+            dispatch_control_journal_seq: None,
             decline: None,
             final_receipt: None,
         }
@@ -224,6 +229,7 @@ impl TerminalDispositionEvidence {
             reason: "live_targets_staged".to_owned(),
             fill: None,
             dispatch_id: Some(dispatch_id),
+            dispatch_control_journal_seq: None,
             decline: None,
             final_receipt: None,
         }
@@ -251,6 +257,7 @@ impl TerminalDispositionEvidence {
                 event_seq: event_seq.0,
             }),
             dispatch_id: None,
+            dispatch_control_journal_seq: None,
             decline: None,
             final_receipt: None,
         }
@@ -262,6 +269,7 @@ impl TerminalDispositionEvidence {
             reason: format!("paper_reject:{error}"),
             fill: None,
             dispatch_id: None,
+            dispatch_control_journal_seq: None,
             decline: Some(WinnerFollowDeclineEvidence {
                 outcome: WinnerFollowDeclineAudit::from(error),
                 inputs,
@@ -276,6 +284,7 @@ impl TerminalDispositionEvidence {
             reason: "paper_fill_committed".to_owned(),
             fill: None,
             dispatch_id: None,
+            dispatch_control_journal_seq: None,
             decline: None,
             final_receipt: Some(final_receipt),
         }
@@ -403,6 +412,8 @@ struct DecisionEvidenceCheckpointBody {
     clocks: Vec<DecisionClockEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     dispatch_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dispatch_control_journal_seq: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -541,6 +552,7 @@ pub struct DecisionEvidenceAccumulator {
     book: Option<BookEvidence>,
     clocks: Vec<DecisionClockEvidence>,
     dispatch_id: Option<String>,
+    dispatch_control_journal_seq: Option<u64>,
 }
 
 impl DecisionEvidenceAccumulator {
@@ -554,6 +566,7 @@ impl DecisionEvidenceAccumulator {
             book: None,
             clocks: Vec::new(),
             dispatch_id: None,
+            dispatch_control_journal_seq: None,
         }
     }
 
@@ -599,6 +612,7 @@ impl DecisionEvidenceAccumulator {
     ) -> Result<String, serde_json::Error> {
         if let Some(dispatch_id) = &self.dispatch_id {
             terminal.dispatch_id = Some(dispatch_id.clone());
+            terminal.dispatch_control_journal_seq = self.dispatch_control_journal_seq;
         }
         let version = if terminal.decline.is_some() || terminal.final_receipt.is_some() {
             TERMINAL_EVIDENCE_VERSION
@@ -635,6 +649,7 @@ impl DecisionEvidenceAccumulator {
             book: self.book.clone(),
             clocks: self.clocks.clone(),
             dispatch_id: self.dispatch_id.clone(),
+            dispatch_control_journal_seq: self.dispatch_control_journal_seq,
         };
         let financial_semantic_version = self.financial_semantic_version;
         let document_blake3 = checkpoint_hash(&body, financial_semantic_version)?;
@@ -685,6 +700,7 @@ impl DecisionEvidenceAccumulator {
                 &continuation,
                 &checkpoint.body.clocks,
                 checkpoint.body.dispatch_id.as_deref(),
+                checkpoint.body.dispatch_control_journal_seq,
             )?;
         }
         Ok(Self {
@@ -698,11 +714,13 @@ impl DecisionEvidenceAccumulator {
             book: checkpoint.body.book,
             clocks: checkpoint.body.clocks,
             dispatch_id: checkpoint.body.dispatch_id,
+            dispatch_control_journal_seq: checkpoint.body.dispatch_control_journal_seq,
         })
     }
 
-    pub(crate) fn record_staged_dispatch(&mut self, dispatch_id: String) {
+    pub(crate) fn record_staged_dispatch(&mut self, dispatch_id: String, journal_seq: Option<u64>) {
         self.dispatch_id = Some(dispatch_id);
+        self.dispatch_control_journal_seq = journal_seq;
     }
 
     pub(crate) fn staged_dispatch_id(&self) -> Option<&str> {
@@ -764,7 +782,11 @@ fn validate_staged_dispatch(
     continuation: &DecisionContinuationV3,
     clocks: &[DecisionClockEvidence],
     dispatch_id: Option<&str>,
+    journal_seq: Option<u64>,
 ) -> Result<(), ReplayDecisionError> {
+    if journal_seq.is_some() && dispatch_id.is_none() {
+        return Err(ReplayDecisionError::ContinuationBinding);
+    }
     let staging_clocks = clocks
         .iter()
         .filter(|clock| clock.purpose == "dispatch_seed_created")
@@ -847,6 +869,8 @@ pub enum ReplayDecisionError {
     PaperPreparedClock,
     #[error("post-boundary document hash mismatch: expected {expected}, actual {actual}")]
     DocumentHash { expected: String, actual: String },
+    #[error("dispatch control journal reference is invalid: {0}")]
+    ControlJournal(String),
 }
 
 /// Reconstruct and validate one terminal decision using only its durable SQLite row.
@@ -910,6 +934,7 @@ pub fn replay_decision_pending(
             &continuation,
             &post_boundary.body.clocks,
             terminal.dispatch_id.as_deref(),
+            terminal.dispatch_control_journal_seq,
         )?;
         let gate = paper_prepared_gate_clock(&post_boundary.body.clocks)?;
         let final_fill = terminal.disposition == "fill"
@@ -1022,6 +1047,34 @@ pub fn replay_decision_pending(
         post_boundary,
         recorded_decision_json: row.post_commit_inputs_json.clone(),
     })
+}
+
+/// Replay a retained paper decision against its referenced selected-target record.
+/// The reference survives ordinary dispatch seed and target pruning.
+pub fn replay_decision_pending_with_control(
+    row: &DecisionPendingRow,
+    journal_path: &std::path::Path,
+) -> Result<ReplayedDecision, ReplayDecisionError> {
+    let replayed = replay_decision_pending(row)?;
+    let terminal = &replayed.post_boundary.body.terminal;
+    if let Some(seq) = terminal.dispatch_control_journal_seq {
+        let dispatch_id = terminal
+            .dispatch_id
+            .as_deref()
+            .ok_or(ReplayDecisionError::ContinuationBinding)?;
+        let referenced = pe_execution_core::live_journal::staged_dispatch_control_at(
+            journal_path,
+            seq,
+            dispatch_id,
+        )
+        .map_err(|error| ReplayDecisionError::ControlJournal(error.to_string()))?;
+        if referenced.is_none() {
+            return Err(ReplayDecisionError::ControlJournal(
+                "referenced selected-target record is missing".to_owned(),
+            ));
+        }
+    }
+    Ok(replayed)
 }
 
 #[cfg(test)]
@@ -1328,6 +1381,91 @@ mod tests {
         assert!(matches!(
             replay_decision_pending(&row),
             Err(ReplayDecisionError::FrozenMismatch)
+        ));
+    }
+
+    #[test]
+    fn retained_decision_reference_replays_selected_control_after_seed_pruning() {
+        use pe_execution_core::live_journal::{
+            LiveControlAvailability, LiveControlMode, LiveControlObservation,
+            LiveStagedDispatchControlAudit, LiveStagedTargetControlAudit,
+        };
+        use pe_execution_core::{CredentialBindingIdentity, LiveJournal, LiveJournalPayload};
+
+        let fixture = crate::bucket_commit::continuation_v3_tests::binding_fixture("valid");
+        let continuation = fixture.continuation.current_paper();
+        let frozen = &continuation.facts;
+        let dispatch_id = pe_strategy_winner_follow::evaluate::build_idempotency_key_parts(
+            &pe_core_types::TraderId(frozen.wallet).to_string(),
+            &frozen.source_trade_id.0,
+            &frozen.market_id.0.0,
+            frozen.outcome_id.0,
+            frozen.side,
+            frozen.source_epoch,
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("live.log");
+        let journal = LiveJournal::open(&path).unwrap();
+        let account_id = pe_core_types::AccountId::new("acct").unwrap();
+        let at = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let staged = LiveStagedDispatchControlAudit {
+            dispatch_id: dispatch_id.clone(),
+            targets: vec![LiveStagedTargetControlAudit {
+                account_id: account_id.clone(),
+                exec_rank: 0,
+                is_primary: true,
+                execution_order: 0,
+                control: LiveControlObservation {
+                    decided_at_unix: at.unix_timestamp(),
+                    last_successful_read_unix: Some(at.unix_timestamp()),
+                    stale_after_secs: 120,
+                    availability: LiveControlAvailability::Fresh,
+                    account_present: true,
+                    requested_mode: Some(LiveControlMode::LiveTiny),
+                    effective_mode: Some(LiveControlMode::LiveTiny),
+                    credential_version_available: true,
+                    bundle_version: Some(1),
+                },
+                observed_credential_key_id: "key".to_owned(),
+                frozen_binding: CredentialBindingIdentity {
+                    version: 1,
+                    key_id: "key".to_owned(),
+                },
+            }],
+        };
+        let event = journal
+            .append(
+                account_id,
+                at,
+                LiveJournalPayload::StagedDispatchControl(Box::new(staged)),
+            )
+            .unwrap();
+        let terminal = TerminalDispositionEvidence::no_fill("market_admission_unavailable");
+        let render_row = |seq| {
+            let mut evidence = DecisionEvidenceAccumulator::new(frozen);
+            evidence.record_clock("dispatch_seed_created", at.unix_timestamp() * 1_000);
+            evidence.record_staged_dispatch(dispatch_id.clone(), Some(seq));
+            DecisionPendingRow {
+                source_trade_id: frozen.source_trade_id.clone(),
+                semantic_revision: frozen.semantic_revision.clone(),
+                wallet: frozen.wallet,
+                source_epoch: frozen.source_epoch,
+                frozen_inputs_json: serde_json::to_string(&continuation).unwrap(),
+                post_commit_inputs_json: evidence
+                    .render(
+                        AuthorityEvidence::not_read("terminal_before_fill_authority"),
+                        terminal.clone(),
+                    )
+                    .unwrap(),
+                state: DecisionPendingState::Terminal,
+                terminal_disposition: Some(terminal.disposition.clone()),
+                updated_at_unix: at.unix_timestamp(),
+            }
+        };
+        assert!(replay_decision_pending_with_control(&render_row(event.seq), &path).is_ok());
+        assert!(matches!(
+            replay_decision_pending_with_control(&render_row(event.seq + 1), &path),
+            Err(ReplayDecisionError::ControlJournal(_))
         ));
     }
 

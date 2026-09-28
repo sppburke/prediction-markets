@@ -1307,34 +1307,16 @@ async fn main() -> Result<()> {
         Some(live)
     };
 
-    // Ordinary #508 live execution: one task owns strict account/seed ordering, mode probes,
-    // redemption posture, and retention. A missing age identity is warned exactly once and
-    // passed as `None`; the mode machine then cannot arm, while the paper orchestrator remains
-    // fully operational. The account-tagged journal is a mode-0600 sibling of the paper log.
+    // Ordinary live execution: fan-out owns strict account/seed ordering, redemption posture,
+    // and retention. A missing age identity is warned once and prevents credential loading for
+    // orders; it does not change the owner's requested mode. The account-tagged journal is a
+    // mode-0600 sibling of the paper log.
+    let mut live_journal_for_staging = None;
     if let Some(live_accounts) = live_accounts.clone() {
-        let qualification = match optional_arg_value(&args, "--qualification-report") {
-            Some(path) => {
-                match pe_service::live_mode::load_qualification_facts(&PathBuf::from(&path)) {
-                    Ok(report) => Some(report),
-                    Err(error) => {
-                        tracing::warn!(
-                            path,
-                            error = %error,
-                            "qualification report unavailable; live arming disabled"
-                        );
-                        None
-                    }
-                }
-            }
-            None => {
-                tracing::warn!("--qualification-report was not supplied; live arming disabled");
-                None
-            }
-        };
         let identity = match pe_service::live_credentials::load_identity_from_credentials_dir() {
             Ok(identity) => Some(identity),
             Err(error) => {
-                tracing::warn!(error = %error, "ordinary live age identity unavailable; live arming disabled");
+                tracing::warn!(error = %error, "ordinary live age identity unavailable; orders cannot load credentials");
                 None
             }
         };
@@ -1362,9 +1344,10 @@ async fn main() -> Result<()> {
             pe_event_log::Scanner::verify_prefix(prefix)
                 .context("verify QualificationStarted live-journal prefix")?;
         }
-        let journal = LiveJournal::open(&journal_path).with_context(|| {
+        let journal = Arc::new(LiveJournal::open(&journal_path).with_context(|| {
             format!("open and validate live journal {}", journal_path.display())
-        })?;
+        })?);
+        live_journal_for_staging = Some(journal.clone());
         let live_http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
             .build()
@@ -1385,9 +1368,8 @@ async fn main() -> Result<()> {
             live_accounts,
             live_watchlist: live_watchlist.clone(),
             runtime_config: live_runtime_config.clone(),
-            qualification,
             identity,
-            journal: Arc::new(journal),
+            journal,
             journal_path,
             era_live_prefix,
             projection,
@@ -1448,6 +1430,7 @@ async fn main() -> Result<()> {
             entry_gate_config,
             runtime_config: Some(live_runtime_config.clone()),
             live_accounts: live_accounts.clone(),
+            live_journal: live_journal_for_staging,
         },
         WinnerFollowStrategy::new(initial_runtime_config.winner_follow_config()),
         paper_writer,

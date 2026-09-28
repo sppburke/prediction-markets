@@ -208,7 +208,61 @@ fn ac_live_block_reports_freshness() {
     let v = serde_json::to_value(&snap).unwrap();
     assert_eq!(v["live"]["fetched_at_unix"], serde_json::Value::Null);
     assert_eq!(v["live"]["stale"], true);
-    println!("PASS: live block reports fetched_at_unix + stale across fresh/boundary/never");
+
+    // Mode state is independent of historical enabled, control read, and binding metadata.
+    snapshot.accounts[0].enabled = false;
+    snapshot.accounts[0].requested_live_mode = "live_tiny".to_owned();
+    snapshot.accounts[0].effective_live_mode = "live_tiny".to_owned();
+    snapshot.fetched_at_unix = Some(1_700_000_499);
+    snapshot.control_available = false;
+    snapshot.credential_metadata_available = false;
+    let status = serde_json::to_value(build_snapshot(
+        &db,
+        "paper",
+        true,
+        1,
+        1_700_000_500,
+        25,
+        &[],
+        100,
+        0,
+        Some(&snapshot),
+    ))
+    .unwrap();
+    assert_eq!(status["live"]["accounts"][0]["armed"], true);
+    assert_eq!(status["live"]["accounts"][0]["enabled"], false);
+    assert_eq!(status["live"]["control_available"], false);
+    assert_eq!(status["live"]["control_age_secs"], 1);
+    assert_eq!(
+        status["live"]["accounts"][0]["credential_binding_ready"],
+        false
+    );
+    snapshot.control_available = true;
+    snapshot.credential_metadata_available = true;
+    snapshot.accounts[0].credential_binding = None;
+    let unverified = serde_json::to_value(build_snapshot(
+        &db,
+        "paper",
+        true,
+        1,
+        1_700_000_500,
+        25,
+        &[],
+        100,
+        0,
+        Some(&snapshot),
+    ))
+    .unwrap();
+    assert_eq!(unverified["live"]["accounts"][0]["armed"], true);
+    assert_eq!(
+        unverified["live"]["accounts"][0]["credential_binding_ready"],
+        false
+    );
+    snapshot.accounts[0].effective_live_mode = "off".to_owned();
+    assert!(!snapshot.accounts[0].is_armed());
+    snapshot.accounts.clear();
+    assert!(snapshot.accounts.is_empty());
+    println!("PASS: live block separates mode, control, binding, and historical enabled");
 }
 
 #[test]

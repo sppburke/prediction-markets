@@ -70,9 +70,9 @@ snapshot; they are not fabricated financial fields.
 
 ## Responsible scaling
 
-Scale only after the sealed paper stream replays exactly, satisfies the promotion gates in
-`_GLOSSARY.md`, and receives the one manual review allowed after a `Pass`. Backtest remains
-non-promotional research evidence; live-tiny is not part of issue #545 qualification.
+The sealed paper stream and backtest remain measurement evidence. The owner's requested mode
+controls ordinary live mode; source, resolver, venue, financial, and risk checks govern each order.
+Live-tiny is not part of issue #545 qualification.
 
 ## Winner-Follow compliance and risk
 

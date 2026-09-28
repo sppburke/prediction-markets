@@ -335,6 +335,7 @@ security definer
 set search_path = ''
 as $$
 declare
+  v_enabled                   boolean;
   v_execution_order           integer;
   v_live_sizing_mode          text;
   v_live_sizing_dollar_usd    numeric;
@@ -343,17 +344,15 @@ declare
   v_from_value                text;
   v_to_value                  text;
 begin
-  if p_enabled is not null then
-    raise exception 'enabled is historical; use Request mode';
-  end if;
-
   select
+    enabled,
     execution_order,
     live_sizing_mode,
     live_sizing_dollar_usd,
     live_sizing_contracts,
     live_price_impact_cap_bps
   into
+    v_enabled,
     v_execution_order,
     v_live_sizing_mode,
     v_live_sizing_dollar_usd,
@@ -368,6 +367,7 @@ begin
   end if;
 
   v_from_value := pg_catalog.jsonb_build_object(
+    'enabled', v_enabled,
     'execution_order', v_execution_order,
     'live_sizing_mode', v_live_sizing_mode,
     'live_sizing_dollar_usd', v_live_sizing_dollar_usd,
@@ -376,7 +376,8 @@ begin
   )::text;
 
   update public.accounts
-     set execution_order           = p_execution_order,
+     set enabled                   = p_enabled,
+         execution_order           = p_execution_order,
          live_sizing_mode          = p_live_sizing_mode,
          live_sizing_dollar_usd    = p_live_sizing_dollar_usd,
          live_sizing_contracts     = p_live_sizing_contracts,
@@ -385,6 +386,7 @@ begin
    where account_id = p_account_id;
 
   v_to_value := pg_catalog.jsonb_build_object(
+    'enabled', p_enabled,
     'execution_order', p_execution_order,
     'live_sizing_mode', p_live_sizing_mode,
     'live_sizing_dollar_usd', p_live_sizing_dollar_usd,
@@ -562,24 +564,15 @@ set search_path = ''
 as $$
 declare
   v_from_mode text;
-  v_requested_mode text;
 begin
-  select effective_live_mode, requested_live_mode
-    into v_from_mode, v_requested_mode
+  select effective_live_mode
+    into v_from_mode
     from public.accounts
    where account_id = p_account_id
    for update;
 
   if not found then
     raise exception 'unknown account_id: %', p_account_id;
-  end if;
-
-  if p_effective_mode is distinct from v_requested_mode then
-    raise exception 'effective mode proposal differs from current requested mode';
-  end if;
-
-  if p_effective_mode is not distinct from v_from_mode then
-    return;
   end if;
 
   update public.accounts
@@ -606,9 +599,78 @@ begin
 end;
 $$;
 
--- Retire only callable review controls. Historical account_events remain readable.
-drop function if exists public.account_record_promotion_review(text, text, text, text);
-drop function if exists public.account_revoke_promotion_review(text, text, text);
+create or replace function public.account_record_promotion_review(
+  p_account_id  text,
+  p_actor       text,
+  p_reason      text,
+  p_evidence_ref text
+) returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  perform 1
+    from public.accounts
+   where account_id = p_account_id
+   for update;
+
+  if not found then
+    raise exception 'unknown account_id: %', p_account_id;
+  end if;
+
+  -- The immutable event itself is the promotion review record (#508).
+  insert into public.account_events (
+    account_id,
+    event_kind,
+    actor,
+    reason,
+    evidence_ref
+  )
+  values (
+    p_account_id,
+    'promotion_reviewed',
+    p_actor,
+    p_reason,
+    p_evidence_ref
+  );
+end;
+$$;
+
+create or replace function public.account_revoke_promotion_review(
+  p_account_id text,
+  p_actor      text,
+  p_reason     text
+) returns void
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  perform 1
+    from public.accounts
+   where account_id = p_account_id
+   for update;
+
+  if not found then
+    raise exception 'unknown account_id: %', p_account_id;
+  end if;
+
+  -- Revocation supersedes prior review events without rewriting history (#508).
+  insert into public.account_events (
+    account_id,
+    event_kind,
+    actor,
+    reason
+  )
+  values (
+    p_account_id,
+    'promotion_review_revoked',
+    p_actor,
+    p_reason
+  );
+end;
+$$;
 
 -- ════════════════════════════════════════════════════════════════════════════
 -- Row-level security and table privileges
@@ -695,6 +757,16 @@ grant execute on function public.account_request_mode(text, text, text)
 revoke all on function public.account_set_effective_mode(text, text, text, text)
   from public, anon, authenticated;
 grant execute on function public.account_set_effective_mode(text, text, text, text)
+  to service_role;
+
+revoke all on function public.account_record_promotion_review(text, text, text, text)
+  from public, anon, authenticated;
+grant execute on function public.account_record_promotion_review(text, text, text, text)
+  to service_role;
+
+revoke all on function public.account_revoke_promotion_review(text, text, text)
+  from public, anon, authenticated;
+grant execute on function public.account_revoke_promotion_review(text, text, text)
   to service_role;
 
 -- ════════════════════════════════════════════════════════════════════════════

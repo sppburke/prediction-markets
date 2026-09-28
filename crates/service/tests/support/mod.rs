@@ -587,6 +587,7 @@ pub fn continuation_orchestrator_with_authority(
             entry_gate_config: pe_service::entry_gate::CopyEntryGateConfig,
             runtime_config: None,
             live_accounts: None,
+            live_journal: None,
         },
         pe_strategy_winner_follow::WinnerFollowStrategy::new(runtime.winner_follow_config()),
         Writer::open(paper_path).unwrap(),

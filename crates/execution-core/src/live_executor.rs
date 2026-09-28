@@ -945,6 +945,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                         LiveOrderPreparationFailedAudit {
                             identity: request.identity,
                             failure: LiveOrderPreparationFailure::Venue,
+                            control: None,
                         },
                     )),
                 )?;
@@ -964,6 +965,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                     LiveOrderPreparationFailedAudit {
                         identity: request.identity,
                         failure: LiveOrderPreparationFailure::PreparedAuditMismatch,
+                        control: None,
                     },
                 )),
             )?;
@@ -1132,6 +1134,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
             LiveJournalPayload::OrderPreparationFailed(Box::new(LiveOrderPreparationFailedAudit {
                 identity,
                 failure,
+                control: None,
             })),
         )?;
         Ok(())
@@ -1151,6 +1154,36 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
             ..
         } = prepared;
         self.terminalize_approved_admission(account_id, identity, now, failure)?;
+        Ok(LiveOrderOutcome::Rejected {
+            order_hash: None,
+            venue_order_id: None,
+            kind: LiveOrderRejectKind::PreparationFailed,
+        })
+    }
+
+    /// Consume the one-use POST capability with a durable control observation.
+    pub fn terminalize_prepared_with_control(
+        &self,
+        prepared: PreparedLiveOrder<V::Submission>,
+        now: OffsetDateTime,
+        failure: LiveOrderPreparationFailure,
+        control: crate::live_journal::LiveControlObservation,
+    ) -> Result<LiveOrderOutcome, LiveExecutorError> {
+        let PreparedLiveOrder {
+            account_id,
+            identity,
+            submission: _,
+            ..
+        } = prepared;
+        self.journal.append(
+            account_id,
+            now,
+            LiveJournalPayload::OrderPreparationFailed(Box::new(LiveOrderPreparationFailedAudit {
+                identity,
+                failure,
+                control: Some(control),
+            })),
+        )?;
         Ok(LiveOrderOutcome::Rejected {
             order_hash: None,
             venue_order_id: None,
