@@ -25,6 +25,8 @@ describe("service readiness contract", () => {
   it("recognizes only the legacy readiness shape as old", () => {
     expect(classifyServiceReady({ ready: true })).toMatchObject({ contract: "old" });
     expect(classifyServiceReady({ ready: false, issues: ["stale"] })).toMatchObject({ contract: "old" });
+    expect(classifyServiceReady({ ready: true, live_control_contract: "owner_requested_mode_v2" })).toMatchObject({ contract: "unverified" });
+    expect(classifyServiceReady({ ready: true, live_control_contract: null })).toMatchObject({ contract: "unverified" });
     expect(classifyServiceReady({ status: "ok" })).toMatchObject({ contract: "unverified" });
     expect(classifyServiceReady({ ready: true, issues: 1 })).toMatchObject({ contract: "unverified" });
     expect(classifyServiceReady("bad")).toMatchObject({ contract: "unreachable" });

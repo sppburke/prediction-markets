@@ -695,6 +695,8 @@ pub enum LiveOrderOutcome {
         order_hash: Option<String>,
         venue_order_id: Option<String>,
         kind: LiveOrderRejectKind,
+        /// Present only when the journal records a preparation failure.
+        preparation: Option<(LiveOrderPreparationFailure, bool)>,
     },
     Ambiguous {
         order_hash: String,
@@ -724,6 +726,10 @@ impl LiveOrderOutcome {
             Self::Refused { .. } => Some("admission_refused"),
             Self::Matched { .. } => None,
             Self::Killed { .. } => Some("killed"),
+            Self::Rejected {
+                preparation: Some((failure, has_control)),
+                ..
+            } => Some(failure.terminal_reason(*has_control)),
             Self::Rejected { .. } => Some("rejected"),
             Self::Ambiguous { .. } => None,
         }
@@ -953,6 +959,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                     order_hash: None,
                     venue_order_id: None,
                     kind: LiveOrderRejectKind::PreparationFailed,
+                    preparation: Some((LiveOrderPreparationFailure::Venue, false)),
                 }));
             }
         };
@@ -973,6 +980,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                 order_hash: None,
                 venue_order_id: None,
                 kind: LiveOrderRejectKind::PreparationFailed,
+                preparation: Some((LiveOrderPreparationFailure::PreparedAuditMismatch, false)),
             }));
         }
 
@@ -1046,6 +1054,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                 order_hash: None,
                 venue_order_id: None,
                 kind: LiveOrderRejectKind::PreparationFailed,
+                preparation: Some((LiveOrderPreparationFailure::RecoveryAdmissionExpired, false)),
             }));
         }
         let recorded_account_state = match admission.account_state.as_ref() {
@@ -1061,6 +1070,10 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                     order_hash: None,
                     venue_order_id: None,
                     kind: LiveOrderRejectKind::PreparationFailed,
+                    preparation: Some((
+                        LiveOrderPreparationFailure::RecoveryAdmissionExpired,
+                        false,
+                    )),
                 }));
             }
         };
@@ -1078,6 +1091,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                     order_hash: None,
                     venue_order_id: None,
                     kind: LiveOrderRejectKind::PreparationFailed,
+                    preparation: Some((LiveOrderPreparationFailure::Venue, false)),
                 }));
             }
         };
@@ -1096,6 +1110,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                 order_hash: None,
                 venue_order_id: None,
                 kind: LiveOrderRejectKind::PreparationFailed,
+                preparation: Some((LiveOrderPreparationFailure::PreparedAuditMismatch, false)),
             }));
         }
         let (prepared, submission) = venue_prepared.into_parts();
@@ -1158,6 +1173,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
             order_hash: None,
             venue_order_id: None,
             kind: LiveOrderRejectKind::PreparationFailed,
+            preparation: Some((failure, false)),
         })
     }
 
@@ -1188,6 +1204,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
             order_hash: None,
             venue_order_id: None,
             kind: LiveOrderRejectKind::PreparationFailed,
+            preparation: Some((failure, true)),
         })
     }
 
@@ -1304,6 +1321,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                             order_hash: Some(order_hash),
                             venue_order_id,
                             kind: LiveOrderRejectKind::VenueRejected,
+                            preparation: None,
                         })
                     }
                     Ok(LivePostClassification::Ambiguous { kind }) => {
@@ -1530,6 +1548,7 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                     order_hash: Some(order_hash),
                     venue_order_id,
                     kind: LiveOrderRejectKind::VenueRejected,
+                    preparation: None,
                 })
             }
             LiveVenueReconciledOutcome::Ambiguous { kind } => {

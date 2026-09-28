@@ -560,24 +560,9 @@ fn terminal_recovery_reason(outcome: &TerminalAdmissionRecoveryOutcome) -> &'sta
             LiveAdmissionRefusal::CredentialVersionChanged,
         ) => "credential_version_changed",
         TerminalAdmissionRecoveryOutcome::Refused(_) => "admission_refused",
-        TerminalAdmissionRecoveryOutcome::PreparationFailed(audit) => match audit.failure {
-            pe_execution_core::LiveOrderPreparationFailure::RecoveryCredentialChanged => {
-                "recovery_credential_changed"
-            }
-            pe_execution_core::LiveOrderPreparationFailure::RecoveryAdmissionExpired
-                if audit.control.is_some() =>
-            {
-                "recovery_account_not_armed"
-            }
-            pe_execution_core::LiveOrderPreparationFailure::RecoveryAdmissionExpired => {
-                "recovery_admission_expired"
-            }
-            pe_execution_core::LiveOrderPreparationFailure::PrePostNotArmed => "not_armed",
-            pe_execution_core::LiveOrderPreparationFailure::PrePostControlUnavailable => {
-                "control_unavailable"
-            }
-            _ => "rejected",
-        },
+        TerminalAdmissionRecoveryOutcome::PreparationFailed(audit) => {
+            audit.failure.terminal_reason(audit.control.is_some())
+        }
     }
 }
 
@@ -655,7 +640,12 @@ fn reconcile_terminal_recovery_work(
             .filter(|target| target.account_id == terminal.account_id.as_str())
         {
             if target.state == "terminal" {
-                if target.terminal_reason.as_deref() != Some(expected_reason) {
+                if target.terminal_reason.as_deref() != Some(expected_reason)
+                    && !historical_terminal_reason_matches(
+                        &terminal.outcome,
+                        target.terminal_reason.as_deref(),
+                    )
+                {
                     return Err(FanoutError::Signal(
                         "terminal target reason contradicts live journal".to_owned(),
                     ));
@@ -670,6 +660,25 @@ fn reconcile_terminal_recovery_work(
             .finalize_dispatch_if_terminal(&terminal.identity.dispatch_id, now.unix_timestamp())?;
     }
     Ok(())
+}
+
+fn historical_terminal_reason_matches(
+    outcome: &TerminalAdmissionRecoveryOutcome,
+    reason: Option<&str>,
+) -> bool {
+    let TerminalAdmissionRecoveryOutcome::PreparationFailed(audit) = outcome else {
+        return false;
+    };
+    use pe_execution_core::LiveOrderPreparationFailure as Failure;
+    match audit.failure {
+        Failure::PrePostRiskDayChanged
+        | Failure::PrePostRiskPriceExpired
+        | Failure::PrePostLadderExpired => reason == Some("rejected"),
+        Failure::RecoveryAdmissionExpired if audit.control.is_none() => {
+            matches!(reason, Some("rejected" | "recovery_account_not_armed"))
+        }
+        _ => false,
+    }
 }
 
 fn due(last: Option<i64>, now: i64, interval: i64) -> bool {
@@ -1026,6 +1035,21 @@ fn pending_control_history(
         .collect())
 }
 
+fn verify_terminal_pending_control(
+    state: &FanoutState,
+    target: &DispatchTargetRow,
+) -> Result<(), FanoutError> {
+    if pending_control_history(state, target)?.iter().any(|audit| {
+        audit.outcome == pe_execution_core::live_journal::LiveTargetControlOutcome::NotArmed
+    }) && target.terminal_reason.as_deref() != Some("not_armed")
+    {
+        return Err(FanoutError::Signal(
+            "terminal target reason contradicts pending control journal".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn same_control_state(
     left: &pe_execution_core::live_journal::LiveControlObservation,
     right: &pe_execution_core::live_journal::LiveControlObservation,
@@ -1084,7 +1108,7 @@ async fn run_dispatch_pass(state: &mut FanoutState) -> Result<(), FanoutError> {
         .config
         .paper_state
         .unfinalized_ready_dispatch_seeds()?;
-    // Ships dark: with no staged seed this tick performs no account, credential, venue, or
+    // With no staged seed this tick performs no account, credential, venue, or
     // projection work. The account snapshot may be empty without affecting the paper path.
     if seeds.is_empty() {
         return Ok(());
@@ -1137,7 +1161,6 @@ enum RecoveryAuthorization {
     PauseControl(pe_execution_core::live_journal::LiveControlObservation),
     Terminal {
         failure: pe_execution_core::LiveOrderPreparationFailure,
-        target_reason: &'static str,
         control: Option<pe_execution_core::live_journal::LiveControlObservation>,
     },
 }
@@ -1187,7 +1210,6 @@ fn recovery_authorization(
     else {
         return Ok(RecoveryAuthorization::Terminal {
             failure: pe_execution_core::LiveOrderPreparationFailure::RecoveryAdmissionExpired,
-            target_reason: "recovery_account_not_armed",
             control: Some(snapshot.control_observation(None, now.unix_timestamp())),
         });
     };
@@ -1197,7 +1219,6 @@ fn recovery_authorization(
     {
         return Ok(RecoveryAuthorization::Terminal {
             failure: pe_execution_core::LiveOrderPreparationFailure::RecoveryAdmissionExpired,
-            target_reason: "recovery_account_not_armed",
             control: Some(snapshot.control_observation(Some(&account), now.unix_timestamp())),
         });
     }
@@ -1216,14 +1237,12 @@ fn recovery_authorization(
     let Some(binding) = binding else {
         return Ok(RecoveryAuthorization::Terminal {
             failure: pe_execution_core::LiveOrderPreparationFailure::RecoveryCredentialChanged,
-            target_reason: "recovery_credential_changed",
             control: None,
         });
     };
     if binding != *frozen_binding {
         return Ok(RecoveryAuthorization::Terminal {
             failure: pe_execution_core::LiveOrderPreparationFailure::RecoveryCredentialChanged,
-            target_reason: "recovery_credential_changed",
             control: None,
         });
     }
@@ -1376,10 +1395,10 @@ fn terminalize_unprepared_recovery(
     target: &DispatchTargetRow,
     identity: LiveOrderIdentity,
     failure: pe_execution_core::LiveOrderPreparationFailure,
-    target_reason: &'static str,
     control: Option<pe_execution_core::live_journal::LiveControlObservation>,
     now: OffsetDateTime,
 ) -> Result<(), FanoutError> {
+    let reason = failure.terminal_reason(control.is_some());
     let now = control
         .as_ref()
         .and_then(|control| OffsetDateTime::from_unix_timestamp(control.decided_at_unix).ok())
@@ -1396,7 +1415,7 @@ fn terminalize_unprepared_recovery(
             },
         )),
     )?;
-    terminalize(state, target, target_reason, now)
+    terminalize(state, target, reason, now)
 }
 
 async fn run_recovery_pass<C>(
@@ -1455,17 +1474,12 @@ where
                 freeze = true;
                 continue;
             }
-            RecoveryAuthorization::Terminal {
-                failure,
-                target_reason,
-                control,
-            } => {
+            RecoveryAuthorization::Terminal { failure, control } => {
                 terminalize_unprepared_recovery(
                     state,
                     &target,
                     pending.admission.identity.clone(),
                     failure,
-                    target_reason,
                     control,
                     recovery_check_at,
                 )?;
@@ -1502,7 +1516,7 @@ where
                 &target.dispatch_id,
                 &target.account_id,
                 "terminal",
-                Some("recovery_risk_evidence_expired"),
+                Some(failure.terminal_reason(false)),
                 preparation_check_at.unix_timestamp(),
             )?;
             continue;
@@ -1527,7 +1541,10 @@ where
                     &target.dispatch_id,
                     &target.account_id,
                     "terminal",
-                    Some("recovery_credential_changed"),
+                    Some(
+                        pe_execution_core::LiveOrderPreparationFailure::RecoveryCredentialChanged
+                            .terminal_reason(false),
+                    ),
                     failed_at.unix_timestamp(),
                 )?;
                 continue;
@@ -1553,17 +1570,12 @@ where
                 freeze = true;
                 continue;
             }
-            RecoveryAuthorization::Terminal {
-                failure,
-                target_reason,
-                control,
-            } => {
+            RecoveryAuthorization::Terminal { failure, control } => {
                 terminalize_unprepared_recovery(
                     state,
                     &target,
                     pending.admission.identity.clone(),
                     failure,
-                    target_reason,
                     control,
                     clock(),
                 )?;
@@ -1593,17 +1605,12 @@ where
                 freeze = true;
                 continue;
             }
-            RecoveryAuthorization::Terminal {
-                failure,
-                target_reason,
-                control,
-            } => {
+            RecoveryAuthorization::Terminal { failure, control } => {
                 terminalize_unprepared_recovery(
                     state,
                     &target,
                     pending.admission.identity.clone(),
                     failure,
-                    target_reason,
                     control,
                     clock(),
                 )?;
@@ -1627,17 +1634,12 @@ where
         .await?
         {
             RecoveryVenueGate::Ready(execution) => execution,
-            RecoveryVenueGate::Control(RecoveryAuthorization::Terminal {
-                failure,
-                target_reason,
-                control,
-            }) => {
+            RecoveryVenueGate::Control(RecoveryAuthorization::Terminal { failure, control }) => {
                 terminalize_unprepared_recovery(
                     state,
                     &target,
                     pending.admission.identity.clone(),
                     failure,
-                    target_reason,
                     control,
                     clock(),
                 )?;
@@ -1798,7 +1800,6 @@ where
             target,
             pending.admission.identity.clone(),
             pe_execution_core::LiveOrderPreparationFailure::PrePostLadderExpired,
-            "recovery_ladder_expired",
             None,
             preparation_check_at,
         )?;
@@ -1933,7 +1934,6 @@ where
                 } else {
                     RecoveryAuthorization::Terminal {
                         failure: pe_execution_core::LiveOrderPreparationFailure::PrePostNotArmed,
-                        target_reason: "not_armed",
                         control: Some(control),
                     }
                 };
@@ -1974,7 +1974,6 @@ fn terminalize_prepared_authorization<V: LiveOrderVenue>(
     let control_failure = match &authorization {
         RecoveryAuthorization::PauseControl(control) => Some((
             pe_execution_core::LiveOrderPreparationFailure::PrePostControlUnavailable,
-            "control_unavailable",
             control.clone(),
         )),
         RecoveryAuthorization::Terminal {
@@ -1982,16 +1981,15 @@ fn terminalize_prepared_authorization<V: LiveOrderVenue>(
             ..
         } => Some((
             pe_execution_core::LiveOrderPreparationFailure::PrePostNotArmed,
-            "not_armed",
             control.clone(),
         )),
         _ => None,
     };
-    if let Some((failure, reason, control)) = control_failure {
+    if let Some((failure, control)) = control_failure {
         let at = OffsetDateTime::from_unix_timestamp(control.decided_at_unix)
             .map_err(|error| FanoutError::Signal(error.to_string()))?;
-        let _ = executor.terminalize_prepared_with_control(prepared, at, failure, control)?;
-        terminalize(state, target, reason, at)?;
+        let outcome = executor.terminalize_prepared_with_control(prepared, at, failure, control)?;
+        persist_outcome(state, target, &outcome, at)?;
     } else {
         let failure = match authorization {
             RecoveryAuthorization::Terminal { failure, .. } => failure,
@@ -2042,6 +2040,9 @@ fn verify_seed_control_reference(
     targets: &[DispatchTargetRow],
     journal_seq: Option<u64>,
 ) -> Result<(), FanoutError> {
+    for target in targets.iter().filter(|target| target.state == "terminal") {
+        verify_terminal_pending_control(state, target)?;
+    }
     let Some(journal_seq) = journal_seq else {
         return Ok(()); // Historical seed predating control records.
     };
@@ -2711,20 +2712,14 @@ async fn process_target(
             let control = latest.control_observation(latest_account, final_at.unix_timestamp());
             if !control.permits_mode() {
                 drop(guard);
-                let (failure, reason) = if control.unavailable() {
-                    (
-                        pe_execution_core::LiveOrderPreparationFailure::PrePostControlUnavailable,
-                        "control_unavailable",
-                    )
+                let failure = if control.unavailable() {
+                    pe_execution_core::LiveOrderPreparationFailure::PrePostControlUnavailable
                 } else {
-                    (
-                        pe_execution_core::LiveOrderPreparationFailure::PrePostNotArmed,
-                        "not_armed",
-                    )
+                    pe_execution_core::LiveOrderPreparationFailure::PrePostNotArmed
                 };
-                let _ = executor
+                let outcome = executor
                     .terminalize_prepared_with_control(prepared, final_at, failure, control)?;
-                terminalize(state, target, reason, final_at)?;
+                persist_outcome(state, target, &outcome, final_at)?;
                 return Ok(PassControl::Continue);
             }
             state.config.paper_state.set_dispatch_target_state(
@@ -6550,6 +6545,7 @@ async fn recover_target(
                     order_hash: Some(order_hash.clone()),
                     venue_order_id,
                     kind: pe_execution_core::LiveOrderRejectKind::VenueRejected,
+                    preparation: None,
                 },
                 reconciliation.evidence,
             ),
@@ -8076,6 +8072,7 @@ mod tests {
             order_hash: Some("hash".to_owned()),
             venue_order_id: None,
             kind: LiveOrderRejectKind::VenueRejected,
+            preparation: None,
         };
         let ambiguous = LiveOrderOutcome::Ambiguous {
             order_hash: "hash".to_owned(),
@@ -18184,6 +18181,43 @@ mod tests {
         let mut changed = targets;
         changed[0].credential_key_id = "other-key".to_owned();
         assert!(verify_seed_control_reference(&state, &seed, &changed, Some(event.seq)).is_err());
+
+        let mut off = snapshot;
+        off.accounts[0].requested_live_mode = "off".to_owned();
+        off.accounts[0].effective_live_mode = "off".to_owned();
+        let target = state
+            .config
+            .paper_state
+            .dispatch_targets("selected-targets")
+            .unwrap()
+            .remove(0);
+        record_pending_control(
+            &state,
+            &target,
+            off.control_observation(Some(&off.accounts[0]), now.unix_timestamp()),
+            pe_execution_core::live_journal::LiveTargetControlOutcome::NotArmed,
+            now,
+        )
+        .unwrap();
+        state
+            .config
+            .paper_state
+            .set_dispatch_target_state(
+                "selected-targets",
+                "acct",
+                "terminal",
+                Some("rejected"),
+                now.unix_timestamp(),
+            )
+            .unwrap();
+        let conflicting = state
+            .config
+            .paper_state
+            .dispatch_targets("selected-targets")
+            .unwrap();
+        assert!(
+            verify_seed_control_reference(&state, &seed, &conflicting, Some(event.seq)).is_err()
+        );
     }
 
     #[tokio::test]
@@ -18257,6 +18291,181 @@ mod tests {
             )),
             "recovery_admission_expired"
         );
+    }
+
+    #[tokio::test]
+    async fn every_preparation_failure_projects_the_same_reason_directly_and_on_recovery() {
+        use pe_execution_core::LiveOrderPreparationFailure as Failure;
+        use pe_execution_core::live_journal::{
+            LiveControlAvailability, LiveControlObservation, TerminalAdmissionRecoveryEntry,
+        };
+
+        let cases = [
+            (Failure::Venue, false),
+            (Failure::PreparedAuditMismatch, false),
+            (Failure::RecoveryCredentialChanged, false),
+            (Failure::RecoveryAdmissionExpired, false),
+            (Failure::RecoveryAdmissionExpired, true),
+            (Failure::PrePostRiskDayChanged, false),
+            (Failure::PrePostRiskPriceExpired, false),
+            (Failure::PrePostLadderExpired, false),
+            (Failure::PrePostAdmissionExpired, false),
+            (Failure::PrePostMarkUnavailable, false),
+            (Failure::PrePostNotArmed, true),
+            (Failure::PrePostControlUnavailable, true),
+        ];
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        for (failure, has_control) in cases {
+            let direct_dir = tempdir().unwrap();
+            let direct_db =
+                Arc::new(PaperStateDb::open(&direct_dir.path().join("paper.db")).unwrap());
+            stage(
+                &direct_db,
+                "dispatch-finality",
+                now.unix_timestamp(),
+                &["acct"],
+            );
+            let direct_state = fanout_state(
+                &direct_dir,
+                direct_db.clone(),
+                LiveAccountsSnapshot::default(),
+                "http://127.0.0.1:9",
+                None,
+            );
+            let direct_target = direct_db
+                .dispatch_targets("dispatch-finality")
+                .unwrap()
+                .remove(0);
+            let direct_outcome = LiveOrderOutcome::Rejected {
+                order_hash: None,
+                venue_order_id: None,
+                kind: pe_execution_core::LiveOrderRejectKind::PreparationFailed,
+                preparation: Some((failure, has_control)),
+            };
+            persist_outcome(&direct_state, &direct_target, &direct_outcome, now).unwrap();
+            let direct_reason = direct_db.dispatch_targets("dispatch-finality").unwrap()[0]
+                .terminal_reason
+                .clone();
+
+            let recovered_dir = tempdir().unwrap();
+            let recovered_db =
+                Arc::new(PaperStateDb::open(&recovered_dir.path().join("paper.db")).unwrap());
+            stage(
+                &recovered_db,
+                "dispatch-finality",
+                now.unix_timestamp(),
+                &["acct"],
+            );
+            let recovered_state = fanout_state(
+                &recovered_dir,
+                recovered_db.clone(),
+                LiveAccountsSnapshot::default(),
+                "http://127.0.0.1:9",
+                None,
+            );
+            let account_id = AccountId::new("acct").unwrap();
+            let audit = pe_execution_core::LiveOrderPreparationFailedAudit {
+                identity: finality_prepared().identity,
+                failure,
+                control: has_control.then_some(LiveControlObservation {
+                    decided_at_unix: now.unix_timestamp(),
+                    last_successful_read_unix: Some(now.unix_timestamp()),
+                    stale_after_secs: 120,
+                    availability: LiveControlAvailability::Fresh,
+                    account_present: false,
+                    requested_mode: None,
+                    effective_mode: None,
+                    credential_version_available: false,
+                    bundle_version: None,
+                }),
+            };
+            let inventory = LiveRecoveryInventory {
+                account_ids: vec![account_id.clone()],
+                approved_admissions: Vec::new(),
+                terminal_admissions: vec![TerminalAdmissionRecoveryEntry {
+                    account_id,
+                    journal_seq: 0,
+                    identity: audit.identity.clone(),
+                    outcome: TerminalAdmissionRecoveryOutcome::PreparationFailed(Box::new(audit)),
+                }],
+                open_orders: Vec::new(),
+            };
+            reconcile_terminal_recovery_work(&recovered_state, &inventory, now).unwrap();
+            let recovered_reason = recovered_db.dispatch_targets("dispatch-finality").unwrap()[0]
+                .terminal_reason
+                .clone();
+            assert_eq!(direct_reason, recovered_reason, "{failure:?}");
+            reconcile_terminal_recovery_work(&direct_state, &inventory, now).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn older_preparation_reasons_remain_verifiable_without_accepting_new_conflicts() {
+        use pe_execution_core::LiveOrderPreparationFailure as Failure;
+        use pe_execution_core::live_journal::TerminalAdmissionRecoveryEntry;
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        for (failure, legacy_reason) in [
+            (Failure::PrePostRiskDayChanged, "rejected"),
+            (Failure::PrePostRiskPriceExpired, "rejected"),
+            (Failure::PrePostLadderExpired, "rejected"),
+            (
+                Failure::RecoveryAdmissionExpired,
+                "recovery_account_not_armed",
+            ),
+        ] {
+            let outcome = TerminalAdmissionRecoveryOutcome::PreparationFailed(Box::new(
+                pe_execution_core::LiveOrderPreparationFailedAudit {
+                    identity: finality_prepared().identity,
+                    failure,
+                    control: None,
+                },
+            ));
+            assert!(historical_terminal_reason_matches(
+                &outcome,
+                Some(legacy_reason)
+            ));
+            assert!(!historical_terminal_reason_matches(&outcome, Some("wrong")));
+            let dir = tempdir().unwrap();
+            let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+            stage(&db, "dispatch-finality", now.unix_timestamp(), &["acct"]);
+            let state = fanout_state(
+                &dir,
+                db.clone(),
+                LiveAccountsSnapshot::default(),
+                "http://127.0.0.1:9",
+                None,
+            );
+            db.set_dispatch_target_state(
+                "dispatch-finality",
+                "acct",
+                "terminal",
+                Some(legacy_reason),
+                now.unix_timestamp(),
+            )
+            .unwrap();
+            let account_id = AccountId::new("acct").unwrap();
+            let inventory = LiveRecoveryInventory {
+                account_ids: vec![account_id.clone()],
+                approved_admissions: Vec::new(),
+                terminal_admissions: vec![TerminalAdmissionRecoveryEntry {
+                    account_id,
+                    journal_seq: 0,
+                    identity: finality_prepared().identity,
+                    outcome,
+                }],
+                open_orders: Vec::new(),
+            };
+            reconcile_terminal_recovery_work(&state, &inventory, now).unwrap();
+            db.set_dispatch_target_state(
+                "dispatch-finality",
+                "acct",
+                "terminal",
+                Some("wrong"),
+                now.unix_timestamp(),
+            )
+            .unwrap();
+            assert!(reconcile_terminal_recovery_work(&state, &inventory, now).is_err());
+        }
     }
 
     #[tokio::test]
@@ -18547,6 +18756,17 @@ mod tests {
         let projected = db.dispatch_targets("control-seed").unwrap().remove(1);
         assert_eq!(projected.state, "terminal");
         assert_eq!(projected.terminal_reason.as_deref(), Some("not_armed"));
+        verify_seed_control_reference(&state, &seed, &[projected], None).unwrap();
+        db.set_dispatch_target_state(
+            "control-seed",
+            "acct",
+            "terminal",
+            Some("rejected"),
+            now.unix_timestamp(),
+        )
+        .unwrap();
+        let conflicting = db.dispatch_targets("control-seed").unwrap().remove(1);
+        assert!(verify_seed_control_reference(&state, &seed, &[conflicting], None).is_err());
         assert_eq!(pending_control_history(&state, &target).unwrap().len(), 1);
         assert!(
             replay_account(&state.config.journal_path, &AccountId::new("acct").unwrap(),).is_ok()
@@ -18874,6 +19094,7 @@ mod tests {
                             order_hash: Some(target.account_id.clone()),
                             venue_order_id,
                             kind: LiveOrderRejectKind::VenueRejected,
+                            preparation: None,
                         }
                     }
                     LiveVenueReconciledOutcome::Ambiguous { kind } => LiveOrderOutcome::Ambiguous {

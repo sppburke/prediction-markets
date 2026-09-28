@@ -18,7 +18,7 @@ export function classifyServiceReady(body: unknown): ServiceContractObservation 
   if (value.live_control_contract === "owner_requested_mode_v1") {
     return { contract: "updated", ready, issues };
   }
-  if (ready !== null && (value.issues === undefined || issues === value.issues)) {
+  if (!("live_control_contract" in value) && ready !== null && (value.issues === undefined || issues === value.issues)) {
     return { contract: "old", ready, issues };
   }
   return { contract: "unverified", ready, issues };

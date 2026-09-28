@@ -34,8 +34,9 @@ use crate::bucket_commit::{BucketCommitEngine, DecisionContinuationV3, PaperFres
 use crate::clob_book::ClobBookFetcher;
 use crate::decision_replay::{
     AuthorityEvidence, BookEvidence, DecisionEvidenceAccumulator, MarketEndEvidence,
-    MarketPriceEvidence, TerminalDispositionEvidence, WinnerFollowDecisionInputs,
-    WinnerFollowRiskInputEvidence, ladder_plan_blake3, replay_decision_pending,
+    MarketPriceEvidence, ReplayDecisionError, TerminalDispositionEvidence,
+    WinnerFollowDecisionInputs, WinnerFollowRiskInputEvidence, ladder_plan_blake3,
+    replay_decision_pending, replay_decision_pending_with_control,
 };
 use crate::entry_gate::CopyEntryGateConfig;
 use crate::health::SharedHealth;
@@ -1581,6 +1582,43 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
     }
 }
 
+pub(crate) fn verify_retained_terminal_decisions(
+    paper_state: &PaperStateDb,
+    journal: Option<&pe_execution_core::LiveJournal>,
+) -> Result<(), anyhow::Error> {
+    for row in paper_state
+        .decision_pending_history()
+        .map_err(|error| anyhow::anyhow!("load decision continuation history: {error}"))?
+        .into_iter()
+        .filter(|row| row.state == pe_paper_state::DecisionPendingState::Terminal)
+    {
+        verify_retained_terminal_decision(&row, journal).map_err(|error| {
+            anyhow::anyhow!("verify terminal pending {}: {error}", row.source_trade_id)
+        })?;
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_retained_terminal_decision(
+    row: &pe_paper_state::DecisionPendingRow,
+    journal: Option<&pe_execution_core::LiveJournal>,
+) -> Result<(), ReplayDecisionError> {
+    let replayed = replay_decision_pending(row)?;
+    if replayed
+        .post_boundary
+        .body
+        .terminal
+        .dispatch_control_journal_seq
+        .is_some()
+    {
+        let journal = journal.ok_or_else(|| {
+            ReplayDecisionError::ControlJournal("live journal is unavailable".to_owned())
+        })?;
+        replay_decision_pending_with_control(row, journal.path())?;
+    }
+    Ok(())
+}
+
 impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -1708,16 +1746,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
 
         let bucket_engine = BucketCommitEngine::load(paper_state.clone(), leader_ledger)
             .map_err(|error| anyhow::anyhow!("load bucket commit engine: {error}"))?;
-        for row in paper_state
-            .decision_pending_history()
-            .map_err(|error| anyhow::anyhow!("load decision continuation history: {error}"))?
-            .into_iter()
-            .filter(|row| row.state == pe_paper_state::DecisionPendingState::Terminal)
-        {
-            replay_decision_pending(&row).map_err(|error| {
-                anyhow::anyhow!("verify terminal pending {}: {error}", row.source_trade_id)
-            })?;
-        }
+        verify_retained_terminal_decisions(&paper_state, config.live_journal.as_deref())?;
         let mut pending_boot = VecDeque::new();
         let mut pending_continuations = HashMap::new();
         for row in paper_state

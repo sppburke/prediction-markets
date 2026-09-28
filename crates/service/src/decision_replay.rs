@@ -1437,7 +1437,19 @@ mod tests {
             .append(
                 account_id,
                 at,
-                LiveJournalPayload::StagedDispatchControl(Box::new(staged)),
+                LiveJournalPayload::StagedDispatchControl(Box::new(staged.clone())),
+            )
+            .unwrap();
+        let wrong_event = journal
+            .append(
+                pe_core_types::AccountId::new("acct").unwrap(),
+                at,
+                LiveJournalPayload::StagedDispatchControl(Box::new(
+                    LiveStagedDispatchControlAudit {
+                        dispatch_id: "other-dispatch".to_owned(),
+                        ..staged
+                    },
+                )),
             )
             .unwrap();
         let terminal = TerminalDispositionEvidence::no_fill("market_admission_unavailable");
@@ -1462,9 +1474,78 @@ mod tests {
                 updated_at_unix: at.unix_timestamp(),
             }
         };
+        let paper_path = dir.path().join("paper.db");
+        let paper_state = pe_paper_state::PaperStateDb::open(&paper_path).unwrap();
+        let stored = render_row(event.seq);
+        let connection = rusqlite::Connection::open(&paper_path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO decision_pending (source_trade_id, semantic_revision, wallet_hex, \
+             source_epoch, frozen_inputs_json, post_commit_inputs_json, state, \
+             terminal_disposition, updated_at_unix) VALUES (?1, ?2, ?3, ?4, ?5, ?6, \
+             'terminal', ?7, ?8)",
+                rusqlite::params![
+                    stored.source_trade_id.0,
+                    stored.semantic_revision,
+                    stored.wallet.to_string(),
+                    stored.source_epoch,
+                    stored.frozen_inputs_json,
+                    stored.post_commit_inputs_json,
+                    stored.terminal_disposition,
+                    stored.updated_at_unix,
+                ],
+            )
+            .unwrap();
+        assert!(
+            crate::orchestrator::verify_retained_terminal_decisions(&paper_state, Some(&journal))
+                .is_ok()
+        );
+        assert!(
+            crate::orchestrator::verify_retained_terminal_decisions(&paper_state, None).is_err()
+        );
+        for bad_seq in [wrong_event.seq, wrong_event.seq + 1] {
+            connection
+                .execute(
+                    "UPDATE decision_pending SET post_commit_inputs_json = ?1",
+                    [render_row(bad_seq).post_commit_inputs_json],
+                )
+                .unwrap();
+            assert!(
+                crate::orchestrator::verify_retained_terminal_decisions(
+                    &paper_state,
+                    Some(&journal)
+                )
+                .is_err()
+            );
+        }
         assert!(replay_decision_pending_with_control(&render_row(event.seq), &path).is_ok());
+        assert!(
+            crate::orchestrator::verify_retained_terminal_decision(
+                &render_row(event.seq),
+                Some(&journal),
+            )
+            .is_ok()
+        );
+        assert!(matches!(
+            crate::orchestrator::verify_retained_terminal_decision(&render_row(event.seq), None),
+            Err(ReplayDecisionError::ControlJournal(_))
+        ));
         assert!(matches!(
             replay_decision_pending_with_control(&render_row(event.seq + 1), &path),
+            Err(ReplayDecisionError::ControlJournal(_))
+        ));
+        assert!(matches!(
+            crate::orchestrator::verify_retained_terminal_decision(
+                &render_row(wrong_event.seq),
+                Some(&journal)
+            ),
+            Err(ReplayDecisionError::ControlJournal(_))
+        ));
+        assert!(matches!(
+            crate::orchestrator::verify_retained_terminal_decision(
+                &render_row(wrong_event.seq + 1),
+                Some(&journal)
+            ),
             Err(ReplayDecisionError::ControlJournal(_))
         ));
     }

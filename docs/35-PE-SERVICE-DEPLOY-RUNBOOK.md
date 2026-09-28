@@ -1112,7 +1112,7 @@ row.
 
 ## #508 Phase D ordinary-live installation and owner mode request
 
-### D1 — ship dark
+### D1 — install the service
 
 Install the service-scoped age identity at a root-owned path with mode `0600`. Install the committed
 `pe-service` drop-in that maps it as `LoadCredential=pe-age-identity:<identity-path>`, then run
@@ -1120,8 +1120,21 @@ Install the service-scoped age identity at a root-owned path with mode `0600`. I
 Phase-D binary in that same swap/restart operation. Verify the running service advertises
 `live_control_contract: "owner_requested_mode_v1"` on `/health/ready` before attributing the new
 mode behavior to it. The marker also appears on an unhealthy 503 response.
+An account already requesting `live_tiny` can become effective when this service starts; deployment
+does not wait for an additional arming action. Inventory existing requested and effective modes
+before the swap.
 
-### Prepare one account and request mode
+### D2 — owner mode request
+
+The owner can request `live_tiny` with **Request mode** at any time, including before service
+deployment or order setup. The request is the sole account-mode command. Observe the audited
+effective-mode transition after the updated service starts; request `off` to disarm. Observe
+`status.json` mode state, control availability and age, and credential-binding readiness.
+
+### D3 — set up orders
+
+These steps let orders succeed once the owner requests live mode; none is a prerequisite for the
+request or for the effective-mode transition.
 
 1. Rotate the account credentials through the panel; plaintext must never enter `.env`, Supabase,
    logs, or shell history.
@@ -1131,11 +1144,9 @@ mode behavior to it. The marker also appears on an unhealthy 503 response.
    for both V2 collateral adapters. Approval mutation remains an external operator action.
 4. For EOA custody, provision a small POL gas balance. EOA transport remains deferred pending the
    wallet-kind inventory; ordinary-live v1 uses Relayer transport only.
-5. Request `live_tiny` with **Request mode** in the panel. The owner's requested mode is the sole
-   mode command. Wait for the service's audited effective-mode transition; request `off` to disarm.
-6. Observe `status.json` mode state, control availability and age, and credential-binding readiness.
-   Credential, venue, financial, resolver, source, risk, and redemption checks apply per order and
-   do not change the owner's requested mode.
+
+Credential, venue, financial, resolver, source, risk, and redemption checks apply per order and
+do not change the owner's requested mode.
 
 ## Rollback
 
@@ -1181,3 +1192,13 @@ running after SQL or site deployment; the site identifies its legacy readiness c
 service identifies the owner-requested contract through the readiness marker. Once L13 records
 exist, do not restore a pre-L13 service binary. Preserve requested and effective modes and recover
 with a compatible binary that reads the new journal records.
+
+Before the cutover, use read-only queries and local journal inspection to record deployed account
+requested/effective modes, callable RPC signatures and grants, account events, open dispatch
+targets, retained paper decisions, and live-journal recovery work. Recheck after each phase:
+
+| Observed phase | Check |
+|---|---|
+| SQL only | The locked mode RPC accepts only a proposal matching the current owner request. The old site's non-null `enabled` settings save and retired review actions fail visibly without changing mode or events. **Request mode** remains available. |
+| SQL and site | The new site labels stored `enabled` as history, leaves **Request mode** visible, and identifies an unmarked legacy readiness response as the old service. Check an unavailable readiness response separately. |
+| SQL, site, and service | The marked readiness body identifies the owner-requested contract on 200 and 503. Compare requested and effective modes, control availability, and retained dispatch/journal work against the inventory; an existing `live_tiny` request may reconcile immediately. |

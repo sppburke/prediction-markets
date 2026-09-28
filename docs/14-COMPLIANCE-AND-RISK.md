@@ -11,9 +11,11 @@ Prevent false edges, source misuse, venue-rule mistakes, operational failures, a
 
 Use official, permitted, licensed, or clearly public sources. Trade the rules as written. Do not bypass access controls, misuse restricted feeds, rely on non-public material, or manipulate venues.
 
-## Compliance gates
+## Compliance review and order eligibility
 
-Every live strategy requires:
+Record these reviews for each live strategy and apply source, venue, jurisdiction, and account
+eligibility checks to each order where they belong. They do not control account mode: the owner's
+requested mode is the only on/off switch for ordinary live execution.
 
 - source access review;
 - venue terms/API review;

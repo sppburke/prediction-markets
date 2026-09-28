@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use pe_core_types::{
@@ -455,6 +455,29 @@ pub enum LiveOrderPreparationFailure {
     PrePostMarkUnavailable,
     PrePostNotArmed,
     PrePostControlUnavailable,
+}
+
+impl LiveOrderPreparationFailure {
+    /// The one terminal projection for a recorded preparation failure. Historical
+    /// records without control evidence retain their original recovery reason.
+    #[must_use]
+    pub const fn terminal_reason(self, has_control: bool) -> &'static str {
+        match self {
+            Self::RecoveryCredentialChanged => "recovery_credential_changed",
+            Self::RecoveryAdmissionExpired if has_control => "recovery_account_not_armed",
+            Self::RecoveryAdmissionExpired => "recovery_admission_expired",
+            Self::PrePostRiskDayChanged | Self::PrePostRiskPriceExpired => {
+                "recovery_risk_evidence_expired"
+            }
+            Self::PrePostLadderExpired => "recovery_ladder_expired",
+            Self::PrePostNotArmed => "not_armed",
+            Self::PrePostControlUnavailable => "control_unavailable",
+            Self::Venue
+            | Self::PreparedAuditMismatch
+            | Self::PrePostAdmissionExpired
+            | Self::PrePostMarkUnavailable => "rejected",
+        }
+    }
 }
 
 /// Values observed for one control decision. No raw account or credential response is retained.
@@ -1050,6 +1073,7 @@ struct LiveJournalInner {
 
 /// Synchronized owner of the single ordinary-live journal stream.
 pub struct LiveJournal {
+    path: PathBuf,
     inner: Mutex<LiveJournalInner>,
 }
 
@@ -1079,8 +1103,14 @@ impl LiveJournal {
         let next_seq =
             u64::try_from(events.len()).map_err(|_| LiveJournalError::SequenceMismatch)?;
         Ok(Self {
+            path: path.to_path_buf(),
             inner: Mutex::new(LiveJournalInner { writer, next_seq }),
         })
+    }
+
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
     }
 
     /// Native payload replay plus the shared physical scanner's exact tail binding (#544).
