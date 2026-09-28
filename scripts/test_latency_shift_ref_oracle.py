@@ -20,6 +20,8 @@ from pathlib import Path
 from unittest import mock
 
 SCRIPT = Path(__file__).with_name("latency_shift_rerank.py")
+sys.path.insert(0, str(SCRIPT.parent))
+from latency_shift_rerank import ORACLE_VERSION  # noqa: E402
 
 SHIFT = 2
 WINDOW = 120
@@ -271,7 +273,7 @@ class RefOracleScenario(unittest.TestCase):
                 manifest = json.loads((out / "oracle_manifest.json").read_text())
                 self.assertEqual(manifest["as_of"], entries[-1])
                 self.assertEqual(manifest["half_life_days"], half_life)
-                self.assertEqual(manifest["oracle_version"], 3)
+                self.assertEqual(manifest["oracle_version"], ORACLE_VERSION)
         self.assertEqual(len(outcomes), 2)
         self.assertEqual(outcomes[0], outcomes[1])
         print("PASS: twenty covered/repriced constant returns have no score and never survive")
@@ -311,8 +313,8 @@ class RefOracleScenario(unittest.TestCase):
         self.assertEqual(man["versions"]["activity_schema"], 2)
         self.assertEqual(man["versions"]["clob_resolution_parser"], 2)
         self.assertEqual(man["versions"]["clob_resolution_schema"], 2)
-        self.assertEqual(man["versions"]["ranker"], 3)
-        self.assertEqual(man["oracle_version"], 3)
+        self.assertEqual(man["versions"]["ranker"], ORACLE_VERSION)
+        self.assertEqual(man["oracle_version"], ORACLE_VERSION)
         self.assertEqual(man["versions"]["configuration"], 1)
         print("PASS: outcomes artifact + manifest regenerate and bind the published aggregates")
 
@@ -386,8 +388,8 @@ class RefOracleScenario(unittest.TestCase):
         self.assertEqual(first, (out / "before_after_diff.json").read_bytes())
         manifest = json.loads((out / "oracle_manifest.json").read_text())
         import hashlib
-        self.assertEqual(manifest["oracle_version"], 3)
-        self.assertEqual(manifest["versions"]["ranker"], 3)
+        self.assertEqual(manifest["oracle_version"], ORACLE_VERSION)
+        self.assertEqual(manifest["versions"]["ranker"], ORACLE_VERSION)
         for name, key in (("latency_shift_ranked.csv", "latency_shift_ranked_sha256"),
                           ("oracle_outcomes.csv", "oracle_outcomes_sha256")):
             self.assertEqual(manifest["outputs"][key],
