@@ -2366,6 +2366,13 @@ impl<'a> From<&'a pe_event_log::EventEnvelope> for SourcePageRef<'a> {
     }
 }
 
+/// A JSON object with neither an activity `type` key nor its `activity_type` alias: a
+/// `/positions` row. A present key, even `null`, is an activity row the parser must judge.
+fn is_untyped_object(raw: &str) -> bool {
+    serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(raw)
+        .is_ok_and(|row| !row.contains_key("type") && !row.contains_key("activity_type"))
+}
+
 fn fold_source_trade_universe(
     first: &mut HashMap<pe_core_types::SourceTradeId, u64>,
     sealed_sequence: EventSeq,
@@ -2397,6 +2404,13 @@ fn fold_source_trade_universe(
                 "activity observation JSON failed: {error}"
             ))
         })?;
+    // The position bracket's recording fetcher writes its `/positions` pages under this same
+    // envelope identity (position_seeder.rs `fetch`). Positions rows are objects without `type`
+    // and carry no trade, so such a page adds nothing to the universe; any other row shape,
+    // including a page mixing typed and untyped rows, still fails closed below.
+    if !raw_rows.is_empty() && raw_rows.iter().all(|raw| is_untyped_object(raw.get())) {
+        return Ok(());
+    }
     let context = ActivityParseContext {
         source_id: SourceId(source_id.to_owned()),
         observed_at: observed_at.clone(),
@@ -5939,6 +5953,37 @@ mod tests {
                     if reason.contains("unsupported envelope")
             ));
         }
+    }
+
+    #[test]
+    fn source_universe_skips_bracket_positions_pages_and_rejects_mixed_pages() {
+        // A recorded `/positions` page shares the activity envelope identity (production
+        // source log, seq 414 onward); its rows carry no `type` and no trade.
+        let positions = br#"[{"proxyWallet":"0x1111111111111111111111111111111111111111","asset":"123","conditionId":"0xc","outcomeIndex":0,"size":5,"negativeRisk":false,"curPrice":0,"currentValue":0},{"proxyWallet":"0x1111111111111111111111111111111111111111","asset":"456","conditionId":"0xd","outcomeIndex":1,"size":2,"negativeRisk":false,"curPrice":0.5,"currentValue":1}]"#;
+        let observations = BTreeMap::from([(1, activity_observation(1, positions))]);
+        assert!(
+            source_trade_universe(EventSeq(1), &observations)
+                .unwrap()
+                .is_empty()
+        );
+
+        let fails_closed = |payload: Vec<u8>| {
+            let observations = BTreeMap::from([(1, activity_observation(1, &payload))]);
+            matches!(
+                source_trade_universe(EventSeq(1), &observations),
+                Err(QualificationError::InsufficientEvidence(message))
+                    if message.contains("activity observation parse failed")
+            )
+        };
+        let trade = activity_row("0xc", "123", "5", "2.5", "0xabc", 1_700_000_000);
+        let position = serde_json::json!({"asset": "123", "curPrice": 0, "currentValue": 0});
+        assert!(fails_closed(activity_payload(vec![trade, position])));
+        assert!(fails_closed(br#"[{"type":null}]"#.to_vec()));
+        assert!(fails_closed(br#"[{"activity_type":null}]"#.to_vec()));
+
+        let not_objects = br#"[1,2]"#;
+        let observations = BTreeMap::from([(1, activity_observation(1, not_objects))]);
+        assert!(source_trade_universe(EventSeq(1), &observations).is_err());
     }
 
     fn activity_observation(sequence: u64, payload: &[u8]) -> SourceObservation {
