@@ -1312,6 +1312,7 @@ async fn main() -> Result<()> {
     // orders; it does not change the owner's requested mode. The account-tagged journal is a
     // mode-0600 sibling of the paper log.
     let mut live_journal_for_staging = None;
+    let mut live_fanout_task = None;
     if let Some(live_accounts) = live_accounts.clone() {
         let identity = match pe_service::live_credentials::load_identity_from_credentials_dir() {
             Ok(identity) => Some(identity),
@@ -1394,7 +1395,8 @@ async fn main() -> Result<()> {
         };
         let fanout_health = health.clone();
         let fanout_shutdown = shutdown.subscribe();
-        supervisor.spawn(TaskName::LiveFanout, async move {
+        // Spawned only after the orchestrator's boot journal check, so no append races it.
+        live_fanout_task = Some(async move {
             let result = pe_service::live_fanout::run_live_fanout_until(
                 fanout_config,
                 fanout_shutdown.wait_for(ShutdownPhase::StopSinks),
@@ -1446,6 +1448,9 @@ async fn main() -> Result<()> {
     )
     .context("build orchestrator")?
     .with_source_receipt_index(source_receipts.clone());
+    if let Some(task) = live_fanout_task {
+        supervisor.spawn(TaskName::LiveFanout, task);
+    }
     if financial_start.is_some() {
         orch.configure_financial_log_paths(
             cfg.event_log_path.clone(),
