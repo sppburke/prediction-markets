@@ -4939,17 +4939,23 @@ mod tests {
                 binding.physical_tail = std::fs::metadata(&source_path).unwrap().len();
                 staging.complete(&binding).unwrap()
             } else {
-                let index = SourceReceiptIndex::replay(&source_path).unwrap();
-                let other_path = source_path.with_file_name("other-source.log");
-                let mut other_writer = Writer::open(&other_path).unwrap();
-                append_source(
-                    &mut other_writer,
-                    "different-source",
-                    cutoff,
-                    b"different".to_vec(),
+                // Index the final frame under a different hash: its offset and sequence still
+                // match the log, so only the hash comparison can reject the tail.
+                let mut staging = SourceReceiptIndex::staging(&source_path).unwrap();
+                let mut binding = Scanner::verify(&source_path).unwrap();
+                for item in pe_event_log::Reader::replay_with_offsets(&source_path).unwrap() {
+                    let (offset, _, mut envelope) = item.unwrap();
+                    if Some(envelope.seq) == binding.last_sequence {
+                        envelope.this_hash = blake3::Hash::from_bytes([7; 32]);
+                        binding.last_hash = envelope.this_hash;
+                    }
+                    staging.observe(offset, &envelope).unwrap();
+                }
+                let index = staging.complete(&binding).unwrap();
+                assert_eq!(
+                    std::fs::metadata(&source_path).unwrap().len(),
+                    binding.physical_tail
                 );
-                drop(other_writer);
-                std::fs::copy(other_path, &source_path).unwrap();
                 index
             };
             let mut orchestrator =
@@ -5086,6 +5092,7 @@ mod tests {
         );
         drop(paper_writer);
 
+        // Boot rebuilds this same index (scenario_source_log_boot) and redrives through this call.
         let rebuilt_index = SourceReceiptIndex::replay(&source_path).unwrap();
         let mut reopened = Writer::open(&paper_path).unwrap();
         assert_eq!(

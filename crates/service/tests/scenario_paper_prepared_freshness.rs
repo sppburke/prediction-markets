@@ -909,12 +909,12 @@ fn assert_bound_clocks(h: &Harness, recorded: &Recorded, stream_epoch: i64) {
 #[tokio::test]
 async fn bound_source_clock_reconstruction_failure_stops_before_admission() {
     let mut h = Harness::new().await;
+    // An index of the configured log taken before the page is appended lacks its receipt.
+    let stale = SourceReceiptIndex::replay(&h.dir.path().join("source.log")).unwrap();
     let recorded = h.record(1).await;
     h.freeze(&recorded, true).await;
     let open = h.terminal(&recorded);
-    let empty_path = h.dir.path().join("empty-source.log");
-    drop(SourceEventSink::open(&empty_path).unwrap());
-    h.index = SourceReceiptIndex::replay(&empty_path).unwrap();
+    h.index = stale;
     h.attempt(&recorded, at());
     h.arm();
     h.start(true);
