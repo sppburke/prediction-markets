@@ -1240,6 +1240,8 @@ impl ScannedPaperFrame {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PaperLogScanError {
+    #[error("source receipt index belongs to a different source log")]
+    SourceIndexPathMismatch,
     #[error("paper log read failed: {0}")]
     EventLog(#[from] pe_event_log::LogError),
     #[error("paper log schema {schema_version} is unsupported at sequence {sequence}")]
