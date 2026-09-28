@@ -798,6 +798,24 @@ of all four and record **each original path and each copy hash**. Recheck sizes 
 the copy. Bind these exact path-and-hash entries to the seal and crash-recovery rehearsal; an
 earlier online snapshot is not the stopped cutover snapshot.
 
+For C1 on these stopped, hash-recorded copies, require zero continuation-6 rows (open or
+terminal) in SQLite `decision_pending`. Query the copy read-only with `immutable=1`:
+`SELECT COUNT(*) FROM decision_pending WHERE json_extract(frozen_inputs_json, '$.version') >= 6`.
+Inventory the Start and seal records below and require no semantic-2 `QualificationStarted`.
+As a supporting check, the running binary's `status.json` revision must be an ancestor of
+`f44702f^`: no binary containing #705 without C1 may have been deployed before this cut.
+Require the stopped live journal to be header-only, with no admission or preparation frames
+of either schema. Any nonzero census or any live frame stops this cutover. Inventory active
+`CopyLatency` causes; they remain recorded and current decisions ignore them.
+
+The effective copy budget must be exactly 120 s before intake. A lower value refuses
+owner-permitted copies; a higher value permits out-of-policy copies. While stopped, set
+`PE_COPY_LATENCY_BUDGET_SECS=120` in the VPS `.env`, replacing `=2`. Resolve the exact systemd
+unit, its environment file, and TOML to verify the effective value before starting intake.
+Record whether websocket mode is enabled. Immediately after start, read only that key from
+`/proc/<pid>/environ` and confirm `120`; stop the service if it differs. Bind this check to
+the running process identity and the stopped artifact hashes.
+
 Run a fresh generation-scoped open-continuation census on the stopped copies with the reviewed
 binary's `--validate-open-continuations` and record the count of **old** paper continuations; boot
 finishes them under their frozen semantics before it writes the seal (verify in the boot log). Check the paper log for unmatched `FinancialPrepared`; allow the existing recovery
@@ -1040,14 +1058,15 @@ first—the token-guarded reader must never run against the legacy producer.
 
 ## #530 websocket rollback ordering
 
-Disabling `polymarket_activity_ws_enabled` (or rolling back to a pre-#530 binary)
-reverts observation to poll-only — proven byte-identical by scenario WS3. **Reverse
-dependency order is mandatory**: while a Δ=2 ranking batch is latest, the flag stays
-enabled so stale REST observations keep failing closed; first restore and publish a
-Δ=20 ranking, verify the newest `ranking_batches.latency_shift_secs = 20` and that
-pe-service applied that batch, and only then disable the flag or roll the binary
-back. Disabling first would copy Δ=2-selected wallets at poll latency — the
-padded-watchlist loss class.
+Disabling `polymarket_activity_ws_enabled` reverts observation to poll-only — proven
+byte-identical by scenario WS3. With websocket mode enabled, REST observations older
+than the copy budget (now 120 s) still fail closed; websocket-off bypasses the age
+checks. **Reverse dependency order is mandatory**: while a Δ=2 ranking batch is latest,
+first restore and publish a Δ=20 ranking, verify the newest
+`ranking_batches.latency_shift_secs = 20` and that pe-service applied that batch, and
+only then disable the flag. After #705's first durable cutover seal, continuation-6
+write, or economic-wire-2 write, a pre-#530 binary is not a rollback target. Stop
+intake, preserve records, and recover forward with a compatible binary.
 
 ## Historical #510 pre-Start restart semantics
 

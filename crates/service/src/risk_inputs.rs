@@ -35,6 +35,7 @@ pub(crate) const MAX_HISTORICAL_MARK_AGE_SECS: i64 = 120;
 pub(crate) fn apply_global_risk_halts(
     active: &HashSet<(RiskHaltOwner, RiskHaltCause)>,
     snapshot: &mut RiskSnapshot,
+    copy_latency_enabled: bool,
 ) {
     use pe_risk_engine::{INTRADAY_STOP_BPS, KILL_SWITCH_DRAWDOWN_BPS, ROLLING_7D_STOP_BPS};
 
@@ -51,7 +52,10 @@ pub(crate) fn apply_global_risk_halts(
                 snapshot.rolling_7d_pnl_bps.0 =
                     snapshot.rolling_7d_pnl_bps.0.min(ROLLING_7D_STOP_BPS);
             }
-            RiskHaltCause::CopyLatency => snapshot.copy_latency_kill_switch_active = true,
+            RiskHaltCause::CopyLatency if copy_latency_enabled => {
+                snapshot.copy_latency_kill_switch_active = true;
+            }
+            RiskHaltCause::CopyLatency => {}
         }
     }
 }
@@ -329,6 +333,7 @@ pub(crate) fn open_positions(
 /// Compose paper risk from a source prefix that the caller has already replayed and verified.
 /// Runtime supplies the maintained source receipt index; offline qualification keeps its own
 /// sealed-prefix view so every Prepared reuses the correct historical boundary.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_paper_risk_snapshot_from_source_receipts<F>(
     base: &PaperExposureBase,
     snapshot: &FinancialSnapshot,
@@ -337,19 +342,28 @@ pub(crate) fn build_paper_risk_snapshot_from_source_receipts<F>(
     source_receipt_received_millis: F,
     now_unix: i64,
     latency_was_active: bool,
+    financial_semantic_version: u32,
 ) -> Result<RiskSnapshot, RiskInputsUnavailable>
 where
     F: Fn(AppendReceipt) -> Result<i64, RiskInputsUnavailable>,
 {
-    let latency =
-        paper_latency_samples_from_source_receipts(era, now_unix, &source_receipt_received_millis)?;
+    let copy_latency_kill_switch_active = if financial_semantic_version < 2 {
+        let latency = paper_latency_samples_from_source_receipts(
+            era,
+            now_unix,
+            &source_receipt_received_millis,
+        )?;
+        latency.switch_active(latency_was_active)
+    } else {
+        false
+    };
     compose_paper_risk_snapshot(
         base,
         snapshot,
         era,
         current_prices,
         now_unix,
-        latency.switch_active(latency_was_active),
+        copy_latency_kill_switch_active,
     )
 }
 
@@ -521,22 +535,6 @@ impl LatencySamples {
     }
 }
 
-/// Replayed owner/cause state from which live latency hysteresis resumes.
-///
-/// New manual releases bind to the exact journal prefix scanned. Pre-`QualificationStarted`
-/// transitions retain the former response-time checkpoint so legacy logs remain replayable.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct LatencyHysteresisSeed {
-    pub active: bool,
-    pub checkpoint: Option<LatencyReplayCheckpoint>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LatencyReplayCheckpoint {
-    LiveJournalTail(pe_execution_core::live_journal::LiveJournalTail),
-    LegacyResponseTime(i64),
-}
-
 /// Audited account-local tail and complete journal-prefix identity used by a manual release scan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -556,82 +554,6 @@ impl From<pe_execution_core::live_journal::LiveJournalTail> for LiveLatencyJourn
             scanned_prefix_last_hash: tail.scanned_prefix_last_hash.to_hex().to_string(),
         }
     }
-}
-
-/// Rebuild the latest synchronized live-owner latency transition from the financial-era log.
-pub(crate) fn latency_hysteresis_seed(
-    era: &PaperEra,
-    owner: &RiskHaltOwner,
-    live_journal_path: &Path,
-) -> Result<LatencyHysteresisSeed, RiskInputsUnavailable> {
-    let transition = era.frames.iter().rev().find_map(|frame| {
-        let PaperLogFrame::Record(PaperLogRecord::RiskHaltChanged {
-            owner: recorded_owner,
-            cause: RiskHaltCause::CopyLatency,
-            state,
-            evidence,
-        }) = &frame.frame
-        else {
-            return None;
-        };
-        (recorded_owner == owner).then_some((frame, *state, evidence))
-    });
-    let Some((frame, state, evidence)) = transition else {
-        return Ok(LatencyHysteresisSeed {
-            active: false,
-            checkpoint: None,
-        });
-    };
-    let post_start_live_release = state == HaltState::Released
-        && matches!(owner, RiskHaltOwner::LiveAccount(_))
-        && era
-            .start
-            .as_ref()
-            .is_some_and(|(start_receipt, _)| frame.receipt.sequence > start_receipt.sequence);
-    let checkpoint = match evidence.get("live_journal_tail") {
-        Some(value) if !value.is_null() => {
-            let tail: LiveLatencyJournalTailEvidence = serde_json::from_value(value.clone())
-                .map_err(|_| RiskInputsUnavailable::SnapshotSequenceMismatch)?;
-            let hash = blake3::Hash::from_hex(&tail.last_hash)
-                .map_err(|_| RiskInputsUnavailable::SnapshotSequenceMismatch)?;
-            let scanned_prefix_hash = blake3::Hash::from_hex(&tail.scanned_prefix_last_hash)
-                .map_err(|_| RiskInputsUnavailable::SnapshotSequenceMismatch)?;
-            let checkpoint = pe_execution_core::live_journal::LiveJournalTail {
-                last_sequence: tail.last_sequence,
-                last_hash: hash,
-                scanned_prefix_last_sequence: tail.scanned_prefix_last_sequence,
-                scanned_prefix_last_hash: scanned_prefix_hash,
-            };
-            let RiskHaltOwner::LiveAccount(account_id) = owner else {
-                return Err(RiskInputsUnavailable::SnapshotSequenceMismatch);
-            };
-            pe_execution_core::live_journal::verify_account_tail_checkpoint(
-                live_journal_path,
-                account_id,
-                checkpoint,
-            )
-            .map_err(|_| RiskInputsUnavailable::SnapshotSequenceMismatch)?;
-            LatencyReplayCheckpoint::LiveJournalTail(checkpoint)
-        }
-        Some(_) | None if post_start_live_release => {
-            return Err(RiskInputsUnavailable::LiveLatencyReleaseCheckpointMissing);
-        }
-        Some(_) | None => {
-            let transitioned_at_unix_ms = frame
-                .envelope
-                .received_at
-                .0
-                .unix_timestamp_nanos()
-                .checked_div(1_000_000)
-                .and_then(|value| i64::try_from(value).ok())
-                .ok_or(RiskInputsUnavailable::Overflow)?;
-            LatencyReplayCheckpoint::LegacyResponseTime(transitioned_at_unix_ms)
-        }
-    };
-    Ok(LatencyHysteresisSeed {
-        active: state == HaltState::Engaged,
-        checkpoint: Some(checkpoint),
-    })
 }
 
 /// Derive paper latency from each Fill Final envelope's `received_at` minus its Prepared
@@ -686,88 +608,24 @@ pub(crate) fn live_latency_samples(
     let previous_start = latest_start
         .checked_sub(SECONDS_PER_HOUR)
         .ok_or(RiskInputsUnavailable::Overflow)?;
-    let all_samples = live_latency_endpoint_samples(events, None)?;
+    let all_samples = live_latency_endpoint_samples(events)?;
     Ok(LatencySamples {
         previous: latency_hour(&all_samples, previous_start)?,
         latest: latency_hour(&all_samples, latest_start)?,
     })
 }
 
-/// Fold owner-local live latency forward from its last synchronized halt transition.
-pub(crate) fn replayed_live_latency_switch(
-    events: &[pe_execution_core::LiveJournalEvent],
-    now_unix: i64,
-    seed: LatencyHysteresisSeed,
-) -> Result<bool, RiskInputsUnavailable> {
-    let latest_completed_hour = now_unix
-        .div_euclid(SECONDS_PER_HOUR)
-        .checked_mul(SECONDS_PER_HOUR)
-        .and_then(|value| value.checked_sub(SECONDS_PER_HOUR))
-        .ok_or(RiskInputsUnavailable::Overflow)?;
-    let samples = live_latency_endpoint_samples(events, seed.checkpoint)?;
-    let hourly = samples
-        .into_iter()
-        .filter(|(endpoint, _)| {
-            endpoint.div_euclid(SECONDS_PER_HOUR) * SECONDS_PER_HOUR <= latest_completed_hour
-        })
-        .fold(
-            BTreeMap::<i64, Vec<u64>>::new(),
-            |mut by_hour, (endpoint, value)| {
-                let hour = endpoint.div_euclid(SECONDS_PER_HOUR) * SECONDS_PER_HOUR;
-                by_hour.entry(hour).or_default().push(value);
-                by_hour
-            },
-        )
-        .into_iter()
-        .filter_map(|(hour, values)| nearest_rank_p95(&values).map(|p95| (hour, p95)));
-
-    let mut active = seed.active;
-    let mut previous = None;
-    for (hour, value) in hourly {
-        if active {
-            active = latency_switch(true, None, Some(value));
-        } else {
-            let adjacent =
-                previous.filter(|(prior_hour, _)| *prior_hour == hour - SECONDS_PER_HOUR);
-            active = latency_switch(false, adjacent.map(|(_, prior)| prior), Some(value));
-        }
-        previous = Some((hour, value));
-    }
-    Ok(active)
-}
-
 fn live_latency_endpoint_samples(
     events: &[pe_execution_core::LiveJournalEvent],
-    checkpoint: Option<LatencyReplayCheckpoint>,
 ) -> Result<Vec<(i64, u64)>, RiskInputsUnavailable> {
     let mut samples = Vec::new();
     for event in events {
-        if matches!(
-            checkpoint,
-            Some(LatencyReplayCheckpoint::LiveJournalTail(tail))
-                if tail.last_sequence.is_some_and(|last| event.seq <= last.0)
-        ) {
-            continue;
-        }
         let pe_execution_core::LiveJournalPayload::OrderPosted(posted) = &event.payload else {
             continue;
         };
         let pe_core_types::RawHttpAttempt::Response(response) = &posted.evidence else {
             continue;
         };
-        let endpoint_ms = response
-            .received_at
-            .unix_timestamp_nanos()
-            .checked_div(1_000_000)
-            .and_then(|value| i64::try_from(value).ok())
-            .ok_or(RiskInputsUnavailable::Overflow)?;
-        if matches!(
-            checkpoint,
-            Some(LatencyReplayCheckpoint::LegacyResponseTime(transitioned_at_unix_ms))
-                if endpoint_ms <= transitioned_at_unix_ms
-        ) {
-            continue;
-        }
         let latency_ms = (response.received_at - response.observed_at)
             .whole_milliseconds()
             .try_into()
@@ -1641,50 +1499,6 @@ mod tests {
 
     fn account() -> RiskHaltOwner {
         RiskHaltOwner::LiveAccount(AccountId::new("live-a").unwrap())
-    }
-
-    fn append_live_mode_event(
-        journal: &pe_execution_core::LiveJournal,
-        account_id: AccountId,
-        unix: i64,
-    ) {
-        journal
-            .append(
-                account_id,
-                OffsetDateTime::from_unix_timestamp(unix).unwrap(),
-                pe_execution_core::LiveJournalPayload::ModeTransitionApplied(
-                    pe_execution_core::LiveModeTransitionAudit {
-                        requested: pe_execution_core::LiveControlMode::LiveTiny,
-                        previous_effective: pe_execution_core::LiveControlMode::Off,
-                        new_effective: pe_execution_core::LiveControlMode::LiveTiny,
-                        reason: pe_execution_core::LiveModeTransitionReason::Armed,
-                    },
-                ),
-            )
-            .unwrap();
-    }
-
-    fn released_latency_era(
-        owner: RiskHaltOwner,
-        tail: LiveLatencyJournalTailEvidence,
-    ) -> PaperEra {
-        crate::paper_recovery::paper_era(vec![
-            frame(
-                1,
-                7_199,
-                PaperLogRecord::QualificationStarted(Box::new(start())),
-            ),
-            frame(
-                2,
-                7_200,
-                PaperLogRecord::RiskHaltChanged {
-                    owner,
-                    cause: RiskHaltCause::CopyLatency,
-                    state: HaltState::Released,
-                    evidence: serde_json::json!({ "live_journal_tail": tail }),
-                },
-            ),
-        ])
     }
 
     fn start() -> crate::paper_recovery::QualificationStarted {
@@ -2665,13 +2479,103 @@ mod tests {
                 concentration_caps: None,
             };
 
-            apply_global_risk_halts(&active, &mut snapshot);
+            apply_global_risk_halts(&active, &mut snapshot, true);
 
             assert_eq!(
                 pe_risk_engine::evaluate_risk(&snapshot),
                 pe_risk_engine::RiskDecision::Blocked(expected)
             );
         }
+    }
+
+    /// Current paper and live decisions ignore a historical latency-only cause; every other
+    /// durable cause still blocks by itself.
+    #[test]
+    fn retired_latency_overlay_keeps_other_single_cause_halts() {
+        let cases = [
+            (RiskHaltCause::CopyLatency, None),
+            (
+                RiskHaltCause::AbsoluteLoss,
+                Some(pe_risk_engine::RiskBlock::KillSwitchDrawdown),
+            ),
+            (
+                RiskHaltCause::IntradayDrawdown,
+                Some(pe_risk_engine::RiskBlock::IntradayDrawdownStop),
+            ),
+            (
+                RiskHaltCause::Rolling7dDrawdown,
+                Some(pe_risk_engine::RiskBlock::Rolling7dDrawdownStop),
+            ),
+        ];
+        for (cause, blocked) in cases {
+            let mut snapshot = RiskSnapshot {
+                leader_exposure_bps: BasisPoints::ZERO,
+                market_exposure_bps: BasisPoints::ZERO,
+                family_exposure_bps: BasisPoints::ZERO,
+                total_copy_exposure_bps: BasisPoints::ZERO,
+                intraday_pnl_bps: BasisPoints::ZERO,
+                rolling_7d_pnl_bps: BasisPoints::ZERO,
+                absolute_pnl_bps: BasisPoints::ZERO,
+                copy_latency_kill_switch_active: false,
+                proposed_trade_bps: BasisPoints(1),
+                per_trade_cap_bps: 25,
+                concentration_caps: None,
+            };
+            apply_global_risk_halts(
+                &HashSet::from([(RiskHaltOwner::Paper, cause)]),
+                &mut snapshot,
+                false,
+            );
+            assert!(!snapshot.copy_latency_kill_switch_active);
+            assert_eq!(
+                pe_risk_engine::evaluate_risk(&snapshot),
+                blocked.map_or(
+                    pe_risk_engine::RiskDecision::Approved,
+                    pe_risk_engine::RiskDecision::Blocked,
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn paper_snapshot_selects_latency_by_recorded_semantic() {
+        let start_frame = frame(
+            1,
+            0,
+            PaperLogRecord::QualificationStarted(Box::new(start())),
+        );
+        let era = crate::paper_recovery::paper_era(vec![start_frame.clone()]);
+        let financial = FinancialSnapshot {
+            cash: dec!(100),
+            positions: Vec::new(),
+            settlements_7d: Vec::new(),
+            fills_for_open_and_7d: Vec::new(),
+            last_prepared_seq: None,
+            start: Some((start_frame.receipt.sequence, start_frame.receipt.this_hash)),
+        };
+        let base = PaperExposureBase {
+            leader_exposure_bps: BasisPoints::ZERO,
+            market_exposure_bps: BasisPoints::ZERO,
+            family_exposure_bps: BasisPoints::ZERO,
+            total_copy_exposure_bps: BasisPoints::ZERO,
+            proposed_trade_bps: BasisPoints(1),
+            per_trade_cap_bps: 25,
+        };
+        let build = |semantic| {
+            build_paper_risk_snapshot_from_source_receipts(
+                &base,
+                &financial,
+                &era,
+                &HashMap::new(),
+                |_| Err(RiskInputsUnavailable::PriceMissing),
+                10_800,
+                true,
+                semantic,
+            )
+            .unwrap()
+        };
+        assert!(build(1).copy_latency_kill_switch_active);
+        assert!(!build(2).copy_latency_kill_switch_active);
     }
 
     /// PASS: an absolute-loss engagement remains effective after raw finances recover because the
@@ -2701,7 +2605,7 @@ mod tests {
             concentration_caps: None,
         };
 
-        apply_global_risk_halts(&active_risk_halts(&era), &mut recovered);
+        apply_global_risk_halts(&active_risk_halts(&era), &mut recovered, true);
 
         assert_eq!(
             pe_risk_engine::evaluate_risk(&recovered),
@@ -2785,214 +2689,5 @@ mod tests {
         .unwrap();
         assert_eq!(latency_release.cause, RiskHaltCause::CopyLatency);
         assert_eq!(latency_release.owner, account());
-    }
-
-    /// PASS: a pre-Start release retains the legacy timestamp checkpoint independently for each
-    /// owner and ignores later transitions for other causes.
-    #[test]
-    fn latency_hysteresis_seed_replays_latest_owner_cause_transition() {
-        let owner = account();
-        let other = RiskHaltOwner::LiveAccount(AccountId::new("live-b").unwrap());
-        let era = PaperEra {
-            start: None,
-            frames: vec![
-                frame(
-                    1,
-                    7_200,
-                    PaperLogRecord::RiskHaltChanged {
-                        owner: owner.clone(),
-                        cause: RiskHaltCause::CopyLatency,
-                        state: HaltState::Engaged,
-                        evidence: serde_json::json!({}),
-                    },
-                ),
-                frame(
-                    2,
-                    7_201,
-                    PaperLogRecord::RiskHaltChanged {
-                        owner: other,
-                        cause: RiskHaltCause::CopyLatency,
-                        state: HaltState::Released,
-                        evidence: serde_json::json!({}),
-                    },
-                ),
-                frame(
-                    3,
-                    7_202,
-                    PaperLogRecord::RiskHaltChanged {
-                        owner: owner.clone(),
-                        cause: RiskHaltCause::CopyLatency,
-                        state: HaltState::Released,
-                        evidence: serde_json::json!({}),
-                    },
-                ),
-                frame(
-                    4,
-                    7_203,
-                    PaperLogRecord::RiskHaltChanged {
-                        owner: owner.clone(),
-                        cause: RiskHaltCause::AbsoluteLoss,
-                        state: HaltState::Engaged,
-                        evidence: serde_json::json!({}),
-                    },
-                ),
-            ],
-        };
-        let expected = LatencyHysteresisSeed {
-            active: false,
-            checkpoint: Some(LatencyReplayCheckpoint::LegacyResponseTime(7_202_000)),
-        };
-        assert_eq!(
-            latency_hysteresis_seed(&era, &owner, Path::new("unused")).unwrap(),
-            expected
-        );
-        assert_eq!(
-            latency_hysteresis_seed(&era, &owner, Path::new("unused")).unwrap(),
-            expected
-        );
-    }
-
-    /// PASS: a post-Start live latency release with absent or null account-tail evidence is typed
-    /// corruption, never an inactive timestamp-checkpoint seed.
-    #[test]
-    fn latency_hysteresis_seed_rejects_missing_post_start_live_tail() {
-        let owner = account();
-        for evidence in [
-            serde_json::json!({}),
-            serde_json::json!({ "live_journal_tail": null }),
-        ] {
-            let started = start();
-            let era = crate::paper_recovery::paper_era(vec![
-                frame(
-                    1,
-                    7_200,
-                    PaperLogRecord::QualificationStarted(Box::new(started)),
-                ),
-                frame(
-                    2,
-                    7_201,
-                    PaperLogRecord::RiskHaltChanged {
-                        owner: owner.clone(),
-                        cause: RiskHaltCause::CopyLatency,
-                        state: HaltState::Released,
-                        evidence,
-                    },
-                ),
-            ]);
-
-            assert_eq!(
-                latency_hysteresis_seed(&era, &owner, Path::new("unused")),
-                Err(RiskInputsUnavailable::LiveLatencyReleaseCheckpointMissing)
-            );
-        }
-    }
-
-    /// PASS: malformed journal-tail evidence fails closed instead of silently falling back to a
-    /// wall-clock checkpoint that could discard a delayed live response.
-    #[test]
-    fn latency_hysteresis_seed_rejects_malformed_live_tail() {
-        let owner = account();
-        let era = crate::paper_recovery::paper_era(vec![
-            frame(
-                1,
-                7_199,
-                PaperLogRecord::QualificationStarted(Box::new(start())),
-            ),
-            frame(
-                2,
-                7_200,
-                PaperLogRecord::RiskHaltChanged {
-                    owner: owner.clone(),
-                    cause: RiskHaltCause::CopyLatency,
-                    state: HaltState::Released,
-                    evidence: serde_json::json!({
-                        "live_journal_tail": {
-                            "last_sequence": EventSeq(4),
-                            "last_hash": "not-a-hash",
-                            "scanned_prefix_last_sequence": EventSeq(4),
-                            "scanned_prefix_last_hash": "00".repeat(32),
-                        },
-                    }),
-                },
-            ),
-        ]);
-        assert_eq!(
-            latency_hysteresis_seed(&era, &owner, Path::new("unused")),
-            Err(RiskInputsUnavailable::SnapshotSequenceMismatch)
-        );
-    }
-
-    /// PASS: a syntactically valid hash that does not bind the recorded account sequence fails
-    /// closed against the verified live journal.
-    #[test]
-    fn latency_hysteresis_seed_rejects_wrong_live_tail_hash() {
-        let dir = tempfile::tempdir().unwrap();
-        let journal_path = dir.path().join("live.log");
-        let account_id = AccountId::new("live-a").unwrap();
-        let owner = RiskHaltOwner::LiveAccount(account_id.clone());
-        let journal = pe_execution_core::LiveJournal::open(&journal_path).unwrap();
-        append_live_mode_event(&journal, account_id.clone(), 7_100);
-        let (_, tail) =
-            pe_execution_core::live_journal::replay_account_with_tail(&journal_path, &account_id)
-                .unwrap();
-        let mut evidence = LiveLatencyJournalTailEvidence::from(tail);
-        let mut wrong_hash = *tail.last_hash.as_bytes();
-        wrong_hash[0] ^= 1;
-        evidence.last_hash = blake3::Hash::from_bytes(wrong_hash).to_hex().to_string();
-        let era = released_latency_era(owner.clone(), evidence);
-
-        assert_eq!(
-            latency_hysteresis_seed(&era, &owner, &journal_path),
-            Err(RiskInputsUnavailable::SnapshotSequenceMismatch)
-        );
-    }
-
-    /// PASS: a future account sequence cannot resolve inside the release's verified journal
-    /// prefix and fails closed even when every hash field is well formed.
-    #[test]
-    fn latency_hysteresis_seed_rejects_future_live_tail_sequence() {
-        let dir = tempfile::tempdir().unwrap();
-        let journal_path = dir.path().join("live.log");
-        let account_id = AccountId::new("live-a").unwrap();
-        let owner = RiskHaltOwner::LiveAccount(account_id.clone());
-        let journal = pe_execution_core::LiveJournal::open(&journal_path).unwrap();
-        append_live_mode_event(&journal, account_id.clone(), 7_100);
-        let (_, tail) =
-            pe_execution_core::live_journal::replay_account_with_tail(&journal_path, &account_id)
-                .unwrap();
-        let mut evidence = LiveLatencyJournalTailEvidence::from(tail);
-        evidence.last_sequence = Some(EventSeq(100));
-        let era = released_latency_era(owner.clone(), evidence);
-
-        assert_eq!(
-            latency_hysteresis_seed(&era, &owner, &journal_path),
-            Err(RiskInputsUnavailable::SnapshotSequenceMismatch)
-        );
-    }
-
-    /// PASS: an empty verified release prefix accepts an account-local `None`, while an account
-    /// event appended after that exact prefix remains post-release.
-    #[test]
-    fn latency_hysteresis_seed_accepts_empty_live_journal_prefix_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let journal_path = dir.path().join("live.log");
-        let account_id = AccountId::new("live-a").unwrap();
-        let owner = RiskHaltOwner::LiveAccount(account_id.clone());
-        let journal = pe_execution_core::LiveJournal::open(&journal_path).unwrap();
-        let (_, tail) =
-            pe_execution_core::live_journal::replay_account_with_tail(&journal_path, &account_id)
-                .unwrap();
-        assert_eq!(tail.last_sequence, None);
-        assert_eq!(tail.scanned_prefix_last_sequence, None);
-        append_live_mode_event(&journal, account_id, 7_201);
-        let era = released_latency_era(owner.clone(), LiveLatencyJournalTailEvidence::from(tail));
-
-        assert_eq!(
-            latency_hysteresis_seed(&era, &owner, &journal_path).unwrap(),
-            LatencyHysteresisSeed {
-                active: false,
-                checkpoint: Some(LatencyReplayCheckpoint::LiveJournalTail(tail)),
-            }
-        );
     }
 }

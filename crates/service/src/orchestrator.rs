@@ -465,6 +465,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         &mut self,
         snapshot: &RiskSnapshot,
         evaluated_at_unix_ms: i64,
+        financial_semantic_version: u32,
     ) -> Result<(), String> {
         use crate::paper_recovery::{HaltState, RiskHaltOwner};
         use pe_risk_engine::{
@@ -494,6 +495,9 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 false,
             ),
         ] {
+            if financial_semantic_version >= 2 && cause == RiskHaltCause::CopyLatency {
+                continue;
+            }
             let active = self.active_risk_halts.contains(&(owner.clone(), cause));
             let state = match (active, desired, manual_release_only) {
                 (false, true, _) => Some(HaltState::Engaged),
@@ -515,8 +519,16 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         Ok(())
     }
 
-    fn apply_global_halts_to_snapshot(&self, snapshot: &mut RiskSnapshot) {
-        apply_global_risk_halts(&self.active_risk_halts, snapshot);
+    fn apply_global_halts_to_snapshot(
+        &self,
+        snapshot: &mut RiskSnapshot,
+        financial_semantic_version: u32,
+    ) {
+        apply_global_risk_halts(
+            &self.active_risk_halts,
+            snapshot,
+            financial_semantic_version < 2,
+        );
     }
 
     fn qualification_seal_reason(
@@ -991,6 +1003,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         signal: &LeaderSignal,
         proposed_debit: CollateralAmount,
         per_trade_cap_bps: i32,
+        financial_semantic_version: u32,
     ) -> Result<(pe_execution_core::RiskAudit, pe_event_log::AppendReceipt), ActivePaperRiskFailure>
     {
         let mut attempt = WinnerFollowRiskInputEvidence {
@@ -1087,19 +1100,21 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             |receipt| source_receipts.received_millis(receipt),
             now,
             latency_was_active,
+            financial_semantic_version,
         )
         .map_err(|cause| ActivePaperRiskFailure::new(cause, &attempt))?;
-        self.synchronize_paper_risk_halts(&snapshot, evaluated_at_unix_ms)
-            .map_err(|_| {
-                ActivePaperRiskFailure::new(
-                    RiskInputsUnavailable::SnapshotSequenceMismatch,
-                    &attempt,
-                )
-            })?;
+        self.synchronize_paper_risk_halts(
+            &snapshot,
+            evaluated_at_unix_ms,
+            financial_semantic_version,
+        )
+        .map_err(|_| {
+            ActivePaperRiskFailure::new(RiskInputsUnavailable::SnapshotSequenceMismatch, &attempt)
+        })?;
         let financial_prefix = attempt.financial_prefix.ok_or_else(|| {
             ActivePaperRiskFailure::new(RiskInputsUnavailable::SnapshotSequenceMismatch, &attempt)
         })?;
-        self.apply_global_halts_to_snapshot(&mut snapshot);
+        self.apply_global_halts_to_snapshot(&mut snapshot, financial_semantic_version);
         let decision = match pe_risk_engine::evaluate_risk(&snapshot) {
             pe_risk_engine::RiskDecision::Approved => {
                 pe_execution_core::RiskDecisionAudit::Approved
@@ -3368,7 +3383,12 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .per_trade_cap
             .resolve_bps(TradingMode::LiveTiny);
         let (risk, _) = match self
-            .active_paper_risk_snapshot(&signal, planned_worst_case_all_in_debit, per_trade_cap_bps)
+            .active_paper_risk_snapshot(
+                &signal,
+                planned_worst_case_all_in_debit,
+                per_trade_cap_bps,
+                if semantic2 { 2 } else { 1 },
+            )
             .await
         {
             Ok(risk) => risk,
@@ -3538,13 +3558,12 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
     }
 
     /// #530/#546 copy-budget rule (websocket-primary mode only): the ranker's latency shift
-    /// assumes copies happen at websocket speed, so an observation from EITHER source older
-    /// than the calibrated budget is admitted for bookkeeping — seen-state, leader ledger,
-    /// and a typed disposition in ONE transaction, so the held cursor (#511) advances — but
-    /// stages no copy. Copying it late is the padded-watchlist loss class. Strict
-    /// full-`Duration` compare (#530 review F6): 2.5s old with a 2s budget IS stale;
-    /// whole-second truncation would admit up to budget+1s. `now` is sampled ONCE per
-    /// decision and stamps both `age_secs` and `recorded_at_unix`.
+    /// keeps Δ at 2 s while the owner permits copies through the 120 s window. An observation
+    /// from EITHER source older than the copy budget is admitted for bookkeeping — seen-state,
+    /// leader ledger, and a typed disposition in ONE transaction, so the held cursor (#511)
+    /// advances — but stages no copy. Strict full-`Duration` compare (#530 review F6): 120.5s old
+    /// with a 120s budget IS stale; whole-second truncation would admit up to budget+1s. `now` is
+    /// sampled ONCE per decision and stamps both `age_secs` and `recorded_at_unix`.
     fn stale_no_copy(
         &self,
         trade: &IncomingTrade,
@@ -5377,12 +5396,54 @@ mod tests {
         )]);
         let mut snapshot = healthy_risk_snapshot();
 
-        apply_global_risk_halts(&active, &mut snapshot);
+        apply_global_risk_halts(&active, &mut snapshot, true);
 
         assert_eq!(
             evaluate_risk(&snapshot),
             RiskDecision::Blocked(RiskBlock::KillSwitchDrawdown)
         );
+    }
+
+    #[test]
+    fn paper_halt_sync_selects_recorded_semantic_without_releasing_latency_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let paper_path = dir.path().join("paper.log");
+        let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let (_, control_rx) = mpsc::channel(4);
+        let mut owner = build_test_orchestrator(
+            Writer::open(&paper_path).unwrap(),
+            paper,
+            control_rx,
+            String::new(),
+            None,
+        );
+        let latency = (RiskHaltOwner::Paper, RiskHaltCause::CopyLatency);
+        owner.active_risk_halts.insert(latency.clone());
+        let mut snapshot = healthy_risk_snapshot();
+        owner
+            .synchronize_paper_risk_halts(&snapshot, 1_000, 2)
+            .unwrap();
+        assert!(owner.active_risk_halts.contains(&latency));
+        assert!(scan_paper_log(&paper_path).unwrap().is_empty());
+
+        snapshot.intraday_pnl_bps.0 = pe_risk_engine::INTRADAY_STOP_BPS;
+        owner
+            .synchronize_paper_risk_halts(&snapshot, 2_000, 2)
+            .unwrap();
+        assert!(owner.active_risk_halts.contains(&latency));
+        assert!(
+            owner
+                .active_risk_halts
+                .contains(&(RiskHaltOwner::Paper, RiskHaltCause::IntradayDrawdown))
+        );
+        assert_eq!(scan_paper_log(&paper_path).unwrap().len(), 1);
+
+        snapshot.intraday_pnl_bps.0 = 0;
+        owner
+            .synchronize_paper_risk_halts(&snapshot, 3_000, 1)
+            .unwrap();
+        assert!(!owner.active_risk_halts.contains(&latency));
+        assert_eq!(scan_paper_log(&paper_path).unwrap().len(), 3);
     }
 
     /// PASS: the first valid boundary that reaches both canonical completion counts requests the

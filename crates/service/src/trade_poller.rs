@@ -2228,6 +2228,34 @@ mod tests {
         PAPER_LOG_SCHEMA_VERSION, PaperLogRecord, PortfolioMark, QualificationStarted, TailBinding,
     };
 
+    #[test]
+    fn poller_stale_gate_uses_full_120_second_window_for_both_provenances() {
+        let source = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
+        let deadline = source + time::Duration::seconds(120);
+        for provenance in [TradeProvenance::RestPoll, TradeProvenance::ActivityWs] {
+            assert!(stale_disposition(provenance, source, deadline, true, 120).is_none());
+            let expired = stale_disposition(
+                provenance,
+                source,
+                deadline + time::Duration::nanoseconds(1),
+                true,
+                120,
+            )
+            .unwrap();
+            assert_eq!(expired.age_secs, 120);
+            assert!(
+                stale_disposition(
+                    provenance,
+                    source,
+                    deadline + time::Duration::seconds(1),
+                    false,
+                    120
+                )
+                .is_none()
+            );
+        }
+    }
+
     fn recorded(sequence: u64, url: &str, hash: &str) -> PageOccurrence {
         PageOccurrence {
             request_url: url.to_owned(),

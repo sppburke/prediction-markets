@@ -31,7 +31,7 @@ Every live strategy requires:
 - leader, market, family, and total-copy concentration;
 - exact proposed-trade size against the resolved cap;
 - intraday, rolling-seven-day, and absolute drawdown;
-- the service-derived copy-latency kill-switch state.
+- the historical copy-latency field for replay of semantic-1 decisions; current paper and live evaluations set it to false.
 
 Source health, resolver tradability, authenticated account state, jurisdiction, venue reconciliation,
 and reservation/allowance checks remain admission or canary gates around the pure ordinary risk
@@ -101,13 +101,13 @@ pub enum RiskBlock {
     IntradayDrawdownStop,
     Rolling7dDrawdownStop,
     KillSwitchDrawdown,
-    CopyLatencyKillSwitch,
+    CopyLatencyKillSwitch, // historical replay meaning only
 }
 ```
 
 The halt scope for each variant (this trade, strategy-wide) is documented canonically in `19-`.
 Source health remains a separate service-readiness/admission gate; it is not a fabricated field in
 the pure risk snapshot. Absolute loss remains latched until its own audited
-`risk_halt_release_hash` is synchronized. Intraday and rolling causes release mechanically;
-latency releases at its canonical lower threshold or, when sample-starved, through its own audited
-hash. One cause never releases another.
+`risk_halt_release_hash` is synchronized. Intraday and rolling causes release mechanically.
+Historical `CopyLatency` records retain their audited-release path, but current decisions ignore
+that cause. One cause never releases another.

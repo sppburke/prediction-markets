@@ -122,11 +122,11 @@ FLOOR_TSTAT="2.0"
 MIN_TRL="20"
 MIN_AVG_PER_MONTH="0"
 MIN_ACTIVE_MONTHS="0"
-# Δ = measured websocket-path copy latency, conservatively rounded (#530: feed p95 1.32s
-# + book fetch 64ms + commit 163ms ≈ 1.6s → 2s; sweep at Δ=2: 290 statistical / 12 active
+# Δ remains the owner-selected 2s (#530: feed p95 1.32s + book fetch 64ms
+# + commit 163ms ≈ 1.6s; sweep at Δ=2: 290 statistical / 12 active
 # survivors vs 185/6 at the old 20s). Ships with the websocket input path under mandatory
-# service-first deploy ordering; RE-CHECK against the +1-week measured span artifact and
-# raise only if measured p95 > 2s (issue #530).
+# service-first deploy ordering; report late-copy measurements from the follow-up
+# artifact while keeping Δ at the owner-selected 2s (issue #710).
 LATENCY_SHIFT_SECS="2"
 FILL_WINDOW_SECS="120"
 TOP_N="200"
