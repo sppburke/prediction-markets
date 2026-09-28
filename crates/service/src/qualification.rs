@@ -7556,6 +7556,8 @@ mod tests {
 
     /// A semantic-1 decision keeps its historical latency audit, while a later semantic-2
     /// continuation in the same generation reconstructs false from the same active halt prefix.
+    /// Qualification checks only pre-seal decisions under its Start semantic, so this test checks
+    /// each reconstruction directly.
     #[tokio::test]
     async fn mixed_era_evaluated_risk_replays_recorded_latency_semantics() {
         let fixture = receipt_backed_decline_fixture().await;

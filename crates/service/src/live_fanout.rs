@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::str::FromStr as _;
 use std::sync::{Arc, Mutex};
@@ -212,7 +212,6 @@ fn derive_projection_rows_for_state(
     )?;
     verify_replayed_live_risks(
         account_id,
-        &state.config.journal_path,
         events,
         &source_envelopes,
         Some(&state.config.source_receipts),
@@ -499,7 +498,6 @@ fn verified_recovery_inventory(state: &FanoutState) -> Result<LiveRecoveryInvent
             .map_err(|_| pe_execution_core::LiveJournalError::OrderFactConflict)?;
             verify_replayed_live_risk_with_index(
                 &event.account_id,
-                &state.config.journal_path,
                 &account_prefix,
                 admission.as_ref(),
                 LiveReplayEvidence {
@@ -4068,7 +4066,6 @@ struct LiveReplayEvidence<'a> {
 
 fn verify_replayed_live_risk_with_index(
     account_id: &AccountId,
-    _live_journal_path: &Path,
     preceding_events: &[LiveJournalEvent],
     admission: &pe_execution_core::LiveAdmissionEvaluationAudit,
     evidence: LiveReplayEvidence<'_>,
@@ -4496,7 +4493,6 @@ fn produced_observation_index(
 #[cfg(test)]
 fn verify_replayed_live_risk(
     account_id: &AccountId,
-    live_journal_path: &Path,
     preceding_events: &[LiveJournalEvent],
     admission: &pe_execution_core::LiveAdmissionEvaluationAudit,
     source_envelopes: &[EventEnvelope],
@@ -4505,7 +4501,6 @@ fn verify_replayed_live_risk(
     let observation_pages = produced_observation_index(admission, source_envelopes)?;
     verify_replayed_live_risk_with_index(
         account_id,
-        live_journal_path,
         preceding_events,
         admission,
         LiveReplayEvidence {
@@ -4519,7 +4514,6 @@ fn verify_replayed_live_risk(
 
 fn verify_replayed_live_risks(
     account_id: &AccountId,
-    live_journal_path: &Path,
     events: &[LiveJournalEvent],
     source_envelopes: &[EventEnvelope],
     source_receipts: Option<&SourceReceiptIndex>,
@@ -4532,7 +4526,6 @@ fn verify_replayed_live_risks(
         };
         verify_replayed_live_risk_with_index(
             account_id,
-            live_journal_path,
             &events[..event_index],
             admission,
             LiveReplayEvidence {
@@ -8503,18 +8496,10 @@ mod tests {
     /// producer-mutated self-consistent snapshot is rejected for every field.
     #[test]
     fn strict_live_risk_reconstructs_every_snapshot_dimension() {
-        let (dir, account_id, events, sources, paper_frames, admission) =
+        let (_dir, account_id, events, sources, paper_frames, admission) =
             reconstructed_live_risk_fixture();
-        let journal_path = dir.path().join("live.journal");
-        verify_replayed_live_risk(
-            &account_id,
-            &journal_path,
-            &events,
-            &admission,
-            &sources,
-            &paper_frames,
-        )
-        .unwrap();
+        verify_replayed_live_risk(&account_id, &events, &admission, &sources, &paper_frames)
+            .unwrap();
         assert_eq!(
             admission.economic.risk.snapshot.leader_exposure_bps,
             BasisPoints(2_501)
@@ -8604,7 +8589,6 @@ mod tests {
                 matches!(
                     verify_replayed_live_risk(
                         &account_id,
-                        &journal_path,
                         &events,
                         &changed,
                         &sources,
@@ -8619,14 +8603,7 @@ mod tests {
         let mut wrong_prefix = admission.clone();
         wrong_prefix.economic.risk.financial_prefix = fixture_receipt(199);
         assert!(matches!(
-            verify_replayed_live_risk(
-                &account_id,
-                &journal_path,
-                &events,
-                &wrong_prefix,
-                &sources,
-                &paper_frames,
-            ),
+            verify_replayed_live_risk(&account_id, &events, &wrong_prefix, &sources, &paper_frames,),
             Err(ProjectionReducerError::InvalidRiskEvidence)
         ));
     }
@@ -8638,9 +8615,8 @@ mod tests {
     /// reaches projection or recovery without all four exact receipts.
     #[test]
     fn strict_live_economic_requires_exact_admission_and_book_receipts() {
-        let (dir, account_id, events, sources, paper_frames, admission) =
+        let (_dir, account_id, events, sources, paper_frames, admission) =
             reconstructed_live_risk_fixture();
-        let journal_path = dir.path().join("live.journal");
         let economic_receipts = [
             admission.economic.admission.receipts.gamma,
             admission.economic.admission.receipts.clob_long,
@@ -8660,7 +8636,6 @@ mod tests {
             assert!(matches!(
                 verify_replayed_live_risk(
                     &account_id,
-                    &journal_path,
                     &events,
                     &admission,
                     &missing,
@@ -8684,7 +8659,6 @@ mod tests {
         assert!(matches!(
             verify_replayed_live_risk(
                 &account_id,
-                &journal_path,
                 &events,
                 &substituted_gamma,
                 &substituted_gamma_sources,
@@ -8710,7 +8684,6 @@ mod tests {
         assert!(matches!(
             verify_replayed_live_risk(
                 &account_id,
-                &journal_path,
                 &events,
                 &substituted_book,
                 &substituted_book_sources,
@@ -8725,9 +8698,8 @@ mod tests {
     /// FAIL: changing only `asset_id` leaves the recorded admission replayable.
     #[test]
     fn strict_live_economic_rejects_book_asset_identity_substitution() {
-        let (dir, account_id, events, mut sources, paper_frames, admission) =
+        let (_dir, account_id, events, mut sources, paper_frames, admission) =
             reconstructed_live_risk_fixture();
-        let journal_path = dir.path().join("live.journal");
         let book = sources
             .iter_mut()
             .find(|source| {
@@ -8742,14 +8714,7 @@ mod tests {
         .into_bytes();
 
         assert!(matches!(
-            verify_replayed_live_risk(
-                &account_id,
-                &journal_path,
-                &events,
-                &admission,
-                &sources,
-                &paper_frames,
-            ),
+            verify_replayed_live_risk(&account_id, &events, &admission, &sources, &paper_frames,),
             Err(ProjectionReducerError::InvalidRiskEvidence)
         ));
     }
@@ -10481,7 +10446,7 @@ mod tests {
     fn strict_live_economic_reconstructs_post_baseline_multipage_admissions() {
         for websocket_assisted in [false, true] {
             for split_group in [false, true] {
-                let (dir, account_id, events, mut sources, paper_frames, mut admission) =
+                let (_dir, account_id, events, mut sources, paper_frames, mut admission) =
                     reconstructed_live_risk_fixture();
                 let observation = admission.economic.observation.as_ref().unwrap().clone();
                 let first_receipt = observation.complete_bound_receipt;
@@ -10590,7 +10555,6 @@ mod tests {
 
                 verify_replayed_live_risk_with_index(
                     &account_id,
-                    &dir.path().join("live.journal"),
                     &events,
                     &admission,
                     LiveReplayEvidence {
@@ -10612,7 +10576,7 @@ mod tests {
     #[test]
     fn strict_live_economic_reconstructs_post_baseline_saturated_admissions() {
         for websocket_assisted in [false, true] {
-            let (dir, account_id, events, mut sources, paper_frames, mut admission) =
+            let (_dir, account_id, events, mut sources, paper_frames, mut admission) =
                 reconstructed_live_risk_fixture();
             let old_observation = admission.economic.observation.as_ref().unwrap().clone();
             let original_page = sources
@@ -10688,7 +10652,6 @@ mod tests {
 
             verify_replayed_live_risk_with_index(
                 &account_id,
-                &dir.path().join("live.journal"),
                 &events,
                 &admission,
                 LiveReplayEvidence {
@@ -11092,9 +11055,8 @@ mod tests {
     /// FAIL: a conflicting payload under the referenced receipt identity is accepted.
     #[test]
     fn strict_live_economic_rejects_payload_conflicts() {
-        let (dir, account_id, events, sources, paper_frames, admission) =
+        let (_dir, account_id, events, sources, paper_frames, admission) =
             reconstructed_live_risk_fixture();
-        let journal_path = dir.path().join("live.journal");
         for receipt in [
             admission.economic.admission.receipts.gamma,
             admission.economic.admission.receipts.clob_long,
@@ -11112,7 +11074,6 @@ mod tests {
             assert!(matches!(
                 verify_replayed_live_risk(
                     &account_id,
-                    &journal_path,
                     &events,
                     &admission,
                     &conflicting,
@@ -11129,9 +11090,8 @@ mod tests {
     /// it.
     #[test]
     fn strict_live_economic_rejects_zero_copied_fee_for_nonzero_source_fee() {
-        let (dir, account_id, events, sources, paper_frames, mut admission) =
+        let (_dir, account_id, events, sources, paper_frames, mut admission) =
             reconstructed_live_risk_fixture();
-        let journal_path = dir.path().join("live.journal");
         admission.economic.admission.fee_schedule = pe_venue_polymarket::CompactFeeSchedule::Zero;
         admission.economic.fee = FeeAudit {
             schedule: pe_venue_polymarket::CompactFeeSchedule::Zero,
@@ -11150,14 +11110,7 @@ mod tests {
             };
 
         assert!(matches!(
-            verify_replayed_live_risk(
-                &account_id,
-                &journal_path,
-                &events,
-                &admission,
-                &sources,
-                &paper_frames,
-            ),
+            verify_replayed_live_risk(&account_id, &events, &admission, &sources, &paper_frames,),
             Err(ProjectionReducerError::InvalidRiskEvidence)
         ));
     }
@@ -11166,9 +11119,8 @@ mod tests {
     /// its derived decision, and fails closed before reconstruction for an out-of-domain cap.
     #[test]
     fn strict_live_risk_replays_recorded_cap_domain() {
-        let (dir, account_id, events, sources, paper_frames, admission) =
+        let (_dir, account_id, events, sources, paper_frames, admission) =
             reconstructed_live_risk_fixture();
-        let journal_path = dir.path().join("live.journal");
 
         for cap in [
             pe_strategy_winner_follow::PerTradeCap::Bps(5_000).resolve_bps(TradingMode::LiveTiny),
@@ -11183,15 +11135,8 @@ mod tests {
                         RiskDecisionAudit::Blocked { reason }
                     }
                 };
-            verify_replayed_live_risk(
-                &account_id,
-                &journal_path,
-                &events,
-                &recorded,
-                &sources,
-                &paper_frames,
-            )
-            .unwrap();
+            verify_replayed_live_risk(&account_id, &events, &recorded, &sources, &paper_frames)
+                .unwrap();
         }
 
         for cap in [0, 10_001] {
@@ -11205,14 +11150,7 @@ mod tests {
                     }
                 };
             assert!(matches!(
-                verify_replayed_live_risk(
-                    &account_id,
-                    &journal_path,
-                    &events,
-                    &invalid,
-                    &sources,
-                    &paper_frames,
-                ),
+                verify_replayed_live_risk(&account_id, &events, &invalid, &sources, &paper_frames,),
                 Err(ProjectionReducerError::InvalidRiskEvidence)
             ));
         }
@@ -11223,7 +11161,6 @@ mod tests {
     #[test]
     fn strict_live_risk_replays_the_recorded_paper_prefix() {
         let (dir, account_id, events, sources, _, admission) = reconstructed_live_risk_fixture();
-        let journal_path = dir.path().join("live.journal");
         let paper_path = dir.path().join("paper.log");
         let late_received = OffsetDateTime::from_unix_timestamp(19).unwrap();
         let mut writer = pe_event_log::Writer::open(&paper_path).unwrap();
@@ -11249,7 +11186,6 @@ mod tests {
 
         verify_replayed_live_risk(
             &account_id,
-            &journal_path,
             &events,
             &admission,
             &sources,
@@ -11265,7 +11201,6 @@ mod tests {
         assert!(matches!(
             verify_replayed_live_risk(
                 &account_id,
-                &journal_path,
                 &events,
                 &tampered,
                 &sources,
@@ -11336,15 +11271,8 @@ mod tests {
                 ),
                 cause == pe_risk_engine::RiskHaltCause::CopyLatency,
             );
-            verify_replayed_live_risk(
-                &account_id,
-                &dir.path().join("live.journal"),
-                &events,
-                &admission,
-                &sources,
-                &paper_frames,
-            )
-            .unwrap();
+            verify_replayed_live_risk(&account_id, &events, &admission, &sources, &paper_frames)
+                .unwrap();
             if cause == pe_risk_engine::RiskHaltCause::CopyLatency {
                 admission
                     .economic
@@ -11354,7 +11282,6 @@ mod tests {
                 assert!(matches!(
                     verify_replayed_live_risk(
                         &account_id,
-                        &dir.path().join("live.journal"),
                         &events,
                         &admission,
                         &sources,
@@ -11434,21 +11361,13 @@ mod tests {
     /// unrelated-market, or substituted-price receipt cannot validate a copied snapshot.
     #[test]
     fn strict_live_risk_rejects_missing_unrelated_and_substituted_price_receipts() {
-        let (dir, account_id, events, mut sources, paper_frames, admission) =
+        let (_dir, account_id, events, mut sources, paper_frames, admission) =
             reconstructed_live_risk_fixture();
-        let journal_path = dir.path().join("live.journal");
 
         let mut missing = admission.clone();
         missing.economic.risk.price_receipts.clear();
         assert!(matches!(
-            verify_replayed_live_risk(
-                &account_id,
-                &journal_path,
-                &events,
-                &missing,
-                &sources,
-                &paper_frames,
-            ),
+            verify_replayed_live_risk(&account_id, &events, &missing, &sources, &paper_frames,),
             Err(ProjectionReducerError::InvalidRiskEvidence)
         ));
 
@@ -11463,14 +11382,7 @@ mod tests {
         let mut unrelated = admission.clone();
         unrelated.economic.risk.price_receipts = vec![unrelated_receipt];
         assert!(matches!(
-            verify_replayed_live_risk(
-                &account_id,
-                &journal_path,
-                &events,
-                &unrelated,
-                &sources,
-                &paper_frames,
-            ),
+            verify_replayed_live_risk(&account_id, &events, &unrelated, &sources, &paper_frames,),
             Err(ProjectionReducerError::InvalidRiskEvidence)
         ));
 
@@ -11491,14 +11403,7 @@ mod tests {
         let mut substituted = admission;
         substituted.economic.risk.price_receipts = vec![substituted_receipt];
         assert!(matches!(
-            verify_replayed_live_risk(
-                &account_id,
-                &journal_path,
-                &events,
-                &substituted,
-                &sources,
-                &paper_frames,
-            ),
+            verify_replayed_live_risk(&account_id, &events, &substituted, &sources, &paper_frames,),
             Err(ProjectionReducerError::InvalidRiskEvidence)
         ));
     }

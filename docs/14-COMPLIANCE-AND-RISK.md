@@ -33,7 +33,7 @@ requested mode is the only on/off switch for ordinary live execution.
 - leader, market, family, and total-copy concentration;
 - exact proposed-trade size against the resolved cap;
 - intraday, rolling-seven-day, and absolute drawdown;
-- the historical copy-latency field for replay of semantic-1 decisions; current paper and live evaluations set it to false.
+- the historical copy-latency field for replay of semantic-1 decisions; semantic-2 paper and new live evaluations set it to false (a resumed semantic-1 continuation can still record true).
 
 Source health, resolver tradability, authenticated account state, jurisdiction, venue reconciliation,
 and reservation/allowance checks remain admission or canary gates around the pure ordinary risk

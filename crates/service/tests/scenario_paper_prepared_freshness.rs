@@ -2091,13 +2091,16 @@ async fn version_six_staged_target_strict_live_admission_submits_and_replays() {
     ));
 }
 
-/// PASS: exactly two seconds fills; one nanosecond later expires, with the predicate's exact clock.
+/// PASS: the frozen exact boundary fills; one nanosecond later expires, with the predicate's exact clock.
 #[tokio::test]
 async fn paper_prepared_gate_preserves_nanosecond_boundary() {
-    for remainder in [0, 1] {
+    for (budget, remainder) in [(2, 0), (2, 1), (120, 0), (120, 1)] {
         let mut h = Harness::new().await;
+        h.copy_budget_secs = budget;
         let recorded = h.record(1).await;
-        let gate = at() + time::Duration::seconds(2) + time::Duration::nanoseconds(remainder);
+        let gate = at()
+            + time::Duration::seconds(i64::try_from(budget).unwrap())
+            + time::Duration::nanoseconds(remainder);
         h.attempt(&recorded, gate);
         h.start(true);
         h.poll(&recorded).await;
@@ -2141,6 +2144,7 @@ async fn resumed_decision_uses_frozen_paper_freshness_policy() {
         let mut h = Harness::new().await;
         let recorded = h.record(1).await;
         h.freeze(&recorded, enabled).await;
+        h.copy_budget_secs = 120;
         h.attempt(&recorded, at() + time::Duration::seconds(3));
         if !enabled {
             *h.hooks.age_clock.lock().unwrap() = [at() + time::Duration::seconds(3); 3].into();
@@ -2149,15 +2153,9 @@ async fn resumed_decision_uses_frozen_paper_freshness_policy() {
         h.barrier().await;
         assert_eq!(h.prepared_count(), usize::from(!enabled));
         let replayed = replay_decision_pending(&h.terminal(&recorded)).unwrap();
-        assert_eq!(
-            replayed
-                .continuation
-                .facts
-                .paper_freshness_policy
-                .unwrap()
-                .activity_ws_enabled,
-            enabled
-        );
+        let frozen = replayed.continuation.facts.paper_freshness_policy.unwrap();
+        assert_eq!(frozen.activity_ws_enabled, enabled);
+        assert_eq!(frozen.copy_latency_budget_secs, 2);
         if enabled {
             assert_expired(&h, &recorded);
         } else {

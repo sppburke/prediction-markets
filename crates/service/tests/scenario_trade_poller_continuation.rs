@@ -95,7 +95,7 @@ impl ReconciliationFetcher for GammaFetcher {
         _url: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
         Box::pin(async {
-            Ok(br#"[{"conditionId":"0xcondition-b","clobTokenIds":["asset-b"]}]"#.to_vec())
+            Ok(br#"[{"conditionId":"0xcondition-a","clobTokenIds":["asset-a"]},{"conditionId":"0xcondition-b","clobTokenIds":["asset-b"]}]"#.to_vec())
         })
     }
 }
@@ -1745,7 +1745,9 @@ async fn older_unmatched_observation_holds_newer_bucket_until_correlated() {
         .send(b"[]".to_vec())
         .unwrap();
     running.round_completed().await;
-    let older = stream_row(wallet(), "older-unmatched", EPOCH);
+    let mut older = stream_row(wallet(), "older-unmatched", EPOCH);
+    older["conditionId"] = json!(MARKET_A);
+    older["asset"] = json!("asset-a");
     let newer = stream_row(wallet(), "newer-held", EPOCH + 1);
     let older_receipt = running.observe(older.clone()).await;
     running
@@ -1798,6 +1800,11 @@ async fn older_unmatched_observation_holds_newer_bucket_until_correlated() {
     assert_eq!(commits.len(), 2);
     assert_eq!(commits[0].2.source_epoch, EPOCH);
     assert_eq!(commits[1].2.source_epoch, EPOCH + 1);
+    assert!(commits[1].1.no_copy_dispositions.is_empty());
+    assert_eq!(
+        commits[1].2.pending,
+        vec![aggregate(newer.clone()).group_id.key().clone()]
+    );
     assert!(
         paper
             .activity_group_state(aggregate(newer).group_id.key())
