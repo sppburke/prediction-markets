@@ -567,6 +567,12 @@ def duck_extract_positions(con, wallets, win_start, win_end, ttr_lo, ttr_secs,
     return df
 
 
+# A position's outcome is its traded token's place in the market's payout evidence,
+# whose order the payout vector follows. The venue's stored index can disagree with
+# the token; the live path and the projection use the token (#690).
+TRADED_OUTCOME = "list_position(json_extract_string(p.tokens_json, '$[*].token_id'), g.asset) - 1"
+
+
 def duck_extract_positions_v2(con, wallets, win_start, win_end):
     """Yield every structurally valid Rust-classified schema-two first buy.
 
@@ -598,6 +604,7 @@ def duck_extract_positions_v2(con, wallets, win_start, win_end):
             "WHERE NOT regexp_full_match(r.source_trade_id, 'g2:[0-9a-f]{64}') "
             "OR g.source_trade_id IS NULL OR p.market_id IS NULL OR g.condition_id IS NULL "
             "OR g.asset IS NULL OR g.outcome_id IS NULL OR g.side != 'buy' "
+            f"OR {TRADED_OUTCOME} IS NULL "
             "OR TRY_CAST(g.share_amount_str AS DECIMAL(38,6)) IS NULL "
             "OR TRY_CAST(g.share_amount_str AS DECIMAL(38,6)) <= 0 "
             "OR TRY_CAST(g.price_weighted_share_amount_str AS DECIMAL(38,12)) IS NULL "
@@ -611,13 +618,13 @@ def duck_extract_positions_v2(con, wallets, win_start, win_end):
             )
         con.execute(
             "COPY (SELECT g.wallet_hex AS wallet, g.condition_id AS market_id, "
-            "g.outcome_id, g.source_time_unix AS entry_ts, "
+            f"{TRADED_OUTCOME} AS outcome_id, g.source_time_unix AS entry_ts, "
             "CAST(p.end_date_unix - g.source_time_unix AS BIGINT) AS ttr_secs, "
             "CAST(TRY_CAST(g.price_weighted_share_amount_str AS DECIMAL(38,12)) / "
             "TRY_CAST(g.share_amount_str AS DECIMAL(38,6)) AS DOUBLE) AS price, "
             "g.share_amount_str AS contracts, "
             "CAST(json_extract_string(p.payout_vector_json, "
-            "'$[' || CAST(g.outcome_id AS VARCHAR) || ']') AS DOUBLE) AS payoff, "
+            f"'$[' || CAST({TRADED_OUTCOME} AS VARCHAR) || ']') AS DOUBLE) AS payoff, "
             "p.end_date_unix AS resolved_at, r.source_trade_id "
             "FROM ranker_entries_v2 r "
             "JOIN activity_groups_v2 g ON g.source_trade_id = r.source_trade_id "
