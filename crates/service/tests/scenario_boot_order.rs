@@ -571,7 +571,6 @@ impl RestartFixture {
                     execution_order: 0,
                     requested_live_mode: "live_tiny".to_owned(),
                     effective_live_mode: "live_tiny".to_owned(),
-                    live_price_impact_cap_bps: 100,
                     custody_wallet_address: None,
                     custody_wallet_kind: None,
                     credential_binding: Some((7, "stored-key".to_owned())),

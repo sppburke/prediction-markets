@@ -537,6 +537,28 @@ fn verified_recovery_inventory(state: &FanoutState) -> Result<LiveRecoveryInvent
                     ))
                 },
             )?;
+        let observation_pages = live_observation_page_index(
+            &state.config.paper_state,
+            &referenced_source_trade_ids(&events),
+        )
+        .map_err(|error| {
+            FanoutError::Signal(format!(
+                "live recovery continuation evidence for {account_id}: {error}"
+            ))
+        })?;
+        verify_replayed_live_risks(
+            &account_id,
+            &events,
+            &source_envelopes,
+            Some(&state.config.source_receipts),
+            &paper_frames,
+            &observation_pages,
+        )
+        .map_err(|error| {
+            FanoutError::Signal(format!(
+                "live recovery event replay for {account_id}: {error}"
+            ))
+        })?;
         let derived = derive_projection_rows_with_sources(&account_id, &events, &source_envelopes)
             .map_err(|error| {
                 FanoutError::Signal(format!(
@@ -1457,6 +1479,18 @@ where
                 "approved recovery target contradicts frozen admission".to_owned(),
             ));
         }
+        let copy_deadline = match verified_live_copy_deadline(
+            state,
+            pending.account_id.as_str(),
+            &pending.admission.identity,
+        ) {
+            Ok(deadline) => deadline,
+            Err(reason) => {
+                warn!(account_id = %target.account_id, dispatch_id = %target.dispatch_id, reason, "Approved recovery has no verified copy deadline; target remains pending");
+                freeze = true;
+                continue;
+            }
+        };
         match recovery_authorization(
             state,
             &pending.account_id,
@@ -1654,8 +1688,16 @@ where
                 continue;
             }
         };
-        if resume_approved_with_venue(state, &target, pending, execution, &venue_context, clock)
-            .await?
+        if resume_approved_with_venue(
+            state,
+            &target,
+            pending,
+            execution,
+            copy_deadline,
+            &venue_context,
+            clock,
+        )
+        .await?
         {
             freeze = true;
         }
@@ -1783,6 +1825,7 @@ async fn resume_approved_with_venue<V, C>(
     target: &DispatchTargetRow,
     pending: pe_execution_core::live_journal::ApprovedAdmissionRecoveryEntry,
     execution: RecoveryExecutionState,
+    copy_deadline: Option<OffsetDateTime>,
     venue_context: &RecoveryVenueContext<'_, V>,
     clock: C,
 ) -> Result<bool, FanoutError>
@@ -1954,7 +1997,9 @@ where
                 latest_at.unix_timestamp(),
             )?;
             drop(guard);
-            let outcome = executor.submit_with_clock(prepared, clock).await?;
+            let outcome = executor
+                .submit_with_clock_and_deadline(prepared, clock, copy_deadline)
+                .await?;
             let transition = outcome_transition(&outcome);
             persist_outcome(state, target, &outcome, clock())?;
             Ok(transition.freeze)
@@ -2325,35 +2370,10 @@ async fn process_target(
             return Ok(PassControl::Continue);
         }
     };
-    let cap_bps = u32::try_from(account.live_price_impact_cap_bps)
-        .ok()
-        .filter(|cap| (1..=10_000).contains(cap));
-    let Some(cap_bps) = cap_bps else {
-        terminalize(
-            state,
-            target,
-            "live_price_impact_cap_invalid",
-            OffsetDateTime::now_utc(),
-        )?;
-        return Ok(PassControl::Continue);
-    };
-    let price_impact_cap_bps = i32::try_from(cap_bps)
-        .map_err(|_| FanoutError::Signal("live price-impact cap exceeds i32".to_owned()))?;
-    let ceiling_raw = (best_ask.0
-        * (Decimal::from(10_000u32 + cap_bps) / Decimal::from(10_000u32)))
-    .min(Decimal::ONE);
-    let ceiling = match Price::new(ceiling_raw) {
-        Ok(price) => price,
-        Err(_) => {
-            terminalize(
-                state,
-                target,
-                "live_price_impact_cap_invalid",
-                OffsetDateTime::now_utc(),
-            )?;
-            return Ok(PassControl::Continue);
-        }
-    };
+    let price_impact_cap_bps = runtime.price_impact_cap_bps;
+    let ceiling =
+        pe_execution_core::economic::current_book_impact_ceiling(best_ask, price_impact_cap_bps)
+            .map_err(|error| FanoutError::Signal(error.to_string()))?;
     let policy_cap = collateral_cap(account_state.reconciled_free_collateral, per_trade_cap_bps)
         .ok_or_else(|| FanoutError::Signal("live per-trade cap arithmetic failed".to_owned()))?;
     let kelly_allocate = live_kelly_share_allocator(
@@ -2386,7 +2406,7 @@ async fn process_target(
         admission.market.minimum_tick_size,
         minimum_price,
         maximum_price,
-        signal.leader_price,
+        Price::ONE,
         ceiling,
     ) {
         Ok(plan) => plan,
@@ -2459,6 +2479,13 @@ async fn process_target(
         book_receipt,
         &strategy_config,
     )?;
+    let copy_deadline = match verified_live_copy_deadline(state, &target.account_id, &identity) {
+        Ok(deadline) => deadline,
+        Err(reason) => {
+            warn!(account_id = %target.account_id, dispatch_id = %target.dispatch_id, reason, "verified copy deadline unavailable; target remains pending");
+            return Ok(PassControl::StopSeed);
+        }
+    };
     let outcome_index = u8::try_from(signal.outcome_id.0)
         .map_err(|_| FanoutError::Signal("outcome index exceeds u8".to_owned()))?;
     let sizing_mode = match strategy_config.sizing_mode {
@@ -2469,7 +2496,7 @@ async fn process_target(
         SizingMode::Dollar { usd } => SizingModeAudit::Dollar { usd },
         SizingMode::Contract { contracts } => SizingModeAudit::Contract { contracts },
     };
-    let economic = EconomicPrepared::compose(EconomicInputs {
+    let economic = EconomicPrepared::compose_wire_two(EconomicInputs {
         market: pe_execution_core::MarketSelection {
             condition_id: admission.market.condition_id.clone(),
             outcome_index,
@@ -2487,7 +2514,7 @@ async fn process_target(
         risk,
         cash_before: account_state.reconciled_free_collateral,
         price_impact_cap_bps,
-        chase_ceiling: signal.leader_price,
+        chase_ceiling: Price::ONE,
         band_floor: minimum_price,
         band_ceiling_exclusive: maximum_price,
         applied_configuration_hash: identity.config_hash.clone(),
@@ -2730,7 +2757,7 @@ async fn process_target(
             )?;
             drop(guard);
             let outcome = executor
-                .submit_with_clock(prepared, OffsetDateTime::now_utc)
+                .submit_with_clock_and_deadline(prepared, OffsetDateTime::now_utc, copy_deadline)
                 .await?;
             let transition = outcome_transition(&outcome);
             persist_outcome(state, target, &outcome, OffsetDateTime::now_utc())?;
@@ -3340,7 +3367,7 @@ impl SourceBackedEconomicReplay {
         };
         let recomposed =
             if economic.version == pe_execution_core::economic::PAPER_ECONOMIC_PREPARED_VERSION {
-                EconomicPrepared::compose_paper(inputs)
+                EconomicPrepared::compose_wire_two(inputs)
             } else {
                 EconomicPrepared::compose(inputs)
             }
@@ -3461,6 +3488,89 @@ fn live_observation_page_index(
     Ok(pages)
 }
 
+/// Resolve the dispatch identity against the durable, authenticated decision clock.
+/// A missing policy or receipt is a pending-target hold, never permission to POST.
+fn verified_live_copy_deadline(
+    state: &FanoutState,
+    account_id: &str,
+    identity: &LiveOrderIdentity,
+) -> Result<Option<OffsetDateTime>, String> {
+    let projection = identity
+        .fill_projection
+        .as_deref()
+        .ok_or_else(|| "live fill projection is missing".to_owned())?;
+    let source_trade_id = SourceTradeId(
+        projection
+            .source_trade_id
+            .clone()
+            .ok_or_else(|| "live source trade identity is missing".to_owned())?,
+    );
+    let row = state
+        .config
+        .paper_state
+        .decision_pending_for(&source_trade_id)
+        .map_err(|error| format!("decision continuation lookup failed: {error}"))?
+        .ok_or_else(|| "decision continuation is missing".to_owned())?;
+    let continuation = DecisionContinuationV3::from_durable(&row)
+        .map_err(|error| format!("decision continuation is invalid: {error}"))?;
+    verified_copy_deadline_for_continuation(&continuation, account_id, identity, &mut |receipt| {
+        state
+            .config
+            .source_receipts
+            .source_envelope(receipt)
+            .map(CompleteActivityPage::from)
+    })
+}
+
+fn verified_copy_deadline_for_continuation<L, E>(
+    continuation: &DecisionContinuationV3,
+    account_id: &str,
+    identity: &LiveOrderIdentity,
+    lookup: &mut L,
+) -> Result<Option<OffsetDateTime>, String>
+where
+    L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
+    E: std::fmt::Display,
+{
+    let projection = identity
+        .fill_projection
+        .as_deref()
+        .ok_or_else(|| "live fill projection is missing".to_owned())?;
+    let source_trade_id = projection
+        .source_trade_id
+        .as_deref()
+        .ok_or_else(|| "live source trade identity is missing".to_owned())?;
+    if continuation.facts.source_trade_id.0 != source_trade_id
+        || continuation.facts.wallet.to_string() != projection.leader_wallet
+        || continuation.facts.market_id.to_string() != projection.market_id
+        || i64::from(continuation.facts.outcome_id.0) != projection.outcome_id
+        || continuation.facts.side != Side::Buy
+        || projection.side != "buy"
+    {
+        return Err("decision continuation differs from dispatch identity".to_owned());
+    }
+    verify_live_decision_hash(continuation, account_id, identity)
+        .map_err(|error| error.to_string())?;
+    let policy = continuation
+        .facts
+        .paper_freshness_policy
+        .filter(|policy| policy.valid())
+        .ok_or_else(|| "frozen copy freshness policy is missing or invalid".to_owned())?;
+    let source_time = continuation
+        .verified_source_time(lookup)
+        .map_err(|error| format!("verified source clock is unavailable: {error}"))?;
+    if !policy.activity_ws_enabled {
+        return Ok(None);
+    }
+    let seconds = i64::try_from(policy.copy_latency_budget_secs)
+        .map_err(|_| "frozen copy freshness budget overflows".to_owned())?;
+    source_time
+        .0
+        .checked_add(time::Duration::seconds(seconds))
+        .map(Some)
+        .ok_or_else(|| "verified copy deadline overflows".to_owned())
+}
+
 fn source_time_from_millis(received_unix_ms: i64) -> Result<OffsetDateTime, EconomicReplayError> {
     OffsetDateTime::from_unix_timestamp_nanos(
         i128::from(received_unix_ms)
@@ -3545,7 +3655,20 @@ fn validate_live_observation_trade(
         ))
     })?;
 
-    let frozen = &binding.continuation.facts;
+    verify_live_decision_hash(
+        binding.continuation,
+        binding.account_id.as_str(),
+        binding.identity,
+    )?;
+    Ok(())
+}
+
+fn verify_live_decision_hash(
+    continuation: &DecisionContinuationV3,
+    account_id: &str,
+    identity: &LiveOrderIdentity,
+) -> Result<(), EconomicReplayError> {
+    let frozen = &continuation.facts;
     let observed_at = OffsetDateTime::from_unix_timestamp(frozen.source_epoch)
         .map_err(|_| economic_replay_error("frozen decision source clock is invalid"))?;
     let signal = LeaderSignal {
@@ -3566,13 +3689,13 @@ fn validate_live_observation_trade(
     let decision_hash = hash_json(&(
         "prediction-edge/live-decision/v1",
         &signal,
-        binding.account_id.as_str(),
-        &binding.identity.config_hash,
-        &binding.identity.quote_id,
-        &binding.identity.evidence_hashes,
+        account_id,
+        &identity.config_hash,
+        &identity.quote_id,
+        &identity.evidence_hashes,
     ))
     .map_err(|error| economic_replay_error(format!("live decision hash replay failed: {error}")))?;
-    if decision_hash != binding.identity.decision_hash {
+    if decision_hash != identity.decision_hash {
         return Err(economic_replay_error(
             "economic observation frozen decision facts differ from the recorded live signal",
         ));
@@ -3730,7 +3853,11 @@ where
         ));
     }
     if live_binding.is_some()
-        && economic.version != pe_execution_core::economic::ECONOMIC_PREPARED_VERSION
+        && !matches!(
+            economic.version,
+            pe_execution_core::economic::ECONOMIC_PREPARED_VERSION
+                | pe_execution_core::economic::PAPER_ECONOMIC_PREPARED_VERSION
+        )
     {
         return Err(economic_replay_error(
             "live economic wire version is invalid",
@@ -3875,7 +4002,11 @@ where
         .first()
         .map(|ask| ask.price)
         .ok_or_else(|| economic_replay_error("economic book has no eligible asks"))?;
-    let impact_ceiling = recorded_impact_ceiling(best_ask, economic.balance.price_impact_cap_bps)?;
+    let impact_ceiling = pe_execution_core::economic::current_book_impact_ceiling(
+        best_ask,
+        economic.balance.price_impact_cap_bps,
+    )
+    .map_err(|error| economic_replay_error(error.to_string()))?;
     let allocate = |price: Price| {
         let SizingModeAudit::Kelly {
             fraction,
@@ -3961,31 +4092,6 @@ where
         None,
         lookup,
     )
-}
-
-fn recorded_impact_ceiling(best_ask: Price, cap_bps: i32) -> Result<Price, EconomicReplayError> {
-    let cap_bps = u32::try_from(cap_bps)
-        .ok()
-        .filter(|cap| (1..=10_000).contains(cap))
-        .ok_or_else(|| {
-            economic_replay_error("EconomicPrepared price-impact cap is outside 1..=10000")
-        })?;
-    let numerator = 10_000u32
-        .checked_add(cap_bps)
-        .ok_or_else(|| economic_replay_error("EconomicPrepared price-impact cap overflow"))?;
-    let ceiling = best_ask
-        .0
-        .checked_mul(Decimal::from(numerator))
-        .and_then(|value| value.checked_div(Decimal::from(10_000u32)))
-        .map(|value| value.min(Decimal::ONE))
-        .ok_or_else(|| {
-            economic_replay_error("EconomicPrepared price-impact arithmetic overflow")
-        })?;
-    Price::new(ceiling).map_err(|error| {
-        economic_replay_error(format!(
-            "EconomicPrepared price-impact ceiling is invalid: {error}"
-        ))
-    })
 }
 
 /// Rebuild the current-position mids from only the receipt inventory recorded on the admission.
@@ -4520,23 +4626,124 @@ fn verify_replayed_live_risks(
     paper_frames: &[ScannedPaperFrame],
     observation_pages: &LiveObservationPageIndex,
 ) -> Result<(), ProjectionReducerError> {
+    let mut wire_two_admissions = HashMap::new();
+    let mut expired_dispatches = HashSet::new();
     for (event_index, event) in events.iter().enumerate() {
-        let LiveJournalPayload::AdmissionEvaluated(admission) = &event.payload else {
-            continue;
-        };
-        verify_replayed_live_risk_with_index(
-            account_id,
-            &events[..event_index],
-            admission,
-            LiveReplayEvidence {
-                source_envelopes,
-                source_receipts,
-                paper_frames,
-                observation_pages,
-            },
-        )?;
+        if let LiveJournalPayload::AdmissionEvaluated(admission) = &event.payload {
+            verify_replayed_live_risk_with_index(
+                account_id,
+                &events[..event_index],
+                admission,
+                LiveReplayEvidence {
+                    source_envelopes,
+                    source_receipts,
+                    paper_frames,
+                    observation_pages,
+                },
+            )?;
+            if admission.economic.version
+                == pe_execution_core::economic::PAPER_ECONOMIC_PREPARED_VERSION
+            {
+                let projection = admission
+                    .identity
+                    .fill_projection
+                    .as_deref()
+                    .ok_or(ProjectionReducerError::InvalidRiskEvidence)?;
+                let source_trade_id = SourceTradeId(
+                    projection
+                        .source_trade_id
+                        .clone()
+                        .ok_or(ProjectionReducerError::InvalidRiskEvidence)?,
+                );
+                let (continuation, _) = observation_pages
+                    .get(&source_trade_id)
+                    .ok_or(ProjectionReducerError::InvalidRiskEvidence)?;
+                let deadline = verified_copy_deadline_for_continuation(
+                    continuation,
+                    account_id.as_str(),
+                    &admission.identity,
+                    &mut |receipt| {
+                        let envelope = match source_receipts {
+                            Some(index) => index
+                                .source_envelope(receipt)
+                                .map_err(|error| error.to_string())?,
+                            None => source_envelopes
+                                .iter()
+                                .find(|envelope| {
+                                    envelope.seq == receipt.sequence
+                                        && envelope.this_hash == receipt.this_hash
+                                })
+                                .cloned()
+                                .ok_or_else(|| "source receipt is absent".to_owned())?,
+                        };
+                        Ok::<_, String>(CompleteActivityPage::from(envelope))
+                    },
+                )
+                .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
+                wire_two_admissions.insert(
+                    admission.identity.dispatch_id.clone(),
+                    (admission.identity.clone(), deadline),
+                );
+            }
+        }
+        verify_copy_timeline_event(event, &wire_two_admissions, &mut expired_dispatches)?;
     }
     Ok(())
+}
+
+fn verify_copy_timeline_event(
+    event: &LiveJournalEvent,
+    wire_two_admissions: &HashMap<String, (LiveOrderIdentity, Option<OffsetDateTime>)>,
+    expired_dispatches: &mut HashSet<String>,
+) -> Result<(), ProjectionReducerError> {
+    match &event.payload {
+        LiveJournalPayload::OrderPreparationFailed(failed)
+            if failed.failure
+                == pe_execution_core::LiveOrderPreparationFailure::PrePostCopyExpired =>
+        {
+            let (identity, deadline) = wire_two_admissions
+                .get(&failed.identity.dispatch_id)
+                .ok_or(ProjectionReducerError::InvalidRiskEvidence)?;
+            if identity != &failed.identity
+                || !copy_expiry_after_deadline(event.timestamp, *deadline)
+                || !expired_dispatches.insert(failed.identity.dispatch_id.clone())
+            {
+                return Err(ProjectionReducerError::InvalidRiskEvidence);
+            }
+        }
+        LiveJournalPayload::OrderPosted(posted) => {
+            if expired_dispatches.contains(&posted.identity.dispatch_id) {
+                return Err(ProjectionReducerError::IdentityConflict);
+            }
+            if let Some((identity, deadline)) =
+                wire_two_admissions.get(&posted.identity.dispatch_id)
+            {
+                let observed_at = match &posted.evidence {
+                    RawHttpAttempt::Response(response) => response.observed_at,
+                    RawHttpAttempt::TransportFailure(failure) => failure.observed_at,
+                };
+                if identity != &posted.identity
+                    || !copy_post_at_or_before_deadline(event.timestamp, observed_at, *deadline)
+                {
+                    return Err(ProjectionReducerError::InvalidRiskEvidence);
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn copy_expiry_after_deadline(failed_at: OffsetDateTime, deadline: Option<OffsetDateTime>) -> bool {
+    deadline.is_some_and(|deadline| failed_at > deadline)
+}
+
+fn copy_post_at_or_before_deadline(
+    event_at: OffsetDateTime,
+    observed_at: OffsetDateTime,
+    deadline: Option<OffsetDateTime>,
+) -> bool {
+    event_at == observed_at && deadline.is_none_or(|deadline| observed_at <= deadline)
 }
 
 fn build_order_identity(
@@ -7586,7 +7793,6 @@ fn journal_recovery_account(
         execution_order: i64::MAX,
         requested_live_mode: "off".to_owned(),
         effective_live_mode: "off".to_owned(),
-        live_price_impact_cap_bps: 0,
         custody_wallet_address: Some(prepared.prepared.funder.clone()),
         custody_wallet_kind: Some("deposit_wallet".to_owned()),
         credential_binding: Some((
@@ -8866,6 +9072,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn live_wire_two_keeps_strict_market_delay_with_a_live_binding() {
+        let (mut prepared, account_id, mut sources, continuation) = observation_replay_fixture();
+        prepared.economic.version = pe_execution_core::economic::PAPER_ECONOMIC_PREPARED_VERSION;
+        prepared.economic.balance.chase_ceiling = Price::ONE;
+        replay_observation_fixture(&prepared, &account_id, &sources, &continuation).unwrap();
+        for (source_id, field) in [
+            (GAMMA_MARKETS_SOURCE_ID, "secondsDelay"),
+            (CLOB_LONG_MARKET_SOURCE_ID, "seconds_delay"),
+        ] {
+            let source = sources
+                .iter_mut()
+                .find(|(_, source)| source.source_id == source_id)
+                .unwrap();
+            let mut payload: serde_json::Value = serde_json::from_slice(&source.1.payload).unwrap();
+            if source_id == GAMMA_MARKETS_SOURCE_ID {
+                payload[0][field] = serde_json::json!(2);
+            } else {
+                payload[field] = serde_json::json!(2);
+            }
+            source.1.payload = serde_json::to_vec(&payload).unwrap();
+        }
+        assert!(
+            replay_observation_fixture(&prepared, &account_id, &sources, &continuation).is_err()
+        );
+    }
+
     /// PASS: the source-backed owner used by live and qualification replay accepts receipt clocks
     /// within one UTC second and derives that second for both market and settlement evidence.
     #[test]
@@ -8936,6 +9169,197 @@ mod tests {
         DecisionContinuationV3,
     ) {
         observation_replay_fixture_for(true)
+    }
+
+    #[test]
+    fn live_copy_deadline_requires_verified_continuation_and_frozen_policy() {
+        let (prepared, account_id, sources, mut continuation) = observation_replay_fixture();
+        let identity = &prepared.identity;
+        let lookup = |receipt| {
+            let source = sources
+                .iter()
+                .find(|(known, _)| *known == receipt)
+                .map(|(_, source)| source)
+                .ok_or("missing source receipt")?;
+            let received_at = source_time_from_millis(source.received_unix_ms)
+                .map_err(|_| "invalid source clock")?;
+            Ok::<_, &'static str>(CompleteActivityPage {
+                payload: source.payload.clone(),
+                observed_at: SourceTimestamp(received_at),
+                received_at: ReceivedAt(received_at),
+                source_id: source.source_id.clone(),
+                schema_version: source.schema_version,
+                parser_version: source.parser_version,
+                content_type: source.content_type.clone(),
+            })
+        };
+        assert!(
+            verified_copy_deadline_for_continuation(
+                &continuation,
+                account_id.as_str(),
+                identity,
+                &mut lookup.clone(),
+            )
+            .is_err()
+        );
+        continuation.facts.paper_freshness_policy =
+            Some(crate::bucket_commit::PaperFreshnessPolicy {
+                activity_ws_enabled: true,
+                copy_latency_budget_secs: 120,
+            });
+        let deadline = verified_copy_deadline_for_continuation(
+            &continuation,
+            account_id.as_str(),
+            identity,
+            &mut lookup.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            deadline,
+            Some(OffsetDateTime::from_unix_timestamp(138).unwrap())
+        );
+        let mut wrong_identity = identity.clone();
+        wrong_identity.decision_hash = "different-decision".to_owned();
+        assert!(
+            verified_copy_deadline_for_continuation(
+                &continuation,
+                account_id.as_str(),
+                &wrong_identity,
+                &mut lookup.clone(),
+            )
+            .is_err()
+        );
+        let mut wrong_revision = continuation.clone();
+        wrong_revision.facts.semantic_revision = "different-revision".to_owned();
+        assert!(
+            verified_copy_deadline_for_continuation(
+                &wrong_revision,
+                account_id.as_str(),
+                identity,
+                &mut lookup.clone(),
+            )
+            .is_err()
+        );
+        let mut missing = |receipt| {
+            if receipt
+                == prepared
+                    .economic
+                    .observation
+                    .as_ref()
+                    .unwrap()
+                    .complete_bound_receipt
+            {
+                return Err("missing source receipt");
+            }
+            lookup(receipt)
+        };
+        assert!(
+            verified_copy_deadline_for_continuation(
+                &continuation,
+                account_id.as_str(),
+                identity,
+                &mut missing,
+            )
+            .is_err()
+        );
+        continuation.facts.paper_freshness_policy =
+            Some(crate::bucket_commit::PaperFreshnessPolicy {
+                activity_ws_enabled: false,
+                copy_latency_budget_secs: 120,
+            });
+        assert_eq!(
+            verified_copy_deadline_for_continuation(
+                &continuation,
+                account_id.as_str(),
+                identity,
+                &mut lookup.clone(),
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn live_wire_two_replay_time_checks_use_strict_expiry_and_attempt_clock() {
+        let deadline = OffsetDateTime::from_unix_timestamp(138).unwrap();
+        let later = deadline + time::Duration::nanoseconds(1);
+        let identity = finality_prepared().identity.clone();
+        let account_id = AccountId::new("account").unwrap();
+        let post = |event_at, observed_at| LiveJournalEvent {
+            account_id: account_id.clone(),
+            seq: 3,
+            timestamp: event_at,
+            payload: LiveJournalPayload::OrderPosted(Box::new(
+                pe_execution_core::LiveOrderPostAudit {
+                    identity: identity.clone(),
+                    order_hash: "order-hash".to_owned(),
+                    evidence: RawHttpAttempt::TransportFailure(
+                        pe_core_types::RawTransportFailure {
+                            source_id: "fixture".to_owned(),
+                            endpoint_kind: "order-post".to_owned(),
+                            method: "POST".to_owned(),
+                            path: "/order".to_owned(),
+                            ordered_query: Vec::new(),
+                            attempt_ordinal: 1,
+                            observed_at,
+                            received_at: observed_at,
+                            error_class: pe_core_types::TransportErrorClass::Other,
+                            schema_version: 1,
+                            parser_version: 1,
+                            adapter_version: "fixture".to_owned(),
+                        },
+                    ),
+                    evidence_hash: "fixture".to_owned(),
+                },
+            )),
+        };
+        let failure = |event_at| LiveJournalEvent {
+            account_id: account_id.clone(),
+            seq: 3,
+            timestamp: event_at,
+            payload: LiveJournalPayload::OrderPreparationFailed(Box::new(
+                pe_execution_core::LiveOrderPreparationFailedAudit {
+                    identity: identity.clone(),
+                    failure: pe_execution_core::LiveOrderPreparationFailure::PrePostCopyExpired,
+                    control: None,
+                },
+            )),
+        };
+        let historical_wire_one = HashMap::new();
+        let wire_two = HashMap::from([(
+            identity.dispatch_id.clone(),
+            (identity.clone(), Some(deadline)),
+        )]);
+        assert!(
+            verify_copy_timeline_event(
+                &post(later, later),
+                &historical_wire_one,
+                &mut HashSet::new()
+            )
+            .is_ok()
+        );
+        assert!(
+            verify_copy_timeline_event(&post(deadline, deadline), &wire_two, &mut HashSet::new())
+                .is_ok()
+        );
+        assert!(
+            verify_copy_timeline_event(&post(later, later), &wire_two, &mut HashSet::new())
+                .is_err()
+        );
+        assert!(
+            verify_copy_timeline_event(&post(later, deadline), &wire_two, &mut HashSet::new())
+                .is_err()
+        );
+        assert!(
+            verify_copy_timeline_event(&failure(deadline), &wire_two, &mut HashSet::new()).is_err()
+        );
+        assert!(
+            verify_copy_timeline_event(&failure(later), &historical_wire_one, &mut HashSet::new())
+                .is_err()
+        );
+        let mut expired = HashSet::new();
+        verify_copy_timeline_event(&failure(later), &wire_two, &mut expired).unwrap();
+        assert!(verify_copy_timeline_event(&post(later, later), &wire_two, &mut expired).is_err());
     }
 
     fn observation_replay_fixture_for(
@@ -11652,11 +12076,12 @@ mod tests {
         fn post_once<'a>(
             &'a self,
             _submission: Self::Submission,
+            _wall_clock_deadline: Option<OffsetDateTime>,
         ) -> Pin<
             Box<
                 dyn Future<
                         Output = Result<
-                            pe_core_types::RawHttpResponse,
+                            pe_core_types::RawPostAttempt,
                             pe_core_types::RawTransportFailure,
                         >,
                     > + Send
@@ -11779,11 +12204,12 @@ mod tests {
         fn post_once<'a>(
             &'a self,
             _submission: Self::Submission,
+            _wall_clock_deadline: Option<OffsetDateTime>,
         ) -> Pin<
             Box<
                 dyn Future<
                         Output = Result<
-                            pe_core_types::RawHttpResponse,
+                            pe_core_types::RawPostAttempt,
                             pe_core_types::RawTransportFailure,
                         >,
                     > + Send
@@ -11795,23 +12221,25 @@ mod tests {
                     post_attempts.fetch_add(1, Ordering::SeqCst);
                 }
                 self.client.post(&self.order_url).send().await.unwrap();
-                Ok(pe_core_types::RawHttpResponse {
-                    source_id: "recovery-loopback".to_owned(),
-                    endpoint_kind: "order-post".to_owned(),
-                    method: "POST".to_owned(),
-                    path: "/order".to_owned(),
-                    ordered_query: Vec::new(),
-                    status: 400,
-                    headers: Vec::new(),
-                    body: Vec::new(),
-                    attempt_ordinal: 1,
-                    source_at: None,
-                    observed_at: self.observed_at,
-                    received_at: self.observed_at,
-                    schema_version: 1,
-                    parser_version: 1,
-                    adapter_version: "recovery-loopback-v1".to_owned(),
-                })
+                Ok(pe_core_types::RawPostAttempt::Attempted(
+                    pe_core_types::RawHttpResponse {
+                        source_id: "recovery-loopback".to_owned(),
+                        endpoint_kind: "order-post".to_owned(),
+                        method: "POST".to_owned(),
+                        path: "/order".to_owned(),
+                        ordered_query: Vec::new(),
+                        status: 400,
+                        headers: Vec::new(),
+                        body: Vec::new(),
+                        attempt_ordinal: 1,
+                        source_at: None,
+                        observed_at: self.observed_at,
+                        received_at: self.observed_at,
+                        schema_version: 1,
+                        parser_version: 1,
+                        adapter_version: "recovery-loopback-v1".to_owned(),
+                    },
+                ))
             })
         }
 
@@ -13408,6 +13836,35 @@ mod tests {
         let derived = derive_projection_rows_for_state(&state, &account_id, &events).unwrap();
         assert_eq!(derived.positions.len(), 1);
         assert_eq!(derived.positions[0].market_id, condition_id);
+    }
+
+    #[tokio::test]
+    async fn approved_recovery_without_frozen_copy_policy_keeps_target_pending() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let mut snapshot = armed_snapshot("acct");
+        snapshot.fetched_at_unix = Some(now.unix_timestamp());
+        let mut state = fanout_state(&dir, db.clone(), snapshot, "http://127.0.0.1:9", None);
+        let (pending, _) = stage_recoverable_approved(&mut state, now, None).await;
+        assert!(
+            verified_live_copy_deadline(
+                &state,
+                pending.account_id.as_str(),
+                &pending.admission.identity,
+            )
+            .is_err()
+        );
+
+        run_recovery_pass(&mut state, || now, true).await.unwrap();
+
+        let target = db.dispatch_targets("dispatch-finality").unwrap().remove(0);
+        assert_eq!(target.state, "pending");
+        let events = replay_live_account(&state, &pending.account_id).unwrap();
+        assert!(!events.iter().any(|event| matches!(
+            event.payload,
+            LiveJournalPayload::OrderPrepared(_) | LiveJournalPayload::OrderPosted(_)
+        )));
     }
 
     /// PASS: a post-Baseline Approved admission with legacy `None` observation fails strict
@@ -16790,7 +17247,6 @@ mod tests {
             execution_order: 0,
             requested_live_mode: "live_tiny".to_owned(),
             effective_live_mode: "live_tiny".to_owned(),
-            live_price_impact_cap_bps: 100,
             custody_wallet_address: None,
             custody_wallet_kind: None,
         }
@@ -17067,6 +17523,7 @@ mod tests {
                         &target,
                         pending,
                         execution,
+                        None,
                         &venue_context,
                         || now,
                     )
@@ -17152,6 +17609,7 @@ mod tests {
                         key_id: "key".to_owned(),
                     },
                 },
+                None,
                 &venue_context,
                 || now,
             )
@@ -17284,6 +17742,7 @@ mod tests {
                         key_id: "key".to_owned(),
                     },
                 },
+                None,
                 &venue_context,
                 &clock,
             )
@@ -17379,6 +17838,7 @@ mod tests {
                         key_id: "key".to_owned(),
                     },
                 },
+                None,
                 &venue_context,
                 &clock,
             )
@@ -17457,6 +17917,7 @@ mod tests {
                         key_id: "key".to_owned(),
                     },
                 },
+                None,
                 &venue_context,
                 || recovery_at,
             )
@@ -17537,6 +17998,7 @@ mod tests {
                         key_id: "key".to_owned(),
                     },
                 },
+                None,
                 &venue_context,
                 || now,
             )
@@ -17621,6 +18083,7 @@ mod tests {
                             key_id: "key".to_owned(),
                         },
                     },
+                    None,
                     &venue_context,
                     || now,
                 )

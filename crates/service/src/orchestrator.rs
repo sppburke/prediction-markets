@@ -1250,7 +1250,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             applied_configuration_hash,
         };
         if semantic2 {
-            pe_execution_core::EconomicPrepared::compose_paper(inputs)
+            pe_execution_core::EconomicPrepared::compose_wire_two(inputs)
         } else {
             pe_execution_core::EconomicPrepared::compose(inputs)
         }
@@ -2301,13 +2301,20 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 checked_at_unix_ms: Some(checked_at_unix_ms),
             });
         }
-        // Inclusive band ceiling: best × (1 + cap/10_000), clamped into the Price domain —
-        // the same edge semantic as the analytics `absorbable_usd_100bps` column.
-        let ceiling_raw = (best.0
-            * (Decimal::from(10_000u32 + u32::try_from(cap_bps).unwrap_or(10_000))
-                / Decimal::from(10_000u32)))
-        .min(Decimal::ONE);
-        let ceiling = Price::new(ceiling_raw).map_err(|_| GatePlanFailure {
+        let ceiling = (if semantic2 {
+            pe_execution_core::economic::current_book_impact_ceiling(
+                best,
+                self.price_impact_cap_bps,
+            )
+        } else {
+            // Preserve the historical semantic-1 arithmetic exactly.
+            let ceiling_raw = (best.0
+                * (Decimal::from(10_000u32 + u32::try_from(cap_bps).unwrap_or(10_000))
+                    / Decimal::from(10_000u32)))
+            .min(Decimal::ONE);
+            Price::new(ceiling_raw).map_err(pe_execution_core::EconomicError::from)
+        })
+        .map_err(|_| GatePlanFailure {
             reason: "price-impact band ceiling not constructible",
             book: Box::new(book_failure(
                 Some(&token_id),

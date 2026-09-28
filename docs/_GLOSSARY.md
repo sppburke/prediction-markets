@@ -409,7 +409,6 @@ Campaign financial limits and eligibility are canonical in
 | `site_service_ready_timeout_secs` | 2 | Server-side admin-page read of the configured loopback `PE_SERVICE_READY_URL` readiness endpoint. A timeout reports the service as unreachable; Request mode remains visible. |
 | `live_accounts_stale_after_secs` | 120 | Accounts-snapshot freshness bound (#514): 4 × `config_poll_interval_secs`, the polled-source block threshold (see Source freshness defaults). While the last successful accounts poll is older than this (or never happened, or is future-dated), the service stages no new dispatch aggregates, pauses `pending` targets, and writes no effective-mode transitions; in-flight order recovery and redemption reconciliation are deliberately not gated. Module const `live_accounts::LIVE_ACCOUNTS_STALE_AFTER_SECS`. |
 | `account_id` | `[a-z0-9_-]{1,32}` | Immutable lowercase account slug grammar, enforced by `core-types::AccountId` and `accounts.account_id`. |
-| `live_price_impact_cap_bps_default` | 100 | Per-account default in `accounts.live_price_impact_cap_bps`; the database accepts `1..=10_000`. This is distinct from the shared paper `price_impact_cap_bps_default`. |
 | `dispatch_seed_retention_days` | 30 | Retain terminal dispatch aggregates for this many days after finalization, then prune seed and target rows together. |
 | `live_redemption_surface_after_attempts` | 3 | Compiled threshold after which an unresolved automatic redemption is surfaced prominently; it is not an operator knob. |
 
@@ -490,11 +489,12 @@ strict budget comparison.
 Pre-Start continuation 2 retains its field-free semantic-0 evidence bytes and legacy hash.
 Start-bound continuations 2–5 retain semantic 1 and their recorded price and admission policy.
 Continuation 6 binds semantic 2 in checkpoint and terminal evidence; a pre-economic no-fill
-contains no economic record. The paper caller selects economic wire 2 and hashes that exact wire;
-the shared composer and ordinary live retain economic wire 1. A later fresh-generation seal can
+contains no economic record. Paper semantic 2 and ordinary live select economic wire 2 and hash
+that exact wire; historical live records retain economic wire 1. A later fresh-generation seal can
 select continuation-6 receipt proof under the same source-prefix rules as continuation 5.
-The isolated live-wrapper qualification check compares its wire-1 economic value with the same
-recorded paper fields expressed as wire 1; the paper wire-2 core hash remains separately bound.
+The isolated live-wrapper qualification check compares historical wire-1 economics with the same
+recorded paper fields expressed as wire 1, and compares wire-2 economics directly with paper wire 2.
+The paper wire-2 core hash remains separately bound in both cases.
 
 **History-only bracket disposition.** `history_only_bracket` (`HISTORY_ONLY_BRACKET`) records an
 admitted first entry whose copying a causal bracket suppresses. It is an applied activity
@@ -554,7 +554,7 @@ the exact hot or removal sets stops `scripts/migrate_service_config_544.sql` bef
 
 | Key | Default | Meaning |
 |---|---:|---|
-| `max_fill_price` | `0.85` | Hot decimal value. The signed ladder's worst accepted tick must be strictly below this ceiling. Paper semantic 2 uses the best-ask price-impact ceiling without a leader-price ceiling; ordinary live retains its leader-price ceiling. `0` disables this band edge, not the mandatory book gate. |
+| `max_fill_price` | `0.85` | Hot decimal value. The signed ladder's worst accepted tick must be strictly below this ceiling. Paper semantic 2 and ordinary live use the applied best-ask price-impact ceiling without a leader-price ceiling. `0` disables this band edge, not the mandatory book gate. |
 | `min_fill_price` | `0.15` | Hot decimal value, added at the 2026-07-03 run28 cutover. Skip a BUY copy whose resolved fill basis is `<` this so selection and deployment share the entry band. The boundary itself fills (strict `<` skip). `0` disables this band edge, not the mandatory book gate. |
 
 Paper semantic 2 admits otherwise valid markets with positive or absent matching delay. Ordinary

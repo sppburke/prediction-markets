@@ -160,11 +160,37 @@ pub enum EconomicError {
     InvalidRiskDecision,
     #[error("the book source receipt is unbound")]
     MissingBookReceipt,
+    #[error("economic wire 2 requires a neutral current-book chase ceiling")]
+    InvalidCurrentBookChase,
+    #[error("current-book price-impact cap is invalid")]
+    InvalidCurrentBookImpact,
+}
+
+/// Inclusive best-ask impact ceiling shared by semantic-2 paper, ordinary live, and replay.
+pub fn current_book_impact_ceiling(best_ask: Price, cap_bps: i32) -> Result<Price, EconomicError> {
+    let cap = u32::try_from(cap_bps)
+        .ok()
+        .filter(|cap| (1..=10_000).contains(cap))
+        .ok_or(EconomicError::InvalidCurrentBookImpact)?;
+    let numerator = 10_000u32
+        .checked_add(cap)
+        .ok_or(EconomicError::InvalidCurrentBookImpact)?;
+    let multiplier = Decimal::from(numerator)
+        .checked_div(Decimal::from(10_000u32))
+        .ok_or(EconomicError::InvalidCurrentBookImpact)?;
+    let raw = best_ask
+        .0
+        .checked_mul(multiplier)
+        .ok_or(EconomicError::InvalidCurrentBookImpact)?;
+    Ok(Price::new(raw.min(Decimal::ONE))?)
 }
 
 impl EconomicPrepared {
-    /// Paper semantic 2 uses the shared composer and binds its distinct wire in the core hash.
-    pub fn compose_paper(inputs: EconomicInputs<'_>) -> Result<Self, EconomicError> {
+    /// Compose economic wire 2 for semantic-2 paper and ordinary live orders.
+    pub fn compose_wire_two(inputs: EconomicInputs<'_>) -> Result<Self, EconomicError> {
+        if inputs.chase_ceiling != Price::ONE {
+            return Err(EconomicError::InvalidCurrentBookChase);
+        }
         let mut prepared = Self::compose(inputs)?;
         prepared.version = PAPER_ECONOMIC_PREPARED_VERSION;
         Ok(prepared)
@@ -330,7 +356,7 @@ mod tests {
     use pe_source_polymarket_public::{
         LIVE_MARKET_PARSER_VERSION, LIVE_MARKET_SCHEMA_VERSION, LiveMarketEvidence,
     };
-    use pe_venue_polymarket::AskLevel;
+    use pe_venue_polymarket::{AskLevel, BuySizing, LadderError, plan_sized_buy};
     use rust_decimal_macros::dec;
 
     use super::*;
@@ -470,23 +496,104 @@ mod tests {
     }
 
     #[test]
-    fn paper_wire_two_binds_a_distinct_core_hash_without_changing_live_default() {
+    fn wire_two_is_shared_while_historical_live_wire_one_remains_distinct() {
         let admission = admission();
         let plan = plan();
         let live = EconomicPrepared::compose(inputs(&admission, &plan)).unwrap();
         let mut paper_inputs = inputs(&admission, &plan);
         paper_inputs.chase_ceiling = Price::ONE;
-        let paper = EconomicPrepared::compose_paper(paper_inputs).unwrap();
+        let paper = EconomicPrepared::compose_wire_two(paper_inputs).unwrap();
+        let mut live_inputs = inputs(&admission, &plan);
+        live_inputs.chase_ceiling = Price::ONE;
+        let ordinary_live = EconomicPrepared::compose_wire_two(live_inputs).unwrap();
         assert_eq!(live.version, ECONOMIC_PREPARED_VERSION);
         assert_eq!(paper.version, PAPER_ECONOMIC_PREPARED_VERSION);
         assert_eq!(paper.balance.chase_ceiling, Price::ONE);
         assert_eq!(live.sizing, paper.sizing);
         assert_eq!(live.fee, paper.fee);
         assert_ne!(live.core_hash().unwrap(), paper.core_hash().unwrap());
+        assert_eq!(ordinary_live, paper);
+        assert_eq!(
+            ordinary_live.core_hash().unwrap(),
+            paper.core_hash().unwrap()
+        );
+        assert!(matches!(
+            EconomicPrepared::compose_wire_two(inputs(&admission, &plan)),
+            Err(EconomicError::InvalidCurrentBookChase)
+        ));
         assert_eq!(
             live,
             EconomicPrepared::compose(inputs(&admission, &plan)).unwrap()
         );
+    }
+
+    #[test]
+    fn fixed_book_paper_live_wire_two_matches_limit_fee_and_size() {
+        let mut admission = admission();
+        admission.market.minimum_tick_size = Price::new(dec!(0.001)).unwrap();
+        let asks = [
+            AskLevel {
+                price: Price::new(dec!(0.400)).unwrap(),
+                shares: ShareAmount::from_whole(2).unwrap(),
+            },
+            AskLevel {
+                price: Price::new(dec!(0.404)).unwrap(),
+                shares: ShareAmount::from_whole(10).unwrap(),
+            },
+            AskLevel {
+                price: Price::new(dec!(0.405)).unwrap(),
+                shares: ShareAmount::from_whole(10).unwrap(),
+            },
+        ];
+        let impact = current_book_impact_ceiling(asks[0].price, 100).unwrap();
+        assert_eq!(impact.0, dec!(0.404));
+        let budget = CollateralAmount::from_decimal_exact(dec!(2)).unwrap();
+        let plan = |minimum_price, maximum_price, impact_ceiling| {
+            plan_sized_buy(
+                &asks,
+                admission.fee_schedule,
+                BuySizing::Dollar { budget },
+                &[budget],
+                admission.market.minimum_order_size,
+                admission.market.minimum_tick_size,
+                minimum_price,
+                maximum_price,
+                Price::ONE,
+                impact_ceiling,
+            )
+        };
+        let floor = Price::new(dec!(0.15)).unwrap();
+        let band_ceiling = Price::new(dec!(0.85)).unwrap();
+        let paper_plan = plan(floor, band_ceiling, impact).unwrap();
+        let live_plan = plan(floor, band_ceiling, impact).unwrap();
+        assert_eq!(paper_plan.ladder, live_plan.ladder);
+        assert_eq!(paper_plan.ladder.limit_price.0, dec!(0.404));
+        assert_eq!(paper_plan.ladder.used_asks.len(), 2);
+        let compose = |plan: &pe_venue_polymarket::SizedBuyPlan| {
+            let mut fields = inputs(&admission, &plan.ladder);
+            fields.budget = plan.budget;
+            fields.chase_ceiling = Price::ONE;
+            EconomicPrepared::compose_wire_two(fields).unwrap()
+        };
+        let paper = compose(&paper_plan);
+        let live = compose(&live_plan);
+        assert_eq!(paper, live);
+        assert_eq!(paper.core_hash().unwrap(), live.core_hash().unwrap());
+        assert!(paper.fee.expected_fee > CollateralAmount::ZERO);
+        assert!(paper.sizing.minimum_shares > ShareAmount::ZERO);
+        assert!(current_book_impact_ceiling(asks[0].price, 0).is_err());
+        assert!(matches!(
+            plan(Price::new(dec!(0.401)).unwrap(), band_ceiling, impact),
+            Err(LadderError::BelowBandAsk)
+        ));
+        assert!(matches!(
+            plan(floor, Price::new(dec!(0.404)).unwrap(), impact),
+            Err(LadderError::InsufficientDepth)
+        ));
+        assert!(matches!(
+            plan(floor, band_ceiling, Price::new(dec!(0.403)).unwrap()),
+            Err(LadderError::InsufficientDepth)
+        ));
     }
 
     #[test]

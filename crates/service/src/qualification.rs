@@ -1567,8 +1567,10 @@ fn verify_live_wrappers(
                     ))
                 })?;
                 let mut expected_live_economic = paper.economic.clone();
-                if expected_live_economic.version
-                    == pe_execution_core::economic::PAPER_ECONOMIC_PREPARED_VERSION
+                if wrapper.economic.version
+                    == pe_execution_core::economic::ECONOMIC_PREPARED_VERSION
+                    && expected_live_economic.version
+                        == pe_execution_core::economic::PAPER_ECONOMIC_PREPARED_VERSION
                 {
                     expected_live_economic.version =
                         pe_execution_core::economic::ECONOMIC_PREPARED_VERSION;
@@ -1581,8 +1583,10 @@ fn verify_live_wrappers(
                     })?;
                 if wrapper.economic != expected_live_economic
                     || economic_core_hash != expected_live_core_hash
-                    || (paper.economic.version
-                        == pe_execution_core::economic::PAPER_ECONOMIC_PREPARED_VERSION
+                    || (wrapper.economic.version
+                        == pe_execution_core::economic::ECONOMIC_PREPARED_VERSION
+                        && paper.economic.version
+                            == pe_execution_core::economic::PAPER_ECONOMIC_PREPARED_VERSION
                         && economic_core_hash == paper.economic_core_hash)
                 {
                     return insufficient(format!(
@@ -8576,6 +8580,14 @@ mod tests {
     fn verify_paper_wrapper_case(
         case: PaperWrapperCase,
     ) -> Result<VerifiedLiveEvidence, QualificationError> {
+        verify_paper_wrapper_case_with_wires(case, false, false)
+    }
+
+    fn verify_paper_wrapper_case_with_wires(
+        case: PaperWrapperCase,
+        paper_wire_two: bool,
+        live_wire_two: bool,
+    ) -> Result<VerifiedLiveEvidence, QualificationError> {
         let temp = tempfile::tempdir().unwrap();
         let live_path = temp.path().join("live.log");
         let source_path = temp.path().join("source.log");
@@ -8638,7 +8650,7 @@ mod tests {
             request_descriptor_hashes: Vec::new(),
             evidence_hashes: Vec::new(),
         };
-        let wrapper = LiveOrderPreparedAudit {
+        let mut wrapper = LiveOrderPreparedAudit {
             identity: identity.clone(),
             frozen_binding: binding.clone(),
             economic: economic.clone(),
@@ -8689,6 +8701,17 @@ mod tests {
             account_read_failure_evidence_hashes: Vec::new(),
             verdict: LiveAdmissionVerdict::Approved,
         };
+        if paper_wire_two {
+            economic.version = pe_execution_core::economic::PAPER_ECONOMIC_PREPARED_VERSION;
+            economic.balance.chase_ceiling = Price::ONE;
+            wrapper.economic.balance.chase_ceiling = Price::ONE;
+            admission.economic.balance.chase_ceiling = Price::ONE;
+        }
+        if live_wire_two {
+            wrapper.economic.version = pe_execution_core::economic::PAPER_ECONOMIC_PREPARED_VERSION;
+            admission.economic.version =
+                pe_execution_core::economic::PAPER_ECONOMIC_PREPARED_VERSION;
+        }
         if matches!(case, PaperWrapperCase::RelabeledAdmission) {
             admission.identity.dispatch_id = "relabeled-dispatch".to_owned();
         }
@@ -8780,6 +8803,24 @@ mod tests {
         let retained_pre_start_baseline =
             verify_paper_wrapper_case(PaperWrapperCase::PreStartBaseline).unwrap();
         assert_eq!(retained_pre_start_baseline.wrapper_facts.len(), 1);
+    }
+
+    #[test]
+    fn qualification_compares_both_live_wires_against_paper_wire_two() {
+        let historical =
+            verify_paper_wrapper_case_with_wires(PaperWrapperCase::Valid, true, false).unwrap();
+        let current =
+            verify_paper_wrapper_case_with_wires(PaperWrapperCase::Valid, true, true).unwrap();
+        assert_eq!(historical.wrapper_facts.len(), 1);
+        assert_eq!(current.wrapper_facts.len(), 1);
+        assert_ne!(
+            historical.wrapper_facts[0].economic_core_hash,
+            current.wrapper_facts[0].economic_core_hash
+        );
+        assert_ne!(
+            current.wrapper_facts[0].paper_wrapper_hash,
+            current.wrapper_facts[0].live_wrapper_hash
+        );
     }
 
     /// PASS: a retained pre-Start Baseline is excluded while a later post-Start Baseline remains

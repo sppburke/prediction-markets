@@ -691,7 +691,6 @@ impl Harness {
                 execution_order: 0,
                 requested_live_mode: "live_tiny".to_owned(),
                 effective_live_mode: "live_tiny".to_owned(),
-                live_price_impact_cap_bps: 100,
                 custody_wallet_address: None,
                 custody_wallet_kind: None,
                 credential_binding: Some((7, "stored-key".to_owned())),
@@ -1640,10 +1639,14 @@ impl LiveOrderVenue for StagedLiveVenue {
         })
     }
 
-    fn post_once<'a>(&'a self, _: Self::Submission) -> pe_execution_core::LivePostFuture<'a> {
+    fn post_once<'a>(
+        &'a self,
+        _: Self::Submission,
+        _wall_clock_deadline: Option<OffsetDateTime>,
+    ) -> pe_execution_core::LivePostFuture<'a> {
         Box::pin(async move {
             assert!(!self.posts.swap(true, Ordering::SeqCst));
-            Ok(pe_core_types::RawHttpResponse {
+            Ok(pe_core_types::RawPostAttempt::Attempted(pe_core_types::RawHttpResponse {
                 source_id: "polymarket-clob-v2".to_owned(),
                 endpoint_kind: "order-post".to_owned(),
                 method: "POST".to_owned(),
@@ -1659,7 +1662,7 @@ impl LiveOrderVenue for StagedLiveVenue {
                 schema_version: 1,
                 parser_version: 1,
                 adapter_version: "fixture".to_owned(),
-            })
+            }))
         })
     }
 

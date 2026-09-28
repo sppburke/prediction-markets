@@ -64,7 +64,6 @@ pub struct AccountRow {
     pub execution_order: i64,
     pub requested_live_mode: String,
     pub effective_live_mode: String,
-    pub live_price_impact_cap_bps: i64,
     pub custody_wallet_address: Option<String>,
     pub custody_wallet_kind: Option<String>,
 }
@@ -87,7 +86,6 @@ pub struct AccountContext {
     pub execution_order: i64,
     pub requested_live_mode: String,
     pub effective_live_mode: String,
-    pub live_price_impact_cap_bps: i64,
     pub custody_wallet_address: Option<String>,
     pub custody_wallet_kind: Option<String>,
     /// Credential binding frozen into dispatch targets (Decision 10); `None` when no
@@ -178,7 +176,6 @@ impl LiveAccountsSnapshot {
                 execution_order: row.execution_order,
                 requested_live_mode: row.requested_live_mode,
                 effective_live_mode: row.effective_live_mode,
-                live_price_impact_cap_bps: row.live_price_impact_cap_bps,
                 custody_wallet_address: row.custody_wallet_address,
                 custody_wallet_kind: row.custody_wallet_kind,
                 credential_binding,
@@ -309,7 +306,7 @@ impl LiveAccounts {
 fn accounts_url(base_url: &str) -> String {
     format!(
         "{}/rest/v1/accounts?select=account_id,is_primary,enabled,execution_order,\
-         requested_live_mode,effective_live_mode,live_price_impact_cap_bps,\
+         requested_live_mode,effective_live_mode,\
          custody_wallet_address,custody_wallet_kind",
         base_url.trim_end_matches('/')
     )
@@ -596,7 +593,6 @@ mod tests {
             execution_order: order,
             requested_live_mode: mode.to_string(),
             effective_live_mode: mode.to_string(),
-            live_price_impact_cap_bps: 100,
             custody_wallet_address: None,
             custody_wallet_kind: None,
         }
@@ -656,7 +652,6 @@ mod tests {
             "live_sizing_mode": "dollar",
             "live_sizing_dollar_usd": 1,
             "live_sizing_contracts": null,
-            "live_price_impact_cap_bps": 100,
             "custody_wallet_address": null,
             "custody_wallet_kind": null
         }]"#;
@@ -811,12 +806,13 @@ mod tests {
     }
 
     #[test]
-    fn accounts_select_omits_the_sizing_columns() {
+    fn accounts_select_omits_sizing_and_removed_impact_cap() {
         let url = accounts_url("https://example.test/");
         for field in [
             "live_sizing_mode",
             "live_sizing_dollar_usd",
             "live_sizing_contracts",
+            "live_price_impact_cap_bps",
         ] {
             assert!(!url.contains(field), "{field} must not be selected");
         }
@@ -998,13 +994,13 @@ mod tests {
                             {
                                 "account_id": "one", "is_primary": true, "enabled": false,
                                 "execution_order": 0, "requested_live_mode": "live_tiny",
-                                "effective_live_mode": "off", "live_price_impact_cap_bps": 100,
+                                "effective_live_mode": "off",
                                 "custody_wallet_address": null, "custody_wallet_kind": null
                             },
                             {
                                 "account_id": "two", "is_primary": false, "enabled": false,
                                 "execution_order": 1, "requested_live_mode": "live_tiny",
-                                "effective_live_mode": "off", "live_price_impact_cap_bps": 100,
+                                "effective_live_mode": "off",
                                 "custody_wallet_address": null, "custody_wallet_kind": null
                             }
                         ]))
@@ -1083,7 +1079,7 @@ mod tests {
                         axum::Json(serde_json::json!([{
                             "account_id": "acct", "is_primary": true, "enabled": false,
                             "execution_order": 0, "requested_live_mode": requested,
-                            "effective_live_mode": effective, "live_price_impact_cap_bps": 100,
+                            "effective_live_mode": effective,
                             "custody_wallet_address": null, "custody_wallet_kind": null
                         }]))
                     }
