@@ -387,16 +387,12 @@ impl QualificationReport {
 pub async fn run_qualify(
     options: &QualifyOptions,
 ) -> Result<(QualificationVerdict, String), QualificationError> {
-    // A former current-generation Start cannot publish another report after the paper cutover.
-    if let Ok(frames) = scan_paper_log(&options.paper_log) {
-        let era = paper_era(frames);
-        if era.start.as_ref().is_some_and(|(_, start)| {
-            start.financial_semantic_version != FINANCIAL_SEMANTIC_VERSION
-        }) {
-            return insufficient(
-                "QualificationStarted predates the current paper financial semantic",
-            );
-        }
+    // A former current-generation Start cannot publish another report after the paper cutover,
+    // even when a later paper-log frame is unreadable.
+    if first_start_semantic(&options.paper_log)
+        .is_some_and(|semantic| semantic != FINANCIAL_SEMANTIC_VERSION)
+    {
+        return insufficient("QualificationStarted predates the current paper financial semantic");
     }
     let report = match verify_qualification(options).await {
         Ok(report) => report,
@@ -407,6 +403,24 @@ pub async fn run_qualify(
     let hash = blake3::hash(&bytes).to_hex().to_string();
     write_report(&options.output, &bytes)?;
     Ok((report.verdict, hash))
+}
+
+/// The financial semantic of the first `QualificationStarted` in the paper log's verified prefix,
+/// so a torn tail after the Start cannot hide it. `None` when no Start is readable.
+fn first_start_semantic(paper_log: &Path) -> Option<u32> {
+    let verified = Scanner::inspect(paper_log).ok()?.verified_tail;
+    let mut semantic = None;
+    Scanner::walk_prefix(&verified, &mut |_, envelope: &EventEnvelope| {
+        if semantic.is_none()
+            && envelope.schema_version == PAPER_LOG_SCHEMA_VERSION
+            && let Ok(PaperLogRecord::QualificationStarted(start)) =
+                serde_json::from_slice(&envelope.payload)
+        {
+            semantic = Some(start.financial_semantic_version);
+        }
+    })
+    .ok()?;
+    semantic
 }
 
 fn write_report(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
@@ -5865,6 +5879,43 @@ mod tests {
             .append_synced(start_envelope(&started("old"), 100).unwrap())
             .unwrap();
         drop(writer);
+        let output = temp.path().join("report.json");
+        fs::write(&output, b"existing report\n").unwrap();
+        let options = QualifyOptions {
+            paper_log,
+            source_log: temp.path().join("missing-source.log"),
+            live_journal: None,
+            paper_state: temp.path().join("missing-paper.db"),
+            seal_hash: "old-seal".to_owned(),
+            output: output.clone(),
+        };
+        assert!(matches!(
+            run_qualify(&options).await,
+            Err(QualificationError::InsufficientEvidence(_))
+        ));
+        assert_eq!(fs::read(output).unwrap(), b"existing report\n");
+    }
+
+    #[tokio::test]
+    async fn semantic_one_start_before_unreadable_frame_keeps_existing_report() {
+        let temp = tempfile::tempdir().unwrap();
+        let paper_log = temp.path().join("paper.log");
+        let mut writer = Writer::open(&paper_log).unwrap();
+        writer
+            .append_synced(start_envelope(&started("old"), 100).unwrap())
+            .unwrap();
+        writer
+            .append_synced(start_envelope(&started("torn"), 101).unwrap())
+            .unwrap();
+        drop(writer);
+        // A torn write: the second frame loses its last bytes.
+        let torn_len = fs::metadata(&paper_log).unwrap().len() - 3;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&paper_log)
+            .unwrap()
+            .set_len(torn_len)
+            .unwrap();
         let output = temp.path().join("report.json");
         fs::write(&output, b"existing report\n").unwrap();
         let options = QualifyOptions {
