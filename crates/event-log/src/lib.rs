@@ -43,3 +43,5 @@ pub use error::{LogError, PoisonReason};
 pub use reader::Reader;
 pub use scanner::{IncompleteTail, LogTailBinding, ScanOutcome, Scanner};
 pub use writer::{AppendReceipt, Writer};
+#[cfg(feature = "scan-metrics")]
+pub mod scan_metrics;

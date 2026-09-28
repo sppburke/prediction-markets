@@ -63,8 +63,12 @@ use crate::supabase_state::{
     terminalize_final_fill_decision,
 };
 
-fn runtime_source_evidence(source_log_path: &std::path::Path) -> SourceEvidence<'_> {
-    SourceEvidence::Log(source_log_path)
+fn runtime_source_evidence(
+    source_receipts: Option<&SourceReceiptIndex>,
+) -> Result<SourceEvidence<'_>, String> {
+    source_receipts
+        .map(SourceEvidence::Index)
+        .ok_or_else(|| "runtime source receipt index is unavailable".to_owned())
 }
 
 /// Hot-path `/book` fetch timeout for the mandatory price-impact gate (#398 WS2). A timeout makes
@@ -747,7 +751,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
     /// The shared recovery routine owns frozen-request reconstruction and appends at most the
     /// missing Final; no control-specific cursor or retry state is maintained here.
     async fn reconcile_oldest_financial_prepared(&mut self) -> Result<(), String> {
-        let (paper_log_path, source_log_path) = self
+        let (paper_log_path, _source_log_path) = self
             .financial_log_paths
             .clone()
             .ok_or_else(|| "active financial log paths are not configured".to_owned())?;
@@ -755,11 +759,12 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .supabase_state
             .clone()
             .ok_or_else(|| "active financial era has no authority client".to_owned())?;
+        let source_evidence = runtime_source_evidence(self.source_receipts.as_ref())?;
         reconcile_active_financial_frames(
             &authority,
             &self.paper_state,
             &paper_log_path,
-            runtime_source_evidence(&source_log_path),
+            source_evidence,
             &mut self.paper_writer,
         )
         .await
@@ -781,7 +786,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         source_receipt: pe_event_log::AppendReceipt,
     ) -> Result<(), String> {
         self.reconcile_oldest_financial_prepared().await?;
-        let (paper_log_path, source_log_path) = self
+        let (paper_log_path, _source_log_path) = self
             .financial_log_paths
             .clone()
             .ok_or_else(|| "active financial log paths are not configured".to_owned())?;
@@ -821,8 +826,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         };
         // Validate and freeze the source-derived settlement time before the irreversible
         // Prepared append. Recovery repeats this check as corruption detection.
+        let source_receipts = self.source_receipts.clone();
+        let source_evidence = runtime_source_evidence(source_receipts.as_ref())?;
         let settled_at_unix = resolution_source_received_at(
-            runtime_source_evidence(&source_log_path),
+            source_evidence,
             source_receipt,
             &condition,
             &payout_by_outcome_index_json,
@@ -864,7 +871,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             prepared_receipt,
             payload,
             &result,
-            runtime_source_evidence(&source_log_path),
+            source_evidence,
         )
         .map_err(|error| error.to_string())?;
         self.append_paper_record(&PaperLogRecord::FinancialFinal {
@@ -892,7 +899,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         }
         self.reconcile_oldest_financial_prepared().await?;
 
-        let (paper_log_path, source_log_path) = self
+        let (paper_log_path, _source_log_path) = self
             .financial_log_paths
             .clone()
             .ok_or_else(|| "active financial log paths are not configured".to_owned())?;
@@ -962,6 +969,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         if self.take_scenario_fault(|hooks| &hooks.fail_next_prepared_append) {
             return Err("injected failure after checkpoint before Prepared".to_owned());
         }
+        let source_receipts = self.source_receipts.clone();
+        let source_evidence = runtime_source_evidence(source_receipts.as_ref())?;
         let prepared_receipt = self.append_paper_record(&PaperLogRecord::FinancialPrepared {
             expected_authority: expected.clone(),
             payload: payload.clone(),
@@ -991,7 +1000,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             prepared_receipt,
             &payload,
             &result,
-            runtime_source_evidence(&source_log_path),
+            source_evidence,
         )
         .map_err(|error| error.to_string())?;
         let final_receipt = self.append_paper_record(&PaperLogRecord::FinancialFinal {
@@ -1248,7 +1257,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         boundary_receipt: pe_event_log::AppendReceipt,
     ) -> Result<(), String> {
         self.reconcile_oldest_financial_prepared().await?;
-        let (paper_log_path, source_log_path) =
+        let (paper_log_path, _source_log_path) =
             self.financial_log_paths.as_ref().cloned().ok_or_else(|| {
                 "daily boundary is unavailable before QualificationStarted".to_owned()
             })?;
@@ -1260,9 +1269,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             crate::paper_recovery::scan_paper_log(&paper_log_path)
                 .map_err(|error| error.to_string())?,
         );
-        let completed = crate::risk_inputs::completed_prepared_before_boundary(
+        let source_receipts = self
+            .source_receipts
+            .as_ref()
+            .ok_or_else(|| "daily boundary source receipt index is unavailable".to_owned())?;
+        let completed = crate::risk_inputs::completed_prepared_before_boundary_indexed(
             &era,
-            &source_log_path,
+            source_receipts,
             cutoff_unix,
             boundary_receipt,
         )
@@ -1373,7 +1386,24 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         } else {
             cash
         };
-        let source_tail = Scanner::verify(&source_log_path).map_err(|error| error.to_string())?;
+        let (source_tail, byte_offset, last_receipt, previous_hash) = source_receipts
+            .tail_with_last_frame()
+            .map_err(|error| error.to_string())?;
+        let (last_frame, end_offset) = pe_event_log::Reader::read_at(
+            &source_tail.path,
+            byte_offset,
+            last_receipt.sequence,
+            previous_hash,
+        )
+        .map_err(|error| error.to_string())?;
+        if end_offset != source_tail.physical_tail
+            || Some(last_frame.seq) != source_tail.last_sequence
+            || last_frame.this_hash != source_tail.last_hash
+        {
+            return Err(
+                "daily boundary source receipt index tail differs from log frame".to_owned(),
+            );
+        }
         let mark = PortfolioMark {
             boundary_receipt,
             cutoff_unix,
@@ -1930,6 +1960,11 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         boundary_mark_fetcher: Arc<HistoricalMarkAdapter>,
         source_receipts: SourceReceiptIndex,
     ) -> Result<(), crate::paper_recovery::PaperLogScanError> {
+        let canonical_path =
+            std::fs::canonicalize(&source_log_path).map_err(pe_event_log::LogError::Io)?;
+        if source_receipts.canonical_path() != Some(canonical_path.as_path()) {
+            return Err(crate::paper_recovery::PaperLogScanError::SourceIndexPathMismatch);
+        }
         let era = crate::paper_recovery::paper_era(crate::paper_recovery::scan_paper_log(
             &paper_log_path,
         )?);
@@ -4132,7 +4167,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use pe_core_types::{
-        AccountId, BasisPoints, CollateralAmount, KellyFraction, PolymarketConditionId,
+        AccountId, BasisPoints, CollateralAmount, EventSeq, KellyFraction, PolymarketConditionId,
         PolymarketTokenId, ReceivedAt, SourceId, SourceTimestamp,
     };
     use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, LogError, Scanner, Writer};
@@ -4744,16 +4779,347 @@ mod tests {
         assert!(orchestrator.pending_continuations.is_empty());
     }
 
-    /// The active runtime redrive, resolution validation, and result-application call sites all
-    /// use this selector, which must stay on the configured source log rather than the receipt
-    /// index (#572).
+    /// Active financial work requires the installed receipt index before writing Prepared.
     #[test]
-    fn active_financial_runtime_selects_the_configured_source_log() {
-        let configured = std::path::Path::new("configured/source-events.log");
+    fn active_financial_runtime_selects_the_installed_source_index() {
+        let index = SourceReceiptIndex::default();
         assert!(matches!(
-            runtime_source_evidence(configured),
-            SourceEvidence::Log(path) if path == configured
+            runtime_source_evidence(Some(&index)),
+            Ok(SourceEvidence::Index(selected)) if std::ptr::eq(selected, &index)
         ));
+        assert!(runtime_source_evidence(None).is_err());
+    }
+
+    #[test]
+    fn financial_log_install_rejects_index_for_another_path_before_configuration() {
+        let StartedSealFixture {
+            _dir,
+            paper_path,
+            source_path,
+            state,
+            paper_writer,
+            ..
+        } = started_seal_fixture("start-hash");
+        let other_path = paper_path.with_file_name("other-source.log");
+        drop(Writer::open(&other_path).unwrap());
+        let other_index = SourceReceiptIndex::replay(&other_path).unwrap();
+        let (_control_tx, control_rx) = mpsc::channel(4);
+        let mut orchestrator =
+            build_test_orchestrator(paper_writer, state, control_rx, String::new(), None)
+                .with_source_receipt_index(other_index.clone());
+        let (source_log, _source_rx) = crate::activity_ingest::SourceLogHandle::channel(1);
+        let result = orchestrator.configure_financial_log_paths(
+            paper_path,
+            source_path,
+            crate::live_venue_adapter::LiveAdmissionBuilder::new(
+                reqwest::Client::new(),
+                "https://offline.invalid",
+                "https://offline.invalid",
+                source_log.clone(),
+            ),
+            Arc::new(HistoricalMarkAdapter::new(
+                reqwest::Client::new(),
+                "https://offline.invalid",
+                source_log,
+            )),
+            other_index,
+        );
+        assert!(matches!(
+            result,
+            Err(crate::paper_recovery::PaperLogScanError::SourceIndexPathMismatch)
+        ));
+        assert!(orchestrator.financial_log_paths.is_none());
+        assert!(orchestrator.admission_builder.is_none());
+        assert!(orchestrator.boundary_mark_fetcher.is_none());
+    }
+
+    #[tokio::test]
+    async fn missing_runtime_index_refuses_fill_before_prepared_or_authority() {
+        let StartedSealFixture {
+            _dir,
+            paper_path,
+            source_path,
+            state,
+            paper_writer,
+            start,
+        } = started_seal_fixture("start-hash");
+        let source_receipt = AppendReceipt {
+            sequence: EventSeq(0),
+            this_hash: blake3::Hash::from_bytes([1; 32]),
+        };
+        let mut orchestrator = test_orchestrator(
+            paper_path.clone(),
+            source_path.clone(),
+            paper_writer,
+            state,
+            SourceReceiptIndex::replay(&source_path).unwrap(),
+        );
+        let calls = orchestrator.supabase_state.as_ref().unwrap().call_counter();
+        orchestrator.source_receipts = None;
+        let at = time::OffsetDateTime::from_unix_timestamp(SEAL_START_UNIX).unwrap();
+        let trade = pe_copy_signal_engine::IncomingTrade {
+            wallet: pe_core_types::WalletAddress::from_hex(
+                "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .unwrap(),
+            market_id: pe_core_types::MarketId(pe_core_types::VenueMarketId(
+                "seal-test-condition".to_owned(),
+            )),
+            outcome_id: pe_core_types::OutcomeId(0),
+            side: pe_core_types::Side::Buy,
+            price: pe_core_types::Price::new(dec!(0.5)).unwrap(),
+            contracts: pe_core_types::ShareAmount::from_whole(1).unwrap(),
+            observed_at: at,
+            received_at: at,
+            source_trade_id: pe_core_types::SourceTradeId("missing-index".to_owned()),
+            transaction_hash: None,
+            provenance: pe_copy_signal_engine::TradeProvenance::default(),
+        };
+        let error = orchestrator
+            .apply_active_financial_fill(
+                &trade,
+                seal_test_economic(source_receipt, start),
+                None,
+                None,
+                &mut None,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert!(error.contains("source receipt index is unavailable"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(
+            !scan_paper_log(&paper_path)
+                .unwrap()
+                .iter()
+                .any(|frame| matches!(
+                    frame.frame,
+                    PaperLogFrame::Record(PaperLogRecord::FinancialPrepared { .. })
+                ))
+        );
+    }
+
+    #[tokio::test]
+    async fn daily_mark_rejects_unconfirmed_index_tail_without_appending() {
+        for stray_bytes in [true, false] {
+            let StartedSealFixture {
+                _dir,
+                paper_path,
+                source_path,
+                state,
+                paper_writer,
+                ..
+            } = started_seal_fixture("start-hash");
+            let cutoff = SEAL_START_UNIX + 86_400;
+            let mut source_writer = Writer::open(&source_path).unwrap();
+            let boundary = append_source(
+                &mut source_writer,
+                crate::trade_poller::DAILY_BOUNDARY_SOURCE_ID,
+                cutoff,
+                serde_json::to_vec(&serde_json::json!({
+                    "kind": "daily_boundary",
+                    "cutoff_unix": cutoff,
+                }))
+                .unwrap(),
+            );
+            drop(source_writer);
+            let index = if stray_bytes {
+                let mut staging = SourceReceiptIndex::staging(&source_path).unwrap();
+                for item in pe_event_log::Reader::replay_with_offsets(&source_path).unwrap() {
+                    let (offset, _, envelope) = item.unwrap();
+                    staging.observe(offset, &envelope).unwrap();
+                }
+                let mut binding = Scanner::verify(&source_path).unwrap();
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&source_path)
+                    .unwrap()
+                    .write_all(b"stray bytes")
+                    .unwrap();
+                binding.physical_tail = std::fs::metadata(&source_path).unwrap().len();
+                staging.complete(&binding).unwrap()
+            } else {
+                // Index the final frame under a different hash: its offset and sequence still
+                // match the log, so only the hash comparison can reject the tail.
+                let mut staging = SourceReceiptIndex::staging(&source_path).unwrap();
+                let mut binding = Scanner::verify(&source_path).unwrap();
+                for item in pe_event_log::Reader::replay_with_offsets(&source_path).unwrap() {
+                    let (offset, _, mut envelope) = item.unwrap();
+                    if Some(envelope.seq) == binding.last_sequence {
+                        envelope.this_hash = blake3::Hash::from_bytes([7; 32]);
+                        binding.last_hash = envelope.this_hash;
+                    }
+                    staging.observe(offset, &envelope).unwrap();
+                }
+                let index = staging.complete(&binding).unwrap();
+                assert_eq!(
+                    std::fs::metadata(&source_path).unwrap().len(),
+                    binding.physical_tail
+                );
+                index
+            };
+            let mut orchestrator =
+                test_orchestrator(paper_path.clone(), source_path, paper_writer, state, index);
+            assert!(
+                orchestrator
+                    .mark_at_boundary(cutoff, boundary)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                !scan_paper_log(&paper_path)
+                    .unwrap()
+                    .iter()
+                    .any(|frame| matches!(
+                        frame.frame,
+                        PaperLogFrame::Record(PaperLogRecord::PortfolioMark(_))
+                    ))
+            );
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct GapFillAuthority {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        mutations: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl crate::supabase_state::SupabaseStateTrait for GapFillAuthority {
+        async fn commit_fill_v2(
+            &self,
+            _: &crate::supabase_sink::SupabaseFillRow,
+        ) -> Result<crate::supabase_state::FillV2Outcome, crate::supabase_state::SupabaseStateError>
+        {
+            Err(crate::supabase_state::SupabaseStateError::Corrupt(
+                "legacy authority route is outside this fixture".to_owned(),
+            ))
+        }
+
+        async fn commit_prepared_fill(
+            &self,
+            request: &crate::supabase_state::PreparedFillRequest,
+        ) -> Result<CanonicalFillResult, crate::supabase_state::SupabaseStateError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call == 0 {
+                self.mutations.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(CanonicalFillResult {
+                outcome: if call == 0 { "applied" } else { "existing" }.to_owned(),
+                bankroll: dec!(999.5),
+                applied_prepared_seq: request.prepared_receipt.sequence,
+                quantity: request.quantity,
+                principal: request.principal,
+                fee: request.fee,
+                fill_price: request.fill_price,
+            })
+        }
+
+        async fn apply_prepared_resolution(
+            &self,
+            _: &crate::supabase_state::PreparedResolutionRequest,
+        ) -> Result<CanonicalResolutionResult, crate::supabase_state::SupabaseStateError> {
+            Err(crate::supabase_state::SupabaseStateError::Corrupt(
+                "resolution authority route is outside this fixture".to_owned(),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn index_gap_redrive_rebuilds_receipt_without_duplicate_authority_mutation() {
+        let StartedSealFixture {
+            _dir,
+            paper_path,
+            source_path,
+            state,
+            mut paper_writer,
+            start,
+        } = started_seal_fixture("start-hash");
+        let stale_index = SourceReceiptIndex::replay(&source_path).unwrap();
+        let mut source_writer = Writer::open(&source_path).unwrap();
+        let source_receipt = append_source(
+            &mut source_writer,
+            "seal-test-financial-source",
+            SEAL_START_UNIX + 1,
+            b"synchronized-but-unindexed".to_vec(),
+        );
+        drop(source_writer);
+        append_paper(
+            &mut paper_writer,
+            &PaperLogRecord::FinancialPrepared {
+                expected_authority: ExpectedAuthority {
+                    qualification_start_receipt: start,
+                    prior_completed_prepared_sequence: None,
+                },
+                payload: FinancialPayload::Fill {
+                    operation: PaperFillOperationIdentity {
+                        leader_wallet: pe_core_types::WalletAddress::from_hex(
+                            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        )
+                        .unwrap(),
+                        source_trade_id: pe_core_types::SourceTradeId("gap-fill".to_owned()),
+                        observed_at_bucket: SEAL_START_UNIX,
+                    },
+                    economic: seal_test_economic(source_receipt, start),
+                },
+            },
+            SEAL_START_UNIX + 1,
+        );
+        let authority = GapFillAuthority::default();
+        let error = crate::supabase_state::reconcile_active_financial_frames(
+            &authority,
+            &state,
+            &paper_path,
+            SourceEvidence::Index(&stale_index),
+            &mut paper_writer,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("absent from the source receipt index")
+        );
+        assert_eq!(authority.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(authority.mutations.load(Ordering::SeqCst), 1);
+        assert!(
+            !scan_paper_log(&paper_path)
+                .unwrap()
+                .iter()
+                .any(|frame| matches!(
+                    frame.frame,
+                    PaperLogFrame::Record(PaperLogRecord::FinancialFinal { .. })
+                ))
+        );
+        drop(paper_writer);
+
+        // Boot rebuilds this same index (scenario_source_log_boot) and redrives through this call.
+        let rebuilt_index = SourceReceiptIndex::replay(&source_path).unwrap();
+        let mut reopened = Writer::open(&paper_path).unwrap();
+        assert_eq!(
+            crate::supabase_state::reconcile_active_financial_frames(
+                &authority,
+                &state,
+                &paper_path,
+                SourceEvidence::Index(&rebuilt_index),
+                &mut reopened,
+            )
+            .await
+            .unwrap(),
+            1
+        );
+        assert_eq!(authority.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(authority.mutations.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            scan_paper_log(&paper_path)
+                .unwrap()
+                .iter()
+                .filter(|frame| matches!(
+                    frame.frame,
+                    PaperLogFrame::Record(PaperLogRecord::FinancialFinal { .. })
+                ))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -5293,12 +5659,15 @@ mod tests {
         assert_eq!(marks.len(), 31);
         assert_eq!(
             marks.last().unwrap().source_tail,
-            TailBinding::from(&mark_candidate)
+            TailBinding::from(&index_candidate)
+        );
+        assert_eq!(
+            Scanner::walk_prefix(&index_candidate, &mut |_, _| {}).unwrap(),
+            Some(index_candidate.clone())
         );
         let seals = sealed_records(&paper_path);
         assert_eq!(seals.len(), 1);
-        assert_eq!(seals[0].source_prefix, TailBinding::from(&mark_candidate));
-        assert_ne!(seals[0].source_prefix, TailBinding::from(&index_candidate));
+        assert_eq!(seals[0].source_prefix, TailBinding::from(&index_candidate));
         assert_ne!(seals[0].source_prefix, TailBinding::from(&file_tail));
 
         let events = events
@@ -5317,7 +5686,7 @@ mod tests {
         assert!(completed.unsigned.contains_key("elapsed_ms"));
         assert_eq!(
             completed.unsigned.get("frames_walked"),
-            mark_candidate
+            index_candidate
                 .last_sequence
                 .map(|sequence| sequence.0 + 1)
                 .as_ref()
