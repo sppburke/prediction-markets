@@ -7,6 +7,7 @@ import { auth } from "@/auth";
 import { AccountsAdminPanel } from "@/components/AccountsAdminPanel";
 import { StateNotice } from "@/components/Panel";
 import { resolveAccess } from "@/lib/authz";
+import { readServiceReady } from "@/lib/service-ready";
 import { getServiceRoleSupabase } from "@/lib/supabase-server";
 import type { AccountAdminRow, AccountCredentialMetadata } from "@/lib/types";
 
@@ -18,7 +19,7 @@ export default async function AccountsAdminPage() {
   if (access?.role !== "admin") notFound();
 
   const supabase = getServiceRoleSupabase();
-  const [accountsResult, credentialsResult] = await Promise.all([
+  const [accountsResult, credentialsResult, serviceReady] = await Promise.all([
     supabase
       .from("accounts")
       .select(
@@ -30,6 +31,7 @@ export default async function AccountsAdminPage() {
     supabase
       .from("account_credentials")
       .select("account_id, bundle_version, key_id, fingerprint, updated_at"),
+    readServiceReady(process.env.PE_SERVICE_READY_URL),
   ]);
 
   const loadError = accountsResult.error ?? credentialsResult.error;
@@ -64,6 +66,17 @@ export default async function AccountsAdminPage() {
           Live account controls and write-only sealed credential rotation. Signed in as{" "}
           <span className="text-text">{session?.user?.email}</span>.
         </p>
+      </div>
+      <div className="rounded-lg border border-border bg-panel p-4 text-sm">
+        {serviceReady.contract === "updated" ? (
+          <p>Running service: owner requested mode contract · readiness {serviceReady.ready ? "healthy" : "unhealthy"}</p>
+        ) : serviceReady.contract === "old" ? (
+          <p>Running service: old live control contract. Request mode applies after the service update.</p>
+        ) : serviceReady.contract === "unverified" ? (
+          <p>Running service contract could not be confirmed. Request mode remains available.</p>
+        ) : (
+          <p>Running service unreachable. Request mode remains available.</p>
+        )}
       </div>
       <AccountsAdminPanel rows={rows} />
     </div>

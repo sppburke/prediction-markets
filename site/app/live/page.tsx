@@ -179,7 +179,7 @@ export default async function LivePage({
         <h1 className="text-lg font-semibold">Live account · {selected.account_id}</h1>
         <p className="text-xs text-muted">
           Effective {selected.effective_live_mode} · requested {selected.requested_live_mode} ·{" "}
-          {selected.enabled ? "execution enabled" : "execution disabled"}
+          Historical enabled: {String(selected.enabled)} (no mode authority)
         </p>
       </div>
 

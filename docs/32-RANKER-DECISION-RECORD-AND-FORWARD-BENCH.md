@@ -1,7 +1,7 @@
 # 32 — Ranker adjudication decision record and retired forward bench
 
 **Status: BINDING DECISION RECORD; FORWARD-BENCH PROTOCOL RETIRED.** Numeric defaults and the
-current promotion contract live in [`_GLOSSARY.md`](_GLOSSARY.md). This document preserves the
+paper measurement contract live in [`_GLOSSARY.md`](_GLOSSARY.md). This document preserves the
 ranker adjudication and the adopted one-observed-system decision; it is not an operative
 qualification protocol.
 
@@ -36,7 +36,7 @@ exact, replayable financial era:
 - paper decisions, fees, signed quantities, financial Finals, marks, membership changes, and the
   qualification seal are recorded as replay evidence;
 - the network-free verifier evaluates only the sealed observed-paper prefix; and
-- a `Pass` report permits one manual paper-to-live-tiny review under `_GLOSSARY.md`.
+- a `Pass` report records paper-measurement evidence; it does not control ordinary live mode.
 
 Backtests remain valuable for walk-forward research, regression, and implementation parity. They
 are not a comparator, control arm, or promotion sample for the sealed qualification era.

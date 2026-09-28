@@ -23,7 +23,6 @@ function controlRpc(accountId: string, body: Record<string, unknown>): RpcCall |
       };
     case "live_settings":
       if (
-        typeof body.enabled !== "boolean" ||
         typeof body.execution_order !== "number" ||
         (body.live_sizing_mode !== null && typeof body.live_sizing_mode !== "string") ||
         (body.live_sizing_dollar_usd !== null &&
@@ -38,7 +37,7 @@ function controlRpc(accountId: string, body: Record<string, unknown>): RpcCall |
         name: "account_update_live_settings",
         args: {
           p_account_id: accountId,
-          p_enabled: body.enabled,
+          p_enabled: null,
           p_execution_order: body.execution_order,
           p_live_sizing_mode: body.live_sizing_mode,
           p_live_sizing_dollar_usd: body.live_sizing_dollar_usd,
@@ -55,27 +54,6 @@ function controlRpc(accountId: string, body: Record<string, unknown>): RpcCall |
           p_account_id: accountId,
           p_requested_mode: body.requested_mode,
           p_actor: ALLOWED_EMAIL,
-        },
-      };
-    case "promotion_review":
-      if (typeof body.reason !== "string" || typeof body.evidence_ref !== "string") return null;
-      return {
-        name: "account_record_promotion_review",
-        args: {
-          p_account_id: accountId,
-          p_actor: ALLOWED_EMAIL,
-          p_reason: body.reason,
-          p_evidence_ref: body.evidence_ref,
-        },
-      };
-    case "revoke_promotion_review":
-      if (typeof body.reason !== "string") return null;
-      return {
-        name: "account_revoke_promotion_review",
-        args: {
-          p_account_id: accountId,
-          p_actor: ALLOWED_EMAIL,
-          p_reason: body.reason,
         },
       };
     default:

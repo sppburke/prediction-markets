@@ -204,6 +204,7 @@ async fn run_trades(
             entry_gate_config: disabled_entry_gate(),
             runtime_config: None,
             live_accounts: None,
+            live_journal: None,
         },
         WinnerFollowStrategy::new(strategy_cfg),
         make_writer(dir),

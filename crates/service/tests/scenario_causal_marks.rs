@@ -301,6 +301,7 @@ async fn run_real_boundary(
             entry_gate_config: CopyEntryGateConfig,
             runtime_config: None,
             live_accounts: None,
+            live_journal: None,
             activity_ws_enabled: false,
             copy_latency_budget_secs: 2,
             watchlist_writer_lock: None,

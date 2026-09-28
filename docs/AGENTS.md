@@ -10,7 +10,7 @@ Build `prediction-edge`: a Rust 1.95.0, Rust 2024, event-sourced, replayable tra
 2. `_BASELINE.md` — toolchain, lints, common acceptance gate
 3. `_GLOSSARY.md` — vocabulary, type aliases, latency budget, rate limits, configuration defaults
 4. `SKILLS.md`
-5. `19-WINNER-FOLLOW-STRATEGY.md` — canonical risk caps, Kelly fractions, eligibility thresholds, promotion ladders
+5. `19-WINNER-FOLLOW-STRATEGY.md` — canonical risk caps, Kelly fractions, eligibility thresholds, paper measurement
 6. The specific phase/venue/source document relevant to the task
 7. Latest official docs for touched APIs (per `21-RESEARCH-AND-SOURCE-DISCOVERY.md`)
 
@@ -53,7 +53,7 @@ Implement in this order (full list in `17-RUST-IMPLEMENTATION-ROADMAP.md` "Phase
 8. fractional-Kelly sizer;
 9. risk gates;
 10. paper-copy execution;
-11. live-tiny after approval.
+11. owner-requested live-tiny with separate order checks.
 
 ## Required quality gates
 

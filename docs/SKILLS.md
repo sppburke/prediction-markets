@@ -32,7 +32,7 @@ Quality bar:
 - robust sample-size shrinkage (Bayesian prior, see `19-` § p estimation);
 - latency/edge decay measured against the production budget in `_GLOSSARY.md`;
 - Kalshi identity restrictions respected (`07-`);
-- live-tiny only after the sealed observed-paper gate in `_GLOSSARY.md` and one post-`Pass` review.
+- live mode follows the owner's requested mode; sealed paper reports remain measurement evidence and order admission retains its own checks.
 
 ## Skill: Venue adapter implementation
 

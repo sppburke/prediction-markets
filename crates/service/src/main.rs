@@ -50,7 +50,7 @@ use pe_service::health::new_shared_health_with_ws;
 use pe_service::live_watchlist::{LiveWatchlist, projection_dirty_channel};
 use pe_service::market_end_cache::MarketEndCache;
 use pe_service::mid_price_cache::MidPriceCache;
-use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
+use pe_service::orchestrator::{LiveJournalAccess, Orchestrator, OrchestratorConfig};
 use pe_service::paper_api::PaperApiState;
 use pe_service::runtime_config::{
     AppliedWatchlistCapacity, ConfigEra, LiveRuntimeConfig, MAX_ACTIVE_WATCHLIST_SIZE,
@@ -1307,34 +1307,17 @@ async fn main() -> Result<()> {
         Some(live)
     };
 
-    // Ordinary #508 live execution: one task owns strict account/seed ordering, mode probes,
-    // redemption posture, and retention. A missing age identity is warned exactly once and
-    // passed as `None`; the mode machine then cannot arm, while the paper orchestrator remains
-    // fully operational. The account-tagged journal is a mode-0600 sibling of the paper log.
+    // Ordinary live execution: fan-out owns strict account/seed ordering, redemption posture,
+    // and retention. A missing age identity is warned once and prevents credential loading for
+    // orders; it does not change the owner's requested mode. The account-tagged journal is a
+    // mode-0600 sibling of the paper log.
+    let mut live_journal_for_staging = None;
+    let mut live_fanout_task = None;
     if let Some(live_accounts) = live_accounts.clone() {
-        let qualification = match optional_arg_value(&args, "--qualification-report") {
-            Some(path) => {
-                match pe_service::live_mode::load_qualification_facts(&PathBuf::from(&path)) {
-                    Ok(report) => Some(report),
-                    Err(error) => {
-                        tracing::warn!(
-                            path,
-                            error = %error,
-                            "qualification report unavailable; live arming disabled"
-                        );
-                        None
-                    }
-                }
-            }
-            None => {
-                tracing::warn!("--qualification-report was not supplied; live arming disabled");
-                None
-            }
-        };
         let identity = match pe_service::live_credentials::load_identity_from_credentials_dir() {
             Ok(identity) => Some(identity),
             Err(error) => {
-                tracing::warn!(error = %error, "ordinary live age identity unavailable; live arming disabled");
+                tracing::warn!(error = %error, "ordinary live age identity unavailable; orders cannot load credentials");
                 None
             }
         };
@@ -1362,9 +1345,10 @@ async fn main() -> Result<()> {
             pe_event_log::Scanner::verify_prefix(prefix)
                 .context("verify QualificationStarted live-journal prefix")?;
         }
-        let journal = LiveJournal::open(&journal_path).with_context(|| {
+        let journal = Arc::new(LiveJournal::open(&journal_path).with_context(|| {
             format!("open and validate live journal {}", journal_path.display())
-        })?;
+        })?);
+        live_journal_for_staging = Some(journal.clone());
         let live_http_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(20))
             .build()
@@ -1385,9 +1369,8 @@ async fn main() -> Result<()> {
             live_accounts,
             live_watchlist: live_watchlist.clone(),
             runtime_config: live_runtime_config.clone(),
-            qualification,
             identity,
-            journal: Arc::new(journal),
+            journal,
             journal_path,
             era_live_prefix,
             projection,
@@ -1412,7 +1395,8 @@ async fn main() -> Result<()> {
         };
         let fanout_health = health.clone();
         let fanout_shutdown = shutdown.subscribe();
-        supervisor.spawn(TaskName::LiveFanout, async move {
+        // Spawned only after the orchestrator's boot journal check, so no append races it.
+        live_fanout_task = Some(async move {
             let result = pe_service::live_fanout::run_live_fanout_until(
                 fanout_config,
                 fanout_shutdown.wait_for(ShutdownPhase::StopSinks),
@@ -1448,6 +1432,7 @@ async fn main() -> Result<()> {
             entry_gate_config,
             runtime_config: Some(live_runtime_config.clone()),
             live_accounts: live_accounts.clone(),
+            live_journal: boot_live_journal_access(live_journal_for_staging, &cfg.event_log_path),
         },
         WinnerFollowStrategy::new(initial_runtime_config.winner_follow_config()),
         paper_writer,
@@ -1463,6 +1448,9 @@ async fn main() -> Result<()> {
     )
     .context("build orchestrator")?
     .with_source_receipt_index(source_receipts.clone());
+    if let Some(task) = live_fanout_task {
+        supervisor.spawn(TaskName::LiveFanout, task);
+    }
     if financial_start.is_some() {
         orch.configure_financial_log_paths(
             cfg.event_log_path.clone(),
@@ -1872,6 +1860,16 @@ async fn join_named_until(
     }
 }
 
+fn boot_live_journal_access(
+    writer: Option<Arc<LiveJournal>>,
+    event_log_path: &std::path::Path,
+) -> Option<LiveJournalAccess> {
+    writer.map(LiveJournalAccess::Writable).or_else(|| {
+        let path = live_journal_path(event_log_path);
+        path.exists().then_some(LiveJournalAccess::ReadOnly(path))
+    })
+}
+
 fn live_journal_path(event_log_path: &std::path::Path) -> PathBuf {
     event_log_path
         .parent()
@@ -2266,6 +2264,20 @@ mod tests {
     use rusqlite::params;
 
     const NOW: i64 = 10_000;
+
+    #[test]
+    fn paper_only_boot_uses_existing_journal_read_only_and_leaves_missing_file_absent() {
+        let directory = tempfile::tempdir().unwrap();
+        let paper_log = directory.path().join("paper.log");
+        assert!(boot_live_journal_access(None, &paper_log).is_none());
+        let path = live_journal_path(&paper_log);
+        let journal = LiveJournal::open(&path).unwrap();
+        drop(journal);
+        assert!(matches!(
+            boot_live_journal_access(None, &paper_log),
+            Some(LiveJournalAccess::ReadOnly(found)) if found == path
+        ));
+    }
 
     fn wallet(id: u64) -> WalletAddress {
         WalletAddress::from_hex(&format!("0x{id:040x}")).unwrap()

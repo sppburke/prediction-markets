@@ -3,7 +3,7 @@
 
 > See [`_BASELINE.md`](_BASELINE.md) for the Rust-only implementation rule, toolchain pin, lints, and common acceptance gate.
 > See [`_GLOSSARY.md`](_GLOSSARY.md) for vocabulary (wallet/trader/leader/candidate), type aliases, latency budget, rate limits, and configuration defaults.
-> See [`19-WINNER-FOLLOW-STRATEGY.md`](19-WINNER-FOLLOW-STRATEGY.md) for canonical risk caps, Kelly fractions, eligibility thresholds, and promotion ladders.
+> See [`19-WINNER-FOLLOW-STRATEGY.md`](19-WINNER-FOLLOW-STRATEGY.md) for canonical risk caps, Kelly fractions, and wallet and order eligibility. The owner's requested account mode is the only live on/off switch.
 
 This v5 package makes **Winner-Follow** the first deployable strategy while preserving the prior resolver-first Polymarket/Kalshi architecture. The system starts by finding the fastest-compounding public traders/operators, reconstructing their behavior, and copying only the subset of trades that survive empirical latency, liquidity, cost, and risk-cap checks. Resolver/source-arbitrage strategies remain Strategy 1+, but the first build target is trader-intelligence plus speed.
 
@@ -30,7 +30,7 @@ Rank traders by **walk-forward LCB_5pct expected log-growth per day** for a foll
 
 ### Eligibility, sizing, risk caps
 
-See [`19-WINNER-FOLLOW-STRATEGY.md`](19-WINNER-FOLLOW-STRATEGY.md) for the canonical thresholds, Kelly fractions, hard caps, drawdown stops, and promotion ladders. Other docs reference that file rather than restating values.
+See [`19-WINNER-FOLLOW-STRATEGY.md`](19-WINNER-FOLLOW-STRATEGY.md) for the canonical thresholds, Kelly fractions, hard caps, and drawdown stops. Other docs reference that file rather than restating values.
 
 ## What changed in this pass
 

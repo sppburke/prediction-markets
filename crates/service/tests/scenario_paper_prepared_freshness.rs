@@ -494,6 +494,15 @@ impl Harness {
                 entry_gate_config: CopyEntryGateConfig,
                 runtime_config: None,
                 live_accounts: Some(self.live.clone()),
+                live_journal: Some(
+                    Arc::new(
+                        pe_execution_core::LiveJournal::open(
+                            self.dir.path().join("live_journal.log"),
+                        )
+                        .unwrap(),
+                    )
+                    .into(),
+                ),
                 activity_ws_enabled: enabled,
                 copy_latency_budget_secs: 2,
                 watchlist_writer_lock: None,
@@ -682,6 +691,9 @@ impl Harness {
                 credential_binding: Some((7, "stored-key".to_owned())),
             }],
             fetched_at_unix: Some(EPOCH),
+            control_available: true,
+            generation: 1,
+            credential_metadata_available: true,
         });
     }
 
@@ -1692,6 +1704,193 @@ impl LiveOrderVenue for StagedLiveVenue {
     }
 }
 
+/// PASS: one orchestrator staging transaction freezes all three selected targets in the
+/// recorded order, with one journal reference shared by the seed and paper decision.
+#[tokio::test]
+async fn owner_mode_stages_one_record_for_three_ordered_accounts() {
+    let mut h = Harness::new().await;
+    h.probability = pe_core_types::Probability::new(dec!(0.9)).unwrap();
+    let recorded = h
+        .record_with_rule(1, Some((dec!(0.50), dec!(0.50), Some(2))))
+        .await;
+    h.arm();
+    let mut snapshot = h.live.snapshot().as_ref().clone();
+    let mut lower = snapshot.accounts[0].clone();
+    lower.account_id = AccountId::new("lower").unwrap();
+    lower.is_primary = false;
+    lower.enabled = false;
+    lower.execution_order = 1;
+    lower.credential_binding = Some((8, "lower-key".to_owned()));
+    let mut higher = lower.clone();
+    higher.account_id = AccountId::new("higher").unwrap();
+    higher.execution_order = 2;
+    higher.credential_binding = Some((9, "higher-key".to_owned()));
+    snapshot.accounts.extend([lower, higher]);
+    h.live.store(snapshot);
+
+    h.attempt(&recorded, at());
+    h.start(true);
+    h.poll_source(&recorded, Some(EPOCH - 1), at()).await;
+    h.barrier().await;
+    let seeds = h.paper.unfinalized_ready_dispatch_seeds().unwrap();
+    assert_eq!(seeds.len(), 1, "{:?}", h.terminal(&recorded));
+    let seed = &seeds[0];
+    let targets = h.paper.dispatch_targets(&seed.dispatch_id).unwrap();
+    assert_eq!(targets.len(), 3);
+    assert_eq!(
+        targets
+            .iter()
+            .map(|target| target.account_id.as_str())
+            .collect::<Vec<_>>(),
+        ["stored-target", "lower", "higher"]
+    );
+    assert_eq!(
+        targets
+            .iter()
+            .map(|target| target.exec_rank)
+            .collect::<Vec<_>>(),
+        [0, 1, 2]
+    );
+    let seq = serde_json::from_str::<Value>(&seed.signal_json).unwrap()["control_journal_seq"]
+        .as_u64()
+        .unwrap();
+    let journal_path = h.dir.path().join("live_journal.log");
+    let recorded_control = pe_execution_core::live_journal::staged_dispatch_control_at(
+        &journal_path,
+        seq,
+        &seed.dispatch_id,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(recorded_control.targets.len(), 3);
+    for (recorded_target, target) in recorded_control.targets.iter().zip(&targets) {
+        assert_eq!(recorded_target.account_id.as_str(), target.account_id);
+        assert_eq!(
+            recorded_target.exec_rank,
+            u64::try_from(target.exec_rank).unwrap()
+        );
+        assert_eq!(
+            recorded_target.frozen_binding.version,
+            target.credential_bundle_version
+        );
+        assert_eq!(
+            recorded_target.frozen_binding.key_id,
+            target.credential_key_id
+        );
+        assert_eq!(
+            recorded_target.observed_credential_key_id,
+            target.credential_key_id
+        );
+    }
+    let staged_count = pe_execution_core::live_journal::replay_account(
+        &journal_path,
+        &AccountId::new("stored-target").unwrap(),
+    )
+    .unwrap()
+    .into_iter()
+    .filter(|event| {
+        matches!(
+            event.payload,
+            pe_execution_core::LiveJournalPayload::StagedDispatchControl(_)
+        )
+    })
+    .count();
+    assert_eq!(staged_count, 1);
+    let decision = h.terminal(&recorded);
+    assert_eq!(
+        pe_service::decision_replay::replay_decision_pending_with_control(
+            &decision,
+            &journal_path,
+        )
+        .unwrap()
+        .post_boundary
+        .body
+        .terminal
+        .dispatch_control_journal_seq,
+        Some(seq)
+    );
+    h.stop().await;
+}
+
+/// PASS: a failure after the selected-target append leaves one replayable orphan attempt and
+/// no committed seed or target that could be dispatched.
+#[tokio::test]
+async fn selected_target_append_before_failed_seed_write_is_uncommitted() {
+    let mut h = Harness::new().await;
+    h.probability = pe_core_types::Probability::new(dec!(0.9)).unwrap();
+    let recorded = h
+        .record_with_rule(1, Some((dec!(0.50), dec!(0.50), Some(2))))
+        .await;
+    h.arm();
+    h.hooks.fail_next_stage_seed.store(true, Ordering::SeqCst);
+    h.attempt(&recorded, at());
+    h.start(true);
+    h.poll_source(&recorded, Some(EPOCH - 1), at()).await;
+    assert!(h.task.take().unwrap().await.unwrap().is_err());
+    assert!(h.paper.pending_dispatch_seeds().unwrap().is_empty());
+    assert!(
+        h.paper
+            .unfinalized_ready_dispatch_seeds()
+            .unwrap()
+            .is_empty()
+    );
+    let journal_path = h.dir.path().join("live_journal.log");
+    let attempts = pe_execution_core::live_journal::replay_account(
+        &journal_path,
+        &AccountId::new("stored-target").unwrap(),
+    )
+    .unwrap()
+    .into_iter()
+    .filter(|event| {
+        matches!(
+            event.payload,
+            pe_execution_core::LiveJournalPayload::StagedDispatchControl(_)
+        )
+    })
+    .count();
+    assert_eq!(attempts, 1);
+}
+
+#[tokio::test]
+async fn live_mode_without_verified_binding_stages_no_control_record() {
+    for metadata_unavailable in [false, true] {
+        let mut h = Harness::new().await;
+        h.probability = pe_core_types::Probability::new(dec!(0.9)).unwrap();
+        let recorded = h
+            .record_with_rule(1, Some((dec!(0.50), dec!(0.50), Some(2))))
+            .await;
+        h.arm();
+        let mut snapshot = h.live.snapshot().as_ref().clone();
+        if metadata_unavailable {
+            snapshot.credential_metadata_available = false;
+        } else {
+            snapshot.accounts[0].credential_binding = None;
+        }
+        h.live.store(snapshot);
+        h.attempt(&recorded, at());
+        h.start(true);
+        h.poll_source(&recorded, Some(EPOCH - 1), at()).await;
+        h.barrier().await;
+        assert!(h.paper.pending_dispatch_seeds().unwrap().is_empty());
+        assert!(
+            h.paper
+                .unfinalized_ready_dispatch_seeds()
+                .unwrap()
+                .is_empty()
+        );
+        let events = pe_execution_core::live_journal::replay_account(
+            h.dir.path().join("live_journal.log"),
+            &AccountId::new("stored-target").unwrap(),
+        )
+        .unwrap();
+        assert!(!events.iter().any(|event| matches!(
+            event.payload,
+            pe_execution_core::LiveJournalPayload::StagedDispatchControl(_)
+        )));
+        h.stop().await;
+    }
+}
+
 /// PASS: a semantic-2 delayed paper fill stages an armed target. A fresh strict zero-delay
 /// market reaches the existing live executor's single POST; the same delayed market has a typed
 /// strict refusal before a POST. The version-6 websocket/REST source clock is bound in the paper
@@ -1853,6 +2052,10 @@ async fn version_six_staged_target_strict_live_admission_submits_and_replays() {
     assert!(matches!(
         events.as_slice(),
         [
+            pe_execution_core::LiveJournalEvent {
+                payload: LiveJournalPayload::StagedDispatchControl(_),
+                ..
+            },
             pe_execution_core::LiveJournalEvent {
                 payload: LiveJournalPayload::AdmissionEvaluated(_),
                 ..

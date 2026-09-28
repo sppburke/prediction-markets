@@ -11,9 +11,11 @@ Prevent false edges, source misuse, venue-rule mistakes, operational failures, a
 
 Use official, permitted, licensed, or clearly public sources. Trade the rules as written. Do not bypass access controls, misuse restricted feeds, rely on non-public material, or manipulate venues.
 
-## Compliance gates
+## Compliance review and order eligibility
 
-Every live strategy requires:
+Record these reviews for each live strategy and apply source, venue, jurisdiction, and account
+eligibility checks to each order where they belong. They do not control account mode: the owner's
+requested mode is the only on/off switch for ordinary live execution.
 
 - source access review;
 - venue terms/API review;
@@ -70,9 +72,9 @@ snapshot; they are not fabricated financial fields.
 
 ## Responsible scaling
 
-Scale only after the sealed paper stream replays exactly, satisfies the promotion gates in
-`_GLOSSARY.md`, and receives the one manual review allowed after a `Pass`. Backtest remains
-non-promotional research evidence; live-tiny is not part of issue #545 qualification.
+The sealed paper stream and backtest remain measurement evidence. The owner's requested mode
+controls ordinary live mode; source, resolver, venue, financial, and risk checks govern each order.
+Live-tiny is not part of issue #545 qualification.
 
 ## Winner-Follow compliance and risk
 

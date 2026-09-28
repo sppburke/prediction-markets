@@ -197,6 +197,7 @@ pub fn new_shared_health_with_ws(
 #[derive(Serialize)]
 pub struct ReadyResponse {
     ready: bool,
+    live_control_contract: &'static str,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     issues: Vec<&'static str>,
 }
@@ -292,7 +293,14 @@ pub async fn ready(State(health): State<SharedHealth>) -> (StatusCode, Json<Read
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
-    (status, Json(ReadyResponse { ready, issues }))
+    (
+        status,
+        Json(ReadyResponse {
+            ready,
+            live_control_contract: "owner_requested_mode_v1",
+            issues,
+        }),
+    )
 }
 
 #[cfg(test)]
@@ -323,6 +331,28 @@ mod tests {
     async fn polygon_enabled_flags_stale_when_silent() {
         // WS configured but no events: a genuine staleness signal must still fire.
         assert_eq!(ready_issues(true).await, vec!["polygon_source_stale"]);
+    }
+
+    #[tokio::test]
+    async fn readiness_contract_marker_is_present_on_success_and_unavailable() {
+        let health = new_shared_health(false);
+        {
+            let mut state = health.lock().unwrap();
+            state.polymarket_last_event_at = Some(OffsetDateTime::now_utc());
+        }
+        let (ok_status, Json(ok)) = ready(State(health.clone())).await;
+        assert_eq!(ok_status, StatusCode::OK);
+        assert_eq!(ok.live_control_contract, "owner_requested_mode_v1");
+        assert!(ok.ready);
+
+        {
+            let mut state = health.lock().unwrap();
+            state.event_log_writable = false;
+        }
+        let (unavailable_status, Json(unavailable)) = ready(State(health)).await;
+        assert_eq!(unavailable_status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(unavailable.live_control_contract, "owner_requested_mode_v1");
+        assert!(!unavailable.ready);
     }
 
     fn t0() -> OffsetDateTime {

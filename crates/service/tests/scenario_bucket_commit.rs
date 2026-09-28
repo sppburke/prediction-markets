@@ -1406,6 +1406,7 @@ fn different_markets_create_independent_pending_deliveries_and_restart_does_not_
             reason: "test_terminal".to_owned(),
             fill: None,
             dispatch_id: None,
+            dispatch_control_journal_seq: None,
             decline: None,
             final_receipt: None,
         };

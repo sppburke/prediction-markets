@@ -135,5 +135,6 @@ behaviour of the `SRC_502_GAP` (64) and `SRC_DATADASH` (128) bits.
   re-optimisation pipeline (includes watchlist export and VPS deploy).
 - `docs/_GLOSSARY.md` — `bootstrap_leaderboard_*` and `bootstrap_datadash_*`
   defaults, `SRC_LEADERBOARD` / `SRC_DATADASH` bit definitions.
-- `docs/19-WINNER-FOLLOW-STRATEGY.md` — promotion ladder and eligibility gates
-  that govern whether a newly-activated wallet reaches live execution.
+- `docs/19-WINNER-FOLLOW-STRATEGY.md` — wallet selection, order eligibility, and
+  risk rules. The owner's requested account mode is the only live on/off switch;
+  discovery and promotion evidence do not change it.
