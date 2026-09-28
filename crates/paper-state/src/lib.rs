@@ -2958,20 +2958,25 @@ impl PaperStateDb {
              FROM dispatch_targets WHERE dispatch_id = ?1 ORDER BY exec_rank ASC",
         )?;
         let rows = stmt
-            .query_map(params![dispatch_id], |row| {
-                Ok(DispatchTargetRow {
-                    dispatch_id: row.get(0)?,
-                    account_id: row.get(1)?,
-                    exec_rank: row.get(2)?,
-                    credential_bundle_version: row.get(3)?,
-                    credential_key_id: row.get(4)?,
-                    state: row.get(5)?,
-                    terminal_reason: row.get(6)?,
-                    updated_at_unix: row.get(7)?,
-                })
-            })?
+            .query_map(params![dispatch_id], row_to_dispatch_target)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// All retained terminal targets, including those whose seed was finalized.
+    pub fn retained_terminal_dispatch_targets(
+        &self,
+    ) -> Result<Vec<DispatchTargetRow>, PaperStateError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT dispatch_id, account_id, exec_rank, credential_bundle_version,
+                    credential_key_id, state, terminal_reason, updated_at_unix
+             FROM dispatch_targets WHERE state = 'terminal'
+             ORDER BY dispatch_id, exec_rank",
+        )?;
+        Ok(stmt
+            .query_map([], row_to_dispatch_target)?
+            .collect::<Result<Vec<_>, _>>()?)
     }
 
     /// Durably transition one target's lifecycle state (`pending` / `submitted` /
@@ -4437,6 +4442,19 @@ fn row_to_dispatch_seed(row: &rusqlite::Row<'_>) -> rusqlite::Result<DispatchSee
         source_trade_id: row.get(4)?,
         created_at_unix: row.get(5)?,
         finalized_at_unix: row.get(6)?,
+    })
+}
+
+fn row_to_dispatch_target(row: &rusqlite::Row<'_>) -> rusqlite::Result<DispatchTargetRow> {
+    Ok(DispatchTargetRow {
+        dispatch_id: row.get(0)?,
+        account_id: row.get(1)?,
+        exec_rank: row.get(2)?,
+        credential_bundle_version: row.get(3)?,
+        credential_key_id: row.get(4)?,
+        state: row.get(5)?,
+        terminal_reason: row.get(6)?,
+        updated_at_unix: row.get(7)?,
     })
 }
 

@@ -1447,9 +1447,16 @@ mod tests {
                 LiveJournalPayload::StagedDispatchControl(Box::new(
                     LiveStagedDispatchControlAudit {
                         dispatch_id: "other-dispatch".to_owned(),
-                        ..staged
+                        ..staged.clone()
                     },
                 )),
+            )
+            .unwrap();
+        let second_event = journal
+            .append(
+                pe_core_types::AccountId::new("acct").unwrap(),
+                at,
+                LiveJournalPayload::StagedDispatchControl(Box::new(staged)),
             )
             .unwrap();
         let terminal = TerminalDispositionEvidence::no_fill("market_admission_unavailable");
@@ -1497,13 +1504,29 @@ mod tests {
             )
             .unwrap();
         assert!(
-            crate::orchestrator::verify_retained_terminal_decisions(&paper_state, Some(&journal))
-                .is_ok()
+            crate::orchestrator::verify_retained_terminal_decisions(
+                &paper_state,
+                Some(journal.path())
+            )
+            .is_ok()
         );
+        crate::orchestrator::verify_retained_live_references(
+            &[
+                render_row(event.seq),
+                render_row(second_event.seq),
+                render_row(event.seq),
+            ],
+            &[],
+            Some(journal.path()),
+        )
+        .unwrap();
         assert!(
-            crate::orchestrator::verify_retained_terminal_decisions(&paper_state, None).is_err()
+            crate::orchestrator::verify_retained_terminal_decisions(&paper_state, None)
+                .unwrap_err()
+                .to_string()
+                .contains("live journal file is unavailable")
         );
-        for bad_seq in [wrong_event.seq, wrong_event.seq + 1] {
+        for bad_seq in [wrong_event.seq, second_event.seq + 1] {
             connection
                 .execute(
                     "UPDATE decision_pending SET post_commit_inputs_json = ?1",
@@ -1513,7 +1536,7 @@ mod tests {
             assert!(
                 crate::orchestrator::verify_retained_terminal_decisions(
                     &paper_state,
-                    Some(&journal)
+                    Some(journal.path())
                 )
                 .is_err()
             );
@@ -1543,7 +1566,7 @@ mod tests {
         ));
         assert!(matches!(
             crate::orchestrator::verify_retained_terminal_decision(
-                &render_row(wrong_event.seq + 1),
+                &render_row(second_event.seq + 1),
                 Some(&journal)
             ),
             Err(ReplayDecisionError::ControlJournal(_))

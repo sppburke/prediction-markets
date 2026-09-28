@@ -50,7 +50,7 @@ use pe_service::health::new_shared_health_with_ws;
 use pe_service::live_watchlist::{LiveWatchlist, projection_dirty_channel};
 use pe_service::market_end_cache::MarketEndCache;
 use pe_service::mid_price_cache::MidPriceCache;
-use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
+use pe_service::orchestrator::{LiveJournalAccess, Orchestrator, OrchestratorConfig};
 use pe_service::paper_api::PaperApiState;
 use pe_service::runtime_config::{
     AppliedWatchlistCapacity, ConfigEra, LiveRuntimeConfig, MAX_ACTIVE_WATCHLIST_SIZE,
@@ -1430,7 +1430,7 @@ async fn main() -> Result<()> {
             entry_gate_config,
             runtime_config: Some(live_runtime_config.clone()),
             live_accounts: live_accounts.clone(),
-            live_journal: live_journal_for_staging,
+            live_journal: boot_live_journal_access(live_journal_for_staging, &cfg.event_log_path),
         },
         WinnerFollowStrategy::new(initial_runtime_config.winner_follow_config()),
         paper_writer,
@@ -1855,6 +1855,16 @@ async fn join_named_until(
     }
 }
 
+fn boot_live_journal_access(
+    writer: Option<Arc<LiveJournal>>,
+    event_log_path: &std::path::Path,
+) -> Option<LiveJournalAccess> {
+    writer.map(LiveJournalAccess::Writable).or_else(|| {
+        let path = live_journal_path(event_log_path);
+        path.exists().then_some(LiveJournalAccess::ReadOnly(path))
+    })
+}
+
 fn live_journal_path(event_log_path: &std::path::Path) -> PathBuf {
     event_log_path
         .parent()
@@ -2249,6 +2259,20 @@ mod tests {
     use rusqlite::params;
 
     const NOW: i64 = 10_000;
+
+    #[test]
+    fn paper_only_boot_uses_existing_journal_read_only_and_leaves_missing_file_absent() {
+        let directory = tempfile::tempdir().unwrap();
+        let paper_log = directory.path().join("paper.log");
+        assert!(boot_live_journal_access(None, &paper_log).is_none());
+        let path = live_journal_path(&paper_log);
+        let journal = LiveJournal::open(&path).unwrap();
+        drop(journal);
+        assert!(matches!(
+            boot_live_journal_access(None, &paper_log),
+            Some(LiveJournalAccess::ReadOnly(found)) if found == path
+        ));
+    }
 
     fn wallet(id: u64) -> WalletAddress {
         WalletAddress::from_hex(&format!("0x{id:040x}")).unwrap()

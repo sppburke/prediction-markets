@@ -3041,8 +3041,9 @@ impl BracketFinancialHarness {
                 entry_gate_config: CopyEntryGateConfig,
                 runtime_config: None,
                 live_accounts: deployed.then(|| accounts.clone()),
-                live_journal: deployed
-                    .then(|| Arc::new(pe_execution_core::LiveJournal::open(&live_path).unwrap())),
+                live_journal: deployed.then(|| {
+                    Arc::new(pe_execution_core::LiveJournal::open(&live_path).unwrap()).into()
+                }),
                 activity_ws_enabled: deployed,
                 copy_latency_budget_secs: 2,
                 watchlist_writer_lock: Some(writer_lock.clone()),

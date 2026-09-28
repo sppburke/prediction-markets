@@ -2528,7 +2528,8 @@ mod legacy_v1 {
     }
 }
 
-fn replay_all(path: impl AsRef<Path>) -> Result<Vec<LiveJournalEvent>, LiveJournalError> {
+/// Replay and validate the complete account-tagged journal once for bulk reference checks.
+pub fn replay_all(path: impl AsRef<Path>) -> Result<Vec<LiveJournalEvent>, LiveJournalError> {
     replay_all_with_receipts(path)
         .map(|events| events.into_iter().map(|(event, _receipt)| event).collect())
 }

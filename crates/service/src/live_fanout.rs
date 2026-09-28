@@ -671,6 +671,7 @@ fn historical_terminal_reason_matches(
     };
     use pe_execution_core::LiveOrderPreparationFailure as Failure;
     match audit.failure {
+        Failure::RecoveryCredentialChanged => reason == Some("rejected"),
         Failure::PrePostRiskDayChanged
         | Failure::PrePostRiskPriceExpired
         | Failure::PrePostLadderExpired => reason == Some("rejected"),
@@ -18218,6 +18219,42 @@ mod tests {
         assert!(
             verify_seed_control_reference(&state, &seed, &conflicting, Some(event.seq)).is_err()
         );
+        state
+            .config
+            .paper_state
+            .finalize_dispatch_if_terminal("selected-targets", now.unix_timestamp())
+            .unwrap();
+        assert!(
+            state
+                .config
+                .paper_state
+                .unfinalized_ready_dispatch_seeds()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            crate::orchestrator::verify_retained_terminal_decisions(
+                &state.config.paper_state,
+                Some(&state.config.journal_path),
+            )
+            .is_err()
+        );
+        state
+            .config
+            .paper_state
+            .set_dispatch_target_state(
+                "selected-targets",
+                "acct",
+                "terminal",
+                Some("not_armed"),
+                now.unix_timestamp(),
+            )
+            .unwrap();
+        crate::orchestrator::verify_retained_terminal_decisions(
+            &state.config.paper_state,
+            Some(&state.config.journal_path),
+        )
+        .unwrap();
     }
 
     #[tokio::test]
@@ -18404,13 +18441,53 @@ mod tests {
         use pe_execution_core::LiveOrderPreparationFailure as Failure;
         use pe_execution_core::live_journal::TerminalAdmissionRecoveryEntry;
         let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
-        for (failure, legacy_reason) in [
-            (Failure::PrePostRiskDayChanged, "rejected"),
-            (Failure::PrePostRiskPriceExpired, "rejected"),
-            (Failure::PrePostLadderExpired, "rejected"),
+        // Deployed recovery and the former prepared-order path persisted these
+        // reasons. List every failure variant to make compatibility explicit.
+        for (failure, legacy_reason, current_reason) in [
+            (Failure::Venue, "rejected", "rejected"),
+            (Failure::PreparedAuditMismatch, "rejected", "rejected"),
+            (
+                Failure::RecoveryCredentialChanged,
+                "rejected",
+                "recovery_credential_changed",
+            ),
+            (
+                Failure::RecoveryAdmissionExpired,
+                "rejected",
+                "recovery_admission_expired",
+            ),
+            (
+                Failure::RecoveryAdmissionExpired,
+                "recovery_admission_expired",
+                "recovery_admission_expired",
+            ),
             (
                 Failure::RecoveryAdmissionExpired,
                 "recovery_account_not_armed",
+                "recovery_admission_expired",
+            ),
+            (
+                Failure::PrePostRiskDayChanged,
+                "rejected",
+                "recovery_risk_evidence_expired",
+            ),
+            (
+                Failure::PrePostRiskPriceExpired,
+                "rejected",
+                "recovery_risk_evidence_expired",
+            ),
+            (
+                Failure::PrePostLadderExpired,
+                "rejected",
+                "recovery_ladder_expired",
+            ),
+            (Failure::PrePostAdmissionExpired, "rejected", "rejected"),
+            (Failure::PrePostMarkUnavailable, "rejected", "rejected"),
+            (Failure::PrePostNotArmed, "not_armed", "not_armed"),
+            (
+                Failure::PrePostControlUnavailable,
+                "control_unavailable",
+                "control_unavailable",
             ),
         ] {
             let outcome = TerminalAdmissionRecoveryOutcome::PreparationFailed(Box::new(
@@ -18420,10 +18497,12 @@ mod tests {
                     control: None,
                 },
             ));
-            assert!(historical_terminal_reason_matches(
-                &outcome,
-                Some(legacy_reason)
-            ));
+            assert_eq!(terminal_recovery_reason(&outcome), current_reason);
+            assert!(
+                current_reason == legacy_reason
+                    || historical_terminal_reason_matches(&outcome, Some(legacy_reason)),
+                "{failure:?} / {legacy_reason}"
+            );
             assert!(!historical_terminal_reason_matches(&outcome, Some("wrong")));
             let dir = tempdir().unwrap();
             let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());

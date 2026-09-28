@@ -493,10 +493,15 @@ impl Harness {
                 entry_gate_config: CopyEntryGateConfig,
                 runtime_config: None,
                 live_accounts: Some(self.live.clone()),
-                live_journal: Some(Arc::new(
-                    pe_execution_core::LiveJournal::open(self.dir.path().join("live_journal.log"))
+                live_journal: Some(
+                    Arc::new(
+                        pe_execution_core::LiveJournal::open(
+                            self.dir.path().join("live_journal.log"),
+                        )
                         .unwrap(),
-                )),
+                    )
+                    .into(),
+                ),
                 activity_ws_enabled: enabled,
                 copy_latency_budget_secs: 2,
                 watchlist_writer_lock: None,

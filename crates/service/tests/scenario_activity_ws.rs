@@ -341,7 +341,7 @@ fn build_orchestrator(
             entry_gate_config: disabled_entry_gate(),
             runtime_config: None,
             live_accounts: opts.live_accounts,
-            live_journal,
+            live_journal: live_journal.map(Into::into),
         },
         WinnerFollowStrategy::new(flat_fill_config()),
         make_writer(dir),
@@ -1670,9 +1670,13 @@ async fn r9_observation_resolution_precedes_the_final_dispatch_age_sample() {
             entry_gate_config: disabled_entry_gate(),
             runtime_config: None,
             live_accounts: Some(LiveAccounts::new(accounts)),
-            live_journal: Some(Arc::new(
-                pe_execution_core::LiveJournal::open(dir.path().join("live_journal.log")).unwrap(),
-            )),
+            live_journal: Some(
+                Arc::new(
+                    pe_execution_core::LiveJournal::open(dir.path().join("live_journal.log"))
+                        .unwrap(),
+                )
+                .into(),
+            ),
             activity_ws_enabled: true,
             copy_latency_budget_secs: 2,
             watchlist_writer_lock: None,
@@ -2011,9 +2015,13 @@ async fn clob_book_wrong_market_with_right_asset_stops_before_dispatch_or_prepar
             entry_gate_config: disabled_entry_gate(),
             runtime_config: None,
             live_accounts: Some(LiveAccounts::new(accounts)),
-            live_journal: Some(Arc::new(
-                pe_execution_core::LiveJournal::open(dir.path().join("live_journal.log")).unwrap(),
-            )),
+            live_journal: Some(
+                Arc::new(
+                    pe_execution_core::LiveJournal::open(dir.path().join("live_journal.log"))
+                        .unwrap(),
+                )
+                .into(),
+            ),
             activity_ws_enabled: false,
             copy_latency_budget_secs: 2,
             watchlist_writer_lock: None,

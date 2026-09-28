@@ -5,6 +5,7 @@
 //! admission/current-price clients, and the one CLOB `/book` fetch used to build exact economics.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,10 +35,11 @@ use crate::bucket_commit::{BucketCommitEngine, DecisionContinuationV3, PaperFres
 use crate::clob_book::ClobBookFetcher;
 use crate::decision_replay::{
     AuthorityEvidence, BookEvidence, DecisionEvidenceAccumulator, MarketEndEvidence,
-    MarketPriceEvidence, ReplayDecisionError, TerminalDispositionEvidence,
-    WinnerFollowDecisionInputs, WinnerFollowRiskInputEvidence, ladder_plan_blake3,
-    replay_decision_pending, replay_decision_pending_with_control,
+    MarketPriceEvidence, TerminalDispositionEvidence, WinnerFollowDecisionInputs,
+    WinnerFollowRiskInputEvidence, ladder_plan_blake3, replay_decision_pending,
 };
+#[cfg(test)]
+use crate::decision_replay::{ReplayDecisionError, replay_decision_pending_with_control};
 use crate::entry_gate::CopyEntryGateConfig;
 use crate::health::SharedHealth;
 use crate::live_watchlist::LiveWatchlist;
@@ -246,7 +248,7 @@ pub struct OrchestratorConfig {
     /// live targets stage a dispatch aggregate. `None` (tests / Supabase off) = zero
     /// targets = the Phase-A baseline path (no seeds).
     pub live_accounts: Option<crate::live_accounts::LiveAccounts>,
-    pub live_journal: Option<Arc<pe_execution_core::LiveJournal>>,
+    pub live_journal: Option<LiveJournalAccess>,
     /// #530: websocket-primary mode. Gates the stale-fallback no-copy rule and the
     /// dual-unhealthy admission block; `false` keeps poll-only behavior byte-identical.
     pub activity_ws_enabled: bool,
@@ -258,6 +260,28 @@ pub struct OrchestratorConfig {
     /// lock used by refresh/maintenance so a newly durable fence is removed
     /// from the published generation before the bucket acknowledgement (#544).
     pub watchlist_writer_lock: Option<Arc<Mutex<()>>>,
+}
+
+/// Boot verification can read an existing journal without granting a paper-only
+/// service the writer used for live dispatch staging.
+pub enum LiveJournalAccess {
+    Writable(Arc<pe_execution_core::LiveJournal>),
+    ReadOnly(PathBuf),
+}
+
+impl LiveJournalAccess {
+    fn path(&self) -> &Path {
+        match self {
+            Self::Writable(journal) => journal.path(),
+            Self::ReadOnly(path) => path,
+        }
+    }
+}
+
+impl From<Arc<pe_execution_core::LiveJournal>> for LiveJournalAccess {
+    fn from(journal: Arc<pe_execution_core::LiveJournal>) -> Self {
+        Self::Writable(journal)
+    }
 }
 
 /// Scenario-only deterministic seams (#546): fixed admission-clock instants and historical mark
@@ -1584,21 +1608,97 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
 
 pub(crate) fn verify_retained_terminal_decisions(
     paper_state: &PaperStateDb,
-    journal: Option<&pe_execution_core::LiveJournal>,
+    journal_path: Option<&Path>,
 ) -> Result<(), anyhow::Error> {
-    for row in paper_state
+    let rows = paper_state
         .decision_pending_history()
-        .map_err(|error| anyhow::anyhow!("load decision continuation history: {error}"))?
-        .into_iter()
+        .map_err(|error| anyhow::anyhow!("load decision continuation history: {error}"))?;
+    let targets = paper_state
+        .retained_terminal_dispatch_targets()
+        .map_err(|error| anyhow::anyhow!("load retained terminal dispatch targets: {error}"))?;
+    verify_retained_live_references(&rows, &targets, journal_path)
+}
+
+pub(crate) fn verify_retained_live_references(
+    rows: &[pe_paper_state::DecisionPendingRow],
+    targets: &[pe_paper_state::DispatchTargetRow],
+    journal_path: Option<&Path>,
+) -> Result<(), anyhow::Error> {
+    let journal_events = if let Some(path) = journal_path {
+        pe_execution_core::live_journal::replay_all(path)
+            .map_err(|error| anyhow::anyhow!("verify retained live journal references: {error}"))?
+    } else {
+        Vec::new()
+    };
+    let mut selected_by_sequence = HashMap::new();
+    let mut not_armed = HashSet::new();
+    for event in journal_events {
+        match event.payload {
+            pe_execution_core::LiveJournalPayload::StagedDispatchControl(audit) => {
+                selected_by_sequence.insert(event.seq, audit.dispatch_id.clone());
+            }
+            pe_execution_core::LiveJournalPayload::PendingTargetControl(audit)
+                if audit.outcome
+                    == pe_execution_core::live_journal::LiveTargetControlOutcome::NotArmed =>
+            {
+                not_armed.insert((
+                    audit.dispatch_id.clone(),
+                    audit.account_id.as_str().to_owned(),
+                    audit.exec_rank,
+                ));
+            }
+            _ => {}
+        }
+    }
+    for row in rows
+        .iter()
         .filter(|row| row.state == pe_paper_state::DecisionPendingState::Terminal)
     {
-        verify_retained_terminal_decision(&row, journal).map_err(|error| {
+        let replayed = replay_decision_pending(row).map_err(|error| {
             anyhow::anyhow!("verify terminal pending {}: {error}", row.source_trade_id)
         })?;
+        let terminal = &replayed.post_boundary.body.terminal;
+        if let Some(seq) = terminal.dispatch_control_journal_seq {
+            let dispatch_id = terminal.dispatch_id.as_deref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "terminal pending {} lacks dispatch binding",
+                    row.source_trade_id
+                )
+            })?;
+            if journal_path.is_none() {
+                anyhow::bail!(
+                    "terminal pending {} references live journal sequence {seq}, but the live journal file is unavailable",
+                    row.source_trade_id
+                );
+            }
+            if selected_by_sequence.get(&seq).map(String::as_str) != Some(dispatch_id) {
+                anyhow::bail!(
+                    "terminal pending {} references a missing or wrong-dispatch selected-target record at live journal sequence {seq}",
+                    row.source_trade_id
+                );
+            }
+        }
+    }
+    if journal_path.is_none() && !targets.is_empty() {
+        anyhow::bail!("live journal file is unavailable for retained terminal target verification");
+    }
+    for target in targets {
+        let rank = u64::try_from(target.exec_rank)
+            .map_err(|_| anyhow::anyhow!("negative retained target rank"))?;
+        if not_armed.contains(&(target.dispatch_id.clone(), target.account_id.clone(), rank))
+            && target.terminal_reason.as_deref() != Some("not_armed")
+        {
+            anyhow::bail!(
+                "terminal target {}/{} reason contradicts bound NotArmed control audit",
+                target.dispatch_id,
+                target.account_id
+            );
+        }
     }
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn verify_retained_terminal_decision(
     row: &pe_paper_state::DecisionPendingRow,
     journal: Option<&pe_execution_core::LiveJournal>,
@@ -1746,7 +1846,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
 
         let bucket_engine = BucketCommitEngine::load(paper_state.clone(), leader_ledger)
             .map_err(|error| anyhow::anyhow!("load bucket commit engine: {error}"))?;
-        verify_retained_terminal_decisions(&paper_state, config.live_journal.as_deref())?;
+        verify_retained_terminal_decisions(
+            &paper_state,
+            config.live_journal.as_ref().map(LiveJournalAccess::path),
+        )?;
         let mut pending_boot = VecDeque::new();
         let mut pending_continuations = HashMap::new();
         for row in paper_state
@@ -1790,7 +1893,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             book_fetcher,
             price_impact_cap_bps: config.price_impact_cap_bps,
             live_accounts: config.live_accounts,
-            live_journal: config.live_journal,
+            live_journal: config.live_journal.and_then(|access| match access {
+                LiveJournalAccess::Writable(journal) => Some(journal),
+                LiveJournalAccess::ReadOnly(_) => None,
+            }),
             intake_stopped: false,
             watchlist_writer_lock: config.watchlist_writer_lock,
             pending_boot,
