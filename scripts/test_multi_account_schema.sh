@@ -1,26 +1,41 @@
 #!/bin/bash
 # Multi-account live schema acceptance suite (#508 Phase B).
 #
-# Runs against a Postgres that has loaded scripts/supabase_multi_account_live_schema.sql
+# Runs against a disposable Postgres that has loaded scripts/supabase_multi_account_live_schema.sql
 # (plus the Supabase roles). Verifies the SQL-layer contracts: slug grammar, at-most-one
-# primary, identity immutability, login_email normalization/uniqueness, the per-account
-# impact-cap CHECK, RPC atomicity (state + exactly one sanitized event per transaction),
+# primary, identity immutability, login_email normalization/uniqueness,
+# RPC atomicity (state + exactly one sanitized event per transaction),
 # retired review controls, credential sanitization, append-only account_events against
 # every runtime role including service_role, full anon/authenticated denial, the break-glass
 # accounts DELETE (events survive; a ledgered account is RESTRICTed), and the live_fills
 # idempotent insert-only ledger.
 #
-# Usage: bash scripts/test_multi_account_schema.sh "$PG_URL"
-# CI runs it after loading the schema twice (idempotency); safe to re-run.
+# Usage: PE_MULTI_ACCOUNT_TEST_DISPOSABLE=1 bash scripts/test_multi_account_schema.sh "$PG_URL"
+# CI runs it after loading the schema twice (idempotency). The target must have
+# empty account/live tables; use a new disposable database for every run.
 set -u
-URL="$1"
+URL="${1:?pass a disposable Postgres URL}"
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 fails=0
 expect_ok()  { if psql "$URL" -v ON_ERROR_STOP=1 -c "$2" >/dev/null 2>&1; then echo "PASS: $1"; else echo "FAIL(expected ok): $1"; fails=$((fails+1)); fi; }
 expect_err() { if psql "$URL" -v ON_ERROR_STOP=1 -c "$2" >/dev/null 2>&1; then echo "FAIL(expected err): $1"; fails=$((fails+1)); else echo "PASS: $1"; fi; }
 
-# Clean slate for re-runs.
-psql "$URL" -c "set session_replication_role = replica; delete from account_events; delete from account_credentials; delete from live_fills; delete from live_positions; delete from live_account_state; delete from accounts;" >/dev/null 2>&1
+# This suite creates accounts and a temporary database. Require an explicit local
+# disposable-db attestation outside CI, a loopback URL, and empty target tables.
+# Never delete existing rows to make a target look disposable.
+if [ "${CI:-}" != "true" ] && [ "${PE_MULTI_ACCOUNT_TEST_DISPOSABLE:-}" != "1" ]; then
+  echo "REFUSE: set PE_MULTI_ACCOUNT_TEST_DISPOSABLE=1 only for a disposable database" >&2
+  exit 2
+fi
+case "$URL" in
+  postgres://*@localhost:*/*|postgresql://*@localhost:*/*|postgres://*@127.0.0.1:*/*|postgresql://*@127.0.0.1:*/*) ;;
+  *) echo "REFUSE: target URL must use a loopback host" >&2; exit 2 ;;
+esac
+guard=$(psql "$URL" -v ON_ERROR_STOP=1 -Atc "select case when not exists (select 1 from public.accounts) and not exists (select 1 from public.account_events) and not exists (select 1 from public.account_credentials) and not exists (select 1 from public.live_fills) and not exists (select 1 from public.live_positions) and not exists (select 1 from public.live_account_state) then 'disposable' else 'unsafe' end" 2>/dev/null) || guard=unsafe
+if [ "$guard" != "disposable" ]; then
+  echo "REFUSE: target must have empty account/live tables" >&2
+  exit 2
+fi
 
 # 1. Slug grammar
 expect_err "slug grammar rejects uppercase"      "select account_create('BadSlug', false, 't')"
@@ -42,18 +57,19 @@ expect_err "duplicate login email rejected"      "select account_set_login_email
 expect_err "direct un-normalized insert rejected" "update accounts set login_email='X@Y.COM' where account_id='sppburke'"
 expect_ok  "clear login email (revoke)"          "select account_set_login_email('partner-2', null, 't')"
 
-# 5. Per-account impact-cap CHECK
-expect_err "impact cap 0 rejected"               "select account_update_live_settings('partner-2', null, 1, null, null, null, 0, 't')"
-expect_err "impact cap 10001 rejected"           "select account_update_live_settings('partner-2', null, 1, null, null, null, 10001, 't')"
-expect_ok  "impact cap 100 accepted"             "select account_update_live_settings('partner-2', null, 1, null, null, null, 100, 't')"
+# 5. Seven-argument settings RPC and retired cap shape
+expect_ok  "live settings accepted"               "select account_update_live_settings('partner-2', null, 1, null, null, null, 't')"
 before=$(psql "$URL" -Atc "select count(*) from account_events")
-expect_err "old settings shape rejects enabled" "select account_update_live_settings('partner-2', false, 2, null, null, null, 100, 't')"
-expect_err "old settings shape rejects enabled true" "select account_update_live_settings('partner-2', true, 2, null, null, null, 100, 't')"
+expect_err "settings rejects enabled" "select account_update_live_settings('partner-2', false, 2, null, null, null, 't')"
+expect_err "settings rejects enabled true" "select account_update_live_settings('partner-2', true, 2, null, null, null, 't')"
 after=$(psql "$URL" -Atc "select count(*) from account_events")
 if [ "$before" = "$after" ]; then echo "PASS: rejected enabled left no event"; else echo "FAIL: rejected enabled wrote event"; fails=$((fails+1)); fi
 expect_ok "historical enabled unchanged" "do \$\$ begin if (select enabled from accounts where account_id='partner-2') is distinct from false then raise exception 'enabled changed'; end if; end \$\$"
 expect_ok "rejected settings left other columns unchanged" "do \$\$ begin if (select execution_order from accounts where account_id='partner-2') is distinct from 1 then raise exception 'settings changed'; end if; end \$\$"
 expect_ok "new settings event omits enabled" "do \$\$ begin if exists (select 1 from account_events where event_kind='live_settings_changed' and (from_value::jsonb ? 'enabled' or to_value::jsonb ? 'enabled')) then raise exception 'enabled in event'; end if; end \$\$"
+expect_ok "retired cap absent from schema and RPC" "do \$\$ begin if to_regprocedure('public.account_update_live_settings(text,boolean,integer,text,numeric,bigint,integer,text)') is not null or exists (select 1 from information_schema.columns where table_schema='public' and table_name='accounts' and column_name='live_price_impact_cap_bps') or exists (select 1 from pg_constraint where conrelid='public.accounts'::regclass and conname='accounts_live_price_impact_cap_bps_check') then raise exception 'retired account cap remains'; end if; end \$\$"
+expect_ok "settings event omits retired cap" "do \$\$ begin if exists (select 1 from account_events where event_kind='live_settings_changed' and (from_value::jsonb ? 'live_price_impact_cap_bps' or to_value::jsonb ? 'live_price_impact_cap_bps')) then raise exception 'cap in new event'; end if; end \$\$"
+expect_ok "seven-argument RPC restricted to service role" "do \$\$ begin if not has_function_privilege('service_role', 'public.account_update_live_settings(text,boolean,integer,text,numeric,bigint,text)', 'EXECUTE') or has_function_privilege('anon', 'public.account_update_live_settings(text,boolean,integer,text,numeric,bigint,text)', 'EXECUTE') or has_function_privilege('authenticated', 'public.account_update_live_settings(text,boolean,integer,text,numeric,bigint,text)', 'EXECUTE') then raise exception 'incorrect settings RPC grants'; end if; end \$\$"
 
 # 6. RPC atomicity: unknown account leaves neither half
 before=$(psql "$URL" -Atc "select count(*) from account_events")
@@ -156,7 +172,7 @@ expect_ok  "fractional live position inserts" "insert into live_positions(accoun
 fractional=$(psql "$URL" -Atc "select long_contracts::text || ',' || short_contracts::text from live_positions where account_id='ledgered' and market_id='0xfractional' and outcome_id=1")
 if [ "$fractional" = "3.125001,0.000001" ]; then echo "PASS: fractional live position round trip"; else echo "FAIL: fractional live position changed ($fractional)"; fails=$((fails+1)); fi
 
-# 15. Pinned ea1a1a6 old-schema upgrade in a private CI database. The production
+# 15. Pinned ea1a1a6 old-schema upgrade in a temporary database. The target
 # schema and its rows above are never downgraded during this rehearsal.
 upgrade_db="live_upgrade_$$"
 case "$URL" in
@@ -165,15 +181,25 @@ case "$URL" in
 esac
 if [ -n "$upgrade_url" ]; then
   if psql "$URL" -v ON_ERROR_STOP=1 -c "create database $upgrade_db" >/dev/null 2>&1; then
-    if psql "$upgrade_url" -v ON_ERROR_STOP=1 -f "$SCRIPT_DIR/fixtures/multi_account_live_schema_ea1a1a6.sql" >/dev/null 2>&1 \
-      && psql "$upgrade_url" -v ON_ERROR_STOP=1 -c "select account_create('upgrade-acct', true, 'fixture'); select account_update_live_settings('upgrade-acct', true, 7, null, null, null, 100, 'fixture'); select account_record_promotion_review('upgrade-acct', 'fixture', 'legacy review', 'legacy-evidence');" >/dev/null 2>&1 \
-      && psql "$upgrade_url" -v ON_ERROR_STOP=1 -f "$SCRIPT_DIR/supabase_multi_account_live_schema.sql" >/dev/null 2>&1 \
-      && psql "$upgrade_url" -v ON_ERROR_STOP=1 -c "do \$\$ begin if (select enabled from accounts where account_id='upgrade-acct') is distinct from true or (select execution_order from accounts where account_id='upgrade-acct') is distinct from 7 then raise exception 'historical account changed'; end if; if not exists (select 1 from account_events where account_id='upgrade-acct' and event_kind='promotion_reviewed') then raise exception 'historical review missing'; end if; if to_regprocedure('public.account_record_promotion_review(text,text,text,text)') is not null then raise exception 'review function retained'; end if; end \$\$" >/dev/null 2>&1; then
-      echo "PASS: ea1a1a6 schema and rows upgrade without losing history"
-    else
-      echo "FAIL: ea1a1a6 schema upgrade fixture"
-      fails=$((fails+1))
-    fi
+    upgrade_ok() { if psql "$upgrade_url" -v ON_ERROR_STOP=1 -c "$2" >/dev/null 2>&1; then echo "PASS: $1"; else echo "FAIL(expected ok): $1"; fails=$((fails+1)); fi; }
+    upgrade_err() { if psql "$upgrade_url" -v ON_ERROR_STOP=1 -c "$2" >/dev/null 2>&1; then echo "FAIL(expected err): $1"; fails=$((fails+1)); else echo "PASS: $1"; fi; }
+    upgrade_file() { if psql "$upgrade_url" -v ON_ERROR_STOP=1 -f "$2" >/dev/null 2>&1; then echo "PASS: $1"; else echo "FAIL(expected ok): $1"; fails=$((fails+1)); fi; }
+    upgrade_file "load pinned old schema" "$SCRIPT_DIR/fixtures/multi_account_live_schema_ea1a1a6.sql"
+    upgrade_ok "seed legacy account and review history" "select account_create('upgrade-acct', true, 'fixture'); select account_update_live_settings('upgrade-acct', true, 7, null, null, null, 100, 'fixture'); select account_record_promotion_review('upgrade-acct', 'fixture', 'legacy review', 'legacy-evidence')"
+    upgrade_file "expand seven-argument settings RPC" "$SCRIPT_DIR/deploy/714_account_cap_expand.sql"
+    upgrade_file "reapply expansion" "$SCRIPT_DIR/deploy/714_account_cap_expand.sql"
+    upgrade_ok "both signatures and cap remain after expansion" "do \$\$ begin if to_regprocedure('public.account_update_live_settings(text,boolean,integer,text,numeric,bigint,text)') is null or to_regprocedure('public.account_update_live_settings(text,boolean,integer,text,numeric,bigint,integer,text)') is null or not exists (select 1 from information_schema.columns where table_schema='public' and table_name='accounts' and column_name='live_price_impact_cap_bps') then raise exception 'expansion catalog mismatch'; end if; end \$\$"
+    upgrade_ok "both signatures have restricted grants" "do \$\$ begin if not has_function_privilege('service_role', 'public.account_update_live_settings(text,boolean,integer,text,numeric,bigint,text)', 'EXECUTE') or not has_function_privilege('service_role', 'public.account_update_live_settings(text,boolean,integer,text,numeric,bigint,integer,text)', 'EXECUTE') or has_function_privilege('anon', 'public.account_update_live_settings(text,boolean,integer,text,numeric,bigint,text)', 'EXECUTE') or has_function_privilege('authenticated', 'public.account_update_live_settings(text,boolean,integer,text,numeric,bigint,text)', 'EXECUTE') or has_function_privilege('anon', 'public.account_update_live_settings(text,boolean,integer,text,numeric,bigint,integer,text)', 'EXECUTE') or has_function_privilege('authenticated', 'public.account_update_live_settings(text,boolean,integer,text,numeric,bigint,integer,text)', 'EXECUTE') then raise exception 'expansion grant mismatch'; end if; end \$\$"
+    upgrade_ok "old eight-argument caller still works" "select account_update_live_settings('upgrade-acct', true, 8, null, null, null, 200, 'old-caller')"
+    upgrade_ok "new seven-argument caller works" "select account_update_live_settings('upgrade-acct', null, 9, null, null, null, 'new-caller')"
+    upgrade_err "new unknown account fails before write" "select account_update_live_settings('upgrade-missing', null, 1, null, null, null, 'new-caller')"
+    upgrade_ok "expansion retains cap and all history" "do \$\$ begin if (select live_price_impact_cap_bps from accounts where account_id='upgrade-acct') is distinct from 200 or (select execution_order from accounts where account_id='upgrade-acct') is distinct from 9 or (select count(*) from account_events where account_id='upgrade-acct') != 5 or not exists (select 1 from account_events where account_id='upgrade-acct' and event_kind='promotion_reviewed') then raise exception 'expansion lost state or history'; end if; if exists (select 1 from account_events where actor='new-caller' and (from_value::jsonb ? 'live_price_impact_cap_bps' or to_value::jsonb ? 'live_price_impact_cap_bps')) then raise exception 'new event retained cap'; end if; end \$\$"
+    upgrade_file "contract to canonical schema" "$SCRIPT_DIR/supabase_multi_account_live_schema.sql"
+    upgrade_file "reapply contraction" "$SCRIPT_DIR/supabase_multi_account_live_schema.sql"
+    upgrade_ok "only seven-argument signature remains" "do \$\$ begin if to_regprocedure('public.account_update_live_settings(text,boolean,integer,text,numeric,bigint,text)') is null or to_regprocedure('public.account_update_live_settings(text,boolean,integer,text,numeric,bigint,integer,text)') is not null or exists (select 1 from information_schema.columns where table_schema='public' and table_name='accounts' and column_name='live_price_impact_cap_bps') or exists (select 1 from pg_constraint where conrelid='public.accounts'::regclass and conname='accounts_live_price_impact_cap_bps_check') then raise exception 'contraction catalog mismatch'; end if; end \$\$"
+    upgrade_err "old eight-argument call rejected" "select account_update_live_settings('upgrade-acct', true, 10, null, null, null, 100, 'old-caller')"
+    upgrade_ok "seven-argument call survives contraction" "select account_update_live_settings('upgrade-acct', null, 10, null, null, null, 'new-caller')"
+    upgrade_ok "contraction keeps grants and historical rows" "do \$\$ begin if not has_function_privilege('service_role', 'public.account_update_live_settings(text,boolean,integer,text,numeric,bigint,text)', 'EXECUTE') or has_function_privilege('anon', 'public.account_update_live_settings(text,boolean,integer,text,numeric,bigint,text)', 'EXECUTE') or has_function_privilege('authenticated', 'public.account_update_live_settings(text,boolean,integer,text,numeric,bigint,text)', 'EXECUTE') or (select enabled from accounts where account_id='upgrade-acct') is distinct from true or (select count(*) from account_events where account_id='upgrade-acct') != 6 or not exists (select 1 from account_events where account_id='upgrade-acct' and event_kind='promotion_reviewed') or to_regprocedure('public.account_record_promotion_review(text,text,text,text)') is not null then raise exception 'contraction lost grant, state, or history'; end if; end \$\$"
     psql "$URL" -v ON_ERROR_STOP=1 -c "drop database $upgrade_db with (force)" >/dev/null 2>&1 || { echo "FAIL: upgrade fixture database cleanup"; fails=$((fails+1)); }
   else
     echo "FAIL: create upgrade fixture database"
