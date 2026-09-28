@@ -18488,77 +18488,154 @@ mod tests {
         db.flip_dispatch_ready(id, "fill").unwrap();
     }
 
-    /// PASS: a paper-reachable delayed market remains a typed strict-live refusal; the target
-    /// records the live terminal disposition and no order POST fact is produced.
+    #[derive(Clone)]
+    struct DelayedMarketServer {
+        hits: Arc<Mutex<Vec<(String, String)>>>,
+        sealed_bundle: String,
+        condition_id: String,
+        delay: u32,
+    }
+
+    async fn delayed_market_response(
+        State(server): State<DelayedMarketServer>,
+        method: axum::http::Method,
+        uri: axum::http::Uri,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        let path = uri.path();
+        server
+            .hits
+            .lock()
+            .unwrap()
+            .push((method.to_string(), path.to_owned()));
+        let [gamma, clob_long, clob_compact, _] = economic_source_payloads(&server.condition_id);
+        let payload = match path {
+            "/rest/v1/account_credentials" => serde_json::json!([{
+                "account_id": "acct",
+                "bundle_version": 1,
+                "key_id": "key",
+                "sealed_bundle": server.sealed_bundle,
+            }]),
+            "/markets" => {
+                let mut value: serde_json::Value = serde_json::from_slice(&gamma).unwrap();
+                value[0]["secondsDelay"] = serde_json::json!(server.delay);
+                value
+            }
+            path if path == format!("/markets/{}", server.condition_id) => {
+                let mut value: serde_json::Value = serde_json::from_slice(&clob_long).unwrap();
+                value["seconds_delay"] = serde_json::json!(server.delay);
+                value
+            }
+            path if path == format!("/clob-markets/{}", server.condition_id) => {
+                serde_json::from_slice(&clob_compact).unwrap()
+            }
+            _ => return (StatusCode::NOT_FOUND, Json(serde_json::Value::Null)),
+        };
+        (StatusCode::OK, Json(payload))
+    }
+
+    fn sealed_delayed_market_credentials(identity: &Identity) -> String {
+        use std::io::Write as _;
+
+        let recipient = identity.to_public();
+        let encryptor =
+            age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
+                .unwrap();
+        let mut armored =
+            age::armor::ArmoredWriter::wrap_output(Vec::new(), age::armor::Format::AsciiArmor)
+                .unwrap();
+        let mut writer = encryptor.wrap_output(&mut armored).unwrap();
+        writer
+            .write_all(
+                serde_json::json!({
+                    "account_id": "acct",
+                    "bundle_version": 1,
+                    "key_id": "key",
+                    "private_key": format!("0x{}", "11".repeat(32)),
+                    "deposit_wallet": "0x1111111111111111111111111111111111111111",
+                    "api_key": "00000000-0000-0000-0000-000000000000",
+                    "api_secret": "c2VjcmV0",
+                    "api_passphrase": "passphrase",
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+        writer.finish().unwrap();
+        String::from_utf8(armored.finish().unwrap()).unwrap()
+    }
+
+    /// PASS: the armed target's actual admission rejects both delayed source contracts before
+    /// any order request, while the same market without delay reaches outcome selection.
     #[tokio::test]
     async fn delayed_paper_target_gets_strict_live_terminal_disposition_without_post() {
-        let dir = tempdir().unwrap();
-        let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
-        stage(&db, "delayed-paper-target", 1_800_000_000, &["acct"]);
-        let now = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
-        let state = fanout_state(
-            &dir,
-            Arc::clone(&db),
-            armed_snapshot("acct"),
-            "http://127.0.0.1:9",
-            None,
-        );
-        let gamma = include_bytes!("../tests/fixtures/golden_stream_v1/gamma_long.json");
-        let mut clob: serde_json::Value = serde_json::from_slice(include_bytes!(
-            "../tests/fixtures/golden_stream_v1/clob_long.json"
-        ))
-        .unwrap();
-        clob["seconds_delay"] = serde_json::json!(2);
-        let clob = serde_json::to_vec(&clob).unwrap();
-        let condition = PolymarketConditionId(
-            serde_json::from_slice::<serde_json::Value>(gamma).unwrap()[0]["conditionId"]
-                .as_str()
-                .unwrap()
-                .to_owned(),
-        );
-        assert!(
-            pe_source_polymarket_public::validate_paper_market(
-                gamma,
-                &clob,
-                &condition,
-                now.unix_timestamp(),
-                60,
+        for (delay, expected_reason) in [(2, "market_evidence_invalid"), (0, "outcome_not_binary")]
+        {
+            let dir = tempdir().unwrap();
+            let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+            let now = OffsetDateTime::now_utc();
+            let dispatch_id = format!("delayed-paper-target-{delay}");
+            stage(&db, &dispatch_id, now.unix_timestamp(), &["acct"]);
+            let identity = Identity::generate();
+            let mut signal = projection_signal();
+            // Outcome selection follows market admission and avoids an unrelated venue read.
+            signal.outcome_id = OutcomeId(2);
+            let hits = Arc::new(Mutex::new(Vec::new()));
+            let server = DelayedMarketServer {
+                hits: hits.clone(),
+                sealed_bundle: sealed_delayed_market_credentials(&identity),
+                condition_id: signal.market_id.0.0.clone(),
+                delay,
+            };
+            let app = Router::new()
+                .fallback(delayed_market_response)
+                .with_state(server);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let base_url = format!("http://{address}");
+            let mut snapshot = armed_snapshot("acct");
+            snapshot.fetched_at_unix = Some(now.unix_timestamp());
+            let mut state = fanout_state(&dir, db.clone(), snapshot, &base_url, Some(identity));
+            state.admission = LiveAdmissionBuilder::new(
+                state.config.http.clone(),
+                &base_url,
+                &base_url,
+                state.config.source_log.clone(),
+            );
+            let seed = db.unfinalized_ready_dispatch_seeds().unwrap().remove(0);
+            let target = db.dispatch_targets(&seed.dispatch_id).unwrap().remove(0);
+            let control = process_target(
+                &mut state,
+                &seed,
+                &target,
+                &signal,
+                &fixture_observation_evidence(),
+                now,
             )
-            .is_ok()
-        );
-        let refusal = pe_source_polymarket_public::validate_live_market(
-            gamma,
-            &clob,
-            &condition,
-            now.unix_timestamp(),
-            60,
-        )
-        .unwrap_err();
-        assert_eq!(
-            refusal,
-            pe_source_polymarket_public::LiveMarketError::NonzeroDelay
-        );
-        let error = LiveVenueAdapterError::MarketValidation(refusal.to_string());
-        let target = db
-            .dispatch_targets("delayed-paper-target")
-            .unwrap()
-            .remove(0);
-        terminalize(&state, &target, admission_terminal_reason(&error), now).unwrap();
-        let terminal = db
-            .dispatch_targets("delayed-paper-target")
-            .unwrap()
-            .remove(0);
-        assert_eq!(terminal.state, "terminal");
-        assert_eq!(
-            terminal.terminal_reason.as_deref(),
-            Some("market_evidence_invalid")
-        );
-        assert!(
-            replay_account(&state.config.journal_path, &AccountId::new("acct").unwrap())
-                .unwrap()
-                .iter()
-                .all(|event| !matches!(event.payload, LiveJournalPayload::OrderPosted(_)))
-        );
+            .await
+            .unwrap();
+            assert_eq!(control, PassControl::Continue);
+            let terminal = db.dispatch_targets(&dispatch_id).unwrap().remove(0);
+            assert_eq!(terminal.state, "terminal");
+            assert_eq!(terminal.terminal_reason.as_deref(), Some(expected_reason));
+            let hits = hits.lock().unwrap();
+            assert!(hits.iter().any(|(_, path)| path == "/markets"));
+            assert!(hits.iter().any(|(_, path)| path.starts_with("/markets/")));
+            assert!(
+                hits.iter()
+                    .any(|(_, path)| path.starts_with("/clob-markets/"))
+            );
+            assert!(
+                hits.iter().all(|(method, _)| method == "GET"),
+                "no POST/order call"
+            );
+            assert!(
+                replay_account(&state.config.journal_path, &AccountId::new("acct").unwrap())
+                    .unwrap()
+                    .iter()
+                    .all(|event| !matches!(event.payload, LiveJournalPayload::OrderPosted(_)))
+            );
+        }
     }
 
     /// PASS: a schema-one pending seed without observation evidence fails before target dispatch;

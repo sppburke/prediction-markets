@@ -675,6 +675,44 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         proposed_financial_semantic_version: u32,
     ) -> Result<(), String> {
         self.reconcile_oldest_financial_prepared().await?;
+        let (paper_log_path, _) = self
+            .financial_log_paths
+            .as_ref()
+            .ok_or_else(|| "qualification seal check is unavailable before Start".to_owned())?;
+        let era = crate::paper_recovery::paper_era(
+            crate::paper_recovery::scan_paper_log(paper_log_path)
+                .map_err(|error| error.to_string())?,
+        );
+        let seal_needed = era.start.as_ref().is_some_and(|(_, start)| {
+            Self::qualification_seal_reason(
+                start,
+                proposed_economic_hash,
+                proposed_financial_semantic_version,
+            )
+            .is_some()
+        }) && !era.frames.iter().any(|frame| {
+            matches!(
+                &frame.frame,
+                PaperLogFrame::Record(PaperLogRecord::QualificationSealed(_))
+            )
+        });
+        if seal_needed && !self.pending_boot.is_empty() {
+            // The seal digest requires terminal decisions. Finish only the preceding
+            // generation's frozen continuations before sealing; no new source producer is
+            // running yet, and continuation 6 may never be decided under an unsealed Start.
+            if self
+                .pending_continuations
+                .values()
+                .any(|continuation| continuation.version() >= 6)
+            {
+                return Err(
+                    "current-semantic continuation is open before qualification seal".to_owned(),
+                );
+            }
+            self.resume_pending_before_producers()
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         self.apply_seal_check(proposed_economic_hash, proposed_financial_semantic_version)
     }
 

@@ -851,8 +851,9 @@ Both are read by `risk-engine` as part of its pure inputs. As of issue #398 (Dec
 
 ### Paper-to-live-tiny qualification — quantified
 
-These thresholds classify a sealed **paper measurement report**. The semantic-2 cutover seals an
-unsealed semantic-1 Start once with `InsufficientEvidence` before paper producers resume. An
+These thresholds classify a sealed **paper measurement report**. The semantic-2 cutover first
+completes verified open continuations 2–5 under their frozen semantic-1 policy, then seals an
+unsealed semantic-1 Start once with `InsufficientEvidence` before current paper producers resume. An
 existing seal remains; paper decisions, fills, and daily marks continue, but automatic completion
 and `--qualify` cannot create another seal or report in that generation. A fresh generation is
 required for a later qualification measurement. No second Start, transition, or anchor is created.

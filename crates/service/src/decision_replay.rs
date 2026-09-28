@@ -17,6 +17,7 @@ pub const POST_BOUNDARY_EVIDENCE_VERSION: u16 = 4;
 pub const TERMINAL_EVIDENCE_VERSION: u16 = 5;
 const LEGACY_FINANCIAL_SEMANTIC_VERSION: u32 = 0;
 const HISTORICAL_FINANCIAL_SEMANTIC_VERSION: u32 = 1;
+const CONTINUATION_6_FINANCIAL_SEMANTIC_VERSION: u32 = 2;
 const EVIDENCE_OWNERS: [&str; 2] = ["source_log", "paper_log"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -306,7 +307,20 @@ pub struct DecisionPostBoundaryEvidence {
 impl DecisionPostBoundaryEvidence {
     /// Seal one post-boundary evidence body with its canonical BLAKE3 identity.
     pub fn from_body(body: DecisionPostBoundaryEvidenceBody) -> Result<Self, serde_json::Error> {
-        Self::from_body_with_semantic(body, crate::paper_recovery::FINANCIAL_SEMANTIC_VERSION)
+        Self::from_body_with_semantic(body, CONTINUATION_6_FINANCIAL_SEMANTIC_VERSION)
+    }
+
+    /// Seal a terminal fixture using the frozen continuation's financial era.
+    pub fn from_body_for_continuation(
+        body: DecisionPostBoundaryEvidenceBody,
+        continuation: &DecisionContinuationV3,
+    ) -> Result<Self, ReplayDecisionError> {
+        let semantic = match continuation.version() {
+            2..=5 => HISTORICAL_FINANCIAL_SEMANTIC_VERSION,
+            6 => CONTINUATION_6_FINANCIAL_SEMANTIC_VERSION,
+            _ => return Err(ReplayDecisionError::ContinuationBinding),
+        };
+        Ok(Self::from_body_with_semantic(body, semantic)?)
     }
 
     pub(crate) fn from_body_with_semantic(
@@ -532,7 +546,7 @@ pub struct DecisionEvidenceAccumulator {
 impl DecisionEvidenceAccumulator {
     pub(crate) fn new(continuation: &DecisionContinuationFacts) -> Self {
         Self {
-            financial_semantic_version: crate::paper_recovery::FINANCIAL_SEMANTIC_VERSION,
+            financial_semantic_version: CONTINUATION_6_FINANCIAL_SEMANTIC_VERSION,
             source_trade_id: continuation.source_trade_id.clone(),
             applied_configuration_hash: continuation.applied_configuration_hash.clone(),
             market_end: None,
@@ -657,7 +671,7 @@ impl DecisionEvidenceAccumulator {
         let expected_semantic = match continuation.version() {
             2 if checkpoint.financial_semantic_version.is_none() => None,
             2..=5 => Some(HISTORICAL_FINANCIAL_SEMANTIC_VERSION),
-            6 => Some(crate::paper_recovery::FINANCIAL_SEMANTIC_VERSION),
+            6 => Some(CONTINUATION_6_FINANCIAL_SEMANTIC_VERSION),
             _ => return Err(ReplayDecisionError::ContinuationBinding),
         };
         if checkpoint.financial_semantic_version != expected_semantic
@@ -857,7 +871,7 @@ pub fn replay_decision_pending(
     let expected_semantic = match (continuation.version(), decoded.legacy) {
         (2, true) => LEGACY_FINANCIAL_SEMANTIC_VERSION,
         (2..=5, false) => HISTORICAL_FINANCIAL_SEMANTIC_VERSION,
-        (6, false) => crate::paper_recovery::FINANCIAL_SEMANTIC_VERSION,
+        (6, false) => CONTINUATION_6_FINANCIAL_SEMANTIC_VERSION,
         _ => return Err(ReplayDecisionError::FrozenMismatch),
     };
     if post_boundary.financial_semantic_version != expected_semantic
