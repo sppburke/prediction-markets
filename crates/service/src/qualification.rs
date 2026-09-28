@@ -3725,6 +3725,7 @@ async fn verify_economic(
         },
         evaluated_at_unix,
         latency_was_active,
+        u32::from(economic.version),
     )
     .map_err(|error| {
         QualificationError::InsufficientEvidence(format!(
@@ -3739,7 +3740,7 @@ async fn verify_economic(
     active_halts.retain(|(owner, cause)| {
         *owner != RiskHaltOwner::Paper || *cause == RiskHaltCause::AbsoluteLoss
     });
-    apply_global_risk_halts(&active_halts, &mut reconstructed);
+    apply_global_risk_halts(&active_halts, &mut reconstructed, economic.version < 2);
     if reconstructed != economic.risk.snapshot {
         return insufficient("EconomicPrepared risk snapshot differs from causal replay");
     }
@@ -4723,6 +4724,7 @@ async fn replay_unavailable_risk_inputs(
         },
         evaluated_at_unix,
         latency_was_active,
+        if continuation.version() == 6 { 2 } else { 1 },
     ) {
         Ok(_) => Ok(None),
         Err(cause) => Ok(Some(cause)),
@@ -6784,6 +6786,7 @@ mod tests {
             |receipt| Ok(source.get(&receipt.sequence.0).unwrap().received_unix_ms),
             EVALUATED_MS.div_euclid(1_000),
             false,
+            start.financial_semantic_version,
         )
         .unwrap();
         let risk = RiskAudit {
@@ -7014,6 +7017,7 @@ mod tests {
             |receipt| Ok(source.get(&receipt.sequence.0).unwrap().received_unix_ms),
             evaluated_at_unix_ms.div_euclid(1_000),
             false,
+            fixture.start.financial_semantic_version,
         )
         .unwrap();
         economic.risk.decision = match evaluate_risk(&economic.risk.snapshot) {
@@ -7508,6 +7512,7 @@ mod tests {
             apply_global_risk_halts(
                 &HashSet::from([(owner, cause)]),
                 &mut economic.risk.snapshot,
+                fixture.start.financial_semantic_version < 2,
             );
             economic.risk.decision = match evaluate_risk(&economic.risk.snapshot) {
                 RiskDecision::Approved => RiskDecisionAudit::Approved,
@@ -7547,6 +7552,147 @@ mod tests {
                 economic
             );
         }
+    }
+
+    /// A semantic-1 decision keeps its historical latency audit, while a later semantic-2
+    /// continuation in the same generation reconstructs false from the same active halt prefix.
+    /// Qualification checks only pre-seal decisions under its Start semantic, so this test checks
+    /// each reconstruction directly.
+    #[tokio::test]
+    async fn mixed_era_evaluated_risk_replays_recorded_latency_semantics() {
+        let fixture = receipt_backed_decline_fixture().await;
+        for semantic in [1_u32, 2] {
+            let continuation = if semantic == 2 {
+                let mut encoded = serde_json::to_value(&fixture.decision.continuation).unwrap();
+                encoded["version"] = serde_json::json!(6);
+                serde_json::from_value(encoded).unwrap()
+            } else {
+                fixture.decision.continuation.clone()
+            };
+            assert_eq!(continuation.version() == 6, semantic == 2);
+            let mut economic = evaluated_economic(&fixture.decision).clone();
+            economic.version = u16::try_from(semantic).unwrap();
+            let halt = test_frame(
+                4,
+                economic.risk.evaluated_at_unix_ms.div_euclid(1_000) - 20,
+                PaperLogRecord::RiskHaltChanged {
+                    owner: RiskHaltOwner::Paper,
+                    cause: RiskHaltCause::CopyLatency,
+                    state: crate::paper_recovery::HaltState::Engaged,
+                    evidence: serde_json::json!({"fixture": "mixed-era"}),
+                },
+            );
+            economic.risk.financial_prefix = halt.receipt;
+            economic.risk.snapshot.copy_latency_kill_switch_active = semantic == 1;
+            economic.risk.decision = match evaluate_risk(&economic.risk.snapshot) {
+                RiskDecision::Approved => RiskDecisionAudit::Approved,
+                RiskDecision::Blocked(reason) => RiskDecisionAudit::Blocked { reason },
+            };
+            let mut frames = fixture.frames.clone();
+            frames.push(halt);
+            let financial = financial_state_at_prefix(
+                fixture.start.starting_bankroll.to_decimal(),
+                &fixture.facts,
+                economic.risk.financial_prefix,
+            )
+            .unwrap();
+            let operation = crate::paper_recovery::PaperFillOperationIdentity {
+                leader_wallet: continuation.facts.wallet,
+                source_trade_id: continuation.facts.source_trade_id.clone(),
+                observed_at_bucket: continuation.facts.source_epoch,
+            };
+            let replay = RiskReplayContext {
+                cash: financial.cash,
+                positions: &financial.positions,
+                fills: &financial.fills,
+                settlements: &financial.settlements,
+                last_completed: financial.last_completed,
+                start_receipt: frames[0].receipt,
+                paper_prefix: &frames,
+                source: &fixture.source,
+                prepared_received_unix_ms: economic.risk.evaluated_at_unix_ms,
+                start_hot_config_hash: &fixture.start.hot_config_hash,
+                financial_semantic_version: if continuation.version() == 6 { 2 } else { 1 },
+            };
+            let verified = verify_economic(&operation, &economic, &replay, false)
+                .await
+                .unwrap();
+            assert_eq!(verified.risk, economic.risk);
+            assert_eq!(
+                serde_json::to_vec(&verified.risk).unwrap(),
+                serde_json::to_vec(&economic.risk).unwrap()
+            );
+            assert_eq!(
+                verified.risk.snapshot.copy_latency_kill_switch_active,
+                semantic == 1
+            );
+        }
+    }
+
+    /// The unavailable-input replay selects its latency rule from the continuation, so a
+    /// missing historical latency receipt is a typed semantic-1 cause but not semantic-2 input.
+    #[tokio::test]
+    async fn mixed_era_unavailable_risk_replays_recorded_semantic() {
+        let mut fixture = receipt_backed_decline_fixture().await;
+        let economic = evaluated_economic(&fixture.decision);
+        let evidence = WinnerFollowRiskInputEvidence {
+            financial_prefix: Some(economic.risk.financial_prefix),
+            price_receipts: economic.risk.price_receipts.clone(),
+            evaluated_at_unix_ms: economic.risk.evaluated_at_unix_ms,
+            proposed_debit: economic.balance.worst_case_debit,
+            per_trade_cap_bps: economic.risk.snapshot.per_trade_cap_bps,
+        };
+        fixture.source.remove(&1008);
+        let legacy = fixture.decision.continuation.clone();
+        assert_eq!(
+            replay_unavailable_risk_inputs(&legacy, &evidence, &fixture.start, &fixture.context())
+                .await
+                .unwrap(),
+            Some(RiskInputsUnavailable::PriceMissing)
+        );
+        let recorded = WinnerFollowDecisionInputs::RiskInputsUnavailable {
+            cause: RiskInputsUnavailable::PriceMissing,
+            evidence: evidence.clone(),
+        };
+        let expected = pe_strategy_winner_follow::WinnerFollowDeclineAudit::RiskInputsUnavailable;
+        verify_winner_follow_decline_decision(
+            &legacy,
+            &recorded,
+            &expected,
+            &fixture.observations,
+            &fixture.start,
+            &fixture.context(),
+        )
+        .await
+        .unwrap();
+        let mut encoded = serde_json::to_value(&legacy).unwrap();
+        encoded["version"] = serde_json::json!(6);
+        let current: DecisionContinuationV3 = serde_json::from_value(encoded).unwrap();
+        assert_eq!(current.version(), 6);
+        assert_eq!(
+            replay_unavailable_risk_inputs(&current, &evidence, &fixture.start, &fixture.context())
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(matches!(
+            verify_winner_follow_decline_decision(
+                &current,
+                &recorded,
+                &expected,
+                &fixture.observations,
+                &fixture.start,
+                &fixture.context(),
+            )
+            .await,
+            Err(QualificationError::InsufficientEvidence(reason))
+                if reason.contains("recorded unavailable risk input")
+        ));
+        let encoded = serde_json::to_vec(&evidence).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<WinnerFollowRiskInputEvidence>(&encoded).unwrap(),
+            evidence
+        );
     }
 
     /// PASS: with a paper drawdown halt engaged at the prefix whose stop the evaluation's own
@@ -7617,6 +7763,7 @@ mod tests {
         apply_global_risk_halts(
             &HashSet::from([(RiskHaltOwner::Paper, cause)]),
             &mut clamped.risk.snapshot,
+            true,
         );
         clamped.risk.decision = match evaluate_risk(&clamped.risk.snapshot) {
             RiskDecision::Approved => RiskDecisionAudit::Approved,

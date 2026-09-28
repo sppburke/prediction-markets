@@ -95,7 +95,7 @@ impl ReconciliationFetcher for GammaFetcher {
         _url: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
         Box::pin(async {
-            Ok(br#"[{"conditionId":"0xcondition-b","clobTokenIds":["asset-b"]}]"#.to_vec())
+            Ok(br#"[{"conditionId":"0xcondition-a","clobTokenIds":["asset-a"]},{"conditionId":"0xcondition-b","clobTokenIds":["asset-b"]}]"#.to_vec())
         })
     }
 }
@@ -851,6 +851,14 @@ fn start_recorded_poller(
     start_recorded_poller_with_owner(dir, wallets, false)
 }
 
+fn start_recorded_poller_with_budget(
+    dir: &tempfile::TempDir,
+    wallets: &[WalletAddress],
+    budget_secs: u64,
+) -> (RunningPoll, Arc<PaperStateDb>) {
+    start_recorded_poller_with_completion_stop(dir, wallets, false, false, None, None, budget_secs)
+}
+
 fn start_recorded_poller_with_owner(
     dir: &tempfile::TempDir,
     wallets: &[WalletAddress],
@@ -873,6 +881,7 @@ fn start_recorded_poller_with_anchors(
         anchors,
         boundary_anchor,
         None,
+        2,
     )
 }
 
@@ -883,6 +892,7 @@ fn start_recorded_poller_with_completion_stop(
     anchors: bool,
     boundary_anchor: Option<i64>,
     stop_after_completion: Option<WalletAddress>,
+    copy_budget_secs: u64,
 ) -> (RunningPoll, Arc<PaperStateDb>) {
     let paper_path = dir.path().join("paper.db");
     let restarting = paper_path.exists();
@@ -982,7 +992,7 @@ fn start_recorded_poller_with_completion_stop(
                                 zero_basis(),
                                 Some(pe_service::bucket_commit::PaperFreshnessPolicy {
                                     activity_ws_enabled: true,
-                                    copy_latency_budget_secs: 2,
+                                    copy_latency_budget_secs: copy_budget_secs,
                                 }),
                             )
                             .unwrap()
@@ -1086,7 +1096,7 @@ fn start_recorded_poller_with_completion_stop(
             base_url: BASE_URL.to_owned(),
             poll_interval_secs: 30,
             activity_ws_enabled: true,
-            copy_latency_budget_secs: 2,
+            copy_latency_budget_secs: copy_budget_secs,
         },
         LiveWatchlist::new(membership),
         fetcher,
@@ -1491,6 +1501,55 @@ async fn urgent_trigger_wakes_idle_poller() {
     assert_eq!(commits.len(), 1);
 }
 
+/// PASS: with no earlier unresolved obligation, REST's third read decides the trade around
+/// three seconds after its source timestamp, using exactly three urgent wallet reads.
+#[tokio::test(start_paused = true)]
+async fn urgent_retry_copies_on_third_read_inside_120_second_window() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut running, paper) = start_recorded_poller_with_budget(&dir, &[wallet()], 120);
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    running.round_completed().await;
+    let row = stream_row(wallet(), "third-read", EPOCH);
+    let receipt = running.observe(row.clone()).await;
+    for elapsed in 0..3 {
+        if elapsed != 0 {
+            running.now.store(EPOCH + elapsed, Ordering::SeqCst);
+            tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        }
+        let request = running.requests.recv().await.unwrap();
+        assert!(request.url.contains(&format!("end={}", EPOCH + elapsed)));
+        if elapsed < 2 {
+            request.respond.send(b"[]".to_vec()).unwrap();
+            running.completed(wallet()).await;
+        } else {
+            running.now.store(EPOCH + 3, Ordering::SeqCst);
+            request
+                .respond
+                .send(serde_json::to_vec(std::slice::from_ref(&row)).unwrap())
+                .unwrap();
+            assert_eq!(running.completed(wallet()).await, vec![receipt]);
+        }
+    }
+    assert!(running.requests.try_recv().is_err());
+    let commits = running.finish().await;
+    assert_eq!(commits.len(), 1);
+    assert_eq!(commits[0].2.source_epoch, EPOCH);
+    assert!(commits[0].1.no_copy_dispositions.is_empty());
+    assert!(
+        paper
+            .activity_group_state(aggregate(row).group_id.key())
+            .unwrap()
+            .is_some()
+    );
+}
+
 /// PASS: B commits while A's backstop response remains held, using at most the two named slots.
 #[tokio::test(start_paused = true)]
 async fn urgent_wallet_progresses_while_unrelated_read_is_blocked() {
@@ -1668,6 +1727,90 @@ async fn unmatched_retry_requires_advancing_fixed_end() {
         "expiry retains the original frontier for the ordinary backstop"
     );
     running.finish().await;
+}
+
+/// PASS: an unmatched older websocket row fences newer REST buckets without ambiguous mapping.
+/// Its expired urgent attempt does not transfer ownership to the newer trigger; when a later
+/// backstop correlates both within the newer trade's budget, it decides the buckets in order.
+#[tokio::test(start_paused = true)]
+async fn older_unmatched_observation_holds_newer_bucket_until_correlated() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut running, paper) = start_recorded_poller_with_budget(&dir, &[wallet()], 120);
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    running.round_completed().await;
+    let mut older = stream_row(wallet(), "older-unmatched", EPOCH);
+    older["conditionId"] = json!(MARKET_A);
+    older["asset"] = json!("asset-a");
+    let newer = stream_row(wallet(), "newer-held", EPOCH + 1);
+    let older_receipt = running.observe(older.clone()).await;
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    running.completed(wallet()).await;
+    running.now.store(EPOCH + 1, Ordering::SeqCst);
+    let newer_receipt = running.observe(newer.clone()).await;
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    let request = running.requests.recv().await.unwrap();
+    assert!(request.url.contains(&format!("end={}", EPOCH + 1)));
+    request
+        .respond
+        .send(serde_json::to_vec(std::slice::from_ref(&newer)).unwrap())
+        .unwrap();
+    assert_eq!(running.completed(wallet()).await, vec![older_receipt]);
+    assert!(
+        paper
+            .activity_group_state(aggregate(newer.clone()).group_id.key())
+            .unwrap()
+            .is_none()
+    );
+    assert!(!paper.is_wallet_fenced(&wallet()).unwrap());
+
+    running.now.store(EPOCH + 121, Ordering::SeqCst);
+    tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    assert!(
+        running.requests.try_recv().is_err(),
+        "the newer trigger cannot re-arm the expired older urgent attempt"
+    );
+    tokio::time::advance(std::time::Duration::from_secs(28)).await;
+    let backstop = running.requests.recv().await.unwrap();
+    backstop
+        .respond
+        .send(serde_json::to_vec(&[newer.clone(), older.clone()]).unwrap())
+        .unwrap();
+    assert_eq!(running.completed(wallet()).await, vec![older_receipt]);
+    let newer_attempt = running.requests.recv().await.unwrap();
+    newer_attempt
+        .respond
+        .send(serde_json::to_vec(&[newer.clone(), older.clone()]).unwrap())
+        .unwrap();
+    assert_eq!(running.completed(wallet()).await, vec![newer_receipt]);
+    let commits = running.finish().await;
+    assert_eq!(commits.len(), 2);
+    assert_eq!(commits[0].2.source_epoch, EPOCH);
+    assert_eq!(commits[1].2.source_epoch, EPOCH + 1);
+    assert!(commits[1].1.no_copy_dispositions.is_empty());
+    assert_eq!(
+        commits[1].2.pending,
+        vec![aggregate(newer.clone()).group_id.key().clone()]
+    );
+    assert!(
+        paper
+            .activity_group_state(aggregate(newer).group_id.key())
+            .unwrap()
+            .is_some()
+    );
 }
 
 /// PASS: history at either adjacent second keeps its canonical epoch and ages from the older clock.
@@ -2409,6 +2552,7 @@ async fn completion_ready_shutdown_cancels_at_loop_top() {
         false,
         None,
         Some(other),
+        2,
     );
     let held = running
         .bucket_ack_gate

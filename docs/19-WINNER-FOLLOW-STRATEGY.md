@@ -361,8 +361,8 @@ All values in basis points (1 bp = 0.01 %). Comments show the percent equivalent
 # - Concentration caps: UN-ENFORCED BY DECISION on the production copy path. The values below
 #   remain canonical for backtest/tests, carried as `RiskSnapshot.concentration_caps =
 #   Some(ConcentrationCaps::CANONICAL)`; production passes `None` (typed, not accidental).
-# - Drawdown stops + latency kill switch: ARMED from exact owner-local financial snapshots,
-#   durable paper/live evidence, and completed-prior-hour latency samples.
+# - Drawdown stops: ARMED from exact owner-local financial snapshots and durable
+#   paper/live evidence. The copy-latency halt is retired for current decisions.
 
 [winner_follow.modes]
 leader_follow                = "live_tiny"   # ordinary live mode; promoted remains deferred
@@ -386,12 +386,10 @@ max_market_bps                       = 200   # 2.00 % per market
 max_family_bps                       = 800   # 8.00 % per MarketFamily
 max_total_copy_bps                   = 2500  # 25.00 % total open copy exposure
 
-# Drawdown stops and latency switch (armed; fixed owner-local baseline and denominator)
+# Drawdown stops (armed; fixed owner-local baseline and denominator)
 intraday_stop_bps                    = -200  # halt new entries at -2.00 % intraday
 rolling_7d_stop_bps                  = -600  # halt at -6.00 % over rolling 7d
 kill_switch_drawdown_bps             = -1000 # -10.00 % bankroll absolute kill
-copy_latency_kill_switch_ms          = 3000  # two completed prior-hour p95 values strictly above
-copy_latency_release_ms              = 2000  # active switch releases at or below; missing holds
 
 [winner_follow.copy]
 max_slippage_from_leader_bps         = 75    # 0.75 % from leader observed price
@@ -414,7 +412,8 @@ Gate order in `orchestrator.rs::handle_trade`, after dedup → watchlist → cla
 | C | Resolution horizon | `now + min_resolution_horizon_secs ≤` market resolution `≤ now + max_resolution_horizon_secs` | admission's recorded CLOB-long `scheduled_end_unix` | Too far out locks capital for months; too soon (< 60 s) cannot be filled and held (`docs/29` copy floor). The same admission read supplies the horizon and economic evidence; the dashboard market-end cache is not consulted by this path. Each bound's `0` disables it; **unknown** resolution time **fails closed** (skipped). |
 | D | Signed-price band | current admission and book evidence are usable, and the signed ladder's worst accepted tick is `≥ min_fill_price` and `< max_fill_price` | shared venue ladder/economic-preparation owner | Paper and ordinary live use the same signed principal, minimum shares, fee schedule, and all-in price. Gamma mid is liveness/mark evidence only. The upper boundary skips and the lower boundary fills. |
 
-**Copy-latency budget (both provenances).** REST poll and activity-websocket observations pass an
+**Copy-latency budget (both provenances).** The owner permits copies through 120 s after
+the leader trade while the ranker's Δ stays 2 s. REST poll and activity-websocket observations pass an
 early freshness gate and the shared pre-dispatch gate. In websocket-primary mode, expiry at either
 gate records a typed no-copy disposition and stages no copy. Continuation 5 freezes its freshness
 policy at bucket commit and adds a final paper-only freshness decision at the Prepared boundary,
@@ -478,7 +477,7 @@ simulation.rs gates (backtest only, lines 457-518)
 | `KillSwitchDrawdown` | strategy-wide new entries; absolute-loss cause remains latched until its own audited append hash releases it |
 | `IntradayDrawdownStop` | strategy-wide new entries; releases mechanically when the current fixed-denominator intraday value clears the threshold |
 | `Rolling7dDrawdownStop` | strategy-wide new entries; releases mechanically when closes age out or the fixed-denominator value clears the threshold |
-| `CopyLatencyKillSwitch` | strategy-wide new entries; releases on an available p95 at or below `copy_latency_release_ms` above, while missing holds; sample-starved release requires its own audited append hash |
+| `CopyLatencyKillSwitch` | historical semantic-1 replay only; retired for current paper and live decisions |
 | `PerTradeSizeExceeded` | this trade |
 | `LeaderConcentrationExceeded` | this trade |
 | `MarketConcentrationExceeded` | this trade |

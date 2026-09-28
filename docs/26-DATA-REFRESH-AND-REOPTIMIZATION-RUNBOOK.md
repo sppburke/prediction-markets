@@ -482,8 +482,7 @@ resolve deterministically via `(timestamp_unix, source_trade_id)`).
 > stale-fallback budget verified (docs/35), and only then does the forge
 > checkout pull the new `LATENCY_SHIFT_SECS`. Rollback is the reverse (docs/35
 > "#530 websocket rollback ordering"). The +1-week re-check compares the
-> measured leader→fill p95 span artifact against 2s and raises Δ only if
-> measurement demands it.
+> measured leader→fill span artifact and reports late copies; the owner keeps Δ at 2s.
 
 > **First full-universe run — stage the half-life.** For the first run after moving to
 > the full trade universe, override with `--half-life-days 0` (decay off) so a

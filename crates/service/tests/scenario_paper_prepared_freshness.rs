@@ -205,6 +205,7 @@ struct Recorded {
 }
 struct Harness {
     config: RuntimeConfig,
+    copy_budget_secs: u64,
     probability: pe_core_types::Probability,
     dir: tempfile::TempDir,
     paper: Arc<PaperStateDb>,
@@ -224,6 +225,10 @@ struct Harness {
 }
 impl Harness {
     async fn new() -> Self {
+        Self::new_with_semantic(pe_service::paper_recovery::FINANCIAL_SEMANTIC_VERSION).await
+    }
+
+    async fn new_with_semantic(financial_semantic_version: u32) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
         paper
@@ -263,7 +268,7 @@ impl Harness {
             .unwrap(),
             schema_version: 3,
             parser_version: 1,
-            financial_semantic_version: pe_service::paper_recovery::FINANCIAL_SEMANTIC_VERSION,
+            financial_semantic_version,
         }));
         let mut writer = Writer::open(dir.path().join("paper.log")).unwrap();
         let start = writer
@@ -299,6 +304,7 @@ impl Harness {
         hooks.financial_clock_unix.store(EPOCH, Ordering::SeqCst);
         Self {
             config: runtime(),
+            copy_budget_secs: 2,
             probability: pe_core_types::Probability::new(dec!(0.7)).unwrap(),
             dir,
             paper,
@@ -504,7 +510,7 @@ impl Harness {
                     .into(),
                 ),
                 activity_ws_enabled: enabled,
-                copy_latency_budget_secs: 2,
+                copy_latency_budget_secs: self.copy_budget_secs,
                 watchlist_writer_lock: None,
             },
             WinnerFollowStrategy::new(self.config.winner_follow_config()),
@@ -615,7 +621,7 @@ impl Harness {
                 base_url: "fixture://activity".to_owned(),
                 poll_interval_secs: 30,
                 activity_ws_enabled: stream_epoch.is_some(),
-                copy_latency_budget_secs: 2,
+                copy_latency_budget_secs: self.copy_budget_secs,
             },
             watchlist(),
             Arc::new(Page(recorded.activity.clone())),
@@ -750,7 +756,7 @@ impl Harness {
                 },
                 Some(PaperFreshnessPolicy {
                     activity_ws_enabled: enabled,
-                    copy_latency_budget_secs: 2,
+                    copy_latency_budget_secs: self.copy_budget_secs,
                 }),
             )
             .unwrap();
@@ -855,7 +861,7 @@ fn assert_shared_stale(
         disposition,
         (
             "activity_ws".to_owned(),
-            2,
+            i64::try_from(h.copy_budget_secs).unwrap(),
             "stale_activity_ws_past_copy_budget".to_owned(),
             dispatch_at.unwrap_or(initial_at).unix_timestamp()
         )
@@ -1023,79 +1029,83 @@ async fn bound_source_clock_expires_initial_shared_gate() {
 /// source deadline and refuses at deadline +1 ns; accepted operation identity stays historical.
 #[tokio::test]
 async fn bound_source_clock_shared_gate_exact_boundary_in_both_directions() {
-    for initial_gate in [false, true] {
-        for history_later in [false, true] {
-            for expired in [false, true] {
-                let mut h = Harness::new().await;
-                let recorded = h.record(if history_later { 2 } else { 1 }).await;
-                let stream_epoch = if history_later { EPOCH } else { EPOCH + 1 };
-                let reconciled_at = at() + time::Duration::milliseconds(1500);
-                let deadline = at() + time::Duration::seconds(2);
-                let dispatch_at = deadline + time::Duration::nanoseconds(i64::from(expired));
-                let initial_at = if initial_gate {
-                    dispatch_at
-                } else {
-                    reconciled_at
-                };
-                h.arm();
-                h.hooks
-                    .age_clock
-                    .lock()
-                    .unwrap()
-                    .extend([initial_at, dispatch_at, dispatch_at]);
-                h.hooks
-                    .admission_artifacts
-                    .lock()
-                    .unwrap()
-                    .push_back(recorded.admission.clone());
-                h.start(true);
-                h.poll_source(&recorded, Some(stream_epoch), reconciled_at)
-                    .await;
-                assert_bound_clocks(&h, &recorded, stream_epoch);
-                if expired {
-                    assert_shared_stale(
-                        &h,
-                        &recorded,
+    for budget in [2, 120] {
+        for initial_gate in [false, true] {
+            for history_later in [false, true] {
+                for expired in [false, true] {
+                    let mut h = Harness::new().await;
+                    h.copy_budget_secs = budget;
+                    let recorded = h.record(if history_later { 2 } else { 1 }).await;
+                    let stream_epoch = if history_later { EPOCH } else { EPOCH + 1 };
+                    let reconciled_at = at() + time::Duration::milliseconds(1500);
+                    let deadline = at() + time::Duration::seconds(i64::try_from(budget).unwrap());
+                    let dispatch_at = deadline + time::Duration::nanoseconds(i64::from(expired));
+                    let initial_at = if initial_gate {
+                        dispatch_at
+                    } else {
+                        reconciled_at
+                    };
+                    h.arm();
+                    h.hooks.age_clock.lock().unwrap().extend([
                         initial_at,
-                        (!initial_gate).then_some(dispatch_at),
-                    );
-                } else {
-                    let row = h.terminal(&recorded);
-                    let replayed = replay_decision_pending(&row).unwrap();
-                    assert_eq!(row.terminal_disposition.as_deref(), Some("fill"));
-                    assert_eq!(h.prepared_count(), 1);
-                    assert_eq!(h.authority.inner.lock().unwrap().fills.len(), 1);
-                    assert_eq!(h.paper.list_fills().unwrap().len(), 1);
-                    let frames = scan_paper_log(&h.dir.path().join("paper.log")).unwrap();
-                    let operation_epoch = frames
-                        .iter()
-                        .find_map(|frame| match &frame.frame {
-                            PaperLogFrame::Record(PaperLogRecord::FinancialPrepared {
-                                payload:
-                                    pe_service::paper_recovery::FinancialPayload::Fill {
-                                        operation, ..
-                                    },
-                                ..
-                            }) => Some(operation.observed_at_bucket),
-                            _ => None,
-                        })
-                        .unwrap();
-                    assert_eq!(operation_epoch, recorded.epoch);
-                    let clock = replayed
-                        .post_boundary
-                        .body
-                        .clocks
-                        .iter()
-                        .find(|clock| clock.purpose == "paper_prepared_staleness_gate")
-                        .unwrap();
-                    assert_eq!(
-                        *clock,
-                        DecisionClockEvidence::precise(
-                            "paper_prepared_staleness_gate",
-                            deadline.unix_timestamp_nanos()
-                        )
+                        dispatch_at,
+                        dispatch_at,
+                    ]);
+                    h.hooks
+                        .admission_artifacts
+                        .lock()
                         .unwrap()
-                    );
+                        .push_back(recorded.admission.clone());
+                    h.start(true);
+                    h.poll_source(&recorded, Some(stream_epoch), reconciled_at)
+                        .await;
+                    assert_bound_clocks(&h, &recorded, stream_epoch);
+                    if expired {
+                        assert_shared_stale(
+                            &h,
+                            &recorded,
+                            initial_at,
+                            (!initial_gate).then_some(dispatch_at),
+                        );
+                    } else {
+                        let row = h.terminal(&recorded);
+                        let replayed = replay_decision_pending(&row).unwrap();
+                        assert_eq!(row.terminal_disposition.as_deref(), Some("fill"));
+                        assert_eq!(h.prepared_count(), 1);
+                        assert_eq!(h.authority.inner.lock().unwrap().fills.len(), 1);
+                        assert_eq!(h.paper.list_fills().unwrap().len(), 1);
+                        let frames = scan_paper_log(&h.dir.path().join("paper.log")).unwrap();
+                        let operation_epoch = frames
+                            .iter()
+                            .find_map(|frame| match &frame.frame {
+                                PaperLogFrame::Record(PaperLogRecord::FinancialPrepared {
+                                    payload:
+                                        pe_service::paper_recovery::FinancialPayload::Fill {
+                                            operation,
+                                            ..
+                                        },
+                                    ..
+                                }) => Some(operation.observed_at_bucket),
+                                _ => None,
+                            })
+                            .unwrap();
+                        assert_eq!(operation_epoch, recorded.epoch);
+                        let clock = replayed
+                            .post_boundary
+                            .body
+                            .clocks
+                            .iter()
+                            .find(|clock| clock.purpose == "paper_prepared_staleness_gate")
+                            .unwrap();
+                        assert_eq!(
+                            *clock,
+                            DecisionClockEvidence::precise(
+                                "paper_prepared_staleness_gate",
+                                deadline.unix_timestamp_nanos()
+                            )
+                            .unwrap()
+                        );
+                    }
                 }
             }
         }
@@ -1123,58 +1133,63 @@ fn assert_expired(h: &Harness, recorded: &Recorded) {
 /// PASS: a cold portfolio read can expire paper after staging, without undoing the entry or its live target.
 #[tokio::test]
 async fn cold_portfolio_prices_expire_before_new_prepared_and_release_live_targets() {
-    let mut h = Harness::new().await;
-    let held = h.record(1).await;
-    h.attempt(&held, at());
-    h.start(true);
-    h.poll(&held).await;
-    assert_eq!(h.prepared_count(), 1);
-    assert_eq!(h.paper.open_positions().unwrap().len(), 1);
-    let cash = h.paper.bankroll().unwrap();
-    h.stop().await;
-    let recorded = h.record(2).await;
-    h.arm();
-    h.start(true);
-    *h.prices.gate.market.lock().unwrap() = Some(held.admission.market.condition_id.0.clone());
-    h.attempt(
-        &recorded,
-        at() + time::Duration::seconds(3) + time::Duration::nanoseconds(1),
-    );
-    h.prices.gate.blocked.store(true, Ordering::SeqCst);
-    let gate = h.prices.gate.clone();
-    let pending = h.poll(&recorded);
-    tokio::pin!(pending);
-    tokio::select! { biased; _ = gate.started.notified() => {}, _ = &mut pending => panic!("copy completed before cold-price gate") }
-    let staged = h.paper.pending_dispatch_seeds().unwrap();
-    assert_eq!(staged.len(), 1, "{:?}", h.terminal(&recorded));
-    let open = h.terminal(&recorded);
-    assert_eq!(open.state, DecisionPendingState::Open);
-    let checkpoint: Value = serde_json::from_str(&open.post_commit_inputs_json).unwrap();
-    assert_eq!(checkpoint["dispatch_id"], staged[0].dispatch_id);
-    assert!(checkpoint.get("terminal").is_none());
-    let targets = h.paper.dispatch_targets(&staged[0].dispatch_id).unwrap();
-    assert_eq!(targets.len(), 1);
-    gate.release.notify_one();
-    pending.await;
-    assert_expired(&h, &recorded);
-    assert_eq!(h.prepared_count(), 1);
-    assert_eq!(h.authority.inner.lock().unwrap().fills.len(), 1);
-    assert_eq!(h.paper.bankroll().unwrap(), cash);
-    assert_eq!(h.paper.open_positions().unwrap().len(), 1);
-    let ready = h
-        .paper
-        .dispatch_seed(&staged[0].dispatch_id)
-        .unwrap()
-        .unwrap();
-    assert_eq!(ready.state, "ready");
-    assert_eq!(
-        ready.paper_outcome.as_deref(),
-        Some("no_fill:paper_stale_before_prepared")
-    );
-    assert_eq!(
-        h.paper.dispatch_targets(&staged[0].dispatch_id).unwrap(),
-        targets
-    );
+    for budget in [2, 120] {
+        let mut h = Harness::new().await;
+        h.copy_budget_secs = budget;
+        let held = h.record(1).await;
+        h.attempt(&held, at());
+        h.start(true);
+        h.poll(&held).await;
+        assert_eq!(h.prepared_count(), 1);
+        assert_eq!(h.paper.open_positions().unwrap().len(), 1);
+        let cash = h.paper.bankroll().unwrap();
+        h.stop().await;
+        let recorded = h.record(2).await;
+        h.arm();
+        h.start(true);
+        *h.prices.gate.market.lock().unwrap() = Some(held.admission.market.condition_id.0.clone());
+        h.attempt(
+            &recorded,
+            OffsetDateTime::from_unix_timestamp(recorded.epoch).unwrap()
+                + time::Duration::seconds(i64::try_from(budget).unwrap())
+                + time::Duration::nanoseconds(1),
+        );
+        h.prices.gate.blocked.store(true, Ordering::SeqCst);
+        let gate = h.prices.gate.clone();
+        let pending = h.poll(&recorded);
+        tokio::pin!(pending);
+        tokio::select! { biased; _ = gate.started.notified() => {}, _ = &mut pending => panic!("copy completed before cold-price gate") }
+        let staged = h.paper.pending_dispatch_seeds().unwrap();
+        assert_eq!(staged.len(), 1, "{:?}", h.terminal(&recorded));
+        let open = h.terminal(&recorded);
+        assert_eq!(open.state, DecisionPendingState::Open);
+        let checkpoint: Value = serde_json::from_str(&open.post_commit_inputs_json).unwrap();
+        assert_eq!(checkpoint["dispatch_id"], staged[0].dispatch_id);
+        assert!(checkpoint.get("terminal").is_none());
+        let targets = h.paper.dispatch_targets(&staged[0].dispatch_id).unwrap();
+        assert_eq!(targets.len(), 1);
+        gate.release.notify_one();
+        pending.await;
+        assert_expired(&h, &recorded);
+        assert_eq!(h.prepared_count(), 1);
+        assert_eq!(h.authority.inner.lock().unwrap().fills.len(), 1);
+        assert_eq!(h.paper.bankroll().unwrap(), cash);
+        assert_eq!(h.paper.open_positions().unwrap().len(), 1);
+        let ready = h
+            .paper
+            .dispatch_seed(&staged[0].dispatch_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(ready.state, "ready");
+        assert_eq!(
+            ready.paper_outcome.as_deref(),
+            Some("no_fill:paper_stale_before_prepared")
+        );
+        assert_eq!(
+            h.paper.dispatch_targets(&staged[0].dispatch_id).unwrap(),
+            targets
+        );
+    }
 }
 
 /// PASS: recorded lifted asks fill above the frozen leader price and replay with either delay shape.
@@ -2076,13 +2091,16 @@ async fn version_six_staged_target_strict_live_admission_submits_and_replays() {
     ));
 }
 
-/// PASS: exactly two seconds fills; one nanosecond later expires, with the predicate's exact clock.
+/// PASS: the frozen exact boundary fills; one nanosecond later expires, with the predicate's exact clock.
 #[tokio::test]
 async fn paper_prepared_gate_preserves_nanosecond_boundary() {
-    for remainder in [0, 1] {
+    for (budget, remainder) in [(2, 0), (2, 1), (120, 0), (120, 1)] {
         let mut h = Harness::new().await;
+        h.copy_budget_secs = budget;
         let recorded = h.record(1).await;
-        let gate = at() + time::Duration::seconds(2) + time::Duration::nanoseconds(remainder);
+        let gate = at()
+            + time::Duration::seconds(i64::try_from(budget).unwrap())
+            + time::Duration::nanoseconds(remainder);
         h.attempt(&recorded, gate);
         h.start(true);
         h.poll(&recorded).await;
@@ -2126,6 +2144,7 @@ async fn resumed_decision_uses_frozen_paper_freshness_policy() {
         let mut h = Harness::new().await;
         let recorded = h.record(1).await;
         h.freeze(&recorded, enabled).await;
+        h.copy_budget_secs = 120;
         h.attempt(&recorded, at() + time::Duration::seconds(3));
         if !enabled {
             *h.hooks.age_clock.lock().unwrap() = [at() + time::Duration::seconds(3); 3].into();
@@ -2134,21 +2153,156 @@ async fn resumed_decision_uses_frozen_paper_freshness_policy() {
         h.barrier().await;
         assert_eq!(h.prepared_count(), usize::from(!enabled));
         let replayed = replay_decision_pending(&h.terminal(&recorded)).unwrap();
-        assert_eq!(
-            replayed
-                .continuation
-                .facts
-                .paper_freshness_policy
-                .unwrap()
-                .activity_ws_enabled,
-            enabled
-        );
+        let frozen = replayed.continuation.facts.paper_freshness_policy.unwrap();
+        assert_eq!(frozen.activity_ws_enabled, enabled);
+        assert_eq!(frozen.copy_latency_budget_secs, 2);
         if enabled {
             assert_expired(&h, &recorded);
         } else {
             assert_eq!(replayed.post_boundary.body.terminal.disposition, "fill");
         }
     }
+}
+
+/// A stopped-cut boot finishes a continuation-five decision against its active historical
+/// latency cause. A later continuation-six decision in the same generation ignores that cause.
+#[tokio::test]
+async fn mixed_era_boot_keeps_old_latency_audit_and_new_decision_false() {
+    let mut h = Harness::new_with_semantic(1).await;
+    let old = h.record(1).await;
+    h.freeze(&old, true).await;
+    let connection = rusqlite::Connection::open(h.dir.path().join("paper.db")).unwrap();
+    let row = h.terminal(&old);
+    let mut frozen: Value = serde_json::from_str(&row.frozen_inputs_json).unwrap();
+    assert_eq!(frozen["version"], json!(6));
+    frozen["version"] = json!(5);
+    connection
+        .execute(
+            "UPDATE decision_pending SET frozen_inputs_json = ?1 WHERE source_trade_id = ?2",
+            rusqlite::params![frozen.to_string(), old.id.0],
+        )
+        .unwrap();
+    let paper_path = h.dir.path().join("paper.log");
+    Writer::open(&paper_path)
+        .unwrap()
+        .append_synced(EnvelopeIn {
+            source_id: SourceId("pe-service.paper".to_owned()),
+            schema_version: 2,
+            parser_version: 1,
+            observed_at: SourceTimestamp(at()),
+            received_at: ReceivedAt(at()),
+            content_type: ContentType::Json,
+            payload: serde_json::to_vec(&PaperLogRecord::RiskHaltChanged {
+                owner: pe_service::paper_recovery::RiskHaltOwner::Paper,
+                cause: pe_risk_engine::RiskHaltCause::CopyLatency,
+                state: pe_service::paper_recovery::HaltState::Engaged,
+                evidence: json!({"fixture": "pre-cutover"}),
+            })
+            .unwrap(),
+        })
+        .unwrap();
+    h.attempt(&old, at());
+    h.start(true);
+    h.barrier().await;
+    let old_row = h.terminal(&old);
+    let old_replay = replay_decision_pending(&old_row).unwrap();
+    assert_eq!(old_replay.continuation.version(), 5);
+    assert_eq!(old_replay.post_boundary.financial_semantic_version, 1);
+    let old_economic = old_replay
+        .post_boundary
+        .body
+        .terminal
+        .decline
+        .as_ref()
+        .and_then(|decline| match &decline.inputs {
+            pe_service::decision_replay::WinnerFollowDecisionInputs::Evaluated { economic } => {
+                Some(economic)
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert!(old_economic.risk.snapshot.copy_latency_kill_switch_active);
+    assert!(matches!(
+        old_economic.risk.decision,
+        pe_execution_core::RiskDecisionAudit::Blocked {
+            reason: pe_risk_engine::RiskBlock::CopyLatencyKillSwitch
+        }
+    ));
+    let old_hash = old_replay.post_boundary.document_blake3.clone();
+    let old_bytes = old_row.post_commit_inputs_json.clone();
+    h.stop().await;
+
+    let source_prefix =
+        TailBinding::from(&pe_event_log::Scanner::verify(h.dir.path().join("source.log")).unwrap());
+    let keys = vec![(
+        old_row.source_trade_id.clone(),
+        old_row.semantic_revision.clone(),
+    )];
+    let digest = h
+        .paper
+        .seal_decision_evidence_for_source_prefix(&keys, &keys, source_prefix.last_sequence)
+        .unwrap();
+    let seal = pe_service::paper_recovery::QualificationSealed {
+        start_receipt: h.authority.inner.lock().unwrap().start,
+        source_prefix,
+        financial_prefix: TailBinding::from(&pe_event_log::Scanner::verify(&paper_path).unwrap()),
+        live_prefix: TailBinding::from(
+            &LiveJournal::verified_tail(h.dir.path().join("live_journal.log")).unwrap(),
+        ),
+        decision_evidence_digest: blake3::hash(&digest).to_hex().to_string(),
+        sealed_cutoff_unix: EPOCH,
+        reason: pe_service::paper_recovery::SealReason::InsufficientEvidence(
+            "financial semantic version changed".to_owned(),
+        ),
+    };
+    Writer::open(&paper_path)
+        .unwrap()
+        .append_synced(EnvelopeIn {
+            source_id: SourceId("pe-service.paper".to_owned()),
+            schema_version: 2,
+            parser_version: 1,
+            observed_at: SourceTimestamp(at()),
+            received_at: ReceivedAt(at()),
+            content_type: ContentType::Json,
+            payload: serde_json::to_vec(&PaperLogRecord::QualificationSealed(Box::new(seal)))
+                .unwrap(),
+        })
+        .unwrap();
+
+    h.copy_budget_secs = 120;
+    let current = h.record(2).await;
+    h.attempt(&current, at() + time::Duration::seconds(1));
+    h.start(true);
+    h.poll(&current).await;
+    let current_replay = replay_decision_pending(&h.terminal(&current)).unwrap();
+    assert_eq!(current_replay.continuation.version(), 6);
+    assert_eq!(current_replay.post_boundary.financial_semantic_version, 2);
+    let current_economic = scan_paper_log(&paper_path)
+        .unwrap()
+        .iter()
+        .find_map(|frame| match &frame.frame {
+            PaperLogFrame::Record(PaperLogRecord::FinancialPrepared {
+                payload: pe_service::paper_recovery::FinancialPayload::Fill { economic, .. },
+                ..
+            }) if economic.version == 2 => Some(economic.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(
+        !current_economic
+            .risk
+            .snapshot
+            .copy_latency_kill_switch_active
+    );
+    let preserved = h.terminal(&old);
+    assert_eq!(preserved.post_commit_inputs_json, old_bytes);
+    assert_eq!(
+        replay_decision_pending(&preserved)
+            .unwrap()
+            .post_boundary
+            .document_blake3,
+        old_hash
+    );
 }
 
 /// PASS: failed terminal transactions retain consumed entry, pending seed/target, and stop intake;

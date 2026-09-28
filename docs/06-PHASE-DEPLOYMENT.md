@@ -79,7 +79,7 @@ source event -> normalized event -> feature snapshot -> fair value -> strategy d
 
 Metrics: source staleness, source parse latency, schema drift, venue book age, delta gaps, order ack latency, cancel latency, model latency, risk block counts, replay/live mismatch count, p50/p95/p99 of the latency budget in `_GLOSSARY.md`.
 
-The **copy-latency kill switch** described in `19-` is wired to the p95 metric: when running p95 over the prior hour exceeds budget by 50 % for two consecutive 5-minute windows, `risk-supervisor` raises `CopyLatencyKillSwitch` and `execution-router` blocks new entries until p95 returns under budget.
+The copy-latency halt is retired for current paper and live decisions. Each copy still uses the freshness budget in `_GLOSSARY.md`; latency remains an operator metric.
 
 ## Reconciliation
 
@@ -133,7 +133,7 @@ Otherwise stay on Fargate. Use Graviton (`aarch64-unknown-linux-gnu`) where depe
 - `copy-signal-engine`: converts newly observed leader trades into classified actions.
 - `strategy-winner-follow`: emits risk-checked order intents.
 - `execution-router`: submits/cancels/reconciles venue orders.
-- `risk-supervisor`: enforces bankroll, exposure, drawdown, kill-switch, and copy-latency limits.
+- `risk-supervisor`: enforces bankroll, exposure, drawdown, and kill-switch limits.
 
 ### Secrets and keys
 

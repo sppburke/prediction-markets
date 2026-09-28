@@ -77,9 +77,8 @@ pub struct ServiceConfig {
     /// no-copy disposition and stages no copy — checked at the early admission
     /// gate and again immediately before dispatch staging, so channel or gate
     /// delay cannot turn a fresh observation into a stale copy. The ranker's
-    /// latency shift assumes copies happen at websocket speed, so copying older
-    /// observations is the padded-watchlist loss class. Matches the deployed
-    /// `LATENCY_SHIFT_SECS`; re-checked at +1 week (issue #530).
+    /// latency shift stays at 2 s while the owner permits copies through the
+    /// 120 s window (issue #710).
     #[serde(default = "default_copy_latency_budget_secs")]
     pub copy_latency_budget_secs: u64,
 
@@ -394,7 +393,7 @@ fn default_source_event_log_path() -> PathBuf {
 }
 
 const fn default_copy_latency_budget_secs() -> u64 {
-    2
+    120
 }
 
 fn default_event_log_path() -> PathBuf {
@@ -574,8 +573,8 @@ pub fn load(path: Option<&Path>) -> Result<ServiceConfig, ServiceConfigError> {
     ]);
     let cfg: ServiceConfig = fig.merge(env).extract()?;
     // #530: the copy budget parameterizes a fail-closed admission rule; an absurd
-    // value is a config error, not a posture. One hour is far beyond any honest
-    // calibration (the ranker's latency shift is 2s).
+    // value is a config error, not a posture. The owner permits copies through
+    // 120 s while the ranker's latency shift stays at 2 s.
     if !valid_copy_latency_budget_secs(cfg.copy_latency_budget_secs) {
         return Err(ServiceConfigError::Invalid(format!(
             "copy_latency_budget_secs must be in 1..=3600, got {}",
@@ -614,6 +613,7 @@ mod tests {
     #[test]
     fn default_values() {
         let cfg = ServiceConfig::default();
+        assert_eq!(cfg.copy_latency_budget_secs, 120);
         assert_eq!(cfg.bind, "127.0.0.1:8080");
         assert_eq!(cfg.status_path, PathBuf::from("./status.json"));
         assert_eq!(cfg.status_interval_secs, 30);

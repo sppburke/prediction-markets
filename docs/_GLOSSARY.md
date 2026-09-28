@@ -32,29 +32,27 @@ End-to-end target from `leader_trade_observed_at` (gateway receive) to `follower
 | p95 | ≤ 2.0 s |
 | p99 | ≤ 3.0 s |
 
-The **copy-latency kill switch** uses nearest-rank p95 values for the last two completed
-prior UTC clock hours (see the canonical `copy_latency_kill_switch_ms` and
-`copy_latency_release_ms` values in `19-WINNER-FOLLOW-STRATEGY.md`). Two consecutive available
-values strictly above the engage threshold activate it. While active, a missing value or a value
-above the release threshold holds it; the first available value at or below the release threshold
-releases it. A missing hour breaks the engage pair while inactive.
+The copy-latency kill switch is retired for current paper and live decisions. Historical
+paper semantic-1 replay still derives it from nearest-rank p95 values for the last two
+completed prior UTC clock hours. Two consecutive available values strictly above the
+historical engage threshold activate it. While active, a missing value or a value above
+the historical release threshold holds it; the first available value at or below that
+threshold releases it. A missing hour breaks the engage pair while inactive.
 
 Paper samples span the chosen source envelope's `received_at` to the synchronized
 `FinancialFinal` envelope's `received_at`. Live samples span request start to every
 transport-successful `OrderPosted` response's `received_at`, irrespective of HTTP status or later
 classification; transport failures and chain-finality time are excluded. Samples belong to the
-hour containing that endpoint. The paper owner and every live account derive the switch locally;
-any active owner blocks strategy-wide new entries.
+hour containing that endpoint. These sample definitions retain their historical replay meaning;
+current decisions ignore an active durable `CopyLatency` cause. Other active causes still block.
 
 > **Two latency metrics, deliberately distinct (#530).** The budget above measures
 > `gateway receive → venue ack` (the service's internal span). The ranker's latency
-> shift (Δ, `LATENCY_SHIFT_SECS`) calibrates against a LONGER span: `leader trade
-> timestamp → durable paper fill`, which additionally includes the venue's own feed
-> delay (measured p50 0.80s / p95 1.32s on the activity websocket). Δ is set to that
-> full span's measured p95, conservatively rounded (currently 2s), never below
-> measurement; the +1-week re-check artifact reports the full denominator (admitted
-> copies, fills, no-fill dispositions, missing spans, clock exclusions; NTP-checked;
-> nearest-rank p95; rounded up to whole seconds).
+> shift (Δ, `LATENCY_SHIFT_SECS`) uses the longer `leader trade timestamp → durable
+> paper fill` span, which includes venue feed delay. The owner keeps Δ at 2 s while
+> permitting copies through the 120 s budget. Late-copy measurements are reported
+> with admitted copies, fills, no-fill dispositions, missing spans, and clock exclusions;
+> they do not direct an automatic Δ increase.
 
 Per-stage budgets are illustrative and refined by `latency-attribution-profiler`:
 
@@ -323,8 +321,8 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `trade_reconciliation_concurrency` | 2 | **Module const** `TRADE_RECONCILIATION_CONCURRENCY` in `service::trade_poller` (not a TOML/env key). Bounded in-flight poller operations: one urgent wallet reconciliation and one backstop/anchor operation, with at most one operation per wallet across both slots. |
 | `polymarket_channel_capacity` | 256 | Bounded mpsc channel capacity between trade poller and orchestrator |
 | `trade_poll_interval_secs` | 30 | Seconds from completion of a Polymarket backstop round to the next round. Trigger-driven urgent wallet reconciliation wakes without waiting for this cadence and runs alongside backstop/anchor work under `trade_reconciliation_concurrency`; duplicate triggers coalesce and a wallet never has overlapping operations. The backstop retains its existing cadence. BOOT-OWNED (TOML/env only; the former runtime-config surface was inert and removed in #530). With the activity websocket enabled, periodic polling remains the always-on correctness backstop. |
-| `polymarket_activity_ws_enabled` | false | #530: websocket-primary trade observation via the officially listed real-time data endpoint whose activity subscription and payload are published by the first-party client, without published completeness, uptime, ordering, continuity, or resume guarantees (`docs/15` entry + re-check policy). #546 runs `activity_ws_reader_count` independent readers per process. Boot-owned; false = poll-only, byte-identical to pre-#530 (the rollback posture). Never disable while a Δ=2 batch is latest — reverse-order rollback: restore a Δ=20 batch first |
-| `copy_latency_budget_secs` | 2 | #530/#546/#588: while websocket-primary, strict `age > budget` rejects copying from either REST poll or activity websocket at the early admission gate and shared pre-dispatch gate (`no_copy_dispositions`: `stale_fallback_past_copy_budget` / `stale_activity_ws_past_copy_budget`). Continuation 5 freezes `PaperFreshnessPolicy { activity_ws_enabled, copy_latency_budget_secs }` at bucket commit and uses the earliest verified bound source time. Its final paper-only freshness decision at the Prepared boundary records the precise `paper_prepared_staleness_gate` clock; expiry becomes `paper_stale_before_prepared`, consumes the entry, and releases staged live targets with a no-fill paper outcome. Matches the ranker `LATENCY_SHIFT_SECS`; re-checked at +1 week against the measured span artifact. |
+| `polymarket_activity_ws_enabled` | false | #530: websocket-primary trade observation via the officially listed real-time data endpoint whose activity subscription and payload are published by the first-party client, without published completeness, uptime, ordering, continuity, or resume guarantees (`docs/15` entry + re-check policy). #546 runs `activity_ws_reader_count` independent readers per process. Boot-owned; false = poll-only, byte-identical to pre-#530. With websocket mode on, REST observations older than the copy budget still fail closed; websocket-off bypasses these age checks. Reverse-order rollback still requires publishing and applying a Δ=20 batch before disabling websocket mode. After the #705 durable reader boundary, recover forward with a compatible binary. |
+| `copy_latency_budget_secs` | 120 | #530/#546/#588/#710: while websocket-primary, strict `age > budget` rejects copying from either REST poll or activity websocket at the early admission gate and shared pre-dispatch gate (`no_copy_dispositions`: `stale_fallback_past_copy_budget` / `stale_activity_ws_past_copy_budget`). Continuation 5 freezes `PaperFreshnessPolicy { activity_ws_enabled, copy_latency_budget_secs }` at bucket commit and uses the earliest verified bound source time. Its final paper-only freshness decision at the Prepared boundary records the precise `paper_prepared_staleness_gate` clock; expiry becomes `paper_stale_before_prepared`, consumes the entry, and releases staged live targets with a no-fill paper outcome. Older continuations keep their frozen budget. The ranker Δ stays 2 s by owner decision. |
 | `activity_ws_reader_count` | 3 | #546: independent activity-websocket reader connections per `pe-service` process, each owning its socket and reconnect backoff; two survive the measured connection-local silent failure. Code constant in `source-polymarket-public::activity_ws` |
 | `activity_ws_normalized_activity_timeout_secs` | 30 | #546: a reader with no normalizer-accepted activity row for this long is not live — while reading it drops its socket at the deadline and re-dials after its own backoff (1, 2, 4 … 60 s, reset only by a normalized row); while blocked on a full fan-in send it keeps the socket and its retained row, derives non-live in health, and drops only after that frame drains. Acknowledgements, keepalives, control frames, unrelated topics, envelope errors, and parser-rejected payloads never refresh it (they advance wire health only). Readiness: 0 live readers or a poisoned sink ⇒ `activity_ws_unavailable`; exactly 1 ⇒ `activity_ws_redundancy_degraded`; unavailable + unhealthy poll ⇒ `copy_admission_blocked` |
 | `poll_unhealthy_error_streak` | 3 | #530: consecutive all-error poll rounds at which the REST source counts unhealthy (round-age bound: 3 × `trade_poll_interval_secs`) |
