@@ -785,12 +785,11 @@ new ranking publication only.
 
 ## #705 paper financial-semantic-2 cutover
 
-This release changes paper measurement, not the ordinary-live price or admission contract. Deploy
-the separate L1 owner-commanded live-control change before or in the same release. Before allowing
-semantic-2 paper producers to run, verify the **running binary identity** includes L1 and its
-mode path follows the owner's requested mode independently of the paper seal and semantic
-version. For a combined release, verify the combined binary and running identity before producer
-release. Stop the cutover if this check fails. This section adds no arming instruction.
+This release changes paper measurement, not the ordinary-live price or admission contract. It does
+not change whether live can be switched on: until the owner-commanded live-control change ships,
+live mode already requires a passing qualification report (`live_mode.rs` `qualification_outcome`)
+and none exists, so this release may deploy before or with that change. This section adds no
+arming instruction.
 
 Under the deployment lock, stop intake and confirm source, paper, and live-journal quiescence.
 Record the configured SQLite, source-log, and paper-log paths, plus the derived live-journal path
@@ -800,8 +799,8 @@ the copy. Bind these exact path-and-hash entries to the seal and crash-recovery 
 earlier online snapshot is not the stopped cutover snapshot.
 
 Run a fresh generation-scoped open-continuation census on the stopped copies with the reviewed
-binary's `--validate-open-continuations`, and require `open_rows=0` for **old** paper
-continuations. Check the paper log for unmatched `FinancialPrepared`; allow the existing recovery
+binary's `--validate-open-continuations` and record the count of **old** paper continuations; boot
+finishes them under their frozen semantics before it writes the seal (verify in the boot log). Check the paper log for unmatched `FinancialPrepared`; allow the existing recovery
 to converge it under recorded economics, then stop and repeat the four-artifact capture and
 census. Require no unmatched Prepared before the seal. Record open positions and reconcile the
 financial authority; zero old positions is not required. Inventory Start and seals. For an
