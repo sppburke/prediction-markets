@@ -1954,12 +1954,32 @@ pub(crate) fn decision_rows_for_source_prefix(
 
 /// Select sealed decisions from the process-wide receipt index without retaining source payloads
 /// while walking the source prefix (GitHub issue #574).
+#[cfg(test)]
 pub(crate) fn decision_rows_for_indexed_source_prefix(
     state: &PaperStateDb,
     index: &SourceReceiptIndex,
     candidate: &LogTailBinding,
     start_prefix: &TailBinding,
 ) -> Result<(SelectedDecisionRows, TailBinding), QualificationError> {
+    let (sealed_prefix, selected) =
+        indexed_source_prefix_selection(state, index, candidate, start_prefix)?;
+    Ok((selected?, sealed_prefix))
+}
+
+/// The walked, verified source prefix and, separately, its decision selection, so an
+/// insufficient-evidence seal can still close the prefix its walk verified (#588).
+pub(crate) fn indexed_source_prefix_selection(
+    state: &PaperStateDb,
+    index: &SourceReceiptIndex,
+    candidate: &LogTailBinding,
+    start_prefix: &TailBinding,
+) -> Result<
+    (
+        TailBinding,
+        Result<SelectedDecisionRows, QualificationError>,
+    ),
+    QualificationError,
+> {
     let candidate_sequence = candidate.last_sequence.unwrap_or(EventSeq(0));
     let mut source_universe = HashMap::new();
     let mut universe_error = None;
@@ -1986,8 +2006,8 @@ pub(crate) fn decision_rows_for_indexed_source_prefix(
         &sealed_prefix,
         SealedSource::Index(index),
         universe,
-    )?;
-    Ok((selected, sealed_prefix))
+    );
+    Ok((sealed_prefix, selected))
 }
 
 fn decision_rows_from_source_observations(
