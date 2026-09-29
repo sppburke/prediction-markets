@@ -23,7 +23,7 @@ export default async function AccountsAdminPage() {
     supabase
       .from("accounts")
       .select(
-        "account_id, is_primary, login_email, enabled, execution_order, requested_live_mode, effective_live_mode, live_sizing_mode, live_sizing_dollar_usd, live_sizing_contracts, live_price_impact_cap_bps, created_at, updated_at",
+        "account_id, is_primary, login_email, enabled, execution_order, requested_live_mode, effective_live_mode, live_sizing_mode, live_sizing_dollar_usd, live_sizing_contracts, created_at, updated_at",
       )
       .order("is_primary", { ascending: false })
       .order("execution_order")

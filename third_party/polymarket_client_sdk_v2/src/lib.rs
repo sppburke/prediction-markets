@@ -262,6 +262,27 @@ pub struct ResponseObservation {
     pub received_at: SystemTime,
 }
 
+/// A request refused at the last wall-clock check, before any bytes are sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ExpiredAt {
+    pub checked_at: SystemTime,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RawOnceOutcome {
+    Attempted(ResponseObservation),
+    NotAttempted(ExpiredAt),
+}
+
+impl RawOnceOutcome {
+    fn attempted(self) -> Result<ResponseObservation> {
+        match self {
+            Self::Attempted(response) => Ok(response),
+            Self::NotAttempted(_) => Err(Error::validation("unexpected wall-clock deadline")),
+        }
+    }
+}
+
 /// Normalized failure classes for the raw-response seam.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransportFailureClass {
@@ -342,7 +363,8 @@ async fn request_raw_once(
     mut request: Request,
     headers: Option<HeaderMap>,
     deadline: Option<std::time::Instant>,
-) -> Result<ResponseObservation> {
+    wall_clock_deadline: Option<SystemTime>,
+) -> Result<RawOnceOutcome> {
     let method = request.method().to_string();
     let path = request.url().path().to_owned();
     let ordered_query: Vec<(String, String)> = request
@@ -362,6 +384,9 @@ async fn request_raw_once(
         None => None,
     };
     let observed_at = SystemTime::now();
+    if let Some(expired) = expired_at(wall_clock_deadline, observed_at) {
+        return Ok(RawOnceOutcome::NotAttempted(expired));
+    }
     let execute = client.execute(request);
     let response = if let Some(remaining) = remaining {
         tokio::time::timeout(remaining, execute)
@@ -460,7 +485,7 @@ async fn request_raw_once(
     })?
     .to_vec();
     let received_at = SystemTime::now();
-    Ok(ResponseObservation {
+    Ok(RawOnceOutcome::Attempted(ResponseObservation {
         method,
         path,
         ordered_query,
@@ -469,7 +494,47 @@ async fn request_raw_once(
         body,
         observed_at,
         received_at,
-    })
+    }))
+}
+
+#[cfg(feature = "clob")]
+fn expired_at(deadline: Option<SystemTime>, checked_at: SystemTime) -> Option<ExpiredAt> {
+    deadline
+        .filter(|deadline| checked_at > *deadline)
+        .map(|_| ExpiredAt { checked_at })
+}
+
+#[cfg(all(test, feature = "clob"))]
+mod raw_once_tests {
+    use super::*;
+
+    #[test]
+    fn wall_clock_deadline_is_strict_at_the_sampled_instant() {
+        let deadline = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(120);
+        assert_eq!(expired_at(Some(deadline), deadline), None);
+        let later = deadline + std::time::Duration::from_nanos(1);
+        assert_eq!(expired_at(Some(deadline), later), Some(ExpiredAt { checked_at: later }));
+        assert_eq!(expired_at(None, later), None);
+    }
+
+    #[tokio::test]
+    async fn expired_request_returns_without_transport_attempt() {
+        let client = reqwest::Client::new();
+        let request = client
+            .post("http://127.0.0.1:1/order")
+            .build()
+            .expect("fixture request must build");
+        let result = request_raw_once(
+            &client,
+            request,
+            Some(HeaderMap::new()),
+            None,
+            Some(SystemTime::UNIX_EPOCH),
+        )
+        .await
+        .expect("expired request must not use transport");
+        assert!(matches!(result, RawOnceOutcome::NotAttempted(_)));
+    }
 }
 
 #[cfg(any(

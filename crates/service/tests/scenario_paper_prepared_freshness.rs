@@ -7,7 +7,7 @@ mod support;
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pe_copy_signal_engine::SignalConfig;
@@ -114,6 +114,32 @@ use support::{Page, PriceGate, Prices};
 
 #[derive(Default)]
 struct Books(Mutex<HashMap<String, OrderBook>>);
+struct DelayedPage {
+    page: Vec<u8>,
+    misses: AtomicUsize,
+    reads: AtomicUsize,
+}
+impl pe_source_polymarket_public::ReconciliationFetcher for DelayedPage {
+    fn fetch<'a>(
+        &'a self,
+        _: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, pe_source_core::SourceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            let remaining =
+                self.misses
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        (remaining > 0).then(|| remaining - 1)
+                    });
+            if remaining.is_ok() {
+                Ok(b"[]".to_vec())
+            } else {
+                Ok(self.page.clone())
+            }
+        })
+    }
+}
 impl ClobBookFetcher for Books {
     async fn fetch_book(&self, _: &str, token: &str) -> Result<OrderBook, ClobBookError> {
         self.0
@@ -580,6 +606,16 @@ impl Harness {
         stream_epoch: Option<i64>,
         now: OffsetDateTime,
     ) {
+        self.poll_source_with_misses(recorded, stream_epoch, now, 0)
+            .await;
+    }
+    async fn poll_source_with_misses(
+        &self,
+        recorded: &Recorded,
+        stream_epoch: Option<i64>,
+        now: OffsetDateTime,
+        misses: usize,
+    ) {
         let (trigger, receiver) = mpsc::channel(1);
         if let Some(epoch) = stream_epoch {
             let mut stream: Value = serde_json::from_slice(&recorded.activity).unwrap();
@@ -616,7 +652,14 @@ impl Harness {
                 .unwrap();
         }
         let (progress, mut completed) = mpsc::channel(8);
-        TradePoller::new(
+        let delayed = Arc::new(DelayedPage {
+            page: recorded.activity.clone(),
+            misses: AtomicUsize::new(misses),
+            reads: AtomicUsize::new(0),
+        });
+        let clock = Arc::new(AtomicI64::new(now.unix_timestamp()));
+        let poll_clock = Arc::clone(&clock);
+        let poller = TradePoller::new(
             TradePollerConfig {
                 base_url: "fixture://activity".to_owned(),
                 poll_interval_secs: 30,
@@ -624,7 +667,7 @@ impl Harness {
                 copy_latency_budget_secs: self.copy_budget_secs,
             },
             watchlist(),
-            Arc::new(Page(recorded.activity.clone())),
+            delayed.clone(),
             Arc::new(AssetIdentityResolver::new_runtime(
                 Arc::new(Page(recorded.gamma.clone())),
                 "fixture://gamma".to_owned(),
@@ -643,19 +686,46 @@ impl Harness {
         )
         .with_source_receipt_index(self.index.clone())
         .with_progress(progress)
-        .with_clock(Arc::new(move || now))
-        .run_until(async move {
-            while let Some(progress) = completed.recv().await {
-                if matches!(
+        .with_clock(Arc::new(move || {
+            OffsetDateTime::from_unix_timestamp(poll_clock.load(Ordering::SeqCst)).unwrap()
+        }));
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(poller.run_until(async move {
+            let _ = stopped.await;
+        }));
+        while let Some(progress) = completed.recv().await {
+            if misses == 0
+                && matches!(
                     progress,
                     pe_service::trade_poller::PollerProgress::RoundCompleted
-                ) {
+                )
+            {
+                break;
+            }
+            if misses > 0
+                && matches!(
+                    progress,
+                    pe_service::trade_poller::PollerProgress::Completed { .. }
+                )
+            {
+                if self
+                    .paper
+                    .activity_group_state(&recorded.id)
+                    .unwrap()
+                    .is_some()
+                {
                     break;
                 }
+                clock.fetch_add(1, Ordering::SeqCst);
+                tokio::time::advance(std::time::Duration::from_secs(1)).await;
             }
-        })
-        .await
-        .unwrap();
+        }
+        assert!(delayed.reads.load(Ordering::SeqCst) > misses);
+        stop.send(()).unwrap();
+        task.await.unwrap().unwrap();
+        if misses > 0 {
+            self.barrier().await;
+        }
     }
     fn terminal(&self, recorded: &Recorded) -> DecisionPendingRow {
         self.paper
@@ -691,7 +761,6 @@ impl Harness {
                 execution_order: 0,
                 requested_live_mode: "live_tiny".to_owned(),
                 effective_live_mode: "live_tiny".to_owned(),
-                live_price_impact_cap_bps: 100,
                 custody_wallet_address: None,
                 custody_wallet_kind: None,
                 credential_binding: Some((7, "stored-key".to_owned())),
@@ -1200,6 +1269,7 @@ async fn recorded_ask_above_leader_fills_with_both_paper_delay_policies() {
         (1, dec!(0.5799999992), dec!(0.58), None),
     ] {
         let mut h = Harness::new().await;
+        h.copy_budget_secs = 120;
         h.probability = pe_core_types::Probability::new(dec!(0.9)).unwrap();
         let recorded = h
             .record_with_rule(ordinal, Some((leader, ask, delay)))
@@ -1592,6 +1662,7 @@ async fn priced_completion_seal_rejects_altered_price_and_receipt() {
 
 struct StagedLiveVenue {
     posts: AtomicBool,
+    checked_at: OffsetDateTime,
 }
 
 impl LiveOrderVenue for StagedLiveVenue {
@@ -1640,10 +1711,22 @@ impl LiveOrderVenue for StagedLiveVenue {
         })
     }
 
-    fn post_once<'a>(&'a self, _: Self::Submission) -> pe_execution_core::LivePostFuture<'a> {
+    fn post_once<'a>(
+        &'a self,
+        _: Self::Submission,
+        wall_clock_deadline: Option<OffsetDateTime>,
+    ) -> pe_execution_core::LivePostFuture<'a> {
         Box::pin(async move {
+            tokio::task::yield_now().await;
+            if wall_clock_deadline.is_some_and(|deadline| self.checked_at > deadline) {
+                return Ok(pe_core_types::RawPostAttempt::NotAttempted(
+                    pe_core_types::ExpiredAt {
+                        checked_at: self.checked_at,
+                    },
+                ));
+            }
             assert!(!self.posts.swap(true, Ordering::SeqCst));
-            Ok(pe_core_types::RawHttpResponse {
+            Ok(pe_core_types::RawPostAttempt::Attempted(pe_core_types::RawHttpResponse {
                 source_id: "polymarket-clob-v2".to_owned(),
                 endpoint_kind: "order-post".to_owned(),
                 method: "POST".to_owned(),
@@ -1654,12 +1737,12 @@ impl LiveOrderVenue for StagedLiveVenue {
                 body: br#"{"success":true,"orderID":"fixture-venue-order","makingAmount":"2.5","takingAmount":"5"}"#.to_vec(),
                 attempt_ordinal: 1,
                 source_at: None,
-                observed_at: at(),
-                received_at: at(),
+                observed_at: self.checked_at,
+                received_at: self.checked_at,
                 schema_version: 1,
                 parser_version: 1,
                 adapter_version: "fixture".to_owned(),
-            })
+            }))
         })
     }
 
@@ -1906,189 +1989,242 @@ async fn live_mode_without_verified_binding_stages_no_control_record() {
     }
 }
 
-/// PASS: a semantic-2 delayed paper fill stages an armed target. A fresh strict zero-delay
-/// market reaches the existing live executor's single POST; the same delayed market has a typed
-/// strict refusal before a POST. The version-6 websocket/REST source clock is bound in the paper
-/// continuation and the resulting live journal replays its admission, preparation and POST.
-#[tokio::test]
+/// One recorded websocket observation survives two empty REST reads, reaches one replayable
+/// paper FinancialFinal/fill and one staged target, then exercises the wire-2 POST deadline at
+/// equality and one nanosecond beyond it against the same identifier-bound path.
+#[tokio::test(start_paused = true)]
 async fn version_six_staged_target_strict_live_admission_submits_and_replays() {
-    let mut h = Harness::new().await;
-    h.probability = pe_core_types::Probability::new(dec!(0.9)).unwrap();
-    let recorded = h
-        .record_with_rule(1, Some((dec!(0.50), dec!(0.50), Some(2))))
-        .await;
-    h.arm();
-    h.attempt(&recorded, at());
-    h.start(true);
-    h.poll_source(&recorded, Some(EPOCH - 1), at()).await;
-    let row = h.terminal(&recorded);
-    assert_eq!(row.terminal_disposition.as_deref(), Some("fill"));
-    assert_bound_clocks(&h, &recorded, EPOCH - 1);
-    let report = h.qualify_one_fill().await;
-    assert!(report.replay.exact, "{:?}", report.reasons);
-    let continuation =
-        pe_service::bucket_commit::DecisionContinuationV3::from_durable(&row).unwrap();
-    assert_eq!(continuation.version(), 6);
-    let staged = h.paper.unfinalized_ready_dispatch_seeds().unwrap();
-    assert_eq!(staged.len(), 1);
-    let target = h.paper.dispatch_targets(&staged[0].dispatch_id).unwrap();
-    assert_eq!(target.len(), 1);
-    assert_eq!(target[0].account_id, "stored-target");
-    assert_eq!(target[0].credential_bundle_version, 7);
+    for beyond_deadline in [false, true] {
+        let mut h = Harness::new().await;
+        h.copy_budget_secs = 120;
+        h.probability = pe_core_types::Probability::new(dec!(0.9)).unwrap();
+        let recorded = h
+            .record_with_rule(1, Some((dec!(0.50), dec!(0.50), Some(2))))
+            .await;
+        h.arm();
+        h.attempt(&recorded, at());
+        h.start(true);
+        h.poll_source_with_misses(&recorded, Some(EPOCH - 1), at(), 2)
+            .await;
+        let row = h.terminal(&recorded);
+        assert_eq!(row.terminal_disposition.as_deref(), Some("fill"));
+        assert_eq!(h.paper.list_fills().unwrap().len(), 1);
+        assert_eq!(
+            scan_paper_log(&h.dir.path().join("paper.log"))
+                .unwrap()
+                .iter()
+                .filter(|frame| matches!(
+                    frame.frame,
+                    PaperLogFrame::Record(PaperLogRecord::FinancialFinal { .. })
+                ))
+                .count(),
+            1
+        );
+        assert_bound_clocks(&h, &recorded, EPOCH - 1);
+        let replayed = replay_decision_pending(&row).unwrap();
+        assert_eq!(replayed.post_boundary.body.terminal.disposition, "fill");
+        let continuation =
+            pe_service::bucket_commit::DecisionContinuationV3::from_durable(&row).unwrap();
+        assert_eq!(continuation.version(), 6);
+        let staged = h.paper.unfinalized_ready_dispatch_seeds().unwrap();
+        assert_eq!(staged.len(), 1);
+        let target = h.paper.dispatch_targets(&staged[0].dispatch_id).unwrap();
+        assert_eq!(target.len(), 1);
+        assert_eq!(target[0].account_id, "stored-target");
+        assert_eq!(target[0].credential_bundle_version, 7);
+        h.stop().await;
 
-    let gamma = source_envelope(&h, recorded.admission.receipts.gamma).payload;
-    let delayed = source_envelope(&h, recorded.admission.receipts.clob_long).payload;
-    let condition = &recorded.admission.market.condition_id;
-    let venue = StagedLiveVenue {
-        posts: AtomicBool::new(false),
-    };
-    assert_eq!(
-        validate_live_market(&gamma, &delayed, condition, EPOCH, 60),
-        Err(pe_source_polymarket_public::LiveMarketError::NonzeroDelay)
-    );
-    assert!(
-        !venue.posts.load(Ordering::SeqCst),
-        "strict refusal precedes POST"
-    );
-    let mut strict_long: Value = serde_json::from_slice(&delayed).unwrap();
-    strict_long["seconds_delay"] = 0.into();
-    let strict_long = serde_json::to_vec(&strict_long).unwrap();
-    let strict_market = validate_live_market(&gamma, &strict_long, condition, EPOCH, 60).unwrap();
-    let compact = source_envelope(&h, recorded.admission.receipts.clob_compact).payload;
-    let admission = LiveAdmissionArtifact {
-        market: strict_market,
-        fee_schedule: recorded.admission.fee_schedule,
-        receipts: AdmissionReceipts {
-            gamma: h.append("polymarket.gamma.markets", &gamma).await,
-            clob_long: h.append("polymarket.clob.markets", &strict_long).await,
-            clob_compact: h.append("polymarket.clob.compact-market", &compact).await,
-        },
-        settlement: VenueSettlementRecord {
-            raw_evidence_hash: blake3::hash(&strict_long).to_hex().to_string(),
-            ..recorded.admission.settlement.clone()
-        },
-    };
-    let paper_economic = scan_paper_log(&h.dir.path().join("paper.log"))
-        .unwrap()
-        .into_iter()
-        .find_map(|frame| match frame.frame {
-            PaperLogFrame::Record(PaperLogRecord::FinancialPrepared {
-                payload: pe_service::paper_recovery::FinancialPayload::Fill { economic, .. },
-                ..
-            }) => Some(economic),
-            _ => None,
-        })
-        .unwrap();
-    assert_eq!(paper_economic.version, 2);
-    let mut economic = paper_economic.clone();
-    economic.version = pe_execution_core::ECONOMIC_PREPARED_VERSION;
-    economic.admission = pe_execution_core::LiveAdmissionArtifactAudit::new(
-        &admission.market,
-        &admission.settlement,
-        admission.fee_schedule,
-        admission.receipts,
-    );
-    economic.balance.chase_ceiling = pe_core_types::Price::new(dec!(0.50)).unwrap();
-    economic.balance.price_impact_cap_bps = 100;
-    assert_eq!(economic.observation, paper_economic.observation);
-    let ladder = LadderPlan {
-        used_asks: economic
-            .ladder
-            .used_asks
-            .iter()
-            .map(|ask| AskLevel {
-                price: ask.price,
-                shares: ask.shares,
+        let gamma = source_envelope(&h, recorded.admission.receipts.gamma).payload;
+        let delayed = source_envelope(&h, recorded.admission.receipts.clob_long).payload;
+        let condition = &recorded.admission.market.condition_id;
+        let venue = StagedLiveVenue {
+            posts: AtomicBool::new(false),
+            checked_at: OffsetDateTime::from_unix_timestamp(
+                EPOCH - 1 + i64::try_from(h.copy_budget_secs).unwrap(),
+            )
+            .unwrap()
+                + time::Duration::nanoseconds(i64::from(beyond_deadline)),
+        };
+        assert_eq!(
+            validate_live_market(&gamma, &delayed, condition, EPOCH, 60),
+            Err(pe_source_polymarket_public::LiveMarketError::NonzeroDelay)
+        );
+        assert!(
+            !venue.posts.load(Ordering::SeqCst),
+            "strict refusal precedes POST"
+        );
+        let mut strict_long: Value = serde_json::from_slice(&delayed).unwrap();
+        strict_long["seconds_delay"] = 0.into();
+        let strict_long = serde_json::to_vec(&strict_long).unwrap();
+        let strict_market =
+            validate_live_market(&gamma, &strict_long, condition, EPOCH, 60).unwrap();
+        let compact = source_envelope(&h, recorded.admission.receipts.clob_compact).payload;
+        let admission = LiveAdmissionArtifact {
+            market: strict_market,
+            fee_schedule: recorded.admission.fee_schedule,
+            receipts: AdmissionReceipts {
+                gamma: h.append("polymarket.gamma.markets", &gamma).await,
+                clob_long: h.append("polymarket.clob.markets", &strict_long).await,
+                clob_compact: h.append("polymarket.clob.compact-market", &compact).await,
+            },
+            settlement: VenueSettlementRecord {
+                raw_evidence_hash: blake3::hash(&strict_long).to_hex().to_string(),
+                ..recorded.admission.settlement.clone()
+            },
+        };
+        let paper_economic = scan_paper_log(&h.dir.path().join("paper.log"))
+            .unwrap()
+            .into_iter()
+            .find_map(|frame| match frame.frame {
+                PaperLogFrame::Record(PaperLogRecord::FinancialPrepared {
+                    payload: pe_service::paper_recovery::FinancialPayload::Fill { economic, .. },
+                    ..
+                }) => Some(economic),
+                _ => None,
             })
-            .collect(),
-        best_ask: economic.ladder.best_ask,
-        limit_price: economic.ladder.limit_price,
-        shares: economic.ladder.minimum_shares,
-        worst_case_debit: economic.ladder.principal,
-    };
-    let account_id = AccountId::new("stored-target").unwrap();
-    let binding = CredentialBindingIdentity {
-        version: 7,
-        key_id: "stored-key".to_owned(),
-    };
-    let identity = LiveOrderIdentity {
-        dispatch_id: staged[0].dispatch_id.clone(),
-        idempotency_key: LiveOrderIdentity::idempotency_key_for(
-            &staged[0].dispatch_id,
-            &account_id,
-        ),
-        quote_id: "fresh-strict-live-quote".to_owned(),
-        config_hash: economic.applied_configuration_hash.clone(),
-        decision_hash: row.semantic_revision.clone(),
-        evidence_hashes: vec![admission.settlement.raw_evidence_hash.clone()],
-        fill_projection: Some(Box::new(pe_execution_core::LiveFillProjectionIdentity {
-            leader_wallet: wallet().to_string(),
-            source_trade_id: Some(recorded.id.0.clone()),
-            market_id: economic.market.market_id.clone(),
-            outcome_id: i64::from(u16::from(economic.market.outcome_index)),
-            side: "buy".to_owned(),
-        })),
-        schema_version: 1,
-        parser_version: 1,
-    };
-    let request = LiveOrderRequest {
-        target: FrozenLiveTarget {
-            account_id: account_id.clone(),
-            credential_binding: binding.clone(),
-        },
-        current_credential_binding: binding,
-        mode: LiveModeSnapshot {
-            requested: LiveControlMode::LiveTiny,
-            effective: LiveControlMode::LiveTiny,
-        },
-        identity,
-        condition_id: condition.clone(),
-        outcome_id: pe_core_types::OutcomeId(0),
-        token_id: admission.market.ordered_outcome_token_ids[0].clone(),
-        admission,
-        ladder,
-        economic,
-    };
-    let path = h.dir.path().join("live_journal.log");
-    let journal = LiveJournal::open(&path).unwrap();
-    let executor = LiveExecutor::new(&venue, &journal);
-    let prepared = match executor.prepare_with_clock(request, at).await.unwrap() {
-        LivePrepareResult::Prepared(prepared) => prepared,
-        LivePrepareResult::Terminal(outcome) => {
-            panic!("fresh strict live target refused: {outcome:?}")
+            .unwrap();
+        assert_eq!(paper_economic.version, 2);
+        let mut economic = paper_economic.clone();
+        economic.admission = pe_execution_core::LiveAdmissionArtifactAudit::new(
+            &admission.market,
+            &admission.settlement,
+            admission.fee_schedule,
+            admission.receipts,
+        );
+        assert_eq!(economic.version, 2);
+        assert_eq!(economic.balance.chase_ceiling, pe_core_types::Price::ONE);
+        assert_eq!(
+            economic.balance.price_impact_cap_bps,
+            h.config.price_impact_cap_bps
+        );
+        assert_eq!(economic.observation, paper_economic.observation);
+        let ladder = LadderPlan {
+            used_asks: economic
+                .ladder
+                .used_asks
+                .iter()
+                .map(|ask| AskLevel {
+                    price: ask.price,
+                    shares: ask.shares,
+                })
+                .collect(),
+            best_ask: economic.ladder.best_ask,
+            limit_price: economic.ladder.limit_price,
+            shares: economic.ladder.minimum_shares,
+            worst_case_debit: economic.ladder.principal,
+        };
+        let account_id = AccountId::new("stored-target").unwrap();
+        let binding = CredentialBindingIdentity {
+            version: 7,
+            key_id: "stored-key".to_owned(),
+        };
+        let identity = LiveOrderIdentity {
+            dispatch_id: staged[0].dispatch_id.clone(),
+            idempotency_key: LiveOrderIdentity::idempotency_key_for(
+                &staged[0].dispatch_id,
+                &account_id,
+            ),
+            quote_id: "fresh-strict-live-quote".to_owned(),
+            config_hash: economic.applied_configuration_hash.clone(),
+            decision_hash: row.semantic_revision.clone(),
+            evidence_hashes: vec![admission.settlement.raw_evidence_hash.clone()],
+            fill_projection: Some(Box::new(pe_execution_core::LiveFillProjectionIdentity {
+                leader_wallet: wallet().to_string(),
+                source_trade_id: Some(recorded.id.0.clone()),
+                market_id: economic.market.market_id.clone(),
+                outcome_id: i64::from(u16::from(economic.market.outcome_index)),
+                side: "buy".to_owned(),
+            })),
+            schema_version: 1,
+            parser_version: 1,
+        };
+        let request = LiveOrderRequest {
+            target: FrozenLiveTarget {
+                account_id: account_id.clone(),
+                credential_binding: binding.clone(),
+            },
+            current_credential_binding: binding,
+            mode: LiveModeSnapshot {
+                requested: LiveControlMode::LiveTiny,
+                effective: LiveControlMode::LiveTiny,
+            },
+            identity,
+            condition_id: condition.clone(),
+            outcome_id: pe_core_types::OutcomeId(0),
+            token_id: admission.market.ordered_outcome_token_ids[0].clone(),
+            admission,
+            ladder,
+            economic,
+        };
+        let path = h.dir.path().join("live_journal.log");
+        let journal = LiveJournal::open(&path).unwrap();
+        let executor = LiveExecutor::new(&venue, &journal);
+        let prepared = match executor.prepare_with_clock(request, at).await.unwrap() {
+            LivePrepareResult::Prepared(prepared) => prepared,
+            LivePrepareResult::Terminal(outcome) => {
+                panic!("fresh strict live target refused: {outcome:?}")
+            }
+        };
+        let deadline = OffsetDateTime::from_unix_timestamp(
+            EPOCH - 1 + i64::try_from(h.copy_budget_secs).unwrap(),
+        )
+        .unwrap();
+        let outcome = executor
+            .submit_with_clock_and_deadline(prepared, || venue.checked_at, Some(deadline))
+            .await
+            .unwrap();
+        if beyond_deadline {
+            assert_eq!(outcome.terminal_reason(), Some("copy_expired_before_post"));
+            assert!(!venue.posts.load(Ordering::SeqCst));
+        } else {
+            assert!(matches!(outcome, LiveOrderOutcome::Matched { .. }));
+            assert!(venue.posts.load(Ordering::SeqCst));
         }
-    };
-    assert!(matches!(
-        executor.submit_with_clock(prepared, at).await.unwrap(),
-        LiveOrderOutcome::Matched { .. }
-    ));
-    assert!(venue.posts.load(Ordering::SeqCst));
-    let events = pe_execution_core::live_journal::replay_account(&path, &account_id).unwrap();
-    assert!(matches!(
-        events.as_slice(),
-        [
-            pe_execution_core::LiveJournalEvent {
-                payload: LiveJournalPayload::StagedDispatchControl(_),
-                ..
-            },
-            pe_execution_core::LiveJournalEvent {
-                payload: LiveJournalPayload::AdmissionEvaluated(_),
-                ..
-            },
-            pe_execution_core::LiveJournalEvent {
-                payload: LiveJournalPayload::OrderPrepared(_),
-                ..
-            },
-            pe_execution_core::LiveJournalEvent {
-                payload: LiveJournalPayload::OrderPosted(_),
-                ..
-            },
-            pe_execution_core::LiveJournalEvent {
-                payload: LiveJournalPayload::OrderReconciled(_),
-                ..
-            },
-        ]
-    ));
+        let events = pe_execution_core::live_journal::replay_account(&path, &account_id).unwrap();
+        assert!(matches!(
+            events.first().map(|event| &event.payload),
+            Some(LiveJournalPayload::StagedDispatchControl(_))
+        ));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event.payload,
+                    LiveJournalPayload::StagedDispatchControl(_)
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.payload, LiveJournalPayload::OrderPosted(_)))
+                .count(),
+            usize::from(!beyond_deadline)
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event.payload,
+                    LiveJournalPayload::OrderPreparationFailed(_)
+                ))
+                .count(),
+            usize::from(beyond_deadline)
+        );
+        assert!(events.iter().all(|event| match &event.payload {
+            LiveJournalPayload::AdmissionEvaluated(value) =>
+                value.identity.dispatch_id == staged[0].dispatch_id,
+            LiveJournalPayload::OrderPrepared(value) =>
+                value.identity.dispatch_id == staged[0].dispatch_id,
+            LiveJournalPayload::OrderPosted(value) =>
+                value.identity.dispatch_id == staged[0].dispatch_id,
+            LiveJournalPayload::OrderPreparationFailed(value) =>
+                value.identity.dispatch_id == staged[0].dispatch_id,
+            _ => true,
+        }));
+        h.stop().await;
+    }
 }
 
 /// PASS: the frozen exact boundary fills; one nanosecond later expires, with the predicate's exact clock.

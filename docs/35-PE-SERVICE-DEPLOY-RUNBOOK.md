@@ -828,8 +828,9 @@ the first seal's cause is the semantic change. Investigate any unexpected mismat
 At the locked cut, record the **applied** `price_impact_cap_bps`, `min_fill_price`, and
 `max_fill_price` and the canonical applied hash, then reconcile the hash to status. This release
 requires the owner-approved 100 bps, 0.15, and 0.85 applied values; defaults do not prove them.
-Rehearse boot sealing before paper recovery and producer release, including a crash after the
-seal and a restart from the four captured artifacts. The first seal remains unique and durable;
+The automated seal test covers idempotence and local reopen; it does not cover a full deployment
+restart or producer release. Verify the deployed seal before paper recovery and producer release.
+The first seal remains unique and durable;
 paper decisions and daily marks continue. An existing seal remains unchanged and this generation
 produces no new qualification report. A seal-write failure keeps producers stopped.
 

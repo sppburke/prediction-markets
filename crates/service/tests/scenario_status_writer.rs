@@ -140,7 +140,6 @@ fn ac_live_block_reports_freshness() {
         execution_order: 0,
         requested_live_mode: "off".to_string(),
         effective_live_mode: "off".to_string(),
-        live_price_impact_cap_bps: 100,
         custody_wallet_address: None,
         custody_wallet_kind: None,
     }];

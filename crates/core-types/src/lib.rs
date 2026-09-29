@@ -21,8 +21,8 @@ pub use amount::{CollateralAmount, ShareAmount};
 pub use canary::CanaryOrigin;
 pub use error::Error;
 pub use http_evidence::{
-    RawArtifactObservation, RawEvidence, RawHttpAttempt, RawHttpResponse, RawTransportFailure,
-    TransportErrorClass,
+    ExpiredAt, RawArtifactObservation, RawEvidence, RawHttpAttempt, RawHttpResponse,
+    RawPostAttempt, RawTransportFailure, TransportErrorClass,
 };
 pub use identity::{AccountId, TraderId, VenueAccountId, WalletAddress};
 pub use ids::{

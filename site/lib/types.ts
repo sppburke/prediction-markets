@@ -76,7 +76,6 @@ export interface AccountAdminRow {
   live_sizing_mode: "kelly" | "dollar" | "contract" | null;
   live_sizing_dollar_usd: Numeric;
   live_sizing_contracts: Numeric;
-  live_price_impact_cap_bps: number;
   created_at: string;
   updated_at: string;
   credentials: AccountCredentialMetadata | null;

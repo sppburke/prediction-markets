@@ -150,7 +150,7 @@ impl SupabaseWatchlistCapacity {
             }
             deferrals.extend(plan.deferrals);
             let reentry_candidates = planned_live_reentries(&self.live, &plan.entries);
-            let reentries = match self
+            let reentry_outcome = match self
                 .preparer
                 .prepare_live_reentries(&reentry_candidates)
                 .await
@@ -171,6 +171,8 @@ impl SupabaseWatchlistCapacity {
                     return Err(CapacityError::Admission(error));
                 }
             };
+            deferrals.extend(reentry_outcome.deferred);
+            let reentries = reentry_outcome.admitted;
             // Every entry that needs no live-only reentry is live already or a proved addition.
             if plan.entries.len() - reentry_candidates.len() + reentries.len() == 0 {
                 warn!(
@@ -1617,13 +1619,22 @@ mod tests {
             rx.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
+        let frames = pe_event_log::Reader::replay(&source_log.path)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(
-            pe_event_log::Reader::replay(&source_log.path)
-                .unwrap()
-                .count(),
-            0,
-            "a pending result writes no capacity config and no audit"
+            frames.len(),
+            1,
+            "a pending result writes no capacity config"
         );
+        assert_eq!(
+            frames[0].1.source_id.0,
+            crate::watchlist_admission::MEMBERSHIP_DEFERRAL_SOURCE_ID
+        );
+        let audit = serde_json::from_slice::<serde_json::Value>(&frames[0].1.payload).unwrap();
+        assert_eq!(audit["outcome"]["type"], "pending_capacity");
+        assert_eq!(audit["deferrals"][0]["wallet"], excluded.to_string());
         source_log.task.abort();
         server.abort();
     }

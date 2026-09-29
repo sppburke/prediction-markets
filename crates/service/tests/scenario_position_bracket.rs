@@ -2116,11 +2116,17 @@ async fn position_revision_twice_defers_after_one_retry() {
         ),
     ]);
 
-    let accepted = validator(responses)
-        .validate_direct(&[wallet], &mut engine, &paper)
+    let outcome = validator(responses)
+        .validate_direct_with_deferrals(&[wallet], &mut engine, &paper)
         .await
         .unwrap();
-    assert!(accepted.is_empty());
+    assert!(outcome.accepted.is_empty());
+    assert_eq!(outcome.deferred.len(), 1);
+    assert_eq!(outcome.deferred[0].0, wallet);
+    assert_eq!(
+        outcome.deferred[0].1.class(),
+        pe_service::position_seeder::FailureClass::WalletTransient
+    );
     assert!(paper.position_validation(&wallet).unwrap().is_none());
     assert!(!paper.is_wallet_fenced(&wallet).unwrap());
 }
@@ -2369,6 +2375,84 @@ async fn positions_before_activity_retry_then_converge_without_fence() {
         .await
         .unwrap();
     assert!(paper.position_validation_current(&wallet).unwrap());
+}
+
+fn mapping_arrives_on_next_walk(wallet: WalletAddress) -> HashMap<String, Vec<Vec<u8>>> {
+    let row = serde_json::to_vec(&vec![activity(wallet, 1, "1.000000", "0xlate-map", 10)]).unwrap();
+    let positions = serde_json::to_vec(&vec![position(wallet, 1, "1.000000")]).unwrap();
+    HashMap::from([
+        (
+            activity_url(wallet),
+            vec![b"[]".to_vec(), row.clone(), row.clone(), row.clone(), row],
+        ),
+        (
+            position_url(wallet, PositionPartition::NotRedeemable),
+            vec![positions.clone(), positions.clone(), positions],
+        ),
+        (
+            position_url(wallet, PositionPartition::Redeemable),
+            vec![b"[]".to_vec(); 3],
+        ),
+    ])
+}
+
+#[tokio::test]
+async fn direct_missing_mapping_waits_for_next_walk_then_retries_without_changing_proof() {
+    let wallet = wallet(0x60);
+    let (dir, paper, mut engine) = fresh(&[wallet]);
+    let fetcher = Arc::new(QueueFetcher::new(mapping_arrives_on_next_walk(wallet)));
+    let accepted = validator_from_fetcher(Arc::clone(&fetcher))
+        .validate_direct(&[wallet], &mut engine, &paper)
+        .await
+        .unwrap();
+    assert_eq!(accepted.len(), 1);
+    assert!(anchor_proves_full_history(&accepted[0].proof.document));
+    assert_eq!(
+        fetcher
+            .urls()
+            .iter()
+            .filter(|url| **url == activity_url(wallet))
+            .count(),
+        5
+    );
+    assert!(!paper.position_anchors(&wallet).unwrap().is_empty());
+    drop(engine);
+    drop(paper);
+    let reopened = PaperStateDb::open(&dir.path().join("paper.db")).unwrap();
+    assert!(reopened.position_validation_current(&wallet).unwrap());
+}
+
+#[tokio::test]
+async fn control_missing_mapping_waits_for_next_walk_then_retries() {
+    let wallet = wallet(0x63);
+    let (_dir, paper, engine) = fresh(&[wallet]);
+    let (control_tx, control_rx) = mpsc::channel(8);
+    let actor = spawn_control_actor(control_rx, engine, Arc::clone(&paper));
+    let fetcher = Arc::new(QueueFetcher::new(mapping_arrives_on_next_walk(wallet)));
+    let outcomes = validator_from_fetcher(Arc::clone(&fetcher))
+        .validate_via_control(
+            &[wallet],
+            &control_tx,
+            &paper,
+            pe_service::position_seeder::ValidationPurpose::CatchUp,
+        )
+        .await;
+    assert!(outcomes.shared.is_none());
+    assert!(outcomes.deferred.is_empty());
+    assert_eq!(outcomes.accepted.len(), 1);
+    assert!(anchor_proves_full_history(
+        &outcomes.accepted[0].proof.document
+    ));
+    assert_eq!(
+        fetcher
+            .urls()
+            .iter()
+            .filter(|url| **url == activity_url(wallet))
+            .count(),
+        5
+    );
+    drop(control_tx);
+    actor.await.unwrap();
 }
 
 /// PASS: receipt, raw-payload, numeric presentation, and field-order changes within one explicit
@@ -3251,7 +3335,7 @@ async fn five_wallet_prepare_defers_mapping_failure_and_preserves_accepted_order
                 .filter(|url| url.as_str() == activity.as_str())
                 .count(),
             if wallet == deferred {
-                1
+                2 // The missing mapping is checked against the next required full walk.
             } else if wallet == raced {
                 6
             } else {
@@ -5056,13 +5140,20 @@ async fn unparseable_venue_row_defers_only_that_wallet_at_boot() {
         vec![page.clone(), page.clone(), page],
     );
 
-    let installs = validator(responses)
-        .validate_direct(&[healthy, corrupt], &mut engine, &paper)
+    let outcome = validator(responses)
+        .validate_direct_with_deferrals(&[healthy, corrupt], &mut engine, &paper)
         .await
         .unwrap();
+    let installs = outcome.accepted;
 
     assert_eq!(installs.len(), 1);
     assert_eq!(installs[0].wallet, healthy);
+    assert_eq!(outcome.deferred.len(), 1);
+    assert_eq!(outcome.deferred[0].0, corrupt);
+    assert_eq!(
+        outcome.deferred[0].1.class(),
+        pe_service::position_seeder::FailureClass::WalletPersistent
+    );
     assert!(paper.position_validation(&healthy).unwrap().is_some());
     assert!(paper.position_validation(&corrupt).unwrap().is_none());
     assert!(paper.position_anchors(&corrupt).unwrap().is_empty());

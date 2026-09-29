@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use pe_core_types::{ReceivedAt, SourceId, SourceTimestamp, WalletAddress};
@@ -315,6 +316,64 @@ pub enum AnchorRefreshOutcome {
     Anchored,
     Skipped,
     Deferred,
+    Cancelled,
+}
+
+/// The poller may cancel validation before the install handoff. Once handoff starts, the
+/// coordinator retains the wallet until the install acknowledgement has been observed.
+#[derive(Clone, Default)]
+pub(crate) struct RefreshHandoff(Arc<AtomicU8>);
+
+impl RefreshHandoff {
+    const VALIDATING: u8 = 0;
+    const PRE_SEND: u8 = 1;
+    const SENT: u8 = 2;
+    const CANCELLED: u8 = 3;
+
+    pub(crate) fn cancel_before_handoff(&self) -> bool {
+        loop {
+            let phase = self.0.load(Ordering::Acquire);
+            if phase == Self::CANCELLED {
+                return true;
+            }
+            if phase != Self::VALIDATING && phase != Self::PRE_SEND {
+                return false;
+            }
+            if self
+                .0
+                .compare_exchange(phase, Self::CANCELLED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return true;
+            }
+        }
+    }
+
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire) == Self::CANCELLED
+    }
+
+    fn pre_send(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::VALIDATING,
+                Self::PRE_SEND,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    fn begin_handoff(&self) -> bool {
+        self.0
+            .compare_exchange(
+                Self::PRE_SEND,
+                Self::SENT,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
 }
 
 /// The runtime predicate shared by periodic refresh and ordinary boot reuse.
@@ -525,20 +584,22 @@ impl AdmissionPreparer {
     pub async fn prepare_live_reentries(
         &self,
         wallets: &[WalletAddress],
-    ) -> Result<Vec<WalletAddress>, AdmissionError> {
+    ) -> Result<AdmissionOutcome, AdmissionError> {
         let mut ready = Vec::new();
+        let mut deferred = Vec::new();
         for wallet in wallets {
             match self.prepare(&[*wallet]).await {
                 Ok(outcome) => {
                     ready.extend(outcome.admitted);
-                    for deferred in outcome.deferred {
-                        warn!(wallet = %deferred.wallet, stage = deferred.stage, kind = deferred.kind, "live-only reentry deferred");
-                    }
+                    deferred.extend(outcome.deferred);
                 }
                 Err(abort) => return Err(abort.cause),
             }
         }
-        Ok(ready)
+        Ok(AdmissionOutcome {
+            admitted: ready,
+            deferred,
+        })
     }
 
     /// Recheck, seed, synchronize one structural record, then publish its exact entries.
@@ -733,6 +794,17 @@ impl AdmissionPreparer {
         now_unix: i64,
         refresh_secs: u64,
     ) -> Result<AnchorRefreshOutcome, AdmissionError> {
+        self.prepare_if_due_observed(wallet, now_unix, refresh_secs, None)
+            .await
+    }
+
+    pub(crate) async fn prepare_if_due_observed(
+        &self,
+        wallet: WalletAddress,
+        now_unix: i64,
+        refresh_secs: u64,
+        handoff: Option<&RefreshHandoff>,
+    ) -> Result<AnchorRefreshOutcome, AdmissionError> {
         let preparer = &self.inner;
         let Ok(_attempt) = preparer.attempt.try_lock() else {
             return Ok(AnchorRefreshOutcome::Skipped);
@@ -789,7 +861,24 @@ impl AdmissionPreparer {
             }
             return Err(AdmissionError::PositionValidation(error));
         }
-        match self.install_anchors(outcomes.accepted).await {
+        if let Some(handoff) = handoff
+            && !handoff.pre_send()
+        {
+            return Ok(AnchorRefreshOutcome::Cancelled);
+        }
+        let permit = self
+            .inner
+            .control_tx
+            .reserve()
+            .await
+            .map_err(|_| AdmissionError::ControlClosed)?;
+        if let Some(handoff) = handoff
+            && !handoff.begin_handoff()
+        {
+            return Ok(AnchorRefreshOutcome::Cancelled);
+        }
+        let installed = Self::send_install_anchors(permit, outcomes.accepted).await;
+        match installed {
             Ok(()) => Ok(AnchorRefreshOutcome::Anchored),
             Err(AdmissionError::ValidationRejected(_)) => Ok(AnchorRefreshOutcome::Deferred),
             Err(error) => Err(error),
@@ -843,15 +932,24 @@ impl AdmissionPreparer {
     }
 
     async fn install_anchors(&self, installs: Vec<AnchorInstall>) -> Result<(), AdmissionError> {
-        let (acknowledged, acknowledgement) = oneshot::channel();
-        self.inner
+        let permit = self
+            .inner
             .control_tx
-            .send(OrchestratorControl::InstallAnchors {
-                installs,
-                acknowledged,
-            })
+            .reserve()
             .await
             .map_err(|_| AdmissionError::ControlClosed)?;
+        Self::send_install_anchors(permit, installs).await
+    }
+
+    async fn send_install_anchors(
+        permit: mpsc::Permit<'_, OrchestratorControl>,
+        installs: Vec<AnchorInstall>,
+    ) -> Result<(), AdmissionError> {
+        let (acknowledged, acknowledgement) = oneshot::channel();
+        permit.send(OrchestratorControl::InstallAnchors {
+            installs,
+            acknowledged,
+        });
         tokio::time::timeout(
             Duration::from_secs(ADMISSION_PREPARE_ACK_TIMEOUT_SECS),
             acknowledgement,

@@ -419,8 +419,16 @@ impl LiveOrderVenue for PolymarketLiveVenue {
         })
     }
 
-    fn post_once<'a>(&'a self, submission: Self::Submission) -> LivePostFuture<'a> {
-        Box::pin(async move { self.client.post_order_once(submission).await })
+    fn post_once<'a>(
+        &'a self,
+        submission: Self::Submission,
+        wall_clock_deadline: Option<OffsetDateTime>,
+    ) -> LivePostFuture<'a> {
+        Box::pin(async move {
+            self.client
+                .post_order_once_with_deadline(submission, wall_clock_deadline)
+                .await
+        })
     }
 
     fn classify_post_response(

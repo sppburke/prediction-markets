@@ -451,6 +451,7 @@ pub enum LiveOrderPreparationFailure {
     PrePostRiskDayChanged,
     PrePostRiskPriceExpired,
     PrePostLadderExpired,
+    PrePostCopyExpired,
     PrePostAdmissionExpired,
     PrePostMarkUnavailable,
     PrePostNotArmed,
@@ -470,6 +471,7 @@ impl LiveOrderPreparationFailure {
                 "recovery_risk_evidence_expired"
             }
             Self::PrePostLadderExpired => "recovery_ladder_expired",
+            Self::PrePostCopyExpired => "copy_expired_before_post",
             Self::PrePostNotArmed => "not_armed",
             Self::PrePostControlUnavailable => "control_unavailable",
             Self::Venue

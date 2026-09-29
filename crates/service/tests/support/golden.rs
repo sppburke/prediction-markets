@@ -710,7 +710,11 @@ impl LiveOrderVenue for GoldenLiveVenue {
         })
     }
 
-    fn post_once<'a>(&'a self, _submission: Self::Submission) -> LivePostFuture<'a> {
+    fn post_once<'a>(
+        &'a self,
+        _submission: Self::Submission,
+        _wall_clock_deadline: Option<OffsetDateTime>,
+    ) -> LivePostFuture<'a> {
         Box::pin(std::future::pending())
     }
 
@@ -3560,7 +3564,9 @@ impl BracketFinancialHarness {
         }));
         let mut background = None;
         let mut urgent = None;
-        for _ in 0..TRADE_RECONCILIATION_CONCURRENCY {
+        // The urgent read and the other wallet's backstop read run together; no refresh is due.
+        let reads = 2;
+        for _ in 0..reads {
             let request = requested.recv().await.unwrap();
             assert!(
                 request.url.contains(&format!("end={epoch}")),
@@ -3602,7 +3608,7 @@ impl BracketFinancialHarness {
                 }
             }
         }
-        assert_eq!(maximum, TRADE_RECONCILIATION_CONCURRENCY);
+        assert_eq!(maximum, reads);
         assert!(
             matches!(requested.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
             "no third operation"
@@ -3831,7 +3837,6 @@ pub(crate) async fn deployed_flow_replays_exactly_and_qualifies() {
                             execution_order: 0,
                             requested_live_mode: "live_tiny".to_owned(),
                             effective_live_mode: "live_tiny".to_owned(),
-                            live_price_impact_cap_bps: 100,
                             custody_wallet_address: None,
                             custody_wallet_kind: None,
                             credential_binding: Some((7, "stored-key".to_owned())),

@@ -366,12 +366,12 @@ async fn rerank_dropped_wallet_cannot_reenter_after_preparation() {
     assert_eq!(removed, vec![dropped]);
     release.send(()).unwrap();
     let prepared = reentry.await.unwrap();
-    assert_eq!(prepared.as_ref().unwrap(), &vec![dropped]);
+    assert_eq!(prepared.as_ref().unwrap().admitted, vec![dropped]);
     let _writer = lock.lock().await;
     scenario_apply_live_reentries(
         &live,
         &db,
-        prepared.as_ref().unwrap(),
+        &prepared.as_ref().unwrap().admitted,
         &[entry(dropped, 900)],
         2,
     );
@@ -413,9 +413,16 @@ async fn ranked_reentry_attempts_are_independent_and_recheck_current_membership(
     });
     let preparer = AdmissionPreparer::new(control, Arc::clone(&db));
     let prepared = preparer.prepare_live_reentries(&[deferred, ready]).await;
-    assert_eq!(prepared.as_ref().unwrap(), &vec![ready]);
+    assert_eq!(prepared.as_ref().unwrap().admitted, vec![ready]);
+    assert_eq!(prepared.as_ref().unwrap().deferred.len(), 1);
     let incoming = vec![entry(ready, 900), entry(deferred, 800)];
-    scenario_apply_live_reentries(&live, &db, prepared.as_ref().unwrap(), &incoming, 2);
+    scenario_apply_live_reentries(
+        &live,
+        &db,
+        &prepared.as_ref().unwrap().admitted,
+        &incoming,
+        2,
+    );
     assert_eq!(live.snapshot().entries.len(), 1);
     assert_eq!(
         live.snapshot().entries[0].leader_score_bps,
@@ -427,14 +434,47 @@ async fn ranked_reentry_attempts_are_independent_and_recheck_current_membership(
     );
 
     live.remove_fenced(&HashSet::from([ready]));
-    scenario_apply_live_reentries(&live, &db, prepared.as_ref().unwrap(), &[], 2);
+    scenario_apply_live_reentries(&live, &db, &prepared.as_ref().unwrap().admitted, &[], 2);
     assert!(live.snapshot().entries.is_empty());
     live.scenario_commit_structural_change(&[ready], &[]);
-    scenario_apply_live_reentries(&live, &db, prepared.as_ref().unwrap(), &incoming, 2);
+    scenario_apply_live_reentries(
+        &live,
+        &db,
+        &prepared.as_ref().unwrap().admitted,
+        &incoming,
+        2,
+    );
     assert!(live.snapshot().entries.is_empty());
     assert_eq!(live.structural_membership(), HashSet::from([deferred]));
     drop(preparer);
     relay.await.unwrap();
+}
+
+#[test]
+fn locked_live_reentry_returns_typed_transient_deferral() {
+    let (_dir, db) = temp_db();
+    let deferred = wallet(44);
+    db.record_reconciled_history_status(&WalletHistoryStatusRecord {
+        wallet: deferred,
+        complete: true,
+        proof_json: "{}".to_owned(),
+        updated_at_unix: NOW,
+    })
+    .unwrap();
+    let live = LiveWatchlist::new(watchlist(vec![entry(deferred, 100)]));
+    live.remove_fenced(&HashSet::from([deferred]));
+    let outcome =
+        scenario_apply_live_reentries(&live, &db, &[deferred], &[entry(deferred, 900)], 2);
+    assert!(outcome.admitted.is_empty());
+    assert_eq!(outcome.deferred.len(), 1);
+    assert_eq!(outcome.deferred[0].wallet, deferred);
+    assert_eq!(outcome.deferred[0].stage, "locked_apply");
+    assert_eq!(
+        outcome.deferred[0].class,
+        pe_service::position_seeder::FailureClass::WalletTransient
+    );
+    assert_eq!(outcome.deferred[0].kind, "publication.unvalidated_position");
+    assert!(live.snapshot().entries.is_empty());
 }
 
 // ── proven-winner-spared-under-72h ──────────────────────────────────────────────

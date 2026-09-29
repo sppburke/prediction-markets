@@ -83,6 +83,19 @@ pub enum RawHttpAttempt {
     TransportFailure(RawTransportFailure),
 }
 
+/// The one-use order POST result. Expiry has no HTTP attempt to record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpiredAt {
+    pub checked_at: OffsetDateTime,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)] // one value per POST; boxing the response buys nothing
+pub enum RawPostAttempt {
+    Attempted(RawHttpResponse),
+    NotAttempted(ExpiredAt),
+}
+
 /// One ordered external-input observation, independent of its transport protocol.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "observation")]

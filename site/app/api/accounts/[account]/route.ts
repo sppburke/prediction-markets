@@ -28,8 +28,7 @@ function controlRpc(accountId: string, body: Record<string, unknown>): RpcCall |
         (body.live_sizing_dollar_usd !== null &&
           typeof body.live_sizing_dollar_usd !== "string") ||
         (body.live_sizing_contracts !== null &&
-          typeof body.live_sizing_contracts !== "string") ||
-        typeof body.live_price_impact_cap_bps !== "number"
+          typeof body.live_sizing_contracts !== "string")
       ) {
         return null;
       }
@@ -42,7 +41,6 @@ function controlRpc(accountId: string, body: Record<string, unknown>): RpcCall |
           p_live_sizing_mode: body.live_sizing_mode,
           p_live_sizing_dollar_usd: body.live_sizing_dollar_usd,
           p_live_sizing_contracts: body.live_sizing_contracts,
-          p_live_price_impact_cap_bps: body.live_price_impact_cap_bps,
           p_actor: ALLOWED_EMAIL,
         },
       };

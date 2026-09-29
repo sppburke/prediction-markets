@@ -86,7 +86,6 @@ function AccountControls({ row }: { row: AccountAdminRow }) {
   const [sizingMode, setSizingMode] = useState(row.live_sizing_mode ?? "");
   const [dollar, setDollar] = useState(String(row.live_sizing_dollar_usd ?? ""));
   const [contracts, setContracts] = useState(String(row.live_sizing_contracts ?? ""));
-  const [impactBps, setImpactBps] = useState(String(row.live_price_impact_cap_bps));
   const [requestedMode, setRequestedMode] = useState<"off" | "live_tiny">(
     row.requested_live_mode,
   );
@@ -219,16 +218,6 @@ function AccountControls({ row }: { row: AccountAdminRow }) {
           </select>
         </label>
         <label className="grid gap-1 text-muted">
-          impact cap (bps)
-          <input
-            className={inputClass}
-            type="number"
-            step="1"
-            value={impactBps}
-            onChange={(event) => setImpactBps(event.target.value)}
-          />
-        </label>
-        <label className="grid gap-1 text-muted">
           dollar size
           <input
             className={inputClass}
@@ -260,7 +249,6 @@ function AccountControls({ row }: { row: AccountAdminRow }) {
                 live_sizing_mode: sizingMode === "" ? null : sizingMode,
                 live_sizing_dollar_usd: dollar === "" ? null : dollar,
                 live_sizing_contracts: contracts === "" ? null : contracts,
-                live_price_impact_cap_bps: Number(impactBps),
               },
               "live settings saved",
             )
