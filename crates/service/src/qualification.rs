@@ -7576,6 +7576,10 @@ mod tests {
             assert_eq!(continuation.version() == 6, semantic == 2);
             let mut economic = evaluated_economic(&fixture.decision).clone();
             economic.version = u16::try_from(semantic).unwrap();
+            if semantic == 2 {
+                // Wire 2 always carries the neutral current-book chase ceiling.
+                economic.balance.chase_ceiling = Price::ONE;
+            }
             let halt = test_frame(
                 4,
                 economic.risk.evaluated_at_unix_ms.div_euclid(1_000) - 20,
