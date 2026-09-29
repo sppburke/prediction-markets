@@ -424,6 +424,11 @@ rule, and version compatibility are canonical in the glossary's
 [`copy_latency_budget_secs`](_GLOSSARY.md#polymarket-public-source-pollingconfig) and
 [continuation contract](_GLOSSARY.md#continuation-and-commitment-compatibility-588).
 
+Ordinary live checks the same frozen continuation policy and verified earliest source time at the
+SDK's final send instant, after authenticated header creation. An expired copy records
+`copy_expired_before_post` without an HTTP attempt. Missing continuation evidence keeps the target
+pending and stops submission.
+
 **Fail posture (gate B history unknown).** Missing or incomplete reconciled history fails closed: the wallet cannot be published into live membership, and any attempted entry receives the typed `wallet_history_incomplete` disposition. Version-two paper-state records are the authority. The captured legacy history file is a one-time migration input only: a valid import is a conservative seed and remains incomplete until a reconciled-history proof is durably recorded (#544).
 
 “History complete” means complete over attributable rows: rows whose asset no configured metadata authority can verify are recorded `raw_only` and cannot contribute a market to first-entry history.
@@ -436,8 +441,9 @@ balance proof, applied configuration hash, and source observation. The signal's 
 frozen audit evidence and cannot substitute for current-book evidence. Paper semantic 2 walks the
 current ask ladder up to the applied best-ask impact cap, inside `[min_fill_price, max_fill_price)`,
 and signs the ladder's tick-aligned limit without a leader-price ceiling. Paper admission permits
-positive or absent matching delay. Ordinary live retains its leader-price ceiling and strict delay
-check on a fresh target-specific admission read. The isolated V2 canary has its own contract.
+positive or absent matching delay. Ordinary live uses the same current-book impact cap and neutral
+chase ceiling, with a strict zero-delay check on a fresh target-specific admission read. The
+isolated V2 canary has its own contract.
 
 ## Strategy-level trade gates
 
@@ -546,7 +552,7 @@ Ordinary `pe-service` has per-account modes `off | live_tiny`. `promoted` is def
 has no distinct financial contract under the current cap policy (the reviewed production row is
 `unlimited`; `ModeDefault` resolves 25 bps for LiveTiny and 100 bps for Promoted only when that row
 is selected); a distinct promoted contract remains deferred. The account grammar,
-per-account price-impact default, dispatch retention, and redemption surfacing
+dispatch retention, and redemption surfacing
 threshold live only in `_GLOSSARY.md`.
 
 The owner uses **Request mode** to set `requested_live_mode`. The service reconciles

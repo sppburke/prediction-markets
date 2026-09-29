@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use alloy_primitives::keccak256;
 use pe_core_types::{
     CollateralAmount, OutcomeId, PolymarketConditionId, PolymarketTokenId, Price, RawEvidence,
-    RawHttpResponse, RawTransportFailure, ShareAmount, TransportErrorClass,
+    RawHttpResponse, RawPostAttempt, RawTransportFailure, ShareAmount, TransportErrorClass,
 };
 use polymarket_client_sdk_v2::auth::state::Authenticated;
 use polymarket_client_sdk_v2::auth::{Credentials, Normal, PrivateKeySigner, Signer as _, Uuid};
@@ -20,7 +20,7 @@ use polymarket_client_sdk_v2::clob::types::{
 use polymarket_client_sdk_v2::clob::{Client, Config, standard_v2_order_hash};
 use polymarket_client_sdk_v2::types::{Address, B256, U256};
 use polymarket_client_sdk_v2::{
-    POLYGON, ResponseObservation, ResponseObserver, TransportFailureClass,
+    POLYGON, RawOnceOutcome, ResponseObservation, ResponseObserver, TransportFailureClass,
     TransportFailureObservation, contract_config,
 };
 use rust_decimal::Decimal;
@@ -344,6 +344,23 @@ impl CanaryV2Client {
         &self,
         submission: PreparedSubmission,
     ) -> Result<RawHttpResponse, RawTransportFailure> {
+        match self.post_order_once_with_deadline(submission, None).await? {
+            RawPostAttempt::Attempted(response) => Ok(response),
+            RawPostAttempt::NotAttempted(_) => Err(local_failure(
+                "order-post",
+                "POST",
+                "/order",
+                TransportErrorClass::RequestBuild,
+                OffsetDateTime::now_utc(),
+            )),
+        }
+    }
+
+    pub async fn post_order_once_with_deadline(
+        &self,
+        submission: PreparedSubmission,
+        wall_clock_deadline: Option<OffsetDateTime>,
+    ) -> Result<RawPostAttempt, RawTransportFailure> {
         if blake3::hash(&submission.serialized_body).to_hex().as_str()
             != submission.prepared.post_body_hash
         {
@@ -358,26 +375,36 @@ impl CanaryV2Client {
         let _ = self.take_observations();
         let observed_at = OffsetDateTime::now_utc();
         self.client
-            .post_order_once_raw(submission.serialized_body)
+            .post_order_once_raw(
+                submission.serialized_body,
+                wall_clock_deadline.map(Into::into),
+            )
             .await
-            .map(|observation| {
-                let source_at = source_at(&observation.headers);
-                RawHttpResponse {
-                    source_id: "polymarket-clob-v2".to_owned(),
-                    endpoint_kind: "order-post".to_owned(),
-                    method: observation.method,
-                    path: observation.path,
-                    ordered_query: observation.ordered_query,
-                    status: observation.status,
-                    headers: observation.headers,
-                    body: observation.body,
-                    attempt_ordinal: 1,
-                    source_at,
-                    observed_at: observation.observed_at.into(),
-                    received_at: observation.received_at.into(),
-                    schema_version: 1,
-                    parser_version: 1,
-                    adapter_version: SDK_VERSION.to_owned(),
+            .map(|observation| match observation {
+                RawOnceOutcome::NotAttempted(expired) => {
+                    RawPostAttempt::NotAttempted(pe_core_types::ExpiredAt {
+                        checked_at: expired.checked_at.into(),
+                    })
+                }
+                RawOnceOutcome::Attempted(observation) => {
+                    let source_at = source_at(&observation.headers);
+                    RawPostAttempt::Attempted(RawHttpResponse {
+                        source_id: "polymarket-clob-v2".to_owned(),
+                        endpoint_kind: "order-post".to_owned(),
+                        method: observation.method,
+                        path: observation.path,
+                        ordered_query: observation.ordered_query,
+                        status: observation.status,
+                        headers: observation.headers,
+                        body: observation.body,
+                        attempt_ordinal: 1,
+                        source_at,
+                        observed_at: observation.observed_at.into(),
+                        received_at: observation.received_at.into(),
+                        schema_version: 1,
+                        parser_version: 1,
+                        adapter_version: SDK_VERSION.to_owned(),
+                    })
                 }
             })
             .map_err(|error| {
@@ -1279,6 +1306,23 @@ mod tests {
         assert_eq!(body["deferExec"], false);
         assert_eq!(body["order"]["makerAmount"], "500000");
         assert_eq!(body["order"]["takerAmount"], "5000000");
+    }
+
+    #[tokio::test]
+    async fn expired_order_deadline_after_authentication_sends_no_post() {
+        let (client, state) = client().await;
+        let submission = prepared(&client).await.unwrap();
+        let deadline = OffsetDateTime::UNIX_EPOCH;
+        let outcome = client
+            .post_order_once_with_deadline(submission, Some(deadline))
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome,
+            RawPostAttempt::NotAttempted(pe_core_types::ExpiredAt { checked_at })
+                if checked_at > deadline
+        ));
+        assert_eq!(state.posts.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

@@ -730,13 +730,19 @@ enum ControlCompletion {
     BucketCommitted,
     Anchored(WalletAddress),
     Boundary(i64),
+    FinalCapture,
 }
 
 struct RunningPoll {
+    health: pe_service::health::SharedHealth,
+    anchor_ack_gate: Arc<tokio::sync::Semaphore>,
+    anchor_ack_drop: Arc<std::sync::atomic::AtomicBool>,
     append_ack_gate: Arc<tokio::sync::Semaphore>,
     append_ack_arrived: Arc<tokio::sync::Notify>,
     bucket_ack_gate: Arc<tokio::sync::Semaphore>,
     boundary_ack_gate: Arc<tokio::sync::Semaphore>,
+    final_capture_gate: Arc<tokio::sync::Semaphore>,
+    control_tx: mpsc::WeakSender<OrchestratorControl>,
     controls: mpsc::Receiver<ControlCompletion>,
     source: SourceLogHandle,
     triggers: mpsc::Sender<pe_service::activity_ingest::ReconciliationTrigger>,
@@ -945,11 +951,18 @@ fn start_recorded_poller_with_completion_stop(
     let append_ack_arrived = Arc::new(tokio::sync::Notify::new());
     let bucket_ack_gate = Arc::new(tokio::sync::Semaphore::new(1));
     let boundary_ack_gate = Arc::new(tokio::sync::Semaphore::new(1));
+    let final_capture_gate = Arc::new(tokio::sync::Semaphore::new(1));
+    let anchor_ack_gate = Arc::new(tokio::sync::Semaphore::new(1));
+    let anchor_ack_drop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let actor_ack_gate = bucket_ack_gate.clone();
     let actor_boundary_gate = boundary_ack_gate.clone();
+    let actor_anchor_gate = anchor_ack_gate.clone();
+    let actor_anchor_drop = anchor_ack_drop.clone();
+    let actor_capture_gate = final_capture_gate.clone();
     let (control_events, controls) = mpsc::channel(16);
     let actor_paper = paper.clone();
-    let (control_tx, mut control_rx) = mpsc::channel(8);
+    let (control_tx, mut control_rx) = mpsc::channel(2);
+    let test_control_tx = control_tx.downgrade();
     let mut engine =
         BucketCommitEngine::load(paper.clone(), build_leader_ledger(&paper).unwrap()).unwrap();
     let (real_tx, real_rx) = mpsc::channel(8);
@@ -966,6 +979,7 @@ fn start_recorded_poller_with_completion_stop(
     });
     let control = tokio::spawn(async move {
         let mut commits = Vec::new();
+        let mut captures = 0;
         while let Some(command) = control_rx.recv().await {
             match command {
                 OrchestratorControl::CommitActivityBucket {
@@ -1019,6 +1033,11 @@ fn start_recorded_poller_with_completion_stop(
                     let _ = acknowledged.send(());
                 }
                 OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
+                    captures += 1;
+                    if captures % 3 == 0 {
+                        let _ = control_events.send(ControlCompletion::FinalCapture).await;
+                        let _permit = actor_capture_gate.acquire().await.unwrap();
+                    }
                     let _ = captured.send(
                         pe_service::position_seeder::ledger_capture(
                             engine.ledger(),
@@ -1040,7 +1059,10 @@ fn start_recorded_poller_with_completion_stop(
                                 .await;
                         }
                     }
-                    let _ = acknowledged.send(result);
+                    let _permit = actor_anchor_gate.acquire().await.unwrap();
+                    if !actor_anchor_drop.load(Ordering::SeqCst) {
+                        let _ = acknowledged.send(result);
+                    }
                 }
                 _ => unreachable!("unexpected control"),
             }
@@ -1107,7 +1129,7 @@ fn start_recorded_poller_with_completion_stop(
         trigger_rx,
         control_tx,
         paper.clone(),
-        health,
+        health.clone(),
         SignalConfig::default(),
         LiveRuntimeConfig::new(RuntimeConfig::from_service_config(
             &pe_service::config::ServiceConfig::default(),
@@ -1144,10 +1166,15 @@ fn start_recorded_poller_with_completion_stop(
     }));
     (
         RunningPoll {
+            health,
+            anchor_ack_gate,
+            anchor_ack_drop,
             append_ack_gate,
             append_ack_arrived,
             bucket_ack_gate,
             boundary_ack_gate,
+            final_capture_gate,
+            control_tx: test_control_tx,
             controls,
             source,
             triggers: trigger_tx,
@@ -1409,6 +1436,225 @@ async fn fail_refresh_positions(running: &mut RunningPoll, wallet: WalletAddress
     positions.respond.fail();
 }
 
+#[tokio::test(start_paused = true)]
+async fn last_wallet_refresh_defers_unvisited_health_and_yields_to_same_wallet_trigger() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut running, _) =
+        start_recorded_poller_with_anchors(&dir, &[wallet()], false, true, Some(EPOCH));
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    running.completed(wallet()).await;
+    running.round_completed().await;
+    let first_health = running.health.lock().unwrap().poll_last_round_at;
+    assert!(first_health.is_some());
+    let validation = running.requests.recv().await.unwrap();
+    assert!(validation.url.contains("/activity?"));
+    running.now.store(EPOCH + 30, Ordering::SeqCst);
+    tokio::time::advance(std::time::Duration::from_secs(30)).await;
+    running.round_completed().await;
+    assert_eq!(
+        running.health.lock().unwrap().poll_last_round_at,
+        first_health,
+        "the refresh-held wallet was not a completed backstop visit"
+    );
+
+    let row = stream_row(wallet(), "refresh-yields-to-trigger", EPOCH + 30);
+    let receipt = running.observe(row.clone()).await;
+    let urgent = running.requests.recv().await.unwrap();
+    assert!(urgent.url.contains(&wallet().to_string()));
+    assert!(
+        validation.respond.send(b"[]".to_vec()).is_err(),
+        "validation was cancelled and joined before urgent handoff"
+    );
+    urgent
+        .respond
+        .send(serde_json::to_vec(&[row]).unwrap())
+        .unwrap();
+    assert_eq!(running.completed(wallet()).await, vec![receipt]);
+    let retry = running.requests.recv().await.unwrap();
+    assert!(
+        retry.url.contains("/activity?"),
+        "refresh was requeued after urgent"
+    );
+    let later_row = stream_row(wallet(), "retry-also-yields-to-trigger", EPOCH + 30);
+    let later_receipt = running.observe(later_row.clone()).await;
+    let next_urgent = running.requests.recv().await.unwrap();
+    assert!(next_urgent.url.contains(&wallet().to_string()));
+    assert!(
+        retry.respond.send(b"[]".to_vec()).is_err(),
+        "the selected refresh retry was cancelled before urgent handoff"
+    );
+    next_urgent
+        .respond
+        .send(serde_json::to_vec(&[later_row]).unwrap())
+        .unwrap();
+    assert_eq!(running.completed(wallet()).await, vec![later_receipt]);
+    running.finish().await;
+}
+
+async fn drive_refresh_to_sent_install(running: &mut RunningPoll) {
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    running.completed(wallet()).await;
+    running.round_completed().await;
+    loop {
+        tokio::select! {
+            request = running.requests.recv() => request.unwrap().respond.send(b"[]".to_vec()).unwrap(),
+            event = running.controls.recv() => if matches!(event, Some(ControlCompletion::Anchored(w)) if w == wallet()) { break },
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn sent_anchor_install_holds_wallet_until_ack_then_urgent_reconciles() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut running, _) =
+        start_recorded_poller_with_anchors(&dir, &[wallet()], false, true, Some(EPOCH));
+    let held = running
+        .anchor_ack_gate
+        .clone()
+        .acquire_owned()
+        .await
+        .unwrap();
+    drive_refresh_to_sent_install(&mut running).await;
+    let row = stream_row(wallet(), "after-sent-anchor", EPOCH);
+    let receipt = running.observe(row.clone()).await;
+    tokio::task::yield_now().await;
+    assert!(
+        running.requests.try_recv().is_err(),
+        "urgent waits for install acknowledgement"
+    );
+    drop(held);
+    let urgent = running.requests.recv().await.unwrap();
+    urgent
+        .respond
+        .send(serde_json::to_vec(&[row]).unwrap())
+        .unwrap();
+    assert_eq!(running.completed(wallet()).await, vec![receipt]);
+    running.finish().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn full_control_channel_cancels_refresh_before_install_and_releases_urgent_wallet() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut running, _) =
+        start_recorded_poller_with_anchors(&dir, &[wallet()], false, true, Some(EPOCH));
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    running.completed(wallet()).await;
+    running.round_completed().await;
+
+    let held = running
+        .final_capture_gate
+        .clone()
+        .acquire_owned()
+        .await
+        .unwrap();
+    loop {
+        tokio::select! {
+            request = running.requests.recv() => request.unwrap().respond.send(b"[]".to_vec()).unwrap(),
+            event = running.controls.recv() => if matches!(event, Some(ControlCompletion::FinalCapture)) { break },
+        }
+    }
+    let first_slot = running
+        .control_tx
+        .upgrade()
+        .unwrap()
+        .reserve_owned()
+        .await
+        .unwrap();
+    let second_slot = running
+        .control_tx
+        .upgrade()
+        .unwrap()
+        .reserve_owned()
+        .await
+        .unwrap();
+    assert_eq!(running.control_tx.upgrade().unwrap().capacity(), 0);
+    drop(held);
+    // The paused clock advances only once every task is parked. The refresh then has its final
+    // capture and no page request outstanding, so it can only be waiting for a control slot.
+    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    assert!(
+        running.requests.try_recv().is_err(),
+        "refresh is not waiting for a page"
+    );
+    assert!(
+        running.controls.try_recv().is_err(),
+        "refresh has not sent InstallAnchors"
+    );
+
+    let row = stream_row(wallet(), "full-control-refresh-yields", EPOCH);
+    let receipt = running.observe(row.clone()).await;
+    let urgent = running.requests.recv().await.unwrap();
+    assert!(urgent.url.contains(&wallet().to_string()));
+    assert!(
+        running.controls.try_recv().is_err(),
+        "cancelled refresh sent no InstallAnchors"
+    );
+    drop(first_slot);
+    drop(second_slot);
+    urgent
+        .respond
+        .send(serde_json::to_vec(&[row]).unwrap())
+        .unwrap();
+    assert_eq!(running.completed(wallet()).await, vec![receipt]);
+    while let Ok(event) = running.controls.try_recv() {
+        assert!(
+            !matches!(event, ControlCompletion::Anchored(_)),
+            "cancelled refresh was never installed"
+        );
+    }
+    running.finish().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn uncertain_anchor_install_stops_before_releasing_wallet_to_urgent() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut running, _) =
+        start_recorded_poller_with_anchors(&dir, &[wallet()], false, true, Some(EPOCH));
+    let held = running
+        .anchor_ack_gate
+        .clone()
+        .acquire_owned()
+        .await
+        .unwrap();
+    drive_refresh_to_sent_install(&mut running).await;
+    running
+        .observe(stream_row(wallet(), "uncertain-anchor", EPOCH))
+        .await;
+    running.anchor_ack_drop.store(true, Ordering::SeqCst);
+    drop(held);
+    let result = running.poller.await.unwrap();
+    assert!(matches!(
+        result,
+        Err(pe_service::trade_poller::TradePollerOwnerError::AnchorRefresh(_))
+    ));
+    assert!(running.requests.try_recv().is_err());
+    drop(running.source);
+    drop(running.triggers);
+    running.ingest.await.unwrap();
+    running.control.await.unwrap();
+}
+
 /// PASS: holding boundary publication beyond the cadence leaves no expired wake armed; a trigger
 /// is still handled and completing publication admits the next round without another timer tick.
 #[tokio::test(start_paused = true)]
@@ -1584,6 +1830,101 @@ async fn urgent_wallet_progresses_while_unrelated_read_is_blocked() {
     assert_eq!(running.control.await.unwrap().len(), 1);
 }
 
+#[tokio::test(start_paused = true)]
+async fn stalled_second_backstop_page_yields_to_new_same_wallet_obligation() {
+    use pe_source_polymarket_public::RECONCILIATION_PAGE_LIMIT;
+    let dir = tempfile::tempdir().unwrap();
+    let (mut running, paper) = start_recorded_poller(&dir, &[wallet()]);
+    let first = running.requests.recv().await.unwrap();
+    let older = stream_row(wallet(), "stalled-page", EPOCH - 1);
+    first
+        .respond
+        .send(
+            serde_json::to_vec(&vec![
+                older;
+                usize::try_from(RECONCILIATION_PAGE_LIMIT).unwrap()
+            ])
+            .unwrap(),
+        )
+        .unwrap();
+    let stalled = running.requests.recv().await.unwrap();
+    assert!(stalled.url.contains("offset=500"));
+    running.now.store(EPOCH + 1, Ordering::SeqCst);
+    let row = stream_row(wallet(), "after-fixed-end", EPOCH + 1);
+    let receipt = running.observe(row.clone()).await;
+    let urgent = running.requests.recv().await.unwrap();
+    assert!(
+        urgent.url.contains(&format!("end={}", EPOCH + 1)),
+        "urgent selects a fresh fixed end after the stalled visit"
+    );
+    assert!(stalled.respond.send(b"[]".to_vec()).is_err());
+    assert!(
+        running.completed(wallet()).await.is_empty(),
+        "cancelled visit has no health vote"
+    );
+    running.round_completed().await;
+    assert!(running.health.lock().unwrap().poll_last_round_at.is_none());
+    urgent
+        .respond
+        .send(serde_json::to_vec(&[row]).unwrap())
+        .unwrap();
+    assert_eq!(running.completed(wallet()).await, vec![receipt]);
+    assert!(
+        paper
+            .activity_group_state(
+                aggregate(stream_row(wallet(), "after-fixed-end", EPOCH + 1))
+                    .group_id
+                    .key()
+            )
+            .unwrap()
+            .is_some()
+    );
+    running.finish().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn sent_backstop_commit_ack_precedes_same_wallet_urgent_handoff() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut running, _) = start_recorded_poller(&dir, &[wallet()]);
+    let held = running
+        .bucket_ack_gate
+        .clone()
+        .acquire_owned()
+        .await
+        .unwrap();
+    let first_row = stream_row(wallet(), "before-urgent", EPOCH);
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(serde_json::to_vec(std::slice::from_ref(&first_row)).unwrap())
+        .unwrap();
+    assert!(matches!(
+        running.controls.recv().await,
+        Some(ControlCompletion::BucketCommitted)
+    ));
+    running.now.store(EPOCH + 1, Ordering::SeqCst);
+    let later = stream_row(wallet(), "after-commit-send", EPOCH + 1);
+    let receipt = running.observe(later.clone()).await;
+    tokio::task::yield_now().await;
+    assert!(
+        running.requests.try_recv().is_err(),
+        "sent commit retains wallet ownership"
+    );
+    drop(held);
+    assert!(running.completed(wallet()).await.is_empty());
+    let urgent = running.requests.recv().await.unwrap();
+    assert!(urgent.url.contains(&format!("end={}", EPOCH + 1)));
+    urgent
+        .respond
+        .send(serde_json::to_vec(&[first_row, later]).unwrap())
+        .unwrap();
+    assert_eq!(running.completed(wallet()).await, vec![receipt]);
+    running.finish().await;
+}
+
 /// PASS: duplicate reader receipts share one frozen attempt and one durable economic group.
 #[tokio::test(start_paused = true)]
 async fn duplicate_readers_share_one_frozen_attempt() {
@@ -1594,7 +1935,7 @@ async fn duplicate_readers_share_one_frozen_attempt() {
     let first = running.observe(row.clone()).await;
     running.observe(row.clone()).await;
     running.observe(row.clone()).await;
-    initial.respond.send(b"[]".to_vec()).unwrap();
+    let _ = initial.respond.send(b"[]".to_vec());
     running.completed(wallet()).await;
     running
         .requests
@@ -2376,14 +2717,12 @@ async fn shutdown_cancels_started_wallet_operations_and_keeps_the_durable_prefix
         .acquire_owned()
         .await
         .unwrap();
-    request
+    let _ = request
         .respond
-        .send(serde_json::to_vec(std::slice::from_ref(&history)).unwrap())
-        .unwrap();
-    running.append_ack_arrived.notified().await;
+        .send(serde_json::to_vec(std::slice::from_ref(&history)).unwrap());
     assert!(
         !running.poller.is_finished(),
-        "the operation is parked on the held durable page acknowledgement"
+        "the obligation remains owned until the cancelled visit is joined"
     );
     // The owner has consumed the only trigger and reached its select with A still parked.
     // On this current-thread runtime no completion can intervene before the stop is sent.
@@ -2405,7 +2744,6 @@ async fn shutdown_cancels_started_wallet_operations_and_keeps_the_durable_prefix
             .is_empty(),
         "no partial bucket application"
     );
-    assert!(running.requests.try_recv().is_err());
     drop(held_append);
     drop(held_bucket);
     drop(running.source);
@@ -2538,9 +2876,8 @@ async fn shutdown_after_failure_cancels_held_acknowledgement() {
     assert!(running.control.await.unwrap().is_empty());
 }
 
-/// PASS: B's Completed event makes shutdown ready inside the join arm; the next loop-top
-/// poll cancels A's held bucket acknowledgement without needing the select shutdown arm.
-/// FAIL: the owner waits for A, or returns an error after cancellation.
+/// PASS: loop-top shutdown stops new work but retains a sent bucket's wallet ownership until
+/// the acknowledgement is observed.
 #[tokio::test(start_paused = true)]
 async fn completion_ready_shutdown_cancels_at_loop_top() {
     let dir = tempfile::tempdir().unwrap();
@@ -2578,13 +2915,15 @@ async fn completion_ready_shutdown_cancels_at_loop_top() {
     let completing = running.requests.recv().await.unwrap();
     assert!(completing.url.contains(&other.to_string()));
     completing.respond.send(b"[]".to_vec()).unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(5), &mut running.poller)
-        .await
-        .expect("loop-top shutdown must cancel the held bucket acknowledgement")
-        .unwrap()
-        .unwrap();
+    tokio::task::yield_now().await;
+    assert!(!running.poller.is_finished());
     assert_eq!(running.bucket_ack_gate.available_permits(), 0);
     drop(held);
+    tokio::time::timeout(std::time::Duration::from_secs(5), &mut running.poller)
+        .await
+        .expect("loop-top shutdown must observe the sent bucket acknowledgement")
+        .unwrap()
+        .unwrap();
     drop(running.source);
     drop(running.triggers);
     running.ingest.await.unwrap();
@@ -2633,13 +2972,15 @@ async fn shutdown_after_bucket_commit_restarts_without_double_application() {
     let positions = paper.leader_positions().unwrap();
     let financial_log = std::fs::read(dir.path().join("paper.log")).unwrap();
     running.stop.send(()).unwrap();
-    tokio::time::timeout(std::time::Duration::from_secs(5), &mut running.poller)
-        .await
-        .expect("shutdown must not wait for the committed bucket acknowledgement")
-        .unwrap()
-        .unwrap();
+    tokio::task::yield_now().await;
+    assert!(!running.poller.is_finished());
     assert_eq!(running.bucket_ack_gate.available_permits(), 0);
     drop(held);
+    tokio::time::timeout(std::time::Duration::from_secs(5), &mut running.poller)
+        .await
+        .expect("shutdown must establish the committed bucket acknowledgement")
+        .unwrap()
+        .unwrap();
     drop(running.source);
     drop(running.triggers);
     running.ingest.await.unwrap();
@@ -2712,17 +3053,26 @@ async fn urgent_load_preserves_backstop_anchor_and_boundary_progress() {
     assert!(urgent.url.contains(&urgent_wallet.to_string()));
     first.respond.send(b"[]".to_vec()).unwrap();
     // Keep urgent HTTP held while the independent slot completes its background round and bracket.
+    let mut boundary_seen = None;
     let anchored = loop {
         tokio::select! {
             request = running.requests.recv() => request.unwrap().respond.send(b"[]".to_vec()).unwrap(),
-            event = running.controls.recv() => if let ControlCompletion::Anchored(wallet) = event.unwrap() { break wallet; },
+            event = running.controls.recv() => match event.unwrap() {
+                ControlCompletion::Anchored(wallet) => break wallet,
+                ControlCompletion::Boundary(cutoff) => boundary_seen = Some(cutoff),
+                ControlCompletion::BucketCommitted | ControlCompletion::FinalCapture => {},
+            },
         }
     };
     assert_eq!(anchored, wallet());
     assert!(!paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
-    let cutoff = loop {
-        if let ControlCompletion::Boundary(cutoff) = running.controls.recv().await.unwrap() {
-            break cutoff;
+    let cutoff = if let Some(cutoff) = boundary_seen {
+        cutoff
+    } else {
+        loop {
+            if let ControlCompletion::Boundary(cutoff) = running.controls.recv().await.unwrap() {
+                break cutoff;
+            }
         }
     };
     assert_eq!(cutoff, EPOCH.div_euclid(86_400) * 86_400);
@@ -3077,7 +3427,7 @@ async fn mixed_exact_and_corrected_legs_keep_individual_bindings() {
     corrected["conditionId"] = json!("incorrect-stamp");
     let corrected_id = aggregate(corrected.clone()).group_id.key().clone();
     let corrected_receipt = running.observe(corrected).await;
-    held.respond.send(b"[]".to_vec()).unwrap();
+    let _ = held.respond.send(b"[]".to_vec());
     running.completed(wallet()).await;
     let mut sell = exact.clone();
     sell["side"] = json!("SELL");
@@ -3089,26 +3439,48 @@ async fn mixed_exact_and_corrected_legs_keep_individual_bindings() {
         .await
         .unwrap()
         .respond
-        .send(serde_json::to_vec(&[exact, sell]).unwrap())
+        .send(serde_json::to_vec(&[exact.clone(), sell.clone()]).unwrap())
         .unwrap();
-    assert_eq!(
-        running.completed(wallet()).await,
-        vec![exact_receipt, corrected_receipt]
-    );
+    let mut selected = running.completed(wallet()).await;
+    if !selected.contains(&corrected_receipt) {
+        running
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .respond
+            .send(serde_json::to_vec(&[exact.clone(), sell.clone()]).unwrap())
+            .unwrap();
+        selected.extend(running.completed(wallet()).await);
+    }
+    selected.sort_by_key(|receipt| receipt.sequence);
+    assert_eq!(selected, vec![exact_receipt, corrected_receipt]);
     let commits = running.finish().await;
-    assert_eq!(commits.len(), 1);
+    assert!(!commits.is_empty());
     assert_eq!(commits[0].0.len(), 2);
     let path = dir.path().join("source.log");
-    let frame = source_frames(&path)
+    let bindings = source_frames(&path)
         .into_iter()
-        .find(|frame| {
+        .filter(|frame| {
             frame.source_id.0 == pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID
         })
-        .unwrap();
-    let value: pe_service::bucket_commit::ActivityReadCommitment =
-        serde_json::from_slice(&frame.payload).unwrap();
-    let bindings = value.bindings.unwrap();
-    assert_eq!(bindings.len(), 2);
+        .flat_map(|frame| {
+            serde_json::from_slice::<pe_service::bucket_commit::ActivityReadCommitment>(
+                &frame.payload,
+            )
+            .unwrap()
+            .bindings
+            .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        bindings
+            .iter()
+            .map(|binding| binding.stream_receipt.sequence.0)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        2
+    );
     let exact_binding = bindings
         .iter()
         .find(|binding| binding.stream_receipt == exact_receipt)

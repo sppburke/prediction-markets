@@ -596,8 +596,11 @@ pub type LiveVenuePrepareFuture<'a, S> = Pin<
     Box<dyn Future<Output = Result<LiveVenuePrepared<S>, LiveVenuePreparationError>> + Send + 'a>,
 >;
 
-pub type LivePostFuture<'a> =
-    Pin<Box<dyn Future<Output = Result<RawHttpResponse, RawTransportFailure>> + Send + 'a>>;
+pub type LivePostFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<pe_core_types::RawPostAttempt, RawTransportFailure>> + Send + 'a,
+    >,
+>;
 
 pub type LiveReconciliationFuture<'a> = Pin<
     Box<
@@ -622,7 +625,11 @@ pub trait LiveOrderVenue: Send + Sync {
         request: LiveVenuePrepareRequest,
     ) -> LiveVenuePrepareFuture<'a, Self::Submission>;
 
-    fn post_once<'a>(&'a self, submission: Self::Submission) -> LivePostFuture<'a>;
+    fn post_once<'a>(
+        &'a self,
+        submission: Self::Submission,
+        wall_clock_deadline: Option<OffsetDateTime>,
+    ) -> LivePostFuture<'a>;
 
     fn classify_post_response(
         &self,
@@ -1218,12 +1225,26 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
         self.submit_with_clock(prepared, move || now).await
     }
 
-    /// Production POST path. The response and any subsequent reconciliation are stamped only
-    /// after their corresponding I/O completes.
+    /// Production POST path. The POST event and response-derived reconciliation use the
+    /// send-point clock carried by the venue; later reconciliation samples its own clock.
     pub async fn submit_with_clock<C>(
         &self,
         prepared: PreparedLiveOrder<V::Submission>,
         clock: C,
+    ) -> Result<LiveOrderOutcome, LiveExecutorError>
+    where
+        C: Fn() -> OffsetDateTime,
+    {
+        self.submit_with_clock_and_deadline(prepared, clock, None)
+            .await
+    }
+
+    /// Submit with a frozen source-age deadline checked by the venue at the actual send point.
+    pub async fn submit_with_clock_and_deadline<C>(
+        &self,
+        prepared: PreparedLiveOrder<V::Submission>,
+        clock: C,
+        wall_clock_deadline: Option<OffsetDateTime>,
     ) -> Result<LiveOrderOutcome, LiveExecutorError>
     where
         C: Fn() -> OffsetDateTime,
@@ -1235,10 +1256,10 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
             submission,
             ..
         } = prepared;
-        let post = self.venue.post_once(submission).await;
-        let posted_at = clock();
+        let post = self.venue.post_once(submission, wall_clock_deadline).await;
         match post {
             Err(failure) => {
+                let posted_at = failure.observed_at;
                 let kind = if failure.error_class == TransportErrorClass::Timeout {
                     LiveOrderAmbiguityKind::Timeout
                 } else {
@@ -1249,7 +1270,22 @@ impl<'a, V: LiveOrderVenue> LiveExecutor<'a, V> {
                 self.reconcile_ambiguous_with_clock(account_id, identity, order_hash, kind, &clock)
                     .await
             }
-            Ok(response) => {
+            Ok(pe_core_types::RawPostAttempt::NotAttempted(expired)) => {
+                self.terminalize_approved_admission(
+                    account_id.clone(),
+                    identity,
+                    expired.checked_at,
+                    LiveOrderPreparationFailure::PrePostCopyExpired,
+                )?;
+                Ok(LiveOrderOutcome::Rejected {
+                    order_hash: None,
+                    venue_order_id: None,
+                    kind: LiveOrderRejectKind::PreparationFailed,
+                    preparation: Some((LiveOrderPreparationFailure::PrePostCopyExpired, false)),
+                })
+            }
+            Ok(pe_core_types::RawPostAttempt::Attempted(response)) => {
+                let posted_at = response.observed_at;
                 let attempt = RawHttpAttempt::Response(response.clone());
                 self.journal_post(
                     &account_id,
@@ -1896,6 +1932,7 @@ mod tests {
         reconciliation: LiveVenueReconciledOutcome,
         posts: AtomicUsize,
         reconciliations: AtomicUsize,
+        post_checked_at: Option<OffsetDateTime>,
     }
 
     impl FixtureVenue {
@@ -1908,6 +1945,7 @@ mod tests {
                 },
                 posts: AtomicUsize::new(0),
                 reconciliations: AtomicUsize::new(0),
+                post_checked_at: None,
             }
         }
     }
@@ -1940,10 +1978,26 @@ mod tests {
         fn post_once<'a>(
             &'a self,
             _submission: Self::Submission,
-        ) -> Pin<Box<dyn Future<Output = Result<RawHttpResponse, RawTransportFailure>> + Send + 'a>>
-        {
-            self.posts.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async { Ok(raw_response("order-post")) })
+            wall_clock_deadline: Option<OffsetDateTime>,
+        ) -> LivePostFuture<'a> {
+            Box::pin(async move {
+                // Stand in for asynchronous SDK header creation before the final clock sample.
+                tokio::task::yield_now().await;
+                if let Some(checked_at) = self.post_checked_at
+                    && wall_clock_deadline.is_some_and(|deadline| checked_at > deadline)
+                {
+                    return Ok(pe_core_types::RawPostAttempt::NotAttempted(
+                        pe_core_types::ExpiredAt { checked_at },
+                    ));
+                }
+                self.posts.fetch_add(1, Ordering::SeqCst);
+                let mut response = raw_response("order-post");
+                if let Some(checked_at) = self.post_checked_at {
+                    response.observed_at = checked_at;
+                    response.received_at = checked_at;
+                }
+                Ok(pe_core_types::RawPostAttempt::Attempted(response))
+            })
         }
 
         fn classify_post_response(
@@ -2248,6 +2302,82 @@ mod tests {
         )
     }
 
+    #[tokio::test]
+    async fn expiry_at_sdk_send_point_records_only_preparation_failure() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("live.log");
+        let journal = LiveJournal::open(&path).unwrap();
+        let checked_at = now() + time::Duration::milliseconds(1);
+        let mut venue = FixtureVenue::new(LivePostClassification::Rejected {
+            venue_order_id: None,
+        });
+        venue.post_checked_at = Some(checked_at);
+        let executor = LiveExecutor::new(&venue, &journal);
+        let account_id = AccountId::new("account").unwrap();
+        let prepared = match executor.prepare(request(&account_id), now()).await.unwrap() {
+            LivePrepareResult::Prepared(prepared) => prepared,
+            LivePrepareResult::Terminal(outcome) => {
+                unreachable!("fixture admission unexpectedly failed: {outcome:?}")
+            }
+        };
+        let outcome = executor
+            .submit_with_clock_and_deadline(prepared, now, Some(now()))
+            .await
+            .unwrap();
+        assert_eq!(outcome.terminal_reason(), Some("copy_expired_before_post"));
+        assert_eq!(venue.posts.load(Ordering::SeqCst), 0);
+        let events = replay_account(&path, &account_id).unwrap();
+        assert!(events.iter().any(|event| {
+            event.timestamp == checked_at
+                && matches!(
+                    event.payload,
+                    LiveJournalPayload::OrderPreparationFailed(ref failed)
+                        if failed.failure == LiveOrderPreparationFailure::PrePostCopyExpired
+                )
+        }));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event.payload, LiveJournalPayload::OrderPosted(_)))
+        );
+    }
+
+    #[tokio::test]
+    async fn send_at_frozen_deadline_records_exact_attempt_instant() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("live.log");
+        let journal = LiveJournal::open(&path).unwrap();
+        let checked_at = now() + time::Duration::seconds(120);
+        let mut venue = FixtureVenue::new(LivePostClassification::Rejected {
+            venue_order_id: None,
+        });
+        venue.post_checked_at = Some(checked_at);
+        let executor = LiveExecutor::new(&venue, &journal);
+        let account_id = AccountId::new("account").unwrap();
+        let prepared = match executor.prepare(request(&account_id), now()).await.unwrap() {
+            LivePrepareResult::Prepared(prepared) => prepared,
+            LivePrepareResult::Terminal(outcome) => {
+                unreachable!("fixture admission unexpectedly failed: {outcome:?}")
+            }
+        };
+        let outcome = executor
+            .submit_with_clock_and_deadline(prepared, now, Some(checked_at))
+            .await
+            .unwrap();
+        assert_eq!(outcome.terminal_reason(), Some("rejected"));
+        assert_eq!(venue.posts.load(Ordering::SeqCst), 1);
+        let events = replay_account(&path, &account_id).unwrap();
+        assert!(events.iter().any(|event| {
+            event.timestamp == checked_at
+                && matches!(
+                    &event.payload,
+                    LiveJournalPayload::OrderPosted(posted)
+                        if matches!(&posted.evidence, RawHttpAttempt::Response(response)
+                            if response.observed_at == checked_at)
+                )
+        }));
+    }
+
     fn assert_common_terminal_evidence(events: &[crate::LiveJournalEvent]) {
         assert!(matches!(
             events,
@@ -2308,13 +2438,14 @@ mod tests {
     /// PASS: account admission, Prepared, and POST facts sample the injected clock after their
     /// respective awaited boundaries instead of reusing the tick's first instant.
     #[tokio::test]
-    async fn durable_execution_facts_use_boundary_clocks() {
+    async fn durable_execution_facts_use_post_attempt_and_reconciliation_clocks() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("live.log");
         let journal = LiveJournal::open(&path).unwrap();
-        let venue = FixtureVenue::new(LivePostClassification::Killed {
+        let mut venue = FixtureVenue::new(LivePostClassification::Killed {
             venue_order_id: Some("venue-clock".to_owned()),
         });
+        venue.post_checked_at = Some(now() + time::Duration::seconds(3));
         let executor = LiveExecutor::new(&venue, &journal);
         let account_id = AccountId::new("clock-account").unwrap();
         let ticks = AtomicUsize::new(0);
@@ -2341,6 +2472,7 @@ mod tests {
         assert_eq!(events[1].timestamp, now() + time::Duration::seconds(2));
         assert_eq!(events[2].timestamp, now() + time::Duration::seconds(3));
         assert_eq!(events[3].timestamp, now() + time::Duration::seconds(3));
+        assert_eq!(ticks.load(Ordering::SeqCst), 3);
     }
 
     /// PASS: a service-observed account snapshot reaches admission and preparation without a

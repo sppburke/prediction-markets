@@ -820,14 +820,23 @@ async fn main() -> Result<()> {
         first_migration_boot = migration_boot.session.is_some(),
         "boot anchor selection census"
     );
-    let anchored = boot_position_validator
-        .validate_direct(
+    let boot_validation = boot_position_validator
+        .validate_direct_with_deferrals(
             &boot_anchor_selection.walked,
             &mut boot_engine,
             &paper_state,
         )
         .await
         .context("causal current-position validation for boot universe")?;
+    let boot_persistent_deferred = boot_validation
+        .deferred
+        .iter()
+        .filter(|(_, error)| {
+            error.class() == pe_service::position_seeder::FailureClass::WalletPersistent
+        })
+        .map(|(wallet, _)| *wallet)
+        .collect();
+    let anchored = boot_validation.accepted;
     let leader_ledger = boot_engine.into_ledger();
     drop(boot_position_validator);
     let (source_log, source_rx) =
@@ -1570,6 +1579,7 @@ async fn main() -> Result<()> {
             applied_watchlist_capacity.clone(),
             admission_preparer.clone(),
             boot_batch_marker,
+            boot_persistent_deferred,
         );
         supervisor.spawn(
             TaskName::WatchlistMaintenance,

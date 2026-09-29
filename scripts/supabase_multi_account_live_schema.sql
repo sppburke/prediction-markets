@@ -1,12 +1,13 @@
 -- Supabase schema for Phase-B multi-account live execution (issue #508).
 --
--- This additive schema introduces typed per-account control state, sealed credential
+-- Canonical end-state schema for typed per-account control state, sealed credential
 -- storage, an immutable control-plane event ledger, and account-scoped live execution
--- state. It creates no rows and is safe to load while the current production binary is
--- running. All control mutations use SECURITY DEFINER RPCs so each state change and its
--- single sanitized audit event commit atomically.
+-- state. It creates no rows. For #714, apply the online expansion script first;
+-- apply this contraction only after the cap-free site and service are running.
+-- Control mutations use SECURITY DEFINER RPCs so each state change and its single
+-- sanitized audit event commit atomically.
 --
--- Idempotent: safe to re-run. Every object created here is new to issue #508.
+-- Idempotent: safe to re-run on fresh or previously deployed databases.
 
 begin;
 
@@ -50,8 +51,6 @@ create table if not exists public.accounts (
       live_sizing_contracts is null
       or live_sizing_contracts > 0
     ),
-  live_price_impact_cap_bps     integer     not null default 100
-    check (live_price_impact_cap_bps between 1 and 10000),
   custody_wallet_address        text,
   custody_wallet_kind           text
     check (
@@ -61,6 +60,14 @@ create table if not exists public.accounts (
   created_at                    timestamptz not null default now(),
   updated_at                    timestamptz not null default now()
 );
+
+-- Contract the retired account cap after the seven-argument RPC has been
+-- installed by the online expansion. Fresh installs take the same path.
+drop function if exists public.account_update_live_settings(
+  text, boolean, integer, text, numeric, bigint, integer, text
+);
+alter table public.accounts
+  drop column if exists live_price_impact_cap_bps;
 
 -- At most one account may be marked primary (#508). Non-primary execution order
 -- intentionally permits ties; Rust orders those accounts by (execution_order, account_id).
@@ -327,7 +334,6 @@ create or replace function public.account_update_live_settings(
   p_live_sizing_mode          text,
   p_live_sizing_dollar_usd    numeric,
   p_live_sizing_contracts     bigint,
-  p_live_price_impact_cap_bps integer,
   p_actor                     text
 ) returns void
 language plpgsql
@@ -339,7 +345,6 @@ declare
   v_live_sizing_mode          text;
   v_live_sizing_dollar_usd    numeric;
   v_live_sizing_contracts     bigint;
-  v_live_price_impact_cap_bps integer;
   v_from_value                text;
   v_to_value                  text;
 begin
@@ -351,14 +356,12 @@ begin
     execution_order,
     live_sizing_mode,
     live_sizing_dollar_usd,
-    live_sizing_contracts,
-    live_price_impact_cap_bps
+    live_sizing_contracts
   into
     v_execution_order,
     v_live_sizing_mode,
     v_live_sizing_dollar_usd,
-    v_live_sizing_contracts,
-    v_live_price_impact_cap_bps
+    v_live_sizing_contracts
   from public.accounts
   where account_id = p_account_id
   for update;
@@ -371,8 +374,7 @@ begin
     'execution_order', v_execution_order,
     'live_sizing_mode', v_live_sizing_mode,
     'live_sizing_dollar_usd', v_live_sizing_dollar_usd,
-    'live_sizing_contracts', v_live_sizing_contracts,
-    'live_price_impact_cap_bps', v_live_price_impact_cap_bps
+    'live_sizing_contracts', v_live_sizing_contracts
   )::text;
 
   update public.accounts
@@ -380,7 +382,6 @@ begin
          live_sizing_mode          = p_live_sizing_mode,
          live_sizing_dollar_usd    = p_live_sizing_dollar_usd,
          live_sizing_contracts     = p_live_sizing_contracts,
-         live_price_impact_cap_bps = p_live_price_impact_cap_bps,
          updated_at                = pg_catalog.now()
    where account_id = p_account_id;
 
@@ -388,8 +389,7 @@ begin
     'execution_order', p_execution_order,
     'live_sizing_mode', p_live_sizing_mode,
     'live_sizing_dollar_usd', p_live_sizing_dollar_usd,
-    'live_sizing_contracts', p_live_sizing_contracts,
-    'live_price_impact_cap_bps', p_live_price_impact_cap_bps
+    'live_sizing_contracts', p_live_sizing_contracts
   )::text;
 
   insert into public.account_events (
@@ -674,10 +674,10 @@ grant execute on function public.account_set_login_email(text, text, text)
   to service_role;
 
 revoke all on function public.account_update_live_settings(
-  text, boolean, integer, text, numeric, bigint, integer, text
+  text, boolean, integer, text, numeric, bigint, text
 ) from public, anon, authenticated;
 grant execute on function public.account_update_live_settings(
-  text, boolean, integer, text, numeric, bigint, integer, text
+  text, boolean, integer, text, numeric, bigint, text
 ) to service_role;
 
 revoke all on function public.account_rotate_credentials(
@@ -797,12 +797,9 @@ grant execute on function public.account_set_effective_mode(text, text, text, te
 --   'verification'
 -- );
 --
--- -- Expected errors: positive sizing and 1..10000 bps constraints.
+-- -- Expected error: positive sizing constraint.
 -- select public.account_update_live_settings(
---   'secondary', true, 10, 'dollar', -1, null, 100, 'verification'
--- );
--- select public.account_update_live_settings(
---   'secondary', true, 10, 'dollar', 25, null, 0, 'verification'
+--   'secondary', null, 10, 'dollar', -1, null, 'verification'
 -- );
 --
 -- -- Rotation succeeds, and the event must contain metadata but not ciphertext.

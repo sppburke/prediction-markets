@@ -49,12 +49,13 @@ describe("service readiness contract", () => {
       account_id: "acct", is_primary: true, login_email: null, enabled: false,
       execution_order: 0, requested_live_mode: "off", effective_live_mode: "off",
       live_sizing_mode: null, live_sizing_dollar_usd: null, live_sizing_contracts: null,
-      live_price_impact_cap_bps: 100, created_at: "", updated_at: "", credentials: null,
+      created_at: "", updated_at: "", credentials: null,
     };
     const html = renderToStaticMarkup(createElement(AccountsAdminPanel, { rows: [row] }));
     expect(html).toContain("Request mode");
     expect(html).toContain("Historical enabled: false");
     expect(html).not.toContain("promotion review");
     expect(html).not.toContain("execution enabled");
+    expect(html).not.toContain("impact cap");
   });
 });

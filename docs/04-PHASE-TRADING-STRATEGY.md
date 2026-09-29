@@ -109,7 +109,7 @@ performance. The owner's requested mode controls ordinary live mode; order admis
 credential, source, resolver, venue, financial, and risk checks.
 The thresholds classify a sealed paper measurement report. Paper semantic 2 prices from the
 current ask ladder inside the applied impact cap and fill-price band and permits matching delay;
-ordinary live retains a leader-price ceiling and strict fresh admission. The isolated V2 canary
+ordinary live uses that current-book price rule with strict fresh admission. The isolated V2 canary
 has a separate contract. This cutover seals the current semantic-1 qualification insufficient
 while paper fills and return measurement continue; a later fresh generation is needed for another
 qualification report.

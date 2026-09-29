@@ -1122,7 +1122,9 @@ impl<S: State> Client<S> {
             .client()
             .request(Method::GET, format!("{}api/geoblock", self.inner.geoblock_host))
             .build()?;
-        crate::request_raw_once(&self.inner.client, request, None, deadline).await
+        crate::request_raw_once(&self.inner.client, request, None, deadline, None)
+            .await?
+            .attempted()
     }
 
     /// Retrieves the full orderbook for a market outcome token.
@@ -1786,7 +1788,9 @@ impl<K: Kind> Client<Authenticated<K>> {
             .request(Method::GET, format!("{}auth/ban-status/closed-only", self.host()))
             .build()?;
         let headers = self.create_headers(&request).await?;
-        crate::request_raw_once(&self.inner.client, request, Some(headers), deadline).await
+        crate::request_raw_once(&self.inner.client, request, Some(headers), deadline, None)
+            .await?
+            .attempted()
     }
 
     /// Creates an [`OrderBuilder<Limit, K>`] used to construct a limit order.
@@ -1972,7 +1976,8 @@ impl<K: Kind> Client<Authenticated<K>> {
     pub async fn post_order_once_raw(
         &self,
         serialized_body: Vec<u8>,
-    ) -> Result<crate::ResponseObservation> {
+        wall_clock_deadline: Option<std::time::SystemTime>,
+    ) -> Result<crate::RawOnceOutcome> {
         let request = self
             .client()
             .request(Method::POST, format!("{}order", self.host()))
@@ -1980,7 +1985,8 @@ impl<K: Kind> Client<Authenticated<K>> {
             .body(serialized_body)
             .build()?;
         let headers = self.create_headers(&request).await?;
-        crate::request_raw_once(&self.inner.client, request, Some(headers), None).await
+        crate::request_raw_once(&self.inner.client, request, Some(headers), None, wall_clock_deadline)
+            .await
     }
 
     /// Posts multiple signed orders to the orderbook in a single request.
@@ -2131,7 +2137,9 @@ impl<K: Kind> Client<Authenticated<K>> {
             .request(Method::GET, format!("{}data/order/{order_id}", self.host()))
             .build()?;
         let headers = self.create_headers(&request).await?;
-        crate::request_raw_once(&self.inner.client, request, Some(headers), deadline).await
+        crate::request_raw_once(&self.inner.client, request, Some(headers), deadline, None)
+            .await?
+            .attempted()
     }
 
     /// Retrieves a paginated list of orders matching the specified criteria.
@@ -2170,7 +2178,9 @@ impl<K: Kind> Client<Authenticated<K>> {
             .request(Method::GET, format!("{}data/orders{params}", self.host()))
             .build()?;
         let headers = self.create_headers(&request).await?;
-        crate::request_raw_once(&self.inner.client, request, Some(headers), deadline).await
+        crate::request_raw_once(&self.inner.client, request, Some(headers), deadline, None)
+            .await?
+            .attempted()
     }
 
     /// Cancels a single order by its order ID.
@@ -2204,7 +2214,9 @@ impl<K: Kind> Client<Authenticated<K>> {
             .json(&json!({ "orderID": order_id }))
             .build()?;
         let headers = self.create_headers(&request).await?;
-        crate::request_raw_once(&self.inner.client, request, Some(headers), None).await
+        crate::request_raw_once(&self.inner.client, request, Some(headers), None, None)
+            .await?
+            .attempted()
     }
 
     /// Cancels multiple orders by their order IDs in a single request.
@@ -2300,7 +2312,9 @@ impl<K: Kind> Client<Authenticated<K>> {
             .request(Method::GET, format!("{}data/trades{params}", self.host()))
             .build()?;
         let headers = self.create_headers(&request).await?;
-        crate::request_raw_once(&self.inner.client, request, Some(headers), deadline).await
+        crate::request_raw_once(&self.inner.client, request, Some(headers), deadline, None)
+            .await?
+            .attempted()
     }
 
     /// Retrieves all notifications for the authenticated user.
@@ -2391,7 +2405,9 @@ impl<K: Kind> Client<Authenticated<K>> {
             .request(Method::GET, format!("{}balance-allowance{params}", self.host()))
             .build()?;
         let headers = self.create_headers(&request).await?;
-        crate::request_raw_once(&self.inner.client, request, Some(headers), deadline).await
+        crate::request_raw_once(&self.inner.client, request, Some(headers), deadline, None)
+            .await?
+            .attempted()
     }
 
     /// Forces an update of the cached balance and allowance data.
