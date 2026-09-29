@@ -1479,18 +1479,6 @@ where
                 "approved recovery target contradicts frozen admission".to_owned(),
             ));
         }
-        let copy_deadline = match verified_live_copy_deadline(
-            state,
-            pending.account_id.as_str(),
-            &pending.admission.identity,
-        ) {
-            Ok(deadline) => deadline,
-            Err(reason) => {
-                warn!(account_id = %target.account_id, dispatch_id = %target.dispatch_id, reason, "Approved recovery has no verified copy deadline; target remains pending");
-                freeze = true;
-                continue;
-            }
-        };
         match recovery_authorization(
             state,
             &pending.account_id,
@@ -1684,6 +1672,20 @@ where
                 continue;
             }
             RecoveryVenueGate::Control(_) | RecoveryVenueGate::MarkUnavailable => {
+                freeze = true;
+                continue;
+            }
+        };
+        // Control and authorization outcomes above record without copy evidence; only an
+        // actual submission needs the verified copy deadline.
+        let copy_deadline = match verified_live_copy_deadline(
+            state,
+            pending.account_id.as_str(),
+            &pending.admission.identity,
+        ) {
+            Ok(deadline) => deadline,
+            Err(reason) => {
+                warn!(account_id = %target.account_id, dispatch_id = %target.dispatch_id, reason, "Approved recovery has no verified copy deadline; target remains pending");
                 freeze = true;
                 continue;
             }
