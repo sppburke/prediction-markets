@@ -3564,7 +3564,9 @@ impl BracketFinancialHarness {
         }));
         let mut background = None;
         let mut urgent = None;
-        for _ in 0..TRADE_RECONCILIATION_CONCURRENCY {
+        // The urgent read and the other wallet's backstop read run together; no refresh is due.
+        let reads = 2;
+        for _ in 0..reads {
             let request = requested.recv().await.unwrap();
             assert!(
                 request.url.contains(&format!("end={epoch}")),
@@ -3606,7 +3608,7 @@ impl BracketFinancialHarness {
                 }
             }
         }
-        assert_eq!(maximum, TRADE_RECONCILIATION_CONCURRENCY);
+        assert_eq!(maximum, reads);
         assert!(
             matches!(requested.try_recv(), Err(mpsc::error::TryRecvError::Empty)),
             "no third operation"
