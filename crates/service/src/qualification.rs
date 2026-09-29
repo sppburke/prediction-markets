@@ -2053,6 +2053,7 @@ fn decision_rows_from_sealed_source(
     let history = state.decision_pending_history()?;
     let (mut source_universe, binding_commitments) = source_universe?;
     let mut disposed_bindings = HashMap::new();
+    let mut bound_streams = HashMap::new();
     for receipt in binding_commitments {
         let bindings = crate::bucket_commit::verified_commitment_bindings_with_lookup(
             receipt,
@@ -2078,12 +2079,16 @@ fn decision_rows_from_sealed_source(
             if binding.history_group_id == binding.stream_group_id {
                 continue;
             }
+            // One observation binds one history identity, in either direction.
             if disposed_bindings
                 .insert(
                     binding.history_group_id.clone(),
                     binding.stream_group_id.clone(),
                 )
                 .is_some_and(|previous| previous != binding.stream_group_id)
+                || bound_streams
+                    .insert(binding.stream_group_id, binding.history_group_id.clone())
+                    .is_some_and(|previous| previous != binding.history_group_id)
             {
                 return insufficient("complete reads disagree about an observation binding target");
             }
@@ -13427,17 +13432,15 @@ mod tests {
             if accepted {
                 assert!(map.is_ok(), "case={case}: {map:?}");
                 assert!(indexed.is_ok(), "case={case}: {indexed:?}");
-                assert_selection_results_equal(map, indexed, &sealed);
             } else {
-                for result in [map.map(|_| ()), indexed.map(|_| ())] {
-                    assert!(
-                        matches!(&result,
-                        Err(QualificationError::InsufficientEvidence(message))
-                            if message.contains("has no durable activity group")),
-                        "case={case}, pending={pending}: {result:?}"
-                    );
-                }
+                assert!(
+                    matches!(&map,
+                    Err(QualificationError::InsufficientEvidence(message))
+                        if message.contains("has no durable activity group")),
+                    "case={case}, pending={pending}: {map:?}"
+                );
             }
+            assert_selection_results_equal(map, indexed, &sealed);
         }
     }
 
