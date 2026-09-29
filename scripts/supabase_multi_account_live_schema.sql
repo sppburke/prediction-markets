@@ -67,8 +67,6 @@ drop function if exists public.account_update_live_settings(
   text, boolean, integer, text, numeric, bigint, integer, text
 );
 alter table public.accounts
-  drop constraint if exists accounts_live_price_impact_cap_bps_check;
-alter table public.accounts
   drop column if exists live_price_impact_cap_bps;
 
 -- At most one account may be marked primary (#508). Non-primary execution order

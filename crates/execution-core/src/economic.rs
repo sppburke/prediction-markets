@@ -565,8 +565,6 @@ mod tests {
         let floor = Price::new(dec!(0.15)).unwrap();
         let band_ceiling = Price::new(dec!(0.85)).unwrap();
         let paper_plan = plan(floor, band_ceiling, impact).unwrap();
-        let live_plan = plan(floor, band_ceiling, impact).unwrap();
-        assert_eq!(paper_plan.ladder, live_plan.ladder);
         assert_eq!(paper_plan.ladder.limit_price.0, dec!(0.404));
         assert_eq!(paper_plan.ladder.used_asks.len(), 2);
         let compose = |plan: &pe_venue_polymarket::SizedBuyPlan| {
@@ -576,9 +574,6 @@ mod tests {
             EconomicPrepared::compose_wire_two(fields).unwrap()
         };
         let paper = compose(&paper_plan);
-        let live = compose(&live_plan);
-        assert_eq!(paper, live);
-        assert_eq!(paper.core_hash().unwrap(), live.core_hash().unwrap());
         assert!(paper.fee.expected_fee > CollateralAmount::ZERO);
         assert!(paper.sizing.minimum_shares > ShareAmount::ZERO);
         assert!(current_book_impact_ceiling(asks[0].price, 0).is_err());

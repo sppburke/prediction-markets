@@ -329,7 +329,6 @@ impl RefreshHandoff {
     const PRE_SEND: u8 = 1;
     const SENT: u8 = 2;
     const CANCELLED: u8 = 3;
-    const ACKNOWLEDGED: u8 = 4;
 
     pub(crate) fn cancel_before_handoff(&self) -> bool {
         loop {
@@ -374,10 +373,6 @@ impl RefreshHandoff {
                 Ordering::Acquire,
             )
             .is_ok()
-    }
-
-    fn acknowledged(&self) {
-        self.0.store(Self::ACKNOWLEDGED, Ordering::Release);
     }
 }
 
@@ -867,21 +862,22 @@ impl AdmissionPreparer {
             return Err(AdmissionError::PositionValidation(error));
         }
         if let Some(handoff) = handoff
-            && (!handoff.pre_send() || !handoff.begin_handoff())
+            && !handoff.pre_send()
         {
             return Ok(AnchorRefreshOutcome::Cancelled);
         }
-        let installed = self.install_anchors(outcomes.accepted).await;
+        let permit = self
+            .inner
+            .control_tx
+            .reserve()
+            .await
+            .map_err(|_| AdmissionError::ControlClosed)?;
         if let Some(handoff) = handoff
-            && matches!(
-                &installed,
-                Ok(())
-                    | Err(AdmissionError::ValidationRejected(_)
-                        | AdmissionError::ValidationInstall(_))
-            )
+            && !handoff.begin_handoff()
         {
-            handoff.acknowledged();
+            return Ok(AnchorRefreshOutcome::Cancelled);
         }
+        let installed = Self::send_install_anchors(permit, outcomes.accepted).await;
         match installed {
             Ok(()) => Ok(AnchorRefreshOutcome::Anchored),
             Err(AdmissionError::ValidationRejected(_)) => Ok(AnchorRefreshOutcome::Deferred),
@@ -936,15 +932,24 @@ impl AdmissionPreparer {
     }
 
     async fn install_anchors(&self, installs: Vec<AnchorInstall>) -> Result<(), AdmissionError> {
-        let (acknowledged, acknowledgement) = oneshot::channel();
-        self.inner
+        let permit = self
+            .inner
             .control_tx
-            .send(OrchestratorControl::InstallAnchors {
-                installs,
-                acknowledged,
-            })
+            .reserve()
             .await
             .map_err(|_| AdmissionError::ControlClosed)?;
+        Self::send_install_anchors(permit, installs).await
+    }
+
+    async fn send_install_anchors(
+        permit: mpsc::Permit<'_, OrchestratorControl>,
+        installs: Vec<AnchorInstall>,
+    ) -> Result<(), AdmissionError> {
+        let (acknowledged, acknowledgement) = oneshot::channel();
+        permit.send(OrchestratorControl::InstallAnchors {
+            installs,
+            acknowledged,
+        });
         tokio::time::timeout(
             Duration::from_secs(ADMISSION_PREPARE_ACK_TIMEOUT_SECS),
             acknowledgement,

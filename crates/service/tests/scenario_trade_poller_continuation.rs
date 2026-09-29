@@ -730,6 +730,7 @@ enum ControlCompletion {
     BucketCommitted,
     Anchored(WalletAddress),
     Boundary(i64),
+    FinalCapture,
 }
 
 struct RunningPoll {
@@ -740,6 +741,8 @@ struct RunningPoll {
     append_ack_arrived: Arc<tokio::sync::Notify>,
     bucket_ack_gate: Arc<tokio::sync::Semaphore>,
     boundary_ack_gate: Arc<tokio::sync::Semaphore>,
+    final_capture_gate: Arc<tokio::sync::Semaphore>,
+    control_tx: mpsc::WeakSender<OrchestratorControl>,
     controls: mpsc::Receiver<ControlCompletion>,
     source: SourceLogHandle,
     triggers: mpsc::Sender<pe_service::activity_ingest::ReconciliationTrigger>,
@@ -948,15 +951,18 @@ fn start_recorded_poller_with_completion_stop(
     let append_ack_arrived = Arc::new(tokio::sync::Notify::new());
     let bucket_ack_gate = Arc::new(tokio::sync::Semaphore::new(1));
     let boundary_ack_gate = Arc::new(tokio::sync::Semaphore::new(1));
+    let final_capture_gate = Arc::new(tokio::sync::Semaphore::new(1));
     let anchor_ack_gate = Arc::new(tokio::sync::Semaphore::new(1));
     let anchor_ack_drop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let actor_ack_gate = bucket_ack_gate.clone();
     let actor_boundary_gate = boundary_ack_gate.clone();
     let actor_anchor_gate = anchor_ack_gate.clone();
     let actor_anchor_drop = anchor_ack_drop.clone();
+    let actor_capture_gate = final_capture_gate.clone();
     let (control_events, controls) = mpsc::channel(16);
     let actor_paper = paper.clone();
-    let (control_tx, mut control_rx) = mpsc::channel(8);
+    let (control_tx, mut control_rx) = mpsc::channel(2);
+    let test_control_tx = control_tx.downgrade();
     let mut engine =
         BucketCommitEngine::load(paper.clone(), build_leader_ledger(&paper).unwrap()).unwrap();
     let (real_tx, real_rx) = mpsc::channel(8);
@@ -973,6 +979,7 @@ fn start_recorded_poller_with_completion_stop(
     });
     let control = tokio::spawn(async move {
         let mut commits = Vec::new();
+        let mut captures = 0;
         while let Some(command) = control_rx.recv().await {
             match command {
                 OrchestratorControl::CommitActivityBucket {
@@ -1026,6 +1033,11 @@ fn start_recorded_poller_with_completion_stop(
                     let _ = acknowledged.send(());
                 }
                 OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
+                    captures += 1;
+                    if captures % 3 == 0 {
+                        let _ = control_events.send(ControlCompletion::FinalCapture).await;
+                        let _permit = actor_capture_gate.acquire().await.unwrap();
+                    }
                     let _ = captured.send(
                         pe_service::position_seeder::ledger_capture(
                             engine.ledger(),
@@ -1161,6 +1173,8 @@ fn start_recorded_poller_with_completion_stop(
             append_ack_arrived,
             bucket_ack_gate,
             boundary_ack_gate,
+            final_capture_gate,
+            control_tx: test_control_tx,
             controls,
             source,
             triggers: trigger_tx,
@@ -1529,6 +1543,80 @@ async fn sent_anchor_install_holds_wallet_until_ack_then_urgent_reconciles() {
         .send(serde_json::to_vec(&[row]).unwrap())
         .unwrap();
     assert_eq!(running.completed(wallet()).await, vec![receipt]);
+    running.finish().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn full_control_channel_cancels_refresh_before_install_and_releases_urgent_wallet() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut running, _) =
+        start_recorded_poller_with_anchors(&dir, &[wallet()], false, true, Some(EPOCH));
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    running.completed(wallet()).await;
+    running.round_completed().await;
+
+    let held = running
+        .final_capture_gate
+        .clone()
+        .acquire_owned()
+        .await
+        .unwrap();
+    loop {
+        tokio::select! {
+            request = running.requests.recv() => request.unwrap().respond.send(b"[]".to_vec()).unwrap(),
+            event = running.controls.recv() => if matches!(event, Some(ControlCompletion::FinalCapture)) { break },
+        }
+    }
+    let first_slot = running
+        .control_tx
+        .upgrade()
+        .unwrap()
+        .reserve_owned()
+        .await
+        .unwrap();
+    let second_slot = running
+        .control_tx
+        .upgrade()
+        .unwrap()
+        .reserve_owned()
+        .await
+        .unwrap();
+    assert_eq!(running.control_tx.upgrade().unwrap().capacity(), 0);
+    drop(held);
+    tokio::task::yield_now().await;
+    assert!(
+        running.controls.try_recv().is_err(),
+        "refresh has not sent InstallAnchors"
+    );
+
+    let row = stream_row(wallet(), "full-control-refresh-yields", EPOCH);
+    let receipt = running.observe(row.clone()).await;
+    let urgent = running.requests.recv().await.unwrap();
+    assert!(urgent.url.contains(&wallet().to_string()));
+    assert!(
+        running.controls.try_recv().is_err(),
+        "cancelled refresh sent no InstallAnchors"
+    );
+    drop(first_slot);
+    drop(second_slot);
+    urgent
+        .respond
+        .send(serde_json::to_vec(&[row]).unwrap())
+        .unwrap();
+    assert_eq!(running.completed(wallet()).await, vec![receipt]);
+    while let Ok(event) = running.controls.try_recv() {
+        assert!(
+            !matches!(event, ControlCompletion::Anchored(_)),
+            "cancelled refresh was never installed"
+        );
+    }
     running.finish().await;
 }
 
@@ -2966,7 +3054,7 @@ async fn urgent_load_preserves_backstop_anchor_and_boundary_progress() {
             event = running.controls.recv() => match event.unwrap() {
                 ControlCompletion::Anchored(wallet) => break wallet,
                 ControlCompletion::Boundary(cutoff) => boundary_seen = Some(cutoff),
-                ControlCompletion::BucketCommitted => {},
+                ControlCompletion::BucketCommitted | ControlCompletion::FinalCapture => {},
             },
         }
     };

@@ -35,11 +35,11 @@ use pe_execution_core::{
     LiveJournalOrderOutcome, LiveJournalPayload, LiveModeSnapshot, LiveOrderAmbiguityKind,
     LiveOrderIdentity, LiveOrderOutcome, LiveOrderReconciliationAudit, LiveOrderVenue,
     LivePrepareResult, LiveReconciliationSource, LiveRecoveryInventory, LiveVenueReconciledOutcome,
-    MarkKind, ObservationEvidence, OrderFillFinalizedAudit, PreparedOrderFact, RedemptionAttempt,
-    RedemptionAttemptIdentity, RedemptionAttemptState, RedemptionPassInput, RiskAudit,
-    RiskDecisionAudit, SizingModeAudit, TerminalAdmissionRecoveryOutcome, http_attempt_hashes,
-    prepared_order_fact_matches, reconstruct_redemption_attempts, recovery_inventory,
-    redemption_posture, replay_account, run_redemption_pass,
+    MarkKind, ObservationEvidence, OrderFillFinalizedAudit, PreparedLiveOrder, PreparedOrderFact,
+    RedemptionAttempt, RedemptionAttemptIdentity, RedemptionAttemptState, RedemptionPassInput,
+    RiskAudit, RiskDecisionAudit, SizingModeAudit, TerminalAdmissionRecoveryOutcome,
+    http_attempt_hashes, prepared_order_fact_matches, reconstruct_redemption_attempts,
+    recovery_inventory, redemption_posture, replay_account, run_redemption_pass,
 };
 use pe_kelly_sizer::{KellyInput, size_contracts};
 use pe_paper_state::{DispatchSeedRow, DispatchTargetRow, PaperStateDb};
@@ -1678,11 +1678,7 @@ where
         };
         // Control and authorization outcomes above record without copy evidence; only an
         // actual submission needs the verified copy deadline.
-        let copy_deadline = match verified_live_copy_deadline(
-            state,
-            pending.account_id.as_str(),
-            &pending.admission.identity,
-        ) {
+        let copy_deadline = match approved_recovery_copy_deadline(state, &pending) {
             Ok(deadline) => deadline,
             Err(reason) => {
                 warn!(account_id = %target.account_id, dispatch_id = %target.dispatch_id, reason, "Approved recovery has no verified copy deadline; target remains pending");
@@ -1999,11 +1995,10 @@ where
                 latest_at.unix_timestamp(),
             )?;
             drop(guard);
-            let outcome = executor
-                .submit_with_clock_and_deadline(prepared, clock, copy_deadline)
-                .await?;
+            let outcome =
+                post_prepared_target(state, target, &executor, prepared, copy_deadline, clock)
+                    .await?;
             let transition = outcome_transition(&outcome);
-            persist_outcome(state, target, &outcome, clock())?;
             Ok(transition.freeze)
         }
     }
@@ -2758,11 +2753,16 @@ async fn process_target(
                 final_at.unix_timestamp(),
             )?;
             drop(guard);
-            let outcome = executor
-                .submit_with_clock_and_deadline(prepared, OffsetDateTime::now_utc, copy_deadline)
-                .await?;
+            let outcome = post_prepared_target(
+                state,
+                target,
+                &executor,
+                prepared,
+                copy_deadline,
+                OffsetDateTime::now_utc,
+            )
+            .await?;
             let transition = outcome_transition(&outcome);
-            persist_outcome(state, target, &outcome, OffsetDateTime::now_utc())?;
             if matches!(outcome, LiveOrderOutcome::Matched { .. }) {
                 reconcile_account_projection(state, &account.account_id, OffsetDateTime::now_utc())
                     .await;
@@ -2774,6 +2774,25 @@ async fn process_target(
             })
         }
     }
+}
+
+async fn post_prepared_target<V, C>(
+    state: &mut FanoutState,
+    target: &DispatchTargetRow,
+    executor: &LiveExecutor<'_, V>,
+    prepared: PreparedLiveOrder<V::Submission>,
+    copy_deadline: Option<OffsetDateTime>,
+    clock: C,
+) -> Result<LiveOrderOutcome, FanoutError>
+where
+    V: LiveOrderVenue,
+    C: Fn() -> OffsetDateTime,
+{
+    let outcome = executor
+        .submit_with_clock_and_deadline(prepared, &clock, copy_deadline)
+        .await?;
+    persist_outcome(state, target, &outcome, clock())?;
+    Ok(outcome)
 }
 
 fn mode_value(value: &str) -> LiveControlMode {
@@ -3522,6 +3541,23 @@ fn verified_live_copy_deadline(
             .source_envelope(receipt)
             .map(CompleteActivityPage::from)
     })
+}
+
+fn approved_recovery_copy_deadline(
+    state: &FanoutState,
+    pending: &pe_execution_core::live_journal::ApprovedAdmissionRecoveryEntry,
+) -> Result<Option<OffsetDateTime>, String> {
+    if pending.admission.economic.version
+        == pe_execution_core::economic::PAPER_ECONOMIC_PREPARED_VERSION
+    {
+        verified_live_copy_deadline(
+            state,
+            pending.account_id.as_str(),
+            &pending.admission.identity,
+        )
+    } else {
+        Ok(None)
+    }
 }
 
 fn verified_copy_deadline_for_continuation<L, E>(
@@ -12040,6 +12076,7 @@ mod tests {
     struct FakeVenue {
         calls: Mutex<Vec<String>>,
         outcomes: Mutex<Vec<LiveVenueReconciledOutcome>>,
+        post_deadlines: Mutex<Vec<Option<OffsetDateTime>>>,
     }
 
     impl FakeVenue {
@@ -12047,6 +12084,7 @@ mod tests {
             Self {
                 calls: Mutex::new(Vec::new()),
                 outcomes: Mutex::new(outcomes.into_iter().rev().collect()),
+                post_deadlines: Mutex::new(Vec::new()),
             }
         }
 
@@ -12078,7 +12116,7 @@ mod tests {
         fn post_once<'a>(
             &'a self,
             _submission: Self::Submission,
-            _wall_clock_deadline: Option<OffsetDateTime>,
+            wall_clock_deadline: Option<OffsetDateTime>,
         ) -> Pin<
             Box<
                 dyn Future<
@@ -12090,7 +12128,11 @@ mod tests {
                     + 'a,
             >,
         > {
-            Box::pin(async {
+            Box::pin(async move {
+                self.post_deadlines
+                    .lock()
+                    .unwrap()
+                    .push(wall_clock_deadline);
                 Err(pe_core_types::RawTransportFailure {
                     source_id: "fake".to_owned(),
                     endpoint_kind: "post".to_owned(),
@@ -12167,6 +12209,7 @@ mod tests {
         prepare_clock_millis: Option<Arc<AtomicI64>>,
         prepare_advance_millis: i64,
         post_attempts: Option<Arc<AtomicUsize>>,
+        post_deadlines: Option<Arc<Mutex<Vec<Option<OffsetDateTime>>>>>,
         account_state: Option<pe_execution_core::LiveVenueAccountState>,
         prepare_barrier: Option<Arc<tokio::sync::Barrier>>,
         prepare_release: Option<Arc<tokio::sync::Notify>>,
@@ -12206,7 +12249,7 @@ mod tests {
         fn post_once<'a>(
             &'a self,
             _submission: Self::Submission,
-            _wall_clock_deadline: Option<OffsetDateTime>,
+            wall_clock_deadline: Option<OffsetDateTime>,
         ) -> Pin<
             Box<
                 dyn Future<
@@ -12219,10 +12262,22 @@ mod tests {
             >,
         > {
             Box::pin(async move {
+                if let Some(deadlines) = &self.post_deadlines {
+                    deadlines.lock().unwrap().push(wall_clock_deadline);
+                }
+                if wall_clock_deadline.is_some_and(|deadline| self.observed_at > deadline) {
+                    return Ok(pe_core_types::RawPostAttempt::NotAttempted(
+                        pe_core_types::ExpiredAt {
+                            checked_at: self.observed_at,
+                        },
+                    ));
+                }
                 if let Some(post_attempts) = &self.post_attempts {
                     post_attempts.fetch_add(1, Ordering::SeqCst);
                 }
-                self.client.post(&self.order_url).send().await.unwrap();
+                if !self.order_url.is_empty() {
+                    self.client.post(&self.order_url).send().await.unwrap();
+                }
                 Ok(pe_core_types::RawPostAttempt::Attempted(
                     pe_core_types::RawHttpResponse {
                         source_id: "recovery-loopback".to_owned(),
@@ -13237,6 +13292,7 @@ mod tests {
         prepared: &mut pe_execution_core::LiveOrderPreparedAudit,
         account_id: &AccountId,
         received_at: OffsetDateTime,
+        copy_policy: Option<crate::bucket_commit::PaperFreshnessPolicy>,
     ) {
         let transaction_hash = activity_transaction_hash(&prepared.identity);
         let economic = &mut prepared.economic;
@@ -13290,13 +13346,20 @@ mod tests {
             (crate::activity_ingest::ACTIVITY_WS_SOURCE_ID, websocket),
             (crate::trade_poller::ACTIVITY_POLL_SOURCE_ID, rest),
         ] {
+            let schema_version = if copy_policy.is_some()
+                && source_id == crate::trade_poller::ACTIVITY_POLL_SOURCE_ID
+            {
+                crate::trade_poller::ACTIVITY_POLL_PAGE_SCHEMA_VERSION
+            } else {
+                pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION
+            };
             observation_receipts.push(
                 state
                     .config
                     .source_log
                     .append(EnvelopeIn {
                         source_id: SourceId(source_id.to_owned()),
-                        schema_version: pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
+                        schema_version,
                         parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
                         observed_at: SourceTimestamp(received_at),
                         received_at: ReceivedAt(received_at),
@@ -13316,13 +13379,14 @@ mod tests {
             received_at,
             &transaction_hash,
         );
-        record_observation_continuation(state, prepared, received_at);
+        record_observation_continuation(state, prepared, received_at, copy_policy).await;
     }
 
-    fn record_observation_continuation(
+    async fn record_observation_continuation(
         state: &FanoutState,
         prepared: &pe_execution_core::LiveOrderPreparedAudit,
         source_time: OffsetDateTime,
+        copy_policy: Option<crate::bucket_commit::PaperFreshnessPolicy>,
     ) {
         let observation = prepared.economic.observation.as_ref().unwrap();
         let complete_bound = state
@@ -13330,19 +13394,66 @@ mod tests {
             .source_receipts
             .source_envelope(observation.complete_bound_receipt)
             .unwrap();
-        let continuation = observation_continuation(
-            prepared,
-            &[complete_bound.payload.as_slice()],
-            vec![activity_page_fixture(
-                observation.complete_bound_receipt,
-                &complete_bound.payload,
-                Some(source_time.unix_timestamp().saturating_sub(1)),
-                source_time.unix_timestamp(),
-                0,
-                complete_bound.received_at.0,
-            )],
+        let page = activity_page_fixture(
+            observation.complete_bound_receipt,
+            &complete_bound.payload,
+            Some(source_time.unix_timestamp().saturating_sub(1)),
+            source_time.unix_timestamp(),
+            0,
+            complete_bound.received_at.0,
         );
-        let continuation = if complete_bound.schema_version
+        let continuation =
+            observation_continuation(prepared, &[complete_bound.payload.as_slice()], vec![page]);
+        let continuation = if let Some(policy) = copy_policy {
+            let mut facts = continuation.facts;
+            facts.paper_freshness_policy = Some(policy);
+            let pages = serde_json::from_value::<
+                Vec<pe_source_polymarket_public::ReconciliationPageEvidence>,
+            >(facts.decision_inputs["pages"].clone())
+            .unwrap();
+            let occurrence = &continuation.page_occurrences[0];
+            let binding = crate::bucket_commit::ObservationBinding {
+                stream_group_id: facts.source_trade_id.clone(),
+                stream_receipt: observation.source_receipt,
+                history_group_id: facts.source_trade_id.clone(),
+                semantic_revision: facts.semantic_revision.clone(),
+                page_raw_hash: occurrence.raw_hash.clone(),
+                page_occurrence_index: 0,
+                identity_provenance: None,
+                identity_receipt: None,
+            };
+            let payload = crate::bucket_commit::activity_read_commitment_payload_v2(
+                facts.wallet,
+                facts.decision_inputs["fixed_end"].as_i64().unwrap(),
+                &continuation.page_occurrences,
+                &pages,
+                &[binding],
+            )
+            .unwrap();
+            let receipt = state
+                .config
+                .source_log
+                .append(EnvelopeIn {
+                    source_id: SourceId(
+                        crate::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID.to_owned(),
+                    ),
+                    schema_version: crate::bucket_commit::ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
+                    parser_version: crate::bucket_commit::ACTIVITY_READ_COMMITMENT_PARSER_VERSION,
+                    observed_at: SourceTimestamp(source_time),
+                    received_at: ReceivedAt(source_time),
+                    content_type: ContentType::Json,
+                    payload,
+                })
+                .await
+                .unwrap();
+            DecisionContinuationV3::new(
+                facts,
+                continuation.observed_source_receipt,
+                continuation.page_occurrences,
+                Some(crate::bucket_commit::ActivityReadCommitmentReceipt::BindingsV2(receipt)),
+            )
+            .current_paper()
+        } else if complete_bound.schema_version
             == pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION
         {
             DecisionContinuationV3::new(
@@ -13681,7 +13792,7 @@ mod tests {
         prior.economic.admission.settlement.observed_at_unix = now.unix_timestamp();
         prior.economic.admission.scheduled_end_unix = now.unix_timestamp().checked_add(300);
         bind_empty_live_risk_to_paper_prefix(state, &mut prior, now);
-        append_economic_sources(state, &mut prior, account_id, now).await;
+        append_economic_sources(state, &mut prior, account_id, now, None).await;
         append_approved_admission(state.config.journal.as_ref(), account_id, &prior, now);
         let prepared = state
             .config
@@ -13720,6 +13831,20 @@ mod tests {
         pe_execution_core::live_journal::ApprovedAdmissionRecoveryEntry,
         pe_venue_polymarket::PreparedPolymarketBuy,
     ) {
+        stage_recoverable_approved_with_copy_policy(state, now, risk_price_receipt, false, None)
+            .await
+    }
+
+    async fn stage_recoverable_approved_with_copy_policy(
+        state: &mut FanoutState,
+        now: OffsetDateTime,
+        risk_price_receipt: Option<AppendReceipt>,
+        wire_two: bool,
+        copy_policy: Option<crate::bucket_commit::PaperFreshnessPolicy>,
+    ) -> (
+        pe_execution_core::live_journal::ApprovedAdmissionRecoveryEntry,
+        pe_venue_polymarket::PreparedPolymarketBuy,
+    ) {
         let account_id = AccountId::new("acct").unwrap();
         stage(
             state.config.paper_state.as_ref(),
@@ -13728,6 +13853,11 @@ mod tests {
             &["acct"],
         );
         let mut prepared = finality_prepared();
+        if wire_two {
+            prepared.economic.version =
+                pe_execution_core::economic::PAPER_ECONOMIC_PREPARED_VERSION;
+            prepared.economic.balance.chase_ceiling = Price::ONE;
+        }
         prepared.identity.idempotency_key =
             LiveOrderIdentity::idempotency_key_for("dispatch-finality", &account_id);
         prepared.account_state = append_recovery_baseline(
@@ -13796,7 +13926,7 @@ mod tests {
         } else {
             bind_empty_live_risk_to_paper_prefix(state, &mut prepared, now);
         }
-        append_economic_sources(state, &mut prepared, &account_id, now).await;
+        append_economic_sources(state, &mut prepared, &account_id, now, copy_policy).await;
         // The fake venue returns this prepared order verbatim; the resume path requires it to
         // match the request derived from the admission (ladder debit and identity hashes).
         prepared.prepared.worst_case_debit = prepared.prepared.maker_collateral;
@@ -13841,25 +13971,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approved_recovery_without_frozen_copy_policy_keeps_target_pending() {
+    async fn approved_recovery_copy_deadline_is_wire_two_only() {
         let dir = tempdir().unwrap();
         let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
         let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
         let mut snapshot = armed_snapshot("acct");
         snapshot.fetched_at_unix = Some(now.unix_timestamp());
         let mut state = fanout_state(&dir, db.clone(), snapshot, "http://127.0.0.1:9", None);
-        let (pending, _) = stage_recoverable_approved(&mut state, now, None).await;
-        assert!(
-            verified_live_copy_deadline(
-                &state,
-                pending.account_id.as_str(),
-                &pending.admission.identity,
+        let (mut pending, _) = stage_recoverable_approved(&mut state, now, None).await;
+        let source_trade_id = pending
+            .admission
+            .identity
+            .fill_projection
+            .as_ref()
+            .and_then(|projection| projection.source_trade_id.as_deref())
+            .unwrap();
+        rusqlite::Connection::open(dir.path().join("paper.db"))
+            .unwrap()
+            .execute(
+                "DELETE FROM decision_pending WHERE source_trade_id = ?1",
+                [source_trade_id],
             )
-            .is_err()
-        );
-
-        run_recovery_pass(&mut state, || now, true).await.unwrap();
-
+            .unwrap();
+        assert_eq!(approved_recovery_copy_deadline(&state, &pending), Ok(None));
+        pending.admission.economic.version =
+            pe_execution_core::economic::PAPER_ECONOMIC_PREPARED_VERSION;
+        assert!(approved_recovery_copy_deadline(&state, &pending).is_err());
         let target = db.dispatch_targets("dispatch-finality").unwrap().remove(0);
         assert_eq!(target.state, "pending");
         let events = replay_live_account(&state, &pending.account_id).unwrap();
@@ -13867,6 +14004,242 @@ mod tests {
             event.payload,
             LiveJournalPayload::OrderPrepared(_) | LiveJournalPayload::OrderPosted(_)
         )));
+    }
+
+    #[tokio::test]
+    async fn fanout_post_uses_wire_deadline_and_replays_expiry() {
+        for (wire_two, expired) in [(true, false), (true, true), (false, false)] {
+            let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+            let dir = tempdir().unwrap();
+            let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+            let mut snapshot = armed_snapshot("acct");
+            snapshot.fetched_at_unix = Some(now.unix_timestamp());
+            let mut state = fanout_state(&dir, db.clone(), snapshot, "http://127.0.0.1:9", None);
+            let policy = crate::bucket_commit::PaperFreshnessPolicy {
+                activity_ws_enabled: true,
+                copy_latency_budget_secs: 120,
+            };
+            let (pending, venue_prepared) = stage_recoverable_approved_with_copy_policy(
+                &mut state,
+                now,
+                None,
+                wire_two,
+                wire_two.then_some(policy),
+            )
+            .await;
+            if !wire_two {
+                let source_trade_id = pending
+                    .admission
+                    .identity
+                    .fill_projection
+                    .as_ref()
+                    .and_then(|projection| projection.source_trade_id.as_deref())
+                    .unwrap();
+                rusqlite::Connection::open(dir.path().join("paper.db"))
+                    .unwrap()
+                    .execute(
+                        "DELETE FROM decision_pending WHERE source_trade_id = ?1",
+                        [source_trade_id],
+                    )
+                    .unwrap();
+            }
+            let deadline = approved_recovery_copy_deadline(&state, &pending).unwrap();
+            assert_eq!(
+                deadline,
+                wire_two.then_some(now + time::Duration::seconds(120))
+            );
+            let account_state =
+                venue_account_state_from_audit(pending.admission.account_state.as_ref().unwrap());
+            let post_deadlines = Arc::new(Mutex::new(Vec::new()));
+            let posts = Arc::new(AtomicUsize::new(0));
+            let venue = RecoveryPostVenue {
+                client: reqwest::Client::new(),
+                order_url: String::new(),
+                prepared: venue_prepared,
+                observed_at: if expired {
+                    now + time::Duration::seconds(120) + time::Duration::nanoseconds(1)
+                } else if !wire_two {
+                    now + time::Duration::seconds(121)
+                } else {
+                    now
+                },
+                prepare_clock_millis: None,
+                prepare_advance_millis: 0,
+                post_attempts: Some(posts.clone()),
+                post_deadlines: Some(post_deadlines.clone()),
+                account_state: Some(account_state.clone()),
+                prepare_barrier: None,
+                prepare_release: None,
+            };
+            let journal = state.config.journal.clone();
+            let executor = LiveExecutor::new(&venue, journal.as_ref());
+            let prepared = executor
+                .resume_approved_admission_with_clock(
+                    pending.account_id,
+                    pending.admission,
+                    LiveModeSnapshot {
+                        requested: LiveControlMode::LiveTiny,
+                        effective: LiveControlMode::LiveTiny,
+                    },
+                    CredentialBindingIdentity {
+                        version: 1,
+                        key_id: "key".to_owned(),
+                    },
+                    account_state,
+                    || now,
+                )
+                .await
+                .unwrap();
+            let prepared = match prepared {
+                LivePrepareResult::Prepared(prepared) => prepared,
+                other => {
+                    assert!(
+                        matches!(other, LivePrepareResult::Prepared(_)),
+                        "valid admission must prepare"
+                    );
+                    return;
+                }
+            };
+            let target = db.dispatch_targets("dispatch-finality").unwrap().remove(0);
+            db.set_dispatch_target_state(
+                &target.dispatch_id,
+                &target.account_id,
+                "submitted",
+                None,
+                now.unix_timestamp(),
+            )
+            .unwrap();
+            let _ =
+                post_prepared_target(&mut state, &target, &executor, prepared, deadline, || now)
+                    .await
+                    .unwrap();
+            assert_eq!(*post_deadlines.lock().unwrap(), vec![deadline]);
+            assert_eq!(posts.load(Ordering::SeqCst), usize::from(!expired));
+            let account_id = AccountId::new("acct").unwrap();
+            let events = replay_live_account(&state, &account_id).unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event.payload, LiveJournalPayload::OrderPosted(_)))
+                    .count(),
+                usize::from(!expired)
+            );
+            assert_eq!(events.iter().filter(|event| matches!(
+                &event.payload,
+                LiveJournalPayload::OrderPreparationFailed(failed)
+                    if failed.failure == pe_execution_core::LiveOrderPreparationFailure::PrePostCopyExpired
+            )).count(), usize::from(expired));
+            if wire_two {
+                assert!(derive_projection_rows_for_state(&state, &account_id, &events).is_ok());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn approved_wire_two_recovery_passes_deadline_and_replays_expiry() {
+        for expired in [false, true] {
+            let posts = Arc::new(AtomicUsize::new(0));
+            let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+            let dir = tempdir().unwrap();
+            let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+            let mut snapshot = armed_snapshot("acct");
+            snapshot.fetched_at_unix = Some(now.unix_timestamp());
+            let mut state = fanout_state(&dir, db.clone(), snapshot, "http://127.0.0.1:9", None);
+            let policy = crate::bucket_commit::PaperFreshnessPolicy {
+                activity_ws_enabled: true,
+                copy_latency_budget_secs: 120,
+            };
+            let (pending, prepared) = stage_recoverable_approved_with_copy_policy(
+                &mut state,
+                now,
+                None,
+                true,
+                Some(policy),
+            )
+            .await;
+            let deadline = approved_recovery_copy_deadline(&state, &pending).unwrap();
+            assert_eq!(deadline, Some(now + time::Duration::seconds(120)));
+            let app = Router::new()
+                .route("/order", post(count_order_post))
+                .route("/positions", get(empty_positions))
+                .with_state(posts.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let account_state =
+                venue_account_state_from_audit(pending.admission.account_state.as_ref().unwrap());
+            let binding = account_binding_fixture(
+                &pending.account_id,
+                "0x1111111111111111111111111111111111111111",
+            );
+            state.config.data_base_url = format!("http://{address}");
+            let target = db.dispatch_targets("dispatch-finality").unwrap().remove(0);
+            let post_deadlines = Arc::new(Mutex::new(Vec::new()));
+            let venue = RecoveryPostVenue {
+                client: reqwest::Client::new(),
+                order_url: format!("http://{address}/order"),
+                prepared,
+                observed_at: if expired {
+                    now + time::Duration::seconds(120) + time::Duration::nanoseconds(1)
+                } else {
+                    now
+                },
+                prepare_clock_millis: None,
+                prepare_advance_millis: 0,
+                post_attempts: None,
+                post_deadlines: Some(post_deadlines.clone()),
+                account_state: Some(account_state.clone()),
+                prepare_barrier: None,
+                prepare_release: None,
+            };
+            let context = RecoveryVenueContext {
+                venue: &venue,
+                account_binding: &binding,
+                custody_wallet: "0x1111111111111111111111111111111111111111",
+            };
+            assert!(
+                !resume_approved_with_venue(
+                    &mut state,
+                    &target,
+                    pending,
+                    RecoveryExecutionState {
+                        mode: LiveModeSnapshot {
+                            requested: LiveControlMode::LiveTiny,
+                            effective: LiveControlMode::LiveTiny,
+                        },
+                        account_state,
+                        binding: CredentialBindingIdentity {
+                            version: 1,
+                            key_id: "key".to_owned(),
+                        },
+                    },
+                    deadline,
+                    &context,
+                    || now,
+                )
+                .await
+                .unwrap()
+            );
+            assert_eq!(*post_deadlines.lock().unwrap(), vec![deadline]);
+            assert_eq!(posts.load(Ordering::SeqCst), usize::from(!expired));
+            let events = replay_live_account(&state, &AccountId::new("acct").unwrap()).unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event.payload, LiveJournalPayload::OrderPosted(_)))
+                    .count(),
+                usize::from(!expired)
+            );
+            assert_eq!(events.iter().filter(|event| matches!(
+            &event.payload,
+            LiveJournalPayload::OrderPreparationFailed(failed)
+                if failed.failure == pe_execution_core::LiveOrderPreparationFailure::PrePostCopyExpired
+        )).count(), usize::from(expired));
+            assert!(
+                derive_projection_rows_for_state(&state, &AccountId::new("acct").unwrap(), &events)
+                    .is_ok()
+            );
+        }
     }
 
     /// PASS: a post-Baseline Approved admission with legacy `None` observation fails strict
@@ -13904,7 +14277,7 @@ mod tests {
         prepared.economic.admission.scheduled_end_unix = now.unix_timestamp().checked_add(300);
         prepared.economic.risk.evaluated_at_unix_ms = unix_millis_i64(now);
         bind_empty_live_risk_to_paper_prefix(&state, &mut prepared, now);
-        append_economic_sources(&state, &mut prepared, &account_id, now).await;
+        append_economic_sources(&state, &mut prepared, &account_id, now, None).await;
         prepared.economic.observation = None;
         append_approved_admission(state.config.journal.as_ref(), &account_id, &prepared, now);
 
@@ -15890,7 +16263,7 @@ mod tests {
                 now.unix_timestamp().saturating_mul(1_000);
             prepared.economic.risk.price_receipts.clear();
             bind_empty_live_risk_to_paper_prefix(&state, &mut prepared, now);
-            append_economic_sources(&state, &mut prepared, &account_id, now).await;
+            append_economic_sources(&state, &mut prepared, &account_id, now, None).await;
             if preparation_failed {
                 append_approved_admission(
                     state.config.journal.as_ref(),
@@ -17496,6 +17869,7 @@ mod tests {
                 prepare_clock_millis: None,
                 prepare_advance_millis: 0,
                 post_attempts: Some(posts.clone()),
+                post_deadlines: None,
                 account_state: (case != "transient").then_some(current_account_state.clone()),
                 prepare_barrier: None,
                 prepare_release: None,
@@ -17567,6 +17941,13 @@ mod tests {
             None,
         );
         let (pending, prepared) = stage_recoverable_approved(&mut armed_state, now, None).await;
+        assert_eq!(
+            pending.admission.economic.version,
+            pe_execution_core::economic::ECONOMIC_PREPARED_VERSION
+        );
+        let copy_deadline = approved_recovery_copy_deadline(&armed_state, &pending).unwrap();
+        assert_eq!(copy_deadline, None);
+        let post_deadlines = Arc::new(Mutex::new(Vec::new()));
         let current_account_state =
             venue_account_state_from_audit(pending.admission.account_state.as_ref().unwrap());
         let account_binding = account_binding_fixture(
@@ -17586,6 +17967,7 @@ mod tests {
             prepare_clock_millis: None,
             prepare_advance_millis: 0,
             post_attempts: None,
+            post_deadlines: Some(post_deadlines.clone()),
             account_state: Some(current_account_state.clone()),
             prepare_barrier: None,
             prepare_release: None,
@@ -17611,7 +17993,7 @@ mod tests {
                         key_id: "key".to_owned(),
                     },
                 },
-                None,
+                copy_deadline,
                 &venue_context,
                 || now,
             )
@@ -17619,6 +18001,7 @@ mod tests {
             .unwrap()
         );
         assert_eq!(posts.load(Ordering::SeqCst), 1);
+        assert_eq!(*post_deadlines.lock().unwrap(), vec![None]);
 
         for case in ["off", "missing", "stale", "closed"] {
             let dir = tempdir().unwrap();
@@ -17710,6 +18093,7 @@ mod tests {
             prepare_clock_millis: Some(clock_millis.clone()),
             prepare_advance_millis: 2,
             post_attempts: Some(posts.clone()),
+            post_deadlines: None,
             account_state: Some(current_account_state.clone()),
             prepare_barrier: None,
             prepare_release: None,
@@ -17806,6 +18190,7 @@ mod tests {
             prepare_clock_millis: Some(clock_millis.clone()),
             prepare_advance_millis: 2,
             post_attempts: Some(posts.clone()),
+            post_deadlines: None,
             account_state: Some(current_account_state.clone()),
             prepare_barrier: None,
             prepare_release: None,
@@ -17892,6 +18277,7 @@ mod tests {
             prepare_clock_millis: None,
             prepare_advance_millis: 0,
             post_attempts: Some(posts.clone()),
+            post_deadlines: None,
             account_state: Some(current_account_state.clone()),
             prepare_barrier: None,
             prepare_release: None,
@@ -17975,6 +18361,7 @@ mod tests {
             prepare_clock_millis: None,
             prepare_advance_millis: 0,
             post_attempts: Some(posts.clone()),
+            post_deadlines: None,
             account_state: Some(current_account_state.clone()),
             prepare_barrier: Some(barrier.clone()),
             prepare_release: Some(release.clone()),
@@ -18060,6 +18447,7 @@ mod tests {
                 prepare_clock_millis: None,
                 prepare_advance_millis: 0,
                 post_attempts: Some(posts.clone()),
+                post_deadlines: None,
                 account_state: Some(current_account_state.clone()),
                 prepare_barrier: Some(barrier.clone()),
                 prepare_release: Some(release.clone()),
