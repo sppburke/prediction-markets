@@ -1742,12 +1742,27 @@ pub(crate) fn verified_commitment_bindings(
     receipt: AppendReceipt,
     source_receipts: &SourceReceiptIndex,
 ) -> Result<Vec<ObservationBinding>, CompleteActivityReadError> {
-    let source = source_receipts
-        .source_envelope(receipt)
-        .map_err(|error| complete_activity_read_error(error.to_string()))?;
+    verified_commitment_bindings_with_lookup(receipt, &mut |receipt| {
+        source_receipts
+            .source_envelope(receipt)
+            .map(CompleteActivityPage::from)
+    })
+}
+
+/// The same commitment-only authentication for either an indexed or replayed sealed prefix.
+pub(crate) fn verified_commitment_bindings_with_lookup<L, E>(
+    receipt: AppendReceipt,
+    lookup: &mut L,
+) -> Result<Vec<ObservationBinding>, CompleteActivityReadError>
+where
+    L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
+    E: Display,
+{
+    let source =
+        lookup(receipt).map_err(|error| complete_activity_read_error(error.to_string()))?;
     let commitment: ActivityReadCommitment = serde_json::from_slice(&source.payload)
         .map_err(|error| complete_activity_read_error(error.to_string()))?;
-    if source.source_id.0 != ACTIVITY_READ_COMMITMENT_SOURCE_ID
+    if source.source_id != ACTIVITY_READ_COMMITMENT_SOURCE_ID
         || source.schema_version != ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION
         || source.parser_version != ACTIVITY_READ_COMMITMENT_PARSER_VERSION
         || source.content_type != ContentType::Json
@@ -1776,11 +1791,7 @@ pub(crate) fn verified_commitment_bindings(
         page_occurrences: &proof.page_occurrences,
         read_commitment: Some(receipt),
     };
-    verifier.reconstruct_complete_activity_read(&mut |receipt| {
-        source_receipts
-            .source_envelope(receipt)
-            .map(CompleteActivityPage::from)
-    })?;
+    verifier.reconstruct_complete_activity_read(lookup)?;
     Ok(bindings.clone())
 }
 
@@ -5125,10 +5136,11 @@ pub(crate) mod continuation_v3_tests {
                 })
                 .unwrap()
         };
+        let disposed = case.starts_with("disposed_");
         let stream_payload = serde_json::to_vec(
             &json!({"proxyWallet":"0x1111111111111111111111111111111111111111",
         "conditionId":"old", "asset":"123", "side":"BUY", "size":1, "price":0.5,
-        "timestamp":99, "transactionHash":"tx", "outcomeIndex":1}),
+        "timestamp":99, "transactionHash":"tx", "outcomeIndex":if disposed { 0 } else { 1 }}),
         )
         .unwrap();
         let stream = parse_activity_trade_observation(&stream_payload).unwrap();
@@ -5152,6 +5164,10 @@ pub(crate) mod continuation_v3_tests {
             "type":"TRADE", "conditionId": condition,
             "asset":"123", "side":"BUY", "size":"1", "usdcSize":"0.5", "price":"0.5",
             "timestamp":100, "transactionHash":"tx", "outcomeIndex":0}]);
+        if disposed {
+            rows[0]["outcomeIndex"] = json!(999);
+            rows[0]["outcome"] = json!("Over");
+        }
         if matches!(
             case,
             "ambiguous_history" | "distinct_legs" | "shared_read" | "shared_recorded_correction"
@@ -5242,7 +5258,7 @@ pub(crate) mod continuation_v3_tests {
             }
             "revision" => binding.semantic_revision = "00".repeat(32),
             "page_hash" => binding.page_raw_hash = "00".repeat(32),
-            "occurrence" => binding.page_occurrence_index = 1,
+            "occurrence" | "disposed_invalid_occurrence" => binding.page_occurrence_index = 1,
             "stream_group" => binding.stream_group_id = aggregate.group_id.key().clone(),
             "stream_receipt" => binding.stream_receipt = page_receipt,
             "metadata_hash" => {
@@ -5263,7 +5279,7 @@ pub(crate) mod continuation_v3_tests {
             "future_receipt" => binding.stream_receipt = receipt(100),
             _ => {}
         }
-        let mut bindings = if case == "poll_only" {
+        let mut bindings = if matches!(case, "poll_only" | "disposed_no_binding") {
             Vec::new()
         } else {
             vec![binding]
