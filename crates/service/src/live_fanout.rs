@@ -3547,17 +3547,18 @@ fn approved_recovery_copy_deadline(
     state: &FanoutState,
     pending: &pe_execution_core::live_journal::ApprovedAdmissionRecoveryEntry,
 ) -> Result<Option<OffsetDateTime>, String> {
+    // Replay verifies copy expiry only for wire 2, so a historical wire-1 admission has no
+    // replayable deadline and stays pending rather than posting unchecked.
     if pending.admission.economic.version
-        == pe_execution_core::economic::PAPER_ECONOMIC_PREPARED_VERSION
+        != pe_execution_core::economic::PAPER_ECONOMIC_PREPARED_VERSION
     {
-        verified_live_copy_deadline(
-            state,
-            pending.account_id.as_str(),
-            &pending.admission.identity,
-        )
-    } else {
-        Ok(None)
+        return Err("historical economic wire 1 has no replayable copy deadline".to_owned());
     }
+    verified_live_copy_deadline(
+        state,
+        pending.account_id.as_str(),
+        &pending.admission.identity,
+    )
 }
 
 fn verified_copy_deadline_for_continuation<L, E>(
@@ -13971,32 +13972,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn approved_recovery_copy_deadline_is_wire_two_only() {
+    async fn approved_wire_one_recovery_stays_pending_without_a_replayable_deadline() {
         let dir = tempdir().unwrap();
         let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
         let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
         let mut snapshot = armed_snapshot("acct");
         snapshot.fetched_at_unix = Some(now.unix_timestamp());
         let mut state = fanout_state(&dir, db.clone(), snapshot, "http://127.0.0.1:9", None);
-        let (mut pending, _) = stage_recoverable_approved(&mut state, now, None).await;
-        let source_trade_id = pending
-            .admission
-            .identity
-            .fill_projection
-            .as_ref()
-            .and_then(|projection| projection.source_trade_id.as_deref())
-            .unwrap();
-        rusqlite::Connection::open(dir.path().join("paper.db"))
-            .unwrap()
-            .execute(
-                "DELETE FROM decision_pending WHERE source_trade_id = ?1",
-                [source_trade_id],
-            )
-            .unwrap();
-        assert_eq!(approved_recovery_copy_deadline(&state, &pending), Ok(None));
-        pending.admission.economic.version =
-            pe_execution_core::economic::PAPER_ECONOMIC_PREPARED_VERSION;
+        let policy = crate::bucket_commit::PaperFreshnessPolicy {
+            activity_ws_enabled: true,
+            copy_latency_budget_secs: 120,
+        };
+        let (pending, _) =
+            stage_recoverable_approved_with_copy_policy(&mut state, now, None, false, Some(policy))
+                .await;
+        assert_eq!(
+            pending.admission.economic.version,
+            pe_execution_core::economic::ECONOMIC_PREPARED_VERSION
+        );
         assert!(approved_recovery_copy_deadline(&state, &pending).is_err());
+
+        run_recovery_pass(&mut state, || now, true).await.unwrap();
+
         let target = db.dispatch_targets("dispatch-finality").unwrap().remove(0);
         assert_eq!(target.state, "pending");
         let events = replay_live_account(&state, &pending.account_id).unwrap();
@@ -14004,135 +14001,6 @@ mod tests {
             event.payload,
             LiveJournalPayload::OrderPrepared(_) | LiveJournalPayload::OrderPosted(_)
         )));
-    }
-
-    #[tokio::test]
-    async fn fanout_post_uses_wire_deadline_and_replays_expiry() {
-        for (wire_two, expired) in [(true, false), (true, true), (false, false)] {
-            let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
-            let dir = tempdir().unwrap();
-            let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
-            let mut snapshot = armed_snapshot("acct");
-            snapshot.fetched_at_unix = Some(now.unix_timestamp());
-            let mut state = fanout_state(&dir, db.clone(), snapshot, "http://127.0.0.1:9", None);
-            let policy = crate::bucket_commit::PaperFreshnessPolicy {
-                activity_ws_enabled: true,
-                copy_latency_budget_secs: 120,
-            };
-            let (pending, venue_prepared) = stage_recoverable_approved_with_copy_policy(
-                &mut state,
-                now,
-                None,
-                wire_two,
-                wire_two.then_some(policy),
-            )
-            .await;
-            if !wire_two {
-                let source_trade_id = pending
-                    .admission
-                    .identity
-                    .fill_projection
-                    .as_ref()
-                    .and_then(|projection| projection.source_trade_id.as_deref())
-                    .unwrap();
-                rusqlite::Connection::open(dir.path().join("paper.db"))
-                    .unwrap()
-                    .execute(
-                        "DELETE FROM decision_pending WHERE source_trade_id = ?1",
-                        [source_trade_id],
-                    )
-                    .unwrap();
-            }
-            let deadline = approved_recovery_copy_deadline(&state, &pending).unwrap();
-            assert_eq!(
-                deadline,
-                wire_two.then_some(now + time::Duration::seconds(120))
-            );
-            let account_state =
-                venue_account_state_from_audit(pending.admission.account_state.as_ref().unwrap());
-            let post_deadlines = Arc::new(Mutex::new(Vec::new()));
-            let posts = Arc::new(AtomicUsize::new(0));
-            let venue = RecoveryPostVenue {
-                client: reqwest::Client::new(),
-                order_url: String::new(),
-                prepared: venue_prepared,
-                observed_at: if expired {
-                    now + time::Duration::seconds(120) + time::Duration::nanoseconds(1)
-                } else if !wire_two {
-                    now + time::Duration::seconds(121)
-                } else {
-                    now
-                },
-                prepare_clock_millis: None,
-                prepare_advance_millis: 0,
-                post_attempts: Some(posts.clone()),
-                post_deadlines: Some(post_deadlines.clone()),
-                account_state: Some(account_state.clone()),
-                prepare_barrier: None,
-                prepare_release: None,
-            };
-            let journal = state.config.journal.clone();
-            let executor = LiveExecutor::new(&venue, journal.as_ref());
-            let prepared = executor
-                .resume_approved_admission_with_clock(
-                    pending.account_id,
-                    pending.admission,
-                    LiveModeSnapshot {
-                        requested: LiveControlMode::LiveTiny,
-                        effective: LiveControlMode::LiveTiny,
-                    },
-                    CredentialBindingIdentity {
-                        version: 1,
-                        key_id: "key".to_owned(),
-                    },
-                    account_state,
-                    || now,
-                )
-                .await
-                .unwrap();
-            let prepared = match prepared {
-                LivePrepareResult::Prepared(prepared) => prepared,
-                other => {
-                    assert!(
-                        matches!(other, LivePrepareResult::Prepared(_)),
-                        "valid admission must prepare"
-                    );
-                    return;
-                }
-            };
-            let target = db.dispatch_targets("dispatch-finality").unwrap().remove(0);
-            db.set_dispatch_target_state(
-                &target.dispatch_id,
-                &target.account_id,
-                "submitted",
-                None,
-                now.unix_timestamp(),
-            )
-            .unwrap();
-            let _ =
-                post_prepared_target(&mut state, &target, &executor, prepared, deadline, || now)
-                    .await
-                    .unwrap();
-            assert_eq!(*post_deadlines.lock().unwrap(), vec![deadline]);
-            assert_eq!(posts.load(Ordering::SeqCst), usize::from(!expired));
-            let account_id = AccountId::new("acct").unwrap();
-            let events = replay_live_account(&state, &account_id).unwrap();
-            assert_eq!(
-                events
-                    .iter()
-                    .filter(|event| matches!(event.payload, LiveJournalPayload::OrderPosted(_)))
-                    .count(),
-                usize::from(!expired)
-            );
-            assert_eq!(events.iter().filter(|event| matches!(
-                &event.payload,
-                LiveJournalPayload::OrderPreparationFailed(failed)
-                    if failed.failure == pe_execution_core::LiveOrderPreparationFailure::PrePostCopyExpired
-            )).count(), usize::from(expired));
-            if wire_two {
-                assert!(derive_projection_rows_for_state(&state, &account_id, &events).is_ok());
-            }
-        }
     }
 
     #[tokio::test]
@@ -17941,13 +17809,6 @@ mod tests {
             None,
         );
         let (pending, prepared) = stage_recoverable_approved(&mut armed_state, now, None).await;
-        assert_eq!(
-            pending.admission.economic.version,
-            pe_execution_core::economic::ECONOMIC_PREPARED_VERSION
-        );
-        let copy_deadline = approved_recovery_copy_deadline(&armed_state, &pending).unwrap();
-        assert_eq!(copy_deadline, None);
-        let post_deadlines = Arc::new(Mutex::new(Vec::new()));
         let current_account_state =
             venue_account_state_from_audit(pending.admission.account_state.as_ref().unwrap());
         let account_binding = account_binding_fixture(
@@ -17967,7 +17828,7 @@ mod tests {
             prepare_clock_millis: None,
             prepare_advance_millis: 0,
             post_attempts: None,
-            post_deadlines: Some(post_deadlines.clone()),
+            post_deadlines: None,
             account_state: Some(current_account_state.clone()),
             prepare_barrier: None,
             prepare_release: None,
@@ -17993,7 +17854,7 @@ mod tests {
                         key_id: "key".to_owned(),
                     },
                 },
-                copy_deadline,
+                None,
                 &venue_context,
                 || now,
             )
@@ -18001,7 +17862,6 @@ mod tests {
             .unwrap()
         );
         assert_eq!(posts.load(Ordering::SeqCst), 1);
-        assert_eq!(*post_deadlines.lock().unwrap(), vec![None]);
 
         for case in ["off", "missing", "stale", "closed"] {
             let dir = tempdir().unwrap();

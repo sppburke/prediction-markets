@@ -1590,7 +1590,13 @@ async fn full_control_channel_cancels_refresh_before_install_and_releases_urgent
         .unwrap();
     assert_eq!(running.control_tx.upgrade().unwrap().capacity(), 0);
     drop(held);
-    tokio::task::yield_now().await;
+    // The paused clock advances only once every task is parked. The refresh then has its final
+    // capture and no page request outstanding, so it can only be waiting for a control slot.
+    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    assert!(
+        running.requests.try_recv().is_err(),
+        "refresh is not waiting for a page"
+    );
     assert!(
         running.controls.try_recv().is_err(),
         "refresh has not sent InstallAnchors"
