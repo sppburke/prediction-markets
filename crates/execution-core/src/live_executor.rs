@@ -1983,12 +1983,12 @@ mod tests {
             Box::pin(async move {
                 // Stand in for asynchronous SDK header creation before the final clock sample.
                 tokio::task::yield_now().await;
-                if let Some(checked_at) = self.post_checked_at {
-                    if wall_clock_deadline.is_some_and(|deadline| checked_at > deadline) {
-                        return Ok(pe_core_types::RawPostAttempt::NotAttempted(
-                            pe_core_types::ExpiredAt { checked_at },
-                        ));
-                    }
+                if let Some(checked_at) = self.post_checked_at
+                    && wall_clock_deadline.is_some_and(|deadline| checked_at > deadline)
+                {
+                    return Ok(pe_core_types::RawPostAttempt::NotAttempted(
+                        pe_core_types::ExpiredAt { checked_at },
+                    ));
                 }
                 self.posts.fetch_add(1, Ordering::SeqCst);
                 let mut response = raw_response("order-post");

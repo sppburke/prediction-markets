@@ -150,7 +150,7 @@ impl SupabaseWatchlistCapacity {
             }
             deferrals.extend(plan.deferrals);
             let reentry_candidates = planned_live_reentries(&self.live, &plan.entries);
-            let reentries = match self
+            let reentry_outcome = match self
                 .preparer
                 .prepare_live_reentries(&reentry_candidates)
                 .await
@@ -171,6 +171,8 @@ impl SupabaseWatchlistCapacity {
                     return Err(CapacityError::Admission(error));
                 }
             };
+            deferrals.extend(reentry_outcome.deferred);
+            let reentries = reentry_outcome.admitted;
             // Every entry that needs no live-only reentry is live already or a proved addition.
             if plan.entries.len() - reentry_candidates.len() + reentries.len() == 0 {
                 warn!(

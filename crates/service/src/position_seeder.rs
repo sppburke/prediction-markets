@@ -504,6 +504,11 @@ pub struct ValidationOutcomes {
     pub shared: Option<CausalPositionError>,
 }
 
+pub struct DirectValidationOutcome {
+    pub accepted: Vec<AnchorInstall>,
+    pub deferred: Vec<(WalletAddress, CausalPositionError)>,
+}
+
 /// Exact per-wallet source outcomes that retry without fencing or failing boot.
 ///
 /// A venue history the activity row parser refuses (issue #594: rehearsal attempt 9 aborted the
@@ -712,6 +717,19 @@ impl CausalPositionValidator {
         engine: &mut BucketCommitEngine,
         paper_state: &PaperStateDb,
     ) -> Result<Vec<AnchorInstall>, CausalPositionError> {
+        Ok(self
+            .validate_direct_with_deferrals(wallets, engine, paper_state)
+            .await?
+            .accepted)
+    }
+
+    /// Boot form that also retains wallet failure classes for the first maintenance batch.
+    pub async fn validate_direct_with_deferrals(
+        &self,
+        wallets: &[WalletAddress],
+        engine: &mut BucketCommitEngine,
+        paper_state: &PaperStateDb,
+    ) -> Result<DirectValidationOutcome, CausalPositionError> {
         let engine = Arc::new(tokio::sync::Mutex::new(engine));
         let mut completed = futures::stream::iter(wallets.iter().copied().enumerate())
             .map(|(index, wallet)| {
@@ -730,6 +748,7 @@ impl CausalPositionValidator {
             .await;
         completed.sort_by_key(|(index, _, _)| *index);
         let mut accepted = Vec::with_capacity(completed.len());
+        let mut deferred = Vec::new();
         for (_, wallet, result) in completed {
             match result {
                 Ok(acceptance) => accepted.push(acceptance),
@@ -749,6 +768,7 @@ impl CausalPositionValidator {
                         wallet = %wallet,
                         "boot bracket: wallet durably fenced; excluded from the boot universe"
                     );
+                    deferred.push((wallet, CausalPositionError::Fenced { wallet }));
                 }
                 Err(error) if is_deferred_causal_position_error(&error) => {
                     tracing::warn!(
@@ -756,6 +776,7 @@ impl CausalPositionValidator {
                         outcome = %error,
                         "boot bracket: wallet left unvalidated for runtime admission"
                     );
+                    deferred.push((wallet, error));
                 }
                 Err(error) => return Err(error),
             }
@@ -775,7 +796,7 @@ impl CausalPositionValidator {
             "{\"source\":\"causal_position_bracket_v2\"}",
             time::OffsetDateTime::now_utc().unix_timestamp(),
         )?;
-        Ok(accepted)
+        Ok(DirectValidationOutcome { accepted, deferred })
     }
 
     async fn validate_control_with_retry(
@@ -855,7 +876,8 @@ impl CausalPositionValidator {
         self.commit_control(wallet, &first_activity, &first_prepared, control_tx, false)
             .await?;
         let first_ledger = capture_control(wallet, control_tx).await?;
-        let first_positions = self.positions(wallet, &first_prepared.mapping).await?;
+        let first_positions =
+            retain_missing_mapping(self.positions(wallet, &first_prepared.mapping).await)?;
         let first_activity = ActivityEvidence::from(first_activity);
 
         let second_activity = self.activity(wallet).await?;
@@ -867,6 +889,7 @@ impl CausalPositionValidator {
             ordinary_reconciliation_needed,
         )?;
         let second_prepared = self.prepare_activity(wallet, &second_activity).await?;
+        resolve_missing_mapping(wallet, &first_positions, &second_prepared.mapping)?;
         metadata_reads.extend(second_prepared.metadata_reads.clone());
         unresolved_assets.extend(second_prepared.unresolved_assets.clone());
         if self
@@ -876,7 +899,8 @@ impl CausalPositionValidator {
             return Err(CausalPositionError::InterveningActivity { wallet });
         }
         let second_ledger = capture_control(wallet, control_tx).await?;
-        let second_positions = self.positions(wallet, &second_prepared.mapping).await?;
+        let second_positions =
+            retain_missing_mapping(self.positions(wallet, &second_prepared.mapping).await)?;
         let second_activity = ActivityEvidence::from(second_activity);
 
         let final_activity = self.activity(wallet).await?;
@@ -888,6 +912,7 @@ impl CausalPositionValidator {
             ordinary_reconciliation_needed,
         )?;
         let final_prepared = self.prepare_activity(wallet, &final_activity).await?;
+        resolve_missing_mapping(wallet, &second_positions, &final_prepared.mapping)?;
         unresolved_assets.extend(final_prepared.unresolved_assets.clone());
         metadata_reads.extend(final_prepared.metadata_reads.clone());
         if self
@@ -902,8 +927,12 @@ impl CausalPositionValidator {
             wallet,
             [&first_activity, &second_activity, &final_activity],
             [&first_ledger, &second_ledger, &final_ledger],
-            &first_positions,
-            &second_positions,
+            first_positions
+                .as_ref()
+                .map_err(|_| CausalPositionError::InterveningActivity { wallet })?,
+            second_positions
+                .as_ref()
+                .map_err(|_| CausalPositionError::InterveningActivity { wallet })?,
             metadata_reads.into_values().collect(),
         )?;
         log_unresolved_activity_assets(wallet, &unresolved_assets);
@@ -943,7 +972,8 @@ impl CausalPositionValidator {
             self.run_step_hook(wallet, 1, &mut engine);
             captured
         };
-        let first_positions = self.positions(wallet, &first_prepared.mapping).await?;
+        let first_positions =
+            retain_missing_mapping(self.positions(wallet, &first_prepared.mapping).await)?;
         let first_activity = ActivityEvidence::from(first_activity);
         #[cfg(feature = "scenario")]
         {
@@ -953,6 +983,7 @@ impl CausalPositionValidator {
 
         let second_activity = self.activity(wallet).await?;
         let second_prepared = self.prepare_activity(wallet, &second_activity).await?;
+        resolve_missing_mapping(wallet, &first_positions, &second_prepared.mapping)?;
         metadata_reads.extend(second_prepared.metadata_reads.clone());
         unresolved_assets.extend(second_prepared.unresolved_assets.clone());
         let second_ledger = {
@@ -972,7 +1003,8 @@ impl CausalPositionValidator {
             self.run_step_hook(wallet, 3, &mut engine);
             captured
         };
-        let second_positions = self.positions(wallet, &second_prepared.mapping).await?;
+        let second_positions =
+            retain_missing_mapping(self.positions(wallet, &second_prepared.mapping).await)?;
         let second_activity = ActivityEvidence::from(second_activity);
         #[cfg(feature = "scenario")]
         {
@@ -982,6 +1014,7 @@ impl CausalPositionValidator {
 
         let final_activity = self.activity(wallet).await?;
         let final_prepared = self.prepare_activity(wallet, &final_activity).await?;
+        resolve_missing_mapping(wallet, &second_positions, &final_prepared.mapping)?;
         unresolved_assets.extend(final_prepared.unresolved_assets.clone());
         metadata_reads.extend(final_prepared.metadata_reads.clone());
         let final_ledger = {
@@ -1003,8 +1036,12 @@ impl CausalPositionValidator {
             wallet,
             [&first_activity, &second_activity, &final_activity],
             [&first_ledger, &second_ledger, &final_ledger],
-            &first_positions,
-            &second_positions,
+            first_positions
+                .as_ref()
+                .map_err(|_| CausalPositionError::InterveningActivity { wallet })?,
+            second_positions
+                .as_ref()
+                .map_err(|_| CausalPositionError::InterveningActivity { wallet })?,
             metadata_reads.into_values().collect(),
         )?;
         log_unresolved_activity_assets(wallet, &unresolved_assets);
@@ -1303,6 +1340,50 @@ impl CausalPositionValidator {
             },
         })
     }
+}
+
+// Only an absent activity mapping is held across the next walk. Every other position-read
+// failure retains its existing immediate classification.
+fn retain_missing_mapping(
+    read: Result<CompletePositionsRead, CausalPositionError>,
+) -> Result<Result<CompletePositionsRead, CausalPositionError>, CausalPositionError> {
+    match read {
+        Err(
+            error @ CausalPositionError::Positions {
+                source:
+                    pe_source_polymarket_public::PositionReadError::MissingActivityMapping { .. },
+                ..
+            },
+        ) => Ok(Err(error)),
+        Err(error) => Err(error),
+        Ok(positions) => Ok(Ok(positions)),
+    }
+}
+
+fn resolve_missing_mapping(
+    wallet: WalletAddress,
+    read: &Result<CompletePositionsRead, CausalPositionError>,
+    next_mapping: &pe_source_polymarket_public::ActivityAssetMapping,
+) -> Result<(), CausalPositionError> {
+    if let Err(CausalPositionError::Positions {
+        source: pe_source_polymarket_public::PositionReadError::MissingActivityMapping { asset },
+        ..
+    }) = read
+    {
+        if next_mapping
+            .identity(&pe_core_types::PolymarketTokenId(asset.clone()))
+            .is_some()
+        {
+            return Err(CausalPositionError::InterveningActivity { wallet });
+        }
+        return Err(CausalPositionError::Positions {
+            wallet,
+            source: pe_source_polymarket_public::PositionReadError::MissingActivityMapping {
+                asset: asset.clone(),
+            },
+        });
+    }
+    Ok(())
 }
 
 fn is_bounded_retry_error(error: &CausalPositionError) -> bool {

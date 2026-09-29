@@ -32,8 +32,8 @@ use pe_source_polymarket_public::{
 };
 use pe_trader_index::WatchlistTier;
 use time::OffsetDateTime;
-use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinSet;
+use tokio::sync::{mpsc, oneshot, watch};
+use tokio::task::{AbortHandle, JoinSet};
 use tracing::warn;
 
 use crate::activity_ingest::{
@@ -51,7 +51,9 @@ use crate::live_watchlist::LiveWatchlist;
 use crate::orchestrator_control::OrchestratorControl;
 use crate::risk_inputs::SourceReceiptIndex;
 use crate::runtime_config::LiveRuntimeConfig;
-use crate::watchlist_admission::{AdmissionPreparer, AnchorRefreshOutcome, anchor_refresh_due};
+use crate::watchlist_admission::{
+    AdmissionPreparer, AnchorRefreshOutcome, RefreshHandoff, anchor_refresh_due,
+};
 
 /// Source id stamped on every fixed-end activity page before it is parsed.
 pub const ACTIVITY_POLL_SOURCE_ID: &str = "polymarket-public.activity-reconciliation";
@@ -61,8 +63,8 @@ pub const DAILY_BOUNDARY_SOURCE_ID: &str = "pe-service.boundary";
 pub const ACTIVITY_POLL_PAGE_SCHEMA_VERSION: u32 = 3;
 /// Best-effort cadence for refreshing venue-authoritative position anchors.
 pub const ANCHOR_REFRESH_SECS: u64 = 3_600;
-/// Compiled bound: one urgent wallet operation and one backstop/anchor operation.
-pub const TRADE_RECONCILIATION_CONCURRENCY: usize = 2;
+/// Compiled bound: one urgent, one backstop/boundary, and one refresh operation.
+pub const TRADE_RECONCILIATION_CONCURRENCY: usize = 3;
 const SECONDS_PER_DAY: i64 = 86_400;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -617,6 +619,8 @@ pub fn rebuild_reconciliation_obligations(
 
 #[derive(Debug, thiserror::Error)]
 enum ReconciliationError {
+    #[error("backstop visit yielded to a newer websocket obligation")]
+    Preempted,
     #[error("activity reconciliation: {0}")]
     Activity(#[from] ActivityReadError),
     #[error("asset identity resolution: {0}")]
@@ -716,7 +720,6 @@ impl WalletAttempt {
 enum RoundStage {
     Boundary,
     Wallets,
-    Refresh,
     Publish,
     Done,
 }
@@ -725,7 +728,6 @@ struct BackstopRound {
     wallets: VecDeque<WalletAddress>,
     live_wallets: Vec<WalletAddress>,
     stage: RoundStage,
-    refresh_wallet: Option<WalletAddress>,
     successes: usize,
     failures: usize,
 }
@@ -749,7 +751,6 @@ impl BackstopRound {
             wallets: wallets.into(),
             live_wallets,
             stage: RoundStage::Boundary,
-            refresh_wallet: None,
             successes: 0,
             failures: 0,
         }
@@ -879,14 +880,12 @@ impl TradePoller {
         let _ = self.run_until(std::future::pending::<()>()).await;
     }
 
-    /// Receive triggers throughout reads. A shutdown request stops admission and cancels every
-    /// started operation at its next await (issue #599): the unit stop deadline is honored even
-    /// when a read is parked on a slow venue. Every source page, commitment and bucket the
-    /// orchestrator already accepted stays durable; an acknowledgement dropped by the cancellation
-    /// does not undo an accepted effect, and an obligation whose target was not disposed is
-    /// rebuilt from the source log at the next boot. A boundary or anchor refresh not yet handed
-    /// over is dropped with its operation and re-derived from the anchor at the next boot. A
-    /// failed operation still terminates the owner after the remaining started operations finish.
+    /// Receive triggers throughout reads. Shutdown cancels venue work, but a sent bucket
+    /// commit or anchor install retains wallet ownership until its acknowledgement or timeout.
+    /// Accepted source pages, commitments, and buckets remain durable; an obligation whose
+    /// target was not disposed is rebuilt from the source log at the next boot. A refresh not
+    /// handed over is re-derived from the anchor at the next boot. A failed operation stops
+    /// admission after remaining started operations finish.
     pub async fn run_until(
         mut self,
         shutdown: impl Future<Output = ()>,
@@ -903,6 +902,11 @@ impl TradePoller {
         let mut busy_wallets = HashSet::new();
         let mut urgent_busy = false;
         let mut backstop_busy = false;
+        let mut refresh_busy = false;
+        let mut refresh_pending = None;
+        let mut refresh_visit: Option<(WalletAddress, RefreshHandoff, AbortHandle)> = None;
+        let mut backstop_visit: Option<(WalletAddress, watch::Sender<bool>)> = None;
+        let mut urgent_visit: Option<watch::Sender<bool>> = None;
         // Expiry changes readiness, not ownership: the frozen frontier returns to the backstop
         // until disposed, while later receipts remain queued for a subsequent attempt.
         let mut attempts = HashMap::<WalletAddress, WalletAttempt>::new();
@@ -921,24 +925,33 @@ impl TradePoller {
             if !shutdown_requested && shutdown.as_mut().now_or_never().is_some() {
                 shutdown_requested = true;
                 stopping = true;
-                tasks.abort_all();
+                if let Some((_, cancel)) = &backstop_visit {
+                    let _ = cancel.send(true);
+                }
+                if let Some(cancel) = &urgent_visit {
+                    let _ = cancel.send(true);
+                }
+                if let Some((_, handoff, handle)) = &refresh_visit
+                    && handoff.cancel_before_handoff()
+                {
+                    handle.abort();
+                }
             }
             if !stopping {
                 self.drain_triggers();
                 let now = (self.now)();
-                if !backstop_busy
-                    && round.stage == RoundStage::Refresh
-                    && round.refresh_wallet.is_none()
+                if let Some((wallet, handoff, handle)) = &refresh_visit
+                    && self.obligations.by_wallet.contains_key(wallet)
+                    && handoff.cancel_before_handoff()
                 {
-                    match self.select_refresh_wallet(&round.live_wallets) {
-                        Ok(wallet) => round.refresh_wallet = wallet,
-                        Err(error) => {
-                            failure = Some(error);
-                            stopping = true;
-                        }
-                    }
+                    handle.abort();
                 }
-                if !stopping && !urgent_busy && tasks.len() < TRADE_RECONCILIATION_CONCURRENCY {
+                if let Some((wallet, cancel)) = &backstop_visit
+                    && self.has_new_obligation(*wallet, &attempts)
+                {
+                    let _ = cancel.send(true);
+                }
+                if !stopping && !urgent_busy {
                     let mut wallets = self
                         .obligations
                         .wallets()
@@ -956,10 +969,7 @@ impl TradePoller {
                     });
                     wallets.dedup();
                     for wallet in wallets {
-                        if busy_wallets.contains(&wallet)
-                            || round.refresh_wallet == Some(wallet)
-                            || refresh_retry.contains(&wallet)
-                        {
+                        if busy_wallets.contains(&wallet) {
                             continue;
                         }
                         let forced = refresh_reconcile
@@ -980,13 +990,16 @@ impl TradePoller {
                         if forced {
                             refresh_reconcile.insert(wallet, Some(now.unix_timestamp()));
                         }
+                        let (cancel, receiver) = watch::channel(false);
                         self.spawn_reconciliation(
                             &mut tasks,
                             wallet,
                             attempt,
                             true,
                             now.unix_timestamp(),
+                            Some(receiver),
                         );
+                        urgent_visit = Some(cancel);
                         busy_wallets.insert(wallet);
                         urgent_busy = true;
                         break;
@@ -1030,6 +1043,12 @@ impl TradePoller {
                             }
                         }
                         RoundStage::Wallets => {
+                            // A refresh owns this wallet's anchor handoff. It has not been
+                            // visited for this round, so retry the visit next round instead of
+                            // waiting here or counting it as healthy.
+                            if let Some((wallet, _, _)) = &refresh_visit {
+                                round.wallets.retain(|candidate| candidate != wallet);
+                            }
                             if let Some(index) = round
                                 .wallets
                                 .iter()
@@ -1051,41 +1070,35 @@ impl TradePoller {
                                         self.freeze_attempt(wallet, false).unwrap_or_default()
                                     });
                                     attempt.last_fixed_end = Some(now.unix_timestamp());
+                                    let (cancel, receiver) = watch::channel(false);
                                     self.spawn_reconciliation(
                                         &mut tasks,
                                         wallet,
                                         attempt,
                                         false,
                                         now.unix_timestamp(),
+                                        Some(receiver),
                                     );
+                                    backstop_visit = Some((wallet, cancel));
                                     busy_wallets.insert(wallet);
                                     backstop_busy = true;
                                 }
                             } else if round.wallets.is_empty() {
-                                round.stage = RoundStage::Refresh;
-                            }
-                        }
-                        RoundStage::Refresh => {
-                            if let Some(wallet) = round.refresh_wallet {
-                                if !busy_wallets.contains(&wallet) {
-                                    busy_wallets.insert(wallet);
-                                    tasks.spawn(async move {
-                                        Completion::Refreshed(
-                                            wallet,
-                                            operation.refresh_one_wallet(wallet).await,
-                                        )
-                                    });
-                                    backstop_busy = true;
-                                    round.refresh_wallet = None;
-                                    round.stage = RoundStage::Publish;
-                                }
-                            } else {
                                 round.stage = RoundStage::Publish;
                             }
                         }
                         RoundStage::Publish => {
                             round.stage = RoundStage::Done;
                             self.record_round_health(&round);
+                            if refresh_pending.is_none() {
+                                match self.select_refresh_wallet(&round.live_wallets) {
+                                    Ok(wallet) => refresh_pending = wallet,
+                                    Err(error) => {
+                                        failure = Some(error);
+                                        stopping = true;
+                                    }
+                                }
+                            }
                             cadence = tokio::time::Instant::now()
                                 + Duration::from_secs(self.config.poll_interval_secs);
                             #[cfg(feature = "scenario")]
@@ -1101,21 +1114,7 @@ impl TradePoller {
                             }
                         }
                         RoundStage::Done => {
-                            if let Some(index) = refresh_retry
-                                .iter()
-                                .position(|wallet| !busy_wallets.contains(wallet))
-                            {
-                                if let Some(wallet) = refresh_retry.remove(index) {
-                                    busy_wallets.insert(wallet);
-                                    tasks.spawn(async move {
-                                        Completion::Refreshed(
-                                            wallet,
-                                            operation.refresh_one_wallet(wallet).await,
-                                        )
-                                    });
-                                    backstop_busy = true;
-                                }
-                            } else if let Some(boundary) = self.obligations.take_ready_boundary() {
+                            if let Some(boundary) = self.obligations.take_ready_boundary() {
                                 tasks.spawn(async move {
                                     Completion::BoundaryPublished(
                                         boundary,
@@ -1125,6 +1124,38 @@ impl TradePoller {
                                 backstop_busy = true;
                             }
                         }
+                    }
+                }
+                if !stopping && !refresh_busy {
+                    let retry = refresh_retry.iter().position(|wallet| {
+                        !busy_wallets.contains(wallet)
+                            && !self.obligations.by_wallet.contains_key(wallet)
+                    });
+                    let selected =
+                        retry
+                            .and_then(|index| refresh_retry.remove(index))
+                            .or_else(|| {
+                                refresh_pending.filter(|wallet| {
+                                    !busy_wallets.contains(wallet)
+                                        && !self.obligations.by_wallet.contains_key(wallet)
+                                })
+                            });
+                    if let Some(wallet) = selected {
+                        if refresh_pending == Some(wallet) {
+                            refresh_pending = None;
+                        }
+                        let handoff = RefreshHandoff::default();
+                        let observed = handoff.clone();
+                        let operation = self.operation();
+                        let handle = tasks.spawn(async move {
+                            Completion::Refreshed(
+                                wallet,
+                                operation.refresh_one_wallet(wallet, &observed).await,
+                            )
+                        });
+                        busy_wallets.insert(wallet);
+                        refresh_busy = true;
+                        refresh_visit = Some((wallet, handoff, handle));
                     }
                 }
             }
@@ -1141,9 +1172,6 @@ impl TradePoller {
                             .iter()
                             .any(|wallet| !busy_wallets.contains(wallet))
                 }
-                RoundStage::Refresh => round
-                    .refresh_wallet
-                    .is_none_or(|wallet| !busy_wallets.contains(&wallet)),
                 RoundStage::Done => false,
             };
             if !stopping && !backstop_busy && background_ready {
@@ -1177,13 +1205,17 @@ impl TradePoller {
                 () = &mut shutdown, if !shutdown_requested => {
                     shutdown_requested = true;
                     stopping = true;
-                    tasks.abort_all();
+                    if let Some((_, cancel)) = &backstop_visit { let _ = cancel.send(true); }
+                    if let Some(cancel) = &urgent_visit { let _ = cancel.send(true); }
+                    if let Some((_, handoff, handle)) = &refresh_visit
+                        && handoff.cancel_before_handoff() { handle.abort(); }
                 }
                 completed = tasks.join_next(), if !tasks.is_empty() => {
                     match completed {
                         Some(Ok(Completion::Reconciled { wallet, urgent, selected, result })) => {
                             busy_wallets.remove(&wallet);
-                            if urgent { urgent_busy = false; } else { backstop_busy = false; }
+                            if urgent { urgent_busy = false; urgent_visit = None; }
+                            else { backstop_busy = false; backstop_visit = None; }
                             let counts_round = if urgent {
                                 if let Some(index) = round.wallets.iter().position(|candidate| *candidate == wallet) {
                                     round.wallets.remove(index);
@@ -1208,6 +1240,11 @@ impl TradePoller {
                                 attempt.selected.clone_from(&selected);
                             }
                             match result {
+                                Err(ReconciliationError::Preempted) => {
+                                    // The frozen frontier remains queued. The next urgent attempt
+                                    // selects a new fixed end; the incomplete visit has no health vote.
+                                    attempts.remove(&wallet);
+                                }
                                 Ok(resolved) => {
                                     if counts_round { round.successes += 1; }
                                     for (epoch, obligation) in resolved {
@@ -1242,8 +1279,12 @@ impl TradePoller {
                         }
                         Some(Ok(Completion::Refreshed(wallet, result))) => {
                             busy_wallets.remove(&wallet);
-                            backstop_busy = false;
+                            refresh_busy = false;
+                            refresh_visit = None;
                             match result {
+                                Ok((AnchorRefreshOutcome::Cancelled, _)) => {
+                                    if !refresh_retry.contains(&wallet) { refresh_retry.push_back(wallet); }
+                                }
                                 Ok((AnchorRefreshOutcome::Deferred, true)) => { refresh_reconcile.entry(wallet).or_insert(None); }
                                 Ok(_) => { refresh_reconcile.remove(&wallet); }
                                 Err(error) => failure = Some(error),
@@ -1264,7 +1305,15 @@ impl TradePoller {
                             }
                         }
                         // Cancelled by shutdown: the operation's durable prefix stands on its own.
-                        Some(Err(error)) if error.is_cancelled() => {}
+                        Some(Err(error)) if error.is_cancelled() => {
+                            if let Some((wallet, handoff, _)) = refresh_visit.take()
+                                && handoff.is_cancelled()
+                            {
+                                busy_wallets.remove(&wallet);
+                                refresh_busy = false;
+                                if !stopping && !refresh_retry.contains(&wallet) { refresh_retry.push_back(wallet); }
+                            }
+                        }
                         Some(Err(error)) => failure = Some(TradePollerOwnerError::Reconciliation(error.to_string())),
                         None => {}
                     }
@@ -1287,6 +1336,27 @@ impl TradePoller {
             };
             self.obligations.insert(trigger);
         }
+    }
+
+    fn has_new_obligation(
+        &self,
+        wallet: WalletAddress,
+        attempts: &HashMap<WalletAddress, WalletAttempt>,
+    ) -> bool {
+        let selected = attempts.get(&wallet).map(|attempt| &attempt.selected);
+        self.obligations
+            .by_wallet
+            .get(&wallet)
+            .is_some_and(|epochs| {
+                epochs.iter().any(|(epoch, groups)| {
+                    groups.iter().any(|(id, obligation)| {
+                        selected
+                            .and_then(|selected| selected.get(epoch))
+                            .and_then(|selected| selected.get(id))
+                            .is_none_or(|frozen| frozen.receipt != obligation.receipt)
+                    })
+                })
+            })
     }
 
     fn freeze_attempt(&self, wallet: WalletAddress, urgent: bool) -> Option<WalletAttempt> {
@@ -1350,6 +1420,7 @@ impl TradePoller {
         attempt: &WalletAttempt,
         urgent: bool,
         fixed_end: i64,
+        mut cancel: Option<watch::Receiver<bool>>,
     ) {
         let operation = self.operation();
         let mut selected = attempt.selected.clone();
@@ -1374,7 +1445,13 @@ impl TradePoller {
         });
         tasks.spawn(async move {
             let result = operation
-                .reconcile_wallet(wallet, entry.as_ref(), &mut selected, fixed_end)
+                .reconcile_wallet(
+                    wallet,
+                    entry.as_ref(),
+                    &mut selected,
+                    fixed_end,
+                    &mut cancel,
+                )
                 .await;
             Completion::Reconciled {
                 wallet,
@@ -1466,9 +1543,25 @@ struct WalletOperation {
 }
 
 impl WalletOperation {
+    async fn cancellable<T>(
+        future: impl Future<Output = T>,
+        cancel: &mut Option<watch::Receiver<bool>>,
+    ) -> Result<T, ReconciliationError> {
+        if let Some(cancel) = cancel {
+            tokio::select! {
+                biased;
+                () = wait_for_cancel(cancel) => Err(ReconciliationError::Preempted),
+                output = future => Ok(output),
+            }
+        } else {
+            Ok(future.await)
+        }
+    }
+
     async fn refresh_one_wallet(
         &self,
         wallet: WalletAddress,
+        handoff: &RefreshHandoff,
     ) -> Result<(AnchorRefreshOutcome, bool), TradePollerOwnerError> {
         let Some(preparer) = &self.admission_preparer else {
             return Ok((AnchorRefreshOutcome::Skipped, false));
@@ -1479,7 +1572,12 @@ impl WalletOperation {
             .map_err(|error| TradePollerOwnerError::AnchorRefresh(error.to_string()))?;
         let routine = coverage.anchor_seq.is_some() && !coverage.reanchor_required;
         let outcome = preparer
-            .prepare_if_due(wallet, (self.now)().unix_timestamp(), ANCHOR_REFRESH_SECS)
+            .prepare_if_due_observed(
+                wallet,
+                (self.now)().unix_timestamp(),
+                ANCHOR_REFRESH_SECS,
+                Some(handoff),
+            )
             .await
             .map_err(|error| TradePollerOwnerError::AnchorRefresh(error.to_string()))?;
         Ok((outcome, routine))
@@ -1545,6 +1643,7 @@ impl WalletOperation {
         entry: Option<&pe_trader_index::WatchlistEntry>,
         selected: &mut WalletObligations,
         fixed_end: i64,
+        cancel: &mut Option<watch::Receiver<bool>>,
     ) -> Result<Vec<(i64, Obligation)>, ReconciliationError> {
         let cursor_start = self
             .paper_state
@@ -1566,14 +1665,11 @@ impl WalletOperation {
             occurrences: Arc::new(Mutex::new(Vec::new())),
             now: self.now.clone(),
         };
-        let activity = match fetch_complete_activity(
-            &recording,
-            &self.config.base_url,
-            wallet,
-            start,
-            fixed_end,
+        let activity = match Self::cancellable(
+            fetch_complete_activity(&recording, &self.config.base_url, wallet, start, fixed_end),
+            cancel,
         )
-        .await
+        .await?
         {
             Ok(activity) => activity,
             Err(_) if append_closed.load(Ordering::Acquire) => {
@@ -1589,7 +1685,7 @@ impl WalletOperation {
         // Resolve every required token and record its metadata before freezing the read commitment.
         let mut identities = Vec::with_capacity(buckets.len());
         for bucket in &buckets {
-            identities.push(self.resolve_bucket(bucket).await?);
+            identities.push(Self::cancellable(self.resolve_bucket(bucket), cancel).await??);
         }
         let correlation = self.correlate(
             wallet,
@@ -1604,15 +1700,17 @@ impl WalletOperation {
             .iter()
             .map(|matched| matched.binding.clone())
             .collect::<Vec<_>>();
-        let read_commitment = self
-            .append_read_commitment(
+        let read_commitment = Self::cancellable(
+            self.append_read_commitment(
                 wallet,
                 fixed_end,
                 &page_occurrences,
                 &activity.pages,
                 &bindings,
-            )
-            .await?;
+            ),
+            cancel,
+        )
+        .await??;
         for matched in &correlation.matched {
             if let Some(obligation) = selected
                 .get_mut(&matched.epoch)
@@ -1639,6 +1737,9 @@ impl WalletOperation {
         // Only unmatched observations block ordering. Matched observations use the endpoint's
         // bucket clock; the original stream second remains in the binding and the age check.
         for (bucket, identities) in buckets.into_iter().zip(identities) {
+            if cancel.as_ref().is_some_and(|cancel| *cancel.borrow()) {
+                return Err(ReconciliationError::Preempted);
+            }
             let source_epoch = bucket_epoch(&bucket)?;
             if correlation
                 .unmatched_epoch
@@ -1666,9 +1767,17 @@ impl WalletOperation {
                 context.decision_inputs_json = serde_json::to_string(&inputs)?;
             }
             let result = self.commit_bucket(bucket, context).await?;
+            // A sent commit is never abandoned: its acknowledgement or failure is established
+            // before the coordinator can hand the wallet to urgent reconciliation.
+            if cancel.as_ref().is_some_and(|cancel| *cancel.borrow()) {
+                return Err(ReconciliationError::Preempted);
+            }
             if result.newly_fenced.is_some() {
                 break;
             }
+        }
+        if cancel.as_ref().is_some_and(|cancel| *cancel.borrow()) {
+            return Err(ReconciliationError::Preempted);
         }
         self.disposed_obligations(wallet, selected)
     }
@@ -2041,6 +2150,14 @@ impl WalletOperation {
             .await
             .map_err(|_| ReconciliationError::ControlClosed)?
             .map_err(ReconciliationError::BucketCommit)
+    }
+}
+
+async fn wait_for_cancel(cancel: &mut watch::Receiver<bool>) {
+    loop {
+        if *cancel.borrow_and_update() || cancel.changed().await.is_err() {
+            return;
+        }
     }
 }
 

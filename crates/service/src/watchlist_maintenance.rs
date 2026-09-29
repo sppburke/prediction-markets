@@ -561,7 +561,7 @@ pub(crate) fn apply_live_reentries(
     prepared: &[WalletAddress],
     applied_entries: &[WatchlistEntry],
     cap: usize,
-) {
+) -> crate::watchlist_admission::AdmissionOutcome {
     let structural = live.structural_membership();
     let mut present = live
         .snapshot()
@@ -571,6 +571,7 @@ pub(crate) fn apply_live_reentries(
         .collect::<HashSet<_>>();
     let prepared = prepared.iter().copied().collect::<HashSet<_>>();
     let mut admitted = Vec::new();
+    let mut deferred = Vec::new();
     for entry in applied_entries {
         if present.len() >= cap {
             break;
@@ -581,7 +582,13 @@ pub(crate) fn apply_live_reentries(
             continue;
         }
         if let Err(error) = recheck_admissions(paper_state, &[wallet]) {
-            warn!(%wallet, %error, "live-only reentry failed locked eligibility check");
+            deferred.push(crate::watchlist_admission::Deferral {
+                wallet,
+                stage: "locked_apply",
+                class: error.class(),
+                kind: error.kind(),
+                message: error.to_string(),
+            });
             continue;
         }
         present.insert(wallet);
@@ -589,6 +596,10 @@ pub(crate) fn apply_live_reentries(
     }
     if !admitted.is_empty() {
         live.replace(&HashSet::new(), &admitted, cap);
+    }
+    crate::watchlist_admission::AdmissionOutcome {
+        admitted: admitted.into_iter().map(|entry| entry.wallet).collect(),
+        deferred,
     }
 }
 
@@ -600,8 +611,8 @@ pub fn scenario_apply_live_reentries(
     prepared: &[WalletAddress],
     applied_entries: &[WatchlistEntry],
     cap: usize,
-) {
-    apply_live_reentries(live, paper_state, prepared, applied_entries, cap);
+) -> crate::watchlist_admission::AdmissionOutcome {
+    apply_live_reentries(live, paper_state, prepared, applied_entries, cap)
 }
 
 fn recheck_publication_evidence(
@@ -1225,6 +1236,173 @@ struct BatchSync {
     knockout_deferred: HashSet<WalletAddress>,
 }
 
+fn park_persistent(sync: &mut BatchSync, deferrals: &[crate::watchlist_admission::Deferral]) {
+    sync.knockout_deferred.extend(
+        deferrals
+            .iter()
+            .filter(|deferral| {
+                deferral.class == crate::position_seeder::FailureClass::WalletPersistent
+            })
+            .map(|deferral| deferral.wallet),
+    );
+}
+
+struct LiveReentryReport {
+    before_live: usize,
+    after_live: usize,
+    admitted: Vec<WalletAddress>,
+    deferred: Vec<crate::watchlist_admission::Deferral>,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn live_reentry_tick(
+    live: &LiveWatchlist,
+    paper_state: &PaperStateDb,
+    client: &reqwest::Client,
+    base_url: &str,
+    anon_key: &str,
+    secret_key: &str,
+    writer_lock: &Mutex<()>,
+    applied_capacity: &AppliedWatchlistCapacity,
+    capacity_epoch: WatchlistCapacityEpoch,
+    preparer: &AdmissionPreparer,
+    sync: &BatchSync,
+    held: Option<&(i64, Watchlist, HashMap<WalletAddress, i64>)>,
+    attempted: &mut HashSet<WalletAddress>,
+    now_unix: i64,
+) -> Option<LiveReentryReport> {
+    let batch_id = sync.marker?;
+    // Read the applied batch only when a structural member is live-absent and retryable this
+    // tick; an ordinary tick with the whole structural set live makes no ranking read.
+    let present = live
+        .snapshot()
+        .entries
+        .iter()
+        .map(|entry| entry.wallet)
+        .collect::<HashSet<_>>();
+    if !live.structural_membership().iter().any(|wallet| {
+        !present.contains(wallet)
+            && !sync.knockout_deferred.contains(wallet)
+            && !attempted.contains(wallet)
+    }) {
+        return None;
+    }
+    let fetched;
+    let (entries, last_trade) = if let Some((held_id, watchlist, last_trade)) = held
+        && *held_id == batch_id
+    {
+        (&watchlist.entries, last_trade)
+    } else {
+        fetched = match supabase_reader::fetch_batch(
+            client,
+            base_url,
+            anon_key,
+            secret_key,
+            batch_id,
+            MAX_ACTIVE_WATCHLIST_SIZE,
+        )
+        .await
+        {
+            Ok(fetched) => fetched,
+            Err(error) => {
+                warn!(batch_id, %error, "live reentry: pinned batch fetch failed; retrying next tick");
+                return None;
+            }
+        };
+        (&fetched.0.entries, &fetched.1)
+    };
+    let before_live = live.snapshot().entries.len();
+    let mut deferred = Vec::new();
+    let freshness_cutoff = now_unix.saturating_sub(supabase_reader::ACTIVE_WINDOW_HOURS * 3_600);
+    let candidates = planned_live_reentries(live, entries)
+        .into_iter()
+        .filter(|wallet| !sync.knockout_deferred.contains(wallet))
+        .filter(|wallet| attempted.insert(*wallet))
+        .filter(|wallet| match last_trade.get(wallet) {
+            Some(last) if *last >= freshness_cutoff && *last <= now_unix => true,
+            value => {
+                deferred.push(crate::watchlist_admission::Deferral {
+                    wallet: *wallet,
+                    stage: "seed",
+                    class: crate::position_seeder::FailureClass::WalletPersistent,
+                    kind: if value.is_none() {
+                        "seed.missing_cursor"
+                    } else {
+                        "seed.stale_cursor"
+                    },
+                    message: format!("missing or stale last_trade_unix for {wallet}"),
+                });
+                false
+            }
+        })
+        .collect::<Vec<_>>();
+    let prepared = match preparer.prepare_live_reentries(&candidates).await {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            warn!(batch_id, kind = error.kind(), %error, "live reentry: shared preparation failed; retrying next tick");
+            return None;
+        }
+    };
+    deferred.extend(prepared.deferred);
+    let _writer = writer_lock.lock().await;
+    if applied_capacity.load() != capacity_epoch {
+        warn!(
+            batch_id,
+            "live reentry: capacity changed before locked apply; retrying next tick"
+        );
+        return None;
+    }
+    let applied = apply_live_reentries(
+        live,
+        paper_state,
+        &prepared.admitted,
+        entries,
+        capacity_epoch.target,
+    );
+    deferred.extend(applied.deferred);
+    let report = LiveReentryReport {
+        before_live,
+        after_live: live.snapshot().entries.len(),
+        admitted: applied.admitted,
+        deferred,
+    };
+    Some(report)
+}
+
+async fn record_live_reentry(
+    preparer: &AdmissionPreparer,
+    sync: &mut BatchSync,
+    mode: MembershipMode,
+    report: Option<LiveReentryReport>,
+) {
+    let Some(report) = report else { return };
+    info!(
+        before_live = report.before_live,
+        after_live = report.after_live,
+        admitted = report.admitted.len(),
+        deferred = report.deferred.len(),
+        "live reentry tick completed"
+    );
+    park_persistent(sync, &report.deferred);
+    if let Some(batch_id) = sync.marker {
+        let context = match mode {
+            MembershipMode::Knockout => {
+                crate::watchlist_admission::DeferralContext::Knockout { batch_id }
+            }
+            MembershipMode::FullRerank => {
+                crate::watchlist_admission::DeferralContext::FullRerank { batch_id }
+            }
+        };
+        preparer
+            .record_deferrals(
+                context,
+                report.deferred,
+                crate::watchlist_admission::DeferralOutcome::NoChange,
+            )
+            .await;
+    }
+}
+
 /// Run the maintenance tick loop until the process exits.
 ///
 /// `cfg.interval_secs == 0` disables the tick (returns immediately). The first tick fires one
@@ -1243,6 +1421,7 @@ pub async fn run_maintenance_loop(
     applied_capacity: AppliedWatchlistCapacity,
     preparer: AdmissionPreparer,
     initial_batch_marker: Option<i64>,
+    boot_persistent_deferred: HashSet<WalletAddress>,
 ) {
     if cfg.interval_secs == 0 {
         info!("watchlist maintenance disabled (maintenance_interval_secs = 0)");
@@ -1266,7 +1445,7 @@ pub async fn run_maintenance_loop(
     let mut sync = BatchSync {
         marker: initial_batch_marker,
         capacity_generation: applied_capacity.load().generation,
-        knockout_deferred: HashSet::new(),
+        knockout_deferred: boot_persistent_deferred,
     };
     loop {
         tokio::time::sleep(interval).await;
@@ -1353,6 +1532,9 @@ async fn maintenance_tick(
     now_unix: i64,
 ) {
     let cap = capacity_epoch.target;
+    let mut held_batch: Option<(i64, Watchlist, HashMap<WalletAddress, i64>)> = None;
+    let mut attempted_reentries = HashSet::new();
+    let mut shared_batch_fetch_failed = false;
     // A capacity transition since the last sync means membership may reflect an older
     // `latest_ranking` read than the batch this loop last applied (#542).
     let capacity_changed = capacity_epoch.generation != sync.capacity_generation;
@@ -1382,42 +1564,19 @@ async fn maintenance_tick(
                     .await
                     {
                         Ok((incoming, incoming_last_trade)) => match paper_state.wallet_fences() {
-                            Ok(records) => {
-                                let fenced =
-                                    records.into_iter().map(|record| record.wallet).collect();
-                                // Fence-filter only: knockout membership is not the batch's
-                                // top-`cap`, so a structural wallet may rank below it.
-                                let (incoming, _) = supabase_reader::select_membership(
-                                    incoming,
-                                    incoming_last_trade,
-                                    &fenced,
-                                    MAX_ACTIVE_WATCHLIST_SIZE,
-                                );
-                                let candidates = planned_live_reentries(live, &incoming.entries);
-                                let reentries = match preparer
-                                    .prepare_live_reentries(&candidates)
-                                    .await
-                                {
-                                    Ok(reentries) => reentries,
-                                    Err(error) => {
-                                        error!(batch_id, kind = error.kind(), %error, "knockout: shared live reentry failure; retaining batch marker");
-                                        return;
-                                    }
-                                };
+                            Ok(_) => {
+                                let fetched =
+                                    (batch_id, incoming.clone(), incoming_last_trade.clone());
+                                // Knockout keeps structural membership. The live-only reentry
+                                // below checks fences under the writer lock using these pinned rows.
                                 let _writer = writer_lock.lock().await;
                                 if applied_capacity.load() == capacity_epoch {
-                                    apply_live_reentries(
-                                        live,
-                                        paper_state,
-                                        &reentries,
-                                        &incoming.entries,
-                                        cap,
-                                    );
                                     if sync.marker.is_some() {
                                         evicted.clear();
                                     }
                                     sync.knockout_deferred.clear();
                                     sync.marker = Some(batch_id);
+                                    held_batch = Some(fetched);
                                 } else {
                                     warn!(
                                         batch_id,
@@ -1428,8 +1587,11 @@ async fn maintenance_tick(
                             Err(error) => warn!(%error, batch_id,
                                     "knockout: fence read failed; keeping batch marker for retry"),
                         },
-                        Err(error) => warn!(%error, batch_id,
-                            "knockout: pinned batch fetch failed; keeping batch marker for retry"),
+                        Err(error) => {
+                            shared_batch_fetch_failed = true;
+                            warn!(%error, batch_id,
+                                "knockout: pinned batch fetch failed; keeping batch marker for retry");
+                        }
                     }
                 }
                 // Knockout structural membership is never batch-applied, so there is no
@@ -1455,6 +1617,7 @@ async fn maintenance_tick(
                     .await
                     {
                         Ok((incoming, incoming_last_trade)) => 'replacement: {
+                            let fetched = (batch_id, incoming.clone(), incoming_last_trade.clone());
                             let fenced: HashSet<WalletAddress> = match paper_state.wallet_fences() {
                                 Ok(records) => {
                                     records.into_iter().map(|record| record.wallet).collect()
@@ -1465,6 +1628,9 @@ async fn maintenance_tick(
                                 }
                             };
                             let mut excluded = fenced;
+                            if Some(batch_id) == sync.marker {
+                                excluded.extend(sync.knockout_deferred.iter().copied());
+                            }
                             let mut prepared = HashSet::new();
                             let mut recaptured = HashSet::new();
                             let mut deferrals = Vec::new();
@@ -1494,19 +1660,6 @@ async fn maintenance_tick(
                                     excluded.insert(deferral.wallet);
                                 }
                                 deferrals.extend(plan.deferrals);
-                                let reentry_candidates =
-                                    planned_live_reentries(live, &plan.entries);
-                                let reentries = match preparer
-                                    .prepare_live_reentries(&reentry_candidates)
-                                    .await
-                                {
-                                    Ok(reentries) => reentries,
-                                    Err(error) => {
-                                        error!(batch_id, kind = error.kind(), %error, "full_rerank: shared live reentry failure");
-                                        preparer.record_deferrals(crate::watchlist_admission::DeferralContext::FullRerank { batch_id }, deferrals, crate::watchlist_admission::DeferralOutcome::AbortedShared { kind: error.kind() }).await;
-                                        break 'replacement;
-                                    }
-                                };
                                 let ranking_receipt = match preparer
                                     .record_ranking_membership(Some(batch_id), plan.entries.clone())
                                     .await
@@ -1555,7 +1708,7 @@ async fn maintenance_tick(
                                     capacity_epoch,
                                     &plan.entries,
                                     &plan.last_trade,
-                                    &reentries,
+                                    &[],
                                 )
                                 .await
                                 {
@@ -1619,6 +1772,10 @@ async fn maintenance_tick(
                                 deferred = deferrals.len(),
                                 "full_rerank: admission attempt completed"
                             );
+                            if latest != sync.marker {
+                                sync.knockout_deferred.clear();
+                            }
+                            park_persistent(sync, &deferrals);
                             preparer
                                 .record_deferrals(
                                     crate::watchlist_admission::DeferralContext::FullRerank {
@@ -1660,6 +1817,7 @@ async fn maintenance_tick(
                             }
                             sync.marker = latest;
                             sync.capacity_generation = capacity_epoch.generation;
+                            held_batch = Some(fetched);
                             if incoming.entries.is_empty() {
                                 // #518 made this reachable in normal operation: the read is
                                 // survivor-filtered, so a batch whose rows all fail the gate —
@@ -1686,16 +1844,65 @@ async fn maintenance_tick(
                                     "full re-rank membership swap applied"
                                 );
                             }
+                            let report = live_reentry_tick(
+                                live,
+                                paper_state,
+                                client,
+                                base_url,
+                                anon_key,
+                                secret_key,
+                                writer_lock,
+                                applied_capacity,
+                                capacity_epoch,
+                                preparer,
+                                sync,
+                                held_batch.as_ref(),
+                                &mut attempted_reentries,
+                                now_unix,
+                            )
+                            .await;
+                            record_live_reentry(preparer, sync, cfg.membership_mode, report).await;
                             return;
                         }
-                        Err(e) => warn!(error = %e, batch_id,
-                            "full_rerank: pinned batch fetch failed; keeping membership, will retry next tick"),
+                        Err(e) => {
+                            shared_batch_fetch_failed = true;
+                            warn!(error = %e, batch_id,
+                                "full_rerank: pinned batch fetch failed; keeping membership, will retry next tick");
+                        }
                     }
                 }
             }
         },
-        Err(e) => warn!(error = %e, "maintenance: batch-id fetch failed; keeping evicted-set"),
+        Err(e) => {
+            shared_batch_fetch_failed = true;
+            warn!(error = %e, "maintenance: batch-id fetch failed; keeping evicted-set");
+        }
     }
+
+    // Every applied batch gives structurally present, live-absent wallets one admission turn,
+    // including ticks that will return on edge-stat failure or full structural capacity.
+    let report = if shared_batch_fetch_failed {
+        None
+    } else {
+        live_reentry_tick(
+            live,
+            paper_state,
+            client,
+            base_url,
+            anon_key,
+            secret_key,
+            writer_lock,
+            applied_capacity,
+            capacity_epoch,
+            preparer,
+            sync,
+            held_batch.as_ref(),
+            &mut attempted_reentries,
+            now_unix,
+        )
+        .await
+    };
+    record_live_reentry(preparer, sync, cfg.membership_mode, report).await;
 
     // 2. Per-wallet edge stats from the authoritative local paper-state (knockout pass only —
     // the batch step above never depends on this succeeding).
@@ -1852,8 +2059,7 @@ async fn maintenance_tick(
         {
             Ok(plan) => plan,
             Err(abort) if !backfill_shared => {
-                sync.knockout_deferred
-                    .extend(abort.deferrals.iter().map(|deferral| deferral.wallet));
+                park_persistent(sync, &abort.deferrals);
                 deferrals.extend(abort.deferrals);
                 error!(kind = abort.kind, cause = %abort.message, "maintenance: shared backfill failure; publishing evictions only");
                 backfill_shared = true;
@@ -1861,8 +2067,7 @@ async fn maintenance_tick(
             }
             Err(abort) => {
                 error!(kind = abort.kind, cause = %abort.message, "maintenance: eviction-only planning failed");
-                sync.knockout_deferred
-                    .extend(abort.deferrals.iter().map(|deferral| deferral.wallet));
+                park_persistent(sync, &abort.deferrals);
                 deferrals.extend(abort.deferrals);
                 audit_knockout_abort(preparer, sync.marker, deferrals, abort.kind).await;
                 return;
@@ -1870,8 +2075,8 @@ async fn maintenance_tick(
         };
         for deferral in &plan.deferrals {
             backfill_excluded.insert(deferral.wallet);
-            sync.knockout_deferred.insert(deferral.wallet);
         }
+        park_persistent(sync, &plan.deferrals);
         deferrals.extend(plan.deferrals);
         let ranking_receipt = if plan.entries.is_empty() {
             None
@@ -1947,7 +2152,9 @@ async fn maintenance_tick(
             Err(error) if error.class() != crate::position_seeder::FailureClass::Shared => {
                 if let Some((wallet, kind)) = error.deferrable_wallet() {
                     backfill_excluded.insert(wallet);
-                    sync.knockout_deferred.insert(wallet);
+                    if error.class() == crate::position_seeder::FailureClass::WalletPersistent {
+                        sync.knockout_deferred.insert(wallet);
+                    }
                     deferrals.push(crate::watchlist_admission::Deferral {
                         wallet,
                         stage: "publication",
@@ -1980,9 +2187,7 @@ async fn maintenance_tick(
     );
     info!(batch_id = ?sync.marker, admitted, deferred = deferrals.len(), "maintenance: knockout admission attempt completed");
     if let Some(batch_id) = sync.marker {
-        for deferral in &deferrals {
-            sync.knockout_deferred.insert(deferral.wallet);
-        }
+        park_persistent(sync, &deferrals);
         preparer
             .record_deferrals(
                 crate::watchlist_admission::DeferralContext::Knockout { batch_id },
@@ -3650,7 +3855,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn shared_live_reentry_keeps_both_batch_transitions_pending() {
+        async fn shared_live_reentry_retries_after_applied_batch() {
             let retained = wallet(58);
             for mode in [MembershipMode::FullRerank, MembershipMode::Knockout] {
                 let mut fake = Fake::new(Some(2));
@@ -3660,7 +3865,7 @@ mod tests {
                 h.live.remove_fenced(&set(&[retained]));
                 let (mut evicted, mut marker) = (HashSet::new(), Some(1));
                 h.tick(mode, &mut evicted, &mut marker).await;
-                assert_eq!(marker, Some(1));
+                assert_eq!(marker, Some(2));
                 assert_eq!(h.live.structural_membership(), set(&[retained]));
                 assert_eq!(h.membership_publications.load(Ordering::SeqCst), 0);
             }
@@ -3863,6 +4068,171 @@ mod tests {
                 assert_eq!(h.membership_publications.load(Ordering::SeqCst), 0);
                 assert_eq!(h.controls().len(), if empty_after_boot { 2 } else { 1 });
             }
+        }
+
+        #[tokio::test]
+        async fn pinned_batch_live_reentry_runs_before_full_rerank_return() {
+            let deferred = wallet(71);
+            let mut fake = Fake::new(Some(2));
+            fake.ranking_entries = vec![row(2, 1, deferred)];
+            let pinned_reads = Arc::clone(&fake.pinned_ranking_hits);
+            let h = harness(fake, &[deferred]).await;
+            h.live.remove_fenced(&set(&[deferred]));
+            let mut sync = BatchSync {
+                marker: Some(1),
+                capacity_generation: h.applied.load().generation,
+                knockout_deferred: HashSet::new(),
+            };
+            h.tick_synced(MembershipMode::FullRerank, &mut HashSet::new(), &mut sync)
+                .await;
+            assert_eq!(sync.marker, Some(2));
+            assert_eq!(members(&h.live), set(&[deferred]));
+            assert_eq!(h.controls().len(), 1);
+            assert_eq!(
+                pinned_reads.load(Ordering::SeqCst),
+                1,
+                "the successful rerank's pinned entries are reused for live reentry"
+            );
+        }
+
+        #[tokio::test]
+        async fn pinned_batch_live_reentry_precedes_edge_failure_and_full_capacity_returns() {
+            for full_capacity in [false, true] {
+                let deferred = wallet(72);
+                let peers = if full_capacity {
+                    vec![wallet(73), wallet(74)]
+                } else {
+                    Vec::new()
+                };
+                let mut initial = vec![deferred];
+                initial.extend(peers.iter().copied());
+                let mut fake = Fake::new(Some(1));
+                fake.ranking_entries = initial
+                    .iter()
+                    .enumerate()
+                    .map(|(index, wallet)| row(1, i64::try_from(index + 1).unwrap(), *wallet))
+                    .collect();
+                let pinned_reads = Arc::clone(&fake.pinned_ranking_hits);
+                let h = harness(fake, &initial).await;
+                h.live.remove_fenced(&set(&[deferred]));
+                if !full_capacity {
+                    rusqlite::Connection::open(h._temp.path().join("paper.db"))
+                        .unwrap()
+                        .execute("DROP TABLE fills", [])
+                        .unwrap();
+                }
+                let mut sync = BatchSync {
+                    marker: Some(1),
+                    capacity_generation: h.applied.load().generation,
+                    knockout_deferred: HashSet::new(),
+                };
+                h.tick_synced(MembershipMode::Knockout, &mut HashSet::new(), &mut sync)
+                    .await;
+                assert_eq!(members(&h.live), set(&initial));
+                assert_eq!(h.controls().len(), 1);
+                assert_eq!(pinned_reads.load(Ordering::SeqCst), 1);
+            }
+        }
+
+        #[tokio::test]
+        async fn reentry_report_counts_once_per_tick_and_parks_only_persistent_deferrals() {
+            let (ready, missing) = (wallet(75), wallet(76));
+            let mut fake = Fake::new(Some(1));
+            fake.ranking_entries = vec![row(1, 1, ready), row(1, 2, missing)];
+            fake.history_missing.insert(missing);
+            let h = harness(fake, &[ready, missing]).await;
+            h.live.remove_fenced(&set(&[ready, missing]));
+            let (watchlist, last_trade) = supabase_reader::fetch_batch(
+                &h.client,
+                &h.base_url,
+                "anon",
+                "",
+                1,
+                MAX_ACTIVE_WATCHLIST_SIZE,
+            )
+            .await
+            .unwrap();
+            let held = (1, watchlist, last_trade);
+            let mut attempted = HashSet::new();
+            let mut sync = BatchSync {
+                marker: Some(1),
+                capacity_generation: h.applied.load().generation,
+                knockout_deferred: HashSet::new(),
+            };
+            let first = live_reentry_tick(
+                &h.live,
+                &h.paper_state,
+                &h.client,
+                &h.base_url,
+                "anon",
+                "",
+                &h.writer_lock,
+                &h.applied,
+                h.applied.load(),
+                &h.preparer,
+                &sync,
+                Some(&held),
+                &mut attempted,
+                NOW,
+            )
+            .await
+            .unwrap();
+            assert_eq!((first.before_live, first.after_live), (0, 1));
+            assert_eq!(first.admitted, vec![ready]);
+            assert_eq!(first.deferred.len(), 1);
+            assert_eq!(first.deferred[0].wallet, missing);
+            assert_eq!(
+                first.deferred[0].class,
+                crate::position_seeder::FailureClass::WalletPersistent
+            );
+            record_live_reentry(
+                &h.preparer,
+                &mut sync,
+                MembershipMode::Knockout,
+                Some(first),
+            )
+            .await;
+            assert_eq!(sync.knockout_deferred, set(&[missing]));
+            let second = live_reentry_tick(
+                &h.live,
+                &h.paper_state,
+                &h.client,
+                &h.base_url,
+                "anon",
+                "",
+                &h.writer_lock,
+                &h.applied,
+                h.applied.load(),
+                &h.preparer,
+                &sync,
+                Some(&held),
+                &mut attempted,
+                NOW,
+            )
+            .await;
+            // Nothing is retryable (one wallet live, one parked): no ranking read, no report.
+            assert!(second.is_none());
+            assert_eq!(h.controls().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn persistent_reentry_deferral_reopens_only_after_batch_marker_advance() {
+            let deferred = wallet(77);
+            let mut fake = Fake::new(Some(2));
+            fake.ranking_entries = vec![row(1, 1, deferred), row(2, 1, deferred)];
+            let h = harness(fake, &[deferred]).await;
+            h.live.remove_fenced(&set(&[deferred]));
+            let mut sync = BatchSync {
+                marker: Some(1),
+                capacity_generation: h.applied.load().generation,
+                knockout_deferred: set(&[deferred]),
+            };
+            h.tick_synced(MembershipMode::Knockout, &mut HashSet::new(), &mut sync)
+                .await;
+            assert_eq!(sync.marker, Some(2));
+            assert!(sync.knockout_deferred.is_empty());
+            assert_eq!(members(&h.live), set(&[deferred]));
+            assert_eq!(h.controls().len(), 1);
         }
 
         #[tokio::test]

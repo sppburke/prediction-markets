@@ -90,6 +90,7 @@ pub struct ExpiredAt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)] // one value per POST; boxing the response buys nothing
 pub enum RawPostAttempt {
     Attempted(RawHttpResponse),
     NotAttempted(ExpiredAt),
