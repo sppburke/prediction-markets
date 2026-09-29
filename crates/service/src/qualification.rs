@@ -1986,14 +1986,18 @@ pub(crate) fn indexed_source_prefix_selection(
 > {
     let candidate_sequence = candidate.last_sequence.unwrap_or(EventSeq(0));
     let mut source_universe = HashMap::new();
+    let mut binding_commitments = Vec::new();
     let mut universe_error = None;
     let binding = Scanner::walk_prefix(candidate, &mut |_, envelope| {
         if universe_error.is_some() {
             return;
         }
-        if let Err(error) =
-            fold_source_trade_universe(&mut source_universe, candidate_sequence, envelope.into())
-        {
+        if let Err(error) = fold_source_trade_universe(
+            &mut source_universe,
+            &mut binding_commitments,
+            candidate_sequence,
+            envelope.into(),
+        ) {
             universe_error = Some(error);
         }
     })?
@@ -2003,7 +2007,7 @@ pub(crate) fn indexed_source_prefix_selection(
         )
     })?;
     let sealed_prefix = TailBinding::from(&binding);
-    let universe = universe_error.map_or_else(|| Ok(source_universe), Err);
+    let universe = universe_error.map_or_else(|| Ok((source_universe, binding_commitments)), Err);
     let selected = decision_rows_from_sealed_source(
         state,
         start_prefix,
@@ -2021,8 +2025,8 @@ fn decision_rows_from_source_observations(
     observations: &BTreeMap<u64, SourceObservation>,
 ) -> Result<SelectedDecisionRows, QualificationError> {
     let source_universe = sealed_prefix.last_sequence.map_or_else(
-        || Ok(HashMap::new()),
-        |sealed_sequence| source_trade_universe(sealed_sequence, observations),
+        || Ok((HashMap::new(), Vec::new())),
+        |sealed_sequence| source_trade_universe_with_commitments(sealed_sequence, observations),
     );
     decision_rows_from_sealed_source(
         state,
@@ -2038,14 +2042,62 @@ fn decision_rows_from_sealed_source(
     start_prefix: &TailBinding,
     sealed_prefix: &TailBinding,
     source: SealedSource<'_>,
-    source_universe: Result<HashMap<pe_core_types::SourceTradeId, u64>, QualificationError>,
+    source_universe: Result<
+        (
+            HashMap<pe_core_types::SourceTradeId, u64>,
+            Vec<AppendReceipt>,
+        ),
+        QualificationError,
+    >,
 ) -> Result<SelectedDecisionRows, QualificationError> {
     let start_sequence = start_prefix.last_sequence;
     let Some(sealed_sequence) = sealed_prefix.last_sequence else {
         return Ok(SelectedDecisionRows::default());
     };
     let history = state.decision_pending_history()?;
-    let mut source_universe = source_universe?;
+    let (mut source_universe, binding_commitments) = source_universe?;
+    let mut disposed_bindings = HashMap::new();
+    let mut bound_streams = HashMap::new();
+    for receipt in binding_commitments {
+        let bindings = crate::bucket_commit::verified_commitment_bindings_with_lookup(
+            receipt,
+            &mut |receipt| {
+                if receipt.sequence > sealed_sequence {
+                    return insufficient("binding receipt exceeds the sealed source prefix");
+                }
+                source
+                    .observation(receipt)
+                    .map(|observation| CompleteActivityPage {
+                        payload: observation.payload,
+                        observed_at: observation.observed_at,
+                        received_at: observation.received_at,
+                        source_id: observation.source_id,
+                        schema_version: observation.schema_version,
+                        parser_version: observation.parser_version,
+                        content_type: observation.content_type,
+                    })
+            },
+        );
+        // A commitment without an authentic complete read cannot excuse an absent group.
+        for binding in bindings.into_iter().flatten() {
+            if binding.history_group_id == binding.stream_group_id {
+                continue;
+            }
+            // One observation binds one history identity, in either direction.
+            if disposed_bindings
+                .insert(
+                    binding.history_group_id.clone(),
+                    binding.stream_group_id.clone(),
+                )
+                .is_some_and(|previous| previous != binding.stream_group_id)
+                || bound_streams
+                    .insert(binding.stream_group_id, binding.history_group_id.clone())
+                    .is_some_and(|previous| previous != binding.history_group_id)
+            {
+                return insufficient("complete reads disagree about an observation binding target");
+            }
+        }
+    }
     let terminal_rows = history
         .iter()
         .filter(|row| row.state == DecisionPendingState::Terminal)
@@ -2105,13 +2157,21 @@ fn decision_rows_from_sealed_source(
         if start_sequence.is_some_and(|start| *first_sequence <= start.0) {
             continue;
         }
-        let group = state
-            .activity_group_state(source_trade_id)?
-            .ok_or_else(|| {
-                QualificationError::InsufficientEvidence(format!(
+        let group = match state.activity_group_state(source_trade_id)? {
+            Some(group) => group,
+            None => {
+                let disposed = match disposed_bindings.get(source_trade_id) {
+                    Some(stream_id) => state.activity_group_state(stream_id)?,
+                    None => None,
+                };
+                if disposed.is_some_and(|group| group.disposition != "decision_pending") {
+                    continue;
+                }
+                return insufficient(format!(
                     "source-log trade {source_trade_id} has no durable activity group"
-                ))
-            })?;
+                ));
+            }
+        };
         if group.disposition == "decision_pending" {
             let row =
                 terminal_rows.get(&(source_trade_id.clone(), group.semantic_revision.clone()));
@@ -2336,21 +2396,41 @@ fn complete_activity_read_scopes(
 /// Source-only, fail-closed trade membership from every raw REST activity page in the prefix.
 /// Event envelopes retain payloads and receipts but not request URLs or bounds, so exact page
 /// grouping remains validated from V3 continuations after this projection-independent check.
+#[cfg(test)]
 fn source_trade_universe(
     sealed_sequence: EventSeq,
     observations: &BTreeMap<u64, SourceObservation>,
 ) -> Result<HashMap<pe_core_types::SourceTradeId, u64>, QualificationError> {
+    source_trade_universe_with_commitments(sealed_sequence, observations).map(|(first, _)| first)
+}
+
+fn source_trade_universe_with_commitments(
+    sealed_sequence: EventSeq,
+    observations: &BTreeMap<u64, SourceObservation>,
+) -> Result<
+    (
+        HashMap<pe_core_types::SourceTradeId, u64>,
+        Vec<AppendReceipt>,
+    ),
+    QualificationError,
+> {
     let mut first = HashMap::new();
+    let mut binding_commitments = Vec::new();
     for observation in observations.values() {
-        fold_source_trade_universe(&mut first, sealed_sequence, observation.into())?;
+        fold_source_trade_universe(
+            &mut first,
+            &mut binding_commitments,
+            sealed_sequence,
+            observation.into(),
+        )?;
     }
-    Ok(first)
+    Ok((first, binding_commitments))
 }
 
 /// One source frame as the universe fold sees it, borrowed from either a replayed
 /// `SourceObservation` (offline map path) or a walked `EventEnvelope` (runtime path) (#574).
 struct SourcePageRef<'a> {
-    sequence: EventSeq,
+    receipt: AppendReceipt,
     source_id: &'a str,
     schema_version: u32,
     parser_version: u32,
@@ -2363,7 +2443,7 @@ struct SourcePageRef<'a> {
 impl<'a> From<&'a SourceObservation> for SourcePageRef<'a> {
     fn from(observation: &'a SourceObservation) -> Self {
         Self {
-            sequence: observation.receipt.sequence,
+            receipt: observation.receipt,
             source_id: &observation.source_id,
             schema_version: observation.schema_version,
             parser_version: observation.parser_version,
@@ -2378,7 +2458,10 @@ impl<'a> From<&'a SourceObservation> for SourcePageRef<'a> {
 impl<'a> From<&'a pe_event_log::EventEnvelope> for SourcePageRef<'a> {
     fn from(envelope: &'a pe_event_log::EventEnvelope) -> Self {
         Self {
-            sequence: envelope.seq,
+            receipt: AppendReceipt {
+                sequence: envelope.seq,
+                this_hash: envelope.this_hash,
+            },
             source_id: &envelope.source_id.0,
             schema_version: envelope.schema_version,
             parser_version: envelope.parser_version,
@@ -2399,11 +2482,12 @@ fn is_untyped_object(raw: &str) -> bool {
 
 fn fold_source_trade_universe(
     first: &mut HashMap<pe_core_types::SourceTradeId, u64>,
+    binding_commitments: &mut Vec<AppendReceipt>,
     sealed_sequence: EventSeq,
     page: SourcePageRef<'_>,
 ) -> Result<(), QualificationError> {
     let SourcePageRef {
-        sequence,
+        receipt,
         source_id,
         schema_version,
         parser_version,
@@ -2412,7 +2496,30 @@ fn fold_source_trade_universe(
         received_at,
         payload,
     } = page;
-    if sequence > sealed_sequence || source_id != crate::trade_poller::ACTIVITY_POLL_SOURCE_ID {
+    let sequence = receipt.sequence;
+    if sequence > sealed_sequence {
+        return Ok(());
+    }
+    if source_id == crate::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID {
+        // Only a binding between two different identities can account for an absent history
+        // group; the rare commitment carrying one is authenticated later, the rest cost a scan.
+        let binds_another_identity = payload
+            .windows(b"\"stream_group_id\"".len())
+            .any(|bytes| bytes == b"\"stream_group_id\"")
+            && serde_json::from_slice::<crate::bucket_commit::ActivityReadCommitment>(payload)
+                .is_ok_and(|commitment| {
+                    commitment
+                        .bindings
+                        .iter()
+                        .flatten()
+                        .any(|binding| binding.history_group_id != binding.stream_group_id)
+                });
+        if binds_another_identity {
+            binding_commitments.push(receipt);
+        }
+        return Ok(());
+    }
+    if source_id != crate::trade_poller::ACTIVITY_POLL_SOURCE_ID {
         return Ok(());
     }
     crate::bucket_commit::activity_page_generation(
@@ -13330,6 +13437,55 @@ mod tests {
                     .is_err()
                 );
             }
+        }
+    }
+
+    /// A commitment-only read can account for a REST history identity disposed under its
+    /// authenticated websocket identity, even when no decision continuation was recorded.
+    #[test]
+    fn disposed_stream_binding_accounts_for_history_trade_without_a_decision() {
+        for (case, pending, accepted) in [
+            ("disposed_valid", false, true),
+            ("disposed_no_binding", false, false),
+            ("disposed_valid", true, false),
+            ("disposed_invalid_occurrence", false, false),
+        ] {
+            let fixture = crate::bucket_commit::continuation_v3_tests::binding_fixture(case);
+            let source_path = fixture.dir.path().join("binding.log");
+            let stream_receipt = fixture.continuation.observed_source_receipt.unwrap();
+            let stream = fixture.index.source_envelope(stream_receipt).unwrap();
+            let stream = parse_activity_trade_observation(&stream.payload).unwrap();
+            let mut disposed = fixture.continuation.clone();
+            disposed.facts.source_trade_id = stream.group_id.key().clone();
+            let state = PaperStateDb::open(&fixture.dir.path().join("disposed.db")).unwrap();
+            store_read_decision(
+                &state,
+                &disposed,
+                if pending {
+                    "decision_pending"
+                } else {
+                    "stale_activity_ws_past_copy_budget"
+                },
+                pending,
+            );
+            let candidate = Scanner::verify(&source_path).unwrap();
+            let sealed = TailBinding::from(&candidate);
+            let start = prefix_at(Some(stream_receipt.sequence.0));
+            let map = decision_rows_for_source_prefix(&state, &source_path, &start, &sealed);
+            let indexed =
+                decision_rows_for_indexed_source_prefix(&state, &fixture.index, &candidate, &start);
+            if accepted {
+                assert!(map.is_ok(), "case={case}: {map:?}");
+                assert!(indexed.is_ok(), "case={case}: {indexed:?}");
+            } else {
+                assert!(
+                    matches!(&map,
+                    Err(QualificationError::InsufficientEvidence(message))
+                        if message.contains("has no durable activity group")),
+                    "case={case}, pending={pending}: {map:?}"
+                );
+            }
+            assert_selection_results_equal(map, indexed, &sealed);
         }
     }
 
