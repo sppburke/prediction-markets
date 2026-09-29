@@ -620,33 +620,53 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             candidate_sequence = ?candidate.last_sequence,
             "qualification seal started"
         );
-        let (decisions, sealed_source_prefix) =
-            crate::qualification::decision_rows_for_indexed_source_prefix(
+        let qualification_error = |error| match error {
+            crate::qualification::QualificationError::EventLog(error) => error.to_string(),
+            other => other.to_string(),
+        };
+        let (sealed_source_prefix, selected) =
+            crate::qualification::indexed_source_prefix_selection(
                 &self.paper_state,
                 source_receipts,
                 &candidate,
                 &started.source_prefix,
             )
-            .map_err(|error| match error {
-                crate::qualification::QualificationError::EventLog(error) => error.to_string(),
-                other => other.to_string(),
-            })?;
+            .map_err(qualification_error)?;
         let frames_walked = sealed_source_prefix
             .last_sequence
             .map_or(0, |sequence| sequence.0.saturating_add(1));
-        let decision_keys = decisions
-            .rows
-            .into_iter()
-            .map(|row| (row.source_trade_id, row.semantic_revision))
-            .collect::<Vec<_>>();
-        let decision_evidence = self
-            .paper_state
-            .seal_decision_evidence_for_source_prefix(
-                &decision_keys,
-                &decisions.in_prefix,
-                sealed_source_prefix.last_sequence,
-            )
-            .map_err(|error| error.to_string())?;
+        let (decision_evidence, reason) = match (selected, reason) {
+            (Ok(decisions), reason) => {
+                let decision_keys = decisions
+                    .rows
+                    .into_iter()
+                    .map(|row| (row.source_trade_id, row.semantic_revision))
+                    .collect::<Vec<_>>();
+                let evidence = self
+                    .paper_state
+                    .seal_decision_evidence_for_source_prefix(
+                        &decision_keys,
+                        &decisions.in_prefix,
+                        sealed_source_prefix.last_sequence,
+                    )
+                    .map_err(|error| error.to_string())?;
+                (evidence, reason)
+            }
+            // An insufficient-evidence seal still closes the verified prefix when its decision
+            // evidence cannot be assembled (a bracket's recorded pages whose install never
+            // committed leave source trades without durable groups): its digest covers no
+            // decisions and its reason says why. A Complete seal still requires the evidence.
+            (
+                Err(crate::qualification::QualificationError::InsufficientEvidence(detail)),
+                SealReason::InsufficientEvidence(why),
+            ) => (
+                Vec::new(),
+                SealReason::InsufficientEvidence(format!(
+                    "{why}; decision evidence unavailable: {detail}"
+                )),
+            ),
+            (Err(error), _) => return Err(qualification_error(error)),
+        };
         let financial_prefix =
             Scanner::verify(paper_log_path).map_err(|error| error.to_string())?;
         let live_prefix = pe_execution_core::LiveJournal::verified_tail(
@@ -5196,6 +5216,68 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(sealed_records(&paper_path), seals);
+    }
+
+    /// PASS: a bracket whose install never committed leaves a recorded activity page with a trade
+    /// that has no durable group; the semantic-change seal still closes the verified prefix.
+    #[tokio::test]
+    async fn boot_semantic_seal_closes_the_prefix_when_decision_evidence_is_unavailable() {
+        let StartedSealFixture {
+            _dir,
+            paper_path,
+            source_path,
+            state,
+            paper_writer,
+            ..
+        } = started_seal_fixture_with_semantic("start-hash", 1);
+        let page = serde_json::to_vec(&serde_json::json!([{
+            "proxyWallet": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "type": "TRADE",
+            "conditionId": "0xuncommitted",
+            "asset": "123",
+            "side": "BUY",
+            "size": "5",
+            "usdcSize": "2.5",
+            "price": "0.5",
+            "timestamp": (SEAL_START_UNIX + 1).to_string(),
+            "transactionHash": "0xuncommitted",
+            "outcomeIndex": "0"
+        }]))
+        .unwrap();
+        let mut source_writer = Writer::open(&source_path).unwrap();
+        append_source(
+            &mut source_writer,
+            crate::trade_poller::ACTIVITY_POLL_SOURCE_ID,
+            SEAL_START_UNIX + 2,
+            page,
+        );
+        drop(source_writer);
+        let source_receipts = SourceReceiptIndex::replay(&source_path).unwrap();
+        let mut orchestrator = test_orchestrator(
+            paper_path.clone(),
+            source_path,
+            paper_writer,
+            state,
+            source_receipts,
+        );
+        orchestrator
+            .seal_before_resume("start-hash", FINANCIAL_SEMANTIC_VERSION)
+            .await
+            .unwrap();
+        let seals = sealed_records(&paper_path);
+        assert_eq!(seals.len(), 1);
+        assert!(
+            matches!(&seals[0].reason, SealReason::InsufficientEvidence(detail)
+                if detail.contains("financial semantic version changed from 1 to 2")
+                    && detail.contains("decision evidence unavailable")
+                    && detail.contains("has no durable activity group")),
+            "{:?}",
+            seals[0].reason
+        );
+        assert_eq!(
+            seals[0].decision_evidence_digest,
+            blake3::hash(&[]).to_hex().to_string()
+        );
     }
 
     /// PASS: configuration drift seals exactly the receipt-index tail supplied by `SealCheck`.
