@@ -973,7 +973,7 @@ impl WalletCache {
         Ok(Self { conn })
     }
 
-    fn apply_connection_tuning(
+    pub(crate) fn apply_connection_tuning(
         conn: &Connection,
         tuning: &CacheTuning,
     ) -> Result<(), BootstrapError> {

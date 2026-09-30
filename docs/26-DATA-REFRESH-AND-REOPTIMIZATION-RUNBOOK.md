@@ -42,7 +42,9 @@ cargo build --release -p pe-bootstrap
   Symptom to recognize: `sqlite: unable to open database file` from a stage whose cache
   path is demonstrably writable.
 - **Wallet-cache memory.** The operator knobs and defaults are in
-  [Bootstrap defaults](_GLOSSARY.md#bootstrap-defaults-pe-bootstrap); the effective
+  [Bootstrap defaults](_GLOSSARY.md#bootstrap-defaults-pe-bootstrap) and apply to
+  writable `WalletCache` opens and activity collector writers in legacy, fresh and
+  bulk modes, including resume. The effective
   [mmap ceiling](https://www.sqlite.org/pragma.html#pragma_mmap_size) is capped by
   bundled SQLite's platform/build limit (or zero when mmap is unavailable), so use
   the writer's `wallet cache: connection tuning applied` log rather than assuming
@@ -68,8 +70,9 @@ cargo build --release -p pe-bootstrap
 Run this comparison on Forge through the existing
 [systemd loop lifecycle](#continuous-forge-supervisor), using the defaults in
 [Bootstrap defaults](_GLOSSARY.md#bootstrap-defaults-pe-bootstrap) for the candidate.
-This changes read-side caching only; acquisition transactions, WAL and index maintenance
-remain unchanged. No automatic memory sizing is performed.
+The tuning also applies to activity collector writers, including resume. Per-wallet
+commits, `synchronous=FULL`, WAL and index maintenance remain unchanged. No automatic
+memory sizing is performed.
 
 1. Before building, preserve the currently installed `c1cdf82` binary as
    `target/release/pe-bootstrap.pre-606-c1cdf82` and retain the current `.env` for
@@ -1178,8 +1181,10 @@ SELECT name, SUM(pgsize) AS bytes FROM dbstat GROUP BY name ORDER BY name;
 
 Record the actual collector writer's startup log: `journal_mode`, `synchronous`,
 `wal_autocheckpoint`, `page_size`, `cache_size`, `mmap_size`, SQLite version/source ID. This connection
-uses `open_existing_rw` and sets busy timeout only; do not infer its connection-local settings from
-`WalletCache` or a separate SQLite shell. Keep durability and automatic checkpoint settings unchanged.
+retains its guarded opener and busy timeout, then applies the configured cache and mmap tuning
+through `WalletCache::apply_connection_tuning`, including on resume. Use this writer log to verify
+effective settings; a separate SQLite shell has its own connection-local settings. Per-wallet commits,
+`synchronous=FULL` and automatic checkpoint settings remain unchanged.
 Enable the `pe_bootstrap::cache_migration` debug log for wallet transaction elapsed time and advancing
 carry counts/batches. Record all of:
 

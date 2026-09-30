@@ -17,6 +17,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use pe_bootstrap::BootstrapConfig;
 use pe_bootstrap::cache::{RankerPageStatus, RankerPricePage, WalletCache};
 use pe_bootstrap::cache_migration::{
     CacheActivationRequest, CacheFinalStageRecord, CacheV2BuildManifest, FrozenCacheFreshness,
@@ -125,6 +126,13 @@ fn write_pending_publication(
         .unwrap();
     std::fs::write(&pending_path, format!("{}\n", relative.display())).unwrap();
     (request_path, pending_path)
+}
+
+fn collection_config(cache_path: &std::path::Path) -> BootstrapConfig {
+    BootstrapConfig {
+        cache_path: cache_path.to_owned(),
+        ..BootstrapConfig::default()
+    }
 }
 
 fn seed_v1(path: &std::path::Path, timestamp: i64) -> WalletCache {
@@ -318,7 +326,7 @@ async fn finalize_empty_activity_side(
         "https://data.example/activity?user={WALLET}&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&limit=500&offset=0&sortDirection=DESC&end={watermark}"
     );
     populate_activity_v2(
-        side,
+        &collection_config(side),
         &FixtureFetcher::new(HashMap::from([(activity_url, b"[]".to_vec())])),
         "https://data.example",
         &frozen_path,
@@ -429,7 +437,7 @@ async fn migration_is_resumable_and_activation_installs_only_the_finalized_main(
         "https://data.example/activity?user={WALLET}&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&limit=500&offset=0&sortDirection=DESC&end={watermark}"
     );
     let activity = populate_activity_v2(
-        &side,
+        &collection_config(&side),
         &FixtureFetcher::new(HashMap::from([(activity_url, b"[]".to_vec())])),
         "https://data.example",
         &frozen_path,
@@ -1138,7 +1146,7 @@ async fn projection_admits_only_entries_the_live_path_takes() {
     );
     let fetcher = FixtureFetcher::new(HashMap::from([(url, body.into_bytes())]));
     populate_activity_v2(
-        &side,
+        &collection_config(&side),
         &fetcher,
         "https://data.example",
         &frozen_path,
@@ -1603,7 +1611,7 @@ async fn v2_activity_population_is_complete_idempotent_and_generation_isolated()
     );
     let fetcher = FixtureFetcher::new(HashMap::from([(url, body.into_bytes())]));
     let first = populate_activity_v2(
-        &side,
+        &collection_config(&side),
         &fetcher,
         "https://data.example",
         &frozen_path,
@@ -1615,7 +1623,7 @@ async fn v2_activity_population_is_complete_idempotent_and_generation_isolated()
     .unwrap();
     assert_eq!(first.generation, 7);
     let second = populate_activity_v2(
-        &side,
+        &collection_config(&side),
         &fetcher,
         "https://data.example",
         &frozen_path,
@@ -1674,7 +1682,7 @@ async fn v2_activity_population_is_complete_idempotent_and_generation_isolated()
                 .unwrap();
             // Completion's validation-only traversal is the error reference.
             let reference_error = populate_activity_v2(
-                &damaged,
+                &collection_config(&damaged),
                 &YieldingFetcher::default(),
                 "https://data.example",
                 &frozen_path,
@@ -1821,7 +1829,7 @@ async fn retained_classifier_activity_at_version(
         "https://data.example/activity?user={WALLET}&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&limit=500&offset=0&sortDirection=DESC&end={fixed_end}"
     );
     populate_activity_v2(
-        side,
+        &collection_config(side),
         &FixtureFetcher::new(HashMap::from([(url, raw.clone())])),
         "https://data.example",
         &frozen,
@@ -2016,7 +2024,7 @@ async fn refinalization_reuses_projection_after_targeted_price_write() {
     );
     drop(connection);
     let verification = populate_activity_v2(
-        &side,
+        &collection_config(&side),
         &FixtureFetcher::new(HashMap::new()),
         "https://data.example",
         &frozen,
@@ -2435,7 +2443,7 @@ fn retain_legacy_empty_projection(path: &std::path::Path) {
 async fn assert_no_activity_recollection(side: &std::path::Path, frozen: &std::path::Path) {
     let fetcher = YieldingFetcher::default();
     populate_activity_v2(
-        side,
+        &collection_config(side),
         &fetcher,
         "https://data.example",
         frozen,
@@ -3409,7 +3417,7 @@ async fn activity_wallet_receipts_bound_resume_and_finalize_atomically() {
         .unwrap();
     drop(connection);
     let failed = populate_activity_v2(
-        &side,
+        &collection_config(&side),
         &YieldingFetcher::default(),
         "https://data.example",
         &frozen,
@@ -3438,7 +3446,7 @@ async fn activity_wallet_receipts_bound_resume_and_finalize_atomically() {
 
     let fetcher = YieldingFetcher::default();
     let preview = populate_activity_v2(
-        &side,
+        &collection_config(&side),
         &fetcher,
         "https://data.example",
         &frozen,
@@ -3474,7 +3482,7 @@ async fn activity_wallet_receipts_bound_resume_and_finalize_atomically() {
     drop(connection);
     assert!(
         populate_activity_v2(
-            &side,
+            &collection_config(&side),
             &YieldingFetcher::default(),
             "https://data.example",
             &frozen,
@@ -3497,7 +3505,7 @@ async fn activity_wallet_receipts_bound_resume_and_finalize_atomically() {
     drop(connection);
     assert!(
         populate_activity_v2(
-            &side,
+            &collection_config(&side),
             &YieldingFetcher::default(),
             "https://data.example",
             &frozen,
@@ -3535,7 +3543,7 @@ async fn activity_wallet_receipts_bound_resume_and_finalize_atomically() {
         .unwrap();
     let resumed = YieldingFetcher::default();
     populate_activity_v2(
-        &side,
+        &collection_config(&side),
         &resumed,
         "https://data.example",
         &frozen,
@@ -4788,7 +4796,7 @@ async fn wallet_budget_excludes_a_read_the_venue_never_answers_and_completes_the
     let side = budgeted_candidate(&dir);
     let fetcher = BudgetedReads::new(WALLET_B, TargetBehaviour::Hang);
     let manifest = pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
-        &side,
+        &collection_config(&side),
         &fetcher,
         "https://data.example",
         1,
@@ -4844,7 +4852,7 @@ async fn wallet_budget_retries_a_rate_limited_read_in_place_then_excludes_it() {
         let fetcher =
             BudgetedReads::new(WALLET_B, TargetBehaviour::RateLimited { retry_after_secs });
         pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
-            &side,
+            &collection_config(&side),
             &fetcher,
             "https://data.example",
             1,
@@ -4880,7 +4888,7 @@ async fn wallet_budget_retries_a_rate_limited_read_in_place_then_excludes_it() {
         },
     );
     let error = pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
-        &side,
+        &collection_config(&side),
         &fetcher,
         "https://data.example",
         1,
@@ -4905,9 +4913,10 @@ async fn without_a_wallet_budget_a_pending_read_waits_and_completes_when_release
     let dir = TempDir::new().unwrap();
     let side = budgeted_candidate(&dir);
     let fetcher = BudgetedReads::new(WALLET_B, TargetBehaviour::Hang);
+    let config = collection_config(&side);
     let mut run = std::pin::pin!(
         pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
-            &side,
+            &config,
             &fetcher,
             "https://data.example",
             1,
@@ -8293,7 +8302,7 @@ async fn incremental_full_read_equivalence_through_aggregation_certification_and
     admit_dataset_wallet(&incremental, WALLET_E);
     source.calls.lock().unwrap().clear();
     let delta_manifest = pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
-        &incremental,
+        &collection_config(&incremental),
         &source,
         "https://data.example",
         7,
@@ -8606,7 +8615,7 @@ async fn incremental_collision_exclusion_then_full_replacement_and_empty_replace
     // An explicit empty full read deletes every retained row; an empty delta on B carries.
     source.rows.retain(|row| row["proxyWallet"] != WALLET);
     pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
-        &side,
+        &collection_config(&side),
         &source,
         "https://data.example",
         9,
@@ -8675,7 +8684,7 @@ async fn incremental_revision_before_boundary_requires_explicit_full_read() {
         "incremental reads cannot discover a pre-boundary revision"
     );
     let c = pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
-        &side,
+        &collection_config(&side),
         &source,
         "https://data.example",
         8,
@@ -8721,6 +8730,18 @@ async fn incremental_wallet_and_manifest_transactions_roll_back_at_every_write_b
         "BUY",
         FRESH_END + 1,
     ));
+    let uninterrupted = dir.path().join("uninterrupted.db");
+    std::fs::copy(&prior, &uninterrupted).unwrap();
+    let expected = populate_activity_fresh_v2(
+        &uninterrupted,
+        &source,
+        "https://data.example",
+        7,
+        FRESH_END + 2,
+        FRESH_END + 4,
+    )
+    .await
+    .unwrap();
     let fixtures = [
         (
             "before_carry",
@@ -8755,13 +8776,20 @@ async fn incremental_wallet_and_manifest_transactions_roll_back_at_every_write_b
         let side = dir.path().join(format!("{name}.db"));
         std::fs::copy(&prior, &side).unwrap();
         Connection::open(&side).unwrap().execute_batch(&format!("CREATE TRIGGER inject_failure {trigger} BEGIN SELECT RAISE(ABORT, 'injected wallet/manifest failure'); END;")).unwrap();
-        let error = populate_activity_fresh_v2(
-            &side,
+        let mut config = BootstrapConfig {
+            cache_page_cache_mib: 1,
+            cache_mmap_mib: 2,
+            ..collection_config(&side)
+        };
+        let error = pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
+            &config,
             &source,
             "https://data.example",
             7,
-            FRESH_END + 2,
+            &[],
+            || Ok(FRESH_END + 2),
             FRESH_END + 3,
+            None,
         )
         .await
         .unwrap_err();
@@ -8793,18 +8821,65 @@ async fn incremental_wallet_and_manifest_transactions_roll_back_at_every_write_b
             .unwrap()
             .execute_batch("DROP TRIGGER inject_failure")
             .unwrap();
+        // Page receive timestamps are part of the receipt commitment. Once
+        // the wallet committed, both resumes can use identical recorded inputs.
+        let committed_receipts = stored_receipt_proofs(&Connection::open(&side).unwrap(), 7);
+        let unchanged_tuning = if manifest_failure {
+            let baseline = dir.path().join(format!("{name}-unchanged-tuning.db"));
+            std::fs::copy(&side, &baseline).unwrap();
+            let baseline_config = BootstrapConfig {
+                cache_path: baseline,
+                ..config.clone()
+            };
+            Some(
+                pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
+                    &baseline_config,
+                    &FixtureFetcher::new(HashMap::new()),
+                    "https://data.example",
+                    7,
+                    &[],
+                    || Ok(FRESH_END + 999),
+                    FRESH_END + 4,
+                    None,
+                )
+                .await
+                .unwrap(),
+            )
+        } else {
+            None
+        };
         source.calls.lock().unwrap().clear();
-        let manifest = populate_activity_fresh_v2(
-            &side,
+        // Connection tuning is outside the frozen identity and commitments.
+        config.cache_page_cache_mib = 8;
+        let manifest = pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
+            &config,
             &source,
             "https://data.example",
             7,
-            FRESH_END + 999,
+            &[],
+            || Ok(FRESH_END + 999),
             FRESH_END + 4,
+            None,
         )
         .await
         .unwrap();
         assert_eq!(manifest.group_count, 1031);
+        assert_eq!(
+            manifest.reference_sha256, expected.reference_sha256,
+            "{name}: identity commitment"
+        );
+        assert_eq!(
+            manifest.aggregate_digest, expected.aggregate_digest,
+            "{name}: aggregate commitment"
+        );
+        if let Some(unchanged_tuning) = unchanged_tuning {
+            assert_eq!(manifest, unchanged_tuning, "{name}: resumed commitments");
+            assert_eq!(
+                stored_receipt_proofs(&Connection::open(&side).unwrap(), 7),
+                committed_receipts,
+                "{name}: retained receipt proofs"
+            );
+        }
         assert_eq!(source.calls.lock().unwrap().is_empty(), manifest_failure);
         assert_eq!(fresh_record(&side)["fixed_end_unix"], FRESH_END + 2);
         source.calls.lock().unwrap().clear();
@@ -9064,7 +9139,7 @@ async fn incremental_versions_windows_and_predecessor_corruption_fail_before_sou
     let sampled = AtomicUsize::new(0);
     assert!(
         pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
-            &damaged,
+            &collection_config(&damaged),
             &source,
             "https://data.example",
             2,
@@ -9120,7 +9195,7 @@ async fn retained_wallet_without_a_predecessor_receipt_refuses_a_successor_befor
     let identity_before = fresh_record(&side);
     let sampled = AtomicUsize::new(0);
     let refused = pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
-        &side,
+        &collection_config(&side),
         &source,
         "https://data.example",
         2,
@@ -9413,9 +9488,10 @@ async fn incremental_full_replacement_rolls_back_deletion_and_keeps_failed_histo
     let old = query_values(&side, "SELECT * FROM activity_groups_v2");
     Connection::open(&side).unwrap().execute_batch("CREATE TRIGGER fail_replacement BEFORE INSERT ON activity_groups_v2 WHEN NEW.coverage_generation = 7 BEGIN SELECT RAISE(ABORT, 'injected replacement failure'); END").unwrap();
     source.rows[0]["size"] = Value::from("3.25");
+    let config = collection_config(&side);
     let replace = || {
         pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
-            &side,
+            &config,
             &source,
             "https://data.example",
             7,
@@ -9427,7 +9503,7 @@ async fn incremental_full_replacement_rolls_back_deletion_and_keeps_failed_histo
     };
     assert!(
         pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
-            &side,
+            &collection_config(&side),
             &source,
             "https://data.example",
             7,
@@ -9681,7 +9757,7 @@ async fn incremental_admission_rejects_invalid_bounds_generation_and_full_read_s
         let source = DatasetFetcher::default();
         assert!(
             pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
-                &side,
+                &collection_config(&side),
                 &source,
                 "https://data.example",
                 generation,
@@ -10361,7 +10437,7 @@ impl BulkRootFixture {
         pe_bootstrap::error::BootstrapError,
     > {
         pe_bootstrap::cache_migration::populate_activity_bulk_root_v2_with_clock(
-            &self.side,
+            &collection_config(&self.side),
             &self.fixed,
             None,
             source,
@@ -10480,7 +10556,7 @@ async fn collect_bulk_root_in_child(
     pe_bootstrap::error::BootstrapError,
 > {
     pe_bootstrap::cache_migration::populate_activity_bulk_root_v2_with_clock(
-        &root.join("side.db"),
+        &collection_config(&root.join("side.db")),
         &root.join("fixed.db"),
         Some(&root.join("prior.db")),
         source,
@@ -10622,7 +10698,7 @@ async fn non_bulk_admission_ignores_unwritable_sqlite_temp_storage() {
         let reference = write_frozen_reference(&dir, FRESH_END - 10, vec![WALLET.to_owned()]);
         let source = YieldingFetcher::default();
         let manifest = populate_activity_v2(
-            &frozen,
+            &collection_config(&frozen),
             &source,
             "https://data.example",
             &reference,
@@ -10928,7 +11004,7 @@ async fn bulk_root_cross_wallet_duplicate_is_permanent_and_preserves_receipts() 
         )
     );
     let successor = pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
-        &fixture.side,
+        &collection_config(&fixture.side),
         &no_reads,
         "https://data.example",
         2,
@@ -11181,7 +11257,7 @@ async fn bulk_root_fence_refuses_other_commands_and_successor_before_clock() {
     }
     let no_reads = DatasetFetcher::default();
     let error = pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
-        &fixture.side,
+        &collection_config(&fixture.side),
         &no_reads,
         "https://data.example",
         2,
@@ -11281,7 +11357,7 @@ async fn bulk_root_admission_refuses_aliases_existing_roots_and_successors() {
     std::fs::hard_link(&fixture.side, &alias).unwrap();
     for fixed in [&fixture.side, &alias] {
         let error = pe_bootstrap::cache_migration::populate_activity_bulk_root_v2_with_clock(
-            &fixture.side,
+            &collection_config(&fixture.side),
             fixed,
             Some(&fixture.prior),
             &DatasetFetcher::default(),
@@ -11783,7 +11859,7 @@ async fn bulk_root_admits_new_staging_baseline_and_legacy_prior() {
         }
         let source = DatasetFetcher::default();
         populate_activity_bulk_root_v2_with_clock(
-            &fixture.side,
+            &collection_config(&fixture.side),
             &fixture.fixed,
             if legacy { Some(&fixture.prior) } else { None },
             &source,
