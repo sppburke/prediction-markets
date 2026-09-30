@@ -15,8 +15,8 @@ env:
 # (test_activate_generation.sh and test_activate_financial_era.sh) were ~16 min each, because
 # both replay the real activation driver once per crash boundary.
 #
-# Splitting by owner turns sum() into max(). The two activation suites are already separate
-# scripts, so no sharding logic is needed. Neither suite invokes cargo, so those jobs skip the
+# Splitting by owner turns sum() into max(). The two activation suites use three financial-era
+# shards and two generation shards. Neither suite invokes cargo, so those jobs skip the
 # toolchain, the cargo tools, the build cache and the disk reclaim entirely.
 #
 # Measured again on 2026-09-18 (#664): pull requests waited about 26 min, set by the financial-era
@@ -236,6 +236,10 @@ jobs:
     needs: changes
     if: needs.changes.outputs.activation == 'true'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -247,12 +251,18 @@ jobs:
           python-version: "3.11"
 
       - run: bash scripts/deploy/test_activate_generation.sh
+        env:
+          SHARD: "${{ matrix.shard }}/2"
 
   activation-financial:
     name: financial-era activation scenarios
     needs: changes
     if: needs.changes.outputs.activation == 'true'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -264,6 +274,8 @@ jobs:
           python-version: "3.11"
 
       - run: bash scripts/paper_reset/test_activate_financial_era.sh
+        env:
+          SHARD: "${{ matrix.shard }}/3"
 
   postgres:
     name: Postgres scenarios

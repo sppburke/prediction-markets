@@ -5,14 +5,27 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 export PE_TEST_GENERATION_COMMON="$SCRIPT_DIR/generation_common.sh"
-TEST_TMP=$(mktemp -d)
-trap 'rm -rf "$TEST_TMP"' EXIT
 
 fail() {
   echo "FAIL: $*" >&2
   exit 1
 }
 
+SHARD=${SHARD:-1/1}
+[[ "$SHARD" =~ ^([1-9][0-9]?)/([1-9][0-9]?)$ ]] || fail "invalid SHARD: $SHARD"
+SHARD_INDEX=${BASH_REMATCH[1]}
+SHARD_TOTAL=${BASH_REMATCH[2]}
+(( SHARD_INDEX <= SHARD_TOTAL )) || fail "invalid SHARD: $SHARD"
+
+shard_owns() {
+  local owner=$1
+  (( SHARD_TOTAL == 1 || SHARD_INDEX == (owner < SHARD_TOTAL ? owner : SHARD_TOTAL) ))
+}
+
+TEST_TMP=$(mktemp -d)
+trap 'rm -rf "$TEST_TMP"' EXIT
+
+if shard_owns 1; then
 # Environment files are parsed as data, including the quoting emitted by the sanitizers.
 parser_env="$TEST_TMP/parser.env"
 printf '%s\n' '# comment' '; comment' 'QUOTED='"'"'two words'"'" \
@@ -119,6 +132,7 @@ set -e
   fail "digest-bound adoption replaced the destination with unreviewed bytes"
 grep -q 'source hash changed before adoption' "$TEST_TMP/adopt.err" ||
   fail "digest-bound adoption refusal was not explicit"
+fi
 
 write_shims() {
   local bin=$1
@@ -746,6 +760,7 @@ run_crash_case() {
   fi
 }
 
+if shard_owns 2; then
 manifest_boundaries=(
   seed prepared prechecked guarded archived reset switched started site-confirmed verified
 )
@@ -763,7 +778,10 @@ artifact_boundaries=(
   adopted-config adopted-env adopted-binary db-commit service-started
 )
 for boundary in "${artifact_boundaries[@]}"; do run_crash_case "$boundary"; done
+(( SHARD_TOTAL == 1 )) || echo "activation crash matrix: PASS"
+fi
 
+if shard_owns 1; then
 # The production lock is provisioned out of band; an absent lock fails before any state is created.
 root=$(make_case lock-absent)
 rm "$root/.pe-deploy.lock"
@@ -2049,7 +2067,7 @@ for state in reset switched started verified; do
   assert_rolled_back "$root" true "$expected_starts"
 done
 
-echo "activation crash matrix: PASS"
+(( SHARD_TOTAL > 1 )) || echo "activation crash matrix: PASS"
 echo "archive stamp exactly once and fresh service starts at most once: PASS"
 echo "rollback durable-fact restore and forward-refusal matrix: PASS"
 echo "lock, preflight, invocation, batch, site, and reboot: PASS"
@@ -2057,3 +2075,4 @@ echo "post-start refusal stop, disable, rewind, audit, and rerun-or-rollback rec
 echo "process cwd, stable snapshot, and exact environment ownership: PASS"
 echo "strict environment grammar and loader-control refusal: PASS"
 echo "Forge pause tri-state, live status proof, and serialization: PASS"
+fi
