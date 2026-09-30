@@ -7,6 +7,9 @@ use std::path::Path;
 use std::process::{Command, Output};
 
 use pe_bootstrap::cache::{CACHE_SCHEMA_VERSION_V1, CACHE_SCHEMA_VERSION_V2, WalletCache};
+use pe_bootstrap::cache_migration::{
+    FrozenCacheFreshness, FrozenPayloadReference, migrate_cache_v2, stage_cache_cycle_v2,
+};
 use pe_bootstrap::lock::CacheMutationLock;
 use pe_bootstrap::pile::SRC_TRADES;
 use tempfile::TempDir;
@@ -503,16 +506,88 @@ fn invalid_cache_tuning_refuses_before_any_opener_creates_database_or_lock() {
 
 #[test]
 fn every_writable_opener_logs_requested_and_effective_cache_tuning_from_env() {
-    let openers: [&[&str]; 3] = [
+    let openers: [&[&str]; 6] = [
         &["clear-infra-exclusion"],
         &[],
         &["cache-populate-payout-v2"],
+        &[
+            "cache-populate-activity-v2",
+            "--frozen-payload",
+            "frozen.json",
+            "--fixed-end",
+            "1800000000",
+            "--generation",
+            "1",
+        ],
+        &["cache-populate-activity-v2", "--fresh-generation", "1"],
+        &[
+            "cache-populate-activity-v2",
+            "--fresh-generation",
+            "1",
+            "--bulk-root",
+            "--fixed-db",
+            "fixed.db",
+        ],
     ];
     for args in openers {
         let dir = TempDir::new().unwrap();
         let cache_path = dir.path().join("cache.db");
+        let activity = args.first() == Some(&"cache-populate-activity-v2");
+        let fixed_path = dir.path().join("fixed.db");
         // These commands tune an existing cache; provisioning is explicit.
-        WalletCache::open(&cache_path).unwrap();
+        let mut cache =
+            WalletCache::open(if activity { &fixed_path } else { &cache_path }).unwrap();
+        if args.contains(&"--frozen-payload") {
+            // Freshness evidence with an empty ranked universe reaches the
+            // legacy writer without making a source request.
+            let watermark = 1_800_000_000;
+            cache.conn_for_test_insert_trade(&wallet_hex(0x65), "legacy", watermark);
+            cache
+                .raw_conn_for_test()
+                .execute_batch(
+                    "INSERT INTO market_resolutions
+                     (market_id, winning_outcome_id, resolved_at_unix, fetched_at_unix, source)
+                 VALUES ('m', 0, 1800000000, 1800000000, 'clob');
+                 INSERT INTO source_cursor (key, value, updated_at)
+                 VALUES ('clob_closed', '', 1800000000);",
+                )
+                .unwrap();
+            let reference = FrozenPayloadReference {
+                version: 1,
+                process_now_unix: watermark + 60,
+                active_window_hours: 72,
+                max_cache_staleness_hours: 24,
+                ranked_wallets: Vec::new(),
+                active_wallets: Vec::new(),
+                freshness: FrozenCacheFreshness {
+                    newest_trade_unix: watermark,
+                    newest_resolution_fetch_unix: watermark,
+                    clob_cursor: String::new(),
+                    clob_cursor_updated_at: watermark,
+                },
+            };
+            std::fs::write(
+                dir.path().join("frozen.json"),
+                serde_json::to_vec(&reference).unwrap(),
+            )
+            .unwrap();
+        }
+        drop(cache);
+        if activity {
+            // Empty fresh/bulk roots also exercise the actual writer, with no
+            // network fixture or interruption lifecycle needed.
+            let build = dir.path().join("build.json");
+            std::fs::create_dir(dir.path().join("eval-results")).unwrap();
+            stage_cache_cycle_v2(
+                &fixed_path,
+                &dir.path().join("prior.db"),
+                &cache_path,
+                Some(&build),
+                None,
+            )
+            .unwrap();
+            migrate_cache_v2(&cache_path, &build).unwrap();
+        }
         let legacy_path = dir.path().join("wallet_set.json");
         // Stop no-argument `all` in the local legacy reader after the open,
         // before wallet discovery can perform any network I/O. The other two
@@ -534,11 +609,19 @@ fn every_writable_opener_logs_requested_and_effective_cache_tuning_from_env() {
                 ),
             ],
         );
-        assert_eq!(output.status.code(), Some(1), "args={args:?}");
+        assert_eq!(
+            output.status.code(),
+            Some(if activity { 0 } else { 1 }),
+            "args={args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         let stderr = String::from_utf8(output.stderr).unwrap();
-        let tuning: Vec<serde_json::Value> = stderr
+        let logs: Vec<serde_json::Value> = stderr
             .lines()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .collect();
+        let tuning: Vec<_> = logs
+            .iter()
             .filter(|entry| entry["fields"]["message"] == "wallet cache: connection tuning applied")
             .collect();
         assert_eq!(tuning.len(), 1, "args={args:?}: {stderr}");
@@ -548,6 +631,19 @@ fn every_writable_opener_logs_requested_and_effective_cache_tuning_from_env() {
         assert_eq!(fields["requested_mmap_bytes"], 2 * (1 << 20));
         let effective_mmap = fields["effective_mmap_bytes"].as_i64().unwrap();
         assert!((0..=2 * (1 << 20)).contains(&effective_mmap));
+        if activity {
+            let writers: Vec<_> = logs
+                .iter()
+                .filter(|entry| {
+                    entry["fields"]["message"] == "activity writer effective SQLite settings"
+                })
+                .collect();
+            assert_eq!(writers.len(), 1, "args={args:?}: {stderr}");
+            let writer = &writers[0]["fields"];
+            assert_eq!(writer["cache_size"], -3 * 1024);
+            assert_eq!(writer["mmap_size"], effective_mmap);
+            assert_eq!(writer["synchronous"], 2);
+        }
         assert!(cache_path.exists());
     }
 }

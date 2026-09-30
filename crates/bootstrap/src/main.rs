@@ -483,13 +483,13 @@ async fn main() {
                                 let fixed = fixed_db_arg.as_deref()
                                     .ok_or_else(|| BootstrapError::Invalid { message: "--bulk-root requires --fixed-db and staging evidence (or legacy --prior) to verify private candidate paths".to_owned() })?;
                                 return populate_activity_bulk_root_v2_with_clock(
-                                    &bootstrap_config.cache_path, fixed, prior_arg.as_deref(), &fetcher,
+                                    &bootstrap_config, fixed, prior_arg.as_deref(), &fetcher,
                                     &bootstrap_config.polymarket_base_url, settled_end, now,
                                     wallet_budget,
                                 ).await.and_then(activity_json_report);
                             }
                             return populate_activity_fresh_v2_with_clock(
-                                &bootstrap_config.cache_path,
+                                &bootstrap_config,
                                 &fetcher,
                                 &bootstrap_config.polymarket_base_url,
                                 generation,
@@ -520,7 +520,7 @@ async fn main() {
                             &bootstrap_config.cache_path,
                         )?;
                         populate_activity_v2(
-                            &bootstrap_config.cache_path,
+                            &bootstrap_config,
                             &fetcher,
                             &bootstrap_config.polymarket_base_url,
                             frozen_reference,

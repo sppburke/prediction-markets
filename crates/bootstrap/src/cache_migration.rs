@@ -58,8 +58,9 @@ use incremental::{
 
 use crate::cache::{
     CACHE_SCHEMA_VERSION_BULK_ROOT, CACHE_SCHEMA_VERSION_V1, CACHE_SCHEMA_VERSION_V2,
-    REQUIRED_TRADES_INDEXES, reject_bulk_root,
+    REQUIRED_TRADES_INDEXES, WalletCache, reject_bulk_root,
 };
+use crate::config::BootstrapConfig;
 use crate::error::BootstrapError;
 use crate::lock::{ForgeActivationLocks, ForgeLockHandoff};
 use crate::reclamation_evidence::{
@@ -744,7 +745,7 @@ impl PublicationConsumptionProbe for SupabasePublicationProbe {
 /// wallet reads run concurrently through the caller's one shared fetcher; only
 /// each wallet's aggregate-and-receipt SQLite transaction is serialized here.
 pub async fn populate_activity_v2(
-    cache_path: &Path,
+    config: &BootstrapConfig,
     fetcher: &dyn ReconciliationFetcher,
     base_url: &str,
     frozen_reference_path: &Path,
@@ -752,6 +753,8 @@ pub async fn populate_activity_v2(
     generation: u64,
     completed_at_unix: i64,
 ) -> Result<ActivityCoverageManifestV2, BootstrapError> {
+    let tuning = config.cache_tuning()?;
+    let cache_path = config.cache_path.as_path();
     let schema_connection = open_existing_rw(cache_path)?;
     require_schema(&schema_connection, CACHE_SCHEMA_VERSION_V2)?;
     if fresh_collection_record(&schema_connection)?.is_some() {
@@ -766,6 +769,7 @@ pub async fn populate_activity_v2(
     wallets.dedup();
 
     let connection = open_existing_rw(cache_path)?;
+    WalletCache::apply_connection_tuning(&connection, &tuning)?;
     require_schema(&connection, CACHE_SCHEMA_VERSION_V2)?;
     bind_frozen_activity_identity(
         &connection,
@@ -812,8 +816,12 @@ pub async fn populate_activity_fresh_v2(
     new_generation_end_unix: i64,
     completed_at_unix: i64,
 ) -> Result<ActivityCoverageManifestV2, BootstrapError> {
+    let config = BootstrapConfig {
+        cache_path: cache_path.to_owned(),
+        ..BootstrapConfig::default()
+    };
     populate_activity_fresh_v2_with_clock(
-        cache_path,
+        &config,
         fetcher,
         base_url,
         generation,
@@ -832,7 +840,7 @@ pub async fn populate_activity_fresh_v2(
     reason = "the collector's universe, clock and wallet budget are explicit call-site inputs"
 )]
 pub async fn populate_activity_fresh_v2_with_clock(
-    cache_path: &Path,
+    config: &BootstrapConfig,
     fetcher: &dyn ReconciliationFetcher,
     base_url: &str,
     generation: u64,
@@ -841,7 +849,9 @@ pub async fn populate_activity_fresh_v2_with_clock(
     completed_at_unix: i64,
     wallet_budget: Option<Duration>,
 ) -> Result<ActivityCoverageManifestV2, BootstrapError> {
-    let mut connection = open_existing_rw(cache_path)?;
+    let tuning = config.cache_tuning()?;
+    let mut connection = open_existing_rw(&config.cache_path)?;
+    WalletCache::apply_connection_tuning(&connection, &tuning)?;
     require_schema(&connection, CACHE_SCHEMA_VERSION_V2)?;
     ensure_lane_a_v2_schema(&connection)?;
     let record = begin_or_resume_fresh_collection(
@@ -879,7 +889,7 @@ pub async fn populate_activity_fresh_v2_with_clock(
     reason = "the collector's universe, clock and wallet budget are explicit call-site inputs"
 )]
 pub async fn populate_activity_bulk_root_v2_with_clock(
-    cache_path: &Path,
+    config: &BootstrapConfig,
     fixed_path: &Path,
     prior_path: Option<&Path>,
     fetcher: &dyn ReconciliationFetcher,
@@ -888,6 +898,8 @@ pub async fn populate_activity_bulk_root_v2_with_clock(
     completed_at_unix: i64,
     wallet_budget: Option<Duration>,
 ) -> Result<ActivityCoverageManifestV2, BootstrapError> {
+    let tuning = config.cache_tuning()?;
+    let cache_path = config.cache_path.as_path();
     let mut roles = vec![
         ("private bulk-root candidate", cache_path),
         ("fixed cache", fixed_path),
@@ -917,6 +929,7 @@ pub async fn populate_activity_bulk_root_v2_with_clock(
     // may have changed since the last wallet receipt was committed.
     require_bulk_root_sqlite_temp_file()?;
     let mut connection = open_root_collector_rw(cache_path)?;
+    WalletCache::apply_connection_tuning(&connection, &tuning)?;
     let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version != CACHE_SCHEMA_VERSION_BULK_ROOT {
         require_schema(&connection, CACHE_SCHEMA_VERSION_V2)?;
