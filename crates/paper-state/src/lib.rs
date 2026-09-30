@@ -277,6 +277,8 @@ pub struct PositionValidationRecord {
 /// accepted activity/positions bracket and wallet coverage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnchorInstallRecord {
+    pub repaired_history: Vec<MarketHistoryRecord>,
+    pub expected_fence: Option<WalletFenceRecord>,
     /// Runtime history completion, committed with this anchor and preserving an existing complete proof.
     pub history_status: Option<WalletHistoryStatusRecord>,
     pub wallet: WalletAddress,
@@ -320,6 +322,14 @@ pub struct ActivityGroupRow {
     pub source_epoch: i64,
     pub semantic_revision: String,
     pub disposition: String,
+    pub proof_json: String,
+}
+
+/// Immutable recovery evidence attributed by the original group, never by recording time.
+#[derive(Debug, Clone)]
+pub struct RecoveryActivityRow {
+    pub source_trade_id: SourceTradeId,
+    pub source_epoch: i64,
     pub proof_json: String,
 }
 
@@ -474,6 +484,17 @@ struct SealPageOccurrence {
     receipt: AppendReceipt,
 }
 
+fn read_wallet_fence(
+    conn: &Connection,
+    wallet: &WalletAddress,
+) -> Result<Option<WalletFenceRecord>, PaperStateError> {
+    conn.query_row("SELECT source_trade_id, cause, proof_json, fenced_at_unix FROM wallet_fences WHERE wallet_hex = ?1",
+        params![wallet.to_string()], |row| Ok(WalletFenceRecord {
+            wallet: *wallet, source_trade_id: SourceTradeId(row.get(0)?), cause: row.get(1)?,
+            proof_json: row.get(2)?, fenced_at_unix: row.get(3)?,
+        })).optional().map_err(PaperStateError::from)
+}
+
 fn validate_seal_decision_keys(
     keys: &[(SourceTradeId, String)],
 ) -> Result<BTreeSet<(String, String)>, PaperStateError> {
@@ -505,8 +526,8 @@ pub enum DispatchStagingEvidence<'a> {
     PaperOutcomeCheckpoint(PendingTerminalEvidence<'a>),
 }
 
-/// Monotonic durable wallet fence.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Durable wallet fence, cleared only by an atomic authoritative recovery anchor.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WalletFenceRecord {
     pub wallet: WalletAddress,
     pub source_trade_id: SourceTradeId,
@@ -917,6 +938,86 @@ impl PaperStateDb {
             .map_err(PaperStateError::from)
     }
 
+    pub fn activity_revision_state(
+        &self,
+        id: &SourceTradeId,
+        revision: &str,
+    ) -> Result<Option<ActivityGroupState>, PaperStateError> {
+        self.lock().query_row("SELECT r.transaction_hash, r.semantic_revision, g.source_epoch, r.disposition, r.proof_json
+            FROM activity_group_revisions r JOIN activity_groups g USING (source_trade_id)
+            WHERE r.source_trade_id = ?1 AND r.semantic_revision = ?2", params![id.0, revision], |row| Ok(ActivityGroupState {
+                transaction_hash: row.get(0)?, semantic_revision: row.get(1)?, source_epoch: row.get(2)?, disposition: row.get(3)?, proof_json: row.get(4)?,
+            })).optional().map_err(PaperStateError::from)
+    }
+
+    /// Exact disposed revision with its canonical transaction identity.
+    pub fn activity_revision_matches(
+        &self,
+        id: &SourceTradeId,
+        revision: &str,
+        transaction_hash: &str,
+    ) -> Result<bool, PaperStateError> {
+        self.lock()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM activity_group_revisions WHERE source_trade_id = ?1
+             AND semantic_revision = ?2 AND transaction_hash = ?3)",
+                params![id.0, revision, transaction_hash],
+                |row| row.get(0),
+            )
+            .map_err(PaperStateError::from)
+    }
+
+    /// All original effects and all retained revisions through an accepted source cutoff.
+    pub fn recovery_activity_evidence(
+        &self,
+        wallet: &WalletAddress,
+        cutoff: i64,
+    ) -> Result<Vec<RecoveryActivityRow>, PaperStateError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT source_trade_id, source_epoch, proof_json FROM (
+             SELECT g.source_trade_id, g.source_epoch, g.proof_json, g.semantic_revision
+             FROM activity_groups g WHERE g.wallet_hex = ?1 AND g.source_epoch <= ?2
+             UNION ALL
+             SELECT g.source_trade_id, g.source_epoch, r.proof_json, r.semantic_revision
+             FROM activity_groups g JOIN activity_group_revisions r USING (source_trade_id)
+             WHERE g.wallet_hex = ?1 AND g.source_epoch <= ?2)
+             ORDER BY source_epoch, source_trade_id, semantic_revision",
+        )?;
+        let rows = statement.query_map(params![wallet.to_string(), cutoff], |row| {
+            Ok(RecoveryActivityRow {
+                source_trade_id: SourceTradeId(row.get(0)?),
+                source_epoch: row.get(1)?,
+                proof_json: row.get(2)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(PaperStateError::from)
+    }
+
+    /// Unique revised fence trigger, attributed through the original group and source epoch.
+    pub fn revised_fence_trigger_disposed(
+        &self,
+        fence: &WalletFenceRecord,
+        epoch: i64,
+    ) -> Result<bool, PaperStateError> {
+        self.lock().query_row(
+            "SELECT COUNT(*) = 1 FROM activity_group_revisions r JOIN activity_groups g USING (source_trade_id)
+             WHERE g.source_trade_id = ?1 AND g.wallet_hex = ?2 AND g.source_epoch = ?3
+               AND r.semantic_revision != g.semantic_revision AND r.transaction_hash = g.transaction_hash
+               AND r.recorded_at_unix = ?4 AND r.disposition IN ('revised_applied_aggregate', 'raw_only')",
+            params![fence.source_trade_id.0, fence.wallet.to_string(), epoch, fence.fenced_at_unix],
+            |row| row.get(0),
+        ).map_err(PaperStateError::from)
+    }
+
+    pub fn wallet_fence(
+        &self,
+        wallet: &WalletAddress,
+    ) -> Result<Option<WalletFenceRecord>, PaperStateError> {
+        read_wallet_fence(&self.lock(), wallet)
+    }
+
     /// Greatest fully committed version-two bucket epoch for one wallet.
     pub fn last_activity_group_epoch(
         &self,
@@ -1111,8 +1212,10 @@ impl PaperStateDb {
             .is_some();
         let mut invalidates_position_validation = false;
         let mut inserts_reanchor_trigger = false;
+        let mut retains_novel_revision = false;
 
         for record in &bucket.dispositions {
+            let mut non_original = false;
             let existing: Option<(String, String, String, String, i64, String, String)> = tx
                 .query_row(
                     "SELECT transaction_hash, semantic_revision, disposition, wallet_hex, \
@@ -1158,6 +1261,7 @@ impl PaperStateDb {
                     ));
                 }
                 invalidates_position_validation |= retained_revision;
+                non_original = revision != record.semantic_revision;
             } else {
                 invalidates_position_validation = true;
                 inserts_reanchor_trigger |= bucket
@@ -1202,6 +1306,7 @@ impl PaperStateDb {
                     ));
                 }
             } else {
+                retains_novel_revision |= non_original;
                 tx.execute(
                     "INSERT INTO activity_group_revisions \
                          (source_trade_id, semantic_revision, transaction_hash, disposition, \
@@ -1256,6 +1361,10 @@ impl PaperStateDb {
                 )));
             }
             invalidates_position_validation = true;
+        }
+
+        if retains_novel_revision && !inserts_reanchor_trigger {
+            tx.execute("UPDATE poll_cursors SET coverage_generation = coverage_generation + 1 WHERE wallet_hex = ?1", params![bucket.wallet.to_string()])?;
         }
 
         for leader in &bucket.leader_positions {
@@ -1571,6 +1680,30 @@ impl PaperStateDb {
         let tx = conn.transaction()?;
         for (install, balances, balances_json) in prepared {
             let wallet_hex = install.wallet.to_string();
+            if read_wallet_fence(&tx, &install.wallet)? != install.expected_fence {
+                return Err(PaperStateError::Internal(format!(
+                    "active fence changed before anchor install for {}",
+                    install.wallet
+                )));
+            }
+            for history in &install.repaired_history {
+                if history.wallet != install.wallet {
+                    return Err(PaperStateError::Internal(
+                        "repaired history wallet mismatch".to_owned(),
+                    ));
+                }
+                tx.execute(
+                    "INSERT OR IGNORE INTO wallet_market_history_v2
+                    (wallet_hex, market_id, first_epoch, source_trade_id, origin)
+                    VALUES (?1, ?2, ?3, ?4, 'activity_v2')",
+                    params![
+                        wallet_hex,
+                        history.market_id.to_string(),
+                        history.first_epoch,
+                        history.source_trade_id.0
+                    ],
+                )?;
+            }
             let stored_cutoff: Option<Option<i64>> = tx
                 .query_row(
                     "SELECT activity_cutoff_unix FROM poll_cursors WHERE wallet_hex = ?1",
@@ -1656,6 +1789,12 @@ impl PaperStateDb {
             };
             if let Some(status) = &install.history_status {
                 upsert_history_status(&tx, status, true)?;
+            }
+            if install.expected_fence.is_some() {
+                tx.execute(
+                    "DELETE FROM wallet_fences WHERE wallet_hex = ?1",
+                    params![wallet_hex],
+                )?;
             }
             tx_upsert_position_validation(&tx, &validation)?;
             tx.execute(
@@ -5695,6 +5834,8 @@ mod tests {
         ledger_hash_after: &str,
     ) -> AnchorInstallRecord {
         AnchorInstallRecord {
+            repaired_history: Vec::new(),
+            expected_fence: None,
             history_status: None,
             wallet,
             balances,
@@ -8950,5 +9091,149 @@ mod tests {
             );
             assert_eq!(db.dispatch_targets(&staged.dispatch_id).unwrap(), targets);
         }
+    }
+    #[test]
+    fn paper_service_rollout_recovery_history_anchor_and_fence_commit_atomically() {
+        for fail in [false, true] {
+            let (_dir, db) = db();
+            let w = wallet();
+            db.set_cursor(&w, 10).unwrap();
+            let fence = WalletFenceRecord {
+                wallet: w,
+                source_trade_id: group_id('a'),
+                cause: "position_underflow".to_owned(),
+                proof_json: "{\"bucket_epoch\":10}".to_owned(),
+                fenced_at_unix: 20,
+            };
+            db.lock()
+                .execute(
+                    "INSERT INTO wallet_fences VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        w.to_string(),
+                        fence.source_trade_id.0,
+                        fence.cause,
+                        fence.proof_json,
+                        fence.fenced_at_unix
+                    ],
+                )
+                .unwrap();
+            let mut install = anchor_install(w, Vec::new(), 100, 200, "recovered");
+            install.expected_fence = Some(fence.clone());
+            install.repaired_history = vec![MarketHistoryRecord {
+                wallet: w,
+                market_id: market(),
+                first_epoch: 5,
+                source_trade_id: group_id('b'),
+            }];
+            install.history_status = Some(WalletHistoryStatusRecord {
+                wallet: w,
+                complete: true,
+                proof_json: "{}".to_owned(),
+                updated_at_unix: 200,
+            });
+            let result = db.install_anchors_inner(&[install], fail);
+            assert_eq!(result.is_ok(), !fail);
+            assert_eq!(db.wallet_fence(&w).unwrap().is_some(), fail);
+            assert_eq!(db.wallet_history_complete(&w).unwrap(), !fail);
+            assert_eq!(db.position_anchors(&w).unwrap().len(), usize::from(!fail));
+            assert_eq!(
+                db.gate_history()
+                    .unwrap()
+                    .get(&w)
+                    .is_some_and(|markets| markets.contains(&market())),
+                !fail
+            );
+        }
+    }
+
+    #[test]
+    fn paper_service_rollout_changed_fence_refuses_the_entire_install() {
+        let (_dir, db) = db();
+        let w = wallet();
+        db.set_cursor(&w, 10).unwrap();
+        let fence = WalletFenceRecord {
+            wallet: w,
+            source_trade_id: group_id('a'),
+            cause: "position_underflow".to_owned(),
+            proof_json: "{\"bucket_epoch\":10}".to_owned(),
+            fenced_at_unix: 20,
+        };
+        db.lock()
+            .execute(
+                "INSERT INTO wallet_fences VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    w.to_string(),
+                    fence.source_trade_id.0,
+                    fence.cause,
+                    fence.proof_json,
+                    fence.fenced_at_unix
+                ],
+            )
+            .unwrap();
+        for component in 0..4 {
+            let mut expected = fence.clone();
+            match component {
+                0 => expected.source_trade_id = group_id('b'),
+                1 => expected.cause = "position_overflow".to_owned(),
+                2 => expected.proof_json = "{}".to_owned(),
+                _ => expected.fenced_at_unix += 1,
+            }
+            let mut install = anchor_install(w, Vec::new(), 100, 200, "refused");
+            install.expected_fence = Some(expected);
+            install.repaired_history = vec![MarketHistoryRecord {
+                wallet: w,
+                market_id: market(),
+                first_epoch: 5,
+                source_trade_id: group_id('b'),
+            }];
+            assert!(db.install_anchors(&[install]).is_err());
+            assert_eq!(db.wallet_fence(&w).unwrap(), Some(fence.clone()));
+            assert!(db.position_anchors(&w).unwrap().is_empty());
+            assert!(!db.gate_history().unwrap().contains_key(&w));
+        }
+    }
+
+    #[test]
+    fn paper_service_rollout_revision_generation_advances_once_and_trigger_is_unique() {
+        let (_dir, db) = db();
+        let w = wallet();
+        db.set_cursor(&w, 100).unwrap();
+        let original = activity_bucket(w, 100, &['a']);
+        db.commit_activity_bucket(&original).unwrap();
+        let before = db.wallet_coverage(&w).unwrap().coverage_generation;
+        let fence = WalletFenceRecord {
+            wallet: w,
+            source_trade_id: group_id('a'),
+            cause: "revised_applied_aggregate".to_owned(),
+            proof_json: "{\"bucket_epoch\":100}".to_owned(),
+            fenced_at_unix: 200,
+        };
+        let mut revision = original.clone();
+        revision.dispositions[0].semantic_revision = "secondary".to_owned();
+        revision.dispositions[0].disposition = "raw_only".to_owned();
+        revision.fence = Some(fence.clone());
+        db.commit_activity_bucket(&revision).unwrap();
+        assert_eq!(
+            db.wallet_coverage(&w).unwrap().coverage_generation,
+            before + 1
+        );
+        assert!(db.revised_fence_trigger_disposed(&fence, 100).unwrap());
+        assert!(!db.revised_fence_trigger_disposed(&fence, 101).unwrap());
+        db.commit_activity_bucket(&revision).unwrap();
+        assert_eq!(
+            db.wallet_coverage(&w).unwrap().coverage_generation,
+            before + 1
+        );
+        revision.dispositions[0].semantic_revision = "third".to_owned();
+        db.commit_activity_bucket(&revision).unwrap();
+        assert_eq!(
+            db.wallet_coverage(&w).unwrap().coverage_generation,
+            before + 2
+        );
+        assert!(!db.revised_fence_trigger_disposed(&fence, 100).unwrap());
+        let evidence = db.recovery_activity_evidence(&w, 100).unwrap();
+        assert_eq!(evidence.len(), 4); // original, its immutable revision, and both secondary revisions
+        assert!(evidence.iter().all(|row| row.source_epoch == 100));
+        assert!(db.recovery_activity_evidence(&w, 99).unwrap().is_empty());
     }
 }

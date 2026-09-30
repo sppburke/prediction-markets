@@ -134,12 +134,55 @@ fn select_boot_anchor_wallets(
     Ok(selection)
 }
 
+fn progressive_boot_enabled(
+    cfg: &pe_service::config::ServiceConfig,
+    first_migration: bool,
+    exit_after_anchors: bool,
+) -> bool {
+    !first_migration
+        && !exit_after_anchors
+        && !cfg.supabase_url.is_empty()
+        && cfg.maintenance_interval_secs > 0
+}
+
+fn boot_wave_has_eligible_wallet<'a>(
+    paper: &PaperStateDb,
+    accepted_or_reused: impl Iterator<Item = &'a WalletAddress>,
+) -> Result<bool, pe_paper_state::PaperStateError> {
+    for wallet in accepted_or_reused {
+        if paper.wallet_history_complete(wallet)? && !paper.is_wallet_fenced(wallet)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     let exit_after_anchors = args
         .iter()
         .any(|argument| argument == "--exit-after-anchors");
+    if args
+        .iter()
+        .any(|argument| argument == "--prepare-source-checkpoint")
+    {
+        let position = args
+            .iter()
+            .position(|argument| argument == "--paper-state")
+            .context("--prepare-source-checkpoint requires --paper-state <installed-path>")?;
+        let paper = args
+            .get(position + 1)
+            .context("--paper-state requires a path")?;
+        let tail = pe_service::source_log_boot::SourceLogBoot::prepare_checkpoint(
+            std::path::Path::new(paper),
+        )?;
+        println!(
+            "prepared source checkpoint: {} bytes, sequence {:?}",
+            tail.physical_tail, tail.last_sequence
+        );
+        return Ok(());
+    }
     if args.iter().any(|argument| argument == "--version") {
         println!("{}", pe_service::build_info::version_line());
         return Ok(());
@@ -820,23 +863,61 @@ async fn main() -> Result<()> {
         first_migration_boot = migration_boot.session.is_some(),
         "boot anchor selection census"
     );
-    let boot_validation = boot_position_validator
-        .validate_direct_with_deferrals(
-            &boot_anchor_selection.walked,
-            &mut boot_engine,
-            &paper_state,
-        )
-        .await
-        .context("causal current-position validation for boot universe")?;
-    let boot_persistent_deferred = boot_validation
-        .deferred
-        .iter()
-        .filter(|(_, error)| {
-            error.class() == pe_service::position_seeder::FailureClass::WalletPersistent
-        })
-        .map(|(wallet, _)| *wallet)
-        .collect();
-    let anchored = boot_validation.accepted;
+    let progressive_boot =
+        progressive_boot_enabled(&cfg, migration_boot.session.is_some(), exit_after_anchors);
+    let mut anchored = Vec::new();
+    let mut boot_persistent_deferred = std::collections::HashSet::new();
+    let mut boot_cooldowns = std::collections::HashMap::new();
+    let reused_eligible =
+        boot_wave_has_eligible_wallet(&paper_state, boot_anchor_selection.reused.iter())?;
+    if !progressive_boot || !reused_eligible {
+        let wave_size = if progressive_boot {
+            pe_service::position_seeder::BRACKET_CONCURRENCY
+        } else {
+            boot_anchor_selection.walked.len().max(1)
+        };
+        for wave in boot_anchor_selection.walked.chunks(wave_size) {
+            let outcome = boot_position_validator
+                .validate_direct_with_deferrals(wave, &mut boot_engine, &paper_state)
+                .await
+                .context("causal current-position validation for boot universe")?;
+            for (wallet, error) in &outcome.deferred {
+                if error.class() == pe_service::position_seeder::FailureClass::WalletPersistent
+                    && !(error.kind() == "validation.fenced"
+                        && paper_state
+                            .wallet_fence(wallet)?
+                            .as_ref()
+                            .map(|fence| {
+                                pe_service::position_seeder::recoverable_fence(&paper_state, fence)
+                            })
+                            .transpose()?
+                            .unwrap_or(false))
+                {
+                    boot_persistent_deferred.insert(*wallet);
+                }
+                if error.class() == pe_service::position_seeder::FailureClass::WalletTransient
+                    && let Some(terminal) = outcome.failure_completed_at(wallet)
+                {
+                    boot_cooldowns.insert(
+                        *wallet,
+                        terminal
+                            + Duration::from_secs(pe_service::trade_poller::ANCHOR_REFRESH_SECS),
+                    );
+                }
+            }
+            anchored.extend(outcome.accepted);
+            let eligible = boot_wave_has_eligible_wallet(
+                &paper_state,
+                anchored
+                    .iter()
+                    .map(|install| &install.wallet)
+                    .chain(&boot_anchor_selection.reused),
+            )?;
+            if progressive_boot && eligible {
+                break;
+            }
+        }
+    }
     let leader_ledger = boot_engine.into_ledger();
     drop(boot_position_validator);
     let (source_log, source_rx) =
@@ -1580,6 +1661,7 @@ async fn main() -> Result<()> {
             admission_preparer.clone(),
             boot_batch_marker,
             boot_persistent_deferred,
+            boot_cooldowns,
         );
         supervisor.spawn(
             TaskName::WatchlistMaintenance,
@@ -1717,6 +1799,12 @@ async fn main() -> Result<()> {
         .await;
         Ok(TaskExit::CleanShutdown)
     });
+
+    if let Some(boot) = &source_log_boot
+        && let Err(error) = boot.publish_checkpoint()
+    {
+        warn!(%error, "source checkpoint publication failed; next boot can perform a full walk");
+    }
 
     let initial_failure = loop {
         tokio::select! {
@@ -2320,6 +2408,8 @@ mod tests {
         paper_state.set_cursor(&wallet, 9_000).unwrap();
         paper_state
             .install_anchors(&[AnchorInstallRecord {
+                repaired_history: Vec::new(),
+                expected_fence: None,
                 history_status: None,
                 wallet,
                 balances: Vec::new(),
@@ -2493,5 +2583,31 @@ mod tests {
             select_boot_anchor_wallets(&paper_state, &[with_validation], true, NOW).unwrap();
         assert!(migration.reused.is_empty());
         assert_eq!(migration.walked, vec![with_validation]);
+    }
+    #[test]
+    fn paper_service_rollout_boot_requires_an_eligible_wave_and_preserves_complete_modes() {
+        let cfg = pe_service::config::ServiceConfig {
+            supabase_url: "http://fixture".to_owned(),
+            ..pe_service::config::ServiceConfig::default()
+        };
+        assert!(progressive_boot_enabled(&cfg, false, false));
+        assert!(!progressive_boot_enabled(&cfg, true, false));
+        assert!(!progressive_boot_enabled(&cfg, false, true));
+        assert!(!progressive_boot_enabled(
+            &pe_service::config::ServiceConfig {
+                maintenance_interval_secs: 0,
+                ..cfg.clone()
+            },
+            false,
+            false
+        ));
+        assert!(!progressive_boot_enabled(
+            &pe_service::config::ServiceConfig {
+                supabase_url: String::new(),
+                ..cfg
+            },
+            false,
+            false
+        ));
     }
 }

@@ -291,6 +291,12 @@ impl MigrationMetadata {
         read_record(&connection)
     }
 
+    /// Inspect installed metadata without opening a writer or upgrading the database.
+    pub fn read_read_only(path: &Path) -> Result<Option<MigrationRecord>, PaperStateError> {
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        read_record(&connection)
+    }
+
     /// Advance one state-machine edge and synchronize the database main file.
     pub fn advance_phase(
         path: &Path,

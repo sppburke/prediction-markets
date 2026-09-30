@@ -1400,7 +1400,7 @@ fn assert_live_wrapper_preimage_rejected(
     );
 }
 
-fn golden_config_rows(runtime: &RuntimeConfig) -> Vec<ConfigRow> {
+pub fn golden_config_rows(runtime: &RuntimeConfig) -> Vec<ConfigRow> {
     let mut rows = vec![
         (
             "active_watchlist_size",
@@ -1698,6 +1698,8 @@ pub(crate) async fn golden_source_stream_replays_exact_economic_core() {
         .map(|wallet| {
             let captured = ledger_capture(seed_engine.ledger(), &paper, *wallet).unwrap();
             AnchorInstall {
+                fresh_history: Vec::new(),
+                expected_fence: None,
                 history_status: None,
                 wallet: *wallet,
                 balances: Vec::new(),

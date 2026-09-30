@@ -156,6 +156,8 @@ fn install(
     let captured = ledger_capture(engine.ledger(), paper, wallet()).unwrap();
     engine
         .install_anchors(&[AnchorInstall {
+            fresh_history: Vec::new(),
+            expected_fence: None,
             history_status: None,
             wallet: wallet(),
             balances,

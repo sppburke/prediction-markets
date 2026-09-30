@@ -24,6 +24,25 @@ pub fn count(path: &Path) -> std::io::Result<u64> {
     Ok(*counts.get(&canonical).unwrap_or(&0))
 }
 
+static DECODED: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+pub(crate) fn record_decoded(path: &Path) {
+    let mut counts = DECODED
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *counts.entry(path.to_path_buf()).or_default() += 1;
+}
+
+/// Verified frame decodes in scanner walks, excluding raw-prefix hashing and receipt metadata.
+pub fn decoded_count(path: &Path) -> std::io::Result<u64> {
+    let canonical = std::fs::canonicalize(path)?;
+    let counts = DECODED
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    Ok(*counts.get(&canonical).unwrap_or(&0))
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {

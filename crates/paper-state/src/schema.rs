@@ -192,7 +192,8 @@ CREATE TABLE IF NOT EXISTS decision_pending (
     updated_at_unix        INTEGER NOT NULL
 );
 
--- Monotonic per-wallet fence set. No DELETE owner exists.
+-- Per-wallet fences clear only with exact-fence comparison, repaired history, and an
+-- authoritative causal anchor in the same install_anchors transaction.
 CREATE TABLE IF NOT EXISTS wallet_fences (
     wallet_hex       TEXT    PRIMARY KEY NOT NULL,
     source_trade_id  TEXT    NOT NULL,

@@ -220,6 +220,8 @@ async fn late_group_then_strict_decrement_in_one_read_both_become_durable() {
         .unwrap();
     paper
         .install_anchors(&[AnchorInstallRecord {
+            repaired_history: Vec::new(),
+            expected_fence: None,
             history_status: None,
             wallet: wallet(),
             balances: vec![
@@ -916,6 +918,8 @@ fn start_recorded_poller_with_completion_stop(
             .unwrap();
         paper
             .install_anchors(&[AnchorInstallRecord {
+                repaired_history: Vec::new(),
+                expected_fence: None,
                 history_status: None,
                 wallet: *wallet,
                 balances: Vec::new(),

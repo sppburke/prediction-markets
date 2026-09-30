@@ -2551,6 +2551,8 @@ mod paper_log_tests {
             state.set_cursor(wallet, 10).unwrap();
             state
                 .install_anchors(&[pe_paper_state::AnchorInstallRecord {
+                    repaired_history: Vec::new(),
+                    expected_fence: None,
                     history_status: None,
                     wallet: *wallet,
                     balances: Vec::new(),
@@ -2788,6 +2790,8 @@ mod paper_log_tests {
             state.set_cursor(&selected, 10).unwrap();
             state
                 .install_anchors(&[pe_paper_state::AnchorInstallRecord {
+                    repaired_history: Vec::new(),
+                    expected_fence: None,
                     history_status: None,
                     wallet: selected,
                     balances: Vec::new(),
@@ -3213,6 +3217,8 @@ mod paper_log_tests {
                 state.set_cursor(&wallet, 10).unwrap();
                 state
                     .install_anchors(&[pe_paper_state::AnchorInstallRecord {
+                        repaired_history: Vec::new(),
+                        expected_fence: None,
                         history_status: None,
                         wallet,
                         balances: Vec::new(),
@@ -3274,6 +3280,8 @@ mod paper_log_tests {
                     let validation = state.position_validation(&blocked).unwrap().unwrap();
                     state
                         .install_anchors(&[pe_paper_state::AnchorInstallRecord {
+                            repaired_history: Vec::new(),
+                            expected_fence: None,
                             history_status: None,
                             wallet: blocked,
                             balances: Vec::new(),
@@ -3444,6 +3452,8 @@ mod paper_log_tests {
         state.set_cursor(&candidate, 10).unwrap();
         state
             .install_anchors(&[pe_paper_state::AnchorInstallRecord {
+                repaired_history: Vec::new(),
+                expected_fence: None,
                 history_status: None,
                 wallet: candidate,
                 balances: Vec::new(),
@@ -3746,6 +3756,8 @@ mod paper_log_tests {
                 state.set_cursor(&wallet, 10).unwrap();
                 state
                     .install_anchors(&[pe_paper_state::AnchorInstallRecord {
+                        repaired_history: Vec::new(),
+                        expected_fence: None,
                         history_status: None,
                         wallet,
                         balances: Vec::new(),
@@ -3958,6 +3970,7 @@ mod paper_log_tests {
                     .record_deferrals(
                         DeferralContext::FullRerank { batch_id: 8 },
                         vec![crate::watchlist_admission::Deferral {
+                            completed_at: None,
                             wallet: deferred,
                             stage: "validation",
                             class: crate::position_seeder::FailureClass::WalletPersistent,

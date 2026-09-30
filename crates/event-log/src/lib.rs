@@ -34,6 +34,7 @@
 pub mod envelope;
 pub mod error;
 mod frame;
+pub use frame::HEADER_LEN;
 pub mod reader;
 pub mod scanner;
 pub mod writer;
@@ -42,6 +43,6 @@ pub use envelope::{ContentType, EnvelopeIn, EventEnvelope};
 pub use error::{LogError, PoisonReason};
 pub use reader::Reader;
 pub use scanner::{IncompleteTail, LogTailBinding, ScanOutcome, Scanner};
-pub use writer::{AppendReceipt, Writer};
+pub use writer::{AppendReceipt, CheckpointVerification, Writer};
 #[cfg(feature = "scan-metrics")]
 pub mod scan_metrics;

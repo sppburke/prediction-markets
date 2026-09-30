@@ -65,7 +65,11 @@ pub fn write_frame(w: &mut impl Write, json_bytes: &[u8]) -> Result<u64, LogErro
 ///
 /// Returns `Ok(Some(json_bytes))` on success, `Ok(None)` on clean EOF (no bytes read for this frame),
 /// or a `FrameReadError` on truncation, CRC failure, or I/O error.
-pub fn read_frame(r: &mut impl Read, byte_offset: u64) -> Result<Option<Vec<u8>>, FrameReadError> {
+pub(crate) fn read_frame_observed(
+    r: &mut impl Read,
+    byte_offset: u64,
+    raw: &mut dyn FnMut(&[u8]),
+) -> Result<Option<Vec<u8>>, FrameReadError> {
     // One-byte probe to distinguish clean EOF from truncated LEN field.
     let mut first = [0u8; 1];
     if r.read(&mut first)? == 0 {
@@ -124,6 +128,9 @@ pub fn read_frame(r: &mut impl Read, byte_offset: u64) -> Result<Option<Vec<u8>>
     let decompressed = zstd::decode_all(compressed.as_slice())
         .map_err(|e| FrameReadError::Decompress(e.to_string()))?;
 
+    raw(&[first[0], len_rest[0], len_rest[1], len_rest[2]]);
+    raw(&compressed);
+    raw(&crc_buf);
     Ok(Some(decompressed))
 }
 

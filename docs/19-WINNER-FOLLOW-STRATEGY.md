@@ -629,5 +629,9 @@ ranked bench; a shared failure leaves full-rerank and capacity unchanged, while 
 decided knockout evictions may publish without backfill. Every added wallet has a cited immutable
 admission proof, and the writer lock checks the prepared structural set and proof digests.
 Boot replays the initial membership and later structural records before producers, then applies the
-separate monotonic wallet fences. `wallet_lifecycle_events` remains a best-effort projection, not an
-authority. No membership table or scheduler exists.
+separate wallet fences. Allowlisted causal recovery commits the exact fence clearance with
+first-entry history repair and its authoritative anchor, as defined in
+[`_GLOSSARY.md`](./_GLOSSARY.md#copy-entry-gate-first-ever-buy-entry-issues-290-339).
+Admission shares the maintenance launch deadline and completion-based transient cooldown; retained
+structural members can remain absent from live eligibility until their proof passes.
+`wallet_lifecycle_events` remains a best-effort projection, not an authority. No membership table or scheduler exists.

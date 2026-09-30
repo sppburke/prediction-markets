@@ -1783,3 +1783,123 @@ fn open_with_expected_tail_refuses_repair_on_mismatch() {
     // And the file was not mutated by either refusal.
     assert_eq!(std::fs::read(&path).unwrap(), bytes);
 }
+
+#[test]
+fn paper_service_rollout_bounded_digest_excludes_incomplete_bytes_and_extends_exactly() {
+    let dir = tmp_dir();
+    let path = dir.path().join("source.log");
+    let mut writer = Writer::open(&path).unwrap();
+    writer
+        .append_synced(make_envelope(b"activation".to_vec()))
+        .unwrap();
+    let activation = writer.verified_tail().unwrap();
+    writer
+        .append_synced(make_envelope(b"suffix".to_vec()))
+        .unwrap();
+    let complete = writer.verified_tail().unwrap();
+    writer
+        .append_synced(make_envelope(b"growing".to_vec()))
+        .unwrap();
+    let all = writer.verified_tail().unwrap();
+    let bytes = std::fs::read(&path).unwrap();
+    for bound in [
+        complete.physical_tail,
+        complete.physical_tail + 2,
+        all.physical_tail - 1,
+    ] {
+        let mut hash = blake3::Hasher::new();
+        let mut seen = Vec::new();
+        let tail =
+            Scanner::walk_bounded(&path, bound, &activation, None, &mut hash, &mut |_, env| {
+                seen.push(env.seq)
+            })
+            .unwrap();
+        assert_eq!(tail, complete);
+        assert_eq!(seen, vec![EventSeq(0), EventSeq(1)]);
+        assert_eq!(
+            hash.finalize(),
+            blake3::hash(&bytes[..usize::try_from(complete.physical_tail).unwrap()])
+        );
+        let mut seen = Vec::new();
+        let resumed = Scanner::walk_bounded(
+            &path,
+            all.physical_tail,
+            &activation,
+            Some(&tail),
+            &mut hash,
+            &mut |_, env| seen.push(env.seq),
+        )
+        .unwrap();
+        assert_eq!(resumed, all);
+        assert_eq!(seen, vec![EventSeq(2)]);
+        assert_eq!(hash.finalize(), blake3::hash(&bytes));
+    }
+    let mut hash = Scanner::hash_prefix(&path, all.physical_tail).unwrap();
+    assert!(
+        Scanner::walk_bounded(
+            &path,
+            complete.physical_tail,
+            &activation,
+            Some(&all),
+            &mut hash,
+            &mut |_, _| {}
+        )
+        .is_err()
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn paper_service_rollout_checkpoint_fallback_preserves_corruption_and_torn_prefix_precedence() {
+    let dir = tmp_dir();
+    let path = dir.path().join("source.log");
+    let mut writer = Writer::open(&path).unwrap();
+    writer
+        .append_synced(make_envelope(b"first".to_vec()))
+        .unwrap();
+    let activation = writer.verified_tail().unwrap();
+    writer
+        .append_synced(make_envelope(b"second".to_vec()))
+        .unwrap();
+    let tail = writer.verified_tail().unwrap();
+    drop(writer);
+    let bytes = std::fs::read(&path).unwrap();
+    let good_hash = blake3::hash(&bytes).to_hex().to_string();
+    let mut corrupt = bytes.clone();
+    let last = corrupt.len() - 1;
+    corrupt[last] ^= 1;
+    std::fs::write(&path, &corrupt).unwrap();
+    let mut hash = blake3::Hasher::new();
+    let mut used = None;
+    assert!(
+        Writer::open_verified_checkpoint(
+            &path,
+            &activation,
+            Some((&tail, &good_hash)),
+            &mut hash,
+            &mut |value| used = Some(value),
+            &mut |_, _| {}
+        )
+        .is_err()
+    );
+    assert_eq!(used, Some(false));
+    assert_eq!(std::fs::read(&path).unwrap(), corrupt);
+    std::fs::write(
+        &path,
+        &bytes[..usize::try_from(activation.physical_tail - 1).unwrap()],
+    )
+    .unwrap();
+    let result = Writer::open_verified_checkpoint(
+        &path,
+        &activation,
+        Some((&tail, &good_hash)),
+        &mut hash,
+        &mut |_| {},
+        &mut |_, _| {},
+    );
+    assert!(matches!(result, Err(LogError::Truncated { .. })));
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        activation.physical_tail - 1
+    );
+}

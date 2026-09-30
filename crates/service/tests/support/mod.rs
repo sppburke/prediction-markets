@@ -344,6 +344,8 @@ pub fn install_empty_anchor(
     paper_state.set_cursor(&wallet, cutoff_unix).unwrap();
     paper_state
         .install_anchors(&[pe_paper_state::AnchorInstallRecord {
+            repaired_history: Vec::new(),
+            expected_fence: None,
             history_status: None,
             wallet,
             balances: Vec::new(),
@@ -381,6 +383,8 @@ pub fn install_full_history_anchor(
     });
     paper_state
         .install_anchors(&[pe_paper_state::AnchorInstallRecord {
+            repaired_history: Vec::new(),
+            expected_fence: None,
             history_status: None,
             wallet,
             balances: Vec::new(),
@@ -396,7 +400,7 @@ pub fn install_full_history_anchor(
         .unwrap();
 }
 
-fn activity_body(trade: &IncomingTrade) -> Vec<u8> {
+pub(crate) fn activity_body(trade: &IncomingTrade) -> Vec<u8> {
     let side = match trade.side {
         Side::Buy => "BUY",
         Side::Sell => "SELL",
@@ -822,6 +826,8 @@ pub fn install_verified_empty_anchor(
     let captured = ledger_capture(engine.ledger(), paper, wallet).unwrap();
     engine
         .install_anchors(&[AnchorInstall {
+            fresh_history: Vec::new(),
+            expected_fence: None,
             wallet,
             balances: Vec::new(),
             cutoff,
@@ -1079,4 +1085,47 @@ pub fn economic_prepared(
         },
         applied_configuration_hash: "config".to_owned(),
     }
+}
+
+/// Drain both pipes concurrently and kill/reap a command that exceeds its completion bound.
+pub async fn bounded_command_output(mut command: std::process::Command) -> std::process::Output {
+    fn read_pipe(mut pipe: impl std::io::Read) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        pipe.read_to_end(&mut bytes).unwrap();
+        bytes
+    }
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let mut stdout = tokio::task::spawn_blocking(move || read_pipe(stdout));
+    let mut stderr = tokio::task::spawn_blocking(move || read_pipe(stderr));
+    // EOF signals process completion. A regression that starts serving must fail within a
+    // bound, killing and reaping this child rather than leaving the test waiting for shutdown.
+    let completed = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        tokio::join!(&mut stdout, &mut stderr)
+    })
+    .await;
+    let timed_out = completed.is_err();
+    let (stdout, stderr) = match completed {
+        Ok(output) => output,
+        Err(_) => {
+            child.kill().unwrap();
+            tokio::join!(stdout, stderr)
+        }
+    };
+    let output = std::process::Output {
+        status: tokio::task::spawn_blocking(move || child.wait().unwrap())
+            .await
+            .unwrap(),
+        stdout: stdout.unwrap(),
+        stderr: stderr.unwrap(),
+    };
+    assert!(
+        !timed_out,
+        "command exceeded its completion bound: {output:?}"
+    );
+    output
 }

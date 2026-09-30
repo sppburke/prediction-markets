@@ -375,7 +375,21 @@ fn first_start_semantic(paper_log: &Path) -> Option<u32> {
     semantic
 }
 
-fn write_report(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
+pub(crate) fn write_report(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
+    write_report_with_finalization(
+        path,
+        bytes,
+        |from, to| fs::rename(from, to),
+        |parent| fs::File::open(parent)?.sync_all(),
+    )
+}
+
+fn write_report_with_finalization(
+    path: &Path,
+    bytes: &[u8],
+    rename: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+    sync_parent: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     let parent = path
         .parent()
         .filter(|candidate| !candidate.as_os_str().is_empty());
@@ -387,15 +401,21 @@ fn write_report(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
         .create_new(true)
         .write(true)
         .open(&temporary)?;
-    use std::io::Write as _;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    fs::rename(&temporary, path)?;
-    if let Some(parent) = parent {
-        fs::File::open(parent)?.sync_all()?;
+    let result = (|| {
+        use std::io::Write as _;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        rename(&temporary, path)?;
+        if let Some(parent) = parent {
+            sync_parent(parent)?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
     }
-    Ok(())
+    result
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9985,6 +10005,8 @@ mod tests {
         state.seed_cursors_if_absent(&[(wallet, at)]).unwrap();
         state
             .install_anchors(&[pe_paper_state::AnchorInstallRecord {
+                repaired_history: Vec::new(),
+                expected_fence: None,
                 history_status: None,
                 wallet,
                 balances: Vec::new(),
@@ -11201,6 +11223,8 @@ mod tests {
         state.seed_cursors_if_absent(&[(member, at)]).unwrap();
         state
             .install_anchors(&[pe_paper_state::AnchorInstallRecord {
+                repaired_history: Vec::new(),
+                expected_fence: None,
                 history_status: None,
                 wallet: member,
                 balances: Vec::new(),
@@ -11943,6 +11967,8 @@ mod tests {
         state.set_cursor(&wallet, at).unwrap();
         state
             .install_anchors(&[pe_paper_state::AnchorInstallRecord {
+                repaired_history: Vec::new(),
+                expected_fence: None,
                 history_status: None,
                 wallet,
                 balances: Vec::new(),
@@ -14276,5 +14302,33 @@ mod tests {
                 verify_paper_prepared_freshness(&decision, &source).unwrap();
             }
         }
+    }
+    #[test]
+    fn paper_service_rollout_checkpoint_publication_faults_preserve_complete_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log.boot-checkpoint");
+        fs::write(&path, b"previous").unwrap();
+        assert!(
+            write_report_with_finalization(
+                &path,
+                b"new",
+                |_, _| Err(std::io::Error::other("before rename")),
+                |_| Ok(())
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"previous");
+        assert!(
+            write_report_with_finalization(
+                &path,
+                b"new",
+                |from, to| fs::rename(from, to),
+                |_| Err(std::io::Error::other("after rename"))
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+        write_report(&path, b"complete retry").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"complete retry");
     }
 }

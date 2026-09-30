@@ -335,7 +335,7 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `reconciliation_page_limit` | 500 | **Module const** in `source-polymarket-public` (not a TOML/env key). Fixed page size for the #544 activity and current-position proof readers. |
 | `activity_max_offset` | 5,000 | **Module const** in `source-polymarket-public` (not a TOML/env key). A full terminal `/activity` page at this offset is split at an integer-second boundary; a still-full one-second terminal window is typed-incomplete and blocks reconciliation (#544). |
 | `positions_max_offset` | 10,000 | **Module const** in `source-polymarket-public` (not a TOML/env key). Each explicit `redeemable=false` and `redeemable=true` current-position partition is walked independently through this offset. A full terminal page is typed-incomplete (#544). |
-| `anchor_refresh_secs` | 3,600 | **Module const** `ANCHOR_REFRESH_SECS` in `service` (not a TOML/env key). Seconds between best-effort per-wallet position re-anchors; an owner-selected operational default, not a calibrated value. |
+| `anchor_refresh_secs` | 3,600 | **Module const** `ANCHOR_REFRESH_SECS` in `service` (not a TOML/env key). Seconds between best-effort per-wallet position re-anchors; also the in-memory transient admission cooldown from terminal failure completion. Cooldowns survive ranking-batch changes, clear on successful admission, and reset on restart. An owner-selected operational default, not a calibrated value. |
 | `bracket_concurrency` | 4 | **Module const** `BRACKET_CONCURRENCY` in `service` (not a TOML/env key). Maximum wallet brackets in flight at once during the boot bracket and runtime admission batches (#555 addendum D9). Chosen from the measured per-wallet peak of ~304 MB resident on the largest wallet against the 2 GB production host; every bracket still reads the wallet's full history three times. |
 | `redeem_residual_limit_atomic` | 100 | **Exclusive module const** `REDEEM_RESIDUAL_LIMIT_ATOMIC` in `position-ledger` (#557). A REDEEM underflow residual of 1..=99 atomic units clamps the position closed and is recorded in the version-3 effect document; 100 or more fences. `ShareAmount` has six decimal places, so 100 atomic units equal one ten-thousandth of a position: the limit is one four-decimal `/positions` reporting quantum and accepts venue-display quantization residue without hiding a full reported quantum. SELL and MERGE remain strict, and the tolerance cannot stack within a bucket. |
 | `rehearsal_quiescence` | production unit policy at run time | The #545 rehearsal reads the production `pe-service` unit's `TimeoutStopSec` as its exact quiescence bound and requires `KillSignal` to be SIGINT, the signal handled by the service. The harness owns no separate numeric shutdown bound (#586). |
@@ -351,7 +351,7 @@ durable and unseen groups, or a revision of an already-durable group, still fenc
 **Installed-boot anchor reuse.** An ordinary installed boot reuses a wallet's `leader_positions`
 mirror only when the wallet is unfenced and history-complete, has a delivery cursor and non-null
 activity cutoff, has an installed anchor no older than `ANCHOR_REFRESH_SECS`, and has
-`reanchor_required = false`. Any failed condition walks the wallet through `validate_direct`.
+`reanchor_required = false`. Any failed condition selects the wallet for `validate_direct`.
 The durable `position_anchors` proof selected by coverage must also retain all three full-history
 activity walks: each walk includes its original page-zero request with exclusive start zero and
 that walk's fixed end. Split pages keep their narrower bounds. Missing or older proof shapes,
@@ -359,13 +359,19 @@ including omitted-start walks, require validation even when an old completion fl
 `position_validation_current` is not a reuse prerequisite: ordinary activity can delete that
 temporary projection without deleting the durable anchor. Only reused wallets and wallets accepted
 by direct validation can enter the boot universe; a deferred walk cannot reuse an old complete flag.
+When Supabase is configured and `maintenance_interval_secs` is positive, an eligible reused wallet
+skips fresh boot validation. Otherwise boot validates `BRACKET_CONCURRENCY`-sized waves until a
+wallet passes the final fence, durable-history and acceptance filters; a successful bracket without
+seeded history does not stop the waves. Migration, `--exit-after-anchors` and disabled maintenance
+retain complete validation. Remaining structural members await runtime admission.
 When a required `validate_direct` walk
 encounters a `TRADE` row with a price outside the unit range (issue #594; observed 2026-09-11), the
 wallet is left out of the accepted set like a transient read failure (unvalidated for runtime
 admission; a wallet reused on a fresh anchor is not re-read at boot), and a live wallet's periodic
 anchor refresh reports it deferred instead of ending the poll round, keeping the anchor it already
-holds (issue #597). Malformed pages, window invalidations, other row validations, aggregation and
-identity failures remain boot-fatal.
+holds (issue #597). Malformed pages, window invalidations, other row validations, aggregation and shared
+identity failures remain boot-fatal. Transient identity reads defer only their wallet; rate limits
+and durability failures preserve shared-abort behavior.
 
 **Rehearsal isolation.** A #557 rehearsal uses a copy of production durable state at dedicated
 paths, an exclusive loopback bind, and a complete environment that explicitly sets `PE_BIND` plus
@@ -416,7 +422,7 @@ Campaign financial limits and eligibility are canonical in
 
 | Key | Default | Meaning |
 |---|---:|---|
-| `paper_state_db_path` | `./paper_state.db` | Path to the crash-safe paper-state SQLite mirror. Schema three stores quantities, principal, and fees as exact decimal strings and binds each financial mutation to its prepared sequence and `QualificationStarted` identity. It also durably owns reconciled activity revisions, first-entry evidence, terminal `decision_pending`, monotonic wallet fences, position validations, and machine-owned migration metadata. |
+| `paper_state_db_path` | `./paper_state.db` | Path to the crash-safe paper-state SQLite mirror. Schema three stores quantities, principal, and fees as exact decimal strings and binds each financial mutation to its prepared sequence and `QualificationStarted` identity. It also durably owns reconciled activity revisions, first-entry evidence, terminal `decision_pending`, wallet fences with atomic causal clearance, position validations, and machine-owned migration metadata. |
 | `gamma_base_url` | `https://gamma-api.polymarket.com` | Base URL for Polymarket Gamma market metadata and mark-price reads. Resolution payout evidence comes from the CLOB market endpoint. Shares the same 50 ms / 20 req/s rate limit as `bootstrap_gamma_min_interval_ms`. |
 | `gamma_resolution_poll_interval_secs` | 120 | Legacy-named cadence for the service's CLOB resolution poll. The poll is limited to conditions with open unsettled positions; Gamma is not a payout authority. |
 | `max_resolution_horizon_secs` | 172_800 (48 h) | `ServiceConfig` field. Drop entry signals whose market resolves further than this many seconds into the future. 0 disables the upper bound. Guards against locking capital in months-long markets (issue #290). **172_800 since the 2026-07-03 run28 cutover** — the copy-time twin of `ranker_ttr_hours` (48 h ≈ 72 h on paired weekly P&L, `docs/33` §5; was 259_200/72 h). Paired with `min_resolution_horizon_secs` — one resolution lookup serves both. NOTE: the live `service_config` row must be PATCHed at deploy (`on conflict do nothing` never updates an already-seeded row). |
@@ -432,11 +438,25 @@ Every causal bracket requests full attributable history through exclusive `Some(
 `start=1`) for each of its three independently bounded activity walks. During catch-up, verified
 prior purchases for unfenced wallets consume all missing markets through the existing bucket
 transaction and history projection, including while reanchoring is required and when a group was
-already stored without history. Fenced wallets retain the existing conservative recording of newly
-seen verified purchases and receive no stored-group repair. Stored dispositions, effects and proof
-bytes remain unchanged; historical balances are not applied again and no copy continuation is
-created. Newly recovered history counts as activity for the bracket's bounded retry. Running
-history changes only after the transaction succeeds.
+already stored without history. Fenced bracket reconciliation defers all covered-history repair to installation. Recovery permits
+only the existing order-dependent, underflow, overflow and late-group causes, or a revised aggregate
+with a unique durably dispositioned trigger matching original wallet/source epoch, canonical
+transaction identity and fence recording time. The second activity read's fixed end must be strictly
+after the integer fence bucket epoch. Missing or ambiguous evidence refuses recovery.
+Fresh metadata-prepared and immutable recorded originals plus all attributable revisions must contain
+no effective conversion or unknown effect. At serialized installation their BUY evidence through
+the cutoff repairs each missing market using the earliest `(source_epoch, source_trade_id)`; SELL
+and raw-only effects consume no history. Clearance requires the accepted cutoff to be at or after the wallet's captured activity
+cursor; an earlier cutoff (for example after a clock rollback) refuses it and the wallet stays
+fenced. Exact fence comparison, history repair, authoritative
+balances, validation, coverage, history completion and fence deletion commit together. Version-one
+anchor proof optionally binds the exact deleted record in `cleared_fence`. Projections publish only
+after commit. Original effects, dispositions, proofs and earlier decisions remain immutable.
+Known disposed revisions with matching canonical transaction identity are idempotent while any
+fence is active and, after clearance, within anchor coverage; this recognition never widens
+clearance eligibility. Every newly retained non-original revision advances the existing coverage generation once
+and invalidates the current bracket, including on its first read; exact retries do not advance it.
+Committed clearance is a forward-only recovery boundary.
 Existing complete records and historical membership proof snapshots remain intact; the corrected
 durable anchor proves current full-history coverage (#641).
 
@@ -458,8 +478,9 @@ closed only by a terminal disposition, and replay consumes the recorded transiti
 executing the continuation. Receipt-bearing continuations pair `ActivityWs` provenance with a
 websocket source receipt exactly; REST provenance has no websocket receipt. A changed semantic
 revision, unprovable activity, invalid mapping,
-or ledger arithmetic failure creates a monotonic `wallet_fences` row. Fenced wallets are removed
-from effective membership/projection and cannot copy; there is no delete owner for a fence.
+or ledger arithmetic failure creates a durable `wallet_fences` row. Fenced wallets are removed
+from effective membership/projection and cannot copy. Only the atomic anchor recovery described
+above can clear an eligible fence; unsafe or unprovable fences remain quarantined.
 
 #### Continuation and commitment compatibility (#588)
 
@@ -564,7 +585,7 @@ checks. The isolated V2 canary keeps its separate admission and price contract.
 
 ### Live wallet source (Supabase ranking handoff, issue #339)
 
-The local latency-shift ranker pushes append-only ranking batches to Supabase (`scripts/push_ranking_to_supabase.py`); `pe-service` reads the `latest_ranking` view on an interval — filtered to `survives=is.true` since #518, so the published 200-row bench admits only the wallets the ranker's own eligibility gate passed, and a batch with no verdict admits nobody (fail-closed) — and refreshes the scores of the live working set (`crate::live_watchlist::LiveWatchlist`, an `ArcSwap`) up to the runtime `active_watchlist_size` cap. Structural membership is the Start-bound generation plus synchronized `MembershipChanged` records that the paper log replays. Live membership is its eligible projection: durable fences and wallets deferred by this boot's history or position bracket stay out of live. MEMBERSHIP follows `watchlist_membership_mode`: maintenance-tick knockout/backfill (`knockout`, issue #350 WS1) or per-batch structural replacement (`full_rerank`, the 2026-07-03 cutover production mode). Every structural addition — capacity grow, full-rerank swap, or knockout backfill — is first prepared through one shared serialized preparer (`crate::watchlist_admission`, #542): validator-backed preparation completes the wallet's prior-market history and validates current positions through the five-step causal bracket; the orchestrator persists completion in the anchor transaction and publishes the running history projection before acknowledgement and membership publication (see [Copy-entry gate](#copy-entry-gate-first-ever-buy-entry-issues-290-339)). Validator-free preparation still requires complete history. Typed wallet-data and wallet-state failures defer only the named wallet (wallet-transient or wallet-persistent); a replan fills its slot from the same pinned ranked bench without preparing already accepted wallets again. Generic source, pagination, metadata, durability, and other shared failures retry the full-rerank or capacity unit unchanged. A shared knockout backfill failure still publishes independently decided evictions without backfill. No count-based outage heuristic retains a wallet the current ranking rejected. One synchronized `MembershipChanged` record carries each published attempt and cites complete proofs for exactly its added wallets. Deferrals are recorded after the known outcome in the audit-only source id `pe-service.watchlist-deferral`; readers and verifiers do not depend on that artifact. A boot-deferred wallet retained by a later ranked step can re-enter live after proved admission without a structural record. A full-rerank transition reads `ranking_entries` pinned to the batch identifier that triggered it, so the applied rows and the committed batch marker always name one batch. Supabase is the sole pre-Start wallet source (issue #370): there is no leaderboard/seed fallback, so an empty or unreachable pre-Start or Start-pinned ranking read refuses boot. A replayed post-Start generation may be empty and then boots with zero live wallets. The Supabase keys follow the secret precedent (plain `String`, empty default, never logged).
+The local latency-shift ranker pushes append-only ranking batches to Supabase (`scripts/push_ranking_to_supabase.py`); `pe-service` reads the `latest_ranking` view on an interval — filtered to `survives=is.true` since #518, so the published 200-row bench admits only the wallets the ranker's own eligibility gate passed, and a batch with no verdict admits nobody (fail-closed) — and refreshes the scores of the live working set (`crate::live_watchlist::LiveWatchlist`, an `ArcSwap`) up to the runtime `active_watchlist_size` cap. Structural membership is the Start-bound generation plus synchronized `MembershipChanged` records that the paper log replays. Live membership is its eligible projection: durable fences and wallets deferred by this boot's history or position bracket stay out of live. MEMBERSHIP follows `watchlist_membership_mode`: maintenance-tick knockout/backfill (`knockout`, issue #350 WS1) or per-batch structural replacement (`full_rerank`, the 2026-07-03 cutover production mode). Every structural addition — capacity grow, full-rerank swap, or knockout backfill — is first prepared through one shared serialized preparer (`crate::watchlist_admission`, #542): validator-backed preparation completes the wallet's prior-market history and validates current positions through the five-step causal bracket; the orchestrator persists completion in the anchor transaction and publishes the running history projection before acknowledgement and membership publication (see [Copy-entry gate](#copy-entry-gate-first-ever-buy-entry-issues-290-339)). Validator-free preparation still requires complete history. Typed wallet-data and wallet-state failures defer only the named wallet (wallet-transient or wallet-persistent); a replan fills its slot from the same pinned ranked bench without preparing already accepted wallets again. Transient identity lookup failures are wallet-transient. Generic source, pagination, non-transient metadata, durability, rate-limit, and other shared failures retry the full-rerank or capacity unit unchanged. A shared knockout backfill failure still publishes independently decided evictions without backfill. No count-based outage heuristic retains a wallet the current ranking rejected. One synchronized `MembershipChanged` record carries each published attempt and cites complete proofs for exactly its added wallets. Deferrals are recorded after the known outcome in the audit-only source id `pe-service.watchlist-deferral`; readers and verifiers do not depend on that artifact. A boot-deferred wallet retained by a later ranked step can re-enter live after proved admission without a structural record. A full-rerank transition reads `ranking_entries` pinned to the batch identifier that triggered it, so the applied rows and the committed batch marker always name one batch. Supabase is the sole pre-Start wallet source (issue #370): there is no leaderboard/seed fallback, so an empty or unreachable pre-Start or Start-pinned ranking read refuses boot. A replayed post-Start generation may be empty and then boots with zero live wallets. The Supabase keys follow the secret precedent (plain `String`, empty default, never logged).
 
 The refresh task is also the sole serialized public-projection worker (#544). Boot, a successful
 score/rank refresh, and every membership or durable-fence transition coalesce into one bounded
@@ -630,7 +651,7 @@ both tokens and row count agree, retrying one token race before returning typed 
 | `clv_compare_trades_dominates_pp` | 20 | CLV source-comparison gate (#429 PR2, const `TRADES_DOMINATES_PP`): trades-bucket coverage must exceed CLOB coverage by ≥ this many percentage points (AND be a sound proxy per `clv_compare_mid_bias_max`) to select `trades_only`. |
 | `clv_compare_trades_fill_min_pp` | 5 | CLV source-comparison gate (#429 PR2, const `TRADES_FILL_MIN_PP`): min coverage (percentage points) the trades series must add beyond CLOB (AND be a sound proxy) to select `clob_primary_with_trades_fill`; below it the trades pass is dropped (`clob_only`). |
 | `true_clv_coverage_warn_pct` | 30 | Warn floor (percent) for the `true_clv` estimator's *position-level* CLOB coverage, checked in `suff_stats.materialize` when the optional `market_price_history` + `token_conditions` views ARE registered (issue #429 PR4): the share of materialized positions carrying a non-NaN `true_clv_close`. `true_clv` is best-effort (PR2's ~63.6% market-level ceiling, less at position level), so 30 catches the degenerate/mis-wired case (≈0% — empty backfill or a broken join) without false-warning on the expected partial coverage. Distinct from the bootstrap-side `prices_history_coverage_warn_pct` (market-level, Rust). Const `TRUE_CLV_COVERAGE_WARN_PCT` in `scripts/ranker/suff_stats.py`. |
-| `maintenance_interval_secs` | 600 | `ServiceConfig` field (issue #350 WS1 PR-D). Seconds between maintenance ticks (inactivity + underperformance knockout + atomic backfill). `0` disables the tick entirely (skipped, not a zero-duration loop). The task is spawned only when `supabase_url` is non-empty and this is `> 0`. `PE_MAINTENANCE_INTERVAL_SECS`. |
+| `maintenance_interval_secs` | 600 | `ServiceConfig` field (issue #350 WS1 PR-D). Seconds between maintenance ticks (inactivity + underperformance knockout + atomic backfill). `0` disables the tick entirely (skipped, not a zero-duration loop). The task is spawned only when `supabase_url` is non-empty and this is `> 0`. `PE_MAINTENANCE_INTERVAL_SECS`. One monotonic launch deadline covers mutex waiting, full rerank, replanning, live reentry and knockout/backfill. Expiry prevents new brackets and optional retries; started work drains and completed acceptances use existing publication checks. Unstarted wallets remain retryable without failure, cooldown or attempted status. |
 | `inactivity_threshold_secs` | 259_200 | `ServiceConfig` field (#350 WS1 PR-D). A live wallet idle (no observed trade) ≥ this many seconds is evicted, unless it is a proven winner (then spared up to `inactivity_hard_cap_secs`). 72 h. The clock is the wallet's **real last-trade time** (#357): the poll cursor is seeded from `ranking_entries.last_trade_unix` at admission/bootstrap and advanced forward-only by the poller, so `idle = now − cursor = now − real_last_trade` (no admission grace — a stale wallet is not reprieved by being freshly admitted). `PE_INACTIVITY_THRESHOLD_SECS`. |
 | `inactivity_hard_cap_secs` | 604_800 | `ServiceConfig` field (#350 WS1 PR-D). Hard ceiling on sparing a proven winner from inactivity eviction: past this idle span the wallet is evicted unconditionally (a winner silent for a week is more likely abandoned than patient). 7 d. `PE_INACTIVITY_HARD_CAP_SECS`. |
 | `bench_overfetch` | 10 | `ServiceConfig` field (#350 WS1 PR-D). Accepted for configuration compatibility only; since #588 it has no runtime effect because membership maintenance reads the latest ranking batch bounded by `MAX_ACTIVE_WATCHLIST_SIZE` (fence-before-cap selection). `PE_BENCH_OVERFETCH`. |
@@ -719,11 +740,18 @@ hash, and BLAKE3 chain. Only a scanner-proven incomplete final frame may be trun
 synchronized under the exclusive writer lock; interior corruption and every other mismatch are
 fatal. Append, flush, or synchronization uncertainty poisons the writer. The account-tagged
 `live_journal.log` uses its native verified replay for the same binding fields. An ordinary
-installed boot walks the source log once under that lock, binds the recorded activation prefix
-during the same walk, and publishes the boot projections built from it only after the walk and
-every reducer succeeded; the walked binding is reused only while that writer stays the sole
-appender and its synchronized tail equals its byte cursor, which detects external length drift but
-not an equal-length rewrite of already-verified bytes (#572).
+installed boot holds that lock while binding the recorded activation prefix. A compatible
+`<source-log>.boot-checkpoint` restores receipt metadata and raw activity/boundary candidates after
+checksum, version, mode, path, activation and tail checks and BLAKE3 verification of its exact raw
+prefix. The existing scanner verifies every suffix frame. Missing, damaged or incompatible artifacts,
+shortened files and prefix mismatch select a full verified walk under the same lock; actual corruption
+still refuses. Incomplete-tail repair and activation-prefix authority remain unchanged, including
+the absence of every-durable-mark coupling. Projections publish only after verification and every
+reducer succeeds. The initial-open checkpoint snapshot freezes the existing receipt-index prefix
+and pre-consumption candidates, excluding later boot/runtime appends. Synchronous best-effort atomic
+publication occurs after the producer barrier with runtime tasks running. The walked binding is
+reused only while that writer remains sole appender and its synchronized tail equals its byte cursor,
+which detects external length drift but not equal-length rewrites of verified bytes (#572).
 The runtime qualification seal verifies the sealed prefix with one scanner walk bounded by the
 caller's candidate (the just-recorded mark tail at a completion boundary, the receipt-index tail on
 configuration drift), reads the frames its decision rows reference exactly through the receipt
@@ -768,7 +796,7 @@ Written to the rolling full-stream files derived from `jsonl_log_path` (default 
 | `kind` | Extra fields | Description |
 |---|---|---|
 | `paper_financial_prepared` / `paper_financial_final` | Prepared authority, exact economic record, synchronized receipt, canonical result | The two-frame paper financial protocol. A Final alone proves a completed fill or resolution. Legacy `paper_fill` frames remain readable only before `QualificationStarted`. |
-| `membership_changed` | reason, removed/added wallets, capacity, ranking batch, structural evidence | A synchronized structural membership snapshot. Score-only refresh is unjournaled; durable wallet fences are applied independently and monotonically. |
+| `membership_changed` | reason, removed/added wallets, capacity, ranking batch, structural evidence | A synchronized structural membership snapshot. Score-only refresh is unjournaled; durable wallet fences are applied independently; only a committed causal recovery can clear one. |
 | `portfolio_mark` / `qualification_sealed` | mark evidence or sealed-prefix/digest evidence | Qualification observation and immutable seal records. An insufficient-evidence outcome is a seal reason, not another command or state. |
 
 ### Logging conventions (issue #184)

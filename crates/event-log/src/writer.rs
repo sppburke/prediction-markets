@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::envelope::{EnvelopeIn, EventEnvelope, HashInput, compute_hashes};
 use crate::frame::{HEADER_LEN, write_file_header, write_frame};
-use crate::scanner::{LogTailBinding, PrefixVerdict, inspect_open, walk_locked};
+use crate::scanner::{LogTailBinding, PrefixVerdict, ScanOutcome, inspect_open, walk_locked};
 use crate::{LogError, PoisonReason};
 
 trait DurableWrite: Write + Send + Sync {
@@ -34,6 +34,14 @@ pub struct AppendReceipt {
     pub sequence: EventSeq,
     #[serde(with = "crate::envelope::hex_hash")]
     pub this_hash: blake3::Hash,
+}
+
+/// Timing and selection of a locked checkpoint verification.
+#[derive(Debug)]
+pub struct CheckpointVerification {
+    pub used: bool,
+    pub prefix_elapsed: std::time::Duration,
+    pub suffix_elapsed: std::time::Duration,
 }
 
 /// Single-writer handle for an append-only event log file.
@@ -181,11 +189,21 @@ impl Writer {
         }
 
         let (scan, verdict) = walk_locked(path, &file, expected_prefix, observer)?;
+        Self::finish_verified_open(path, file, scan, verdict, expected_prefix.is_some())
+    }
+
+    fn finish_verified_open(
+        path: &Path,
+        mut file: File,
+        scan: ScanOutcome,
+        verdict: PrefixVerdict,
+        has_expected_prefix: bool,
+    ) -> Result<(Self, LogTailBinding), LogError> {
         // As `Scanner::verify_prefix`: with an expected prefix, a torn final frame is reported
         // before any boundary verdict unless the prefix matched (the tear then lies wholly after
         // it and is repaired below). A tear that cuts into the prefix can never match.
         if let Some(incomplete) = scan.incomplete_tail
-            && expected_prefix.is_some()
+            && has_expected_prefix
             && verdict != PrefixVerdict::Matched
         {
             return Err(LogError::Truncated {
@@ -215,6 +233,65 @@ impl Writer {
             binding.physical_tail,
         );
         Ok((writer, binding))
+    }
+
+    /// Checkpoint-assisted verification holds the same exclusive lock for raw-prefix checking,
+    /// full-walk fallback, suffix verification, and torn-tail repair.
+    pub fn open_verified_checkpoint(
+        path: &Path,
+        expected: &LogTailBinding,
+        checkpoint: Option<(&LogTailBinding, &str)>,
+        digest: &mut blake3::Hasher,
+        start: &mut dyn FnMut(bool),
+        observer: &mut dyn FnMut(u64, &EventEnvelope),
+    ) -> Result<(Self, LogTailBinding, CheckpointVerification), LogError> {
+        let file = OpenOptions::new().read(true).write(true).open(path)?;
+        file.try_lock_exclusive().map_err(|error| {
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                LogError::Locked {
+                    path: path.to_owned(),
+                }
+            } else {
+                LogError::Io(error)
+            }
+        })?;
+        let prefix_started = std::time::Instant::now();
+        let resume = checkpoint.and_then(|(tail, expected_hash)| {
+            if tail.path != std::fs::canonicalize(path).ok()?
+                || tail.physical_tail < expected.physical_tail
+            {
+                return None;
+            }
+            let hash = crate::scanner::hash_open_prefix(&file, tail.physical_tail).ok()?;
+            if hash.finalize().to_hex().as_str() != expected_hash {
+                return None;
+            }
+            *digest = hash;
+            Some(tail)
+        });
+        let used = resume.is_some();
+        let prefix_elapsed = prefix_started.elapsed();
+        start(used);
+        let suffix_started = std::time::Instant::now();
+        let (scan, verdict) = crate::scanner::walk_hashed(
+            path,
+            &file,
+            Some(expected),
+            resume,
+            None,
+            digest,
+            observer,
+        )?;
+        let (writer, binding) = Self::finish_verified_open(path, file, scan, verdict, true)?;
+        Ok((
+            writer,
+            binding,
+            CheckpointVerification {
+                used,
+                prefix_elapsed,
+                suffix_elapsed: suffix_started.elapsed(),
+            },
+        ))
     }
 
     /// Open for append with a trusted external tail binding: destructive repair is

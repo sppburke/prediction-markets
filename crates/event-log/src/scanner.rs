@@ -1,7 +1,7 @@
 //! One physical event-log scanner shared by append recovery and read-side verification.
 
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use blake3::Hash;
@@ -9,10 +9,12 @@ use pe_core_types::EventSeq;
 
 use crate::LogError;
 use crate::envelope::{ChainError, EventEnvelope, verify_chain};
-use crate::frame::{FrameReadError, HEADER_LEN, MAX_FRAME_BYTES, read_frame, verify_file_header};
+use crate::frame::{
+    FrameReadError, HEADER_LEN, MAX_FRAME_BYTES, read_frame_observed, verify_file_header,
+};
 
 /// Exact identity of a completely verified append-only log prefix (#544).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LogTailBinding {
     /// Canonical absolute path resolved from the configured path.
     pub path: PathBuf,
@@ -21,6 +23,7 @@ pub struct LogTailBinding {
     /// Sequence of the final verified frame; `None` when the log has no frames.
     pub last_sequence: Option<EventSeq>,
     /// Chain hash of the final verified frame, or the all-zero genesis hash for an empty log.
+    #[serde(with = "crate::envelope::hex_hash")]
     pub last_hash: Hash,
 }
 
@@ -102,6 +105,34 @@ impl Scanner {
             });
         }
         Ok((verdict == PrefixVerdict::Matched).then_some(outcome.verified_tail))
+    }
+    /// Verify a finite online capture through its last complete frame without repairing the file.
+    /// A compatible prefix can be resumed after raw verification by the caller.
+    pub fn walk_bounded(
+        path: &Path,
+        byte_bound: u64,
+        expected: &LogTailBinding,
+        resume: Option<&LogTailBinding>,
+        digest: &mut blake3::Hasher,
+        observer: &mut dyn FnMut(u64, &EventEnvelope),
+    ) -> Result<LogTailBinding, LogError> {
+        let file = File::open(path)?;
+        let (outcome, verdict) = walk_hashed(
+            path,
+            &file,
+            Some(expected),
+            resume,
+            Some(byte_bound),
+            digest,
+            observer,
+        )?;
+        verdict.require_match()?;
+        Ok(outcome.verified_tail)
+    }
+
+    /// Hash exactly a claimed physical prefix. No frames are decoded by this check.
+    pub fn hash_prefix(path: &Path, physical_tail: u64) -> Result<blake3::Hasher, LogError> {
+        hash_open_prefix(&File::open(path)?, physical_tail)
     }
 }
 
@@ -245,8 +276,16 @@ pub(crate) fn read_verified_frame(
     reader: &mut (impl std::io::Read + std::io::Seek),
     state: &mut ScanState,
 ) -> Result<ScanStep, LogError> {
+    read_verified_frame_observed(reader, state, &mut |_| {})
+}
+
+fn read_verified_frame_observed(
+    reader: &mut (impl Read + Seek),
+    state: &mut ScanState,
+    raw: &mut dyn FnMut(&[u8]),
+) -> Result<ScanStep, LogError> {
     let frame_start = state.physical_tail;
-    let json = match read_frame(reader, frame_start) {
+    let json = match read_frame_observed(reader, frame_start, raw) {
         Ok(Some(json)) => json,
         Ok(None) => return Ok(ScanStep::Eof),
         Err(FrameReadError::Truncated { byte_offset }) => {
@@ -380,6 +419,8 @@ pub(crate) fn walk_locked<'a>(
         let frame_start = state.physical_tail();
         match read_verified_frame(&mut reader, &mut state)? {
             ScanStep::Frame(envelope) => {
+                #[cfg(feature = "scan-metrics")]
+                crate::scan_metrics::record_decoded(&resolved_path);
                 observer(frame_start, &envelope);
                 prefix.observe(&state);
             }
@@ -401,6 +442,146 @@ pub(crate) fn walk_locked<'a>(
                         incomplete_tail: Some(incomplete_tail),
                     },
                     verdict,
+                ));
+            }
+        }
+    }
+}
+
+/// Reader bounds an online capture even when the writer grows the file during the walk.
+struct BoundedReader<R> {
+    inner: R,
+    cursor: u64,
+    bound: u64,
+}
+impl<R: Read> Read for BoundedReader<R> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let available = usize::try_from(self.bound.saturating_sub(self.cursor))
+            .unwrap_or(usize::MAX)
+            .min(bytes.len());
+        let read = self.inner.read(&mut bytes[..available])?;
+        self.cursor += u64::try_from(read).map_err(std::io::Error::other)?;
+        Ok(read)
+    }
+}
+impl<R: Seek> Seek for BoundedReader<R> {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.cursor = self.inner.seek(position)?;
+        Ok(self.cursor)
+    }
+
+    fn stream_position(&mut self) -> std::io::Result<u64> {
+        // Querying each frame boundary must preserve the inner reader's buffered bytes.
+        Ok(self.cursor)
+    }
+}
+
+pub(crate) fn hash_open_prefix(
+    file: &File,
+    physical_tail: u64,
+) -> Result<blake3::Hasher, LogError> {
+    let mut reader = BufReader::new(file);
+    reader.seek(SeekFrom::Start(0))?;
+    let mut hash = blake3::Hasher::new();
+    let mut remaining = physical_tail;
+    let mut buffer = [0u8; 64 * 1024];
+    while remaining > 0 {
+        let size = usize::try_from(remaining)
+            .unwrap_or(usize::MAX)
+            .min(buffer.len());
+        let count = reader.read(&mut buffer[..size])?;
+        if count == 0 {
+            return Err(LogError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "checkpoint prefix shortened",
+            )));
+        }
+        hash.update(&buffer[..count]);
+        remaining -= u64::try_from(count).map_err(std::io::Error::other)?;
+    }
+    Ok(hash)
+}
+
+/// Digest advances only after the exact consumed frame bytes pass every verifier.
+pub(crate) fn walk_hashed(
+    path: &Path,
+    file: &File,
+    expected: Option<&LogTailBinding>,
+    resume: Option<&LogTailBinding>,
+    bound: Option<u64>,
+    digest: &mut blake3::Hasher,
+    observer: &mut dyn FnMut(u64, &EventEnvelope),
+) -> Result<(ScanOutcome, PrefixVerdict), LogError> {
+    let resolved_path = std::fs::canonicalize(path)?;
+    #[cfg(feature = "scan-metrics")]
+    crate::scan_metrics::record(&resolved_path);
+    let mut reader = BoundedReader {
+        inner: BufReader::new(file),
+        cursor: 0,
+        bound: bound.unwrap_or(u64::MAX),
+    };
+    reader.seek(SeekFrom::Start(0))?;
+    verify_file_header(path, &mut reader)?;
+    let mut state = if let Some(resume) = resume {
+        if resume.physical_tail > reader.bound {
+            return Err(LogError::Io(std::io::Error::other(
+                "checkpoint exceeds captured source bound",
+            )));
+        }
+        if resume.path != resolved_path {
+            return Err(LogError::Io(std::io::Error::other(
+                "checkpoint path mismatch",
+            )));
+        }
+        reader.seek(SeekFrom::Start(resume.physical_tail))?;
+        ScanState::at_frame(
+            EventSeq(resume.last_sequence.map_or(Ok(0), |seq| {
+                seq.0.checked_add(1).ok_or(LogError::SequenceOverflow)
+            })?),
+            resume.last_hash,
+            resume.physical_tail,
+        )
+    } else {
+        *digest = blake3::Hasher::new();
+        // These are the bytes just read and checked by verify_file_header.
+        digest.update(crate::frame::MAGIC);
+        digest.update(&[crate::frame::VERSION]);
+        ScanState::after_header()
+    };
+    let mut prefix = PrefixTracker::new(expected, &resolved_path);
+    if resume.is_some() {
+        prefix.matched = true;
+    } // Caller authenticated the checkpoint's activation binding.
+    prefix.observe(&state);
+    loop {
+        let start = state.physical_tail();
+        let mut candidate = digest.clone();
+        match read_verified_frame_observed(&mut reader, &mut state, &mut |bytes| {
+            candidate.update(bytes);
+        })? {
+            ScanStep::Frame(envelope) => {
+                #[cfg(feature = "scan-metrics")]
+                crate::scan_metrics::record_decoded(&resolved_path);
+                *digest = candidate;
+                observer(start, &envelope);
+                prefix.observe(&state);
+            }
+            ScanStep::Eof => {
+                return Ok((
+                    ScanOutcome {
+                        verified_tail: tail_binding(resolved_path, &state),
+                        incomplete_tail: None,
+                    },
+                    prefix.verdict(&state),
+                ));
+            }
+            ScanStep::Incomplete(tail) => {
+                return Ok((
+                    ScanOutcome {
+                        verified_tail: tail_binding(resolved_path, &state),
+                        incomplete_tail: Some(tail),
+                    },
+                    prefix.verdict(&state),
                 ));
             }
         }

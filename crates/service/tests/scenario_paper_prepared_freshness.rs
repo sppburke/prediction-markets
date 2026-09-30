@@ -3117,7 +3117,8 @@ async fn boot_fence_completes_staged_handoff_atomically_in_both_recovery_orders(
             assert_eq!(h.prepared_count(), 1);
 
             // The same source group with a changed semantic revision fences during boot's
-            // first activity read, through the real validator and bucket commit owner.
+            // first activity read, through the real validator and bucket commit owner. A novel
+            // revision invalidates that attempt before any positions read or anchor install.
             let mut changed: Value = serde_json::from_slice(&held.activity).unwrap();
             changed[0]["size"] = "11".into();
             let validator = pe_service::position_seeder::CausalPositionValidator::new(
@@ -3135,13 +3136,18 @@ async fn boot_fence_completes_staged_handoff_atomically_in_both_recovery_orders(
             let mut engine =
                 BucketCommitEngine::load(h.paper.clone(), build_leader_ledger(&h.paper).unwrap())
                     .unwrap();
-            assert!(
-                validator
-                    .validate_direct(&[wallet()], &mut engine, &h.paper)
-                    .await
-                    .unwrap()
-                    .is_empty()
-            );
+            let anchors_before = h.paper.position_anchors(&wallet()).unwrap();
+            let outcome = validator
+                .validate_direct_with_deferrals(&[wallet()], &mut engine, &h.paper)
+                .await
+                .unwrap();
+            assert!(outcome.accepted.is_empty());
+            assert!(matches!(
+                outcome.deferred.as_slice(),
+                [(deferred_wallet, pe_service::position_seeder::CausalPositionError::Fenced { wallet: fenced_wallet })]
+                    if *deferred_wallet == wallet() && *fenced_wallet == wallet()
+            ));
+            assert_eq!(h.paper.position_anchors(&wallet()).unwrap(), anchors_before);
             assert!(h.paper.is_wallet_fenced(&wallet()).unwrap());
             assert_eq!(h.terminal(&recorded), open);
 

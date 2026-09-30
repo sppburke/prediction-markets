@@ -923,6 +923,30 @@ comparisons decide what remains; never guess from memory.
    If installed = desired but running is prior, go to step 5. Any unit-policy or ownership drift
    stops the deploy for a reviewed correction; only enablement drift may be repaired in place with
    `sudo systemctl enable pe-service` (no `--now`, no restart).
+
+   Before activation, while the old service still runs, prepare the disposable source checkpoint
+   with the staged binary against the exact installed paper-state path:
+
+   ```bash
+   /tmp/pe-service.new.<desired-sha12> --prepare-source-checkpoint \
+     --paper-state /absolute/path/to/installed/paper_state.db
+   ```
+
+   Run this before the guarded binary swap in step 4. The command derives the canonical source path
+   from installed activation metadata and reads Start without upgrading or writing the database. It
+   verifies a finite captured source prefix through its last complete frame, excludes incomplete bytes
+   without repair, and performs no HTTP requests. Interrupted initial preparation can restart while the
+   old process serves; compatible completed artifacts raw-verify and extend incrementally. Ignore
+   temporary files. Publication failure before rename preserves the previous artifact; after rename a
+   complete new artifact may remain despite a directory-sync error.
+
+   Record checkpoint-loading, BLAKE3 raw-prefix verification and verified suffix durations separately
+   from first-copy time, plus checkpoint use and prefix/suffix sizes. Admission logs report wallet
+   bracket elapsed/outcome and tick budget, starts, acceptances, deferrals and unstarted candidates.
+   Compare these stages with the captured restart baseline; BLAKE2 throughput is not a BLAKE3 restart
+   measurement. The launch deadline and cooldown use the existing
+   [`maintenance_interval_secs` and `ANCHOR_REFRESH_SECS`](./_GLOSSARY.md); started work may overrun it.
+
 4. **Baseline, online census, and atomic swap** (the old process keeps running on its open inode).
    Run this guarded sequence in the same shell holding the deployment lock. Substitute the actual
    configured state/source paths for `paper_state.db` and `source_events.log` before execution:
@@ -961,6 +985,14 @@ comparisons decide what remains; never guess from memory.
    running hashes and `InvocationID`: if the running hash is already desired (the unit re-activated on
    its own after a crash), do not restart again.
 6. **Verify**:
+
+   Verify an eligible paper copy and one exact settlement, the recovered wallet's old-market
+   first-entry refusal, unsafe-wallet quarantine, later progressive admissions and Supabase
+   projection convergence. Full/checkpoint restart must preserve history, ledger and financial
+   state. Before committed clearance, prior-reader rollback follows existing era boundaries and
+   ignores the sidecar. After clearance, recover forward with a compatible implementation. Stop
+   and drain before assessing this boundary: queued controls can commit during shutdown. Never
+   restore stale state or delete fences manually.
 
    ```bash
    systemctl show pe-service -p MainPID -p InvocationID -p ExecMainStartTimestamp -p NRestarts -p ExecStart -p WorkingDirectory
