@@ -20,6 +20,23 @@ fail() {
   exit 1
 }
 
+SHARD=${SHARD:-1/1}
+[[ "$SHARD" =~ ^([1-9][0-9]?)/([1-9][0-9]?)$ ]] || fail "invalid SHARD: $SHARD"
+SHARD_INDEX=${BASH_REMATCH[1]}
+SHARD_TOTAL=${BASH_REMATCH[2]}
+(( SHARD_INDEX <= SHARD_TOTAL )) || fail "invalid SHARD: $SHARD"
+
+shard_owns() {
+  local owner=$1
+  (( SHARD_TOTAL == 1 || SHARD_INDEX == (owner < SHARD_TOTAL ? owner : SHARD_TOTAL) ))
+}
+
+MATRIX_ROW=0
+matrix_row_selected() {
+  MATRIX_ROW=$((MATRIX_ROW + 1))
+  (( SHARD_TOTAL == 1 || SHARD_INDEX == 2 + (MATRIX_ROW - 1) % (SHARD_TOTAL - 1) ))
+}
+
 require_text() {
   local path=$1 text=$2
   grep -Fq -- "$text" "$path" || fail "$path is missing: $text"
@@ -1337,6 +1354,7 @@ run_driver_traced() {
     bash -x "$DRIVER" "${DRIVER_ARGS[@]}"
 }
 
+if shard_owns 1; then
 # Scenario REHEARSAL-BINDINGS-01
 # Preconditions: authoritative reviewed config/environment and a clean copied generation.
 # PASS: outer and result evidence bind all C2/C3 identities plus the exact final scan.
@@ -3424,6 +3442,8 @@ for readiness_mode in http_failure not_ready issues; do
     fail "$readiness_mode readiness failure was not queried exactly once"
 done
 
+fi
+
 # Scenario FE-FORWARD-MATRIX-08
 # Preconditions: fresh fixture at each case; exact staged/environment and Legacy17 guard pass.
 # Injected boundaries: before, at, and after every durable manifest receipt, plus each atomic
@@ -3446,6 +3466,7 @@ for receipt in "${forward_manifest_boundaries[@]}"; do
   forward_boundaries+=("before-manifest-$receipt" "$receipt" "after-manifest-$receipt")
 done
 for boundary in "${forward_boundaries[@]}"; do
+  matrix_row_selected || continue
   root="$TEST_TMP/forward-$boundary"
   [[ ! -e "$root" ]] || fail "duplicate forward fixture path for $boundary"
   setup_fixture "$root"
@@ -3468,6 +3489,7 @@ for boundary in "${forward_boundaries[@]}"; do
     fail "$boundary did not install the live financial schema"
   [[ -f "$root/test-state/forward-refresh-count" && $(<"$root/test-state/forward-refresh-count") -ge 1 ]] ||
     fail "$boundary did not refresh the public projection"
+  echo "PASS: FE-FORWARD-MATRIX-08/$boundary"
 done
 
 # Scenario FE-ROLLBACK-MATRIX-09
@@ -3486,6 +3508,7 @@ for receipt in "${rollback_manifest_boundaries[@]}"; do
   rollback_boundaries+=("before-manifest-$receipt" "$receipt" "after-manifest-$receipt")
 done
 for boundary in "${rollback_boundaries[@]}"; do
+  matrix_row_selected || continue
   root="$TEST_TMP/rollback-$boundary"
   [[ ! -e "$root" ]] || fail "duplicate rollback fixture path for $boundary"
   setup_fixture "$root"
@@ -3515,8 +3538,10 @@ db=sqlite3.connect(sys.argv[1]); db.execute("update durable set value=\"mutated\
     fail "$boundary did not refresh the restored public projection"
   [[ $(<"$root/test-state/local-restore-count") -eq 1 ]] || fail "$boundary repeated local restoration"
   assert_restored_sqlite "$root"
+  echo "PASS: FE-ROLLBACK-MATRIX-09/$boundary"
 done
 
+if shard_owns 2; then
 # Scenario FE-ROLLBACK-WAL-ONLY-10
 # PASS: unchanged guarded main plus committed reset WAL restores exact backup/schema/content,
 # removes sidecars before reopening, and starts the old service once. FAIL: hash-only certification.
@@ -3925,5 +3950,10 @@ c=sqlite3.connect(sys.argv[1]); c.execute("pragma cache_size=-262144"); c.execut
 cur=c.execute("select 1"); c.execute("pragma cache_size=-2000")
 cur.execute("pragma integrity_check").fetchone(); c.close()'
 echo "PASS: FE-BACKUPCACHE-64"
+fi
 
+if [[ "$SHARD_TOTAL" == 1 ]]; then
 echo "PASS: 73 scenario contracts, including the pre-stop and immediate post-stop financial-era preflight, WAL-only rollback and resumed-write preservation; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; ${#wal_restore_boundaries[@]} WAL restore hooks converge; PostgreSQL execution remains shimmed"
+else
+  echo "PASS: financial-era shard $SHARD"
+fi
