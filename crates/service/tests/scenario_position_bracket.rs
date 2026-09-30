@@ -918,6 +918,7 @@ fn fenced_bracket_records_new_covered_purchases_without_repairing_stored_groups(
     let mut engine =
         BucketCommitEngine::load(paper.clone(), build_leader_ledger(&paper).unwrap()).unwrap();
     assert!(engine.is_fenced(&wallet));
+    let history_before = paper.gate_history().unwrap();
     let mut bracket = context(END);
     bracket.bracket_commit = true;
     let result = engine
@@ -940,8 +941,8 @@ fn fenced_bracket_records_new_covered_purchases_without_repairing_stored_groups(
     );
     assert!(result.pending.is_empty());
     assert!(!result.already_committed);
-    let expected = HashSet::from([MarketId(VenueMarketId(condition(4)))]);
-    assert_eq!(paper.gate_history().unwrap()[&wallet], expected);
+    // All fenced bracket history waits for an eligible serialized recovery installation.
+    assert_eq!(paper.gate_history().unwrap(), history_before);
     assert_eq!(
         paper.activity_group_state(stored.group_id.key()).unwrap(),
         stored_before
@@ -949,7 +950,7 @@ fn fenced_bracket_records_new_covered_purchases_without_repairing_stored_groups(
 
     let retry = engine.commit(groups, &bracket, zero_basis()).unwrap();
     assert!(retry.already_committed);
-    assert_eq!(paper.gate_history().unwrap()[&wallet], expected);
+    assert_eq!(paper.gate_history().unwrap(), history_before);
     assert!(paper.is_wallet_fenced(&wallet).unwrap());
     assert!(paper.decision_pending_history().unwrap().is_empty());
 }
@@ -2800,20 +2801,40 @@ async fn periodic_refresh_skips_a_wallet_newly_fenced_inside_the_bracket() {
         )
         .unwrap();
     revised["size"] = json!("2.000000");
+    let mut retry_revision = revised.clone();
+    retry_revision["size"] = json!("3.000000");
     let responses = HashMap::from([(
         activity_url(wallet),
-        vec![serde_json::to_vec(&vec![revised]).unwrap()],
+        vec![
+            serde_json::to_vec(&vec![revised]).unwrap(),
+            serde_json::to_vec(&vec![retry_revision]).unwrap(),
+        ],
     )]);
+    let fetcher = Arc::new(QueueFetcher::new(responses));
     let (control_tx, control_rx) = mpsc::channel(2);
     let actor = spawn_control_actor(control_rx, engine, Arc::clone(&paper));
-    let preparer =
-        AdmissionPreparer::with_validator(control_tx, Arc::clone(&paper), validator(responses));
+    let preparer = AdmissionPreparer::with_validator(
+        control_tx,
+        Arc::clone(&paper),
+        validator_from_fetcher(Arc::clone(&fetcher)),
+    );
+    let anchors_before = paper.position_anchors(&wallet).unwrap();
 
+    // A recoverable fence permits one retry; another novel revision defers without installing.
     assert_eq!(
         preparer.prepare_if_due(wallet, END, 1).await.unwrap(),
-        AnchorRefreshOutcome::Skipped
+        AnchorRefreshOutcome::Deferred
     );
     assert!(paper.is_wallet_fenced(&wallet).unwrap());
+    assert_eq!(paper.position_anchors(&wallet).unwrap(), anchors_before);
+    assert_eq!(
+        fetcher
+            .urls()
+            .iter()
+            .filter(|url| url.contains("/activity?"))
+            .count(),
+        2
+    );
     drop(preparer);
     actor.await.unwrap();
 }

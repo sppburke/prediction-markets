@@ -386,6 +386,78 @@ fn paper_service_rollout_ordinary_retry_of_disposed_revision_preserves_fence() {
         );
         assert_eq!(paper.open_decision_pending().unwrap(), pending_before_retry);
     }
+
+    // Clear the recoverable fence with authoritative coverage over the disposed revision.
+    let captured = ledger_capture(engine.ledger(), &paper, wallet()).unwrap();
+    engine
+        .install_anchors(&[AnchorInstall {
+            fresh_history: Vec::new(),
+            expected_fence: Some(fence),
+            history_status: None,
+            wallet: wallet(),
+            balances: vec![(
+                MarketId(VenueMarketId(MARKET_A.to_owned())),
+                OutcomeId(0),
+                ShareAmount::from_atomic(2_000_000),
+            )],
+            cutoff: 101,
+            proof: AnchorProof {
+                positions_proof_hash: "disposed-retry-recovery".to_owned(),
+                activity_bounds_json: "[]".to_owned(),
+                source_log_generation: "scenario".to_owned(),
+                document: "{}".to_owned(),
+                recorded_at_unix: 121,
+            },
+            expected: AnchorExpectation {
+                ledger_hash: captured.hash,
+                cursor: captured.cursor,
+                anchor_seq: captured.anchor_seq,
+                coverage_generation: captured.coverage_generation,
+            },
+        }])
+        .unwrap();
+    assert!(!engine.is_fenced(&wallet()));
+    assert!(paper.wallet_fence(&wallet()).unwrap().is_none());
+    assert_eq!(
+        paper
+            .wallet_coverage(&wallet())
+            .unwrap()
+            .activity_cutoff_unix,
+        Some(101)
+    );
+    let pending = paper.decision_pending_history().unwrap();
+    let coverage = paper.wallet_coverage(&wallet()).unwrap();
+    assert_eq!(coverage.coverage_generation, generation);
+
+    // Reconciliation still recognizes R1, but a first-time invalid-mapping fence must witness R0.
+    let retry = engine
+        .commit_read(vec![revised.clone()], &ordinary, zero_basis())
+        .unwrap();
+    assert!(retry.already_committed);
+    assert!(retry.pending.is_empty());
+    let quarantined = engine
+        .commit_read(vec![revised.clone()], &ambiguous_mapping, zero_basis())
+        .unwrap();
+    assert_eq!(
+        quarantined.newly_fenced,
+        Some(WalletFenceCause::InvalidMapping)
+    );
+    assert!(!quarantined.retained_revision);
+    assert!(quarantined.pending.is_empty());
+    assert!(engine.is_fenced(&wallet()));
+    assert_eq!(
+        paper.wallet_fence(&wallet()).unwrap().unwrap().cause,
+        "invalid_mapping"
+    );
+    assert_eq!(paper.activity_group_state(&id).unwrap(), original_state);
+    assert_eq!(
+        paper
+            .activity_revision_state(&id, revised.semantic_revision.as_str())
+            .unwrap(),
+        disposition
+    );
+    assert_eq!(paper.wallet_coverage(&wallet()).unwrap(), coverage);
+    assert_eq!(paper.decision_pending_history().unwrap(), pending);
 }
 
 fn install_anchor(

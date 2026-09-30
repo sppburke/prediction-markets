@@ -1047,14 +1047,16 @@ impl CausalPositionValidator {
         unresolved_assets.extend(first_prepared.unresolved_assets.clone());
         let first_ledger = {
             let mut engine = engine.lock().await;
-            commit_direct(
+            if commit_direct(
                 wallet,
                 &first_activity,
                 &first_prepared,
                 &mut engine,
                 false,
                 &self.source_log_generation,
-            )?;
+            )? {
+                return Err(CausalPositionError::InterveningActivity { wallet });
+            }
             let captured = ledger_capture(engine.ledger(), paper_state, wallet)?;
             #[cfg(feature = "scenario")]
             self.run_step_hook(wallet, 1, &mut engine);
@@ -1873,7 +1875,11 @@ mod tests {
             },
             _ => unreachable!(),
         };
-        for index in 0..3 {
+        for (index, identity_class) in [
+            (0, FailureClass::WalletTransient),
+            (1, FailureClass::Shared),
+            (2, FailureClass::Shared),
+        ] {
             assert_eq!(
                 CausalPositionError::Activity {
                     wallet,
@@ -1902,7 +1908,7 @@ mod tests {
                     source: source(index)
                 }
                 .class(),
-                FailureClass::Shared
+                identity_class
             );
         }
         assert_eq!(

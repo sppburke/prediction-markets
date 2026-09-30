@@ -3879,11 +3879,17 @@ impl BucketCommitEngine {
         let proof_json = serde_json::to_string(&proof)?;
         if cause == WalletFenceCause::InvalidMapping
             && !already_fenced
-            && let Some((aggregate, state)) = aggregates
+            && let Some(aggregate) = aggregates
                 .iter()
                 .zip(durable)
-                .find_map(|(aggregate, state)| state.as_ref().map(|state| (aggregate, state)))
+                .find_map(|(aggregate, state)| state.is_some().then_some(aggregate))
         {
+            // Comparison states may contain a disposed revision; the witness must use
+            // the immutable original even after a recovery cleared the previous fence.
+            let state = self
+                .paper_state
+                .activity_group_state(aggregate.group_id.key())?
+                .ok_or(BucketCommitError::PartialDurableBucket)?;
             // Preserve the original disposition and its history clock as the fence witness.
             // Once that fence is durable, the existing bucket owner can retain any revised
             // candidates without replacing their original economic effects. A crash between
