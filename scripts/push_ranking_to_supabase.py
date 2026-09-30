@@ -561,7 +561,7 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--keep-batches", type=int, default=1080,
                     help="keep only the newest N ranking_batches after a successful push "
                          "(0 disables; docs/_GLOSSARY ranking_batches_retention; default 1080 "
-                         "= ~6 months at the 4h production cadence, 6 pushes/day)")
+                         "batches cover a span set by the actual push cadence)")
     # Active-only upload filter (issue #350 WS3). Off unless --db is given.
     ap.add_argument("--db", default=None,
                     help="wallet_cache.db; when set, drop ranked wallets idle beyond "

@@ -332,7 +332,7 @@ class DefaultsDriftTest(unittest.TestCase):
         a = pr.build_parser().parse_args(["--ranked-csv", "x.csv"])
         self.assertEqual(a.active_window_hours, 72)       # upload_active_window_hours
         self.assertEqual(a.max_cache_staleness_hours, 24)  # upload_max_cache_staleness_hours
-        self.assertEqual(a.keep_batches, 1080)            # ranking_batches_retention (#411; 1080 at the 4h cadence, run28 cutover)
+        self.assertEqual(a.keep_batches, 1080)            # ranking_batches_retention (#411; raised to 1080 at run28 cutover)
         self.assertIsNone(a.db)                            # filter off unless --db given
         self.assertEqual(pr.SUPABASE_MAX_RETRIES, 5)       # ranking_publish_max_retries
         self.assertEqual(pr.SUPABASE_RETRY_BASE_SECS, 1)   # ranking_publish_retry_base_secs
