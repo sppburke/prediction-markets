@@ -2755,6 +2755,18 @@ impl BucketCommitEngine {
                     wallet: install.wallet,
                 });
             }
+            // Clearance must cover every recorded revision so its exact retry stays
+            // recognizable after the wallet is unfenced, including after UTC rollback.
+            if install.expected_fence.is_some()
+                && let Some(stored) = capture.cursor
+                && stored > install.cutoff
+            {
+                return Err(AnchorInstallError::CutoffRegression {
+                    wallet: install.wallet,
+                    stored,
+                    candidate: install.cutoff,
+                });
+            }
             let coverage = self.paper_state.wallet_coverage(&install.wallet)?;
             if let Some(stored) = coverage.activity_cutoff_unix
                 && stored > install.cutoff
@@ -2931,13 +2943,6 @@ impl BucketCommitEngine {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let coverage = self.paper_state.wallet_coverage(&wallet)?;
-        let recovery = self
-            .paper_state
-            .wallet_fence(&wallet)?
-            .as_ref()
-            .map(|fence| crate::position_seeder::recoverable_fence(&self.paper_state, fence))
-            .transpose()?
-            .unwrap_or(false);
         // Both fence dispatches must recognize exact disposed revisions before comparing them,
         // including while an ineligible fence keeps the wallet quarantined.
         for (aggregate, state) in aggregates.iter().zip(&mut durable) {
@@ -2945,11 +2950,9 @@ impl BucketCommitEngine {
                 && original.semantic_revision != aggregate.semantic_revision.as_str()
                 && original.transaction_hash == aggregate.group_id.components().transaction_hash
                 && (self.fences.contains(&wallet)
-                    || recovery
-                    || (!self.fences.contains(&wallet)
-                        && coverage
-                            .activity_cutoff_unix
-                            .is_some_and(|cutoff| source_epoch <= cutoff)))
+                    || coverage
+                        .activity_cutoff_unix
+                        .is_some_and(|cutoff| source_epoch <= cutoff))
                 && let Some(revision) = self.paper_state.activity_revision_state(
                     aggregate.group_id.key(),
                     aggregate.semantic_revision.as_str(),

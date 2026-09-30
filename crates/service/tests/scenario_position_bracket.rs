@@ -5660,6 +5660,122 @@ async fn paper_service_rollout_fence_allowlist_cutoff_and_install_races_fail_clo
     }
 }
 
+/// PASS: an internally monotonic bracket after UTC rollback cannot clear a fence below a
+/// disposed revision's epoch. Admission defers and exact retries remain nonfatal while fenced.
+#[tokio::test]
+async fn paper_service_rollout_recovery_cutoff_before_recorded_revision_defers() {
+    let wallet = wallet(0xd6);
+    let (dir, paper, mut engine) = fresh(&[wallet]);
+    let older_row = activity(wallet, 1, "1", "0xolder-fence", 100);
+    let older = aggregate(older_row.clone(), wallet);
+    engine
+        .commit(vec![older.clone()], &context(100), zero_basis())
+        .unwrap();
+    rollout_fence(
+        &dir,
+        wallet,
+        older.group_id.key(),
+        "position_underflow",
+        100,
+    );
+    let fence = paper.wallet_fence(&wallet).unwrap();
+    let mut engine = BucketCommitEngine::load(paper.clone(), engine.into_ledger()).unwrap();
+    let later_row = activity(wallet, 1, "1", "0xlater-revision", 200);
+    engine
+        .commit(
+            vec![aggregate(later_row, wallet)],
+            &context(200),
+            zero_basis(),
+        )
+        .unwrap();
+    let mut revised_row = activity(wallet, 1, "2", "0xlater-revision", 200);
+    revised_row["usdcSize"] = json!("1");
+    let revised = aggregate(revised_row, wallet);
+    let retained = engine
+        .commit(vec![revised.clone()], &context(200), zero_basis())
+        .unwrap();
+    assert!(retained.retained_revision);
+    let stored_revision = paper
+        .activity_revision_state(revised.group_id.key(), revised.semantic_revision.as_str())
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored_revision.disposition, "wallet_fenced");
+    assert_eq!(
+        ledger_capture(engine.ledger(), &paper, wallet)
+            .unwrap()
+            .cursor,
+        Some(200)
+    );
+    let coverage = paper.wallet_coverage(&wallet).unwrap();
+    let history = rollout_history(&dir);
+
+    // All three new bounds increase, but the accepted second-read cutoff is only 150.
+    // The older row retains the same asset's metadata mapping below that cutoff.
+    let mut responses = rollout_empty_reads(wallet, 1);
+    responses.remove(&activity_url(wallet));
+    for end in [149, 150, 151] {
+        responses.insert(
+            activity_url_at(wallet, end),
+            vec![serde_json::to_vec(&vec![older_row.clone()]).unwrap()],
+        );
+    }
+    let fetcher = Arc::new(QueueFetcher::new(responses));
+    let ends = Arc::new(Mutex::new(VecDeque::from([149, 150, 151, 151])));
+    let validator = validator_from_fetcher(fetcher.clone()).with_clock(Arc::new(move || {
+        ends.lock().unwrap().pop_front().unwrap_or(151)
+    }));
+    let (tx, rx) = mpsc::channel(4);
+    let actor = spawn_control_actor(rx, engine, paper.clone());
+    let preparer = AdmissionPreparer::with_validator(tx.clone(), paper.clone(), validator);
+    let outcome = preparer.prepare(&[wallet]).await.unwrap();
+    assert!(outcome.admitted.is_empty());
+    assert_eq!(outcome.deferred.len(), 1);
+    assert_eq!(outcome.deferred[0].stage, "anchor_install");
+    assert_eq!(outcome.deferred[0].kind, "anchor.cutoff_regression");
+    assert_eq!(
+        outcome.deferred[0].class,
+        pe_service::position_seeder::FailureClass::WalletTransient
+    );
+    assert!(outcome.deferred[0].message.contains("from 200 to 150"));
+    assert_eq!(
+        fetcher
+            .urls()
+            .into_iter()
+            .filter(|url| url.contains("/activity?"))
+            .collect::<Vec<_>>(),
+        [149, 150, 151].map(|end| activity_url_at(wallet, end))
+    );
+    assert_eq!(paper.wallet_fence(&wallet).unwrap(), fence);
+    assert!(paper.position_anchors(&wallet).unwrap().is_empty());
+    assert!(paper.position_validation(&wallet).unwrap().is_none());
+    assert_eq!(paper.wallet_coverage(&wallet).unwrap(), coverage);
+    assert_eq!(rollout_history(&dir), history);
+
+    // An ordinary retry through the same serialized owner remains an exact disposed retry.
+    let (committed, acknowledgement) = tokio::sync::oneshot::channel();
+    tx.send(OrchestratorControl::CommitActivityBucket {
+        aggregates: vec![revised.clone()],
+        context: Arc::new(context(200)),
+        committed,
+    })
+    .await
+    .unwrap();
+    let retried = acknowledgement.await.unwrap().unwrap();
+    assert!(retried.already_committed);
+    assert!(!retried.retained_revision);
+    assert_eq!(
+        paper
+            .activity_revision_state(revised.group_id.key(), revised.semantic_revision.as_str())
+            .unwrap(),
+        Some(stored_revision)
+    );
+    assert_eq!(paper.wallet_fence(&wallet).unwrap(), fence);
+    assert_eq!(paper.wallet_coverage(&wallet).unwrap(), coverage);
+    drop(preparer);
+    drop(tx);
+    actor.await.unwrap();
+}
+
 struct RolloutDeadlineFetcher {
     inner: QueueFetcher,
     starts: mpsc::UnboundedSender<WalletAddress>,
