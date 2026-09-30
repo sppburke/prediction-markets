@@ -2938,12 +2938,14 @@ impl BucketCommitEngine {
             .map(|fence| crate::position_seeder::recoverable_fence(&self.paper_state, fence))
             .transpose()?
             .unwrap_or(false);
-        // Both fence dispatches must recognize exact disposed revisions before comparing them.
+        // Both fence dispatches must recognize exact disposed revisions before comparing them,
+        // including while an ineligible fence keeps the wallet quarantined.
         for (aggregate, state) in aggregates.iter().zip(&mut durable) {
             if let Some(original) = state
                 && original.semantic_revision != aggregate.semantic_revision.as_str()
                 && original.transaction_hash == aggregate.group_id.components().transaction_hash
-                && (recovery
+                && (self.fences.contains(&wallet)
+                    || recovery
                     || (!self.fences.contains(&wallet)
                         && coverage
                             .activity_cutoff_unix

@@ -2839,6 +2839,85 @@ async fn periodic_refresh_skips_a_wallet_newly_fenced_inside_the_bracket() {
     actor.await.unwrap();
 }
 
+#[tokio::test]
+async fn paper_service_rollout_periodic_refresh_recovers_a_stable_revision_on_bounded_retry() {
+    let wallet = wallet(0x77);
+    let (_dir, paper, mut engine) = fresh(&[wallet]);
+    install_empty_anchor(&mut engine, &paper, wallet, 0);
+    let mut revised = activity(wallet, 1, "1.000000", "0xrefresh-revision", 10);
+    let original = aggregate(revised.clone(), wallet);
+    let id = original.group_id.key().clone();
+    engine
+        .commit(vec![original], &context(10), zero_basis())
+        .unwrap();
+    let original_state = paper.activity_group_state(&id).unwrap();
+    let pending = paper.decision_pending_history().unwrap();
+    let anchors_before = paper.position_anchors(&wallet).unwrap();
+    revised["size"] = json!("2.000000");
+    let revision = aggregate(revised.clone(), wallet).semantic_revision;
+    let mut responses = stable_responses(&[(wallet, 1, "2.000000")]);
+    responses.insert(
+        activity_url(wallet),
+        vec![serde_json::to_vec(&vec![revised]).unwrap(); 4],
+    );
+    let fetcher = Arc::new(QueueFetcher::new(responses));
+    let (control_tx, control_rx) = mpsc::channel(2);
+    let actor = spawn_control_actor(control_rx, engine, Arc::clone(&paper));
+    let preparer = AdmissionPreparer::with_validator(
+        control_tx,
+        Arc::clone(&paper),
+        validator_from_fetcher(Arc::clone(&fetcher)),
+    );
+
+    // The first read retains R1 and fences; the bounded retry sees only that disposed revision.
+    assert_eq!(
+        preparer.prepare_if_due(wallet, END, 1).await.unwrap(),
+        AnchorRefreshOutcome::Anchored
+    );
+    assert!(paper.wallet_fence(&wallet).unwrap().is_none());
+    let anchors = paper.position_anchors(&wallet).unwrap();
+    assert_eq!(anchors.len(), anchors_before.len() + 1);
+    assert_eq!(&anchors[..anchors_before.len()], anchors_before);
+    let anchor = anchors.last().unwrap();
+    assert_eq!(anchor.activity_cutoff_unix, END);
+    assert_full_history_proof(&anchor.proof_json);
+    let proof: Value = serde_json::from_str(&anchor.proof_json).unwrap();
+    assert_eq!(proof["cleared_fence"]["cause"], "revised_applied_aggregate");
+    assert_eq!(proof["cleared_fence"]["source_trade_id"], id.0);
+    assert!(paper.position_validation_current(&wallet).unwrap());
+    let coverage = paper.wallet_coverage(&wallet).unwrap();
+    assert_eq!(coverage.activity_cutoff_unix, Some(END));
+    assert_eq!(coverage.anchor_seq, Some(anchor.anchor_seq));
+    assert!(!coverage.reanchor_required);
+    let ledger = build_leader_ledger(&paper).unwrap();
+    assert_eq!(
+        ledger.position(&wallet).unwrap().positions
+            [&MarketOutcomeId::new(MarketId(VenueMarketId(condition(1))), OutcomeId(0),)]
+            .long_contracts,
+        ShareAmount::from_atomic(2_000_000)
+    );
+    assert_eq!(paper.activity_group_state(&id).unwrap(), original_state);
+    assert_eq!(
+        paper
+            .activity_revision_state(&id, revision.as_str())
+            .unwrap()
+            .unwrap()
+            .disposition,
+        "revised_applied_aggregate"
+    );
+    assert_eq!(paper.decision_pending_history().unwrap(), pending);
+    assert_eq!(
+        fetcher
+            .urls()
+            .iter()
+            .filter(|url| url.contains("/activity?"))
+            .count(),
+        4
+    );
+    drop(preparer);
+    actor.await.unwrap();
+}
+
 #[test]
 fn anchor_transaction_failure_preserves_engine_before_retry_and_rejects_regressed_cutoff() {
     let wallet = wallet(0x66);

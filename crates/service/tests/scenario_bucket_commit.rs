@@ -312,7 +312,7 @@ fn fresh_anchored() -> (tempfile::TempDir, Arc<PaperStateDb>, BucketCommitEngine
 
 #[test]
 fn paper_service_rollout_ordinary_retry_of_disposed_revision_preserves_fence() {
-    let (_dir, paper, mut engine) = fresh_anchored();
+    let (dir, paper, mut engine) = fresh_anchored();
     let original = position_row(
         "TRADE",
         "0xdisposed-retry",
@@ -458,6 +458,71 @@ fn paper_service_rollout_ordinary_retry_of_disposed_revision_preserves_fence() {
     );
     assert_eq!(paper.wallet_coverage(&wallet()).unwrap(), coverage);
     assert_eq!(paper.decision_pending_history().unwrap(), pending);
+
+    let invalid_mapping_fence = paper.wallet_fence(&wallet()).unwrap().unwrap();
+    assert!(
+        !pe_service::position_seeder::recoverable_fence(&paper, &invalid_mapping_fence).unwrap()
+    );
+    let history = paper.gate_history().unwrap();
+    let history_status = paper.wallet_history_status(&wallet()).unwrap();
+    let connection = rusqlite::Connection::open(dir.path().join("paper.db")).unwrap();
+    let history_rows = || {
+        connection
+            .prepare("SELECT wallet_hex, market_id, first_epoch, source_trade_id, origin FROM wallet_market_history_v2 ORDER BY wallet_hex, market_id")
+            .unwrap()
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    };
+    let history_before = history_rows();
+    let anchors = paper.position_anchors(&wallet()).unwrap();
+    for reload in [false, true] {
+        if reload {
+            engine =
+                BucketCommitEngine::load(Arc::clone(&paper), build_leader_ledger(&paper).unwrap())
+                    .unwrap();
+        }
+        for (retry_context, already_committed) in [(&ordinary, true), (&ambiguous_mapping, false)] {
+            let retry = engine
+                .commit_read(vec![revised.clone()], retry_context, zero_basis())
+                .unwrap();
+            assert_eq!(retry.already_committed, already_committed);
+            assert!(!retry.retained_revision);
+            assert!(retry.pending.is_empty());
+            assert!(retry.newly_fenced.is_none());
+            assert!(engine.is_fenced(&wallet()));
+            assert_eq!(
+                paper.wallet_fence(&wallet()).unwrap(),
+                Some(invalid_mapping_fence.clone())
+            );
+            assert_eq!(paper.activity_group_state(&id).unwrap(), original_state);
+            assert_eq!(
+                paper
+                    .activity_revision_state(&id, revised.semantic_revision.as_str())
+                    .unwrap(),
+                disposition
+            );
+            assert_eq!(paper.wallet_coverage(&wallet()).unwrap(), coverage);
+            assert_eq!(paper.gate_history().unwrap(), history);
+            assert_eq!(history_rows(), history_before);
+            assert_eq!(
+                paper.wallet_history_status(&wallet()).unwrap(),
+                history_status
+            );
+            assert_eq!(paper.position_anchors(&wallet()).unwrap(), anchors);
+            assert_eq!(paper.decision_pending_history().unwrap(), pending);
+            assert_eq!(paper.open_decision_pending().unwrap(), pending_before_retry);
+        }
+    }
 }
 
 fn install_anchor(
