@@ -8851,6 +8851,14 @@ async fn incremental_wallet_and_manifest_transactions_roll_back_at_every_write_b
         source.calls.lock().unwrap().clear();
         // Connection tuning is outside the frozen identity and commitments.
         config.cache_page_cache_mib = 8;
+        let log = CheckLog::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let guard = tracing::subscriber::set_default(subscriber);
         let manifest = pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
             &config,
             &source,
@@ -8863,6 +8871,18 @@ async fn incremental_wallet_and_manifest_transactions_roll_back_at_every_write_b
         )
         .await
         .unwrap();
+        drop(guard);
+        let settings = log.take_named("activity writer effective SQLite settings");
+        assert_eq!(settings.len(), 1, "{name}: one resumed writer");
+        assert_eq!(
+            settings[0]["fields"]["cache_size"],
+            -8 * 1024,
+            "{name}: resumed writer tuning"
+        );
+        assert_eq!(
+            settings[0]["fields"]["synchronous"], 2,
+            "{name}: resumed durability"
+        );
         assert_eq!(manifest.group_count, 1031);
         assert_eq!(
             manifest.reference_sha256, expected.reference_sha256,
