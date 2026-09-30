@@ -14,6 +14,7 @@ use pe_paper_state::{PaperStateDb, WalletCoverage};
 use pe_trader_index::WatchlistEntry;
 use serde::Serialize;
 use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::time::Instant;
 use tracing::warn;
 
 use crate::activity_ingest::{SourceLogHandle, SourceLogHandleError};
@@ -172,6 +173,8 @@ mod admission_tests {
         state.set_cursor(&missing_validation, 1).unwrap();
         state
             .install_anchors(&[AnchorInstallRecord {
+                repaired_history: Vec::new(),
+                expected_fence: None,
                 history_status: None,
                 wallet: missing_validation,
                 balances: Vec::new(),
@@ -204,6 +207,26 @@ mod admission_tests {
         assert_eq!(abort.deferred.len(), 1);
         assert_eq!(abort.deferred[0].wallet, missing_validation);
         assert_eq!(abort.deferred[0].kind, "proof.missing_validation");
+    }
+    #[tokio::test(start_paused = true)]
+    async fn paper_service_rollout_mutex_wait_consumes_launch_budget_without_attempts() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let (tx, mut rx) = mpsc::channel(1);
+        let preparer = AdmissionPreparer::new(tx, state.clone());
+        let held = preparer.inner.attempt.lock().await;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let outcome = preparer
+            .prepare_with_cursors(&[wallet(1), wallet(2)], None, Some(deadline))
+            .await
+            .unwrap();
+        assert_eq!(Instant::now(), deadline);
+        assert!(outcome.started.is_empty());
+        assert!(outcome.deferred.is_empty());
+        assert_eq!(outcome.unstarted, vec![wallet(1), wallet(2)]);
+        assert!(rx.try_recv().is_err());
+        assert!(state.cursor(&wallet(1)).unwrap().is_none());
+        drop(held);
     }
 }
 
@@ -252,6 +275,8 @@ impl AdmissionError {
 
 #[derive(Debug, serde::Serialize)]
 pub struct Deferral {
+    #[serde(skip)]
+    pub(crate) completed_at: Option<Instant>,
     pub wallet: WalletAddress,
     pub stage: &'static str,
     pub class: FailureClass,
@@ -262,6 +287,7 @@ pub struct Deferral {
 impl Deferral {
     fn from_error(wallet: WalletAddress, stage: &'static str, error: &AdmissionError) -> Self {
         Self {
+            completed_at: Some(tokio::time::Instant::now()),
             wallet,
             stage,
             class: error.class(),
@@ -273,6 +299,8 @@ impl Deferral {
 
 #[derive(Debug)]
 pub struct AdmissionOutcome {
+    pub started: Vec<WalletAddress>,
+    pub unstarted: Vec<WalletAddress>,
     pub admitted: Vec<WalletAddress>,
     pub deferred: Vec<Deferral>,
 }
@@ -282,6 +310,9 @@ pub(crate) type CapturedProofs = Vec<(WalletAddress, MembershipProofManifest)>;
 #[derive(Debug, thiserror::Error)]
 #[error("{cause}")]
 pub struct AdmissionAbort {
+    pub started: Vec<WalletAddress>,
+    pub unstarted: Vec<WalletAddress>,
+    pub admitted: Vec<WalletAddress>,
     pub cause: AdmissionError,
     pub deferred: Vec<Deferral>,
 }
@@ -417,6 +448,10 @@ impl AdmissionPreparer {
         }
     }
 
+    pub(crate) fn paper_state(&self) -> &PaperStateDb {
+        &self.inner.paper_state
+    }
+
     /// Production constructor with the five-step causal positions bracket.
     pub fn with_validator(
         control_tx: mpsc::Sender<OrchestratorControl>,
@@ -460,12 +495,23 @@ impl AdmissionPreparer {
         Ok(())
     }
 
-    pub(crate) async fn prepare_ranked(
+    pub(crate) async fn prepare_ranked_until(
         &self,
         additions: &[WalletAddress],
         ranked_last_trade: &HashMap<WalletAddress, i64>,
+        deadline: Option<Instant>,
     ) -> Result<AdmissionOutcome, AdmissionAbort> {
-        self.prepare_with_cursors(additions, Some(ranked_last_trade))
+        self.prepare_with_cursors(additions, Some(ranked_last_trade), deadline)
+            .await
+    }
+
+    #[cfg(feature = "scenario")]
+    pub async fn scenario_prepare_until(
+        &self,
+        additions: &[WalletAddress],
+        deadline: tokio::time::Instant,
+    ) -> Result<AdmissionOutcome, AdmissionAbort> {
+        self.prepare_with_cursors(additions, None, Some(deadline))
             .await
     }
 
@@ -476,31 +522,62 @@ impl AdmissionPreparer {
         &self,
         additions: &[WalletAddress],
     ) -> Result<AdmissionOutcome, AdmissionAbort> {
-        self.prepare_with_cursors(additions, None).await
+        self.prepare_with_cursors(additions, None, None).await
     }
 
     async fn prepare_with_cursors(
         &self,
         additions: &[WalletAddress],
         ranked_last_trade: Option<&HashMap<WalletAddress, i64>>,
+        deadline: Option<Instant>,
     ) -> Result<AdmissionOutcome, AdmissionAbort> {
         let preparer = &self.inner;
-        let _attempt = preparer.attempt.lock().await;
+        let mut started = Vec::new();
+        let mut unstarted = Vec::new();
+        let _attempt = if let Some(end) = deadline {
+            match tokio::time::timeout_at(end, preparer.attempt.lock()).await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    return Ok(AdmissionOutcome {
+                        started,
+                        unstarted: additions.to_vec(),
+                        admitted: Vec::new(),
+                        deferred: Vec::new(),
+                    });
+                }
+            }
+        } else {
+            preparer.attempt.lock().await
+        };
         let mut admitted = Vec::new();
         let mut deferred = Vec::new();
         let mut eligible = Vec::new();
         for wallet in additions {
-            match self.check_fences(&[*wallet]) {
+            match self.check_recovery_fence(wallet) {
                 Ok(()) => eligible.push(*wallet),
                 Err(error) if error.class() != FailureClass::Shared => {
                     deferred.push(Deferral::from_error(*wallet, "fence", &error))
                 }
-                Err(cause) => return Err(AdmissionAbort { cause, deferred }),
+                Err(cause) => {
+                    return Err(AdmissionAbort {
+                        started,
+                        unstarted,
+                        admitted,
+                        cause,
+                        deferred,
+                    });
+                }
             }
         }
         if let Some(validator) = &preparer.validator {
             if let Err(cause) = self.seed_ranked_cursors(&eligible, ranked_last_trade) {
-                return Err(AdmissionAbort { cause, deferred });
+                return Err(AdmissionAbort {
+                    started,
+                    unstarted,
+                    admitted,
+                    cause,
+                    deferred,
+                });
             }
             let outcomes = validator
                 .validate_via_control(
@@ -508,14 +585,22 @@ impl AdmissionPreparer {
                     &preparer.control_tx,
                     &preparer.paper_state,
                     ValidationPurpose::CatchUp,
+                    deadline,
                 )
                 .await;
+            started.extend_from_slice(&eligible[..outcomes.started_prefix]);
+            unstarted.extend_from_slice(&eligible[outcomes.started_prefix..]);
             for (wallet, error) in outcomes.deferred {
                 let error = AdmissionError::PositionValidation(error);
-                deferred.push(Deferral::from_error(wallet, "validation", &error));
+                let mut deferral = Deferral::from_error(wallet, "validation", &error);
+                deferral.completed_at = outcomes.completed_at.get(&wallet).copied();
+                deferred.push(deferral);
             }
             if let Some(cause) = outcomes.shared {
                 return Err(AdmissionAbort {
+                    started,
+                    unstarted,
+                    admitted,
                     cause: AdmissionError::PositionValidation(cause),
                     deferred,
                 });
@@ -534,69 +619,94 @@ impl AdmissionPreparer {
                         };
                         let Some(wallet) = wallet else {
                             return Err(AdmissionAbort {
+                                started,
+                                unstarted,
+                                admitted,
                                 cause: error,
                                 deferred,
                             });
                         };
-                        deferred.push(Deferral::from_error(wallet, "anchor_install", &error));
+                        let mut deferral = Deferral::from_error(wallet, "anchor_install", &error);
+                        deferral.completed_at = Some(Instant::now());
+                        deferred.push(deferral);
                         remaining.retain(|install| install.wallet != wallet);
                     }
-                    Err(cause) => return Err(AdmissionAbort { cause, deferred }),
+                    Err(cause) => {
+                        return Err(AdmissionAbort {
+                            started,
+                            unstarted,
+                            admitted,
+                            cause,
+                            deferred,
+                        });
+                    }
                 }
             }
         } else {
             for wallet in eligible {
+                if deadline.is_some_and(|end| Instant::now() >= end) {
+                    unstarted.push(wallet);
+                    continue;
+                }
+                started.push(wallet);
                 match self.check_prerequisites(&[wallet]) {
                     Ok(()) => {}
                     Err(error) if error.class() != FailureClass::Shared => {
                         deferred.push(Deferral::from_error(wallet, "history", &error));
                         continue;
                     }
-                    Err(cause) => return Err(AdmissionAbort { cause, deferred }),
+                    Err(cause) => {
+                        return Err(AdmissionAbort {
+                            started,
+                            unstarted,
+                            admitted,
+                            cause,
+                            deferred,
+                        });
+                    }
                 }
                 if let Err(cause) = self.seed_ranked_cursors(&[wallet], ranked_last_trade) {
-                    return Err(AdmissionAbort { cause, deferred });
+                    return Err(AdmissionAbort {
+                        started,
+                        unstarted,
+                        admitted,
+                        cause,
+                        deferred,
+                    });
                 }
                 if let Err(cause) = self.prepare_locked(&[wallet]).await {
-                    return Err(AdmissionAbort { cause, deferred });
+                    return Err(AdmissionAbort {
+                        started,
+                        unstarted,
+                        admitted,
+                        cause,
+                        deferred,
+                    });
                 }
                 admitted.push(wallet);
             }
         }
         let mut ready = Vec::new();
-        for wallet in admitted {
+        for wallet in admitted.iter().copied() {
             match self.check_prerequisites(&[wallet]) {
                 Ok(()) => ready.push(wallet),
                 Err(error) if error.class() != FailureClass::Shared => {
                     deferred.push(Deferral::from_error(wallet, "history", &error))
                 }
-                Err(cause) => return Err(AdmissionAbort { cause, deferred }),
-            }
-        }
-        Ok(AdmissionOutcome {
-            admitted: ready,
-            deferred,
-        })
-    }
-
-    /// One ranked-step attempt for live-only deferred wallets. A failure of one bracket does
-    /// not hold back another wallet selected in the same batch.
-    pub async fn prepare_live_reentries(
-        &self,
-        wallets: &[WalletAddress],
-    ) -> Result<AdmissionOutcome, AdmissionError> {
-        let mut ready = Vec::new();
-        let mut deferred = Vec::new();
-        for wallet in wallets {
-            match self.prepare(&[*wallet]).await {
-                Ok(outcome) => {
-                    ready.extend(outcome.admitted);
-                    deferred.extend(outcome.deferred);
+                Err(cause) => {
+                    return Err(AdmissionAbort {
+                        started,
+                        unstarted,
+                        admitted,
+                        cause,
+                        deferred,
+                    });
                 }
-                Err(abort) => return Err(abort.cause),
             }
         }
         Ok(AdmissionOutcome {
+            started,
+            unstarted,
             admitted: ready,
             deferred,
         })
@@ -670,7 +780,7 @@ impl AdmissionPreparer {
     pub(crate) fn capture_proofs(
         &self,
         additions: &[WalletAddress],
-    ) -> Result<(CapturedProofs, Vec<Deferral>), AdmissionAbort> {
+    ) -> Result<(CapturedProofs, Vec<Deferral>), Box<AdmissionAbort>> {
         let mut captured = Vec::with_capacity(additions.len());
         let mut deferred = Vec::new();
         for wallet in additions {
@@ -679,10 +789,13 @@ impl AdmissionPreparer {
                 Err(error) => {
                     let error = AdmissionError::MembershipProof(error);
                     if error.class() == FailureClass::Shared {
-                        return Err(AdmissionAbort {
+                        return Err(Box::new(AdmissionAbort {
+                            started: Vec::new(),
+                            unstarted: Vec::new(),
+                            admitted: Vec::new(),
                             cause: error,
                             deferred,
-                        });
+                        }));
                     }
                     deferred.push(Deferral::from_error(*wallet, "proof", &error));
                 }
@@ -841,6 +954,7 @@ impl AdmissionPreparer {
                 &preparer.control_tx,
                 &preparer.paper_state,
                 purpose,
+                None,
             )
             .await;
         if let Some(error) = outcomes.shared {
@@ -883,6 +997,15 @@ impl AdmissionPreparer {
             Err(AdmissionError::ValidationRejected(_)) => Ok(AnchorRefreshOutcome::Deferred),
             Err(error) => Err(error),
         }
+    }
+
+    fn check_recovery_fence(&self, wallet: &WalletAddress) -> Result<(), AdmissionError> {
+        if let Some(fence) = self.inner.paper_state.wallet_fence(wallet)?
+            && !crate::position_seeder::recoverable_fence(&self.inner.paper_state, &fence)?
+        {
+            return Err(AdmissionError::Fenced { wallet: *wallet });
+        }
+        Ok(())
     }
 
     fn check_fences(&self, additions: &[WalletAddress]) -> Result<(), AdmissionError> {

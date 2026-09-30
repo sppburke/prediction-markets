@@ -569,6 +569,8 @@ async fn mutex_recheck_skips_a_fresh_anchor_without_a_validator() {
     paper.set_cursor(&wallet, 10).unwrap();
     paper
         .install_anchors(&[AnchorInstallRecord {
+            repaired_history: Vec::new(),
+            expected_fence: None,
             history_status: None,
             wallet,
             balances: Vec::new(),
@@ -624,6 +626,8 @@ async fn contended_mutex_rereads_fresh_anchor_before_refreshing() {
     paper.set_cursor(&target, 10).unwrap();
     paper
         .install_anchors(&[AnchorInstallRecord {
+            repaired_history: Vec::new(),
+            expected_fence: None,
             history_status: None,
             wallet: target,
             balances: Vec::new(),
@@ -770,6 +774,8 @@ async fn deferred_refresh_continues_the_poller() {
     paper.set_cursor(&wallet, 0).unwrap();
     paper
         .install_anchors(&[AnchorInstallRecord {
+            repaired_history: Vec::new(),
+            expected_fence: None,
             history_status: None,
             wallet,
             balances: Vec::new(),

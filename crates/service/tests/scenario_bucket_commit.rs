@@ -132,6 +132,16 @@ impl CommitFixtureRead for BucketCommitEngine {
             ),
         );
         context.decision_inputs_json = read.decision_inputs_json;
+        if !template.decision_inputs_json.is_empty() {
+            let template_inputs: Value =
+                serde_json::from_str(&template.decision_inputs_json).unwrap();
+            if let Some(observations) = template_inputs.get("invalid_mapping_observations") {
+                let mut inputs: Value =
+                    serde_json::from_str(&context.decision_inputs_json).unwrap();
+                inputs["invalid_mapping_observations"] = observations.clone();
+                context.decision_inputs_json = serde_json::to_string(&inputs).unwrap();
+            }
+        }
         context.page_occurrences = vec![read.page];
         self.commit(aggregates, &context, basis)
     }
@@ -300,6 +310,84 @@ fn fresh_anchored() -> (tempfile::TempDir, Arc<PaperStateDb>, BucketCommitEngine
     (dir, paper, engine)
 }
 
+#[test]
+fn paper_service_rollout_ordinary_retry_of_disposed_revision_preserves_fence() {
+    let (_dir, paper, mut engine) = fresh_anchored();
+    let original = position_row(
+        "TRADE",
+        "0xdisposed-retry",
+        MARKET_A,
+        0,
+        "BUY",
+        "1",
+        "0.5",
+        100,
+    );
+    let revised = position_row(
+        "TRADE",
+        "0xdisposed-retry",
+        MARKET_A,
+        0,
+        "BUY",
+        "2",
+        "0.5",
+        100,
+    );
+    let id = original.group_id.key().clone();
+    let ordinary = context(100, true);
+    assert!(!ordinary.bracket_commit);
+    engine
+        .commit_read(vec![original], &ordinary, zero_basis())
+        .unwrap();
+    let original_state = paper.activity_group_state(&id).unwrap();
+    engine
+        .commit_read(vec![revised.clone()], &ordinary, zero_basis())
+        .unwrap();
+    let fence = paper.wallet_fence(&wallet()).unwrap().unwrap();
+    assert_eq!(fence.cause, "revised_applied_aggregate");
+    let generation = paper
+        .wallet_coverage(&wallet())
+        .unwrap()
+        .coverage_generation;
+    let disposition = paper
+        .activity_revision_state(&id, revised.semantic_revision.as_str())
+        .unwrap();
+    let pending_before_retry = paper.open_decision_pending().unwrap();
+    let mut ambiguous_mapping = ordinary.clone();
+    ambiguous_mapping.decision_inputs_json = json!({
+        "invalid_mapping_observations": [(id.clone(), support::scenario_receipt(500))],
+    })
+    .to_string();
+    for (retry_context, already_committed) in [(&ordinary, true), (&ambiguous_mapping, false)] {
+        let retry = engine
+            .commit_read(vec![revised.clone()], retry_context, zero_basis())
+            .unwrap();
+        assert_eq!(retry.already_committed, already_committed);
+        assert!(!retry.retained_revision);
+        assert!(retry.pending.is_empty());
+        assert!(retry.newly_fenced.is_none());
+        assert_eq!(
+            paper
+                .wallet_coverage(&wallet())
+                .unwrap()
+                .coverage_generation,
+            generation
+        );
+        assert_eq!(paper.wallet_fence(&wallet()).unwrap(), Some(fence.clone()));
+        assert_eq!(paper.activity_group_state(&id).unwrap(), original_state);
+        assert_eq!(
+            paper
+                .activity_revision_state(
+                    &id,
+                    disposition.as_ref().unwrap().semantic_revision.as_str()
+                )
+                .unwrap(),
+            disposition
+        );
+        assert_eq!(paper.open_decision_pending().unwrap(), pending_before_retry);
+    }
+}
+
 fn install_anchor(
     engine: &mut BucketCommitEngine,
     paper: &PaperStateDb,
@@ -321,6 +409,8 @@ fn install_anchor_for_wallet(
     let captured = ledger_capture(engine.ledger(), paper, wallet).unwrap();
     engine
         .install_anchors(&[AnchorInstall {
+            fresh_history: Vec::new(),
+            expected_fence: None,
             history_status: None,
             wallet,
             balances,
@@ -645,6 +735,8 @@ fn bracket_unverified_covered_group_is_raw_only_without_reanchor_then_anchors() 
     let captured = ledger_capture(engine.ledger(), &paper, wallet()).unwrap();
     engine
         .install_anchors(&[AnchorInstall {
+            fresh_history: Vec::new(),
+            expected_fence: None,
             history_status: None,
             wallet: wallet(),
             balances: Vec::new(),

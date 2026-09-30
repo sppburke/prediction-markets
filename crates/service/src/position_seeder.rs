@@ -15,7 +15,11 @@ use pe_core_types::{
     ShareAmount, SourceId, SourceTimestamp, SourceTradeId, VenueMarketId, WalletAddress,
 };
 use pe_event_log::{ContentType, EnvelopeIn};
-use pe_paper_state::{NoCopyDisposition, PaperStateDb, WalletHistoryStatusRecord};
+use pe_paper_state::{
+    MarketHistoryRecord, NoCopyDisposition, PaperStateDb, WalletFenceRecord,
+    WalletHistoryStatusRecord,
+};
+use pe_position_ledger::LedgerEffect;
 use pe_position_ledger::PositionLedger;
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
@@ -28,6 +32,7 @@ use rust_decimal::Decimal;
 use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Instant;
 
 use crate::asset_identity::{AssetIdentityResolver, BootSourceLog, IdentityProvenance};
 use crate::bucket_commit::{
@@ -54,6 +59,8 @@ pub enum ValidationPurpose {
 /// A venue-authoritative balance snapshot waiting for the single-owner install.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnchorInstall {
+    pub fresh_history: Vec<MarketHistoryRecord>,
+    pub expected_fence: Option<WalletFenceRecord>,
     /// Runtime acceptance completes history in the anchor transaction; direct boot leaves this absent.
     pub history_status: Option<WalletHistoryStatusRecord>,
     pub wallet: WalletAddress,
@@ -138,6 +145,8 @@ pub enum CausalPositionError {
     },
     #[error("wallet {wallet} became durably fenced during validation")]
     Fenced { wallet: WalletAddress },
+    #[error("unsafe attributable activity prevents fence recovery for {wallet}")]
+    UnsafeRecovery { wallet: WalletAddress },
     #[error("activity changed between bracket steps for {wallet}")]
     InterveningActivity { wallet: WalletAddress },
     #[error("current-position semantic proofs changed for {wallet}")]
@@ -262,8 +271,14 @@ impl CausalPositionError {
         match self {
             Self::Activity { source, .. } => classify_activity_read(source),
             Self::Positions { source, .. } => classify_position_read(source),
+            Self::Identity {
+                source: SourceError::Transient { .. },
+                ..
+            } => FailureClass::WalletTransient,
             Self::Identity { source, .. } => classify_source(source),
-            Self::Fenced { .. } | Self::DuplicateOutcome { .. } => FailureClass::WalletPersistent,
+            Self::UnsafeRecovery { .. } | Self::Fenced { .. } | Self::DuplicateOutcome { .. } => {
+                FailureClass::WalletPersistent
+            }
             Self::InterveningActivity { .. }
             | Self::PositionRevision { .. }
             | Self::LedgerRevision { .. } => FailureClass::WalletTransient,
@@ -483,6 +498,7 @@ impl CausalPositionError {
             Self::ProofEncoding(_) => "validation.proof_encoding",
             Self::BucketCommit { .. } => "validation.bucket_commit",
             Self::Fenced { .. } => "validation.fenced",
+            Self::UnsafeRecovery { .. } => "validation.unsafe_recovery",
             Self::InterveningActivity { .. } => "validation.intervening_activity",
             Self::PositionRevision { .. } => "validation.position_revision",
             Self::LedgerRevision { .. } => "validation.ledger_revision",
@@ -499,14 +515,23 @@ impl CausalPositionError {
 }
 
 pub struct ValidationOutcomes {
+    pub started_prefix: usize,
+    pub(crate) completed_at: HashMap<WalletAddress, Instant>,
     pub accepted: Vec<AnchorInstall>,
     pub deferred: Vec<(WalletAddress, CausalPositionError)>,
     pub shared: Option<CausalPositionError>,
 }
 
 pub struct DirectValidationOutcome {
+    pub(crate) completed_at: HashMap<WalletAddress, Instant>,
     pub accepted: Vec<AnchorInstall>,
     pub deferred: Vec<(WalletAddress, CausalPositionError)>,
+}
+
+impl DirectValidationOutcome {
+    pub fn failure_completed_at(&self, wallet: &WalletAddress) -> Option<Instant> {
+        self.completed_at.get(wallet).copied()
+    }
 }
 
 /// Exact per-wallet source outcomes that retry without fencing or failing boot.
@@ -677,25 +702,42 @@ impl CausalPositionValidator {
         control_tx: &mpsc::Sender<OrchestratorControl>,
         paper_state: &PaperStateDb,
         purpose: ValidationPurpose,
+        deadline: Option<Instant>,
     ) -> ValidationOutcomes {
-        let mut completed = futures::stream::iter(wallets.iter().copied().enumerate())
-            .map(|(index, wallet)| async move {
-                (
-                    index,
-                    self.validate_control_with_retry(wallet, control_tx, paper_state, purpose)
-                        .await,
-                )
-            })
-            .buffer_unordered(BRACKET_CONCURRENCY)
-            .collect::<Vec<_>>()
-            .await;
-        completed.sort_by_key(|(index, _)| *index);
+        let mut running = futures::stream::FuturesUnordered::new();
+        let mut started_prefix = 0;
+        let mut completed = Vec::new();
+        loop {
+            while running.len() < BRACKET_CONCURRENCY
+                && started_prefix < wallets.len()
+                && deadline.is_none_or(|end| Instant::now() < end)
+            {
+                let index = started_prefix;
+                let wallet = wallets[index];
+                started_prefix += 1;
+                running.push(async move {
+                    let started = Instant::now();
+                    let result = self.validate_control_with_retry(wallet, control_tx, paper_state, purpose, deadline).await;
+                    tracing::info!(wallet = %wallet, elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        outcome = result.as_ref().map_or_else(|error| error.kind(), |_| "accepted"), "wallet bracket completed");
+                    (index, result, Instant::now())
+                });
+            }
+            let Some(result) = running.next().await else {
+                break;
+            };
+            completed.push(result);
+        }
+        completed.sort_by_key(|(index, _, _)| *index);
         let mut outcomes = ValidationOutcomes {
+            started_prefix,
+            completed_at: HashMap::new(),
             accepted: Vec::with_capacity(completed.len()),
             deferred: Vec::new(),
             shared: None,
         };
-        for (index, result) in completed {
+        for (index, result, completed_at) in completed {
+            outcomes.completed_at.insert(wallets[index], completed_at);
             match result {
                 Ok(install) => outcomes.accepted.push(install),
                 Err(error) if error.class() == FailureClass::Shared => {
@@ -735,21 +777,22 @@ impl CausalPositionValidator {
             .map(|(index, wallet)| {
                 let engine = Arc::clone(&engine);
                 async move {
-                    (
-                        index,
-                        wallet,
-                        self.validate_direct_with_retry(wallet, &engine, paper_state)
-                            .await,
-                    )
+                    let started = Instant::now();
+                    let outcome = self.validate_direct_with_retry(wallet, &engine, paper_state).await;
+                    let completed = Instant::now();
+                    tracing::info!(%wallet, elapsed_ms = u64::try_from(completed.duration_since(started).as_millis()).unwrap_or(u64::MAX), outcome = outcome.as_ref().map_or_else(|error| error.kind(), |_| "accepted"), "wallet bracket completed");
+                    (index, wallet, outcome, completed)
                 }
             })
             .buffer_unordered(BRACKET_CONCURRENCY)
             .collect::<Vec<_>>()
             .await;
-        completed.sort_by_key(|(index, _, _)| *index);
+        completed.sort_by_key(|(index, _, _, _)| *index);
         let mut accepted = Vec::with_capacity(completed.len());
         let mut deferred = Vec::new();
-        for (_, wallet, result) in completed {
+        let mut completed_at = HashMap::new();
+        for (_, wallet, result, terminal) in completed {
+            completed_at.insert(wallet, terminal);
             match result {
                 Ok(acceptance) => accepted.push(acceptance),
                 // A newly durable fence is deterministic quarantine (the
@@ -796,7 +839,11 @@ impl CausalPositionValidator {
             "{\"source\":\"causal_position_bracket_v2\"}",
             time::OffsetDateTime::now_utc().unix_timestamp(),
         )?;
-        Ok(DirectValidationOutcome { accepted, deferred })
+        Ok(DirectValidationOutcome {
+            accepted,
+            deferred,
+            completed_at,
+        })
     }
 
     async fn validate_control_with_retry(
@@ -805,6 +852,7 @@ impl CausalPositionValidator {
         control_tx: &mpsc::Sender<OrchestratorControl>,
         paper_state: &PaperStateDb,
         purpose: ValidationPurpose,
+        deadline: Option<Instant>,
     ) -> Result<AnchorInstall, CausalPositionError> {
         let mut ordinary_reconciliation_needed = false;
         let first = self
@@ -819,8 +867,12 @@ impl CausalPositionValidator {
         if ordinary_reconciliation_needed {
             return first;
         }
-        if first.as_ref().is_err_and(is_bounded_retry_error) {
-            if paper_state.is_wallet_fenced(&wallet)? {
+        if first.as_ref().is_err_and(is_bounded_retry_error)
+            && deadline.is_none_or(|end| Instant::now() < end)
+        {
+            if let Some(fence) = paper_state.wallet_fence(&wallet)?
+                && !recoverable_fence(paper_state, &fence)?
+            {
                 return Err(CausalPositionError::Fenced { wallet });
             }
             return self
@@ -860,6 +912,13 @@ impl CausalPositionValidator {
         purpose: ValidationPurpose,
         ordinary_reconciliation_needed: &mut bool,
     ) -> Result<AnchorInstall, CausalPositionError> {
+        let expected_fence = paper_state.wallet_fence(&wallet)?;
+        if let Some(fence) = &expected_fence
+            && !recoverable_fence(paper_state, fence)?
+        {
+            return Err(CausalPositionError::Fenced { wallet });
+        }
+        let mut fresh_history = Vec::new();
         let mut metadata_reads = BTreeMap::new();
         let mut unresolved_assets = BTreeMap::new();
         let first_activity = self.activity(wallet).await?;
@@ -871,6 +930,13 @@ impl CausalPositionValidator {
             ordinary_reconciliation_needed,
         )?;
         let first_prepared = self.prepare_activity(wallet, &first_activity).await?;
+        if expected_fence.is_some() {
+            fresh_history.extend(recovery_fresh_history(
+                wallet,
+                &first_activity,
+                &first_prepared,
+            )?);
+        }
         metadata_reads.extend(first_prepared.metadata_reads.clone());
         unresolved_assets.extend(first_prepared.unresolved_assets.clone());
         self.commit_control(wallet, &first_activity, &first_prepared, control_tx, false)
@@ -889,6 +955,13 @@ impl CausalPositionValidator {
             ordinary_reconciliation_needed,
         )?;
         let second_prepared = self.prepare_activity(wallet, &second_activity).await?;
+        if expected_fence.is_some() {
+            fresh_history.extend(recovery_fresh_history(
+                wallet,
+                &second_activity,
+                &second_prepared,
+            )?);
+        }
         resolve_missing_mapping(wallet, &first_positions, &second_prepared.mapping)?;
         metadata_reads.extend(second_prepared.metadata_reads.clone());
         unresolved_assets.extend(second_prepared.unresolved_assets.clone());
@@ -912,6 +985,13 @@ impl CausalPositionValidator {
             ordinary_reconciliation_needed,
         )?;
         let final_prepared = self.prepare_activity(wallet, &final_activity).await?;
+        if expected_fence.is_some() {
+            fresh_history.extend(recovery_fresh_history(
+                wallet,
+                &final_activity,
+                &final_prepared,
+            )?);
+        }
         resolve_missing_mapping(wallet, &second_positions, &final_prepared.mapping)?;
         unresolved_assets.extend(final_prepared.unresolved_assets.clone());
         metadata_reads.extend(final_prepared.metadata_reads.clone());
@@ -936,6 +1016,14 @@ impl CausalPositionValidator {
             metadata_reads.into_values().collect(),
         )?;
         log_unresolved_activity_assets(wallet, &unresolved_assets);
+        if let Some(fence) = &expected_fence {
+            if fence_epoch(fence).is_none_or(|epoch| install.cutoff <= epoch) {
+                return Err(CausalPositionError::Fenced { wallet });
+            }
+            fresh_history.retain(|history| history.first_epoch <= install.cutoff);
+            install.fresh_history = fresh_history;
+            install.expected_fence = expected_fence;
+        }
         install.history_status = Some(WalletHistoryStatusRecord {
             wallet,
             complete: true,
@@ -1249,6 +1337,9 @@ impl CausalPositionValidator {
                 .await
                 .map_err(|_| CausalPositionError::AcknowledgementClosed)?
                 .map_err(|message| CausalPositionError::BucketCommit { wallet, message })?;
+            if result.retained_revision {
+                return Err(CausalPositionError::InterveningActivity { wallet });
+            }
             if result.newly_fenced.is_some() {
                 return Err(CausalPositionError::Fenced { wallet });
             }
@@ -1321,6 +1412,8 @@ impl CausalPositionValidator {
             ],
         });
         Ok(AnchorInstall {
+            fresh_history: Vec::new(),
+            expected_fence: None,
             history_status: None,
             wallet,
             balances,
@@ -1384,6 +1477,92 @@ fn resolve_missing_mapping(
         });
     }
     Ok(())
+}
+
+pub(crate) fn fence_epoch(fence: &WalletFenceRecord) -> Option<i64> {
+    serde_json::from_str::<serde_json::Value>(&fence.proof_json)
+        .ok()?
+        .get("bucket_epoch")?
+        .as_i64()
+}
+
+pub fn recoverable_fence(
+    paper: &PaperStateDb,
+    fence: &WalletFenceRecord,
+) -> Result<bool, pe_paper_state::PaperStateError> {
+    let Some(epoch) = fence_epoch(fence) else {
+        return Ok(false);
+    };
+    Ok(match fence.cause.as_str() {
+        "order_dependent_equal_second"
+        | "position_underflow"
+        | "position_overflow"
+        | "late_group_after_bucket_commit" => true,
+        "revised_applied_aggregate" => paper.revised_fence_trigger_disposed(fence, epoch)?,
+        _ => false,
+    })
+}
+
+/// Only fence-only failures bypass batch-local persistent parking.
+pub(crate) fn recoverable_fence_failure(
+    paper: &PaperStateDb,
+    wallet: &WalletAddress,
+    kind: &str,
+) -> bool {
+    matches!(
+        kind,
+        "fence.active" | "validation.fenced" | "anchor.fenced" | "publication.fenced"
+    ) && paper
+        .wallet_fence(wallet)
+        .ok()
+        .flatten()
+        .is_some_and(|fence| recoverable_fence(paper, &fence).unwrap_or(false))
+}
+
+pub(crate) fn unrecoverable_fenced_wallets(
+    paper: &PaperStateDb,
+) -> Result<HashSet<WalletAddress>, pe_paper_state::PaperStateError> {
+    let mut wallets = HashSet::new();
+    for fence in paper.wallet_fences()? {
+        if !recoverable_fence(paper, &fence)? {
+            wallets.insert(fence.wallet);
+        }
+    }
+    Ok(wallets)
+}
+
+fn recovery_fresh_history(
+    wallet: WalletAddress,
+    read: &CompleteActivityRead,
+    prepared: &PreparedActivity,
+) -> Result<Vec<MarketHistoryRecord>, CausalPositionError> {
+    let context = bracket_context(read, "", prepared)?;
+    let mut history = Vec::new();
+    for bucket in read
+        .buckets()
+        .map_err(|source| CausalPositionError::Activity { wallet, source })?
+    {
+        for aggregate in bucket {
+            let mutation = crate::bucket_commit::recordable_mutation(&aggregate, &context);
+            match mutation.effect.effective() {
+                LedgerEffect::Conversion | LedgerEffect::UnknownEffect => {
+                    return Err(CausalPositionError::UnsafeRecovery { wallet });
+                }
+                LedgerEffect::Trade {
+                    market_id,
+                    side: pe_core_types::Side::Buy,
+                    ..
+                } => history.push(MarketHistoryRecord {
+                    wallet,
+                    market_id: market_id.clone(),
+                    first_epoch: aggregate.source_time.0.unix_timestamp(),
+                    source_trade_id: aggregate.group_id.key().clone(),
+                }),
+                _ => {}
+            }
+        }
+    }
+    Ok(history)
 }
 
 fn is_bounded_retry_error(error: &CausalPositionError) -> bool {
@@ -1506,6 +1685,9 @@ fn commit_direct(
                         bankroll: rust_decimal::Decimal::ZERO,
                     },
                 )?;
+                if result.retained_revision {
+                    return Ok(BatchOutcome::Complete { changed: true });
+                }
                 if result.newly_fenced.is_some() {
                     return Ok(BatchOutcome::NewlyFenced);
                 }
@@ -1997,6 +2179,7 @@ mod tests {
                 first_context.get_or_insert_with(|| Arc::clone(&context));
                 committed
                     .send(Ok(crate::bucket_commit::BucketCommitResult {
+                        retained_revision: false,
                         wallet,
                         source_epoch,
                         dispositions: BTreeMap::new(),
@@ -2081,6 +2264,8 @@ mod tests {
         let captured = ledger_capture(engine.ledger(), &paper, wallet).unwrap();
         engine
             .install_anchors(&[AnchorInstall {
+                fresh_history: Vec::new(),
+                expected_fence: None,
                 history_status: None,
                 wallet,
                 balances: Vec::new(),
@@ -2130,5 +2315,34 @@ mod tests {
                 .map(|position| position.long_contracts.atomic()),
             Some(1_000_000)
         );
+    }
+    #[test]
+    fn paper_service_rollout_identity_transient_is_wallet_scoped_and_rate_limit_shared() {
+        let wallet = WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
+        for (source, expected) in [
+            (
+                SourceError::Transient {
+                    message: "Gamma unavailable".to_owned(),
+                },
+                FailureClass::WalletTransient,
+            ),
+            (
+                SourceError::RateLimited {
+                    retry_after_secs: 1,
+                },
+                FailureClass::Shared,
+            ),
+            (
+                SourceError::Fatal {
+                    message: "durability unavailable".to_owned(),
+                },
+                FailureClass::Shared,
+            ),
+        ] {
+            assert_eq!(
+                CausalPositionError::Identity { wallet, source }.class(),
+                expected
+            );
+        }
     }
 }

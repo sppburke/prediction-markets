@@ -715,7 +715,18 @@ fn installed_boot_reads_the_source_log_once() {
 }
 
 fn install_committed_open_read(paper: &Arc<PaperStateDb>, source_log: &Path) {
-    let wallet = WalletAddress::from_hex(WALLET).unwrap();
+    install_committed_open_read_for_wallet(
+        paper,
+        source_log,
+        WalletAddress::from_hex(WALLET).unwrap(),
+    );
+}
+
+fn install_committed_open_read_for_wallet(
+    paper: &Arc<PaperStateDb>,
+    source_log: &Path,
+    wallet: WalletAddress,
+) {
     support::install_empty_anchor(paper, wallet, 0);
     paper
         .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
@@ -726,7 +737,7 @@ fn install_committed_open_read(paper: &Arc<PaperStateDb>, source_log: &Path) {
         })
         .unwrap();
     let payload = serde_json::to_vec(&serde_json::json!([{
-        "proxyWallet": WALLET, "timestamp": NOW_UNIX + 25_000,
+        "proxyWallet": wallet, "timestamp": NOW_UNIX + 25_000,
         "conditionId": "0xboot-open", "type": "TRADE", "size": "2.5", "usdcSize": "1.25",
         "transactionHash": "0xboot-open", "price": "0.5", "asset": "boot-token",
         "side": "BUY", "outcomeIndex": 0, "outcome": "Yes", "isCombo": false,
@@ -1257,6 +1268,13 @@ enum PostStartBootCase {
 }
 
 async fn post_start_boot_bankroll_case(case: PostStartBootCase) {
+    post_start_boot_bankroll_case_with_checkpoint_parity(case, false).await;
+}
+
+async fn post_start_boot_bankroll_case_with_checkpoint_parity(
+    case: PostStartBootCase,
+    checkpoint_parity: bool,
+) {
     use axum::{Json, Router, extract::State, http::Uri, routing::any};
     use std::sync::Mutex;
 
@@ -1561,6 +1579,14 @@ async fn post_start_boot_bankroll_case(case: PostStartBootCase) {
             )
             .unwrap();
     }
+    if checkpoint_parity {
+        let pending_paper = Arc::new(PaperStateDb::open(&paths.fixed_main).unwrap());
+        install_committed_open_read_for_wallet(
+            &pending_paper,
+            &paths.source_log,
+            WalletAddress([0xcc; 20]),
+        );
+    }
     drop(paper);
 
     let requests = Arc::new(Mutex::new(Vec::new()));
@@ -1603,6 +1629,113 @@ async fn post_start_boot_bankroll_case(case: PostStartBootCase) {
     };
     let config_path = dir.path().join("service.toml");
     std::fs::write(&config_path, toml::to_string(&cfg).unwrap()).unwrap();
+    if checkpoint_parity {
+        // Restore the exact same initial durable state before each boot. The full walk and
+        // checkpoint must recover both the unmatched Prepared and the independent open entry.
+        let initial = [&paths.fixed_main, &paths.source_log, &paths.paper_log]
+            .map(|path| std::fs::read(path).unwrap());
+        let mut expected = None;
+        for checkpoint in [false, true] {
+            for (path, bytes) in [&paths.fixed_main, &paths.source_log, &paths.paper_log]
+                .into_iter()
+                .zip(&initial)
+            {
+                std::fs::write(path, bytes).unwrap();
+            }
+            requests.lock().unwrap().clear();
+            if checkpoint {
+                SourceLogBoot::prepare_checkpoint(&paths.fixed_main).unwrap();
+            }
+            let before = pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap();
+            let opened = SourceLogBoot::open(&paths, true).unwrap().unwrap();
+            let decoded =
+                pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap() - before;
+            assert_eq!(
+                decoded == 0,
+                checkpoint,
+                "the checkpoint must restore the financial-mode prefix"
+            );
+            let mut boot = opened.boot;
+            let mut sink = opened.sink;
+            boot.extend(&mut sink).unwrap();
+            let paper = Arc::new(PaperStateDb::open(&paths.fixed_main).unwrap());
+            let index = boot.receipt_index();
+            assert_same_receipts(
+                &index,
+                &SourceReceiptIndex::replay(&paths.source_log).unwrap(),
+                opened.binding.last_sequence.unwrap().0,
+            );
+            assert_eq!(
+                pe_service::bucket_commit::validate_open_continuations(&paper, &index).unwrap(),
+                1
+            );
+            let obligations = boot.obligations(&paper, &paths.paper_log).unwrap();
+            let pending_before = paper.decision_pending_history().unwrap();
+            drop(sink);
+            drop(boot);
+            let output = boot_binary(&config_path, true).await;
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stderr}");
+            assert_eq!(
+                stderr.contains("\"checkpoint_used\":true"),
+                checkpoint,
+                "{stderr}"
+            );
+            assert!(
+                requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|uri| uri.path() == "/rest/v1/rpc/commit_fill_v2")
+            );
+            assert_eq!(paper.fills_count().unwrap(), 1);
+            assert_eq!(paper.bankroll().unwrap(), Some(dec!(9)));
+            assert_eq!(paper.decision_pending_history().unwrap(), pending_before);
+            let (_tx, rx) = tokio::sync::mpsc::channel(4);
+            let mut orchestrator = support::continuation_orchestrator(
+                paper.clone(),
+                &paths.paper_log,
+                WalletAddress([0xcc; 20]),
+                rx,
+                support::continuation_hooks(NOW_UNIX + 25_010),
+            )
+            .with_source_receipt_index(index);
+            pe_service::orchestrator::SCENARIO_TERMINAL_CLOCK
+                .scope(
+                    OffsetDateTime::from_unix_timestamp(NOW_UNIX + 25_010).unwrap(),
+                    orchestrator.resume_pending_before_producers(),
+                )
+                .await
+                .unwrap();
+            assert!(paper.open_decision_pending().unwrap().is_empty());
+            let finals = paper_era(scan_paper_log(&paths.paper_log).unwrap())
+                .frames
+                .into_iter()
+                .filter_map(|frame| match frame.frame {
+                    PaperLogFrame::Record(PaperLogRecord::FinancialFinal {
+                        prepared_receipt,
+                        result,
+                    }) => Some((prepared_receipt, serde_json::to_value(result).unwrap())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(finals.len(), 1);
+            let result = (
+                paper.financial_snapshot(NOW_UNIX + 30_000).unwrap(),
+                paper.decision_pending_history().unwrap(),
+                obligations,
+                finals,
+            );
+            if let Some(expected) = &expected {
+                assert_eq!(&result, expected);
+            } else {
+                expected = Some(result);
+            }
+        }
+        stop.send(()).unwrap();
+        server.await.unwrap();
+        return;
+    }
     let output = boot_binary(&config_path, true).await;
     let stderr = String::from_utf8(output.stderr).unwrap();
     let hit = requests
@@ -1763,49 +1896,15 @@ enum PreStartBootCase {
 }
 
 async fn boot_binary(config_path: &Path, exit_after_anchors: bool) -> std::process::Output {
-    fn read_pipe(mut pipe: impl std::io::Read) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        pipe.read_to_end(&mut bytes).unwrap();
-        bytes
-    }
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pe-service"));
     command
         .env_clear()
         .current_dir(config_path.parent().unwrap())
-        .arg(config_path)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .arg(config_path);
     if exit_after_anchors {
         command.arg("--exit-after-anchors");
     }
-    let mut child = command.spawn().unwrap();
-    let stdout = child.stdout.take().unwrap();
-    let stderr = child.stderr.take().unwrap();
-    let mut stdout = tokio::task::spawn_blocking(move || read_pipe(stdout));
-    let mut stderr = tokio::task::spawn_blocking(move || read_pipe(stderr));
-    // EOF signals process completion. A regression that starts serving must fail within a
-    // bound, killing and reaping this child rather than leaving the test waiting for shutdown.
-    let completed = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-        tokio::join!(&mut stdout, &mut stderr)
-    })
-    .await;
-    let timed_out = completed.is_err();
-    let (stdout, stderr) = match completed {
-        Ok(output) => output,
-        Err(_) => {
-            child.kill().unwrap();
-            tokio::join!(stdout, stderr)
-        }
-    };
-    let output = std::process::Output {
-        status: tokio::task::spawn_blocking(move || child.wait().unwrap())
-            .await
-            .unwrap(),
-        stdout: stdout.unwrap(),
-        stderr: stderr.unwrap(),
-    };
-    assert!(!timed_out, "boot exceeded its failure bound: {output:?}");
-    output
+    support::bounded_command_output(command).await
 }
 
 #[tokio::test]
@@ -1824,4 +1923,171 @@ async fn fresh_pre_start_boot_refuses_empty_active_main_selection() {
 #[tokio::test]
 async fn post_snapshot_invalid_continuation_refuses_real_binary_boot() {
     pre_start_boot_membership_case(PreStartBootCase::InvalidContinuation).await;
+}
+
+/// PASS: checkpoint restores exactly the full walk's receipts and raw obligations, decodes only
+/// its suffix, and freezes the initial shared-index prefix despite later appends/consumption.
+#[test]
+fn paper_service_rollout_checkpoint_freezes_prefix_and_replays_suffix_exactly() {
+    let (_dir, paths) = installed_fixture();
+    append(
+        &paths.source_log,
+        activity_envelope("0xcheckpoint-first", NOW_UNIX + 1),
+    );
+    let opened = SourceLogBoot::open(&paths, false).unwrap().unwrap();
+    let frozen_tail = opened.binding.clone();
+    let mut boot = opened.boot;
+    let mut sink = opened.sink;
+    sink.append_durable(activity_envelope("0xcheckpoint-second", NOW_UNIX + 2))
+        .unwrap();
+    boot.extend(&mut sink).unwrap();
+    let paper = PaperStateDb::open(&paths.fixed_main).unwrap();
+    let expected = boot.obligations(&paper, &paths.paper_log).unwrap();
+    boot.publish_checkpoint().unwrap();
+    let artifact = std::fs::read(paths.source_log.with_extension("log.boot-checkpoint")).unwrap();
+    let projection: serde_json::Value = serde_json::from_slice(&artifact[65..]).unwrap();
+    assert_eq!(
+        projection["tail"]["physical_tail"],
+        frozen_tail.physical_tail
+    );
+    assert_eq!(
+        projection["receipts"].as_array().unwrap().len(),
+        usize::try_from(frozen_tail.last_sequence.unwrap().0 + 1).unwrap()
+    );
+    drop(sink);
+    let before = pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap();
+    let opened = SourceLogBoot::open(&paths, false).unwrap().unwrap();
+    assert_eq!(
+        pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap() - before,
+        1
+    );
+    let mut restored = opened.boot;
+    let mut sink = opened.sink;
+    let index = SourceReceiptIndex::replay(&paths.source_log).unwrap();
+    assert_same_receipts(
+        &restored.receipt_index(),
+        &index,
+        opened.binding.last_sequence.unwrap().0,
+    );
+    restored.extend(&mut sink).unwrap();
+    assert_eq!(
+        restored.obligations(&paper, &paths.paper_log).unwrap(),
+        expected
+    );
+    restored.verify_handoff(&mut sink).unwrap();
+}
+
+#[test]
+fn paper_service_rollout_checkpoint_damage_incompatibility_and_prefix_drift_fall_back() {
+    for fault in [
+        "checksum",
+        "mode",
+        "version",
+        "receipt",
+        "shortened",
+        "corruption",
+    ] {
+        let (_dir, paths) = installed_fixture();
+        append(
+            &paths.source_log,
+            activity_envelope("0xcheckpoint-fallback", NOW_UNIX + 1),
+        );
+        SourceLogBoot::prepare_checkpoint(&paths.fixed_main).unwrap();
+        let sidecar = paths.source_log.with_extension("log.boot-checkpoint");
+        let mut artifact = std::fs::read(&sidecar).unwrap();
+        let mut data: serde_json::Value = serde_json::from_slice(&artifact[65..]).unwrap();
+        match fault {
+            "checksum" => artifact[0] ^= 1,
+            "mode" => data["financial_era"] = serde_json::json!(true),
+            "version" => data["scanner_version"] = serde_json::json!(99),
+            "receipt" => data["receipts"][0]["byte_offset"] = serde_json::json!(99999),
+            "shortened" => {
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&paths.source_log)
+                    .unwrap()
+                    .set_len(recorded_source_tail(&paths))
+                    .unwrap();
+            }
+            "corruption" => {
+                let mut bytes = std::fs::read(&paths.source_log).unwrap();
+                let last = bytes.len() - 1;
+                bytes[last] ^= 1;
+                std::fs::write(&paths.source_log, bytes).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        if matches!(fault, "mode" | "version" | "receipt") {
+            let projections = serde_json::to_vec(&data).unwrap();
+            artifact = blake3::hash(&projections).to_hex().as_bytes().to_vec();
+            artifact.push(b'\n');
+            artifact.extend_from_slice(&projections);
+        }
+        std::fs::write(&sidecar, &artifact).unwrap();
+        let before = pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap();
+        let opened = SourceLogBoot::open(&paths, false);
+        if fault == "corruption" {
+            assert!(format!("{:#}", opened.err().unwrap()).contains("CRC"));
+        } else {
+            let opened = opened.unwrap().unwrap();
+            assert_eq!(opened.binding, Scanner::verify(&paths.source_log).unwrap());
+        }
+        assert!(pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap() > before);
+    }
+}
+
+#[tokio::test]
+async fn paper_service_rollout_checkpoint_preparation_is_early_read_only_and_ignores_torn_tail() {
+    let (_dir, paths) = installed_fixture();
+    let mut writer = Writer::open(&paths.source_log).unwrap();
+    writer
+        .append_synced(activity_envelope("0xonline-checkpoint", NOW_UNIX + 1))
+        .unwrap();
+    let before_db = std::fs::read(&paths.fixed_main).unwrap();
+    let complete_size = file_len(&paths.source_log);
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pe-service"));
+    command
+        .env_clear()
+        .env("PE_BIND", "invalid")
+        .arg("--prepare-source-checkpoint")
+        .arg("--paper-state")
+        .arg(&paths.fixed_main);
+    let output = support::bounded_command_output(command).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(std::fs::read(&paths.fixed_main).unwrap(), before_db);
+    assert_eq!(file_len(&paths.source_log), complete_size);
+    writer
+        .append_synced(activity_envelope("0xonline-suffix", NOW_UNIX + 2))
+        .unwrap();
+    drop(writer);
+    let complete_tail = Scanner::verify(&paths.source_log).unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&paths.source_log)
+        .unwrap()
+        .write_all(&[1, 2])
+        .unwrap();
+    let torn_size = file_len(&paths.source_log);
+    let prepared = SourceLogBoot::prepare_checkpoint(&paths.fixed_main).unwrap();
+    assert_eq!(prepared, complete_tail);
+    assert_eq!(file_len(&paths.source_log), torn_size);
+    assert_eq!(std::fs::read(&paths.fixed_main).unwrap(), before_db);
+    let opened = SourceLogBoot::open(&paths, false).unwrap().unwrap();
+    assert_eq!(opened.binding, complete_tail);
+    assert_eq!(file_len(&paths.source_log), complete_tail.physical_tail);
+}
+
+/// PASS: the identical unmatched-Prepared/open-continuation snapshot recovers identically with
+/// decoded full-walk metadata and restored checkpoint metadata, including the resumed terminal.
+#[tokio::test]
+async fn paper_service_rollout_checkpoint_matches_full_walk_financial_and_pending_recovery() {
+    post_start_boot_bankroll_case_with_checkpoint_parity(
+        PostStartBootCase::AuthorityAheadLocalUntouched,
+        true,
+    )
+    .await;
 }

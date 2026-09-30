@@ -238,6 +238,8 @@ fn temp_db() -> (TempDir, Arc<PaperStateDb>) {
 fn install_anchor(db: &PaperStateDb, wallet: WalletAddress, cursor: i64) {
     db.set_cursor(&wallet, cursor).unwrap();
     db.install_anchors(&[AnchorInstallRecord {
+        repaired_history: Vec::new(),
+        expected_fence: None,
         history_status: None,
         wallet,
         balances: Vec::new(),
@@ -330,8 +332,7 @@ async fn rerank_dropped_wallet_cannot_reenter_after_preparation() {
         }
     });
     let reentry_preparer = AdmissionPreparer::new(control, Arc::clone(&db));
-    let reentry =
-        tokio::spawn(async move { reentry_preparer.prepare_live_reentries(&[dropped]).await });
+    let reentry = tokio::spawn(async move { reentry_preparer.prepare(&[dropped]).await });
     prepared.await.unwrap();
     let publications = Arc::new(AtomicUsize::new(0));
     let (applied, epoch) = capacity(2);
@@ -412,7 +413,7 @@ async fn ranked_reentry_attempts_are_independent_and_recheck_current_membership(
         }
     });
     let preparer = AdmissionPreparer::new(control, Arc::clone(&db));
-    let prepared = preparer.prepare_live_reentries(&[deferred, ready]).await;
+    let prepared = preparer.prepare(&[deferred, ready]).await;
     assert_eq!(prepared.as_ref().unwrap().admitted, vec![ready]);
     assert_eq!(prepared.as_ref().unwrap().deferred.len(), 1);
     let incoming = vec![entry(ready, 900), entry(deferred, 800)];
@@ -1272,4 +1273,251 @@ async fn full_rerank_swap_on_a_batch_with_no_survivors_empties_the_live_set() {
         "an empty batch never moves the applied capacity target"
     );
     println!("PASS: full-rerank-swap-on-a-batch-with-no-survivors-empties-the-live-set");
+}
+
+/// PASS: 95 proved members plus five ranked newcomers reach 100 across two ticks. The first
+/// tick's launch deadline expires with four brackets in flight; their accepted proofs publish,
+/// the untouched fifth remains in the pinned batch, and the next tick backfills its slot.
+#[tokio::test]
+async fn budgeted_admission_reaches_100_across_ticks() {
+    use axum::{
+        Json, Router,
+        extract::{Query, State},
+        routing::get,
+    };
+    use pe_position_ledger::PositionLedger;
+    use pe_service::{
+        activity_ingest::{ActivityIngest, SourceLogHandle},
+        asset_identity::AssetIdentityResolver,
+        bucket_commit::{BucketCommitEngine, FrozenDecisionBasis},
+        health::new_shared_health_with_ws,
+        position_seeder::{CausalPositionValidator, ledger_capture},
+        source_event_sink::SourceEventSink,
+        watchlist_maintenance::ScenarioMaintenanceState,
+    };
+    use pe_source_polymarket_public::{GAMMA_BATCH_SIZE, ReqwestFetcher};
+    use serde_json::{Value, json};
+    #[derive(Clone)]
+    struct Population {
+        first: Arc<std::sync::Mutex<HashSet<String>>>,
+        started: mpsc::UnboundedSender<String>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+    async fn respond(
+        State(state): State<Population>,
+        uri: axum::http::Uri,
+        Query(query): Query<HashMap<String, String>>,
+    ) -> Json<Value> {
+        Json(match uri.path() {
+            "/rest/v1/ranking_batches" => json!([{"batch_id":2}]),
+            "/rest/v1/ranking_entries" => json!((1..=100).map(|n| json!({"batch_id":2,"rank":n,"wallet_hex":wallet(n),"ls_tstat":"3","hit_rate":"0.7","n_trades":60,"last_trade_unix":NOW-10,"survives":true})).collect::<Vec<_>>()),
+            "/activity" => {
+                let user = query["user"].clone();
+                let first = state.first.lock().unwrap().insert(user.clone());
+                if first { state.started.send(user.clone()).unwrap(); state.release.acquire().await.unwrap().forget(); }
+                json!([{"proxyWallet":user,"timestamp":NOW-10,"conditionId":"population-market","type":"TRADE","size":"1","usdcSize":"0.5","transactionHash":"0xpopulation","price":"0.5","asset":"123","side":"BUY","outcomeIndex":0}])
+            },
+            "/positions" => json!([]),
+            "/markets" => json!([{"conditionId":"population-market","clobTokenIds":["123","456"]}]),
+            _ => json!([]),
+        })
+    }
+    let (dir, paper) = temp_db();
+    for n in 1..=95 {
+        install_anchor(&paper, wallet(n), NOW - 10);
+    }
+    // The shared helper pre-completes every synthetic wallet. Newcomers must earn their
+    // history completion through the real bracket and anchor installation in this scenario.
+    for n in 96..=100 {
+        paper
+            .record_reconciled_history_status(&WalletHistoryStatusRecord {
+                wallet: wallet(n),
+                complete: false,
+                proof_json: "{\"scenario\":\"newcomer\"}".to_owned(),
+                updated_at_unix: NOW - 10,
+            })
+            .unwrap();
+    }
+    let live = LiveWatchlist::new(watchlist((1..=95).map(|n| entry(wallet(n), 300)).collect()));
+    let (applied, _) = capacity(100);
+    let lock = Arc::new(Mutex::new(()));
+    let (started, mut starts) = mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(
+        axum::serve(
+            listener,
+            Router::new().fallback(get(respond)).with_state(Population {
+                first: Arc::new(std::sync::Mutex::new(HashSet::new())),
+                started,
+                release: release.clone(),
+            }),
+        )
+        .into_future(),
+    );
+    let (source, source_rx) = SourceLogHandle::channel(32);
+    let (trigger, _triggers) = mpsc::channel(1);
+    let source_task = tokio::spawn(
+        ActivityIngest::poll_only(
+            SourceEventSink::open(dir.path().join("source.log")).unwrap(),
+            source_rx,
+            trigger,
+            new_shared_health_with_ws(false, true, 30),
+        )
+        .run(),
+    );
+    let fetcher = Arc::new(ReqwestFetcher::new(reqwest::Client::new()));
+    let identity = Arc::new(AssetIdentityResolver::new_runtime(
+        fetcher.clone(),
+        base.clone(),
+        GAMMA_BATCH_SIZE,
+        source.clone(),
+    ));
+    let validator = CausalPositionValidator::new(fetcher, base.clone(), "population", identity)
+        .with_clock(Arc::new(|| NOW));
+    let (control, mut commands) = mpsc::channel(16);
+    let actor_paper = paper.clone();
+    let actor_live = live.clone();
+    let actor_lock = lock.clone();
+    let actor = tokio::spawn(async move {
+        let mut engine =
+            BucketCommitEngine::load(actor_paper.clone(), PositionLedger::new()).unwrap();
+        while let Some(command) = commands.recv().await {
+            match command {
+                OrchestratorControl::CommitActivityBucket {
+                    aggregates,
+                    context,
+                    committed,
+                } => {
+                    let _ = committed.send(
+                        engine
+                            .commit(
+                                aggregates,
+                                &context,
+                                FrozenDecisionBasis {
+                                    win_rate_p: pe_core_types::Probability::ZERO,
+                                    bankroll: Decimal::ZERO,
+                                },
+                            )
+                            .map_err(|e| e.to_string()),
+                    );
+                }
+                OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
+                    let _ = captured.send(
+                        ledger_capture(engine.ledger(), &actor_paper, wallet)
+                            .map_err(|e| e.to_string()),
+                    );
+                }
+                OrchestratorControl::InstallAnchors {
+                    installs,
+                    acknowledged,
+                } => {
+                    let _ = acknowledged.send(engine.install_anchors(&installs));
+                }
+                OrchestratorControl::PublishMembership {
+                    change,
+                    replacements,
+                    checks,
+                    acknowledged,
+                } => {
+                    let _writer = actor_lock.lock().await;
+                    if let Err(error) =
+                        checks.recheck_and_seed(&actor_paper, &actor_live, &change, &replacements)
+                    {
+                        let _ = acknowledged.send(Err(error.into_publish()));
+                        continue;
+                    }
+                    actor_live.scenario_commit_structural_change(&change.removed, &change.added);
+                    actor_live.replace(
+                        &change.removed.iter().copied().collect(),
+                        &replacements,
+                        change.capacity,
+                    );
+                    let _ = acknowledged.send(Ok(pe_event_log::AppendReceipt {
+                        sequence: pe_core_types::EventSeq(1),
+                        this_hash: blake3::hash(b"population-publication"),
+                    }));
+                }
+                _ => panic!("unexpected population control"),
+            }
+        }
+    });
+    let preparer = AdmissionPreparer::with_validator(control, paper.clone(), validator)
+        .with_source_log(source.clone());
+    let state = ScenarioMaintenanceState::new(Some(1), applied.load().generation);
+    let mut config = cfg();
+    config.membership_mode = MembershipMode::FullRerank;
+    config.interval_secs = 1;
+    let run_tick = |mut state: ScenarioMaintenanceState| {
+        let live = live.clone();
+        let paper = paper.clone();
+        let lock = lock.clone();
+        let applied = applied.clone();
+        let preparer = preparer.clone();
+        let base = base.clone();
+        let config = config.clone();
+        tokio::spawn(async move {
+            state
+                .tick(
+                    &live,
+                    &paper,
+                    &reqwest::Client::new(),
+                    &base,
+                    &lock,
+                    &applied,
+                    &preparer,
+                    &config,
+                    NOW,
+                )
+                .await;
+            state
+        })
+    };
+    let task = run_tick(state);
+    let mut launched = HashSet::new();
+    for _ in 0..4 {
+        launched.insert(
+            tokio::time::timeout(std::time::Duration::from_secs(10), starts.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    assert_eq!(launched, (96..=99).map(|n| wallet(n).to_string()).collect());
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    release.add_permits(4);
+    let state = tokio::time::timeout(std::time::Duration::from_secs(20), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(live.structural_membership().len(), 99);
+    assert_eq!(live.snapshot().entries.len(), 99);
+    // Ranked cursors are seeded before bracket capture, including for an unstarted wallet.
+    // The deadline forbids validation starts; history and position proofs require a bracket.
+    assert_eq!(paper.cursor(&wallet(100)).unwrap(), Some(NOW - 10));
+    assert!(!paper.wallet_history_complete(&wallet(100)).unwrap());
+    assert!(!paper.position_validation_current(&wallet(100)).unwrap());
+    assert!(paper.position_anchors(&wallet(100)).unwrap().is_empty());
+    assert_eq!(applied.load().target, 100);
+    assert!(starts.try_recv().is_err());
+    release.add_permits(1);
+    let state = tokio::time::timeout(std::time::Duration::from_secs(20), run_tick(state))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(starts.recv().await.unwrap(), wallet(100).to_string());
+    assert_eq!(live.structural_membership().len(), 100);
+    assert_eq!(live.snapshot().entries.len(), 100);
+    assert_eq!(applied.load().target, 100);
+    for n in 96..=100 {
+        assert!(paper.wallet_history_complete(&wallet(n)).unwrap());
+        assert!(paper.position_validation_current(&wallet(n)).unwrap());
+    }
+    drop(state);
+    drop(preparer);
+    drop(source);
+    actor.await.unwrap();
+    source_task.await.unwrap();
+    server.abort();
 }

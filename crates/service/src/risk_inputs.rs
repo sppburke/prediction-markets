@@ -791,8 +791,8 @@ struct SourceReceiptIndexState {
     next_byte_offset: Option<u64>,
 }
 
-#[derive(Clone)]
-struct SourceFrameMetadata {
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct SourceFrameMetadata {
     receipt: AppendReceipt,
     received_millis: i64,
     byte_offset: Option<u64>,
@@ -874,6 +874,82 @@ impl SourceReceiptIndexStaging {
 impl SourceReceiptIndex {
     pub(crate) fn canonical_path(&self) -> Option<&Path> {
         self.source_log_path.as_deref().map(PathBuf::as_path)
+    }
+
+    pub(crate) fn checkpoint_prefix(
+        &self,
+        count: usize,
+        binding: &LogTailBinding,
+    ) -> Result<Vec<SourceFrameMetadata>, RiskInputsUnavailable> {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let frames = state
+            .frames
+            .get(..count)
+            .ok_or(RiskInputsUnavailable::PriceConflict)?
+            .to_vec();
+        if frames.last().map(|frame| frame.receipt.sequence) != binding.last_sequence
+            || frames
+                .last()
+                .map_or(blake3::Hash::from_bytes([0; 32]), |frame| {
+                    frame.receipt.this_hash
+                })
+                != binding.last_hash
+        {
+            return Err(RiskInputsUnavailable::PriceConflict);
+        }
+        Ok(frames)
+    }
+
+    pub(crate) fn checkpoint_metadata_valid(
+        path: &Path,
+        frames: &[SourceFrameMetadata],
+        binding: &LogTailBinding,
+    ) -> Result<PathBuf, RiskInputsUnavailable> {
+        let canonical_source_log_path =
+            std::fs::canonicalize(path).map_err(|_| RiskInputsUnavailable::PriceMissing)?;
+        let mut previous_offset = None;
+        for (index, frame) in frames.iter().enumerate() {
+            if frame.receipt.sequence.0
+                != u64::try_from(index).map_err(|_| RiskInputsUnavailable::Overflow)?
+                || frame.byte_offset.is_none_or(|offset| {
+                    offset < pe_event_log::HEADER_LEN
+                        || offset >= binding.physical_tail
+                        || previous_offset.is_some_and(|previous| offset <= previous)
+                })
+                || (index == 0 && frame.byte_offset != Some(pe_event_log::HEADER_LEN))
+            {
+                return Err(RiskInputsUnavailable::PriceConflict);
+            }
+            previous_offset = frame.byte_offset;
+        }
+        if (frames.is_empty() && binding.physical_tail != pe_event_log::HEADER_LEN)
+            || frames.last().map(|frame| frame.receipt.sequence) != binding.last_sequence
+            || frames
+                .last()
+                .map_or(blake3::Hash::from_bytes([0; 32]), |frame| {
+                    frame.receipt.this_hash
+                })
+                != binding.last_hash
+            || canonical_source_log_path != binding.path
+        {
+            return Err(RiskInputsUnavailable::PriceConflict);
+        }
+        Ok(canonical_source_log_path)
+    }
+
+    pub(crate) fn restore_staging(
+        path: &Path,
+        frames: Vec<SourceFrameMetadata>,
+        binding: &LogTailBinding,
+    ) -> Result<SourceReceiptIndexStaging, RiskInputsUnavailable> {
+        let canonical_source_log_path = Self::checkpoint_metadata_valid(path, &frames, binding)?;
+        Ok(SourceReceiptIndexStaging {
+            canonical_source_log_path,
+            frames,
+        })
     }
 
     /// Start an externally driven source-receipt projection bound to the canonical log path (#572).

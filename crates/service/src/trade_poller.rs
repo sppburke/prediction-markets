@@ -112,7 +112,7 @@ pub struct TradePollerConfig {
     pub copy_latency_budget_secs: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct Obligation {
     group_id: SourceTradeId,
     received_at: OffsetDateTime,
@@ -180,7 +180,7 @@ pub struct ReconciliationObligations {
 }
 
 /// Log-pure websocket candidates awaiting one durable-state filter (#572).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ActivityCandidates {
     by_wallet: CoalescedObligations,
     binding_commitments: Vec<AppendReceipt>,
@@ -308,7 +308,7 @@ impl ActivityCandidates {
 }
 
 /// The sole source-ordered daily boundary waiting for qualifying activity acknowledgements.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PendingBoundary {
     pub cutoff_unix: i64,
     pub receipt: AppendReceipt,
@@ -475,7 +475,7 @@ pub enum ObligationRebuildError {
 }
 
 /// Log-pure daily-boundary candidates awaiting the paper-log anchor (#572).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct DailyBoundaryCandidates {
     boundaries: Vec<PendingBoundary>,
 }

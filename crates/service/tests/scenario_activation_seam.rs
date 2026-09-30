@@ -86,6 +86,8 @@ fn state_with_sized_members(
         // preimages, so each member contributes about twice this document to the binding.
         state
             .install_anchors(&[AnchorInstallRecord {
+                repaired_history: Vec::new(),
+                expected_fence: None,
                 history_status: None,
                 wallet: member,
                 balances: Vec::new(),

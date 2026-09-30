@@ -131,6 +131,7 @@ pub struct IdentityOverride {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BucketCommitResult {
+    pub retained_revision: bool,
     pub wallet: WalletAddress,
     pub source_epoch: i64,
     pub dispositions: BTreeMap<String, String>,
@@ -2366,6 +2367,8 @@ pub(crate) mod continuation_validation_tests {
         paper_state.set_cursor(&wallet, 0).unwrap();
         paper_state
             .install_anchors(&[AnchorInstallRecord {
+                repaired_history: Vec::new(),
+                expected_fence: None,
                 history_status: None,
                 wallet,
                 balances: Vec::new(),
@@ -2550,6 +2553,8 @@ pub enum AnchorInstallError {
         stored: i64,
         candidate: i64,
     },
+    #[error("unsafe recorded activity prevents recovery for wallet {wallet}")]
+    UnsafeRecovery { wallet: WalletAddress },
     #[error("anchor install durability failure: {0}")]
     Durability(String),
 }
@@ -2558,7 +2563,7 @@ impl AnchorInstallError {
     pub fn class(&self) -> crate::position_seeder::FailureClass {
         use crate::position_seeder::FailureClass;
         match self {
-            Self::Fenced { .. } => FailureClass::WalletPersistent,
+            Self::UnsafeRecovery { .. } | Self::Fenced { .. } => FailureClass::WalletPersistent,
             Self::LedgerHashChanged { .. }
             | Self::CursorChanged { .. }
             | Self::AnchorSeqChanged { .. }
@@ -2570,7 +2575,8 @@ impl AnchorInstallError {
 
     pub fn wallet(&self) -> Option<WalletAddress> {
         match self {
-            Self::Fenced { wallet }
+            Self::UnsafeRecovery { wallet }
+            | Self::Fenced { wallet }
             | Self::LedgerHashChanged { wallet }
             | Self::CursorChanged { wallet }
             | Self::AnchorSeqChanged { wallet }
@@ -2583,6 +2589,7 @@ impl AnchorInstallError {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Fenced { .. } => "anchor.fenced",
+            Self::UnsafeRecovery { .. } => "anchor.unsafe_recovery",
             Self::LedgerHashChanged { .. } => "anchor.ledger_hash_changed",
             Self::CursorChanged { .. } => "anchor.cursor_changed",
             Self::AnchorSeqChanged { .. } => "anchor.anchor_seq_changed",
@@ -2715,7 +2722,7 @@ impl BucketCommitEngine {
                     install.wallet
                 )));
             }
-            if self.is_fenced(&install.wallet) {
+            if self.paper_state.wallet_fence(&install.wallet)? != install.expected_fence {
                 return Err(AnchorInstallError::Fenced {
                     wallet: install.wallet,
                 });
@@ -2763,6 +2770,64 @@ impl BucketCommitEngine {
         let mut candidate = self.ledger.clone();
         let mut records = Vec::with_capacity(installs.len());
         for install in installs {
+            let mut repaired_history = BTreeMap::<String, MarketHistoryRecord>::new();
+            let mut proof_json = install.proof.document.clone();
+            let mut history_status = install.history_status.clone();
+            if let Some(fence) = &install.expected_fence {
+                if !crate::position_seeder::recoverable_fence(&self.paper_state, fence)?
+                    || crate::position_seeder::fence_epoch(fence)
+                        .is_none_or(|epoch| install.cutoff <= epoch)
+                {
+                    return Err(AnchorInstallError::Fenced {
+                        wallet: install.wallet,
+                    });
+                }
+                let mut history = install.fresh_history.clone();
+                for row in self
+                    .paper_state
+                    .recovery_activity_evidence(&install.wallet, install.cutoff)?
+                {
+                    let applied = AppliedEffect::from_document(&row.proof_json)
+                        .map_err(|error| AnchorInstallError::Durability(error.to_string()))?;
+                    match applied.effect.effective() {
+                        LedgerEffect::Conversion | LedgerEffect::UnknownEffect => {
+                            return Err(AnchorInstallError::UnsafeRecovery {
+                                wallet: install.wallet,
+                            });
+                        }
+                        LedgerEffect::Trade {
+                            market_id,
+                            side: Side::Buy,
+                            ..
+                        } => history.push(MarketHistoryRecord {
+                            wallet: install.wallet,
+                            market_id: market_id.clone(),
+                            first_epoch: row.source_epoch,
+                            source_trade_id: row.source_trade_id,
+                        }),
+                        _ => {}
+                    }
+                }
+                for record in history {
+                    let entry = repaired_history
+                        .entry(record.market_id.to_string())
+                        .or_insert_with(|| record.clone());
+                    if (record.first_epoch, &record.source_trade_id.0)
+                        < (entry.first_epoch, &entry.source_trade_id.0)
+                    {
+                        *entry = record;
+                    }
+                }
+                let mut proof: Value = serde_json::from_str(&proof_json)
+                    .map_err(|error| AnchorInstallError::Durability(error.to_string()))?;
+                proof["cleared_fence"] = serde_json::to_value(fence)
+                    .map_err(|error| AnchorInstallError::Durability(error.to_string()))?;
+                proof_json = serde_json::to_string(&proof)
+                    .map_err(|error| AnchorInstallError::Durability(error.to_string()))?;
+                if let Some(status) = history_status.as_mut() {
+                    status.proof_json = proof_json.clone();
+                }
+            }
             let mut positions = HashMap::new();
             for (market_id, outcome_id, amount) in &install.balances {
                 let key = MarketOutcomeId::new(market_id.clone(), *outcome_id);
@@ -2791,7 +2856,9 @@ impl BucketCommitEngine {
                     ))
                 })?;
             records.push(AnchorInstallRecord {
-                history_status: install.history_status.clone(),
+                repaired_history: repaired_history.into_values().collect(),
+                expected_fence: install.expected_fence.clone(),
+                history_status,
                 wallet: install.wallet,
                 balances: install.balances.clone(),
                 activity_cutoff_unix: install.cutoff,
@@ -2800,15 +2867,20 @@ impl BucketCommitEngine {
                 positions_proof_hash: install.proof.positions_proof_hash.clone(),
                 activity_bounds_json: install.proof.activity_bounds_json.clone(),
                 source_log_generation: install.proof.source_log_generation.clone(),
-                proof_json: install.proof.document.clone(),
+                proof_json,
                 recorded_at_unix: install.proof.recorded_at_unix,
             });
         }
         self.paper_state.install_anchors(&records)?;
         self.ledger = candidate;
-        for install in installs {
-            if let Some(status) = &install.history_status {
-                self.apply_history_projection(install.wallet, &[], Some(status));
+        for record in &records {
+            self.apply_history_projection(
+                record.wallet,
+                &record.repaired_history,
+                record.history_status.as_ref(),
+            );
+            if record.expected_fence.is_some() {
+                self.fences.remove(&record.wallet);
             }
         }
         Ok(())
@@ -2851,13 +2923,40 @@ impl BucketCommitEngine {
             .map(|aggregate| recordable_mutation(aggregate, context))
             .collect::<Vec<_>>();
 
-        let durable = aggregates
+        let mut durable = aggregates
             .iter()
             .map(|aggregate| {
                 self.paper_state
                     .activity_group_state(aggregate.group_id.key())
             })
             .collect::<Result<Vec<_>, _>>()?;
+        let coverage = self.paper_state.wallet_coverage(&wallet)?;
+        let recovery = self
+            .paper_state
+            .wallet_fence(&wallet)?
+            .as_ref()
+            .map(|fence| crate::position_seeder::recoverable_fence(&self.paper_state, fence))
+            .transpose()?
+            .unwrap_or(false);
+        // Both fence dispatches must recognize exact disposed revisions before comparing them.
+        for (aggregate, state) in aggregates.iter().zip(&mut durable) {
+            if let Some(original) = state
+                && original.semantic_revision != aggregate.semantic_revision.as_str()
+                && original.transaction_hash == aggregate.group_id.components().transaction_hash
+                && (recovery
+                    || (!self.fences.contains(&wallet)
+                        && coverage
+                            .activity_cutoff_unix
+                            .is_some_and(|cutoff| source_epoch <= cutoff)))
+                && let Some(revision) = self.paper_state.activity_revision_state(
+                    aggregate.group_id.key(),
+                    aggregate.semantic_revision.as_str(),
+                )?
+                && revision.transaction_hash == aggregate.group_id.components().transaction_hash
+            {
+                *original = revision;
+            }
+        }
         let correlation_inputs: Value = serde_json::from_str(&context.decision_inputs_json)?;
         if let Some(observations) = correlation_inputs.get("invalid_mapping_observations") {
             let observations: Vec<(SourceTradeId, AppendReceipt)> =
@@ -2913,7 +3012,6 @@ impl BucketCommitEngine {
                 context,
             );
         }
-        let coverage = self.paper_state.wallet_coverage(&wallet)?;
         let seen = durable.iter().filter(|state| state.is_some()).count();
         if seen == aggregates.len() {
             if context.bracket_commit
@@ -2937,6 +3035,7 @@ impl BucketCommitEngine {
             }
             self.paper_state.set_cursor(&wallet, source_epoch)?;
             return Ok(BucketCommitResult {
+                retained_revision: false,
                 wallet,
                 source_epoch,
                 dispositions: BTreeMap::new(),
@@ -3340,6 +3439,7 @@ impl BucketCommitEngine {
         self.ledger = candidate;
         self.apply_history_projection(wallet, &history_effects, context.history_status.as_ref());
         Ok(BucketCommitResult {
+            retained_revision: false,
             wallet,
             source_epoch,
             dispositions,
@@ -3416,6 +3516,7 @@ impl BucketCommitEngine {
             })?;
         self.apply_history_projection(wallet, &history_effects, None);
         Ok(BucketCommitResult {
+            retained_revision: false,
             wallet,
             source_epoch,
             dispositions,
@@ -3454,6 +3555,10 @@ impl BucketCommitEngine {
                     "already_committed".to_owned(),
                 );
                 if repair_history {
+                    let original = self
+                        .paper_state
+                        .activity_group_state(aggregate.group_id.key())?;
+                    let state = original.as_ref().unwrap_or(state);
                     records.push(ActivityDispositionRecord {
                         source_trade_id: aggregate.group_id.key().clone(),
                         transaction_hash: state.transaction_hash.clone(),
@@ -3493,15 +3598,19 @@ impl BucketCommitEngine {
             )?);
             mutations.push(mutation.clone());
         }
-        let history_effects = self.covered_history_effects(
-            wallet,
-            source_epoch,
-            if repair_history {
-                resolved_mutations
-            } else {
-                &mutations
-            },
-        );
+        let history_effects = if context.bracket_commit && self.fences.contains(&wallet) {
+            Vec::new()
+        } else {
+            self.covered_history_effects(
+                wallet,
+                source_epoch,
+                if repair_history {
+                    resolved_mutations
+                } else {
+                    &mutations
+                },
+            )
+        };
         let unresolved_trigger = (!context.bracket_commit)
             .then(|| {
                 mutations.iter().find_map(|mutation| {
@@ -3554,6 +3663,7 @@ impl BucketCommitEngine {
             self.paper_state.set_cursor(&wallet, source_epoch)?;
         }
         Ok(BucketCommitResult {
+            retained_revision: false,
             wallet,
             source_epoch,
             dispositions,
@@ -3738,6 +3848,7 @@ impl BucketCommitEngine {
             })?;
         self.fences.insert(wallet);
         Ok(BucketCommitResult {
+            retained_revision: false,
             wallet,
             source_epoch,
             dispositions,
@@ -3827,6 +3938,7 @@ impl BucketCommitEngine {
         let mut dispositions = BTreeMap::new();
         let mut records = Vec::new();
         let mut unresolved_trigger = None;
+        let mut retained_revision = false;
         for (aggregate, state) in aggregates.iter().zip(durable) {
             let differs = state.as_ref().is_none_or(|state| {
                 state.semantic_revision != aggregate.semantic_revision.as_str()
@@ -3852,6 +3964,13 @@ impl BucketCommitEngine {
             };
             dispositions.insert(aggregate.group_id.key().0.clone(), disposition.clone());
             if differs {
+                retained_revision |= state.as_ref().is_some_and(|original| {
+                    original.semantic_revision != aggregate.semantic_revision.as_str()
+                }) && !self.paper_state.activity_revision_matches(
+                    aggregate.group_id.key(),
+                    aggregate.semantic_revision.as_str(),
+                    &aggregate.group_id.components().transaction_hash,
+                )?;
                 let mutation = recordable_mutation(aggregate, context);
                 records.push(activity_record(
                     aggregate,
@@ -3896,6 +4015,7 @@ impl BucketCommitEngine {
             self.fences.insert(wallet);
         }
         Ok(BucketCommitResult {
+            retained_revision,
             wallet,
             source_epoch,
             dispositions,
@@ -4021,6 +4141,7 @@ impl BucketCommitEngine {
             self.ledger = candidate;
         }
         Ok(BucketCommitResult {
+            retained_revision: false,
             wallet,
             source_epoch,
             dispositions,
@@ -4056,7 +4177,7 @@ fn activity_record(
     })
 }
 
-fn recordable_mutation(
+pub(crate) fn recordable_mutation(
     aggregate: &ActivityAggregate,
     context: &BucketDecisionContext,
 ) -> LedgerMutation {
@@ -5665,6 +5786,8 @@ pub(crate) mod continuation_v3_tests {
         state.set_cursor(&wallet, 0).unwrap();
         state
             .install_anchors(&[AnchorInstallRecord {
+                repaired_history: Vec::new(),
+                expected_fence: None,
                 wallet,
                 balances: Vec::new(),
                 activity_cutoff_unix: 0,

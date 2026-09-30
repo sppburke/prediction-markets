@@ -102,13 +102,8 @@ impl SupabaseWatchlistCapacity {
             MAX_ACTIVE_WATCHLIST_SIZE,
         )
         .await?;
-        let fenced: HashSet<WalletAddress> = self
-            .paper_state
-            .wallet_fences()
-            .map_err(MembershipApplyError::from)?
-            .into_iter()
-            .map(|record| record.wallet)
-            .collect();
+        let fenced = crate::position_seeder::unrecoverable_fenced_wallets(&self.paper_state)
+            .map_err(MembershipApplyError::from)?;
         validate_unique_ranking(&incoming.entries)?;
         let mut excluded = fenced;
         let mut prepared = HashSet::new();
@@ -125,6 +120,8 @@ impl SupabaseWatchlistCapacity {
                 target,
                 None,
                 &mut prepared,
+                None,
+                None,
             )
             .await
             {
@@ -150,13 +147,11 @@ impl SupabaseWatchlistCapacity {
             }
             deferrals.extend(plan.deferrals);
             let reentry_candidates = planned_live_reentries(&self.live, &plan.entries);
-            let reentry_outcome = match self
-                .preparer
-                .prepare_live_reentries(&reentry_candidates)
-                .await
-            {
+            let reentry_outcome = match self.preparer.prepare(&reentry_candidates).await {
                 Ok(reentries) => reentries,
-                Err(error) => {
+                Err(abort) => {
+                    deferrals.extend(abort.deferred);
+                    let error = abort.cause;
                     error!(generation = request.generation, target, kind = error.kind(), %error, "capacity: shared live reentry failure");
                     self.preparer
                         .record_deferrals(
@@ -331,6 +326,7 @@ impl SupabaseWatchlistCapacity {
                     if let Some((wallet, kind)) = error.deferrable_wallet() {
                         excluded.insert(wallet);
                         deferrals.push(Deferral {
+                            completed_at: None,
                             wallet,
                             stage: "publication",
                             class: error.class(),
@@ -407,6 +403,8 @@ mod tests {
         let installs: Vec<pe_paper_state::AnchorInstallRecord> = wallets
             .iter()
             .map(|wallet| pe_paper_state::AnchorInstallRecord {
+                repaired_history: Vec::new(),
+                expected_fence: None,
                 history_status: None,
                 wallet: *wallet,
                 balances: Vec::new(),

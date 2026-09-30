@@ -287,6 +287,8 @@ async fn delayed_indexing_restart_and_four_paths_apply_one_aggregate() {
     // ledger below the scenario epoch so the bucket is post-cutoff.
     paper_state
         .install_anchors(&[AnchorInstallRecord {
+            repaired_history: Vec::new(),
+            expected_fence: None,
             history_status: None,
             wallet: wallet(),
             balances: Vec::new(),
@@ -409,6 +411,8 @@ async fn first_seen_unverified_poller_group_is_raw_only_and_reanchors() {
     paper_state.set_cursor(&wallet(), epoch - 1).unwrap();
     paper_state
         .install_anchors(&[AnchorInstallRecord {
+            repaired_history: Vec::new(),
+            expected_fence: None,
             history_status: None,
             wallet: wallet(),
             balances: Vec::new(),

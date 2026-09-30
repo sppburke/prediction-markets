@@ -583,6 +583,7 @@ pub(crate) fn apply_live_reentries(
         }
         if let Err(error) = recheck_admissions(paper_state, &[wallet]) {
             deferred.push(crate::watchlist_admission::Deferral {
+                completed_at: Some(tokio::time::Instant::now()),
                 wallet,
                 stage: "locked_apply",
                 class: error.class(),
@@ -598,6 +599,8 @@ pub(crate) fn apply_live_reentries(
         live.replace(&HashSet::new(), &admitted, cap);
     }
     crate::watchlist_admission::AdmissionOutcome {
+        started: Vec::new(),
+        unstarted: Vec::new(),
         admitted: admitted.into_iter().map(|entry| entry.wallet).collect(),
         deferred,
     }
@@ -969,6 +972,8 @@ pub(crate) async fn plan_membership(
     membership_cap: usize,
     removed: Option<&HashSet<WalletAddress>>,
     prepared: &mut HashSet<WalletAddress>,
+    deadline: Option<tokio::time::Instant>,
+    mut sync: Option<&mut BatchSync>,
 ) -> Result<PlannedMembership, PlanningAbort> {
     let mut deferrals = Vec::new();
     for _ in 0..=candidates.entries.len() {
@@ -995,6 +1000,7 @@ pub(crate) async fn plan_membership(
             if !selected_last_trade.contains_key(wallet) {
                 changed |= excluded.insert(*wallet);
                 deferrals.push(crate::watchlist_admission::Deferral {
+                    completed_at: Some(tokio::time::Instant::now()),
                     wallet: *wallet,
                     stage: "seed",
                     class: crate::position_seeder::FailureClass::WalletPersistent,
@@ -1004,10 +1010,28 @@ pub(crate) async fn plan_membership(
             }
         }
         if changed {
+            if let Some(sync) = sync.as_deref_mut() {
+                park_persistent(sync, preparer.paper_state(), &deferrals);
+            }
             continue;
         }
-        match preparer.prepare_ranked(&new, &selected_last_trade).await {
+        match preparer
+            .prepare_ranked_until(&new, &selected_last_trade, deadline)
+            .await
+        {
             Ok(outcome) => {
+                if let Some(sync) = sync.as_deref_mut() {
+                    sync.completed(
+                        preparer.paper_state(),
+                        &outcome.started,
+                        &outcome.admitted,
+                        &outcome.deferred,
+                        &outcome.unstarted,
+                    );
+                }
+                for wallet in outcome.unstarted {
+                    changed |= excluded.insert(wallet);
+                }
                 prepared.extend(outcome.admitted);
                 for deferral in outcome.deferred {
                     changed |= excluded.insert(deferral.wallet);
@@ -1015,6 +1039,18 @@ pub(crate) async fn plan_membership(
                 }
             }
             Err(abort) => {
+                if let Some(sync) = sync.as_deref_mut() {
+                    sync.completed(
+                        preparer.paper_state(),
+                        &abort.started,
+                        &abort.admitted,
+                        &abort.deferred,
+                        &abort.unstarted,
+                    );
+                }
+                if let Some(sync) = sync.as_deref_mut() {
+                    park_persistent(sync, preparer.paper_state(), &abort.deferred);
+                }
                 deferrals.extend(abort.deferred);
                 return Err(PlanningAbort {
                     kind: abort.cause.kind(),
@@ -1024,11 +1060,17 @@ pub(crate) async fn plan_membership(
             }
         }
         if changed {
+            if let Some(sync) = sync.as_deref_mut() {
+                park_persistent(sync, preparer.paper_state(), &deferrals);
+            }
             continue;
         }
         let (proofs, proof_deferrals) = match preparer.capture_proofs(&additions) {
             Ok(result) => result,
             Err(abort) => {
+                if let Some(sync) = sync.as_deref_mut() {
+                    park_persistent(sync, preparer.paper_state(), &abort.deferred);
+                }
                 deferrals.extend(abort.deferred);
                 return Err(PlanningAbort {
                     kind: abort.cause.kind(),
@@ -1042,6 +1084,9 @@ pub(crate) async fn plan_membership(
             deferrals.push(deferral);
         }
         if changed {
+            if let Some(sync) = sync.as_deref_mut() {
+                park_persistent(sync, preparer.paper_state(), &deferrals);
+            }
             continue;
         }
         let binding =
@@ -1230,21 +1275,73 @@ pub async fn apply_full_rerank_swap(
 /// batch this loop last applied, so the next full-rerank tick re-applies the newest batch even
 /// when the marker already names it (#542). The marker itself is never erased — it still decides
 /// whether a tick is a genuine batch transition, which is what clears the eviction memory.
-struct BatchSync {
+pub(crate) struct BatchSync {
+    cooldowns: HashMap<WalletAddress, tokio::time::Instant>,
+    parking_batch: Option<i64>,
+    started: usize,
+    accepted: usize,
+    deferred: usize,
+    unstarted: usize,
     marker: Option<i64>,
     capacity_generation: u64,
     knockout_deferred: HashSet<WalletAddress>,
 }
 
-fn park_persistent(sync: &mut BatchSync, deferrals: &[crate::watchlist_admission::Deferral]) {
+fn park_persistent(
+    sync: &mut BatchSync,
+    paper: &PaperStateDb,
+    deferrals: &[crate::watchlist_admission::Deferral],
+) {
+    for deferral in deferrals {
+        if deferral.class == crate::position_seeder::FailureClass::WalletTransient {
+            let terminal = deferral
+                .completed_at
+                .unwrap_or_else(tokio::time::Instant::now);
+            sync.cooldowns.insert(
+                deferral.wallet,
+                terminal + Duration::from_secs(crate::trade_poller::ANCHOR_REFRESH_SECS),
+            );
+        }
+    }
     sync.knockout_deferred.extend(
         deferrals
             .iter()
             .filter(|deferral| {
                 deferral.class == crate::position_seeder::FailureClass::WalletPersistent
+                    && !crate::position_seeder::recoverable_fence_failure(
+                        paper,
+                        &deferral.wallet,
+                        deferral.kind,
+                    )
             })
             .map(|deferral| deferral.wallet),
     );
+}
+
+impl BatchSync {
+    fn cooling(&self, wallet: &WalletAddress) -> bool {
+        self.cooldowns
+            .get(wallet)
+            .is_some_and(|end| tokio::time::Instant::now() < *end)
+    }
+
+    fn completed(
+        &mut self,
+        paper: &PaperStateDb,
+        started: &[WalletAddress],
+        admitted: &[WalletAddress],
+        deferred: &[crate::watchlist_admission::Deferral],
+        unstarted: &[WalletAddress],
+    ) {
+        self.started += started.len();
+        self.accepted += admitted.len();
+        self.deferred += deferred.len();
+        self.unstarted += unstarted.len();
+        park_persistent(self, paper, deferred);
+        for wallet in admitted {
+            self.cooldowns.remove(wallet);
+        }
+    }
 }
 
 struct LiveReentryReport {
@@ -1266,10 +1363,11 @@ async fn live_reentry_tick(
     applied_capacity: &AppliedWatchlistCapacity,
     capacity_epoch: WatchlistCapacityEpoch,
     preparer: &AdmissionPreparer,
-    sync: &BatchSync,
+    sync: &mut BatchSync,
     held: Option<&(i64, Watchlist, HashMap<WalletAddress, i64>)>,
     attempted: &mut HashSet<WalletAddress>,
     now_unix: i64,
+    deadline: Option<tokio::time::Instant>,
 ) -> Option<LiveReentryReport> {
     let batch_id = sync.marker?;
     // Read the applied batch only when a structural member is live-absent and retryable this
@@ -1284,6 +1382,7 @@ async fn live_reentry_tick(
         !present.contains(wallet)
             && !sync.knockout_deferred.contains(wallet)
             && !attempted.contains(wallet)
+            && !sync.cooling(wallet)
     }) {
         return None;
     }
@@ -1317,11 +1416,12 @@ async fn live_reentry_tick(
     let candidates = planned_live_reentries(live, entries)
         .into_iter()
         .filter(|wallet| !sync.knockout_deferred.contains(wallet))
-        .filter(|wallet| attempted.insert(*wallet))
+        .filter(|wallet| !attempted.contains(wallet) && !sync.cooling(wallet))
         .filter(|wallet| match last_trade.get(wallet) {
             Some(last) if *last >= freshness_cutoff && *last <= now_unix => true,
             value => {
                 deferred.push(crate::watchlist_admission::Deferral {
+                    completed_at: Some(tokio::time::Instant::now()),
                     wallet: *wallet,
                     stage: "seed",
                     class: crate::position_seeder::FailureClass::WalletPersistent,
@@ -1336,13 +1436,34 @@ async fn live_reentry_tick(
             }
         })
         .collect::<Vec<_>>();
-    let prepared = match preparer.prepare_live_reentries(&candidates).await {
+    park_persistent(sync, paper_state, &deferred);
+    let prepared = match preparer
+        .prepare_ranked_until(&candidates, last_trade, deadline)
+        .await
+    {
         Ok(prepared) => prepared,
-        Err(error) => {
+        Err(abort) => {
+            attempted.extend(abort.started.iter().copied());
+            sync.completed(
+                paper_state,
+                &abort.started,
+                &abort.admitted,
+                &abort.deferred,
+                &abort.unstarted,
+            );
+            let error = abort.cause;
             warn!(batch_id, kind = error.kind(), %error, "live reentry: shared preparation failed; retrying next tick");
             return None;
         }
     };
+    attempted.extend(prepared.started.iter().copied());
+    sync.completed(
+        paper_state,
+        &prepared.started,
+        &prepared.admitted,
+        &prepared.deferred,
+        &prepared.unstarted,
+    );
     deferred.extend(prepared.deferred);
     let _writer = writer_lock.lock().await;
     if applied_capacity.load() != capacity_epoch {
@@ -1359,6 +1480,7 @@ async fn live_reentry_tick(
         entries,
         capacity_epoch.target,
     );
+    park_persistent(sync, paper_state, &applied.deferred);
     deferred.extend(applied.deferred);
     let report = LiveReentryReport {
         before_live,
@@ -1383,7 +1505,7 @@ async fn record_live_reentry(
         deferred = report.deferred.len(),
         "live reentry tick completed"
     );
-    park_persistent(sync, &report.deferred);
+    park_persistent(sync, preparer.paper_state(), &report.deferred);
     if let Some(batch_id) = sync.marker {
         let context = match mode {
             MembershipMode::Knockout => {
@@ -1400,6 +1522,64 @@ async fn record_live_reentry(
                 crate::watchlist_admission::DeferralOutcome::NoChange,
             )
             .await;
+    }
+}
+
+/// Stateful, fixed-clock entry point for composed maintenance scenarios.
+#[cfg(feature = "scenario")]
+pub struct ScenarioMaintenanceState {
+    sync: BatchSync,
+    evicted: HashSet<WalletAddress>,
+}
+#[cfg(feature = "scenario")]
+impl ScenarioMaintenanceState {
+    pub fn new(marker: Option<i64>, capacity_generation: u64) -> Self {
+        Self {
+            sync: BatchSync {
+                marker,
+                capacity_generation,
+                parking_batch: marker,
+                knockout_deferred: HashSet::new(),
+                cooldowns: HashMap::new(),
+                started: 0,
+                accepted: 0,
+                deferred: 0,
+                unstarted: 0,
+            },
+            evicted: HashSet::new(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn tick(
+        &mut self,
+        live: &LiveWatchlist,
+        paper: &Arc<PaperStateDb>,
+        client: &reqwest::Client,
+        base_url: &str,
+        writer_lock: &Mutex<()>,
+        applied: &AppliedWatchlistCapacity,
+        preparer: &AdmissionPreparer,
+        cfg: &MaintenanceConfig,
+        now_unix: i64,
+    ) {
+        maintenance_tick(
+            live,
+            paper,
+            client,
+            base_url,
+            "fixture",
+            "fixture",
+            writer_lock,
+            applied,
+            preparer,
+            cfg,
+            applied.load(),
+            &mut self.evicted,
+            &mut self.sync,
+            now_unix,
+        )
+        .await;
     }
 }
 
@@ -1422,6 +1602,7 @@ pub async fn run_maintenance_loop(
     preparer: AdmissionPreparer,
     initial_batch_marker: Option<i64>,
     boot_persistent_deferred: HashSet<WalletAddress>,
+    boot_cooldowns: HashMap<WalletAddress, tokio::time::Instant>,
 ) {
     if cfg.interval_secs == 0 {
         info!("watchlist maintenance disabled (maintenance_interval_secs = 0)");
@@ -1446,6 +1627,12 @@ pub async fn run_maintenance_loop(
         marker: initial_batch_marker,
         capacity_generation: applied_capacity.load().generation,
         knockout_deferred: boot_persistent_deferred,
+        parking_batch: initial_batch_marker,
+        cooldowns: boot_cooldowns,
+        started: 0,
+        accepted: 0,
+        deferred: 0,
+        unstarted: 0,
     };
     loop {
         tokio::time::sleep(interval).await;
@@ -1531,6 +1718,59 @@ async fn maintenance_tick(
     sync: &mut BatchSync,
     now_unix: i64,
 ) {
+    let started = tokio::time::Instant::now();
+    let deadline = started + Duration::from_secs(cfg.interval_secs);
+    sync.started = 0;
+    sync.accepted = 0;
+    sync.deferred = 0;
+    sync.unstarted = 0;
+    maintenance_tick_inner(
+        live,
+        paper_state,
+        client,
+        base_url,
+        anon_key,
+        secret_key,
+        writer_lock,
+        applied_capacity,
+        preparer,
+        cfg,
+        capacity_epoch,
+        evicted,
+        sync,
+        now_unix,
+        deadline,
+    )
+    .await;
+    info!(
+        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        deadline_expired = tokio::time::Instant::now() >= deadline,
+        started = sync.started,
+        accepted = sync.accepted,
+        deferred = sync.deferred,
+        unstarted = sync.unstarted,
+        "maintenance admission budget completed"
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn maintenance_tick_inner(
+    live: &LiveWatchlist,
+    paper_state: &Arc<PaperStateDb>,
+    client: &reqwest::Client,
+    base_url: &str,
+    anon_key: &str,
+    secret_key: &str,
+    writer_lock: &Mutex<()>,
+    applied_capacity: &AppliedWatchlistCapacity,
+    preparer: &AdmissionPreparer,
+    cfg: &MaintenanceConfig,
+    capacity_epoch: WatchlistCapacityEpoch,
+    evicted: &mut HashSet<WalletAddress>,
+    sync: &mut BatchSync,
+    now_unix: i64,
+    deadline: tokio::time::Instant,
+) {
     let cap = capacity_epoch.target;
     let mut held_batch: Option<(i64, Watchlist, HashMap<WalletAddress, i64>)> = None;
     let mut attempted_reentries = HashSet::new();
@@ -1548,331 +1788,372 @@ async fn maintenance_tick(
     // so a failed fetch retries next tick. Audit stats for dropped wallets are best-effort
     // decoration: a list_fills failure degrades the audit rows, never blocks the swap.
     match supabase_reader::fetch_latest_batch_id(client, base_url, anon_key, secret_key).await {
-        Ok(latest) => match cfg.membership_mode {
-            MembershipMode::Knockout => {
-                if let Some(batch_id) = latest
-                    && latest != sync.marker
-                {
-                    match supabase_reader::fetch_batch(
-                        client,
-                        base_url,
-                        anon_key,
-                        secret_key,
-                        batch_id,
-                        MAX_ACTIVE_WATCHLIST_SIZE,
-                    )
-                    .await
+        Ok(latest) => {
+            if latest.is_some() && latest != sync.parking_batch {
+                sync.knockout_deferred.clear();
+                sync.parking_batch = latest;
+            }
+            match cfg.membership_mode {
+                MembershipMode::Knockout => {
+                    if let Some(batch_id) = latest
+                        && latest != sync.marker
                     {
-                        Ok((incoming, incoming_last_trade)) => match paper_state.wallet_fences() {
-                            Ok(_) => {
-                                let fetched =
-                                    (batch_id, incoming.clone(), incoming_last_trade.clone());
-                                // Knockout keeps structural membership. The live-only reentry
-                                // below checks fences under the writer lock using these pinned rows.
-                                let _writer = writer_lock.lock().await;
-                                if applied_capacity.load() == capacity_epoch {
-                                    if sync.marker.is_some() {
-                                        evicted.clear();
+                        match supabase_reader::fetch_batch(
+                            client,
+                            base_url,
+                            anon_key,
+                            secret_key,
+                            batch_id,
+                            MAX_ACTIVE_WATCHLIST_SIZE,
+                        )
+                        .await
+                        {
+                            Ok((incoming, incoming_last_trade)) => {
+                                match paper_state.wallet_fences() {
+                                    Ok(_) => {
+                                        let fetched = (
+                                            batch_id,
+                                            incoming.clone(),
+                                            incoming_last_trade.clone(),
+                                        );
+                                        // Knockout keeps structural membership. The live-only reentry
+                                        // below checks fences under the writer lock using these pinned rows.
+                                        let _writer = writer_lock.lock().await;
+                                        if applied_capacity.load() == capacity_epoch {
+                                            if sync.marker.is_some() {
+                                                evicted.clear();
+                                            }
+                                            sync.knockout_deferred.clear();
+                                            sync.marker = Some(batch_id);
+                                            held_batch = Some(fetched);
+                                        } else {
+                                            warn!(
+                                                batch_id,
+                                                "knockout: capacity changed during live reentry preparation; retrying batch"
+                                            );
+                                        }
                                     }
-                                    sync.knockout_deferred.clear();
-                                    sync.marker = Some(batch_id);
-                                    held_batch = Some(fetched);
-                                } else {
-                                    warn!(
-                                        batch_id,
-                                        "knockout: capacity changed during live reentry preparation; retrying batch"
-                                    );
+                                    Err(error) => warn!(%error, batch_id,
+                                    "knockout: fence read failed; keeping batch marker for retry"),
                                 }
                             }
-                            Err(error) => warn!(%error, batch_id,
-                                    "knockout: fence read failed; keeping batch marker for retry"),
-                        },
-                        Err(error) => {
-                            shared_batch_fetch_failed = true;
-                            warn!(%error, batch_id,
+                            Err(error) => {
+                                shared_batch_fetch_failed = true;
+                                warn!(%error, batch_id,
                                 "knockout: pinned batch fetch failed; keeping batch marker for retry");
+                            }
                         }
                     }
+                    // Knockout structural membership is never batch-applied, so there is no
+                    // capacity-driven re-sync.
+                    sync.capacity_generation = capacity_epoch.generation;
                 }
-                // Knockout structural membership is never batch-applied, so there is no
-                // capacity-driven re-sync.
-                sync.capacity_generation = capacity_epoch.generation;
-            }
-            MembershipMode::FullRerank => {
-                // Every transition applies the batch it triggered on — including the first tick
-                // after a failed boot batch read (#542). The pinned `ranking_entries` read binds
-                // the rows, the preparation, and the committed marker to one batch identifier;
-                // the moving `latest_ranking` view could otherwise return a newer batch's rows.
-                if let Some(batch_id) = latest
-                    && (latest != sync.marker || capacity_changed)
-                {
-                    match supabase_reader::fetch_batch(
-                        client,
-                        base_url,
-                        anon_key,
-                        secret_key,
-                        batch_id,
-                        MAX_ACTIVE_WATCHLIST_SIZE,
-                    )
-                    .await
+                MembershipMode::FullRerank => {
+                    // Every transition applies the batch it triggered on — including the first tick
+                    // after a failed boot batch read (#542). The pinned `ranking_entries` read binds
+                    // the rows, the preparation, and the committed marker to one batch identifier;
+                    // the moving `latest_ranking` view could otherwise return a newer batch's rows.
+                    if let Some(batch_id) = latest
+                        && (latest != sync.marker || capacity_changed)
                     {
-                        Ok((incoming, incoming_last_trade)) => 'replacement: {
-                            let fetched = (batch_id, incoming.clone(), incoming_last_trade.clone());
-                            let fenced: HashSet<WalletAddress> = match paper_state.wallet_fences() {
-                                Ok(records) => {
-                                    records.into_iter().map(|record| record.wallet).collect()
-                                }
-                                Err(error) => {
-                                    warn!(%error, "full_rerank: fence read failed; keeping batch marker for retry");
-                                    break 'replacement;
-                                }
-                            };
-                            let mut excluded = fenced;
-                            if Some(batch_id) == sync.marker {
+                        match supabase_reader::fetch_batch(
+                            client,
+                            base_url,
+                            anon_key,
+                            secret_key,
+                            batch_id,
+                            MAX_ACTIVE_WATCHLIST_SIZE,
+                        )
+                        .await
+                        {
+                            Ok((incoming, incoming_last_trade)) => 'replacement: {
+                                let fetched =
+                                    (batch_id, incoming.clone(), incoming_last_trade.clone());
+                                let fenced =
+                                    match crate::position_seeder::unrecoverable_fenced_wallets(
+                                        paper_state,
+                                    ) {
+                                        Ok(wallets) => wallets,
+                                        Err(error) => {
+                                            warn!(%error, "full_rerank: fence read failed; keeping batch marker for retry");
+                                            break 'replacement;
+                                        }
+                                    };
+                                let mut excluded = fenced;
                                 excluded.extend(sync.knockout_deferred.iter().copied());
-                            }
-                            let mut prepared = HashSet::new();
-                            let mut recaptured = HashSet::new();
-                            let mut deferrals = Vec::new();
-                            let (incoming, additions, live_total, dropped, paper_receipt) = loop {
-                                let plan = match plan_membership(
-                                    live,
-                                    preparer,
-                                    &incoming,
-                                    &incoming_last_trade,
-                                    excluded.clone(),
-                                    cap,
-                                    cap,
-                                    None,
-                                    &mut prepared,
-                                )
-                                .await
-                                {
-                                    Ok(plan) => plan,
-                                    Err(abort) => {
-                                        deferrals.extend(abort.deferrals);
-                                        error!(batch_id, kind = abort.kind, cause = %abort.message, "full_rerank: shared admission failure");
-                                        preparer.record_deferrals(crate::watchlist_admission::DeferralContext::FullRerank { batch_id }, deferrals, crate::watchlist_admission::DeferralOutcome::AbortedShared { kind: abort.kind }).await;
-                                        break 'replacement;
+                                let retained = live.structural_membership();
+                                excluded.extend(
+                                    incoming
+                                        .entries
+                                        .iter()
+                                        .filter(|entry| {
+                                            !retained.contains(&entry.wallet)
+                                                && sync.cooling(&entry.wallet)
+                                        })
+                                        .map(|entry| entry.wallet),
+                                );
+                                let mut prepared = HashSet::new();
+                                let mut recaptured = HashSet::new();
+                                let mut deferrals = Vec::new();
+                                let (incoming, additions, live_total, dropped, paper_receipt) = loop {
+                                    let plan = match plan_membership(
+                                        live,
+                                        preparer,
+                                        &incoming,
+                                        &incoming_last_trade,
+                                        excluded.clone(),
+                                        cap,
+                                        cap,
+                                        None,
+                                        &mut prepared,
+                                        Some(deadline),
+                                        Some(sync),
+                                    )
+                                    .await
+                                    {
+                                        Ok(plan) => plan,
+                                        Err(abort) => {
+                                            deferrals.extend(abort.deferrals);
+                                            error!(batch_id, kind = abort.kind, cause = %abort.message, "full_rerank: shared admission failure");
+                                            park_persistent(sync, paper_state, &deferrals);
+                                            preparer.record_deferrals(crate::watchlist_admission::DeferralContext::FullRerank { batch_id }, deferrals, crate::watchlist_admission::DeferralOutcome::AbortedShared { kind: abort.kind }).await;
+                                            break 'replacement;
+                                        }
+                                    };
+                                    for deferral in &plan.deferrals {
+                                        excluded.insert(deferral.wallet);
+                                    }
+                                    deferrals.extend(plan.deferrals);
+                                    let ranking_receipt = match preparer
+                                        .record_ranking_membership(
+                                            Some(batch_id),
+                                            plan.entries.clone(),
+                                        )
+                                        .await
+                                    {
+                                        Ok(receipt) => receipt,
+                                        Err(error) => {
+                                            error!(batch_id, kind = error.kind(), %error, "full_rerank: ranking artifact failed");
+                                            park_persistent(sync, paper_state, &deferrals);
+                                            preparer.record_deferrals(crate::watchlist_admission::DeferralContext::FullRerank { batch_id }, deferrals, crate::watchlist_admission::DeferralOutcome::AbortedShared { kind: error.kind() }).await;
+                                            break 'replacement;
+                                        }
+                                    };
+                                    let admission_receipts = match preparer
+                                        .record_admission_proofs(&plan.proofs)
+                                        .await
+                                    {
+                                        Ok(receipts) => receipts,
+                                        Err(error) => {
+                                            error!(batch_id, kind = error.kind(), %error, "full_rerank: admission artifact failed");
+                                            park_persistent(sync, paper_state, &deferrals);
+                                            preparer.record_deferrals(crate::watchlist_admission::DeferralContext::FullRerank { batch_id }, deferrals, crate::watchlist_admission::DeferralOutcome::AbortedShared { kind: error.kind() }).await;
+                                            break 'replacement;
+                                        }
+                                    };
+                                    let evidence = match SealedMembershipEvidence::full_rerank(
+                                        ranking_receipt,
+                                        admission_receipts,
+                                    ) {
+                                        Ok(evidence) => evidence,
+                                        Err(error) => {
+                                            error!(batch_id, %error, "full_rerank: membership evidence failed");
+                                            park_persistent(sync, paper_state, &deferrals);
+                                            preparer.record_deferrals(crate::watchlist_admission::DeferralContext::FullRerank { batch_id }, deferrals, crate::watchlist_admission::DeferralOutcome::AbortedShared { kind: "evidence.encoding" }).await;
+                                            break 'replacement;
+                                        }
+                                    };
+                                    match apply_full_rerank_swap(
+                                        live,
+                                        paper_state,
+                                        writer_lock,
+                                        preparer,
+                                        MembershipPublication {
+                                            reason: MembershipReason::FullRerank,
+                                            ranking_batch_id: Some(batch_id),
+                                            evidence,
+                                            binding: plan.binding,
+                                        },
+                                        applied_capacity,
+                                        capacity_epoch,
+                                        &plan.entries,
+                                        &plan.last_trade,
+                                        &[],
+                                    )
+                                    .await
+                                    {
+                                        Ok((live_total, dropped, receipt)) => {
+                                            let mut selected = incoming.clone();
+                                            selected.entries = plan.entries;
+                                            break (
+                                                selected,
+                                                plan.additions,
+                                                live_total,
+                                                dropped,
+                                                receipt,
+                                            );
+                                        }
+                                        Err(MembershipApplyError::Publication(
+                                            PublishError::Wallet {
+                                                wallet,
+                                                cause: WalletPublishCause::ProofChanged,
+                                            },
+                                        )) if recaptured.insert(wallet) => continue,
+                                        Err(error)
+                                            if error.class()
+                                                != crate::position_seeder::FailureClass::Shared =>
+                                        {
+                                            if let Some((wallet, kind)) = error.deferrable_wallet()
+                                            {
+                                                excluded.insert(wallet);
+                                                deferrals.push(
+                                                    crate::watchlist_admission::Deferral {
+                                                        completed_at: Some(
+                                                            tokio::time::Instant::now(),
+                                                        ),
+                                                        wallet,
+                                                        stage: "publication",
+                                                        class: error.class(),
+                                                        kind,
+                                                        message: error.to_string(),
+                                                    },
+                                                );
+                                                park_persistent(sync, paper_state, &deferrals);
+                                                continue;
+                                            }
+                                            error!(batch_id, %error, "full_rerank: unlocated wallet failure");
+                                            break 'replacement;
+                                        }
+                                        Err(MembershipApplyError::Publication(
+                                            PublishError::UncertainAppend(message),
+                                        )) => {
+                                            error!(batch_id, %message, "full_rerank: paper append outcome uncertain");
+                                            break 'replacement;
+                                        }
+                                        Err(error) => {
+                                            error!(batch_id, kind = error.kind(), %error, "full_rerank: shared publication failure");
+                                            park_persistent(sync, paper_state, &deferrals);
+                                            preparer.record_deferrals(crate::watchlist_admission::DeferralContext::FullRerank { batch_id }, deferrals, crate::watchlist_admission::DeferralOutcome::AbortedShared { kind: error.kind() }).await;
+                                            break 'replacement;
+                                        }
                                     }
                                 };
-                                for deferral in &plan.deferrals {
-                                    excluded.insert(deferral.wallet);
+                                let outcome = paper_receipt.map_or(
+                                    crate::watchlist_admission::DeferralOutcome::NoChange,
+                                    |receipt| {
+                                        crate::watchlist_admission::DeferralOutcome::Published {
+                                            paper_seq: receipt.sequence.0,
+                                        }
+                                    },
+                                );
+                                info!(
+                                    batch_id,
+                                    admitted = additions.len(),
+                                    deferred = deferrals.len(),
+                                    "full_rerank: admission attempt completed"
+                                );
+
+                                park_persistent(sync, paper_state, &deferrals);
+                                preparer
+                                    .record_deferrals(
+                                        crate::watchlist_admission::DeferralContext::FullRerank {
+                                            batch_id,
+                                        },
+                                        deferrals,
+                                        outcome,
+                                    )
+                                    .await;
+                                let audit_stats = load_edge_stats(paper_state, cfg, now_unix);
+                                for w in &dropped {
+                                    let s = audit_stats
+                                        .as_ref()
+                                        .and_then(|loaded| loaded.by_wallet.get(&w.to_string()));
+                                    if let Err(e) = supabase_reader::write_lifecycle_event(
+                                        client,
+                                        base_url,
+                                        anon_key,
+                                        secret_key,
+                                        &w.to_string(),
+                                        KnockoutReason::RankerRotation.reason_text(),
+                                        s.map(|st| st.realized_pnl),
+                                        i64::try_from(s.map_or(0, |st| st.settled_count))
+                                            .unwrap_or(i64::MAX),
+                                        paper_state.cursor(w).unwrap_or(None),
+                                    )
+                                    .await
+                                    {
+                                        warn!(wallet = %w, error = %e,
+                                        "full_rerank: lifecycle write failed (best-effort)");
+                                    }
                                 }
-                                deferrals.extend(plan.deferrals);
-                                let ranking_receipt = match preparer
-                                    .record_ranking_membership(Some(batch_id), plan.entries.clone())
-                                    .await
-                                {
-                                    Ok(receipt) => receipt,
-                                    Err(error) => {
-                                        error!(batch_id, kind = error.kind(), %error, "full_rerank: ranking artifact failed");
-                                        preparer.record_deferrals(crate::watchlist_admission::DeferralContext::FullRerank { batch_id }, deferrals, crate::watchlist_admission::DeferralOutcome::AbortedShared { kind: error.kind() }).await;
-                                        break 'replacement;
-                                    }
-                                };
-                                let admission_receipts = match preparer
-                                    .record_admission_proofs(&plan.proofs)
-                                    .await
-                                {
-                                    Ok(receipts) => receipts,
-                                    Err(error) => {
-                                        error!(batch_id, kind = error.kind(), %error, "full_rerank: admission artifact failed");
-                                        preparer.record_deferrals(crate::watchlist_admission::DeferralContext::FullRerank { batch_id }, deferrals, crate::watchlist_admission::DeferralOutcome::AbortedShared { kind: error.kind() }).await;
-                                        break 'replacement;
-                                    }
-                                };
-                                let evidence = match SealedMembershipEvidence::full_rerank(
-                                    ranking_receipt,
-                                    admission_receipts,
-                                ) {
-                                    Ok(evidence) => evidence,
-                                    Err(error) => {
-                                        error!(batch_id, %error, "full_rerank: membership evidence failed");
-                                        preparer.record_deferrals(crate::watchlist_admission::DeferralContext::FullRerank { batch_id }, deferrals, crate::watchlist_admission::DeferralOutcome::AbortedShared { kind: "evidence.encoding" }).await;
-                                        break 'replacement;
-                                    }
-                                };
-                                match apply_full_rerank_swap(
+                                // Memoryless by design: the ranker's verdict overrides demotion
+                                // memory at each batch transition; the knockout resumes next tick.
+                                // A capacity re-sync of the same batch is not a transition and
+                                // keeps this batch's eviction memory.
+                                if latest != sync.marker {
+                                    evicted.clear();
+                                }
+                                sync.marker = latest;
+                                sync.capacity_generation = capacity_epoch.generation;
+                                held_batch = Some(fetched);
+                                if incoming.entries.is_empty() {
+                                    // #518 made this reachable in normal operation: the read is
+                                    // survivor-filtered, so a batch whose rows all fail the gate —
+                                    // or one that carries no verdict at all — legitimately returns
+                                    // zero rows. Retaining the previous set would keep copying
+                                    // wallets the CURRENT batch says are ineligible. Applying the
+                                    // empty membership matches the cold-boot stance (`main.rs`
+                                    // refuses to start on an empty filtered read) and the
+                                    // fail-closed contract. Open positions keep resolving; only
+                                    // new copies stop.
+                                    warn!(
+                                        batch_id,
+                                        dropped = dropped.len(),
+                                        live_total,
+                                        "full_rerank: batch has no surviving rows; live set emptied \
+                                     (fail-closed — the ranker endorsed nobody)"
+                                    );
+                                } else {
+                                    info!(
+                                        batch_id,
+                                        admitted = additions.len(),
+                                        dropped = dropped.len(),
+                                        live_total,
+                                        "full re-rank membership swap applied"
+                                    );
+                                }
+                                let report = live_reentry_tick(
                                     live,
                                     paper_state,
-                                    writer_lock,
-                                    preparer,
-                                    MembershipPublication {
-                                        reason: MembershipReason::FullRerank,
-                                        ranking_batch_id: Some(batch_id),
-                                        evidence,
-                                        binding: plan.binding,
-                                    },
-                                    applied_capacity,
-                                    capacity_epoch,
-                                    &plan.entries,
-                                    &plan.last_trade,
-                                    &[],
-                                )
-                                .await
-                                {
-                                    Ok((live_total, dropped, receipt)) => {
-                                        let mut selected = incoming.clone();
-                                        selected.entries = plan.entries;
-                                        break (
-                                            selected,
-                                            plan.additions,
-                                            live_total,
-                                            dropped,
-                                            receipt,
-                                        );
-                                    }
-                                    Err(MembershipApplyError::Publication(
-                                        PublishError::Wallet {
-                                            wallet,
-                                            cause: WalletPublishCause::ProofChanged,
-                                        },
-                                    )) if recaptured.insert(wallet) => continue,
-                                    Err(error)
-                                        if error.class()
-                                            != crate::position_seeder::FailureClass::Shared =>
-                                    {
-                                        if let Some((wallet, kind)) = error.deferrable_wallet() {
-                                            excluded.insert(wallet);
-                                            deferrals.push(crate::watchlist_admission::Deferral {
-                                                wallet,
-                                                stage: "publication",
-                                                class: error.class(),
-                                                kind,
-                                                message: error.to_string(),
-                                            });
-                                            continue;
-                                        }
-                                        error!(batch_id, %error, "full_rerank: unlocated wallet failure");
-                                        break 'replacement;
-                                    }
-                                    Err(MembershipApplyError::Publication(
-                                        PublishError::UncertainAppend(message),
-                                    )) => {
-                                        error!(batch_id, %message, "full_rerank: paper append outcome uncertain");
-                                        break 'replacement;
-                                    }
-                                    Err(error) => {
-                                        error!(batch_id, kind = error.kind(), %error, "full_rerank: shared publication failure");
-                                        preparer.record_deferrals(crate::watchlist_admission::DeferralContext::FullRerank { batch_id }, deferrals, crate::watchlist_admission::DeferralOutcome::AbortedShared { kind: error.kind() }).await;
-                                        break 'replacement;
-                                    }
-                                }
-                            };
-                            let outcome = paper_receipt.map_or(
-                                crate::watchlist_admission::DeferralOutcome::NoChange,
-                                |receipt| crate::watchlist_admission::DeferralOutcome::Published {
-                                    paper_seq: receipt.sequence.0,
-                                },
-                            );
-                            info!(
-                                batch_id,
-                                admitted = additions.len(),
-                                deferred = deferrals.len(),
-                                "full_rerank: admission attempt completed"
-                            );
-                            if latest != sync.marker {
-                                sync.knockout_deferred.clear();
-                            }
-                            park_persistent(sync, &deferrals);
-                            preparer
-                                .record_deferrals(
-                                    crate::watchlist_admission::DeferralContext::FullRerank {
-                                        batch_id,
-                                    },
-                                    deferrals,
-                                    outcome,
-                                )
-                                .await;
-                            let audit_stats = load_edge_stats(paper_state, cfg, now_unix);
-                            for w in &dropped {
-                                let s = audit_stats
-                                    .as_ref()
-                                    .and_then(|loaded| loaded.by_wallet.get(&w.to_string()));
-                                if let Err(e) = supabase_reader::write_lifecycle_event(
                                     client,
                                     base_url,
                                     anon_key,
                                     secret_key,
-                                    &w.to_string(),
-                                    KnockoutReason::RankerRotation.reason_text(),
-                                    s.map(|st| st.realized_pnl),
-                                    i64::try_from(s.map_or(0, |st| st.settled_count))
-                                        .unwrap_or(i64::MAX),
-                                    paper_state.cursor(w).unwrap_or(None),
+                                    writer_lock,
+                                    applied_capacity,
+                                    capacity_epoch,
+                                    preparer,
+                                    sync,
+                                    held_batch.as_ref(),
+                                    &mut attempted_reentries,
+                                    now_unix,
+                                    Some(deadline),
                                 )
-                                .await
-                                {
-                                    warn!(wallet = %w, error = %e,
-                                        "full_rerank: lifecycle write failed (best-effort)");
-                                }
+                                .await;
+                                record_live_reentry(preparer, sync, cfg.membership_mode, report)
+                                    .await;
+                                return;
                             }
-                            // Memoryless by design: the ranker's verdict overrides demotion
-                            // memory at each batch transition; the knockout resumes next tick.
-                            // A capacity re-sync of the same batch is not a transition and
-                            // keeps this batch's eviction memory.
-                            if latest != sync.marker {
-                                evicted.clear();
-                            }
-                            sync.marker = latest;
-                            sync.capacity_generation = capacity_epoch.generation;
-                            held_batch = Some(fetched);
-                            if incoming.entries.is_empty() {
-                                // #518 made this reachable in normal operation: the read is
-                                // survivor-filtered, so a batch whose rows all fail the gate —
-                                // or one that carries no verdict at all — legitimately returns
-                                // zero rows. Retaining the previous set would keep copying
-                                // wallets the CURRENT batch says are ineligible. Applying the
-                                // empty membership matches the cold-boot stance (`main.rs`
-                                // refuses to start on an empty filtered read) and the
-                                // fail-closed contract. Open positions keep resolving; only
-                                // new copies stop.
-                                warn!(
-                                    batch_id,
-                                    dropped = dropped.len(),
-                                    live_total,
-                                    "full_rerank: batch has no surviving rows; live set emptied \
-                                     (fail-closed — the ranker endorsed nobody)"
-                                );
-                            } else {
-                                info!(
-                                    batch_id,
-                                    admitted = additions.len(),
-                                    dropped = dropped.len(),
-                                    live_total,
-                                    "full re-rank membership swap applied"
-                                );
-                            }
-                            let report = live_reentry_tick(
-                                live,
-                                paper_state,
-                                client,
-                                base_url,
-                                anon_key,
-                                secret_key,
-                                writer_lock,
-                                applied_capacity,
-                                capacity_epoch,
-                                preparer,
-                                sync,
-                                held_batch.as_ref(),
-                                &mut attempted_reentries,
-                                now_unix,
-                            )
-                            .await;
-                            record_live_reentry(preparer, sync, cfg.membership_mode, report).await;
-                            return;
-                        }
-                        Err(e) => {
-                            shared_batch_fetch_failed = true;
-                            warn!(error = %e, batch_id,
+                            Err(e) => {
+                                shared_batch_fetch_failed = true;
+                                warn!(error = %e, batch_id,
                                 "full_rerank: pinned batch fetch failed; keeping membership, will retry next tick");
+                            }
                         }
                     }
                 }
             }
-        },
+        }
         Err(e) => {
             shared_batch_fetch_failed = true;
             warn!(error = %e, "maintenance: batch-id fetch failed; keeping evicted-set");
@@ -1899,6 +2180,7 @@ async fn maintenance_tick(
             held_batch.as_ref(),
             &mut attempted_reentries,
             now_unix,
+            Some(deadline),
         )
         .await
     };
@@ -1950,8 +2232,14 @@ async fn maintenance_tick(
         .chain(next_evicted.iter().copied())
         .chain(sync.knockout_deferred.iter().copied())
         .collect();
-    match paper_state.wallet_fences() {
-        Ok(records) => backfill_excluded.extend(records.into_iter().map(|record| record.wallet)),
+    backfill_excluded.extend(
+        sync.cooldowns
+            .iter()
+            .filter(|(_, end)| tokio::time::Instant::now() < **end)
+            .map(|(wallet, _)| *wallet),
+    );
+    match crate::position_seeder::unrecoverable_fenced_wallets(paper_state) {
+        Ok(wallets) => backfill_excluded.extend(wallets),
         Err(error) => {
             warn!(%error, "maintenance: fence read failed; keeping membership for retry");
             return;
@@ -2054,12 +2342,14 @@ async fn maintenance_tick(
             cap,
             Some(&removed),
             &mut prepared,
+            Some(deadline),
+            Some(sync),
         )
         .await
         {
             Ok(plan) => plan,
             Err(abort) if !backfill_shared => {
-                park_persistent(sync, &abort.deferrals);
+                park_persistent(sync, paper_state, &abort.deferrals);
                 deferrals.extend(abort.deferrals);
                 error!(kind = abort.kind, cause = %abort.message, "maintenance: shared backfill failure; publishing evictions only");
                 backfill_shared = true;
@@ -2067,7 +2357,7 @@ async fn maintenance_tick(
             }
             Err(abort) => {
                 error!(kind = abort.kind, cause = %abort.message, "maintenance: eviction-only planning failed");
-                park_persistent(sync, &abort.deferrals);
+                park_persistent(sync, paper_state, &abort.deferrals);
                 deferrals.extend(abort.deferrals);
                 audit_knockout_abort(preparer, sync.marker, deferrals, abort.kind).await;
                 return;
@@ -2076,7 +2366,7 @@ async fn maintenance_tick(
         for deferral in &plan.deferrals {
             backfill_excluded.insert(deferral.wallet);
         }
-        park_persistent(sync, &plan.deferrals);
+        park_persistent(sync, paper_state, &plan.deferrals);
         deferrals.extend(plan.deferrals);
         let ranking_receipt = if plan.entries.is_empty() {
             None
@@ -2152,16 +2442,24 @@ async fn maintenance_tick(
             Err(error) if error.class() != crate::position_seeder::FailureClass::Shared => {
                 if let Some((wallet, kind)) = error.deferrable_wallet() {
                     backfill_excluded.insert(wallet);
-                    if error.class() == crate::position_seeder::FailureClass::WalletPersistent {
+                    if error.class() == crate::position_seeder::FailureClass::WalletPersistent
+                        && !crate::position_seeder::recoverable_fence_failure(
+                            paper_state,
+                            &wallet,
+                            kind,
+                        )
+                    {
                         sync.knockout_deferred.insert(wallet);
                     }
                     deferrals.push(crate::watchlist_admission::Deferral {
+                        completed_at: Some(tokio::time::Instant::now()),
                         wallet,
                         stage: "publication",
                         class: error.class(),
                         kind,
                         message: error.to_string(),
                     });
+                    park_persistent(sync, paper_state, &deferrals);
                     continue;
                 }
                 warn!(%error, "maintenance: unlocated wallet publication failure");
@@ -2187,7 +2485,7 @@ async fn maintenance_tick(
     );
     info!(batch_id = ?sync.marker, admitted, deferred = deferrals.len(), "maintenance: knockout admission attempt completed");
     if let Some(batch_id) = sync.marker {
-        park_persistent(sync, &deferrals);
+        park_persistent(sync, paper_state, &deferrals);
         preparer
             .record_deferrals(
                 crate::watchlist_admission::DeferralContext::Knockout { batch_id },
@@ -3009,6 +3307,8 @@ mod tests {
                             let installs: Vec<pe_paper_state::AnchorInstallRecord> = wallets
                                 .iter()
                                 .map(|wallet| pe_paper_state::AnchorInstallRecord {
+                                    repaired_history: Vec::new(),
+                                    expected_fence: None,
                                     history_status: None,
                                     wallet: *wallet,
                                     balances: Vec::new(),
@@ -3246,6 +3546,12 @@ mod tests {
                 marker: &mut Option<i64>,
             ) {
                 let mut sync = BatchSync {
+                    parking_batch: None,
+                    cooldowns: HashMap::new(),
+                    started: 0,
+                    accepted: 0,
+                    deferred: 0,
+                    unstarted: 0,
                     marker: *marker,
                     capacity_generation: self.applied.load().generation,
                     knockout_deferred: HashSet::new(),
@@ -3292,6 +3598,12 @@ mod tests {
                 marker: &mut Option<i64>,
             ) {
                 let mut sync = BatchSync {
+                    parking_batch: None,
+                    cooldowns: HashMap::new(),
+                    started: 0,
+                    accepted: 0,
+                    deferred: 0,
+                    unstarted: 0,
                     marker: *marker,
                     capacity_generation: self.applied.load().generation,
                     knockout_deferred: HashSet::new(),
@@ -3623,6 +3935,12 @@ mod tests {
             h.paper_state.set_cursor(&kept_b, NOW - 1).unwrap();
             let mut evicted = HashSet::new();
             let mut sync = BatchSync {
+                parking_batch: None,
+                cooldowns: HashMap::new(),
+                started: 0,
+                accepted: 0,
+                deferred: 0,
+                unstarted: 0,
                 marker: Some(1),
                 capacity_generation: h.applied.load().generation,
                 knockout_deferred: HashSet::new(),
@@ -3654,6 +3972,12 @@ mod tests {
             let preparer = validator_preparer(&h, Some(blocked), HashSet::new());
             let mut evicted = HashSet::new();
             let mut sync = BatchSync {
+                parking_batch: None,
+                cooldowns: HashMap::new(),
+                started: 0,
+                accepted: 0,
+                deferred: 0,
+                unstarted: 0,
                 marker: Some(1),
                 capacity_generation: h.applied.load().generation,
                 knockout_deferred: HashSet::new(),
@@ -4079,6 +4403,12 @@ mod tests {
             let h = harness(fake, &[deferred]).await;
             h.live.remove_fenced(&set(&[deferred]));
             let mut sync = BatchSync {
+                parking_batch: None,
+                cooldowns: HashMap::new(),
+                started: 0,
+                accepted: 0,
+                deferred: 0,
+                unstarted: 0,
                 marker: Some(1),
                 capacity_generation: h.applied.load().generation,
                 knockout_deferred: HashSet::new(),
@@ -4122,6 +4452,12 @@ mod tests {
                         .unwrap();
                 }
                 let mut sync = BatchSync {
+                    parking_batch: None,
+                    cooldowns: HashMap::new(),
+                    started: 0,
+                    accepted: 0,
+                    deferred: 0,
+                    unstarted: 0,
                     marker: Some(1),
                     capacity_generation: h.applied.load().generation,
                     knockout_deferred: HashSet::new(),
@@ -4155,6 +4491,12 @@ mod tests {
             let held = (1, watchlist, last_trade);
             let mut attempted = HashSet::new();
             let mut sync = BatchSync {
+                parking_batch: None,
+                cooldowns: HashMap::new(),
+                started: 0,
+                accepted: 0,
+                deferred: 0,
+                unstarted: 0,
                 marker: Some(1),
                 capacity_generation: h.applied.load().generation,
                 knockout_deferred: HashSet::new(),
@@ -4170,10 +4512,11 @@ mod tests {
                 &h.applied,
                 h.applied.load(),
                 &h.preparer,
-                &sync,
+                &mut sync,
                 Some(&held),
                 &mut attempted,
                 NOW,
+                None,
             )
             .await
             .unwrap();
@@ -4204,10 +4547,11 @@ mod tests {
                 &h.applied,
                 h.applied.load(),
                 &h.preparer,
-                &sync,
+                &mut sync,
                 Some(&held),
                 &mut attempted,
                 NOW,
+                None,
             )
             .await;
             // Nothing is retryable (one wallet live, one parked): no ranking read, no report.
@@ -4223,6 +4567,12 @@ mod tests {
             let h = harness(fake, &[deferred]).await;
             h.live.remove_fenced(&set(&[deferred]));
             let mut sync = BatchSync {
+                parking_batch: None,
+                cooldowns: HashMap::new(),
+                started: 0,
+                accepted: 0,
+                deferred: 0,
+                unstarted: 0,
                 marker: Some(1),
                 capacity_generation: h.applied.load().generation,
                 knockout_deferred: set(&[deferred]),
@@ -4355,6 +4705,12 @@ mod tests {
             let h = harness(fake, &[a]).await;
             let mut evicted = set(&[knocked_out]);
             let mut sync = BatchSync {
+                parking_batch: None,
+                cooldowns: HashMap::new(),
+                started: 0,
+                accepted: 0,
+                deferred: 0,
+                unstarted: 0,
                 marker: Some(2),
                 capacity_generation: 0,
                 knockout_deferred: HashSet::new(),
@@ -4401,6 +4757,12 @@ mod tests {
             let h = harness(fake, &[live_wallet]).await;
             let mut evicted = set(&[knocked_out]);
             let mut sync = BatchSync {
+                parking_batch: None,
+                cooldowns: HashMap::new(),
+                started: 0,
+                accepted: 0,
+                deferred: 0,
+                unstarted: 0,
                 marker: Some(1),
                 capacity_generation: 0,
                 knockout_deferred: HashSet::new(),
@@ -4744,5 +5106,47 @@ mod tests {
                 assert!(h.paper_state.cursor(&fenced).unwrap().is_none());
             }
         }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn paper_service_rollout_cooldown_uses_terminal_time_and_survives_batch_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let paper = PaperStateDb::open(&dir.path().join("paper.db")).unwrap();
+        let wallet = WalletAddress([0xab; 20]);
+        let mut sync = BatchSync {
+            marker: Some(1),
+            parking_batch: Some(1),
+            capacity_generation: 0,
+            knockout_deferred: HashSet::new(),
+            cooldowns: HashMap::new(),
+            started: 0,
+            accepted: 0,
+            deferred: 0,
+            unstarted: 0,
+        };
+        let terminal = tokio::time::Instant::now();
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let failure = crate::watchlist_admission::Deferral {
+            wallet,
+            stage: "validation",
+            class: crate::position_seeder::FailureClass::WalletTransient,
+            kind: "identity.transient",
+            message: "Gamma failed".to_owned(),
+            completed_at: Some(terminal),
+        };
+        sync.completed(&paper, &[wallet], &[], &[failure], &[]);
+        assert_eq!(
+            sync.cooldowns[&wallet],
+            terminal + Duration::from_secs(crate::trade_poller::ANCHOR_REFRESH_SECS)
+        );
+        sync.marker = Some(2);
+        sync.knockout_deferred.clear();
+        assert!(sync.cooling(&wallet));
+        tokio::time::advance(Duration::from_secs(
+            crate::trade_poller::ANCHOR_REFRESH_SECS - 30,
+        ))
+        .await;
+        assert!(!sync.cooling(&wallet));
+        sync.completed(&paper, &[wallet], &[wallet], &[], &[]);
+        assert!(!sync.cooldowns.contains_key(&wallet));
     }
 }

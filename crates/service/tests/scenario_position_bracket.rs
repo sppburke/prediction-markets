@@ -473,6 +473,8 @@ fn install_empty_anchor(
     let captured = ledger_capture(engine.ledger(), paper, wallet).unwrap();
     engine
         .install_anchors(&[AnchorInstall {
+            fresh_history: Vec::new(),
+            expected_fence: None,
             history_status: None,
             wallet,
             balances: Vec::new(),
@@ -1394,6 +1396,7 @@ async fn runtime_control_bracket_uses_three_full_history_walks() {
             &control_tx,
             &paper,
             pe_service::position_seeder::ValidationPurpose::CatchUp,
+            None,
         )
         .await;
     assert!(accepted.shared.is_none());
@@ -2435,6 +2438,7 @@ async fn control_missing_mapping_waits_for_next_walk_then_retries() {
             &control_tx,
             &paper,
             pe_service::position_seeder::ValidationPurpose::CatchUp,
+            None,
         )
         .await;
     assert!(outcomes.shared.is_none());
@@ -2826,6 +2830,8 @@ fn anchor_transaction_failure_preserves_engine_before_retry_and_rejects_regresse
         ShareAmount::from_atomic(3_000_000),
     );
     let install = AnchorInstall {
+        fresh_history: Vec::new(),
+        expected_fence: None,
         history_status: None,
         wallet,
         balances: vec![balance.clone()],
@@ -2892,6 +2898,8 @@ fn anchor_transaction_failure_preserves_engine_before_retry_and_rejects_regresse
         paper.wallet_coverage(&wallet).unwrap(),
     );
     let regressed = AnchorInstall {
+        fresh_history: Vec::new(),
+        expected_fence: None,
         history_status: None,
         wallet,
         balances: Vec::new(),
@@ -2938,6 +2946,8 @@ fn cursor_and_anchor_sequence_cas_reject_stale_expectations() {
     paper.set_cursor(&cursor_wallet, 10).unwrap();
     let captured = ledger_capture(engine.ledger(), &paper, cursor_wallet).unwrap();
     let candidate = AnchorInstall {
+        fresh_history: Vec::new(),
+        expected_fence: None,
         history_status: None,
         wallet: cursor_wallet,
         balances: Vec::new(),
@@ -2967,6 +2977,8 @@ fn cursor_and_anchor_sequence_cas_reject_stale_expectations() {
     install_empty_anchor(&mut engine, &paper, wallet, 10);
     let captured = ledger_capture(engine.ledger(), &paper, wallet).unwrap();
     let candidate = AnchorInstall {
+        fresh_history: Vec::new(),
+        expected_fence: None,
         history_status: None,
         wallet,
         balances: Vec::new(),
@@ -2999,6 +3011,8 @@ fn covered_late_generation_change_rejects_an_otherwise_unchanged_anchor() {
     install_empty_anchor(&mut engine, &paper, wallet, 100);
     let captured = ledger_capture(engine.ledger(), &paper, wallet).unwrap();
     let candidate = AnchorInstall {
+        fresh_history: Vec::new(),
+        expected_fence: None,
         history_status: None,
         wallet,
         balances: Vec::new(),
@@ -4191,6 +4205,8 @@ async fn runtime_completion_transaction_failure_publishes_neither_completion_nor
         }
         let captured = ledger_capture(engine.ledger(), &paper, wallet).unwrap();
         let install = AnchorInstall {
+            fresh_history: Vec::new(),
+            expected_fence: None,
             wallet,
             balances: Vec::new(),
             cutoff: END,
@@ -4841,6 +4857,8 @@ async fn proof_changed_at_locked_publication_recaptures_cited_manifest() {
     let validation = paper.position_validation(&selected).unwrap().unwrap();
     paper
         .install_anchors(&[AnchorInstallRecord {
+            repaired_history: Vec::new(),
+            expected_fence: None,
             history_status: None,
             wallet: selected,
             balances: Vec::new(),
@@ -5186,4 +5204,595 @@ async fn periodic_refresh_defers_a_wallet_with_an_unparseable_venue_row() {
     assert!(!paper.is_wallet_fenced(&wallet).unwrap());
     drop(preparer);
     actor.await.unwrap();
+}
+
+fn rollout_history(dir: &TempDir) -> Vec<pe_paper_state::MarketHistoryRecord> {
+    let conn = rusqlite::Connection::open(dir.path().join("paper.db")).unwrap();
+    let mut query = conn.prepare("SELECT wallet_hex, market_id, first_epoch, source_trade_id FROM wallet_market_history_v2 ORDER BY wallet_hex, market_id").unwrap();
+    query
+        .query_map([], |row| {
+            Ok(pe_paper_state::MarketHistoryRecord {
+                wallet: WalletAddress::from_hex(&row.get::<_, String>(0)?).unwrap(),
+                market_id: MarketId(VenueMarketId(row.get(1)?)),
+                first_epoch: row.get(2)?,
+                source_trade_id: pe_core_types::SourceTradeId(row.get(3)?),
+            })
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
+fn rollout_record_effect(
+    paper: &PaperStateDb,
+    row: &pe_source_polymarket_public::ActivityAggregate,
+    effect: &pe_position_ledger::LedgerEffect,
+    disposition: &str,
+) {
+    paper
+        .commit_activity_bucket(&pe_paper_state::ActivityBucketCommit {
+            wallet: row.group_id.components().wallet,
+            source_epoch: row.source_time.0.unix_timestamp(),
+            dispositions: vec![pe_paper_state::ActivityDispositionRecord {
+                source_trade_id: row.group_id.key().clone(),
+                transaction_hash: row.group_id.components().transaction_hash.clone(),
+                wallet: row.group_id.components().wallet,
+                source_epoch: row.source_time.0.unix_timestamp(),
+                semantic_revision: row.semantic_revision.as_str().to_owned(),
+                activity_type: row.group_id.components().activity_type.as_str().to_owned(),
+                disposition: disposition.to_owned(),
+                proof_json: effect.to_document().unwrap(),
+                no_copy: None,
+            }],
+            leader_positions: Vec::new(),
+            gate_results: Vec::new(),
+            history_effects: Vec::new(),
+            history_status: None,
+            pending: Vec::new(),
+            fence: None,
+            reanchor: None,
+            advance_cursor: true,
+        })
+        .unwrap();
+}
+
+fn rollout_fence(
+    dir: &TempDir,
+    wallet: WalletAddress,
+    id: &pe_core_types::SourceTradeId,
+    cause: &str,
+    epoch: i64,
+) {
+    rusqlite::Connection::open(dir.path().join("paper.db"))
+        .unwrap()
+        .execute(
+            "INSERT INTO wallet_fences VALUES (?1, ?2, ?3, ?4, 99)",
+            rusqlite::params![
+                wallet.to_string(),
+                id.0,
+                cause,
+                json!({"bucket_epoch":epoch}).to_string()
+            ],
+        )
+        .unwrap();
+}
+
+fn rollout_empty_reads(wallet: WalletAddress, attempts: usize) -> HashMap<String, Vec<Vec<u8>>> {
+    HashMap::from([
+        (activity_url(wallet), vec![b"[]".to_vec(); 3 * attempts]),
+        (
+            position_url(wallet, PositionPartition::NotRedeemable),
+            vec![b"[]".to_vec(); 2 * attempts],
+        ),
+        (
+            position_url(wallet, PositionPartition::Redeemable),
+            vec![b"[]".to_vec(); 2 * attempts],
+        ),
+    ])
+}
+
+/// PASS: every immutable effect participates in installation; a zero current revision cannot
+/// erase a prior BUY or hide a prior conversion/unknown effect. Exact secondary revisions remain
+/// idempotent after clearance, restart, and a full-history refresh.
+#[tokio::test]
+async fn paper_service_rollout_recorded_union_repairs_buys_and_refuses_unsafe_effects() {
+    use pe_position_ledger::{LedgerEffect, LedgerMutation};
+    for unsafe_effect in [
+        None,
+        Some(LedgerEffect::Conversion),
+        Some(LedgerEffect::UnknownEffect),
+    ] {
+        let wallet = wallet(0xd1);
+        let (dir, paper, _) = fresh(&[wallet]);
+        let original = aggregate(activity(wallet, 1, "1", "0xunion", 10), wallet);
+        let original_effect = unsafe_effect
+            .clone()
+            .unwrap_or_else(|| LedgerMutation::from_activity(&original).unwrap().effect);
+        rollout_record_effect(&paper, &original, &original_effect, "applied");
+        rollout_fence(
+            &dir,
+            wallet,
+            original.group_id.key(),
+            "position_underflow",
+            10,
+        );
+        let mut zero = activity(wallet, 1, "0", "0xunion", 10);
+        zero["usdcSize"] = json!("0");
+        let revised = aggregate(zero.clone(), wallet);
+        rollout_record_effect(&paper, &revised, &LedgerEffect::RawOnly, "wallet_fenced");
+        let stored = paper.activity_group_state(original.group_id.key()).unwrap();
+        let generation = paper.wallet_coverage(&wallet).unwrap().coverage_generation;
+        let engine =
+            BucketCommitEngine::load(paper.clone(), build_leader_ledger(&paper).unwrap()).unwrap();
+        let (tx, rx) = mpsc::channel(4);
+        let actor = spawn_control_actor(rx, engine, paper.clone());
+        let mut reads = rollout_empty_reads(wallet, 1);
+        reads.insert(
+            activity_url(wallet),
+            vec![serde_json::to_vec(&vec![zero.clone()]).unwrap(); 3],
+        );
+        let preparer =
+            AdmissionPreparer::with_validator(tx.clone(), paper.clone(), validator(reads));
+        let result = preparer.prepare(&[wallet]).await.unwrap();
+        if unsafe_effect.is_some() {
+            assert!(result.admitted.is_empty());
+            assert_eq!(result.deferred[0].kind, "anchor.unsafe_recovery");
+            assert!(paper.is_wallet_fenced(&wallet).unwrap());
+            assert!(paper.position_anchors(&wallet).unwrap().is_empty());
+            assert!(rollout_history(&dir).is_empty());
+        } else {
+            assert_eq!(result.admitted, vec![wallet]);
+            assert!(!paper.is_wallet_fenced(&wallet).unwrap());
+            let history = rollout_history(&dir);
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0].first_epoch, 10);
+            assert_eq!(history[0].source_trade_id, *original.group_id.key());
+            let proof: Value =
+                serde_json::from_str(&paper.position_anchors(&wallet).unwrap()[0].proof_json)
+                    .unwrap();
+            assert_eq!(proof["version"], 1);
+            assert_eq!(proof["cleared_fence"]["cause"], "position_underflow");
+            assert!(proof.get("repaired_history").is_none());
+        }
+        assert_eq!(
+            paper.activity_group_state(original.group_id.key()).unwrap(),
+            stored
+        );
+        assert_eq!(
+            paper.wallet_coverage(&wallet).unwrap().coverage_generation,
+            generation
+        );
+        drop(preparer);
+        drop(tx);
+        actor.await.unwrap();
+        if unsafe_effect.is_none() {
+            let mut engine =
+                BucketCommitEngine::load(paper.clone(), build_leader_ledger(&paper).unwrap())
+                    .unwrap();
+            let mut reads = rollout_empty_reads(wallet, 1);
+            reads.insert(
+                activity_url(wallet),
+                vec![serde_json::to_vec(&vec![zero]).unwrap(); 3],
+            );
+            validator(reads)
+                .validate_direct(&[wallet], &mut engine, &paper)
+                .await
+                .unwrap();
+            assert!(!paper.is_wallet_fenced(&wallet).unwrap());
+            assert_eq!(
+                paper.activity_group_state(original.group_id.key()).unwrap(),
+                stored
+            );
+            assert_eq!(
+                paper.wallet_coverage(&wallet).unwrap().coverage_generation,
+                generation
+            );
+            assert_eq!(rollout_history(&dir).len(), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn paper_service_rollout_fresh_metadata_rejects_previously_raw_only_unsafe_effects() {
+    use pe_position_ledger::LedgerEffect;
+    for activity_type in ["CONVERSION", "OTHER"] {
+        let wallet = wallet(0xd2);
+        let (dir, paper, _) = fresh(&[wallet]);
+        let mut row = activity(wallet, 1, "1", "0xfresh-unsafe", 10);
+        row["type"] = json!(activity_type);
+        let original = aggregate(row.clone(), wallet);
+        rollout_record_effect(&paper, &original, &LedgerEffect::RawOnly, "raw_only");
+        rollout_fence(
+            &dir,
+            wallet,
+            original.group_id.key(),
+            "position_underflow",
+            10,
+        );
+        let engine = BucketCommitEngine::load(paper.clone(), PositionLedger::new()).unwrap();
+        let (tx, rx) = mpsc::channel(4);
+        let actor = spawn_control_actor(rx, engine, paper.clone());
+        let mut reads = rollout_empty_reads(wallet, 1);
+        reads.insert(
+            activity_url(wallet),
+            vec![serde_json::to_vec(&vec![row]).unwrap(); 3],
+        );
+        let preparer =
+            AdmissionPreparer::with_validator(tx.clone(), paper.clone(), validator(reads));
+        let result = preparer.prepare(&[wallet]).await.unwrap();
+        assert!(result.admitted.is_empty());
+        assert_eq!(result.deferred[0].kind, "validation.unsafe_recovery");
+        assert!(paper.is_wallet_fenced(&wallet).unwrap());
+        assert!(paper.position_anchors(&wallet).unwrap().is_empty());
+        assert!(rollout_history(&dir).is_empty());
+        drop(preparer);
+        drop(tx);
+        actor.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn paper_service_rollout_fence_allowlist_cutoff_and_install_races_fail_closed() {
+    use pe_position_ledger::LedgerEffect;
+    for (cause, epoch, succeeds) in [
+        ("position_underflow", 10, true),
+        ("position_overflow", 10, true),
+        ("order_dependent_equal_second", 10, true),
+        ("late_group_after_bucket_commit", 10, true),
+        ("position_underflow", END, false),
+        ("invalid_mapping", 10, false),
+        ("conversion_unknown_conditions", 10, false),
+        ("unknown_activity_effect", 10, false),
+        ("revised_applied_aggregate", 10, false),
+    ] {
+        let wallet = wallet(0xd3);
+        let (dir, paper, _) = fresh(&[wallet]);
+        let original = aggregate(activity(wallet, 1, "1", "0xallowlist", 10), wallet);
+        rollout_record_effect(&paper, &original, &LedgerEffect::RawOnly, "raw_only");
+        rollout_fence(&dir, wallet, original.group_id.key(), cause, epoch);
+        let engine = BucketCommitEngine::load(paper.clone(), PositionLedger::new()).unwrap();
+        let (tx, rx) = mpsc::channel(4);
+        let actor = spawn_control_actor(rx, engine, paper.clone());
+        let preparer = AdmissionPreparer::with_validator(
+            tx.clone(),
+            paper.clone(),
+            validator(rollout_empty_reads(wallet, 1)),
+        );
+        let result = preparer.prepare(&[wallet]).await.unwrap();
+        assert_eq!(!result.admitted.is_empty(), succeeds, "{cause}/{epoch}");
+        assert_eq!(paper.is_wallet_fenced(&wallet).unwrap(), !succeeds);
+        drop(preparer);
+        drop(tx);
+        actor.await.unwrap();
+    }
+    for proof in ["{}", "{\"bucket_epoch\":\"10\"}", "malformed"] {
+        let wallet = wallet(0xd5);
+        let (dir, paper, _) = fresh(&[wallet]);
+        let original = aggregate(activity(wallet, 1, "1", "0xmalformed", 10), wallet);
+        rollout_record_effect(&paper, &original, &LedgerEffect::RawOnly, "raw_only");
+        rollout_fence(
+            &dir,
+            wallet,
+            original.group_id.key(),
+            "position_underflow",
+            10,
+        );
+        rusqlite::Connection::open(dir.path().join("paper.db"))
+            .unwrap()
+            .execute("UPDATE wallet_fences SET proof_json=?1", [proof])
+            .unwrap();
+        let (tx, rx) = mpsc::channel(4);
+        let actor = spawn_control_actor(
+            rx,
+            BucketCommitEngine::load(paper.clone(), PositionLedger::new()).unwrap(),
+            paper.clone(),
+        );
+        let preparer = AdmissionPreparer::with_validator(
+            tx.clone(),
+            paper.clone(),
+            validator(rollout_empty_reads(wallet, 1)),
+        );
+        assert!(
+            preparer
+                .prepare(&[wallet])
+                .await
+                .unwrap()
+                .admitted
+                .is_empty()
+        );
+        assert!(paper.is_wallet_fenced(&wallet).unwrap());
+        assert!(paper.position_anchors(&wallet).unwrap().is_empty());
+        assert!(rollout_history(&dir).is_empty());
+        drop(preparer);
+        drop(tx);
+        actor.await.unwrap();
+    }
+    for unsafe_revision in [false, true] {
+        let wallet = wallet(0xd4);
+        let (dir, paper, _) = fresh(&[wallet]);
+        let original = aggregate(activity(wallet, 1, "1", "0xrace", 10), wallet);
+        rollout_record_effect(&paper, &original, &LedgerEffect::RawOnly, "raw_only");
+        rollout_fence(
+            &dir,
+            wallet,
+            original.group_id.key(),
+            "position_underflow",
+            10,
+        );
+        let mut engine = BucketCommitEngine::load(paper.clone(), PositionLedger::new()).unwrap();
+        let (tx, rx) = mpsc::channel(4);
+        let actor = spawn_control_actor(
+            rx,
+            BucketCommitEngine::load(paper.clone(), PositionLedger::new()).unwrap(),
+            paper.clone(),
+        );
+        let outcome = validator(rollout_empty_reads(wallet, 1))
+            .validate_via_control(
+                &[wallet],
+                &tx,
+                &paper,
+                pe_service::position_seeder::ValidationPurpose::CatchUp,
+                None,
+            )
+            .await;
+        let mut revised = activity(wallet, 1, "2", "0xrace", 10);
+        revised["usdcSize"] = json!("1");
+        let revised = aggregate(revised, wallet);
+        rollout_record_effect(
+            &paper,
+            &revised,
+            &if unsafe_revision {
+                LedgerEffect::Conversion
+            } else {
+                LedgerEffect::RawOnly
+            },
+            "wallet_fenced",
+        );
+        assert!(matches!(
+            engine.install_anchors(&outcome.accepted),
+            Err(pe_service::bucket_commit::AnchorInstallError::CoverageGenerationChanged { .. })
+        ));
+        assert!(paper.position_anchors(&wallet).unwrap().is_empty());
+        assert!(rollout_history(&dir).is_empty());
+        assert!(paper.is_wallet_fenced(&wallet).unwrap());
+        drop(tx);
+        actor.await.unwrap();
+    }
+}
+
+struct RolloutDeadlineFetcher {
+    inner: QueueFetcher,
+    starts: mpsc::UnboundedSender<WalletAddress>,
+    first: Mutex<HashSet<WalletAddress>>,
+    release: Arc<tokio::sync::Semaphore>,
+}
+impl PageFetcher for RolloutDeadlineFetcher {
+    async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+        if url.contains("/activity?") {
+            let wallet = url
+                .split("user=")
+                .nth(1)
+                .unwrap()
+                .split('&')
+                .next()
+                .unwrap();
+            let wallet = WalletAddress::from_hex(wallet).unwrap();
+            if self.first.lock().unwrap().insert(wallet) {
+                self.starts.send(wallet).unwrap();
+                self.release.acquire().await.unwrap().forget();
+            }
+        }
+        self.inner.fetch_page(url).await
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn paper_service_rollout_deadline_drains_four_and_leaves_fifth_unstarted() {
+    let wallets = (0xe1..=0xe5).map(wallet).collect::<Vec<_>>();
+    let (_dir, paper, engine) = fresh(&wallets);
+    let specs = wallets
+        .iter()
+        .enumerate()
+        .map(|(n, w)| (*w, u8::try_from(n + 1).unwrap(), "1"))
+        .collect::<Vec<_>>();
+    let (starts, mut started) = mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let fetcher = Arc::new(RolloutDeadlineFetcher {
+        inner: QueueFetcher::new(stable_responses(&specs)),
+        starts,
+        first: Mutex::new(HashSet::new()),
+        release: release.clone(),
+    });
+    let validator = validator_from_reconciliation(fetcher);
+    let (tx, rx) = mpsc::channel(4);
+    let actor = spawn_control_actor(rx, engine, paper.clone());
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let paper_task = paper.clone();
+    let wallets_task = wallets.clone();
+    let tx_task = tx.clone();
+    let task = tokio::spawn(async move {
+        validator
+            .validate_via_control(
+                &wallets_task,
+                &tx_task,
+                &paper_task,
+                pe_service::position_seeder::ValidationPurpose::CatchUp,
+                Some(deadline),
+            )
+            .await
+    });
+    let mut launched = HashSet::new();
+    for _ in 0..4 {
+        launched.insert(started.recv().await.unwrap());
+    }
+    assert_eq!(launched, wallets[..4].iter().copied().collect());
+    tokio::time::advance(std::time::Duration::from_secs(11)).await;
+    release.add_permits(4);
+    let outcome = task.await.unwrap();
+    assert_eq!(outcome.started_prefix, 4);
+    assert_eq!(
+        outcome
+            .accepted
+            .iter()
+            .map(|install| install.wallet)
+            .collect::<Vec<_>>(),
+        wallets[..4]
+    );
+    assert!(outcome.deferred.is_empty());
+    assert!(outcome.shared.is_none());
+    assert!(started.try_recv().is_err());
+    assert!(paper.cursor(&wallets[4]).unwrap().is_none());
+    drop(tx);
+    actor.await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn paper_service_rollout_deadline_suppresses_optional_retry_and_maps_filtered_prefix() {
+    let wallets = (0xd0..=0xd5).map(wallet).collect::<Vec<_>>();
+    let (dir, paper, engine) = fresh(&wallets);
+    rollout_fence(
+        &dir,
+        wallets[0],
+        &pe_core_types::SourceTradeId("g2:filtered".to_owned()),
+        "conversion_requires_reanchor",
+        1,
+    );
+    let specs = wallets[1..]
+        .iter()
+        .enumerate()
+        .map(|(n, w)| (*w, u8::try_from(n + 1).unwrap(), "1"))
+        .collect::<Vec<_>>();
+    let mut responses = stable_responses(&specs);
+    responses.insert(
+        position_url(wallets[1], PositionPartition::NotRedeemable),
+        ["1", "2"]
+            .into_iter()
+            .map(|amount| serde_json::to_vec(&vec![position(wallets[1], 1, amount)]).unwrap())
+            .collect(),
+    );
+    let (starts, mut started) = mpsc::unbounded_channel();
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let fetcher = Arc::new(RolloutDeadlineFetcher {
+        inner: QueueFetcher::new(responses),
+        starts,
+        first: Mutex::new(HashSet::new()),
+        release: release.clone(),
+    });
+    let validator = validator_from_reconciliation(fetcher.clone());
+    let (tx, rx) = mpsc::channel(4);
+    let actor = spawn_control_actor(rx, engine, paper.clone());
+    let preparer = AdmissionPreparer::with_validator(tx.clone(), paper.clone(), validator);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let input = wallets.clone();
+    let task = tokio::spawn(async move {
+        preparer
+            .scenario_prepare_until(&input, deadline)
+            .await
+            .unwrap()
+    });
+    let mut seen = HashSet::new();
+    for _ in 0..4 {
+        seen.insert(started.recv().await.unwrap());
+    }
+    assert_eq!(seen, wallets[1..5].iter().copied().collect());
+    tokio::time::advance(std::time::Duration::from_secs(11)).await;
+    release.add_permits(4);
+    let outcome = task.await.unwrap();
+    assert_eq!(outcome.started, wallets[1..5]);
+    assert_eq!(outcome.unstarted, vec![wallets[5]]);
+    assert_eq!(outcome.admitted, wallets[2..5]);
+    assert_eq!(outcome.deferred.len(), 2);
+    assert_eq!(outcome.deferred[0].wallet, wallets[0]);
+    assert_eq!(outcome.deferred[1].wallet, wallets[1]);
+    assert_eq!(outcome.deferred[1].kind, "validation.position_revision");
+    assert_eq!(
+        fetcher
+            .inner
+            .urls()
+            .iter()
+            .filter(|url| url.contains("/activity?") && url.contains(&wallets[1].to_string()))
+            .count(),
+        3
+    );
+    assert!(started.try_recv().is_err());
+    assert!(paper.position_anchors(&wallets[5]).unwrap().is_empty());
+    drop(tx);
+    actor.await.unwrap();
+}
+
+#[tokio::test]
+async fn paper_service_rollout_novel_revision_on_first_read_refuses_then_safe_retry_recovers() {
+    let wallet = wallet(0xc1);
+    let (dir, paper, _) = fresh(&[wallet]);
+    let original = aggregate(activity(wallet, 1, "1", "0xretained-first", 10), wallet);
+    rollout_record_effect(
+        &paper,
+        &original,
+        &pe_position_ledger::LedgerEffect::RawOnly,
+        "raw_only",
+    );
+    rollout_fence(
+        &dir,
+        wallet,
+        original.group_id.key(),
+        "position_underflow",
+        10,
+    );
+    let mut engine = BucketCommitEngine::load(
+        paper.clone(),
+        pe_service::paper_recovery::build_leader_ledger(&paper).unwrap(),
+    )
+    .unwrap();
+    let revised =
+        serde_json::to_vec(&vec![activity(wallet, 1, "2", "0xretained-first", 10)]).unwrap();
+    let mut responses = rollout_empty_reads(wallet, 2);
+    responses.insert(activity_url(wallet), vec![revised; 4]);
+    let fetcher = Arc::new(QueueFetcher::new(responses));
+    let validator = validator_from_reconciliation(fetcher.clone());
+    let before = paper.wallet_coverage(&wallet).unwrap().coverage_generation;
+    // The first attempt retains the revision and refuses; its bounded retry sees the disposed
+    // secondary and obtains a genuinely fresh bracket, without replaying historical balances.
+    let (tx, rx) = mpsc::channel(4);
+    let actor = spawn_control_actor(rx, engine, paper.clone());
+    let outcomes = validator
+        .validate_via_control(
+            &[wallet],
+            &tx,
+            &paper,
+            pe_service::position_seeder::ValidationPurpose::CatchUp,
+            None,
+        )
+        .await;
+    assert_eq!(
+        outcomes.accepted.len(),
+        1,
+        "deferred={:?} shared={:?}",
+        outcomes.deferred,
+        outcomes.shared
+    );
+    assert_eq!(
+        paper.wallet_coverage(&wallet).unwrap().coverage_generation,
+        before + 1
+    );
+    assert!(paper.is_wallet_fenced(&wallet).unwrap());
+    assert!(paper.position_anchors(&wallet).unwrap().is_empty());
+    assert!(rollout_history(&dir).is_empty());
+    assert_eq!(
+        fetcher
+            .urls()
+            .iter()
+            .filter(|url| url.contains("/activity?"))
+            .count(),
+        4
+    );
+    drop(tx);
+    actor.await.unwrap();
+    engine = BucketCommitEngine::load(
+        paper.clone(),
+        pe_service::paper_recovery::build_leader_ledger(&paper).unwrap(),
+    )
+    .unwrap();
+    engine.install_anchors(&outcomes.accepted).unwrap();
+    assert!(!paper.is_wallet_fenced(&wallet).unwrap());
+    assert_eq!(rollout_history(&dir).len(), 1);
 }
