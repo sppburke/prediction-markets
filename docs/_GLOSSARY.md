@@ -446,12 +446,15 @@ after the integer fence bucket epoch. Missing or ambiguous evidence refuses reco
 Fresh metadata-prepared and immutable recorded originals plus all attributable revisions must contain
 no effective conversion or unknown effect. At serialized installation their BUY evidence through
 the cutoff repairs each missing market using the earliest `(source_epoch, source_trade_id)`; SELL
-and raw-only effects consume no history. Exact fence comparison, history repair, authoritative
+and raw-only effects consume no history. Clearance requires the accepted cutoff to be at or after the wallet's captured activity
+cursor; an earlier cutoff (for example after a clock rollback) refuses it and the wallet stays
+fenced. Exact fence comparison, history repair, authoritative
 balances, validation, coverage, history completion and fence deletion commit together. Version-one
 anchor proof optionally binds the exact deleted record in `cleared_fence`. Projections publish only
 after commit. Original effects, dispositions, proofs and earlier decisions remain immutable.
-Known disposed revisions are idempotent during eligible recovery and, after clearance, within anchor
-coverage. Every newly retained non-original revision advances the existing coverage generation once
+Known disposed revisions with matching canonical transaction identity are idempotent while any
+fence is active and, after clearance, within anchor coverage; this recognition never widens
+clearance eligibility. Every newly retained non-original revision advances the existing coverage generation once
 and invalidates the current bracket, including on its first read; exact retries do not advance it.
 Committed clearance is a forward-only recovery boundary.
 Existing complete records and historical membership proof snapshots remain intact; the corrected
