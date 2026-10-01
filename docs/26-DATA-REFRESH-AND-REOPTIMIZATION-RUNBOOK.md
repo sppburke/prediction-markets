@@ -804,7 +804,7 @@ pe-bootstrap cache-migrate-v2 --db "$SIDE" --manifest "$CACHE_BUILD_MANIFEST"   
 pe-bootstrap winner-discovery --db "$SIDE" --defer-activation
 pe-bootstrap activate-next --db "$SIDE" --batch-id "$BATCH" --audit-csv "$AUDIT"
 pe-bootstrap cache-populate-activity-v2 --db "$SIDE" --fresh-generation "$N"
-pe-bootstrap cache-populate-payout-v2 --db "$SIDE"         # unless generation T is complete
+pe-bootstrap cache-populate-payout-v2 --db "$SIDE"         # skip only when candidate-targets --after-collection returns 1 as field three
 pe-bootstrap cache-finalize-v2 --db "$SIDE" --stage-record "$CACHE_STAGE_RECORD"
 ```
 
@@ -944,7 +944,11 @@ publisher's unchanged `max_cache_staleness_hours`, the wrapper admits one linked
 base link consumes that allowance across restarts; a stale top-up stops before ranking and never
 starts another. Actual trade/payout source times still govern preparation after downstream work.
 The payout target is the staging baseline's active walk if present, otherwise its newest completed walk plus one;
-a completed target on the candidate is reused. After every successful fresh-lane publication — the
+a walk on the candidate is reused only when the newest completed walk's `completed_at_unix` is at or
+after the selected activity head's fixed end. Otherwise the wrapper invokes `cache-populate-payout-v2`,
+which resumes an active walk or starts `MAX(completed generation)+1`. Completion records the installing
+invocation's start, so preparation never meets a payout older than its trades.
+After every successful fresh-lane publication — the
 ordinary path, automatic pending resume or explicit `--resume-pending` — the accepted two-field
 lane record is written before the pointers clear. Recurring schema-two cycles therefore start
 again on the same UTC day; the legacy lane retains the full accepted capture and unchanged-day gate.

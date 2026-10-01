@@ -129,10 +129,10 @@ class CandidateTargetsTest(unittest.TestCase):
         with sqlite3.connect(self.side) as c:
             c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (root,))
             c.execute("INSERT INTO activity_coverage_manifests_v2(generation, reference_sha256, collection_identity_json) VALUES (1, ?, ?)", (json.loads(root)["digest"], root))
-            c.execute("INSERT INTO clob_payout_coverage_manifests_v2(generation) VALUES (1)")
+            c.execute("INSERT INTO clob_payout_coverage_manifests_v2(generation, completed_at_unix) VALUES (1, 100)")
         self.assertEqual(self.targets(), (1, 1, 1, 0, 1))
         self.assertEqual(self.targets(after_collection=True, now=100, max_staleness_hours=24), (1, 1, 1, 0, 1))
-        self.assertEqual(self.targets(after_collection=True, now=90000, max_staleness_hours=24), (2, 1, 1, 0, 0))
+        self.assertEqual(self.targets(after_collection=True, now=90000, max_staleness_hours=24), (2, 1, 0, 0, 0))
         self.assertEqual(self.targets(after_collection=True, now=86500, max_staleness_hours=24), (1, 1, 1, 0, 1))
         with sqlite3.connect(self.side) as c:
             c.execute("UPDATE activity_coverage_manifests_v2 SET reference_sha256=?", ("b" * 64,))
@@ -170,7 +170,7 @@ class CandidateTargetsTest(unittest.TestCase):
         with sqlite3.connect(self.side) as c:
             c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (root,))
             c.execute("INSERT INTO activity_coverage_manifests_v2(generation) VALUES (1)")
-            c.execute("INSERT INTO clob_payout_coverage_manifests_v2(generation) VALUES (4)")
+            c.execute("INSERT INTO clob_payout_coverage_manifests_v2(generation, completed_at_unix) VALUES (4, 100)")
         self.assertEqual(candidate_targets(None, self.side, include_bulk_root=True), (2, 4, 1, 0, 0))
         # A mutated candidate cannot change the baseline or grant a second top-up.
         with sqlite3.connect(self.side) as c:
@@ -178,6 +178,37 @@ class CandidateTargetsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "single top-up"):
             candidate_targets(None, self.side)
         self.assertFalse(self.prior.exists())
+
+    def test_after_collection_reuses_only_the_newest_payout_at_or_after_the_head(self):
+        root = identity()
+        with sqlite3.connect(self.side) as c:
+            c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (root,))
+            c.execute("INSERT INTO activity_coverage_manifests_v2(generation, reference_sha256, collection_identity_json) VALUES (1, ?, ?)", (json.loads(root)["digest"], root))
+        cases = (
+            (((1, 100),), 1),
+            (((1, 99),), 0),
+            (((1, 99), (2, 100)), 1),
+            (((1, 100), (2, 99)), 0),
+        )
+        for prior in (self.prior, None):
+            if prior is None:
+                self.prior.unlink()
+                self.side.with_suffix(".stage.json").write_text(json.dumps(dict(
+                    version=1, side_path=str(self.side), prior_path=str(self.prior),
+                    source_sha256="a" * 64, activity_generation=0,
+                    payout_generation=1, fresh_identity=None)))
+            for rows, done in cases:
+                with self.subTest(baseline="legacy" if prior else "two-file", rows=rows):
+                    with sqlite3.connect(self.side) as c:
+                        c.execute("DELETE FROM clob_payout_coverage_manifests_v2")
+                        c.executemany("INSERT INTO clob_payout_coverage_manifests_v2(generation, completed_at_unix) VALUES (?, ?)", rows)
+                    self.assertEqual(candidate_targets(prior, self.side), (1, 1, 1))
+                    self.assertEqual(candidate_targets(prior, self.side, after_collection=True,
+                                     now=100, max_staleness_hours=24), (1, 1, done))
+                    self.assertEqual(candidate_targets(prior, self.side, include_bulk_root=True,
+                                     after_collection=True, now=100, max_staleness_hours=24), (1, 1, done, 0, 1))
+                    self.assertEqual(candidate_targets(prior, self.side, include_bulk_root=True,
+                                     after_collection=True, now=90000, max_staleness_hours=24), (2, 1, 0, 0, 0))
 
 
 if __name__ == "__main__":

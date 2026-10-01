@@ -457,9 +457,14 @@ def candidate_targets(prior_path: Path | None, side_path: Path, *, after_collect
         if side_schema == -2 and (not include_bulk_root or after_collection):
             raise ValueError("unfinished bulk root (schema -2); resume cache-populate-activity-v2 --bulk-root before any other command")
         head = _fresh_identity(_one(side, "SELECT fresh_collection_json FROM cache_v2_migration_state WHERE singleton = 1"))
-        payout_done = int(_one(side, "SELECT EXISTS(SELECT 1 FROM clob_payout_coverage_manifests_v2 WHERE generation = ?)", (payout,)))
 
         def targets(generation):
+            if after_collection:
+                latest = side.execute("SELECT generation, completed_at_unix FROM clob_payout_coverage_manifests_v2 ORDER BY generation DESC LIMIT 1").fetchone()
+                payout_done = int(generation == head["generation"] and latest is not None
+                                  and latest[0] >= payout and latest[1] >= head["fixed_end_unix"])
+            else:
+                payout_done = int(_one(side, "SELECT EXISTS(SELECT 1 FROM clob_payout_coverage_manifests_v2 WHERE generation = ?)", (payout,)))
             values = (generation, payout, payout_done)
             if not include_bulk_root:
                 return values
