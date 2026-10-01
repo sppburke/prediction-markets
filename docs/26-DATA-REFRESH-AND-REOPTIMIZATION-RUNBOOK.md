@@ -18,8 +18,8 @@ and publishes to Supabase `latest_ranking`, which `pe-service` reads.
 ## Prerequisites
 
 ```bash
-# Build the bootstrap binary used below (from repo root).
-# For the #606 comparison, preserve the installed baseline first (protocol below).
+# Build from the prepared release checkout, separate from the installed checkout.
+# Finish before draining; install through the release procedure below.
 cargo build --release -p pe-bootstrap
 ```
 
@@ -41,6 +41,8 @@ cargo build --release -p pe-bootstrap
   rebuild.
   Symptom to recognize: `sqlite: unable to open database file` from a stage whose cache
   path is demonstrably writable.
+- **Immutable reads.** Use `immutable=1` only for stopped or fixed copies without
+  uncheckpointed writes. A running candidate requires an ordinary read-only connection.
 - **Wallet-cache memory.** The operator knobs and defaults are in
   [Bootstrap defaults](_GLOSSARY.md#bootstrap-defaults-pe-bootstrap) and apply to
   writable `WalletCache` opens and activity collector writers in legacy, fresh and
@@ -65,6 +67,54 @@ cargo build --release -p pe-bootstrap
 
 ---
 
+## Forge release deployment and rollback
+
+Use this one procedure to install or roll back any Forge binary/checkout release. It retains the
+configured writer tuning and requires no service restart. Emergency stop is incident control, not
+deployment.
+
+One operator owns a resumable deployment record containing completed steps, the original
+pre-drain run intent and enablement, target checkout/binary identities, the prior rollback
+binary/checkout pair, and cycle/pending/request identities. Preserve other operators' pause
+records and all user work. Resume an interrupted deployment from its recorded step.
+
+1. Prepare the combined release while work continues. Finish verification and building before
+   pausing; keep the release executable separate from the installed executable.
+2. Record the operator's run intent and enablement before changing them, then atomically set
+   `data/eval-results/rank_and_push.loop` to `stop` using the existing temporary-file/rename pattern.
+3. Let the current attempt finish or fail. Successful publication, exit 75 and a zero-price
+   failure are valid stopped-attempt boundaries. Recovery pointers need not be cleared.
+4. Verify no loop, wrapper, bootstrap or ranking descendants remain, and that the loop, one-shot
+   and relevant cache mutation locks are free, including the candidate's actual physical path.
+   Keep lock inodes; old PID text does not prove ownership.
+5. Preserve fixed/prior/candidate files, committed WAL, cycle and pending pointers, configuration,
+   generations, receipts and artifacts. Replay any prepared publication request unchanged;
+   never rebuild it from the new clock, cache or code revision.
+6. Run `bash scripts/deploy/forge_pause.sh status` first. Invoke `pause` and `restore` only when
+   no pause record exists, or when the record belongs to this deployment's interrupted procedure:
+   its `recorded_at` must match the deployment record. If another operator's record exists or
+   ownership is unknown, preserve the record and paused state and obtain an explicit handoff.
+   The helper's `pause` reuses an existing record and `restore` consumes it. Then run
+   `bash scripts/deploy/forge_pause.sh pause` and require `status` to report `paused_complete`.
+   Record the helper's `recorded_at` in the deployment record. Preserve the prior binary once,
+   atomically replace the executable, install the matching checkout, and verify both identities.
+   Installation is the operator step between `pause` and `restore`; the helper has no `install`
+   command. A partial binary/checkout pair stays paused. Do not overwrite the original rollback
+   backup when resuming an interrupted installation.
+7. Run `bash scripts/deploy/forge_pause.sh restore`, consuming only this deployment's record,
+   then explicitly reinstate the recorded **pre-drain run intent** and enablement: pause observed
+   `stop`/inactive after draining. Verify that a running loop resumes the retained prepared
+   request first, otherwise the retained cycle. A recorded stopped intent stays stopped.
+
+Verify installed checkout/binary identities, retained-cycle recovery, exact publication and
+successor creation. Observe the first three ordinary #704 publications and the existing
+batch-application, bounded-membership and service-health checks while the loop runs. Record
+same-revision stage durations, source ages and publication cadence; no total saving is projected.
+
+Rollback reinstalls the recorded prior binary/checkout pair through these same seven steps,
+retaining cache state, recovery evidence and published batches. The target pair must support any
+unfinished bulk root and recorded parser/classifier contracts.
+
 ## Wallet-cache tuning measurement and rollback (#606)
 
 Run this comparison on Forge through the existing
@@ -74,9 +124,9 @@ The tuning also applies to activity collector writers, including resume. Per-wal
 commits, `synchronous=FULL`, WAL and index maintenance remain unchanged. No automatic
 memory sizing is performed.
 
-1. Before building, preserve the currently installed `c1cdf82` binary as
-   `target/release/pe-bootstrap.pre-606-c1cdf82` and retain the current `.env` for
-   rollback. Use that binary and `.env` as the baseline. Record baseline pragmas as
+1. Record the installed binary/checkout identities and retain the current `.env` as
+   the measurement baseline; the [release procedure](#forge-release-deployment-and-rollback)
+   owns its rollback backup. The historical baseline used `c1cdf82`. Record baseline pragmas as
    **SQLite defaults (no pragma set by the binary, `cache.rs:95–96` at `c1cdf82`)**;
    a fresh read-only Python connection's cache/mmap pragmas are not the writer's view.
 2. Measure two 10-minute windows per binary, on the same cache generation and the
@@ -91,17 +141,17 @@ memory sizing is performed.
    sampled RSS peak and available-memory minimum. Read bytes per 1,000 inserted
    rows is `1000 * read_bytes_delta / inserted_rows`; zero inserted rows makes
    the window inconclusive and requires a repeat. Do not report pages/s.
-4. Build the candidate on Forge, stop the loop, verify its descendants have exited,
-   and restart via systemd with the candidate binary and configured `.env`.
+4. Install the candidate binary/checkout pair with the
+   [release procedure](#forge-release-deployment-and-rollback), retaining the configured `.env`.
    Retain the new writer log's `requested_cache_kib`, `effective_cache_kib`,
    `requested_mmap_bytes` and `effective_mmap_bytes` for each candidate window;
    cache KiB values use SQLite's negative-KiB convention. Success requires lower
    read bytes per 1,000 inserted rows than baseline with `MemAvailable` never
    below **2 GiB**.
 5. If `MemAvailable` falls below that floor or any `MemoryPressure`/OOM kernel
-   line occurs during measurement, stop the loop through systemd, verify descendants
-   have exited, restore the preserved binary and prior `.env`, and restart the
-   loop through that same lifecycle. Keep the cache generation and recovery pointers.
+   line occurs during measurement, restore the recorded prior binary/checkout pair and `.env`
+   through the [same release procedure](#forge-release-deployment-and-rollback).
+   Keep the cache generation and recovery pointers.
 
 ## Part 1 — Backfill tradeable wallets (no new wallet discovery)
 
@@ -217,10 +267,9 @@ activation policy. Event mappings are refreshed by the separate `events` command
 
 ### #608/#609 rollout, acceptance and rollback on Forge
 
-Stop the loop through the [systemd lifecycle](#continuous-forge-supervisor) and wait
-for its cycle/descendants to exit. Preserve `target/release/pe-bootstrap` as
-`pe-bootstrap.pre-608-<rev>`, record the revision, then build and restart with the
-Python changes. Both public writable openers delegate to `open_with_tuning`, whose
+Use the [release procedure](#forge-release-deployment-and-rollback) for installation
+and rollback of the matching binary/Python checkout pair. Both public writable openers delegate
+to `open_with_tuning`, whose
 schema-one migration installs the marker and two nullable coverage columns without
 changing #606 tuning. `capture` runs before the first writable open and tolerates
 missing columns; `winner-discovery` is the cycle's first writable opener.
@@ -265,7 +314,8 @@ refuses comparison. Acceptance requires an empty difference for that completed
 wallet; collisions remain explicit evidence of schema-one loss, not a false clean
 audit. `--base-url` supports a deterministic test endpoint.
 
-**Binary-only rollback:** stop the loop, restore the preserved executable, restart.
+**Historical writer compatibility:** the release procedure restores a matching binary/checkout
+pair; the following describes the old writer's behavior.
 The old writer never updates the new columns, so marked histories remain
 quarantined and become retryable as soon as the corrected binary returns.
 If the old writer appended above an established frontier with #609 gaps, the
@@ -276,7 +326,7 @@ corrected binary seeds from cached bounds and may inherit those holes; use the
 re-walk lever or accept the documented legacy limitation. Never clear a marker
 by hand from an old success stamp.
 
-**Full rollback** including Python exposes retained partial histories to ranking.
+**Historical Python compatibility:** an older checkout can expose retained partial histories to ranking.
 Keep the filter or explicitly accept that visibility and use the
 [published-batch recovery](#part-2--rank-and-publish-the-one-command) procedure if
 necessary. Replay impact: none; this is the schema-one research cache and ranking
@@ -855,20 +905,13 @@ The plain-check timing is a measured baseline. [#694](https://github.com/sppburk
 records the local prefetch measurement; the first Forge activation-candidate check
 will establish its host duration. Neither establishes a total freshness bound.
 
-Deploy a validated binary and scripts only through `scripts/deploy/forge_pause.sh pause`
-and `restore`, after confirming the recorded paused state, stopped descendants and
-released locks. Resume the same cycle with unchanged fixed/prior/candidate paths and
-bytes, committed WAL, collection generation/end/wallet union/digest, receipts,
-parser/classifier versions, payout target, cycle configuration, activation batch,
-cycle/pending pointers and prepared request; do not restage, reseal, clear receipts or
-advance an unfinished generation. Binary/script rollback uses the same pause/restore
-lifecycle; the structural-check change requires no database migration, freshness override or
-event/replay change. Install a classifier-version change only at a clean publication boundary
-with no cycle in progress (`paused_complete`, no `rank_and_push.cycle`, no `cache_stage_record.json`,
-no `ranking_publish_request.json` and no `rank_and_push.pending`): a resumed cycle keeps its frozen
-manifest and pipeline versions, so installing into one would mix the old classifier's provenance
-with the new classifier's projection. The next cycle's first finalization rebuilds the projection
-at the new version.
+Install and roll back through the [release procedure](#forge-release-deployment-and-rollback).
+Resume the same cycle with its fixed/prior/candidate paths, committed WAL, identities, receipts,
+configuration and prepared request intact. A release that preserves parser/classifier versions
+may install with a cycle retained at a stopped-attempt boundary. A classifier-version change
+requires a clean publication boundary with `paused_complete`, no cycle pointer,
+`cache_stage_record.json`, `ranking_publish_request.json` or pending pointer: a resumed cycle freezes
+its pipeline versions. The next cycle's first finalization rebuilds the projection at the new version.
 
 The zero-argument `rank_and_push.sh` production cycle enters this lane automatically when
 the installed cache is schema two, and for the one-time initial cutover when `.env` sets
@@ -886,7 +929,15 @@ to candidate capture and the publisher. Then come
 `--prepare-only`, `cache-activate` and the exact `--resume-request`. The candidate snapshot stamps
 the UTC day when capture starts. The immutable staging baseline fixes the initial activity generation
 and payout target for new cycles; existing legacy cycles read those values from their prior. The activity owner resumes the candidate's recorded head, including a manually started or
-interrupted successor belonging to this cycle. If the completed initial head's age exceeds the
+interrupted successor belonging to this cycle. `candidate-targets --include-bulk-root` appends
+bulk eligibility as field four and `activity_complete` as field five; the default interface stays
+three fields. Inside its read transaction, completion requires schema two, the selected generation
+matching the validated head, and a completed manifest referencing that head's digest. Only that
+completed selected head skips the collection invocation. Incomplete and unsealed bulk roots still
+collect; standalone Rust collection still certifies content. The wrapper always calls
+`--after-collection`, including after a skip, so freshness equality and the single-top-up allowance
+are unchanged. Activation still rejects corrupt receipts and nonprojected content before publication.
+If the completed initial head's age exceeds the
 publisher's unchanged `max_cache_staleness_hours`, the wrapper admits one linked top-up. Its persisted
 base link consumes that allowance across restarts; a stale top-up stops before ranking and never
 starts another. Actual trade/payout source times still govern preparation after downstream work.
@@ -954,9 +1005,8 @@ the same line and exit 2 with the pointer retained. Record the measurement from 
 artifacts: the wallet union (`wallet_count` in the activity manifest of the candidate's
 `activity_coverage_manifests_v2`, also in `candidate_cycle_manifest.json`), the candidate
 size, elapsed time from the cycle log, and the source times the publisher accepted. Then set
-the value to `1` and either run the zero-argument command once by hand or, if the loop was
-paused, `scripts/deploy/forge_pause.sh restore` (it restores the recorded run flag and unit
-state; a plain unit start would exit on the `stop` flag the pause wrote): the
+the value to `1` and resume with the recorded run intent through the
+[release procedure](#forge-release-deployment-and-rollback): the
 pending-publication recovery activates and publishes exactly that request. If the publisher
 refuses (stale source times, incomplete coverage), the cycle stops with the installed cache
 untouched and the candidate, staging evidence, any legacy prior and log preserved; do not relabel times, narrow
@@ -1058,17 +1108,12 @@ No automatic disk estimator, conversion driver or resource-tuning framework is i
 Capture available bytes, `dbstat` table/index sizes, free pages, WAL peak and build/checkpoint elapsed
 time on Forge; the implementation tests do not establish throughput, duration or production capacity.
 
-**Supervised sequence for a fresh Forge cycle.** Use the existing loop for the initial schema-one
-cutover; installed schema-two caches use ordinary successors. Pause with `forge_pause.sh pause`,
-check `forge_pause.sh status`, establish the compatibility prerequisite above, deploy the validated
-binary and scripts, retain the old candidate/prior/manifests, and keep the persisted `.env` cutover
-setting at `prepare`. If replacing an interrupted cycle, first verify that its recorded acquisition
-configuration and activation audit are available, that no prepared request exists, and that its prior
-still binds the installed cache. Archive only the old cycle pointer as shown in the fallback below
-if a new cycle is required; an existing ordinary root is never converted. Configure SSD scratch and
-verify the final-build headroom above in the supervisor's environment before restoring it with
-`forge_pause.sh restore`. That restores the saved loop state; verify that it was previously running
-and is running again.
+**Supervised sequence for a fresh Forge cycle.** Install and resume through the
+[release procedure](#forge-release-deployment-and-rollback), establishing the compatibility and
+disk prerequisites above. Preserve any interrupted cycle and its recovery artifacts. Keep the
+persisted `.env` cutover setting at `prepare` until acceptance of the exact pending request;
+installed schema-two caches use ordinary successors. Configure SSD scratch and verify final-build
+headroom in the supervisor's environment before resuming the recorded run intent.
 
 The zero-argument wrapper stages/migrates, discovers and activates, then asks
 `candidate-targets --include-bulk-root` for the initial generation and durable eligibility. A new
@@ -1077,7 +1122,9 @@ the exact named unique index with no primary-key layout, and the unfinalized pri
 completed activity manifest, frozen verification or projection. A reserved-state root resumes only
 with its version-two generation-one identity, no predecessor, and that same private state; retained
 wallet rows/receipts are allowed. Rust still owns admission and fails closed. Ordinary interrupted
-roots, completed roots and successors use ordinary collection. After a transient exit 75 the existing
+roots and unfinished successors use ordinary collection. Completed selected schema-two heads
+skip wrapper collection re-entry; the always-run `--after-collection` check still selects an allowed
+stale-head top-up or refuses a stale completed top-up. After a transient exit 75 the existing
 supervisor re-enters the same cycle, skips staging/migration/discovery/activation for a fenced
 candidate, and resumes bulk collection from its receipts. After sealing, the one allowed top-up
 never receives `--bulk-root`. Payout, finalization and preparation keep their existing gates.
@@ -1090,80 +1137,12 @@ is on the USB stick.
 The default `/var/tmp` is read-only with the root filesystem, and writable `/tmp` is too small.
 The supervisor unit `pe-rank-loop.service` sets no `Environment`, but the wrapper exports
 its whole `.env`, including `SQLITE_TMPDIR`, to the collector. Export it for manual
-invocations/resumes as below.
+invocations/resumes from the same retained configuration.
 
-**Manual fallback.** Use the following sequence only when supervised collection is unavailable.
-The supervisor stays paused, so every transient exit requires manually rerunning the same bulk
-command with the same paths and scratch environment; it will not resume by itself. This uses a
-new private cycle and the existing preparation entry point. Run each phase only after the preceding
-command succeeds, and pass the reviewed bootstrap TOML too if the old cycle used one. The same
-compatibility prerequisite and disk checks apply.
-
-```bash
-set -euo pipefail
-cd "$HOME/prediction-markets"
-bash scripts/deploy/forge_pause.sh pause
-bash scripts/deploy/forge_pause.sh status
-set -a
-source .env
-set +a
-test "$PE_RANK_SCHEMA_TWO_CUTOVER" = prepare
-test ! -e data/eval-results/rank_and_push.pending
-test ! -L data/eval-results/rank_and_push.pending
-# Archive only the old logical-cycle pointer; retain every old cycle artifact.
-if test -f data/eval-results/rank_and_push.cycle; then
-  TASK_OLD_RUN="$(cat data/eval-results/rank_and_push.cycle)"
-  test ! -e "$TASK_OLD_RUN/ranking_publish_request.json"
-  test ! -e "$TASK_OLD_RUN/bulk-restart.cycle"
-  mv data/eval-results/rank_and_push.cycle "$TASK_OLD_RUN/bulk-restart.cycle"
-fi
-TASK_BOOTSTRAP="${PE_BOOTSTRAP_BIN:-target/release/pe-bootstrap}"
-TASK_FIXED="$(readlink -f data/wallet_cache.db)"
-TASK_CYCLE="cron-$(date -u +%Y%m%dT%H%M%SZ)"
-TASK_RUN="data/eval-results/$TASK_CYCLE"
-mkdir "$TASK_RUN"
-TASK_PRIOR="$(dirname "$TASK_FIXED")/wallet_cache.$TASK_CYCLE.prior.db"
-TASK_SIDE="$(dirname "$TASK_FIXED")/wallet_cache.$TASK_CYCLE.side.db"
-TASK_DISPLACED="$(dirname "$TASK_FIXED")/wallet_cache.$TASK_CYCLE.displaced.db"
-TASK_SCRATCH="/mnt/t7/sqlite-tmp"
-mkdir -p "$TASK_SCRATCH"
-export SQLITE_TMPDIR="$TASK_SCRATCH"
-findmnt -T "$TASK_SCRATCH"
-df -B1 "$(dirname "$TASK_FIXED")" "$TASK_SCRATCH"
-# Verify the headroom above, including collection growth, before proceeding.
-"$TASK_BOOTSTRAP" cache-stage-v2 --db "$TASK_FIXED" --prior "$TASK_PRIOR" \
-  --side "$TASK_SIDE" --manifest "$TASK_RUN/cache_build_manifest.json" \
-  > "$TASK_RUN/cache_stage.json"
-"$TASK_BOOTSTRAP" cache-migrate-v2 --db "$TASK_SIDE" \
-  --manifest "$TASK_RUN/cache_build_manifest.json"
-"$TASK_BOOTSTRAP" winner-discovery --db "$TASK_SIDE" --defer-activation
-"$TASK_BOOTSTRAP" activate-next --db "$TASK_SIDE" --batch-id "$TASK_CYCLE" \
-  --audit-csv "$TASK_RUN/activated_wallets.csv"
-# Check the approved cohort against its acquisition/activation evidence here.
-# Keep these exact paths for retries; only this command accepts schema -2.
-"$TASK_BOOTSTRAP" cache-populate-activity-v2 --db "$TASK_SIDE" \
-  --fresh-generation 1 --bulk-root --fixed-db "$TASK_FIXED"
-```
-
-The last command performs collection **and** mandatory sealing. After successful sealing, continue
-with the ordinary linked top-up, payout and finalization; never pass `--bulk-root` for generation 2:
-
-```bash
-"$TASK_BOOTSTRAP" cache-populate-activity-v2 --db "$TASK_SIDE" --fresh-generation 2
-"$TASK_BOOTSTRAP" cache-populate-payout-v2 --db "$TASK_SIDE"
-"$TASK_BOOTSTRAP" cache-finalize-v2 --db "$TASK_SIDE" \
-  --stage-record "$TASK_RUN/cache_stage_record.json"
-bash scripts/rank_and_push.sh --db "$TASK_SIDE" --out-dir "$TASK_RUN" \
-  --skip-discovery --skip-backfill --cache-stage-record "$TASK_RUN/cache_stage_record.json" \
-  --fixed-db "$TASK_FIXED" --prior-cache-backup "$TASK_DISPLACED"
-```
-
-Require `RANK_AND_PUSH_PREPARED_ONLY=…`, exit 2, the retained exact pending request and unchanged
-fixed bytes as the preparation result. Keep the supervisor paused if freshness or any other check
-fails. After operator acceptance, follow the existing exact pending-publication activation and
-`forge_pause.sh restore` procedure above. Do not restore the archived old cycle pointer over a new
-prepared request. Bulk routing adds no automatic conversion or deployment and preserves the
-existing prepare-only activation/publication boundary.
+**Interrupted collection.** Use the retained cycle and exact paths through the
+[release procedure](#forge-release-deployment-and-rollback). An unfinished bulk root resumes its
+same command and receipts; never archive the cycle pointer, allocate a replacement candidate or
+force a successor as part of deployment. A prepared request takes precedence over collection.
 
 ### Incremental top-up measurement and paused-cycle handoff (#648)
 
@@ -1209,43 +1188,14 @@ Require the complete production-sized top-up → preparation → activation path
 freshness and measured disk budget. Preparation must accept actual trade/payout times with the full
 union. Report any bottleneck and keep recovery evidence; never relabel clocks or relax gates.
 
-For the paused `cron-20260916T164030Z` handoff, first install the compatible, locally gated release
-while the loop is paused and the ranking locks have no holder. Confirm the cycle pointer and
-`fresh_v2` configuration, authentic generation-1 identity/receipts/end, agreement of fixed/prior/candidate
-paths and backup evidence, unchanged fixed/prior bytes, stale initial end, no pending pointer or
-request, and `PE_RANK_SCHEMA_TWO_CUTOVER=prepare`. Verify the recorded payout target and whether it
-completed; the reported target of 10 is an observation to check, not an assumed contract. After the
-representative measurement gate passes, execute each step only after its preceding checks succeed:
-
-```bash
-cd "$HOME/prediction-markets"
-bash scripts/deploy/forge_pause.sh pause
-bash scripts/deploy/forge_pause.sh status
-TASK_RUN=data/eval-results/cron-20260916T164030Z
-test "$(cat data/eval-results/rank_and_push.cycle)" = "$TASK_RUN"
-test ! -e data/eval-results/rank_and_push.pending
-test ! -L data/eval-results/rank_and_push.pending
-test ! -e "$TASK_RUN/ranking_publish_request.json"
-set -a
-source .env
-set +a
-test "$PE_RANK_SCHEMA_TWO_CUTOVER" = prepare
-TASK_BOOTSTRAP="${PE_BOOTSTRAP_BIN:-target/release/pe-bootstrap}"
-TASK_SIDE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["side_path"])' "$TASK_RUN/cache_stage.json")"
-"$TASK_BOOTSTRAP" cache-populate-activity-v2 --db "$TASK_SIDE" --fresh-generation 1
-bash scripts/rank_and_push.sh
-```
-
-The explicit generation-1 retry installs its completed manifest from valid receipts without venue
-reads, payout or ranking. The wrapper then selects exactly one linked generation-2 top-up, or adopts
-an already recorded generation 2. An unfinished generation resumes; a stale completed top-up stops
-before ranking. A durable request always takes precedence. Acceptance is specifically
-`RANK_AND_PUSH_PREPARED_ONLY=...`, exit 2, retained pending state and unchanged fixed bytes; unrelated
-exit-2 failures are not acceptance. Record measured costs and the source timestamps preparation accepted.
-
-After operator acceptance, set `PE_RANK_SCHEMA_TWO_CUTOVER=1`, run `bash scripts/rank_and_push.sh` to
-activate/publish the exact pending request, then `bash scripts/deploy/forge_pause.sh restore` to restore
-the recorded supervisor state. Require one real recurring publication before closing the handoff.
+For an interrupted handoff, install the combined release through the
+[release procedure](#forge-release-deployment-and-rollback), preserving the authentic identities,
+fixed/prior/candidate paths, payout target, cycle configuration and any prepared request. On resume,
+a completed selected head skips re-entry, an unfinished head resumes, and a stale initial head may
+receive exactly one linked top-up. A stale completed top-up stops before ranking. Preparation
+still requires `RANK_AND_PUSH_PREPARED_ONLY=...`, exit 2, retained pending state and unchanged fixed
+bytes while cutover is `prepare`; unrelated exit-2 failures are not acceptance. Preserve any exact
+prepared request through acceptance and resume rather than recreating it.
 
 ### Continuous Forge supervisor
 
@@ -1353,9 +1303,8 @@ Both pointers are regular, non-symlink, one-line repository-relative paths and
 are validated beneath `data/eval-results/cron-<UTC>/`. Successful completion
 compare-and-clears only a pointer that still names the run being completed. If
 the pointer changed or became malformed, the wrapper warns and preserves it.
-Rollback writes `stop`, waits until `systemctl --user is-active pe-rank-loop`
-reports `inactive`, then runs `systemctl --user disable pe-rank-loop` if the
-loop should not return at boot.
+Deployment and rollback use the [release procedure](#forge-release-deployment-and-rollback),
+which preserves the original run intent and enablement before draining.
 
 Inspect recovery state without changing it:
 
@@ -1394,8 +1343,9 @@ Forge checkout. The additive `ranking_batches.publish_key` column and unique
 index preserve historical batches whose key is null. The service-role-only
 `publish_ranking_batch` RPC creates/reuses the keyed batch and inserts all entries
 inside one PostgreSQL transaction, so a failed request exposes neither a partial
-epoch nor a duplicate epoch. If code rollback is required, stop the loop and
-restore the prior checkout; the additive schema can remain in place.
+epoch nor a duplicate epoch. If code rollback is required, restore the recorded prior binary/checkout
+pair through the
+[release procedure](#forge-release-deployment-and-rollback); the additive schema can remain in place.
 
 Before allocating a new legacy schema-one production run, the wrapper captures the current
 daily source watermark, pipeline versions, and configuration. If they exactly match a prior

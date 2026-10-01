@@ -1831,6 +1831,11 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertIn("FATAL: the Parquet export failed", failed.stderr)
         self.assertTrue(self._log("export.log"))
         self.assertFalse(self._log("rank.log"))
+        before = len(self._bootstrap_lines("cache-populate-activity-v2"))
+        resumed = self._run()
+        self.assertEqual(resumed.returncode, 2, resumed.stderr)
+        self.assertIn("RANK_AND_PUSH_PREPARED_ONLY=", resumed.stdout)
+        self.assertEqual(len(self._bootstrap_lines("cache-populate-activity-v2")), before)
 
     def test_two_file_staging_refuses_previous_backup_before_candidate_allocation(self):
         """Proves skipped retirement blocks another full candidate allocation without deleting evidence."""
@@ -2075,8 +2080,7 @@ finally:
         before = len(self._bootstrap_lines("cache-populate-activity-v2"))
         resumed = self._run()
         self.assertIn("RANK_AND_PUSH_PREPARED_ONLY=", resumed.stdout, resumed.stderr)
-        self.assertEqual(len(self._bootstrap_lines("cache-populate-activity-v2")), before + 1)
-        self.assertIn("--fresh-generation 2", self._bootstrap_lines("cache-populate-activity-v2")[-1])
+        self.assertEqual(len(self._bootstrap_lines("cache-populate-activity-v2")), before)
 
     def test_stale_completed_top_up_stops_before_ranking_on_every_restart(self):
         self._prepare_incremental_fixture()
@@ -2085,6 +2089,7 @@ finally:
             self.assertNotEqual(result.returncode, 0)
             self.assertNotIn("RANK_AND_PUSH_PREPARED_ONLY=", result.stdout)
             self.assertIn("top-up is stale", result.stderr)
+        self.assertEqual(len(self._bootstrap_lines("cache-populate-activity-v2")), 2)
         self.assertFalse(any("--fresh-generation 3" in line for line in self._bootstrap_lines("cache-populate-activity-v2")))
         self.assertIsNone(self._log("rank.log"))
         self.assertFalse((self.root / "data/eval-results/rank_and_push.pending").exists())
@@ -2501,7 +2506,7 @@ finally:
     def test_recurring_lane_advances_generation_and_reuses_a_completed_payout_walk(self):
         """PASS: an installed schema-two cache selects the lane without the opt-in,
         requests generation prior+1, and after a transient finalization the retry
-        reuses the same names, resumes the same generation, skips the completed
+        reuses the same names, skips completed activity and the completed
         payout walk and publishes. FAIL: a migration, a new payout walk, another
         candidate, or a changed generation on retry."""
         fixed = self._install_candidate_layout(schema=2)
@@ -2532,7 +2537,7 @@ finally:
         ops = self._bootstrap_ops()
         self.assertEqual(ops.count("cache-stage-v2"), 2)
         self.assertEqual(ops.count("cache-populate-payout-v2"), 1, "completed payout walk was restarted")
-        self.assertEqual(ops.count("cache-populate-activity-v2"), 2)
+        self.assertEqual(ops.count("cache-populate-activity-v2"), 1, "completed activity was recollected")
         self.assertNotIn("cache-migrate-v2", ops)
         self.assertEqual({line.split()[4] for line in self._bootstrap_lines("cache-populate-activity-v2")}, {"2"})
         self.assertEqual(len(list((self.root / "phys").glob("wallet_cache.*.side.db"))), 0)

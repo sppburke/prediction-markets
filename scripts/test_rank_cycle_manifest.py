@@ -42,10 +42,10 @@ class CandidateTargetsTest(unittest.TestCase):
     def test_fresh_root_and_unchanged_three_value_api_and_cli(self):
         before = self.side.read_bytes()
         self.assertEqual(candidate_targets(self.prior, self.side), (1, 1, 0))
-        self.assertEqual(self.targets(), (1, 1, 0, 1))
+        self.assertEqual(self.targets(), (1, 1, 0, 1, 0))
         command = [sys.executable, str(Path(__file__).with_name("rank_cycle_manifest.py")),
                    "candidate-targets", "--prior", str(self.prior), "--side", str(self.side)]
-        for args, expected in (([], "1\n1\n0\n"), (["--include-bulk-root"], "1\n1\n0\n1\n")):
+        for args, expected in (([], "1\n1\n0\n"), (["--include-bulk-root"], "1\n1\n0\n1\n0\n")):
             result = subprocess.run(command + args, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout, expected)
@@ -69,7 +69,7 @@ class CandidateTargetsTest(unittest.TestCase):
                 original = self.side.read_bytes()
                 with sqlite3.connect(self.side) as c:
                     c.execute(mutation)
-                self.assertEqual(self.targets(), (1, 1, 0, 0))
+                self.assertEqual(self.targets(), (1, 1, 0, 0, 0))
                 self.assertEqual(candidate_targets(self.prior, self.side), (1, 1, 0))
                 self.side.write_bytes(original)
 
@@ -92,20 +92,20 @@ class CandidateTargetsTest(unittest.TestCase):
                     c.execute("DROP INDEX idx_activity_groups_v2_source_trade_id")
                     if ddl:
                         c.execute(ddl)
-                self.assertEqual(self.targets()[-1], 0)
+                self.assertEqual(self.targets()[3], 0)
                 self.side.write_bytes(original)
         with sqlite3.connect(self.side) as c:
             c.executescript("""DROP TABLE activity_groups_v2;
                 CREATE TABLE activity_groups_v2(source_trade_id TEXT PRIMARY KEY);
                 CREATE UNIQUE INDEX idx_activity_groups_v2_source_trade_id ON activity_groups_v2(source_trade_id);""")
-        self.assertEqual(self.targets()[-1], 0)
+        self.assertEqual(self.targets()[3], 0)
 
     def test_interrupted_ordinary_identity_never_converts_even_without_rows(self):
         for version in (1, 2):
             with self.subTest(version=version):
                 with sqlite3.connect(self.side) as c:
                     c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (identity(version=version),))
-                self.assertEqual(self.targets(), (1, 1, 0, 0))
+                self.assertEqual(self.targets(), (1, 1, 0, 0, 0))
 
     def test_reserved_root_resumes_with_committed_rows_and_receipts(self):
         with sqlite3.connect(self.side) as c:
@@ -114,7 +114,7 @@ class CandidateTargetsTest(unittest.TestCase):
                 INSERT INTO activity_groups_v2(source_trade_id) VALUES ('retained');
                 INSERT INTO activity_wallet_coverage_staging_v2 VALUES (1);""")
             c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (identity(),))
-        self.assertEqual(self.targets(), (1, 1, 0, 1))
+        self.assertEqual(self.targets(), (1, 1, 0, 1, 0))
         with self.assertRaisesRegex(ValueError, "unfinished bulk root"):
             candidate_targets(self.prior, self.side)  # Old caller still refuses.
         with self.assertRaisesRegex(ValueError, "unfinished bulk root"):
@@ -124,22 +124,30 @@ class CandidateTargetsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "invalid unfinished bulk root"):
             self.targets()
 
-    def test_completed_root_and_predecessor_select_ordinary_collection(self):
+    def test_completed_root_skips_collection_and_unfinished_successor_still_collects(self):
         root = identity()
         with sqlite3.connect(self.side) as c:
             c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (root,))
             c.execute("INSERT INTO activity_coverage_manifests_v2(generation, reference_sha256, collection_identity_json) VALUES (1, ?, ?)", (json.loads(root)["digest"], root))
             c.execute("INSERT INTO clob_payout_coverage_manifests_v2(generation) VALUES (1)")
-        self.assertEqual(self.targets(), (1, 1, 1, 0))
-        self.assertEqual(self.targets(after_collection=True, now=100, max_staleness_hours=24), (1, 1, 1, 0))
-        self.assertEqual(self.targets(after_collection=True, now=90000, max_staleness_hours=24), (2, 1, 1, 0))
+        self.assertEqual(self.targets(), (1, 1, 1, 0, 1))
+        self.assertEqual(self.targets(after_collection=True, now=100, max_staleness_hours=24), (1, 1, 1, 0, 1))
+        self.assertEqual(self.targets(after_collection=True, now=90000, max_staleness_hours=24), (2, 1, 1, 0, 0))
+        self.assertEqual(self.targets(after_collection=True, now=86500, max_staleness_hours=24), (1, 1, 1, 0, 1))
+        with sqlite3.connect(self.side) as c:
+            c.execute("UPDATE activity_coverage_manifests_v2 SET reference_sha256=?", ("b" * 64,))
+        self.assertEqual(self.targets(), (1, 1, 1, 0, 0))
+        with self.assertRaisesRegex(ValueError, "matching completed manifest"):
+            self.targets(after_collection=True, now=100, max_staleness_hours=24)
+        with sqlite3.connect(self.side) as c:
+            c.execute("UPDATE activity_coverage_manifests_v2 SET reference_sha256=?", (json.loads(root)["digest"],))
         with sqlite3.connect(self.prior) as c:
             c.execute("PRAGMA user_version=2")
             c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (root,))
             c.execute("INSERT INTO activity_coverage_manifests_v2(generation) VALUES (1)")
         with sqlite3.connect(self.side) as c:
             c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (identity(2, 1),))
-        self.assertEqual(self.targets(), (2, 1, 1, 0))
+        self.assertEqual(self.targets(), (2, 1, 1, 0, 0))
         self.assertEqual(candidate_targets(self.prior, self.side), (2, 1, 1))
 
     def test_two_file_baseline_routes_bulk_without_prior_and_freezes_successor_targets(self):
@@ -150,12 +158,12 @@ class CandidateTargetsTest(unittest.TestCase):
         self.prior.unlink()
         receipt = self.side.with_suffix(".stage.json")
         receipt.write_text(json.dumps(baseline))
-        self.assertEqual(candidate_targets(None, self.side, include_bulk_root=True), (1, 1, 0, 1))
+        self.assertEqual(candidate_targets(None, self.side, include_bulk_root=True), (1, 1, 0, 1, 0))
         result = subprocess.run([sys.executable, str(Path(__file__).with_name("rank_cycle_manifest.py")),
                                  "candidate-targets", "--side", str(self.side), "--include-bulk-root"],
                                 capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, "1\n1\n0\n1\n")
+        self.assertEqual(result.stdout, "1\n1\n0\n1\n0\n")
         root = identity()
         baseline.update(activity_generation=1, payout_generation=4, fresh_identity=json.loads(root))
         receipt.write_text(json.dumps(baseline))
@@ -163,7 +171,7 @@ class CandidateTargetsTest(unittest.TestCase):
             c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (root,))
             c.execute("INSERT INTO activity_coverage_manifests_v2(generation) VALUES (1)")
             c.execute("INSERT INTO clob_payout_coverage_manifests_v2(generation) VALUES (4)")
-        self.assertEqual(candidate_targets(None, self.side, include_bulk_root=True), (2, 4, 1, 0))
+        self.assertEqual(candidate_targets(None, self.side, include_bulk_root=True), (2, 4, 1, 0, 0))
         # A mutated candidate cannot change the baseline or grant a second top-up.
         with sqlite3.connect(self.side) as c:
             c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (identity(4, 3),))
