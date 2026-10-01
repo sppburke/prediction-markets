@@ -1295,6 +1295,7 @@ impl TradePoller {
                             match &result {
                                 Ok((AnchorRefreshOutcome::Deferred, _)) => {
                                     self.refresh_cooldown.insert(wallet, completed_at + Duration::from_secs(ANCHOR_REFRESH_SECS));
+                                    if refresh_pending == Some(wallet) { refresh_pending = None; }
                                 }
                                 Ok((AnchorRefreshOutcome::Anchored, _)) => {
                                     self.refresh_cooldown.remove(&wallet);

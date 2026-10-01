@@ -796,8 +796,9 @@ impl CausalPositionValidator {
                 // filter would exclude the wallet anyway). Wallet-scoped
                 // classifier outcomes and legacy deferrals leave the wallet
                 // unvalidated for serialized runtime admission. Shared failures
-                // outside the legacy predicate, including a post-loop ledger
-                // revision, still fail boot.
+                // outside the legacy predicate still fail boot. The final atomic
+                // anchor install separately propagates every error, including a
+                // post-loop ledger revision.
                 Err(CausalPositionError::Fenced { wallet }) => {
                     tracing::warn!(
                         wallet = %wallet,

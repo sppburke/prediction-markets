@@ -1436,6 +1436,242 @@ async fn deferred_maintenance_yields_to_receipts_and_returns_failures_to_backsto
     running.finish().await;
 }
 
+/// PASS: a deferred queued refresh leaves normal selection free to refresh another wallet.
+#[tokio::test(start_paused = true)]
+async fn refresh_cooldown_clears_queued_wallet_so_other_wallet_refreshes() {
+    use pe_service::trade_poller::ANCHOR_REFRESH_SECS;
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    let dir = tempfile::tempdir().unwrap();
+    let other = WalletAddress([0xbb; 20]);
+    let (mut running, paper) =
+        start_recorded_poller_with_anchors(&dir, &[wallet(), other], false, true, Some(EPOCH));
+    let connection = rusqlite::Connection::open(dir.path().join("paper.db")).unwrap();
+    connection
+        .execute(
+            "UPDATE position_anchors SET anchored_at_unix = ?1 WHERE wallet_hex = ?2",
+            rusqlite::params![EPOCH, other.to_string()],
+        )
+        .unwrap();
+    for expected in [wallet(), other] {
+        let request = running.requests.recv().await.unwrap();
+        assert!(request.url.contains(&expected.to_string()));
+        request.respond.send(b"[]".to_vec()).unwrap();
+        running.completed(expected).await;
+    }
+    running.round_completed().await;
+    let activity = running.requests.recv().await.unwrap();
+    assert!(activity.url.contains(&wallet().to_string()));
+    assert!(activity.url.ends_with("&start=1"));
+    activity.respond.send(b"[]".to_vec()).unwrap();
+    let positions = running.requests.recv().await.unwrap();
+    assert!(positions.url.contains("/positions?"));
+
+    // A remains held across the next round, whose normal selector queues A again.
+    running.now.store(EPOCH + 30, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(30)).await;
+    let ordinary = running.requests.recv().await.unwrap();
+    assert!(ordinary.url.contains(&other.to_string()));
+    ordinary.respond.send(b"[]".to_vec()).unwrap();
+    running.completed(other).await;
+    running.round_completed().await;
+    let deadline = Instant::now() + Duration::from_secs(ANCHOR_REFRESH_SECS);
+    positions.respond.fail();
+    let follow_up = running.requests.recv().await.unwrap();
+    assert!(follow_up.url.contains(&wallet().to_string()));
+    assert!(!follow_up.url.ends_with("&start=1"));
+    running.clear_waits();
+    follow_up.respond.send(b"[]".to_vec()).unwrap();
+    running.completed(wallet()).await;
+    assert_eq!(
+        running.waiting().await.refresh_cooldown.get(&wallet()),
+        Some(&deadline)
+    );
+
+    connection
+        .execute(
+            "UPDATE poll_cursors SET reanchor_required = 1 WHERE wallet_hex = ?1",
+            [other.to_string()],
+        )
+        .unwrap();
+    running.now.store(EPOCH + 60, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(30)).await;
+    for expected in [wallet(), other] {
+        let request = running.requests.recv().await.unwrap();
+        assert!(request.url.contains(&expected.to_string()));
+        assert!(!request.url.ends_with("&start=1"));
+        request.respond.send(b"[]".to_vec()).unwrap();
+        running.completed(expected).await;
+    }
+    running.round_completed().await;
+    let refresh = tokio::time::timeout(Duration::from_secs(1), running.requests.recv())
+        .await
+        .expect("B must refresh while A is cooling down")
+        .unwrap();
+    assert!(refresh.url.contains(&other.to_string()));
+    assert!(refresh.url.ends_with("&start=1"));
+    assert!(Instant::now() < deadline);
+    refresh.respond.send(b"[]".to_vec()).unwrap();
+    loop {
+        tokio::select! {
+            request = running.requests.recv() => request.unwrap().respond.send(b"[]".to_vec()).unwrap(),
+            event = running.controls.recv() => if matches!(event, Some(ControlCompletion::Anchored(w)) if w == other) { break },
+        }
+    }
+    assert!(Instant::now() < deadline);
+    assert_eq!(paper.position_anchors(&other).unwrap().len(), 2);
+    assert_eq!(paper.position_anchors(&wallet()).unwrap().len(), 1);
+    running.finish().await;
+}
+
+/// PASS: a short non-routine deferral has no queued duplicate or retry; normal selection
+/// refreshes another eligible wallet before the deadline and the deferred wallet at expiry.
+#[tokio::test(start_paused = true)]
+async fn refresh_cooldown_normal_selection_skips_before_and_selects_at_expiry() {
+    use pe_service::trade_poller::ANCHOR_REFRESH_SECS;
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    let dir = tempfile::tempdir().unwrap();
+    let other = WalletAddress([0xbb; 20]);
+    let start = Instant::now();
+    let (mut running, _) =
+        start_recorded_poller_with_anchors(&dir, &[wallet(), other], false, true, Some(EPOCH));
+    let connection = rusqlite::Connection::open(dir.path().join("paper.db")).unwrap();
+    connection
+        .execute(
+            "UPDATE poll_cursors SET reanchor_required = 1 WHERE wallet_hex = ?1",
+            [wallet().to_string()],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE position_anchors SET anchored_at_unix = ?1 WHERE wallet_hex = ?2",
+            rusqlite::params![EPOCH, other.to_string()],
+        )
+        .unwrap();
+    for expected in [wallet(), other] {
+        let request = running.requests.recv().await.unwrap();
+        assert!(request.url.contains(&expected.to_string()));
+        request.respond.send(b"[]".to_vec()).unwrap();
+        running.completed(expected).await;
+    }
+    running.round_completed().await;
+    fail_refresh_positions(&mut running, wallet()).await;
+    let deadline = start + Duration::from_secs(ANCHOR_REFRESH_SECS);
+    loop {
+        if let Some(actual) = running.waiting().await.refresh_cooldown.get(&wallet()) {
+            assert_eq!(*actual, deadline);
+            break;
+        }
+    }
+    assert_eq!(
+        Instant::now(),
+        start,
+        "deferral finishes before another round"
+    );
+    assert!(
+        running.requests.try_recv().is_err(),
+        "no non-routine follow-up"
+    );
+
+    running.now.store(EPOCH + 30, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(30)).await;
+    for expected in [wallet(), other] {
+        let request = running.requests.recv().await.unwrap();
+        assert!(request.url.contains(&expected.to_string()));
+        assert!(!request.url.ends_with("&start=1"));
+        running.clear_waits();
+        request.respond.send(b"[]".to_vec()).unwrap();
+        running.completed(expected).await;
+    }
+    running.round_completed().await;
+    assert_eq!(
+        running.waiting().await.wake,
+        Some(Instant::now() + Duration::from_secs(30))
+    );
+    assert!(running.requests.try_recv().is_err());
+
+    // The next selection prefers reanchor-required A over age-due B. Only the selector's
+    // cooldown filter can leave B selected; filtering A at launch would leave B idle.
+    connection
+        .execute(
+            "UPDATE position_anchors SET anchored_at_unix = ?1 WHERE wallet_hex = ?2",
+            rusqlite::params![EPOCH - 3_601, other.to_string()],
+        )
+        .unwrap();
+    let before_expiry = deadline - Duration::from_secs(30);
+    running.now.store(
+        EPOCH + i64::try_from(ANCHOR_REFRESH_SECS).unwrap() - 30,
+        Ordering::SeqCst,
+    );
+    tokio::time::advance(before_expiry.duration_since(Instant::now())).await;
+    for expected in [wallet(), other] {
+        let request = running.requests.recv().await.unwrap();
+        assert!(request.url.contains(&expected.to_string()));
+        assert!(!request.url.ends_with("&start=1"));
+        request.respond.send(b"[]".to_vec()).unwrap();
+        running.completed(expected).await;
+    }
+    running.round_completed().await;
+    let refresh = tokio::time::timeout(Duration::from_secs(1), running.requests.recv())
+        .await
+        .expect("normal selection must skip cooling A and refresh eligible B")
+        .unwrap();
+    assert!(refresh.url.contains(&other.to_string()));
+    assert!(refresh.url.ends_with("&start=1"));
+    assert_eq!(Instant::now(), before_expiry);
+    refresh.respond.send(b"[]".to_vec()).unwrap();
+    loop {
+        tokio::select! {
+            request = running.requests.recv() => request.unwrap().respond.send(b"[]".to_vec()).unwrap(),
+            event = running.controls.recv() => if matches!(event, Some(ControlCompletion::Anchored(w)) if w == other) { break },
+        }
+    }
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+
+    // Both wallets are eligible at expiry, and the cursor now starts at A. With no
+    // follow-up/retry or queued A, only normal selection can select A at this deadline.
+    connection
+        .execute(
+            "UPDATE poll_cursors SET reanchor_required = 1 WHERE wallet_hex = ?1",
+            [other.to_string()],
+        )
+        .unwrap();
+    running.now.fetch_add(29, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(29)).await;
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    assert!(running.requests.try_recv().is_err());
+    running.now.fetch_add(1, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert_eq!(Instant::now(), deadline);
+    for expected in [wallet(), other] {
+        let request = running.requests.recv().await.unwrap();
+        assert!(request.url.contains(&expected.to_string()));
+        assert!(!request.url.ends_with("&start=1"));
+        request.respond.send(b"[]".to_vec()).unwrap();
+        running.completed(expected).await;
+    }
+    running.round_completed().await;
+    let refresh = tokio::time::timeout(Duration::from_secs(1), running.requests.recv())
+        .await
+        .expect("normal selection must launch a refresh at expiry")
+        .unwrap();
+    assert!(refresh.url.ends_with("&start=1"));
+    assert!(
+        refresh.url.contains(&wallet().to_string()),
+        "normal selection must choose A exactly at expiry: {}",
+        refresh.url
+    );
+    assert_eq!(Instant::now(), deadline);
+    running.finish().await;
+}
+
 /// PASS: both refresh classes cool down from terminal completion even when the coordinator is
 /// delayed; queued and retry launches wait, and a routine deferral gets just one successful read.
 #[tokio::test(start_paused = true)]
@@ -1569,6 +1805,13 @@ async fn refresh_cooldown_uses_terminal_time_and_gates_normal_queued_and_retry_p
         running.now.fetch_add(1, Ordering::SeqCst);
         tokio::time::advance(Duration::from_secs(1)).await;
         assert_eq!(Instant::now(), deadline);
+        if !routine {
+            let ordinary = running.requests.recv().await.unwrap();
+            assert!(!ordinary.url.ends_with("&start=1"));
+            ordinary.respond.send(b"[]".to_vec()).unwrap();
+            running.completed(wallet()).await;
+            running.round_completed().await;
+        }
         let retry = running.requests.recv().await.unwrap();
         assert!(
             retry.url.ends_with("&start=1"),
