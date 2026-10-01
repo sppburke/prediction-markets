@@ -828,15 +828,19 @@ async fn deferred_refresh_continues_the_poller() {
             .await
             .is_ok()
     );
+    // The urgent reconciliation runs at once (one backstop plus one urgent read); the
+    // bracket retry waits out the refresh cooldown (#597), one backstop read per second.
+    let installed = installed.lock().unwrap().clone();
+    let cooldown = usize::try_from(pe_service::trade_poller::ANCHOR_REFRESH_SECS).unwrap();
     assert_eq!(
-        *installed.lock().unwrap(),
-        vec![(wallet, 2)],
-        "the urgent reconciliation precedes the bracket retry"
+        installed,
+        vec![(wallet, 2 + cooldown - 1)],
+        "the bracket retry waits for the refresh cooldown after the urgent reconciliation"
     );
     assert_eq!(
         poll_fetcher.calls.load(Ordering::SeqCst),
-        2,
-        "one backstop plus one urgent read"
+        installed[0].1,
+        "no read after the retried anchor installs"
     );
     let mut starts = Vec::new();
     while let Ok(progress) = completed.try_recv() {
@@ -850,7 +854,10 @@ async fn deferred_refresh_continues_the_poller() {
             starts.push(urgent);
         }
     }
-    assert_eq!(starts, vec![false, true]);
+    // A backstop visit, then the urgent reconciliation; the hour of cooldown adds only
+    // ordinary backstop visits before the retry.
+    assert_eq!(starts[..2], [false, true]);
+    assert!(starts[2..].iter().all(|urgent| !urgent), "{starts:?}");
     assert_eq!(
         paper.decision_pending_history().unwrap().len(),
         1,
