@@ -903,7 +903,7 @@ print(int(json.load(open(sys.argv[1], encoding="utf-8"))["side_schema"]))' "$sta
     [[ "${targets[0]}" == "$activity_target" ]] || { echo "FATAL: unexpected second activity top-up" >&2; exit 2; }
   fi
   if [[ "${targets[2]}" == "1" ]]; then
-    echo "   [payout] generation ${targets[1]} already complete on the candidate; reused"
+    echo "   [payout] completed walk at or after the activity head; reused"
   else
     run_refresh_stage "payout" "$PE_BOOTSTRAP_BIN" cache-populate-payout-v2 --db "$side" \
       "${BOOTSTRAP_CONFIG_ARGS[@]}"

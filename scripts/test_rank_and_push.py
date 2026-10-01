@@ -2032,6 +2032,81 @@ raise SystemExit(subprocess.run([sys.executable, 'scripts/_rank_cycle_manifest_r
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(message, result.stderr)
 
+    def test_activity_top_up_refreshes_an_older_payout_and_reuses_it_on_resume(self):
+        """PASS: a top-up refreshes a payout older than its activity head, then
+        plain resume reuses the newer walk and passes real publication freshness.
+        FAIL: stale payout reuse, repeated collection or payout, changed fixed
+        bytes, or missing retained cycle and prepared-request pointers."""
+        import hashlib
+
+        fixed = self._prepare_incremental_fixture(two_file=True)
+        fixed_bytes = fixed.read_bytes()
+        first = self._run(exit_env={"STUB_ACTIVITY_AGE_1": "120", "STUB_EXIT_cache_finalize_v2": "75"})
+        self.assertEqual(first.returncode, 75, first.stderr + first.stdout)
+        self.assertEqual(len(self._bootstrap_lines("cache-populate-activity-v2")), 1)
+        self.assertEqual(len(self._bootstrap_lines("cache-populate-payout-v2")), 1)
+        pointer = self.root / "data/eval-results/rank_and_push.cycle"
+        cycle_bytes = pointer.read_bytes()
+        cycle = self.root / pointer.read_text().strip()
+        request_path = cycle / "ranking_publish_request.json"
+        pending = self.root / "data/eval-results/rank_and_push.pending"
+        self.assertFalse(request_path.exists())
+        self.assertFalse(pending.exists())
+        side = next(fixed.parent.glob("*.side.db"))
+        target = json.loads(side.with_suffix(".stage.json").read_text())["payout_generation"]
+        with sqlite3.connect(side) as c:
+            head = json.loads(c.execute("SELECT fresh_collection_json FROM cache_v2_migration_state").fetchone()[0])
+            head["fixed_end_unix"] -= 90000
+            content = {key: value for key, value in head.items() if key != "digest"}
+            head["digest"] = hashlib.sha256(json.dumps(content, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+            raw = json.dumps(head)
+            c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (raw,))
+            c.execute("UPDATE activity_coverage_manifests_v2 SET reference_sha256=?, collection_identity_json=? WHERE generation=?",
+                      (head["digest"], raw, head["generation"]))
+            c.execute("UPDATE activity_groups_v2 SET source_time_unix=? WHERE coverage_generation=? AND activity_type='TRADE'",
+                      (head["fixed_end_unix"], head["generation"]))
+            c.execute("UPDATE clob_payout_coverage_manifests_v2 SET completed_at_unix=? WHERE generation=?",
+                      (head["fixed_end_unix"] + 1, target))
+
+        second = self._run(exit_env={"STUB_ACTIVITY_AGE_2": "0", "STUB_EXIT_cache_finalize_v2": "75"})
+        self.assertEqual(second.returncode, 75, second.stderr + second.stdout)
+        activity = self._bootstrap_lines("cache-populate-activity-v2")
+        self.assertEqual(len(activity), 2)
+        self.assertIn("--fresh-generation 2", activity[-1])
+        self.assertEqual(len(self._bootstrap_lines("cache-populate-payout-v2")), 2,
+                         "activity top-up reused the stale payout walk")
+        self.assertFalse(request_path.exists())
+        self.assertFalse(pending.exists())
+        with sqlite3.connect(side) as c:
+            top_up = json.loads(c.execute("SELECT fresh_collection_json FROM cache_v2_migration_state").fetchone()[0])
+            payout = c.execute("SELECT generation, completed_at_unix FROM clob_payout_coverage_manifests_v2 ORDER BY generation DESC LIMIT 1").fetchone()
+        self.assertEqual(top_up["generation"], 2)
+        self.assertGreater(payout[0], target)
+        self.assertGreaterEqual(payout[1], top_up["fixed_end_unix"])
+
+        resumed = self._run()
+        self.assertEqual(resumed.returncode, 2, resumed.stderr + resumed.stdout)
+        self.assertIn("RANK_AND_PUSH_PREPARED_ONLY=", resumed.stdout)
+        self.assertEqual(len(self._bootstrap_lines("cache-populate-activity-v2")), 2)
+        self.assertEqual(len(self._bootstrap_lines("cache-populate-payout-v2")), 2)
+        self.assertIn("   [payout] completed walk at or after the activity head; reused", resumed.stdout)
+        self.assertEqual(fixed.read_bytes(), fixed_bytes)
+        self.assertEqual(pointer.read_bytes(), cycle_bytes)
+        self.assertTrue(request_path.is_file())
+        self.assertEqual(self.root / pending.read_text().strip(), request_path)
+        self.assertNotIn("cache-activate", self._bootstrap_ops())
+        # Keep the real publisher isolated from this suite's importable stubs.
+        check = subprocess.run([sys.executable, "-c", """
+import sys
+sys.path.insert(0, sys.argv[1])
+from push_ranking_to_supabase import filter_active_rows
+side, end = sys.argv[2], int(sys.argv[3])
+rows = [{"wallet": "0xabc"}]
+assert filter_active_rows(rows, side, 72, 24, end + 60) == (rows, 0, {"0xabc": end})
+""", str(WRAPPER.parent), str(side), str(top_up["fixed_end_unix"])], capture_output=True, text=True)
+        self.assertEqual(check.returncode, 0, check.stderr)
+        print("PASS: activity top-up refreshes an older payout, plain resume reuses it, and real publication freshness passes")
+
     def test_manually_completed_top_up_is_adopted_and_uses_exact_freshness_boundary(self):
         self._prepare_incremental_fixture()
         first = self._run(exit_env={"STUB_ACTIVITY_AGE_1": "180000", "STUB_FAIL_ACTIVITY_GENERATION": "2"})
@@ -2543,7 +2618,7 @@ finally:
         self.assertEqual(len(list((self.root / "phys").glob("wallet_cache.*.side.db"))), 0)
         self.assertEqual(len(list((self.root / "phys").glob("wallet_cache.*.prior.db"))), 0)
         self._assert_lane_record(self.root / "data/eval-results" / out / "accepted_cycle_manifest.json")
-        self.assertIn("[payout] generation 4 already complete on the candidate; reused", second.stdout)
+        self.assertIn("   [payout] completed walk at or after the activity head; reused", second.stdout)
         print("PASS: recurring lane resumes its own candidate and reuses the completed payout walk")
 
     def test_lane_is_frozen_with_the_cycle_across_opt_in_changes(self):
