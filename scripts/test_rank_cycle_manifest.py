@@ -211,5 +211,25 @@ class CandidateTargetsTest(unittest.TestCase):
                                      after_collection=True, now=90000, max_staleness_hours=24), (2, 1, 0, 0, 0))
 
 
+    def test_after_collection_refreshes_a_completed_payout_below_the_target(self):
+        """PASS: a fresh completed walk below the staged payout target is not reused, for
+        both baselines. FAIL: reuse without the newest generation reaching the target."""
+        root = identity()
+        with sqlite3.connect(self.side) as c:
+            c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (root,))
+            c.execute("INSERT INTO activity_coverage_manifests_v2(generation, reference_sha256, collection_identity_json) VALUES (1, ?, ?)", (json.loads(root)["digest"], root))
+            c.execute("INSERT INTO clob_payout_coverage_manifests_v2(generation, completed_at_unix) VALUES (1, 100)")
+        with sqlite3.connect(self.prior) as c:
+            c.execute("INSERT INTO clob_payout_coverage_manifests_v2(generation, completed_at_unix) VALUES (1, 100)")
+        self.assertEqual(candidate_targets(self.prior, self.side, after_collection=True,
+                                           now=100, max_staleness_hours=24), (1, 2, 0))
+        self.prior.unlink()
+        self.side.with_suffix(".stage.json").write_text(json.dumps(dict(
+            version=1, side_path=str(self.side), prior_path=str(self.prior),
+            source_sha256="a" * 64, activity_generation=0,
+            payout_generation=2, fresh_identity=None)))
+        self.assertEqual(candidate_targets(None, self.side, after_collection=True,
+                                           now=100, max_staleness_hours=24), (1, 2, 0))
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
