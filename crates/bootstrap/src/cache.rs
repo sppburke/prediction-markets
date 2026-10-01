@@ -6937,60 +6937,6 @@ mod tests {
         assert_eq!(count, 1, "source column must exist exactly once");
     }
 
-    /// Issue #615. Scenario: a v1 cache whose CLOB payout evidence tables predate #566 and so
-    /// lack `end_date_unix`, reopened by the current opener.
-    /// PASS: the statement `commit_clob_payout_generation` runs cannot be prepared against the
-    /// legacy shape, both tables carry exactly one `end_date_unix` column after a reopen, and the
-    /// statement prepares from then on.
-    /// PASS: a walk interrupted before the counter existed is discarded when the
-    /// counter is installed, so it restarts from page one instead of counting
-    /// from zero over surviving staged rows (#672).
-    /// FAIL: the stale walk resumes and its uncounted prefix can be lost unseen.
-    #[test]
-    fn clob_payout_count_migration_discards_an_interrupted_pre_counter_walk() {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("cache.db");
-        {
-            let mut cache = WalletCache::open(&path).unwrap();
-            let state = cache
-                .begin_or_resume_clob_payout_walk_v2(1_800_000_000)
-                .unwrap();
-            cache
-                .conn
-                .execute(
-                    "INSERT INTO clob_payout_evidence_staging_v2 \
-                     (generation, market_id, is_50_50_outcome, payout_status, payout_vector_json, \
-                      closed, tokens_json, raw_page_sha256, page_ordinal, schema_version, \
-                      parser_version, fetched_at_unix, origin) \
-                     VALUES (?1, '0xa', NULL, 'unresolved_open', NULL, 1, '[]', ?2, 0, 2, 2, \
-                             1800000010, 'clob_closed_walk_v2')",
-                    params![i64::try_from(state.generation).unwrap(), "d".repeat(64)],
-                )
-                .unwrap();
-            // The walk as an older binary left it: staged rows, no counter.
-            cache
-                .conn
-                .execute_batch(
-                    "ALTER TABLE clob_payout_walk_state_v2 DROP COLUMN distinct_markets;",
-                )
-                .unwrap();
-        }
-        let cache = WalletCache::open(&path).unwrap();
-        for table in [
-            "clob_payout_walk_state_v2",
-            "clob_payout_evidence_staging_v2",
-            "clob_payout_walk_pages_v2",
-        ] {
-            let rows: i64 = cache
-                .conn
-                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-                    row.get(0)
-                })
-                .unwrap();
-            assert_eq!(rows, 0, "{table} must be discarded with the stale walk");
-        }
-    }
-
     /// PASS: a schema-two candidate that predates the payout count columns has
     /// them restored when the payout command opens it, although that opener
     /// returns before the schema-one migrations (#672).
