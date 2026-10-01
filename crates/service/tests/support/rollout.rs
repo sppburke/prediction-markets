@@ -81,6 +81,7 @@ struct HttpState {
     start: Mutex<Option<pe_event_log::AppendReceipt>>,
     authority: Mutex<Authority>,
     activity: Mutex<HashMap<String, Vec<Value>>>,
+    positions: Mutex<Vec<Value>>,
     slow_started: Notify,
     slow: Semaphore,
     release_slow: std::sync::atomic::AtomicBool,
@@ -131,7 +132,19 @@ async fn serve(
         return (StatusCode::OK, Json(json!(data)));
     }
     if path == "/positions" {
-        return (StatusCode::OK, Json(json!([])));
+        let data = state
+            .positions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|row| {
+                row["proxyWallet"] == *q.get("user").unwrap()
+                    && row["redeemable"].as_bool().unwrap()
+                        == (q.get("redeemable").unwrap() == "true")
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        return (StatusCode::OK, Json(json!(data)));
     }
     if path == "/markets" {
         let token = q
@@ -428,6 +441,7 @@ async fn run_case(boot_waves: bool) {
                 vec![row(wallet(4), 4, now - 20, 400)],
             ),
         ])),
+        positions: Mutex::new(Vec::new()),
         slow_started: Notify::new(),
         slow: Semaphore::new(0),
         release_slow: AtomicBool::new(boot_waves),
@@ -786,7 +800,7 @@ async fn run_case(boot_waves: bool) {
         .clone();
     let decisions = paper.decision_pending_history().unwrap();
     assert!(!decisions.is_empty());
-    // Re-prepare against a completed snapshot, then append a verified suffix to prove restart decodes it.
+    // Re-prepare against completed state, then force one wallet's boot walk to fail locally.
     SourceLogBoot::prepare_checkpoint(&cfg.paper_state_db_path).unwrap();
     Writer::open(&cfg.source_event_log_path)
         .unwrap()
@@ -798,6 +812,44 @@ async fn run_case(boot_waves: bool) {
             .physical_tail
             > prepared_tail
     );
+    let mut corrupt = row(wallet(1), 1, now - 20, 101);
+    corrupt["size"] = json!("-1");
+    state
+        .activity
+        .lock()
+        .unwrap()
+        .get_mut(&wallet(1).to_string())
+        .unwrap()
+        .push(corrupt);
+    rusqlite::Connection::open(&cfg.paper_state_db_path)
+        .unwrap()
+        .execute(
+            "UPDATE position_anchors SET anchored_at_unix=?3 WHERE wallet_hex IN (?1, ?2)",
+            rusqlite::params![wallet(1).to_string(), wallet(2).to_string(), now - 4000],
+        )
+        .unwrap();
+    // No eligible anchor is reused, so boot validates both wallets. The healthy venue mirror
+    // matches its recorded balance; only the negative-size wallet is left unvalidated.
+    *state.positions.lock().unwrap() = paper
+        .leader_positions()
+        .unwrap()
+        .into_iter()
+        .filter(|position| position.wallet == wallet(2))
+        .map(|position| {
+            let market =
+                usize::from_str_radix(position.market_id.0.0.trim_start_matches("0x"), 16).unwrap();
+            assert_eq!(position.short_contracts, ShareAmount::ZERO);
+            json!({
+                "proxyWallet": position.wallet,
+                "conditionId": position.market_id.0.0,
+                "asset": (market * 2 + 101 + usize::from(position.outcome_id.0)).to_string(),
+                "outcomeIndex": position.outcome_id.0,
+                "size": position.long_contracts.to_decimal().to_string(),
+                "negativeRisk": false,
+                "redeemable": market == 5,
+            })
+        })
+        .collect();
     state.gamma_fails.store(false, Ordering::SeqCst);
     let child = Child::start(&config_path);
     until(|| {
@@ -810,18 +862,14 @@ async fn run_case(boot_waves: bool) {
     .await;
     until(|| {
         let a = state.authority.lock().unwrap();
-        a.projection.len() == 3
-            && !a
-                .projection
-                .iter()
-                .any(|row| row["wallet_hex"] == wallet(3).to_string())
+        a.projection.len() == 2
+            && !a.projection.iter().any(|row| {
+                row["wallet_hex"] == wallet(1).to_string()
+                    || row["wallet_hex"] == wallet(3).to_string()
+            })
     })
     .await;
-    let second_logs = child.stop().await;
-    assert!(
-        second_logs.contains("\"checkpoint_used\":true"),
-        "{second_logs}"
-    );
+    assert!(!paper.is_wallet_fenced(&wallet(1)).unwrap());
     assert!(paper.is_wallet_fenced(&wallet(3)).unwrap());
     assert!(!paper.is_wallet_fenced(&wallet(2)).unwrap());
     assert_eq!(paper.financial_snapshot(now + 1000).unwrap(), financial);
@@ -838,7 +886,66 @@ async fn run_case(boot_waves: bool) {
             ledger.get(&w)
         );
     }
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let epoch = OffsetDateTime::now_utc().unix_timestamp();
+    let copying = row(wallet(2), 6, epoch, 2006);
+    let copying_id = pe_source_polymarket_public::parse_activity_trade_observation(
+        &serde_json::to_vec(&copying).unwrap(),
+    )
+    .unwrap()
+    .group_id
+    .key()
+    .clone();
+    state
+        .activity
+        .lock()
+        .unwrap()
+        .get_mut(&wallet(2).to_string())
+        .unwrap()
+        .push(copying);
+    until(|| paper.list_fills().unwrap().len() == 3).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let second_logs = child.stop().await;
+    assert!(
+        second_logs.contains("\"checkpoint_used\":true"),
+        "{second_logs}"
+    );
+    assert!(
+        second_logs.contains("boot bracket: wallet left unvalidated for runtime admission"),
+        "{second_logs}"
+    );
+    assert!(
+        second_logs.contains("invalid share amount"),
+        "{second_logs}"
+    );
+    let fills = paper.list_fills().unwrap();
+    assert_eq!(fills.len(), 3);
+    let copied = fills
+        .iter()
+        .filter(|fill| fill.market_id.0.0 == condition(6))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        copied.len(),
+        1,
+        "the healthy wallet copies once across repeated polls"
+    );
+    assert!(copied[0].quantity > ShareAmount::ZERO);
     let era = paper_era(scan_paper_log(&cfg.event_log_path).unwrap());
+    let prepared = era.frames.iter().filter(|frame| matches!(
+        &frame.frame,
+        pe_service::paper_recovery::PaperLogFrame::Record(PaperLogRecord::FinancialPrepared {
+            payload: FinancialPayload::Fill { operation, .. }, ..
+        }) if operation.leader_wallet == wallet(2) && operation.source_trade_id == copying_id
+    )).collect::<Vec<_>>();
+    assert_eq!(prepared.len(), 1);
+    assert_eq!(prepared[0].receipt.sequence, copied[0].prepared_seq);
+    assert_eq!(era.frames.iter().filter(|frame| matches!(
+        &frame.frame,
+        pe_service::paper_recovery::PaperLogFrame::Record(PaperLogRecord::FinancialFinal {
+            prepared_receipt,
+            result: pe_service::paper_recovery::FinancialResult::Fill { canonical },
+        }) if *prepared_receipt == prepared[0].receipt && canonical.outcome == "applied" && canonical.quantity == copied[0].quantity
+    )).count(), 1, "the unique fill has a matching durable financial Final");
     let entries = crate::golden::BracketFinancialHarness::entries(&wallets);
     let initial = pe_trader_index::Watchlist {
         active_count: entries.len(),

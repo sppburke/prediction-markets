@@ -1927,11 +1927,26 @@ async fn mutation_between_each_bracket_step_installs_nothing() {
                 }
             },
         );
-        let error = validator(stable_responses(&[(wallet, 1, "1.000000")]))
+        let result = validator(stable_responses(&[(wallet, 1, "1.000000")]))
             .with_step_hook(hook)
-            .validate_direct(&[wallet], &mut engine, &paper)
-            .await
-            .unwrap_err();
+            .validate_direct_with_deferrals(&[wallet], &mut engine, &paper)
+            .await;
+        let error = if target_step == 5 {
+            result
+                .err()
+                .expect("the atomic install race still fails boot")
+        } else {
+            let outcome = result.expect("wallet-scoped ledger changes defer before installation");
+            assert!(outcome.accepted.is_empty());
+            assert_eq!(outcome.deferred.len(), 1);
+            let (deferred, error) = outcome.deferred.into_iter().next().unwrap();
+            assert_eq!(deferred, wallet);
+            assert_eq!(
+                error.class(),
+                pe_service::position_seeder::FailureClass::WalletTransient
+            );
+            error
+        };
         assert!(matches!(
             error,
             CausalPositionError::LedgerRevision { .. } | CausalPositionError::AnchorInstall(_)
@@ -5238,6 +5253,68 @@ async fn routine_refresh_retries_covered_history_intervention() {
     );
     drop(preparer);
     actor.await.unwrap();
+}
+
+#[tokio::test]
+async fn negative_share_amount_defers_only_that_wallet_and_promotes_only_seeded_healthy_history() {
+    let healthy = wallet(0x74);
+    let corrupt = wallet(0x75);
+    for seeded in [true, false] {
+        let (_dir, paper, mut engine) = fresh(&[]);
+        for wallet in [healthy, corrupt].into_iter().filter(|_| seeded) {
+            paper
+                .record_reconciled_history_status(&WalletHistoryStatusRecord {
+                    wallet,
+                    complete: false,
+                    proof_json: "{\"seed\":true}".to_owned(),
+                    updated_at_unix: 1,
+                })
+                .unwrap();
+        }
+        let corrupt_history = paper.wallet_history_status(&corrupt).unwrap();
+        let mut responses = stable_responses(&[(healthy, 1, "1.000000")]);
+        let row = activity(corrupt, 2, "-1.000000", "0xnegative-size", 10);
+        responses.insert(
+            activity_url(corrupt),
+            vec![serde_json::to_vec(&[row]).unwrap()],
+        );
+
+        let outcome = validator(responses)
+            .validate_direct_with_deferrals(&[corrupt, healthy], &mut engine, &paper)
+            .await
+            .unwrap();
+        assert_eq!(outcome.accepted.len(), 1);
+        assert_eq!(outcome.accepted[0].wallet, healthy);
+        assert_eq!(outcome.deferred.len(), 1);
+        let (wallet, error) = &outcome.deferred[0];
+        assert_eq!(*wallet, corrupt);
+        assert!(matches!(
+            error,
+            CausalPositionError::Activity {
+                source: ActivityReadError::Parse(ActivityParseError::InvalidRow {
+                    source: ActivityValidationError::InvalidShareAmount { .. },
+                    ..
+                }),
+                ..
+            }
+        ));
+        assert!(!is_deferred_causal_position_error(error));
+        assert_eq!(
+            error.class(),
+            pe_service::position_seeder::FailureClass::WalletPersistent
+        );
+        assert_eq!(paper.position_anchors(&healthy).unwrap().len(), 1);
+        assert!(paper.position_validation(&healthy).unwrap().is_some());
+        assert!(paper.position_anchors(&corrupt).unwrap().is_empty());
+        assert!(paper.position_validation(&corrupt).unwrap().is_none());
+        assert!(!paper.is_wallet_fenced(&corrupt).unwrap());
+        assert_eq!(paper.wallet_history_complete(&healthy).unwrap(), seeded);
+        assert!(!paper.wallet_history_complete(&corrupt).unwrap());
+        assert_eq!(
+            paper.wallet_history_status(&corrupt).unwrap(),
+            corrupt_history
+        );
+    }
 }
 
 #[tokio::test]

@@ -671,6 +671,7 @@ pub struct TradePoller {
     admission_preparer: Option<AdmissionPreparer>,
     refresh_cursor: usize,
     refresh_reanchor_turn: bool,
+    refresh_cooldown: HashMap<WalletAddress, tokio::time::Instant>,
     now: Arc<dyn Fn() -> OffsetDateTime + Send + Sync>,
     source_receipts: Option<SourceReceiptIndex>,
     #[cfg(feature = "scenario")]
@@ -767,6 +768,7 @@ enum Completion {
     Refreshed(
         WalletAddress,
         Result<(AnchorRefreshOutcome, bool), TradePollerOwnerError>,
+        tokio::time::Instant,
     ),
     BoundaryInstalled(Result<PendingBoundary, TradePollerOwnerError>),
     BoundaryPublished(PendingBoundary, Result<(), TradePollerOwnerError>),
@@ -793,6 +795,7 @@ pub enum PollerProgress {
 pub struct PollerWait {
     pub obligations: ReconciliationObligations,
     pub wake: Option<tokio::time::Instant>,
+    pub refresh_cooldown: HashMap<WalletAddress, tokio::time::Instant>,
 }
 
 fn remove_wallet_obligation(selected: &mut WalletObligations, epoch: i64, group: &SourceTradeId) {
@@ -838,6 +841,7 @@ impl TradePoller {
             admission_preparer,
             refresh_cursor: 0,
             refresh_reanchor_turn: true,
+            refresh_cooldown: HashMap::new(),
             now: Arc::new(OffsetDateTime::now_utc),
             source_receipts: None,
             #[cfg(feature = "scenario")]
@@ -1130,6 +1134,10 @@ impl TradePoller {
                     let retry = refresh_retry.iter().position(|wallet| {
                         !busy_wallets.contains(wallet)
                             && !self.obligations.by_wallet.contains_key(wallet)
+                            && self
+                                .refresh_cooldown
+                                .get(wallet)
+                                .is_none_or(|deadline| tokio::time::Instant::now() >= *deadline)
                     });
                     let selected =
                         retry
@@ -1138,6 +1146,9 @@ impl TradePoller {
                                 refresh_pending.filter(|wallet| {
                                     !busy_wallets.contains(wallet)
                                         && !self.obligations.by_wallet.contains_key(wallet)
+                                        && self.refresh_cooldown.get(wallet).is_none_or(
+                                            |deadline| tokio::time::Instant::now() >= *deadline,
+                                        )
                                 })
                             });
                     if let Some(wallet) = selected {
@@ -1148,10 +1159,9 @@ impl TradePoller {
                         let observed = handoff.clone();
                         let operation = self.operation();
                         let handle = tasks.spawn(async move {
-                            Completion::Refreshed(
-                                wallet,
-                                operation.refresh_one_wallet(wallet, &observed).await,
-                            )
+                            let result = operation.refresh_one_wallet(wallet, &observed).await;
+                            let completed_at = tokio::time::Instant::now();
+                            Completion::Refreshed(wallet, result, completed_at)
                         });
                         busy_wallets.insert(wallet);
                         refresh_busy = true;
@@ -1198,6 +1208,7 @@ impl TradePoller {
                 let _ = observer.try_send(PollerWait {
                     obligations: self.obligations.clone(),
                     wake,
+                    refresh_cooldown: self.refresh_cooldown.clone(),
                 });
             }
             tokio::select! {
@@ -1256,7 +1267,7 @@ impl TradePoller {
                                     if attempts.get(&wallet).is_some_and(|attempt| attempt.selected.is_empty()) {
                                         attempts.remove(&wallet);
                                     }
-                                    if refresh_reconcile.contains_key(&wallet) && !refresh_retry.contains(&wallet) {
+                                    if refresh_reconcile.remove(&wallet).is_some() && !refresh_retry.contains(&wallet) {
                                         refresh_retry.push_back(wallet);
                                     }
                                 }
@@ -1277,10 +1288,19 @@ impl TradePoller {
                                     .map(|obligation| obligation.receipt).collect(),
                             });
                         }
-                        Some(Ok(Completion::Refreshed(wallet, result))) => {
+                        Some(Ok(Completion::Refreshed(wallet, result, completed_at))) => {
                             busy_wallets.remove(&wallet);
                             refresh_busy = false;
                             refresh_visit = None;
+                            match &result {
+                                Ok((AnchorRefreshOutcome::Deferred, _)) => {
+                                    self.refresh_cooldown.insert(wallet, completed_at + Duration::from_secs(ANCHOR_REFRESH_SECS));
+                                }
+                                Ok((AnchorRefreshOutcome::Anchored, _)) => {
+                                    self.refresh_cooldown.remove(&wallet);
+                                }
+                                _ => {}
+                            }
                             match result {
                                 Ok((AnchorRefreshOutcome::Cancelled, _)) => {
                                     if !refresh_retry.contains(&wallet) { refresh_retry.push_back(wallet); }
@@ -1503,6 +1523,13 @@ impl TradePoller {
         for offset in 0..wallets.len() {
             let index = self.refresh_cursor.saturating_add(offset) % wallets.len();
             let wallet = wallets[index];
+            if self
+                .refresh_cooldown
+                .get(&wallet)
+                .is_some_and(|deadline| tokio::time::Instant::now() < *deadline)
+            {
+                continue;
+            }
             let coverage = self
                 .paper_state
                 .wallet_coverage(&wallet)

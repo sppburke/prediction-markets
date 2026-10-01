@@ -534,16 +534,12 @@ impl DirectValidationOutcome {
     }
 }
 
-/// Exact per-wallet source outcomes that retry without fencing or failing boot.
+/// Legacy deferrals in addition to the wallet-scoped failure classifier at boot.
 ///
-/// A venue history the activity row parser refuses (issue #594: rehearsal attempt 9 aborted the
-/// whole boot on one wallet's `TRADE` row with price 3.1968021978) is that wallet's problem. A
-/// `validate_direct` walk that encounters the row leaves the wallet out of the accepted set
-/// (unvalidated for runtime admission; a wallet reused on a fresh anchor is not re-read at boot),
-/// and a live wallet's periodic refresh yields `Deferred`, retried whenever the refresh rotation
-/// selects it while it keeps the anchor it already holds (issue #597). Only the observed shape is
-/// deferred: malformed pages, window invalidations, other row validations, aggregation and
-/// identity failures stay fatal.
+/// This narrower predicate retains position/activity races, saturated terminal seconds,
+/// invalid prices (#594), and transient/rate-limited source reads. Boot also defers every
+/// wallet-scoped classifier outcome; shared failures outside this predicate still fail boot.
+/// Runtime refresh keeps its existing error policy and leaves a deferred wallet's anchor intact.
 #[must_use]
 pub fn is_deferred_causal_position_error(error: &CausalPositionError) -> bool {
     match error {
@@ -797,15 +793,11 @@ impl CausalPositionValidator {
                 Ok(acceptance) => accepted.push(acceptance),
                 // A newly durable fence is deterministic quarantine (the
                 // commit already recorded it; the next boot's pre-bracket
-                // filter would exclude the wallet anyway). A retryable
-                // outcome — positions revised between reads, activity
-                // intervening mid-bracket, or an incomplete source read —
-                // leaves the wallet unvalidated: it stays history-incomplete,
-                // is filtered after the bracket, and re-enters only through
-                // the serialized runtime admission preparer, which owns the
-                // retries (both observed live in the #544 activation
-                // rehearsals as activation deadlocks). Infrastructure errors
-                // and a post-loop ledger revision still fail the boot.
+                // filter would exclude the wallet anyway). Wallet-scoped
+                // classifier outcomes and legacy deferrals leave the wallet
+                // unvalidated for serialized runtime admission. Shared failures
+                // outside the legacy predicate, including a post-loop ledger
+                // revision, still fail boot.
                 Err(CausalPositionError::Fenced { wallet }) => {
                     tracing::warn!(
                         wallet = %wallet,
@@ -813,7 +805,10 @@ impl CausalPositionValidator {
                     );
                     deferred.push((wallet, CausalPositionError::Fenced { wallet }));
                 }
-                Err(error) if is_deferred_causal_position_error(&error) => {
+                Err(error)
+                    if error.class() != FailureClass::Shared
+                        || is_deferred_causal_position_error(&error) =>
+                {
                     tracing::warn!(
                         wallet = %wallet,
                         outcome = %error,
