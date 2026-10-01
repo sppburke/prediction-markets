@@ -2290,6 +2290,11 @@ async fn refinalization_refuses_changed_or_missing_projection_proof() {
             "impossible row count",
         ),
         (
+            "payout_committed_zero",
+            "UPDATE clob_payout_coverage_manifests_v2 SET evidence_count = 0 WHERE market_count > 0",
+            "impossible row count",
+        ),
+        (
             "payout_market",
             "UPDATE clob_payout_evidence_v2 SET market_id = '0xother'
              WHERE market_id = '0xlater-a'",
@@ -8115,6 +8120,220 @@ fn dataset_row(wallet: &str, market: &str, id: &str, side: &str, epoch: i64) -> 
         "price":"0.500000", "timestamp":epoch, "transactionHash":id, "outcomeIndex":"0"})
 }
 
+#[tokio::test]
+async fn payout_duplicate_and_blank_ids_finalize_with_distinct_evidence_and_projection() {
+    let dir = TempDir::new().unwrap();
+    let half: Value = serde_json::from_str(include_str!(
+        "../../source-polymarket-public/tests/fixtures/clob_market_5050.json"
+    ))
+    .unwrap();
+    let winner: Value = serde_json::from_str(include_str!(
+        "../../source-polymarket-public/tests/fixtures/clob_market_winner.json"
+    ))
+    .unwrap();
+    for duplicate in [true, false] {
+        let side = dataset_candidate(&dir, &format!("payout-{duplicate}.db"), &[]);
+        let mut row = dataset_row(
+            WALLET,
+            half["condition_id"].as_str().unwrap(),
+            "fixture-buy",
+            "BUY",
+            1_673_654_400 - 60,
+        );
+        row["asset"] = half["tokens"][0]["token_id"].clone();
+        row["outcome"] = half["tokens"][0]["outcome"].clone();
+        populate_activity_fresh_v2(
+            &side,
+            &DatasetFetcher {
+                rows: vec![row],
+                ..Default::default()
+            },
+            "https://data.example",
+            1,
+            FRESH_END,
+            FRESH_END + 1,
+        )
+        .await
+        .unwrap();
+        let mut extra = half.clone();
+        if !duplicate {
+            extra = winner.clone();
+            extra["condition_id"] = Value::from("");
+        }
+        let responses = if duplicate {
+            HashMap::from([
+                (
+                    "https://clob.example/markets?closed=true&limit=1000".to_owned(),
+                    serde_json::to_vec(
+                        &serde_json::json!({"data":[half, winner], "next_cursor":"MTAwMA=="}),
+                    )
+                    .unwrap(),
+                ),
+                (
+                    "https://clob.example/markets?closed=true&limit=1000&next_cursor=MTAwMA=="
+                        .to_owned(),
+                    serde_json::to_vec(&serde_json::json!({"data":[extra], "next_cursor":"LTE="}))
+                        .unwrap(),
+                ),
+            ])
+        } else {
+            HashMap::from([(
+                "https://clob.example/markets?closed=true&limit=1000".to_owned(),
+                serde_json::to_vec(
+                    &serde_json::json!({"data":[half, winner, extra], "next_cursor":"LTE="}),
+                )
+                .unwrap(),
+            )])
+        };
+        let manifest = ClobFetcher::new(
+            "https://clob.example".to_owned(),
+            FixtureFetcher::new(responses),
+        )
+        .fetch_closed_markets(&mut WalletCache::open(&side).unwrap())
+        .await
+        .unwrap()
+        .coverage_manifest
+        .unwrap();
+        assert_eq!(manifest.counts.markets, 3);
+        assert_eq!(manifest.counts.pages, if duplicate { 2 } else { 1 });
+        assert_eq!(
+            count(&side, "SELECT COUNT(*) FROM clob_payout_evidence_v2"),
+            2
+        );
+        assert_eq!(
+            count(
+                &side,
+                "SELECT evidence_count FROM clob_payout_coverage_manifests_v2"
+            ),
+            2
+        );
+        let stage = finalize_cache_v2(
+            &side,
+            &dir.path().join(format!("payout-{duplicate}-stage.json")),
+            FRESH_END + 2,
+        )
+        .unwrap();
+        assert_eq!(stage.ranker_projection_count, 1);
+        assert_eq!(
+            stage.ranker_projection_digest,
+            reference_projection_digest(&side)
+        );
+        assert_eq!(stage.cache_sha256, sha256_file(&side).unwrap());
+    }
+}
+
+#[tokio::test]
+async fn clob_payout_count_migration_discards_an_interrupted_pre_counter_walk() {
+    let dir = TempDir::new().unwrap();
+    let side = dir.path().join("payout-recovery.db");
+    drop(seed_v1(&side, FRESH_END - 10));
+    {
+        let mut cache = WalletCache::open(&side).unwrap();
+        let state = cache
+            .begin_or_resume_clob_payout_walk_v2(FRESH_END)
+            .unwrap();
+        let evidence = pe_source_polymarket_public::parse_clob_market(
+            br#"{"condition_id":"0xa", "closed":true, "tokens":[]}"#,
+        )
+        .unwrap()
+        .resolution_evidence();
+        cache
+            .commit_clob_payout_page_v2(
+                state.generation,
+                &ClobCoveragePage {
+                    ordinal: 0,
+                    request_cursor: None,
+                    returned_next_cursor: Some("MTAwMA==".to_owned()),
+                    raw_sha256: "d".repeat(64),
+                    market_count: 1,
+                    closed_market_count: 1,
+                    resolved_payout_count: 0,
+                    unresolved_payout_count: 1,
+                    explicit_fifty_fifty_count: 0,
+                },
+                &[evidence],
+                FRESH_END + 1,
+            )
+            .unwrap();
+        for table in [
+            "clob_payout_walk_state_v2",
+            "clob_payout_evidence_staging_v2",
+            "clob_payout_walk_pages_v2",
+        ] {
+            assert_eq!(count(&side, &format!("SELECT COUNT(*) FROM {table}")), 1);
+        }
+        cache
+            .raw_conn_for_test()
+            .execute_batch("ALTER TABLE clob_payout_walk_state_v2 DROP COLUMN distinct_markets;")
+            .unwrap();
+    }
+    let cache = WalletCache::open(&side).unwrap();
+    for table in [
+        "clob_payout_walk_state_v2",
+        "clob_payout_evidence_staging_v2",
+        "clob_payout_walk_pages_v2",
+    ] {
+        assert_eq!(
+            count(&side, &format!("SELECT COUNT(*) FROM {table}")),
+            0,
+            "{table} must be discarded with the stale walk"
+        );
+    }
+    drop(cache);
+    migrate_cache_v2(&side, &write_build_manifest(&dir, &side)).unwrap();
+    let rows = vec![dataset_row(
+        WALLET,
+        "0xreplacement",
+        "buy",
+        "BUY",
+        FRESH_END,
+    )];
+    populate_activity_fresh_v2(
+        &side,
+        &DatasetFetcher {
+            rows: rows.clone(),
+            ..Default::default()
+        },
+        "https://data.example",
+        1,
+        FRESH_END,
+        FRESH_END + 1,
+    )
+    .await
+    .unwrap();
+    dataset_payouts(&side, &rows).await;
+    assert_eq!(
+        count(&side, "SELECT COUNT(*) FROM clob_payout_evidence_v2"),
+        1
+    );
+    assert_eq!(
+        count(
+            &side,
+            "SELECT COUNT(*) FROM clob_payout_evidence_v2 WHERE market_id = '0xa'"
+        ),
+        0
+    );
+    assert_eq!(
+        count(
+            &side,
+            "SELECT evidence_count FROM clob_payout_coverage_manifests_v2"
+        ),
+        1
+    );
+    let stage = finalize_cache_v2(
+        &side,
+        &dir.path().join("recovery-stage.json"),
+        FRESH_END + 2,
+    )
+    .unwrap();
+    assert_eq!(stage.ranker_projection_count, 1);
+    assert_eq!(
+        stage.ranker_projection_digest,
+        reference_projection_digest(&side)
+    );
+    assert_eq!(stage.cache_sha256, sha256_file(&side).unwrap());
+}
+
 fn dataset_candidate(dir: &TempDir, name: &str, wallets: &[&str]) -> std::path::PathBuf {
     let side = dir.path().join(name);
     let mut cache = seed_v1(&side, FRESH_END - 10);
@@ -9152,14 +9371,40 @@ async fn incremental_versions_windows_and_predecessor_corruption_fail_before_sou
     )
     .await
     .unwrap();
-    Connection::open(&damaged)
-        .unwrap()
-        .execute("DELETE FROM activity_groups_v2", [])
-        .unwrap();
-    let sampled = AtomicUsize::new(0);
-    assert!(
-        pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
-            &collection_config(&damaged),
+    for (name, sql) in [
+        ("missing", "DELETE FROM activity_groups_v2"),
+        (
+            "older",
+            "UPDATE activity_groups_v2 SET coverage_generation = 0",
+        ),
+        (
+            "current",
+            "UPDATE activity_groups_v2 SET coverage_generation = 2",
+        ),
+        (
+            "future",
+            "UPDATE activity_groups_v2 SET coverage_generation = 3",
+        ),
+        // A certified-generation row no receipt covers: only the fused count sees it.
+        (
+            "unreceipted",
+            "INSERT INTO activity_groups_v2
+             SELECT 'g2:unreceipted', coverage_generation, semantic_revision, components_json,
+                    '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee', transaction_hash,
+                    activity_type, condition_id, asset, outcome_id, side, row_count,
+                    share_amount_str, price_weighted_share_amount_str, source_usdc_amount_str,
+                    source_time_unix, is_combo, schema_version, parser_version
+             FROM activity_groups_v2 LIMIT 1",
+        ),
+    ] {
+        let side = dir.path().join(format!("clock-{name}.db"));
+        std::fs::copy(&damaged, &side).unwrap();
+        Connection::open(&side).unwrap().execute_batch(sql).unwrap();
+        let sampled = AtomicUsize::new(0);
+        let calls_before = source.calls.lock().unwrap().len();
+        let hash_before = sha256_file(&side).unwrap();
+        let error = pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
+            &collection_config(&side),
             &source,
             "https://data.example",
             2,
@@ -9172,10 +9417,16 @@ async fn incremental_versions_windows_and_predecessor_corruption_fail_before_sou
             None,
         )
         .await
-        .is_err()
-    );
-    assert_eq!(sampled.load(Ordering::SeqCst), 0);
-    assert_eq!(fresh_record(&damaged)["generation"], 1);
+        .unwrap_err()
+        .to_string();
+        if name == "unreceipted" {
+            assert!(error.contains("unreceipted rows"), "{error}");
+        }
+        assert_eq!(sampled.load(Ordering::SeqCst), 0, "{name}");
+        assert_eq!(source.calls.lock().unwrap().len(), calls_before, "{name}");
+        assert_eq!(fresh_record(&side)["generation"], 1, "{name}");
+        assert_eq!(sha256_file(&side).unwrap(), hash_before, "{name}");
+    }
 }
 
 #[tokio::test]
@@ -9805,6 +10056,23 @@ async fn incremental_admission_rejects_invalid_bounds_generation_and_full_read_s
             ),
             0
         );
+    }
+    // An empty completed predecessor has a nullable maximum and a certified count of zero.
+    let side = dataset_candidate(&dir, "empty-admission.db", &[]);
+    for generation in [1, 2] {
+        let manifest = populate_activity_fresh_v2(
+            &side,
+            &DatasetFetcher::default(),
+            "https://data.example",
+            generation,
+            FRESH_END + i64::try_from(generation).unwrap(),
+            FRESH_END + 3,
+        )
+        .await
+        .unwrap();
+        assert_eq!(manifest.generation, generation);
+        assert_eq!(manifest.group_count, 0);
+        assert_eq!(manifest.source_row_count, 0);
     }
 }
 

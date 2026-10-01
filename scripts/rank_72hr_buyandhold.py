@@ -355,12 +355,12 @@ def process_wallet_positions(w, positions, prm, writer, summaries, floor_pos):
     for p in positions:
         price = p["price"]
         payoff = p["payoff"]
-        gross = (payoff - price) / price
+        gross = (payoff - price) / price if price != 0 else float("nan")
         # realistic price-aware entry slippage (module docstring Stage 2): cross the
         # spread by up to `slip`, never paying more than ~$1; hold-to-resolution has
         # no exit cost (settles at $1/$0).
         eff = min(price + prm.slip, 0.999)
-        net = (payoff - eff) / eff
+        net = (payoff - eff) / eff if eff != 0 else float("nan")
         nets.append(net)
         grosses.append(gross)
         payoffs.append(payoff)

@@ -279,6 +279,59 @@ class FlatRankingGoldenTest(unittest.TestCase):
 
 
 class PositionsOutcomeIdTest(unittest.TestCase):
+    def test_zero_price_shared_scorer_retains_mixed_positions_and_healthy_peer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "cache.db")
+            out = str(Path(tmp) / "out")
+            build_core_cache(db)
+            run_ranker(db, out, "--universe-from-trades", "--half-life-days", "0")
+            raw = read_csv_rows(str(Path(out) / "qualifying_positions_72hr.csv"))
+            for slip in (0.0, SLIP):
+                with self.subTest(slip=slip):
+                    with mock.patch.object(sys, "argv", ["ranker", "--universe-from-trades",
+                            "--win-start", WIN_START_ISO, "--win-end", WIN_END_ISO,
+                            "--as-of", AS_OF_ISO, "--half-life-days", "0",
+                            "--min-avg-per-month", "1", "--min-active-months", "2", "--floor-tstat", "0",
+                            "--slip-cents", str(slip * 100)]):
+                        prm = rk.parse_args()
+                    positions = {w: [dict(market_id=r["market_id"], outcome_id=int(r["outcome_id"]),
+                        entry_ts=int(r["entry_ts"]), ttr=int(r["ttr_secs"]), price=float(r["price"]),
+                        contracts=int(r["contracts"]), payoff=float(r["payoff"]),
+                        resolved_at=int(r["resolved_at"])) for r in raw if r["wallet"] == w]
+                        for w in (WA, WB)}
+                    baseline, baseline_floor, baseline_writer = [], {}, mock.Mock()
+                    for w in (WA, WB):
+                        rk.process_wallet_positions(w, positions[w], prm, baseline_writer,
+                                                    baseline, baseline_floor)
+                    ordinary_rows = baseline_writer.writerows.call_args_list[0].args[0]
+                    positions[WA] += [dict(positions[WA][0], market_id=f"zero-{payoff}",
+                                          price=0.0, payoff=payoff) for payoff in (0.0, 1.0)]
+                    before = {w: [dict(p) for p in rows] for w, rows in positions.items()}
+                    summaries, floor, writer = [], {}, mock.Mock()
+                    for w in (WA, WB):
+                        self.assertEqual(rk.process_wallet_positions(w, positions[w], prm,
+                                         writer, summaries, floor), len(positions[w]))
+                    self.assertEqual(positions, before)
+                    rows = writer.writerows.call_args_list[0].args[0]
+                    self.assertEqual(rows[:-2], ordinary_rows)
+                    self.assertEqual(len(rows), len(positions[WA]))
+                    for row, p in zip(rows[-2:], positions[WA][-2:]):
+                        self.assertEqual(row[:8], (WA, p["market_id"], p["outcome_id"],
+                            p["entry_ts"], p["ttr"], p["price"], p["contracts"], p["payoff"]))
+                        self.assertEqual(row[10], p["resolved_at"])
+                        self.assertTrue(math.isnan(row[8]))
+                        if slip == 0:
+                            self.assertTrue(math.isnan(row[9]))
+                        else:
+                            self.assertEqual(row[9], (p["payoff"] - slip) / slip)
+                    self.assertEqual(summaries[0]["n"], len(positions[WA]))
+                    self.assertEqual(summaries[1], baseline[1])
+                    self.assertEqual(writer.writerows.call_args_list[1],
+                                     baseline_writer.writerows.call_args_list[1])
+                    self.assertIn(WB, baseline_floor)
+                    for actual, expected in zip(floor[WB], baseline_floor[WB]):
+                        np.testing.assert_array_equal(actual, expected)
+
     def test_outcome_id_present_and_first_buy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = str(Path(tmp) / "cache.db")

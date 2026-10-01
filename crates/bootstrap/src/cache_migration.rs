@@ -1123,29 +1123,52 @@ fn begin_or_resume_fresh_collection(
         .as_ref()
         .map(|record| to_i64(record.generation, "fresh activity generation"))
         .transpose()?;
-    for sql in [
+    let head: Option<i64> = transaction.query_row(
         "SELECT MAX(generation) FROM activity_coverage_manifests_v2",
+        [],
+        |row| row.get(0),
+    )?;
+    known = known.max(head);
+    for sql in [
         "SELECT MAX(generation) FROM activity_wallet_coverage_staging_v2",
         "SELECT MAX(activity_generation) FROM cache_frozen_payload_verifications",
-        "SELECT MAX(coverage_generation) FROM activity_groups_v2",
     ] {
         let value: Option<i64> = transaction.query_row(sql, [], |row| row.get(0))?;
         known = known.max(value);
     }
+    // Count the predecessor being certified, not the requested successor.
+    let certified_generation = recorded
+        .as_ref()
+        .map(|record| to_i64(record.generation, "activity generation"))
+        .transpose()?
+        .or(head);
+    let generation_rows = if let Some(certified_generation) = certified_generation {
+        let (maximum, count): (Option<i64>, i64) = transaction.query_row(
+            "SELECT MAX(coverage_generation),
+                    COUNT(CASE WHEN coverage_generation = ?1 THEN 1 END)
+             FROM activity_groups_v2",
+            params![certified_generation],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        known = known.max(maximum);
+        Some(to_u64(count, "generation rows")?)
+    } else {
+        let maximum: Option<i64> = transaction.query_row(
+            "SELECT MAX(coverage_generation) FROM activity_groups_v2",
+            [],
+            |row| row.get(0),
+        )?;
+        known = known.max(maximum);
+        None
+    };
     if generation_i64 <= known.unwrap_or(0) {
         return invalid(format!(
             "fresh activity generation {generation} must exceed the recorded generation {}",
             known.unwrap_or(0)
         ));
     }
-    let head: Option<i64> = transaction.query_row(
-        "SELECT MAX(generation) FROM activity_coverage_manifests_v2",
-        [],
-        |row| row.get(0),
-    )?;
     let prior = if let Some(record) = recorded.as_ref() {
-        let manifest = completed_activity_manifest(&transaction, record.generation, &record.digest,
-            record.fixed_end_unix, &record.wallets)?.ok_or_else(|| BootstrapError::Invalid {
+        let manifest = stored_activity_manifest(&transaction, record.generation)?.ok_or_else(|| BootstrapError::Invalid {
                 message: format!("fresh activity generation {} is incomplete; resume it instead of starting {generation}", record.generation),
             })?;
         if head != Some(to_i64(record.generation, "activity generation")?) {
@@ -1157,16 +1180,35 @@ fn begin_or_resume_fresh_collection(
         if head != Some(to_i64(identity.generation, "activity generation")?) {
             return invalid("prior activity manifest generation mismatch".to_owned());
         }
-        completed_activity_manifest(
-            &transaction,
-            identity.generation,
-            &identity.reference_sha256,
-            identity.fixed_end_unix,
-            &identity.wallets,
-        )?
+        stored_activity_manifest(&transaction, identity.generation)?
     } else {
         None
     };
+
+    let mut prior_wallets = BTreeSet::new();
+    let mut full = BTreeSet::new();
+    if let Some(manifest) = &prior {
+        let identity = activity_identity(&transaction)?;
+        let prior_generation = to_i64(manifest.generation, "activity generation")?;
+        aggregate_scan::scoped(|scan| {
+            verify_activity_manifest_with(
+                &transaction,
+                manifest,
+                &identity.reference_sha256,
+                identity.fixed_end_unix,
+                &identity.wallets,
+                generation_rows,
+                |validation, receipt| {
+                    validation.visit(scan, &transaction, prior_generation, receipt, |_| {})?;
+                    if receipt.excluded() {
+                        full.insert(receipt.wallet_hex.clone());
+                    }
+                    Ok(())
+                },
+            )
+        })?;
+        prior_wallets.extend(identity.wallets);
+    }
 
     let retained = distinct_wallets(
         &transaction,
@@ -1186,35 +1228,7 @@ fn begin_or_resume_fresh_collection(
         validate_wallet_hex(&wallet)?;
         wallets.insert(wallet);
     }
-    let mut prior_wallets = BTreeSet::new();
-    let mut full = BTreeSet::new();
-    if let Some(manifest) = &prior {
-        let identity = activity_identity(&transaction)?;
-        let mut visit = |receipt: ActivityWalletReceiptProof| {
-            prior_wallets.insert(receipt.wallet_hex.clone());
-            if receipt.excluded() {
-                wallets.insert(receipt.wallet_hex.clone());
-                full.insert(receipt.wallet_hex);
-            }
-            Ok(())
-        };
-        if uses_retained_receipts(&manifest.cursors)? {
-            visit_activity_receipts(
-                &transaction,
-                identity.generation,
-                &identity.reference_sha256,
-                identity.fixed_end_unix,
-                &identity.wallets,
-                &mut visit,
-            )?;
-        } else {
-            for receipt in
-                serde_json::from_value::<Vec<ActivityWalletReceiptProof>>(manifest.cursors.clone())?
-            {
-                visit(receipt)?;
-            }
-        }
-    }
+    wallets.extend(full.iter().cloned());
     // Retained history without a receipt is corruption, never a new-wallet exception.
     if recorded.is_some() && !retained.is_subset(&prior_wallets) {
         return invalid("retained wallet has no predecessor proof".to_owned());
@@ -2513,6 +2527,7 @@ fn validate_activity_staging(
             reference_sha256,
             fixed_end_unix,
             wallets,
+            None,
             |validation, receipt| {
                 validation.visit(scan, connection, generation_i64, receipt, |_| {})
             },
@@ -2526,6 +2541,7 @@ fn validate_activity_staging_with(
     reference_sha256: &str,
     fixed_end_unix: i64,
     wallets: &[String],
+    generation_rows: Option<u64>,
     mut visit: impl FnMut(
         &mut ActivityValidation,
         &ActivityWalletReceiptProof,
@@ -2548,12 +2564,18 @@ fn validate_activity_staging_with(
     {
         return invalid("activity coverage is missing frozen wallets".to_owned());
     }
-    let actual: i64 = connection.query_row(
-        "SELECT COUNT(*) FROM activity_groups_v2 WHERE coverage_generation = ?1",
-        params![generation_i64],
-        |row| row.get(0),
-    )?;
-    if to_u64(actual, "generation rows")? != validation.group_count {
+    let actual = match generation_rows {
+        Some(count) => count,
+        None => {
+            let count: i64 = connection.query_row(
+                "SELECT COUNT(*) FROM activity_groups_v2 WHERE coverage_generation = ?1",
+                params![generation_i64],
+                |row| row.get(0),
+            )?;
+            to_u64(count, "generation rows")?
+        }
+    };
+    if actual != validation.group_count {
         return invalid("activity generation contains unreceipted rows".to_owned());
     }
     Ok(validation.finish())
@@ -2728,6 +2750,7 @@ fn verify_activity_manifest(
             reference_sha256,
             fixed_end_unix,
             wallets,
+            None,
             |validation, receipt| validation.visit(scan, connection, generation, receipt, |_| {}),
         )
     })
@@ -2739,6 +2762,7 @@ fn verify_activity_manifest_with(
     reference_sha256: &str,
     fixed_end_unix: i64,
     wallets: &[String],
+    generation_rows: Option<u64>,
     mut visit: impl FnMut(
         &mut ActivityValidation,
         &ActivityWalletReceiptProof,
@@ -2794,6 +2818,7 @@ fn verify_activity_manifest_with(
             reference_sha256,
             fixed_end_unix,
             wallets,
+            generation_rows,
             &mut visit,
         )?
     } else {
@@ -3045,6 +3070,7 @@ fn prepare_activity_manifest(
                 &reference_sha256,
                 fixed_end_unix,
                 &wallets,
+                None,
                 visit,
             )?;
             return Ok((manifest, false));
@@ -3055,6 +3081,7 @@ fn prepare_activity_manifest(
             &reference_sha256,
             fixed_end_unix,
             &wallets,
+            None,
             visit,
         )?
         .into_manifest(

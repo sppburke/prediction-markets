@@ -429,8 +429,8 @@ def candidate_targets(prior_path: Path | None, side_path: Path, *, after_collect
 
     Rust certifies content and linkage on every collection call. This owner only
     establishes cycle membership and the restart-safe one-top-up allowance.
-    The optional fourth integer reports bulk routing; the default three values
-    and their meaning remain unchanged for existing callers.
+    The optional fourth and fifth integers report bulk routing and completed
+    activity; the default three values remain unchanged for existing callers.
     """
     if side_path.with_suffix(".stage.json").exists():
         baseline = read_staging_baseline(side_path)
@@ -466,7 +466,10 @@ def candidate_targets(prior_path: Path | None, side_path: Path, *, after_collect
             bulk = not after_collection and _bulk_root_eligible(side, side_schema, head, generation)
             if side_schema == -2 and not bulk:
                 raise ValueError("invalid unfinished bulk root; resume cache-populate-activity-v2 --bulk-root to diagnose the candidate")
-            return (*values, int(bulk))
+            activity_complete = (side_schema == 2 and head is not None
+                                 and generation == head["generation"]
+                                 and _one(side, "SELECT reference_sha256 FROM activity_coverage_manifests_v2 WHERE generation = ?", (generation,)) == head["digest"])
+            return (*values, int(bulk), int(activity_complete))
 
         if head is None or (head == prior_identity and head["generation"] == previous):
             if after_collection:
@@ -528,7 +531,7 @@ def parse_args():
     targets.add_argument("--after-collection", action="store_true")
     targets.add_argument("--max-staleness-hours", type=int)
     targets.add_argument("--include-bulk-root", action="store_true",
-                         help="append bulk eligibility (0/1); default output stays three lines")
+                         help="append bulk eligibility and activity completion (0/1); default output stays three lines")
     return parser.parse_args()
 
 

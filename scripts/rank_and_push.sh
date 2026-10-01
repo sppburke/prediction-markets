@@ -877,7 +877,7 @@ print(int(json.load(open(sys.argv[1], encoding="utf-8"))["side_schema"]))' "$sta
   local target_output
   target_output="$("$PYTHON_BIN" scripts/rank_cycle_manifest.py candidate-targets --prior "$prior" --side "$side" --include-bulk-root)" || exit $?
   mapfile -t targets <<< "$target_output"
-  [[ "${#targets[@]}" -eq 4 && "${targets[3]}" =~ ^[01]$ ]] || { echo "FATAL: could not derive candidate targets" >&2; exit 2; }
+  [[ "${#targets[@]}" -eq 5 && "${targets[3]}" =~ ^[01]$ && "${targets[4]}" =~ ^[01]$ ]] || { echo "FATAL: could not derive candidate targets" >&2; exit 2; }
   local activity_target="${targets[0]}"
   local -a bulk_args=()
   if [[ "${targets[3]}" == "1" ]]; then
@@ -885,8 +885,10 @@ print(int(json.load(open(sys.argv[1], encoding="utf-8"))["side_schema"]))' "$sta
     [[ ! -f "$prior" ]] || bulk_args+=(--prior "$prior")
   fi
   echo "   [targets] activity generation $activity_target; payout generation ${targets[1]} (complete=${targets[2]})"
-  run_refresh_stage "activity" "$PE_BOOTSTRAP_BIN" cache-populate-activity-v2 --db "$side" \
-    --fresh-generation "$activity_target" "${bulk_args[@]}" "${BOOTSTRAP_CONFIG_ARGS[@]}"
+  if [[ "${targets[4]}" == "0" ]]; then
+    run_refresh_stage "activity" "$PE_BOOTSTRAP_BIN" cache-populate-activity-v2 --db "$side" \
+      --fresh-generation "$activity_target" "${bulk_args[@]}" "${BOOTSTRAP_CONFIG_ARGS[@]}"
+  fi
   local -a freshness_args=()
   [[ -z "$MAX_CACHE_STALENESS_HOURS" ]] || freshness_args+=(--max-staleness-hours "$MAX_CACHE_STALENESS_HOURS")
   target_output="$("$PYTHON_BIN" scripts/rank_cycle_manifest.py candidate-targets --prior "$prior" --side "$side" --include-bulk-root --after-collection "${freshness_args[@]}")" || exit $?
