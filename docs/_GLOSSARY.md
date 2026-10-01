@@ -335,7 +335,7 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `reconciliation_page_limit` | 500 | **Module const** in `source-polymarket-public` (not a TOML/env key). Fixed page size for the #544 activity and current-position proof readers. |
 | `activity_max_offset` | 5,000 | **Module const** in `source-polymarket-public` (not a TOML/env key). A full terminal `/activity` page at this offset is split at an integer-second boundary; a still-full one-second terminal window is typed-incomplete and blocks reconciliation (#544). |
 | `positions_max_offset` | 10,000 | **Module const** in `source-polymarket-public` (not a TOML/env key). Each explicit `redeemable=false` and `redeemable=true` current-position partition is walked independently through this offset. A full terminal page is typed-incomplete (#544). |
-| `anchor_refresh_secs` | 3,600 | **Module const** `ANCHOR_REFRESH_SECS` in `service` (not a TOML/env key). Seconds between best-effort per-wallet position re-anchors; also the in-memory transient admission cooldown from terminal failure completion. Cooldowns survive ranking-batch changes, clear on successful admission, and reset on restart. An owner-selected operational default, not a calibrated value. |
+| `anchor_refresh_secs` | 3,600 | **Module const** `ANCHOR_REFRESH_SECS` in `service` (not a TOML/env key). Seconds between best-effort per-wallet position re-anchors; also the in-memory transient admission cooldown and the refresh-only cooldown for every terminal `Deferred`. Refresh deadlines use monotonic time captured immediately after terminal completion, before coordinator handling, and gate normal selection, retry selection and queued launch. Successful anchoring clears the refresh deadline; cancelled, skipped and unstarted work create none. Cooldowns survive membership/ranking-batch changes and reset on restart; successful admission clears its admission cooldown. An owner-selected operational default, not a calibrated value. |
 | `bracket_concurrency` | 4 | **Module const** `BRACKET_CONCURRENCY` in `service` (not a TOML/env key). Maximum wallet brackets in flight at once during the boot bracket and runtime admission batches (#555 addendum D9). Chosen from the measured per-wallet peak of ~304 MB resident on the largest wallet against the 2 GB production host; every bracket still reads the wallet's full history three times. |
 | `redeem_residual_limit_atomic` | 100 | **Exclusive module const** `REDEEM_RESIDUAL_LIMIT_ATOMIC` in `position-ledger` (#557). A REDEEM underflow residual of 1..=99 atomic units clamps the position closed and is recorded in the version-3 effect document; 100 or more fences. `ShareAmount` has six decimal places, so 100 atomic units equal one ten-thousandth of a position: the limit is one four-decimal `/positions` reporting quantum and accepts venue-display quantization residue without hiding a full reported quantum. SELL and MERGE remain strict, and the tolerance cannot stack within a bucket. |
 | `rehearsal_quiescence` | production unit policy at run time | The #545 rehearsal reads the production `pe-service` unit's `TimeoutStopSec` as its exact quiescence bound and requires `KillSignal` to be SIGINT, the signal handled by the service. The harness owns no separate numeric shutdown bound (#586). |
@@ -364,14 +364,16 @@ skips fresh boot validation. Otherwise boot validates `BRACKET_CONCURRENCY`-size
 wallet passes the final fence, durable-history and acceptance filters; a successful bracket without
 seeded history does not stop the waves. Migration, `--exit-after-anchors` and disabled maintenance
 retain complete validation. Remaining structural members await runtime admission.
-When a required `validate_direct` walk
-encounters a `TRADE` row with a price outside the unit range (issue #594; observed 2026-09-11), the
-wallet is left out of the accepted set like a transient read failure (unvalidated for runtime
-admission; a wallet reused on a fresh anchor is not re-read at boot), and a live wallet's periodic
-anchor refresh reports it deferred instead of ending the poll round, keeping the anchor it already
-holds (issue #597). Malformed pages, window invalidations, other row validations, aggregation and shared
-identity failures remain boot-fatal. Transient identity reads defer only their wallet; rate limits
-and durability failures preserve shared-abort behavior.
+When a required `validate_direct` walk fails, boot defers every wallet-scoped failure class plus
+the legacy deferral predicate (including the invalid-price row observed in #594, transient and
+rate-limited source reads). Only accepted wallets install anchors atomically, and only their seeded
+history promotes to complete. Deferred wallets stay unvalidated for runtime admission; a wallet
+reused on a fresh anchor is not re-read at boot. Shared infrastructure and consistency failures
+outside the legacy predicate retain their boot failure policy. Runtime-refresh error conversion is
+unchanged: a deferred refresh keeps the current anchor usable under existing eligibility rules and
+starts the refresh-only cooldown (#597). A deferred routine refresh still gets its immediate
+incremental follow-up; success consumes that reconciliation marker and queues a cooldown-gated
+refresh retry. Urgent reconciliation and ordinary polling retain their existing behavior.
 
 **Rehearsal isolation.** A #557 rehearsal uses a copy of production durable state at dedicated
 paths, an exclusive loopback bind, and a complete environment that explicitly sets `PE_BIND` plus
