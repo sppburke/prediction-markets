@@ -9385,6 +9385,17 @@ async fn incremental_versions_windows_and_predecessor_corruption_fail_before_sou
             "future",
             "UPDATE activity_groups_v2 SET coverage_generation = 3",
         ),
+        // A certified-generation row no receipt covers: only the fused count sees it.
+        (
+            "unreceipted",
+            "INSERT INTO activity_groups_v2
+             SELECT 'g2:unreceipted', coverage_generation, semantic_revision, components_json,
+                    '0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee', transaction_hash,
+                    activity_type, condition_id, asset, outcome_id, side, row_count,
+                    share_amount_str, price_weighted_share_amount_str, source_usdc_amount_str,
+                    source_time_unix, is_combo, schema_version, parser_version
+             FROM activity_groups_v2 LIMIT 1",
+        ),
     ] {
         let side = dir.path().join(format!("clock-{name}.db"));
         std::fs::copy(&damaged, &side).unwrap();
@@ -9392,24 +9403,25 @@ async fn incremental_versions_windows_and_predecessor_corruption_fail_before_sou
         let sampled = AtomicUsize::new(0);
         let calls_before = source.calls.lock().unwrap().len();
         let hash_before = sha256_file(&side).unwrap();
-        assert!(
-            pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
-                &collection_config(&side),
-                &source,
-                "https://data.example",
-                2,
-                &[],
-                || {
-                    sampled.fetch_add(1, Ordering::SeqCst);
-                    Ok(FRESH_END + 10)
-                },
-                FRESH_END + 11,
-                None,
-            )
-            .await
-            .is_err(),
-            "{name}"
-        );
+        let error = pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
+            &collection_config(&side),
+            &source,
+            "https://data.example",
+            2,
+            &[],
+            || {
+                sampled.fetch_add(1, Ordering::SeqCst);
+                Ok(FRESH_END + 10)
+            },
+            FRESH_END + 11,
+            None,
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        if name == "unreceipted" {
+            assert!(error.contains("unreceipted rows"), "{error}");
+        }
         assert_eq!(sampled.load(Ordering::SeqCst), 0, "{name}");
         assert_eq!(source.calls.lock().unwrap().len(), calls_before, "{name}");
         assert_eq!(fresh_record(&side)["generation"], 1, "{name}");

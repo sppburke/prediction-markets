@@ -506,7 +506,9 @@ or checkpoint stage (#544).
 
 **Oracle rollback (#536):** reverting the ranker code alone does NOT restore the
 prior ranking — `latest_ranking` always serves the maximum `batch_id`. To roll back
-externally: stop the loop, restore the prior revision, run the one-shot with a unique
+externally: restore the prior binary/checkout pair through the
+[release procedure](#forge-release-deployment-and-rollback), leaving the loop stopped, run the
+one-shot with a unique
 `--notes "rollback-of=<batch-id>"` (the note is hashed into the content-addressed
 publish key, guaranteeing a NEW batch even same-day with unchanged inputs — a
 same-day revert without it can reproduce an old key and silently fail to advance the
@@ -1233,10 +1235,11 @@ systemctl --user enable --now pe-rank-loop
 ```
 
 The flag accepts exactly `run` or `stop`. Missing means a clean stop; empty or
-any other value is fatal. The supervisor checks only between completed cycles:
+any other value is fatal. The supervisor checks it before each attempt and every second
+while waiting (retry backoff or idle):
 
 ```bash
-# Graceful: finish the current full cycle, then stop (unit ends inactive/exit 0).
+# Graceful: finish the current attempt, then stop (unit ends inactive/exit 0).
 loop_flag_tmp="data/eval-results/.rank_and_push.loop.$$"
 printf 'stop\n' > "$loop_flag_tmp"
 mv "$loop_flag_tmp" data/eval-results/rank_and_push.loop
