@@ -674,10 +674,8 @@ without writing and recomputes that digest over the committed projection from ei
 connections, one key range each, hashed in key order, so the bytes are the serial read's while its
 random activity reads overlap (#675). A different recorded classifier
 version instead runs full activity verification and rebuilds the projection with the current
-classifier. Classifier version three admits what the live copy path takes: a market's entry history is
-consumed only by a first entry (not by a sell, split, merge or redemption), and an entry whose
-action depends on the order of its second is not projected. An activation accepts an installed
-cache of classifier version one to three. Each rebuilding finalization loads a wallet once, validates its entire aggregate
+classifier. The current classifier version and its entry rules are `ranker_classifier_version`
+in `_GLOSSARY.md`. An activation accepts an installed cache of classifier version one to three. Each rebuilding finalization loads a wallet once, validates its entire aggregate
 vector, then classifies that same vector; a classifier stopping point never truncates validation.
 Manifest installation and projection replacement commit together with a cleared, unfinalized state;
 the finalized state commits in a second transaction, after the digest is computed over the committed
@@ -786,7 +784,7 @@ requires the verified DuckDB snapshot and refuses SQLite.
 The frozen-payload flow above seals one historical snapshot; it cannot collect a later
 generation because the frozen reference is bound to one generation and end, the wallet
 list is fixed to the sealed schema-one history, and activity insertion moves matching rows
-between generations inside one database. Recurring classifier-two publication therefore
+between generations inside one database. Recurring schema-two publication therefore
 builds each new cycle in a **private candidate** copied directly from the checkpointed fixed
 cache and certifies one complete current activity generation for the union of acquisition candidates,
 every retained history and every wallet the prior's newest generation excluded, without a
@@ -1018,7 +1016,7 @@ pending-publication recovery activates and publishes exactly that request. If th
 refuses (stale source times, incomplete coverage), the cycle stops with the installed cache
 untouched and the candidate, staging evidence, any legacy prior and log preserved; do not relabel times, narrow
 membership or relax freshness. Require the next real scheduled refresh and publication
-(installed schema two selects the lane automatically) before closing the classifier-two
+(installed schema two selects the lane automatically) before closing the schema-two
 handoff.
 
 **Recovery states.** Before a prepared request exists, abandon a cycle only after

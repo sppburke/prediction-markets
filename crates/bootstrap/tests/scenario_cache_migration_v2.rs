@@ -1108,7 +1108,7 @@ async fn v2_payout_walk_never_touches_sealed_resolution_or_cursor_rows() {
     );
 }
 
-/// PASS: the projection admits exactly the entries the live copy path takes. A SELL
+/// PASS: only a first entry consumes a market's history. A SELL
 /// of one outcome, or a SPLIT fully MERGEd back, does not consume the market, so the
 /// wallet's later first BUY there is projected; a BUY whose action depends on the
 /// order of its second (a SPLIT of the same outcome in that second) is not. FAIL:

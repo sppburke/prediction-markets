@@ -3281,8 +3281,8 @@ fn classify_loaded_wallet(
         if ledger.apply_all_or_none(&mutations).is_err() {
             break;
         }
-        // As on the live path, only a first entry consumes its market's history;
-        // sells, splits, merges and redemptions do not (docs/_GLOSSARY.md).
+        // Only a first entry consumes its market's history; sells, splits, merges
+        // and redemptions do not (docs/_GLOSSARY.md).
         history.extend(
             first_entries
                 .into_iter()
