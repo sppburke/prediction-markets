@@ -2146,6 +2146,15 @@ pub fn validate_open_continuations(
                 source_trade_id: None,
                 cause: error.to_string(),
             })?;
+    validate_continuation_rows(paper_state, rows, source_receipts)
+}
+
+/// Validate open rows read earlier (for example before a log bound) against `source_receipts`.
+pub(crate) fn validate_continuation_rows(
+    paper_state: &PaperStateDb,
+    rows: Vec<DecisionPendingRow>,
+    source_receipts: &SourceReceiptIndex,
+) -> Result<usize, ContinuationValidationError> {
     let validated = rows.len();
     let mut reads = Vec::<(DecisionContinuationV3, Vec<DecisionContinuationV3>)>::new();
     let mut page_reads = HashMap::<pe_core_types::EventSeq, usize>::new();

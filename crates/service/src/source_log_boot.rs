@@ -355,8 +355,9 @@ impl SourceLogBoot {
     }
 
     /// Prepare while an installed service appends: read-only database/log access, finite size
-    /// bound, no upgrades, activation census, writer lock, or torn-tail repair.
-    pub fn prepare_checkpoint(paper_path: &Path) -> Result<LogTailBinding> {
+    /// bound, no upgrades, activation census, writer lock, or torn-tail repair; also validates
+    /// the open continuations read before the bound.
+    pub fn prepare_checkpoint(paper_path: &Path) -> Result<(LogTailBinding, usize)> {
         let record = MigrationMetadata::read_read_only(paper_path)?
             .context("checkpoint preparation requires installed migration metadata")?;
         ensure!(
@@ -369,6 +370,9 @@ impl SourceLogBoot {
             .source;
         let paper = PaperStateDb::open_read_only_allowing_unmigrated(paper_path)?;
         let financial_era = paper.financial_start()?.is_some();
+        // Read rows before bounding the log: every referenced frame is synced before its row
+        // commits, so the bounded index covers them.
+        let open = paper.open_decision_pending()?;
         let path = &activation.path;
         let byte_bound = std::fs::metadata(path)?.len();
         let cached = load_checkpoint(path, &activation, financial_era);
@@ -415,6 +419,8 @@ impl SourceLogBoot {
         }
         reducers.take_error()?;
         let index = staging.complete(&tail)?;
+        let validated = crate::bucket_commit::validate_continuation_rows(&paper, open, &index)
+            .context("validate open decision continuations before deployment")?;
         let count = tail.last_sequence.map_or(Ok(0), |seq| {
             usize::try_from(seq.0)
                 .ok()
@@ -433,7 +439,7 @@ impl SourceLogBoot {
             activity: reducers.activity,
             daily_boundary: reducers.daily_boundary,
         })?;
-        Ok(tail)
+        Ok((tail, validated))
     }
 
     /// Install the scenario-only fault seams. Scenario builds only.
