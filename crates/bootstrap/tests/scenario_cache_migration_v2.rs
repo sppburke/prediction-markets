@@ -2694,7 +2694,7 @@ async fn stale_classifier_projection_cannot_be_certified() {
     )
     .unwrap();
     // Historical classifier 1 is permitted, but rows still certified by their
-    // unchanged classifier-2 digest cannot be relabeled by changing only state.
+    // unchanged current-classifier digest cannot be relabeled by changing only state.
     let connection = Connection::open(&fixed).unwrap();
     connection
         .execute(
@@ -3456,7 +3456,7 @@ async fn projection_auto_rollback_leaves_manifest_identity_and_state_unchanged()
 //
 // PASS: a fresh generation binds the union of current acquisition candidates
 // and retained histories, resumes only missing wallets, keeps the immutable
-// prior byte-identical, certifies classifier two without a frozen reference,
+// prior byte-identical, certifies the schema-two cache without a frozen reference,
 // and staging copies the checkpointed fixed main exactly under the cache lock.
 // FAIL: a wallet outside the union is fetched, a retry refetches or clears
 // progress, a stale/tampered identity certifies, or a staged copy differs.
