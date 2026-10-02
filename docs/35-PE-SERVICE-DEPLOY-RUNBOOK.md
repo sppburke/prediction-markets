@@ -702,8 +702,8 @@ A continuation validation failure exits nonzero with `open decision continuation
 it blocks the swap for diagnosis without repairing rows or fabricating dispositions. Normal boot
 uses the same validator and logs `open decision continuations validated` with `open_rows=N` before
 resuming any open row. This mandatory validation of actual current rows is the final continuation
-gate before producers, serving requests, and the status writer; rows committed after preparation
-read them must pass it too. A boot-time validation failure is a startup error on stderr/journal (live
+gate before producers, serving requests, and the status writer; rows committed after preparation's
+initial row read must pass it too. A boot-time validation failure is a startup error on stderr/journal (live
 fan-out, the HTTP server, and the status writer have not started yet); the row stays intact and the
 unit's `Restart=on-failure` policy repeats the failed start until the row is diagnosed. A `paper durability became uncertain` exit (for example after a failed risk-halt append)
 repeats the same way until storage works; preserve the era and the pending rows and diagnose
