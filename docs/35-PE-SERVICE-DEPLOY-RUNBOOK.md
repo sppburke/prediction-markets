@@ -684,26 +684,26 @@ open-continuation census does not authorize a plain swap. The binary enters prod
 `activate_financial_era.sh` after a rehearsal attempt passes from a fresh root on the exact merged,
 hash-bound release tree.
 
-For an ordinary compatible update after verified financial activation, leave the service running
-while taking a private online SQLite backup, then copy the source log with `cp -p`, then run the
-staged binary's unchanged `--validate-open-continuations --paper-state ... --source-log ...` on
-those copies. Perform all three operations inside step 4's guarded private-artifact sequence,
-before atomic binary replacement. Use the actual configured database and source paths. Do not run
-the rehearsal itself for this census: it rebinds migration paths and boots the service.
+For an ordinary compatible update after verified financial activation, the census is step 3's
+checkpoint preparation, run by the staged binary while the service keeps running. It reads the open
+continuation rows, then bounds the live source log, and validates each row with boot's validator
+against the receipts it verified. Every frame a row references is synchronized before that row
+commits, so the bound covers it; no database or log copy is made. Do not run the rehearsal itself
+for this census: it rebinds migration paths and boots the service.
 
-A successful copy validates only its captured rows. The source may advance between the backup
-and copy; a torn source tail fails validation and requires a fresh source copy, without repairing the
-copied log or changing production rows. Failure of backup, copy, or census blocks replacement.
-After a successful census, perform only the required restart; skip it if the exact desired binary
-already runs.
+The census validates only the rows it read; rows committed later are validated at boot. A refusal
+publishes no checkpoint and blocks replacement, without repairing rows or the log. After a successful
+census, perform only the required restart; skip it if the exact desired binary already runs.
 
-Record stdout, stderr, and the exit status. Success prints `open_rows=N validated=N` and exits zero.
+Record stdout, stderr, and the exit status. Success prints
+`prepared source checkpoint: <bytes> bytes, sequence <sequence>, validated N open continuations` and
+exits zero.
 A continuation validation failure exits nonzero with `open decision continuation <source_trade_id>: <cause>`;
 it blocks the swap for diagnosis without repairing rows or fabricating dispositions. Normal boot
 uses the same validator and logs `open decision continuations validated` with `open_rows=N` before
 resuming any open row. This mandatory validation of actual current rows is the final continuation
-gate before producers, serving requests, and the status writer; rows added after the private backup
-must pass it too. A boot-time validation failure is a startup error on stderr/journal (live
+gate before producers, serving requests, and the status writer; rows committed after preparation's
+initial row read must pass it too. A boot-time validation failure is a startup error on stderr/journal (live
 fan-out, the HTTP server, and the status writer have not started yet); the row stays intact and the
 unit's `Restart=on-failure` policy repeats the failed start until the row is diagnosed. A `paper durability became uncertain` exit (for example after a failed risk-halt append)
 repeats the same way until storage works; preserve the era and the pending rows and diagnose
@@ -724,8 +724,8 @@ source records, recorded effects, fences, financial records, and publication art
 [canonical continuation and commitment contract](_GLOSSARY.md#continuation-and-commitment-compatibility-588).
 
 **#641 full-history admission repair.** Deploy the request-bound change, bucket history repair,
-and boot anchor proof check together. After verified financial activation, use the private
-state-copy and open-continuation validation procedure above, then the single required restart.
+and boot anchor proof check together. After verified financial activation, use step 3's
+preparation-time open-continuation census, then the single required restart.
 This repair does not create a new financial activation, state generation, table, event, config
 key or migration marker.
 
@@ -755,10 +755,12 @@ Required release evidence for the first-activation/ordinary-update distinction:
 | `online_snapshot_does_not_cover_later_continuation` | A continuation added after the backup is absent from the private census and included by current-state validation. |
 | `post_snapshot_invalid_continuation_blocks_boot_resume` | Invalid newer evidence fails current-state validation before continuation effects; pending rows remain intact for diagnosis and compatible recovery. |
 | `offline_census_rejects_torn_source_copy_without_repair` | The actual census CLI rejects a torn copied frame without changing either input; recover by making fresh copies. |
+| `post_snapshot_invalid_continuation_refuses_real_binary_boot` | Checkpoint preparation and the real binary's boot both refuse the altered continuation by ID; preparation publishes no checkpoint and nothing changes. |
 
 The shell cases belong to `scripts/paper_reset/test_activate_financial_era.sh`; the snapshot/boot
-cases belong to `crates/service/tests/scenario_bucket_commit.rs`. Bind their passing results to the
-exact reviewed release before deployment. A passing private census never substitutes for boot
+cases belong to `crates/service/tests/scenario_bucket_commit.rs`, except the real-binary case in
+`crates/service/tests/scenario_source_log_boot.rs`. Bind their passing results to the
+exact reviewed release before deployment. A passing census never substitutes for boot
 validation or the first financial Start procedure.
 
 ## Facts
@@ -899,7 +901,7 @@ comparisons decide what remains; never guess from memory.
    pre-capture finalization.
 2. **Ship** hash-qualified:
    `scp -i ~/.ssh/id_personal target/release/pe-service sean@82.22.32.225:/tmp/pe-service.new.<desired-sha12>`
-3. **Preflight on the VPS** (read-only; lock first):
+3. **Preflight and checkpoint preparation on the VPS** (lock first; the service keeps running):
 
    ```bash
    exec 9</home/sean/.pe-deploy.lock && flock -n 9 || { echo 'another deploy holds the lock'; exit 1; }
@@ -928,11 +930,24 @@ comparisons decide what remains; never guess from memory.
    with the staged binary against the exact installed paper-state path:
 
    ```bash
-   /tmp/pe-service.new.<desired-sha12> --prepare-source-checkpoint \
-     --paper-state /absolute/path/to/installed/paper_state.db
+   set -euo pipefail
+   art=/home/sean/.pe-deploy-artifacts/<desired-sha12>
+   install -d -m 0700 "$art"
+   umask 077
+   if /tmp/pe-service.new.<desired-sha12> --prepare-source-checkpoint \
+     --paper-state /absolute/path/to/installed/paper_state.db \
+     > "$art/checkpoint-prepare.stdout" 2> "$art/checkpoint-prepare.stderr"; then
+     printf '0\n' > "$art/checkpoint-prepare.exit"
+   else
+     prepare_status=$?
+     printf '%s\n' "$prepare_status" > "$art/checkpoint-prepare.exit"
+     exit "$prepare_status"
+   fi
    ```
 
-   Run this before the guarded binary swap in step 4. The command derives the canonical source path
+   Run this before the guarded binary swap in step 4. It is also the
+   [open-continuation census](#565-open-continuation-census-before-deployment); a nonzero exit stops
+   the deploy. The command derives the canonical source path
    from installed activation metadata and reads Start without upgrading or writing the database. It
    verifies a finite captured source prefix through its last complete frame, excludes incomplete bytes
    without repair, and performs no HTTP requests. Interrupted initial preparation can restart while the
@@ -947,30 +962,13 @@ comparisons decide what remains; never guess from memory.
    measurement. The launch deadline and cooldown use the existing
    [`maintenance_interval_secs` and `ANCHOR_REFRESH_SECS`](./_GLOSSARY.md); started work may overrun it.
 
-4. **Baseline, online census, and atomic swap** (the old process keeps running on its open inode).
-   Run this guarded sequence in the same shell holding the deployment lock. Substitute the actual
-   configured state/source paths for `paper_state.db` and `source_events.log` before execution:
+4. **Baseline and atomic swap** (the old process keeps running on its open inode).
+   Run this guarded sequence in the same shell holding the deployment lock, with `$art` from step 3:
 
    ```bash
    set -euo pipefail
-   art=/home/sean/.pe-deploy-artifacts/<desired-sha12>
-   install -d -m 0700 "$art"
-   umask 077
    cp status.json "$art/status.before.json"
    systemctl show pe-service -p InvocationID -p MainPID -p ExecStart -p WorkingDirectory > "$art/unit.before"
-   sqlite3 -readonly paper_state.db ".backup '$art/paper.before.db'"
-   cp -p source_events.log "$art/source.before.log"
-   chmod 0600 "$art/paper.before.db" "$art/source.before.log"
-   if /tmp/pe-service.new.<desired-sha12> --validate-open-continuations \
-     --paper-state "$art/paper.before.db" \
-     --source-log "$art/source.before.log" \
-     > "$art/continuation-census.stdout" 2> "$art/continuation-census.stderr"; then
-     printf '0\n' > "$art/continuation-census.exit"
-   else
-     census_status=$?
-     printf '%s\n' "$census_status" > "$art/continuation-census.exit"
-     exit "$census_status"
-   fi
    [ -f target/release/pe-service.bak-<prior-sha12> ] || cp -p target/release/pe-service target/release/pe-service.bak-<prior-sha12>
    sha256sum target/release/pe-service.bak-<prior-sha12>       # = prior (= installed = running)
    chmod 0755 /tmp/pe-service.new.<desired-sha12>

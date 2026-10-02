@@ -1187,6 +1187,26 @@ async fn pre_start_boot_membership_case(case: PreStartBootCase) {
         let source_log = std::fs::read(&paths.source_log).unwrap();
         assert!(!cfg.status_path.exists());
         requests.lock().unwrap().clear();
+        let sidecar = paths.source_log.with_extension("log.boot-checkpoint");
+        let sidecar_before = std::fs::read(&sidecar).ok();
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pe-service"));
+        command
+            .env_clear()
+            .arg("--prepare-source-checkpoint")
+            .arg("--paper-state")
+            .arg(&paths.fixed_main);
+        let output = support::bounded_command_output(command).await;
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(!output.status.success(), "{stderr}");
+        assert!(
+            stderr.contains("validate open decision continuations before deployment"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("open decision continuation {id}:")),
+            "{stderr}"
+        );
+        assert_eq!(std::fs::read(&sidecar).ok(), sidecar_before);
         source.batch.store(8, Ordering::SeqCst);
         let output = boot_binary(&config_path, false).await;
         let stderr = String::from_utf8(output.stderr).unwrap();
@@ -1644,7 +1664,12 @@ async fn post_start_boot_bankroll_case_with_checkpoint_parity(
             }
             requests.lock().unwrap().clear();
             if checkpoint {
-                SourceLogBoot::prepare_checkpoint(&paths.fixed_main).unwrap();
+                assert_eq!(
+                    SourceLogBoot::prepare_checkpoint(&paths.fixed_main)
+                        .unwrap()
+                        .1,
+                    1
+                );
             }
             let before = pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap();
             let opened = SourceLogBoot::open(&paths, true).unwrap().unwrap();
@@ -1919,7 +1944,8 @@ async fn fresh_pre_start_boot_refuses_empty_active_main_selection() {
 
 /// PASS: the real binary rejects the altered post-snapshot continuation by ID before resume,
 /// producer requests, HTTP serving or status publication, preserving every pending/ledger/gate/
-/// cursor/group value and both financial logs. The older offline census still passes.
+/// cursor/group value and both financial logs. The older offline census still passes;
+/// checkpoint preparation refuses the same row first and publishes nothing.
 #[tokio::test]
 async fn post_snapshot_invalid_continuation_refuses_real_binary_boot() {
     pre_start_boot_membership_case(PreStartBootCase::InvalidContinuation).await;
@@ -2073,7 +2099,8 @@ async fn paper_service_rollout_checkpoint_preparation_is_early_read_only_and_ign
         .unwrap();
     let torn_size = file_len(&paths.source_log);
     let prepared = SourceLogBoot::prepare_checkpoint(&paths.fixed_main).unwrap();
-    assert_eq!(prepared, complete_tail);
+    assert_eq!(prepared.0, complete_tail);
+    assert_eq!(prepared.1, 0);
     assert_eq!(file_len(&paths.source_log), torn_size);
     assert_eq!(std::fs::read(&paths.fixed_main).unwrap(), before_db);
     let opened = SourceLogBoot::open(&paths, false).unwrap().unwrap();

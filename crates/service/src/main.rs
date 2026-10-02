@@ -174,11 +174,11 @@ async fn main() -> Result<()> {
         let paper = args
             .get(position + 1)
             .context("--paper-state requires a path")?;
-        let tail = pe_service::source_log_boot::SourceLogBoot::prepare_checkpoint(
+        let (tail, validated) = pe_service::source_log_boot::SourceLogBoot::prepare_checkpoint(
             std::path::Path::new(paper),
         )?;
         println!(
-            "prepared source checkpoint: {} bytes, sequence {:?}",
+            "prepared source checkpoint: {} bytes, sequence {:?}, validated {validated} open continuations",
             tail.physical_tail, tail.last_sequence
         );
         return Ok(());
