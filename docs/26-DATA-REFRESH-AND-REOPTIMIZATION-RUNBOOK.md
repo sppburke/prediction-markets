@@ -674,9 +674,10 @@ without writing and recomputes that digest over the committed projection from ei
 connections, one key range each, hashed in key order, so the bytes are the serial read's while its
 random activity reads overlap (#675). A different recorded classifier
 version instead runs full activity verification and rebuilds the projection with the current
-classifier. The current classifier version and its entry rules are `ranker_classifier_version` and
-`ranker_redeem_pause_secs` in `_GLOSSARY.md`. An activation accepts an installed cache of classifier
-version one to four. Each rebuilding finalization loads a wallet once, validates its entire aggregate
+classifier. Classifier version three admits what the live copy path takes: a market's entry history is
+consumed only by a first entry (not by a sell, split, merge or redemption), and an entry whose
+action depends on the order of its second is not projected. An activation accepts an installed
+cache of classifier version one to three. Each rebuilding finalization loads a wallet once, validates its entire aggregate
 vector, then classifies that same vector; a classifier stopping point never truncates validation.
 Manifest installation and projection replacement commit together with a cleared, unfinalized state;
 the finalized state commits in a second transaction, after the digest is computed over the committed
