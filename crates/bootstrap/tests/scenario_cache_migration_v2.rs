@@ -1114,7 +1114,7 @@ async fn v2_payout_walk_never_touches_sealed_resolution_or_cursor_rows() {
 /// order of its second (a SPLIT of the same outcome in that second) is not. FAIL:
 /// the market is consumed by non-entry activity, or the order-dependent BUY projects.
 #[tokio::test]
-async fn projection_admits_only_entries_the_live_path_takes() {
+async fn projection_admits_only_order_independent_first_entries() {
     let dir = TempDir::new().unwrap();
     let side = dir.path().join("side.db");
     let fixed_end = 1_800_000_000_i64;
