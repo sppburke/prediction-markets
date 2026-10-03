@@ -208,11 +208,23 @@ impl CollectionProof {
             .full_read_wallets
             .as_ref()
             .is_some_and(|full| full.binary_search_by(|w| w.as_str().cmp(wallet)).is_ok())
+            || self.deferred(wallet)
         {
             ActivityReadMode::Full
         } else {
             ActivityReadMode::Incremental
         }
+    }
+
+    pub(super) fn deferred(&self, wallet: &str) -> bool {
+        self.identity
+            .deferred_wallets
+            .as_ref()
+            .is_some_and(|deferred| {
+                deferred
+                    .binary_search_by(|w| w.as_str().cmp(wallet))
+                    .is_ok()
+            })
     }
 
     pub(super) fn start(&self, wallet: &str) -> i64 {
@@ -266,6 +278,16 @@ impl CollectionProof {
                 message: "version-two activity receipt omitted acquisition proof".to_owned(),
             })?;
         let complete = acquisition.disposition == ActivityDisposition::Complete;
+        let deferred = self.deferred(&receipt.wallet_hex);
+        if (deferred
+            && (acquisition.aggregation_status != AggregationStatus::NotAttempted
+                || !receipt.pages.is_empty()
+                || acquisition.exclusion_reason != Some(ActivityExclusionReason::DormantDeferred)))
+            || (!deferred
+                && acquisition.exclusion_reason == Some(ActivityExclusionReason::DormantDeferred))
+        {
+            return invalid("activity deferral disagrees with frozen identity".to_owned());
+        }
         let carried = complete && acquisition.mode == ActivityReadMode::Incremental;
         if acquisition.version != 2
             || acquisition.mode != self.mode(&receipt.wallet_hex)
@@ -329,7 +351,11 @@ impl CollectionProof {
                     || acquisition.fetched_aggregate_count.is_some()
                     || acquisition.fetched_aggregate_digest.is_some()
                     || acquisition.exclusion_reason
-                        != Some(ActivityExclusionReason::AcquisitionFailure)
+                        != Some(if deferred {
+                            ActivityExclusionReason::DormantDeferred
+                        } else {
+                            ActivityExclusionReason::AcquisitionFailure
+                        })
                     || receipt
                         .exclusion_reason
                         .as_deref()
@@ -393,7 +419,7 @@ fn verify_historical_receipts(
     manifest: &ActivityCoverageManifestV2,
     identity: &FreshCollectionIdentity,
 ) -> Result<(), BootstrapError> {
-    if (identity.version == 2) != (manifest.cursors == receipt_marker_v2()) {
+    if (identity.version >= 2) != (manifest.cursors == receipt_marker_v2()) {
         return invalid("historical receipt marker disagrees with its identity".to_owned());
     }
     let mut digest = ReceiptSetDigest::new(
@@ -533,7 +559,7 @@ pub(super) fn decode_receipt(
         })
         || (receipt.aggregate_count == 0 && receipt.source_row_count != 0)
         || (receipt.exclusion_reason.is_some() && receipt.aggregate_count != 0)
-        || (version == 2) != receipt.acquisition.is_some()
+        || (version >= 2) != receipt.acquisition.is_some()
     {
         return invalid(format!(
             "activity receipt identity mismatch for {}",
@@ -1076,7 +1102,11 @@ pub(super) fn commit_incremental_wallet(
             ActivityDisposition::Complete
         },
         exclusion_reason: if completion.aggregation_status == AggregationStatus::NotAttempted {
-            Some(ActivityExclusionReason::AcquisitionFailure)
+            Some(if proof.deferred(wallet) {
+                ActivityExclusionReason::DormantDeferred
+            } else {
+                ActivityExclusionReason::AcquisitionFailure
+            })
         } else if incomplete {
             Some(ActivityExclusionReason::AggregationFailure)
         } else if collision {
@@ -1158,7 +1188,7 @@ pub(super) fn commit_incremental_wallet(
             to_i64(source_rows, "source row count")?, to_i64(count, "aggregate count")?, i64::from(ACTIVITY_SCHEMA_VERSION),
             i64::from(ACTIVITY_PARSER_VERSION), completed_at, canonical_json(&receipt.acquisition)?, receipt.exclusion_reason])?;
     transaction.commit()?;
-    if excluded {
+    if excluded && !proof.deferred(wallet) {
         tracing::warn!(wallet, generation, reason = ?receipt.acquisition.as_ref().and_then(|a| a.exclusion_reason.as_ref()), "activity wallet excluded from generation");
     }
     tracing::debug!(

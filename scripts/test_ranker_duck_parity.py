@@ -399,6 +399,76 @@ def assert_certified_full_incremental_equivalence(full: str, incremental: str) -
         print("PASS: real full/delta caches have identical exported positions, wallet universe, publisher times and content watermarks")
 
 
+def assert_certified_deferred_publication_equivalence(
+        deferred: str, control: str, deferred_record: str, control_record: str,
+        process_now: int) -> None:
+    """Prove exact publication entries with each cache's own certification and provenance."""
+    import latency_shift_rerank as latency
+    import push_ranking_to_supabase as publisher
+    import rank_cycle_manifest as cycle
+
+    day = datetime.fromtimestamp(process_now, timezone.utc).strftime("%Y-%m-%d")
+    versions = {"source": "polymarket-public-activity", "activity_schema": 2,
+                "activity_parser": 2, "clob_resolution_schema": 2,
+                "clob_resolution_parser": 2, "cache_schema": 2, "configuration": 1}
+    requests = []
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        (root / "before.json").write_text("[]")
+        (root / "versions.json").write_text(json.dumps(versions))
+        for index, (db, record) in enumerate(((deferred, deferred_record),
+                                             (control, control_record))):
+            out, parquet = root / f"rank-{index}", root / f"parquet-{index}"
+            _export_certified_cache(db, str(parquet))
+            snapshot = root / f"cycle-{index}.json"
+            snapshot.write_text(json.dumps(cycle.snapshot(Path(db), day, versions, {})))
+            argv = ["rank", "--db", db, "--out-dir", str(out), "--universe-from-trades",
+                    "--as-of", str(process_now), "--win-end", day, "--scheduled-only",
+                    "--min-trl", "20", "--min-avg-per-month", "0", "--min-active-months", "0",
+                    "--floor-tstat", "2.0", "--ttr-hours", "48"]
+            with mock.patch.dict(os.environ, {"PE_RANKER_ENGINE": "duck",
+                                              "PE_RANKER_PARQUET_DIR": str(parquet),
+                                              "PE_RANKER_PARQUET_MAX_AGE_HOURS": "0"}), \
+                    mock.patch.object(sys, "argv", argv):
+                assert rk.main() == 0
+            argv = ["latency", "--db", db, "--out-dir", str(out),
+                    "--ranked-csv", str(out / "ranked_72hr_buyandhold.csv"),
+                    "--positions-csv", str(out / "qualifying_positions_72hr.csv"),
+                    "--as-of", str(process_now), "--min-trl", "20",
+                    "--min-active-months", "0", "--min-avg-per-month", "0", "--floor-tstat", "2.0",
+                    "--ttr-max-secs", "172800", "--before-ranking-json", str(root / "before.json"),
+                    "--cycle-manifest-file", str(snapshot), "--cache-stage-record", record,
+                    "--pipeline-versions-file", str(root / "versions.json")]
+            with mock.patch.object(sys, "argv", argv + ["--emit-targets", str(out / "targets.csv")]):
+                assert latency.main() == 0
+            with mock.patch.object(sys, "argv", argv):
+                assert latency.main() == 0
+            manifest_path = out / "oracle_manifest.json"
+            with mock.patch.object(sys, "argv", ["push", "--db", db,
+                    "--ranked-csv", str(out / "latency_shift_ranked.csv"),
+                    "--manifest-file", str(manifest_path), "--cache-stage-record", record,
+                    "--cache-side-db", db, "--cache-fixed-db", str(root / f"fixed-{index}.db"),
+                    "--prior-cache-backup", str(root / f"prior-{index}.db")]):
+                args = publisher.build_parser().parse_args()
+            with mock.patch.object(publisher, "_request_once") as network:
+                request = publisher.prepare_publish_request(args, process_now)
+            network.assert_not_called()
+            publisher.validate_publish_request(request)
+            stage = json.loads(Path(record).read_text())
+            assert request["cache_activation"]["expected_sha256"] == stage["cache_sha256"]
+            assert stage["cache_sha256"] == hashlib.sha256(Path(db).read_bytes()).hexdigest()
+            manifest = json.loads(manifest_path.read_text())
+            assert request["batch"]["config_hash"] == hashlib.sha256(
+                json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            requests.append(request)
+        assert requests[0]["entries"] == requests[1]["entries"], "deferral changed published entries"
+        assert requests[0]["entries"] and all(row["survives"] for row in requests[0]["entries"])
+        assert requests[0]["batch"]["universe_size"] < requests[1]["batch"]["universe_size"]
+        assert requests[0]["batch"]["config_hash"] != requests[1]["batch"]["config_hash"]
+        assert requests[0]["cache_activation"] != requests[1]["cache_activation"]
+        print("PASS: deferral preserves exact published entries with independently bound provenance")
+
+
 class DuckParityTest(unittest.TestCase):
     @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
     def test_certified_subset_matches_full_export_through_publication(self):

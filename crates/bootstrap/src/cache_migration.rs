@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs::{File, OpenOptions};
 use std::future::Future;
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr as _;
@@ -75,6 +75,10 @@ const FRESH_COLLECTION_VERSION: u32 = 1;
 /// in `docs/_GLOSSARY.md`). Each wallet pages serially, so this width sets throughput
 /// until the fetcher's shared rate gate binds; it leaves the gate's budget unchanged.
 const MAX_ACTIVITY_WALLET_FETCHES: usize = 32;
+/// Quiet-history threshold (`activity_quiet_after_secs` in `docs/_GLOSSARY.md`).
+const QUIET_AFTER_SECS: i64 = 2_592_000;
+/// Quiet-wallet polling period (`activity_repoll_period_secs` in `docs/_GLOSSARY.md`).
+const REPOLL_PERIOD_SECS: i64 = 604_800;
 const ACTIVITY_ID_INDEX_SQL: &str = "CREATE UNIQUE INDEX idx_activity_groups_v2_source_trade_id
     ON activity_groups_v2(source_trade_id COLLATE BINARY)";
 
@@ -326,6 +330,12 @@ struct FreshCollectionIdentity {
     start_exclusive: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     full_read_wallets: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deferred_wallets: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quiet_after_secs: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    repoll_period_secs: Option<i64>,
 }
 
 impl Serialize for FreshCollectionIdentity {
@@ -337,11 +347,16 @@ impl Serialize for FreshCollectionIdentity {
         map.serialize_entry("fixed_end_unix", &self.fixed_end_unix)?;
         map.serialize_entry("wallets", &self.wallets)?;
         map.serialize_entry("digest", &self.digest)?;
-        if self.version == 2 {
+        if self.version >= 2 {
             map.serialize_entry("base_generation", &self.base_generation)?;
             map.serialize_entry("base_manifest_sha256", &self.base_manifest_sha256)?;
             map.serialize_entry("start_exclusive", &self.start_exclusive)?;
             map.serialize_entry("full_read_wallets", &self.full_read_wallets)?;
+        }
+        if self.version == 3 {
+            map.serialize_entry("deferred_wallets", &self.deferred_wallets)?;
+            map.serialize_entry("quiet_after_secs", &self.quiet_after_secs)?;
+            map.serialize_entry("repoll_period_secs", &self.repoll_period_secs)?;
         }
         map.end()
     }
@@ -354,9 +369,10 @@ impl FreshCollectionIdentity {
         wallets: Vec<String>,
         base: Option<(&FreshCollectionIdentity, &ActivityCoverageManifestV2)>,
         full_read_wallets: Vec<String>,
+        deferred_wallets: Vec<String>,
     ) -> Result<Self, BootstrapError> {
         let mut record = Self {
-            version: 2,
+            version: if base.is_some() { 3 } else { 2 },
             generation,
             fixed_end_unix,
             wallets,
@@ -367,6 +383,9 @@ impl FreshCollectionIdentity {
                 .transpose()?,
             start_exclusive: Some(base.map_or(0, |(record, _)| record.fixed_end_unix)),
             full_read_wallets: Some(full_read_wallets),
+            deferred_wallets: base.map(|_| deferred_wallets),
+            quiet_after_secs: base.map(|_| QUIET_AFTER_SECS),
+            repoll_period_secs: base.map(|_| REPOLL_PERIOD_SECS),
         };
         let mut value = serde_json::to_value(&record)?;
         value
@@ -378,7 +397,7 @@ impl FreshCollectionIdentity {
     }
 
     fn verified(self) -> Result<Self, BootstrapError> {
-        if !matches!(self.version, 1 | 2) {
+        if !matches!(self.version, 1..=3) {
             return invalid(format!(
                 "fresh collection identity version {} is unsupported",
                 self.version
@@ -389,6 +408,13 @@ impl FreshCollectionIdentity {
         }
         for wallet in &self.wallets {
             validate_wallet_hex(wallet)?;
+        }
+        if self.version != 3
+            && (self.deferred_wallets.is_some()
+                || self.quiet_after_secs.is_some()
+                || self.repoll_period_secs.is_some())
+        {
+            return invalid("older identity contains deferral fields".to_owned());
         }
         let expected = if self.version == 1 {
             if self.base_generation.is_some()
@@ -438,6 +464,25 @@ impl FreshCollectionIdentity {
                 (None, None) if start == 0 && full == &self.wallets => {}
                 _ => return invalid("invalid incremental predecessor binding".to_owned()),
             }
+            if self.version == 3 {
+                let deferred =
+                    self.deferred_wallets
+                        .as_ref()
+                        .ok_or_else(|| BootstrapError::Invalid {
+                            message: "version-three identity omitted deferred wallets".to_owned(),
+                        })?;
+                if self.base_generation.is_none()
+                    || deferred.windows(2).any(|pair| pair[0] >= pair[1])
+                    || deferred.iter().any(|wallet| {
+                        self.wallets.binary_search(wallet).is_err()
+                            || full.binary_search(wallet).is_ok()
+                    })
+                    || self.quiet_after_secs.is_none_or(|value| value <= 0)
+                    || self.repoll_period_secs.is_none_or(|value| value <= 0)
+                {
+                    return invalid("invalid version-three deferral identity".to_owned());
+                }
+            }
             let mut value = serde_json::to_value(&self)?;
             value
                 .as_object_mut()
@@ -461,6 +506,13 @@ fn decode_fresh_identity(json: &str) -> Result<FreshCollectionIdentity, Bootstra
             && (keys.len() != 9
                 || !keys.contains_key("base_generation")
                 || !keys.contains_key("base_manifest_sha256")))
+        || (record.version == 3
+            && (keys.len() != 12
+                || !keys.contains_key("base_generation")
+                || !keys.contains_key("base_manifest_sha256")
+                || !keys.contains_key("deferred_wallets")
+                || !keys.contains_key("quiet_after_secs")
+                || !keys.contains_key("repoll_period_secs")))
     {
         return invalid("collection identity fields do not match its version".to_owned());
     }
@@ -1046,6 +1098,22 @@ fn distinct_wallets(
     Ok(wallets)
 }
 
+fn weekly_due(wallet: &str, start_exclusive: i64, end: i64) -> Result<bool, BootstrapError> {
+    validate_wallet_hex(wallet)?;
+    let phase = i64::from_str_radix(&wallet[wallet.len() - 12..], 16)
+        .map_err(|error| BootstrapError::Invalid {
+            message: format!("invalid weekly wallet phase: {error}"),
+        })?
+        .rem_euclid(REPOLL_PERIOD_SECS);
+    let offset = (end.rem_euclid(REPOLL_PERIOD_SECS) + phase).rem_euclid(REPOLL_PERIOD_SECS);
+    let latest = end
+        .checked_sub(offset)
+        .ok_or_else(|| BootstrapError::Invalid {
+            message: "weekly activity instant underflow".to_owned(),
+        })?;
+    Ok(latest > start_exclusive)
+}
+
 fn begin_or_resume_fresh_collection(
     connection: &mut Connection,
     generation: u64,
@@ -1180,6 +1248,9 @@ fn begin_or_resume_fresh_collection(
 
     let mut prior_wallets = BTreeSet::new();
     let mut full = BTreeSet::new();
+    let mut quiet = BTreeSet::new();
+    let mut due = BTreeSet::new();
+    let mut prior_exclusions = BTreeSet::new();
     if let Some(manifest) = &prior {
         let identity = activity_identity(&transaction)?;
         let prior_generation = to_i64(manifest.generation, "activity generation")?;
@@ -1192,9 +1263,41 @@ fn begin_or_resume_fresh_collection(
                 &identity.wallets,
                 generation_rows,
                 |validation, receipt| {
-                    validation.visit(scan, &transaction, prior_generation, receipt, |_| {})?;
+                    let mut newest = None;
+                    validation.visit(
+                        scan,
+                        &transaction,
+                        prior_generation,
+                        receipt,
+                        |aggregate| {
+                            newest = newest.max(Some(aggregate.source_time.0.unix_timestamp()));
+                        },
+                    )?;
+                    let deferred = receipt.acquisition.as_ref().is_some_and(|acquisition| {
+                        acquisition.exclusion_reason
+                            == Some(ActivityExclusionReason::DormantDeferred)
+                    });
                     if receipt.excluded() {
+                        prior_exclusions.insert(receipt.wallet_hex.clone());
+                    }
+                    if receipt.excluded() && !deferred {
                         full.insert(receipt.wallet_hex.clone());
+                    } else if let Some(record) = &recorded
+                        && (deferred
+                            || newest
+                                .is_none_or(|time| time < record.fixed_end_unix - QUIET_AFTER_SECS))
+                    {
+                        quiet.insert(receipt.wallet_hex.clone());
+                        if weekly_due(
+                            &receipt.wallet_hex,
+                            record.start_exclusive.unwrap_or(0),
+                            record.fixed_end_unix,
+                        )? {
+                            due.insert(receipt.wallet_hex.clone());
+                            if deferred {
+                                full.insert(receipt.wallet_hex.clone());
+                            }
+                        }
                     }
                     Ok(())
                 },
@@ -1222,6 +1325,7 @@ fn begin_or_resume_fresh_collection(
         wallets.insert(wallet);
     }
     wallets.extend(full.iter().cloned());
+    wallets.extend(prior_exclusions);
     // Retained history without a receipt is corruption, never a new-wallet exception.
     if recorded.is_some() && !retained.is_subset(&prior_wallets) {
         return invalid("retained wallet has no predecessor proof".to_owned());
@@ -1238,6 +1342,13 @@ fn begin_or_resume_fresh_collection(
     } else {
         full.extend(wallets.difference(&prior_wallets).cloned());
     }
+    quiet.retain(|wallet| wallets.contains(wallet));
+    due.retain(|wallet| quiet.contains(wallet));
+    let deferred = quiet
+        .difference(&due)
+        .filter(|wallet| !full.contains(*wallet))
+        .cloned()
+        .collect();
     // All predecessor and membership work is complete before this clock is read.
     let fixed_end_unix = settled_end()?;
     let base = recorded.as_ref().zip(prior.as_ref());
@@ -1247,7 +1358,14 @@ fn begin_or_resume_fresh_collection(
         wallets.into_iter().collect(),
         base,
         full.into_iter().collect(),
+        deferred,
     )?;
+    tracing::info!(
+        generation,
+        deferred = record.deferred_wallets.as_ref().map_or(0, Vec::len),
+        due = due.len(),
+        "activity quiet-wallet admission"
+    );
     if bulk_root {
         require_bulk_root_state(&transaction, &record)?;
     }
@@ -1341,6 +1459,9 @@ async fn collect_activity_v2(
     }
     let proof_ref = proof.as_ref();
     let reads = stream::iter(missing.into_iter().map(|wallet_hex| async move {
+        if proof_ref.is_some_and(|proof| proof.deferred(&wallet_hex)) {
+            return Ok(excluded_completion(wallet_hex, "dormant_deferred".to_owned()));
+        }
         let wallet =
             WalletAddress::from_hex(&wallet_hex).map_err(|error| BootstrapError::Invalid {
                 message: format!("frozen universe contains invalid wallet {wallet_hex}: {error}"),
@@ -1574,7 +1695,14 @@ async fn collect_activity_v2(
         fixed_end_unix,
         wallets,
     )?;
-    let excluded = staged.excluded_count;
+    let deferred = proof
+        .as_ref()
+        .and_then(|proof| proof.identity.deferred_wallets.as_ref())
+        .map_or(0, Vec::len);
+    let excluded = staged
+        .excluded_count
+        .checked_sub(u64::try_from(deferred).map_err(|_| BootstrapError::Internal)?)
+        .ok_or(BootstrapError::Internal)?;
     if excluded > 0 {
         tracing::warn!(
             generation,
@@ -1582,6 +1710,7 @@ async fn collect_activity_v2(
             "activity wallets excluded from the generation; see per-wallet exclusion reasons"
         );
     }
+    tracing::info!(generation, deferred, "activity collection complete");
     let mut manifest = staged.into_manifest(
         generation,
         reference_sha256.clone(),
@@ -1909,6 +2038,7 @@ enum ActivityExclusionReason {
     AcquisitionFailure,
     AggregationFailure,
     CrossBoundaryCollision,
+    DormantDeferred,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2779,7 +2909,7 @@ fn verify_activity_manifest_with(
     }
     let identity = generation_identity(connection, manifest.generation)?;
     if let Some(identity) = identity.as_ref() {
-        if (identity.version == 2) != (manifest.cursors == incremental::receipt_marker_v2()) {
+        if (identity.version >= 2) != (manifest.cursors == incremental::receipt_marker_v2()) {
             return invalid("activity identity and receipt marker versions disagree".to_owned());
         }
         if incremental::has_column(
@@ -2791,9 +2921,9 @@ fn verify_activity_manifest_with(
                 connection,
                 manifest.generation,
                 identity,
-                identity.version == 2,
+                identity.version >= 2,
             )?;
-        } else if identity.version == 2 {
+        } else if identity.version >= 2 {
             return invalid(
                 "completed version-two collection omitted archived identity".to_owned(),
             );
@@ -3406,15 +3536,15 @@ fn verify_reusable_ranker_projection(
     ))
 }
 
-/// Finalize a complete v2 side cache and emit a hash-bound stage record.
+/// Finalize a complete v2 side cache and optionally emit a hash-bound stage record.
 /// First finalization and classifier upgrades validate activity and rebuild the
 /// projection. Reuse verifies unchanged inputs and the projection count/digest;
 /// activation validates complete content and structural health before installation.
 pub fn finalize_cache_v2(
     cache_path: &Path,
-    stage_record_path: &Path,
+    stage_record_path: Option<&Path>,
     finalized_at_unix: i64,
-) -> Result<CacheFinalStageRecord, BootstrapError> {
+) -> Result<Option<CacheFinalStageRecord>, BootstrapError> {
     let mut connection = open_existing_rw(cache_path)?;
     // A rebuild inserts every projection row. With SQLite's default page cache
     // the key index's pages are evicted and rewritten per insert; 1 GiB cut
@@ -3505,6 +3635,9 @@ pub fn finalize_cache_v2(
     connection.close().map_err(|(_, error)| error)?;
     reject_nonempty_sidecars(cache_path)?;
     sync_file_and_parent(cache_path)?;
+    let Some(stage_record_path) = stage_record_path else {
+        return Ok(None);
+    };
     let record = CacheFinalStageRecord {
         version: FINAL_STAGE_RECORD_VERSION,
         cache_path: std::fs::canonicalize(cache_path)?,
@@ -3518,7 +3651,7 @@ pub fn finalize_cache_v2(
         ranker_classifier_version: RANKER_CLASSIFIER_VERSION,
     };
     atomic_write_json(stage_record_path, &record)?;
-    Ok(record)
+    Ok(Some(record))
 }
 
 /// Takes the write lock again after this connection's commit, refusing if any
@@ -3542,7 +3675,7 @@ fn relock_unchanged(
 
 /// Stage a single verified copy of the checkpointed fixed main. Existing
 /// prior-backed cycles retain their legacy resume behavior. New cycles record
-/// their immutable source binding before copying directly to the candidate.
+/// their immutable source binding before adopting the verified pending copy.
 pub fn stage_cache_cycle_v2(
     fixed_path: &Path,
     prior_path: &Path,
@@ -3723,15 +3856,14 @@ fn stage_two_file_cycle(
         return invalid("cycle has both prior and two-file staging evidence".to_owned());
     }
     let resumed = side.exists();
-    let recorded = evidence_path.exists();
-    let evidence = if recorded {
+    let recorded = if evidence_path.exists() {
         let evidence = read_stage_evidence(side)?;
         if evidence.fixed_path != canonical_intended_path(fixed)?
             || evidence.prior_path != canonical_intended_path(prior)?
         {
             return invalid("cycle staging paths changed".to_owned());
         }
-        evidence
+        Some(evidence)
     } else {
         if resumed {
             return invalid(
@@ -3739,20 +3871,43 @@ fn stage_two_file_cycle(
                     .to_owned(),
             );
         }
+        None
+    };
+    if displaced_path_for(side)?.exists() || restore_marker_path(side).exists() {
+        return invalid(
+            "cycle has activation or restoration state; resume its prepared request".to_owned(),
+        );
+    }
+    let pending = if resumed {
+        None
+    } else {
+        refuse_retained_backups(fixed)?;
         let current = open_existing_rw(fixed)?;
         checkpoint_truncate(&current)?;
-        std::fs::File::open(fixed)?.sync_all()?;
-        let source_sha256 = sha256_file(fixed)?;
-        if installed_by(installed_request, fixed, &source_sha256)? {
+        current.close().map_err(|(_, error)| error)?;
+        Some(copy_to_pending(fixed, side)?)
+    };
+    let evidence = if let Some(evidence) = recorded {
+        if let Some((pending, source_sha256)) = &pending
+            && source_sha256 != &evidence.source_sha256
+        {
+            std::fs::remove_file(pending)?;
+            return invalid("fixed cache differs from recorded staging baseline".to_owned());
+        }
+        evidence
+    } else {
+        let source_sha256 = &pending.as_ref().ok_or(BootstrapError::Internal)?.1;
+        if installed_by(installed_request, fixed, source_sha256)? {
             tracing::info!(
                 path = %fixed.display(),
                 sha256 = %source_sha256,
                 "staging_fixed quick_check skipped: an accepted activation installed these bytes"
             );
         } else {
+            let current = open_existing_rw(fixed)?;
             quick_check(&current, "staging_fixed", fixed)?;
+            current.close().map_err(|(_, error)| error)?;
         }
-        current.close().map_err(|(_, error)| error)?;
         let source_schema = verified_user_version(fixed)?;
         let baseline = open_immutable(fixed)?;
         let activity_generation = if source_schema == CACHE_SCHEMA_VERSION_V2 {
@@ -3794,7 +3949,7 @@ fn stage_two_file_cycle(
             fresh_identity,
             payout_generation,
             build_manifest: if source_schema != CACHE_SCHEMA_VERSION_V2 {
-                Some(build_manifest(fixed, &source_sha256)?)
+                Some(build_manifest(fixed, source_sha256)?)
             } else {
                 None
             },
@@ -3802,22 +3957,6 @@ fn stage_two_file_cycle(
         atomic_write_json(&evidence_path, &evidence)?;
         evidence
     };
-    if evidence.displaced_path.exists() || restore_marker_path(side).exists() {
-        return invalid(
-            "cycle has activation or restoration state; resume its prepared request".to_owned(),
-        );
-    }
-    if !resumed {
-        refuse_retained_backups(fixed)?;
-        if recorded {
-            let current = open_existing_rw(fixed)?;
-            checkpoint_truncate(&current)?;
-            current.close().map_err(|(_, error)| error)?;
-            if sha256_file(fixed)? != evidence.source_sha256 {
-                return invalid("fixed cache differs from recorded staging baseline".to_owned());
-            }
-        }
-    }
     let side_schema = if resumed {
         candidate_user_version(side)?
     } else {
@@ -3830,8 +3969,8 @@ fn stage_two_file_cycle(
     {
         atomic_write_json(path, manifest)?;
     }
-    if !resumed {
-        copy_file_atomic_verified(fixed, side, Some(&evidence.source_sha256))?;
+    if let Some((pending, source_sha256)) = pending {
+        adopt_pending(&pending, side, Some(&source_sha256))?;
     }
     Ok(CacheStageReport {
         fixed_path: evidence.fixed_path,
@@ -5708,6 +5847,11 @@ fn copy_file_atomic_verified(
     target: &Path,
     expected_sha256: Option<&str>,
 ) -> Result<(), BootstrapError> {
+    let (pending, _) = copy_to_pending(source, target)?;
+    adopt_pending(&pending, target, expected_sha256)
+}
+
+fn copy_to_pending(source: &Path, target: &Path) -> Result<(PathBuf, String), BootstrapError> {
     let pending = pending_path_for(target);
     match std::fs::remove_file(&pending) {
         Ok(()) => {}
@@ -5715,23 +5859,40 @@ fn copy_file_atomic_verified(
         Err(error) => return Err(error.into()),
     }
     tracing::info!(source = %source.display(), target = %target.display(), "cache whole-file copy");
-    std::fs::copy(source, &pending)?;
-    OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&pending)?
-        .sync_all()?;
+    let mut input = std::io::BufReader::new(File::open(source)?);
+    let mut output = std::io::BufWriter::new(File::create(&pending)?);
+    std::fs::set_permissions(&pending, std::fs::metadata(source)?.permissions())?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 65_536];
+    loop {
+        let read = input.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        output.write_all(&buffer[..read])?;
+        digest.update(&buffer[..read]);
+    }
+    output.flush()?;
+    output.get_ref().sync_all()?;
+    Ok((pending, format!("{:x}", digest.finalize())))
+}
+
+fn adopt_pending(
+    pending: &Path,
+    target: &Path,
+    expected_sha256: Option<&str>,
+) -> Result<(), BootstrapError> {
     if let Some(expected) = expected_sha256 {
-        let actual = sha256_file(&pending)?;
+        let actual = sha256_file(pending)?;
         if actual != expected {
-            std::fs::remove_file(&pending)?;
+            std::fs::remove_file(pending)?;
             return invalid(format!(
                 "staged copy hash mismatch: {} is {actual}, source is {expected}",
                 pending.display()
             ));
         }
     }
-    std::fs::rename(&pending, target).map_err(map_rename_error)?;
+    std::fs::rename(pending, target).map_err(map_rename_error)?;
     sync_parent(target)
 }
 
@@ -6280,5 +6441,162 @@ mod relock_tests {
             let relocked = relock_unchanged(&mut own, baseline);
             assert_eq!(relocked.is_err(), interleaved);
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod quiet_identity_tests {
+    use super::*;
+
+    // PASS: versions 1–3 round-trip with authentic digests and invalid deferral
+    // shapes are rejected; FAIL: an invalid list, constant or root is accepted.
+    #[test]
+    fn fresh_identity_versions_and_deferral_contract() {
+        let wallet = format!("0x{}", "11".repeat(20));
+        let other = format!("0x{}", "22".repeat(20));
+        let wallets = vec![wallet.clone(), other.clone()];
+        let v1 = serde_json::json!({"version":1,"generation":1,"fixed_end_unix":100,
+            "wallets":wallets,"digest":fresh_collection_digest(1,100,&wallets).unwrap()});
+        assert_eq!(decode_fresh_identity(&v1.to_string()).unwrap().version, 1);
+        let root = FreshCollectionIdentity::new(
+            1,
+            100,
+            wallets.clone(),
+            None,
+            wallets.clone(),
+            Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            decode_fresh_identity(&canonical_json(&root).unwrap()).unwrap(),
+            root
+        );
+        let manifest = ActivityCoverageManifestV2 {
+            generation: 1,
+            reference_sha256: root.digest.clone(),
+            wallet_count: 2,
+            receipt_set_digest: "a".repeat(64),
+            aggregate_digest: "b".repeat(64),
+            source_row_count: 0,
+            group_count: 0,
+            source_bounds: Value::Null,
+            cursors: incremental::receipt_marker_v2(),
+            page_hashes: Vec::new(),
+            completed_at_unix: 101,
+            schema_version: 2,
+            parser_version: 2,
+        };
+        let v3 = FreshCollectionIdentity::new(
+            2,
+            200,
+            wallets.clone(),
+            Some((&root, &manifest)),
+            Vec::new(),
+            wallets.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            decode_fresh_identity(&canonical_json(&v3).unwrap()).unwrap(),
+            v3
+        );
+        let mut v2 = v3.clone();
+        v2.version = 2;
+        v2.deferred_wallets = None;
+        v2.quiet_after_secs = None;
+        v2.repoll_period_secs = None;
+        let mut value = serde_json::to_value(&v2).unwrap();
+        value.as_object_mut().unwrap().remove("digest");
+        v2.digest = sha256_bytes(canonical_json(&value).unwrap().as_bytes());
+        assert_eq!(
+            decode_fresh_identity(&canonical_json(&v2).unwrap()).unwrap(),
+            v2
+        );
+        for (key, value) in [
+            ("deferred_wallets", serde_json::json!([wallet, wallet])),
+            ("deferred_wallets", serde_json::json!([other, wallet])),
+            (
+                "deferred_wallets",
+                serde_json::json!([format!("0x{}", "33".repeat(20))]),
+            ),
+            ("deferred_wallets", Value::Null),
+            ("full_read_wallets", serde_json::json!([wallet])),
+            ("quiet_after_secs", serde_json::json!(0)),
+            ("repoll_period_secs", serde_json::json!(-1)),
+            ("base_generation", Value::Null),
+        ] {
+            let mut invalid = serde_json::to_value(&v3).unwrap();
+            invalid[key] = value;
+            invalid.as_object_mut().unwrap().remove("digest");
+            invalid["digest"] =
+                Value::from(sha256_bytes(canonical_json(&invalid).unwrap().as_bytes()));
+            assert!(
+                decode_fresh_identity(&invalid.to_string()).is_err(),
+                "{key}"
+            );
+        }
+        let mut invalid = serde_json::to_value(&root).unwrap();
+        invalid["deferred_wallets"] = serde_json::json!([]);
+        assert!(decode_fresh_identity(&invalid.to_string()).is_err());
+        invalid["version"] = Value::from(3);
+        invalid["quiet_after_secs"] = Value::from(QUIET_AFTER_SECS);
+        invalid["repoll_period_secs"] = Value::from(REPOLL_PERIOD_SECS);
+        invalid.as_object_mut().unwrap().remove("digest");
+        invalid["digest"] = Value::from(sha256_bytes(canonical_json(&invalid).unwrap().as_bytes()));
+        assert!(decode_fresh_identity(&invalid.to_string()).is_err());
+        let mut invalid = serde_json::to_value(&v3).unwrap();
+        invalid.as_object_mut().unwrap().remove("quiet_after_secs");
+        assert!(decode_fresh_identity(&invalid.to_string()).is_err());
+    }
+
+    // PASS: endpoint instants belong to exactly one tiled interval and long
+    // intervals coalesce; FAIL: an instant is skipped or counted twice.
+    #[test]
+    fn weekly_due_tiles_endpoints_and_coalesces_long_intervals() {
+        let wallet = format!("0x{}000000000001", "11".repeat(14));
+        let instant = REPOLL_PERIOD_SECS - 1;
+        assert!(!weekly_due(&wallet, instant - 2, instant - 1).unwrap());
+        assert!(weekly_due(&wallet, instant - 1, instant).unwrap());
+        assert!(!weekly_due(&wallet, instant, instant + 1).unwrap());
+        assert!(weekly_due(&wallet, instant, instant + 3 * REPOLL_PERIOD_SECS).unwrap());
+        assert!(weekly_due(&wallet, 0, 1_800_000_000).unwrap());
+        assert!(!weekly_due(&wallet, i64::MAX - 1, i64::MAX - 1).unwrap());
+        assert!(weekly_due("invalid", 0, instant).is_err());
+    }
+
+    // PASS: the streamed source digest matches the file hash and damaged or
+    // truncated pending copies are never adopted; FAIL: any mismatch is renamed.
+    #[test]
+    fn streamed_copy_digest_and_pending_corruption_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.db");
+        let target = dir.path().join("side.db");
+        let bytes = vec![42_u8; 200_000];
+        std::fs::write(&source, &bytes).unwrap();
+        for corrupt in [false, true] {
+            std::fs::write(pending_path_for(&target), b"interrupted copy").unwrap();
+            let (pending, digest) = copy_to_pending(&source, &target).unwrap();
+            assert_eq!(digest, sha256_file(&source).unwrap());
+            assert_eq!(sha256_file(&pending).unwrap(), digest);
+            assert!(!target.exists());
+            if corrupt {
+                let mut damaged = bytes.clone();
+                damaged[100_000] = 43;
+                std::fs::write(&pending, damaged).unwrap();
+            } else {
+                File::options()
+                    .write(true)
+                    .open(&pending)
+                    .unwrap()
+                    .set_len(199_999)
+                    .unwrap();
+            }
+            let error = adopt_pending(&pending, &target, Some(&digest)).unwrap_err();
+            assert!(error.to_string().contains("staged copy hash mismatch"));
+            assert!(!target.exists() && !pending.exists());
+        }
+        let (pending, digest) = copy_to_pending(&source, &target).unwrap();
+        adopt_pending(&pending, &target, Some(&digest)).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), bytes);
     }
 }
