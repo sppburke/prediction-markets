@@ -560,16 +560,15 @@ async fn main() {
                     }
                     .await
                 }
-                "cache-finalize-v2" => stage_record_arg
-                    .as_deref()
-                    .ok_or_else(|| BootstrapError::Invalid {
-                        message: "cache-finalize-v2 requires --stage-record".to_owned(),
-                    })
-                    .and_then(|stage_record| {
-                        let _lock = pe_bootstrap::lock::CacheMutationLock::acquire(
+                "cache-finalize-v2" => pe_bootstrap::lock::CacheMutationLock::acquire(
+                    &bootstrap_config.cache_path,
+                )
+                    .and_then(|_lock| {
+                        finalize_cache_v2(
                             &bootstrap_config.cache_path,
-                        )?;
-                        finalize_cache_v2(&bootstrap_config.cache_path, stage_record, now)
+                            stage_record_arg.as_deref(),
+                            now,
+                        )
                             .and_then(json_report)
                     }),
                 "cache-activate" => fixed_db_arg

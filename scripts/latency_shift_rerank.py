@@ -60,7 +60,7 @@ from ranker_decay import (
 # the lookup rule or repricing semantics; the fetch side's parser identity is
 # `pe_bootstrap::prices_history::RANKER_PRICE_PARSER_VERSION` (mirrored here).
 ORACLE_NAME = "clob-minute-reference"
-ORACLE_VERSION = 3
+ORACLE_VERSION = 5
 ORACLE_FIDELITY_MINUTES = 1
 ORACLE_PARSER_VERSION = 1
 
@@ -351,16 +351,11 @@ def main() -> int:
             return 1
         for r in rd:
             w = r["wallet"]
-            if w not in universe:
-                continue
-            # Every universe row claims its pair's slot, so evaluated pairs keep the
-            # order, and wallets the accumulation order, of evaluating them all (#588).
-            pair = by_mo.setdefault((r["market_id"], r["outcome_id"]), [])
             if w not in cand:
                 continue
             # The positions file's `price` column (the leader's entry) is retained in
             # the file format but not loaded: repricing uses only the reference sample.
-            pair.append({
+            by_mo.setdefault((r["market_id"], r["outcome_id"]), []).append({
                 "wallet": w,
                 "entry_ts": int(r["entry_ts"]),
                 "ttr_secs": int(r["ttr_secs"]),
@@ -369,7 +364,9 @@ def main() -> int:
                 "in_scope": schema_version < 2 or in_horizon(int(r["ttr_secs"]), a),
             })
             npos += 1
-    by_mo = {key: positions for key, positions in by_mo.items() if positions}
+    # Sorted pairs fix each wallet's accumulation order to its own positions, so its
+    # statistics do not depend on which other wallets were ranked.
+    by_mo = dict(sorted(by_mo.items()))
     log(f"candidate positions: {npos} across {len(by_mo)} (market,outcome) pairs")
 
     conn = sqlite3.connect(f"file:{a.db}?mode=ro", uri=True)
