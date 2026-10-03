@@ -10,9 +10,9 @@ use std::sync::Arc;
 
 use pe_copy_signal_engine::{IncomingTrade, PositionState, SignalConfig, TradeProvenance};
 use pe_core_types::{
-    LeaderAction, MarketId, MarketOutcomeId, OutcomeId, Price, Probability, ProbabilityPpm,
-    ReceivedAt, ReconstructionQuality, ShareAmount, Side, SourceId, SourceTimestamp, SourceTradeId,
-    WalletAddress,
+    LeaderAction, MarketId, MarketOutcomeId, OutcomeId, PolymarketTokenId, Price, Probability,
+    ProbabilityPpm, ReceivedAt, ReconstructionQuality, ShareAmount, Side, SourceId,
+    SourceTimestamp, SourceTradeId, WalletAddress,
 };
 use pe_event_log::{AppendReceipt, ContentType};
 use pe_execution_core::ObservationEvidence;
@@ -1406,12 +1406,12 @@ impl DecisionContinuationV3 {
         Ok(())
     }
 
-    /// Verify the complete history and its bindings before selecting the earliest source clock.
+    /// Verify the complete history and its bindings before selecting the earliest source clock and target asset.
     /// Receive timestamps remain separate evidence for copy-delay measurement.
     pub(crate) fn verified_source_time<L, E>(
         &self,
         lookup: &mut L,
-    ) -> Result<SourceTimestamp, CompleteActivityReadError>
+    ) -> Result<(SourceTimestamp, Option<PolymarketTokenId>), CompleteActivityReadError>
     where
         L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
         E: Display,
@@ -1456,7 +1456,7 @@ impl DecisionContinuationV3 {
                 ));
             }
         }
-        Ok(earliest)
+        Ok((earliest, target.group_id.components().asset.clone()))
     }
 }
 
@@ -5601,7 +5601,8 @@ pub(crate) mod continuation_v3_tests {
                             .map(CompleteActivityPage::from)
                     })
                     .unwrap();
-                assert_eq!(source_time, time);
+                assert_eq!(source_time.0, time);
+                assert_eq!(source_time.1, aggregate.group_id.components().asset);
                 assert_eq!(aggregate.source_time.0.unix_timestamp(), 100);
                 let mut poll_selected = continuation.clone();
                 poll_selected.observed_source_receipt = None;

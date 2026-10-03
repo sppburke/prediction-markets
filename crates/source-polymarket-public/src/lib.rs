@@ -53,7 +53,7 @@ pub use endpoint::{
 };
 pub use fetcher::{
     FixtureFetcher, HttpRequestContext, PageFetcher, RECONCILIATION_RATE_LIMIT_RETRY_SECS,
-    ReqwestFetcher,
+    RateGate, ReqwestFetcher,
 };
 pub use gamma_markets::{
     GAMMA_BATCH_LIMIT_PARAM, GAMMA_BATCH_SIZE, GAMMA_BROWSER_UA, GAMMA_MARKETS_PARSER_VERSION,

@@ -5789,7 +5789,7 @@ fn verify_paper_prepared_freshness(
         .ok_or_else(|| {
             QualificationError::InsufficientEvidence("paper freshness policy is missing".to_owned())
         })?;
-    let source_time = decision
+    let (source_time, _) = decision
         .continuation
         .verified_source_time(&mut |receipt| {
             let source = decision_source_receipt(source, receipt)?;

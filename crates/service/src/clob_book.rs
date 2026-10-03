@@ -16,11 +16,11 @@
 
 use std::collections::HashMap;
 use std::str::FromStr as _;
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use pe_core_types::{ReceivedAt, SourceId, SourceTimestamp};
 use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn};
+use pe_source_polymarket_public::RateGate;
 use rust_decimal::Decimal;
 use serde::Deserialize;
 
@@ -30,8 +30,7 @@ use crate::activity_ingest::{SourceLogHandle, SourceLogHandleError};
 const CLOB_BASE_URL: &str = "https://clob.polymarket.com";
 /// Minimum interval between `/book` requests — ≤ 5 req/s sustained, the
 /// canonical Polymarket CLOB REST limit in `docs/_GLOSSARY.md`
-/// (`polymarket_clob_min_interval_ms` = 200; "Venue rate limits" table). Mirrors
-/// `ReqwestCLOBClient::MIN_INTERVAL_MS` in `crates/venue-polymarket`.
+/// (`polymarket_clob_min_interval_ms` = 200; "Venue rate limits" table).
 const CLOB_MIN_INTERVAL_MS: u64 = 200;
 /// Per-request timeout for the `/book` call — `clob_book_request_timeout_secs`
 /// in `docs/_GLOSSARY.md`. Shorter than the order-submission client's 10s
@@ -255,7 +254,7 @@ pub trait ClobBookFetcher {
 /// Production [`ClobBookFetcher`] over the public CLOB REST `/book` endpoint.
 ///
 /// Enforces a `CLOB_MIN_INTERVAL_MS` (200 ms, ≤ 5 req/s) min-interval gate via
-/// interior mutability — matching `ReqwestCLOBClient::rate_limit_gate` — and a
+/// [`RateGate`] and a
 /// `CLOB_REQUEST_TIMEOUT_SECS` (5 s) per-request timeout. No auth headers: the
 /// `/book` endpoint is public.
 pub struct ReqwestClobBookFetcher {
@@ -263,7 +262,7 @@ pub struct ReqwestClobBookFetcher {
     base_url: String,
     min_interval: Duration,
     timeout: Duration,
-    last_request_at: Mutex<Option<Instant>>,
+    rate_gate: RateGate,
     source_log: Option<SourceLogHandle>,
 }
 
@@ -275,7 +274,7 @@ impl ReqwestClobBookFetcher {
             base_url: CLOB_BASE_URL.to_string(),
             min_interval: Duration::from_millis(CLOB_MIN_INTERVAL_MS),
             timeout: Duration::from_secs(CLOB_REQUEST_TIMEOUT_SECS),
-            last_request_at: Mutex::new(None),
+            rate_gate: RateGate::default(),
             source_log: None,
         }
     }
@@ -294,31 +293,6 @@ impl ReqwestClobBookFetcher {
         self.base_url = base_url;
         self
     }
-
-    /// Reserve the next request slot at `min_interval` past the later of the
-    /// last reserved slot and now, then sleep until it. Successive `/book` calls
-    /// are spaced ≥ `min_interval` apart and concurrent callers are serialized
-    /// via the interior mutex (poison-safe); the very first call (no prior slot)
-    /// fires immediately. Mirrors `ReqwestCLOBClient::rate_limit_gate`
-    /// (`crates/venue-polymarket/src/clob_client.rs`).
-    async fn rate_limit_gate(&self) {
-        let sleep_for = {
-            let mut guard = self
-                .last_request_at
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            let now = Instant::now();
-            let next_slot = match *guard {
-                None => now,
-                Some(last) => last.max(now) + self.min_interval,
-            };
-            *guard = Some(next_slot);
-            next_slot.checked_duration_since(now)
-        };
-        if let Some(d) = sleep_for {
-            tokio::time::sleep(d).await;
-        }
-    }
 }
 
 impl ClobBookFetcher for ReqwestClobBookFetcher {
@@ -327,7 +301,7 @@ impl ClobBookFetcher for ReqwestClobBookFetcher {
         condition_id: &str,
         token_id: &str,
     ) -> Result<OrderBook, ClobBookError> {
-        self.rate_limit_gate().await;
+        self.rate_gate.wait(self.min_interval, None).await;
         let url = format!("{}/book?token_id={token_id}", self.base_url);
         let resp = self
             .client
@@ -454,6 +428,29 @@ mod tests {
         "neg_risk": false,
         "timestamp": "1781655409736"
     }"#;
+
+    #[tokio::test]
+    async fn rate_gate_idle_spacing_and_deadline_refusal() {
+        let fetcher = ReqwestClobBookFetcher::new(reqwest::Client::new());
+        let interval = Duration::from_millis(200);
+        let now = std::time::Instant::now();
+        let gate = &fetcher.rate_gate;
+        assert_eq!(gate.reserve(now, interval, Some(now)), None);
+        assert_eq!(gate.reserve(now, interval, None), Some(now));
+        assert_eq!(gate.reserve(now, interval, Some(now + interval)), None);
+        assert_eq!(gate.reserve(now, interval, None), Some(now + interval));
+        assert_eq!(gate.reserve(now, interval, None), Some(now + interval * 2));
+        let idle = now + interval * 10;
+        assert_eq!(gate.reserve(idle, interval, None), Some(idle));
+
+        // An expired first deadline also leaves an idle gate immediately ready.
+        let idle_gate = RateGate::default();
+        assert!(!idle_gate.wait(interval, Some(now)).await);
+        assert_eq!(
+            futures::poll!(Box::pin(idle_gate.wait(interval, None))),
+            std::task::Poll::Ready(true)
+        );
+    }
 
     #[test]
     fn parses_real_book_shape_asks_only() {

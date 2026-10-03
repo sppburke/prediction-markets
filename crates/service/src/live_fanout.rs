@@ -3609,7 +3609,7 @@ where
         .paper_freshness_policy
         .filter(|policy| policy.valid())
         .ok_or_else(|| "frozen copy freshness policy is missing or invalid".to_owned())?;
-    let source_time = continuation
+    let (source_time, _) = continuation
         .verified_source_time(lookup)
         .map_err(|error| format!("verified source clock is unavailable: {error}"))?;
     if !policy.activity_ws_enabled {
@@ -9041,6 +9041,76 @@ mod tests {
                     .ok_or_else(|| EconomicReplayError("fixture receipt missing".to_owned()))
             },
         )
+    }
+
+    #[test]
+    fn early_book_replay_accepts_book_receipt_before_admission_receipts() {
+        let mut economic = finality_prepared().economic.clone();
+        economic.admission.market.observed_at_unix = 20;
+        economic.admission.settlement.observed_at_unix = 20;
+        economic.risk.snapshot.per_trade_cap_bps = 10_000;
+        economic.book_receipt.sequence = EventSeq(0);
+        let payloads = economic_source_payloads(&economic.market.condition_id.0);
+        let receipts = [
+            economic.admission.receipts.gamma,
+            economic.admission.receipts.clob_long,
+            economic.admission.receipts.clob_compact,
+            economic.book_receipt,
+        ];
+        assert!(
+            receipts[..3]
+                .iter()
+                .all(|receipt| receipt.sequence > economic.book_receipt.sequence)
+        );
+        let sources = receipts
+            .into_iter()
+            .zip([
+                GAMMA_MARKETS_SOURCE_ID,
+                CLOB_LONG_MARKET_SOURCE_ID,
+                CLOB_COMPACT_MARKET_SOURCE_ID,
+                CLOB_BOOK_SOURCE_ID,
+            ])
+            .zip(payloads)
+            .map(|((receipt, source_id), payload)| {
+                (
+                    receipt,
+                    RecordedEconomicSource {
+                        payload,
+                        received_unix_ms: if source_id == CLOB_BOOK_SOURCE_ID {
+                            20_100
+                        } else {
+                            20_900
+                        },
+                        source_id: source_id.to_owned(),
+                        schema_version: 1,
+                        parser_version: 1,
+                        content_type: ContentType::Json,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let replay = replay_source_backed_economic(
+            &economic,
+            21_000,
+            CollateralAmount::from_atomic(10_000_000),
+            |receipt| {
+                sources
+                    .iter()
+                    .find(|(candidate, _)| *candidate == receipt)
+                    .map(|(_, source)| source.clone())
+                    .ok_or_else(|| EconomicReplayError("fixture receipt missing".to_owned()))
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            replay.admission.market.ordered_outcome_token_ids[0],
+            economic.market.token_id
+        );
+        assert_eq!(replay.sized.ladder.shares, economic.ladder.minimum_shares);
+        assert_eq!(
+            replay.sized.ladder.worst_case_debit,
+            economic.ladder.principal
+        );
     }
 
     #[test]

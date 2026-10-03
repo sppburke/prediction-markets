@@ -5,7 +5,9 @@
 //! admission/current-price clients, and the one CLOB `/book` fetch used to build exact economics.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,9 +15,9 @@ use pe_copy_signal_engine::{
     IncomingTrade, LeaderSignal, SignalConfig, TradeProvenance, classify_trade,
 };
 use pe_core_types::{
-    CollateralAmount, EventSeq, MarketId, MarketOutcomeId, OutcomeId, Price, Probability,
-    ReceivedAt, ReconstructionQuality, ShareAmount, Side, SourceId, SourceTimestamp, SourceTradeId,
-    TraderId, VenueId, WalletAddress,
+    CollateralAmount, EventSeq, MarketId, MarketOutcomeId, OutcomeId, PolymarketTokenId, Price,
+    Probability, ReceivedAt, ReconstructionQuality, ShareAmount, Side, SourceId, SourceTimestamp,
+    SourceTradeId, TraderId, VenueId, WalletAddress,
 };
 use pe_event_log::{ContentType, EnvelopeIn};
 use pe_kelly_sizer::{KellyInput, size_contracts};
@@ -32,7 +34,7 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::{error, info, warn};
 
 use crate::bucket_commit::{BucketCommitEngine, DecisionContinuationV3, PaperFreshnessPolicy};
-use crate::clob_book::ClobBookFetcher;
+use crate::clob_book::{ClobBookError, ClobBookFetcher, OrderBook};
 use crate::decision_replay::{
     AuthorityEvidence, BookEvidence, DecisionEvidenceAccumulator, MarketEndEvidence,
     MarketPriceEvidence, TerminalDispositionEvidence, WinnerFollowDecisionInputs,
@@ -107,6 +109,37 @@ struct GatePlanFailure {
     checked_at_unix_ms: Option<u64>,
 }
 
+type BookReadResult = Result<Result<OrderBook, ClobBookError>, tokio::time::error::Elapsed>;
+
+/// The decision owns this read; dropping it cancels unfinished book work.
+struct EarlyBookRead<F: Future> {
+    token_id: PolymarketTokenId,
+    future: Pin<Box<F>>,
+    completed: Option<F::Output>,
+}
+
+impl<F: Future> EarlyBookRead<F> {
+    async fn during<W: Future>(&mut self, work: W) -> W::Output {
+        tokio::pin!(work);
+        if self.completed.is_none() {
+            tokio::select! {
+                biased;
+                result = &mut self.future => self.completed = Some(result),
+                output = &mut work => return output,
+            }
+        }
+        work.await
+    }
+
+    async fn finish(self) -> (PolymarketTokenId, F::Output) {
+        let output = match self.completed {
+            Some(output) => output,
+            None => self.future.await,
+        };
+        (self.token_id, output)
+    }
+}
+
 struct ActivePaperRiskFailure {
     cause: RiskInputsUnavailable,
     evidence: WinnerFollowRiskInputEvidence,
@@ -126,6 +159,7 @@ fn book_failure(
     outcome: &str,
     response_blake3: Option<&str>,
     fetched_at_unix_ms: Option<u64>,
+    best_ask: Option<Price>,
     reason: &str,
 ) -> BookEvidence {
     BookEvidence {
@@ -133,7 +167,7 @@ fn book_failure(
         outcome: outcome.to_owned(),
         response_blake3: response_blake3.map(str::to_owned),
         fetched_at_unix_ms,
-        best_ask: None,
+        best_ask: best_ask.map(|price| price.0.normalize().to_string()),
         vwap_basis: None,
         ladder_plan_blake3: None,
         reason: Some(reason.to_owned()),
@@ -301,6 +335,10 @@ pub struct ScenarioHooks {
     pub observation_resolution_advance_millis: std::sync::atomic::AtomicI64,
     pub admission_artifacts:
         std::sync::Mutex<std::collections::VecDeque<pe_execution_core::LiveAdmissionArtifact>>,
+    #[cfg(test)]
+    admission_wait: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    #[cfg(test)]
+    admission_failure: std::sync::atomic::AtomicBool,
     pub boundary_mark_prices:
         std::sync::Mutex<std::collections::VecDeque<crate::risk_inputs::HistoricalMarkPrice>>,
     pub financial_clock_unix: std::sync::atomic::AtomicI64,
@@ -2217,12 +2255,14 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         probability: Probability,
         sizing_bankroll: Decimal,
         admission: &pe_execution_core::LiveAdmissionArtifact,
+        early_book: Option<BookReadResult>,
     ) -> Result<GatePlanEvidence, GatePlanFailure> {
         let cap_bps = u64::try_from(self.price_impact_cap_bps).map_err(|_| GatePlanFailure {
             reason: "impact gate cap invalid",
             book: Box::new(book_failure(
                 None,
                 "not_read",
+                None,
                 None,
                 None,
                 "impact gate cap invalid",
@@ -2242,18 +2282,24 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     "missing_token",
                     None,
                     None,
+                    None,
                     "outcome had no CLOB token id",
                 )),
                 checked_at_unix_ms: None,
             });
         };
-        let book = match tokio::time::timeout(
-            Duration::from_secs(CLOB_BOOK_HOT_PATH_TIMEOUT_SECS),
-            self.book_fetcher
-                .fetch_book(&admission.market.condition_id.0, &token_id),
-        )
-        .await
-        {
+        let book_read = match early_book {
+            Some(result) => result,
+            None => {
+                tokio::time::timeout(
+                    Duration::from_secs(CLOB_BOOK_HOT_PATH_TIMEOUT_SECS),
+                    self.book_fetcher
+                        .fetch_book(&admission.market.condition_id.0, &token_id),
+                )
+                .await
+            }
+        };
+        let book = match book_read {
             Ok(Ok(book)) => book,
             Ok(Err(_)) => {
                 return Err(GatePlanFailure {
@@ -2261,6 +2307,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     book: Box::new(book_failure(
                         Some(&token_id),
                         "fetch_failed",
+                        None,
                         None,
                         None,
                         "/book fetch failed",
@@ -2274,6 +2321,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     book: Box::new(book_failure(
                         Some(&token_id),
                         "fetch_timed_out",
+                        None,
                         None,
                         None,
                         "/book fetch timed out",
@@ -2290,6 +2338,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     "corrupt_ladder",
                     Some(&book.response_blake3),
                     Some(book.fetched_at_ms),
+                    None,
                     "ask levels could not form an exact ladder",
                 )),
                 checked_at_unix_ms: None,
@@ -2303,6 +2352,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     "empty_ladder",
                     Some(&book.response_blake3),
                     Some(book.fetched_at_ms),
+                    None,
                     "ask ladder was empty",
                 )),
                 checked_at_unix_ms: None,
@@ -2348,6 +2398,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 "arithmetic_failure",
                 Some(&book.response_blake3),
                 Some(book.fetched_at_ms),
+                None,
                 "price-impact band ceiling not constructible",
             )),
             checked_at_unix_ms: Some(checked_at_unix_ms),
@@ -2365,6 +2416,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     "arithmetic_failure",
                     Some(&book.response_blake3),
                     Some(book.fetched_at_ms),
+                    None,
                     "impact budget not constructible",
                 )),
                 checked_at_unix_ms: Some(checked_at_unix_ms),
@@ -2387,6 +2439,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                         "arithmetic_failure",
                         Some(&book.response_blake3),
                         Some(book.fetched_at_ms),
+                        None,
                         "per-trade cap not constructible",
                     )),
                     checked_at_unix_ms: Some(checked_at_unix_ms),
@@ -2425,6 +2478,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 "arithmetic_failure",
                 Some(&book.response_blake3),
                 Some(book.fetched_at_ms),
+                None,
                 "price domain invariant broken",
             )),
             checked_at_unix_ms: Some(checked_at_unix_ms),
@@ -2437,6 +2491,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     "arithmetic_failure",
                     Some(&book.response_blake3),
                     Some(book.fetched_at_ms),
+                    None,
                     "price band floor not constructible",
                 )),
                 checked_at_unix_ms: Some(checked_at_unix_ms),
@@ -2472,6 +2527,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                                 "arithmetic_failure",
                                 Some(&book.response_blake3),
                                 Some(book.fetched_at_ms),
+                                None,
                                 "all-in ladder debit could not be derived",
                             )),
                             checked_at_unix_ms: Some(checked_at_unix_ms),
@@ -2516,7 +2572,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 worst_case_all_in_debit: CollateralAmount::ZERO,
                 checked_at_unix_ms,
             }),
-            Err(LadderError::BelowBandAsk | LadderError::InsufficientDepth) => {
+            Err(decline @ (LadderError::BelowBandAsk | LadderError::InsufficientDepth)) => {
                 Err(GatePlanFailure {
                     reason: "price-impact ladder walk failed (fail closed)",
                     book: Box::new(book_failure(
@@ -2524,7 +2580,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                         "ladder_rejected",
                         Some(&book.response_blake3),
                         Some(book.fetched_at_ms),
-                        "ladder walk did not satisfy the price band",
+                        Some(best),
+                        &format!("{decline:?}"),
                     )),
                     checked_at_unix_ms: Some(checked_at_unix_ms),
                 })
@@ -2551,24 +2608,26 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                         outcome,
                         Some(&book.response_blake3),
                         Some(book.fetched_at_ms),
-                        reason,
+                        Some(best),
+                        &format!("{decline:?}"),
                     )),
                     checked_at_unix_ms: Some(checked_at_unix_ms),
                 })
             }
-            Err(LadderError::Amount | LadderError::KellySizing | LadderError::Fee(_)) => {
-                Err(GatePlanFailure {
-                    reason: "price-impact ladder arithmetic failed (fail closed)",
-                    book: Box::new(book_failure(
-                        Some(&token_id),
-                        "arithmetic_failure",
-                        Some(&book.response_blake3),
-                        Some(book.fetched_at_ms),
-                        "ladder arithmetic failed",
-                    )),
-                    checked_at_unix_ms: Some(checked_at_unix_ms),
-                })
-            }
+            Err(
+                decline @ (LadderError::Amount | LadderError::KellySizing | LadderError::Fee(_)),
+            ) => Err(GatePlanFailure {
+                reason: "price-impact ladder arithmetic failed (fail closed)",
+                book: Box::new(book_failure(
+                    Some(&token_id),
+                    "arithmetic_failure",
+                    Some(&book.response_blake3),
+                    Some(book.fetched_at_ms),
+                    Some(best),
+                    &format!("{decline:?}"),
+                )),
+                checked_at_unix_ms: Some(checked_at_unix_ms),
+            }),
         }
     }
 
@@ -2865,7 +2924,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                             .source_envelope(receipt)
                             .map(crate::bucket_commit::CompleteActivityPage::from)
                     })
-                    .map(|source_time| (policy, source_time))
+                    .map(|(source_time, asset)| (policy, source_time, asset))
                     .map_err(|error| error.to_string())
             })
             .transpose();
@@ -2877,6 +2936,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 return;
             }
         };
+        let authenticated_asset = paper_freshness
+            .as_ref()
+            .and_then(|(_, _, asset)| asset.clone());
+        let paper_freshness = paper_freshness.map(|(policy, source_time, _)| (policy, source_time));
         let mut decision_evidence = pending
             .as_ref()
             .map(DecisionEvidenceAccumulator::for_continuation);
@@ -3219,11 +3282,46 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         let semantic2 = pending
             .as_ref()
             .is_some_and(|continuation| continuation.version() == 6);
-        let admission = if let Some(admission) = scenario_admission {
-            admission
-        } else {
-            match &self.admission_builder {
-                Some(builder) => match if semantic2 {
+        let mut early_book = authenticated_asset.map(|token_id| {
+            let fetcher = Arc::clone(&self.book_fetcher);
+            let condition = condition_id.clone();
+            let asset = token_id.clone();
+            let deadline =
+                tokio::time::Instant::now() + Duration::from_secs(CLOB_BOOK_HOT_PATH_TIMEOUT_SECS);
+            EarlyBookRead {
+                token_id,
+                future: Box::pin(tokio::time::timeout_at(deadline, async move {
+                    fetcher.fetch_book(&condition.0, &asset.0).await
+                })),
+                completed: None,
+            }
+        });
+        #[cfg(all(test, feature = "scenario"))]
+        let admission_wait = self
+            .scenario_hooks
+            .as_ref()
+            .and_then(|hooks| hooks.admission_wait.lock().ok()?.take());
+        let admission_read = async {
+            #[cfg(all(test, feature = "scenario"))]
+            if let Some(wait) = admission_wait {
+                let _ = wait.await;
+            }
+            #[cfg(all(test, feature = "scenario"))]
+            if self.scenario_hooks.as_ref().is_some_and(|hooks| {
+                hooks
+                    .admission_failure
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            }) {
+                return Some(Err(
+                    crate::live_venue_adapter::LiveVenueAdapterError::MarketValidation(
+                        "injected admission refusal".to_owned(),
+                    ),
+                ));
+            }
+            if let Some(admission) = scenario_admission {
+                Some(Ok(admission))
+            } else if let Some(builder) = &self.admission_builder {
+                Some(if semantic2 {
                     builder
                         .build_paper(&condition_id, OffsetDateTime::now_utc())
                         .await
@@ -3231,30 +3329,71 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     builder
                         .build(&condition_id, OffsetDateTime::now_utc())
                         .await
-                } {
-                    Ok(admission) => admission,
-                    Err(error) => {
-                        info!(%error, market = %signal.market_id, "market admission failed closed");
-                        self.no_fill_or_rollback(
-                            &trade,
-                            &leader_row,
-                            None,
-                            "market_admission_unavailable",
-                            &rb,
-                            Some(&signal.market_id),
-                            decision_evidence.as_ref(),
-                        )
-                        .await;
-                        return;
-                    }
-                },
-                None => {
-                    error!(market = %signal.market_id, "active financial era has no admission builder");
-                    self.intake_stopped = true;
-                    return;
-                }
+                })
+            } else {
+                None
             }
         };
+        let admission = match early_book.as_mut() {
+            Some(book) => book.during(admission_read).await,
+            None => admission_read.await,
+        };
+        let admission = match admission {
+            Some(Ok(admission)) => admission,
+            Some(Err(error)) => {
+                drop(early_book);
+                info!(%error, market = %signal.market_id, "market admission failed closed");
+                self.no_fill_or_rollback(
+                    &trade,
+                    &leader_row,
+                    None,
+                    "market_admission_unavailable",
+                    &rb,
+                    Some(&signal.market_id),
+                    decision_evidence.as_ref(),
+                )
+                .await;
+                return;
+            }
+            None => {
+                drop(early_book);
+                error!(market = %signal.market_id, "active financial era has no admission builder");
+                self.intake_stopped = true;
+                return;
+            }
+        };
+
+        if let Some(book) = early_book.as_ref()
+            && admission
+                .market
+                .ordered_outcome_token_ids
+                .get(usize::from(signal.outcome_id.0))
+                != Some(&book.token_id)
+        {
+            let reason = "price-impact book unusable: token mismatch (fail closed)";
+            if let Some(evidence) = decision_evidence.as_mut() {
+                evidence.record_book(book_failure(
+                    Some(&book.token_id.0),
+                    "token_mismatch",
+                    None,
+                    None,
+                    None,
+                    "authenticated asset differs from admission's ordered outcome token",
+                ));
+            }
+            drop(early_book);
+            self.no_fill_or_rollback(
+                &trade,
+                &leader_row,
+                None,
+                reason,
+                &rb,
+                Some(&signal.market_id),
+                decision_evidence.as_ref(),
+            )
+            .await;
+            return;
+        }
 
         // Resolution-horizon gate uses the scheduled end already carried by admission; no second
         // Gamma request or dashboard cache participates in economics.
@@ -3286,6 +3425,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     resolution_unix = ?resolution_unix,
                     "signal did not produce order",
                 );
+                drop(early_book);
                 self.no_fill_or_rollback(
                     &trade,
                     &leader_row,
@@ -3309,10 +3449,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         // diagnosis; sizing and gating below use `fill_basis` instead. Fail closed on an
         // absent mid (unchanged liveness behaviour).
         let _market_mid = {
-            let mids = self
+            let mid_read = self
                 .mid_price_cache
-                .fetch_mids(std::slice::from_ref(&signal.market_id))
-                .await;
+                .fetch_mids(std::slice::from_ref(&signal.market_id));
+            let mids = match early_book.as_mut() {
+                Some(book) => book.during(mid_read).await,
+                None => mid_read.await,
+            };
             let px = mids
                 .get(&signal.market_id)
                 .and_then(|prices| prices.get(usize::from(signal.outcome_id.0)).copied());
@@ -3343,6 +3486,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                         outcome = signal.outcome_id.0,
                         "signal did not produce order",
                     );
+                    drop(early_book);
                     self.no_fill_or_rollback(
                         &trade,
                         &leader_row,
@@ -3384,8 +3528,19 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 }
             },
         };
+        let early_book = match early_book {
+            Some(book) => Some(book.finish().await.1),
+            None => None,
+        };
         let gate_evidence = match self
-            .plan_impact_gate(&signal, semantic2, p, sizing_bankroll, &admission)
+            .plan_impact_gate(
+                &signal,
+                semantic2,
+                p,
+                sizing_bankroll,
+                &admission,
+                early_book,
+            )
             .await
         {
             Ok(outcome) => outcome,
@@ -4270,6 +4425,404 @@ mod tests {
     use crate::orchestrator_control::OrchestratorControl;
     use crate::risk_inputs::{SourceReceiptIndex, apply_global_risk_halts};
     use crate::supabase_state::{SourceEvidence, SupabaseStateClient};
+
+    #[cfg(feature = "scenario")]
+    mod early_book_tests {
+        use super::*;
+        use crate::bucket_commit::continuation_v3_tests::{binding_fixture, binding_state};
+        use crate::clob_book::{BookLevel, ClobBookError, ClobBookFetcher, OrderBook};
+        use pe_copy_signal_engine::TradeProvenance;
+        use pe_core_types::{Price, ShareAmount};
+        use pe_execution_core::LiveAdmissionArtifact;
+        use pe_strategy_winner_follow::{PerTradeCap, SizingMode};
+        use std::sync::atomic::AtomicUsize;
+        use tokio::sync::oneshot;
+
+        struct Books {
+            book: StdMutex<OrderBook>,
+            stalled: bool,
+            started: StdMutex<Vec<(String, String)>>,
+            dropped: Arc<AtomicUsize>,
+        }
+
+        struct DropRead(Arc<AtomicUsize>);
+        impl Drop for DropRead {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        impl ClobBookFetcher for Books {
+            async fn fetch_book(
+                &self,
+                condition: &str,
+                token: &str,
+            ) -> Result<OrderBook, ClobBookError> {
+                let _read = DropRead(Arc::clone(&self.dropped));
+                self.started
+                    .lock()
+                    .unwrap()
+                    .push((condition.to_owned(), token.to_owned()));
+                if self.stalled {
+                    std::future::pending::<()>().await;
+                }
+                Ok(self.book.lock().unwrap().clone())
+            }
+        }
+
+        struct Harness {
+            _fixture: crate::bucket_commit::continuation_v3_tests::BindingFixture,
+            owner: Orchestrator<FixtureFetcher, Books>,
+            trade: pe_copy_signal_engine::IncomingTrade,
+            books: Arc<Books>,
+            hooks: Arc<super::super::ScenarioHooks>,
+            release: Option<oneshot::Sender<()>>,
+        }
+
+        impl Harness {
+            fn new(provenance: TradeProvenance, authenticated: bool, stalled: bool) -> Self {
+                let fixture = binding_fixture("valid");
+                let state = binding_state(&fixture);
+                let row = state
+                    .decision_pending_for(&fixture.continuation.facts.source_trade_id)
+                    .unwrap()
+                    .unwrap();
+                let mut continuation =
+                    crate::bucket_commit::DecisionContinuationV3::from_durable(&row).unwrap();
+                continuation.facts.provenance = provenance;
+                if provenance == TradeProvenance::RestPoll {
+                    continuation.observed_source_receipt = None;
+                }
+                let config = &mut continuation.facts.applied_configuration;
+                config.min_resolution_horizon_secs = 0;
+                config.max_resolution_horizon_secs = 0;
+                config.min_fill_price = Decimal::ZERO;
+                config.max_fill_price = dec!(0.85);
+                config.per_trade_cap = PerTradeCap::Unlimited;
+                config.sizing_mode = SizingMode::Dollar { usd: dec!(25) };
+                config.sizing_dollar_usd = dec!(25);
+                continuation.facts.applied_configuration_hash = config.canonical_hash();
+                if !authenticated {
+                    continuation.facts.paper_freshness_policy = None;
+                    continuation = crate::bucket_commit::DecisionContinuationV3::new(
+                        continuation.facts,
+                        continuation.observed_source_receipt,
+                        continuation.page_occurrences,
+                        None,
+                    );
+                }
+                rusqlite::Connection::open(fixture.dir.path().join("paper.db")).unwrap().execute(
+                    "UPDATE decision_pending SET frozen_inputs_json = ?1 WHERE source_trade_id = ?2",
+                    rusqlite::params![serde_json::to_string(&continuation).unwrap(), row.source_trade_id.0],
+                ).unwrap();
+                let now = u64::try_from(SEAL_START_UNIX * 1000).unwrap();
+                let books = Arc::new(Books {
+                    book: StdMutex::new(OrderBook {
+                        asks: vec![BookLevel {
+                            price: dec!(0.5),
+                            size: dec!(1),
+                        }],
+                        fetched_at_ms: now,
+                        response_blake3: "early-book".to_owned(),
+                        source_receipt: None,
+                    }),
+                    stalled,
+                    started: StdMutex::new(Vec::new()),
+                    dropped: Arc::new(AtomicUsize::new(0)),
+                });
+                let (control, receiver) = mpsc::channel(4);
+                drop(control);
+                let writer =
+                    crate::paper_recovery::PaperLog::open(fixture.dir.path().join("paper.log"))
+                        .unwrap();
+                let base = "https://offline.invalid";
+                let mids = serde_json::to_vec(&serde_json::json!([{
+                    "conditionId": "new", "outcomePrices": "[\"0.5\",\"0.5\"]", "clobTokenIds": "[\"123\",\"456\"]"
+                }])).unwrap();
+                let mid_fetcher = FixtureFetcher::new(HashMap::from([(
+                    format!("{base}/markets?condition_ids=new&limit=500"),
+                    mids,
+                )]));
+                let mut owner = Orchestrator::new(
+                    LiveWatchlist::new(Watchlist {
+                        entries: Vec::new(),
+                        snapshot_at: SourceTimestamp(time::OffsetDateTime::UNIX_EPOCH),
+                        active_count: 0,
+                        incubator_count: 0,
+                    }),
+                    super::super::OrchestratorConfig {
+                        bankroll: dec!(100),
+                        mode: ExecutionMode::Paper,
+                        signal_config: Default::default(),
+                        max_resolution_horizon_secs: 0,
+                        min_resolution_horizon_secs: 0,
+                        max_fill_price: dec!(0.85),
+                        min_fill_price: Decimal::ZERO,
+                        price_impact_cap_bps: 100,
+                        entry_gate_config: CopyEntryGateConfig,
+                        runtime_config: None,
+                        live_accounts: None,
+                        live_journal: None,
+                        activity_ws_enabled: false,
+                        copy_latency_budget_secs: 2,
+                        watchlist_writer_lock: None,
+                    },
+                    WinnerFollowStrategy::new(WinnerFollowConfig::default()),
+                    writer,
+                    state.clone(),
+                    crate::paper_recovery::build_leader_ledger(&state).unwrap(),
+                    new_shared_health(false),
+                    MidPriceCache::with_fetcher(mid_fetcher, base.to_owned()),
+                    receiver,
+                    None,
+                    None,
+                    None,
+                    books.clone(),
+                )
+                .unwrap();
+                owner.resuming_boot = true;
+                owner.source_receipts = Some(fixture.index.clone());
+                owner.qualification_start = Some(fixture.metadata_receipt);
+                let hooks = Arc::new(super::super::ScenarioHooks::default());
+                hooks
+                    .age_clock
+                    .lock()
+                    .unwrap()
+                    .push_back(time::OffsetDateTime::from_unix_timestamp(101).unwrap());
+                hooks
+                    .financial_clock_unix
+                    .store(SEAL_START_UNIX, Ordering::SeqCst);
+                let economic =
+                    seal_test_economic(fixture.metadata_receipt, fixture.metadata_receipt);
+                let mut market = pe_source_polymarket_public::LiveMarketEvidence {
+                    condition_id: PolymarketConditionId("new".to_owned()),
+                    ordered_outcome_token_ids: [
+                        PolymarketTokenId("123".to_owned()),
+                        PolymarketTokenId("456".to_owned()),
+                    ],
+                    neg_risk: false,
+                    minimum_tick_size: Price::new(dec!(0.01)).unwrap(),
+                    minimum_order_size: ShareAmount::from_whole(5).unwrap(),
+                    scheduled_end_unix: None,
+                    observed_at_unix: SEAL_START_UNIX,
+                    schema_version: 1,
+                    parser_version: 1,
+                    freshness_window_secs: 60,
+                };
+                market.scheduled_end_unix =
+                    Some(time::OffsetDateTime::now_utc().unix_timestamp() + 3600);
+                hooks
+                    .admission_artifacts
+                    .lock()
+                    .unwrap()
+                    .push_back(LiveAdmissionArtifact {
+                        market,
+                        settlement: economic.admission.settlement,
+                        fee_schedule: CompactFeeSchedule::Zero,
+                        receipts: economic.admission.receipts,
+                    });
+                let (release, wait) = oneshot::channel();
+                *hooks.admission_wait.lock().unwrap() = Some(wait);
+                owner.set_scenario_hooks(hooks.clone());
+                let trade = continuation.incoming_trade().unwrap();
+                Self {
+                    _fixture: fixture,
+                    owner,
+                    trade,
+                    books,
+                    hooks,
+                    release: Some(release),
+                }
+            }
+
+            fn change_config(
+                &mut self,
+                change: impl FnOnce(&mut crate::runtime_config::RuntimeConfig),
+            ) {
+                let continuation = self
+                    .owner
+                    .pending_continuations
+                    .get_mut(&self.trade.source_trade_id)
+                    .unwrap();
+                change(&mut continuation.facts.applied_configuration);
+                continuation.facts.applied_configuration_hash =
+                    continuation.facts.applied_configuration.canonical_hash();
+                rusqlite::Connection::open(self._fixture.dir.path().join("paper.db")).unwrap().execute(
+                    "UPDATE decision_pending SET frozen_inputs_json = ?1 WHERE source_trade_id = ?2",
+                    rusqlite::params![serde_json::to_string(continuation).unwrap(), self.trade.source_trade_id.0],
+                ).unwrap();
+            }
+
+            fn evidence(&self) -> crate::decision_replay::DecisionPostBoundaryEvidence {
+                let row = self
+                    .owner
+                    .paper_state
+                    .decision_pending_for(&self.trade.source_trade_id)
+                    .unwrap()
+                    .unwrap();
+                let replayed = crate::decision_replay::replay_decision_pending(&row).unwrap();
+                assert_eq!(
+                    replayed.continuation.facts.source_trade_id,
+                    self.trade.source_trade_id
+                );
+                serde_json::from_str(&row.post_commit_inputs_json).unwrap()
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn websocket_and_rest_book_overlap_admission_and_match_ordered_token() {
+            for provenance in [TradeProvenance::ActivityWs, TradeProvenance::RestPoll] {
+                let mut harness = Harness::new(provenance, true, false);
+                let mut decision = Box::pin(harness.owner.handle_trade_once(harness.trade.clone()));
+                assert!(futures::poll!(&mut decision).is_pending());
+                assert_eq!(
+                    *harness.books.started.lock().unwrap(),
+                    [("new".to_owned(), "123".to_owned())]
+                );
+                harness.release.take().unwrap().send(()).unwrap();
+                decision.await;
+                let evidence = harness.evidence();
+                let book = evidence.body.book.unwrap();
+                assert_eq!(book.request_token_id.as_deref(), Some("123"));
+                assert_eq!(book.outcome, "ladder_rejected");
+                assert_eq!(book.reason.as_deref(), Some("InsufficientDepth"));
+                assert_eq!(book.best_ask.as_deref(), Some("0.5"));
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn ladder_rejections_retain_specific_reason_and_best_ask() {
+            for (floor, depth, expected) in [
+                (dec!(0.6), dec!(100), "BelowBandAsk"),
+                (Decimal::ZERO, dec!(100), "BelowMinimum"),
+            ] {
+                let mut harness = Harness::new(TradeProvenance::RestPoll, true, false);
+                harness.change_config(|config| {
+                    config.min_fill_price = floor;
+                    config.sizing_dollar_usd = dec!(1);
+                    config.sizing_mode = SizingMode::Dollar { usd: dec!(1) };
+                });
+                harness.books.book.lock().unwrap().asks[0].size = depth;
+                harness.release.take().unwrap().send(()).unwrap();
+                harness.owner.handle_trade_once(harness.trade.clone()).await;
+                let book = harness.evidence().body.book.unwrap();
+                assert_eq!(book.reason.as_deref(), Some(expected));
+                assert_eq!(book.best_ask.as_deref(), Some("0.5"));
+                assert_eq!(book.response_blake3.as_deref(), Some("early-book"));
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn mismatch_drops_stalled_book_before_mid_or_planning() {
+            let mut harness = Harness::new(TradeProvenance::RestPoll, true, true);
+            harness.hooks.admission_artifacts.lock().unwrap()[0]
+                .market
+                .ordered_outcome_token_ids
+                .swap(0, 1);
+            let mut decision = Box::pin(harness.owner.handle_trade_once(harness.trade.clone()));
+            assert!(futures::poll!(&mut decision).is_pending());
+            harness.release.take().unwrap().send(()).unwrap();
+            assert!(futures::poll!(&mut decision).is_ready());
+            drop(decision);
+            assert_eq!(harness.books.dropped.load(Ordering::SeqCst), 1);
+            let evidence = harness.evidence();
+            assert!(evidence.body.market_price.is_none());
+            assert_eq!(evidence.body.book.unwrap().outcome, "token_mismatch");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn book_age_is_checked_at_use_after_admission_waits() {
+            let mut harness = Harness::new(TradeProvenance::ActivityWs, true, false);
+            let mut decision = Box::pin(harness.owner.handle_trade_once(harness.trade.clone()));
+            assert!(futures::poll!(&mut decision).is_pending());
+            harness
+                .hooks
+                .financial_clock_unix
+                .store(SEAL_START_UNIX + 3, Ordering::SeqCst);
+            harness.release.take().unwrap().send(()).unwrap();
+            decision.await;
+            let evidence = harness.evidence();
+            assert_eq!(evidence.body.book.unwrap().outcome, "stale");
+            assert_eq!(
+                evidence
+                    .body
+                    .clocks
+                    .iter()
+                    .find(|clock| clock.purpose == "book_staleness_check")
+                    .unwrap()
+                    .unix_millis,
+                (SEAL_START_UNIX + 3) * 1000
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn admission_and_horizon_refusals_drop_stalled_book_immediately() {
+            for admission_failure in [true, false] {
+                let mut harness = Harness::new(TradeProvenance::ActivityWs, true, true);
+                if admission_failure {
+                    harness
+                        .hooks
+                        .admission_failure
+                        .store(true, Ordering::SeqCst);
+                } else {
+                    harness.change_config(|config| config.min_resolution_horizon_secs = 60);
+                    harness.hooks.admission_artifacts.lock().unwrap()[0]
+                        .market
+                        .scheduled_end_unix = None;
+                }
+                let mut decision = Box::pin(harness.owner.handle_trade_once(harness.trade.clone()));
+                assert!(futures::poll!(&mut decision).is_pending());
+                assert_eq!(harness.books.started.lock().unwrap().len(), 1);
+                harness.release.take().unwrap().send(()).unwrap();
+                assert!(futures::poll!(&mut decision).is_ready());
+                drop(decision);
+                assert_eq!(harness.books.dropped.load(Ordering::SeqCst), 1);
+                let row = harness
+                    .owner
+                    .paper_state
+                    .decision_pending_for(&harness.trade.source_trade_id)
+                    .unwrap()
+                    .unwrap();
+                let evidence: crate::decision_replay::DecisionPostBoundaryEvidence =
+                    serde_json::from_str(&row.post_commit_inputs_json).unwrap();
+                assert!(evidence.body.book.is_none());
+                assert!(evidence.body.market_price.is_none());
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn unauthenticated_continuation_keeps_admission_first_order() {
+            let mut harness = Harness::new(TradeProvenance::RestPoll, false, false);
+            let mut decision = Box::pin(harness.owner.handle_trade_once(harness.trade.clone()));
+            assert!(futures::poll!(&mut decision).is_pending());
+            assert!(harness.books.started.lock().unwrap().is_empty());
+            harness.release.take().unwrap().send(()).unwrap();
+            decision.await;
+            assert_eq!(harness.books.started.lock().unwrap().len(), 1);
+            assert_eq!(
+                harness.evidence().body.book.unwrap().outcome,
+                "ladder_rejected"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn stalled_book_timeout_is_measured_from_launch() {
+            let mut harness = Harness::new(TradeProvenance::RestPoll, true, true);
+            let mut decision = Box::pin(harness.owner.handle_trade_once(harness.trade.clone()));
+            assert!(futures::poll!(&mut decision).is_pending());
+            tokio::time::advance(std::time::Duration::from_millis(1500)).await;
+            harness.release.take().unwrap().send(()).unwrap();
+            assert!(futures::poll!(&mut decision).is_pending());
+            tokio::time::advance(std::time::Duration::from_millis(501)).await;
+            assert!(futures::poll!(&mut decision).is_ready());
+            drop(decision);
+            assert_eq!(
+                harness.evidence().body.book.unwrap().outcome,
+                "fetch_timed_out"
+            );
+            assert_eq!(harness.books.dropped.load(Ordering::SeqCst), 1);
+        }
+    }
 
     const NOW: i64 = 1_700_000_000;
     const SEAL_START_UNIX: i64 = 1_800_057_600;
