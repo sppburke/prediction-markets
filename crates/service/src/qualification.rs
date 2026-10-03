@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use pe_copy_signal_engine::{LeaderSignal, PositionState, SignalConfig};
 use pe_core_types::{
@@ -720,7 +721,7 @@ struct RiskReplayContext<'a> {
     settlements: &'a [SettledMarketRow],
     last_completed: Option<EventSeq>,
     start_receipt: AppendReceipt,
-    paper_prefix: &'a [ScannedPaperFrame],
+    paper_prefix: &'a [Arc<ScannedPaperFrame>],
     source: &'a BTreeMap<u64, SourceObservation>,
     prepared_received_unix_ms: i64,
     start_hot_config_hash: &'a str,
@@ -1427,7 +1428,7 @@ fn sealed_source_envelopes(
 }
 
 fn paper_live_wrapper_bases(
-    frames: &[ScannedPaperFrame],
+    frames: &[Arc<ScannedPaperFrame>],
 ) -> Result<HashMap<String, PaperLiveWrapperBasis>, QualificationError> {
     let mut bases = HashMap::new();
     for frame in frames {
@@ -1480,7 +1481,7 @@ fn verify_live_wrappers(
     source_prefix: &TailBinding,
     live_prefix: &TailBinding,
     start: &QualificationStarted,
-    paper_frames: &[ScannedPaperFrame],
+    paper_frames: &[Arc<ScannedPaperFrame>],
 ) -> Result<VerifiedLiveEvidence, QualificationError> {
     let wrapper_events = replay_live_prefix(live_journal, &start.live_prefix, live_prefix)?;
     let source_envelopes = sealed_source_envelopes(source_log, source_prefix)?;
@@ -1761,7 +1762,7 @@ fn receipt_key(receipt: AppendReceipt) -> (u64, String) {
 }
 
 fn find_seal(
-    frames: &[ScannedPaperFrame],
+    frames: &[Arc<ScannedPaperFrame>],
     requested_hash: blake3::Hash,
 ) -> Result<(usize, AppendReceipt, QualificationSealed), QualificationError> {
     frames
@@ -1786,7 +1787,7 @@ fn find_seal(
 }
 
 fn find_start(
-    frames: &[ScannedPaperFrame],
+    frames: &[Arc<ScannedPaperFrame>],
     seal_index: usize,
     seal: &QualificationSealed,
 ) -> Result<(usize, AppendReceipt, QualificationStarted), QualificationError> {
@@ -1812,7 +1813,7 @@ fn find_start(
 }
 
 fn verify_seal_boundary(
-    frames: &[ScannedPaperFrame],
+    frames: &[Arc<ScannedPaperFrame>],
     seal_index: usize,
     seal: &QualificationSealed,
 ) -> Result<usize, QualificationError> {
@@ -4512,7 +4513,7 @@ fn reason_moves_anchor(reason: MembershipReason) -> bool {
 }
 
 struct DeclineReplayContext<'a> {
-    frames: &'a [ScannedPaperFrame],
+    frames: &'a [Arc<ScannedPaperFrame>],
     start_index: usize,
     source: &'a BTreeMap<u64, SourceObservation>,
     completed_financial_facts: &'a [CompletedFinancialFact],
@@ -4533,11 +4534,11 @@ fn financial_state_at_prefix(
 }
 
 fn recorded_fill_paper_prefix<'a>(
-    frames_before_prepared: &'a [ScannedPaperFrame],
+    frames_before_prepared: &'a [Arc<ScannedPaperFrame>],
     financial_prefix: AppendReceipt,
     evaluated_at_unix_ms: i64,
     previous_fill_financial_prefix: &mut Option<AppendReceipt>,
-) -> Result<&'a [ScannedPaperFrame], QualificationError> {
+) -> Result<&'a [Arc<ScannedPaperFrame>], QualificationError> {
     let prefix = paper_prefix_at_financial_prefix(
         frames_before_prepared,
         financial_prefix,
@@ -5704,7 +5705,7 @@ fn scan_verified_paper_prefix(
     path: &Path,
     verified_tail: u64,
     complete_file: bool,
-) -> Result<Vec<ScannedPaperFrame>, QualificationError> {
+) -> Result<Vec<Arc<ScannedPaperFrame>>, QualificationError> {
     if complete_file {
         return Ok(scan_paper_log(path)?);
     }
@@ -5722,7 +5723,7 @@ fn scan_verified_paper_prefix(
         options.mode(0o600);
     }
     let mut target = options.open(&temporary_path)?;
-    let result = (|| -> Result<Vec<ScannedPaperFrame>, QualificationError> {
+    let result = (|| -> Result<Vec<Arc<ScannedPaperFrame>>, QualificationError> {
         use std::io::Read as _;
 
         let source = fs::File::open(path)?;
@@ -5756,7 +5757,7 @@ fn start_envelope(
         observed_at: SourceTimestamp(timestamp),
         received_at: ReceivedAt(timestamp),
         content_type: ContentType::Json,
-        payload: serde_json::to_vec(&PaperLogRecord::QualificationStarted(Box::new(
+        payload: serde_json::to_vec(&PaperLogRecord::QualificationStarted(Arc::new(
             start.clone(),
         )))?,
     })
@@ -6493,14 +6494,14 @@ mod tests {
         }
     }
 
-    fn risk_frame(sequence: u64, record: PaperLogRecord) -> ScannedPaperFrame {
+    fn risk_frame(sequence: u64, record: PaperLogRecord) -> Arc<ScannedPaperFrame> {
         let receipt = AppendReceipt {
             sequence: EventSeq(sequence),
             this_hash: blake3::hash(&sequence.to_be_bytes()),
         };
         let timestamp =
             OffsetDateTime::from_unix_timestamp(i64::try_from(sequence).unwrap()).unwrap();
-        ScannedPaperFrame {
+        Arc::new(ScannedPaperFrame {
             envelope: pe_event_log::EventEnvelope {
                 seq: receipt.sequence,
                 source_id: SourceId("paper-test".to_owned()),
@@ -6517,7 +6518,7 @@ mod tests {
             receipt,
             frame: PaperLogFrame::Record(record),
             legacy_fill: None,
-        }
+        })
     }
 
     fn test_receipt(sequence: u64) -> AppendReceipt {
@@ -6527,10 +6528,10 @@ mod tests {
         }
     }
 
-    fn test_frame(sequence: u64, unix: i64, record: PaperLogRecord) -> ScannedPaperFrame {
+    fn test_frame(sequence: u64, unix: i64, record: PaperLogRecord) -> Arc<ScannedPaperFrame> {
         let receipt = test_receipt(sequence);
         let timestamp = OffsetDateTime::from_unix_timestamp(unix).unwrap();
-        ScannedPaperFrame {
+        Arc::new(ScannedPaperFrame {
             envelope: EventEnvelope {
                 seq: receipt.sequence,
                 source_id: SourceId("paper-test".to_owned()),
@@ -6547,7 +6548,7 @@ mod tests {
             receipt,
             frame: PaperLogFrame::Record(record),
             legacy_fill: None,
-        }
+        })
     }
 
     fn classification_fixture() -> (DecisionContinuationV3, LedgerMutation) {
@@ -6669,7 +6670,7 @@ mod tests {
     struct DeclineFixture {
         decision: crate::decision_replay::ReplayedDecision,
         start: QualificationStarted,
-        frames: Vec<ScannedPaperFrame>,
+        frames: Vec<Arc<ScannedPaperFrame>>,
         source: BTreeMap<u64, SourceObservation>,
         facts: Vec<CompletedFinancialFact>,
         observations: HashMap<SourceTradeId, ObservationEvidence>,
@@ -6876,7 +6877,7 @@ mod tests {
         let start_frame = test_frame(
             1,
             EVALUATED_MS.div_euclid(1_000) - 100,
-            PaperLogRecord::QualificationStarted(Box::new(start.clone())),
+            PaperLogRecord::QualificationStarted(Arc::new(start.clone())),
         );
         let mut prior = risk_economic(
             OPEN_CONDITION,
@@ -10276,32 +10277,33 @@ mod tests {
         let mut frames = vec![test_frame(
             1,
             1,
-            PaperLogRecord::QualificationStarted(Box::new(start.clone())),
+            PaperLogRecord::QualificationStarted(Arc::new(start.clone())),
         )];
         let mut sequence = 2u64;
-        let push_mark = |frames: &mut Vec<ScannedPaperFrame>, sequence: u64, cutoff_unix: i64| {
-            frames.push(test_frame(
-                sequence,
-                cutoff_unix,
-                PaperLogRecord::PortfolioMark(Box::new(PortfolioMark {
-                    boundary_receipt: test_receipt(10_000 + sequence),
+        let push_mark =
+            |frames: &mut Vec<Arc<ScannedPaperFrame>>, sequence: u64, cutoff_unix: i64| {
+                frames.push(test_frame(
+                    sequence,
                     cutoff_unix,
-                    source_tail: TailBinding {
-                        physical_tail: 0,
-                        last_sequence: Some(EventSeq(10_000 + sequence)),
-                        last_hash: test_receipt(10_000 + sequence)
-                            .this_hash
-                            .to_hex()
-                            .to_string(),
-                    },
-                    financial_prefix_seq: None,
-                    prices: Vec::new(),
-                    cash: dec!(100),
-                    equity: dec!(100),
-                    invalid: None,
-                })),
-            ));
-        };
+                    PaperLogRecord::PortfolioMark(Box::new(PortfolioMark {
+                        boundary_receipt: test_receipt(10_000 + sequence),
+                        cutoff_unix,
+                        source_tail: TailBinding {
+                            physical_tail: 0,
+                            last_sequence: Some(EventSeq(10_000 + sequence)),
+                            last_hash: test_receipt(10_000 + sequence)
+                                .this_hash
+                                .to_hex()
+                                .to_string(),
+                        },
+                        financial_prefix_seq: None,
+                        prices: Vec::new(),
+                        cash: dec!(100),
+                        equity: dec!(100),
+                        invalid: None,
+                    })),
+                ));
+            };
         push_mark(&mut frames, sequence, 86_400);
         sequence += 1;
 
@@ -10429,7 +10431,7 @@ mod tests {
         sequence += 1;
         push_mark(&mut frames, sequence, 31 * 86_400);
         let era = PaperEra {
-            start: Some((start_receipt, start)),
+            start: Some((start_receipt, Arc::new(start))),
             frames,
         };
 
@@ -10623,7 +10625,7 @@ mod tests {
         let one = CollateralAmount::from_decimal_exact(dec!(1)).unwrap();
         let four = CollateralAmount::from_decimal_exact(dec!(4)).unwrap();
         let era = crate::paper_recovery::PaperEra {
-            start: Some((start_receipt, start.clone())),
+            start: Some((start_receipt, Arc::new(start.clone()))),
             frames: vec![
                 risk_frame(1, fill("unresolved", "market-a", one)),
                 risk_frame(2, fill_final(1, one)),

@@ -402,7 +402,7 @@ impl RestartFixture {
         let mut paper_writer = Writer::open(dir.path().join("paper.log")).unwrap();
         let mut start_envelope = envelope(
             "pe-service.paper",
-            &serde_json::to_vec(&PaperLogRecord::QualificationStarted(Box::new(start))).unwrap(),
+            &serde_json::to_vec(&PaperLogRecord::QualificationStarted(Arc::new(start))).unwrap(),
         );
         start_envelope.schema_version = 2;
         let start_receipt = paper_writer.append_synced(start_envelope).unwrap();
@@ -621,7 +621,7 @@ impl RestartFixture {
                 watchlist_writer_lock: None,
             },
             WinnerFollowStrategy::new(self.config.winner_follow_config()),
-            Writer::open(self.dir.path().join("paper.log")).unwrap(),
+            pe_service::paper_recovery::PaperLog::open(self.dir.path().join("paper.log")).unwrap(),
             paper.clone(),
             build_leader_ledger(&paper).unwrap(),
             ingest.health.clone(),

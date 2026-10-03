@@ -577,7 +577,7 @@ fn empty_tail() -> TailBinding {
 }
 
 fn active_start_record() -> PaperLogRecord {
-    PaperLogRecord::QualificationStarted(Box::new(QualificationStarted {
+    PaperLogRecord::QualificationStarted(Arc::new(QualificationStarted {
         starting_bankroll: CollateralAmount::from_decimal_exact(dec!(10)).unwrap(),
         paper_prefix: empty_tail(),
         source_prefix: empty_tail(),
@@ -596,7 +596,10 @@ fn active_start_record() -> PaperLogRecord {
     }))
 }
 
-fn append_active_record(writer: &mut Writer, record: &PaperLogRecord) -> AppendReceipt {
+fn append_active_record(
+    writer: &pe_service::paper_recovery::PaperLog,
+    record: &PaperLogRecord,
+) -> AppendReceipt {
     let timestamp = OffsetDateTime::from_unix_timestamp(1_800_000_000).unwrap();
     writer
         .append_synced(EnvelopeIn {
@@ -665,8 +668,8 @@ async fn active_fill_crash_matrix_converges_once() {
         } else {
             SourceEvidence::Log(&source_log)
         };
-        let mut writer = Writer::open(&paper_log).unwrap();
-        let start = append_active_record(&mut writer, &active_start_record());
+        let writer = pe_service::paper_recovery::PaperLog::open(&paper_log).unwrap();
+        let start = append_active_record(&writer, &active_start_record());
         let state = PaperStateDb::open(&dir.path().join("active-paper.db")).unwrap();
         state
             .reset_financial_era(
@@ -693,7 +696,7 @@ async fn active_fill_crash_matrix_converges_once() {
             economic: support::economic_prepared(source_receipt, start),
         };
         let prepared_receipt = append_active_record(
-            &mut writer,
+            &writer,
             &PaperLogRecord::FinancialPrepared {
                 expected_authority: expected.clone(),
                 payload: payload.clone(),
@@ -747,7 +750,7 @@ async fn active_fill_crash_matrix_converges_once() {
         }
         if matches!(seam, FillCrashSeam::FinalAppend) {
             append_active_record(
-                &mut writer,
+                &writer,
                 &PaperLogRecord::FinancialFinal {
                     prepared_receipt,
                     result: FinancialResult::Fill {
@@ -757,15 +760,10 @@ async fn active_fill_crash_matrix_converges_once() {
             );
         }
 
-        let appended = reconcile_active_financial_frames(
-            &authority,
-            &state,
-            &paper_log,
-            source_evidence,
-            &mut writer,
-        )
-        .await
-        .unwrap();
+        let appended =
+            reconcile_active_financial_frames(&authority, &state, source_evidence, &writer)
+                .await
+                .unwrap();
         assert_eq!(
             appended,
             usize::from(!matches!(seam, FillCrashSeam::FinalAppend)),
@@ -790,15 +788,9 @@ async fn active_fill_crash_matrix_converges_once() {
             "seam {seam:?}"
         );
         assert_eq!(
-            reconcile_active_financial_frames(
-                &authority,
-                &state,
-                &paper_log,
-                source_evidence,
-                &mut writer,
-            )
-            .await
-            .unwrap(),
+            reconcile_active_financial_frames(&authority, &state, source_evidence, &writer,)
+                .await
+                .unwrap(),
             0
         );
         assert_eq!(authority.prepared_mutations(), 1);
@@ -1036,8 +1028,8 @@ async fn resumed_legacy_checkpoints_keep_financial_terminal_bytes() {
             let mut source_writer = Writer::open(&source_log).unwrap();
             let source_receipt = append_source_observation(&mut source_writer);
             drop(source_writer);
-            let mut writer = Writer::open(&paper_log).unwrap();
-            let start = append_active_record(&mut writer, &active_start_record());
+            let writer = pe_service::paper_recovery::PaperLog::open(&paper_log).unwrap();
+            let start = append_active_record(&writer, &active_start_record());
             let state_path = dir.path().join("paper.db");
             let state = PaperStateDb::open(&state_path).unwrap();
             state
@@ -1082,7 +1074,7 @@ async fn resumed_legacy_checkpoints_keep_financial_terminal_bytes() {
             };
             let economic = support::economic_prepared(source_receipt, start);
             let prepared = append_active_record(
-                &mut writer,
+                &writer,
                 &PaperLogRecord::FinancialPrepared {
                     expected_authority: expected_authority.clone(),
                     payload: FinancialPayload::Fill {
@@ -1100,7 +1092,7 @@ async fn resumed_legacy_checkpoints_keep_financial_terminal_bytes() {
             );
             let canonical = authority.commit_prepared_fill(&request).await.unwrap();
             let final_receipt = append_active_record(
-                &mut writer,
+                &writer,
                 &PaperLogRecord::FinancialFinal {
                     prepared_receipt: prepared,
                     result: FinancialResult::Fill { canonical },
@@ -1139,9 +1131,8 @@ async fn resumed_legacy_checkpoints_keep_financial_terminal_bytes() {
                             reconcile_active_financial_frames(
                                 &authority,
                                 &state,
-                                &paper_log,
                                 SourceEvidence::Log(&source_log),
-                                &mut writer,
+                                &writer,
                             ),
                         )
                         .await

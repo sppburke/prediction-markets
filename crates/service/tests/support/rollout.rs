@@ -521,7 +521,10 @@ async fn run_case(boot_waves: bool) {
     let start_receipt = Writer::open(&cfg.event_log_path)
         .unwrap()
         .append_synced(envelope(
-            serde_json::to_vec(&PaperLogRecord::QualificationStarted(Box::new(start))).unwrap(),
+            serde_json::to_vec(&PaperLogRecord::QualificationStarted(std::sync::Arc::new(
+                start,
+            )))
+            .unwrap(),
             "pe-service.paper",
             now - 5,
             2,

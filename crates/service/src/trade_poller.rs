@@ -530,7 +530,9 @@ pub(crate) fn recover_daily_boundary_anchor(
         .find_map(|frame| match &frame.frame {
             crate::paper_recovery::PaperLogFrame::Record(
                 crate::paper_recovery::PaperLogRecord::QualificationStarted(candidate),
-            ) if candidate.as_ref() == start => Some(frame.envelope.received_at.0.unix_timestamp()),
+            ) if candidate.as_ref() == start.as_ref() => {
+                Some(frame.envelope.received_at.0.unix_timestamp())
+            }
             _ => None,
         })
         .ok_or_else(|| ObligationRebuildError::Boundary("Start envelope is absent".to_owned()))?;
@@ -2502,7 +2504,7 @@ mod tests {
     }
 
     fn qualification_start(wallet: WalletAddress) -> PaperLogRecord {
-        PaperLogRecord::QualificationStarted(Box::new(QualificationStarted {
+        PaperLogRecord::QualificationStarted(Arc::new(QualificationStarted {
             starting_bankroll: CollateralAmount::from_atomic(100_000_000),
             paper_prefix: empty_tail(),
             source_prefix: empty_tail(),

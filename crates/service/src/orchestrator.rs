@@ -17,7 +17,7 @@ use pe_core_types::{
     ReceivedAt, ReconstructionQuality, ShareAmount, Side, SourceId, SourceTimestamp, SourceTradeId,
     TraderId, VenueId, WalletAddress,
 };
-use pe_event_log::{ContentType, EnvelopeIn, Scanner, Writer};
+use pe_event_log::{ContentType, EnvelopeIn};
 use pe_kelly_sizer::{KellyInput, size_contracts};
 use pe_paper_state::{FillRecord, LeaderPositionRow, PaperStateDb, PendingTerminalEvidence};
 use pe_position_ledger::PositionLedger;
@@ -329,7 +329,7 @@ pub struct Orchestrator<
     live_watchlist: LiveWatchlist,
     signal_config: SignalConfig,
     strategy: WinnerFollowStrategy,
-    paper_writer: Writer,
+    paper_writer: crate::paper_recovery::PaperLog,
     mode: ExecutionMode,
     bankroll: Decimal,
     paper_state: Arc<PaperStateDb>,
@@ -445,7 +445,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 content_type: ContentType::Json,
                 payload,
             })
-            .map_err(|error| error.to_string())
+            .map_err(|error| {
+                self.intake_stopped = true;
+                error.to_string()
+            })
     }
 
     fn apply_risk_halt_transition(
@@ -593,7 +596,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .as_ref()
             .ok_or_else(|| "qualification seal is unavailable before Start".to_owned())?;
         let era = crate::paper_recovery::paper_era(
-            crate::paper_recovery::scan_paper_log(paper_log_path)
+            self.paper_writer
+                .snapshot()
                 .map_err(|error| error.to_string())?,
         );
         let (start_receipt, started) = era
@@ -667,8 +671,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             ),
             (Err(error), _) => return Err(qualification_error(error)),
         };
-        let financial_prefix =
-            Scanner::verify(paper_log_path).map_err(|error| error.to_string())?;
+        let financial_prefix = self.paper_writer.verified_tail().map_err(|error| {
+            self.intake_stopped = true;
+            error.to_string()
+        })?;
         let live_prefix = pe_execution_core::LiveJournal::verified_tail(
             paper_log_path.with_file_name("live_journal.log"),
         )
@@ -696,12 +702,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         proposed_economic_hash: &str,
         proposed_financial_semantic_version: u32,
     ) -> Result<(), String> {
-        let (paper_log_path, _) = self
+        let (_paper_log_path, _) = self
             .financial_log_paths
             .as_ref()
             .ok_or_else(|| "qualification seal check is unavailable before Start".to_owned())?;
         let era = crate::paper_recovery::paper_era(
-            crate::paper_recovery::scan_paper_log(paper_log_path)
+            self.paper_writer
+                .snapshot()
                 .map_err(|error| error.to_string())?,
         );
         let (_, started) = era
@@ -738,12 +745,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         proposed_financial_semantic_version: u32,
     ) -> Result<(), String> {
         self.reconcile_oldest_financial_prepared().await?;
-        let (paper_log_path, _) = self
+        let (_paper_log_path, _) = self
             .financial_log_paths
             .as_ref()
             .ok_or_else(|| "qualification seal check is unavailable before Start".to_owned())?;
         let era = crate::paper_recovery::paper_era(
-            crate::paper_recovery::scan_paper_log(paper_log_path)
+            self.paper_writer
+                .snapshot()
                 .map_err(|error| error.to_string())?,
         );
         let seal_needed = era.start.as_ref().is_some_and(|(_, start)| {
@@ -783,7 +791,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
     /// The shared recovery routine owns frozen-request reconstruction and appends at most the
     /// missing Final; no control-specific cursor or retry state is maintained here.
     async fn reconcile_oldest_financial_prepared(&mut self) -> Result<(), String> {
-        let (paper_log_path, _source_log_path) = self
+        let (_paper_log_path, _source_log_path) = self
             .financial_log_paths
             .clone()
             .ok_or_else(|| "active financial log paths are not configured".to_owned())?;
@@ -795,14 +803,14 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         reconcile_active_financial_frames(
             &authority,
             &self.paper_state,
-            &paper_log_path,
             source_evidence,
-            &mut self.paper_writer,
+            &self.paper_writer,
         )
         .await
         .map_err(|error| error.to_string())?;
         let era = crate::paper_recovery::paper_era(
-            crate::paper_recovery::scan_paper_log(&paper_log_path)
+            self.paper_writer
+                .snapshot()
                 .map_err(|error| error.to_string())?,
         );
         if crate::paper_recovery::oldest_unmatched_prepared(&era).is_some() {
@@ -818,7 +826,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         source_receipt: pe_event_log::AppendReceipt,
     ) -> Result<(), String> {
         self.reconcile_oldest_financial_prepared().await?;
-        let (paper_log_path, _source_log_path) = self
+        let (_paper_log_path, _source_log_path) = self
             .financial_log_paths
             .clone()
             .ok_or_else(|| "active financial log paths are not configured".to_owned())?;
@@ -828,7 +836,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "resolution candidate precedes QualificationStarted".to_owned())?;
         let era = crate::paper_recovery::paper_era(
-            crate::paper_recovery::scan_paper_log(&paper_log_path)
+            self.paper_writer
+                .snapshot()
                 .map_err(|error| error.to_string())?,
         );
         let completed = era
@@ -931,7 +940,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         }
         self.reconcile_oldest_financial_prepared().await?;
 
-        let (paper_log_path, _source_log_path) = self
+        let (_paper_log_path, _source_log_path) = self
             .financial_log_paths
             .clone()
             .ok_or_else(|| "active financial log paths are not configured".to_owned())?;
@@ -941,7 +950,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .ok_or_else(|| "active financial era has no authority client".to_owned())?;
 
         let era = crate::paper_recovery::paper_era(
-            crate::paper_recovery::scan_paper_log(&paper_log_path)
+            self.paper_writer
+                .snapshot()
                 .map_err(|error| error.to_string())?,
         );
         if crate::paper_recovery::oldest_unmatched_prepared(&era).is_some() {
@@ -1069,20 +1079,15 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             proposed_debit,
             per_trade_cap_bps,
         };
-        let (paper_log_path, _) = self.financial_log_paths.as_ref().cloned().ok_or_else(|| {
+        let (_paper_log_path, _) = self.financial_log_paths.as_ref().cloned().ok_or_else(|| {
             ActivePaperRiskFailure::new(RiskInputsUnavailable::SnapshotSequenceMismatch, &attempt)
         })?;
         let source_receipts = self.source_receipts.as_ref().ok_or_else(|| {
             ActivePaperRiskFailure::new(RiskInputsUnavailable::SnapshotSequenceMismatch, &attempt)
         })?;
-        let era = crate::paper_recovery::paper_era(
-            crate::paper_recovery::scan_paper_log(&paper_log_path).map_err(|_| {
-                ActivePaperRiskFailure::new(
-                    RiskInputsUnavailable::SnapshotSequenceMismatch,
-                    &attempt,
-                )
-            })?,
-        );
+        let era = crate::paper_recovery::paper_era(self.paper_writer.snapshot().map_err(|_| {
+            ActivePaperRiskFailure::new(RiskInputsUnavailable::SnapshotSequenceMismatch, &attempt)
+        })?);
         let financial_prefix = era
             .frames
             .last()
@@ -1292,7 +1297,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         boundary_receipt: pe_event_log::AppendReceipt,
     ) -> Result<(), String> {
         self.reconcile_oldest_financial_prepared().await?;
-        let (paper_log_path, _source_log_path) =
+        let (_paper_log_path, _source_log_path) =
             self.financial_log_paths.as_ref().cloned().ok_or_else(|| {
                 "daily boundary is unavailable before QualificationStarted".to_owned()
             })?;
@@ -1301,7 +1306,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 "daily boundary historical-price reader is unavailable".to_owned()
             })?);
         let era = crate::paper_recovery::paper_era(
-            crate::paper_recovery::scan_paper_log(&paper_log_path)
+            self.paper_writer
+                .snapshot()
                 .map_err(|error| error.to_string())?,
         );
         let source_receipts = self
@@ -1453,7 +1459,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         self.append_paper_record(&PaperLogRecord::PortfolioMark(Box::new(mark)))?;
         let completion = if mark_is_valid {
             let era = crate::paper_recovery::paper_era(
-                crate::paper_recovery::scan_paper_log(&paper_log_path)
+                self.paper_writer
+                    .snapshot()
                     .map_err(|error| error.to_string())?,
             );
             crate::qualification::qualification_completion_for_causal_facts(&era, &completed)
@@ -1790,7 +1797,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         live_watchlist: LiveWatchlist,
         config: OrchestratorConfig,
         strategy: WinnerFollowStrategy,
-        paper_writer: Writer,
+        paper_writer: crate::paper_recovery::PaperLog,
         paper_state: Arc<PaperStateDb>,
         leader_ledger: PositionLedger,
         health: SharedHealth,
@@ -1829,7 +1836,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         live_watchlist: LiveWatchlist,
         config: OrchestratorConfig,
         strategy: WinnerFollowStrategy,
-        paper_writer: Writer,
+        paper_writer: crate::paper_recovery::PaperLog,
         paper_state: Arc<PaperStateDb>,
         leader_ledger: PositionLedger,
         health: SharedHealth,
@@ -1861,7 +1868,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         live_watchlist: LiveWatchlist,
         config: OrchestratorConfig,
         strategy: WinnerFollowStrategy,
-        paper_writer: Writer,
+        paper_writer: crate::paper_recovery::PaperLog,
         paper_state: Arc<PaperStateDb>,
         leader_ledger: PositionLedger,
         health: SharedHealth,
@@ -4293,7 +4300,11 @@ mod tests {
             .unwrap()
     }
 
-    fn append_paper(writer: &mut Writer, record: &PaperLogRecord, unix: i64) -> AppendReceipt {
+    fn append_paper(
+        writer: &crate::paper_recovery::PaperLog,
+        record: &PaperLogRecord,
+        unix: i64,
+    ) -> AppendReceipt {
         let at = time::OffsetDateTime::from_unix_timestamp(unix).unwrap();
         writer
             .append_synced(EnvelopeIn {
@@ -4313,7 +4324,7 @@ mod tests {
         source_prefix: TailBinding,
         hot_config_hash: &str,
     ) -> PaperLogRecord {
-        PaperLogRecord::QualificationStarted(Box::new(QualificationStarted {
+        PaperLogRecord::QualificationStarted(Arc::new(QualificationStarted {
             starting_bankroll: CollateralAmount::from_decimal_exact(dec!(1_000)).unwrap(),
             paper_prefix,
             source_prefix,
@@ -4442,7 +4453,7 @@ mod tests {
         paper_path: PathBuf,
         source_path: PathBuf,
         state: Arc<PaperStateDb>,
-        paper_writer: Writer,
+        paper_writer: crate::paper_recovery::PaperLog,
         start: AppendReceipt,
     }
 
@@ -4459,16 +4470,16 @@ mod tests {
         let source_path = dir.path().join("source.log");
         drop(Writer::open(&source_path).unwrap());
         drop(pe_execution_core::LiveJournal::open(dir.path().join("live_journal.log")).unwrap());
-        let mut paper_writer = Writer::open(&paper_path).unwrap();
+        let paper_writer = crate::paper_recovery::PaperLog::open(&paper_path).unwrap();
         let mut started = qualification_start(
             TailBinding::from(&Scanner::verify(&paper_path).unwrap()),
             TailBinding::from(&Scanner::verify(&source_path).unwrap()),
             hot_config_hash,
         );
         if let PaperLogRecord::QualificationStarted(start) = &mut started {
-            start.financial_semantic_version = financial_semantic_version;
+            Arc::make_mut(start).financial_semantic_version = financial_semantic_version;
         }
-        let start = append_paper(&mut paper_writer, &started, SEAL_START_UNIX);
+        let start = append_paper(&paper_writer, &started, SEAL_START_UNIX);
         let state = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
         state
             .reset_financial_era(
@@ -4489,7 +4500,7 @@ mod tests {
     fn test_orchestrator(
         paper_path: PathBuf,
         source_path: PathBuf,
-        paper_writer: Writer,
+        paper_writer: crate::paper_recovery::PaperLog,
         state: Arc<PaperStateDb>,
         source_receipts: SourceReceiptIndex,
     ) -> TestOrchestrator {
@@ -4518,7 +4529,7 @@ mod tests {
     }
 
     fn build_test_orchestrator(
-        paper_writer: Writer,
+        paper_writer: crate::paper_recovery::PaperLog,
         state: Arc<PaperStateDb>,
         control_rx: mpsc::Receiver<OrchestratorControl>,
         mid_price_base_url: String,
@@ -4629,8 +4640,10 @@ mod tests {
         paper_era(scan_paper_log(path).unwrap())
             .frames
             .into_iter()
-            .filter_map(|frame| match frame.frame {
-                PaperLogFrame::Record(PaperLogRecord::QualificationSealed(seal)) => Some(*seal),
+            .filter_map(|frame| match &frame.frame {
+                PaperLogFrame::Record(PaperLogRecord::QualificationSealed(seal)) => {
+                    Some(seal.as_ref().clone())
+                }
                 _ => None,
             })
             .collect()
@@ -4692,7 +4705,7 @@ mod tests {
         let rows = paper_state.open_decision_pending().unwrap();
         let (control_tx, control_rx) = mpsc::channel(2);
         let mut orchestrator = build_test_orchestrator(
-            Writer::open(dir.path().join("paper.log")).unwrap(),
+            crate::paper_recovery::PaperLog::open(dir.path().join("paper.log")).unwrap(),
             Arc::clone(&paper_state),
             control_rx,
             "https://gamma.test".to_owned(),
@@ -5062,11 +5075,168 @@ mod tests {
 
         async fn apply_prepared_resolution(
             &self,
-            _: &crate::supabase_state::PreparedResolutionRequest,
+            request: &crate::supabase_state::PreparedResolutionRequest,
         ) -> Result<CanonicalResolutionResult, crate::supabase_state::SupabaseStateError> {
-            Err(crate::supabase_state::SupabaseStateError::Corrupt(
-                "resolution authority route is outside this fixture".to_owned(),
-            ))
+            Ok(CanonicalResolutionResult {
+                outcome: "applied".to_owned(),
+                bankroll: dec!(1000.5),
+                applied_prepared_seq: request.prepared_receipt.sequence,
+                credit: CollateralAmount::from_decimal_exact(dec!(1)).unwrap(),
+                settled_at_unix: request.settled_at_unix,
+            })
+        }
+    }
+
+    #[cfg(feature = "scenario")]
+    #[tokio::test]
+    async fn financial_risk_fill_and_resolution_use_shared_paper_frames_without_scans() {
+        use super::*;
+        let StartedSealFixture {
+            _dir,
+            paper_path,
+            source_path,
+            state,
+            paper_writer,
+            start,
+        } = started_seal_fixture("start-hash");
+        let mut source_writer = Writer::open(&source_path).unwrap();
+        let fill_source = append_source(
+            &mut source_writer,
+            "seal-test-financial-source",
+            SEAL_START_UNIX + 1,
+            b"{}".to_vec(),
+        );
+        let resolution_source = append_source(&mut source_writer, "polymarket.clob.market", SEAL_START_UNIX + 3,
+            br#"{"condition_id":"seal-test-condition","closed":true,"is_50_50_outcome":false,"tokens":[{"token_id":"yes","outcome":"Yes","price":1,"winner":true},{"token_id":"no","outcome":"No","price":0,"winner":false}]}"#.to_vec());
+        drop(source_writer);
+        let index = SourceReceiptIndex::replay(&source_path).unwrap();
+        let now = OffsetDateTime::from_unix_timestamp(SEAL_START_UNIX + 1).unwrap();
+        let (_tx, rx) = mpsc::channel(1);
+        let authority = GapFillAuthority::default();
+        let mut owner = Orchestrator::new_inner(
+            LiveWatchlist::new(Watchlist {
+                entries: Vec::new(),
+                snapshot_at: SourceTimestamp(now),
+                active_count: 0,
+                incubator_count: 0,
+            }),
+            OrchestratorConfig {
+                bankroll: dec!(1000),
+                mode: ExecutionMode::Paper,
+                signal_config: Default::default(),
+                max_resolution_horizon_secs: 0,
+                min_resolution_horizon_secs: 0,
+                max_fill_price: Decimal::ZERO,
+                min_fill_price: Decimal::ZERO,
+                price_impact_cap_bps: 100,
+                entry_gate_config: CopyEntryGateConfig,
+                runtime_config: None,
+                live_accounts: None,
+                live_journal: None,
+                activity_ws_enabled: false,
+                copy_latency_budget_secs: 2,
+                watchlist_writer_lock: None,
+            },
+            WinnerFollowStrategy::new(WinnerFollowConfig::default()),
+            paper_writer.clone(),
+            state.clone(),
+            crate::paper_recovery::build_leader_ledger(&state).unwrap(),
+            new_shared_health(false),
+            MidPriceCache::with_fetcher(FixtureFetcher::new(HashMap::new()), String::new())
+                .with_clock(Arc::new(move || now)),
+            rx,
+            None,
+            None,
+            Some(authority),
+            Arc::new(FixtureClobBookFetcher::new(HashMap::new())),
+        )
+        .unwrap();
+        owner.financial_log_paths = Some((paper_path.clone(), source_path));
+        owner.source_receipts = Some(index);
+        let hooks = Arc::new(ScenarioHooks::default());
+        hooks
+            .financial_clock_unix
+            .store(SEAL_START_UNIX + 2, Ordering::SeqCst);
+        owner.scenario_hooks = Some(hooks.clone());
+        let trade = IncomingTrade {
+            wallet: WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+            market_id: MarketId(pe_core_types::VenueMarketId(
+                "seal-test-condition".to_owned(),
+            )),
+            outcome_id: OutcomeId(0),
+            side: Side::Buy,
+            price: Price::new(dec!(0.5)).unwrap(),
+            contracts: ShareAmount::from_whole(1).unwrap(),
+            observed_at: now,
+            received_at: now,
+            source_trade_id: SourceTradeId(format!("g2:{}", "a".repeat(64))),
+            transaction_hash: None,
+            provenance: TradeProvenance::RestPoll,
+        };
+        let signal = LeaderSignal {
+            leader: TraderId(trade.wallet),
+            venue: VenueId::polymarket(),
+            market_id: trade.market_id.clone(),
+            outcome_id: trade.outcome_id,
+            action: pe_core_types::LeaderAction::Entry,
+            leader_side: Side::Buy,
+            leader_price: trade.price,
+            leader_size: trade.contracts,
+            observed_at: now,
+            received_at: now,
+            reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+            source_trade_id: trade.source_trade_id.clone(),
+            action_confidence_ppm: pe_core_types::ProbabilityPpm(1_000_000),
+        };
+        let paper_walks = pe_event_log::scan_metrics::count(&paper_path).unwrap();
+        let (risk, _) = owner
+            .active_paper_risk_snapshot(
+                &signal,
+                CollateralAmount::ZERO,
+                10_000,
+                FINANCIAL_SEMANTIC_VERSION,
+            )
+            .await
+            .map_err(|error| error.cause)
+            .unwrap();
+        assert_eq!(risk.decision, RiskDecisionAudit::Approved);
+        assert!(matches!(
+            owner
+                .apply_active_financial_fill(
+                    &trade,
+                    seal_test_economic(fill_source, start),
+                    None,
+                    None,
+                    &mut None
+                )
+                .await
+                .unwrap(),
+            ActiveFinancialFill::Committed(_)
+        ));
+        hooks
+            .financial_clock_unix
+            .store(SEAL_START_UNIX + 4, Ordering::SeqCst);
+        owner
+            .apply_resolution_candidate(
+                PolymarketConditionId("seal-test-condition".to_owned()),
+                "[\"1\",\"0\"]".to_owned(),
+                resolution_source,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            state.financial_snapshot(SEAL_START_UNIX + 4).unwrap().cash,
+            dec!(1000.5)
+        );
+        assert_eq!(
+            pe_event_log::scan_metrics::count(&paper_path).unwrap(),
+            paper_walks
+        );
+        let cached = paper_writer.snapshot().unwrap();
+        let scanned = scan_paper_log(&paper_path).unwrap();
+        assert_eq!(cached.len(), scanned.len());
+        for (cached, scanned) in cached.iter().zip(scanned) {
+            assert_eq!(cached.envelope, scanned.envelope);
         }
     }
 
@@ -5077,7 +5247,7 @@ mod tests {
             paper_path,
             source_path,
             state,
-            mut paper_writer,
+            paper_writer,
             start,
         } = started_seal_fixture("start-hash");
         let stale_index = SourceReceiptIndex::replay(&source_path).unwrap();
@@ -5090,7 +5260,7 @@ mod tests {
         );
         drop(source_writer);
         append_paper(
-            &mut paper_writer,
+            &paper_writer,
             &PaperLogRecord::FinancialPrepared {
                 expected_authority: ExpectedAuthority {
                     qualification_start_receipt: start,
@@ -5114,9 +5284,8 @@ mod tests {
         let error = crate::supabase_state::reconcile_active_financial_frames(
             &authority,
             &state,
-            &paper_path,
             SourceEvidence::Index(&stale_index),
-            &mut paper_writer,
+            &paper_writer,
         )
         .await
         .unwrap_err();
@@ -5140,14 +5309,13 @@ mod tests {
 
         // Boot rebuilds this same index (scenario_source_log_boot) and redrives through this call.
         let rebuilt_index = SourceReceiptIndex::replay(&source_path).unwrap();
-        let mut reopened = Writer::open(&paper_path).unwrap();
+        let reopened = crate::paper_recovery::PaperLog::open(&paper_path).unwrap();
         assert_eq!(
             crate::supabase_state::reconcile_active_financial_frames(
                 &authority,
                 &state,
-                &paper_path,
                 SourceEvidence::Index(&rebuilt_index),
-                &mut reopened,
+                &reopened,
             )
             .await
             .unwrap(),
@@ -5186,12 +5354,22 @@ mod tests {
             Arc::clone(&state),
             source_receipts,
         );
+        let paper_walks = pe_event_log::scan_metrics::count(&paper_path).unwrap();
+        let financial_prefix = orchestrator.paper_writer.verified_tail().unwrap();
         orchestrator
             .seal_before_resume("start-hash", FINANCIAL_SEMANTIC_VERSION)
             .await
             .unwrap();
+        assert_eq!(
+            pe_event_log::scan_metrics::count(&paper_path).unwrap(),
+            paper_walks
+        );
         let seals = sealed_records(&paper_path);
         assert_eq!(seals.len(), 1);
+        assert_eq!(
+            seals[0].financial_prefix,
+            TailBinding::from(&financial_prefix)
+        );
         assert!(matches!(
             seals[0].reason,
             SealReason::InsufficientEvidence(_)
@@ -5202,7 +5380,7 @@ mod tests {
             .unwrap();
         assert_eq!(sealed_records(&paper_path), seals);
         drop(orchestrator);
-        let paper_writer = Writer::open(&paper_path).unwrap();
+        let paper_writer = crate::paper_recovery::PaperLog::open(&paper_path).unwrap();
         let source_receipts = SourceReceiptIndex::replay(&source_path).unwrap();
         let mut restarted = test_orchestrator(
             paper_path.clone(),
@@ -5402,6 +5580,7 @@ mod tests {
             state,
             source_receipts,
         );
+        let paper_walks = pe_event_log::scan_metrics::count(&paper_path).unwrap();
         assert_eq!(
             apply_seal_check_control(&mut orchestrator, "changed-hash").await,
             Ok(())
@@ -5410,10 +5589,77 @@ mod tests {
         std::fs::rename(&source_path, &renamed).unwrap();
 
         assert_eq!(
+            apply_seal_check_control(&mut orchestrator, "start-hash").await,
+            Ok(())
+        );
+        assert_eq!(
             apply_seal_check_control(&mut orchestrator, "changed-hash").await,
             Ok(())
         );
+        assert_eq!(
+            pe_event_log::scan_metrics::count(&paper_path).unwrap(),
+            paper_walks
+        );
         assert_eq!(sealed_records(&paper_path).len(), 1);
+    }
+
+    #[cfg(feature = "scenario")]
+    #[tokio::test]
+    async fn seal_tail_sync_uncertainty_stops_intake_and_snapshots_until_reopen() {
+        let StartedSealFixture {
+            _dir,
+            paper_path,
+            source_path,
+            state,
+            paper_writer,
+            ..
+        } = started_seal_fixture("start-hash");
+        let index = SourceReceiptIndex::replay(&source_path).unwrap();
+        let shared = paper_writer.clone();
+        let mut orchestrator = test_orchestrator(
+            paper_path.clone(),
+            source_path.clone(),
+            paper_writer,
+            state.clone(),
+            index,
+        );
+        shared.scenario_fail_next_sync().unwrap();
+        let paper_walks = pe_event_log::scan_metrics::count(&paper_path).unwrap();
+        let error = apply_seal_check_control(&mut orchestrator, "changed-hash")
+            .await
+            .unwrap_err();
+        assert!(error.contains("injected synchronization uncertainty"));
+        assert!(orchestrator.intake_stopped);
+        assert!(shared.snapshot().is_err());
+        assert!(
+            orchestrator
+                .append_paper_record(&PaperLogRecord::RiskHaltChanged {
+                    owner: RiskHaltOwner::Paper,
+                    cause: RiskHaltCause::AbsoluteLoss,
+                    state: crate::paper_recovery::HaltState::Engaged,
+                    evidence: serde_json::json!({}),
+                })
+                .is_err()
+        );
+        assert_eq!(
+            pe_event_log::scan_metrics::count(&paper_path).unwrap(),
+            paper_walks
+        );
+        assert!(sealed_records(&paper_path).is_empty());
+        drop(orchestrator);
+        drop(shared);
+        let reopened = crate::paper_recovery::PaperLog::open(&paper_path).unwrap();
+        assert_eq!(reopened.snapshot().unwrap().len(), 1);
+        let mut restarted = test_orchestrator(
+            paper_path,
+            source_path.clone(),
+            reopened,
+            state,
+            SourceReceiptIndex::replay(&source_path).unwrap(),
+        );
+        apply_seal_check_control(&mut restarted, "changed-hash")
+            .await
+            .unwrap();
     }
 
     /// PASS: unmatched Prepared refuses before source I/O and preserves the exact legacy error.
@@ -5545,7 +5791,7 @@ mod tests {
             paper_path,
             source_path,
             state,
-            mut paper_writer,
+            paper_writer,
             start,
         } = started_seal_fixture("start-hash");
         let final_cutoff = SEAL_START_UNIX + 30 * 86_400;
@@ -5581,7 +5827,7 @@ mod tests {
         assert_ne!(mark_candidate, index_candidate);
 
         append_paper(
-            &mut paper_writer,
+            &paper_writer,
             &PaperLogRecord::PortfolioMark(Box::new(PortfolioMark {
                 boundary_receipt,
                 cutoff_unix: SEAL_START_UNIX,
@@ -5606,7 +5852,7 @@ mod tests {
         for index in 0..90_u64 {
             let economic = seal_test_economic(financial_source, start);
             let prepared = append_paper(
-                &mut paper_writer,
+                &paper_writer,
                 &PaperLogRecord::FinancialPrepared {
                     expected_authority: ExpectedAuthority {
                         qualification_start_receipt: start,
@@ -5656,7 +5902,7 @@ mod tests {
                 )
                 .unwrap();
             append_paper(
-                &mut paper_writer,
+                &paper_writer,
                 &PaperLogRecord::FinancialFinal {
                     prepared_receipt: prepared,
                     result: FinancialResult::Fill { canonical },
@@ -5666,7 +5912,7 @@ mod tests {
             prior = Some(prepared.sequence);
         }
         let resolution_prepared = append_paper(
-            &mut paper_writer,
+            &paper_writer,
             &PaperLogRecord::FinancialPrepared {
                 expected_authority: ExpectedAuthority {
                     qualification_start_receipt: start,
@@ -5696,7 +5942,7 @@ mod tests {
             )
             .unwrap();
         append_paper(
-            &mut paper_writer,
+            &paper_writer,
             &PaperLogRecord::FinancialFinal {
                 prepared_receipt: resolution_prepared,
                 result: FinancialResult::Resolution {
@@ -5713,7 +5959,7 @@ mod tests {
         );
         for day in 1..30_i64 {
             append_paper(
-                &mut paper_writer,
+                &paper_writer,
                 &PaperLogRecord::PortfolioMark(Box::new(PortfolioMark {
                     boundary_receipt,
                     cutoff_unix: SEAL_START_UNIX + day * 86_400,
@@ -5742,6 +5988,7 @@ mod tests {
         });
         let (acknowledged, response) = oneshot::channel();
 
+        let paper_walks = pe_event_log::scan_metrics::count(&paper_path).unwrap();
         orchestrator
             .apply_control_message(OrchestratorControl::DailyBoundary {
                 cutoff_unix: final_cutoff,
@@ -5752,6 +5999,10 @@ mod tests {
             .await;
 
         assert_eq!(response.await.unwrap(), Ok(()));
+        assert_eq!(
+            pe_event_log::scan_metrics::count(&paper_path).unwrap(),
+            paper_walks
+        );
         assert!(!appended.load(Ordering::SeqCst));
         let file_tail = Scanner::verify(&source_path).unwrap();
         assert_ne!(file_tail, mark_candidate);
@@ -5810,9 +6061,9 @@ mod tests {
         let candidate = source_receipts.current_tail_binding().unwrap();
         let paper_path = dir.path().join("paper.log");
         drop(pe_execution_core::LiveJournal::open(dir.path().join("live_journal.log")).unwrap());
-        let mut paper_writer = Writer::open(&paper_path).unwrap();
+        let paper_writer = crate::paper_recovery::PaperLog::open(&paper_path).unwrap();
         let start = append_paper(
-            &mut paper_writer,
+            &paper_writer,
             &qualification_start(
                 TailBinding::from(&Scanner::verify(&paper_path).unwrap()),
                 TailBinding {
@@ -5934,9 +6185,9 @@ mod tests {
 
         let paper_path = dir.path().join("paper.log");
         drop(pe_execution_core::LiveJournal::open(dir.path().join("live_journal.log")).unwrap());
-        let mut paper_writer = Writer::open(&paper_path).unwrap();
+        let paper_writer = crate::paper_recovery::PaperLog::open(&paper_path).unwrap();
         let start = append_paper(
-            &mut paper_writer,
+            &paper_writer,
             &qualification_start(
                 TailBinding::from(&Scanner::verify(&paper_path).unwrap()),
                 TailBinding {
@@ -6085,7 +6336,7 @@ mod tests {
         let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
         let (_, control_rx) = mpsc::channel(4);
         let mut owner = build_test_orchestrator(
-            Writer::open(&paper_path).unwrap(),
+            crate::paper_recovery::PaperLog::open(&paper_path).unwrap(),
             paper,
             control_rx,
             String::new(),

@@ -3050,7 +3050,7 @@ async fn valid_pending_restart_resumes_once() {
             received_at: pe_core_types::ReceivedAt(at),
             content_type: pe_event_log::ContentType::Json,
             payload: serde_json::to_vec(
-                &pe_service::paper_recovery::PaperLogRecord::QualificationStarted(Box::new(start)),
+                &pe_service::paper_recovery::PaperLogRecord::QualificationStarted(Arc::new(start)),
             )
             .unwrap(),
         })
@@ -3196,10 +3196,10 @@ async fn valid_pending_restart_resumes_once() {
         let seals = pe_service::paper_recovery::scan_paper_log(&paper_path)
             .unwrap()
             .into_iter()
-            .filter_map(|frame| match frame.frame {
+            .filter_map(|frame| match &frame.frame {
                 pe_service::paper_recovery::PaperLogFrame::Record(
                     pe_service::paper_recovery::PaperLogRecord::QualificationSealed(seal),
-                ) => Some(seal),
+                ) => Some(seal.clone()),
                 _ => None,
             })
             .collect::<Vec<_>>();

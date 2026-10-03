@@ -100,12 +100,11 @@ use crate::mid_price_cache::{
     replay_strict_risk_prices,
 };
 use crate::orchestrator_control::OrchestratorControl;
-#[cfg(test)]
-use crate::paper_recovery::PaperLogRecord;
 use crate::paper_recovery::{
     HaltState, PaperEra, RiskHaltOwner, ScannedPaperFrame, active_risk_halts, paper_era,
-    scan_paper_log,
 };
+#[cfg(test)]
+use crate::paper_recovery::{PaperLogRecord, scan_paper_log};
 use crate::risk_inputs::{
     RiskInputsUnavailable, SourceReceiptIndex, apply_global_risk_halts,
     paper_prefix_at_financial_prefix,
@@ -144,7 +143,7 @@ pub struct LiveFanoutConfig {
     pub source_log: SourceLogHandle,
     /// Boot-verified, append-extended source receipt and evidence projection.
     pub source_receipts: SourceReceiptIndex,
-    pub paper_log_path: PathBuf,
+    pub paper_log: crate::paper_recovery::PaperLog,
     /// Issue #599: the fanout outlives the orchestrator drain, so it must not keep the
     /// control channel open; it upgrades per send and, once the orchestrator is gone, the sync
     /// fails closed with the same error a closed channel produced.
@@ -204,7 +203,10 @@ fn derive_projection_rows_for_state(
     events: &[LiveJournalEvent],
 ) -> Result<ProjectionDerivation, ProjectionReducerError> {
     let source_envelopes = source_envelopes_for_live_events(&state.config.source_receipts, events)?;
-    let paper_frames = scan_paper_log(&state.config.paper_log_path)
+    let paper_frames = state
+        .config
+        .paper_log
+        .snapshot()
         .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
     let observation_pages = live_observation_page_index(
         &state.config.paper_state,
@@ -472,7 +474,10 @@ pub async fn run_live_fanout_until(
 }
 
 fn verified_recovery_inventory(state: &FanoutState) -> Result<LiveRecoveryInventory, FanoutError> {
-    let paper_frames = scan_paper_log(&state.config.paper_log_path)
+    let paper_frames = state
+        .config
+        .paper_log
+        .snapshot()
         .map_err(|error| FanoutError::Signal(format!("paper risk prefix: {error}")))?;
     let inventory = pe_execution_core::live_journal::recovery_inventory_with_admission_verifier(
         &state.config.journal_path,
@@ -3045,7 +3050,10 @@ async fn live_risk_audit(
         .await;
     let now = price_attempt.evaluated_at;
     let mids = price_attempt.result?;
-    let paper_frames = scan_paper_log(&state.config.paper_log_path)
+    let paper_frames = state
+        .config
+        .paper_log
+        .snapshot()
         .map_err(|_| RiskInputsUnavailable::SnapshotSequenceMismatch)?;
     let era = paper_era_at_evaluation(&paper_frames, evaluated_at_millis(now)?)?;
     compose_live_risk_audit(
@@ -3079,7 +3087,7 @@ fn evaluated_at_millis(now: OffsetDateTime) -> Result<i64, RiskInputsUnavailable
 /// Select the exact paper prefix available at the risk clock. A later frame with an earlier
 /// timestamp would make cross-log causality ambiguous and therefore fails closed.
 fn paper_era_at_evaluation(
-    frames: &[ScannedPaperFrame],
+    frames: &[Arc<ScannedPaperFrame>],
     evaluated_at_unix_ms: i64,
 ) -> Result<PaperEra, RiskInputsUnavailable> {
     let mut prefix = Vec::new();
@@ -3243,7 +3251,10 @@ async fn sync_live_risk_halts(
 ) -> Result<bool, FanoutError> {
     let owner = RiskHaltOwner::LiveAccount(account.account_id.clone());
     let current = active_risk_halts(&paper_era(
-        scan_paper_log(&state.config.paper_log_path)
+        state
+            .config
+            .paper_log
+            .snapshot()
             .map_err(|error| FanoutError::Signal(error.to_string()))?,
     ));
     let desired = [
@@ -3301,7 +3312,10 @@ async fn sync_live_risk_halts(
 
 fn global_risk_halt_active(state: &FanoutState) -> Result<bool, FanoutError> {
     Ok(active_risk_halts(&paper_era(
-        scan_paper_log(&state.config.paper_log_path)
+        state
+            .config
+            .paper_log
+            .snapshot()
             .map_err(|error| FanoutError::Signal(error.to_string()))?,
     ))
     .iter()
@@ -4205,7 +4219,7 @@ fn replay_live_risk_prices(
 struct LiveReplayEvidence<'a> {
     source_envelopes: &'a [EventEnvelope],
     source_receipts: Option<&'a SourceReceiptIndex>,
-    paper_frames: &'a [ScannedPaperFrame],
+    paper_frames: &'a [Arc<ScannedPaperFrame>],
     observation_pages: &'a LiveObservationPageIndex,
 }
 
@@ -4643,7 +4657,7 @@ fn verify_replayed_live_risk(
     preceding_events: &[LiveJournalEvent],
     admission: &pe_execution_core::LiveAdmissionEvaluationAudit,
     source_envelopes: &[EventEnvelope],
-    paper_frames: &[ScannedPaperFrame],
+    paper_frames: &[Arc<ScannedPaperFrame>],
 ) -> Result<(), ProjectionReducerError> {
     let observation_pages = produced_observation_index(admission, source_envelopes)?;
     verify_replayed_live_risk_with_index(
@@ -4664,7 +4678,7 @@ fn verify_replayed_live_risks(
     events: &[LiveJournalEvent],
     source_envelopes: &[EventEnvelope],
     source_receipts: Option<&SourceReceiptIndex>,
-    paper_frames: &[ScannedPaperFrame],
+    paper_frames: &[Arc<ScannedPaperFrame>],
     observation_pages: &LiveObservationPageIndex,
 ) -> Result<(), ProjectionReducerError> {
     let mut wire_two_admissions = HashMap::new();
@@ -8626,12 +8640,13 @@ mod tests {
         (receipt, condition_id)
     }
 
+    #[allow(clippy::type_complexity)]
     fn reconstructed_live_risk_fixture() -> (
         tempfile::TempDir,
         AccountId,
         Vec<LiveJournalEvent>,
         Vec<EventEnvelope>,
-        Vec<ScannedPaperFrame>,
+        Vec<Arc<ScannedPaperFrame>>,
         Box<pe_execution_core::LiveAdmissionEvaluationAudit>,
     ) {
         let dir = tempdir().unwrap();
@@ -11782,7 +11797,7 @@ mod tests {
                 state: HaltState::Engaged,
                 evidence: serde_json::json!({"fixture": "retired-latency"}),
             };
-            let mut writer = pe_event_log::Writer::open(&state.config.paper_log_path).unwrap();
+            let writer = state.config.paper_log.clone();
             writer
                 .append_synced(EnvelopeIn {
                     source_id: SourceId("pe-service.paper".to_owned()),
@@ -11817,11 +11832,152 @@ mod tests {
                 sync_live_risk_halts(&state, &account, &risk).await.unwrap(),
                 cause != pe_risk_engine::RiskHaltCause::CopyLatency
             );
-            assert_eq!(
-                scan_paper_log(&state.config.paper_log_path).unwrap().len(),
-                1
-            );
+            assert_eq!(state.config.paper_log.snapshot().unwrap().len(), 1);
         }
+    }
+
+    #[cfg(feature = "scenario")]
+    #[tokio::test]
+    async fn live_risk_projection_recovery_and_halts_use_shared_paper_frames_without_scans() {
+        let dir = tempfile::tempdir().unwrap();
+        let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let snapshot = armed_snapshot("cached-risk");
+        let account = snapshot.accounts[0].clone();
+        let mut state = fanout_state(&dir, paper, snapshot, "http://127.0.0.1:9", None);
+        let now = OffsetDateTime::from_unix_timestamp(20).unwrap();
+        state.config.mid_price_cache = state
+            .config
+            .mid_price_cache
+            .clone()
+            .with_clock(Arc::new(move || now));
+        let mut prepared = finality_prepared();
+        bind_empty_live_risk_to_paper_prefix(&state, &mut prepared, now);
+        append_recovery_baseline(
+            &state,
+            &account.account_id,
+            now,
+            CollateralAmount::from_atomic(10_000_000),
+        )
+        .await;
+        let path = dir.path().join("paper.log");
+        let paper_walks = pe_event_log::scan_metrics::count(&path).unwrap();
+        let events = replay_live_account(&state, &account.account_id).unwrap();
+        let projection =
+            derive_projection_rows_for_state(&state, &account.account_id, &events).unwrap();
+        assert_eq!(projection.economic_cash, Some(dec!(10)));
+        assert!(
+            verified_recovery_inventory(&state)
+                .unwrap()
+                .approved_admissions
+                .is_empty()
+        );
+        let risk = live_risk_audit(&state, &account, None, CollateralAmount::ZERO, 10_000)
+            .await
+            .unwrap();
+        assert_eq!(risk.decision, RiskDecisionAudit::Approved);
+        assert_eq!(
+            risk.financial_prefix,
+            prepared.economic.risk.financial_prefix
+        );
+        assert!(!sync_live_risk_halts(&state, &account, &risk).await.unwrap());
+        assert!(!global_risk_halt_active(&state).unwrap());
+        assert_eq!(
+            pe_event_log::scan_metrics::count(&path).unwrap(),
+            paper_walks
+        );
+    }
+
+    #[test]
+    fn cached_live_risk_checks_the_physical_clock_prefix_before_dropping_pre_start_frames() {
+        use crate::paper_recovery::{
+            PAPER_LOG_SCHEMA_VERSION, PaperLog, QualificationStarted, TailBinding,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("paper.log");
+        let log = PaperLog::open(&path).unwrap();
+        let tail = TailBinding::from(&log.verified_tail().unwrap());
+        let append = |record: PaperLogRecord, unix| {
+            let at = OffsetDateTime::from_unix_timestamp(unix).unwrap();
+            log.append_synced(EnvelopeIn {
+                source_id: SourceId("paper-clock".to_owned()),
+                schema_version: PAPER_LOG_SCHEMA_VERSION,
+                parser_version: 1,
+                observed_at: SourceTimestamp(at),
+                received_at: ReceivedAt(at),
+                content_type: ContentType::Json,
+                payload: serde_json::to_vec(&record).unwrap(),
+            })
+            .unwrap()
+        };
+        append(
+            PaperLogRecord::RiskHaltChanged {
+                owner: RiskHaltOwner::Paper,
+                cause: pe_risk_engine::RiskHaltCause::CopyLatency,
+                state: HaltState::Released,
+                evidence: serde_json::json!({}),
+            },
+            30,
+        );
+        let start = append(
+            PaperLogRecord::QualificationStarted(Arc::new(QualificationStarted {
+                starting_bankroll: CollateralAmount::from_atomic(10_000_000),
+                paper_prefix: tail.clone(),
+                source_prefix: tail.clone(),
+                live_prefix: tail,
+                artifact_blake3: "artifact".to_owned(),
+                static_config_hash: "static".to_owned(),
+                hot_config_hash: "hot".to_owned(),
+                generation: "generation".to_owned(),
+                activation_id: "clock".to_owned(),
+                ranking_batch_id: 1,
+                membership: Vec::new(),
+                membership_proofs_hash: "proofs".to_owned(),
+                schema_version: 1,
+                parser_version: 1,
+                financial_semantic_version: 2,
+            })),
+            10,
+        );
+        let snapshot = log.snapshot().unwrap();
+        let reference = scan_paper_log(&path).unwrap();
+        let paper_walks = pe_event_log::scan_metrics::count(&path).unwrap();
+        for frames in [&snapshot, &reference] {
+            assert!(matches!(
+                paper_era_at_evaluation(frames, 20_000),
+                Err(RiskInputsUnavailable::SnapshotSequenceMismatch)
+            ));
+            let complete = paper_era_at_evaluation(frames, 30_000).unwrap();
+            assert_eq!(complete.frames.len(), 1);
+            assert_eq!(complete.start.as_ref().unwrap().0, start);
+            assert!(Arc::ptr_eq(&complete.frames[0], &frames[1]));
+        }
+        let later = append(
+            PaperLogRecord::RiskHaltChanged {
+                owner: RiskHaltOwner::Paper,
+                cause: pe_risk_engine::RiskHaltCause::AbsoluteLoss,
+                state: HaltState::Engaged,
+                evidence: serde_json::json!({}),
+            },
+            40,
+        );
+        let current = log.snapshot().unwrap();
+        let preceding = paper_era_at_evaluation(&current, 30_000).unwrap();
+        assert_eq!(preceding.frames.len(), 1);
+        assert!(active_risk_halts(&preceding).is_empty());
+        assert_eq!(
+            paper_era_at_evaluation(&current, 40_000)
+                .unwrap()
+                .frames
+                .last()
+                .unwrap()
+                .receipt,
+            later
+        );
+        assert_eq!(
+            pe_event_log::scan_metrics::count(&path).unwrap(),
+            paper_walks
+        );
     }
 
     /// PASS: an open live position requires its exact source-backed price inventory; a missing,
@@ -13912,7 +14068,7 @@ mod tests {
                 Some(&state.config.source_receipts),
             )
             .unwrap();
-            let paper_frames = scan_paper_log(&state.config.paper_log_path).unwrap();
+            let paper_frames = state.config.paper_log.snapshot().unwrap();
             let projection = prepared.identity.fill_projection.as_ref().unwrap();
             prepared.economic.risk = compose_live_risk_audit(
                 &derived,
@@ -17576,7 +17732,7 @@ mod tests {
                 mid_price_cache: MidPriceCache::new("http://127.0.0.1:9".to_owned()),
                 source_log: source_log.clone(),
                 source_receipts,
-                paper_log_path,
+                paper_log: crate::paper_recovery::PaperLog::open(&paper_log_path).unwrap(),
                 orchestrator_control: orchestrator_control_weak,
                 http: http.clone(),
                 polygon_receipt_rpc_url: "http://127.0.0.1:9".to_owned(),
@@ -17608,7 +17764,7 @@ mod tests {
         prepared: &mut pe_execution_core::LiveOrderPreparedAudit,
         now: OffsetDateTime,
     ) {
-        let mut writer = pe_event_log::Writer::open(&state.config.paper_log_path).unwrap();
+        let writer = state.config.paper_log.clone();
         let financial_prefix = writer
             .append_synced(EnvelopeIn {
                 source_id: SourceId("pe-service.paper".to_owned()),

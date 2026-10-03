@@ -594,7 +594,7 @@ pub fn continuation_orchestrator_with_authority(
             live_journal: None,
         },
         pe_strategy_winner_follow::WinnerFollowStrategy::new(runtime.winner_follow_config()),
-        Writer::open(paper_path).unwrap(),
+        pe_service::paper_recovery::PaperLog::open(paper_path).unwrap(),
         paper,
         ledger,
         pe_service::health::new_shared_health(false),
@@ -751,7 +751,7 @@ pub async fn qualify_source_census(
         }
     };
     let start_receipt = writer
-        .append_synced(envelope(PaperLogRecord::QualificationStarted(Box::new(
+        .append_synced(envelope(PaperLogRecord::QualificationStarted(Arc::new(
             start,
         ))))
         .unwrap();

@@ -1365,10 +1365,10 @@ pub(crate) enum PaperPrefixError {
 }
 
 pub(crate) fn paper_prefix_at_financial_prefix(
-    frames: &[ScannedPaperFrame],
+    frames: &[Arc<ScannedPaperFrame>],
     financial_prefix: AppendReceipt,
     evaluated_at_unix_ms: i64,
-) -> Result<&[ScannedPaperFrame], PaperPrefixError> {
+) -> Result<&[Arc<ScannedPaperFrame>], PaperPrefixError> {
     let prefix_index = frames
         .iter()
         .position(|frame| frame.receipt == financial_prefix)
@@ -1613,10 +1613,10 @@ mod tests {
         )
     }
 
-    fn frame(sequence: u64, unix: i64, record: PaperLogRecord) -> ScannedPaperFrame {
+    fn frame(sequence: u64, unix: i64, record: PaperLogRecord) -> Arc<ScannedPaperFrame> {
         let receipt = receipt(sequence, u8::try_from(sequence).unwrap_or(u8::MAX));
         let at = OffsetDateTime::from_unix_timestamp(unix).unwrap();
-        ScannedPaperFrame {
+        Arc::new(ScannedPaperFrame {
             envelope: EventEnvelope {
                 seq: receipt.sequence,
                 source_id: SourceId("paper".to_owned()),
@@ -1633,7 +1633,7 @@ mod tests {
             receipt,
             frame: PaperLogFrame::Record(record),
             legacy_fill: None,
-        }
+        })
     }
 
     fn halt(
@@ -1641,7 +1641,7 @@ mod tests {
         owner: RiskHaltOwner,
         cause: RiskHaltCause,
         state: HaltState,
-    ) -> ScannedPaperFrame {
+    ) -> Arc<ScannedPaperFrame> {
         frame(
             sequence,
             i64::try_from(sequence).unwrap(),
@@ -1803,7 +1803,7 @@ mod tests {
         cutoff_unix: i64,
         equity: Decimal,
         invalid: Option<&str>,
-    ) -> ScannedPaperFrame {
+    ) -> Arc<ScannedPaperFrame> {
         frame(
             sequence,
             cutoff_unix,
@@ -1824,17 +1824,17 @@ mod tests {
         )
     }
 
-    fn era_with_marks(marks: Vec<ScannedPaperFrame>) -> PaperEra {
+    fn era_with_marks(marks: Vec<Arc<ScannedPaperFrame>>) -> PaperEra {
         let start = start();
         let start_frame = frame(
             1,
             100,
-            PaperLogRecord::QualificationStarted(Box::new(start.clone())),
+            PaperLogRecord::QualificationStarted(Arc::new(start.clone())),
         );
         let mut frames = vec![start_frame];
         frames.extend(marks);
         PaperEra {
-            start: Some((receipt(1, 1), start)),
+            start: Some((receipt(1, 1), Arc::new(start))),
             frames,
         }
     }
@@ -2239,7 +2239,7 @@ mod tests {
         if let PaperLogFrame::Record(PaperLogRecord::FinancialPrepared {
             payload: FinancialPayload::Fill { economic, .. },
             ..
-        }) = &mut wrong_hash_era.frames[0].frame
+        }) = &mut Arc::make_mut(&mut wrong_hash_era.frames[0]).frame
         {
             economic
                 .observation
@@ -2825,7 +2825,7 @@ mod tests {
         let start_frame = frame(
             1,
             0,
-            PaperLogRecord::QualificationStarted(Box::new(start())),
+            PaperLogRecord::QualificationStarted(Arc::new(start())),
         );
         let era = crate::paper_recovery::paper_era(vec![start_frame.clone()]);
         let financial = FinancialSnapshot {

@@ -211,8 +211,8 @@ fn flat_fill_config() -> WinnerFollowConfig {
     }
 }
 
-fn make_writer(dir: &Path) -> Writer {
-    Writer::open(dir.join("paper.log")).unwrap()
+fn make_writer(dir: &Path) -> pe_service::paper_recovery::PaperLog {
+    pe_service::paper_recovery::PaperLog::open(dir.join("paper.log")).unwrap()
 }
 
 fn disabled_entry_gate() -> CopyEntryGateConfig {
@@ -1530,7 +1530,7 @@ async fn r9_observation_resolution_precedes_the_final_dispatch_age_sample() {
     runtime.min_resolution_horizon_secs = 0;
     runtime.price_impact_cap_bps = 100;
     runtime.sizing_mode = SizingMode::Dollar { usd: dec!(10) };
-    let mut paper_writer = Writer::open(&paper_path).unwrap();
+    let paper_writer = pe_service::paper_recovery::PaperLog::open(&paper_path).unwrap();
     let start_at = observed_at - time::Duration::seconds(1);
     let paper_prefix = TailBinding::from(&Scanner::verify(&paper_path).unwrap());
     let source_prefix = TailBinding::from(&Scanner::verify(&source_path).unwrap());
@@ -1542,7 +1542,7 @@ async fn r9_observation_resolution_precedes_the_final_dispatch_age_sample() {
             observed_at: SourceTimestamp(start_at),
             received_at: ReceivedAt(start_at),
             content_type: ContentType::Json,
-            payload: serde_json::to_vec(&PaperLogRecord::QualificationStarted(Box::new(
+            payload: serde_json::to_vec(&PaperLogRecord::QualificationStarted(Arc::new(
                 QualificationStarted {
                     starting_bankroll: CollateralAmount::from_decimal_exact(dec!(10_000)).unwrap(),
                     paper_prefix,
@@ -1891,7 +1891,7 @@ async fn clob_book_wrong_market_with_right_asset_stops_before_dispatch_or_prepar
     runtime.price_impact_cap_bps = 100;
     runtime.sizing_mode = SizingMode::Dollar { usd: dec!(10) };
 
-    let mut paper_writer = Writer::open(&paper_path).unwrap();
+    let paper_writer = pe_service::paper_recovery::PaperLog::open(&paper_path).unwrap();
     let start_at = observed_at - time::Duration::seconds(1);
     let start = paper_writer
         .append_synced(EnvelopeIn {
@@ -1901,7 +1901,7 @@ async fn clob_book_wrong_market_with_right_asset_stops_before_dispatch_or_prepar
             observed_at: SourceTimestamp(start_at),
             received_at: ReceivedAt(start_at),
             content_type: ContentType::Json,
-            payload: serde_json::to_vec(&PaperLogRecord::QualificationStarted(Box::new(
+            payload: serde_json::to_vec(&PaperLogRecord::QualificationStarted(Arc::new(
                 QualificationStarted {
                     starting_bankroll: CollateralAmount::from_decimal_exact(dec!(10_000)).unwrap(),
                     paper_prefix: TailBinding::from(&Scanner::verify(&paper_path).unwrap()),

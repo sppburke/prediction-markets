@@ -112,8 +112,8 @@ fn flat_fill_config() -> WinnerFollowConfig {
     }
 }
 
-fn make_writer(dir: &TempDir) -> Writer {
-    Writer::open(dir.path().join("paper.log")).unwrap()
+fn make_writer(dir: &TempDir) -> pe_service::paper_recovery::PaperLog {
+    pe_service::paper_recovery::PaperLog::open(dir.path().join("paper.log")).unwrap()
 }
 
 /// Copy-entry gate disabled for these correctness tests: fail-open (no band since #339).

@@ -273,7 +273,7 @@ impl Harness {
             last_sequence: None,
             last_hash: "00".repeat(32),
         };
-        let record = PaperLogRecord::QualificationStarted(Box::new(QualificationStarted {
+        let record = PaperLogRecord::QualificationStarted(Arc::new(QualificationStarted {
             starting_bankroll: CollateralAmount::from_decimal_exact(CASH).unwrap(),
             paper_prefix: empty.clone(),
             source_prefix: empty.clone(),
@@ -540,7 +540,7 @@ impl Harness {
                 watchlist_writer_lock: None,
             },
             WinnerFollowStrategy::new(self.config.winner_follow_config()),
-            Writer::open(self.dir.path().join("paper.log")).unwrap(),
+            pe_service::paper_recovery::PaperLog::open(self.dir.path().join("paper.log")).unwrap(),
             self.paper.clone(),
             build_leader_ledger(&self.paper).unwrap(),
             new_shared_health_with_ws(false, true, 90),
@@ -1314,7 +1314,7 @@ async fn recorded_ask_above_leader_fills_with_both_paper_delay_policies() {
                 PaperLogFrame::Record(PaperLogRecord::FinancialPrepared {
                     payload: pe_service::paper_recovery::FinancialPayload::Fill { economic, .. },
                     ..
-                }) => Some(economic),
+                }) => Some(economic.clone()),
                 _ => None,
             })
             .unwrap();
@@ -1399,7 +1399,7 @@ async fn priced_mark_resolved_before_completion_seal_verifies() {
     let mark = frames
         .iter()
         .find_map(|frame| match &frame.frame {
-            PaperLogFrame::Record(PaperLogRecord::PortfolioMark(mark)) => Some(mark),
+            PaperLogFrame::Record(PaperLogRecord::PortfolioMark(mark)) => Some(mark.clone()),
             _ => None,
         })
         .unwrap();
@@ -2075,11 +2075,11 @@ async fn version_six_staged_target_strict_live_admission_submits_and_replays() {
         let paper_economic = scan_paper_log(&h.dir.path().join("paper.log"))
             .unwrap()
             .into_iter()
-            .find_map(|frame| match frame.frame {
+            .find_map(|frame| match &frame.frame {
                 PaperLogFrame::Record(PaperLogRecord::FinancialPrepared {
                     payload: pe_service::paper_recovery::FinancialPayload::Fill { economic, .. },
                     ..
-                }) => Some(economic),
+                }) => Some(economic.clone()),
                 _ => None,
             })
             .unwrap();
@@ -2564,14 +2564,13 @@ async fn durable_prepared_recovers_after_copy_budget() {
         .financial_clock_unix
         .store(EPOCH + 86_400, Ordering::SeqCst);
     let paper_log = h.dir.path().join("paper.log");
-    let mut writer = Writer::open(&paper_log).unwrap();
+    let writer = pe_service::paper_recovery::PaperLog::open(&paper_log).unwrap();
     assert_eq!(
         reconcile_active_financial_frames(
             &h.authority,
             &h.paper,
-            &paper_log,
             SourceEvidence::Index(&h.index),
-            &mut writer
+            &writer
         )
         .await
         .unwrap(),
@@ -2581,9 +2580,8 @@ async fn durable_prepared_recovers_after_copy_budget() {
         reconcile_active_financial_frames(
             &h.authority,
             &h.paper,
-            &paper_log,
             SourceEvidence::Index(&h.index),
-            &mut writer
+            &writer
         )
         .await
         .unwrap(),
@@ -3430,8 +3428,8 @@ impl Harness {
         let mark = scan_paper_log(&self.dir.path().join("paper.log"))
             .unwrap()
             .into_iter()
-            .find_map(|frame| match frame.frame {
-                PaperLogFrame::Record(PaperLogRecord::PortfolioMark(mark)) => Some(mark),
+            .find_map(|frame| match &frame.frame {
+                PaperLogFrame::Record(PaperLogRecord::PortfolioMark(mark)) => Some(mark.clone()),
                 _ => None,
             })
             .unwrap();
@@ -3638,7 +3636,7 @@ async fn reverse_completion_admission_executes_and_qualifies_exactly() {
             PaperLogFrame::Record(PaperLogRecord::FinancialPrepared {
                 payload: pe_service::paper_recovery::FinancialPayload::Fill { economic, .. },
                 ..
-            }) => Some(economic),
+            }) => Some(economic.clone()),
             _ => None,
         })
         .unwrap();

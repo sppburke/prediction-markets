@@ -94,7 +94,7 @@ fn append_source(
 }
 
 fn append_paper(
-    writer: &mut Writer,
+    writer: &pe_service::paper_recovery::PaperLog,
     record: &PaperLogRecord,
     received_at_unix: i64,
 ) -> AppendReceipt {
@@ -117,7 +117,7 @@ fn empty_tail(path: &std::path::Path) -> TailBinding {
 }
 
 fn start_record(source_path: &std::path::Path, paper_path: &std::path::Path) -> PaperLogRecord {
-    PaperLogRecord::QualificationStarted(Box::new(QualificationStarted {
+    PaperLogRecord::QualificationStarted(Arc::new(QualificationStarted {
         starting_bankroll: CollateralAmount::from_decimal_exact(dec!(100)).unwrap(),
         paper_prefix: empty_tail(paper_path),
         source_prefix: empty_tail(source_path),
@@ -280,7 +280,7 @@ fn make_watchlist() -> Watchlist {
 async fn run_real_boundary(
     paper_path: &std::path::Path,
     source_path: &std::path::Path,
-    paper_writer: Writer,
+    paper_writer: pe_service::paper_recovery::PaperLog,
     state: Arc<PaperStateDb>,
     boundary_receipt: AppendReceipt,
 ) {
@@ -362,8 +362,10 @@ fn emitted_marks(paper_path: &std::path::Path) -> Vec<pe_service::paper_recovery
     paper_era(scan_paper_log(paper_path).unwrap())
         .frames
         .into_iter()
-        .filter_map(|frame| match frame.frame {
-            PaperLogFrame::Record(PaperLogRecord::PortfolioMark(mark)) => Some(*mark),
+        .filter_map(|frame| match &frame.frame {
+            PaperLogFrame::Record(PaperLogRecord::PortfolioMark(mark)) => {
+                Some(mark.as_ref().clone())
+            }
             _ => None,
         })
         .collect()
@@ -380,9 +382,9 @@ async fn quiet_boundary_records_no_causal_prepared_prefix() {
     let paper_path = dir.path().join("paper.log");
     let state_path = dir.path().join("paper.db");
     let mut source_writer = Writer::open(&source_path).unwrap();
-    let mut paper_writer = Writer::open(&paper_path).unwrap();
+    let paper_writer = pe_service::paper_recovery::PaperLog::open(&paper_path).unwrap();
     let start = append_paper(
-        &mut paper_writer,
+        &paper_writer,
         &start_record(&source_path, &paper_path),
         START_UNIX,
     );
@@ -456,9 +458,9 @@ async fn acknowledged_pre_cutoff_websocket_fill_survives_late_final_and_replay()
     let paper_path = dir.path().join("paper.log");
     let state_path = dir.path().join("paper.db");
     let mut source_writer = Writer::open(&source_path).unwrap();
-    let mut paper_writer = Writer::open(&paper_path).unwrap();
+    let paper_writer = pe_service::paper_recovery::PaperLog::open(&paper_path).unwrap();
     let start = append_paper(
-        &mut paper_writer,
+        &paper_writer,
         &start_record(&source_path, &paper_path),
         START_UNIX,
     );
@@ -558,7 +560,7 @@ async fn acknowledged_pre_cutoff_websocket_fill_survives_late_final_and_replay()
 
     let economic = economic(start, websocket, complete_page);
     let prepared = append_paper(
-        &mut paper_writer,
+        &paper_writer,
         &PaperLogRecord::FinancialPrepared {
             expected_authority: ExpectedAuthority {
                 qualification_start_receipt: start,
@@ -605,7 +607,7 @@ async fn acknowledged_pre_cutoff_websocket_fill_survives_late_final_and_replay()
         )
         .unwrap();
     append_paper(
-        &mut paper_writer,
+        &paper_writer,
         &PaperLogRecord::FinancialFinal {
             prepared_receipt: prepared,
             result: FinancialResult::Fill { canonical },
@@ -615,7 +617,7 @@ async fn acknowledged_pre_cutoff_websocket_fill_survives_late_final_and_replay()
 
     let payout_json = "[\"1\",\"0\"]";
     let resolution_prepared = append_paper(
-        &mut paper_writer,
+        &paper_writer,
         &PaperLogRecord::FinancialPrepared {
             expected_authority: ExpectedAuthority {
                 qualification_start_receipt: start,
@@ -644,7 +646,7 @@ async fn acknowledged_pre_cutoff_websocket_fill_survives_late_final_and_replay()
         )
         .unwrap();
     append_paper(
-        &mut paper_writer,
+        &paper_writer,
         &PaperLogRecord::FinancialFinal {
             prepared_receipt: resolution_prepared,
             result: FinancialResult::Resolution {

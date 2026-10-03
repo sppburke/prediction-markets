@@ -12,7 +12,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use axum::{Router, routing::get};
 use pe_core_types::{PolymarketConditionId, ReceivedAt, SourceId, SourceTimestamp, WalletAddress};
-use pe_event_log::{ContentType, EnvelopeIn, Scanner, Writer};
+use pe_event_log::{ContentType, EnvelopeIn, Scanner};
 use pe_execution_core::LiveJournal;
 use pe_paper_state::{MigrationMetadata, MigrationPhase, PaperStateDb};
 use pe_service::asset_identity::AssetIdentityResolver;
@@ -718,7 +718,7 @@ async fn main() -> Result<()> {
 
     // Open the sole paper writer and converge the active financial prefix before reading any
     // bankroll used for sizing or API state.
-    let mut paper_writer = Writer::open(&cfg.event_log_path)
+    let paper_writer = pe_service::paper_recovery::PaperLog::open(&cfg.event_log_path)
         .with_context(|| format!("open event log {}", cfg.event_log_path.display()))?;
     if financial_start.is_some() {
         let authority = supabase_state.as_ref().context(
@@ -732,9 +732,8 @@ async fn main() -> Result<()> {
         let recovered = reconcile_active_financial_frames(
             authority,
             &paper_state,
-            &cfg.event_log_path,
             source_evidence,
-            &mut paper_writer,
+            &paper_writer,
         )
         .await
         .context("recover active paper financial protocol")?;
@@ -1470,7 +1469,7 @@ async fn main() -> Result<()> {
                 .with_source_log(resolution_source_log.clone()),
             source_log: resolution_source_log.clone(),
             source_receipts: source_receipts.clone(),
-            paper_log_path: cfg.event_log_path.clone(),
+            paper_log: paper_writer.clone(),
             orchestrator_control: control_tx.downgrade(),
             http: live_http_client,
             polygon_receipt_rpc_url: cfg.polygon_receipt_rpc_url.clone(),
