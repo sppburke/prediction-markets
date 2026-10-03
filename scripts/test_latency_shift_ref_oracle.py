@@ -373,10 +373,8 @@ class RefOracleScenario(unittest.TestCase):
         import latency_shift_rerank as lsr
 
         x, k1, k2 = ("0x" + c * 40 for c in "0ab")
-        # (wallet, pair, entry offset, ttr, venue sample price or None). X enters pairs 1
-        # and 6 first with no horizon-feasible position; K1 and K2 tie, and K2 ranks first
-        # only because pair 1, which X opens, comes first. K2's pair-6 sample is X's, stale.
-        rows = [(x, 1, 0, 30, "0.5"), (x, 6, 0, 30, "0.5")]
+        # X opens pair 2 before pair 1; sorted pairs fix the tie order, and its pair-6 sample is stale for K2.
+        rows = [(x, 2, 0, 30, "0.5"), (x, 6, 0, 30, "0.5")]
         rows += [(k1, p, 100, 3600, px) for p, px in zip((2, 3, 4, 5), ("0.31", "0.41", "0.51", "0.61"))]
         rows += [(k2, p, 400, 3600, px) for p, px in zip((1, 3, 4, 5), ("0.31", "0.41", "0.51", "0.61"))]
         rows.append((k2, 6, 500, 3600, None))
@@ -497,6 +495,79 @@ class RefOracleScenario(unittest.TestCase):
         # Scoring without an explicit anchor is refused.
         self.assertEqual(run(pruned_db, "unanchored", anchor=())[0], 1)
         print("PASS: schema two evaluates only survivable wallets, exactly as evaluating all")
+
+    def test_shared_pair_order_and_non_candidate_keep_rounding_boundary_rows_identical(self):
+        from ranker_decay import decay_weights, weighted_stats
+
+        w2, quiet = ("0x" + c * 40 for c in "2f")
+        entries = [1_000_000 + 10_000 * i for i in range(8)]
+        prices = ["0.31", "0.41", "0.51", "0.61", "0.33", "0.43", "0.53",
+                  "0.5151860152874558"]
+        order = [7, 0, 6, 1, 5, 2, 4, 3]
+        nets = [(1 - (float(price) + .01)) / (float(price) + .01) for price in prices]
+        weights = decay_weights(entries, entries[-1], 30)
+        mean = weighted_stats(nets, weights)[0]
+        self.assertAlmostEqual(mean, 1.2500005, places=15)
+        # The fixture crosses the rounding boundary if accumulation follows file order.
+        self.assertNotEqual(round(mean, 6), round(weighted_stats(
+            [nets[i] for i in order], [weights[i] for i in order])[0], 6))
+        with sqlite3.connect(self.db) as con:
+            con.execute("PRAGMA user_version=2")
+            for i in range(8):
+                con.execute("INSERT INTO token_conditions VALUES (?, ?, 1, 0)",
+                            (f"T{i}", f"0xm{i}"))
+        for i, entry in enumerate(entries):
+            self.add_points([(entry + SHIFT, prices[i])], token_id=f"T{i}")
+            self.add_full_coverage(entries=[entry, entry + 10], token_id=f"T{i}")
+        before = self.root / "before.json"
+        before.write_text("[]")
+        cycle = self.root / "cycle.json"
+        cycle.write_text('{"cache_schema":2}\n')
+        stage = self.root / "cache-stage.json"
+        stage.write_text('{"cache_sha256":"aa"}\n')
+
+        common_rows = {}
+        for i, entry in enumerate(entries):
+            common_rows[i] = [
+                [W1, f"0xm{i}", 0, entry, 3600, .5, 10, 1, 0, 0, entry + 3600],
+                [w2, f"0xm{i}", 0, entry + 10, 3600, .5, 10, int(i != 7),
+                 0, 0, entry + 3610],
+            ]
+        outputs = []
+        for extra_wallet in (False, True):
+            with self.subTest(extra_wallet=extra_wallet):
+                with open(self.positions, "w", newline="") as f:
+                    writer = csv.writer(f)
+                    writer.writerow(POSITIONS_HEADER)
+                    if extra_wallet:
+                        writer.writerow([quiet, "0xm7", 0, entries[7], 30, .5, 10,
+                                         1, 0, 0, entries[7] + 30])
+                    for i in order if extra_wallet else range(8):
+                        writer.writerows(common_rows[i])
+                result, out = self.run_pass2("--as-of", str(entries[-1]),
+                                             "--half-life-days", "30", "--min-trl", "2",
+                                             "--before-ranking-json", str(before),
+                                             "--cycle-manifest-file", str(cycle),
+                                             "--cache-stage-record", str(stage))
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                prefix = tuple((wallet + ",").encode() for wallet in (W1, w2))
+                outputs.append([line for line in (out / "latency_shift_ranked.csv").read_bytes().splitlines(keepends=True)
+                                if line.startswith(prefix)])
+                with open(out / "latency_shift_ranked.csv", newline="") as f:
+                    ranked = list(csv.DictReader(f))
+                boundary = next(row for row in ranked if row["wallet"] == W1)
+                self.assertEqual(boundary["mean_net_ls"], "1.250001")
+                self.assertEqual(boundary["survives"], "True")
+                if extra_wallet:
+                    self.assertIn("candidate positions: 16 across 8 (market,outcome) pairs", result.stdout)
+                    skipped = next(row for row in ranked if row["wallet"] == quiet)
+                    self.assertEqual((skipped["n_total"], skipped["survives"]), ("0", "False"))
+                with open(out / "oracle_outcomes.csv", newline="") as f:
+                    outcomes = list(csv.DictReader(f))
+                self.assertEqual([(row["market_id"], row["wallet"]) for row in outcomes],
+                                 [(f"0xm{i}", wallet) for i in range(8) for wallet in (W1, w2)])
+        self.assertEqual(len(outputs[0]), 2)
+        self.assertEqual(outputs[0], outputs[1])
 
     def test_nonpositive_fill_window_is_fatal(self):
         # #536 review M2: staleness bound 0 would admit every stale sample; reject

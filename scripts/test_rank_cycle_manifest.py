@@ -10,16 +10,20 @@ import sys
 import tempfile
 import unittest
 
-from rank_cycle_manifest import candidate_targets
+from rank_cycle_manifest import _fresh_identity, candidate_targets
 import test_rank_and_push as wrapper_tests
 
 
 def identity(generation=1, base=None, version=2):
     value = dict(version=version, generation=generation, fixed_end_unix=100,
                  wallets=["0x" + "1" * 40])
-    if version == 2:
+    if version >= 2:
         value.update(base_generation=base, base_manifest_sha256="a" * 64 if base else None,
                      start_exclusive=90 if base else 0, full_read_wallets=value["wallets"])
+    if version == 3:
+        value.update(deferred_wallets=value["wallets"] if base else [],
+                     full_read_wallets=[] if base else value["wallets"],
+                     quiet_after_secs=2_592_000, repoll_period_secs=604_800)
     value["digest"] = hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     return json.dumps(value)
 
@@ -38,6 +42,76 @@ class CandidateTargetsTest(unittest.TestCase):
 
     def targets(self, **kwargs):
         return candidate_targets(self.prior, self.side, include_bulk_root=True, **kwargs)
+
+    def test_version_three_identity_decodes_with_deferred_wallets_and_constants(self):
+        raw = identity(2, 1, version=3)
+        self.assertEqual(_fresh_identity(raw), json.loads(raw))
+        decoded = _fresh_identity(raw)
+        self.assertEqual(decoded["deferred_wallets"], decoded["wallets"])
+        self.assertEqual(decoded["full_read_wallets"], [])
+        self.assertEqual((decoded["quiet_after_secs"], decoded["repoll_period_secs"]),
+                         (2_592_000, 604_800))
+
+    def test_version_three_identity_refuses_missing_extra_keys_and_wrong_digest(self):
+        valid = json.loads(identity(2, 1, version=3))
+        for key in valid:
+            with self.subTest(missing=key):
+                malformed = {k: v for k, v in valid.items() if k != key}
+                with self.assertRaisesRegex(ValueError, "malformed candidate activity identity|unsupported candidate activity identity version"):
+                    _fresh_identity(json.dumps(malformed))
+        extra = dict(valid, unexpected=True)
+        content = {key: value for key, value in extra.items() if key != "digest"}
+        extra["digest"] = hashlib.sha256(json.dumps(content, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        with self.assertRaisesRegex(ValueError, "malformed candidate activity identity"):
+            _fresh_identity(json.dumps(extra))
+        for key, value in (("digest", "0" * 64), ("deferred_wallets", []),
+                           ("quiet_after_secs", 1), ("repoll_period_secs", 1)):
+            with self.subTest(changed=key):
+                with self.assertRaisesRegex(ValueError, "identity digest mismatch"):
+                    _fresh_identity(json.dumps(dict(valid, **{key: value})))
+
+    def test_version_three_initial_head_and_archived_top_up_keep_base_gates(self):
+        prior = identity()
+        initial = identity(2, 1, version=3)
+        with sqlite3.connect(self.prior) as c:
+            c.execute("PRAGMA user_version=2")
+            c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (prior,))
+            c.execute("INSERT INTO activity_coverage_manifests_v2(generation) VALUES (1)")
+        with sqlite3.connect(self.side) as c:
+            c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (initial,))
+            c.execute("INSERT INTO activity_coverage_manifests_v2(generation, reference_sha256, collection_identity_json) VALUES (2, ?, ?)",
+                      (json.loads(initial)["digest"], initial))
+        self.assertEqual(self.targets(), (2, 1, 0, 0, 1))
+        self.assertEqual(self.targets(after_collection=True, now=100, max_staleness_hours=24),
+                         (2, 1, 0, 0, 1))
+        top_up = identity(3, 2, version=3)
+        with sqlite3.connect(self.side) as c:
+            c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (top_up,))
+            c.execute("INSERT INTO activity_coverage_manifests_v2(generation, reference_sha256, collection_identity_json) VALUES (3, ?, ?)",
+                      (json.loads(top_up)["digest"], top_up))
+        self.assertEqual(self.targets(), (3, 1, 0, 0, 1))
+        self.assertEqual(self.targets(after_collection=True, now=100, max_staleness_hours=24),
+                         (3, 1, 0, 0, 1))
+        for head, message in ((identity(3, 1, version=3), "single top-up"),
+                              (identity(2, None, version=3), "initial activity head")):
+            with self.subTest(head=head):
+                with sqlite3.connect(self.side) as c:
+                    c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (head,))
+                with self.assertRaisesRegex(ValueError, message):
+                    self.targets()
+        with sqlite3.connect(self.side) as c:
+            c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (top_up,))
+            c.execute("UPDATE activity_coverage_manifests_v2 SET collection_identity_json=? WHERE generation=2",
+                      (identity(2, None, version=3),))
+        with self.assertRaisesRegex(ValueError, "initial activity head"):
+            self.targets()
+
+    def test_version_three_root_is_not_bulk_eligible(self):
+        with sqlite3.connect(self.side) as c:
+            c.executescript("PRAGMA user_version=-2; DROP INDEX idx_activity_groups_v2_source_trade_id;")
+            c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (identity(version=3),))
+        with self.assertRaisesRegex(ValueError, "invalid unfinished bulk root"):
+            self.targets()
 
     def test_fresh_root_and_unchanged_three_value_api_and_cli(self):
         before = self.side.read_bytes()
@@ -101,7 +175,7 @@ class CandidateTargetsTest(unittest.TestCase):
         self.assertEqual(self.targets()[3], 0)
 
     def test_interrupted_ordinary_identity_never_converts_even_without_rows(self):
-        for version in (1, 2):
+        for version in (1, 2, 3):
             with self.subTest(version=version):
                 with sqlite3.connect(self.side) as c:
                     c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (identity(version=version),))

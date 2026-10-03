@@ -1186,6 +1186,24 @@ class RankAndPushScenario(unittest.TestCase):
         )
         print("PASS: schema-two request preparation precedes activation and exact resume")
 
+    def test_operator_stage_record_missing_or_symlink_fails_before_step_zero(self):
+        missing = self.root / "missing-stage.json"
+        regular = self.root / "stage.json"
+        regular.write_text("{}\n")
+        linked = self.root / "linked-stage.json"
+        linked.symlink_to(regular)
+        for stage in (missing, linked):
+            with self.subTest(stage=stage.name):
+                result = self._run("--cache-stage-record", str(stage))
+                self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
+                self.assertIn("FATAL: --cache-stage-record must be a regular file", result.stderr)
+                self.assertNotIn("Step 0", result.stdout)
+                for log in ("pe_bootstrap.log", "export.log", "rank.log", "rerank.log", "push.log"):
+                    self.assertIsNone(self._log(log), f"{log} ran before refusing the record")
+        self.assertFalse(missing.exists())
+        self.assertTrue(linked.is_symlink())
+        self.assertEqual(regular.read_text(), "{}\n")
+
     def test_parameterized_research_run_never_owns_production_pending_pointer(self):
         result = self._run("--skip-purge")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1863,6 +1881,36 @@ class RankAndPushScenario(unittest.TestCase):
         with (self.root / ".env").open("a") as handle:
             handle.write("PE_RANK_SCHEMA_TWO_CUTOVER=prepare\n")
         return fixed
+
+    def test_fresh_finalize_without_record_resumes_to_record_after_price_fetch(self):
+        self._prepare_incremental_fixture(two_file=True)
+        stopped = self._run(exit_env={"STUB_EXIT_prices_history": "75"})
+        self.assertEqual(stopped.returncode, 75, stopped.stderr + stopped.stdout)
+        out = self.root / (self.root / "data/eval-results/rank_and_push.cycle").read_text().strip()
+        stage = out / "cache_stage_record.json"
+        first = self._bootstrap_lines("cache-finalize-v2")
+        self.assertEqual(len(first), 1)
+        self.assertNotIn("--stage-record", shlex.split(first[0]))
+        self.assertFalse(stage.exists())
+        self.assertFalse((out / "ranking_publish_request.json").exists())
+
+        before = len(self._bootstrap_ops())
+        resumed = self._run()
+        self.assertEqual(resumed.returncode, 2, resumed.stderr + resumed.stdout)
+        self.assertIn("RANK_AND_PUSH_PREPARED_ONLY=", resumed.stdout)
+        self.assertEqual(self._bootstrap_ops()[before:],
+                         ["cache-stage-v2", "winner-discovery", "activate-next",
+                          "cache-finalize-v2", "prices-history", "cache-finalize-v2"])
+        finalizes = [shlex.split(line) for line in self._bootstrap_lines("cache-finalize-v2")]
+        self.assertEqual(len(finalizes), 3)
+        self.assertTrue(all("--stage-record" not in args for args in finalizes[:2]))
+        self.assertEqual(finalizes[-1][finalizes[-1].index("--stage-record") + 1],
+                         str(stage.relative_to(self.root)))
+        self.assertTrue(stage.is_file())
+        record = json.loads(stage.read_text())
+        request = json.loads((out / "ranking_publish_request.json").read_text())
+        self.assertEqual(request["cache_activation"]["expected_sha256"], record["cache_sha256"])
+        self.assertEqual(request["cache_activation"]["side_path"], record["cache_path"])
 
     def _install_candidate_capture_probe(self):
         manifest = self.root / "scripts/rank_cycle_manifest.py"
