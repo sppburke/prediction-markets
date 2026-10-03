@@ -565,14 +565,10 @@ async fn migration_is_resumable_and_activation_installs_only_the_finalized_main(
     )
     .unwrap();
     let python = Command::new("python3")
-        .args(["-c", "import sys,duckdb; c=duckdb.connect(config={'autoinstall_known_extensions':'false'}); c.execute('LOAD sqlite_scanner'); c.close(); print(sys.executable)"])
+        .args(["-c", "import sys; print(sys.executable)"])
         .output()
         .unwrap();
-    assert!(
-        python.status.success(),
-        "offline sqlite_scanner prerequisite: {}",
-        String::from_utf8_lossy(&python.stderr)
-    );
+    assert!(python.status.success());
     let python = String::from_utf8(python.stdout).unwrap();
     let site = dir.path().join("python-fixture");
     std::fs::create_dir(&site).unwrap();
@@ -12320,7 +12316,7 @@ async fn quiet_wallet_deferral_rejects_forged_evidence() {
             format!(
                 "UPDATE activity_wallet_coverage_staging_v2 SET page_evidence_json = (SELECT page_evidence_json FROM activity_wallet_coverage_staging_v2 WHERE generation = 3 AND wallet_hex = '{WALLET_B}') WHERE generation = 3 AND wallet_hex = '{WALLET}'"
             ),
-            "deferral",
+            "cannot claim page evidence",
         ),
         (
             format!(

@@ -1060,7 +1060,7 @@ it is not due, and it is not an explicit full-read repair. Roots never defer. Du
 take the ordinary incremental read; due deferred wallets take a full read `(0,E2]` to recover
 activity since deferral. Top-ups use the same rule: a just-read quiet wallet is deferred when not
 due and read incrementally when due. A returning active wallet resumes ordinary incremental polling.
-Admission logs deferred and due counts before sampling E2; completion logs the deferred count.
+Admission logs deferred and due counts; completion logs the deferred count.
 Resume keeps the frozen deferred list, whose full read mode also refuses a newly selected repair.
 
 Admission archives the predecessor identity, clears the derived projection and invalidates

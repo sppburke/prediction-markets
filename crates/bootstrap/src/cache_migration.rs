@@ -5848,18 +5848,20 @@ fn copy_file_atomic_verified(
     target: &Path,
     expected_sha256: Option<&str>,
 ) -> Result<(), BootstrapError> {
-    let (pending, _) = copy_to_pending(source, target)?;
+    let pending = clear_pending(source, target)?;
+    std::fs::copy(source, &pending)?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&pending)?
+        .sync_all()?;
     adopt_pending(&pending, target, expected_sha256)
 }
 
+/// The verified copy's first half for staging, which also needs the source
+/// digest: one read both copies and hashes the source.
 fn copy_to_pending(source: &Path, target: &Path) -> Result<(PathBuf, String), BootstrapError> {
-    let pending = pending_path_for(target);
-    match std::fs::remove_file(&pending) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
-    tracing::info!(source = %source.display(), target = %target.display(), "cache whole-file copy");
+    let pending = clear_pending(source, target)?;
     let mut input = File::open(source)?;
     let mut output = File::create(&pending)?;
     std::fs::set_permissions(&pending, std::fs::metadata(source)?.permissions())?;
@@ -5875,6 +5877,17 @@ fn copy_to_pending(source: &Path, target: &Path) -> Result<(PathBuf, String), Bo
     }
     output.sync_all()?;
     Ok((pending, format!("{:x}", digest.finalize())))
+}
+
+fn clear_pending(source: &Path, target: &Path) -> Result<PathBuf, BootstrapError> {
+    let pending = pending_path_for(target);
+    match std::fs::remove_file(&pending) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    tracing::info!(source = %source.display(), target = %target.display(), "cache whole-file copy");
+    Ok(pending)
 }
 
 fn adopt_pending(
