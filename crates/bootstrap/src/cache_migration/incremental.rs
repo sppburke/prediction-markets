@@ -279,12 +279,11 @@ impl CollectionProof {
             })?;
         let complete = acquisition.disposition == ActivityDisposition::Complete;
         let deferred = self.deferred(&receipt.wallet_hex);
-        if (deferred
-            && (acquisition.aggregation_status != AggregationStatus::NotAttempted
-                || !receipt.pages.is_empty()
-                || acquisition.exclusion_reason != Some(ActivityExclusionReason::DormantDeferred)))
-            || (!deferred
-                && acquisition.exclusion_reason == Some(ActivityExclusionReason::DormantDeferred))
+        // A frozen deferral is exactly an unattempted read with its own reason; the
+        // not-attempted arm below refuses page evidence.
+        if deferred
+            != (acquisition.exclusion_reason == Some(ActivityExclusionReason::DormantDeferred))
+            || (deferred && acquisition.aggregation_status != AggregationStatus::NotAttempted)
         {
             return invalid("activity deferral disagrees with frozen identity".to_owned());
         }

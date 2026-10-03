@@ -3885,6 +3885,7 @@ fn stage_two_file_cycle(
         let current = open_existing_rw(fixed)?;
         checkpoint_truncate(&current)?;
         current.close().map_err(|(_, error)| error)?;
+        std::fs::File::open(fixed)?.sync_all()?;
         Some(copy_to_pending(fixed, side)?)
     };
     let evidence = if let Some(evidence) = recorded {
@@ -5859,8 +5860,8 @@ fn copy_to_pending(source: &Path, target: &Path) -> Result<(PathBuf, String), Bo
         Err(error) => return Err(error.into()),
     }
     tracing::info!(source = %source.display(), target = %target.display(), "cache whole-file copy");
-    let mut input = std::io::BufReader::new(File::open(source)?);
-    let mut output = std::io::BufWriter::new(File::create(&pending)?);
+    let mut input = File::open(source)?;
+    let mut output = File::create(&pending)?;
     std::fs::set_permissions(&pending, std::fs::metadata(source)?.permissions())?;
     let mut digest = Sha256::new();
     let mut buffer = [0_u8; 65_536];
@@ -5872,8 +5873,7 @@ fn copy_to_pending(source: &Path, target: &Path) -> Result<(PathBuf, String), Bo
         output.write_all(&buffer[..read])?;
         digest.update(&buffer[..read]);
     }
-    output.flush()?;
-    output.get_ref().sync_all()?;
+    output.sync_all()?;
     Ok((pending, format!("{:x}", digest.finalize())))
 }
 
