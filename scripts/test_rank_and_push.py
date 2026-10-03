@@ -1753,7 +1753,7 @@ class RankAndPushScenario(unittest.TestCase):
             "        generation = json.loads(c.execute('SELECT fresh_collection_json FROM cache_v2_migration_state').fetchone()[0])['generation']\n"
             "        c.execute('INSERT OR IGNORE INTO activity_coverage_manifests_v2 (generation, cursors_json, completed_at_unix, reference_sha256, wallet_count, receipt_set_digest, aggregate_digest, source_row_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', (generation, '[]', now, f'fresh-{generation}', 1, 'bb', 'cc', 1))\n"
             "        c.execute('UPDATE cache_v2_migration_state SET ranker_projection_count = 1, ranker_projection_digest = ?, ranker_classifier_version = 2', (f'digest-{generation}',))\n"
-            "    json.dump({'cache_path': os.path.abspath(db), 'cache_sha256': sha(db)}, open(opt('--stage-record'), 'w'))\n"
+            "    if opt('--stage-record'): json.dump({'cache_path': os.path.abspath(db), 'cache_sha256': sha(db)}, open(opt('--stage-record'), 'w'))\n"
             "elif sub == 'cache-activate':\n"
             "    fixed, backup = opt('--fixed-db'), opt('--backup')\n"
             "    evidence_path = Path(db).with_suffix('.stage.json')\n"
@@ -1875,7 +1875,7 @@ a = sys.argv[1:]
 if a and a[0] == 'capture' and '--output' in a and 'candidate_cycle_manifest' in a[a.index('--output') + 1]:
     Path('capture_started').write_text(str(os.getpid()))
     output = Path(a[a.index('--output') + 1])
-    if not (output.parent / 'cache_stage_record.json').is_file() or not (output.parent / 'cycle_configuration.json').is_file():
+    if 'cache-finalize-v2' not in Path('pe_bootstrap.log').read_text() or not (output.parent / 'cycle_configuration.json').is_file():
         raise SystemExit(97)
     mode = os.environ.get('STUB_CAPTURE_MODE', 'normal')
     if mode == 'fail':

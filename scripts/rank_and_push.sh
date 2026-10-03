@@ -584,14 +584,16 @@ echo "RANK_AND_PUSH_RUN_DIR=$OUT_DIR"
 
 CUTOVER_MODE="0"
 BEFORE_RANKING_JSON=""
-[[ -z "$CACHE_STAGE_RECORD" ]] || CUTOVER_MODE="1"
+if [[ -n "$CACHE_STAGE_RECORD" ]]; then
+  [[ -f "$CACHE_STAGE_RECORD" && ! -L "$CACHE_STAGE_RECORD" ]] || {
+    echo "FATAL: --cache-stage-record must be a regular file" >&2; exit 2;
+  }
+  CUTOVER_MODE="1"
+fi
 
 # Validate the finalized candidate and snapshot the current publication. Runs
 # after Step 0 because the candidate lane finalizes its candidate there.
 require_cutover_inputs() {
-  [[ -f "$CACHE_STAGE_RECORD" && ! -L "$CACHE_STAGE_RECORD" ]] || {
-    echo "FATAL: --cache-stage-record must be a regular file" >&2; exit 2;
-  }
   [[ -n "$FIXED_DB" && -f "$FIXED_DB" ]] || {
     echo "FATAL: schema-two cutover requires an existing --fixed-db" >&2; exit 2;
   }
@@ -908,9 +910,11 @@ print(int(json.load(open(sys.argv[1], encoding="utf-8"))["side_schema"]))' "$sta
     run_refresh_stage "payout" "$PE_BOOTSTRAP_BIN" cache-populate-payout-v2 --db "$side" \
       "${BOOTSTRAP_CONFIG_ARGS[@]}"
   fi
+  # Certify only: the re-finalize after the targeted price writes records the bytes
+  # activation binds, and nothing reads a record before it.
   CACHE_STAGE_RECORD="$OUT_DIR/cache_stage_record.json"
   run_refresh_stage "cache-finalize" "$PE_BOOTSTRAP_BIN" cache-finalize-v2 --db "$side" \
-    --stage-record "$CACHE_STAGE_RECORD" "${BOOTSTRAP_CONFIG_ARGS[@]}"
+    "${BOOTSTRAP_CONFIG_ARGS[@]}"
   DB="$side"
   # The prior stands in as the installed cache's backup only when it is that
   # file's byte copy, which activation proves by hash; the initial cutover

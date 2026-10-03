@@ -342,8 +342,10 @@ def _fresh_identity(raw: str | None) -> dict | None:
     identity = json.loads(raw)
     version = identity.get("version")
     expected = {"version", "generation", "fixed_end_unix", "wallets", "digest"}
-    if version == 2:
+    if version in (2, 3):
         expected |= {"base_generation", "base_manifest_sha256", "start_exclusive", "full_read_wallets"}
+        if version == 3:
+            expected |= {"deferred_wallets", "quiet_after_secs", "repoll_period_secs"}
     elif version != 1:
         raise ValueError("unsupported candidate activity identity version")
     if set(identity) != expected:
@@ -484,12 +486,12 @@ def candidate_targets(prior_path: Path | None, side_path: Path, *, after_collect
         top_up_used = generation != initial
         initial_identity = head
         if top_up_used:
-            if generation < initial or head.get("version") != 2 or head.get("base_generation") != initial:
+            if generation < initial or head["version"] < 2 or head.get("base_generation") != initial:
                 raise ValueError("candidate head is outside this cycle's single top-up allowance")
             initial_identity = _fresh_identity(_one(side, "SELECT collection_identity_json FROM activity_coverage_manifests_v2 WHERE generation = ?", (initial,)))
             if initial_identity is None or initial_identity["generation"] != initial:
                 raise ValueError("top-up omitted this cycle's initial identity")
-        if initial_identity["version"] == 2 and initial_identity["base_generation"] != (previous if prior_identity else None):
+        if initial_identity["version"] >= 2 and initial_identity["base_generation"] != (previous if prior_identity else None):
             raise ValueError("initial activity head does not belong to this staged cycle")
         if after_collection:
             reference = _one(side, "SELECT reference_sha256 FROM activity_coverage_manifests_v2 WHERE generation = ?", (generation,))
