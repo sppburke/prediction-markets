@@ -345,8 +345,26 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 **Late-group re-anchor.** Previously unseen activity groups arriving for a wallet at or before an
 already-committed source epoch are recorded raw-only as `reanchor_required_late_group`; they do not
 mutate the ledger or produce a decision. The existing `reanchor_required` flag selects the wallet at
-its class's next fair refresh turn for a fresh complete history/positions bracket. A bucket mixing
-durable and unseen groups, or a revision of an already-durable group, still fences.
+its class's next fair refresh turn for a fresh complete history/positions bracket. An all-twin
+bucket is the exception: outcome restamps whose unattributed member rows reproduce a recorded
+group's id and semantic revision (and whose outcome agrees with a recorded trade correction) are
+recorded `raw_only`, with no ledger, first-entry history, re-anchor or fence effect, including under
+anchor coverage and beside exact recorded groups. A twin mixed with a genuinely new group keeps
+the existing routing. Revisions still fence; partially recorded non-twin buckets retain their fence,
+and covered non-twin arrivals retain `anchor_covered_late` re-anchoring.
+
+Known-condition `RequiresAnchor` redemptions and TRADE/REDEEM combos reaching ordinary routing
+record `raw_only` without a wallet re-anchor. An unexpressible redemption leaves that resolved
+condition's balances and first-entry history unchanged until the next successful anchor; routine
+refresh deferrals can postpone replacement. Late, partially recorded and covered non-twin arrivals,
+unknown-condition redemptions and unresolved non-combo identities retain the existing causal rule.
+Conversion and unknown-type effect precedence is unchanged.
+
+Missing-group confirmation retries add no interval: the attempt becomes eligible when its read
+completes, and the single urgent slot selects the least recently launched eligible wallet. Control
+acknowledgement retains the slot, wallet exclusivity and the attempt deadline remain, and every
+request uses the existing shared reconciliation gate and 429 policy. Only forced refresh reads keep
+the next-whole-second wake; periodic work retains its cadence. A held urgent slot adds no retry wake.
 
 **Installed-boot anchor reuse.** An ordinary installed boot reuses a wallet's `leader_positions`
 mirror only when the wallet is unfenced and history-complete, has a delivery cursor and non-null

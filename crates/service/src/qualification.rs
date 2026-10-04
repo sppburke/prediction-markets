@@ -7991,6 +7991,61 @@ mod tests {
         verify_complete_second_action(&ledger, &continuation, &[mutation], &expected).unwrap();
     }
 
+    #[test]
+    fn raw_only_trade_and_redeem_combos_do_not_change_qualification_entry_classification() {
+        let (continuation, mutation) = classification_fixture();
+        let wallet = mutation.wallet;
+        let epoch = mutation.source_time.0.unix_timestamp();
+        let ledger = PositionLedger::new();
+        let (_, expected) = ledger
+            .simulate_all_or_none(std::slice::from_ref(&mutation))
+            .unwrap();
+        for kind in ["TRADE", "REDEEM"] {
+            let mut row = activity_row("combo", "combo-asset", "1", "1", "combo-tx", epoch);
+            row["type"] = serde_json::json!(kind);
+            row["isCombo"] = serde_json::json!(true);
+            row["outcomeIndex"] = serde_json::json!(999);
+            row["outcome"] = serde_json::json!("");
+            let aggregates = pe_source_polymarket_public::parse_activity_response(
+                &activity_payload(vec![row]),
+                wallet,
+                &pe_source_polymarket_public::ActivityParseContext {
+                    source_id: SourceId("fixture".to_owned()),
+                    observed_at: SourceTimestamp(mutation.source_time.0),
+                    received_at: ReceivedAt(mutation.source_time.0),
+                    transport: pe_source_polymarket_public::ActivityTransport::Rest,
+                },
+            )
+            .unwrap()
+            .aggregates()
+            .unwrap();
+            let combo = LedgerMutation::from_activity(&aggregates[0]).unwrap();
+            assert_eq!(combo.effect, pe_position_ledger::LedgerEffect::RawOnly);
+            let groups = vec![
+                pe_paper_state::ActivityGroupRow {
+                    source_trade_id: combo.source_trade_id,
+                    source_epoch: epoch,
+                    semantic_revision: aggregates[0].semantic_revision.as_str().to_owned(),
+                    disposition: "raw_only".to_owned(),
+                    proof_json: combo.effect.to_document().unwrap(),
+                },
+                pe_paper_state::ActivityGroupRow {
+                    source_trade_id: mutation.source_trade_id.clone(),
+                    source_epoch: epoch,
+                    semantic_revision: "entry".to_owned(),
+                    disposition: "decision_pending".to_owned(),
+                    proof_json: expected[0].to_document().unwrap(),
+                },
+            ];
+            let (applied, expected) = recorded_applied_bucket(wallet, epoch, &groups).unwrap();
+            assert_eq!(applied.len(), 1);
+            verify_complete_second_action(&ledger, &continuation, &applied, &expected).unwrap();
+        }
+        for disposition in ["raw_only", "reanchor_required_redemption"] {
+            assert!(!recorded_group_was_applied(&mutation.source_trade_id, disposition).unwrap());
+        }
+    }
+
     /// PASS: the independent first entry verifies only under generation five's repaired proof;
     /// the authentic legacy read retains the larger-component refusal.
     #[test]

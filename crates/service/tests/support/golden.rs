@@ -2060,6 +2060,7 @@ pub(crate) async fn golden_source_stream_replays_exact_economic_core() {
                 no_copy_dispositions: HashMap::new(),
                 identity_overrides: HashMap::new(),
                 identity_unresolved: Default::default(),
+                restamp_twins: Default::default(),
                 history_status: Some(WalletHistoryStatusRecord {
                     wallet: bodies.wallet,
                     complete: true,

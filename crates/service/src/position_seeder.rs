@@ -1647,6 +1647,7 @@ fn bracket_context(
         no_copy_dispositions: prepared.no_copy_dispositions.clone(),
         identity_overrides: prepared.identity_overrides.clone(),
         identity_unresolved: prepared.identity_unresolved.clone(),
+        restamp_twins: Default::default(),
         history_status: None,
     })
 }

@@ -526,6 +526,7 @@ pub fn read_context(
         no_copy_dispositions: HashMap::new(),
         identity_overrides: HashMap::new(),
         identity_unresolved: Default::default(),
+        restamp_twins: Default::default(),
         history_status: None,
     }
 }
@@ -860,6 +861,14 @@ pub struct PageResponse(oneshot::Sender<Result<Vec<u8>, SourceError>>);
 impl PageResponse {
     pub fn send(self, payload: Vec<u8>) -> Result<(), Result<Vec<u8>, SourceError>> {
         self.0.send(Ok(payload))
+    }
+
+    pub fn rate_limited(self) {
+        self.0
+            .send(Err(SourceError::RateLimited {
+                retry_after_secs: 1,
+            }))
+            .unwrap();
     }
 
     pub fn fail(self) {

@@ -521,6 +521,7 @@ fn context(epoch: i64) -> BucketDecisionContext {
         no_copy_dispositions: HashMap::new(),
         identity_overrides: HashMap::new(),
         identity_unresolved: Default::default(),
+        restamp_twins: Default::default(),
         history_status: None,
     }
 }
@@ -2190,7 +2191,7 @@ async fn intervening_twice_defers_after_one_retry() {
         .unwrap();
     assert!(accepted.is_empty());
     assert!(paper.position_validation(&wallet).unwrap().is_none());
-    assert!(paper.wallet_coverage(&wallet).unwrap().reanchor_required);
+    assert!(!paper.wallet_coverage(&wallet).unwrap().reanchor_required);
     assert!(!paper.is_wallet_fenced(&wallet).unwrap());
 }
 

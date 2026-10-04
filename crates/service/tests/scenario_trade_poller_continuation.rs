@@ -92,8 +92,12 @@ struct GammaFetcher;
 impl ReconciliationFetcher for GammaFetcher {
     fn fetch<'a>(
         &'a self,
-        _url: &'a str,
+        url: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
+        assert!(
+            !url.contains("combo-token-missing-from-gamma"),
+            "combo tokens never enter identity lookup"
+        );
         Box::pin(async {
             Ok(br#"[{"conditionId":"0xcondition-a","clobTokenIds":["asset-a"]},{"conditionId":"0xcondition-b","clobTokenIds":["asset-b"]}]"#.to_vec())
         })
@@ -167,6 +171,7 @@ fn context(epoch: i64) -> BucketDecisionContext {
         no_copy_dispositions: HashMap::new(),
         identity_overrides: HashMap::new(),
         identity_unresolved: Default::default(),
+        restamp_twins: Default::default(),
         history_status: None,
     }
 }
@@ -193,6 +198,45 @@ fn watchlist() -> Watchlist {
         active_count: 1,
         incubator_count: 0,
     }
+}
+
+fn cover_recorded_groups(paper: &PaperStateDb, cutoff: i64) {
+    paper
+        .install_anchors(&[AnchorInstallRecord {
+            wallet: wallet(),
+            balances: paper
+                .leader_positions()
+                .unwrap()
+                .into_iter()
+                .filter(|position| position.wallet == wallet())
+                .map(|position| {
+                    (
+                        position.market_id,
+                        position.outcome_id,
+                        position.long_contracts,
+                    )
+                })
+                .collect(),
+            activity_cutoff_unix: cutoff,
+            anchored_at_unix: cutoff,
+            ledger_hash_after: "fixture".to_owned(),
+            positions_proof_hash: "fixture".to_owned(),
+            activity_bounds_json: "[]".to_owned(),
+            source_log_generation: "fixture".to_owned(),
+            history_status: None,
+            proof_json: "{}".to_owned(),
+            recorded_at_unix: cutoff,
+            repaired_history: Vec::new(),
+            expected_fence: None,
+        }])
+        .unwrap();
+    assert_eq!(
+        paper
+            .wallet_coverage(&wallet())
+            .unwrap()
+            .activity_cutoff_unix,
+        Some(cutoff)
+    );
 }
 
 fn long(engine: &BucketCommitEngine, market_id: &str) -> ShareAmount {
@@ -2216,8 +2260,8 @@ async fn urgent_trigger_wakes_idle_poller() {
     assert_eq!(commits.len(), 1);
 }
 
-/// PASS: with no earlier unresolved obligation, REST's third read decides the trade around
-/// three seconds after its source timestamp, using exactly three urgent wallet reads.
+/// PASS: missing-group reads add no timer; three distinct page occurrences in the same second
+/// use the single urgent slot and the third confirms the trade.
 #[tokio::test(start_paused = true)]
 async fn urgent_retry_copies_on_third_read_inside_120_second_window() {
     let dir = tempfile::tempdir().unwrap();
@@ -2233,18 +2277,15 @@ async fn urgent_retry_copies_on_third_read_inside_120_second_window() {
     running.round_completed().await;
     let row = stream_row(wallet(), "third-read", EPOCH);
     let receipt = running.observe(row.clone()).await;
+    let started = tokio::time::Instant::now();
     for elapsed in 0..3 {
-        if elapsed != 0 {
-            running.now.store(EPOCH + elapsed, Ordering::SeqCst);
-            tokio::time::advance(std::time::Duration::from_secs(1)).await;
-        }
         let request = running.requests.recv().await.unwrap();
-        assert!(request.url.contains(&format!("end={}", EPOCH + elapsed)));
+        assert_eq!(tokio::time::Instant::now(), started);
+        assert!(request.url.contains(&format!("end={EPOCH}")));
         if elapsed < 2 {
             request.respond.send(b"[]".to_vec()).unwrap();
             running.completed(wallet()).await;
         } else {
-            running.now.store(EPOCH + 3, Ordering::SeqCst);
             request
                 .respond
                 .send(serde_json::to_vec(std::slice::from_ref(&row)).unwrap())
@@ -2479,9 +2520,10 @@ async fn continuous_arrivals_do_not_expand_attempt_frontier() {
     running.finish().await;
 }
 
-/// PASS: notifications in one second cannot repeat a successful unmatched read; expiry uses backstop.
+/// PASS: an unmatched group retries immediately in the same second; expiry keeps its frozen
+/// frontier owned by the backstop even when a newer observation arrives.
 #[tokio::test(start_paused = true)]
-async fn unmatched_retry_requires_advancing_fixed_end() {
+async fn unmatched_retry_is_immediate_but_expiry_keeps_backstop_ownership() {
     let dir = tempfile::tempdir().unwrap();
     let (mut running, _) = start_recorded_poller(&dir, &[wallet()]);
     running
@@ -2495,27 +2537,24 @@ async fn unmatched_retry_requires_advancing_fixed_end() {
     running.round_completed().await;
     let row = stream_row(wallet(), "not-indexed", EPOCH);
     let first = running.observe(row.clone()).await;
-    running
-        .requests
-        .recv()
-        .await
-        .unwrap()
-        .respond
-        .send(b"[]".to_vec())
-        .unwrap();
+    let first_read = running.requests.recv().await.unwrap();
+    let started = tokio::time::Instant::now();
+    first_read.respond.send(b"[]".to_vec()).unwrap();
     running.completed(wallet()).await;
+    let retry = running.requests.recv().await.unwrap();
+    assert_eq!(tokio::time::Instant::now(), started);
+    assert!(retry.url.contains(&format!("end={EPOCH}")));
     for _ in 0..3 {
         running.observe(row.clone()).await;
     }
-    assert!(running.requests.try_recv().is_err());
-    running.now.store(EPOCH + 1, Ordering::SeqCst);
-    tokio::time::advance(std::time::Duration::from_secs(1)).await;
-    let request = running.requests.recv().await.unwrap();
-    assert!(request.url.contains(&format!("end={}", EPOCH + 1)));
-    request.respond.send(b"[]".to_vec()).unwrap();
-    running.completed(wallet()).await;
+    assert!(
+        running.requests.try_recv().is_err(),
+        "the retry owns the urgent slot"
+    );
     running.now.store(EPOCH + 3, Ordering::SeqCst);
-    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+    tokio::time::advance(std::time::Duration::from_secs(3)).await;
+    retry.respond.send(b"[]".to_vec()).unwrap();
+    running.completed(wallet()).await;
     assert!(running.requests.try_recv().is_err());
     running
         .observe(stream_row(wallet(), "arrived-after-expiry", EPOCH + 3))
@@ -2531,11 +2570,7 @@ async fn unmatched_retry_requires_advancing_fixed_end() {
         .respond
         .send(b"[]".to_vec())
         .unwrap();
-    assert_eq!(
-        running.completed(wallet()).await,
-        vec![first],
-        "expiry retains the original frontier for the ordinary backstop"
-    );
+    assert_eq!(running.completed(wallet()).await, vec![first]);
     running.finish().await;
 }
 
@@ -2560,20 +2595,17 @@ async fn older_unmatched_observation_holds_newer_bucket_until_correlated() {
     older["asset"] = json!("asset-a");
     let newer = stream_row(wallet(), "newer-held", EPOCH + 1);
     let older_receipt = running.observe(older.clone()).await;
-    running
-        .requests
-        .recv()
-        .await
-        .unwrap()
-        .respond
-        .send(b"[]".to_vec())
-        .unwrap();
-    running.completed(wallet()).await;
+    let first_read = running.requests.recv().await.unwrap();
     running.now.store(EPOCH + 1, Ordering::SeqCst);
     let newer_receipt = running.observe(newer.clone()).await;
     tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    first_read.respond.send(b"[]".to_vec()).unwrap();
+    running.completed(wallet()).await;
     let request = running.requests.recv().await.unwrap();
     assert!(request.url.contains(&format!("end={}", EPOCH + 1)));
+    // Expiry occurs while the history read is held. Its unmatched completion must not launch
+    // another urgent read or transfer the frozen frontier to the newer trigger.
+    running.now.store(EPOCH + 121, Ordering::SeqCst);
     request
         .respond
         .send(serde_json::to_vec(std::slice::from_ref(&newer)).unwrap())
@@ -2587,7 +2619,6 @@ async fn older_unmatched_observation_holds_newer_bucket_until_correlated() {
     );
     assert!(!paper.is_wallet_fenced(&wallet()).unwrap());
 
-    running.now.store(EPOCH + 121, Ordering::SeqCst);
     tokio::time::advance(std::time::Duration::from_secs(1)).await;
     assert!(
         running.requests.try_recv().is_err(),
@@ -2643,10 +2674,10 @@ async fn cross_second_binding_preserves_history_order_and_oldest_age() {
         let request = running.requests.recv().await.unwrap();
         // A +1 history row becomes available on the next fixed end, without changing the frontier.
         let request = if delta == 1 {
-            request.respond.send(b"[]".to_vec()).unwrap();
-            running.completed(wallet()).await;
             running.now.store(EPOCH + 1, Ordering::SeqCst);
             tokio::time::advance(std::time::Duration::from_secs(1)).await;
+            request.respond.send(b"[]".to_vec()).unwrap();
+            running.completed(wallet()).await;
             running.requests.recv().await.unwrap()
         } else {
             request
@@ -3631,10 +3662,10 @@ async fn arrivals_during_failure_and_ack_delay_preserve_frontier_and_two_slots()
     let later = running.observe(later_row.clone()).await;
     failing.respond.fail();
     assert_eq!(running.completed(other).await, vec![first]);
-    assert!(running.requests.try_recv().is_err());
+    let retry = running.requests.recv().await.unwrap();
+    assert!(retry.url.contains(&format!("end={EPOCH}")));
     running.now.store(EPOCH + 1, Ordering::SeqCst);
     tokio::time::advance(std::time::Duration::from_secs(1)).await;
-    let retry = running.requests.recv().await.unwrap();
     let gate = running.bucket_ack_gate.clone();
     let held = gate.acquire().await.unwrap();
     retry
@@ -4254,5 +4285,567 @@ async fn qualifying_obligation_holds_boundary_until_durable_acknowledgment() {
         matches!(running.controls.recv().await.unwrap(), ControlCompletion::Boundary(value) if value == cutoff)
     );
     assert!(paper.wallet_fences().unwrap().is_empty());
+    running.finish().await;
+}
+
+/// AC4: slow and rate-limited missing reads release the urgent slot to the least recently
+/// launched wallet, without a whole-second wake or overlapping same-wallet operations.
+#[tokio::test(start_paused = true)]
+async fn missing_retries_rotate_wallets_in_the_same_second_without_busy_wakes() {
+    use std::time::Duration;
+    for rate_limited in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let other = WalletAddress([0xbb; 20]);
+        let (mut running, _) = start_recorded_poller_with_budget(&dir, &[wallet(), other], 120);
+        for expected in [wallet(), other] {
+            let request = running.requests.recv().await.unwrap();
+            assert!(request.url.contains(&expected.to_string()));
+            request.respond.send(b"[]".to_vec()).unwrap();
+            running.completed(expected).await;
+            tokio::time::advance(Duration::from_millis(10)).await;
+        }
+        running.round_completed().await;
+        let first = stream_row(wallet(), "missing-a", EPOCH);
+        let first_receipt = running.observe(first.clone()).await;
+        let held = running.requests.recv().await.unwrap();
+        assert!(held.url.contains(&wallet().to_string()));
+        let second = stream_row(other, "missing-b", EPOCH);
+        running.clear_waits();
+        let second_receipt = running.observe(second.clone()).await;
+        let waiting = loop {
+            let waiting = running.waiting().await;
+            if waiting.obligations.len() == 2 {
+                break waiting;
+            }
+        };
+        assert!(
+            waiting
+                .wake
+                .is_some_and(|wake| wake > tokio::time::Instant::now() + Duration::from_secs(1))
+        );
+        assert!(running.requests.try_recv().is_err());
+        running.clear_waits();
+        tokio::time::advance(Duration::from_millis(500)).await;
+        assert!(running.requests.try_recv().is_err());
+        assert!(
+            running.waits.try_recv().is_err(),
+            "a held urgent slot adds no retry timer"
+        );
+        let freed_at = tokio::time::Instant::now();
+        if rate_limited {
+            held.respond.rate_limited();
+        } else {
+            held.respond.send(b"[]".to_vec()).unwrap();
+        }
+        assert_eq!(running.completed(wallet()).await, vec![first_receipt]);
+        let next = running.requests.recv().await.unwrap();
+        assert_eq!(tokio::time::Instant::now(), freed_at);
+        assert!(
+            next.url.contains(&other.to_string()),
+            "B precedes A's immediate retry"
+        );
+        assert!(next.url.contains(&format!("end={EPOCH}")));
+        tokio::time::advance(Duration::from_millis(10)).await;
+        next.respond.send(b"[]".to_vec()).unwrap();
+        assert_eq!(running.completed(other).await, vec![second_receipt]);
+        let retry = running.requests.recv().await.unwrap();
+        assert!(retry.url.contains(&wallet().to_string()));
+        tokio::time::advance(Duration::from_millis(10)).await;
+        retry
+            .respond
+            .send(serde_json::to_vec(&[first]).unwrap())
+            .unwrap();
+        running.completed(wallet()).await;
+        let retry = running.requests.recv().await.unwrap();
+        assert!(retry.url.contains(&other.to_string()));
+        retry
+            .respond
+            .send(serde_json::to_vec(&[second]).unwrap())
+            .unwrap();
+        running.completed(other).await;
+        assert!(running.requests.try_recv().is_err());
+        running.finish().await;
+    }
+}
+
+/// AC4: a committed bucket awaiting control acknowledgement retains the urgent slot. The
+/// periodic slot still starts background work; shutdown cancels its held read without a retry.
+#[tokio::test(start_paused = true)]
+async fn urgent_ack_backpressure_has_no_retry_wake_and_background_still_progresses() {
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let other = WalletAddress([0xbb; 20]);
+    let (mut running, paper) = start_recorded_poller_with_budget(&dir, &[wallet(), other], 120);
+    for expected in [wallet(), other] {
+        running
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .respond
+            .send(b"[]".to_vec())
+            .unwrap();
+        running.completed(expected).await;
+    }
+    running.round_completed().await;
+    let held_ack = running
+        .bucket_ack_gate
+        .clone()
+        .acquire_owned()
+        .await
+        .unwrap();
+    let first = stream_row(wallet(), "ack-held", EPOCH);
+    running.observe(first.clone()).await;
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(serde_json::to_vec(std::slice::from_ref(&first)).unwrap())
+        .unwrap();
+    assert!(matches!(
+        running.controls.recv().await.unwrap(),
+        ControlCompletion::BucketCommitted
+    ));
+    assert!(
+        paper
+            .activity_group_state(aggregate(first).group_id.key())
+            .unwrap()
+            .is_some()
+    );
+    running.clear_waits();
+    running
+        .observe(stream_row(other, "background-waiting", EPOCH))
+        .await;
+    let waiting = running.waiting().await;
+    assert_eq!(
+        waiting.wake,
+        Some(tokio::time::Instant::now() + Duration::from_secs(30))
+    );
+    running.clear_waits();
+    tokio::time::advance(Duration::from_secs(1)).await;
+    assert!(running.waits.try_recv().is_err());
+    assert!(running.requests.try_recv().is_err());
+    running.now.store(EPOCH + 30, Ordering::SeqCst);
+    tokio::time::advance(Duration::from_secs(29)).await;
+    let background = running.requests.recv().await.unwrap();
+    assert!(background.url.contains(&other.to_string()));
+    drop(held_ack);
+    running.finish().await;
+    assert!(
+        background.respond.send(b"[]".to_vec()).is_err(),
+        "shutdown cancels the held background read"
+    );
+}
+
+/// AC5: the poller proves twins from every member row; the owner records them raw-only before
+/// late, covered and partial routing, and a different market's next first entry is decided.
+#[tokio::test]
+async fn restamp_twins_single_multirow_and_recorded_siblings_preserve_later_decisions() {
+    for covered in [false, true] {
+        for alongside_recorded in [false, true] {
+            for count in [1, 3] {
+                let dir = tempfile::tempdir().unwrap();
+                let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+                support::install_empty_anchor(&paper, wallet(), 0);
+                paper
+                    .record_reconciled_history_status(&WalletHistoryStatusRecord {
+                        wallet: wallet(),
+                        complete: true,
+                        proof_json: "{}".to_owned(),
+                        updated_at_unix: EPOCH,
+                    })
+                    .unwrap();
+                let current_trade = activity_row(
+                    "TRADE",
+                    "restamp-trade",
+                    MARKET_A,
+                    "BUY",
+                    "1",
+                    "asset-a",
+                    EPOCH,
+                );
+                let current_redeem =
+                    activity_row("REDEEM", "restamp-redeem", MARKET_A, "", "1", "", EPOCH);
+                let mut originals = [current_trade.clone(), current_redeem.clone()];
+                for row in &mut originals {
+                    row["outcomeIndex"] = json!(999);
+                    if row["type"] == "REDEEM" {
+                        row["outcome"] = json!("");
+                    }
+                }
+                let original_rows = originals
+                    .iter()
+                    .flat_map(|row| vec![row.clone(); count])
+                    .collect::<Vec<_>>();
+                let parsed = parse_activity_response(
+                    &serde_json::to_vec(&original_rows).unwrap(),
+                    wallet(),
+                    &ActivityParseContext {
+                        source_id: SourceId("fixture".to_owned()),
+                        observed_at: SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
+                        received_at: ReceivedAt(OffsetDateTime::UNIX_EPOCH),
+                        transport: ActivityTransport::Rest,
+                    },
+                )
+                .unwrap()
+                .aggregates()
+                .unwrap();
+                let mut initial = context(EPOCH);
+                let trade = parsed
+                    .iter()
+                    .find(|aggregate| {
+                        aggregate.group_id.components().activity_type
+                            == pe_source_polymarket_public::ActivityType::Trade
+                    })
+                    .unwrap();
+                initial.identity_overrides.insert(
+                    trade.group_id.key().clone(),
+                    pe_service::bucket_commit::IdentityOverride {
+                        verified: MarketOutcomeId::new(market(MARKET_A), OutcomeId(0)),
+                        evidence_hash: "gamma".to_owned(),
+                    },
+                );
+                BucketCommitEngine::load(paper.clone(), Default::default())
+                    .unwrap()
+                    .commit(parsed, &initial, zero_basis())
+                    .unwrap();
+                if covered {
+                    cover_recorded_groups(&paper, EPOCH);
+                }
+                let before = build_leader_ledger(&paper).unwrap().snapshots().clone();
+                let history = paper.gate_history().unwrap();
+                let mut rows = [current_trade, current_redeem]
+                    .iter()
+                    .flat_map(|row| vec![row.clone(); count])
+                    .collect::<Vec<_>>();
+                if alongside_recorded {
+                    rows.extend(original_rows);
+                }
+                let commits = recorded_poll(
+                    paper.clone(),
+                    &dir.path().join("source.log"),
+                    Arc::new(QueueFetcher::new(serde_json::to_vec(&rows).unwrap())),
+                )
+                .await;
+                assert_eq!(commits.len(), 1);
+                let (_, context, result) = &commits[0];
+                assert_eq!(context.restamp_twins.len(), 2);
+                assert_eq!(result.dispositions.len(), 2);
+                assert!(
+                    result
+                        .dispositions
+                        .values()
+                        .all(|disposition| disposition == "raw_only")
+                );
+                assert_eq!(result.newly_fenced, None);
+                assert!(result.pending.is_empty());
+                assert!(!paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+                assert!(!paper.is_wallet_fenced(&wallet()).unwrap());
+                assert_eq!(paper.cursor(&wallet()).unwrap(), Some(EPOCH));
+                assert_eq!(paper.gate_history().unwrap(), history);
+                assert_eq!(build_leader_ledger(&paper).unwrap().snapshots(), &before);
+                let entry = activity_row(
+                    "TRADE",
+                    "after-twins",
+                    MARKET_B,
+                    "BUY",
+                    "1",
+                    "asset-b",
+                    EPOCH + 1,
+                );
+                let id = aggregate(entry.clone()).group_id.key().clone();
+                let decisions = recorded_poll(
+                    paper.clone(),
+                    &dir.path().join("source.log"),
+                    Arc::new(QueueFetcher::new(serde_json::to_vec(&[entry]).unwrap())),
+                )
+                .await;
+                assert_eq!(decisions[0].2.dispositions[&id.0], "decision_pending");
+                assert_eq!(decisions[0].2.pending, vec![id]);
+                assert!(!paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+            }
+        }
+    }
+}
+
+/// AC5: known-condition unexpressible redemptions and combos have no wallet suppression on
+/// ordinary routing. Combo tokens never enter Gamma lookup; a later independent entry decides.
+#[tokio::test]
+async fn ordinary_redemptions_and_trade_redeem_combos_preserve_first_entry_decisions() {
+    for (kind, combo, size) in [
+        ("REDEEM", false, "1"),
+        ("REDEEM", false, "0"),
+        ("TRADE", true, "1"),
+        ("REDEEM", true, "1"),
+    ] {
+        for entry_epoch in [EPOCH, EPOCH + 1] {
+            let dir = tempfile::tempdir().unwrap();
+            let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+            support::install_empty_anchor(&paper, wallet(), 0);
+            paper
+                .record_reconciled_history_status(&WalletHistoryStatusRecord {
+                    wallet: wallet(),
+                    complete: true,
+                    proof_json: "{}".to_owned(),
+                    updated_at_unix: EPOCH,
+                })
+                .unwrap();
+            let mut raw = activity_row(
+                kind,
+                "ordinary-raw",
+                MARKET_A,
+                if kind == "TRADE" { "BUY" } else { "" },
+                size,
+                if combo {
+                    "combo-token-missing-from-gamma"
+                } else {
+                    ""
+                },
+                EPOCH,
+            );
+            raw["outcomeIndex"] = json!(999);
+            raw["outcome"] = json!("");
+            raw["isCombo"] = json!(combo);
+            let raw_id = aggregate(raw.clone()).group_id.key().clone();
+            let entry = activity_row(
+                "TRADE",
+                "after-raw",
+                MARKET_B,
+                "BUY",
+                "1",
+                "asset-b",
+                entry_epoch,
+            );
+            let entry_id = aggregate(entry.clone()).group_id.key().clone();
+            let before = paper.gate_history().unwrap();
+            let commits = recorded_poll(
+                paper.clone(),
+                &dir.path().join("source.log"),
+                Arc::new(QueueFetcher::new(
+                    serde_json::to_vec(&[raw, entry]).unwrap(),
+                )),
+            )
+            .await;
+            assert_eq!(commits.len(), if entry_epoch == EPOCH { 1 } else { 2 });
+            assert!(commits[0].1.identity_unresolved.is_empty());
+            assert!(commits[0].1.identity_overrides.is_empty());
+            assert_eq!(commits[0].2.dispositions[&raw_id.0], "raw_only");
+            let entry_commit = commits.last().unwrap();
+            assert_eq!(entry_commit.2.dispositions[&entry_id.0], "decision_pending");
+            assert_eq!(entry_commit.2.pending, vec![entry_id]);
+            assert!(!paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+            assert!(!paper.is_wallet_fenced(&wallet()).unwrap());
+            assert!(!before[&wallet()].contains(&market(MARKET_A)));
+            assert!(!paper.gate_history().unwrap()[&wallet()].contains(&market(MARKET_A)));
+            assert_eq!(paper.cursor(&wallet()).unwrap(), Some(entry_epoch));
+        }
+    }
+}
+
+#[tokio::test]
+async fn twin_beside_genuinely_new_activity_retains_late_and_partial_routing() {
+    for covered in [false, true] {
+        for alongside_recorded in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+            support::install_empty_anchor(&paper, wallet(), 0);
+            let current = activity_row(
+                "TRADE",
+                "mixed-twin",
+                MARKET_A,
+                "BUY",
+                "1",
+                "asset-a",
+                EPOCH,
+            );
+            let mut original = current.clone();
+            original["outcomeIndex"] = json!(999);
+            let original_aggregate = aggregate(original.clone());
+            let mut initial = context(EPOCH);
+            initial.identity_overrides.insert(
+                original_aggregate.group_id.key().clone(),
+                pe_service::bucket_commit::IdentityOverride {
+                    verified: MarketOutcomeId::new(market(MARKET_A), OutcomeId(0)),
+                    evidence_hash: "gamma".to_owned(),
+                },
+            );
+            BucketCommitEngine::load(paper.clone(), Default::default())
+                .unwrap()
+                .commit(vec![original_aggregate], &initial, zero_basis())
+                .unwrap();
+            if covered {
+                cover_recorded_groups(&paper, EPOCH);
+            }
+            let genuine = activity_row(
+                "TRADE",
+                "genuinely-new",
+                MARKET_B,
+                "BUY",
+                "1",
+                "asset-b",
+                EPOCH,
+            );
+            let genuine_id = aggregate(genuine.clone()).group_id.key().clone();
+            let mut rows = vec![current, genuine];
+            if alongside_recorded {
+                rows.push(original);
+            }
+            let commits = recorded_poll(
+                paper.clone(),
+                &dir.path().join("source.log"),
+                Arc::new(QueueFetcher::new(serde_json::to_vec(&rows).unwrap())),
+            )
+            .await;
+            assert_eq!(commits[0].1.restamp_twins.len(), 1);
+            let result = &commits[0].2;
+            assert!(result.pending.is_empty());
+            if alongside_recorded && !covered {
+                assert_eq!(
+                    result.newly_fenced,
+                    Some(pe_position_ledger::WalletFenceCause::LateEqualSecondGroup)
+                );
+                assert!(paper.is_wallet_fenced(&wallet()).unwrap());
+            } else {
+                assert_eq!(
+                    result.dispositions[&genuine_id.0],
+                    if covered {
+                        "anchor_covered_late"
+                    } else {
+                        "reanchor_required_late_group"
+                    }
+                );
+                assert!(paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+                assert!(!paper.is_wallet_fenced(&wallet()).unwrap());
+            }
+        }
+    }
+}
+
+/// A deferred routine anchor leaves a redeemed condition's balance in place and does not
+/// suppress the wallet's next independent first entry.
+#[tokio::test(start_paused = true)]
+async fn known_redemption_preserves_balance_and_decision_during_deferred_anchor() {
+    let dir = tempfile::tempdir().unwrap();
+    let paper = PaperStateDb::open(&dir.path().join("paper.db")).unwrap();
+    paper.set_cursor(&wallet(), EPOCH - 10).unwrap();
+    paper
+        .record_reconciled_history_status(&WalletHistoryStatusRecord {
+            wallet: wallet(),
+            complete: true,
+            proof_json: "{}".to_owned(),
+            updated_at_unix: EPOCH - 10,
+        })
+        .unwrap();
+    paper
+        .install_anchors(&[AnchorInstallRecord {
+            wallet: wallet(),
+            balances: vec![(
+                market(MARKET_A),
+                OutcomeId(0),
+                ShareAmount::from_whole(5).unwrap(),
+            )],
+            activity_cutoff_unix: EPOCH - 10,
+            anchored_at_unix: EPOCH - 3601,
+            ledger_hash_after: "fixture".to_owned(),
+            positions_proof_hash: "fixture".to_owned(),
+            activity_bounds_json: "[]".to_owned(),
+            source_log_generation: "fixture".to_owned(),
+            history_status: None,
+            proof_json: "{}".to_owned(),
+            recorded_at_unix: EPOCH - 10,
+            repaired_history: Vec::new(),
+            expected_fence: None,
+        }])
+        .unwrap();
+    let history_before = paper.gate_history().unwrap();
+    drop(paper);
+    let (mut running, paper) =
+        start_recorded_poller_with_anchors(&dir, &[wallet()], false, true, Some(EPOCH));
+    let anchor_before = paper.wallet_coverage(&wallet()).unwrap().anchor_seq;
+    let mut redeem = activity_row(
+        "REDEEM",
+        "deferred-redemption",
+        MARKET_A,
+        "",
+        "5",
+        "",
+        EPOCH,
+    );
+    redeem["outcomeIndex"] = json!(999);
+    redeem["outcome"] = json!("");
+    let redeem_id = aggregate(redeem.clone()).group_id.key().clone();
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(serde_json::to_vec(&[redeem]).unwrap())
+        .unwrap();
+    running.completed(wallet()).await;
+    running.round_completed().await;
+    fail_refresh_positions(&mut running, wallet()).await;
+    // A routine deferral retains its one incremental follow-up and refresh cooldown.
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    running.completed(wallet()).await;
+    assert_eq!(
+        paper
+            .activity_group_state(&redeem_id)
+            .unwrap()
+            .unwrap()
+            .disposition,
+        "raw_only"
+    );
+    assert_eq!(
+        paper.wallet_coverage(&wallet()).unwrap().anchor_seq,
+        anchor_before
+    );
+    assert!(!paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+    assert_eq!(paper.gate_history().unwrap(), history_before);
+    assert_eq!(
+        paper.leader_positions().unwrap()[0].long_contracts,
+        ShareAmount::from_whole(5).unwrap()
+    );
+    loop {
+        if running
+            .waiting()
+            .await
+            .refresh_cooldown
+            .contains_key(&wallet())
+        {
+            break;
+        }
+    }
+    running.now.store(EPOCH + 1, Ordering::SeqCst);
+    let entry = stream_row(wallet(), "entry-during-deferral", EPOCH + 1);
+    running.observe(entry.clone()).await;
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(serde_json::to_vec(std::slice::from_ref(&entry)).unwrap())
+        .unwrap();
+    running.completed(wallet()).await;
+    let id = aggregate(entry).group_id.key().clone();
+    assert!(paper.is_decision_pending_open(&id).unwrap());
+    assert!(!paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+    let balance = paper
+        .leader_positions()
+        .unwrap()
+        .into_iter()
+        .find(|position| position.market_id == market(MARKET_A))
+        .unwrap();
+    assert_eq!(balance.long_contracts, ShareAmount::from_whole(5).unwrap());
     running.finish().await;
 }

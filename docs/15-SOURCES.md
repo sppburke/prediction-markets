@@ -157,9 +157,12 @@
 > other markets, so the sentinel row is the complete record for its condition. Zero-size REDEEM legs
 > and `outcomeIndex: 999` sentinel rows do not identify the burn scope: the venue's redemption call
 > accepts arbitrary index sets, and the public feed carries no calldata. Combo rows stay raw-only;
-> ordinary rows with unknowable burn scope require a positions re-anchor rather than any inferred
-> ledger effect. **On multi-outcome markets, one asset id can appear with two different
-> `outcomeIndex` values:** for wallet `0x180e62e6…` and condition `0xd21e5817…`, four rows carry
+> ordinary rows with unknowable burn scope never infer a ledger effect. Known-condition
+> `RequiresAnchor` redemptions reaching ordinary routing now record `raw_only` and leave that
+> condition's balances unchanged until the next successful anchor. Outcome restamp twins and the
+> retained late/covered/non-twin exceptions follow the canonical
+> [causal re-anchor rule](_GLOSSARY.md#causal-re-anchor-and-rehearsal-rules-557). **On
+> multi-outcome markets, one asset id can appear with two different `outcomeIndex` values:** for wallet `0x180e62e6…` and condition `0xd21e5817…`, four rows carry
 > index 1 and three carry index 0. Activity `outcomeIndex` is therefore not a reliable identity on
 > those markets, and the bracket defers such wallets. The `/positions` endpoint, walked through both
 > `redeemable` partitions with `sizeThreshold=0&includeArchived=true`, reports the wallet's true

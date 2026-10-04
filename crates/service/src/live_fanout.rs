@@ -4510,6 +4510,7 @@ fn produced_decision_continuation(
         no_copy_dispositions: HashMap::new(),
         identity_overrides: HashMap::new(),
         identity_unresolved: HashSet::new(),
+        restamp_twins: Default::default(),
         history_status: Some(pe_paper_state::WalletHistoryStatusRecord {
             wallet,
             complete: true,
@@ -10759,6 +10760,7 @@ mod tests {
                     HashMap::new()
                 },
                 identity_unresolved: HashSet::new(),
+                restamp_twins: Default::default(),
                 history_status: Some(pe_paper_state::WalletHistoryStatusRecord {
                     wallet,
                     complete: true,
