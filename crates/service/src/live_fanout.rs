@@ -128,6 +128,8 @@ const DEPOSIT_WALLET_REDEMPTION_DEADLINE_SECS: u64 = 4 * 60;
 /// Inputs owned by the one strictly sequential live task.
 pub struct LiveFanoutConfig {
     pub paper_state: Arc<PaperStateDb>,
+    /// Shared with the paper owner; a permit follows each committed ready transition.
+    pub dispatch_ready: Arc<tokio::sync::Notify>,
     pub live_accounts: LiveAccounts,
     pub live_watchlist: LiveWatchlist,
     pub runtime_config: LiveRuntimeConfig,
@@ -383,7 +385,8 @@ pub async fn run_live_fanout_until(
         tokio::select! {
             biased;
             () = &mut shutdown => break,
-            _ = ticker.tick() => {}
+            _ = ticker.tick() => {},
+            () = state.config.dispatch_ready.notified() => {}
         }
         if state
             .config
@@ -17839,6 +17842,7 @@ mod tests {
         FanoutState {
             config: LiveFanoutConfig {
                 paper_state,
+                dispatch_ready: Arc::new(tokio::sync::Notify::new()),
                 live_accounts: LiveAccounts::new(snapshot),
                 live_watchlist: LiveWatchlist::new(Watchlist {
                     entries: Vec::new(),
@@ -18668,6 +18672,62 @@ mod tests {
                 )));
             }
         }
+    }
+
+    /// Ready permits survive a competing tick; coalesced seeds drain without advancing time.
+    #[tokio::test(start_paused = true)]
+    async fn live_fanout_ready_wake_coalesces_and_periodic_work_keeps_progressing() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let state = fanout_state(&dir, db.clone(), LiveAccountsSnapshot::default(), "", None);
+        let ready = state.config.dispatch_ready.clone();
+        let (stop, shutdown) = tokio::sync::oneshot::channel();
+        let owner = run_live_fanout_until(state.config, async {
+            let _ = shutdown.await;
+        });
+        tokio::pin!(owner);
+        assert!(futures::poll!(&mut owner).is_pending()); // immediate boot pass, no seeds
+        let stage = |id: &str| {
+            db.stage_dispatch_seed(&DispatchSeedRecord {
+                dispatch_id: id.to_owned(),
+                signal_json: serde_json::to_string(&serde_json::json!({
+                    "schema_version": 1,
+                    "signal": projection_signal(),
+                    "observation": fixture_observation_evidence(),
+                }))
+                .unwrap(),
+                source_trade_id: id.to_owned(),
+                created_at_unix: 0,
+                targets: Vec::new(),
+            })
+            .unwrap();
+            db.flip_dispatch_ready(id, "fill").unwrap();
+        };
+        for id in ["first", "second"] {
+            stage(id);
+            ready.notify_one();
+        }
+        assert!(futures::poll!(&mut owner).is_pending());
+        assert!(db.unfinalized_ready_dispatch_seeds().unwrap().is_empty());
+        // Select cancels its registered notify future when the periodic tick wins.
+        stage("tick-and-wake");
+        ready.notify_one();
+        tokio::time::advance(Duration::from_secs(FANOUT_INTERVAL_SECS)).await;
+        assert!(futures::poll!(&mut owner).is_pending());
+        assert!(db.unfinalized_ready_dispatch_seeds().unwrap().is_empty());
+        // A readiness write without a wake (boot/recovery shape) retains periodic coverage.
+        stage("periodic");
+        assert!(futures::poll!(&mut owner).is_pending());
+        assert_eq!(db.unfinalized_ready_dispatch_seeds().unwrap().len(), 1);
+        tokio::time::advance(Duration::from_secs(FANOUT_INTERVAL_SECS)).await;
+        assert!(futures::poll!(&mut owner).is_pending());
+        assert!(db.unfinalized_ready_dispatch_seeds().unwrap().is_empty());
+        // Shutdown wins over a ready permit and admits no new work.
+        stage("shutdown");
+        ready.notify_one();
+        stop.send(()).unwrap();
+        assert!(futures::poll!(&mut owner).is_ready());
+        assert_eq!(db.unfinalized_ready_dispatch_seeds().unwrap().len(), 1);
     }
 
     /// PASS: resolving the owner shutdown future leaves an Approved-but-unprepared admission

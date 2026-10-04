@@ -1405,6 +1405,7 @@ async fn main() -> Result<()> {
     // mode-0600 sibling of the paper log.
     let mut live_journal_for_staging = None;
     let mut live_fanout_task = None;
+    let live_dispatch_ready = Arc::new(tokio::sync::Notify::new());
     if let Some(live_accounts) = live_accounts.clone() {
         let identity = match pe_service::live_credentials::load_identity_from_credentials_dir() {
             Ok(identity) => Some(identity),
@@ -1458,6 +1459,7 @@ async fn main() -> Result<()> {
         );
         let fanout_config = pe_service::live_fanout::LiveFanoutConfig {
             paper_state: paper_state.clone(),
+            dispatch_ready: live_dispatch_ready.clone(),
             live_accounts,
             live_watchlist: live_watchlist.clone(),
             runtime_config: live_runtime_config.clone(),
@@ -1539,7 +1541,8 @@ async fn main() -> Result<()> {
         book_fetcher,
     )
     .context("build orchestrator")?
-    .with_source_receipt_index(source_receipts.clone());
+    .with_source_receipt_index(source_receipts.clone())
+    .with_live_dispatch_ready(live_dispatch_ready);
     if let Some(task) = live_fanout_task {
         supervisor.spawn(TaskName::LiveFanout, task);
     }

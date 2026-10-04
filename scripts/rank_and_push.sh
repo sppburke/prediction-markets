@@ -1070,11 +1070,12 @@ else
   [[ -n "$ACTIVE_WINDOW_HOURS" ]] && FILTER_ARGS+=(--active-window-hours "$ACTIVE_WINDOW_HOURS")
   [[ -n "$MAX_CACHE_STALENESS_HOURS" ]] && FILTER_ARGS+=(--max-cache-staleness-hours "$MAX_CACHE_STALENESS_HOURS")
 
-  # TTR provenance: pass the actual ranking TTR ceiling so the durable request reflects
+  # TTR provenance: pass the actual ranking TTR bounds so the durable request reflects
   # the shape these entries were ranked at.
   PUSH_ARGS+=(
     --ranked-csv "$LATENCY_CSV" --top-n "$TOP_N"
     --band-lo "$PRICE_MIN" --band-hi "$PRICE_MAX"
+    --ttr-floor-secs 60
     --ttr-max-secs "$TTR_MAX_SECS"
     --latency-shift-secs "$LATENCY_SHIFT_SECS"
     "${FILTER_ARGS[@]}"

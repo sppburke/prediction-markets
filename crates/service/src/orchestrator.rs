@@ -412,6 +412,7 @@ pub struct Orchestrator<
     // tests / when Supabase is off — zero targets, Phase-A baseline behavior.
     live_accounts: Option<crate::live_accounts::LiveAccounts>,
     live_journal: Option<Arc<pe_execution_core::LiveJournal>>,
+    live_dispatch_ready: Option<Arc<tokio::sync::Notify>>,
     /// Set at the first uncertain paper sync boundary. Dropping the receiver
     /// then backpressures/stops every producer; supervisor owns process exit.
     intake_stopped: bool,
@@ -1090,9 +1091,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         terminalize_final_fill_decision(&self.paper_state, &payload, &result, final_receipt)
             .map_err(|error| error.to_string())?;
         if let Some(dispatch_id) = dispatch_id {
-            self.paper_state
+            let flipped = self
+                .paper_state
                 .flip_dispatch_ready(dispatch_id, "fill")
                 .map_err(|error| error.to_string())?;
+            if flipped {
+                self.notify_live_dispatch_ready();
+            }
         }
         let crate::paper_recovery::FinancialResult::Fill { canonical } = result else {
             return Err("internal fill Final kind mismatch".to_owned());
@@ -2010,6 +2015,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             book_fetcher,
             price_impact_cap_bps: config.price_impact_cap_bps,
             live_accounts: config.live_accounts,
+            live_dispatch_ready: None,
             live_journal: config.live_journal.and_then(|access| match access {
                 LiveJournalAccess::Writable(journal) => Some(journal),
                 LiveJournalAccess::ReadOnly(_) => None,
@@ -2036,6 +2042,20 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
     pub fn with_source_receipt_index(mut self, source_receipts: SourceReceiptIndex) -> Self {
         self.source_receipts = Some(source_receipts);
         self
+    }
+
+    /// Wake the sequential live owner after a committed paper outcome releases a seed.
+    #[must_use]
+    pub fn with_live_dispatch_ready(mut self, ready: Arc<tokio::sync::Notify>) -> Self {
+        self.live_dispatch_ready = Some(ready);
+        self
+    }
+
+    fn notify_live_dispatch_ready(&self) {
+        if let Some(ready) = &self.live_dispatch_ready {
+            // One consumer; retain a permit when it is busy or its select is cancelled.
+            ready.notify_one();
+        }
     }
 
     /// Install the verified log pair used by the Start-bound financial protocol.
@@ -4094,6 +4114,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             error!(error = %e, trade = %trade.source_trade_id,
                 "no-copy disposition commit failed; rolling back admission");
             self.rollback_admission(rb, unrecord_market);
+        } else if flip.is_some() {
+            self.notify_live_dispatch_ready();
         }
     }
 
@@ -4242,7 +4264,12 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 flip,
                 pending.as_ref().map(pending_terminal),
             ) {
-                Ok(()) => return true,
+                Ok(()) => {
+                    if flip.is_some() {
+                        self.notify_live_dispatch_ready();
+                    }
+                    return true;
+                }
                 Err(e) if attempt < LOCAL_COMMIT_RETRIES => {
                     error!(
                         error = %e,
@@ -5282,6 +5309,112 @@ mod tests {
         }
     }
 
+    /// A ready handoff wakes only after commit; failed flips retain the open seed and no permit.
+    #[tokio::test(start_paused = true)]
+    async fn live_dispatch_ready_no_copy_and_no_fill_follow_successful_commits() {
+        use super::{DecisionContinuationV3, DecisionEvidenceAccumulator, RollbackCtx};
+        use pe_core_types::{MarketOutcomeId, ShareAmount};
+
+        for no_copy in [false, true] {
+            let ContinuationOrchestratorFixture {
+                dir,
+                paper_state,
+                rows,
+                mut orchestrator,
+                _control_tx,
+            } = continuation_orchestrator_fixture();
+            let continuation = DecisionContinuationV3::from_durable(&rows[0]).unwrap();
+            let trade = continuation.incoming_trade().unwrap();
+            let ready = Arc::new(tokio::sync::Notify::new());
+            orchestrator = orchestrator.with_live_dispatch_ready(ready.clone());
+            let mut evidence = DecisionEvidenceAccumulator::for_continuation(&continuation);
+            evidence.record_staged_dispatch("wake-test".to_owned(), None);
+            let checkpoint = evidence.checkpoint_json().unwrap();
+            paper_state
+                .stage_dispatch_seed_pending(
+                    &pe_paper_state::DispatchSeedRecord {
+                        dispatch_id: "wake-test".to_owned(),
+                        signal_json: "{}".to_owned(),
+                        source_trade_id: trade.source_trade_id.0.clone(),
+                        created_at_unix: trade.received_at.unix_timestamp(),
+                        targets: Vec::new(),
+                    },
+                    Some(
+                        pe_paper_state::DispatchStagingEvidence::PaperOutcomeCheckpoint(
+                            pe_paper_state::PendingTerminalEvidence {
+                                post_commit_inputs_json: &checkpoint,
+                                updated_at_unix: trade.received_at.unix_timestamp(),
+                            },
+                        ),
+                    ),
+                )
+                .unwrap();
+            let leader = pe_paper_state::LeaderPositionRow {
+                wallet: trade.wallet,
+                market_id: trade.market_id.clone(),
+                outcome_id: trade.outcome_id,
+                long_contracts: ShareAmount::ZERO,
+                short_contracts: ShareAmount::ZERO,
+            };
+            let rollback = RollbackCtx {
+                wallet: trade.wallet,
+                key: MarketOutcomeId::new(trade.market_id.clone(), trade.outcome_id),
+                prev: None,
+                enabled: false,
+            };
+            let disposition = pe_paper_state::NoCopyDisposition {
+                provenance: "rest_poll".to_owned(),
+                age_secs: 121,
+                reason: "stale_fallback_past_copy_budget".to_owned(),
+                recorded_at_unix: trade.received_at.unix_timestamp(),
+            };
+            let connection = rusqlite::Connection::open(dir.path().join("paper.db")).unwrap();
+            connection.execute_batch("CREATE TRIGGER refuse_ready BEFORE UPDATE ON dispatch_seeds BEGIN SELECT RAISE(ABORT, 'injected ready failure'); END;").unwrap();
+            for succeeds in [false, true] {
+                if succeeds {
+                    connection
+                        .execute_batch("DROP TRIGGER refuse_ready;")
+                        .unwrap();
+                }
+                if no_copy {
+                    orchestrator.commit_no_copy_or_rollback(
+                        &trade,
+                        &leader,
+                        &disposition,
+                        &rollback,
+                        None,
+                        Some(&evidence),
+                    );
+                } else {
+                    assert_eq!(
+                        orchestrator
+                            .commit_no_fill_flipping(
+                                &trade,
+                                &leader,
+                                Some("wake-test"),
+                                "declined",
+                                None,
+                                Some(&evidence),
+                            )
+                            .await,
+                        succeeds
+                    );
+                }
+                assert_eq!(
+                    paper_state
+                        .dispatch_seed("wake-test")
+                        .unwrap()
+                        .unwrap()
+                        .state,
+                    if succeeds { "ready" } else { "pending_paper" }
+                );
+                let notified = ready.notified();
+                tokio::pin!(notified);
+                assert_eq!(futures::poll!(&mut notified).is_ready(), succeeds);
+            }
+        }
+    }
+
     /// PASS: once paper durability is uncertain, resuming a committed bucket loads and handles no
     /// further row: every row stays open with its frozen inputs and no continuation is registered.
     /// FAIL: a row is loaded, resumed, or terminalized after the latch.
@@ -5748,6 +5881,17 @@ mod tests {
             source_trade_id: trade.source_trade_id.clone(),
             action_confidence_ppm: pe_core_types::ProbabilityPpm(1_000_000),
         };
+        let ready = Arc::new(tokio::sync::Notify::new());
+        owner = owner.with_live_dispatch_ready(ready.clone());
+        state
+            .stage_dispatch_seed(&pe_paper_state::DispatchSeedRecord {
+                dispatch_id: "fill-wake".to_owned(),
+                signal_json: "{}".to_owned(),
+                source_trade_id: trade.source_trade_id.0.clone(),
+                created_at_unix: now.unix_timestamp(),
+                targets: Vec::new(),
+            })
+            .unwrap();
         let paper_walks = pe_event_log::scan_metrics::count(&paper_path).unwrap();
         let (risk, _) = owner
             .active_paper_risk_snapshot(
@@ -5765,7 +5909,7 @@ mod tests {
                 .apply_active_financial_fill(
                     &trade,
                     seal_test_economic(fill_source, start),
-                    None,
+                    Some("fill-wake"),
                     None,
                     &mut None
                 )
@@ -5773,6 +5917,13 @@ mod tests {
                 .unwrap(),
             ActiveFinancialFill::Committed(_)
         ));
+        assert_eq!(
+            state.dispatch_seed("fill-wake").unwrap().unwrap().state,
+            "ready"
+        );
+        let notified = ready.notified();
+        tokio::pin!(notified);
+        assert!(futures::poll!(&mut notified).is_ready());
         hooks
             .financial_clock_unix
             .store(SEAL_START_UNIX + 4, Ordering::SeqCst);

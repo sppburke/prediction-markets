@@ -38,6 +38,24 @@
 
 ## Polymarket
 
+> **Closed prices, closure clocks and minimum shares (#730 Part 1), Last checked:
+> 2026-10-03; re-verify by 2026-12-02.** The captured official
+> [market details](https://docs.polymarket.com/market-data/market-details) describe `closed`
+> as resolved or closed to further trading. The read-only Gamma closed-query probe returned
+> `closed=true` and `closedTime` separately from `endDate`; the captured timestamp uses a
+> space-separated UTC offset form. Scheduled end is not proof of actual closure. The
+> [prices and order books](https://docs.polymarket.com/market-data/prices-order-books) page
+> describes historical-price reads; the captured legacy CLOB `/prices-history` probe returned
+> historical points after close over a wider range while the final short window was empty.
+> This establishes availability for that sampled token, not completeness or a last-minute
+> sample guarantee. The paper mark's closure proof and bounded fallback use
+> [`closed_mark_lookback_secs`](_GLOSSARY.md); ordinary live retains its existing mark window.
+> The [place-orders](https://docs.polymarket.com/trading/place-orders) and
+> [error-code](https://docs.polymarket.com/resources/error-codes) pages, together with the book's
+> `min_order_size`, confirm the minimum is an order quantity in shares, not collateral.
+> These pages and `probe15_prices_history.json` / `probe16_closure_fields.json` were read from
+> the supplied 2026-10-03 captures; no new live request was made for this implementation.
+
 > **Short-429 retry budget (#588), Last checked: 2026-10-03; re-verify by
 > 2026-12-02.** The [official rate-limit reference](https://docs.polymarket.com/api-reference/rate-limits)
 > still describes sliding windows and queued throttling. It lists legacy `/trades`
@@ -74,7 +92,9 @@
 > (transport/envelope/constants) and `pe-service::activity_ingest` (readers, liveness,
 > fan-in); the service's `trade_parser` normalizes identically to the REST path. The CLOB
 > market channel remains wallet-anonymous — the note below stands for THAT feed.
-> Last checked: 2026-08-31.
+> Last checked: 2026-10-03 (`scripts/probe_activity_ws.py`: the activity subscription delivered
+> 5,414 `trades` frames in 60 s with envelope keys `connection_id`, `payload`, `timestamp`,
+> `topic` and `type`, and `payload.proxyWallet` present).
 >
 > **Historical (2026-06-03, issue #282 Phase 2 verification — CLOB channel still true; RTDS part superseded above).**
 > `wss://ws-subscriptions-clob.polymarket.com/ws/market` (`last_trade_price` events) does not include the **wallet address**; wallet-level trade identification is impossible from the frame alone.
@@ -189,6 +209,10 @@
 | https://docs.polymarket.com/developers/CLOB/websocket/wss-overview | 2026-06-10 | 2026-08-09 |
 | https://docs.polymarket.com/ | 2026-05-02 | 2026-07-01 |
 | https://docs.polymarket.com/llms.txt | — | — |
+| https://docs.polymarket.com/market-data/market-details | 2026-10-03 | 2026-12-02 |
+| https://docs.polymarket.com/market-data/prices-order-books | 2026-10-03 | 2026-12-02 |
+| https://docs.polymarket.com/trading/place-orders | 2026-10-03 | 2026-12-02 |
+| https://docs.polymarket.com/resources/error-codes | 2026-10-03 | 2026-12-02 |
 | https://docs.polymarket.com/api-reference/rate-limits | 2026-09-17 | 2026-11-16 |
 | https://docs.polymarket.com/market-data/websocket/overview | 2026-05-02 | 2026-07-01 |
 | https://docs.polymarket.com/market-data/websocket/market-channel | 2026-06-09 | 2026-09-01 |

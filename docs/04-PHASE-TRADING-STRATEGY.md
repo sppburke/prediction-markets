@@ -72,12 +72,11 @@ Do not copy unless ALL are true:
    `active_watchlist_size` survivors — membership is re-derived at each batch transition, so a
    wallet whose verdict flips is dropped at the next swap, not mid-batch;
 2. the event is a first-ever BUY `Entry`; SELLs and all later actions are blocked by the production copy-entry gate;
-3. current price is within `max_slippage_from_leader_bps` of leader's observed entry;
-4. market liquidity can fill the follower order without exceeding adverse-selection limits;
-5. market is not in a blocked category, settlement dispute, or stale-metadata state;
-6. leader's family-specific model has positive lower-confidence expected log growth;
-7. portfolio risk caps permit new exposure (caps in `19-`);
-8. order can be represented as an idempotent `OrderIntent` and replayed (key in `_GLOSSARY.md` "Idempotency").
+3. market liquidity can fill the follower order without exceeding adverse-selection limits;
+4. market is not in a blocked category, settlement dispute, or stale-metadata state;
+5. leader's family-specific model has positive lower-confidence expected log growth;
+6. portfolio risk caps permit new exposure (caps in `19-`);
+7. order can be represented as an idempotent `OrderIntent` and replayed (key in `_GLOSSARY.md` "Idempotency").
 
 ### Fractional Kelly sizing
 

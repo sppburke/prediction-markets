@@ -1,7 +1,7 @@
 //! Polymarket CLOB `/book` order-book fetcher (public, no auth).
 //!
-//! Captures ask-side depth for the liquidity-at-fill snapshot worker (WS2 of
-//! issue #350). This module is the **fetcher only**: it fetches a token's order
+//! Supplies the decision's current ask ladder and the liquidity-at-fill snapshot
+//! worker (WS2 of issue #350). This module is the **fetcher only**: it fetches a token's order
 //! book over the public CLOB REST endpoint and parses the ask side into
 //! `Decimal` levels. The downstream `absorbable_usd_100bps` derivation (Σ
 //! price·size within 1% of best ask) lives in the snapshot worker that consumes
@@ -11,8 +11,8 @@
 //! Endpoint: `GET https://clob.polymarket.com/book?token_id=<id>` — re-confirmed
 //! public/no-auth, HTTP 200 with `asks`/`bids` as arrays of `{price, size}`
 //! **string** levels and a bogus token id returning `404` (2026-06-16;
-//! `docs/15-SOURCES.md`). Only the ask side is parsed — liquidity capture is
-//! buy-only and a BUY consumes the ask side.
+//! `docs/15-SOURCES.md`). Only the ask side is parsed — the copy path is buy-only
+//! and a BUY consumes the ask side.
 
 use std::collections::HashMap;
 use std::str::FromStr as _;
@@ -33,10 +33,9 @@ const CLOB_BASE_URL: &str = "https://clob.polymarket.com";
 /// (`polymarket_clob_min_interval_ms` = 200; "Venue rate limits" table).
 const CLOB_MIN_INTERVAL_MS: u64 = 200;
 /// Per-request timeout for the `/book` call — `clob_book_request_timeout_secs`
-/// in `docs/_GLOSSARY.md`. Shorter than the order-submission client's 10s
-/// (`polymarket_request_timeout_secs`) because the fetch runs off the fill hot
-/// path (PR-H's snapshot worker), so a slow book is dropped to a partial
-/// snapshot rather than blocking a trade.
+/// in `docs/_GLOSSARY.md`. Shared by decision and snapshot reads. The decision
+/// bounds its entire fetch with `orchestrator::CLOB_BOOK_HOT_PATH_TIMEOUT_SECS`
+/// and fails closed on timeout; the snapshot worker keeps its partial-snapshot policy.
 const CLOB_REQUEST_TIMEOUT_SECS: u64 = 5;
 pub(crate) const CLOB_BOOK_SOURCE_ID: &str = "polymarket.clob.book";
 pub(crate) const CLOB_BOOK_SCHEMA_VERSION: u32 = 1;

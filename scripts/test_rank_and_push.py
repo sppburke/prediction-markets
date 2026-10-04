@@ -781,6 +781,30 @@ class RankAndPushScenario(unittest.TestCase):
         )
         print("PASS: transient push resume replays only the exact publication request")
 
+    def test_new_publication_records_ranking_floor_and_resume_keeps_old_floor(self):
+        first = self._run(exit_env={"STUB_PUSH_EXIT": "75"})
+        self.assertEqual(first.returncode, 75, first.stderr)
+        pending = self.root / "data/eval-results/rank_and_push.pending"
+        request = self.root / pending.read_text().strip()
+        fresh_args = shlex.split((self._log("push.log") or "").splitlines()[0])
+        self.assertEqual(fresh_args[fresh_args.index("--ttr-floor-secs") + 1], "60")
+        # Emulate a request prepared by the prior checkout; its recorded floor is immutable.
+        payload = json.loads(request.read_text())
+        payload["batch"]["ttr_floor_secs"] = 30
+        identity = {"batch": payload["batch"], "entries": payload["entries"]}
+        import hashlib
+        payload["publish_key"] = hashlib.sha256(json.dumps(
+            identity, allow_nan=False, ensure_ascii=False, separators=(",", ":"), sort_keys=True,
+        ).encode()).hexdigest()
+        request.write_text(json.dumps(payload) + "\n")
+        before = request.read_bytes()
+        resumed = self._run("--resume-pending")
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        self.assertEqual(request.read_bytes(), before)
+        resume_args = shlex.split((self._log("push.log") or "").splitlines()[-1])
+        self.assertEqual(resume_args, ["--resume-request", str(request)])
+        self.assertEqual(json.loads(before)["batch"]["ttr_floor_secs"], 30)
+
     def test_zero_arg_transient_cycle_reuses_run_directory_and_activation_batch(self):
         first = self._run(exit_env={"STUB_EXIT_events": "75"})
         self.assertEqual(first.returncode, 75, first.stderr)
@@ -2984,6 +3008,7 @@ raise SystemExit(real_ranker.main())
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)
         request=out/"ranking_publish_request.json";before=request.read_bytes()
         self.assertEqual(json.loads(before)["entries"][0]["wallet_hex"],self.wb)
+        self.assertEqual(json.loads(before)["batch"]["ttr_floor_secs"], 60)
         with sqlite3.connect(db) as con: con.execute("UPDATE wallets SET backfill_partial=1")
         unavailable=self._run(*args,exit_env={"PYTHONPATH":str(blocker)})
         self.assertEqual(unavailable.returncode,75,unavailable.stdout+unavailable.stderr)

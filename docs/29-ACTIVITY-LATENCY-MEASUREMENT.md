@@ -107,3 +107,66 @@ Harnesses: `scripts/probe_activity_ws.py` (feed discovery/attribution re-check),
 (continuity + bench-wallet reaction capture). Re-run the probe before each deploy
 relying on the feed (officially listed endpoint; the first-party client publishes
 the subscription/payload contract; no published continuity guarantee — `docs/15`).
+
+## #730 Part 1 acceptance measurement
+
+Use [#730 AC10](https://github.com/sppburke/prediction-markets/issues/730) for the fill-cohort
+size and latency acceptance bounds. The measurements below are the audit recipe, not a claim
+that the deployed service has passed. Keep three populations distinct:
+
+- The first post-deploy websocket-fill cohort, with source identity, continuation version and
+  applied configuration fixed per row. Report each stage's available count, median, p90 and
+  maximum, plus the slowest decision in every bucket containing multiple decisions.
+- Every proven first-entry BUY in the same window from a wallet in the service's **recorded
+  membership when it traded**, including wallets subsequently removed and every leader price.
+  A current-watchlist join or price-band screen cannot define this population.
+- BUY units whose first-entry status depends on ordering inside one source second. List these
+  separately; each requires a recorded ambiguity refusal or a justified causal suppression.
+
+Join `decision_pending` by the canonical source group id to its authenticated websocket receipt,
+complete activity-page receipts, `activity_groups` and `entry_gate_results`. Use the gateway
+receipt's `received_at` as the websocket origin, not the venue's second-granular timestamp.
+Measure history-page receipt, `book.fetched_at_unix_ms` and durable fill completion from that
+origin. For a fill, durable completion is the recorded `terminal_transition` clock: the paper
+owner renders it **after** the synchronized `FinancialFinal`, through
+`supabase_state::terminalize_final_fill_decision` and `orchestrator::render_pending_evidence`.
+The Final envelope's `received_at` is sampled before sync and is not that endpoint.
+No-copy/no-fill terminal clocks do not establish a synchronized financial fill.
+
+Book receipt and book use are separate endpoints. The early `/book` read can finish before
+admission; use `book_staleness_check` for the recorded use check, and
+`initial_staleness_gate` for the available decision-start boundary. Report their span separately
+from websocket-to-book receipt. A continuation lacking either clock has a missing span; do not
+substitute an admission receipt, Prepared timestamp, bucket timestamp or a zero. Report missing
+clocks, future/negative spans, provenance exclusions and restart-recovered decisions explicitly.
+Report 429 retry time, reads per confirmation, retry-interval waits and urgent-slot waits
+separately from page transport and decision work; unavailable wait clocks remain unknown.
+
+For a paired projection, freeze the same recorded fill identities and original stage endpoints
+on both sides. Attach the benchmarked scan costs and measured gate waits/serial reads to each
+row, subtract only the work the implemented change removes or overlaps, then recompute each
+row's projected endpoints before taking population percentiles. Keep queue delay and the
+unmeasured tail unchanged; do not subtract one aggregate median from another. Report inputs,
+sample counts, missing spans and the matched before/projected distributions. New confirmations
+and recovered first entries are separate populations; they are not gains measured by this paired
+fill projection. Deployed measurements remain the acceptance authority.
+
+Run the acceptance audit read-only on captured verified log prefixes and a consistent database
+snapshot; record deployment revision, config hash, era, window and prefix identities. Prove the
+first BUY from complete attributable public `/activity` history and join it to the recorded
+membership and local group/gate/decision evidence. Classify every member of the audit population
+as filled, correctly refused, refused by a retained Part 2 limitation (thin book, opposite outcome
+or VWAP rounding), or suppressed by a required causal re-anchor. Trace a suppression to the
+causing groups in `activity_groups` insertion order, not only the recorded trigger id: a mixed
+bucket may name a twin while a genuinely new or late group requires the flag. Covered non-twin
+arrivals, unknown-condition redemptions and unresolved non-combo identities retain their
+[canonical causal rule](_GLOSSARY.md#causal-re-anchor-and-rehearsal-rules-557).
+All-twin buckets and known-condition redemptions/combos reaching ordinary routing must not
+create re-anchors. Any other miss fails acceptance; an unproved first-entry status is reported
+as unknown rather than silently removed.
+
+Inspect the next daily marks against recorded closure proof and available samples under the
+canonical closed-mark rule. A usable in-lookback sample with valid closure proof must not produce
+an invalid midnight mark; cases lacking that evidence retain their recorded fail-closed cause.
+Post the audit results to #730, then the final results to #588 and #530; issue closure waits for
+AC16. This recipe authorizes no production mutation or live order.
