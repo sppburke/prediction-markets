@@ -298,6 +298,12 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
         let fetcher = &self.fetcher;
         let closed = filter.closed_param();
         let limit = self.limit;
+        // Every request of this read, so an abort can retain the ones it abandons.
+        let chunk_urls = chunks
+            .iter()
+            .map(|chunk| build_batch_url(base, chunk, closed, limit))
+            .collect::<Vec<_>>();
+        let mut answered = HashSet::new();
 
         let mut stream = stream::iter(chunks)
             .map(|chunk| async move {
@@ -315,6 +321,7 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
         let mut conflicting_closure_condition_ids = Vec::new();
         let mut condition_page_hashes = HashMap::new();
         while let Some((chunk, url, result)) = stream.next().await {
+            answered.insert(url.clone());
             let bytes = match result {
                 Ok(b) => b,
                 Err(SourceError::Fatal { message }) => {
@@ -329,6 +336,7 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
                 Err(e) => {
                     let message = e.to_string();
                     failed_requests.push((url, message.clone()));
+                    failed_requests.extend(abandoned_requests(&chunk_urls, &answered));
                     return Err(GammaConditionMarketsError {
                         source: GammaMarketsError::Fetch(message),
                         pages,
@@ -342,6 +350,7 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
                 Ok(markets) => markets,
                 Err(error) => {
                     pages.push((evidence, bytes));
+                    failed_requests.extend(abandoned_requests(&chunk_urls, &answered));
                     return Err(GammaConditionMarketsError {
                         source: GammaMarketsError::Parse(error.to_string()),
                         pages,
@@ -485,6 +494,25 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
             page: Some((evidence, raw)),
         })
     }
+}
+
+/// The requests an aborted read drops, retained as failures so the caller records that they
+/// produced no usable response.
+fn abandoned_requests(
+    chunk_urls: &[String],
+    answered: &HashSet<String>,
+) -> impl Iterator<Item = (String, String)> {
+    chunk_urls
+        .iter()
+        .filter(|url| !answered.contains(*url))
+        .map(|url| {
+            (
+                url.clone(),
+                "abandoned after another request of this read failed".to_owned(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
 }
 
 /// Parsed identity of the canonical condition request emitted by the Gamma client.
@@ -1302,6 +1330,64 @@ mod tests {
             .unwrap();
         assert_eq!(result.conflicting_condition_ids, vec!["condition"]);
         assert!(result.conflicting_closure_condition_ids.is_empty());
+    }
+
+    struct StallSecondFetcher {
+        failing: String,
+        transient: bool,
+    }
+
+    impl PageFetcher for StallSecondFetcher {
+        async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+            if url == self.failing {
+                return if self.transient {
+                    Err(SourceError::Transient {
+                        message: "HTTP 503".to_owned(),
+                    })
+                } else {
+                    Ok(b"{".to_vec())
+                };
+            }
+            std::future::pending::<()>().await;
+            Ok(Vec::new())
+        }
+    }
+
+    /// PASS: when one request of a multi-request read fails, the requests it abandons are
+    /// retained as failures beside the failing page.
+    #[tokio::test]
+    async fn condition_batch_abort_retains_abandoned_requests() {
+        let a_url = build_batch_url("https://g", &ids(&["A"]), "", GAMMA_BATCH_LIMIT_PARAM);
+        let b_url = build_batch_url("https://g", &ids(&["B"]), "", GAMMA_BATCH_LIMIT_PARAM);
+        for transient in [false, true] {
+            let error = GammaMarketsClient::new(
+                "https://g".to_owned(),
+                StallSecondFetcher {
+                    failing: a_url.clone(),
+                    transient,
+                },
+            )
+            .with_batch_size(1)
+            .fetch_markets_with_pages(&ids(&["A", "B"]), MarketFilter::OpenOnly)
+            .await
+            .err()
+            .unwrap();
+            let mut failed = error
+                .failed_requests
+                .iter()
+                .map(|(url, _)| url.clone())
+                .collect::<Vec<_>>();
+            if transient {
+                assert!(matches!(error.source, GammaMarketsError::Fetch(_)));
+                assert!(error.pages.is_empty());
+                assert_eq!(failed.remove(0), a_url);
+            } else {
+                assert!(matches!(error.source, GammaMarketsError::Parse(_)));
+                assert_eq!(error.pages.len(), 1);
+                assert_eq!(error.pages[0].0.request_url, a_url);
+            }
+            assert_eq!(failed, vec![b_url.clone()]);
+        }
     }
 
     /// PASS: a chunk's row for a condition it did not request is ignored, so the condition keeps

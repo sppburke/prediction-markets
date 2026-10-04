@@ -1520,6 +1520,92 @@ mod tests {
         }
     }
 
+    /// Fails the big chunk (malformed JSON or a transport error) and never answers any other
+    /// request.
+    struct AbortFirstFetcher {
+        failing: String,
+        transient: bool,
+    }
+
+    impl PageFetcher for AbortFirstFetcher {
+        async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, pe_source_core::SourceError> {
+            if url == self.failing {
+                return if self.transient {
+                    Err(pe_source_core::SourceError::Transient {
+                        message: "HTTP 503".to_owned(),
+                    })
+                } else {
+                    Ok(b"{".to_vec())
+                };
+            }
+            std::future::pending::<()>().await;
+            Ok(Vec::new())
+        }
+    }
+
+    /// PASS: a multi-chunk read that aborts (malformed page or transport error) refuses `PriceMissing`, and replay
+    /// of its recorded receipts, which include the abandoned request, reproduces that cause.
+    #[tokio::test]
+    async fn aborted_multi_chunk_read_replays_price_missing() {
+        let many = (0..50).map(|n| format!("0x{n:02}")).collect::<Vec<_>>();
+        let big_url = format!(
+            "{BASE}/markets?{}&limit={GAMMA_BATCH_LIMIT_PARAM}",
+            many.iter()
+                .map(|id| format!("condition_ids={id}"))
+                .collect::<Vec<_>>()
+                .join("&")
+        );
+        for transient in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("source.log");
+            let (source_log, source_rx) = SourceLogHandle::channel(4);
+            let (trigger_tx, _trigger_rx) = mpsc::channel(1);
+            let ingest = tokio::spawn(
+                ActivityIngest::poll_only(
+                    SourceEventSink::open(&source_path).unwrap(),
+                    source_rx,
+                    trigger_tx,
+                    new_shared_health_with_ws(false, false, 90),
+                )
+                .run(),
+            );
+            let now = datetime!(2026-10-03 00:00 UTC);
+            let cache = MidPriceCache::with_fetcher(
+                AbortFirstFetcher {
+                    failing: big_url.clone(),
+                    transient,
+                },
+                BASE.to_owned(),
+            )
+            .with_source_log(source_log)
+            .with_clock(Arc::new(move || now));
+            let ids = many
+                .iter()
+                .map(|id| outcome(id, 0))
+                .chain([outcome("0xb", 0)])
+                .collect::<Vec<_>>();
+            let attempt = cache.fetch_mids_strict_attempt(&ids).await;
+            assert_eq!(attempt.result, Err(RiskInputsUnavailable::PriceMissing));
+            assert_eq!(attempt.price_receipts.len(), 2);
+            let replayed = replay_strict_risk_prices(
+                &ids,
+                &attempt.price_receipts,
+                i64::try_from(unix_timestamp_ms(attempt.evaluated_at)).unwrap(),
+                replay_from_log(&source_path),
+            )
+            .await;
+            assert!(matches!(
+                replayed,
+                Err(RiskPriceReplayError::Unavailable(
+                    RiskInputsUnavailable::PriceMissing
+                ))
+            ));
+            drop(cache);
+            ingest.abort();
+            let _ = ingest.await;
+        }
+    }
+
     /// PASS: after a backward clock step, a cached conflicting row recorded in the future refuses
     /// with `PriceConflict` (conflict precedes time) on both acquisition and replay.
     #[tokio::test]
