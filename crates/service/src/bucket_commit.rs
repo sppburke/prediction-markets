@@ -427,6 +427,7 @@ pub(crate) struct VerifiedObservationBindings {
         ),
     >,
     identities: HashMap<SourceTradeId, MarketOutcomeId>,
+    restamp_pairs: HashMap<SourceTradeId, SourceTradeId>,
 }
 
 impl VerifiedObservationBindings {
@@ -686,18 +687,6 @@ impl ActivityReadVerification<'_> {
     /// Page evidence is joined with multiplicity, every retained payload is parsed and checked,
     /// and saturated parent segments contribute no production aggregates. Only complete leaves of
     /// the validated split graph are aggregated, matching the production reconciliation reader.
-    pub(crate) fn reconstruct_complete_activity_read<L, E>(
-        &self,
-        lookup: &mut L,
-    ) -> Result<Vec<ActivityAggregate>, CompleteActivityReadError>
-    where
-        L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
-        E: Display,
-    {
-        self.reconstruct_verified_activity_read(lookup)
-            .map(|read| read.aggregates)
-    }
-
     fn reconstruct_verified_activity_read<L, E>(
         &self,
         lookup: &mut L,
@@ -1092,6 +1081,7 @@ impl ActivityReadVerification<'_> {
                 (binding.stream_receipt, observation),
             );
         }
+        verified.restamp_pairs = restamp_pairs;
         Ok(verified)
     }
 
@@ -1851,13 +1841,20 @@ pub(crate) fn verified_commitment_bindings(
             .source_envelope(receipt)
             .map(CompleteActivityPage::from)
     })
+    .map(|commitment| commitment.bindings)
+}
+
+/// An authenticated commitment: its bindings and the restamp pairs its complete read proves.
+pub(crate) struct VerifiedCommitment {
+    pub(crate) bindings: Vec<ObservationBinding>,
+    pub(crate) restamp_pairs: HashMap<SourceTradeId, SourceTradeId>,
 }
 
 /// The same commitment-only authentication for either an indexed or replayed sealed prefix.
 pub(crate) fn verified_commitment_bindings_with_lookup<L, E>(
     receipt: AppendReceipt,
     lookup: &mut L,
-) -> Result<Vec<ObservationBinding>, CompleteActivityReadError>
+) -> Result<VerifiedCommitment, CompleteActivityReadError>
 where
     L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
     E: Display,
@@ -1881,7 +1878,10 @@ where
         .as_ref()
         .ok_or_else(|| complete_activity_read_error("v2 commitment bindings are absent"))?;
     if bindings.is_empty() && commitment.read_proof.is_none() {
-        return Ok(Vec::new());
+        return Ok(VerifiedCommitment {
+            bindings: Vec::new(),
+            restamp_pairs: HashMap::new(),
+        });
     }
     let proof = commitment
         .read_proof
@@ -1895,8 +1895,11 @@ where
         page_occurrences: &proof.page_occurrences,
         read_commitment: Some(receipt),
     };
-    verifier.reconstruct_complete_activity_read(lookup)?;
-    Ok(bindings.clone())
+    let read = verifier.reconstruct_verified_activity_read(lookup)?;
+    Ok(VerifiedCommitment {
+        bindings: bindings.clone(),
+        restamp_pairs: read.bindings.restamp_pairs,
+    })
 }
 
 pub(crate) fn joined_read_pages<'a>(
@@ -5422,7 +5425,7 @@ pub(crate) mod continuation_v3_tests {
     ) -> (DecisionContinuationV3, ActivityAggregate, AppendReceipt) {
         let condition = match case {
             "recorded_correction" | "shared_recorded_correction" => "stamped",
-            "other_target" => "other",
+            "other_target" | "exact_other_target" => "other",
             _ => "new",
         };
         let at = time::OffsetDateTime::from_unix_timestamp(100).unwrap();
@@ -5440,10 +5443,16 @@ pub(crate) mod continuation_v3_tests {
                 .unwrap()
         };
         let disposed = case.starts_with("disposed_");
+        // An exact stream carries its history row's own stamp; an alias carries another one.
+        let (stream_condition, stream_outcome) = match case {
+            "alias" | "disposed_alias" => ("alias", if disposed { 0 } else { 1 }),
+            "exact" | "exact_other_target" => ("new", 0),
+            _ => ("old", if disposed { 0 } else { 1 }),
+        };
         let stream_payload = serde_json::to_vec(
             &json!({"proxyWallet":"0x1111111111111111111111111111111111111111",
-        "conditionId":if case == "alias" { "alias" } else { "old" }, "asset":"123", "side":"BUY", "size":1, "price":0.5,
-        "timestamp":99, "transactionHash":"tx", "outcomeIndex":if disposed { 0 } else { 1 }}),
+        "conditionId":stream_condition, "asset":"123", "side":"BUY", "size":1, "price":0.5,
+        "timestamp":99, "transactionHash":"tx", "outcomeIndex":stream_outcome}),
         )
         .unwrap();
         let stream = parse_activity_trade_observation(&stream_payload).unwrap();
@@ -5470,6 +5479,13 @@ pub(crate) mod continuation_v3_tests {
         if disposed {
             rows[0]["outcomeIndex"] = json!(999);
             rows[0]["outcome"] = json!("Over");
+        }
+        if case == "pair" {
+            // The unattributed original and its restamp, listed together.
+            rows[0]["outcome"] = json!("Over");
+            let mut original = rows[0].clone();
+            original["outcomeIndex"] = json!(999);
+            rows = json!([original, rows[0].clone()]);
         }
         if matches!(
             case,
@@ -5507,22 +5523,20 @@ pub(crate) mod continuation_v3_tests {
         .into_iter()
         .find(|aggregate| {
             let components = aggregate.group_id.components();
-            components.condition_id.as_ref().is_some_and(|condition| {
-                condition.0
-                    == match case {
-                        "recorded_correction" | "shared_recorded_correction" => "stamped",
-                        "other_target" => "other",
-                        _ => "new",
-                    }
-            }) && components
-                .asset
+            components
+                .condition_id
                 .as_ref()
-                .is_some_and(|asset| asset.0 == "123")
+                .is_some_and(|stamped| stamped.0 == condition)
+                && (case != "pair" || components.outcome == Some(OutcomeId(999)))
+                && components
+                    .asset
+                    .as_ref()
+                    .is_some_and(|asset| asset.0 == "123")
                 && components.side == Some(Side::Buy)
         })
         .unwrap();
         let metadata = serde_json::to_vec(&json!([{
-            "conditionId": if matches!(case, "metadata_wrong_condition" | "other_target") { "other" } else { "new" },
+            "conditionId": if matches!(case, "metadata_wrong_condition" | "other_target" | "exact_other_target") { "other" } else { "new" },
             "clobTokenIds": match case {
                 "metadata_unverified" => "[\"456\"]",
                 "metadata_wrong_outcome" => "[\"456\",\"123\"]",
@@ -5579,6 +5593,10 @@ pub(crate) mod continuation_v3_tests {
                     .source_log_sequence = 0
             }
             "metadata_missing" => binding.identity_receipt = None,
+            "exact" => {
+                binding.identity_provenance = None;
+                binding.identity_receipt = None;
+            }
             "future_receipt" => binding.stream_receipt = receipt(100),
             _ => {}
         }
@@ -5660,7 +5678,7 @@ pub(crate) mod continuation_v3_tests {
         frozen.source_epoch = 100;
         frozen.transaction_hash = "tx".to_owned();
         frozen.market_id = MarketId(pe_core_types::VenueMarketId(
-            if case == "other_target" {
+            if matches!(case, "other_target" | "exact_other_target") {
                 "other"
             } else {
                 "new"
