@@ -20,8 +20,8 @@ use futures::FutureExt;
 
 use pe_copy_signal_engine::{SignalConfig, TradeProvenance};
 use pe_core_types::{
-    MarketId, MarketOutcomeId, OutcomeId, PolymarketTokenId, ReceivedAt, ReconstructionQuality,
-    SourceId, SourceTimestamp, SourceTradeId, VenueMarketId, WalletAddress,
+    MarketId, MarketOutcomeId, PolymarketTokenId, ReceivedAt, ReconstructionQuality, SourceId,
+    SourceTimestamp, SourceTradeId, VenueMarketId, WalletAddress,
 };
 use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, EventEnvelope, Reader};
 use pe_paper_state::{NoCopyDisposition, PaperStateDb};
@@ -29,8 +29,8 @@ use pe_position_ledger::LedgerEffect;
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
     ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ActivityAggregate, ActivityReadError,
-    ActivityType, NormalizedActivity, ReconciliationFetcher, aggregate_activity_rows,
-    fetch_complete_activity, parse_activity_trade_observation,
+    ActivityType, NormalizedActivity, ReconciliationFetcher, fetch_complete_activity,
+    parse_activity_trade_observation,
 };
 use pe_trader_index::WatchlistTier;
 use time::OffsetDateTime;
@@ -1715,6 +1715,7 @@ impl WalletOperation {
         let correlation = self.correlate(
             wallet,
             selected,
+            &activity.rows,
             &buckets,
             &identities,
             &page_occurrences,
@@ -1830,10 +1831,12 @@ impl WalletOperation {
         Ok(resolved)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn correlate(
         &self,
         wallet: WalletAddress,
         selected: &WalletObligations,
+        rows: &[NormalizedActivity],
         buckets: &[Vec<ActivityAggregate>],
         identities: &[BucketIdentities],
         occurrences: &[PageOccurrence],
@@ -1843,6 +1846,8 @@ impl WalletOperation {
         if selected.is_empty() {
             return Ok(result);
         }
+        let restamp_pairs =
+            crate::bucket_commit::read_restamp_pairs(rows).map_err(ActivityReadError::from)?;
         let index = self.source_receipts.as_ref().ok_or_else(|| {
             ReconciliationError::Binding("source receipt index is absent".to_owned())
         })?;
@@ -1929,6 +1934,7 @@ impl WalletOperation {
                         })
                         .collect::<Vec<_>>()
                 };
+                crate::bucket_commit::collapse_restamp_pairs(&mut candidates, &restamp_pairs);
                 let provenance = if by_group.contains_key(&obligation.group_id) {
                     None
                 } else {
@@ -2211,45 +2217,29 @@ fn restamp_twins(
         let Some(first) = members.first() else {
             continue;
         };
-        if !matches!(
-            first.activity_type,
-            ActivityType::Trade | ActivityType::Redeem
-        ) || first
-            .outcome
-            .is_none_or(|outcome| outcome == OutcomeId(999))
-            || paper_state.activity_group_state(&group)?.is_some()
-        {
+        let originals =
+            crate::bucket_commit::unattributed_forms(&members).map_err(ActivityReadError::from)?;
+        if originals.is_empty() || paper_state.activity_group_state(&group)?.is_some() {
             continue;
         }
-        for outcome in [Some(OutcomeId(999)), None] {
-            let rows = members
-                .iter()
-                .map(|member| {
-                    let mut row = (**member).clone();
-                    row.outcome = outcome;
-                    row
-                })
-                .collect::<Vec<_>>();
-            for original in aggregate_activity_rows(&rows).map_err(ActivityReadError::from)? {
-                let Some(recorded) = paper_state.activity_group_state(original.group_id.key())?
-                else {
-                    continue;
-                };
-                if recorded.semantic_revision != original.semantic_revision.as_str() {
-                    continue;
-                }
-                if first.activity_type == ActivityType::Trade {
-                    let effect = LedgerEffect::from_document(&recorded.proof_json)
-                        .map_err(|error| ReconciliationError::Binding(error.to_string()))?;
-                    if matches!(effect, LedgerEffect::Corrected { .. })
-                        && !matches!(effect.effective(), LedgerEffect::Trade { outcome_id, .. }
-                            if Some(*outcome_id) == first.outcome)
-                    {
-                        continue;
-                    }
-                }
-                twins.insert(group.clone());
+        for original in originals {
+            let Some(recorded) = paper_state.activity_group_state(original.group_id.key())? else {
+                continue;
+            };
+            if recorded.semantic_revision != original.semantic_revision.as_str() {
+                continue;
             }
+            if first.activity_type == ActivityType::Trade {
+                let effect = LedgerEffect::from_document(&recorded.proof_json)
+                    .map_err(|error| ReconciliationError::Binding(error.to_string()))?;
+                if matches!(effect, LedgerEffect::Corrected { .. })
+                    && !matches!(effect.effective(), LedgerEffect::Trade { outcome_id, .. }
+                        if Some(*outcome_id) == first.outcome)
+                {
+                    continue;
+                }
+            }
+            twins.insert(group.clone());
         }
     }
     Ok(twins)
@@ -2438,9 +2428,10 @@ impl ReconciliationFetcher for RecordingFetcher {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use pe_core_types::CollateralAmount;
+    use pe_core_types::{CollateralAmount, OutcomeId};
     use pe_event_log::Writer;
     use pe_paper_state::{ActivityBucketCommit, ActivityDispositionRecord};
+    use pe_source_polymarket_public::aggregate_activity_rows;
     use tempfile::tempdir;
 
     use crate::paper_recovery::{
@@ -2644,6 +2635,99 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn read_restamp_pairs_count_one_trade_and_keep_distinct_legs() {
+        let key = |rows: &[serde_json::Value]| {
+            aggregate_activity_rows(&restamp_rows(rows))
+                .unwrap()
+                .remove(0)
+                .group_id
+                .key()
+                .clone()
+        };
+        let pairs = |rows: &[serde_json::Value]| {
+            crate::bucket_commit::read_restamp_pairs(&restamp_rows(rows)).unwrap()
+        };
+        for activity_type in ["TRADE", "REDEEM"] {
+            for count in [1, 3] {
+                let mut current = restamp_row(activity_type);
+                if activity_type == "REDEEM" {
+                    current["asset"] = serde_json::json!("");
+                    current["side"] = serde_json::json!("");
+                }
+                let mut stamped = current.clone();
+                stamped["outcomeIndex"] = serde_json::json!(999);
+                if activity_type == "REDEEM" {
+                    stamped["outcome"] = serde_json::json!("");
+                }
+                let originals = vec![stamped.clone(); count];
+                let restamps = vec![current.clone(); count];
+                assert_eq!(
+                    pairs(&[originals.clone(), restamps.clone()].concat()),
+                    HashMap::from([(key(&restamps), key(&originals))])
+                );
+                // A missing or extra member row, or a changed size, is a distinct leg.
+                let extra = vec![current.clone(); count + 1];
+                assert!(pairs(&[originals.clone(), extra].concat()).is_empty());
+                let mut changed = current.clone();
+                changed["size"] = serde_json::json!("11.22");
+                assert!(pairs(&[originals.clone(), vec![changed; count]].concat()).is_empty());
+            }
+        }
+
+        let current = restamp_row("TRADE");
+        let mut stamped = current.clone();
+        stamped["outcomeIndex"] = serde_json::json!(999);
+        let mut other = current.clone();
+        other["outcomeIndex"] = serde_json::json!(1);
+        assert_eq!(
+            pairs(&[stamped.clone(), other.clone()]),
+            HashMap::from([(
+                key(std::slice::from_ref(&other)),
+                key(std::slice::from_ref(&stamped))
+            )])
+        );
+        // Two groups reproducing one original cannot both be its restamp.
+        let read = restamp_rows(&[stamped.clone(), current.clone(), other.clone()]);
+        assert!(
+            crate::bucket_commit::read_restamp_pairs(&read)
+                .unwrap()
+                .is_empty()
+        );
+        let read = restamp_rows(&[stamped.clone(), current.clone()]);
+        let pairs = crate::bucket_commit::read_restamp_pairs(&read).unwrap();
+        let aggregates = aggregate_activity_rows(&read).unwrap();
+        let collapsed = |rows: &[&serde_json::Value]| {
+            let mut candidates = rows
+                .iter()
+                .map(|row| {
+                    let id = key(std::slice::from_ref(*row));
+                    aggregates
+                        .iter()
+                        .find(|aggregate| aggregate.group_id.key() == &id)
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            crate::bucket_commit::collapse_restamp_pairs(&mut candidates, &pairs);
+            candidates
+                .iter()
+                .map(|aggregate| aggregate.group_id.key().clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            collapsed(&[&stamped, &current]),
+            vec![key(std::slice::from_ref(&stamped))]
+        );
+        assert_eq!(
+            collapsed(&[&current, &stamped]),
+            vec![key(std::slice::from_ref(&stamped))]
+        );
+        assert_eq!(
+            collapsed(&[&current]),
+            vec![key(std::slice::from_ref(&current))]
+        );
     }
 
     #[test]

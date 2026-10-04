@@ -4570,6 +4570,124 @@ async fn restamp_twins_single_multirow_and_recorded_siblings_preserve_later_deci
     }
 }
 
+/// AC5 with the activity feed: a restamp read beside its recorded original is one trade. A feed
+/// observation stamped like neither binds the original instead of fencing the wallet; the twin
+/// records `raw_only` with no ledger, re-anchor or fence effect, covered or not; the read's open
+/// decisions re-verify from the source log, and a later first entry in another market decides.
+#[tokio::test(start_paused = true)]
+async fn feed_observation_of_a_restamp_pair_binds_the_recorded_original() {
+    for covered in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut running, paper) = start_recorded_poller(&dir, &[wallet()]);
+        let mut original = stream_row(wallet(), "restamp-feed", EPOCH);
+        original["outcomeIndex"] = json!(999);
+        let original_id = aggregate(original.clone()).group_id.key().clone();
+        running
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .respond
+            .send(serde_json::to_vec(&[original.clone()]).unwrap())
+            .unwrap();
+        running.round_completed().await;
+        assert!(paper.activity_group_state(&original_id).unwrap().is_some());
+        if covered {
+            cover_recorded_groups(&paper, EPOCH);
+        }
+        let market_b_positions = || {
+            paper
+                .leader_positions()
+                .unwrap()
+                .into_iter()
+                .filter(|position| position.market_id == market(MARKET_B))
+                .collect::<Vec<_>>()
+        };
+        let before = market_b_positions();
+        let restamp = stream_row(wallet(), "restamp-feed", EPOCH);
+        let restamp_id = aggregate(restamp.clone()).group_id.key().clone();
+        let mut stream = restamp.clone();
+        stream["conditionId"] = json!("incorrect-stream-stamp");
+        let stream_id = aggregate(stream.clone()).group_id.key().clone();
+        running.now.store(EPOCH + 1, Ordering::SeqCst);
+        let stream_receipt = running.observe(stream).await;
+        let entry = activity_row(
+            "TRADE",
+            "after-restamp",
+            MARKET_A,
+            "BUY",
+            "1",
+            "asset-a",
+            EPOCH + 1,
+        );
+        let entry_id = aggregate(entry.clone()).group_id.key().clone();
+        running
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .respond
+            .send(serde_json::to_vec(&[original, restamp, entry]).unwrap())
+            .unwrap();
+        running.completed(wallet()).await;
+        let commits = running.finish().await;
+
+        let committed = |id: &pe_core_types::SourceTradeId| {
+            commits
+                .iter()
+                .find(|(aggregates, _, _)| {
+                    aggregates
+                        .iter()
+                        .any(|aggregate| aggregate.group_id.key() == id)
+                })
+                .unwrap()
+        };
+        let (_, context, twin) = committed(&restamp_id);
+        assert_eq!(
+            context.restamp_twins,
+            std::collections::HashSet::from([restamp_id.clone()])
+        );
+        assert_eq!(
+            twin.dispositions,
+            std::collections::BTreeMap::from([(restamp_id.0.clone(), "raw_only".to_owned())])
+        );
+        assert_eq!(twin.newly_fenced, None);
+        let (_, _, decision) = committed(&entry_id);
+        assert_eq!(decision.dispositions[&entry_id.0], "decision_pending");
+        assert_eq!(decision.pending, vec![entry_id.clone()]);
+        assert!(paper.wallet_fences().unwrap().is_empty());
+        assert!(!paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+        assert_eq!(market_b_positions(), before);
+
+        let source = dir.path().join("source.log");
+        let commitment = source_frames(&source)
+            .into_iter()
+            .rfind(|frame| {
+                frame.source_id.0 == pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID
+            })
+            .unwrap();
+        let commitment: pe_service::bucket_commit::ActivityReadCommitment =
+            serde_json::from_slice(&commitment.payload).unwrap();
+        let bindings = commitment.bindings.unwrap();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].stream_group_id, stream_id);
+        assert_eq!(bindings[0].stream_receipt, stream_receipt);
+        assert_eq!(bindings[0].history_group_id, original_id);
+        assert!(
+            pe_service::trade_poller::rebuild_reconciliation_obligations(&source, &paper)
+                .unwrap()
+                .is_empty()
+        );
+        let open = paper.open_decision_pending().unwrap();
+        assert!(open.iter().any(|row| row.source_trade_id == entry_id));
+        let index = pe_service::risk_inputs::SourceReceiptIndex::replay(&source).unwrap();
+        assert_eq!(
+            pe_service::bucket_commit::validate_open_continuations(&paper, &index).unwrap(),
+            open.len()
+        );
+    }
+}
+
 /// AC5: known-condition unexpressible redemptions and combos have no wallet suppression on
 /// ordinary routing. Combo tokens never enter Gamma lookup; a later independent entry decides.
 #[tokio::test]

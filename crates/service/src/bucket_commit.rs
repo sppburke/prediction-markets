@@ -28,9 +28,10 @@ use pe_position_ledger::{
 };
 use pe_source_polymarket_public::{
     ACTIVITY_MAX_OFFSET, ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ActivityAggregate,
-    ActivityParseContext, ActivityTransport, PolymarketEndpoint, RECONCILIATION_PAGE_LIMIT,
-    ReconciliationPageEvidence, aggregate_activity_rows, canonical_page_hash,
-    parse_activity_response, parse_activity_trade_observation,
+    ActivityAggregationError, ActivityParseContext, ActivityTransport, ActivityType,
+    NormalizedActivity, PolymarketEndpoint, RECONCILIATION_PAGE_LIMIT, ReconciliationPageEvidence,
+    aggregate_activity_rows, canonical_page_hash, parse_activity_response,
+    parse_activity_trade_observation,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -300,6 +301,99 @@ impl From<pe_event_log::EventEnvelope> for CompleteActivityPage {
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 pub struct CompleteActivityReadError(String);
+
+/// The aggregates an attributed TRADE or REDEEM group's member rows produce under each
+/// unattributed outcome form the parser emits (`Some(999)`, `None`); a restamp reproduces the
+/// group first published in one of them (#730 item 5). Any other group has none.
+pub(crate) fn unattributed_forms(
+    members: &[&NormalizedActivity],
+) -> Result<Vec<ActivityAggregate>, ActivityAggregationError> {
+    let Some(first) = members.first() else {
+        return Ok(Vec::new());
+    };
+    if !matches!(
+        first.activity_type,
+        ActivityType::Trade | ActivityType::Redeem
+    ) || first
+        .outcome
+        .is_none_or(|outcome| outcome == OutcomeId(999))
+    {
+        return Ok(Vec::new());
+    }
+    let mut forms = Vec::new();
+    for outcome in [Some(OutcomeId(999)), None] {
+        let rows = members
+            .iter()
+            .map(|member| {
+                let mut row = (*member).clone();
+                row.outcome = outcome;
+                row
+            })
+            .collect::<Vec<_>>();
+        forms.extend(aggregate_activity_rows(&rows)?);
+    }
+    Ok(forms)
+}
+
+/// Restamp pairs inside one complete read, keyed by the attributed restamp: an unattributed group
+/// reproduced, by id and semantic revision, by exactly one attributed group's member rows under
+/// its unattributed outcome. Both are one trade, so feed correlation and its replay count them
+/// once; an original reproduced by several groups pairs with none of them.
+pub(crate) fn read_restamp_pairs(
+    rows: &[NormalizedActivity],
+) -> Result<HashMap<SourceTradeId, SourceTradeId>, ActivityAggregationError> {
+    let mut members = HashMap::<SourceTradeId, Vec<&NormalizedActivity>>::new();
+    for row in rows {
+        members
+            .entry(row.group_id()?.key().clone())
+            .or_default()
+            .push(row);
+    }
+    let revisions = aggregate_activity_rows(rows)?
+        .into_iter()
+        .map(|aggregate| {
+            (
+                aggregate.group_id.key().clone(),
+                aggregate.semantic_revision,
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let mut restamps = HashMap::<SourceTradeId, Vec<SourceTradeId>>::new();
+    for (group, members) in &members {
+        for original in unattributed_forms(members)? {
+            if revisions.get(original.group_id.key()) == Some(&original.semantic_revision) {
+                restamps
+                    .entry(original.group_id.key().clone())
+                    .or_default()
+                    .push(group.clone());
+            }
+        }
+    }
+    Ok(restamps
+        .into_iter()
+        .filter_map(|(original, groups)| match groups.as_slice() {
+            [restamp] => Some((restamp.clone(), original)),
+            _ => None,
+        })
+        .collect())
+}
+
+/// Count a restamp pair as one correlation candidate: the unattributed original stays and its
+/// attributed restamp leaves. Genuinely distinct candidates remain ambiguous.
+pub(crate) fn collapse_restamp_pairs(
+    candidates: &mut Vec<&ActivityAggregate>,
+    pairs: &HashMap<SourceTradeId, SourceTradeId>,
+) {
+    let keys = candidates
+        .iter()
+        .map(|candidate| candidate.group_id.key().clone())
+        .collect::<HashSet<_>>();
+    candidates.retain(|candidate| {
+        pairs
+            .get(candidate.group_id.key())
+            .is_none_or(|original| !keys.contains(original))
+    });
+}
 
 fn complete_activity_read_error(message: impl Into<String>) -> CompleteActivityReadError {
     CompleteActivityReadError(message.into())
@@ -671,7 +765,7 @@ impl ActivityReadVerification<'_> {
             ))
         })?;
         let bindings = if let Some(commitment) = &commitment {
-            self.verify_observation_bindings(commitment, &aggregates, lookup)?
+            self.verify_observation_bindings(commitment, &rows, &aggregates, lookup)?
         } else {
             VerifiedObservationBindings::default()
         };
@@ -819,6 +913,7 @@ impl ActivityReadVerification<'_> {
     fn verify_observation_bindings<L, E>(
         &self,
         commitment: &ActivityReadCommitment,
+        rows: &[NormalizedActivity],
         aggregates: &[ActivityAggregate],
         lookup: &mut L,
     ) -> Result<VerifiedObservationBindings, CompleteActivityReadError>
@@ -831,6 +926,11 @@ impl ActivityReadVerification<'_> {
         let Some(bindings) = &commitment.bindings else {
             return Ok(verified);
         };
+        let restamp_pairs = read_restamp_pairs(rows).map_err(|error| {
+            complete_activity_read_error(format!(
+                "complete activity read aggregate failed: {error}"
+            ))
+        })?;
         let commitment_receipt = self
             .read_commitment
             .ok_or_else(|| complete_activity_read_error("binding commitment receipt is absent"))?;
@@ -917,7 +1017,7 @@ impl ActivityReadVerification<'_> {
                     ));
                 }
             } else {
-                let candidates = aggregates
+                let mut candidates = aggregates
                     .iter()
                     .filter(|aggregate| {
                         let candidate = aggregate.group_id.components();
@@ -928,6 +1028,7 @@ impl ActivityReadVerification<'_> {
                             && candidate.side == original.side
                     })
                     .collect::<Vec<_>>();
+                collapse_restamp_pairs(&mut candidates, &restamp_pairs);
                 if candidates.len() != 1
                     || candidates[0].group_id != target.group_id
                     || original.asset.is_none()
