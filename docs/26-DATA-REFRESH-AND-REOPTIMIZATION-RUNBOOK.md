@@ -444,10 +444,9 @@ walk — no RPC required, #369/#372).
 >   (the dropped count is logged; the comparison is case-insensitive).
 >
 > Each ranking row also carries `last_trade_unix` — the wallet's real last on-chain
-> trade time — which `pe-service` uses both as the inactivity clock and as the
+> trade time — which seeds `pe-service`'s inactivity clock at admission and is the
 > candidate-freshness filter (`ACTIVE_WINDOW_HOURS = 72`, #357). It is a push-time
-> snapshot of the cache, so a stale cache yields stale clocks; backfilling immediately
-> before the push is mandatory.
+> snapshot of the cache; backfilling immediately before the push is mandatory.
 >
 > Because these checks read `wallet_cache.db`, **run Part 1 (backfill) immediately
 > before Part 2's ranking push.** A stale cache would otherwise filter out every

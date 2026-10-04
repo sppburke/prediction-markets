@@ -9,14 +9,12 @@
 //!      trailing-window realized P&L < 0 (`demotion_pnl_window_secs`) AND
 //!      ≥ `demotion_min_trades` settled fills.
 //!
-//! The idle clock is the wallet's *real last-trade time* (#357): the poll cursor is seeded from
-//! `ranking_entries.last_trade_unix` at admission — here, for each backfilled wallet, inside the
-//! writer-locked critical section — and advanced forward by the [`crate::trade_poller`], so
-//! `idle = now − cursor = now − real_last_trade`. There is no admission grace: a wallet whose real
-//! last trade is already > `inactivity_threshold_secs` ago is eviction-eligible on the next tick
-//! (candidates are pre-filtered to < 72h at fetch, so this bites only stale bootstrap admissions).
-//! A `cursor == None` wallet (not yet polled and no seed value) is treated as idle 0: it self-heals
-//! to "now" rather than being read as inactive-forever, until the poller writes its real last trade.
+//! The idle clock is the wallet's activity clock (#511), falling back to its delivery cursor:
+//! `ranking_entries.last_trade_unix` seeds it at admission and the [`crate::trade_poller`]
+//! advances it, so `idle = now − last observed trade`. There is no admission grace: a wallet whose
+//! last trade is already > `inactivity_threshold_secs` ago is eviction-eligible on the next tick.
+//! A wallet with neither clock (not yet polled and no seed value) is treated as idle 0: it
+//! self-heals to "now" rather than being read as inactive-forever.
 //!
 //! Freed slots are atomically backfilled via [`LiveWatchlist::replace`] from the top of
 //! the batch-pinned survivor bench, excluding the live ∪ evicted sets. The refresh loop and this tick are
@@ -701,8 +699,8 @@ pub struct Eviction {
     pub live_pnl: Option<Decimal>,
     /// Settled-fill count observed for the wallet (`0` when no stats exist).
     pub trades_observed: usize,
-    /// The wallet's real last-trade time (its poll cursor = the inactivity clock) at eviction
-    /// (#357); `None` for a never-polled wallet evicted on a non-inactivity trigger.
+    /// The wallet's inactivity clock at eviction: activity clock (#511), delivery-cursor fallback;
+    /// `None` for a never-polled wallet evicted on a non-inactivity trigger.
     pub last_trade_unix: Option<i64>,
 }
 
@@ -712,9 +710,9 @@ pub struct Eviction {
 /// signal and its trailing-window realized-P&L AND-gate is the safety net for the CB constants.
 ///
 /// # Precondition
-/// `last_ts` is the wallet's poll cursor (its real last-trade time, #357). `None` means the wallet
-/// has not yet been polled and is treated as just-admitted (idle 0) — never inactive-evicted this
-/// tick.
+/// `last_ts` is the wallet's inactivity clock: activity clock (#511), delivery-cursor fallback.
+/// `None` means the wallet has not yet been polled and is treated as just-admitted (idle 0) —
+/// never inactive-evicted this tick.
 #[must_use]
 pub fn knockout_decision(
     last_ts: Option<i64>,
@@ -748,7 +746,8 @@ pub fn knockout_decision(
 
 /// Decide all evictions for the current live set. Pure: no I/O.
 ///
-/// `cursors` maps each live wallet to its poll cursor (`None` = not yet polled). `stats` is keyed
+/// `cursors` maps each live wallet to its inactivity clock (activity clock, delivery-cursor
+/// fallback; `None` = not yet polled). `stats` is keyed
 /// by leader hex (`WalletAddress::to_string`, canonical lowercase `0x…`) per [`wallet_edge_stats`].
 #[must_use]
 pub fn decide_evictions(
@@ -769,7 +768,6 @@ pub fn decide_evictions(
                 reason,
                 live_pnl: s.map(|st| st.realized_pnl),
                 trades_observed: s.map_or(0, |st| st.settled_count),
-                // The poll cursor IS the real last-trade time (#357) — record it for the audit.
                 last_trade_unix: last_ts,
             })
         })
@@ -1351,10 +1349,49 @@ struct LiveReentryReport {
     deferred: Vec<crate::watchlist_admission::Deferral>,
 }
 
+/// What live re-entry does with one live-absent structural member this tick.
+#[derive(Debug, PartialEq, Eq)]
+enum Reentry {
+    /// Prepare it for admission.
+    Admit,
+    /// Missing or future ranking timestamp: today's seed deferral, parked until another batch.
+    Park,
+    /// Not eligible on the evidence available now; check again next tick without parking.
+    Retry,
+}
+
+/// Re-entry eligibility of a live-absent structural member. The pinned batch's
+/// `last_trade_unix` admits it inside [`supabase_reader::ACTIVE_WINDOW_HOURS`]. Past that window
+/// its own activity clock (#511) admits it when the knockout would keep it, proven winners
+/// included, so a restart cannot strand a wallet the live set would have kept. A missing or
+/// future batch value parks: neither changes within a batch, and admission seeding would raise
+/// the activity clock to a future value.
+fn reentry(
+    ranked: Option<i64>,
+    observed: Option<i64>,
+    stats: Option<&HashMap<String, WalletEdgeStats>>,
+    wallet: &WalletAddress,
+    cfg: &MaintenanceConfig,
+    now_unix: i64,
+) -> Reentry {
+    let Some(ranked) = ranked.filter(|at| *at <= now_unix) else {
+        return Reentry::Park;
+    };
+    if ranked >= now_unix.saturating_sub(supabase_reader::ACTIVE_WINDOW_HOURS * 3_600) {
+        return Reentry::Admit;
+    }
+    let kept = observed.is_some_and(|at| at <= now_unix)
+        && stats.is_some_and(|stats| {
+            knockout_decision(observed, stats.get(&wallet.to_string()), cfg, now_unix).is_none()
+        });
+    if kept { Reentry::Admit } else { Reentry::Retry }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn live_reentry_tick(
     live: &LiveWatchlist,
-    paper_state: &PaperStateDb,
+    paper_state: &Arc<PaperStateDb>,
+    cfg: &MaintenanceConfig,
     client: &reqwest::Client,
     base_url: &str,
     anon_key: &str,
@@ -1412,30 +1449,58 @@ async fn live_reentry_tick(
     };
     let before_live = live.snapshot().entries.len();
     let mut deferred = Vec::new();
-    let freshness_cutoff = now_unix.saturating_sub(supabase_reader::ACTIVE_WINDOW_HOURS * 3_600);
-    let candidates = planned_live_reentries(live, entries)
+    let retryable = planned_live_reentries(live, entries)
         .into_iter()
         .filter(|wallet| !sync.knockout_deferred.contains(wallet))
         .filter(|wallet| !attempted.contains(wallet) && !sync.cooling(wallet))
-        .filter(|wallet| match last_trade.get(wallet) {
-            Some(last) if *last >= freshness_cutoff && *last <= now_unix => true,
-            value => {
-                deferred.push(crate::watchlist_admission::Deferral {
-                    completed_at: Some(tokio::time::Instant::now()),
-                    wallet: *wallet,
-                    stage: "seed",
-                    class: crate::position_seeder::FailureClass::WalletPersistent,
-                    kind: if value.is_none() {
-                        "seed.missing_cursor"
-                    } else {
-                        "seed.stale_cursor"
-                    },
-                    message: format!("missing or stale last_trade_unix for {wallet}"),
-                });
-                false
+        .map(|wallet| (wallet, paper_state.activity(&wallet).unwrap_or(None)))
+        .collect::<Vec<_>>();
+    // Statistics decide only a stale-ranked wallet with a usable clock: load them once, then.
+    let stats = retryable
+        .iter()
+        .any(|(wallet, observed)| {
+            observed.is_some_and(|at| at <= now_unix)
+                && reentry(
+                    last_trade.get(wallet).copied(),
+                    *observed,
+                    None,
+                    wallet,
+                    cfg,
+                    now_unix,
+                ) == Reentry::Retry
+        })
+        .then(|| load_edge_stats(paper_state, cfg, now_unix))
+        .flatten();
+    let candidates = retryable
+        .into_iter()
+        .filter(|(wallet, observed)| {
+            let ranked = last_trade.get(wallet).copied();
+            let by_wallet = stats.as_ref().map(|loaded| &loaded.by_wallet);
+            match reentry(ranked, *observed, by_wallet, wallet, cfg, now_unix) {
+                Reentry::Admit => true,
+                Reentry::Retry => false,
+                Reentry::Park => {
+                    deferred.push(crate::watchlist_admission::Deferral {
+                        completed_at: Some(tokio::time::Instant::now()),
+                        wallet: *wallet,
+                        stage: "seed",
+                        class: crate::position_seeder::FailureClass::WalletPersistent,
+                        kind: if ranked.is_none() {
+                            "seed.missing_cursor"
+                        } else {
+                            "seed.stale_cursor"
+                        },
+                        message: format!("missing or future last_trade_unix for {wallet}"),
+                    });
+                    false
+                }
             }
         })
+        .map(|(wallet, _)| wallet)
         .collect::<Vec<_>>();
+    if candidates.is_empty() && deferred.is_empty() {
+        return None;
+    }
     park_persistent(sync, paper_state, &deferred);
     let prepared = match preparer
         .prepare_ranked_until(&candidates, last_trade, deadline)
@@ -1493,7 +1558,7 @@ async fn live_reentry_tick(
 
 async fn record_live_reentry(
     preparer: &AdmissionPreparer,
-    sync: &mut BatchSync,
+    sync: &BatchSync,
     mode: MembershipMode,
     report: Option<LiveReentryReport>,
 ) {
@@ -1505,7 +1570,6 @@ async fn record_live_reentry(
         deferred = report.deferred.len(),
         "live reentry tick completed"
     );
-    park_persistent(sync, preparer.paper_state(), &report.deferred);
     if let Some(batch_id) = sync.marker {
         let context = match mode {
             MembershipMode::Knockout => {
@@ -1585,9 +1649,7 @@ impl ScenarioMaintenanceState {
 
 /// Run the maintenance tick loop until the process exits.
 ///
-/// `cfg.interval_secs == 0` disables the tick (returns immediately). The first tick fires one
-/// interval after startup, so the poller has advanced each bootstrap-seeded cursor forward from
-/// its real last trade (#357) before the first inactivity check — there is no admission grace.
+/// `cfg.interval_secs == 0` disables the loop. The first tick fires one interval after startup.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_maintenance_loop(
     live: LiveWatchlist,
@@ -2125,6 +2187,7 @@ async fn maintenance_tick_inner(
                                 let report = live_reentry_tick(
                                     live,
                                     paper_state,
+                                    cfg,
                                     client,
                                     base_url,
                                     anon_key,
@@ -2168,6 +2231,7 @@ async fn maintenance_tick_inner(
         live_reentry_tick(
             live,
             paper_state,
+            cfg,
             client,
             base_url,
             anon_key,
@@ -2265,8 +2329,6 @@ async fn maintenance_tick_inner(
         )
         .await
         {
-            // The candidate last-trade side-map (#357) seeds each admitted wallet's poll cursor
-            // (its inactivity clock) from the wallet's real last trade in the apply step.
             Ok((w, candidate_last_trade)) => {
                 if w.entries.is_empty() {
                     // Expected steady state after #518: the bench is survivor-filtered, and
@@ -2864,6 +2926,41 @@ mod tests {
             knockout_decision(last, Some(&winner), &cfg(), NOW),
             Some(KnockoutReason::InactivityHardCap)
         );
+    }
+
+    #[test]
+    fn reentry_admits_fresh_batch_or_kept_clock_and_parks_only_bad_batch_values() {
+        let wallet = WalletAddress::from_hex("0x00000000000000000000000000000000000000aa").unwrap();
+        let by_wallet = |edge: WalletEdgeStats| HashMap::from([(wallet.to_string(), edge)]);
+        let winner = by_wallet(stats(40, dec!(120), Some(dec!(0.05)), Some(dec!(0.30))));
+        let loser = by_wallet(stats(20, dec!(-50), Some(dec!(-0.30)), Some(dec!(-0.05))));
+        let none = HashMap::new();
+        let (recent, stale, future) = (Some(NOW - 60), Some(NOW - 300_000), Some(NOW + 60));
+        let (four_days, eight_days) = (Some(NOW - 345_600), Some(NOW - 691_200));
+        use Reentry::{Admit, Park, Retry};
+        let (empty, winners, losers) = (Some(&none), Some(&winner), Some(&loser));
+        let cases = [
+            (recent, None, empty, Admit),        // fresh batch
+            (stale, recent, empty, Admit),       // stale batch, recent clock
+            (stale, stale, empty, Retry),        // both stale
+            (future, recent, empty, Park),       // future batch
+            (None, recent, empty, Park),         // missing batch
+            (stale, future, empty, Retry),       // future clock
+            (stale, future, None, Retry),        // future clock, statistics unavailable
+            (stale, None, empty, Retry),         // no clock (also a read error)
+            (stale, None, None, Retry),          // no clock, statistics unavailable
+            (stale, four_days, winners, Admit),  // proven winner idle 4 d
+            (stale, four_days, empty, Retry),    // unproven idle 4 d
+            (stale, eight_days, winners, Retry), // winner past the hard cap
+            (stale, recent, losers, Retry),      // demotable
+            (recent, None, None, Admit),         // statistics unavailable, fresh batch
+            (stale, recent, None, Retry),        // statistics unavailable, stale batch
+            (future, recent, None, Park),        // statistics unavailable, future batch
+        ];
+        for (index, (ranked, observed, edge, expected)) in cases.into_iter().enumerate() {
+            let actual = reentry(ranked, observed, edge, &wallet, &cfg(), NOW);
+            assert_eq!(actual, expected, "case {index}");
+        }
     }
 
     #[test]
@@ -4399,8 +4496,12 @@ mod tests {
             let deferred = wallet(71);
             let mut fake = Fake::new(Some(2));
             fake.ranking_entries = vec![row(2, 1, deferred)];
+            // A stale ranking timestamp: only the wallet's recent activity clock admits it.
+            fake.ranking_entries[0]["last_trade_unix"] = serde_json::json!(NOW - 300_000);
             let pinned_reads = Arc::clone(&fake.pinned_ranking_hits);
             let h = harness(fake, &[deferred]).await;
+            h.paper_state.set_cursor(&deferred, NOW - 300_000).unwrap();
+            h.paper_state.set_activity(&deferred, NOW - 60).unwrap();
             h.live.remove_fenced(&set(&[deferred]));
             let mut sync = BatchSync {
                 parking_batch: None,
@@ -4429,12 +4530,14 @@ mod tests {
         async fn pinned_batch_live_reentry_precedes_edge_failure_and_full_capacity_returns() {
             for full_capacity in [false, true] {
                 let deferred = wallet(72);
+                // Stale in the pinned batch; only its own activity clock can bring it back.
+                let stale_ranked = wallet(75);
                 let peers = if full_capacity {
-                    vec![wallet(73), wallet(74)]
+                    vec![wallet(73)]
                 } else {
                     Vec::new()
                 };
-                let mut initial = vec![deferred];
+                let mut initial = vec![deferred, stale_ranked];
                 initial.extend(peers.iter().copied());
                 let mut fake = Fake::new(Some(1));
                 fake.ranking_entries = initial
@@ -4442,13 +4545,28 @@ mod tests {
                     .enumerate()
                     .map(|(index, wallet)| row(1, i64::try_from(index + 1).unwrap(), *wallet))
                     .collect();
+                fake.ranking_entries[1]["last_trade_unix"] = serde_json::json!(NOW - 300_000);
                 let pinned_reads = Arc::clone(&fake.pinned_ranking_hits);
                 let h = harness(fake, &initial).await;
-                h.live.remove_fenced(&set(&[deferred]));
+                h.paper_state
+                    .set_cursor(&stale_ranked, NOW - 300_000)
+                    .unwrap();
+                // With statistics, its clock starts stale and advances within the batch; without
+                // them, its clock is recent and only the statistics must recover.
+                let first_activity = if full_capacity {
+                    NOW - 300_000
+                } else {
+                    NOW - 60
+                };
+                h.paper_state
+                    .set_activity(&stale_ranked, first_activity)
+                    .unwrap();
+                h.live.remove_fenced(&set(&[deferred, stale_ranked]));
+                let paper_db = h._temp.path().join("paper.db");
                 if !full_capacity {
-                    rusqlite::Connection::open(h._temp.path().join("paper.db"))
+                    rusqlite::Connection::open(&paper_db)
                         .unwrap()
-                        .execute("DROP TABLE fills", [])
+                        .execute("ALTER TABLE fills RENAME TO hidden_fills", [])
                         .unwrap();
                 }
                 let mut sync = BatchSync {
@@ -4464,9 +4582,34 @@ mod tests {
                 };
                 h.tick_synced(MembershipMode::Knockout, &mut HashSet::new(), &mut sync)
                     .await;
-                assert_eq!(members(&h.live), set(&initial));
+                let mut first_live = vec![deferred];
+                first_live.extend(peers.iter().copied());
+                assert_eq!(members(&h.live), set(&first_live));
                 assert_eq!(h.controls().len(), 1);
-                assert_eq!(pinned_reads.load(Ordering::SeqCst), 1);
+                assert!(
+                    sync.knockout_deferred.is_empty(),
+                    "a retried wallet is never parked"
+                );
+                if full_capacity {
+                    h.paper_state.set_activity(&stale_ranked, NOW - 60).unwrap();
+                } else {
+                    rusqlite::Connection::open(&paper_db)
+                        .unwrap()
+                        .execute("ALTER TABLE hidden_fills RENAME TO fills", [])
+                        .unwrap();
+                }
+                h.tick_synced(MembershipMode::Knockout, &mut HashSet::new(), &mut sync)
+                    .await;
+                assert_eq!(members(&h.live), set(&initial));
+                assert_eq!(h.controls().len(), 2);
+                assert_eq!(pinned_reads.load(Ordering::SeqCst), 2);
+                assert_eq!(sync.marker, Some(1));
+                assert!(sync.knockout_deferred.is_empty());
+                assert_eq!(
+                    h.paper_state.cursor(&stale_ranked).unwrap(),
+                    Some(NOW - 300_000)
+                );
+                assert_eq!(h.membership_publications.load(Ordering::SeqCst), 0);
             }
         }
 
@@ -4504,6 +4647,7 @@ mod tests {
             let first = live_reentry_tick(
                 &h.live,
                 &h.paper_state,
+                &cfg(),
                 &h.client,
                 &h.base_url,
                 "anon",
@@ -4539,6 +4683,7 @@ mod tests {
             let second = live_reentry_tick(
                 &h.live,
                 &h.paper_state,
+                &cfg(),
                 &h.client,
                 &h.base_url,
                 "anon",
