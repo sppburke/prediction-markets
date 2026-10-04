@@ -2569,7 +2569,7 @@ pub(crate) async fn golden_source_stream_replays_exact_economic_core() {
     assert!(decision_rows.iter().all(|row| {
         replay_decision_pending(row).is_ok_and(|decision| {
             decision.continuation.facts.gate_result == "admitted"
-                && decision.continuation.version() == 6
+                && decision.continuation.version() == 7
                 && decision.continuation.read_commitment.is_some()
                 && decision.continuation.facts.provenance == TradeProvenance::ActivityWs
                 && decision.post_boundary.body.terminal.final_receipt.is_some()
@@ -3627,7 +3627,7 @@ impl BracketFinancialHarness {
             .unwrap();
         assert_eq!(row.state, pe_paper_state::DecisionPendingState::Terminal);
         let replay = replay_decision_pending(&row).unwrap();
-        assert_eq!(replay.continuation.version(), 6);
+        assert_eq!(replay.continuation.version(), 7);
         assert_eq!(row.updated_at_unix, self.terminal_at.unix_timestamp());
         assert_eq!(
             replay

@@ -472,6 +472,8 @@ struct SelectedSealTerminal {
 struct SealDecisionScope {
     version: u16,
     #[serde(default)]
+    source_authority: Option<String>,
+    #[serde(default)]
     observed_source_receipt: Option<AppendReceipt>,
     #[serde(default)]
     page_occurrences: Vec<SealPageOccurrence>,
@@ -2204,6 +2206,15 @@ impl PaperStateDb {
         for candidate in candidates {
             let (source_trade_id, semantic_revision, frozen_inputs_json) = candidate?;
             let scope: SealDecisionScope = serde_json::from_str(&frozen_inputs_json)?;
+            match (scope.version, scope.source_authority.as_deref()) {
+                (2..=6, None) | (7, Some("complete_read")) => {}
+                _ => {
+                    return Err(PaperStateError::SealEvidenceSelectionMismatch {
+                        requested: requested.len(),
+                        stored: stored.len(),
+                    });
+                }
+            }
             let receipts = scope
                 .page_occurrences
                 .iter()
@@ -2211,7 +2222,7 @@ impl PaperStateDb {
                 .chain(scope.observed_source_receipt)
                 .chain(scope.read_commitment)
                 .collect::<Vec<_>>();
-            let in_scope = matches!(scope.version, 3..=6)
+            let in_scope = matches!(scope.version, 3..=7)
                 && !receipts.is_empty()
                 && receipts.iter().all(|receipt| {
                     sealed_inclusive.is_some_and(|sealed| receipt.sequence <= sealed)
@@ -7751,13 +7762,16 @@ mod tests {
         let (_dir, db) = db();
         insert_seal_fixture(&db, "rev-1");
         let keys = vec![(SourceTradeId("g2:seal".to_owned()), "rev-1".to_owned())];
-        for version in [3, 4, 5, 6] {
-            let frozen = serde_json::json!({
+        for version in [3, 4, 5, 6, 7] {
+            let mut frozen = serde_json::json!({
                 "version": version,
                 "observed_source_receipt": append_receipt(1, 1),
                 "page_occurrences": [{"receipt": append_receipt(2, 2)}],
-                "read_commitment": if matches!(version, 4..=6) { Some(append_receipt(3, 3)) } else { None },
+                "read_commitment": if matches!(version, 4..=7) { Some(append_receipt(3, 3)) } else { None },
             });
+            if version == 7 {
+                frozen["source_authority"] = serde_json::json!("complete_read");
+            }
             db.lock()
                 .execute(
                     "UPDATE decision_pending SET frozen_inputs_json = ?1",
@@ -7789,7 +7803,7 @@ mod tests {
                 db.seal_decision_evidence_for_source_prefix(&extra, &keys, Some(EventSeq(3))),
                 Err(PaperStateError::SealEvidenceSelectionMismatch { .. })
             ));
-            if matches!(version, 4..=6) {
+            if matches!(version, 4..=7) {
                 assert!(
                     db.seal_decision_evidence_for_source_prefix(&keys, &keys, Some(EventSeq(2)))
                         .is_err()
@@ -7797,6 +7811,36 @@ mod tests {
                 db.seal_decision_evidence_for_source_prefix(&[], &[], Some(EventSeq(2)))
                     .unwrap();
             }
+        }
+    }
+
+    #[test]
+    fn source_prefix_seal_refuses_frame_authority_and_authority_mismatches() {
+        let (_dir, db) = db();
+        insert_seal_fixture(&db, "rev-1");
+        let keys = vec![(SourceTradeId("g2:seal".to_owned()), "rev-1".to_owned())];
+        for (version, authority) in [
+            (7, Some("activity_frame")),
+            (7, None),
+            (6, Some("complete_read")),
+        ] {
+            let mut frozen = serde_json::json!({
+                "version": version,
+                "page_occurrences": [{"receipt": append_receipt(2, 2)}],
+            });
+            if let Some(authority) = authority {
+                frozen["source_authority"] = serde_json::json!(authority);
+            }
+            db.lock()
+                .execute(
+                    "UPDATE decision_pending SET frozen_inputs_json = ?1",
+                    [frozen.to_string()],
+                )
+                .unwrap();
+            assert!(matches!(
+                db.seal_decision_evidence_for_source_prefix(&keys, &keys, Some(EventSeq(3))),
+                Err(PaperStateError::SealEvidenceSelectionMismatch { .. })
+            ));
         }
     }
 

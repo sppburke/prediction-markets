@@ -3514,6 +3514,9 @@ fn live_observation_page_index(
         };
         let continuation = DecisionContinuationV3::from_durable(&row)
             .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
+        continuation
+            .require_complete_read()
+            .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
         let applied = continuation
             .facts
             .durable_group_effect(paper_state)
@@ -3642,6 +3645,10 @@ fn validate_live_observation_trade(
     selected: &RecordedEconomicSource,
     binding: LiveObservationBinding<'_>,
 ) -> Result<(), EconomicReplayError> {
+    binding
+        .continuation
+        .require_complete_read()
+        .map_err(|error| economic_replay_error(error.to_string()))?;
     let projection =
         binding.identity.fill_projection.as_deref().ok_or_else(|| {
             economic_replay_error("current live observation has no fill projection")
@@ -3682,7 +3689,7 @@ fn validate_live_observation_trade(
         ));
     }
 
-    if !matches!(binding.continuation.version(), 5 | 6)
+    if !matches!(binding.continuation.version(), 5..=7)
         && selected.source_id == crate::activity_ingest::ACTIVITY_WS_SOURCE_ID
     {
         let websocket = parse_activity_trade_observation(&selected.payload).map_err(|error| {
@@ -9711,7 +9718,7 @@ mod tests {
             Vec<pe_source_polymarket_public::ReconciliationPageEvidence>,
         >(continuation.facts.decision_inputs["pages"].clone())
         .unwrap();
-        let encode = if matches!(continuation.version(), 5 | 6) {
+        let encode = if matches!(continuation.version(), 5..=7) {
             crate::bucket_commit::activity_read_commitment_payload
         } else {
             crate::bucket_commit::activity_read_commitment_payload_v1
@@ -10315,7 +10322,7 @@ mod tests {
     /// FAIL: strict live replay accepts a mutable continuation that redefines its committed read.
     #[test]
     fn strict_live_economic_rejects_read_commitment_substitution() {
-        for version in [4, 5, 6] {
+        for version in [4, 5, 6, 7] {
             let (prepared, account_id, mut sources, mut continuation) =
                 saturated_observation_replay_fixture(false, false);
             let old_sources = sources.clone();
@@ -10334,6 +10341,10 @@ mod tests {
                         .map(crate::bucket_commit::ActivityReadCommitmentReceipt::BindingsV2),
                 );
                 if version == 6 {
+                    let mut encoded = serde_json::to_value(&continuation).unwrap();
+                    encoded["version"] = serde_json::json!(6);
+                    continuation = serde_json::from_value(encoded).unwrap();
+                } else if version == 7 {
                     continuation = continuation.current_paper();
                 }
                 let replacement = read_commitment_source(&continuation);
@@ -10449,11 +10460,11 @@ mod tests {
             .1
             .payload = payload;
         replay_observation_fixture(&prepared, &account_id, &sources, &current).unwrap();
-        let current_six = current.current_paper();
-        assert_eq!(current_six.version(), 6);
-        let bound_clock = current_six
+        let current_seven = current.current_paper();
+        assert_eq!(current_seven.version(), 7);
+        let bound_clock = current_seven
             .verify_stream_binding(
-                &current_six.facts.source_trade_id,
+                &current_seven.facts.source_trade_id,
                 receipt,
                 &mut |candidate| {
                     let source = sources
@@ -10492,7 +10503,7 @@ mod tests {
         let LiveJournalPayload::OrderPrepared(replayed) = &events[1].payload else {
             panic!("version-six fixture lost its live Prepared record");
         };
-        replay_observation_fixture(replayed, &account_id, &sources, &current_six)
+        replay_observation_fixture(replayed, &account_id, &sources, &current_seven)
             .unwrap()
             .recompose(
                 &replayed.economic,

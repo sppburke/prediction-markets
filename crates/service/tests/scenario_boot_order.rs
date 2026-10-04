@@ -530,7 +530,7 @@ impl RestartFixture {
             DecisionContinuationV3::from_durable(&row)
                 .unwrap()
                 .version(),
-            6
+            7
         );
         let checkpoint: Value = serde_json::from_str(&row.post_commit_inputs_json).unwrap();
         assert_eq!(

@@ -3077,8 +3077,12 @@ async fn valid_pending_restart_resumes_once() {
     let connection = rusqlite::Connection::open(&state_path).unwrap();
     for legacy in legacy_rows {
         let mut historical: Value = serde_json::from_str(&legacy.frozen_inputs_json).unwrap();
-        assert_eq!(historical["version"], json!(6));
+        assert_eq!(historical["version"], json!(7));
         historical["version"] = json!(5);
+        historical
+            .as_object_mut()
+            .unwrap()
+            .remove("source_authority");
         assert_eq!(
             connection
                 .execute(

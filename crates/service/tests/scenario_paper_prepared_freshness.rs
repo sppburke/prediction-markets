@@ -954,7 +954,7 @@ fn assert_bound_clocks(h: &Harness, recorded: &Recorded, stream_epoch: i64) {
     let row = h.terminal(recorded);
     let continuation =
         pe_service::bucket_commit::DecisionContinuationV3::from_durable(&row).unwrap();
-    assert_eq!(continuation.version(), 6);
+    assert_eq!(continuation.version(), 7);
     assert_eq!(continuation.facts.source_epoch, recorded.epoch);
     assert_eq!(
         continuation
@@ -1305,7 +1305,7 @@ async fn recorded_ask_above_leader_fills_with_both_paper_delay_policies() {
             pe_service::bucket_commit::DecisionContinuationV3::from_durable(&row)
                 .unwrap()
                 .version(),
-            6
+            7
         );
         let frames = scan_paper_log(&h.dir.path().join("paper.log")).unwrap();
         let economic = frames
@@ -2025,7 +2025,7 @@ async fn version_six_staged_target_strict_live_admission_submits_and_replays() {
         assert_eq!(replayed.post_boundary.body.terminal.disposition, "fill");
         let continuation =
             pe_service::bucket_commit::DecisionContinuationV3::from_durable(&row).unwrap();
-        assert_eq!(continuation.version(), 6);
+        assert_eq!(continuation.version(), 7);
         let staged = h.paper.unfinalized_ready_dispatch_seeds().unwrap();
         assert_eq!(staged.len(), 1);
         let target = h.paper.dispatch_targets(&staged[0].dispatch_id).unwrap();
@@ -2301,7 +2301,7 @@ async fn resumed_decision_uses_frozen_paper_freshness_policy() {
 }
 
 /// A stopped-cut boot finishes a continuation-five decision against its active historical
-/// latency cause. A later continuation-six decision in the same generation ignores that cause.
+/// latency cause. A later continuation-seven decision in the same generation ignores that cause.
 #[tokio::test]
 async fn mixed_era_boot_keeps_old_latency_audit_and_new_decision_false() {
     let mut h = Harness::new_with_semantic(1).await;
@@ -2310,8 +2310,9 @@ async fn mixed_era_boot_keeps_old_latency_audit_and_new_decision_false() {
     let connection = rusqlite::Connection::open(h.dir.path().join("paper.db")).unwrap();
     let row = h.terminal(&old);
     let mut frozen: Value = serde_json::from_str(&row.frozen_inputs_json).unwrap();
-    assert_eq!(frozen["version"], json!(6));
+    assert_eq!(frozen["version"], json!(7));
     frozen["version"] = json!(5);
+    frozen.as_object_mut().unwrap().remove("source_authority");
     connection
         .execute(
             "UPDATE decision_pending SET frozen_inputs_json = ?1 WHERE source_trade_id = ?2",
@@ -2411,8 +2412,8 @@ async fn mixed_era_boot_keeps_old_latency_audit_and_new_decision_false() {
     h.start(true);
     h.poll(&current).await;
     let current_replay = replay_decision_pending(&h.terminal(&current)).unwrap();
-    assert_eq!(current_replay.continuation.version(), 6);
-    assert_eq!(current_replay.post_boundary.financial_semantic_version, 2);
+    assert_eq!(current_replay.continuation.version(), 7);
+    assert_eq!(current_replay.post_boundary.financial_semantic_version, 3);
     let current_economic = scan_paper_log(&paper_path)
         .unwrap()
         .iter()

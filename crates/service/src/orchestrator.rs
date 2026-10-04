@@ -809,11 +809,11 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         if seal_needed && !self.pending_boot.is_empty() {
             // The seal digest requires terminal decisions. Finish only the preceding
             // generation's frozen continuations before sealing; no new source producer is
-            // running yet, and continuation 6 may never be decided under an unsealed Start.
+            // running yet, and continuation 7 may never be decided under an unsealed Start.
             if self
                 .pending_continuations
                 .values()
-                .any(|continuation| continuation.version() >= 6)
+                .any(|continuation| continuation.version() == 7)
             {
                 return Err(
                     "current-semantic continuation is open before qualification seal".to_owned(),
@@ -1245,7 +1245,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
     fn compose_active_paper_economic(
         &self,
         signal: &LeaderSignal,
-        semantic2: bool,
+        current_book_policy: bool,
         admission: &pe_execution_core::LiveAdmissionArtifact,
         plan: &LadderPlan,
         book_receipt: pe_event_log::AppendReceipt,
@@ -1308,7 +1308,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             risk,
             cash_before,
             price_impact_cap_bps: self.price_impact_cap_bps,
-            chase_ceiling: if semantic2 {
+            chase_ceiling: if current_book_policy {
                 Price::ONE
             } else {
                 signal.leader_price
@@ -1317,7 +1317,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             band_ceiling_exclusive,
             applied_configuration_hash,
         };
-        if semantic2 {
+        if current_book_policy {
             pe_execution_core::EconomicPrepared::compose_wire_two(inputs)
         } else {
             pe_execution_core::EconomicPrepared::compose(inputs)
@@ -2278,7 +2278,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
     async fn plan_impact_gate(
         &self,
         signal: &LeaderSignal,
-        semantic2: bool,
+        current_book_policy: bool,
         probability: Probability,
         sizing_bankroll: Decimal,
         admission: &pe_execution_core::LiveAdmissionArtifact,
@@ -2405,7 +2405,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 checked_at_unix_ms: Some(checked_at_unix_ms),
             });
         }
-        let ceiling = (if semantic2 {
+        let ceiling = (if current_book_policy {
             pe_execution_core::economic::current_book_impact_ceiling(
                 best,
                 self.price_impact_cap_bps,
@@ -2535,7 +2535,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             minimum_tick_size,
             minimum_price,
             maximum_price_exclusive,
-            if semantic2 {
+            if current_book_policy {
                 Price::ONE
             } else {
                 signal.leader_price
@@ -2816,7 +2816,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 "scenario fault: dispatch seed staging failed; abandoning the trade unseen");
             return Err(());
         }
-        let checkpoint = matches!(continuation_version, 5 | 6);
+        let checkpoint = matches!(continuation_version, 5..=7);
         let pending = if checkpoint {
             evidence
                 .as_ref()
@@ -2972,7 +2972,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .map(DecisionEvidenceAccumulator::for_continuation);
         if pending
             .as_ref()
-            .is_some_and(|continuation| matches!(continuation.version(), 5 | 6))
+            .is_some_and(|continuation| matches!(continuation.version(), 5..=7))
         {
             let restored = self
                 .paper_state
@@ -3306,9 +3306,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .and_then(|hooks| hooks.admission_artifacts.lock().ok()?.pop_front());
         #[cfg(not(feature = "scenario"))]
         let scenario_admission = None;
-        let semantic2 = pending
+        let financial_semantic_version = pending
             .as_ref()
-            .is_some_and(|continuation| continuation.version() == 6);
+            .map_or(1, DecisionContinuationV3::financial_semantic);
+        let current_book_policy = matches!(financial_semantic_version, 2 | 3);
         let mut early_book = authenticated_asset.map(|token_id| {
             let fetcher = Arc::clone(&self.book_fetcher);
             let condition = condition_id.clone();
@@ -3348,7 +3349,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             if let Some(admission) = scenario_admission {
                 Some(Ok(admission))
             } else if let Some(builder) = &self.admission_builder {
-                Some(if semantic2 {
+                Some(if current_book_policy {
                     builder
                         .build_paper(&condition_id, OffsetDateTime::now_utc())
                         .await
@@ -3562,7 +3563,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         let gate_evidence = match self
             .plan_impact_gate(
                 &signal,
-                semantic2,
+                current_book_policy,
                 p,
                 sizing_bankroll,
                 &admission,
@@ -3853,7 +3854,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 &signal,
                 planned_worst_case_all_in_debit,
                 per_trade_cap_bps,
-                if semantic2 { 2 } else { 1 },
+                financial_semantic_version,
             )
             .await
         {
@@ -3895,7 +3896,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         let applied_configuration_hash = applied_runtime.canonical_hash();
         let economic = match self.compose_active_paper_economic(
             &signal,
-            semantic2,
+            current_book_policy,
             &admission,
             plan,
             book_receipt,
@@ -3915,7 +3916,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         match self.strategy.evaluate_at_price_with_limit(
             &signal,
             economic.sizing.all_in_price,
-            if semantic2 {
+            if current_book_policy {
                 plan.limit_price
             } else {
                 signal.leader_price
@@ -3946,7 +3947,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             Ok(intent) => {
                 if pending
                     .as_ref()
-                    .is_none_or(|continuation| !matches!(continuation.version(), 5 | 6))
+                    .is_none_or(|continuation| !matches!(continuation.version(), 5..=7))
                 {
                     let execution_at = OffsetDateTime::now_utc();
                     record_clock(&mut decision_evidence, "paper_dispatch", execution_at);
@@ -6107,6 +6108,70 @@ mod tests {
         assert_eq!(sealed_records(&paper_path), seals);
     }
 
+    #[tokio::test]
+    async fn boot_semantic_three_resumes_open_six_but_refuses_open_seven_before_seal() {
+        for version in [6_u16, 7] {
+            let StartedSealFixture {
+                _dir: dir,
+                paper_path,
+                source_path,
+                state,
+                paper_writer,
+                ..
+            } = started_seal_fixture_with_semantic("start-hash", 2);
+            let fixture = crate::bucket_commit::continuation_v3_tests::binding_fixture("poll_only");
+            std::fs::copy(fixture.dir.path().join("binding.log"), &source_path).unwrap();
+            let continuation = fixture.continuation.current_paper();
+            let facts = &continuation.facts;
+            let source_trade_id = facts.source_trade_id.clone();
+            let mut frozen = serde_json::to_value(&continuation).unwrap();
+            frozen["version"] = serde_json::json!(version);
+            if version == 6 {
+                frozen.as_object_mut().unwrap().remove("source_authority");
+            }
+            rusqlite::Connection::open(dir.path().join("paper.db"))
+                .unwrap()
+                .execute(
+                    "INSERT INTO decision_pending (source_trade_id, semantic_revision, wallet_hex, source_epoch, frozen_inputs_json, post_commit_inputs_json, state, updated_at_unix) VALUES (?1, ?2, ?3, ?4, ?5, '[]', 'open', ?4)",
+                    rusqlite::params![facts.source_trade_id.0, facts.semantic_revision, facts.wallet.to_string(), facts.source_epoch, frozen.to_string()],
+                )
+                .unwrap();
+            let source_receipts = SourceReceiptIndex::replay(&source_path).unwrap();
+            let mut orchestrator = test_orchestrator(
+                paper_path.clone(),
+                source_path,
+                paper_writer,
+                Arc::clone(&state),
+                source_receipts,
+            );
+            assert_eq!(orchestrator.pending_boot.len(), 1);
+            let result = orchestrator
+                .seal_before_resume("start-hash", FINANCIAL_SEMANTIC_VERSION)
+                .await;
+            if version == 7 {
+                assert_eq!(
+                    result.unwrap_err(),
+                    "current-semantic continuation is open before qualification seal"
+                );
+                assert_eq!(orchestrator.pending_boot.len(), 1);
+                assert_eq!(state.open_decision_pending().unwrap().len(), 1);
+                assert!(sealed_records(&paper_path).is_empty());
+            } else {
+                result.unwrap();
+                assert!(orchestrator.pending_boot.is_empty());
+                assert!(state.open_decision_pending().unwrap().is_empty());
+                assert_eq!(sealed_records(&paper_path).len(), 1);
+                let terminal = state
+                    .decision_pending_for(&source_trade_id)
+                    .unwrap()
+                    .unwrap();
+                let replay = crate::decision_replay::replay_decision_pending(&terminal).unwrap();
+                assert_eq!(replay.continuation.version(), 6);
+                assert_eq!(replay.post_boundary.financial_semantic_version, 2);
+            }
+        }
+    }
+
     /// PASS: a bracket whose install never committed leaves a recorded activity page with a trade
     /// that has no durable group; the semantic-change seal still closes the verified prefix.
     #[tokio::test]
@@ -6157,7 +6222,7 @@ mod tests {
         assert_eq!(seals.len(), 1);
         assert!(
             matches!(&seals[0].reason, SealReason::InsufficientEvidence(detail)
-                if detail.contains("financial semantic version changed from 1 to 2")
+                if detail.contains("financial semantic version changed from 1 to 3")
                     && detail.contains("decision evidence unavailable")
                     && detail.contains("has no durable activity group")),
             "{:?}",

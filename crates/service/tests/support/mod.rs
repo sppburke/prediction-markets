@@ -297,7 +297,7 @@ pub fn post_snapshot_invalid_continuation(
             pe_service::bucket_commit::DecisionContinuationV3::from_durable(&row)
                 .unwrap()
                 .version(),
-            6
+            7
         );
         let index = pe_service::risk_inputs::SourceReceiptIndex::replay(source_path).unwrap();
         assert_eq!(

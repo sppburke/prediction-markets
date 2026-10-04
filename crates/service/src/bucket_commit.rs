@@ -200,15 +200,25 @@ pub struct PageOccurrence {
     pub receipt: AppendReceipt,
 }
 
+/// The recorded source contract authorizing a version-seven decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceAuthority {
+    CompleteRead,
+    ActivityFrame,
+}
+
 /// Durable receipt-bearing successor and runtime owner of a frozen continuation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DecisionContinuationV3 {
     version: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_authority: Option<SourceAuthority>,
     #[serde(flatten)]
     pub facts: DecisionContinuationFacts,
     pub observed_source_receipt: Option<AppendReceipt>,
     pub page_occurrences: Vec<PageOccurrence>,
-    /// Receipt of the complete-read commitment record; present exactly in versions 4 and 5.
+    /// Receipt of the complete-read commitment; required for complete reads from version 4.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_commitment: Option<AppendReceipt>,
 }
@@ -466,6 +476,7 @@ impl DecisionContinuationV3 {
                 Some(ActivityReadCommitmentReceipt::LegacyV1(_)) => 4,
                 Some(ActivityReadCommitmentReceipt::BindingsV2(_)) => 5,
             },
+            source_authority: None,
             facts,
             observed_source_receipt,
             page_occurrences,
@@ -473,18 +484,38 @@ impl DecisionContinuationV3 {
         }
     }
 
-    /// New paper writes retain the v5 source contract under continuation wire 6.
+    /// New REST paper writes retain the v5 source contract under continuation wire 7.
     pub(crate) fn current_paper(mut self) -> Self {
-        if matches!(self.version, 5 | 6) {
-            self.version = 6;
+        if matches!(self.version, 5..=7) {
+            self.version = 7;
+            self.source_authority = Some(SourceAuthority::CompleteRead);
         }
         self
     }
 
-    /// Durable wire version (2 through 6).
+    /// Durable wire version (2 through 7).
     #[must_use]
     pub fn version(&self) -> u16 {
         self.version
+    }
+
+    /// Financial era of the frozen continuation, independently of economic wire version.
+    #[must_use]
+    pub fn financial_semantic(&self) -> u32 {
+        match self.version {
+            2..=5 => 1,
+            6 => 2,
+            7 => 3,
+            _ => 0,
+        }
+    }
+
+    /// Frame authority cannot execute until its authenticated admission verifier is installed.
+    pub(crate) fn require_complete_read(&self) -> Result<(), DecisionContinuationError> {
+        match (self.version, self.source_authority) {
+            (2..=6, None) | (7, Some(SourceAuthority::CompleteRead)) => Ok(()),
+            _ => Err(DecisionContinuationError::DurableMismatch),
+        }
     }
 
     /// Whether both continuations describe one complete read: equal wallet, logical read proof,
@@ -493,6 +524,7 @@ impl DecisionContinuationV3 {
     #[must_use]
     pub(crate) fn same_complete_read(&self, other: &Self) -> bool {
         self.version == other.version
+            && self.source_authority == other.source_authority
             && self.facts.wallet == other.facts.wallet
             && self.facts.decision_inputs == other.facts.decision_inputs
             && self.page_occurrences == other.page_occurrences
@@ -502,6 +534,7 @@ impl DecisionContinuationV3 {
     /// Greatest synchronized activity-page receipt in this complete read.
     #[must_use]
     pub fn complete_bound(&self) -> Option<AppendReceipt> {
+        self.require_complete_read().ok()?;
         self.page_occurrences
             .iter()
             .map(|page| page.receipt)
@@ -593,6 +626,8 @@ impl DecisionContinuationV3 {
         L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
         E: Display,
     {
+        self.require_complete_read()
+            .map_err(|error| complete_activity_read_error(error.to_string()))?;
         let read = self
             .read_verification()
             .reconstruct_verified_activity_read(lookup)?;
@@ -611,6 +646,8 @@ impl DecisionContinuationV3 {
         L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
         E: Display,
     {
+        self.require_complete_read()
+            .map_err(|error| complete_activity_read_error(error.to_string()))?;
         let read = self
             .read_verification()
             .reconstruct_verified_activity_read_parts(fixed_end, pages, commitment, lookup)?;
@@ -629,12 +666,15 @@ impl DecisionContinuationV3 {
         L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
         E: Display,
     {
+        self.require_complete_read()
+            .map_err(|error| complete_activity_read_error(error.to_string()))?;
         read.bindings.verify_facts(&self.facts)?;
         self.read_verification()
             .verify_stream_binding_in_read(target_id, receipt, read, lookup)
     }
 
     pub(crate) fn commitment_contract(&self) -> Option<(u32, u32)> {
+        self.require_complete_read().ok()?;
         self.read_verification().commitment_contract()
     }
 
@@ -648,6 +688,8 @@ impl DecisionContinuationV3 {
         L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
         E: Display,
     {
+        self.require_complete_read()
+            .map_err(|error| complete_activity_read_error(error.to_string()))?;
         self.read_verification()
             .verify_read_commitment(fixed_end, pages, lookup)
     }
@@ -662,7 +704,9 @@ impl DecisionContinuationV3 {
         L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
         E: Display,
     {
-        if matches!(self.version, 5 | 6) {
+        self.require_complete_read()
+            .map_err(|error| complete_activity_read_error(error.to_string()))?;
+        if matches!(self.version, 5..=7) {
             let read = self.reconstruct_verified_activity_read(lookup)?;
             return self.verify_stream_binding_in_read(target_id, receipt, &read, lookup);
         }
@@ -772,7 +816,7 @@ impl ActivityReadVerification<'_> {
                 ACTIVITY_READ_COMMITMENT_V1_SCHEMA_VERSION,
                 ACTIVITY_READ_COMMITMENT_PARSER_VERSION,
             )),
-            5 | 6 => Some((
+            5..=7 => Some((
                 ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
                 ACTIVITY_READ_COMMITMENT_PARSER_VERSION,
             )),
@@ -828,7 +872,7 @@ impl ActivityReadVerification<'_> {
                 "complete activity read commitment is invalid: {error}"
             ))
         })?;
-        if (matches!(self.version, 5 | 6)) != value.get("bindings").is_some() {
+        if (matches!(self.version, 5..=7)) != value.get("bindings").is_some() {
             return Err(complete_activity_read_error(
                 "complete activity read commitment has inconsistent binding generation",
             ));
@@ -848,7 +892,7 @@ impl ActivityReadVerification<'_> {
                 "observation bindings have noncanonical or unknown fields",
             ));
         }
-        let expected_version = if matches!(self.version, 5 | 6) { 2 } else { 1 };
+        let expected_version = if matches!(self.version, 5..=7) { 2 } else { 1 };
         if commitment.version != expected_version
             || (expected_version == 2) != commitment.bindings.is_some()
             || commitment.wallet != self.wallet
@@ -869,7 +913,7 @@ impl ActivityReadVerification<'_> {
             ));
         }
         if let Some(proof) = &commitment.read_proof
-            && (!matches!(self.version, 5 | 6)
+            && (!matches!(self.version, 5..=7)
                 || proof.page_occurrences != self.page_occurrences
                 || proof.pages != pages)
         {
@@ -1097,7 +1141,7 @@ impl ActivityReadVerification<'_> {
         L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
         E: Display,
     {
-        if matches!(self.version, 5 | 6) {
+        if matches!(self.version, 5..=7) {
             let read = self.reconstruct_verified_activity_read(lookup)?;
             return self.verify_stream_binding_in_read(target_id, receipt, &read, lookup);
         }
@@ -1135,7 +1179,7 @@ impl ActivityReadVerification<'_> {
             })?;
             verified_stream_observation(&source, self.wallet)?
         };
-        if !matches!(self.version, 5 | 6) {
+        if !matches!(self.version, 5..=7) {
             if observation.group_id.key() != target_id {
                 return Err(complete_activity_read_error(
                     "websocket differs from the reconciled trade",
@@ -1358,10 +1402,11 @@ impl DecisionContinuationV3 {
         &self,
         source_receipts: &SourceReceiptIndex,
     ) -> Result<Option<ObservationEvidence>, DecisionContinuationError> {
+        self.require_complete_read()?;
         let Some(selected) = self.observation_receipt() else {
             return Ok(None);
         };
-        if matches!(self.version, 5 | 6) {
+        if matches!(self.version, 5..=7) {
             let mut lookup = |receipt| {
                 #[cfg(test)]
                 continuation_validation_tests::LOOKUPS.with(|count| count.set(count.get() + 1));
@@ -1485,6 +1530,7 @@ impl DecisionContinuationV3 {
         &self,
         source_receipts: &SourceReceiptIndex,
     ) -> Result<(), DecisionContinuationError> {
+        self.require_complete_read()?;
         let Some(websocket) = self.observed_source_receipt else {
             return Ok(());
         };
@@ -1521,7 +1567,7 @@ impl DecisionContinuationV3 {
                 complete_activity_read_error("source clock target differs from continuation")
             })?;
         let mut earliest = target.source_time.clone();
-        if matches!(self.version, 5 | 6) {
+        if matches!(self.version, 5..=7) {
             let wire: CompleteActivityReadWire =
                 serde_json::from_value(self.facts.decision_inputs.clone())
                     .map_err(|error| complete_activity_read_error(error.to_string()))?;
@@ -1588,7 +1634,7 @@ impl PageGeneration {
     pub(crate) fn matches_continuation(self, version: u16) -> bool {
         matches!(
             (self, version),
-            (Self::Historical, 3) | (Self::Committed, 4..=6)
+            (Self::Historical, 3) | (Self::Committed, 4..=7)
         )
     }
 }
@@ -2136,6 +2182,10 @@ impl DecisionContinuationV3 {
             .and_then(|value| u16::try_from(value).ok())
             .ok_or(DecisionContinuationError::Version(0))?;
         let policy_present = value.get("paper_freshness_policy").is_some();
+        let authority_present = value.get("source_authority").is_some();
+        if (version == 7) != authority_present {
+            return Err(DecisionContinuationError::DurableMismatch);
+        }
         let continuation = match version {
             2 => {
                 let applied_configuration =
@@ -2150,15 +2200,19 @@ impl DecisionContinuationV3 {
                 let legacy: DecisionContinuationV2Wire = serde_json::from_value(value)?;
                 Self {
                     version: legacy.version,
+                    source_authority: None,
                     facts: legacy.facts,
                     observed_source_receipt: None,
                     page_occurrences: Vec::new(),
                     read_commitment: None,
                 }
             }
-            3..=6 => serde_json::from_value(value)?,
+            3..=7 => serde_json::from_value(value)?,
             version => return Err(DecisionContinuationError::Version(version)),
         };
+        if (version == 7) != continuation.source_authority.is_some() {
+            return Err(DecisionContinuationError::DurableMismatch);
+        }
         let frozen = &continuation.facts;
         if frozen.source_trade_id != row.source_trade_id
             || frozen.semantic_revision != row.semantic_revision
@@ -2170,18 +2224,20 @@ impl DecisionContinuationV3 {
         {
             return Err(DecisionContinuationError::DurableMismatch);
         }
-        if (matches!(version, 5 | 6)) != policy_present
-            || (matches!(version, 5 | 6)) != frozen.paper_freshness_policy.is_some()
+        if (matches!(version, 5..=7)) != policy_present
+            || (matches!(version, 5..=7)) != frozen.paper_freshness_policy.is_some()
             || frozen
                 .paper_freshness_policy
                 .is_some_and(|policy| !policy.valid())
         {
             return Err(DecisionContinuationError::DurableMismatch);
         }
-        if matches!(version, 3..=6) {
+        if matches!(version, 3..=7)
+            && continuation.source_authority != Some(SourceAuthority::ActivityFrame)
+        {
             if (frozen.provenance == TradeProvenance::ActivityWs)
                 != continuation.observed_source_receipt.is_some()
-                || matches!(version, 4..=6) != continuation.read_commitment.is_some()
+                || matches!(version, 4..=7) != continuation.read_commitment.is_some()
                 || continuation.read_commitment.is_some_and(|receipt| {
                     continuation
                         .page_occurrences
@@ -2214,6 +2270,7 @@ impl DecisionContinuationV3 {
     /// Reconstruct only the transport-neutral trade facts needed by the existing
     /// idempotent decision continuation. Ledger/classification/gate are not rerun.
     pub fn incoming_trade(&self) -> Result<IncomingTrade, DecisionContinuationError> {
+        self.require_complete_read()?;
         let observed_at = time::OffsetDateTime::from_unix_timestamp(self.facts.source_epoch)
             .map_err(|_| DecisionContinuationError::SourceEpoch(self.facts.source_epoch))?;
         Ok(IncomingTrade {
@@ -2271,6 +2328,9 @@ pub(crate) fn validate_continuation_rows(
         };
         let continuation =
             DecisionContinuationV3::from_durable(&row).map_err(|error| fail(error.to_string()))?;
+        continuation
+            .require_complete_read()
+            .map_err(|error| fail(error.to_string()))?;
         if continuation.page_occurrences().is_empty() {
             return Err(fail(
                 "open decision continuation has no receipt-bearing activity read".to_owned(),
@@ -2606,6 +2666,8 @@ pub(crate) mod continuation_validation_tests {
             "page_occurrences",
             "observed_source_receipt",
             "read_commitment",
+            "source_authority",
+            "paper_freshness_policy",
         ] {
             legacy.as_object_mut().unwrap().remove(key);
         }
@@ -4872,6 +4934,7 @@ pub(crate) mod continuation_v3_tests {
 
         let version_two = DecisionContinuationV3 {
             version: 2,
+            source_authority: None,
             facts: facts(json!({"legacy": true})),
             observed_source_receipt: None,
             page_occurrences: vec![occurrence],
@@ -5944,7 +6007,7 @@ pub(crate) mod continuation_v3_tests {
     }
 
     #[test]
-    fn continuation_six_inherits_corrected_binding_and_earliest_source_time() {
+    fn continuation_seven_inherits_corrected_binding_and_earliest_source_time() {
         let fixture = binding_fixture("valid");
         let historical_time = fixture
             .continuation
@@ -5956,7 +6019,7 @@ pub(crate) mod continuation_v3_tests {
             })
             .unwrap();
         let current = fixture.continuation.clone().current_paper();
-        assert_eq!(current.version(), 6);
+        assert_eq!(current.version(), 7);
         let decoded = DecisionContinuationV3::from_durable(&durable(&current)).unwrap();
         assert_eq!(
             decoded
@@ -5982,6 +6045,100 @@ pub(crate) mod continuation_v3_tests {
         let mut incompatible = current;
         incompatible.read_commitment = None;
         assert!(DecisionContinuationV3::from_durable(&durable(&incompatible)).is_err());
+    }
+
+    #[test]
+    fn continuation_authority_round_trip_preserves_historical_bytes() {
+        let (mut historical, _) = committed_empty_read_v2();
+        for version in 2..=6 {
+            historical.version = version;
+            historical.source_authority = None;
+            let json = serde_json::to_string(&historical).unwrap();
+            assert!(!json.contains("source_authority"));
+            let decoded: DecisionContinuationV3 = serde_json::from_str(&json).unwrap();
+            assert_eq!(serde_json::to_string(&decoded).unwrap(), json);
+            assert_eq!(
+                decoded.financial_semantic(),
+                if version == 6 { 2 } else { 1 }
+            );
+        }
+        DecisionContinuationV3::from_durable(&durable(&historical)).unwrap();
+        let legacy_bytes = serde_json::to_string(&historical).unwrap();
+        for authority in [
+            SourceAuthority::CompleteRead,
+            SourceAuthority::ActivityFrame,
+        ] {
+            let mut current = historical.clone().current_paper();
+            current.source_authority = Some(authority);
+            let json = serde_json::to_string(&current).unwrap();
+            let decoded = DecisionContinuationV3::from_durable(&durable(&current)).unwrap();
+            assert_eq!(decoded, current);
+            assert_eq!(decoded.financial_semantic(), 3);
+            assert_eq!(serde_json::to_string(&decoded).unwrap(), json);
+            assert!(json.contains(match authority {
+                SourceAuthority::CompleteRead => "\"source_authority\":\"complete_read\"",
+                SourceAuthority::ActivityFrame => "\"source_authority\":\"activity_frame\"",
+            }));
+            for version in 2..=6 {
+                let mut mismatched = serde_json::to_value(&current).unwrap();
+                mismatched["version"] = json!(version);
+                assert!(matches!(
+                    DecisionContinuationV3::from_durable(&durable(&mismatched)),
+                    Err(DecisionContinuationError::DurableMismatch)
+                ));
+            }
+        }
+        let mut missing = historical.current_paper();
+        missing.source_authority = None;
+        assert!(matches!(
+            DecisionContinuationV3::from_durable(&durable(&missing)),
+            Err(DecisionContinuationError::DurableMismatch)
+        ));
+        let mut null = serde_json::to_value(&missing).unwrap();
+        null["source_authority"] = Value::Null;
+        assert!(matches!(
+            DecisionContinuationV3::from_durable(&durable(&null)),
+            Err(DecisionContinuationError::DurableMismatch)
+        ));
+        assert!(!legacy_bytes.contains("source_authority"));
+    }
+
+    #[test]
+    fn activity_frame_decodes_without_rest_proof_but_validation_fails_closed() {
+        let fixture = binding_fixture("valid");
+        let mut frame = fixture.continuation.current_paper();
+        frame.source_authority = Some(SourceAuthority::ActivityFrame);
+        frame.page_occurrences.clear();
+        frame.read_commitment = None;
+        frame.facts.decision_inputs = json!({});
+        let decoded = DecisionContinuationV3::from_durable(&durable(&frame)).unwrap();
+        assert!(matches!(
+            decoded.incoming_trade(),
+            Err(DecisionContinuationError::DurableMismatch)
+        ));
+        assert!(matches!(
+            decoded.observation_from_receipt_index(&fixture.index),
+            Err(DecisionContinuationError::DurableMismatch)
+        ));
+        assert!(matches!(
+            decoded.verify_websocket_receipt(&fixture.index),
+            Err(DecisionContinuationError::DurableMismatch)
+        ));
+        assert!(
+            decoded
+                .verified_source_time(&mut |_receipt| -> Result<CompleteActivityPage, &str> {
+                    Err("unexpected lookup")
+                })
+                .is_err()
+        );
+        assert!(decoded.complete_bound().is_none());
+        let state = Arc::new(PaperStateDb::open(&fixture.dir.path().join("frame.db")).unwrap());
+        let error =
+            validate_continuation_rows(&state, vec![durable(&frame)], &fixture.index).unwrap_err();
+        assert_eq!(
+            error.cause,
+            DecisionContinuationError::DurableMismatch.to_string()
+        );
     }
 
     pub(crate) fn binding_state(fixture: &BindingFixture) -> Arc<PaperStateDb> {
