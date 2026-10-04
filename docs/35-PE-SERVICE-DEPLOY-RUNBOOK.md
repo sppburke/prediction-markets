@@ -856,10 +856,12 @@ rollback.
 with one service restart. Copying pauses during that restart; the measured 2026-10-01
 restart took 164 s, not a guaranteed bound. This update preserves the existing era and its
 seal. Its additional rollback boundary is the first durable paper mark recording a
-`closure_receipt`, or the first ordinary-live admission consuming a closed-query price:
-older mark readers reject the added field, and live recovery strictly replays its price receipts.
-Before either write, reverse the swap only if every existing [rollback prerequisite](#rollback)
-also holds; after either write, preserve state and fix forward. Live remains dark unless armed.
+`closure_receipt`, or the first ordinary-live admission this binary records: older mark readers
+reject the added field, and live recovery strictly replays an admission's price receipts, which
+this binary may select from a closed query or from the newest of overlapping pages that older
+readers reject. Before either write, reverse the swap only if every existing
+[rollback prerequisite](#rollback) also holds; after either write, preserve state and fix forward.
+Live remains dark unless armed.
 A paper decision recording a closed-price request alone does not cross this new boundary:
 paper price receipts are replayed by `--qualify`, which already refuses this era's semantic-1
 Start. Stop and drain before inspecting durable state for any reversal, because shutdown can

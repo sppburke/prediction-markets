@@ -11269,6 +11269,58 @@ mod tests {
         );
     }
 
+    /// PASS: a selected page's extra row for a market it did not request is not that market's
+    /// price; the market replays from the page that requested it.
+    #[tokio::test]
+    async fn qualification_ignores_unrequested_rows_in_selected_pages() {
+        let position = |market: &str| PaperPositionRow {
+            market_id: MarketId(VenueMarketId(market.to_owned())),
+            outcome_id: OutcomeId(0),
+            long: ShareAmount::from_whole(1).unwrap(),
+            short: ShareAmount::ZERO,
+        };
+        let b_url = format!(
+            "https://offline.invalid/markets?condition_ids=0xb&limit={GAMMA_BATCH_LIMIT_PARAM}"
+        );
+        let a_url = format!(
+            "https://offline.invalid/markets?condition_ids=0xa&limit={GAMMA_BATCH_LIMIT_PARAM}"
+        );
+        let b_page = source_observation(
+            2,
+            100_000,
+            GAMMA_MARKETS_SOURCE_ID,
+            GAMMA_PRICE_ATTEMPT_SCHEMA_VERSION,
+            GAMMA_PRICE_ATTEMPT_PARSER_VERSION,
+            &gamma_price_page_record(
+                &b_url,
+                100_000,
+                br#"[{"conditionId":"0xb","outcomePrices":"[\"0.5\",\"0.5\"]"}]"#,
+                true,
+            ),
+        );
+        let a_page = source_observation(
+            4,
+            100_000,
+            GAMMA_MARKETS_SOURCE_ID,
+            GAMMA_PRICE_ATTEMPT_SCHEMA_VERSION,
+            GAMMA_PRICE_ATTEMPT_PARSER_VERSION,
+            &gamma_price_page_record(&a_url, 100_000, br#"[{"conditionId":"0xa","outcomePrices":"[\"0.4\",\"0.6\"]"},{"conditionId":"0xb","outcomePrices":"[\"0.9\",\"0.1\"]"}]"#, true),
+        );
+        let receipts = [b_page.receipt, a_page.receipt];
+        let prices = replayed_risk_prices(
+            &receipts,
+            100_000,
+            &[position("0xa"), position("0xb")],
+            &BTreeMap::from([(2, b_page), (4, a_page)]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            prices[&(MarketId(VenueMarketId("0xb".to_owned())), OutcomeId(0))],
+            Price::new(dec!(0.5)).unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn qualification_mark_replays_both_rules_and_authenticates_closure() {
         let cutoff = 1_790_985_600;

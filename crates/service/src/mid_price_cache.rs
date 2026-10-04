@@ -365,7 +365,10 @@ where
             .collect::<HashSet<_>>();
         for row in replayed.markets.markets.into_values() {
             let market = MarketId(pe_core_types::VenueMarketId(row.condition_id.clone()));
-            if !wanted_markets.contains(&market) {
+            // Acquisition stores only a page's requested markets; an extra row is not evidence.
+            if !wanted_markets.contains(&market)
+                || !request.condition_ids.contains(&row.condition_id)
+            {
                 continue;
             }
             let strict_mids = row.strict_outcome_prices;
@@ -1049,6 +1052,12 @@ mod tests {
                 Decimal::ONE,
             ),
             (
+                vec![outcome("0xb", 0)],
+                br#"[{"conditionId":"0xb","outcomePrices":"[\"0.6\",\"0.4\"]"}]"#.to_vec(),
+                vec![outcome("0xa", 0), outcome("0xb", 0)],
+                Decimal::new(6, 1),
+            ),
+            (
                 vec![outcome("0xb", 0), outcome("0xc", 0)],
                 br#"[{"conditionId":"0xb"},{"conditionId":"0xc","outcomePrices":"[\"0.7\",\"0.3\"]"}]"#
                     .to_vec(),
@@ -1140,6 +1149,96 @@ mod tests {
             ingest.abort();
             let _ = ingest.await;
         }
+    }
+
+    /// PASS: a page carrying an extra row for a market it did not request leaves that market's
+    /// selected row unchanged in acquisition, and replay ignores the extra row too.
+    #[tokio::test]
+    async fn extra_unrequested_rows_are_ignored_by_acquisition_and_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let (source_log, source_rx) = SourceLogHandle::channel(4);
+        let (trigger_tx, _trigger_rx) = mpsc::channel(1);
+        let ingest = tokio::spawn(
+            ActivityIngest::poll_only(
+                SourceEventSink::open(&source_path).unwrap(),
+                source_rx,
+                trigger_tx,
+                new_shared_health_with_ws(false, false, 90),
+            )
+            .run(),
+        );
+        let now = datetime!(2026-10-03 00:00 UTC);
+        let cache = MidPriceCache::with_fetcher(
+            FixtureFetcher::new(HashMap::from([
+                (
+                    url(BASE, "0xb"),
+                    br#"[{"conditionId":"0xb","outcomePrices":"[\"0.5\",\"0.5\"]"}]"#.to_vec(),
+                ),
+                (
+                    url(BASE, "0xa"),
+                    br#"[{"conditionId":"0xa","outcomePrices":"[\"0.4\",\"0.6\"]"},{"conditionId":"0xb","outcomePrices":"[\"0.9\",\"0.1\"]"}]"#
+                        .to_vec(),
+                ),
+            ])),
+            BASE.to_owned(),
+        )
+        .with_source_log(source_log)
+        .with_clock(Arc::new(move || now));
+        assert!(
+            cache
+                .fetch_mids_strict_attempt(&[outcome("0xb", 0)])
+                .await
+                .result
+                .is_ok()
+        );
+        assert!(
+            cache
+                .fetch_mids_strict_attempt(&[outcome("0xa", 0)])
+                .await
+                .result
+                .is_ok()
+        );
+        let ids = [outcome("0xa", 0), outcome("0xb", 0)];
+        let attempt = cache.fetch_mids_strict_attempt(&ids).await;
+        let observations = attempt.result.unwrap();
+        assert_eq!(
+            observations[&("0xb".to_owned(), 0)].price.0,
+            Decimal::new(5, 1)
+        );
+        assert_eq!(attempt.price_receipts.len(), 2);
+        let envelopes = pe_event_log::Reader::replay(&source_path)
+            .unwrap()
+            .map(|entry| entry.unwrap().1)
+            .collect::<Vec<_>>();
+        let replayed = replay_strict_risk_prices(
+            &ids,
+            &attempt.price_receipts,
+            i64::try_from(unix_timestamp_ms(now)).unwrap(),
+            |receipt| {
+                let envelope = envelopes
+                    .iter()
+                    .find(|envelope| {
+                        envelope.seq == receipt.sequence && envelope.this_hash == receipt.this_hash
+                    })
+                    .unwrap();
+                Ok(RecordedPriceAttempt {
+                    payload: envelope.payload.clone(),
+                    received_unix_ms: i64::try_from(unix_timestamp_ms(envelope.received_at.0))
+                        .unwrap(),
+                    source_id: envelope.source_id.0.clone(),
+                    schema_version: envelope.schema_version,
+                    parser_version: envelope.parser_version,
+                    content_type: envelope.content_type.clone(),
+                })
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(replayed, observations);
+        drop(cache);
+        ingest.abort();
+        let _ = ingest.await;
     }
 
     #[tokio::test]
