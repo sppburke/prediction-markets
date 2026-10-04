@@ -241,9 +241,10 @@ pub struct ServiceConfig {
     pub maintenance_interval_secs: u64,
 
     /// A live wallet idle (no observed trade) for at least this many seconds is evicted,
-    /// unless it is a proven winner (then spared up to `inactivity_hard_cap_secs`). The
-    /// clock is the admission clock — `max(admission_time, last_observed_trade)` — because
-    /// the poll cursor is seeded to `now` at admission. Default: 259_200 (72 h). See
+    /// unless it is a proven winner (then spared up to `inactivity_hard_cap_secs`).
+    /// Inactivity uses the activity clock (#511), falling back to the delivery cursor. Ranking
+    /// timestamps seed the activity clock without an admission grace period. Default: 259_200
+    /// (72 h). See
     /// `docs/_GLOSSARY.md`: `inactivity_threshold_secs`.
     #[serde(default = "default_inactivity_threshold_secs")]
     pub inactivity_threshold_secs: u64,

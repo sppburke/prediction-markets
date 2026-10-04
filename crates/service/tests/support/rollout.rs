@@ -86,6 +86,7 @@ struct HttpState {
     slow: Semaphore,
     release_slow: std::sync::atomic::AtomicBool,
     gamma_fails: std::sync::atomic::AtomicBool,
+    stale_ranked_wallet_2: std::sync::atomic::AtomicBool,
     gamma_failures: std::sync::atomic::AtomicUsize,
     resolved: std::sync::atomic::AtomicBool,
 }
@@ -234,7 +235,7 @@ async fn serve(
         "/rest/v1/accounts"|"/rest/v1/account_credentials"=>json!([]),
         "/rest/v1/service_config"=>json!(state.rows),
         "/rest/v1/ranking_batches"=>json!([{"batch_id":1}]),
-        "/rest/v1/ranking_entries"|"/rest/v1/latest_ranking"=>json!((1..=state.ranked_wallets).map(|n|json!({"batch_id":1,"rank":n,"wallet_hex":wallet(n).to_string(),"ls_tstat":"3","hit_rate":"0.65","n_trades":100,"last_trade_unix":state.now-20,"survives":true})).collect::<Vec<_>>()),
+        "/rest/v1/ranking_entries"|"/rest/v1/latest_ranking"=>json!((1..=state.ranked_wallets).map(|n|json!({"batch_id":1,"rank":n,"wallet_hex":wallet(n).to_string(),"ls_tstat":"3","hit_rate":"0.65","n_trades":100,"last_trade_unix":if n == 2 && state.stale_ranked_wallet_2.load(Ordering::SeqCst) { state.now - 300_000 } else { state.now - 20 },"survives":true})).collect::<Vec<_>>()),
         "/rest/v1/service_runtime"=>json!([{"updated_at":a.projection_generation.to_string(),"watchlist_size":a.projection.len()}]),
         "/rest/v1/rpc/service_watchlist_replace_v1"=> { assert_eq!(body["expected_token"],a.projection_generation.to_string());a.projection=body["entries"].as_array().unwrap().clone();a.projection_generation+=1;json!([{"new_token":a.projection_generation.to_string(),"count":a.projection.len()}]) },
         "/rest/v1/paper_bankroll"=>json!([{"bankroll_str":a.cash.to_string(),"last_prepared_seq":a.progress}]),
@@ -446,6 +447,7 @@ async fn run_case(boot_waves: bool) {
         slow: Semaphore::new(0),
         release_slow: AtomicBool::new(boot_waves),
         gamma_fails: AtomicBool::new(!boot_waves),
+        stale_ranked_wallet_2: AtomicBool::new(false),
         gamma_failures: std::sync::atomic::AtomicUsize::new(0),
         resolved: AtomicBool::new(false),
     });
@@ -683,6 +685,16 @@ async fn run_case(boot_waves: bool) {
         rusqlite::params![wallet(4).to_string(), now - 4000],
     )
     .unwrap();
+    // Wallet 2's pinned ranking timestamp turns stale: only its recorded activity re-admits it.
+    assert_eq!(
+        c.execute(
+            "UPDATE poll_cursors SET last_activity_unix=?2 WHERE wallet_hex=?1",
+            rusqlite::params![wallet(2).to_string(), now - 20],
+        )
+        .unwrap(),
+        1
+    );
+    state.stale_ranked_wallet_2.store(true, Ordering::SeqCst);
     drop(c);
     let config_path = root.join("service.toml");
     std::fs::write(&config_path, toml::to_string(&cfg).unwrap()).unwrap();

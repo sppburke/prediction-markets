@@ -92,8 +92,8 @@
 > (transport/envelope/constants) and `pe-service::activity_ingest` (readers, liveness,
 > fan-in); the service's `trade_parser` normalizes identically to the REST path. The CLOB
 > market channel remains wallet-anonymous — the note below stands for THAT feed.
-> Last checked: 2026-10-03 (`scripts/probe_activity_ws.py`: the activity subscription delivered
-> 5,414 `trades` frames in 60 s with envelope keys `connection_id`, `payload`, `timestamp`,
+> Last checked: 2026-10-04 (`scripts/probe_activity_ws.py`: the activity subscription delivered
+> 2,694 `trades` frames in 60 s with envelope keys `connection_id`, `payload`, `timestamp`,
 > `topic` and `type`, and `payload.proxyWallet` present).
 >
 > **Historical (2026-06-03, issue #282 Phase 2 verification — CLOB channel still true; RTDS part superseded above).**
