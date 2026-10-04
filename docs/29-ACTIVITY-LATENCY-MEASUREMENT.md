@@ -112,7 +112,7 @@ the subscription/payload contract; no published continuity guarantee — `docs/1
 
 Use [#730 AC10](https://github.com/sppburke/prediction-markets/issues/730) for the fill-cohort
 size and latency acceptance bounds. The measurements below are the audit recipe, not a claim
-that the deployed service has passed. Keep three populations distinct:
+that the deployed service has passed. Keep four populations distinct:
 
 - The first post-deploy websocket-fill cohort, with source identity, continuation version and
   applied configuration fixed per row. Report each stage's available count, median, p90 and
@@ -122,6 +122,8 @@ that the deployed service has passed. Keep three populations distinct:
   A current-watchlist join or price-band screen cannot define this population.
 - BUY units whose first-entry status depends on ordering inside one source second. List these
   separately; each requires a recorded ambiguity refusal or a justified causal suppression.
+- Every new paper fill in the window, websocket or REST, enumerated independently of the
+  populations above for the converse reconciliation below.
 
 Join `decision_pending` by the canonical source group id to its authenticated websocket receipt,
 complete activity-page receipts, `activity_groups` and `entry_gate_results`. Use the gateway
@@ -155,15 +157,19 @@ Run the acceptance audit read-only on captured verified log prefixes and a consi
 snapshot; record deployment revision, config hash, era, window and prefix identities. Prove the
 first BUY from complete attributable public `/activity` history and join it to the recorded
 membership and local group/gate/decision evidence. Classify every member of the audit population
-as filled, correctly refused, refused by a retained Part 2 limitation (thin book, opposite outcome
-or VWAP rounding), or suppressed by a required causal re-anchor. Trace a suppression to the
+as filled, correctly refused, refused under the frozen thin-book or VWAP-rounding rules that
+Part 2 replaces, or suppressed by a required causal re-anchor. Opposite-outcome entries stay
+permitted in Part 1 (the paper hold is keyed by market and outcome): list their fills; a refusal
+for holding the other outcome is a miss. Trace a suppression to the
 causing groups in `activity_groups` insertion order, not only the recorded trigger id: a mixed
 bucket may name a twin while a genuinely new or late group requires the flag. Covered non-twin
 arrivals, unknown-condition redemptions and unresolved non-combo identities retain their
 [canonical causal rule](_GLOSSARY.md#causal-re-anchor-and-rehearsal-rules-557).
 All-twin buckets and known-condition redemptions/combos reaching ordinary routing must not
 create re-anchors. Any other miss fails acceptance; an unproved first-entry status is reported
-as unknown rather than silently removed.
+as unknown rather than silently removed. Conversely, reconcile every new paper fill in the window,
+websocket or REST, to a proven first-entry BUY by a wallet in the recorded membership when it
+traded; a fill without that proof, a same-second-order ambiguity included, fails acceptance.
 
 Inspect the next daily marks against recorded closure proof and available samples under the
 canonical closed-mark rule. A usable in-lookback sample with valid closure proof must not produce

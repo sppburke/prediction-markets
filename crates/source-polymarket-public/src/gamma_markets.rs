@@ -151,6 +151,9 @@ pub struct GammaConditionMarketsWithPages {
     /// the exact missing-price observation instead of inferring it from the source-log tail.
     pub failed_requests: Vec<(String, String)>,
     pub conflicting_condition_ids: Vec<String>,
+    /// Conditions whose repeated rows disagree on `closed` or `closedTime`: their closure
+    /// evidence is ambiguous. Price conflicts stay in `conflicting_condition_ids`.
+    pub conflicting_closure_condition_ids: Vec<String>,
     pub condition_page_hashes: HashMap<String, String>,
 }
 
@@ -309,6 +312,7 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
         let mut pages = Vec::new();
         let mut failed_requests = Vec::new();
         let mut conflicting_condition_ids = Vec::new();
+        let mut conflicting_closure_condition_ids = Vec::new();
         let mut condition_page_hashes = HashMap::new();
         while let Some((chunk, url, result)) = stream.next().await {
             let bytes = match result {
@@ -348,10 +352,15 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
             pages.push((evidence, bytes));
             for m in markets {
                 let market = gamma_market(m);
-                if out.get(&market.condition_id).is_some_and(|prior| {
-                    prior.strict_outcome_prices != market.strict_outcome_prices
-                }) {
-                    conflicting_condition_ids.push(market.condition_id.clone());
+                if let Some(prior) = out.get(&market.condition_id) {
+                    if prior.strict_outcome_prices != market.strict_outcome_prices {
+                        conflicting_condition_ids.push(market.condition_id.clone());
+                    }
+                    if prior.closed != market.closed
+                        || prior.closed_time_unix != market.closed_time_unix
+                    {
+                        conflicting_closure_condition_ids.push(market.condition_id.clone());
+                    }
                 }
                 condition_page_hashes.insert(
                     market.condition_id.clone(),
@@ -370,6 +379,7 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
             pages,
             failed_requests,
             conflicting_condition_ids,
+            conflicting_closure_condition_ids,
             condition_page_hashes,
         })
     }
@@ -714,17 +724,22 @@ fn parse_rfc3339_unix(s: &str) -> Option<i64> {
         .ok()
 }
 
+/// A fractional closure second counts as the next whole second, so `closed_time_unix <= cutoff`
+/// never admits a closure after the cutoff.
 fn parse_closed_time_unix(s: &str) -> Option<i64> {
-    parse_rfc3339_unix(s).or_else(|| {
-        time::OffsetDateTime::parse(
-            s,
-            &time::macros::format_description!(
-                "[year]-[month]-[day] [hour]:[minute]:[second][offset_hour sign:mandatory]"
-            ),
-        )
-        .map(|dt| dt.unix_timestamp())
-        .ok()
-    })
+    let closed = time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+        .or_else(|_| {
+            time::OffsetDateTime::parse(
+                s,
+                &time::macros::format_description!(
+                    "[year]-[month]-[day] [hour]:[minute]:[second][offset_hour sign:mandatory]"
+                ),
+            )
+        })
+        .ok()?;
+    closed
+        .unix_timestamp()
+        .checked_add(i64::from(closed.nanosecond() > 0))
 }
 
 /// Serde DTO for one element of the `/markets` response array. Extra fields are ignored.
@@ -1014,6 +1029,15 @@ mod tests {
         for value in ["", "unknown", "2026-10-02 23:51:02"] {
             assert_eq!(parse_closed_time_unix(value), None);
         }
+        // A fractional second rounds up: a closure 500 ms after midnight is after that cutoff.
+        assert_eq!(
+            parse_closed_time_unix("2026-10-03T00:00:00Z"),
+            Some(1_790_985_600)
+        );
+        assert_eq!(
+            parse_closed_time_unix("2026-10-03T00:00:00.500Z"),
+            Some(1_790_985_601)
+        );
     }
 
     #[test]
@@ -1272,6 +1296,26 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.conflicting_condition_ids, vec!["condition"]);
+        assert!(result.conflicting_closure_condition_ids.is_empty());
+    }
+
+    /// PASS: repeated rows that disagree on closure are a closure conflict in either order, while
+    /// equal prices keep them out of the price conflicts.
+    #[tokio::test]
+    async fn condition_batch_reports_conflicting_duplicate_closure_in_either_order() {
+        let ids = ids(&["condition"]);
+        let url = build_batch_url("https://g", &ids, "&closed=true", GAMMA_BATCH_LIMIT_PARAM);
+        let early = r#"{"conditionId":"condition","closed":true,"closedTime":"2026-10-02 23:51:02+00","outcomePrices":"[\"0.4\",\"0.6\"]"}"#;
+        let late = r#"{"conditionId":"condition","closed":true,"closedTime":"2026-10-03 00:00:01+00","outcomePrices":"[\"0.4\",\"0.6\"]"}"#;
+        for raw in [format!("[{early},{late}]"), format!("[{late},{early}]")] {
+            let fetcher = FixtureFetcher::new(HashMap::from([(url.clone(), raw.into_bytes())]));
+            let result = GammaMarketsClient::new("https://g".to_owned(), fetcher)
+                .fetch_markets_with_pages(&ids, MarketFilter::ClosedOnly)
+                .await
+                .unwrap();
+            assert_eq!(result.conflicting_closure_condition_ids, vec!["condition"]);
+            assert!(result.conflicting_condition_ids.is_empty());
+        }
     }
 
     /// PASS: a request rejected before a response page retains its exact URL for the caller-owned

@@ -220,6 +220,14 @@ pub(crate) async fn replay_paper_mark_price(
     .fetch_markets_with_pages(&request.condition_ids, request.filter)
     .await
     .map_err(|error| BoundaryMarkError::Classification(error.to_string()))?;
+    if fetched
+        .conflicting_closure_condition_ids
+        .contains(&price.market_id)
+    {
+        return Err(BoundaryMarkError::Invalid(
+            RiskInputsUnavailable::MarkInvalid,
+        ));
+    }
     let closure =
         fetched
             .markets
@@ -2121,6 +2129,26 @@ mod tests {
             .unwrap();
         assert_eq!(selected.price, price.price.unwrap());
         assert_eq!(selected.sample_unix, price.sample_unix.unwrap());
+        // Closure after the cutoff (a fractional second rounds up) or conflicting repeated rows,
+        // in either order, stay invalid.
+        let rows: serde_json::Value = serde_json::from_slice(closure).unwrap();
+        let mut late = rows[0].clone();
+        late["closedTime"] = serde_json::json!("2026-10-03 00:00:01+00");
+        let mut fraction = rows[0].clone();
+        fraction["closedTime"] = serde_json::json!("2026-10-03T00:00:00.500Z");
+        for invalid in [
+            serde_json::json!([fraction]),
+            serde_json::json!([late.clone(), rows[0].clone()]),
+            serde_json::json!([rows[0].clone(), late]),
+        ] {
+            let payload = serde_json::to_vec(&invalid).unwrap();
+            assert!(matches!(
+                replay_paper_mark_price(&price, token, cutoff, history, Some(&payload)).await,
+                Err(BoundaryMarkError::Invalid(
+                    RiskInputsUnavailable::MarkInvalid
+                ))
+            ));
+        }
         let mut marked = mark(2, cutoff, dec!(99.001), None);
         let PaperLogFrame::Record(PaperLogRecord::PortfolioMark(mark)) =
             &mut Arc::make_mut(&mut marked).frame

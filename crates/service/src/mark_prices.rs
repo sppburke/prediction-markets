@@ -110,6 +110,15 @@ impl HistoricalMarkAdapter {
             GammaMarketsError::Fetch(message) => BoundaryMarkError::Retryable(message),
             error => BoundaryMarkError::Classification(error.to_string()),
         })?;
+        if fetched
+            .conflicting_closure_condition_ids
+            .iter()
+            .any(|conflict| conflict == condition_id)
+        {
+            return Err(BoundaryMarkError::Invalid(
+                crate::risk_inputs::RiskInputsUnavailable::MarkInvalid,
+            ));
+        }
         let closure =
             fetched
                 .markets
@@ -269,13 +278,29 @@ mod tests {
             include_bytes!("../tests/fixtures/london_closed_mark/prices_history_13d.json").to_vec();
         let gamma =
             include_bytes!("../tests/fixtures/london_closed_mark/gamma_closed.json").to_vec();
-        for mutation in ["closed", "open", "later", "unknown", "wrong_condition"] {
+        for mutation in [
+            "closed",
+            "open",
+            "later",
+            "fraction_after",
+            "unknown",
+            "wrong_condition",
+            "conflict_late_first",
+            "conflict_late_last",
+        ] {
             let mut closure: serde_json::Value = serde_json::from_slice(&gamma).unwrap();
+            let mut late = closure[0].clone();
+            late["closedTime"] = serde_json::json!("2026-10-03 00:00:01+00");
             match mutation {
                 "open" => closure[0]["closed"] = serde_json::json!(false),
-                "later" => closure[0]["closedTime"] = serde_json::json!("2026-10-03 00:00:01+00"),
+                "later" => closure[0] = late,
+                "fraction_after" => {
+                    closure[0]["closedTime"] = serde_json::json!("2026-10-03T00:00:00.500Z");
+                }
                 "unknown" => closure[0]["closedTime"] = serde_json::Value::Null,
                 "wrong_condition" => closure[0]["conditionId"] = serde_json::json!("other"),
+                "conflict_late_first" => closure = serde_json::json!([late, closure[0].clone()]),
+                "conflict_late_last" => closure = serde_json::json!([closure[0].clone(), late]),
                 _ => {}
             }
             let closure = if mutation == "closed" {
