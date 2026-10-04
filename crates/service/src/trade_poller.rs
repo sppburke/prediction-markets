@@ -1848,10 +1848,20 @@ impl WalletOperation {
         if selected.is_empty() {
             return Ok(result);
         }
-        // A restamp counts with its original only as a twin of a recorded original: a pair first
-        // seen together keeps the ambiguity fence, because bucket routing would apply both.
-        let restamp_pairs = crate::bucket_commit::read_restamp_pairs(rows)
-            .map_err(ActivityReadError::from)?
+        let pairs =
+            crate::bucket_commit::read_restamp_pairs(rows).map_err(ActivityReadError::from)?;
+        // A pair first seen together, neither stamp recorded, is one trade that bucket routing
+        // would apply twice, so a feed observation of either stamp keeps the ambiguity fence.
+        let mut first_seen = HashSet::new();
+        for (restamp, original) in &pairs {
+            if self.paper_state.activity_group_state(restamp)?.is_none()
+                && self.paper_state.activity_group_state(original)?.is_none()
+            {
+                first_seen.extend([restamp.clone(), original.clone()]);
+            }
+        }
+        // A restamp counts with its original only as a twin of a recorded original.
+        let restamp_pairs = pairs
             .into_iter()
             .filter(|(restamp, _)| restamp_twins.contains(restamp))
             .collect::<HashMap<_, _>>();
@@ -1958,7 +1968,11 @@ impl WalletOperation {
                 if !by_group.contains_key(&obligation.group_id) && provenance.is_none() {
                     candidates.clear();
                 }
-                if candidates.len() > 1 {
+                if candidates.len() > 1
+                    || candidates
+                        .iter()
+                        .any(|candidate| first_seen.contains(candidate.group_id.key()))
+                {
                     result
                         .ambiguous
                         .push((obligation.group_id.clone(), obligation.receipt));

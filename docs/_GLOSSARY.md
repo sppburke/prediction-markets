@@ -351,9 +351,10 @@ group's id and semantic revision (and whose outcome agrees with a recorded trade
 recorded `raw_only`, with no ledger, first-entry history, re-anchor or fence effect, including under
 anchor coverage and beside exact recorded groups. In feed correlation, a twin listed beside its
 recorded original counts with it as one candidate, so an `activity/trades` observation stamped
-like neither binds the original. A pair first seen together, or genuinely distinct candidates,
-keep the invalid-mapping fence. A twin mixed with a genuinely new group keeps the existing
-routing. Revisions still fence; partially recorded non-twin buckets retain their fence,
+like neither binds the original. An observation of either stamp of a pair first seen together
+(neither recorded), or one fitting genuinely distinct candidates, keeps the invalid-mapping fence;
+without a feed observation, such a pair keeps today's routing. A twin mixed with a genuinely new
+group keeps the existing routing. Revisions still fence; partially recorded non-twin buckets retain their fence,
 and covered non-twin arrivals retain `anchor_covered_late` re-anchoring.
 
 Known-condition `RequiresAnchor` redemptions and TRADE/REDEEM combos reaching ordinary routing
