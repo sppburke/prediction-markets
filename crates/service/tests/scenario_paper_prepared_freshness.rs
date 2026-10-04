@@ -113,7 +113,27 @@ fn runtime() -> RuntimeConfig {
 use support::{Page, PriceGate, Prices};
 
 #[derive(Default)]
-struct Books(Mutex<HashMap<String, OrderBook>>);
+struct Books {
+    values: Mutex<HashMap<String, OrderBook>>,
+    gate: Arc<PriceGate>,
+}
+
+#[derive(Clone)]
+struct CountingPrices {
+    inner: Prices,
+    requests: Arc<AtomicUsize>,
+}
+impl pe_source_polymarket_public::PageFetcher for CountingPrices {
+    async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, pe_source_core::SourceError> {
+        self.requests.fetch_add(1, Ordering::SeqCst);
+        self.inner.fetch_page(url).await
+    }
+}
+
+struct BookEconomics {
+    depth: Decimal,
+    fee_free: bool,
+}
 struct DelayedPage {
     page: Vec<u8>,
     misses: AtomicUsize,
@@ -141,8 +161,14 @@ impl pe_source_polymarket_public::ReconciliationFetcher for DelayedPage {
     }
 }
 impl ClobBookFetcher for Books {
-    async fn fetch_book(&self, _: &str, token: &str) -> Result<OrderBook, ClobBookError> {
-        self.0
+    async fn fetch_book(&self, condition: &str, token: &str) -> Result<OrderBook, ClobBookError> {
+        if self.gate.market.lock().unwrap().as_deref() == Some(condition)
+            && self.gate.blocked.swap(false, Ordering::SeqCst)
+        {
+            self.gate.started.notify_one();
+            self.gate.release.notified().await;
+        }
+        self.values
             .lock()
             .unwrap()
             .get(token)
@@ -240,6 +266,8 @@ struct Harness {
     hooks: Arc<ScenarioHooks>,
     books: Arc<Books>,
     prices: Prices,
+    mid_requests: Arc<AtomicUsize>,
+    watchlist: LiveWatchlist,
     authority: Authority,
     live: LiveAccounts,
     admission_builder: Option<LiveAdmissionBuilder>,
@@ -255,17 +283,34 @@ impl Harness {
     }
 
     async fn new_with_semantic(financial_semantic_version: u32) -> Self {
+        Self::new_with_configuration(financial_semantic_version, runtime()).await
+    }
+
+    async fn new_with_configuration(
+        financial_semantic_version: u32,
+        config: RuntimeConfig,
+    ) -> Self {
+        Self::new_with_leaders(financial_semantic_version, config, vec![wallet()]).await
+    }
+
+    async fn new_with_leaders(
+        financial_semantic_version: u32,
+        config: RuntimeConfig,
+        leaders: Vec<WalletAddress>,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
-        paper
-            .record_reconciled_history_status(&WalletHistoryStatusRecord {
-                wallet: wallet(),
-                complete: true,
-                proof_json: "{}".to_owned(),
-                updated_at_unix: EPOCH - 1,
-            })
-            .unwrap();
-        support::install_verified_empty_anchor(&paper, wallet(), 0);
+        for leader in &leaders {
+            paper
+                .record_reconciled_history_status(&WalletHistoryStatusRecord {
+                    wallet: *leader,
+                    complete: true,
+                    proof_json: "{}".to_owned(),
+                    updated_at_unix: EPOCH - 1,
+                })
+                .unwrap();
+            support::install_verified_empty_anchor(&paper, *leader, 0);
+        }
         let live_path = dir.path().join("live_journal.log");
         drop(pe_execution_core::LiveJournal::open(&live_path).unwrap());
         let empty = TailBinding {
@@ -282,14 +327,13 @@ impl Harness {
             ),
             artifact_blake3: "fixture".to_owned(),
             static_config_hash: "fixture".to_owned(),
-            hot_config_hash: runtime().canonical_hash(),
+            hot_config_hash: config.canonical_hash(),
             generation: "prepared-freshness".to_owned(),
             activation_id: "prepared-freshness".to_owned(),
             ranking_batch_id: 588,
-            membership: vec![wallet()],
+            membership: leaders.clone(),
             membership_proofs_hash: pe_service::qualification::scenario_membership_proofs_hash(
-                &paper,
-                &[wallet()],
+                &paper, &leaders,
             )
             .unwrap(),
             schema_version: 3,
@@ -328,8 +372,18 @@ impl Harness {
         );
         let hooks = Arc::new(ScenarioHooks::default());
         hooks.financial_clock_unix.store(EPOCH, Ordering::SeqCst);
+        let mut membership = (*watchlist().snapshot()).clone();
+        let entry = membership.entries[0].clone();
+        membership.entries = leaders
+            .into_iter()
+            .map(|wallet| pe_trader_index::WatchlistEntry {
+                wallet,
+                ..entry.clone()
+            })
+            .collect();
+        membership.active_count = membership.entries.len();
         Self {
-            config: runtime(),
+            config,
             copy_budget_secs: 2,
             probability: pe_core_types::Probability::new(dec!(0.7)).unwrap(),
             dir,
@@ -352,6 +406,8 @@ impl Harness {
                 fail: Arc::new(AtomicBool::new(false)),
             },
             live: LiveAccounts::new(LiveAccountsSnapshot::default()),
+            mid_requests: Arc::new(AtomicUsize::new(0)),
+            watchlist: LiveWatchlist::new(membership),
             admission_builder: None,
             control: None,
             task: None,
@@ -381,6 +437,15 @@ impl Harness {
         &self,
         ordinal: u32,
         paper_rule: Option<(Decimal, Decimal, Option<i64>)>,
+    ) -> Recorded {
+        self.record_with_economics(ordinal, paper_rule, None).await
+    }
+
+    async fn record_with_economics(
+        &self,
+        ordinal: u32,
+        paper_rule: Option<(Decimal, Decimal, Option<i64>)>,
+        economics: Option<BookEconomics>,
     ) -> Recorded {
         let condition = format!("0x{ordinal:064x}");
         let token = (ordinal * 2 + 11).to_string();
@@ -452,6 +517,23 @@ impl Harness {
         if let Some((_, ask, _)) = paper_rule {
             book["asks"] = json!([{"price": ask.normalize().to_string(), "size": "100"}]);
         }
+        if let Some(economics) = economics {
+            book["asks"][0]["size"] = economics.depth.normalize().to_string().into();
+            gamma[0]["orderPriceMinTickSize"] = "0.0001".into();
+            long["minimum_tick_size"] = "0.0001".into();
+            compact["mts"] = json!("0.0001");
+            if economics.fee_free {
+                compact["fd"]["r"] = json!(0);
+                for field in ["makerBaseFee", "takerBaseFee"] {
+                    gamma[0][field] = json!(0);
+                }
+                for field in ["maker_base_fee", "taker_base_fee"] {
+                    long[field] = json!(0);
+                }
+                compact["mbf"] = json!(0);
+                compact["tbf"] = json!(0);
+            }
+        }
         let activity = serde_json::to_vec(&activity).unwrap();
         let gamma = serde_json::to_vec(&gamma).unwrap();
         let long = serde_json::to_vec(&long).unwrap();
@@ -494,7 +576,7 @@ impl Harness {
         let mut parsed = OrderBook::from_book_json(&book).unwrap();
         parsed.source_receipt = Some(book_receipt);
         parsed.fetched_at_ms = u64::try_from(EPOCH * 1000).unwrap();
-        self.books.0.lock().unwrap().insert(token, parsed);
+        self.books.values.lock().unwrap().insert(token, parsed);
         let read = support::producer_shaped_read_v2(
             wallet(),
             &activity,
@@ -513,7 +595,7 @@ impl Harness {
     fn start(&mut self, enabled: bool) {
         let (control, receiver) = mpsc::channel(4);
         let mut owner = Orchestrator::new_with_authority(
-            watchlist(),
+            self.watchlist.clone(),
             OrchestratorConfig {
                 bankroll: self.paper.bankroll().unwrap().unwrap_or(CASH),
                 mode: ExecutionMode::Paper,
@@ -544,9 +626,15 @@ impl Harness {
             self.paper.clone(),
             build_leader_ledger(&self.paper).unwrap(),
             new_shared_health_with_ws(false, true, 90),
-            MidPriceCache::with_fetcher(self.prices.clone(), "fixture://gamma".to_owned())
-                .with_source_log(self.source.clone())
-                .with_clock(Arc::new(at)),
+            MidPriceCache::with_fetcher(
+                CountingPrices {
+                    inner: self.prices.clone(),
+                    requests: self.mid_requests.clone(),
+                },
+                "fixture://gamma".to_owned(),
+            )
+            .with_source_log(self.source.clone())
+            .with_clock(Arc::new(at)),
             receiver,
             None,
             self.authority.clone(),
@@ -666,7 +754,7 @@ impl Harness {
                 activity_ws_enabled: stream_epoch.is_some(),
                 copy_latency_budget_secs: self.copy_budget_secs,
             },
-            watchlist(),
+            self.watchlist.clone(),
             delayed.clone(),
             Arc::new(AssetIdentityResolver::new_runtime(
                 Arc::new(Page(recorded.gamma.clone())),
@@ -786,8 +874,11 @@ impl Harness {
             })
             .await
             .unwrap();
+        let activity: Value = serde_json::from_slice(&recorded.activity).unwrap();
+        let source_wallet =
+            WalletAddress::from_hex(activity[0]["proxyWallet"].as_str().unwrap()).unwrap();
         let read = support::producer_shaped_read_v2(
-            wallet(),
+            source_wallet,
             &recorded.activity,
             recorded.epoch,
             recorded.epoch,
@@ -830,6 +921,22 @@ impl Harness {
             )
             .unwrap();
         assert_eq!(result.pending, vec![recorded.id.clone()]);
+    }
+
+    fn set_continuation_version(&self, recorded: &Recorded, version: u16) {
+        let row = self.terminal(recorded);
+        let mut wire: Value = serde_json::from_str(&row.frozen_inputs_json).unwrap();
+        wire["version"] = json!(version);
+        if version <= 6 {
+            wire.as_object_mut().unwrap().remove("source_authority");
+        }
+        rusqlite::Connection::open(self.dir.path().join("paper.db"))
+            .unwrap()
+            .execute(
+                "UPDATE decision_pending SET frozen_inputs_json = ?1 WHERE source_trade_id = ?2",
+                rusqlite::params![wire.to_string(), recorded.id.0],
+            )
+            .unwrap();
     }
 
     async fn barrier(&self) {
@@ -1025,10 +1132,10 @@ async fn bound_source_clock_expires_shared_dispatch_on_first_pass_and_restart() 
             .lock()
             .unwrap()
             .push_back(recorded.admission.clone());
-        *h.prices.gate.market.lock().unwrap() =
+        *h.books.gate.market.lock().unwrap() =
             Some(recorded.admission.market.condition_id.0.clone());
-        h.prices.gate.blocked.store(true, Ordering::SeqCst);
-        let gate = h.prices.gate.clone();
+        h.books.gate.blocked.store(true, Ordering::SeqCst);
+        let gate = h.books.gate.clone();
         h.start(true);
         {
             let pending = h.poll_source(&recorded, Some(EPOCH), initial_at);
@@ -3676,4 +3783,279 @@ fn source_envelope(h: &Harness, receipt: AppendReceipt) -> pe_event_log::EventEn
         .unwrap();
     assert_eq!(envelope.this_hash, receipt.this_hash);
     envelope
+}
+
+fn dollar_runtime() -> RuntimeConfig {
+    let mut config = runtime();
+    config.sizing_mode = SizingMode::Dollar { usd: dec!(25) };
+    config.sizing_dollar_usd = dec!(25);
+    config
+}
+
+#[tokio::test]
+async fn floor_fill_without_mid() {
+    for version in [7, 6] {
+        let mut h =
+            Harness::new_with_configuration(if version == 7 { 3 } else { 2 }, dollar_runtime())
+                .await;
+        let recorded = h
+            .record_with_economics(
+                1,
+                Some((dec!(0.15), dec!(0.15), Some(0))),
+                Some(BookEconomics {
+                    depth: dec!(1000),
+                    fee_free: true,
+                }),
+            )
+            .await;
+        h.freeze(&recorded, true).await;
+        h.set_continuation_version(&recorded, version);
+        h.attempt(&recorded, at());
+        h.start(true);
+        h.barrier().await;
+        let row = h.terminal(&recorded);
+        let replay = replay_decision_pending(&row).unwrap();
+        let book = replay.post_boundary.body.book.as_ref().unwrap();
+        let expected_shares = (dec!(25) / dec!(0.15))
+            .round_dp_with_strategy(6, rust_decimal::RoundingStrategy::ToNegativeInfinity);
+        let expected_spend = (expected_shares * dec!(0.15))
+            .round_dp_with_strategy(6, rust_decimal::RoundingStrategy::ToNegativeInfinity);
+        assert_eq!(expected_shares, dec!(166.666666));
+        assert_eq!(expected_spend, dec!(24.999999));
+        let vwap = expected_spend / expected_shares;
+        assert!(vwap < dec!(0.15));
+        assert_eq!(
+            book.vwap_basis
+                .as_ref()
+                .unwrap()
+                .parse::<Decimal>()
+                .unwrap(),
+            vwap
+        );
+        if version == 7 {
+            assert_eq!(h.mid_requests.load(Ordering::SeqCst), 0);
+            assert!(replay.post_boundary.body.market_price.is_none());
+            assert_eq!(row.terminal_disposition.as_deref(), Some("fill"));
+            let fills = h.authority.inner.lock().unwrap();
+            assert_eq!(fills.fills.len(), 1);
+            assert_eq!(fills.fills[0].0.quantity.to_decimal(), expected_shares);
+            assert_eq!(fills.fills[0].0.principal.to_decimal(), dec!(25));
+            assert_eq!(fills.fills[0].0.fill_price.0, vwap);
+            assert_eq!(h.prepared_count(), 1);
+            assert!(replay.post_boundary.body.terminal.final_receipt.is_some());
+        } else {
+            assert_eq!(h.mid_requests.load(Ordering::SeqCst), 1);
+            assert!(
+                replay
+                    .post_boundary
+                    .body
+                    .market_price
+                    .as_ref()
+                    .unwrap()
+                    .mid_price
+                    .is_some()
+            );
+            assert_eq!(
+                replay.post_boundary.body.terminal.reason,
+                "fill_price_below_min"
+            );
+            assert_eq!(h.prepared_count(), 0);
+        }
+        h.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn semantic_three_partial_replay() {
+    let mut h = Harness::new_with_configuration(3, dollar_runtime()).await;
+    let recorded = h
+        .record_with_economics(
+            1,
+            Some((dec!(0.50), dec!(0.50), Some(0))),
+            Some(BookEconomics {
+                depth: dec!(20.123457),
+                fee_free: false,
+            }),
+        )
+        .await;
+    h.attempt(&recorded, at());
+    h.start(true);
+    h.poll(&recorded).await;
+    assert_eq!(
+        h.terminal(&recorded).terminal_disposition.as_deref(),
+        Some("fill")
+    );
+    let replay = replay_decision_pending(&h.terminal(&recorded)).unwrap();
+    assert_eq!(replay.continuation.version(), 7);
+    assert_eq!(replay.post_boundary.financial_semantic_version, 3);
+    let fills = h.authority.inner.lock().unwrap().fills.clone();
+    assert_eq!(fills.len(), 1);
+    assert!(fills[0].0.principal.to_decimal() < dec!(25));
+    assert!(fills[0].0.fee.to_decimal() > Decimal::ZERO);
+    let report = h.qualify_one_fill().await;
+    assert!(report.replay.exact, "{:?}", report.replay);
+    assert_eq!(report.replay.fills, 1);
+}
+
+#[tokio::test]
+async fn homogeneous_same_second_production_and_qualification() {
+    let mut h = Harness::new().await;
+    let mut recorded = h.record(1).await;
+    let mut activity: Value = serde_json::from_slice(&recorded.activity).unwrap();
+    let mut second = activity[0].clone();
+    second["transactionHash"] = format!("0x{:064x}", 900).into();
+    activity.as_array_mut().unwrap().push(second);
+    recorded.activity = serde_json::to_vec(&activity).unwrap();
+    let read = support::producer_shaped_read_v2(
+        wallet(),
+        &recorded.activity,
+        recorded.epoch,
+        recorded.epoch,
+        support::scenario_receipt(1),
+    );
+    recorded.id = read
+        .aggregates
+        .iter()
+        .map(|aggregate| aggregate.group_id.key().clone())
+        .min_by(|a, b| a.0.cmp(&b.0))
+        .unwrap();
+    h.attempt(&recorded, at());
+    h.start(true);
+    h.poll(&recorded).await;
+    assert_eq!(h.paper.decision_pending_history().unwrap().len(), 1);
+    assert_eq!(h.paper.gate_history().unwrap()[&wallet()].len(), 1);
+    assert_eq!(h.paper.leader_positions().unwrap().len(), 1);
+    assert_eq!(
+        h.paper.leader_positions().unwrap()[0]
+            .long_contracts
+            .to_decimal(),
+        dec!(10)
+    );
+    assert_eq!(h.prepared_count(), 1);
+    let report = h.qualify_one_fill().await;
+    assert!(report.replay.exact, "{:?}", report.replay);
+    assert_eq!(report.replay.fills, 1);
+}
+
+#[tokio::test]
+async fn held_market_across_leaders_and_outcomes() {
+    let other = WalletAddress::from_hex("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+    for version in [7, 6] {
+        let mut h = Harness::new_with_leaders(
+            if version == 7 { 3 } else { 2 },
+            runtime(),
+            vec![wallet(), other],
+        )
+        .await;
+        let held = h.record(1).await;
+        h.freeze(&held, true).await;
+        h.set_continuation_version(&held, version);
+        let market = held.admission.market.condition_id.0.clone();
+        let token = held.admission.market.ordered_outcome_token_ids[1].0.clone();
+        let payload = serde_json::to_vec(
+            &json!({"market":market,"asset_id":token,"asks":[{"price":"0.50","size":"100"}]}),
+        )
+        .unwrap();
+        let receipt = h.append("polymarket.clob.book", &payload).await;
+        let mut book = OrderBook::from_book_json(&payload).unwrap();
+        book.source_receipt = Some(receipt);
+        book.fetched_at_ms = u64::try_from(EPOCH * 1000).unwrap();
+        h.books.values.lock().unwrap().insert(token.clone(), book);
+        let mut activity: Value = serde_json::from_slice(&held.activity).unwrap();
+        activity[0]["proxyWallet"] = other.to_string().into();
+        activity[0]["asset"] = token.into();
+        activity[0]["outcomeIndex"] = json!(1);
+        activity[0]["outcome"] = json!("No");
+        activity[0]["timestamp"] = json!(EPOCH + 1);
+        activity[0]["transactionHash"] = format!("0x{:064x}", 901).into();
+        let activity = serde_json::to_vec(&activity).unwrap();
+        let read = support::producer_shaped_read_v2(
+            other,
+            &activity,
+            EPOCH + 1,
+            EPOCH + 1,
+            support::scenario_receipt(1),
+        );
+        let second = Recorded {
+            epoch: EPOCH + 1,
+            activity,
+            gamma: held.gamma.clone(),
+            id: read.aggregates[0].group_id.key().clone(),
+            admission: held.admission.clone(),
+        };
+        h.freeze(&second, true).await;
+        h.set_continuation_version(&second, version);
+        h.attempt(&held, at());
+        h.attempt(&second, at() + time::Duration::seconds(1));
+        h.arm();
+        h.start(true);
+        h.barrier().await;
+        assert_eq!(
+            h.terminal(&held).terminal_disposition.as_deref(),
+            Some("fill")
+        );
+        let row = h.terminal(&second);
+        let replay = replay_decision_pending(&row).unwrap();
+        assert!(
+            h.paper.gate_history().unwrap()[&other].contains(&pe_core_types::MarketId(
+                pe_core_types::VenueMarketId(market)
+            ))
+        );
+        assert_eq!(h.paper.decision_pending_history().unwrap().len(), 2);
+        if version == 7 {
+            assert_eq!(row.terminal_disposition.as_deref(), Some("no_fill"));
+            assert_eq!(
+                replay.post_boundary.body.terminal.reason,
+                "paper_held_market"
+            );
+            assert_eq!(h.prepared_count(), 1);
+            assert_eq!(h.paper.open_positions().unwrap().len(), 1);
+            assert!(replay.post_boundary.body.terminal.dispatch_id.is_some());
+        } else {
+            assert_eq!(row.terminal_disposition.as_deref(), Some("fill"));
+            assert_eq!(h.prepared_count(), 2);
+            assert_eq!(h.paper.open_positions().unwrap().len(), 2);
+        }
+        h.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn mixed_same_second_outcomes_stay_ambiguous_in_production() {
+    let mut h = Harness::new().await;
+    let mut recorded = h.record(1).await;
+    let mut activity: Value = serde_json::from_slice(&recorded.activity).unwrap();
+    let mut second = activity[0].clone();
+    second["transactionHash"] = format!("0x{:064x}", 902).into();
+    second["asset"] = recorded.admission.market.ordered_outcome_token_ids[1]
+        .0
+        .clone()
+        .into();
+    second["outcomeIndex"] = json!(1);
+    second["outcome"] = json!("No");
+    activity.as_array_mut().unwrap().push(second);
+    recorded.activity = serde_json::to_vec(&activity).unwrap();
+    h.start(true);
+    h.poll(&recorded).await;
+    assert!(h.paper.decision_pending_history().unwrap().is_empty());
+    assert_eq!(h.paper.gate_history().unwrap()[&wallet()].len(), 1);
+    assert_eq!(h.paper.leader_positions().unwrap().len(), 2);
+    for aggregate in support::producer_shaped_read_v2(
+        wallet(),
+        &recorded.activity,
+        recorded.epoch,
+        recorded.epoch,
+        support::scenario_receipt(1),
+    )
+    .aggregates
+    {
+        let group = h
+            .paper
+            .activity_group_state(aggregate.group_id.key())
+            .unwrap()
+            .unwrap();
+        assert_eq!(group.disposition, "ambiguous_first_entry_same_second");
+    }
+    assert_eq!(h.prepared_count(), 0);
+    h.stop().await;
 }

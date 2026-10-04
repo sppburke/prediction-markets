@@ -3904,6 +3904,7 @@ fn replay_source_backed_economic_with_live_binding<L>(
     economic: &EconomicPrepared,
     evidence_cutoff_unix_ms: i64,
     cash_before: CollateralAmount,
+    paper_continuation_version: Option<u16>,
     live_binding: Option<LiveObservationBinding<'_>>,
     mut lookup: L,
 ) -> Result<SourceBackedEconomicReplay, EconomicReplayError>
@@ -4096,7 +4097,11 @@ where
             .map_err(|error| {
                 economic_replay_error(format!("economic Dollar budget is invalid: {error}"))
             })?;
-            BuySizing::Dollar { budget }
+            if paper_continuation_version == Some(7) && live_binding.is_none() {
+                BuySizing::DollarUpTo { budget }
+            } else {
+                BuySizing::Dollar { budget }
+            }
         }
         SizingModeAudit::Contract { contracts } => BuySizing::Contract { contracts },
         SizingModeAudit::Kelly { .. } => BuySizing::Kelly {
@@ -4143,6 +4148,7 @@ pub(crate) fn replay_source_backed_economic<L>(
     economic: &EconomicPrepared,
     evidence_cutoff_unix_ms: i64,
     cash_before: CollateralAmount,
+    paper_continuation_version: u16,
     lookup: L,
 ) -> Result<SourceBackedEconomicReplay, EconomicReplayError>
 where
@@ -4152,6 +4158,7 @@ where
         economic,
         evidence_cutoff_unix_ms,
         cash_before,
+        Some(paper_continuation_version),
         None,
         lookup,
     )
@@ -4285,6 +4292,7 @@ fn verify_replayed_live_risk_with_index(
         &admission.economic,
         evaluated_at_unix_ms,
         cash_before,
+        None,
         Some(LiveObservationBinding {
             account_id,
             identity: &admission.identity,
@@ -9098,6 +9106,7 @@ mod tests {
             &economic,
             clob_long_received_unix_ms.saturating_add(10_000),
             CollateralAmount::from_atomic(10_000_000),
+            6,
             |receipt| {
                 observations
                     .iter()
@@ -9158,6 +9167,7 @@ mod tests {
             &economic,
             21_000,
             CollateralAmount::from_atomic(10_000_000),
+            6,
             |receipt| {
                 sources
                     .iter()
@@ -9236,6 +9246,7 @@ mod tests {
                     economic,
                     21_000,
                     CollateralAmount::from_atomic(10_000_000),
+                    6,
                     |receipt| {
                         sources
                             .iter()
@@ -9261,6 +9272,116 @@ mod tests {
             assert_eq!(recomposed.version, economic.version);
             assert_eq!(recomposed.balance.chase_ceiling, Price::ONE);
         }
+    }
+
+    #[test]
+    fn paper_partial_policy_is_not_live_wire_two() {
+        let mut economic = finality_prepared().economic.clone();
+        economic.version = 2;
+        economic.observation = None;
+        economic.balance.chase_ceiling = Price::ONE;
+        economic.admission.market.observed_at_unix = 20;
+        economic.admission.settlement.observed_at_unix = 20;
+        economic.sizing.mode = SizingModeAudit::Dollar { usd: dec!(25) };
+        economic.risk.snapshot.per_trade_cap_bps = 10_000;
+        let payloads = economic_source_payloads(&economic.market.condition_id.0);
+        let sources = [
+            economic.admission.receipts.gamma,
+            economic.admission.receipts.clob_long,
+            economic.admission.receipts.clob_compact,
+            economic.book_receipt,
+        ]
+        .into_iter()
+        .zip([
+            GAMMA_MARKETS_SOURCE_ID,
+            CLOB_LONG_MARKET_SOURCE_ID,
+            CLOB_COMPACT_MARKET_SOURCE_ID,
+            CLOB_BOOK_SOURCE_ID,
+        ])
+        .zip(payloads)
+        .map(|((receipt, source_id), payload)| {
+            (
+                receipt,
+                RecordedEconomicSource {
+                    payload,
+                    received_unix_ms: 20_100,
+                    source_id: source_id.to_owned(),
+                    schema_version: 1,
+                    parser_version: 1,
+                    content_type: ContentType::Json,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+        let lookup = |receipt| {
+            sources
+                .iter()
+                .find(|(candidate, _)| *candidate == receipt)
+                .map(|(_, source)| source.clone())
+                .ok_or_else(|| EconomicReplayError("fixture receipt missing".to_owned()))
+        };
+        let cash = CollateralAmount::from_decimal_exact(dec!(1000)).unwrap();
+        let partial = replay_source_backed_economic(&economic, 21_000, cash, 7, lookup).unwrap();
+        assert_eq!(
+            partial.sized.ladder.worst_case_debit.to_decimal(),
+            dec!(2.5)
+        );
+        assert!(partial.sized.ladder.shares.to_decimal() >= dec!(1));
+        assert!(
+            replay_source_backed_economic(&economic, 21_000, cash, 6, lookup)
+                .err()
+                .unwrap()
+                .0
+                .contains("cannot fill")
+        );
+        // Ordinary live supplies no paper continuation, even when its source continuation is 7.
+        assert!(
+            replay_source_backed_economic_with_live_binding(
+                &economic, 21_000, cash, None, None, lookup
+            )
+            .err()
+            .unwrap()
+            .0
+            .contains("cannot fill")
+        );
+        let recomposed = EconomicPrepared::compose_wire_two(EconomicInputs {
+            market: economic.market.clone(),
+            admission: &partial.admission,
+            plan: &partial.sized.ladder,
+            book_receipt: economic.book_receipt,
+            observation: None,
+            sizing_mode: economic.sizing.mode,
+            budget: partial.sized.budget,
+            slippage_rate: economic.sizing.slippage_rate,
+            risk: economic.risk.clone(),
+            cash_before: cash,
+            price_impact_cap_bps: economic.balance.price_impact_cap_bps,
+            chase_ceiling: Price::ONE,
+            band_floor: economic.balance.band_floor,
+            band_ceiling_exclusive: economic.balance.band_ceiling_exclusive,
+            applied_configuration_hash: economic.applied_configuration_hash.clone(),
+        })
+        .unwrap();
+        let replayed = replay_source_backed_economic(&recomposed, 21_000, cash, 7, lookup).unwrap();
+        replayed
+            .recompose(
+                &recomposed,
+                recomposed.risk.clone(),
+                recomposed.applied_configuration_hash.clone(),
+            )
+            .unwrap();
+        let (mut live, account, live_sources, continuation) = observation_replay_fixture();
+        live.economic.version = 2;
+        live.economic.balance.chase_ceiling = Price::ONE;
+        live.economic.sizing.mode = SizingModeAudit::Dollar { usd: dec!(25) };
+        assert!(
+            replay_observation_fixture(&live, &account, &live_sources, &continuation)
+                .err()
+                .unwrap()
+                .0
+                .contains("cannot fill")
+        );
+        assert_eq!(partial.sized, replayed.sized);
     }
 
     #[test]
@@ -9804,6 +9925,7 @@ mod tests {
             economic,
             economic.risk.evaluated_at_unix_ms,
             CollateralAmount::from_atomic(10_000_000),
+            None,
             Some(LiveObservationBinding {
                 account_id,
                 identity: &prepared.identity,
@@ -10971,6 +11093,7 @@ mod tests {
                 economic,
                 economic.risk.evaluated_at_unix_ms,
                 CollateralAmount::from_atomic(10_000_000),
+                None,
                 Some(LiveObservationBinding {
                     account_id: &account_id,
                     identity: &prepared.identity,

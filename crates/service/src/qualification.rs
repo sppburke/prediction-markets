@@ -890,6 +890,18 @@ async fn verify_qualification(
                                 start_hot_config_hash: &start.hot_config_hash,
                                 financial_semantic_version: start.financial_semantic_version,
                             },
+                            replayed_decisions
+                                .iter()
+                                .find(|decision| {
+                                    decision.continuation.facts.source_trade_id
+                                        == operation.source_trade_id
+                                })
+                                .map(|decision| decision.continuation.version())
+                                .ok_or_else(|| {
+                                    QualificationError::InsufficientEvidence(
+                                        "Fill has no frozen continuation".to_owned(),
+                                    )
+                                })?,
                             true,
                         )
                         .await?;
@@ -3621,10 +3633,29 @@ fn verify_complete_second_action(
     expected: &[AppliedEffect],
 ) -> Result<(), QualificationError> {
     let frozen = &continuation.facts;
-    let classify = if matches!(continuation.version(), 5..=7) {
-        classify_complete_second
-    } else {
-        pe_position_ledger::classify_complete_second_legacy
+    let classify = |ledger, wallet, mutations, quality, config, history_complete, has_market| {
+        if matches!(continuation.version(), 5..=7) {
+            classify_complete_second(
+                crate::bucket_commit::complete_read_entry_policy(continuation.version()),
+                ledger,
+                wallet,
+                mutations,
+                quality,
+                config,
+                history_complete,
+                has_market,
+            )
+        } else {
+            pe_position_ledger::classify_complete_second_legacy(
+                ledger,
+                wallet,
+                mutations,
+                quality,
+                config,
+                history_complete,
+                has_market,
+            )
+        }
     };
     let verdict = classify(
         ledger,
@@ -3675,6 +3706,8 @@ fn verify_complete_second_action(
         || classified.price != frozen.price
         || classified.action != frozen.pre_bucket_action
         || classified.action_order_dependent
+        || (continuation.version() == 7
+            && classified.entry != pe_position_ledger::EntryClassification::Admitted)
         || frozen.action_confidence_ppm != expected_confidence
     {
         return insufficient(format!(
@@ -3849,6 +3882,7 @@ async fn verify_economic(
     operation: &crate::paper_recovery::PaperFillOperationIdentity,
     economic: &EconomicPrepared,
     context: &RiskReplayContext<'_>,
+    continuation_version: u16,
     require_risk_approval: bool,
 ) -> Result<EconomicPrepared, QualificationError> {
     verify_economic_configuration(
@@ -3917,6 +3951,7 @@ async fn verify_economic(
         economic,
         economic.risk.evaluated_at_unix_ms,
         cash_before,
+        continuation_version,
         |receipt| {
             let observation = context
                 .source
@@ -4787,7 +4822,7 @@ fn verify_winner_follow_fill_decision(
     }
 
     let (signal, mode) = verify_winner_follow_economic_policy(continuation, economic)?;
-    let intent =
+    let mut intent =
         pe_strategy_winner_follow::WinnerFollowStrategy::new(configuration.winner_follow_config())
             .evaluate_at_price_with_limit(
                 &signal,
@@ -4809,7 +4844,18 @@ fn verify_winner_follow_fill_decision(
                     pe_strategy_winner_follow::WinnerFollowDeclineAudit::from(&error)
                 ))
             })?;
-    verify_winner_follow_intent_plan(&intent, economic, &frozen.source_trade_id)?;
+    if continuation.version() == 7 && matches!(economic.sizing.mode, SizingModeAudit::Dollar { .. })
+    {
+        intent.contracts =
+            pe_venue_polymarket::ladder::signed_share_contracts(economic.ladder.minimum_shares)
+                .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+    }
+    verify_winner_follow_intent_plan(
+        &intent,
+        economic,
+        continuation.version(),
+        &frozen.source_trade_id,
+    )?;
     if intent.market_id != frozen.market_id
         || intent.outcome_id != frozen.outcome_id
         || intent.side != frozen.side
@@ -4906,6 +4952,7 @@ fn verify_winner_follow_economic_policy(
 fn verify_winner_follow_intent_plan(
     intent: &pe_venue_core::OrderIntent,
     economic: &EconomicPrepared,
+    continuation_version: u16,
     source_trade_id: &SourceTradeId,
 ) -> Result<(), QualificationError> {
     let allocation_matches = match economic.sizing.mode {
@@ -4915,6 +4962,10 @@ fn verify_winner_follow_intent_plan(
             intent.contracts.0 == contracts
                 && ShareAmount::from_whole(intent.contracts.0)
                     .is_ok_and(|shares| shares == economic.ladder.minimum_shares)
+        }
+        SizingModeAudit::Dollar { .. } if continuation_version == 7 => {
+            pe_venue_polymarket::ladder::signed_share_contracts(economic.ladder.minimum_shares)
+                .is_ok_and(|contracts| contracts == intent.contracts)
         }
         SizingModeAudit::Dollar { usd } => {
             usd.checked_div(economic.sizing.all_in_price.0)
@@ -5089,7 +5140,9 @@ async fn verify_winner_follow_decline_decision(
                 source_trade_id: frozen.source_trade_id.clone(),
                 observed_at_bucket: frozen.source_epoch,
             };
-            let reconstructed = verify_economic(&operation, economic, &replay, false).await?;
+            let reconstructed =
+                verify_economic(&operation, economic, &replay, continuation.version(), false)
+                    .await?;
             match pe_strategy_winner_follow::WinnerFollowStrategy::new(
                 frozen.applied_configuration.winner_follow_config(),
             )
@@ -7358,7 +7411,7 @@ mod tests {
             source: &source,
             ..initial_context
         };
-        verify_economic(&operation, &economic, &context, false)
+        verify_economic(&operation, &economic, &context, 5, false)
             .await
             .unwrap();
 
@@ -7370,7 +7423,7 @@ mod tests {
                 ..context
             };
             assert!(matches!(
-                verify_economic(&operation, &economic, &late_context, false).await,
+                verify_economic(&operation, &economic, &late_context, 5, false).await,
                 Err(QualificationError::InsufficientEvidence(_))
             ));
         }
@@ -7510,15 +7563,69 @@ mod tests {
             mode,
         )
         .unwrap();
-        verify_winner_follow_intent_plan(&intent, &economic, &continuation.facts.source_trade_id)
-            .unwrap();
+        verify_winner_follow_intent_plan(
+            &intent,
+            &economic,
+            6,
+            &continuation.facts.source_trade_id,
+        )
+        .unwrap();
 
         economic.sizing.minimum_shares = ShareAmount::from_whole(10).unwrap();
         assert!(
             verify_winner_follow_intent_plan(
                 &intent,
                 &economic,
+                6,
                 &continuation.facts.source_trade_id,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn semantic_three_dollar_intent_requires_signed_plan_conversion() {
+        let (continuation, mut economic) = winner_follow_policy_fixture();
+        economic.version = 2;
+        economic.balance.chase_ceiling = Price::ONE;
+        economic.sizing.mode = SizingModeAudit::Dollar { usd: dec!(25) };
+        economic.ladder.minimum_shares = ShareAmount::from_decimal_exact(dec!(7.123456)).unwrap();
+        economic.sizing.minimum_shares = economic.ladder.minimum_shares;
+        let (signal, mode) = reconstruct_winner_follow_signal(&continuation).unwrap();
+        let mut intent = pe_strategy_winner_follow::WinnerFollowStrategy::new(
+            continuation
+                .facts
+                .applied_configuration
+                .winner_follow_config(),
+        )
+        .evaluate_at_price_with_limit(
+            &signal,
+            economic.sizing.all_in_price,
+            economic.ladder.limit_price,
+            continuation.facts.frozen_basis.win_rate_p,
+            economic.risk.snapshot.clone(),
+            continuation.facts.frozen_basis.bankroll,
+            mode,
+        )
+        .unwrap();
+        intent.contracts =
+            pe_venue_polymarket::ladder::signed_share_contracts(economic.ladder.minimum_shares)
+                .unwrap();
+        verify_winner_follow_intent_plan(
+            &intent,
+            &economic,
+            7,
+            &continuation.facts.source_trade_id,
+        )
+        .unwrap();
+        intent.contracts = pe_core_types::ContractQty(6);
+        assert!(Decimal::from(intent.contracts.0) * economic.sizing.all_in_price.0 < dec!(25));
+        assert!(
+            verify_winner_follow_intent_plan(
+                &intent,
+                &economic,
+                7,
+                &continuation.facts.source_trade_id
             )
             .is_err()
         );
@@ -7553,8 +7660,13 @@ mod tests {
             )
             .unwrap();
         assert_ne!(intent.limit_price, signal.leader_price);
-        verify_winner_follow_intent_plan(&intent, &economic, &continuation.facts.source_trade_id)
-            .unwrap();
+        verify_winner_follow_intent_plan(
+            &intent,
+            &economic,
+            6,
+            &continuation.facts.source_trade_id,
+        )
+        .unwrap();
         economic.balance.chase_ceiling = signal.leader_price;
         assert!(verify_winner_follow_economic_policy(&continuation, &economic).is_err());
         economic.balance.chase_ceiling = Price::ONE;
@@ -7563,6 +7675,7 @@ mod tests {
             verify_winner_follow_intent_plan(
                 &intent,
                 &economic,
+                6,
                 &continuation.facts.source_trade_id
             )
             .is_err()
@@ -7623,14 +7736,20 @@ mod tests {
             mode,
         )
         .unwrap();
-        verify_winner_follow_intent_plan(&intent, &economic, &continuation.facts.source_trade_id)
-            .unwrap();
+        verify_winner_follow_intent_plan(
+            &intent,
+            &economic,
+            6,
+            &continuation.facts.source_trade_id,
+        )
+        .unwrap();
 
         economic.ladder.limit_price = Price::new(dec!(0.51)).unwrap();
         assert!(
             verify_winner_follow_intent_plan(
                 &intent,
                 &economic,
+                6,
                 &continuation.facts.source_trade_id,
             )
             .is_err()
@@ -7774,13 +7893,13 @@ mod tests {
             financial_semantic_version: fixture.start.financial_semantic_version,
         };
         assert_eq!(
-            verify_economic(&operation, &economic, &replay, false)
+            verify_economic(&operation, &economic, &replay, 5, false)
                 .await
                 .unwrap(),
             economic
         );
         assert!(matches!(
-            verify_economic(&operation, &economic, &replay, true).await,
+            verify_economic(&operation, &economic, &replay, 5, true).await,
             Err(QualificationError::InsufficientEvidence(reason))
                 if reason.contains("risk decision is not an approval")
         ));
@@ -7903,7 +8022,7 @@ mod tests {
             };
 
             assert_eq!(
-                verify_economic(&operation, &economic, &replay, false)
+                verify_economic(&operation, &economic, &replay, 5, false)
                     .await
                     .unwrap(),
                 economic
@@ -7975,7 +8094,7 @@ mod tests {
                 start_hot_config_hash: &fixture.start.hot_config_hash,
                 financial_semantic_version: if continuation.version() == 6 { 2 } else { 1 },
             };
-            let verified = verify_economic(&operation, &economic, &replay, false)
+            let verified = verify_economic(&operation, &economic, &replay, 5, false)
                 .await
                 .unwrap();
             assert_eq!(verified.risk, economic.risk);
@@ -8113,7 +8232,7 @@ mod tests {
         };
 
         assert_eq!(
-            verify_economic(&operation, &released, &replay, false)
+            verify_economic(&operation, &released, &replay, 5, false)
                 .await
                 .unwrap(),
             released,
@@ -8132,7 +8251,7 @@ mod tests {
         };
         assert_ne!(clamped.risk.snapshot, released.risk.snapshot);
         assert!(matches!(
-            verify_economic(&operation, &clamped, &replay, false).await,
+            verify_economic(&operation, &clamped, &replay, 5, false).await,
             Err(QualificationError::InsufficientEvidence(reason))
                 if reason == "EconomicPrepared risk snapshot differs from causal replay"
         ));
@@ -8149,6 +8268,41 @@ mod tests {
             .unwrap();
 
         verify_complete_second_action(&ledger, &continuation, &[mutation], &expected).unwrap();
+    }
+
+    #[test]
+    fn same_second_piece_replay_selects_the_recorded_continuation() {
+        let (mut continuation, mutation) = classification_fixture();
+        let ledger = PositionLedger::new();
+        let mut second = mutation.clone();
+        second.source_trade_id = SourceTradeId(format!("{}z", mutation.source_trade_id.0));
+        let mut mutations = vec![second, mutation];
+        let (_, expected) = ledger.simulate_all_or_none(&mutations).unwrap();
+        let mut wire = serde_json::to_value(&continuation).unwrap();
+        wire["version"] = serde_json::json!(7);
+        wire["source_authority"] = serde_json::json!("complete_read");
+        continuation = serde_json::from_value(wire.clone()).unwrap();
+        verify_complete_second_action(&ledger, &continuation, &mutations, &expected).unwrap();
+        let mut wrong_representative = continuation.clone();
+        wrong_representative.facts.source_trade_id = mutations[0].source_trade_id.clone();
+        assert!(
+            verify_complete_second_action(&ledger, &wrong_representative, &mutations, &expected)
+                .is_err()
+        );
+        wire["version"] = serde_json::json!(6);
+        wire.as_object_mut().unwrap().remove("source_authority");
+        let historical = serde_json::from_value(wire).unwrap();
+        assert!(
+            verify_complete_second_action(&ledger, &historical, &mutations, &expected).is_err()
+        );
+        if let pe_position_ledger::LedgerEffect::Trade { outcome_id, .. } = &mut mutations[0].effect
+        {
+            *outcome_id = OutcomeId(1);
+        }
+        let (_, expected) = ledger.simulate_all_or_none(&mutations).unwrap();
+        assert!(
+            verify_complete_second_action(&ledger, &continuation, &mutations, &expected).is_err()
+        );
     }
 
     #[test]

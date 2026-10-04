@@ -2278,12 +2278,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
     async fn plan_impact_gate(
         &self,
         signal: &LeaderSignal,
-        current_book_policy: bool,
+        continuation_version: u16,
         probability: Probability,
         sizing_bankroll: Decimal,
         admission: &pe_execution_core::LiveAdmissionArtifact,
         early_book: Option<BookReadResult>,
     ) -> Result<GatePlanEvidence, GatePlanFailure> {
+        let current_book_policy = matches!(continuation_version, 6 | 7);
         let cap_bps = u64::try_from(self.price_impact_cap_bps).map_err(|_| GatePlanFailure {
             reason: "impact gate cap invalid",
             book: Box::new(book_failure(
@@ -2484,9 +2485,14 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             ShareAmount::from_whole(quantity.0).map_err(|_| LadderError::Amount)
         };
         let sizing = match self.strategy.config().sizing_mode {
-            SizingMode::Dollar { usd } => BuySizing::Dollar {
-                budget: to_budget(usd)?,
-            },
+            SizingMode::Dollar { usd } => {
+                let budget = to_budget(usd)?;
+                if continuation_version == 7 {
+                    BuySizing::DollarUpTo { budget }
+                } else {
+                    BuySizing::Dollar { budget }
+                }
+            }
             SizingMode::Contract { contracts } => BuySizing::Contract { contracts },
             SizingMode::Kelly => BuySizing::Kelly {
                 allocate: &allocate,
@@ -3309,6 +3315,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         let financial_semantic_version = pending
             .as_ref()
             .map_or(1, DecisionContinuationV3::financial_semantic);
+        let continuation_version = pending.as_ref().map_or(0, DecisionContinuationV3::version);
+        let continuation_seven = continuation_version == 7;
         let current_book_policy = matches!(financial_semantic_version, 2 | 3);
         let mut early_book = authenticated_asset.map(|token_id| {
             let fetcher = Arc::clone(&self.book_fetcher);
@@ -3475,8 +3483,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         // uncontrolled notional and let fills slip outside the band. We keep fetching it
         // only to (a) confirm the market is open/priced and (b) log the divergence for
         // diagnosis; sizing and gating below use `fill_basis` instead. Fail closed on an
-        // absent mid (unchanged liveness behaviour).
-        let _market_mid = {
+        // absent mid. Continuation 7 relies on admission and the mandatory fresh book.
+        if !continuation_seven {
             let mid_read = self
                 .mid_price_cache
                 .fetch_mids(std::slice::from_ref(&signal.market_id));
@@ -3497,7 +3505,6 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                             source: "gamma.outcome_prices".to_owned(),
                         });
                     }
-                    p
                 }
                 None => {
                     if let Some(evidence) = decision_evidence.as_mut() {
@@ -3563,7 +3570,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         let gate_evidence = match self
             .plan_impact_gate(
                 &signal,
-                current_book_policy,
+                continuation_version,
                 p,
                 sizing_bankroll,
                 &admission,
@@ -3660,7 +3667,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         // max_fill_price safety rail (#142 parity): skip BUYs whose FILL price is at or
         // above the cap (catastrophic payoff geometry near $1). ZERO disables. Gated on
         // `fill_basis` (the price paid), matching the backtest's fill-price cap.
-        if signal.leader_side == Side::Buy
+        if !continuation_seven
+            && signal.leader_side == Side::Buy
             && self.max_fill_price > Decimal::ZERO
             && fill_basis.0 >= self.max_fill_price
         {
@@ -3689,7 +3697,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         // skip BUYs whose FILL price is below the entry-band lower bound. Strictly `<` so
         // the boundary value fills, mirroring the backtest `min_signal_price` floor (also
         // gated on the fill price). ZERO disables.
-        if signal.leader_side == Side::Buy
+        if !continuation_seven
+            && signal.leader_side == Side::Buy
             && self.min_fill_price > Decimal::ZERO
             && fill_basis.0 < self.min_fill_price
         {
@@ -3793,9 +3802,16 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         // position we already hold skips the PAPER order only — live targets in the staged
         // aggregate still execute against their own venue state.
         let pos_key = MarketOutcomeId::new(signal.market_id.clone(), signal.outcome_id);
-        if self.filled_positions.contains(&pos_key) {
+        let held = if continuation_seven {
+            self.filled_positions
+                .iter()
+                .any(|held| held.market() == &signal.market_id)
+        } else {
+            self.filled_positions.contains(&pos_key)
+        };
+        if held {
             info!(
-                reason = "already hold position in this market outcome (paper-only)",
+                reason = if continuation_seven { "already hold position in this market (paper-only)" } else { "already hold position in this market outcome (paper-only)" },
                 market = %signal.market_id,
                 outcome = signal.outcome_id.0,
                 "signal did not produce order",
@@ -3804,7 +3820,11 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 &trade,
                 &leader_row,
                 dispatch_id.as_deref(),
-                "paper_held",
+                if continuation_seven {
+                    "paper_held_market"
+                } else {
+                    "paper_held"
+                },
                 &rb,
                 Some(&signal.market_id),
                 decision_evidence.as_ref(),
@@ -3944,7 +3964,24 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 )
                 .await;
             }
-            Ok(intent) => {
+            Ok(mut intent) => {
+                if continuation_seven
+                    && matches!(
+                        self.strategy.config().sizing_mode,
+                        SizingMode::Dollar { .. }
+                    )
+                {
+                    intent.contracts = match pe_venue_polymarket::ladder::signed_share_contracts(
+                        plan.shares,
+                    ) {
+                        Ok(contracts) => contracts,
+                        Err(error) => {
+                            error!(%error, trade = %trade.source_trade_id, "signed quantity cannot convert to whole contracts");
+                            self.intake_stopped = true;
+                            return;
+                        }
+                    };
+                }
                 if pending
                     .as_ref()
                     .is_none_or(|continuation| !matches!(continuation.version(), 5..=7))
@@ -4719,8 +4756,8 @@ mod tests {
                 let evidence = harness.evidence();
                 let book = evidence.body.book.unwrap();
                 assert_eq!(book.request_token_id.as_deref(), Some("123"));
-                assert_eq!(book.outcome, "ladder_rejected");
-                assert_eq!(book.reason.as_deref(), Some("InsufficientDepth"));
+                assert_eq!(book.outcome, "below_minimum");
+                assert_eq!(book.reason.as_deref(), Some("BelowMinimum"));
                 assert_eq!(book.best_ask.as_deref(), Some("0.5"));
             }
         }

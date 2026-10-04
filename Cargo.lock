@@ -3941,6 +3941,7 @@ dependencies = [
  "hmac 0.12.1",
  "pe-core-types",
  "polymarket_client_sdk_v2",
+ "proptest",
  "reqwest 0.12.28",
  "rust_decimal",
  "rust_decimal_macros",

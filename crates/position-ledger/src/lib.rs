@@ -1142,9 +1142,18 @@ pub enum SecondVerdict {
     OrderDependent { trigger: SourceTradeId },
 }
 
+/// First-entry policy for a complete wallet-second, independent of the mutation-order proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SameSecondEntryPolicy {
+    Legacy,
+    HomogeneousPieces,
+}
+
 /// Prove mutation-order independence, apply the bucket to a disposable ledger clone,
 /// classify ordinary trades from the immutable pre-bucket snapshot, and classify first entries.
+#[allow(clippy::too_many_arguments)]
 pub fn classify_complete_second(
+    entry_policy: SameSecondEntryPolicy,
     ledger: &PositionLedger,
     wallet: WalletAddress,
     mutations: &[LedgerMutation],
@@ -1155,6 +1164,7 @@ pub fn classify_complete_second(
 ) -> Result<SecondVerdict, LedgerError> {
     classify_with_second_proof(
         SecondProof::Repaired,
+        entry_policy,
         ledger,
         wallet,
         mutations,
@@ -1177,6 +1187,7 @@ pub fn classify_complete_second_legacy(
 ) -> Result<SecondVerdict, LedgerError> {
     classify_with_second_proof(
         SecondProof::Legacy,
+        SameSecondEntryPolicy::Legacy,
         ledger,
         wallet,
         mutations,
@@ -1196,6 +1207,7 @@ enum SecondProof {
 #[allow(clippy::too_many_arguments)]
 fn classify_with_second_proof(
     proof: SecondProof,
+    entry_policy: SameSecondEntryPolicy,
     ledger: &PositionLedger,
     wallet: WalletAddress,
     mutations: &[LedgerMutation],
@@ -1288,6 +1300,40 @@ fn classify_with_second_proof(
             continue;
         }
 
+        let representative = candidate_indices.iter().copied().min_by(|left, right| {
+            decisions[*left]
+                .source_trade_id
+                .0
+                .cmp(&decisions[*right].source_trade_id.0)
+        });
+        let homogeneous = entry_policy == SameSecondEntryPolicy::HomogeneousPieces
+            && representative.is_some_and(|first| {
+                decisions
+                    .iter()
+                    .filter(|decision| decision.market_id == market_id)
+                    .all(|decision| {
+                        decision.side == Side::Buy
+                            && decision.action == LeaderAction::Entry
+                            && decision.outcome_id == decisions[first].outcome_id
+                    })
+            })
+            && mutations.iter().all(|mutation| {
+                mutation.wallet == wallet
+                    && mutations
+                        .first()
+                        .is_some_and(|first| mutation.source_time == first.source_time)
+                    && (!mutation
+                        .touched_keys()
+                        .iter()
+                        .any(|key| key.market() == &market_id)
+                        || matches!(
+                            mutation.effect.effective(),
+                            LedgerEffect::Trade {
+                                side: Side::Buy,
+                                ..
+                            }
+                        ))
+            });
         if let Some(first_id) = candidate_indices
             .iter()
             .map(|index| decisions[*index].source_trade_id.clone())
@@ -1297,13 +1343,22 @@ fn classify_with_second_proof(
         }
         let entry = if !history_complete {
             EntryClassification::WalletHistoryIncomplete
-        } else if candidate_indices.len() >= 2 {
+        } else if candidate_indices.len() >= 2 && !homogeneous {
             EntryClassification::AmbiguousFirstEntrySameSecond
         } else {
             EntryClassification::Admitted
         };
         for index in candidate_indices {
-            decisions[index].entry = entry;
+            decisions[index].entry = if homogeneous && entry == EntryClassification::Admitted {
+                if Some(index) == representative {
+                    decisions[index].action_order_dependent = false;
+                    EntryClassification::Admitted
+                } else {
+                    EntryClassification::NotFirstEntry
+                }
+            } else {
+                entry
+            };
         }
     }
 
@@ -1328,6 +1383,7 @@ pub fn classify_complete_historical_second(
     has_market: &dyn Fn(&MarketId) -> bool,
 ) -> Result<SecondVerdict, LedgerError> {
     classify_complete_second(
+        SameSecondEntryPolicy::Legacy,
         ledger,
         wallet,
         mutations,
@@ -1978,6 +2034,7 @@ mod tests {
                     );
                     assert_eq!(
                         classify_complete_second(
+                            SameSecondEntryPolicy::Legacy,
                             &ledger,
                             w,
                             &mutations,
@@ -2064,6 +2121,7 @@ mod tests {
             );
             let quality = ReconstructionQuality::new(100).unwrap();
             let verdict = classify_complete_second(
+                SameSecondEntryPolicy::Legacy,
                 &ledger,
                 w,
                 &mutations,
@@ -2074,6 +2132,7 @@ mod tests {
             )
             .unwrap();
             let mut expected = classify_complete_second(
+                SameSecondEntryPolicy::Legacy,
                 &ledger,
                 w,
                 &plain,
@@ -2170,6 +2229,7 @@ mod tests {
                         let classify = |mutations: &[LedgerMutation]| {
                             classify_with_second_proof(
                                 proof,
+                                SameSecondEntryPolicy::Legacy,
                                 &ledger,
                                 w,
                                 mutations,
@@ -2209,6 +2269,7 @@ mod tests {
         let mutations = same_side_trades(w, Side::Sell, &[2; 32]);
         let classify = |mutations: &[LedgerMutation]| {
             classify_complete_second(
+                SameSecondEntryPolicy::Legacy,
                 &ledger,
                 w,
                 mutations,
@@ -2329,12 +2390,104 @@ mod tests {
     }
 
     #[test]
+    fn homogeneous_same_second_pieces_have_one_representative() {
+        let w = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        let ledger = PositionLedger::new();
+        let mut mutations = same_side_trades(w, Side::Buy, &[1_000_001, 2_000_003, 3_000_005]);
+        mutations.reverse();
+        for policy in [
+            SameSecondEntryPolicy::Legacy,
+            SameSecondEntryPolicy::HomogeneousPieces,
+        ] {
+            let verdict = classify_complete_second(
+                policy,
+                &ledger,
+                w,
+                &mutations,
+                ReconstructionQuality::new(100).unwrap(),
+                &SignalConfig::default(),
+                true,
+                &|_| false,
+            )
+            .unwrap();
+            let SecondVerdict::OrderIndependent {
+                applied,
+                decisions,
+                first_entries,
+            } = verdict
+            else {
+                panic!("homogeneous second refused")
+            };
+            assert_eq!(applied.len(), mutations.len());
+            assert_eq!(first_entries.len(), 1);
+            if policy == SameSecondEntryPolicy::HomogeneousPieces {
+                let admitted = decisions
+                    .iter()
+                    .filter(|decision| decision.entry == EntryClassification::Admitted)
+                    .collect::<Vec<_>>();
+                assert_eq!(admitted.len(), 1);
+                assert_eq!(admitted[0].source_trade_id, first_entries[0].1);
+                assert!(!admitted[0].action_order_dependent);
+                assert_eq!(
+                    decisions
+                        .iter()
+                        .filter(|decision| decision.entry == EntryClassification::NotFirstEntry)
+                        .count(),
+                    2
+                );
+            } else {
+                assert!(decisions.iter().all(|decision| decision.entry
+                    == EntryClassification::AmbiguousFirstEntrySameSecond
+                    && decision.action_order_dependent));
+            }
+            let mut applied_ledger = ledger.clone();
+            applied_ledger.apply_all_or_none(&mutations).unwrap();
+            let position = applied_ledger
+                .position(&w)
+                .unwrap()
+                .positions
+                .values()
+                .next()
+                .unwrap();
+            assert_eq!(position.long_contracts.atomic(), 6_000_009);
+        }
+        if let LedgerEffect::Trade { outcome_id, .. } = &mut mutations[0].effect {
+            *outcome_id = OutcomeId(1);
+        }
+        let SecondVerdict::OrderIndependent {
+            decisions,
+            first_entries,
+            ..
+        } = classify_complete_second(
+            SameSecondEntryPolicy::HomogeneousPieces,
+            &ledger,
+            w,
+            &mutations,
+            ReconstructionQuality::new(100).unwrap(),
+            &SignalConfig::default(),
+            true,
+            &|_| false,
+        )
+        .unwrap()
+        else {
+            panic!("mixed second refused")
+        };
+        assert_eq!(first_entries.len(), 1);
+        assert!(
+            decisions.iter().all(
+                |decision| decision.entry == EntryClassification::AmbiguousFirstEntrySameSecond
+            )
+        );
+    }
+
+    #[test]
     fn repaired_large_component_retains_ambiguity_and_legacy_cutoff() {
         let w = wallet("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let ledger = PositionLedger::new();
         let mutations = same_side_trades(w, Side::Buy, &[1, 2, 3, 4, 5]);
         let quality = ReconstructionQuality::new(100).unwrap();
         let verdict = classify_complete_second(
+            SameSecondEntryPolicy::Legacy,
             &ledger,
             w,
             &mutations,
@@ -2465,6 +2618,7 @@ mod tests {
         assert_eq!(ledger.snapshots(), &before);
         assert_eq!(
             classify_complete_second(
+                SameSecondEntryPolicy::Legacy,
                 &ledger,
                 w,
                 &mutations,
@@ -2871,6 +3025,7 @@ mod tests {
         };
 
         let verdict = classify_complete_second(
+            SameSecondEntryPolicy::Legacy,
             &PositionLedger::new(),
             w,
             &[sell, split],

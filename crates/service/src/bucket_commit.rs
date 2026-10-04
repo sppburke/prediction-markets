@@ -462,6 +462,32 @@ impl VerifiedObservationBindings {
     }
 }
 
+fn complete_read_version(commitment: Option<ActivityReadCommitmentReceipt>) -> u16 {
+    match commitment {
+        None => 3,
+        Some(ActivityReadCommitmentReceipt::LegacyV1(_)) => 4,
+        Some(ActivityReadCommitmentReceipt::BindingsV2(_)) => 5,
+    }
+}
+
+fn current_paper_version(version: u16) -> u16 {
+    if matches!(version, 5..=7) { 7 } else { version }
+}
+
+/// Complete reads emit wire 7 exactly for payload-2 commitments; older read contracts emit
+/// their historical wire. Use that emitted wire for bucket classification and read it back from
+/// the recorded decision in qualification. Dispositions retain every other piece, so both owners
+/// reconstruct the same whole second without consulting today's configuration.
+pub(crate) fn complete_read_entry_policy(
+    version: u16,
+) -> pe_position_ledger::SameSecondEntryPolicy {
+    if version == 7 {
+        pe_position_ledger::SameSecondEntryPolicy::HomogeneousPieces
+    } else {
+        pe_position_ledger::SameSecondEntryPolicy::Legacy
+    }
+}
+
 impl DecisionContinuationV3 {
     /// Wire version 5 for commitment v2, version 4 for v1, and version 3 without a commitment.
     pub(crate) fn new(
@@ -471,11 +497,7 @@ impl DecisionContinuationV3 {
         read_commitment: Option<ActivityReadCommitmentReceipt>,
     ) -> Self {
         Self {
-            version: match read_commitment {
-                None => 3,
-                Some(ActivityReadCommitmentReceipt::LegacyV1(_)) => 4,
-                Some(ActivityReadCommitmentReceipt::BindingsV2(_)) => 5,
-            },
+            version: complete_read_version(read_commitment),
             source_authority: None,
             facts,
             observed_source_receipt,
@@ -486,8 +508,8 @@ impl DecisionContinuationV3 {
 
     /// New REST paper writes retain the v5 source contract under continuation wire 7.
     pub(crate) fn current_paper(mut self) -> Self {
-        if matches!(self.version, 5..=7) {
-            self.version = 7;
+        self.version = current_paper_version(self.version);
+        if self.version == 7 {
             self.source_authority = Some(SourceAuthority::CompleteRead);
         }
         self
@@ -3428,6 +3450,9 @@ impl BucketCommitEngine {
                 |status| status.complete,
             );
         let (applied, trade_decisions, first_entries) = match classify_complete_second(
+            complete_read_entry_policy(current_paper_version(complete_read_version(
+                context.read_commitment,
+            ))),
             &self.ledger,
             wallet,
             &mutations,
@@ -4300,6 +4325,7 @@ impl BucketCommitEngine {
                 |status| status.complete,
             );
         let applied_outcomes = match classify_complete_second(
+            pe_position_ledger::SameSecondEntryPolicy::Legacy,
             &self.ledger,
             wallet,
             &known,

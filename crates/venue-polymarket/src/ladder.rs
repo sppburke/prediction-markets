@@ -6,7 +6,8 @@
 //! The isolated canary keeps its exact-share behavior through
 //! [`plan_exact_shares`], which uses the same private ask walk.
 
-use pe_core_types::{CollateralAmount, Price, ShareAmount};
+use pe_core_types::{CollateralAmount, ContractQty, Price, ShareAmount};
+use rust_decimal::prelude::ToPrimitive as _;
 use rust_decimal::{Decimal, RoundingStrategy};
 
 use crate::canary_market::AskLevel;
@@ -91,6 +92,17 @@ impl LadderPlan {
     }
 }
 
+/// Project the signed minimum shares to the legacy intent's whole-contract quantity.
+/// Fractional shares remain in the financial plan; the intent records their checked floor.
+pub fn signed_share_contracts(shares: ShareAmount) -> Result<ContractQty, LadderError> {
+    shares
+        .to_decimal()
+        .floor()
+        .to_u64()
+        .map(ContractQty)
+        .ok_or(LadderError::Amount)
+}
+
 /// Caller-owned allocation from an exact all-in price per share.
 pub type KellyAllocator<'a> = &'a dyn Fn(Price) -> Result<ShareAmount, LadderError>;
 
@@ -98,6 +110,10 @@ pub type KellyAllocator<'a> = &'a dyn Fn(Price) -> Result<ShareAmount, LadderErr
 #[derive(Clone, Copy)]
 pub enum BuySizing<'a> {
     Dollar {
+        budget: CollateralAmount,
+    },
+    /// Accept the available in-band principal up to the requested budget.
+    DollarUpTo {
         budget: CollateralAmount,
     },
     Contract {
@@ -159,12 +175,13 @@ pub fn plan_sized_buy(
         .unwrap_or(CollateralAmount::from_atomic(u64::MAX));
 
     let (budget, ladder) = match sizing {
-        BuySizing::Dollar { budget } => {
+        BuySizing::Dollar { budget } | BuySizing::DollarUpTo { budget } => {
             let principal = principal_for_budget(schedule, budget, best_ask, ceiling)?;
             let ladder = plan_principal_buy_with_scale(
                 asks,
                 principal,
                 signed_share_scale,
+                matches!(sizing, BuySizing::DollarUpTo { .. }),
                 minimum_price,
                 maximum_price_exclusive,
                 chase_ceiling,
@@ -319,6 +336,7 @@ fn plan_share_buy(
         asks,
         signed_principal,
         signed_share_scale,
+        false,
         minimum_price,
         maximum_price_exclusive,
         chase_ceiling,
@@ -425,6 +443,7 @@ fn plan_principal_buy(
         asks,
         principal,
         6,
+        false,
         minimum_price,
         maximum_price_exclusive,
         chase_ceiling,
@@ -432,10 +451,12 @@ fn plan_principal_buy(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan_principal_buy_with_scale(
     asks: &[AskLevel],
     principal: CollateralAmount,
     signed_share_scale: u32,
+    accept_partial: bool,
     minimum_price: Price,
     maximum_price_exclusive: Price,
     chase_ceiling: Price,
@@ -448,10 +469,12 @@ fn plan_principal_buy_with_scale(
     let walked = walk_principal(
         asks,
         principal,
+        accept_partial,
         minimum_price,
         maximum_price_exclusive,
         ceiling,
     )?;
+    let principal = walked.principal;
     let shares = shares_for_principal(principal, walked.limit_price, signed_share_scale)?;
     if shares == ShareAmount::ZERO {
         return Err(LadderError::NothingAffordable);
@@ -528,6 +551,7 @@ fn plan_requested_shares(
 }
 
 struct PrincipalWalk {
+    principal: CollateralAmount,
     used_asks: Vec<AskLevel>,
     best_ask: Price,
     limit_price: Price,
@@ -536,6 +560,7 @@ struct PrincipalWalk {
 fn walk_principal(
     asks: &[AskLevel],
     principal: CollateralAmount,
+    accept_partial: bool,
     minimum_price: Price,
     maximum_price_exclusive: Price,
     ceiling: Price,
@@ -589,12 +614,18 @@ fn walk_principal(
         }
         break;
     }
-    if in_band_capacity < principal.to_decimal() {
+    if !accept_partial && in_band_capacity < principal.to_decimal() {
         return Err(LadderError::InsufficientDepth);
     }
+    let principal = if accept_partial {
+        principal.min(collateral_floor(in_band_capacity)?)
+    } else {
+        principal
+    };
     let best_ask = best_ask.ok_or(LadderError::NothingAffordable)?;
     let limit_price = limit_price.ok_or(LadderError::NothingAffordable)?;
     Ok(PrincipalWalk {
+        principal,
         used_asks,
         best_ask,
         limit_price,
@@ -727,6 +758,48 @@ mod tests {
 
     fn price(value: Decimal) -> Price {
         Price::new(value).unwrap()
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            rng_seed: proptest::test_runner::RngSeed::Fixed(730),
+            ..proptest::test_runner::Config::default()
+        })]
+        #[test]
+        fn dollar_up_to_capacity_bounds(
+            first_atomic in 1u64..8_000_000,
+            second_atomic in 1u64..8_000_000,
+            rate_bps in 0u32..1000,
+            minimum in 1u64..10,
+        ) {
+            let asks = [
+                AskLevel { price: price(dec!(0.15)), shares: ShareAmount::from_atomic(first_atomic) },
+                AskLevel { price: price(dec!(0.16)), shares: ShareAmount::from_atomic(second_atomic) },
+                level(dec!(0.85), dec!(1000)),
+            ];
+            let schedule = CompactFeeSchedule::Taker { rate: Decimal::from(rate_bps) / dec!(10_000) };
+            let budget = CollateralAmount::from_decimal_exact(dec!(25)).unwrap();
+            let minimum = ShareAmount::from_whole(minimum).unwrap();
+            let plan = plan_sized_buy(&asks, schedule, BuySizing::DollarUpTo { budget }, &[budget],
+                minimum, price(dec!(0.0001)), price(dec!(0.15)), price(dec!(0.85)), Price::ONE, price(dec!(0.16)));
+            let capacity = expected_spend_decimal(&asks[..2]).unwrap();
+            let principal = collateral_floor(capacity).unwrap();
+            let signed = shares_for_principal(principal, price(dec!(0.16)), 6).unwrap();
+            if signed < minimum {
+                proptest::prop_assert_eq!(plan, Err(LadderError::BelowMinimum));
+            } else {
+                let plan = plan.unwrap();
+                proptest::prop_assert_eq!(&plan.ladder.used_asks, &asks[..2]);
+                proptest::prop_assert_eq!(plan.ladder.worst_case_debit, principal);
+                proptest::prop_assert_eq!(plan.ladder.shares, signed);
+                let fee = taker_fee(schedule, plan.ladder.expected_shares().unwrap(), plan.ladder.vwap().unwrap()).unwrap();
+                proptest::prop_assert!(plan.ladder.worst_case_debit.checked_add(fee).unwrap().checked_add(plan.reserve).unwrap() <= budget);
+                proptest::prop_assert!(plan.worst_case_all_in_debit().unwrap() <= budget);
+                proptest::prop_assert!(plan.ladder.shares >= minimum);
+                proptest::prop_assert_eq!(plan_sized_buy(&asks, schedule, BuySizing::Dollar { budget }, &[budget],
+                    minimum, price(dec!(0.0001)), price(dec!(0.15)), price(dec!(0.85)), Price::ONE, price(dec!(0.16))), Err(LadderError::InsufficientDepth));
+            }
+        }
     }
 
     #[test]
