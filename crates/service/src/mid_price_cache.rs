@@ -184,6 +184,20 @@ pub(crate) fn classify_strict_prices(
     Ok(output)
 }
 
+/// Store `entry` unless the cache already holds a newer recorded row for the market: a slower
+/// overlapping read must not replace it, so a strict price always comes from the market's newest
+/// recorded page, which is the row strict replay selects.
+fn insert_newest(map: &mut HashMap<MarketId, CachedEntry>, id: MarketId, entry: CachedEntry) {
+    let older = map
+        .get(&id)
+        .and_then(|existing| existing.receipt)
+        .zip(entry.receipt)
+        .is_some_and(|(existing, new)| new.sequence.0 < existing.sequence.0);
+    if !older {
+        map.insert(id, entry);
+    }
+}
+
 /// The retained source-log fields needed to replay one strict Gamma price attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RecordedPriceAttempt {
@@ -356,12 +370,19 @@ where
             }
             let strict_mids = row.strict_outcome_prices;
             if let Some(existing) = entries.get_mut(&market) {
-                existing.conflicting = existing.conflicting
-                    || conflicting.contains(&row.condition_id)
-                    || existing.strict_mids != strict_mids;
-                existing.strict_mids = strict_mids;
-                existing.observed_at_unix_ms = i128::from(observation.received_unix_ms);
-                existing.receipt = *receipt;
+                // Like acquisition's cache, a market keeps its newest selected page's row with
+                // prices; another selected page's older row for it is obsolete, not a conflict.
+                // Repeated rows inside one page remain a conflict through the demux.
+                if row.outcome_prices.is_none() || receipt.sequence.0 <= existing.receipt.sequence.0
+                {
+                    continue;
+                }
+                *existing = StrictPriceInput {
+                    strict_mids,
+                    observed_at_unix_ms: i128::from(observation.received_unix_ms),
+                    receipt: *receipt,
+                    conflicting: conflicting.contains(&row.condition_id),
+                };
             } else {
                 entries.insert(
                     market,
@@ -744,7 +765,7 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
                         .copied(),
                     conflicting: conflicts.contains(&id.to_string()),
                 };
-                map.insert(id.clone(), entry.clone());
+                insert_newest(&mut map, id.clone(), entry.clone());
                 out.insert(id, entry);
             }
             drop(map);
@@ -855,6 +876,30 @@ mod tests {
         body: Vec<u8>,
     }
 
+    /// The left read (`0xa` with others) answers only after the right read's open request has
+    /// arrived; the right read's open answer is held until the test releases it.
+    struct RacingFetcher {
+        right_arrived: Arc<tokio::sync::Notify>,
+        release_right: Arc<tokio::sync::Notify>,
+        right_open: Vec<u8>,
+        closed: Vec<u8>,
+    }
+
+    impl PageFetcher for RacingFetcher {
+        async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, pe_source_core::SourceError> {
+            if url.contains("condition_ids=0xa") {
+                self.right_arrived.notified().await;
+                return Ok(br#"[{"conditionId":"0xa","outcomePrices":"[\"0.4\",\"0.6\"]"},{"conditionId":"0xb","outcomePrices":"[\"0.5\",\"0.5\"]"}]"#.to_vec());
+            }
+            if url.contains("closed=true") {
+                return Ok(self.closed.clone());
+            }
+            self.right_arrived.notify_one();
+            self.release_right.notified().await;
+            Ok(self.right_open.clone())
+        }
+    }
+
     impl PageFetcher for ControlledResponseFetcher {
         async fn fetch_page(&self, _url: &str) -> Result<Vec<u8>, pe_source_core::SourceError> {
             let body = self.body.clone();
@@ -963,6 +1008,135 @@ mod tests {
             .await
             .unwrap();
             assert_eq!(replayed, observations);
+            ingest.abort();
+            let _ = ingest.await;
+        }
+    }
+
+    /// PASS: an older overlapping read never replaces a newer recorded row; a newer one does, and a
+    /// row without a recorded receipt keeps the previous replacement behavior.
+    #[test]
+    fn insert_newest_keeps_the_newest_recorded_row() {
+        let entry = |tenths: i64, sequence: Option<u64>| CachedEntry {
+            mids: vec![Decimal::new(tenths, 1)],
+            strict_mids: Some(vec![Price::new(Decimal::new(tenths, 1)).unwrap()]),
+            snapshot: MidMarketSnapshot::default(),
+            observed_at: datetime!(2026-10-03 00:00 UTC),
+            receipt: sequence.map(receipt),
+            conflicting: false,
+        };
+        let mut map = HashMap::new();
+        insert_newest(&mut map, mid("0xm"), entry(5, Some(3)));
+        insert_newest(&mut map, mid("0xm"), entry(4, Some(1)));
+        assert_eq!(map[&mid("0xm")].receipt, Some(receipt(3)));
+        insert_newest(&mut map, mid("0xm"), entry(6, Some(7)));
+        assert_eq!(map[&mid("0xm")].receipt, Some(receipt(7)));
+        insert_newest(&mut map, mid("0xm"), entry(2, None));
+        assert_eq!(map[&mid("0xm")].receipt, None);
+    }
+
+    /// PASS: when an overlapping read publishes a newer row for a market (a closed fallback after
+    /// an open miss), the next strict attempt selects each market's newest recorded row with
+    /// prices, and replay of its receipts reproduces it; a newer page carrying the market without
+    /// prices leaves the older priced row selected on both sides.
+    #[tokio::test]
+    async fn overlapping_reads_replay_each_markets_newest_priced_row() {
+        let cases = [
+            (
+                vec![outcome("0xb", 0)],
+                b"[]".to_vec(),
+                vec![outcome("0xa", 0), outcome("0xb", 0)],
+                Decimal::ONE,
+            ),
+            (
+                vec![outcome("0xb", 0), outcome("0xc", 0)],
+                br#"[{"conditionId":"0xb"},{"conditionId":"0xc","outcomePrices":"[\"0.7\",\"0.3\"]"}]"#
+                    .to_vec(),
+                vec![outcome("0xa", 0), outcome("0xb", 0), outcome("0xc", 0)],
+                Decimal::new(5, 1),
+            ),
+        ];
+        for (right_ids, right_open, next_ids, b_price) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("source.log");
+            let (source_log, source_rx) = SourceLogHandle::channel(8);
+            let (trigger_tx, _trigger_rx) = mpsc::channel(1);
+            let ingest = tokio::spawn(
+                ActivityIngest::poll_only(
+                    SourceEventSink::open(&source_path).unwrap(),
+                    source_rx,
+                    trigger_tx,
+                    new_shared_health_with_ws(false, false, 90),
+                )
+                .run(),
+            );
+            let now = datetime!(2026-10-03 00:00 UTC);
+            let release_right = Arc::new(tokio::sync::Notify::new());
+            let cache = MidPriceCache::with_fetcher(
+                RacingFetcher {
+                    right_arrived: Arc::new(tokio::sync::Notify::new()),
+                    release_right: release_right.clone(),
+                    right_open,
+                    closed:
+                        br#"[{"conditionId":"0xb","closed":true,"outcomePrices":"[\"1\",\"0\"]"}]"#
+                            .to_vec(),
+                },
+                BASE.to_owned(),
+            )
+            .with_source_log(source_log)
+            .with_clock(Arc::new(move || now));
+            let left_ids = [outcome("0xa", 0), outcome("0xb", 0)];
+            let right = cache.clone();
+            let (left, right) = tokio::join!(
+                async {
+                    let left = cache.fetch_mids_strict_attempt(&left_ids).await;
+                    release_right.notify_one();
+                    left
+                },
+                right.fetch_mids_strict_attempt(&right_ids),
+            );
+            assert_eq!(left.price_receipts.len(), 1);
+            assert!(right.result.is_ok());
+            let next = cache.fetch_mids_strict_attempt(&next_ids).await;
+            let observations = next.result.unwrap();
+            assert_eq!(
+                observations[&("0xa".to_owned(), 0)].price.0,
+                Decimal::new(4, 1)
+            );
+            assert_eq!(observations[&("0xb".to_owned(), 0)].price.0, b_price);
+            assert_eq!(next.price_receipts.len(), 2);
+            let envelopes = pe_event_log::Reader::replay(&source_path)
+                .unwrap()
+                .map(|entry| entry.unwrap().1)
+                .collect::<Vec<_>>();
+            let replayed = replay_strict_risk_prices(
+                &next_ids,
+                &next.price_receipts,
+                i64::try_from(unix_timestamp_ms(now)).unwrap(),
+                |receipt| {
+                    let envelope = envelopes
+                        .iter()
+                        .find(|envelope| {
+                            envelope.seq == receipt.sequence
+                                && envelope.this_hash == receipt.this_hash
+                        })
+                        .unwrap();
+                    Ok(RecordedPriceAttempt {
+                        payload: envelope.payload.clone(),
+                        received_unix_ms: i64::try_from(unix_timestamp_ms(envelope.received_at.0))
+                            .unwrap(),
+                        source_id: envelope.source_id.0.clone(),
+                        schema_version: envelope.schema_version,
+                        parser_version: envelope.parser_version,
+                        content_type: envelope.content_type.clone(),
+                    })
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(replayed, observations);
+            drop(right);
+            drop(cache);
             ingest.abort();
             let _ = ingest.await;
         }
