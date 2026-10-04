@@ -38,8 +38,8 @@
 
 ## Polymarket
 
-> **Short-429 retry budget (#588), Last checked: 2026-09-17; re-verify by
-> 2026-11-16.** The [official rate-limit reference](https://docs.polymarket.com/api-reference/rate-limits)
+> **Short-429 retry budget (#588), Last checked: 2026-10-03; re-verify by
+> 2026-12-02.** The [official rate-limit reference](https://docs.polymarket.com/api-reference/rate-limits)
 > still describes sliding windows and queued throttling. It lists legacy `/trades`
 > at 200 requests/10 seconds and v2 `/activity` at the same limit; it does not
 > separately list legacy `/activity` or promise a one-second `Retry-After`.

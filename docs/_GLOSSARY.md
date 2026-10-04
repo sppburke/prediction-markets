@@ -72,7 +72,7 @@ Production budgets are conservative; they reduce automatically on 429/5xx. The "
 
 | Venue / surface | Documented limit | Production budget | Burst |
 |---|---|---|---|
-| Polymarket Data API | 200 req/10s on `/activity`, 100 req/s general | ≤ 20 req/s sustained on `/activity` | page bursts DO return HTTP 429 with `Retry-After: 1` (observed 2026-09-02, #555); the service's reconciliation fetcher and the bootstrap activity collection (`cache-populate-activity-v2`) wait out `Retry-After` ≤ `reconciliation_rate_limit_retry_secs` (1 s) inside the separate `reconciliation_rate_limit_max_retries` budget |
+| Polymarket Data API | 200 req/10s on v2 `/activity`; legacy `/activity` is not listed separately on the official page; 100 req/s general on v1 | ≤ 20 req/s sustained on legacy `/activity` | page bursts DO return HTTP 429 with `Retry-After: 1` (observed 2026-09-02, #555); the service's reconciliation fetcher and the bootstrap activity collection (`cache-populate-activity-v2`) wait out `Retry-After` ≤ `reconciliation_rate_limit_retry_secs` (1 s) inside the separate `reconciliation_rate_limit_max_retries` budget |
 | Polymarket Gamma API | verify | ≤ 2 req/s sustained | 10-req burst |
 | Polymarket CLOB REST | verify | ≤ 5 req/s sustained | 10-req burst |
 | Polymarket WebSocket | per-account socket cap | ≤ 4 concurrent sockets | n/a |
@@ -1022,7 +1022,9 @@ for admission, supervised resume, older-binary exclusion and manual recovery.
 | `ranker_price_fidelity_minutes` | 1 | Fidelity of the targeted ranker fill-oracle fetch (#536): `RANKER_PRICE_FIDELITY_MINUTES` in `pe_bootstrap::prices_history`. Part of the `ranker_price_pages` coverage identity — a fidelity change invalidates coverage; a code deploy (parser version, provenance-only) does not. |
 | `ranker_price_page_max_span_secs` | 80_000 | Maximum requested span per targeted `/prices-history` page (#536): safely under the measured ~1,437-point (~24 h at minute fidelity) END-anchored response cap, so silent truncation cannot occur (80,000 s → ≤ 1,334 points). Const `RANKER_PAGE_MAX_SPAN_SECS`. The endpoint also rejects spans somewhere above 14 days with HTTP 400 at any fidelity; the `interval` enum mode returns empty on resolved markets and is never used. |
 | `ranker_price_store` | `ranker_price_points` + `ranker_price_pages` | Isolated minute price-reference store for the pass-2 fill oracle (#536) — deliberately separate from `market_price_history`, whose every `source='clob'` row feeds true-CLV and the mark index. Points are write-once `(token_id, t)`; pages are an append-only validated ledger (`complete`/`empty`, full per-page provenance incl. `raw_sha256`) committed atomically with their points. Coverage = range algebra over terminal pages; a conflicting duplicate point rolls back its whole page. Written only by `pe-bootstrap prices-history --targets-csv` (cache-mutation-locked); read by `latency_shift_rerank.py` (the sole pass-2 oracle since the #536 cutover), whose binary publication gate exits 75 (supervised retry) while any needed window is un-terminal. Pass-2 also writes `oracle_outcomes.csv` (per-position provenance) and `oracle_manifest.json`, whose canonical sha256 the push stores as `ranking_batches.config_hash` with a round-trip check. |
-| `fresh_collection_json` | version 2 | Frozen fresh acquisition identity owned by `cache_migration`: generation, preceding completed fresh generation and manifest commitment (both null for a root), exclusive start, fixed end, sorted wallet union, sorted `full_read_wallets` subset, and canonical identity digest. Existing version-1 collections resume authentically. See the acquisition contract below. |
+| `fresh_collection_json` | versions 2 and 3 | Frozen fresh acquisition identity owned by `cache_migration`: generation, preceding completed fresh generation and manifest commitment (both null for a version-2 root), exclusive start, fixed end, sorted wallet union, sorted `full_read_wallets` subset, and canonical identity digest. Version-3 successors add sorted `deferred_wallets`, `quiet_after_secs` and `repoll_period_secs`, all inside the digest. Existing version-1 and version-2 collections resume authentically. See the acquisition contract below. |
+| `activity_quiet_after_secs` | 2,592,000 | **Module const** `QUIET_AFTER_SECS` in `pe-bootstrap`'s `cache_migration.rs` (not a TOML/env key). A predecessor's newest verified aggregate must be strictly older than its fixed end minus this interval to make a completed wallet quiet. Recorded as `quiet_after_secs` in each version-3 identity. |
+| `activity_repoll_period_secs` | 604,800 | **Module const** `REPOLL_PERIOD_SECS` in `pe-bootstrap`'s `cache_migration.rs` (not a TOML/env key). Weekly polling period for quiet wallets, phased by the wallet address's low 48 bits modulo this period. Recorded as `repoll_period_secs` in each version-3 identity. |
 | `activity_coverage_manifests_v2` receipt storage | marker version 2 for new fresh collections | `cursors_json = {"receipt_storage":"activity_wallet_coverage_staging_v2","version":2}`, `page_hashes_json = []`; receipts and historical manifest commitments remain retained. Version-1 retained and authentic embedded proofs remain readable; unknown versions and downgrades fail closed. `collection_identity_json TEXT NULL` archives the completed fresh identity; `acquisition_json TEXT NULL` on wallet receipts holds version-2 read/carry proof. NULL selects authentic historical decoding only. |
 | `activity_carry_batch_size` | 512 | Module const `CARRY_BATCH_SIZE` in `cache_migration::incremental`. Rows per advancing wallet-index batch; all batches remain in one atomic wallet transaction. This bounds in-memory carry work, not transaction/WAL size. |
 | `activity_scan_batch_rows` | 512 | Module const `BATCH_ROWS` in `cache_migration::aggregate_scan`. Stored rows packed into one batch for a decode worker. Batching is internal: commitments see every aggregate in stored order regardless of where batches fall (#670). |
@@ -1055,17 +1057,35 @@ for admission, supervised resume, older-binary exclusion and manual recovery.
 #### Complete activity generations and incremental acquisition (#648)
 
 New fresh collections keep cache storage, activity schema/parser and classifier versions unchanged.
-The identity is `{version:2,generation:N,base_generation:B,base_manifest_sha256:H,
-start_exclusive:E1,fixed_end_unix:E2,wallets:[…],full_read_wallets:[…],digest:D}`. Validate the
+A root retains the identity `{version:2,generation:N,base_generation:B,base_manifest_sha256:H,
+start_exclusive:E1,fixed_end_unix:E2,wallets:[…],full_read_wallets:[…],digest:D}`. New successors
+use version 3, adding `deferred_wallets:[…]`, `quiet_after_secs:Q` and `repoll_period_secs:R`
+inside the digest, with Q and R from `activity_quiet_after_secs` and `activity_repoll_period_secs`
+above. The sorted deferred list is a subset of `wallets` and disjoint from `full_read_wallets`.
+Versions 2 and 3 use the same acquisition receipt format. Validate the
 predecessor's complete content and derive membership before sampling
 `E2 = now − ACTIVITY_SETTLE_LAG_SECS`. Require `0 <= E1 < E2` and N above every known generation;
 numbers need not be consecutive. Freeze both bounds and lists before source I/O. The union contains
 current acquisition candidates, all retained-history wallets (including inactive/infrastructure
 wallets or wallets absent from the pile/projection), and predecessor exclusions. A missing or corrupt
-established-wallet proof is fatal. New wallets, previous exclusions and explicit
+established-wallet proof is fatal. New wallets, genuine previous exclusions and explicit
 `--full-read-wallets wallet1,wallet2` selections read `(0,E2]` (wire `start=1`); ordinary wallets read
 `(E1,E2]` (wire `start=E1+1`). A root has null base fields, E1=0 and every wallet full-read. Resume
 keeps the authentic recorded identity and skips all valid receipts, including exclusions.
+
+At admission from predecessor P with interval `(S_P,E_P]`, the existing verified aggregate visit
+finds the newest source time. A completed wallet is **quiet** when that time is strictly older than
+`E_P − Q`. Its phase is the address's low 48 bits modulo R; it is **due** when an instant
+`t ≡ −phase (mod R)` falls in `(S_P,E_P]`. Tiled generation intervals assign each instant to exactly
+one generation admitted after the interval containing it; several instants in one long interval
+coalesce into one read. A version-1 predecessor has no interval start and uses S_P=0, so every
+wallet is due. A wallet is **deferred** when P's receipt is complete-and-quiet or `dormant_deferred`,
+it is not due, and it is not an explicit full-read repair. Roots never defer. Due complete wallets
+take the ordinary incremental read; due deferred wallets take a full read `(0,E2]` to recover
+activity since deferral. Top-ups use the same rule: a just-read quiet wallet is deferred when not
+due and read incrementally when due. A returning active wallet resumes ordinary incremental polling.
+Admission logs deferred and due counts; completion logs the deferred count.
+Resume keeps the frozen deferred list, whose full read mode also refuses a newly selected repair.
 
 Admission archives the predecessor identity, clears the derived projection and invalidates
 finalization; it preserves activity rows, receipts and manifests. Successful delta collection verifies
@@ -1080,7 +1100,13 @@ Unexpected N rows, foreign-wallet collisions or contradictory predecessor eviden
 The acquisition object commits read mode/window, pages, aggregation status, fetched aggregate
 digest/counts, predecessor identity and manifest/wallet receipt/history commitments, whether history
 was carried, and explicit complete/excluded disposition. Stable reasons are `acquisition_failure`,
-`aggregation_failure` and `cross_boundary_collision`. Failed acquisition has aggregation status
+`aggregation_failure`, `cross_boundary_collision` and `dormant_deferred`. A deferred wallet makes
+no source call and records a full-mode exclusion with status `not_attempted`, no pages, null fetched
+aggregate digest/count, zero fetched source rows and zero resulting counts, and a bound predecessor
+with `carried=false`. Its older rows stay untouched and are absent from current-generation projection,
+export and ranking inputs. Validation requires `dormant_deferred` for frozen deferred wallets and
+refuses it elsewhere; intentional deferrals emit no per-wallet or exclusion-completion warning.
+Failed acquisition has aggregation status
 `not_attempted`, no page evidence, null fetched aggregate digest/count and zero fetched source rows;
 it requires the receipt's nonempty `exclusion_reason`. Failed aggregation has status `failed`, null
 fetched aggregate digest/count and the actual fetched source-row count. Collision retains its valid

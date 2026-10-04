@@ -15,6 +15,8 @@ and publishes to Supabase `latest_ranking`, which `pe-service` reads.
 > to `scp`, and `pe-service` has **no** seed/leaderboard fallback (Supabase is the sole
 > wallet source, #370/#379). Do not run these procedures on the VPS.
 
+On Forge, `~/prediction-markets` links to `/mnt/t7/prediction-markets`.
+
 ## Prerequisites
 
 ```bash
@@ -614,7 +616,7 @@ pending a before-and-after comparison of physical write bytes per committed row
 on the same collection. The retained primary-key index still incurs its own write cost.
 
 Existing condition indexes remain accepted and are never dropped automatically;
-finalized cache bytes must remain unchanged because finalization hashes the physical file.
+finalized cache bytes must remain unchanged because finalization with `--stage-record` hashes the physical file.
 Backward reads remain compatible, but do not run an older `cache-migrate-v2`,
 `cache-populate-activity-v2` or `cache-finalize-v2` against a finalized cache created
 without the condition index: these commands recreate the index, rewrite the file
@@ -663,8 +665,9 @@ diff, durably prepares the publication request, activates the side cache, then r
 request. The export copies the certified activity rows with eight DuckDB cursors, one key range
 each, merged into one file, and certifies the exported projection against the finalized count and
 digest; it does not re-read SQLite's projection or assert that SQLite stays unchanged afterwards. An
-export failure stops a schema-two cutover run. The normal fresh-cutover path re-finalizes after the
-targeted price-store write and before request preparation, so the stage hash covers the installed
+export failure stops a schema-two cutover run. The fresh lane's first finalization certifies,
+checkpoints and syncs without hashing the file or writing a stage record. It re-finalizes with
+`--stage-record` after the targeted price-store write and before request preparation, so the stage hash covers the installed
 bytes; a pending request's replay relies on activation's bound-artifact checks.
 Refinalization reuses the projection only when the finalized database's saved activity generation,
 reference, aggregate and manifest digests, payout generation/coverage and evidence digest, and
@@ -691,7 +694,8 @@ and `payout_vector_json`, including markets currently excluded from the projecti
 entire payout table because the rebuild's eligibility query has no generation filter. Projection
 digest recomputation walks the projection and looks up its activity rows by source-trade key;
 the join order prevents SQLite from choosing a full activity traversal. It retains payout coverage
-verification, checkpointing, sidecar checks, the full-file hash and the stage-record write. Receipt or activity
+verification, checkpointing and sidecar checks; `--stage-record` additionally retains the full-file
+hash and stage-record write. Receipt or activity
 corruption outside the projected values introduced after first finalization is detected by
 activation's full candidate manifest/content validation, before replacing the fixed cache:
 
@@ -791,8 +795,8 @@ every retained history and every wallet the prior's newest generation excluded, 
 frozen reference:
 
 ```bash
-# Under the cache lock: checkpoint + quick-check + hash the fixed main, durably record H0
-# and generation targets in SIDE's .stage.json, then make one verified atomic copy to SIDE.
+# Under the cache lock: checkpoint, copy to pending while hashing the fixed main, then
+# decide quick-check reuse from H0, atomically record evidence, verify and adopt the copy.
 # --prior reserves the legacy name; no prior file is created for a new cycle.
 # Schema-one input also gets its H0-bound build manifest for the initial seal.
 # Every path names a file in an existing directory (the cycle directory beside the fixed
@@ -804,15 +808,21 @@ pe-bootstrap winner-discovery --db "$SIDE" --defer-activation
 pe-bootstrap activate-next --db "$SIDE" --batch-id "$BATCH" --audit-csv "$AUDIT"
 pe-bootstrap cache-populate-activity-v2 --db "$SIDE" --fresh-generation "$N"
 pe-bootstrap cache-populate-payout-v2 --db "$SIDE"         # skip only when candidate-targets --after-collection returns 1 as field three
-pe-bootstrap cache-finalize-v2 --db "$SIDE" --stage-record "$CACHE_STAGE_RECORD"
+pe-bootstrap cache-finalize-v2 --db "$SIDE"                # certify, checkpoint and sync without a stage record
 ```
 
 `--fresh-generation N` records the versioned acquisition identity specified in
 [`_GLOSSARY.md`](_GLOSSARY.md#complete-activity-generations-and-incremental-acquisition-648).
 The collector first validates its completed predecessor and derives the wallet union, then samples
-and freezes the settled end. New roots read full history; successors read only `(previous_end,new_end]`
-for wallets with usable predecessor history. New wallets and previous exclusions read full history.
+and freezes the settled end. New roots read full history; polled successors read only `(previous_end,new_end]`
+for wallets with usable predecessor history. New wallets and genuine previous exclusions read full history.
 Generation numbers may have gaps; carry always uses the recorded predecessor generation.
+
+Version-3 successors defer quiet wallets until their address-phased weekly instant falls in the
+predecessor interval, using the [canonical quiet/due/deferred rule and constants](_GLOSSARY.md#complete-activity-generations-and-incremental-acquisition-648).
+Due complete wallets read incrementally; due `dormant_deferred` wallets read full history. Roots,
+new wallets, genuine exclusions and repairs never defer. Top-ups use the same rule, resume keeps
+the frozen list, and admission/completion logs report deferrals separately from failures.
 
 Admission preserves activity rows, receipts and historical manifests, clears the derived projection
 and its recorded `ranker_projection_inputs_json` binding and invalidates finalization. Each successful
@@ -827,7 +837,7 @@ its baseline from a changed installed cache. Legacy cycles continue to use their
 A retry resumes the exact recorded bounds and lists and fetches only wallets without a valid receipt.
 Receipt-only startup validates proof metadata without reading completed wallets' aggregates;
 completion and first finalization verify the content. A completed generation returns the same manifest
-without source calls or a new clock. Authentic version-1 roots resume without rewriting their
+without source calls or a new clock. Authentic version-1 and version-2 collections resume without rewriting their
 identity or receipt bytes; their identity is archived when a successor starts. Storage version,
 aggregate and projection digest encodings, and generation-equality consumers remain unchanged.
 
@@ -877,8 +887,8 @@ scanned at staging as before. At 590 GB the measured plain-check baseline took a
 10 h (17 MB/s of 4 KB reads on Forge, 2026-09-23). The activation candidate now starts
 the walk-order prefetch described in [#694](https://github.com/sppburke/prediction-markets/issues/694).
 
-Finalization certifies exact bytes and activity, payout and projection evidence, not
-every SQLite page. Damage outside those reads may now survive migration resume, the
+Finalization certifies activity, payout and projection evidence, and with `--stage-record`
+binds exact bytes, not every SQLite page. Damage outside those reads may now survive migration resume, the
 post-seal step and either finalization, wasting private collection/ranking work before
 activation refuses installation; fault localization is consequently later. Outgoing
 and retained backups keep hash and schema validation. Activation skips the outgoing
@@ -922,7 +932,8 @@ opt-in changes and an outstanding legacy cycle completes under its original cont
 the lane, Step 0 is the sequence above (legacy `backfill`, `events` and `resolutions` read
 retired `trades`/`source_cursor` and do not run), followed by the existing cutover path:
 candidate capture into `candidate_cycle_manifest.json` alongside Parquet export, pass one and
-target emission, then targeted `prices-history` and second finalization. Pass two binds that
+target emission, then targeted `prices-history` and second finalization with `--stage-record`,
+which writes the record binding the price writes. Pass two binds that
 capture. An initial schema-one cutover keeps its full initial `cycle_manifest.json` capture and
 same-day gate; recurring cycles started on installed schema two write a two-field lane record
 (`version`, `configuration`) instead. The new-cycle `pipeline-versions` output remains available
@@ -955,8 +966,8 @@ again on the same UTC day; the legacy lane retains the full accepted capture and
 **Physical layout.** The candidate lane uses the regular physical fixed file
 (`readlink -f data/wallet_cache.db`) and derives per-cycle names beside it from the
 durable cycle directory: `wallet_cache.<cron-UTC>.side.db` (`C`) and `.displaced.db` (`D`).
-The `.prior.db` (`P`) name remains for legacy cycles. The sibling `.side.stage.json` is written
-atomically by Rust before copying; `cache_stage.json` in the run directory is command output. The Rust lock owners derive the
+The `.prior.db` (`P`) name remains for legacy cycles. Rust writes the sibling `.side.stage.json`
+staging evidence atomically before adopting the verified pending copy; `cache_stage.json` in the run directory is command output. The Rust lock owners derive the
 cache lock and the loop/run lock directory from that physical path, so the physical
 directory must carry two aliases to the repository inodes, checked before any mutation:
 
@@ -1034,6 +1045,13 @@ After activation but before the publication is consumed,
 for a new cycle, including its interrupted gap. A legacy cycle keeps its prior/displaced arguments
 and existing semantics. The supervisor must stay paused until the recovery is resolved. After consumption, roll
 forward. Confirm the host paths before cutover and keep the prior until publication is confirmed.
+
+For version-3 collection identities (#731), reinstall the prior binary/checkout pair only before
+a prepared version-3 request exists and while that pair can read the installed cache and retained
+recovery artifacts, before the first version-3 activation. From request preparation onward, or
+after any version-3 activation, keep a version-3-capable release and fix forward. A release that
+stops deferring full-reads every deferred wallet in its next generation through exclusion recovery.
+`cache-restore-prior` remains paused integrity recovery, not a return to the prior release.
 
 ### Fresh bulk root with deferred global uniqueness (#588)
 
