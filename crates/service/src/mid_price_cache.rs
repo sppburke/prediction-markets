@@ -276,13 +276,8 @@ where
                 "risk price receipt has the wrong Gamma source contract".to_owned(),
             ));
         }
-        // The refusal cause comes from classifying the rebuilt rows as acquisition did (conflict
-        // before freshness); a page's own age is not a cause, but none can postdate evaluation.
-        if i128::from(observation.received_unix_ms) > evaluated_at_unix_ms {
-            return Err(RiskPriceReplayError::Unavailable(
-                RiskInputsUnavailable::PriceFuture,
-            ));
-        }
+        // A page's own time is not a refusal cause: the rebuilt rows are classified exactly as
+        // acquisition classifies them (conflict before freshness or future).
         let record = serde_json::from_slice::<GammaPriceAttemptRecord>(&observation.payload)
             .map_err(|error| {
                 RiskPriceReplayError::Insufficient(format!(
@@ -1400,6 +1395,185 @@ mod tests {
             replayed,
             Err(RiskPriceReplayError::Unavailable(
                 RiskInputsUnavailable::PriceMissing
+            ))
+        ));
+        drop(cache);
+        ingest.abort();
+        let _ = ingest.await;
+    }
+
+    /// Serves fixed bodies; when `hold` is set, that URL answers only after another URL has.
+    struct OrderedFetcher {
+        bodies: HashMap<String, Vec<u8>>,
+        hold: Option<String>,
+        released: Arc<tokio::sync::Notify>,
+    }
+
+    impl PageFetcher for OrderedFetcher {
+        async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, pe_source_core::SourceError> {
+            if self.hold.as_deref() == Some(url) {
+                self.released.notified().await;
+            } else {
+                self.released.notify_one();
+            }
+            Ok(self.bodies[url].clone())
+        }
+    }
+
+    fn replay_from_log(
+        source_path: &std::path::Path,
+    ) -> impl FnMut(AppendReceipt) -> Result<RecordedPriceAttempt, RiskPriceReplayError> {
+        let envelopes = pe_event_log::Reader::replay(source_path)
+            .unwrap()
+            .map(|entry| entry.unwrap().1)
+            .collect::<Vec<_>>();
+        move |receipt| {
+            let envelope = envelopes
+                .iter()
+                .find(|envelope| {
+                    envelope.seq == receipt.sequence && envelope.this_hash == receipt.this_hash
+                })
+                .unwrap();
+            Ok(RecordedPriceAttempt {
+                payload: envelope.payload.clone(),
+                received_unix_ms: i64::try_from(unix_timestamp_ms(envelope.received_at.0)).unwrap(),
+                source_id: envelope.source_id.0.clone(),
+                schema_version: envelope.schema_version,
+                parser_version: envelope.parser_version,
+                content_type: envelope.content_type.clone(),
+            })
+        }
+    }
+
+    /// PASS: across two chunks of one read, the first chunk's unrequested row for a condition the
+    /// second chunk requested is ignored in either completion order, so acquisition prices every
+    /// market from its own chunk and replay of the selected receipts reproduces it.
+    #[tokio::test]
+    async fn cross_chunk_extra_row_is_ignored_in_both_completion_orders() {
+        let many = (0..50).map(|n| format!("0x{n:02}")).collect::<Vec<_>>();
+        let big_url = format!(
+            "{BASE}/markets?{}&limit={GAMMA_BATCH_LIMIT_PARAM}",
+            many.iter()
+                .map(|id| format!("condition_ids={id}"))
+                .collect::<Vec<_>>()
+                .join("&")
+        );
+        let mut big_rows = many
+            .iter()
+            .map(|id| format!(r#"{{"conditionId":"{id}","outcomePrices":"[\"0.4\",\"0.6\"]"}}"#))
+            .collect::<Vec<_>>();
+        big_rows.push(r#"{"conditionId":"0xb","outcomePrices":"[\"0.9\",\"0.1\"]"}"#.to_owned());
+        let big_body = format!("[{}]", big_rows.join(",")).into_bytes();
+        let small_body = br#"[{"conditionId":"0xb","outcomePrices":"[\"0.5\",\"0.5\"]"}]"#.to_vec();
+        for hold_big in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("source.log");
+            let (source_log, source_rx) = SourceLogHandle::channel(4);
+            let (trigger_tx, _trigger_rx) = mpsc::channel(1);
+            let ingest = tokio::spawn(
+                ActivityIngest::poll_only(
+                    SourceEventSink::open(&source_path).unwrap(),
+                    source_rx,
+                    trigger_tx,
+                    new_shared_health_with_ws(false, false, 90),
+                )
+                .run(),
+            );
+            let now = datetime!(2026-10-03 00:00 UTC);
+            let cache = MidPriceCache::with_fetcher(
+                OrderedFetcher {
+                    bodies: HashMap::from([
+                        (big_url.clone(), big_body.clone()),
+                        (url(BASE, "0xb"), small_body.clone()),
+                    ]),
+                    hold: hold_big.then(|| big_url.clone()),
+                    released: Arc::new(tokio::sync::Notify::new()),
+                },
+                BASE.to_owned(),
+            )
+            .with_source_log(source_log)
+            .with_clock(Arc::new(move || now));
+            let ids = many
+                .iter()
+                .map(|id| outcome(id, 0))
+                .chain([outcome("0xb", 0)])
+                .collect::<Vec<_>>();
+            let attempt = cache.fetch_mids_strict_attempt(&ids).await;
+            let observations = attempt.result.unwrap();
+            assert_eq!(
+                observations[&("0xb".to_owned(), 0)].price.0,
+                Decimal::new(5, 1)
+            );
+            assert_eq!(attempt.price_receipts.len(), 2);
+            let replayed = replay_strict_risk_prices(
+                &ids,
+                &attempt.price_receipts,
+                i64::try_from(unix_timestamp_ms(now)).unwrap(),
+                replay_from_log(&source_path),
+            )
+            .await
+            .unwrap();
+            assert_eq!(replayed, observations);
+            drop(cache);
+            ingest.abort();
+            let _ = ingest.await;
+        }
+    }
+
+    /// PASS: after a backward clock step, a cached conflicting row recorded in the future refuses
+    /// with `PriceConflict` (conflict precedes time) on both acquisition and replay.
+    #[tokio::test]
+    async fn future_conflicting_row_replays_acquisitions_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let (source_log, source_rx) = SourceLogHandle::channel(4);
+        let (trigger_tx, _trigger_rx) = mpsc::channel(1);
+        let ingest = tokio::spawn(
+            ActivityIngest::poll_only(
+                SourceEventSink::open(&source_path).unwrap(),
+                source_rx,
+                trigger_tx,
+                new_shared_health_with_ws(false, false, 90),
+            )
+            .run(),
+        );
+        let start = datetime!(2026-10-03 00:00:10 UTC);
+        let back_secs = Arc::new(AtomicUsize::new(0));
+        let clock_back = back_secs.clone();
+        let cache = MidPriceCache::with_fetcher(
+            FixtureFetcher::new(HashMap::from([(
+                url(BASE, "0xb"),
+                br#"[{"conditionId":"0xb","outcomePrices":"[\"0.5\",\"0.5\"]"},{"conditionId":"0xb","outcomePrices":"[\"0.6\",\"0.4\"]"}]"#
+                    .to_vec(),
+            )])),
+            BASE.to_owned(),
+        )
+        .with_source_log(source_log)
+        .with_clock(Arc::new(move || {
+            start
+                - time::Duration::seconds(
+                    i64::try_from(clock_back.load(Ordering::SeqCst)).unwrap(),
+                )
+        }));
+        let ids = [outcome("0xb", 0)];
+        assert_eq!(
+            cache.fetch_mids_strict_attempt(&ids).await.result,
+            Err(RiskInputsUnavailable::PriceConflict)
+        );
+        back_secs.store(1, Ordering::SeqCst);
+        let attempt = cache.fetch_mids_strict_attempt(&ids).await;
+        assert_eq!(attempt.result, Err(RiskInputsUnavailable::PriceConflict));
+        let replayed = replay_strict_risk_prices(
+            &ids,
+            &attempt.price_receipts,
+            i64::try_from(unix_timestamp_ms(attempt.evaluated_at)).unwrap(),
+            replay_from_log(&source_path),
+        )
+        .await;
+        assert!(matches!(
+            replayed,
+            Err(RiskPriceReplayError::Unavailable(
+                RiskInputsUnavailable::PriceConflict
             ))
         ));
         drop(cache);

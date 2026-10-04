@@ -352,6 +352,11 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
             pages.push((evidence, bytes));
             for m in markets {
                 let market = gamma_market(m);
+                // A row the request did not ask for is not evidence for any condition: it can
+                // neither collide with another chunk's requested row nor raise a conflict.
+                if !chunk.contains(&market.condition_id) {
+                    continue;
+                }
                 if let Some(prior) = out.get(&market.condition_id) {
                     if prior.strict_outcome_prices != market.strict_outcome_prices {
                         conflicting_condition_ids.push(market.condition_id.clone());
@@ -1297,6 +1302,36 @@ mod tests {
             .unwrap();
         assert_eq!(result.conflicting_condition_ids, vec!["condition"]);
         assert!(result.conflicting_closure_condition_ids.is_empty());
+    }
+
+    /// PASS: a chunk's row for a condition it did not request is ignored, so the condition keeps
+    /// its own chunk's row, page and conflict state whichever chunk is read first.
+    #[tokio::test]
+    async fn condition_batch_ignores_rows_the_chunk_did_not_request() {
+        let a_url = build_batch_url("https://g", &ids(&["A"]), "", GAMMA_BATCH_LIMIT_PARAM);
+        let b_url = build_batch_url("https://g", &ids(&["B"]), "", GAMMA_BATCH_LIMIT_PARAM);
+        let a_raw = br#"[{"conditionId":"A","outcomePrices":"[\"0.4\",\"0.6\"]"},{"conditionId":"B","outcomePrices":"[\"0.9\",\"0.1\"]"}]"#.to_vec();
+        let b_raw = br#"[{"conditionId":"B","outcomePrices":"[\"0.5\",\"0.5\"]"}]"#.to_vec();
+        for order in [ids(&["A", "B"]), ids(&["B", "A"])] {
+            let fetcher = FixtureFetcher::new(HashMap::from([
+                (a_url.clone(), a_raw.clone()),
+                (b_url.clone(), b_raw.clone()),
+            ]));
+            let result = GammaMarketsClient::new("https://g".to_owned(), fetcher)
+                .with_batch_size(1)
+                .fetch_markets_with_pages(&order, MarketFilter::OpenOnly)
+                .await
+                .unwrap();
+            assert_eq!(
+                result.markets.markets["B"].outcome_prices,
+                Some(vec![Decimal::new(5, 1), Decimal::new(5, 1)])
+            );
+            assert!(result.conflicting_condition_ids.is_empty());
+            assert_eq!(
+                result.condition_page_hashes["B"],
+                blake3::hash(&b_raw).to_hex().to_string()
+            );
+        }
     }
 
     /// PASS: repeated rows that disagree on closure are a closure conflict in either order, while
