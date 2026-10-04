@@ -188,7 +188,7 @@ fn append_qualification_start(
             observed_at: SourceTimestamp(timestamp),
             received_at: ReceivedAt(timestamp),
             content_type: ContentType::Json,
-            payload: serde_json::to_vec(&PaperLogRecord::QualificationStarted(Box::new(
+            payload: serde_json::to_vec(&PaperLogRecord::QualificationStarted(Arc::new(
                 start.clone(),
             )))
             .unwrap(),
@@ -1903,7 +1903,7 @@ pub(crate) async fn golden_source_stream_replays_exact_economic_core() {
             watchlist_writer_lock: None,
         },
         WinnerFollowStrategy::new(runtime_config.winner_follow_config()),
-        Writer::open(&paper_path).unwrap(),
+        pe_service::paper_recovery::PaperLog::open(&paper_path).unwrap(),
         Arc::clone(&paper),
         leader_ledger,
         new_shared_health_with_ws(false, true, 90),
@@ -2060,6 +2060,7 @@ pub(crate) async fn golden_source_stream_replays_exact_economic_core() {
                 no_copy_dispositions: HashMap::new(),
                 identity_overrides: HashMap::new(),
                 identity_unresolved: Default::default(),
+                restamp_twins: Default::default(),
                 history_status: Some(WalletHistoryStatusRecord {
                     wallet: bodies.wallet,
                     complete: true,
@@ -3055,7 +3056,7 @@ impl BracketFinancialHarness {
                 watchlist_writer_lock: Some(writer_lock.clone()),
             },
             WinnerFollowStrategy::new(runtime.winner_follow_config()),
-            Writer::open(&paper_path).unwrap(),
+            pe_service::paper_recovery::PaperLog::open(&paper_path).unwrap(),
             paper.clone(),
             pe_service::paper_recovery::build_leader_ledger(&paper).unwrap(),
             new_shared_health_with_ws(false, true, 90),
@@ -3959,14 +3960,13 @@ pub(crate) async fn deployed_flow_replays_exactly_and_qualifies() {
     let before_recovery = std::fs::read(&paths.0).unwrap();
     let mutations = authority.mutations();
     for _ in 0..2 {
-        let mut writer = Writer::open(&paths.0).unwrap();
+        let writer = pe_service::paper_recovery::PaperLog::open(&paths.0).unwrap();
         assert_eq!(
             pe_service::supabase_state::reconcile_active_financial_frames(
                 &authority,
                 &paper,
-                &paths.0,
                 pe_service::supabase_state::SourceEvidence::Index(&index),
-                &mut writer,
+                &writer,
             )
             .await
             .unwrap(),

@@ -100,12 +100,11 @@ use crate::mid_price_cache::{
     replay_strict_risk_prices,
 };
 use crate::orchestrator_control::OrchestratorControl;
-#[cfg(test)]
-use crate::paper_recovery::PaperLogRecord;
 use crate::paper_recovery::{
     HaltState, PaperEra, RiskHaltOwner, ScannedPaperFrame, active_risk_halts, paper_era,
-    scan_paper_log,
 };
+#[cfg(test)]
+use crate::paper_recovery::{PaperLogRecord, scan_paper_log};
 use crate::risk_inputs::{
     RiskInputsUnavailable, SourceReceiptIndex, apply_global_risk_halts,
     paper_prefix_at_financial_prefix,
@@ -129,6 +128,8 @@ const DEPOSIT_WALLET_REDEMPTION_DEADLINE_SECS: u64 = 4 * 60;
 /// Inputs owned by the one strictly sequential live task.
 pub struct LiveFanoutConfig {
     pub paper_state: Arc<PaperStateDb>,
+    /// Shared with the paper owner; a permit follows each committed ready transition.
+    pub dispatch_ready: Arc<tokio::sync::Notify>,
     pub live_accounts: LiveAccounts,
     pub live_watchlist: LiveWatchlist,
     pub runtime_config: LiveRuntimeConfig,
@@ -144,7 +145,7 @@ pub struct LiveFanoutConfig {
     pub source_log: SourceLogHandle,
     /// Boot-verified, append-extended source receipt and evidence projection.
     pub source_receipts: SourceReceiptIndex,
-    pub paper_log_path: PathBuf,
+    pub paper_log: crate::paper_recovery::PaperLog,
     /// Issue #599: the fanout outlives the orchestrator drain, so it must not keep the
     /// control channel open; it upgrades per send and, once the orchestrator is gone, the sync
     /// fails closed with the same error a closed channel produced.
@@ -204,7 +205,10 @@ fn derive_projection_rows_for_state(
     events: &[LiveJournalEvent],
 ) -> Result<ProjectionDerivation, ProjectionReducerError> {
     let source_envelopes = source_envelopes_for_live_events(&state.config.source_receipts, events)?;
-    let paper_frames = scan_paper_log(&state.config.paper_log_path)
+    let paper_frames = state
+        .config
+        .paper_log
+        .snapshot()
         .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
     let observation_pages = live_observation_page_index(
         &state.config.paper_state,
@@ -381,7 +385,8 @@ pub async fn run_live_fanout_until(
         tokio::select! {
             biased;
             () = &mut shutdown => break,
-            _ = ticker.tick() => {}
+            _ = ticker.tick() => {},
+            () = state.config.dispatch_ready.notified() => {}
         }
         if state
             .config
@@ -472,7 +477,10 @@ pub async fn run_live_fanout_until(
 }
 
 fn verified_recovery_inventory(state: &FanoutState) -> Result<LiveRecoveryInventory, FanoutError> {
-    let paper_frames = scan_paper_log(&state.config.paper_log_path)
+    let paper_frames = state
+        .config
+        .paper_log
+        .snapshot()
         .map_err(|error| FanoutError::Signal(format!("paper risk prefix: {error}")))?;
     let inventory = pe_execution_core::live_journal::recovery_inventory_with_admission_verifier(
         &state.config.journal_path,
@@ -3045,7 +3053,10 @@ async fn live_risk_audit(
         .await;
     let now = price_attempt.evaluated_at;
     let mids = price_attempt.result?;
-    let paper_frames = scan_paper_log(&state.config.paper_log_path)
+    let paper_frames = state
+        .config
+        .paper_log
+        .snapshot()
         .map_err(|_| RiskInputsUnavailable::SnapshotSequenceMismatch)?;
     let era = paper_era_at_evaluation(&paper_frames, evaluated_at_millis(now)?)?;
     compose_live_risk_audit(
@@ -3079,7 +3090,7 @@ fn evaluated_at_millis(now: OffsetDateTime) -> Result<i64, RiskInputsUnavailable
 /// Select the exact paper prefix available at the risk clock. A later frame with an earlier
 /// timestamp would make cross-log causality ambiguous and therefore fails closed.
 fn paper_era_at_evaluation(
-    frames: &[ScannedPaperFrame],
+    frames: &[Arc<ScannedPaperFrame>],
     evaluated_at_unix_ms: i64,
 ) -> Result<PaperEra, RiskInputsUnavailable> {
     let mut prefix = Vec::new();
@@ -3243,7 +3254,10 @@ async fn sync_live_risk_halts(
 ) -> Result<bool, FanoutError> {
     let owner = RiskHaltOwner::LiveAccount(account.account_id.clone());
     let current = active_risk_halts(&paper_era(
-        scan_paper_log(&state.config.paper_log_path)
+        state
+            .config
+            .paper_log
+            .snapshot()
             .map_err(|error| FanoutError::Signal(error.to_string()))?,
     ));
     let desired = [
@@ -3301,7 +3315,10 @@ async fn sync_live_risk_halts(
 
 fn global_risk_halt_active(state: &FanoutState) -> Result<bool, FanoutError> {
     Ok(active_risk_halts(&paper_era(
-        scan_paper_log(&state.config.paper_log_path)
+        state
+            .config
+            .paper_log
+            .snapshot()
             .map_err(|error| FanoutError::Signal(error.to_string()))?,
     ))
     .iter()
@@ -3595,7 +3612,7 @@ where
         .paper_freshness_policy
         .filter(|policy| policy.valid())
         .ok_or_else(|| "frozen copy freshness policy is missing or invalid".to_owned())?;
-    let source_time = continuation
+    let (source_time, _) = continuation
         .verified_source_time(lookup)
         .map_err(|error| format!("verified source clock is unavailable: {error}"))?;
     if !policy.activity_ws_enabled {
@@ -4205,7 +4222,7 @@ fn replay_live_risk_prices(
 struct LiveReplayEvidence<'a> {
     source_envelopes: &'a [EventEnvelope],
     source_receipts: Option<&'a SourceReceiptIndex>,
-    paper_frames: &'a [ScannedPaperFrame],
+    paper_frames: &'a [Arc<ScannedPaperFrame>],
     observation_pages: &'a LiveObservationPageIndex,
 }
 
@@ -4496,6 +4513,7 @@ fn produced_decision_continuation(
         no_copy_dispositions: HashMap::new(),
         identity_overrides: HashMap::new(),
         identity_unresolved: HashSet::new(),
+        restamp_twins: Default::default(),
         history_status: Some(pe_paper_state::WalletHistoryStatusRecord {
             wallet,
             complete: true,
@@ -4643,7 +4661,7 @@ fn verify_replayed_live_risk(
     preceding_events: &[LiveJournalEvent],
     admission: &pe_execution_core::LiveAdmissionEvaluationAudit,
     source_envelopes: &[EventEnvelope],
-    paper_frames: &[ScannedPaperFrame],
+    paper_frames: &[Arc<ScannedPaperFrame>],
 ) -> Result<(), ProjectionReducerError> {
     let observation_pages = produced_observation_index(admission, source_envelopes)?;
     verify_replayed_live_risk_with_index(
@@ -4664,7 +4682,7 @@ fn verify_replayed_live_risks(
     events: &[LiveJournalEvent],
     source_envelopes: &[EventEnvelope],
     source_receipts: Option<&SourceReceiptIndex>,
-    paper_frames: &[ScannedPaperFrame],
+    paper_frames: &[Arc<ScannedPaperFrame>],
     observation_pages: &LiveObservationPageIndex,
 ) -> Result<(), ProjectionReducerError> {
     let mut wire_two_admissions = HashMap::new();
@@ -8600,6 +8618,60 @@ mod tests {
         envelope
     }
 
+    #[test]
+    fn live_risk_replay_accepts_the_selected_closed_condition_request() {
+        let (_dir, account_id, events, mut sources, paper_frames, admission) =
+            reconstructed_live_risk_fixture();
+        let receipt = admission.economic.risk.price_receipts[0];
+        let source = sources
+            .iter_mut()
+            .find(|source| source.seq == receipt.sequence)
+            .unwrap();
+        let mut record: GammaPriceAttemptRecord = serde_json::from_slice(&source.payload).unwrap();
+        let GammaPriceAttemptRecord::Page { evidence, .. } = &mut record else {
+            unreachable!()
+        };
+        evidence.request_url = evidence
+            .request_url
+            .replace("&limit=", "&closed=true&limit=");
+        source.payload = serde_json::to_vec(&record).unwrap();
+        verify_replayed_live_risk(&account_id, &events, &admission, &sources, &paper_frames)
+            .unwrap();
+    }
+
+    #[test]
+    fn live_daily_mark_replay_keeps_the_london_empty_window_refusal() {
+        let cutoff = 1_790_985_600;
+        let token = "27556300168112004153063282106116891181228462668915873615116883805553394180154";
+        let receipt = fixture_receipt(1);
+        let price = pe_execution_core::MarkPrice {
+            condition_id: PolymarketConditionId(
+                "0x50365ef0731cfa26e35d89b66a91bca5ef1ee8090b02d1ced099acc738868e87".to_owned(),
+            ),
+            outcome_index: 0,
+            price: Price::new(dec!(0.0005)).unwrap(),
+            observed_unix: 1_790_985_077,
+            receipt,
+        };
+        for payload in [
+            include_bytes!("../tests/fixtures/london_closed_mark/prices_history_120s.json")
+                .as_slice(),
+            include_bytes!("../tests/fixtures/london_closed_mark/prices_history_13d.json")
+                .as_slice(),
+        ] {
+            let source = source_envelope(
+                receipt,
+                "pe-service.clob-prices-history",
+                payload.to_vec(),
+                OffsetDateTime::from_unix_timestamp(cutoff).unwrap(),
+            );
+            assert!(matches!(
+                verify_mark_price(&price, token, cutoff, &[source]),
+                Err(ProjectionReducerError::InvalidPriceEvidence)
+            ));
+        }
+    }
+
     async fn append_recovery_risk_price(
         state: &FanoutState,
         now: OffsetDateTime,
@@ -8626,12 +8698,13 @@ mod tests {
         (receipt, condition_id)
     }
 
+    #[allow(clippy::type_complexity)]
     fn reconstructed_live_risk_fixture() -> (
         tempfile::TempDir,
         AccountId,
         Vec<LiveJournalEvent>,
         Vec<EventEnvelope>,
-        Vec<ScannedPaperFrame>,
+        Vec<Arc<ScannedPaperFrame>>,
         Box<pe_execution_core::LiveAdmissionEvaluationAudit>,
     ) {
         let dir = tempdir().unwrap();
@@ -9026,6 +9099,76 @@ mod tests {
                     .ok_or_else(|| EconomicReplayError("fixture receipt missing".to_owned()))
             },
         )
+    }
+
+    #[test]
+    fn early_book_replay_accepts_book_receipt_before_admission_receipts() {
+        let mut economic = finality_prepared().economic.clone();
+        economic.admission.market.observed_at_unix = 20;
+        economic.admission.settlement.observed_at_unix = 20;
+        economic.risk.snapshot.per_trade_cap_bps = 10_000;
+        economic.book_receipt.sequence = EventSeq(0);
+        let payloads = economic_source_payloads(&economic.market.condition_id.0);
+        let receipts = [
+            economic.admission.receipts.gamma,
+            economic.admission.receipts.clob_long,
+            economic.admission.receipts.clob_compact,
+            economic.book_receipt,
+        ];
+        assert!(
+            receipts[..3]
+                .iter()
+                .all(|receipt| receipt.sequence > economic.book_receipt.sequence)
+        );
+        let sources = receipts
+            .into_iter()
+            .zip([
+                GAMMA_MARKETS_SOURCE_ID,
+                CLOB_LONG_MARKET_SOURCE_ID,
+                CLOB_COMPACT_MARKET_SOURCE_ID,
+                CLOB_BOOK_SOURCE_ID,
+            ])
+            .zip(payloads)
+            .map(|((receipt, source_id), payload)| {
+                (
+                    receipt,
+                    RecordedEconomicSource {
+                        payload,
+                        received_unix_ms: if source_id == CLOB_BOOK_SOURCE_ID {
+                            20_100
+                        } else {
+                            20_900
+                        },
+                        source_id: source_id.to_owned(),
+                        schema_version: 1,
+                        parser_version: 1,
+                        content_type: ContentType::Json,
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let replay = replay_source_backed_economic(
+            &economic,
+            21_000,
+            CollateralAmount::from_atomic(10_000_000),
+            |receipt| {
+                sources
+                    .iter()
+                    .find(|(candidate, _)| *candidate == receipt)
+                    .map(|(_, source)| source.clone())
+                    .ok_or_else(|| EconomicReplayError("fixture receipt missing".to_owned()))
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            replay.admission.market.ordered_outcome_token_ids[0],
+            economic.market.token_id
+        );
+        assert_eq!(replay.sized.ladder.shares, economic.ladder.minimum_shares);
+        assert_eq!(
+            replay.sized.ladder.worst_case_debit,
+            economic.ladder.principal
+        );
     }
 
     #[test]
@@ -10674,6 +10817,7 @@ mod tests {
                     HashMap::new()
                 },
                 identity_unresolved: HashSet::new(),
+                restamp_twins: Default::default(),
                 history_status: Some(pe_paper_state::WalletHistoryStatusRecord {
                     wallet,
                     complete: true,
@@ -11782,7 +11926,7 @@ mod tests {
                 state: HaltState::Engaged,
                 evidence: serde_json::json!({"fixture": "retired-latency"}),
             };
-            let mut writer = pe_event_log::Writer::open(&state.config.paper_log_path).unwrap();
+            let writer = state.config.paper_log.clone();
             writer
                 .append_synced(EnvelopeIn {
                     source_id: SourceId("pe-service.paper".to_owned()),
@@ -11817,11 +11961,152 @@ mod tests {
                 sync_live_risk_halts(&state, &account, &risk).await.unwrap(),
                 cause != pe_risk_engine::RiskHaltCause::CopyLatency
             );
-            assert_eq!(
-                scan_paper_log(&state.config.paper_log_path).unwrap().len(),
-                1
-            );
+            assert_eq!(state.config.paper_log.snapshot().unwrap().len(), 1);
         }
+    }
+
+    #[cfg(feature = "scenario")]
+    #[tokio::test]
+    async fn live_risk_projection_recovery_and_halts_use_shared_paper_frames_without_scans() {
+        let dir = tempfile::tempdir().unwrap();
+        let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let snapshot = armed_snapshot("cached-risk");
+        let account = snapshot.accounts[0].clone();
+        let mut state = fanout_state(&dir, paper, snapshot, "http://127.0.0.1:9", None);
+        let now = OffsetDateTime::from_unix_timestamp(20).unwrap();
+        state.config.mid_price_cache = state
+            .config
+            .mid_price_cache
+            .clone()
+            .with_clock(Arc::new(move || now));
+        let mut prepared = finality_prepared();
+        bind_empty_live_risk_to_paper_prefix(&state, &mut prepared, now);
+        append_recovery_baseline(
+            &state,
+            &account.account_id,
+            now,
+            CollateralAmount::from_atomic(10_000_000),
+        )
+        .await;
+        let path = dir.path().join("paper.log");
+        let paper_walks = pe_event_log::scan_metrics::count(&path).unwrap();
+        let events = replay_live_account(&state, &account.account_id).unwrap();
+        let projection =
+            derive_projection_rows_for_state(&state, &account.account_id, &events).unwrap();
+        assert_eq!(projection.economic_cash, Some(dec!(10)));
+        assert!(
+            verified_recovery_inventory(&state)
+                .unwrap()
+                .approved_admissions
+                .is_empty()
+        );
+        let risk = live_risk_audit(&state, &account, None, CollateralAmount::ZERO, 10_000)
+            .await
+            .unwrap();
+        assert_eq!(risk.decision, RiskDecisionAudit::Approved);
+        assert_eq!(
+            risk.financial_prefix,
+            prepared.economic.risk.financial_prefix
+        );
+        assert!(!sync_live_risk_halts(&state, &account, &risk).await.unwrap());
+        assert!(!global_risk_halt_active(&state).unwrap());
+        assert_eq!(
+            pe_event_log::scan_metrics::count(&path).unwrap(),
+            paper_walks
+        );
+    }
+
+    #[test]
+    fn cached_live_risk_checks_the_physical_clock_prefix_before_dropping_pre_start_frames() {
+        use crate::paper_recovery::{
+            PAPER_LOG_SCHEMA_VERSION, PaperLog, QualificationStarted, TailBinding,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("paper.log");
+        let log = PaperLog::open(&path).unwrap();
+        let tail = TailBinding::from(&log.verified_tail().unwrap());
+        let append = |record: PaperLogRecord, unix| {
+            let at = OffsetDateTime::from_unix_timestamp(unix).unwrap();
+            log.append_synced(EnvelopeIn {
+                source_id: SourceId("paper-clock".to_owned()),
+                schema_version: PAPER_LOG_SCHEMA_VERSION,
+                parser_version: 1,
+                observed_at: SourceTimestamp(at),
+                received_at: ReceivedAt(at),
+                content_type: ContentType::Json,
+                payload: serde_json::to_vec(&record).unwrap(),
+            })
+            .unwrap()
+        };
+        append(
+            PaperLogRecord::RiskHaltChanged {
+                owner: RiskHaltOwner::Paper,
+                cause: pe_risk_engine::RiskHaltCause::CopyLatency,
+                state: HaltState::Released,
+                evidence: serde_json::json!({}),
+            },
+            30,
+        );
+        let start = append(
+            PaperLogRecord::QualificationStarted(Arc::new(QualificationStarted {
+                starting_bankroll: CollateralAmount::from_atomic(10_000_000),
+                paper_prefix: tail.clone(),
+                source_prefix: tail.clone(),
+                live_prefix: tail,
+                artifact_blake3: "artifact".to_owned(),
+                static_config_hash: "static".to_owned(),
+                hot_config_hash: "hot".to_owned(),
+                generation: "generation".to_owned(),
+                activation_id: "clock".to_owned(),
+                ranking_batch_id: 1,
+                membership: Vec::new(),
+                membership_proofs_hash: "proofs".to_owned(),
+                schema_version: 1,
+                parser_version: 1,
+                financial_semantic_version: 2,
+            })),
+            10,
+        );
+        let snapshot = log.snapshot().unwrap();
+        let reference = scan_paper_log(&path).unwrap();
+        let paper_walks = pe_event_log::scan_metrics::count(&path).unwrap();
+        for frames in [&snapshot, &reference] {
+            assert!(matches!(
+                paper_era_at_evaluation(frames, 20_000),
+                Err(RiskInputsUnavailable::SnapshotSequenceMismatch)
+            ));
+            let complete = paper_era_at_evaluation(frames, 30_000).unwrap();
+            assert_eq!(complete.frames.len(), 1);
+            assert_eq!(complete.start.as_ref().unwrap().0, start);
+            assert!(Arc::ptr_eq(&complete.frames[0], &frames[1]));
+        }
+        let later = append(
+            PaperLogRecord::RiskHaltChanged {
+                owner: RiskHaltOwner::Paper,
+                cause: pe_risk_engine::RiskHaltCause::AbsoluteLoss,
+                state: HaltState::Engaged,
+                evidence: serde_json::json!({}),
+            },
+            40,
+        );
+        let current = log.snapshot().unwrap();
+        let preceding = paper_era_at_evaluation(&current, 30_000).unwrap();
+        assert_eq!(preceding.frames.len(), 1);
+        assert!(active_risk_halts(&preceding).is_empty());
+        assert_eq!(
+            paper_era_at_evaluation(&current, 40_000)
+                .unwrap()
+                .frames
+                .last()
+                .unwrap()
+                .receipt,
+            later
+        );
+        assert_eq!(
+            pe_event_log::scan_metrics::count(&path).unwrap(),
+            paper_walks
+        );
     }
 
     /// PASS: an open live position requires its exact source-backed price inventory; a missing,
@@ -13912,7 +14197,7 @@ mod tests {
                 Some(&state.config.source_receipts),
             )
             .unwrap();
-            let paper_frames = scan_paper_log(&state.config.paper_log_path).unwrap();
+            let paper_frames = state.config.paper_log.snapshot().unwrap();
             let projection = prepared.identity.fill_projection.as_ref().unwrap();
             prepared.economic.risk = compose_live_risk_audit(
                 &derived,
@@ -17557,6 +17842,7 @@ mod tests {
         FanoutState {
             config: LiveFanoutConfig {
                 paper_state,
+                dispatch_ready: Arc::new(tokio::sync::Notify::new()),
                 live_accounts: LiveAccounts::new(snapshot),
                 live_watchlist: LiveWatchlist::new(Watchlist {
                     entries: Vec::new(),
@@ -17576,7 +17862,7 @@ mod tests {
                 mid_price_cache: MidPriceCache::new("http://127.0.0.1:9".to_owned()),
                 source_log: source_log.clone(),
                 source_receipts,
-                paper_log_path,
+                paper_log: crate::paper_recovery::PaperLog::open(&paper_log_path).unwrap(),
                 orchestrator_control: orchestrator_control_weak,
                 http: http.clone(),
                 polygon_receipt_rpc_url: "http://127.0.0.1:9".to_owned(),
@@ -17608,7 +17894,7 @@ mod tests {
         prepared: &mut pe_execution_core::LiveOrderPreparedAudit,
         now: OffsetDateTime,
     ) {
-        let mut writer = pe_event_log::Writer::open(&state.config.paper_log_path).unwrap();
+        let writer = state.config.paper_log.clone();
         let financial_prefix = writer
             .append_synced(EnvelopeIn {
                 source_id: SourceId("pe-service.paper".to_owned()),
@@ -18386,6 +18672,62 @@ mod tests {
                 )));
             }
         }
+    }
+
+    /// Ready permits survive a competing tick; coalesced seeds drain without advancing time.
+    #[tokio::test(start_paused = true)]
+    async fn live_fanout_ready_wake_coalesces_and_periodic_work_keeps_progressing() {
+        let dir = tempdir().unwrap();
+        let db = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let state = fanout_state(&dir, db.clone(), LiveAccountsSnapshot::default(), "", None);
+        let ready = state.config.dispatch_ready.clone();
+        let (stop, shutdown) = tokio::sync::oneshot::channel();
+        let owner = run_live_fanout_until(state.config, async {
+            let _ = shutdown.await;
+        });
+        tokio::pin!(owner);
+        assert!(futures::poll!(&mut owner).is_pending()); // immediate boot pass, no seeds
+        let stage = |id: &str| {
+            db.stage_dispatch_seed(&DispatchSeedRecord {
+                dispatch_id: id.to_owned(),
+                signal_json: serde_json::to_string(&serde_json::json!({
+                    "schema_version": 1,
+                    "signal": projection_signal(),
+                    "observation": fixture_observation_evidence(),
+                }))
+                .unwrap(),
+                source_trade_id: id.to_owned(),
+                created_at_unix: 0,
+                targets: Vec::new(),
+            })
+            .unwrap();
+            db.flip_dispatch_ready(id, "fill").unwrap();
+        };
+        for id in ["first", "second"] {
+            stage(id);
+            ready.notify_one();
+        }
+        assert!(futures::poll!(&mut owner).is_pending());
+        assert!(db.unfinalized_ready_dispatch_seeds().unwrap().is_empty());
+        // Select cancels its registered notify future when the periodic tick wins.
+        stage("tick-and-wake");
+        ready.notify_one();
+        tokio::time::advance(Duration::from_secs(FANOUT_INTERVAL_SECS)).await;
+        assert!(futures::poll!(&mut owner).is_pending());
+        assert!(db.unfinalized_ready_dispatch_seeds().unwrap().is_empty());
+        // A readiness write without a wake (boot/recovery shape) retains periodic coverage.
+        stage("periodic");
+        assert!(futures::poll!(&mut owner).is_pending());
+        assert_eq!(db.unfinalized_ready_dispatch_seeds().unwrap().len(), 1);
+        tokio::time::advance(Duration::from_secs(FANOUT_INTERVAL_SECS)).await;
+        assert!(futures::poll!(&mut owner).is_pending());
+        assert!(db.unfinalized_ready_dispatch_seeds().unwrap().is_empty());
+        // Shutdown wins over a ready permit and admits no new work.
+        stage("shutdown");
+        ready.notify_one();
+        stop.send(()).unwrap();
+        assert!(futures::poll!(&mut owner).is_ready());
+        assert_eq!(db.unfinalized_ready_dispatch_seeds().unwrap().len(), 1);
     }
 
     /// PASS: resolving the owner shutdown future leaves an Approved-but-unprepared admission

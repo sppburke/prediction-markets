@@ -5,7 +5,9 @@
 //! admission/current-price clients, and the one CLOB `/book` fetch used to build exact economics.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,11 +15,11 @@ use pe_copy_signal_engine::{
     IncomingTrade, LeaderSignal, SignalConfig, TradeProvenance, classify_trade,
 };
 use pe_core_types::{
-    CollateralAmount, EventSeq, MarketId, MarketOutcomeId, OutcomeId, Price, Probability,
-    ReceivedAt, ReconstructionQuality, ShareAmount, Side, SourceId, SourceTimestamp, SourceTradeId,
-    TraderId, VenueId, WalletAddress,
+    CollateralAmount, EventSeq, MarketId, MarketOutcomeId, OutcomeId, PolymarketTokenId, Price,
+    Probability, ReceivedAt, ReconstructionQuality, ShareAmount, Side, SourceId, SourceTimestamp,
+    SourceTradeId, TraderId, VenueId, WalletAddress,
 };
-use pe_event_log::{ContentType, EnvelopeIn, Scanner, Writer};
+use pe_event_log::{ContentType, EnvelopeIn};
 use pe_kelly_sizer::{KellyInput, size_contracts};
 use pe_paper_state::{FillRecord, LeaderPositionRow, PaperStateDb, PendingTerminalEvidence};
 use pe_position_ledger::PositionLedger;
@@ -32,7 +34,7 @@ use tokio::sync::{Mutex, mpsc};
 use tracing::{error, info, warn};
 
 use crate::bucket_commit::{BucketCommitEngine, DecisionContinuationV3, PaperFreshnessPolicy};
-use crate::clob_book::ClobBookFetcher;
+use crate::clob_book::{ClobBookError, ClobBookFetcher, OrderBook};
 use crate::decision_replay::{
     AuthorityEvidence, BookEvidence, DecisionEvidenceAccumulator, MarketEndEvidence,
     MarketPriceEvidence, TerminalDispositionEvidence, WinnerFollowDecisionInputs,
@@ -107,6 +109,37 @@ struct GatePlanFailure {
     checked_at_unix_ms: Option<u64>,
 }
 
+type BookReadResult = Result<Result<OrderBook, ClobBookError>, tokio::time::error::Elapsed>;
+
+/// The decision owns this read; dropping it cancels unfinished book work.
+struct EarlyBookRead<F: Future> {
+    token_id: PolymarketTokenId,
+    future: Pin<Box<F>>,
+    completed: Option<F::Output>,
+}
+
+impl<F: Future> EarlyBookRead<F> {
+    async fn during<W: Future>(&mut self, work: W) -> W::Output {
+        tokio::pin!(work);
+        if self.completed.is_none() {
+            tokio::select! {
+                biased;
+                result = &mut self.future => self.completed = Some(result),
+                output = &mut work => return output,
+            }
+        }
+        work.await
+    }
+
+    async fn finish(self) -> (PolymarketTokenId, F::Output) {
+        let output = match self.completed {
+            Some(output) => output,
+            None => self.future.await,
+        };
+        (self.token_id, output)
+    }
+}
+
 struct ActivePaperRiskFailure {
     cause: RiskInputsUnavailable,
     evidence: WinnerFollowRiskInputEvidence,
@@ -126,6 +159,7 @@ fn book_failure(
     outcome: &str,
     response_blake3: Option<&str>,
     fetched_at_unix_ms: Option<u64>,
+    best_ask: Option<Price>,
     reason: &str,
 ) -> BookEvidence {
     BookEvidence {
@@ -133,7 +167,7 @@ fn book_failure(
         outcome: outcome.to_owned(),
         response_blake3: response_blake3.map(str::to_owned),
         fetched_at_unix_ms,
-        best_ask: None,
+        best_ask: best_ask.map(|price| price.0.normalize().to_string()),
         vwap_basis: None,
         ladder_plan_blake3: None,
         reason: Some(reason.to_owned()),
@@ -301,6 +335,10 @@ pub struct ScenarioHooks {
     pub observation_resolution_advance_millis: std::sync::atomic::AtomicI64,
     pub admission_artifacts:
         std::sync::Mutex<std::collections::VecDeque<pe_execution_core::LiveAdmissionArtifact>>,
+    #[cfg(test)]
+    admission_wait: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    #[cfg(test)]
+    admission_failure: std::sync::atomic::AtomicBool,
     pub boundary_mark_prices:
         std::sync::Mutex<std::collections::VecDeque<crate::risk_inputs::HistoricalMarkPrice>>,
     pub financial_clock_unix: std::sync::atomic::AtomicI64,
@@ -329,7 +367,7 @@ pub struct Orchestrator<
     live_watchlist: LiveWatchlist,
     signal_config: SignalConfig,
     strategy: WinnerFollowStrategy,
-    paper_writer: Writer,
+    paper_writer: crate::paper_recovery::PaperLog,
     mode: ExecutionMode,
     bankroll: Decimal,
     paper_state: Arc<PaperStateDb>,
@@ -374,6 +412,7 @@ pub struct Orchestrator<
     // tests / when Supabase is off — zero targets, Phase-A baseline behavior.
     live_accounts: Option<crate::live_accounts::LiveAccounts>,
     live_journal: Option<Arc<pe_execution_core::LiveJournal>>,
+    live_dispatch_ready: Option<Arc<tokio::sync::Notify>>,
     /// Set at the first uncertain paper sync boundary. Dropping the receiver
     /// then backpressures/stops every producer; supervisor owns process exit.
     intake_stopped: bool,
@@ -445,7 +484,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 content_type: ContentType::Json,
                 payload,
             })
-            .map_err(|error| error.to_string())
+            .map_err(|error| {
+                self.intake_stopped = true;
+                error.to_string()
+            })
     }
 
     fn apply_risk_halt_transition(
@@ -593,7 +635,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .as_ref()
             .ok_or_else(|| "qualification seal is unavailable before Start".to_owned())?;
         let era = crate::paper_recovery::paper_era(
-            crate::paper_recovery::scan_paper_log(paper_log_path)
+            self.paper_writer
+                .snapshot()
                 .map_err(|error| error.to_string())?,
         );
         let (start_receipt, started) = era
@@ -667,8 +710,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             ),
             (Err(error), _) => return Err(qualification_error(error)),
         };
-        let financial_prefix =
-            Scanner::verify(paper_log_path).map_err(|error| error.to_string())?;
+        let financial_prefix = self.paper_writer.verified_tail().map_err(|error| {
+            self.intake_stopped = true;
+            error.to_string()
+        })?;
         let live_prefix = pe_execution_core::LiveJournal::verified_tail(
             paper_log_path.with_file_name("live_journal.log"),
         )
@@ -696,12 +741,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         proposed_economic_hash: &str,
         proposed_financial_semantic_version: u32,
     ) -> Result<(), String> {
-        let (paper_log_path, _) = self
+        let (_paper_log_path, _) = self
             .financial_log_paths
             .as_ref()
             .ok_or_else(|| "qualification seal check is unavailable before Start".to_owned())?;
         let era = crate::paper_recovery::paper_era(
-            crate::paper_recovery::scan_paper_log(paper_log_path)
+            self.paper_writer
+                .snapshot()
                 .map_err(|error| error.to_string())?,
         );
         let (_, started) = era
@@ -738,12 +784,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         proposed_financial_semantic_version: u32,
     ) -> Result<(), String> {
         self.reconcile_oldest_financial_prepared().await?;
-        let (paper_log_path, _) = self
+        let (_paper_log_path, _) = self
             .financial_log_paths
             .as_ref()
             .ok_or_else(|| "qualification seal check is unavailable before Start".to_owned())?;
         let era = crate::paper_recovery::paper_era(
-            crate::paper_recovery::scan_paper_log(paper_log_path)
+            self.paper_writer
+                .snapshot()
                 .map_err(|error| error.to_string())?,
         );
         let seal_needed = era.start.as_ref().is_some_and(|(_, start)| {
@@ -783,7 +830,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
     /// The shared recovery routine owns frozen-request reconstruction and appends at most the
     /// missing Final; no control-specific cursor or retry state is maintained here.
     async fn reconcile_oldest_financial_prepared(&mut self) -> Result<(), String> {
-        let (paper_log_path, _source_log_path) = self
+        let (_paper_log_path, _source_log_path) = self
             .financial_log_paths
             .clone()
             .ok_or_else(|| "active financial log paths are not configured".to_owned())?;
@@ -795,14 +842,14 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         reconcile_active_financial_frames(
             &authority,
             &self.paper_state,
-            &paper_log_path,
             source_evidence,
-            &mut self.paper_writer,
+            &self.paper_writer,
         )
         .await
         .map_err(|error| error.to_string())?;
         let era = crate::paper_recovery::paper_era(
-            crate::paper_recovery::scan_paper_log(&paper_log_path)
+            self.paper_writer
+                .snapshot()
                 .map_err(|error| error.to_string())?,
         );
         if crate::paper_recovery::oldest_unmatched_prepared(&era).is_some() {
@@ -818,7 +865,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         source_receipt: pe_event_log::AppendReceipt,
     ) -> Result<(), String> {
         self.reconcile_oldest_financial_prepared().await?;
-        let (paper_log_path, _source_log_path) = self
+        let (_paper_log_path, _source_log_path) = self
             .financial_log_paths
             .clone()
             .ok_or_else(|| "active financial log paths are not configured".to_owned())?;
@@ -828,7 +875,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .map_err(|error| error.to_string())?
             .ok_or_else(|| "resolution candidate precedes QualificationStarted".to_owned())?;
         let era = crate::paper_recovery::paper_era(
-            crate::paper_recovery::scan_paper_log(&paper_log_path)
+            self.paper_writer
+                .snapshot()
                 .map_err(|error| error.to_string())?,
         );
         let completed = era
@@ -931,7 +979,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         }
         self.reconcile_oldest_financial_prepared().await?;
 
-        let (paper_log_path, _source_log_path) = self
+        let (_paper_log_path, _source_log_path) = self
             .financial_log_paths
             .clone()
             .ok_or_else(|| "active financial log paths are not configured".to_owned())?;
@@ -941,7 +989,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .ok_or_else(|| "active financial era has no authority client".to_owned())?;
 
         let era = crate::paper_recovery::paper_era(
-            crate::paper_recovery::scan_paper_log(&paper_log_path)
+            self.paper_writer
+                .snapshot()
                 .map_err(|error| error.to_string())?,
         );
         if crate::paper_recovery::oldest_unmatched_prepared(&era).is_some() {
@@ -1042,9 +1091,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         terminalize_final_fill_decision(&self.paper_state, &payload, &result, final_receipt)
             .map_err(|error| error.to_string())?;
         if let Some(dispatch_id) = dispatch_id {
-            self.paper_state
+            let flipped = self
+                .paper_state
                 .flip_dispatch_ready(dispatch_id, "fill")
                 .map_err(|error| error.to_string())?;
+            if flipped {
+                self.notify_live_dispatch_ready();
+            }
         }
         let crate::paper_recovery::FinancialResult::Fill { canonical } = result else {
             return Err("internal fill Final kind mismatch".to_owned());
@@ -1069,20 +1122,15 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             proposed_debit,
             per_trade_cap_bps,
         };
-        let (paper_log_path, _) = self.financial_log_paths.as_ref().cloned().ok_or_else(|| {
+        let (_paper_log_path, _) = self.financial_log_paths.as_ref().cloned().ok_or_else(|| {
             ActivePaperRiskFailure::new(RiskInputsUnavailable::SnapshotSequenceMismatch, &attempt)
         })?;
         let source_receipts = self.source_receipts.as_ref().ok_or_else(|| {
             ActivePaperRiskFailure::new(RiskInputsUnavailable::SnapshotSequenceMismatch, &attempt)
         })?;
-        let era = crate::paper_recovery::paper_era(
-            crate::paper_recovery::scan_paper_log(&paper_log_path).map_err(|_| {
-                ActivePaperRiskFailure::new(
-                    RiskInputsUnavailable::SnapshotSequenceMismatch,
-                    &attempt,
-                )
-            })?,
-        );
+        let era = crate::paper_recovery::paper_era(self.paper_writer.snapshot().map_err(|_| {
+            ActivePaperRiskFailure::new(RiskInputsUnavailable::SnapshotSequenceMismatch, &attempt)
+        })?);
         let financial_prefix = era
             .frames
             .last()
@@ -1292,7 +1340,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         boundary_receipt: pe_event_log::AppendReceipt,
     ) -> Result<(), String> {
         self.reconcile_oldest_financial_prepared().await?;
-        let (paper_log_path, _source_log_path) =
+        let (_paper_log_path, _source_log_path) =
             self.financial_log_paths.as_ref().cloned().ok_or_else(|| {
                 "daily boundary is unavailable before QualificationStarted".to_owned()
             })?;
@@ -1301,7 +1349,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 "daily boundary historical-price reader is unavailable".to_owned()
             })?);
         let era = crate::paper_recovery::paper_era(
-            crate::paper_recovery::scan_paper_log(&paper_log_path)
+            self.paper_writer
+                .snapshot()
                 .map_err(|error| error.to_string())?,
         );
         let source_receipts = self
@@ -1363,6 +1412,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     price: None,
                     sample_unix: None,
                     receipt: None,
+                    closure_receipt: None,
                     invalid: Some(reason),
                 });
                 continue;
@@ -1375,11 +1425,15 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             #[cfg(not(feature = "scenario"))]
             let scenario_mark = None;
             let fetched = match scenario_mark {
-                Some(mark) => Ok(mark),
-                None => mark_fetcher.fetch(token_id, cutoff_unix).await,
+                Some(mark) => Ok((mark, None)),
+                None => {
+                    mark_fetcher
+                        .fetch_paper(&key.0, token_id, cutoff_unix)
+                        .await
+                }
             };
             match fetched {
-                Ok(mark) => {
+                Ok((mark, closure_receipt)) => {
                     let net = position.long.checked_sub(position.short).map_err(|_| {
                         "daily boundary encountered a net-short paper position".to_owned()
                     })?;
@@ -1390,6 +1444,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                         price: Some(mark.price),
                         sample_unix: Some(mark.sample_unix),
                         receipt: Some(mark.receipt),
+                        closure_receipt,
                         invalid: None,
                     });
                 }
@@ -1403,6 +1458,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                         price: None,
                         sample_unix: None,
                         receipt: None,
+                        closure_receipt: None,
                         invalid: Some(reason),
                     });
                 }
@@ -1453,7 +1509,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         self.append_paper_record(&PaperLogRecord::PortfolioMark(Box::new(mark)))?;
         let completion = if mark_is_valid {
             let era = crate::paper_recovery::paper_era(
-                crate::paper_recovery::scan_paper_log(&paper_log_path)
+                self.paper_writer
+                    .snapshot()
                     .map_err(|error| error.to_string())?,
             );
             crate::qualification::qualification_completion_for_causal_facts(&era, &completed)
@@ -1790,7 +1847,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher> Orchestrator<F, B> {
         live_watchlist: LiveWatchlist,
         config: OrchestratorConfig,
         strategy: WinnerFollowStrategy,
-        paper_writer: Writer,
+        paper_writer: crate::paper_recovery::PaperLog,
         paper_state: Arc<PaperStateDb>,
         leader_ledger: PositionLedger,
         health: SharedHealth,
@@ -1829,7 +1886,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         live_watchlist: LiveWatchlist,
         config: OrchestratorConfig,
         strategy: WinnerFollowStrategy,
-        paper_writer: Writer,
+        paper_writer: crate::paper_recovery::PaperLog,
         paper_state: Arc<PaperStateDb>,
         leader_ledger: PositionLedger,
         health: SharedHealth,
@@ -1861,7 +1918,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         live_watchlist: LiveWatchlist,
         config: OrchestratorConfig,
         strategy: WinnerFollowStrategy,
-        paper_writer: Writer,
+        paper_writer: crate::paper_recovery::PaperLog,
         paper_state: Arc<PaperStateDb>,
         leader_ledger: PositionLedger,
         health: SharedHealth,
@@ -1958,6 +2015,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             book_fetcher,
             price_impact_cap_bps: config.price_impact_cap_bps,
             live_accounts: config.live_accounts,
+            live_dispatch_ready: None,
             live_journal: config.live_journal.and_then(|access| match access {
                 LiveJournalAccess::Writable(journal) => Some(journal),
                 LiveJournalAccess::ReadOnly(_) => None,
@@ -1984,6 +2042,20 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
     pub fn with_source_receipt_index(mut self, source_receipts: SourceReceiptIndex) -> Self {
         self.source_receipts = Some(source_receipts);
         self
+    }
+
+    /// Wake the sequential live owner after a committed paper outcome releases a seed.
+    #[must_use]
+    pub fn with_live_dispatch_ready(mut self, ready: Arc<tokio::sync::Notify>) -> Self {
+        self.live_dispatch_ready = Some(ready);
+        self
+    }
+
+    fn notify_live_dispatch_ready(&self) {
+        if let Some(ready) = &self.live_dispatch_ready {
+            // One consumer; retain a permit when it is busy or its select is cancelled.
+            ready.notify_one();
+        }
     }
 
     /// Install the verified log pair used by the Start-bound financial protocol.
@@ -2210,12 +2282,14 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         probability: Probability,
         sizing_bankroll: Decimal,
         admission: &pe_execution_core::LiveAdmissionArtifact,
+        early_book: Option<BookReadResult>,
     ) -> Result<GatePlanEvidence, GatePlanFailure> {
         let cap_bps = u64::try_from(self.price_impact_cap_bps).map_err(|_| GatePlanFailure {
             reason: "impact gate cap invalid",
             book: Box::new(book_failure(
                 None,
                 "not_read",
+                None,
                 None,
                 None,
                 "impact gate cap invalid",
@@ -2235,18 +2309,24 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     "missing_token",
                     None,
                     None,
+                    None,
                     "outcome had no CLOB token id",
                 )),
                 checked_at_unix_ms: None,
             });
         };
-        let book = match tokio::time::timeout(
-            Duration::from_secs(CLOB_BOOK_HOT_PATH_TIMEOUT_SECS),
-            self.book_fetcher
-                .fetch_book(&admission.market.condition_id.0, &token_id),
-        )
-        .await
-        {
+        let book_read = match early_book {
+            Some(result) => result,
+            None => {
+                tokio::time::timeout(
+                    Duration::from_secs(CLOB_BOOK_HOT_PATH_TIMEOUT_SECS),
+                    self.book_fetcher
+                        .fetch_book(&admission.market.condition_id.0, &token_id),
+                )
+                .await
+            }
+        };
+        let book = match book_read {
             Ok(Ok(book)) => book,
             Ok(Err(_)) => {
                 return Err(GatePlanFailure {
@@ -2254,6 +2334,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     book: Box::new(book_failure(
                         Some(&token_id),
                         "fetch_failed",
+                        None,
                         None,
                         None,
                         "/book fetch failed",
@@ -2267,6 +2348,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     book: Box::new(book_failure(
                         Some(&token_id),
                         "fetch_timed_out",
+                        None,
                         None,
                         None,
                         "/book fetch timed out",
@@ -2283,6 +2365,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     "corrupt_ladder",
                     Some(&book.response_blake3),
                     Some(book.fetched_at_ms),
+                    None,
                     "ask levels could not form an exact ladder",
                 )),
                 checked_at_unix_ms: None,
@@ -2296,6 +2379,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     "empty_ladder",
                     Some(&book.response_blake3),
                     Some(book.fetched_at_ms),
+                    None,
                     "ask ladder was empty",
                 )),
                 checked_at_unix_ms: None,
@@ -2341,6 +2425,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 "arithmetic_failure",
                 Some(&book.response_blake3),
                 Some(book.fetched_at_ms),
+                None,
                 "price-impact band ceiling not constructible",
             )),
             checked_at_unix_ms: Some(checked_at_unix_ms),
@@ -2358,6 +2443,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     "arithmetic_failure",
                     Some(&book.response_blake3),
                     Some(book.fetched_at_ms),
+                    None,
                     "impact budget not constructible",
                 )),
                 checked_at_unix_ms: Some(checked_at_unix_ms),
@@ -2380,6 +2466,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                         "arithmetic_failure",
                         Some(&book.response_blake3),
                         Some(book.fetched_at_ms),
+                        None,
                         "per-trade cap not constructible",
                     )),
                     checked_at_unix_ms: Some(checked_at_unix_ms),
@@ -2418,6 +2505,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 "arithmetic_failure",
                 Some(&book.response_blake3),
                 Some(book.fetched_at_ms),
+                None,
                 "price domain invariant broken",
             )),
             checked_at_unix_ms: Some(checked_at_unix_ms),
@@ -2430,6 +2518,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     "arithmetic_failure",
                     Some(&book.response_blake3),
                     Some(book.fetched_at_ms),
+                    None,
                     "price band floor not constructible",
                 )),
                 checked_at_unix_ms: Some(checked_at_unix_ms),
@@ -2465,6 +2554,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                                 "arithmetic_failure",
                                 Some(&book.response_blake3),
                                 Some(book.fetched_at_ms),
+                                None,
                                 "all-in ladder debit could not be derived",
                             )),
                             checked_at_unix_ms: Some(checked_at_unix_ms),
@@ -2509,7 +2599,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 worst_case_all_in_debit: CollateralAmount::ZERO,
                 checked_at_unix_ms,
             }),
-            Err(LadderError::BelowBandAsk | LadderError::InsufficientDepth) => {
+            Err(decline @ (LadderError::BelowBandAsk | LadderError::InsufficientDepth)) => {
                 Err(GatePlanFailure {
                     reason: "price-impact ladder walk failed (fail closed)",
                     book: Box::new(book_failure(
@@ -2517,7 +2607,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                         "ladder_rejected",
                         Some(&book.response_blake3),
                         Some(book.fetched_at_ms),
-                        "ladder walk did not satisfy the price band",
+                        Some(best),
+                        &format!("{decline:?}"),
                     )),
                     checked_at_unix_ms: Some(checked_at_unix_ms),
                 })
@@ -2544,24 +2635,26 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                         outcome,
                         Some(&book.response_blake3),
                         Some(book.fetched_at_ms),
-                        reason,
+                        Some(best),
+                        &format!("{decline:?}"),
                     )),
                     checked_at_unix_ms: Some(checked_at_unix_ms),
                 })
             }
-            Err(LadderError::Amount | LadderError::KellySizing | LadderError::Fee(_)) => {
-                Err(GatePlanFailure {
-                    reason: "price-impact ladder arithmetic failed (fail closed)",
-                    book: Box::new(book_failure(
-                        Some(&token_id),
-                        "arithmetic_failure",
-                        Some(&book.response_blake3),
-                        Some(book.fetched_at_ms),
-                        "ladder arithmetic failed",
-                    )),
-                    checked_at_unix_ms: Some(checked_at_unix_ms),
-                })
-            }
+            Err(
+                decline @ (LadderError::Amount | LadderError::KellySizing | LadderError::Fee(_)),
+            ) => Err(GatePlanFailure {
+                reason: "price-impact ladder arithmetic failed (fail closed)",
+                book: Box::new(book_failure(
+                    Some(&token_id),
+                    "arithmetic_failure",
+                    Some(&book.response_blake3),
+                    Some(book.fetched_at_ms),
+                    Some(best),
+                    &format!("{decline:?}"),
+                )),
+                checked_at_unix_ms: Some(checked_at_unix_ms),
+            }),
         }
     }
 
@@ -2858,7 +2951,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                             .source_envelope(receipt)
                             .map(crate::bucket_commit::CompleteActivityPage::from)
                     })
-                    .map(|source_time| (policy, source_time))
+                    .map(|(source_time, asset)| (policy, source_time, asset))
                     .map_err(|error| error.to_string())
             })
             .transpose();
@@ -2870,6 +2963,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 return;
             }
         };
+        let authenticated_asset = paper_freshness
+            .as_ref()
+            .and_then(|(_, _, asset)| asset.clone());
+        let paper_freshness = paper_freshness.map(|(policy, source_time, _)| (policy, source_time));
         let mut decision_evidence = pending
             .as_ref()
             .map(DecisionEvidenceAccumulator::for_continuation);
@@ -3212,11 +3309,46 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         let semantic2 = pending
             .as_ref()
             .is_some_and(|continuation| continuation.version() == 6);
-        let admission = if let Some(admission) = scenario_admission {
-            admission
-        } else {
-            match &self.admission_builder {
-                Some(builder) => match if semantic2 {
+        let mut early_book = authenticated_asset.map(|token_id| {
+            let fetcher = Arc::clone(&self.book_fetcher);
+            let condition = condition_id.clone();
+            let asset = token_id.clone();
+            let deadline =
+                tokio::time::Instant::now() + Duration::from_secs(CLOB_BOOK_HOT_PATH_TIMEOUT_SECS);
+            EarlyBookRead {
+                token_id,
+                future: Box::pin(tokio::time::timeout_at(deadline, async move {
+                    fetcher.fetch_book(&condition.0, &asset.0).await
+                })),
+                completed: None,
+            }
+        });
+        #[cfg(all(test, feature = "scenario"))]
+        let admission_wait = self
+            .scenario_hooks
+            .as_ref()
+            .and_then(|hooks| hooks.admission_wait.lock().ok()?.take());
+        let admission_read = async {
+            #[cfg(all(test, feature = "scenario"))]
+            if let Some(wait) = admission_wait {
+                let _ = wait.await;
+            }
+            #[cfg(all(test, feature = "scenario"))]
+            if self.scenario_hooks.as_ref().is_some_and(|hooks| {
+                hooks
+                    .admission_failure
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            }) {
+                return Some(Err(
+                    crate::live_venue_adapter::LiveVenueAdapterError::MarketValidation(
+                        "injected admission refusal".to_owned(),
+                    ),
+                ));
+            }
+            if let Some(admission) = scenario_admission {
+                Some(Ok(admission))
+            } else if let Some(builder) = &self.admission_builder {
+                Some(if semantic2 {
                     builder
                         .build_paper(&condition_id, OffsetDateTime::now_utc())
                         .await
@@ -3224,30 +3356,71 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     builder
                         .build(&condition_id, OffsetDateTime::now_utc())
                         .await
-                } {
-                    Ok(admission) => admission,
-                    Err(error) => {
-                        info!(%error, market = %signal.market_id, "market admission failed closed");
-                        self.no_fill_or_rollback(
-                            &trade,
-                            &leader_row,
-                            None,
-                            "market_admission_unavailable",
-                            &rb,
-                            Some(&signal.market_id),
-                            decision_evidence.as_ref(),
-                        )
-                        .await;
-                        return;
-                    }
-                },
-                None => {
-                    error!(market = %signal.market_id, "active financial era has no admission builder");
-                    self.intake_stopped = true;
-                    return;
-                }
+                })
+            } else {
+                None
             }
         };
+        let admission = match early_book.as_mut() {
+            Some(book) => book.during(admission_read).await,
+            None => admission_read.await,
+        };
+        let admission = match admission {
+            Some(Ok(admission)) => admission,
+            Some(Err(error)) => {
+                drop(early_book);
+                info!(%error, market = %signal.market_id, "market admission failed closed");
+                self.no_fill_or_rollback(
+                    &trade,
+                    &leader_row,
+                    None,
+                    "market_admission_unavailable",
+                    &rb,
+                    Some(&signal.market_id),
+                    decision_evidence.as_ref(),
+                )
+                .await;
+                return;
+            }
+            None => {
+                drop(early_book);
+                error!(market = %signal.market_id, "active financial era has no admission builder");
+                self.intake_stopped = true;
+                return;
+            }
+        };
+
+        if let Some(book) = early_book.as_ref()
+            && admission
+                .market
+                .ordered_outcome_token_ids
+                .get(usize::from(signal.outcome_id.0))
+                != Some(&book.token_id)
+        {
+            let reason = "price-impact book unusable: token mismatch (fail closed)";
+            if let Some(evidence) = decision_evidence.as_mut() {
+                evidence.record_book(book_failure(
+                    Some(&book.token_id.0),
+                    "token_mismatch",
+                    None,
+                    None,
+                    None,
+                    "authenticated asset differs from admission's ordered outcome token",
+                ));
+            }
+            drop(early_book);
+            self.no_fill_or_rollback(
+                &trade,
+                &leader_row,
+                None,
+                reason,
+                &rb,
+                Some(&signal.market_id),
+                decision_evidence.as_ref(),
+            )
+            .await;
+            return;
+        }
 
         // Resolution-horizon gate uses the scheduled end already carried by admission; no second
         // Gamma request or dashboard cache participates in economics.
@@ -3279,6 +3452,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     resolution_unix = ?resolution_unix,
                     "signal did not produce order",
                 );
+                drop(early_book);
                 self.no_fill_or_rollback(
                     &trade,
                     &leader_row,
@@ -3302,10 +3476,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         // diagnosis; sizing and gating below use `fill_basis` instead. Fail closed on an
         // absent mid (unchanged liveness behaviour).
         let _market_mid = {
-            let mids = self
+            let mid_read = self
                 .mid_price_cache
-                .fetch_mids(std::slice::from_ref(&signal.market_id))
-                .await;
+                .fetch_mids(std::slice::from_ref(&signal.market_id));
+            let mids = match early_book.as_mut() {
+                Some(book) => book.during(mid_read).await,
+                None => mid_read.await,
+            };
             let px = mids
                 .get(&signal.market_id)
                 .and_then(|prices| prices.get(usize::from(signal.outcome_id.0)).copied());
@@ -3336,6 +3513,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                         outcome = signal.outcome_id.0,
                         "signal did not produce order",
                     );
+                    drop(early_book);
                     self.no_fill_or_rollback(
                         &trade,
                         &leader_row,
@@ -3377,8 +3555,19 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 }
             },
         };
+        let early_book = match early_book {
+            Some(book) => Some(book.finish().await.1),
+            None => None,
+        };
         let gate_evidence = match self
-            .plan_impact_gate(&signal, semantic2, p, sizing_bankroll, &admission)
+            .plan_impact_gate(
+                &signal,
+                semantic2,
+                p,
+                sizing_bankroll,
+                &admission,
+                early_book,
+            )
             .await
         {
             Ok(outcome) => outcome,
@@ -3925,6 +4114,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             error!(error = %e, trade = %trade.source_trade_id,
                 "no-copy disposition commit failed; rolling back admission");
             self.rollback_admission(rb, unrecord_market);
+        } else if flip.is_some() {
+            self.notify_live_dispatch_ready();
         }
     }
 
@@ -4073,7 +4264,12 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 flip,
                 pending.as_ref().map(pending_terminal),
             ) {
-                Ok(()) => return true,
+                Ok(()) => {
+                    if flip.is_some() {
+                        self.notify_live_dispatch_ready();
+                    }
+                    return true;
+                }
                 Err(e) if attempt < LOCAL_COMMIT_RETRIES => {
                     error!(
                         error = %e,
@@ -4264,6 +4460,404 @@ mod tests {
     use crate::risk_inputs::{SourceReceiptIndex, apply_global_risk_halts};
     use crate::supabase_state::{SourceEvidence, SupabaseStateClient};
 
+    #[cfg(feature = "scenario")]
+    mod early_book_tests {
+        use super::*;
+        use crate::bucket_commit::continuation_v3_tests::{binding_fixture, binding_state};
+        use crate::clob_book::{BookLevel, ClobBookError, ClobBookFetcher, OrderBook};
+        use pe_copy_signal_engine::TradeProvenance;
+        use pe_core_types::{Price, ShareAmount};
+        use pe_execution_core::LiveAdmissionArtifact;
+        use pe_strategy_winner_follow::{PerTradeCap, SizingMode};
+        use std::sync::atomic::AtomicUsize;
+        use tokio::sync::oneshot;
+
+        struct Books {
+            book: StdMutex<OrderBook>,
+            stalled: bool,
+            started: StdMutex<Vec<(String, String)>>,
+            dropped: Arc<AtomicUsize>,
+        }
+
+        struct DropRead(Arc<AtomicUsize>);
+        impl Drop for DropRead {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        impl ClobBookFetcher for Books {
+            async fn fetch_book(
+                &self,
+                condition: &str,
+                token: &str,
+            ) -> Result<OrderBook, ClobBookError> {
+                let _read = DropRead(Arc::clone(&self.dropped));
+                self.started
+                    .lock()
+                    .unwrap()
+                    .push((condition.to_owned(), token.to_owned()));
+                if self.stalled {
+                    std::future::pending::<()>().await;
+                }
+                Ok(self.book.lock().unwrap().clone())
+            }
+        }
+
+        struct Harness {
+            _fixture: crate::bucket_commit::continuation_v3_tests::BindingFixture,
+            owner: Orchestrator<FixtureFetcher, Books>,
+            trade: pe_copy_signal_engine::IncomingTrade,
+            books: Arc<Books>,
+            hooks: Arc<super::super::ScenarioHooks>,
+            release: Option<oneshot::Sender<()>>,
+        }
+
+        impl Harness {
+            fn new(provenance: TradeProvenance, authenticated: bool, stalled: bool) -> Self {
+                let fixture = binding_fixture("valid");
+                let state = binding_state(&fixture);
+                let row = state
+                    .decision_pending_for(&fixture.continuation.facts.source_trade_id)
+                    .unwrap()
+                    .unwrap();
+                let mut continuation =
+                    crate::bucket_commit::DecisionContinuationV3::from_durable(&row).unwrap();
+                continuation.facts.provenance = provenance;
+                if provenance == TradeProvenance::RestPoll {
+                    continuation.observed_source_receipt = None;
+                }
+                let config = &mut continuation.facts.applied_configuration;
+                config.min_resolution_horizon_secs = 0;
+                config.max_resolution_horizon_secs = 0;
+                config.min_fill_price = Decimal::ZERO;
+                config.max_fill_price = dec!(0.85);
+                config.per_trade_cap = PerTradeCap::Unlimited;
+                config.sizing_mode = SizingMode::Dollar { usd: dec!(25) };
+                config.sizing_dollar_usd = dec!(25);
+                continuation.facts.applied_configuration_hash = config.canonical_hash();
+                if !authenticated {
+                    continuation.facts.paper_freshness_policy = None;
+                    continuation = crate::bucket_commit::DecisionContinuationV3::new(
+                        continuation.facts,
+                        continuation.observed_source_receipt,
+                        continuation.page_occurrences,
+                        None,
+                    );
+                }
+                rusqlite::Connection::open(fixture.dir.path().join("paper.db")).unwrap().execute(
+                    "UPDATE decision_pending SET frozen_inputs_json = ?1 WHERE source_trade_id = ?2",
+                    rusqlite::params![serde_json::to_string(&continuation).unwrap(), row.source_trade_id.0],
+                ).unwrap();
+                let now = u64::try_from(SEAL_START_UNIX * 1000).unwrap();
+                let books = Arc::new(Books {
+                    book: StdMutex::new(OrderBook {
+                        asks: vec![BookLevel {
+                            price: dec!(0.5),
+                            size: dec!(1),
+                        }],
+                        fetched_at_ms: now,
+                        response_blake3: "early-book".to_owned(),
+                        source_receipt: None,
+                    }),
+                    stalled,
+                    started: StdMutex::new(Vec::new()),
+                    dropped: Arc::new(AtomicUsize::new(0)),
+                });
+                let (control, receiver) = mpsc::channel(4);
+                drop(control);
+                let writer =
+                    crate::paper_recovery::PaperLog::open(fixture.dir.path().join("paper.log"))
+                        .unwrap();
+                let base = "https://offline.invalid";
+                let mids = serde_json::to_vec(&serde_json::json!([{
+                    "conditionId": "new", "outcomePrices": "[\"0.5\",\"0.5\"]", "clobTokenIds": "[\"123\",\"456\"]"
+                }])).unwrap();
+                let mid_fetcher = FixtureFetcher::new(HashMap::from([(
+                    format!("{base}/markets?condition_ids=new&limit=500"),
+                    mids,
+                )]));
+                let mut owner = Orchestrator::new(
+                    LiveWatchlist::new(Watchlist {
+                        entries: Vec::new(),
+                        snapshot_at: SourceTimestamp(time::OffsetDateTime::UNIX_EPOCH),
+                        active_count: 0,
+                        incubator_count: 0,
+                    }),
+                    super::super::OrchestratorConfig {
+                        bankroll: dec!(100),
+                        mode: ExecutionMode::Paper,
+                        signal_config: Default::default(),
+                        max_resolution_horizon_secs: 0,
+                        min_resolution_horizon_secs: 0,
+                        max_fill_price: dec!(0.85),
+                        min_fill_price: Decimal::ZERO,
+                        price_impact_cap_bps: 100,
+                        entry_gate_config: CopyEntryGateConfig,
+                        runtime_config: None,
+                        live_accounts: None,
+                        live_journal: None,
+                        activity_ws_enabled: false,
+                        copy_latency_budget_secs: 2,
+                        watchlist_writer_lock: None,
+                    },
+                    WinnerFollowStrategy::new(WinnerFollowConfig::default()),
+                    writer,
+                    state.clone(),
+                    crate::paper_recovery::build_leader_ledger(&state).unwrap(),
+                    new_shared_health(false),
+                    MidPriceCache::with_fetcher(mid_fetcher, base.to_owned()),
+                    receiver,
+                    None,
+                    None,
+                    None,
+                    books.clone(),
+                )
+                .unwrap();
+                owner.resuming_boot = true;
+                owner.source_receipts = Some(fixture.index.clone());
+                owner.qualification_start = Some(fixture.metadata_receipt);
+                let hooks = Arc::new(super::super::ScenarioHooks::default());
+                hooks
+                    .age_clock
+                    .lock()
+                    .unwrap()
+                    .push_back(time::OffsetDateTime::from_unix_timestamp(101).unwrap());
+                hooks
+                    .financial_clock_unix
+                    .store(SEAL_START_UNIX, Ordering::SeqCst);
+                let economic =
+                    seal_test_economic(fixture.metadata_receipt, fixture.metadata_receipt);
+                let mut market = pe_source_polymarket_public::LiveMarketEvidence {
+                    condition_id: PolymarketConditionId("new".to_owned()),
+                    ordered_outcome_token_ids: [
+                        PolymarketTokenId("123".to_owned()),
+                        PolymarketTokenId("456".to_owned()),
+                    ],
+                    neg_risk: false,
+                    minimum_tick_size: Price::new(dec!(0.01)).unwrap(),
+                    minimum_order_size: ShareAmount::from_whole(5).unwrap(),
+                    scheduled_end_unix: None,
+                    observed_at_unix: SEAL_START_UNIX,
+                    schema_version: 1,
+                    parser_version: 1,
+                    freshness_window_secs: 60,
+                };
+                market.scheduled_end_unix =
+                    Some(time::OffsetDateTime::now_utc().unix_timestamp() + 3600);
+                hooks
+                    .admission_artifacts
+                    .lock()
+                    .unwrap()
+                    .push_back(LiveAdmissionArtifact {
+                        market,
+                        settlement: economic.admission.settlement,
+                        fee_schedule: CompactFeeSchedule::Zero,
+                        receipts: economic.admission.receipts,
+                    });
+                let (release, wait) = oneshot::channel();
+                *hooks.admission_wait.lock().unwrap() = Some(wait);
+                owner.set_scenario_hooks(hooks.clone());
+                let trade = continuation.incoming_trade().unwrap();
+                Self {
+                    _fixture: fixture,
+                    owner,
+                    trade,
+                    books,
+                    hooks,
+                    release: Some(release),
+                }
+            }
+
+            fn change_config(
+                &mut self,
+                change: impl FnOnce(&mut crate::runtime_config::RuntimeConfig),
+            ) {
+                let continuation = self
+                    .owner
+                    .pending_continuations
+                    .get_mut(&self.trade.source_trade_id)
+                    .unwrap();
+                change(&mut continuation.facts.applied_configuration);
+                continuation.facts.applied_configuration_hash =
+                    continuation.facts.applied_configuration.canonical_hash();
+                rusqlite::Connection::open(self._fixture.dir.path().join("paper.db")).unwrap().execute(
+                    "UPDATE decision_pending SET frozen_inputs_json = ?1 WHERE source_trade_id = ?2",
+                    rusqlite::params![serde_json::to_string(continuation).unwrap(), self.trade.source_trade_id.0],
+                ).unwrap();
+            }
+
+            fn evidence(&self) -> crate::decision_replay::DecisionPostBoundaryEvidence {
+                let row = self
+                    .owner
+                    .paper_state
+                    .decision_pending_for(&self.trade.source_trade_id)
+                    .unwrap()
+                    .unwrap();
+                let replayed = crate::decision_replay::replay_decision_pending(&row).unwrap();
+                assert_eq!(
+                    replayed.continuation.facts.source_trade_id,
+                    self.trade.source_trade_id
+                );
+                serde_json::from_str(&row.post_commit_inputs_json).unwrap()
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn websocket_and_rest_book_overlap_admission_and_match_ordered_token() {
+            for provenance in [TradeProvenance::ActivityWs, TradeProvenance::RestPoll] {
+                let mut harness = Harness::new(provenance, true, false);
+                let mut decision = Box::pin(harness.owner.handle_trade_once(harness.trade.clone()));
+                assert!(futures::poll!(&mut decision).is_pending());
+                assert_eq!(
+                    *harness.books.started.lock().unwrap(),
+                    [("new".to_owned(), "123".to_owned())]
+                );
+                harness.release.take().unwrap().send(()).unwrap();
+                decision.await;
+                let evidence = harness.evidence();
+                let book = evidence.body.book.unwrap();
+                assert_eq!(book.request_token_id.as_deref(), Some("123"));
+                assert_eq!(book.outcome, "ladder_rejected");
+                assert_eq!(book.reason.as_deref(), Some("InsufficientDepth"));
+                assert_eq!(book.best_ask.as_deref(), Some("0.5"));
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn ladder_rejections_retain_specific_reason_and_best_ask() {
+            for (floor, depth, expected) in [
+                (dec!(0.6), dec!(100), "BelowBandAsk"),
+                (Decimal::ZERO, dec!(100), "BelowMinimum"),
+            ] {
+                let mut harness = Harness::new(TradeProvenance::RestPoll, true, false);
+                harness.change_config(|config| {
+                    config.min_fill_price = floor;
+                    config.sizing_dollar_usd = dec!(1);
+                    config.sizing_mode = SizingMode::Dollar { usd: dec!(1) };
+                });
+                harness.books.book.lock().unwrap().asks[0].size = depth;
+                harness.release.take().unwrap().send(()).unwrap();
+                harness.owner.handle_trade_once(harness.trade.clone()).await;
+                let book = harness.evidence().body.book.unwrap();
+                assert_eq!(book.reason.as_deref(), Some(expected));
+                assert_eq!(book.best_ask.as_deref(), Some("0.5"));
+                assert_eq!(book.response_blake3.as_deref(), Some("early-book"));
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn mismatch_drops_stalled_book_before_mid_or_planning() {
+            let mut harness = Harness::new(TradeProvenance::RestPoll, true, true);
+            harness.hooks.admission_artifacts.lock().unwrap()[0]
+                .market
+                .ordered_outcome_token_ids
+                .swap(0, 1);
+            let mut decision = Box::pin(harness.owner.handle_trade_once(harness.trade.clone()));
+            assert!(futures::poll!(&mut decision).is_pending());
+            harness.release.take().unwrap().send(()).unwrap();
+            assert!(futures::poll!(&mut decision).is_ready());
+            drop(decision);
+            assert_eq!(harness.books.dropped.load(Ordering::SeqCst), 1);
+            let evidence = harness.evidence();
+            assert!(evidence.body.market_price.is_none());
+            assert_eq!(evidence.body.book.unwrap().outcome, "token_mismatch");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn book_age_is_checked_at_use_after_admission_waits() {
+            let mut harness = Harness::new(TradeProvenance::ActivityWs, true, false);
+            let mut decision = Box::pin(harness.owner.handle_trade_once(harness.trade.clone()));
+            assert!(futures::poll!(&mut decision).is_pending());
+            harness
+                .hooks
+                .financial_clock_unix
+                .store(SEAL_START_UNIX + 3, Ordering::SeqCst);
+            harness.release.take().unwrap().send(()).unwrap();
+            decision.await;
+            let evidence = harness.evidence();
+            assert_eq!(evidence.body.book.unwrap().outcome, "stale");
+            assert_eq!(
+                evidence
+                    .body
+                    .clocks
+                    .iter()
+                    .find(|clock| clock.purpose == "book_staleness_check")
+                    .unwrap()
+                    .unix_millis,
+                (SEAL_START_UNIX + 3) * 1000
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn admission_and_horizon_refusals_drop_stalled_book_immediately() {
+            for admission_failure in [true, false] {
+                let mut harness = Harness::new(TradeProvenance::ActivityWs, true, true);
+                if admission_failure {
+                    harness
+                        .hooks
+                        .admission_failure
+                        .store(true, Ordering::SeqCst);
+                } else {
+                    harness.change_config(|config| config.min_resolution_horizon_secs = 60);
+                    harness.hooks.admission_artifacts.lock().unwrap()[0]
+                        .market
+                        .scheduled_end_unix = None;
+                }
+                let mut decision = Box::pin(harness.owner.handle_trade_once(harness.trade.clone()));
+                assert!(futures::poll!(&mut decision).is_pending());
+                assert_eq!(harness.books.started.lock().unwrap().len(), 1);
+                harness.release.take().unwrap().send(()).unwrap();
+                assert!(futures::poll!(&mut decision).is_ready());
+                drop(decision);
+                assert_eq!(harness.books.dropped.load(Ordering::SeqCst), 1);
+                let row = harness
+                    .owner
+                    .paper_state
+                    .decision_pending_for(&harness.trade.source_trade_id)
+                    .unwrap()
+                    .unwrap();
+                let evidence: crate::decision_replay::DecisionPostBoundaryEvidence =
+                    serde_json::from_str(&row.post_commit_inputs_json).unwrap();
+                assert!(evidence.body.book.is_none());
+                assert!(evidence.body.market_price.is_none());
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn unauthenticated_continuation_keeps_admission_first_order() {
+            let mut harness = Harness::new(TradeProvenance::RestPoll, false, false);
+            let mut decision = Box::pin(harness.owner.handle_trade_once(harness.trade.clone()));
+            assert!(futures::poll!(&mut decision).is_pending());
+            assert!(harness.books.started.lock().unwrap().is_empty());
+            harness.release.take().unwrap().send(()).unwrap();
+            decision.await;
+            assert_eq!(harness.books.started.lock().unwrap().len(), 1);
+            assert_eq!(
+                harness.evidence().body.book.unwrap().outcome,
+                "ladder_rejected"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn stalled_book_timeout_is_measured_from_launch() {
+            let mut harness = Harness::new(TradeProvenance::RestPoll, true, true);
+            let mut decision = Box::pin(harness.owner.handle_trade_once(harness.trade.clone()));
+            assert!(futures::poll!(&mut decision).is_pending());
+            tokio::time::advance(std::time::Duration::from_millis(1500)).await;
+            harness.release.take().unwrap().send(()).unwrap();
+            assert!(futures::poll!(&mut decision).is_pending());
+            tokio::time::advance(std::time::Duration::from_millis(501)).await;
+            assert!(futures::poll!(&mut decision).is_ready());
+            drop(decision);
+            assert_eq!(
+                harness.evidence().body.book.unwrap().outcome,
+                "fetch_timed_out"
+            );
+            assert_eq!(harness.books.dropped.load(Ordering::SeqCst), 1);
+        }
+    }
+
     const NOW: i64 = 1_700_000_000;
     const SEAL_START_UNIX: i64 = 1_800_057_600;
 
@@ -4293,7 +4887,11 @@ mod tests {
             .unwrap()
     }
 
-    fn append_paper(writer: &mut Writer, record: &PaperLogRecord, unix: i64) -> AppendReceipt {
+    fn append_paper(
+        writer: &crate::paper_recovery::PaperLog,
+        record: &PaperLogRecord,
+        unix: i64,
+    ) -> AppendReceipt {
         let at = time::OffsetDateTime::from_unix_timestamp(unix).unwrap();
         writer
             .append_synced(EnvelopeIn {
@@ -4313,7 +4911,7 @@ mod tests {
         source_prefix: TailBinding,
         hot_config_hash: &str,
     ) -> PaperLogRecord {
-        PaperLogRecord::QualificationStarted(Box::new(QualificationStarted {
+        PaperLogRecord::QualificationStarted(Arc::new(QualificationStarted {
             starting_bankroll: CollateralAmount::from_decimal_exact(dec!(1_000)).unwrap(),
             paper_prefix,
             source_prefix,
@@ -4442,7 +5040,7 @@ mod tests {
         paper_path: PathBuf,
         source_path: PathBuf,
         state: Arc<PaperStateDb>,
-        paper_writer: Writer,
+        paper_writer: crate::paper_recovery::PaperLog,
         start: AppendReceipt,
     }
 
@@ -4459,16 +5057,16 @@ mod tests {
         let source_path = dir.path().join("source.log");
         drop(Writer::open(&source_path).unwrap());
         drop(pe_execution_core::LiveJournal::open(dir.path().join("live_journal.log")).unwrap());
-        let mut paper_writer = Writer::open(&paper_path).unwrap();
+        let paper_writer = crate::paper_recovery::PaperLog::open(&paper_path).unwrap();
         let mut started = qualification_start(
             TailBinding::from(&Scanner::verify(&paper_path).unwrap()),
             TailBinding::from(&Scanner::verify(&source_path).unwrap()),
             hot_config_hash,
         );
         if let PaperLogRecord::QualificationStarted(start) = &mut started {
-            start.financial_semantic_version = financial_semantic_version;
+            Arc::make_mut(start).financial_semantic_version = financial_semantic_version;
         }
-        let start = append_paper(&mut paper_writer, &started, SEAL_START_UNIX);
+        let start = append_paper(&paper_writer, &started, SEAL_START_UNIX);
         let state = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
         state
             .reset_financial_era(
@@ -4489,7 +5087,7 @@ mod tests {
     fn test_orchestrator(
         paper_path: PathBuf,
         source_path: PathBuf,
-        paper_writer: Writer,
+        paper_writer: crate::paper_recovery::PaperLog,
         state: Arc<PaperStateDb>,
         source_receipts: SourceReceiptIndex,
     ) -> TestOrchestrator {
@@ -4518,7 +5116,7 @@ mod tests {
     }
 
     fn build_test_orchestrator(
-        paper_writer: Writer,
+        paper_writer: crate::paper_recovery::PaperLog,
         state: Arc<PaperStateDb>,
         control_rx: mpsc::Receiver<OrchestratorControl>,
         mid_price_base_url: String,
@@ -4629,8 +5227,10 @@ mod tests {
         paper_era(scan_paper_log(path).unwrap())
             .frames
             .into_iter()
-            .filter_map(|frame| match frame.frame {
-                PaperLogFrame::Record(PaperLogRecord::QualificationSealed(seal)) => Some(*seal),
+            .filter_map(|frame| match &frame.frame {
+                PaperLogFrame::Record(PaperLogRecord::QualificationSealed(seal)) => {
+                    Some(seal.as_ref().clone())
+                }
                 _ => None,
             })
             .collect()
@@ -4692,7 +5292,7 @@ mod tests {
         let rows = paper_state.open_decision_pending().unwrap();
         let (control_tx, control_rx) = mpsc::channel(2);
         let mut orchestrator = build_test_orchestrator(
-            Writer::open(dir.path().join("paper.log")).unwrap(),
+            crate::paper_recovery::PaperLog::open(dir.path().join("paper.log")).unwrap(),
             Arc::clone(&paper_state),
             control_rx,
             "https://gamma.test".to_owned(),
@@ -4706,6 +5306,112 @@ mod tests {
             rows,
             orchestrator,
             _control_tx: control_tx,
+        }
+    }
+
+    /// A ready handoff wakes only after commit; failed flips retain the open seed and no permit.
+    #[tokio::test(start_paused = true)]
+    async fn live_dispatch_ready_no_copy_and_no_fill_follow_successful_commits() {
+        use super::{DecisionContinuationV3, DecisionEvidenceAccumulator, RollbackCtx};
+        use pe_core_types::{MarketOutcomeId, ShareAmount};
+
+        for no_copy in [false, true] {
+            let ContinuationOrchestratorFixture {
+                dir,
+                paper_state,
+                rows,
+                mut orchestrator,
+                _control_tx,
+            } = continuation_orchestrator_fixture();
+            let continuation = DecisionContinuationV3::from_durable(&rows[0]).unwrap();
+            let trade = continuation.incoming_trade().unwrap();
+            let ready = Arc::new(tokio::sync::Notify::new());
+            orchestrator = orchestrator.with_live_dispatch_ready(ready.clone());
+            let mut evidence = DecisionEvidenceAccumulator::for_continuation(&continuation);
+            evidence.record_staged_dispatch("wake-test".to_owned(), None);
+            let checkpoint = evidence.checkpoint_json().unwrap();
+            paper_state
+                .stage_dispatch_seed_pending(
+                    &pe_paper_state::DispatchSeedRecord {
+                        dispatch_id: "wake-test".to_owned(),
+                        signal_json: "{}".to_owned(),
+                        source_trade_id: trade.source_trade_id.0.clone(),
+                        created_at_unix: trade.received_at.unix_timestamp(),
+                        targets: Vec::new(),
+                    },
+                    Some(
+                        pe_paper_state::DispatchStagingEvidence::PaperOutcomeCheckpoint(
+                            pe_paper_state::PendingTerminalEvidence {
+                                post_commit_inputs_json: &checkpoint,
+                                updated_at_unix: trade.received_at.unix_timestamp(),
+                            },
+                        ),
+                    ),
+                )
+                .unwrap();
+            let leader = pe_paper_state::LeaderPositionRow {
+                wallet: trade.wallet,
+                market_id: trade.market_id.clone(),
+                outcome_id: trade.outcome_id,
+                long_contracts: ShareAmount::ZERO,
+                short_contracts: ShareAmount::ZERO,
+            };
+            let rollback = RollbackCtx {
+                wallet: trade.wallet,
+                key: MarketOutcomeId::new(trade.market_id.clone(), trade.outcome_id),
+                prev: None,
+                enabled: false,
+            };
+            let disposition = pe_paper_state::NoCopyDisposition {
+                provenance: "rest_poll".to_owned(),
+                age_secs: 121,
+                reason: "stale_fallback_past_copy_budget".to_owned(),
+                recorded_at_unix: trade.received_at.unix_timestamp(),
+            };
+            let connection = rusqlite::Connection::open(dir.path().join("paper.db")).unwrap();
+            connection.execute_batch("CREATE TRIGGER refuse_ready BEFORE UPDATE ON dispatch_seeds BEGIN SELECT RAISE(ABORT, 'injected ready failure'); END;").unwrap();
+            for succeeds in [false, true] {
+                if succeeds {
+                    connection
+                        .execute_batch("DROP TRIGGER refuse_ready;")
+                        .unwrap();
+                }
+                if no_copy {
+                    orchestrator.commit_no_copy_or_rollback(
+                        &trade,
+                        &leader,
+                        &disposition,
+                        &rollback,
+                        None,
+                        Some(&evidence),
+                    );
+                } else {
+                    assert_eq!(
+                        orchestrator
+                            .commit_no_fill_flipping(
+                                &trade,
+                                &leader,
+                                Some("wake-test"),
+                                "declined",
+                                None,
+                                Some(&evidence),
+                            )
+                            .await,
+                        succeeds
+                    );
+                }
+                assert_eq!(
+                    paper_state
+                        .dispatch_seed("wake-test")
+                        .unwrap()
+                        .unwrap()
+                        .state,
+                    if succeeds { "ready" } else { "pending_paper" }
+                );
+                let notified = ready.notified();
+                tokio::pin!(notified);
+                assert_eq!(futures::poll!(&mut notified).is_ready(), succeeds);
+            }
         }
     }
 
@@ -5062,11 +5768,186 @@ mod tests {
 
         async fn apply_prepared_resolution(
             &self,
-            _: &crate::supabase_state::PreparedResolutionRequest,
+            request: &crate::supabase_state::PreparedResolutionRequest,
         ) -> Result<CanonicalResolutionResult, crate::supabase_state::SupabaseStateError> {
-            Err(crate::supabase_state::SupabaseStateError::Corrupt(
-                "resolution authority route is outside this fixture".to_owned(),
-            ))
+            Ok(CanonicalResolutionResult {
+                outcome: "applied".to_owned(),
+                bankroll: dec!(1000.5),
+                applied_prepared_seq: request.prepared_receipt.sequence,
+                credit: CollateralAmount::from_decimal_exact(dec!(1)).unwrap(),
+                settled_at_unix: request.settled_at_unix,
+            })
+        }
+    }
+
+    #[cfg(feature = "scenario")]
+    #[tokio::test]
+    async fn financial_risk_fill_and_resolution_use_shared_paper_frames_without_scans() {
+        use super::*;
+        let StartedSealFixture {
+            _dir,
+            paper_path,
+            source_path,
+            state,
+            paper_writer,
+            start,
+        } = started_seal_fixture("start-hash");
+        let mut source_writer = Writer::open(&source_path).unwrap();
+        let fill_source = append_source(
+            &mut source_writer,
+            "seal-test-financial-source",
+            SEAL_START_UNIX + 1,
+            b"{}".to_vec(),
+        );
+        let resolution_source = append_source(&mut source_writer, "polymarket.clob.market", SEAL_START_UNIX + 3,
+            br#"{"condition_id":"seal-test-condition","closed":true,"is_50_50_outcome":false,"tokens":[{"token_id":"yes","outcome":"Yes","price":1,"winner":true},{"token_id":"no","outcome":"No","price":0,"winner":false}]}"#.to_vec());
+        drop(source_writer);
+        let index = SourceReceiptIndex::replay(&source_path).unwrap();
+        let now = OffsetDateTime::from_unix_timestamp(SEAL_START_UNIX + 1).unwrap();
+        let (_tx, rx) = mpsc::channel(1);
+        let authority = GapFillAuthority::default();
+        let mut owner = Orchestrator::new_inner(
+            LiveWatchlist::new(Watchlist {
+                entries: Vec::new(),
+                snapshot_at: SourceTimestamp(now),
+                active_count: 0,
+                incubator_count: 0,
+            }),
+            OrchestratorConfig {
+                bankroll: dec!(1000),
+                mode: ExecutionMode::Paper,
+                signal_config: Default::default(),
+                max_resolution_horizon_secs: 0,
+                min_resolution_horizon_secs: 0,
+                max_fill_price: Decimal::ZERO,
+                min_fill_price: Decimal::ZERO,
+                price_impact_cap_bps: 100,
+                entry_gate_config: CopyEntryGateConfig,
+                runtime_config: None,
+                live_accounts: None,
+                live_journal: None,
+                activity_ws_enabled: false,
+                copy_latency_budget_secs: 2,
+                watchlist_writer_lock: None,
+            },
+            WinnerFollowStrategy::new(WinnerFollowConfig::default()),
+            paper_writer.clone(),
+            state.clone(),
+            crate::paper_recovery::build_leader_ledger(&state).unwrap(),
+            new_shared_health(false),
+            MidPriceCache::with_fetcher(FixtureFetcher::new(HashMap::new()), String::new())
+                .with_clock(Arc::new(move || now)),
+            rx,
+            None,
+            None,
+            Some(authority),
+            Arc::new(FixtureClobBookFetcher::new(HashMap::new())),
+        )
+        .unwrap();
+        owner.financial_log_paths = Some((paper_path.clone(), source_path));
+        owner.source_receipts = Some(index);
+        let hooks = Arc::new(ScenarioHooks::default());
+        hooks
+            .financial_clock_unix
+            .store(SEAL_START_UNIX + 2, Ordering::SeqCst);
+        owner.scenario_hooks = Some(hooks.clone());
+        let trade = IncomingTrade {
+            wallet: WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+            market_id: MarketId(pe_core_types::VenueMarketId(
+                "seal-test-condition".to_owned(),
+            )),
+            outcome_id: OutcomeId(0),
+            side: Side::Buy,
+            price: Price::new(dec!(0.5)).unwrap(),
+            contracts: ShareAmount::from_whole(1).unwrap(),
+            observed_at: now,
+            received_at: now,
+            source_trade_id: SourceTradeId(format!("g2:{}", "a".repeat(64))),
+            transaction_hash: None,
+            provenance: TradeProvenance::RestPoll,
+        };
+        let signal = LeaderSignal {
+            leader: TraderId(trade.wallet),
+            venue: VenueId::polymarket(),
+            market_id: trade.market_id.clone(),
+            outcome_id: trade.outcome_id,
+            action: pe_core_types::LeaderAction::Entry,
+            leader_side: Side::Buy,
+            leader_price: trade.price,
+            leader_size: trade.contracts,
+            observed_at: now,
+            received_at: now,
+            reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+            source_trade_id: trade.source_trade_id.clone(),
+            action_confidence_ppm: pe_core_types::ProbabilityPpm(1_000_000),
+        };
+        let ready = Arc::new(tokio::sync::Notify::new());
+        owner = owner.with_live_dispatch_ready(ready.clone());
+        state
+            .stage_dispatch_seed(&pe_paper_state::DispatchSeedRecord {
+                dispatch_id: "fill-wake".to_owned(),
+                signal_json: "{}".to_owned(),
+                source_trade_id: trade.source_trade_id.0.clone(),
+                created_at_unix: now.unix_timestamp(),
+                targets: Vec::new(),
+            })
+            .unwrap();
+        let paper_walks = pe_event_log::scan_metrics::count(&paper_path).unwrap();
+        let (risk, _) = owner
+            .active_paper_risk_snapshot(
+                &signal,
+                CollateralAmount::ZERO,
+                10_000,
+                FINANCIAL_SEMANTIC_VERSION,
+            )
+            .await
+            .map_err(|error| error.cause)
+            .unwrap();
+        assert_eq!(risk.decision, RiskDecisionAudit::Approved);
+        assert!(matches!(
+            owner
+                .apply_active_financial_fill(
+                    &trade,
+                    seal_test_economic(fill_source, start),
+                    Some("fill-wake"),
+                    None,
+                    &mut None
+                )
+                .await
+                .unwrap(),
+            ActiveFinancialFill::Committed(_)
+        ));
+        assert_eq!(
+            state.dispatch_seed("fill-wake").unwrap().unwrap().state,
+            "ready"
+        );
+        let notified = ready.notified();
+        tokio::pin!(notified);
+        assert!(futures::poll!(&mut notified).is_ready());
+        hooks
+            .financial_clock_unix
+            .store(SEAL_START_UNIX + 4, Ordering::SeqCst);
+        owner
+            .apply_resolution_candidate(
+                PolymarketConditionId("seal-test-condition".to_owned()),
+                "[\"1\",\"0\"]".to_owned(),
+                resolution_source,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            state.financial_snapshot(SEAL_START_UNIX + 4).unwrap().cash,
+            dec!(1000.5)
+        );
+        assert_eq!(
+            pe_event_log::scan_metrics::count(&paper_path).unwrap(),
+            paper_walks
+        );
+        let cached = paper_writer.snapshot().unwrap();
+        let scanned = scan_paper_log(&paper_path).unwrap();
+        assert_eq!(cached.len(), scanned.len());
+        for (cached, scanned) in cached.iter().zip(scanned) {
+            assert_eq!(cached.envelope, scanned.envelope);
         }
     }
 
@@ -5077,7 +5958,7 @@ mod tests {
             paper_path,
             source_path,
             state,
-            mut paper_writer,
+            paper_writer,
             start,
         } = started_seal_fixture("start-hash");
         let stale_index = SourceReceiptIndex::replay(&source_path).unwrap();
@@ -5090,7 +5971,7 @@ mod tests {
         );
         drop(source_writer);
         append_paper(
-            &mut paper_writer,
+            &paper_writer,
             &PaperLogRecord::FinancialPrepared {
                 expected_authority: ExpectedAuthority {
                     qualification_start_receipt: start,
@@ -5114,9 +5995,8 @@ mod tests {
         let error = crate::supabase_state::reconcile_active_financial_frames(
             &authority,
             &state,
-            &paper_path,
             SourceEvidence::Index(&stale_index),
-            &mut paper_writer,
+            &paper_writer,
         )
         .await
         .unwrap_err();
@@ -5140,14 +6020,13 @@ mod tests {
 
         // Boot rebuilds this same index (scenario_source_log_boot) and redrives through this call.
         let rebuilt_index = SourceReceiptIndex::replay(&source_path).unwrap();
-        let mut reopened = Writer::open(&paper_path).unwrap();
+        let reopened = crate::paper_recovery::PaperLog::open(&paper_path).unwrap();
         assert_eq!(
             crate::supabase_state::reconcile_active_financial_frames(
                 &authority,
                 &state,
-                &paper_path,
                 SourceEvidence::Index(&rebuilt_index),
-                &mut reopened,
+                &reopened,
             )
             .await
             .unwrap(),
@@ -5186,12 +6065,22 @@ mod tests {
             Arc::clone(&state),
             source_receipts,
         );
+        let paper_walks = pe_event_log::scan_metrics::count(&paper_path).unwrap();
+        let financial_prefix = orchestrator.paper_writer.verified_tail().unwrap();
         orchestrator
             .seal_before_resume("start-hash", FINANCIAL_SEMANTIC_VERSION)
             .await
             .unwrap();
+        assert_eq!(
+            pe_event_log::scan_metrics::count(&paper_path).unwrap(),
+            paper_walks
+        );
         let seals = sealed_records(&paper_path);
         assert_eq!(seals.len(), 1);
+        assert_eq!(
+            seals[0].financial_prefix,
+            TailBinding::from(&financial_prefix)
+        );
         assert!(matches!(
             seals[0].reason,
             SealReason::InsufficientEvidence(_)
@@ -5202,7 +6091,7 @@ mod tests {
             .unwrap();
         assert_eq!(sealed_records(&paper_path), seals);
         drop(orchestrator);
-        let paper_writer = Writer::open(&paper_path).unwrap();
+        let paper_writer = crate::paper_recovery::PaperLog::open(&paper_path).unwrap();
         let source_receipts = SourceReceiptIndex::replay(&source_path).unwrap();
         let mut restarted = test_orchestrator(
             paper_path.clone(),
@@ -5402,6 +6291,7 @@ mod tests {
             state,
             source_receipts,
         );
+        let paper_walks = pe_event_log::scan_metrics::count(&paper_path).unwrap();
         assert_eq!(
             apply_seal_check_control(&mut orchestrator, "changed-hash").await,
             Ok(())
@@ -5410,10 +6300,77 @@ mod tests {
         std::fs::rename(&source_path, &renamed).unwrap();
 
         assert_eq!(
+            apply_seal_check_control(&mut orchestrator, "start-hash").await,
+            Ok(())
+        );
+        assert_eq!(
             apply_seal_check_control(&mut orchestrator, "changed-hash").await,
             Ok(())
         );
+        assert_eq!(
+            pe_event_log::scan_metrics::count(&paper_path).unwrap(),
+            paper_walks
+        );
         assert_eq!(sealed_records(&paper_path).len(), 1);
+    }
+
+    #[cfg(feature = "scenario")]
+    #[tokio::test]
+    async fn seal_tail_sync_uncertainty_stops_intake_and_snapshots_until_reopen() {
+        let StartedSealFixture {
+            _dir,
+            paper_path,
+            source_path,
+            state,
+            paper_writer,
+            ..
+        } = started_seal_fixture("start-hash");
+        let index = SourceReceiptIndex::replay(&source_path).unwrap();
+        let shared = paper_writer.clone();
+        let mut orchestrator = test_orchestrator(
+            paper_path.clone(),
+            source_path.clone(),
+            paper_writer,
+            state.clone(),
+            index,
+        );
+        shared.scenario_fail_next_sync().unwrap();
+        let paper_walks = pe_event_log::scan_metrics::count(&paper_path).unwrap();
+        let error = apply_seal_check_control(&mut orchestrator, "changed-hash")
+            .await
+            .unwrap_err();
+        assert!(error.contains("injected synchronization uncertainty"));
+        assert!(orchestrator.intake_stopped);
+        assert!(shared.snapshot().is_err());
+        assert!(
+            orchestrator
+                .append_paper_record(&PaperLogRecord::RiskHaltChanged {
+                    owner: RiskHaltOwner::Paper,
+                    cause: RiskHaltCause::AbsoluteLoss,
+                    state: crate::paper_recovery::HaltState::Engaged,
+                    evidence: serde_json::json!({}),
+                })
+                .is_err()
+        );
+        assert_eq!(
+            pe_event_log::scan_metrics::count(&paper_path).unwrap(),
+            paper_walks
+        );
+        assert!(sealed_records(&paper_path).is_empty());
+        drop(orchestrator);
+        drop(shared);
+        let reopened = crate::paper_recovery::PaperLog::open(&paper_path).unwrap();
+        assert_eq!(reopened.snapshot().unwrap().len(), 1);
+        let mut restarted = test_orchestrator(
+            paper_path,
+            source_path.clone(),
+            reopened,
+            state,
+            SourceReceiptIndex::replay(&source_path).unwrap(),
+        );
+        apply_seal_check_control(&mut restarted, "changed-hash")
+            .await
+            .unwrap();
     }
 
     /// PASS: unmatched Prepared refuses before source I/O and preserves the exact legacy error.
@@ -5545,7 +6502,7 @@ mod tests {
             paper_path,
             source_path,
             state,
-            mut paper_writer,
+            paper_writer,
             start,
         } = started_seal_fixture("start-hash");
         let final_cutoff = SEAL_START_UNIX + 30 * 86_400;
@@ -5581,7 +6538,7 @@ mod tests {
         assert_ne!(mark_candidate, index_candidate);
 
         append_paper(
-            &mut paper_writer,
+            &paper_writer,
             &PaperLogRecord::PortfolioMark(Box::new(PortfolioMark {
                 boundary_receipt,
                 cutoff_unix: SEAL_START_UNIX,
@@ -5606,7 +6563,7 @@ mod tests {
         for index in 0..90_u64 {
             let economic = seal_test_economic(financial_source, start);
             let prepared = append_paper(
-                &mut paper_writer,
+                &paper_writer,
                 &PaperLogRecord::FinancialPrepared {
                     expected_authority: ExpectedAuthority {
                         qualification_start_receipt: start,
@@ -5656,7 +6613,7 @@ mod tests {
                 )
                 .unwrap();
             append_paper(
-                &mut paper_writer,
+                &paper_writer,
                 &PaperLogRecord::FinancialFinal {
                     prepared_receipt: prepared,
                     result: FinancialResult::Fill { canonical },
@@ -5666,7 +6623,7 @@ mod tests {
             prior = Some(prepared.sequence);
         }
         let resolution_prepared = append_paper(
-            &mut paper_writer,
+            &paper_writer,
             &PaperLogRecord::FinancialPrepared {
                 expected_authority: ExpectedAuthority {
                     qualification_start_receipt: start,
@@ -5696,7 +6653,7 @@ mod tests {
             )
             .unwrap();
         append_paper(
-            &mut paper_writer,
+            &paper_writer,
             &PaperLogRecord::FinancialFinal {
                 prepared_receipt: resolution_prepared,
                 result: FinancialResult::Resolution {
@@ -5713,7 +6670,7 @@ mod tests {
         );
         for day in 1..30_i64 {
             append_paper(
-                &mut paper_writer,
+                &paper_writer,
                 &PaperLogRecord::PortfolioMark(Box::new(PortfolioMark {
                     boundary_receipt,
                     cutoff_unix: SEAL_START_UNIX + day * 86_400,
@@ -5742,6 +6699,7 @@ mod tests {
         });
         let (acknowledged, response) = oneshot::channel();
 
+        let paper_walks = pe_event_log::scan_metrics::count(&paper_path).unwrap();
         orchestrator
             .apply_control_message(OrchestratorControl::DailyBoundary {
                 cutoff_unix: final_cutoff,
@@ -5752,6 +6710,10 @@ mod tests {
             .await;
 
         assert_eq!(response.await.unwrap(), Ok(()));
+        assert_eq!(
+            pe_event_log::scan_metrics::count(&paper_path).unwrap(),
+            paper_walks
+        );
         assert!(!appended.load(Ordering::SeqCst));
         let file_tail = Scanner::verify(&source_path).unwrap();
         assert_ne!(file_tail, mark_candidate);
@@ -5810,9 +6772,9 @@ mod tests {
         let candidate = source_receipts.current_tail_binding().unwrap();
         let paper_path = dir.path().join("paper.log");
         drop(pe_execution_core::LiveJournal::open(dir.path().join("live_journal.log")).unwrap());
-        let mut paper_writer = Writer::open(&paper_path).unwrap();
+        let paper_writer = crate::paper_recovery::PaperLog::open(&paper_path).unwrap();
         let start = append_paper(
-            &mut paper_writer,
+            &paper_writer,
             &qualification_start(
                 TailBinding::from(&Scanner::verify(&paper_path).unwrap()),
                 TailBinding {
@@ -5934,9 +6896,9 @@ mod tests {
 
         let paper_path = dir.path().join("paper.log");
         drop(pe_execution_core::LiveJournal::open(dir.path().join("live_journal.log")).unwrap());
-        let mut paper_writer = Writer::open(&paper_path).unwrap();
+        let paper_writer = crate::paper_recovery::PaperLog::open(&paper_path).unwrap();
         let start = append_paper(
-            &mut paper_writer,
+            &paper_writer,
             &qualification_start(
                 TailBinding::from(&Scanner::verify(&paper_path).unwrap()),
                 TailBinding {
@@ -6085,7 +7047,7 @@ mod tests {
         let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
         let (_, control_rx) = mpsc::channel(4);
         let mut owner = build_test_orchestrator(
-            Writer::open(&paper_path).unwrap(),
+            crate::paper_recovery::PaperLog::open(&paper_path).unwrap(),
             paper,
             control_rx,
             String::new(),

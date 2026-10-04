@@ -392,7 +392,6 @@ rolling_7d_stop_bps                  = -600  # halt at -6.00 % over rolling 7d
 kill_switch_drawdown_bps             = -1000 # -10.00 % bankroll absolute kill
 
 [winner_follow.copy]
-max_slippage_from_leader_bps         = 75    # 0.75 % from leader observed price
 order_validity_seconds               = 30    # cancel if unfilled within window
 prefer_market_order                  = false # only true when "very liquid" gate passes (see _GLOSSARY.md)
 ```
@@ -495,12 +494,10 @@ simulation.rs gates (backtest only, lines 457-518)
 1. Submit limit orders, not market orders, unless `prefer_market_order = true` AND the market passes the "very liquid" gate (`_GLOSSARY.md`).
 2. Use the idempotency key above so duplicate signals cannot double-enter.
 3. Cancel if the order is not filled within `order_validity_seconds`.
-4. Apply `max_slippage_from_leader_bps` to ordinary live; paper semantic 2 uses its recorded
-   best-ask impact cap and fill-price band instead.
-5. Recheck risk after partial fills.
-6. Reconcile against venue state before the next order.
-7. Current production Winner-Follow ignores all SELL/Trim/Exit signals and holds copied BUYs to resolution. Any future exit-following profile must require matching inventory and `action_confidence_ppm ≥ exit_high_confidence_threshold_ppm`.
-8. Require current source-health/readiness and resolver-card tradability before risk evaluation;
+4. Recheck risk after partial fills.
+5. Reconcile against venue state before the next order.
+6. Current production Winner-Follow ignores all SELL/Trim/Exit signals and holds copied BUYs to resolution. Any future exit-following profile must require matching inventory and `action_confidence_ppm ≥ exit_high_confidence_threshold_ppm`.
+7. Require current source-health/readiness and resolver-card tradability before risk evaluation;
    missing, stale, ambiguous, or deferred resolver evidence fails closed independently of the
    owner-local financial risk snapshot.
 

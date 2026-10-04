@@ -29,7 +29,7 @@ use pe_core_types::{
     BasisPoints, MarketId, OutcomeId, Price, ReconstructionQuality, Side, SourceTimestamp,
     SourceTradeId, VenueMarketId, WalletAddress,
 };
-use pe_event_log::{Reader, Writer};
+use pe_event_log::Reader;
 use pe_paper_state::PaperStateDb;
 use pe_position_ledger::PositionLedger;
 use pe_service::clob_book::{
@@ -135,8 +135,8 @@ fn mid_cache_for(markets: &[MarketId], price: &str) -> MidPriceCache<FixtureFetc
     MidPriceCache::with_fetcher(FixtureFetcher::new(fx), BASE.to_string())
 }
 
-fn make_writer(dir: &TempDir) -> Writer {
-    Writer::open(dir.path().join("paper.log")).unwrap()
+fn make_writer(dir: &TempDir) -> pe_service::paper_recovery::PaperLog {
+    pe_service::paper_recovery::PaperLog::open(dir.path().join("paper.log")).unwrap()
 }
 
 fn paper_fill_count(dir: &TempDir) -> usize {
@@ -843,7 +843,7 @@ impl ClobBookFetcher for PanicBookFetcher {
 
 /// A dispatcher whose LiveTiny path completes cleanly with a filled fixture order (AC6 asserts the
 /// BOOK fetcher is untouched, not the order path).
-fn make_live_writer(dir: &TempDir) -> Writer {
+fn make_live_writer(dir: &TempDir) -> pe_service::paper_recovery::PaperLog {
     make_writer(dir)
 }
 

@@ -131,6 +131,7 @@ fn context(epoch: i64) -> BucketDecisionContext {
         no_copy_dispositions: HashMap::new(),
         identity_overrides: HashMap::new(),
         identity_unresolved: Default::default(),
+        restamp_twins: Default::default(),
         history_status: Some(WalletHistoryStatusRecord {
             wallet: wallet(),
             complete: true,

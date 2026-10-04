@@ -58,6 +58,42 @@ pub trait PageFetcher {
     ) -> impl std::future::Future<Output = Result<Vec<u8>, SourceError>> + Send;
 }
 
+/// Per-fetcher request reservations, spaced by the caller's minimum interval.
+#[derive(Default)]
+pub struct RateGate {
+    last_reserved: Mutex<Option<Instant>>,
+}
+
+impl RateGate {
+    /// Reserve a slot without consuming one at or beyond the workflow deadline.
+    pub fn reserve(
+        &self,
+        now: Instant,
+        interval: Duration,
+        deadline: Option<Instant>,
+    ) -> Option<Instant> {
+        let mut last = self.last_reserved.lock().unwrap_or_else(|p| p.into_inner());
+        let slot = last.map_or(now, |last| (last + interval).max(now));
+        if deadline.is_some_and(|deadline| slot >= deadline) {
+            return None;
+        }
+        *last = Some(slot);
+        Some(slot)
+    }
+
+    /// Wait for a reservation; an idle gate grants immediately.
+    pub async fn wait(&self, interval: Duration, deadline: Option<Instant>) -> bool {
+        let now = Instant::now();
+        let Some(slot) = self.reserve(now, interval, deadline) else {
+            return false;
+        };
+        if slot > now {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(slot)).await;
+        }
+        true
+    }
+}
+
 // ── Production fetcher ────────────────────────────────────────────────────────
 
 /// A [`PageFetcher`] backed by a [`reqwest::Client`].
@@ -67,8 +103,7 @@ pub trait PageFetcher {
 ///   (`polymarket_max_retries = 3` retries; 4 total attempts).
 /// - Rate limiting: enforces ≤ 1 / `min_interval_ms` req/ms (defaults to ≤ 20 req/s
 ///   at 50 ms) by reserving a future slot before each call. The reservation is
-///   shared via `Mutex<Option<Instant>>` so concurrent callers all observe the
-///   serial gate (see `last_request_at` and the gate logic in `fetch_page`).
+///   shared via [`RateGate`] so concurrent callers all observe the serial gate.
 ///   Override via [`Self::with_min_interval_ms`] for APIs with different rate limits.
 /// - HTTP 429 → [`SourceError::RateLimited`] (returned to caller, not retried) unless the
 ///   instance opted in via [`Self::with_rate_limit_retry_max_secs`], in which case a
@@ -86,7 +121,7 @@ pub struct ReqwestFetcher {
     /// Shared rate-limit clock: serializes the gate across concurrent callers
     /// so the global throughput stays under `min_interval_ms` even when a single
     /// fetcher is shared by many tasks (e.g. via `Arc<ReqwestFetcher>`).
-    last_request_at: Mutex<Option<Instant>>,
+    rate_gate: RateGate,
 }
 
 impl ReqwestFetcher {
@@ -99,7 +134,7 @@ impl ReqwestFetcher {
             initial_backoff_ms: 200,
             rate_limit_retry_max_secs: None,
             min_interval_ms: MIN_INTERVAL_MS,
-            last_request_at: Mutex::new(None),
+            rate_gate: RateGate::default(),
         }
     }
 
@@ -334,27 +369,9 @@ impl ReqwestFetcher {
     }
 
     async fn wait_for_rate_slot(&self, deadline: Option<Instant>) -> bool {
-        let min_interval = Duration::from_millis(self.min_interval_ms);
-        let sleep_for = {
-            let mut guard = self
-                .last_request_at
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            let now = Instant::now();
-            let next_slot = match *guard {
-                None => now,
-                Some(last) => last.max(now) + min_interval,
-            };
-            if deadline.is_some_and(|deadline| next_slot >= deadline) {
-                return false;
-            }
-            *guard = Some(next_slot);
-            next_slot.checked_duration_since(now)
-        };
-        if let Some(duration) = sleep_for {
-            tokio::time::sleep(duration).await;
-        }
-        true
+        self.rate_gate
+            .wait(Duration::from_millis(self.min_interval_ms), deadline)
+            .await
     }
 }
 
@@ -442,6 +459,29 @@ impl PageFetcher for FixtureFetcher {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rate_gate_idle_spacing_and_deadline_refusal() {
+        let fetcher = ReqwestFetcher::new(reqwest::Client::new());
+        let interval = Duration::from_millis(50);
+        let now = std::time::Instant::now();
+        let gate = &fetcher.rate_gate;
+        assert_eq!(gate.reserve(now, interval, Some(now)), None);
+        assert_eq!(gate.reserve(now, interval, None), Some(now));
+        assert_eq!(gate.reserve(now, interval, Some(now + interval)), None);
+        assert_eq!(gate.reserve(now, interval, None), Some(now + interval));
+        assert_eq!(gate.reserve(now, interval, None), Some(now + interval * 2));
+        let idle = now + interval * 10;
+        assert_eq!(gate.reserve(idle, interval, None), Some(idle));
+
+        // An expired first deadline also leaves an idle gate immediately ready.
+        let idle_gate = RateGate::default();
+        assert!(!idle_gate.wait(interval, Some(now)).await);
+        assert_eq!(
+            futures::poll!(Box::pin(idle_gate.wait(interval, None))),
+            std::task::Poll::Ready(true)
+        );
+    }
 
     #[tokio::test]
     async fn short_retry_after_is_honored_inside_the_retry_budget() {
@@ -577,12 +617,12 @@ mod tests {
         ));
         assert_eq!(RECONCILIATION_RATE_LIMIT_MAX_RETRIES, 10);
         assert_eq!(ordinals, (1..=11).map(|n| (n, 429)).collect::<Vec<_>>());
-        // Retry-After: 0 still floors to one second, then each retry takes
-        // another shared rate slot (the gate adds its interval after the wait).
+        // Retry-After: 0 still floors to one second; the gate, idle after that wait,
+        // grants the retry's shared rate slot immediately (#730 item 2).
         assert!(
             observed
                 .windows(2)
-                .all(|pair| { pair[1].duration_since(pair[0]) >= Duration::from_millis(1_020) })
+                .all(|pair| { pair[1].duration_since(pair[0]) >= Duration::from_millis(1_000) })
         );
     }
 

@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use pe_copy_signal_engine::{LeaderSignal, PositionState, SignalConfig};
 use pe_core_types::{
@@ -42,7 +43,6 @@ use pe_risk_engine::{
     BinaryPayout, KILL_SWITCH_DRAWDOWN_BPS, RiskDecision, RiskHaltCause,
     aggregate_resolution_credit, evaluate_risk, nearest_rank_p95,
 };
-use pe_source_polymarket_public::ClassifiedPricesHistory;
 #[cfg(test)]
 use pe_source_polymarket_public::{
     ACTIVITY_MAX_OFFSET, GAMMA_BATCH_LIMIT_PARAM, GAMMA_MARKETS_PARSER_VERSION,
@@ -53,8 +53,7 @@ use pe_source_polymarket_public::{
 use pe_source_polymarket_public::{
     ActivityParseContext, ActivityTransport, ActivityType, BinaryPayoutVector,
     CLOB_RESOLUTION_PARSER_VERSION, CLOB_RESOLUTION_SCHEMA_VERSION, ClobPayoutResolution,
-    ClobPricesHistoryClient, FixtureFetcher, parse_activity_row, parse_activity_trade_observation,
-    parse_clob_market,
+    parse_activity_row, parse_activity_trade_observation, parse_clob_market,
 };
 use pe_trader_index::score::lcb_5pct_decimal;
 use rust_decimal::{Decimal, MathematicalOps};
@@ -64,7 +63,7 @@ use time::OffsetDateTime;
 #[cfg(test)]
 use crate::bucket_commit::PageOccurrence;
 use crate::bucket_commit::{
-    CompleteActivityPage, DecisionContinuationFacts, DecisionContinuationV3,
+    CompleteActivityPage, DecisionContinuationFacts, DecisionContinuationV3, VerifiedCommitment,
     VerifiedObservationBindings,
 };
 use crate::config::ServiceConfig;
@@ -92,8 +91,8 @@ use crate::paper_recovery::{
 };
 use crate::risk_inputs::{
     PaperExposureBase, RiskInputsUnavailable, SourceReceiptIndex, apply_global_risk_halts,
-    build_paper_risk_base, build_paper_risk_snapshot_from_source_receipts, historical_mark_price,
-    paper_prefix_at_financial_prefix,
+    build_paper_risk_base, build_paper_risk_snapshot_from_source_receipts,
+    paper_prefix_at_financial_prefix, replay_paper_mark_price,
 };
 use crate::runtime_config::{
     ConfigEra, ConfigRow, RISK_HALT_RELEASE_HASH_KEY, RuntimeConfig, parse_config,
@@ -706,6 +705,7 @@ impl FinancialFactState {
 }
 
 struct CausalFinancialState {
+    token_by_position: HashMap<(String, u16), String>,
     cash: Decimal,
     positions: Vec<OpenPosition>,
     last_completed: Option<EventSeq>,
@@ -720,7 +720,7 @@ struct RiskReplayContext<'a> {
     settlements: &'a [SettledMarketRow],
     last_completed: Option<EventSeq>,
     start_receipt: AppendReceipt,
-    paper_prefix: &'a [ScannedPaperFrame],
+    paper_prefix: &'a [Arc<ScannedPaperFrame>],
     source: &'a BTreeMap<u64, SourceObservation>,
     prepared_received_unix_ms: i64,
     start_hot_config_hash: &'a str,
@@ -1427,7 +1427,7 @@ fn sealed_source_envelopes(
 }
 
 fn paper_live_wrapper_bases(
-    frames: &[ScannedPaperFrame],
+    frames: &[Arc<ScannedPaperFrame>],
 ) -> Result<HashMap<String, PaperLiveWrapperBasis>, QualificationError> {
     let mut bases = HashMap::new();
     for frame in frames {
@@ -1480,7 +1480,7 @@ fn verify_live_wrappers(
     source_prefix: &TailBinding,
     live_prefix: &TailBinding,
     start: &QualificationStarted,
-    paper_frames: &[ScannedPaperFrame],
+    paper_frames: &[Arc<ScannedPaperFrame>],
 ) -> Result<VerifiedLiveEvidence, QualificationError> {
     let wrapper_events = replay_live_prefix(live_journal, &start.live_prefix, live_prefix)?;
     let source_envelopes = sealed_source_envelopes(source_log, source_prefix)?;
@@ -1761,7 +1761,7 @@ fn receipt_key(receipt: AppendReceipt) -> (u64, String) {
 }
 
 fn find_seal(
-    frames: &[ScannedPaperFrame],
+    frames: &[Arc<ScannedPaperFrame>],
     requested_hash: blake3::Hash,
 ) -> Result<(usize, AppendReceipt, QualificationSealed), QualificationError> {
     frames
@@ -1786,7 +1786,7 @@ fn find_seal(
 }
 
 fn find_start(
-    frames: &[ScannedPaperFrame],
+    frames: &[Arc<ScannedPaperFrame>],
     seal_index: usize,
     seal: &QualificationSealed,
 ) -> Result<(usize, AppendReceipt, QualificationStarted), QualificationError> {
@@ -1812,7 +1812,7 @@ fn find_start(
 }
 
 fn verify_seal_boundary(
-    frames: &[ScannedPaperFrame],
+    frames: &[Arc<ScannedPaperFrame>],
     seal_index: usize,
     seal: &QualificationSealed,
 ) -> Result<usize, QualificationError> {
@@ -2065,7 +2065,7 @@ fn decision_rows_from_sealed_source(
     source_universe: Result<
         (
             HashMap<pe_core_types::SourceTradeId, u64>,
-            Vec<AppendReceipt>,
+            BindingCommitments,
         ),
         QualificationError,
     >,
@@ -2076,45 +2076,102 @@ fn decision_rows_from_sealed_source(
     };
     let history = state.decision_pending_history()?;
     let (mut source_universe, binding_commitments) = source_universe?;
-    let mut disposed_bindings = HashMap::new();
-    let mut bound_streams = HashMap::new();
-    for receipt in binding_commitments {
-        let bindings = crate::bucket_commit::verified_commitment_bindings_with_lookup(
-            receipt,
-            &mut |receipt| {
-                if receipt.sequence > sealed_sequence {
-                    return insufficient("binding receipt exceeds the sealed source prefix");
-                }
-                source
-                    .observation(receipt)
-                    .map(|observation| CompleteActivityPage {
-                        payload: observation.payload,
-                        observed_at: observation.observed_at,
-                        received_at: observation.received_at,
-                        source_id: observation.source_id,
-                        schema_version: observation.schema_version,
-                        parser_version: observation.parser_version,
-                        content_type: observation.content_type,
-                    })
-            },
-        );
-        // A commitment without an authentic complete read cannot excuse an absent group.
-        for binding in bindings.into_iter().flatten() {
-            if binding.history_group_id == binding.stream_group_id {
-                continue;
+    let mut lookup = |receipt: AppendReceipt| {
+        if receipt.sequence > sealed_sequence {
+            return insufficient("binding receipt exceeds the sealed source prefix");
+        }
+        source
+            .observation(receipt)
+            .map(|observation| CompleteActivityPage {
+                payload: observation.payload,
+                observed_at: observation.observed_at,
+                received_at: observation.received_at,
+                source_id: observation.source_id,
+                schema_version: observation.schema_version,
+                parser_version: observation.parser_version,
+                content_type: observation.content_type,
+            })
+    };
+    // One observation binds one trade, whether its binding is exact or corrected; a restamp
+    // pair proven by either read is one trade. A history identity may carry several differently
+    // stamped observations, as the commit path's verifier accepts. A commitment with a corrected
+    // binding is authenticated up front; an exact-only commitment only when it can change the
+    // selection. A commitment without an authentic complete read counts for nothing.
+    let mut verified = HashMap::new();
+    let mut targets = HashMap::<_, (pe_core_types::SourceTradeId, Vec<AppendReceipt>)>::new();
+    let mut aliases = HashMap::<_, HashSet<_>>::new();
+    let mut exact = HashMap::<_, Vec<AppendReceipt>>::new();
+    for (receipt, recorded) in &binding_commitments {
+        let bindings = if recorded
+            .iter()
+            .any(|binding| binding.history_group_id != binding.stream_group_id)
+        {
+            match verified_commitment(&mut verified, *receipt, &mut lookup) {
+                Some(commitment) => commitment.bindings.clone(),
+                None => continue,
             }
-            // One observation binds one history identity, in either direction.
-            if disposed_bindings
-                .insert(
-                    binding.history_group_id.clone(),
-                    binding.stream_group_id.clone(),
-                )
-                .is_some_and(|previous| previous != binding.stream_group_id)
-                || bound_streams
-                    .insert(binding.stream_group_id, binding.history_group_id.clone())
-                    .is_some_and(|previous| previous != binding.history_group_id)
-            {
-                return insufficient("complete reads disagree about an observation binding target");
+        } else {
+            recorded.clone()
+        };
+        for binding in bindings {
+            match targets.get_mut(&binding.stream_group_id) {
+                None => {
+                    targets.insert(
+                        binding.stream_group_id.clone(),
+                        (binding.history_group_id.clone(), vec![*receipt]),
+                    );
+                }
+                Some((previous, receipts)) if *previous == binding.history_group_id => {
+                    receipts.push(*receipt);
+                }
+                Some((previous, receipts)) => {
+                    // A conflict is decided on authentic evidence only: this binding and every
+                    // recorded receipt of the earlier target.
+                    let (previous, earlier) = (previous.clone(), receipts.clone());
+                    if verified_commitment(&mut verified, *receipt, &mut lookup).is_none() {
+                        continue;
+                    }
+                    let mut authentic = Vec::new();
+                    for earlier in earlier {
+                        if verified_commitment(&mut verified, earlier, &mut lookup).is_some() {
+                            authentic.push(earlier);
+                        }
+                    }
+                    if authentic.is_empty() {
+                        targets.insert(
+                            binding.stream_group_id.clone(),
+                            (binding.history_group_id.clone(), vec![*receipt]),
+                        );
+                    } else {
+                        let same_trade = authentic.iter().chain([receipt]).any(|receipt| {
+                            verified
+                                .get(&receipt.sequence)
+                                .and_then(Option::as_ref)
+                                .is_some_and(|commitment: &VerifiedCommitment| {
+                                    commitment.restamp_pairs.get(&previous)
+                                        == Some(&binding.history_group_id)
+                                        || commitment.restamp_pairs.get(&binding.history_group_id)
+                                            == Some(&previous)
+                                })
+                        });
+                        if !same_trade {
+                            return insufficient(
+                                "complete reads disagree about an observation binding target",
+                            );
+                        }
+                    }
+                }
+            }
+            if binding.history_group_id == binding.stream_group_id {
+                exact
+                    .entry(binding.history_group_id)
+                    .or_default()
+                    .push(*receipt);
+            } else {
+                aliases
+                    .entry(binding.history_group_id)
+                    .or_default()
+                    .insert(binding.stream_group_id);
             }
         }
     }
@@ -2135,7 +2192,6 @@ fn decision_rows_from_sealed_source(
             .is_ok_and(|continuation| matches!(continuation.version(), 5 | 6))
     }) {
         let reads = complete_activity_read_scopes(&history, sealed_sequence, source)?;
-        let mut targets = HashMap::new();
         for read in &reads {
             if !matches!(read.continuation.version(), 5 | 6) {
                 continue;
@@ -2146,18 +2202,8 @@ fn decision_rows_from_sealed_source(
             let observation = source.observation(receipt)?;
             let commitment: crate::bucket_commit::ActivityReadCommitment =
                 serde_json::from_slice(&observation.payload)?;
+            // Every binding's target consistency was checked above, over all commitments.
             for binding in commitment.bindings.into_iter().flatten() {
-                if targets
-                    .insert(
-                        binding.stream_group_id.clone(),
-                        binding.history_group_id.clone(),
-                    )
-                    .is_some_and(|previous| previous != binding.history_group_id)
-                {
-                    return insufficient(
-                        "complete reads disagree about an observation binding target",
-                    );
-                }
                 if binding.stream_group_id != binding.history_group_id
                     && let Some(sequence) = source_universe.remove(&binding.stream_group_id)
                 {
@@ -2180,11 +2226,23 @@ fn decision_rows_from_sealed_source(
         let group = match state.activity_group_state(source_trade_id)? {
             Some(group) => group,
             None => {
-                let disposed = match disposed_bindings.get(source_trade_id) {
-                    Some(stream_id) => state.activity_group_state(stream_id)?,
-                    None => None,
-                };
-                if disposed.is_some_and(|group| group.disposition != "decision_pending") {
+                // An absent history identity is accounted for only by its corrected bindings:
+                // every differently stamped observation bound to it must be durable and disposed
+                // without a decision, and no authentic exact observation of it may exist, since
+                // that observation's own group is the absent one.
+                let mut disposed = aliases.contains_key(source_trade_id);
+                if disposed {
+                    for receipt in exact.get(source_trade_id).into_iter().flatten() {
+                        disposed &=
+                            verified_commitment(&mut verified, *receipt, &mut lookup).is_none();
+                    }
+                }
+                for stream_id in aliases.get(source_trade_id).into_iter().flatten() {
+                    disposed &= state
+                        .activity_group_state(stream_id)?
+                        .is_some_and(|group| group.disposition != "decision_pending");
+                }
+                if disposed {
                     continue;
                 }
                 return insufficient(format!(
@@ -2424,13 +2482,34 @@ fn source_trade_universe(
     source_trade_universe_with_commitments(sealed_sequence, observations).map(|(first, _)| first)
 }
 
+/// Commitments that record observation bindings, with their bindings as recorded.
+type BindingCommitments = Vec<(AppendReceipt, Vec<crate::bucket_commit::ObservationBinding>)>;
+
+/// Authenticate one binding commitment once per selection; an inauthentic one yields `None`.
+fn verified_commitment<'a, L, E>(
+    verified: &'a mut HashMap<EventSeq, Option<VerifiedCommitment>>,
+    receipt: AppendReceipt,
+    lookup: &mut L,
+) -> Option<&'a VerifiedCommitment>
+where
+    L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
+    E: std::fmt::Display,
+{
+    verified
+        .entry(receipt.sequence)
+        .or_insert_with(|| {
+            crate::bucket_commit::verified_commitment_bindings_with_lookup(receipt, lookup).ok()
+        })
+        .as_ref()
+}
+
 fn source_trade_universe_with_commitments(
     sealed_sequence: EventSeq,
     observations: &BTreeMap<u64, SourceObservation>,
 ) -> Result<
     (
         HashMap<pe_core_types::SourceTradeId, u64>,
-        Vec<AppendReceipt>,
+        BindingCommitments,
     ),
     QualificationError,
 > {
@@ -2502,7 +2581,7 @@ fn is_untyped_object(raw: &str) -> bool {
 
 fn fold_source_trade_universe(
     first: &mut HashMap<pe_core_types::SourceTradeId, u64>,
-    binding_commitments: &mut Vec<AppendReceipt>,
+    binding_commitments: &mut BindingCommitments,
     sealed_sequence: EventSeq,
     page: SourcePageRef<'_>,
 ) -> Result<(), QualificationError> {
@@ -2521,21 +2600,17 @@ fn fold_source_trade_universe(
         return Ok(());
     }
     if source_id == crate::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID {
-        // Only a binding between two different identities can account for an absent history
-        // group; the rare commitment carrying one is authenticated later, the rest cost a scan.
-        let binds_another_identity = payload
+        // Every recorded binding is kept with its commitment; selection authenticates the
+        // commitments whose bindings can change its result.
+        if payload
             .windows(b"\"stream_group_id\"".len())
             .any(|bytes| bytes == b"\"stream_group_id\"")
-            && serde_json::from_slice::<crate::bucket_commit::ActivityReadCommitment>(payload)
-                .is_ok_and(|commitment| {
-                    commitment
-                        .bindings
-                        .iter()
-                        .flatten()
-                        .any(|binding| binding.history_group_id != binding.stream_group_id)
-                });
-        if binds_another_identity {
-            binding_commitments.push(receipt);
+            && let Ok(commitment) =
+                serde_json::from_slice::<crate::bucket_commit::ActivityReadCommitment>(payload)
+            && let Some(bindings) = commitment.bindings
+            && !bindings.is_empty()
+        {
+            binding_commitments.push((receipt, bindings));
         }
         return Ok(());
     }
@@ -4172,7 +4247,25 @@ fn causal_financial_state(
             _ => return insufficient("causal mark Prepared/Final kinds disagree"),
         }
     }
+    let token_by_position = facts
+        .iter()
+        .filter_map(|fact| match &fact.payload {
+            FinancialPayload::Fill { economic, .. }
+                if completed_prepared.contains(&fact.prepared_receipt.sequence) =>
+            {
+                Some((
+                    (
+                        economic.market.market_id.clone(),
+                        u16::from(economic.market.outcome_index),
+                    ),
+                    economic.market.token_id.0.clone(),
+                ))
+            }
+            _ => None,
+        })
+        .collect();
     Ok(CausalFinancialState {
+        token_by_position,
         cash: financial.cash,
         positions: financial.positions,
         last_completed: financial.last_completed,
@@ -4269,13 +4362,60 @@ async fn verify_mark(
                 "PortfolioMark price observation disappeared during replay".to_owned(),
             )
         })?;
-        let classified = classify_recorded_prices_history(observation).await?;
-        let selected =
-            historical_mark_price(&classified, mark.cutoff_unix, receipt).map_err(|error| {
-                QualificationError::InsufficientEvidence(format!(
-                    "PortfolioMark historical selection failed: {error}"
-                ))
+        if observation.source_id != "pe-service.clob-prices-history"
+            || observation.schema_version != 1
+            || observation.parser_version != 1
+        {
+            return insufficient("PortfolioMark price receipt has the wrong source contract");
+        }
+        let closure_payload = if let Some(receipt) = price.closure_receipt {
+            let closure = source
+                .get(&receipt.sequence.0)
+                .filter(|observation| observation.receipt == receipt)
+                .ok_or_else(|| {
+                    QualificationError::InsufficientEvidence(
+                        "PortfolioMark closure receipt is absent from sealed source prefix"
+                            .to_owned(),
+                    )
+                })?;
+            if receipt.sequence <= mark.boundary_receipt.sequence
+                || receipt.sequence > source_tail_sequence
+                || !price_receipts.insert(receipt_key(receipt))
+                || closure.source_id != pe_source_polymarket_public::GAMMA_MARKETS_SOURCE_ID
+                || closure.schema_version
+                    != pe_source_polymarket_public::GAMMA_MARKETS_SCHEMA_VERSION
+                || closure.parser_version
+                    != pe_source_polymarket_public::GAMMA_MARKETS_PARSER_VERSION
+            {
+                return insufficient(
+                    "PortfolioMark closure receipt has invalid causal source evidence",
+                );
+            }
+            Some(closure.payload.as_slice())
+        } else {
+            None
+        };
+        let token_id = financial
+            .token_by_position
+            .get(&(price.market_id.clone(), price.outcome_id))
+            .ok_or_else(|| {
+                QualificationError::InsufficientEvidence(
+                    "PortfolioMark position has no causal Prepared token mapping".to_owned(),
+                )
             })?;
+        let selected = replay_paper_mark_price(
+            price,
+            token_id,
+            mark.cutoff_unix,
+            &observation.payload,
+            closure_payload,
+        )
+        .await
+        .map_err(|error| {
+            QualificationError::InsufficientEvidence(format!(
+                "PortfolioMark historical selection failed: {error}",
+            ))
+        })?;
         if selected.price != value
             || Some(selected.sample_unix) != price.sample_unix
             || selected.receipt != receipt
@@ -4318,42 +4458,6 @@ async fn verify_mark(
         cash: mark.cash,
         equity: mark.equity,
     })
-}
-
-async fn classify_recorded_prices_history(
-    observation: &SourceObservation,
-) -> Result<ClassifiedPricesHistory, QualificationError> {
-    if observation.source_id != "pe-service.clob-prices-history"
-        || observation.schema_version != 1
-        || observation.parser_version != 1
-    {
-        return insufficient("PortfolioMark price receipt has the wrong source contract");
-    }
-    let base_url = "https://offline.invalid";
-    let request_url =
-        format!("{base_url}/prices-history?market=recorded&startTs=0&endTs=1&fidelity=1");
-    let replayed = ClobPricesHistoryClient::new(
-        base_url.to_owned(),
-        FixtureFetcher::new(HashMap::from([(request_url, observation.payload.clone())])),
-    )
-    .with_fidelity_minutes(1)
-    .fetch_prices_history_classified("recorded", 0, 1)
-    .await
-    .map_err(|error| {
-        QualificationError::InsufficientEvidence(format!(
-            "PortfolioMark production historical parse failed: {error}"
-        ))
-    })?;
-    if replayed.body != observation.payload {
-        return insufficient("PortfolioMark historical parser did not consume the recorded body");
-    }
-    if let ClassifiedPricesHistory::Points(points) = &replayed.outcome {
-        let mut timestamps = HashSet::new();
-        if points.iter().any(|point| !timestamps.insert(point.t)) {
-            return insufficient("PortfolioMark historical response contains a duplicate sample");
-        }
-    }
-    Ok(replayed.outcome)
 }
 
 fn complete_day_growth(
@@ -4512,7 +4616,7 @@ fn reason_moves_anchor(reason: MembershipReason) -> bool {
 }
 
 struct DeclineReplayContext<'a> {
-    frames: &'a [ScannedPaperFrame],
+    frames: &'a [Arc<ScannedPaperFrame>],
     start_index: usize,
     source: &'a BTreeMap<u64, SourceObservation>,
     completed_financial_facts: &'a [CompletedFinancialFact],
@@ -4533,11 +4637,11 @@ fn financial_state_at_prefix(
 }
 
 fn recorded_fill_paper_prefix<'a>(
-    frames_before_prepared: &'a [ScannedPaperFrame],
+    frames_before_prepared: &'a [Arc<ScannedPaperFrame>],
     financial_prefix: AppendReceipt,
     evaluated_at_unix_ms: i64,
     previous_fill_financial_prefix: &mut Option<AppendReceipt>,
-) -> Result<&'a [ScannedPaperFrame], QualificationError> {
+) -> Result<&'a [Arc<ScannedPaperFrame>], QualificationError> {
     let prefix = paper_prefix_at_financial_prefix(
         frames_before_prepared,
         financial_prefix,
@@ -5704,7 +5808,7 @@ fn scan_verified_paper_prefix(
     path: &Path,
     verified_tail: u64,
     complete_file: bool,
-) -> Result<Vec<ScannedPaperFrame>, QualificationError> {
+) -> Result<Vec<Arc<ScannedPaperFrame>>, QualificationError> {
     if complete_file {
         return Ok(scan_paper_log(path)?);
     }
@@ -5722,7 +5826,7 @@ fn scan_verified_paper_prefix(
         options.mode(0o600);
     }
     let mut target = options.open(&temporary_path)?;
-    let result = (|| -> Result<Vec<ScannedPaperFrame>, QualificationError> {
+    let result = (|| -> Result<Vec<Arc<ScannedPaperFrame>>, QualificationError> {
         use std::io::Read as _;
 
         let source = fs::File::open(path)?;
@@ -5756,7 +5860,7 @@ fn start_envelope(
         observed_at: SourceTimestamp(timestamp),
         received_at: ReceivedAt(timestamp),
         content_type: ContentType::Json,
-        payload: serde_json::to_vec(&PaperLogRecord::QualificationStarted(Box::new(
+        payload: serde_json::to_vec(&PaperLogRecord::QualificationStarted(Arc::new(
             start.clone(),
         )))?,
     })
@@ -5788,7 +5892,7 @@ fn verify_paper_prepared_freshness(
         .ok_or_else(|| {
             QualificationError::InsufficientEvidence("paper freshness policy is missing".to_owned())
         })?;
-    let source_time = decision
+    let (source_time, _) = decision
         .continuation
         .verified_source_time(&mut |receipt| {
             let source = decision_source_receipt(source, receipt)?;
@@ -6493,14 +6597,14 @@ mod tests {
         }
     }
 
-    fn risk_frame(sequence: u64, record: PaperLogRecord) -> ScannedPaperFrame {
+    fn risk_frame(sequence: u64, record: PaperLogRecord) -> Arc<ScannedPaperFrame> {
         let receipt = AppendReceipt {
             sequence: EventSeq(sequence),
             this_hash: blake3::hash(&sequence.to_be_bytes()),
         };
         let timestamp =
             OffsetDateTime::from_unix_timestamp(i64::try_from(sequence).unwrap()).unwrap();
-        ScannedPaperFrame {
+        Arc::new(ScannedPaperFrame {
             envelope: pe_event_log::EventEnvelope {
                 seq: receipt.sequence,
                 source_id: SourceId("paper-test".to_owned()),
@@ -6517,7 +6621,7 @@ mod tests {
             receipt,
             frame: PaperLogFrame::Record(record),
             legacy_fill: None,
-        }
+        })
     }
 
     fn test_receipt(sequence: u64) -> AppendReceipt {
@@ -6527,10 +6631,10 @@ mod tests {
         }
     }
 
-    fn test_frame(sequence: u64, unix: i64, record: PaperLogRecord) -> ScannedPaperFrame {
+    fn test_frame(sequence: u64, unix: i64, record: PaperLogRecord) -> Arc<ScannedPaperFrame> {
         let receipt = test_receipt(sequence);
         let timestamp = OffsetDateTime::from_unix_timestamp(unix).unwrap();
-        ScannedPaperFrame {
+        Arc::new(ScannedPaperFrame {
             envelope: EventEnvelope {
                 seq: receipt.sequence,
                 source_id: SourceId("paper-test".to_owned()),
@@ -6547,7 +6651,7 @@ mod tests {
             receipt,
             frame: PaperLogFrame::Record(record),
             legacy_fill: None,
-        }
+        })
     }
 
     fn classification_fixture() -> (DecisionContinuationV3, LedgerMutation) {
@@ -6669,7 +6773,7 @@ mod tests {
     struct DeclineFixture {
         decision: crate::decision_replay::ReplayedDecision,
         start: QualificationStarted,
-        frames: Vec<ScannedPaperFrame>,
+        frames: Vec<Arc<ScannedPaperFrame>>,
         source: BTreeMap<u64, SourceObservation>,
         facts: Vec<CompletedFinancialFact>,
         observations: HashMap<SourceTradeId, ObservationEvidence>,
@@ -6876,7 +6980,7 @@ mod tests {
         let start_frame = test_frame(
             1,
             EVALUATED_MS.div_euclid(1_000) - 100,
-            PaperLogRecord::QualificationStarted(Box::new(start.clone())),
+            PaperLogRecord::QualificationStarted(Arc::new(start.clone())),
         );
         let mut prior = risk_economic(
             OPEN_CONDITION,
@@ -7988,6 +8092,61 @@ mod tests {
             .unwrap();
 
         verify_complete_second_action(&ledger, &continuation, &[mutation], &expected).unwrap();
+    }
+
+    #[test]
+    fn raw_only_trade_and_redeem_combos_do_not_change_qualification_entry_classification() {
+        let (continuation, mutation) = classification_fixture();
+        let wallet = mutation.wallet;
+        let epoch = mutation.source_time.0.unix_timestamp();
+        let ledger = PositionLedger::new();
+        let (_, expected) = ledger
+            .simulate_all_or_none(std::slice::from_ref(&mutation))
+            .unwrap();
+        for kind in ["TRADE", "REDEEM"] {
+            let mut row = activity_row("combo", "combo-asset", "1", "1", "combo-tx", epoch);
+            row["type"] = serde_json::json!(kind);
+            row["isCombo"] = serde_json::json!(true);
+            row["outcomeIndex"] = serde_json::json!(999);
+            row["outcome"] = serde_json::json!("");
+            let aggregates = pe_source_polymarket_public::parse_activity_response(
+                &activity_payload(vec![row]),
+                wallet,
+                &pe_source_polymarket_public::ActivityParseContext {
+                    source_id: SourceId("fixture".to_owned()),
+                    observed_at: SourceTimestamp(mutation.source_time.0),
+                    received_at: ReceivedAt(mutation.source_time.0),
+                    transport: pe_source_polymarket_public::ActivityTransport::Rest,
+                },
+            )
+            .unwrap()
+            .aggregates()
+            .unwrap();
+            let combo = LedgerMutation::from_activity(&aggregates[0]).unwrap();
+            assert_eq!(combo.effect, pe_position_ledger::LedgerEffect::RawOnly);
+            let groups = vec![
+                pe_paper_state::ActivityGroupRow {
+                    source_trade_id: combo.source_trade_id,
+                    source_epoch: epoch,
+                    semantic_revision: aggregates[0].semantic_revision.as_str().to_owned(),
+                    disposition: "raw_only".to_owned(),
+                    proof_json: combo.effect.to_document().unwrap(),
+                },
+                pe_paper_state::ActivityGroupRow {
+                    source_trade_id: mutation.source_trade_id.clone(),
+                    source_epoch: epoch,
+                    semantic_revision: "entry".to_owned(),
+                    disposition: "decision_pending".to_owned(),
+                    proof_json: expected[0].to_document().unwrap(),
+                },
+            ];
+            let (applied, expected) = recorded_applied_bucket(wallet, epoch, &groups).unwrap();
+            assert_eq!(applied.len(), 1);
+            verify_complete_second_action(&ledger, &continuation, &applied, &expected).unwrap();
+        }
+        for disposition in ["raw_only", "reanchor_required_redemption"] {
+            assert!(!recorded_group_was_applied(&mutation.source_trade_id, disposition).unwrap());
+        }
     }
 
     /// PASS: the independent first entry verifies only under generation five's repaired proof;
@@ -10276,32 +10435,33 @@ mod tests {
         let mut frames = vec![test_frame(
             1,
             1,
-            PaperLogRecord::QualificationStarted(Box::new(start.clone())),
+            PaperLogRecord::QualificationStarted(Arc::new(start.clone())),
         )];
         let mut sequence = 2u64;
-        let push_mark = |frames: &mut Vec<ScannedPaperFrame>, sequence: u64, cutoff_unix: i64| {
-            frames.push(test_frame(
-                sequence,
-                cutoff_unix,
-                PaperLogRecord::PortfolioMark(Box::new(PortfolioMark {
-                    boundary_receipt: test_receipt(10_000 + sequence),
+        let push_mark =
+            |frames: &mut Vec<Arc<ScannedPaperFrame>>, sequence: u64, cutoff_unix: i64| {
+                frames.push(test_frame(
+                    sequence,
                     cutoff_unix,
-                    source_tail: TailBinding {
-                        physical_tail: 0,
-                        last_sequence: Some(EventSeq(10_000 + sequence)),
-                        last_hash: test_receipt(10_000 + sequence)
-                            .this_hash
-                            .to_hex()
-                            .to_string(),
-                    },
-                    financial_prefix_seq: None,
-                    prices: Vec::new(),
-                    cash: dec!(100),
-                    equity: dec!(100),
-                    invalid: None,
-                })),
-            ));
-        };
+                    PaperLogRecord::PortfolioMark(Box::new(PortfolioMark {
+                        boundary_receipt: test_receipt(10_000 + sequence),
+                        cutoff_unix,
+                        source_tail: TailBinding {
+                            physical_tail: 0,
+                            last_sequence: Some(EventSeq(10_000 + sequence)),
+                            last_hash: test_receipt(10_000 + sequence)
+                                .this_hash
+                                .to_hex()
+                                .to_string(),
+                        },
+                        financial_prefix_seq: None,
+                        prices: Vec::new(),
+                        cash: dec!(100),
+                        equity: dec!(100),
+                        invalid: None,
+                    })),
+                ));
+            };
         push_mark(&mut frames, sequence, 86_400);
         sequence += 1;
 
@@ -10429,7 +10589,7 @@ mod tests {
         sequence += 1;
         push_mark(&mut frames, sequence, 31 * 86_400);
         let era = PaperEra {
-            start: Some((start_receipt, start)),
+            start: Some((start_receipt, Arc::new(start))),
             frames,
         };
 
@@ -10623,7 +10783,7 @@ mod tests {
         let one = CollateralAmount::from_decimal_exact(dec!(1)).unwrap();
         let four = CollateralAmount::from_decimal_exact(dec!(4)).unwrap();
         let era = crate::paper_recovery::PaperEra {
-            start: Some((start_receipt, start.clone())),
+            start: Some((start_receipt, Arc::new(start.clone()))),
             frames: vec![
                 risk_frame(1, fill("unresolved", "market-a", one)),
                 risk_frame(2, fill_final(1, one)),
@@ -11090,6 +11250,263 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn qualification_replays_selected_closed_current_prices() {
+        let market = MarketId(VenueMarketId("condition-closed".to_owned()));
+        let position = PaperPositionRow {
+            market_id: market.clone(),
+            outcome_id: OutcomeId(0),
+            long: ShareAmount::from_whole(1).unwrap(),
+            short: ShareAmount::ZERO,
+        };
+        let url = format!(
+            "https://offline.invalid/markets?condition_ids={market}&closed=true&limit={GAMMA_BATCH_LIMIT_PARAM}"
+        );
+        let payload = gamma_price_page_record(&url, 100_000, br#"[{"conditionId":"condition-closed","closed":true,"outcomePrices":"[\"0.0005\",\"0.9995\"]"}]"#, true);
+        let observation = source_observation(
+            2,
+            100_000,
+            GAMMA_MARKETS_SOURCE_ID,
+            GAMMA_PRICE_ATTEMPT_SCHEMA_VERSION,
+            GAMMA_PRICE_ATTEMPT_PARSER_VERSION,
+            &payload,
+        );
+        let receipt = observation.receipt;
+        let prices = replayed_risk_prices(
+            &[receipt],
+            100_000,
+            &[position],
+            &BTreeMap::from([(2, observation)]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            prices[&(market, OutcomeId(0))],
+            Price::new(dec!(0.0005)).unwrap()
+        );
+    }
+
+    /// PASS: two selected pages that both carry a market (an older open batch and a newer closed
+    /// fallback) replay each market from its newest page, as acquisition selected it.
+    #[tokio::test]
+    async fn qualification_replays_each_market_from_its_newest_selected_page() {
+        let position = |market: &str| PaperPositionRow {
+            market_id: MarketId(VenueMarketId(market.to_owned())),
+            outcome_id: OutcomeId(0),
+            long: ShareAmount::from_whole(1).unwrap(),
+            short: ShareAmount::ZERO,
+        };
+        let open_url = format!(
+            "https://offline.invalid/markets?condition_ids=0xa&condition_ids=0xb&limit={GAMMA_BATCH_LIMIT_PARAM}"
+        );
+        let closed_url = format!(
+            "https://offline.invalid/markets?condition_ids=0xb&closed=true&limit={GAMMA_BATCH_LIMIT_PARAM}"
+        );
+        let open = source_observation(
+            2,
+            100_000,
+            GAMMA_MARKETS_SOURCE_ID,
+            GAMMA_PRICE_ATTEMPT_SCHEMA_VERSION,
+            GAMMA_PRICE_ATTEMPT_PARSER_VERSION,
+            &gamma_price_page_record(&open_url, 100_000, br#"[{"conditionId":"0xa","outcomePrices":"[\"0.4\",\"0.6\"]"},{"conditionId":"0xb","outcomePrices":"[\"0.5\",\"0.5\"]"}]"#, true),
+        );
+        let closed = source_observation(
+            4,
+            100_000,
+            GAMMA_MARKETS_SOURCE_ID,
+            GAMMA_PRICE_ATTEMPT_SCHEMA_VERSION,
+            GAMMA_PRICE_ATTEMPT_PARSER_VERSION,
+            &gamma_price_page_record(
+                &closed_url,
+                100_000,
+                br#"[{"conditionId":"0xb","closed":true,"outcomePrices":"[\"1\",\"0\"]"}]"#,
+                true,
+            ),
+        );
+        let receipts = [open.receipt, closed.receipt];
+        let prices = replayed_risk_prices(
+            &receipts,
+            100_000,
+            &[position("0xa"), position("0xb")],
+            &BTreeMap::from([(2, open), (4, closed)]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            prices[&(MarketId(VenueMarketId("0xa".to_owned())), OutcomeId(0))],
+            Price::new(dec!(0.4)).unwrap()
+        );
+        assert_eq!(
+            prices[&(MarketId(VenueMarketId("0xb".to_owned())), OutcomeId(0))],
+            Price::new(dec!(1)).unwrap()
+        );
+    }
+
+    /// PASS: a selected page's extra row for a market it did not request is not that market's
+    /// price; the market replays from the page that requested it.
+    #[tokio::test]
+    async fn qualification_ignores_unrequested_rows_in_selected_pages() {
+        let position = |market: &str| PaperPositionRow {
+            market_id: MarketId(VenueMarketId(market.to_owned())),
+            outcome_id: OutcomeId(0),
+            long: ShareAmount::from_whole(1).unwrap(),
+            short: ShareAmount::ZERO,
+        };
+        let b_url = format!(
+            "https://offline.invalid/markets?condition_ids=0xb&limit={GAMMA_BATCH_LIMIT_PARAM}"
+        );
+        let a_url = format!(
+            "https://offline.invalid/markets?condition_ids=0xa&limit={GAMMA_BATCH_LIMIT_PARAM}"
+        );
+        let b_page = source_observation(
+            2,
+            100_000,
+            GAMMA_MARKETS_SOURCE_ID,
+            GAMMA_PRICE_ATTEMPT_SCHEMA_VERSION,
+            GAMMA_PRICE_ATTEMPT_PARSER_VERSION,
+            &gamma_price_page_record(
+                &b_url,
+                100_000,
+                br#"[{"conditionId":"0xb","outcomePrices":"[\"0.5\",\"0.5\"]"}]"#,
+                true,
+            ),
+        );
+        let a_page = source_observation(
+            4,
+            100_000,
+            GAMMA_MARKETS_SOURCE_ID,
+            GAMMA_PRICE_ATTEMPT_SCHEMA_VERSION,
+            GAMMA_PRICE_ATTEMPT_PARSER_VERSION,
+            &gamma_price_page_record(&a_url, 100_000, br#"[{"conditionId":"0xa","outcomePrices":"[\"0.4\",\"0.6\"]"},{"conditionId":"0xb","outcomePrices":"[\"0.9\",\"0.1\"]"}]"#, true),
+        );
+        let receipts = [b_page.receipt, a_page.receipt];
+        let prices = replayed_risk_prices(
+            &receipts,
+            100_000,
+            &[position("0xa"), position("0xb")],
+            &BTreeMap::from([(2, b_page), (4, a_page)]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            prices[&(MarketId(VenueMarketId("0xb".to_owned())), OutcomeId(0))],
+            Price::new(dec!(0.5)).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn qualification_mark_replays_both_rules_and_authenticates_closure() {
+        let cutoff = 1_790_985_600;
+        let condition = "0x50365ef0731cfa26e35d89b66a91bca5ef1ee8090b02d1ced099acc738868e87";
+        let token = "27556300168112004153063282106116891181228462668915873615116883805553394180154";
+        let financial = CausalFinancialState {
+            token_by_position: HashMap::from([((condition.to_owned(), 0), token.to_owned())]),
+            cash: dec!(99),
+            positions: vec![OpenPosition {
+                condition_id: condition.to_owned(),
+                market_id: condition.to_owned(),
+                outcome_index: 0,
+                shares_atomic: 2_000_000,
+            }],
+            last_completed: Some(EventSeq(10)),
+            completed_prepared: HashSet::from([EventSeq(10)]),
+            closed_fill_final_conditions: HashMap::new(),
+        };
+        for closed in [false, true] {
+            let value = if closed { dec!(0.0005) } else { dec!(0.4) };
+            let history = if closed {
+                include_bytes!("../tests/fixtures/london_closed_mark/prices_history_13d.json")
+                    .to_vec()
+            } else {
+                format!(r#"{{"history":[{{"t":{},"p":0.4}}]}}"#, cutoff - 60).into_bytes()
+            };
+            let boundary = source_observation(
+                1,
+                cutoff * 1_000,
+                "pe-service.boundary",
+                1,
+                1,
+                &serde_json::to_vec(
+                    &serde_json::json!({"kind":"daily_boundary","cutoff_unix":cutoff}),
+                )
+                .unwrap(),
+            );
+            let closure = source_observation(
+                3,
+                cutoff * 1_000 + 1_000,
+                GAMMA_MARKETS_SOURCE_ID,
+                GAMMA_MARKETS_SCHEMA_VERSION,
+                GAMMA_MARKETS_PARSER_VERSION,
+                include_bytes!("../tests/fixtures/london_closed_mark/gamma_closed.json"),
+            );
+            let history = source_observation(
+                4,
+                cutoff * 1_000 + 2_000,
+                "pe-service.clob-prices-history",
+                1,
+                1,
+                &history,
+            );
+            let mark = PortfolioMark {
+                boundary_receipt: boundary.receipt,
+                cutoff_unix: cutoff,
+                source_tail: TailBinding {
+                    physical_tail: 0,
+                    last_sequence: Some(history.receipt.sequence),
+                    last_hash: history.receipt.this_hash.to_hex().to_string(),
+                },
+                financial_prefix_seq: financial.last_completed,
+                prices: vec![crate::paper_recovery::PaperMarkPrice {
+                    market_id: condition.to_owned(),
+                    outcome_id: 0,
+                    price: Some(Price::new(value).unwrap()),
+                    sample_unix: Some(if closed { 1_790_985_077 } else { cutoff - 60 }),
+                    receipt: Some(history.receipt),
+                    closure_receipt: closed.then_some(closure.receipt),
+                    invalid: None,
+                }],
+                cash: financial.cash,
+                equity: financial.cash + dec!(2) * value,
+                invalid: None,
+            };
+            let mut source = BTreeMap::from([(1, boundary), (3, closure), (4, history)]);
+            assert_eq!(
+                verify_mark(&mark, &financial, &source)
+                    .await
+                    .unwrap()
+                    .equity,
+                mark.equity
+            );
+            if closed {
+                let mut legacy = mark.clone();
+                legacy.prices[0].closure_receipt = None;
+                assert!(verify_mark(&legacy, &financial, &source).await.is_err());
+                let mut invalid = mark.clone();
+                invalid.prices[0].closure_receipt = Some(test_receipt(100));
+                assert!(verify_mark(&invalid, &financial, &source).await.is_err());
+                for mutation in ["open", "later", "unknown", "wrong_condition"] {
+                    let mut row: serde_json::Value = serde_json::from_slice(include_bytes!(
+                        "../tests/fixtures/london_closed_mark/gamma_closed.json"
+                    ))
+                    .unwrap();
+                    match mutation {
+                        "open" => row[0]["closed"] = serde_json::json!(false),
+                        "later" => {
+                            row[0]["closedTime"] = serde_json::json!("2026-10-03 00:00:01+00")
+                        }
+                        "unknown" => row[0]["closedTime"] = serde_json::Value::Null,
+                        _ => row[0]["conditionId"] = serde_json::json!("other"),
+                    }
+                    source.get_mut(&3).unwrap().payload = serde_json::to_vec(&row).unwrap();
+                    assert!(
+                        verify_mark(&mark, &financial, &source).await.is_err(),
+                        "{mutation}"
+                    );
+                }
+            }
+        }
     }
 
     fn financial_era_live_source_fixture(root: &Path) -> (FinancialEraManifest, ServiceConfig) {
@@ -13771,6 +14188,274 @@ mod tests {
             "{map}"
         );
         assert_eq!(map.to_string(), indexed.to_string());
+    }
+
+    /// PASS: two authentic, differently stamped observations bound to one history identity in
+    /// separate reads select in both selectors, as the commit path's verifier accepts them.
+    #[test]
+    fn corrected_binding_selection_accepts_two_observations_of_one_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let mut writer = Writer::open(&source_path).unwrap();
+        let (first, _, _) =
+            crate::bucket_commit::continuation_v3_tests::append_binding_read("valid", &mut writer);
+        let (alias, _, _) =
+            crate::bucket_commit::continuation_v3_tests::append_binding_read("alias", &mut writer);
+        assert_eq!(first.facts.source_trade_id, alias.facts.source_trade_id);
+        drop(writer);
+        let state = PaperStateDb::open(&dir.path().join("state.db")).unwrap();
+        store_read_decision(&state, &first, "decision_pending", true);
+        let index = SourceReceiptIndex::replay(&source_path).unwrap();
+        let streams = [&first, &alias].map(|continuation| {
+            let observation = continuation
+                .observation_from_receipt_index(&index)
+                .unwrap()
+                .unwrap();
+            let stream = index.source_envelope(observation.source_receipt).unwrap();
+            parse_activity_trade_observation(&stream.payload)
+                .unwrap()
+                .group_id
+                .key()
+                .clone()
+        });
+        assert_ne!(
+            streams[0], streams[1],
+            "the two observations carry different stamps"
+        );
+        let candidate = Scanner::verify(&source_path).unwrap();
+        let sealed = TailBinding::from(&candidate);
+        let map = decision_rows_for_source_prefix(&state, &source_path, &prefix_at(None), &sealed);
+        let indexed =
+            decision_rows_for_indexed_source_prefix(&state, &index, &candidate, &prefix_at(None));
+        assert!(map.is_ok(), "{map:?}");
+        assert_selection_results_equal(map, indexed, &sealed);
+    }
+
+    /// The observation identity a binding read recorded.
+    fn stream_key(
+        index: &SourceReceiptIndex,
+        continuation: &DecisionContinuationV3,
+    ) -> pe_core_types::SourceTradeId {
+        let stream = index
+            .source_envelope(continuation.observed_source_receipt.unwrap())
+            .unwrap();
+        parse_activity_trade_observation(&stream.payload)
+            .unwrap()
+            .group_id
+            .key()
+            .clone()
+    }
+
+    /// Record a read's observation group, disposed before any decision or decision-pending.
+    fn record_observation_group(
+        state: &PaperStateDb,
+        index: &SourceReceiptIndex,
+        continuation: &DecisionContinuationV3,
+        pending: bool,
+    ) {
+        let mut observation = continuation.clone();
+        observation.facts.source_trade_id = stream_key(index, continuation);
+        store_read_decision(
+            state,
+            &observation,
+            if pending {
+                "decision_pending"
+            } else {
+                "stale_activity_ws_past_copy_budget"
+            },
+            pending,
+        );
+    }
+
+    /// Both selectors over the whole recorded prefix agree; an accepted selection then seals.
+    fn select_both_and_seal(
+        state: &PaperStateDb,
+        source_path: &Path,
+    ) -> Result<(), QualificationError> {
+        let index = SourceReceiptIndex::replay(source_path).unwrap();
+        let candidate = Scanner::verify(source_path).unwrap();
+        let sealed = TailBinding::from(&candidate);
+        let select =
+            || decision_rows_for_source_prefix(state, source_path, &prefix_at(None), &sealed);
+        assert_selection_results_equal(
+            select(),
+            decision_rows_for_indexed_source_prefix(state, &index, &candidate, &prefix_at(None)),
+            &sealed,
+        );
+        let selected = select()?;
+        let keys = selected
+            .rows
+            .iter()
+            .map(|row| (row.source_trade_id.clone(), row.semantic_revision.clone()))
+            .collect::<Vec<_>>();
+        state.seal_decision_evidence_for_source_prefix(
+            &keys,
+            &selected.in_prefix,
+            sealed.last_sequence,
+        )?;
+        Ok(())
+    }
+
+    /// PASS: an absent history identity with two corrected observations is accounted for, and
+    /// seals, only when both observation groups are durable and disposed without a decision.
+    #[test]
+    fn absent_history_needs_every_bound_observation_disposed() {
+        for (second, accepted) in [(Some(false), true), (None, false), (Some(true), false)] {
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("source.log");
+            let mut writer = Writer::open(&source_path).unwrap();
+            let (first, _, _) = crate::bucket_commit::continuation_v3_tests::append_binding_read(
+                "disposed_valid",
+                &mut writer,
+            );
+            let (alias, _, _) = crate::bucket_commit::continuation_v3_tests::append_binding_read(
+                "disposed_alias",
+                &mut writer,
+            );
+            drop(writer);
+            let index = SourceReceiptIndex::replay(&source_path).unwrap();
+            assert_eq!(first.facts.source_trade_id, alias.facts.source_trade_id);
+            assert_ne!(stream_key(&index, &first), stream_key(&index, &alias));
+            let state = PaperStateDb::open(&dir.path().join("state.db")).unwrap();
+            record_observation_group(&state, &index, &first, false);
+            if let Some(pending) = second {
+                record_observation_group(&state, &index, &alias, pending);
+            }
+            let result = select_both_and_seal(&state, &source_path);
+            if accepted {
+                result.unwrap();
+            } else {
+                assert!(
+                    matches!(&result, Err(QualificationError::InsufficientEvidence(message))
+                        if message.contains("has no durable activity group")),
+                    "second={second:?}: {result:?}"
+                );
+            }
+        }
+    }
+
+    /// PASS: an authentic exact observation of an absent history identity keeps it unaccounted
+    /// for beside a disposed corrected observation; without it, #719's exemption still applies.
+    #[test]
+    fn absent_history_with_an_exact_observation_is_not_excused() {
+        for exact in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("source.log");
+            let mut writer = Writer::open(&source_path).unwrap();
+            let (corrected, _, _) =
+                crate::bucket_commit::continuation_v3_tests::append_binding_read(
+                    "valid",
+                    &mut writer,
+                );
+            if exact {
+                let (exact_read, _, _) =
+                    crate::bucket_commit::continuation_v3_tests::append_binding_read(
+                        "exact",
+                        &mut writer,
+                    );
+                assert_eq!(
+                    exact_read.facts.source_trade_id,
+                    corrected.facts.source_trade_id
+                );
+            }
+            drop(writer);
+            let index = SourceReceiptIndex::replay(&source_path).unwrap();
+            let state = PaperStateDb::open(&dir.path().join("state.db")).unwrap();
+            record_observation_group(&state, &index, &corrected, false);
+            let result = select_both_and_seal(&state, &source_path);
+            if exact {
+                assert!(
+                    matches!(&result, Err(QualificationError::InsufficientEvidence(message))
+                        if message.contains("has no durable activity group")),
+                    "{result:?}"
+                );
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+
+    /// PASS: one observation bound exactly to its own history identity and, after a crash before
+    /// that bucket committed, to a different corrected identity fails both selectors, also when an
+    /// inauthentic exact commitment of the same observation was recorded first.
+    #[test]
+    fn exact_and_corrected_targets_of_one_observation_disagree() {
+        for masked in [false, true] {
+            exact_and_corrected_targets_disagree(masked);
+        }
+    }
+
+    fn exact_and_corrected_targets_disagree(masked: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let mut writer = Writer::open(&source_path).unwrap();
+        if masked {
+            crate::bucket_commit::continuation_v3_tests::append_binding_read(
+                "exact_digest",
+                &mut writer,
+            );
+        }
+        let (exact, _, _) =
+            crate::bucket_commit::continuation_v3_tests::append_binding_read("exact", &mut writer);
+        let (corrected, _, _) = crate::bucket_commit::continuation_v3_tests::append_binding_read(
+            "exact_other_target",
+            &mut writer,
+        );
+        drop(writer);
+        let index = SourceReceiptIndex::replay(&source_path).unwrap();
+        assert_eq!(stream_key(&index, &exact), exact.facts.source_trade_id);
+        assert_eq!(stream_key(&index, &exact), stream_key(&index, &corrected));
+        assert_ne!(exact.facts.source_trade_id, corrected.facts.source_trade_id);
+        let state = PaperStateDb::open(&dir.path().join("state.db")).unwrap();
+        store_read_decision(&state, &corrected, "decision_pending", true);
+        let result = select_both_and_seal(&state, &source_path);
+        assert!(
+            matches!(&result, Err(QualificationError::InsufficientEvidence(message))
+                if message.contains("disagree about an observation binding target")),
+            "masked={masked}: {result:?}"
+        );
+    }
+
+    /// PASS: one observation bound to an unattributed original and, after a crash and the venue's
+    /// restamp, to the restamp is one trade: a pair proven by any read binding either target
+    /// selects and seals, also when an earlier read listed only the original.
+    #[test]
+    fn restamp_pair_targets_of_one_observation_are_one_trade() {
+        for original_only_first in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("source.log");
+            let mut writer = Writer::open(&source_path).unwrap();
+            if original_only_first {
+                crate::bucket_commit::continuation_v3_tests::append_binding_read(
+                    "original_only",
+                    &mut writer,
+                );
+            }
+            let (original, _, _) = crate::bucket_commit::continuation_v3_tests::append_binding_read(
+                "pair",
+                &mut writer,
+            );
+            // The later read lists only the restamp.
+            let (restamp, _, _) = crate::bucket_commit::continuation_v3_tests::append_binding_read(
+                "valid",
+                &mut writer,
+            );
+            drop(writer);
+            let index = SourceReceiptIndex::replay(&source_path).unwrap();
+            assert_eq!(stream_key(&index, &original), stream_key(&index, &restamp));
+            assert_ne!(
+                original.facts.source_trade_id,
+                restamp.facts.source_trade_id
+            );
+            let state = PaperStateDb::open(&dir.path().join("state.db")).unwrap();
+            store_read_decision(&state, &original, "decision_pending", true);
+            store_read_decision(&state, &restamp, "raw_only", false);
+            let result = select_both_and_seal(&state, &source_path);
+            assert!(
+                result.is_ok(),
+                "original_only_first={original_only_first}: {result:?}"
+            );
+        }
     }
 
     /// PASS: malformed v5 policy and a valid policy substituted into authentic v2 bytes fail both selectors.

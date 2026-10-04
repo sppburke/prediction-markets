@@ -195,8 +195,8 @@ fn pending_read(market_id: &str, source_epoch: i64) -> support::ProducerShapedRe
     )
 }
 
-fn make_writer(dir: &TempDir) -> Writer {
-    Writer::open(dir.path().join("paper.log")).unwrap()
+fn make_writer(dir: &TempDir) -> pe_service::paper_recovery::PaperLog {
+    pe_service::paper_recovery::PaperLog::open(dir.path().join("paper.log")).unwrap()
 }
 
 fn paper_fill_count(dir: &TempDir) -> usize {

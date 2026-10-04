@@ -33,7 +33,7 @@ use pe_core_types::{
     ReconstructionQuality, Side, SourceTimestamp, SourceTradeId, VenueId, VenueMarketId,
     WalletAddress,
 };
-use pe_event_log::Writer;
+
 use pe_paper_state::{PaperStateDb, WalletHistoryStatusRecord};
 use pe_position_ledger::PositionLedger;
 use pe_risk_engine::{ConcentrationCaps, RiskSnapshot};
@@ -101,9 +101,9 @@ fn make_trade(wallet: WalletAddress) -> IncomingTrade {
     }
 }
 
-fn make_writer(dir: &TempDir) -> Writer {
+fn make_writer(dir: &TempDir) -> pe_service::paper_recovery::PaperLog {
     let paper_path = dir.path().join("paper.log");
-    Writer::open(&paper_path).unwrap()
+    pe_service::paper_recovery::PaperLog::open(&paper_path).unwrap()
 }
 
 fn make_paper_state(dir: &TempDir) -> Arc<PaperStateDb> {

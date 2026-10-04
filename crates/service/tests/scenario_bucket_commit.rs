@@ -267,6 +267,7 @@ fn context(epoch: i64, complete_history: bool) -> BucketDecisionContext {
         no_copy_dispositions: HashMap::new(),
         identity_overrides: HashMap::new(),
         identity_unresolved: Default::default(),
+        restamp_twins: Default::default(),
         history_status: complete_history.then(|| WalletHistoryStatusRecord {
             wallet: wallet(),
             complete: true,
@@ -1824,94 +1825,58 @@ fn conversion_and_underflow_fence_without_partial_ledger_apply() {
 }
 
 #[test]
-fn unexpressible_redeems_require_an_anchor_without_mutating_balances() {
-    let (_dir, paper, mut engine) = fresh_anchored();
-    engine
-        .commit_read(
-            vec![position_row(
-                "TRADE", "0x70", MARKET_A, 0, "BUY", "5", "0.5", 559,
+fn known_unexpressible_redeems_preserve_balances_and_other_market_decisions() {
+    for size in ["2", "0"] {
+        let (_dir, paper, mut engine) = fresh_anchored();
+        engine
+            .commit_read(
+                vec![position_row(
+                    "TRADE", "0x70", MARKET_A, 0, "BUY", "5", "0.5", 559,
+                )],
+                &context(559, true),
+                zero_basis(),
+            )
+            .unwrap();
+        let history_before = paper.gate_history().unwrap();
+        let sentinel = aggregate(json!({
+            "timestamp": 560, "conditionId": MARKET_A, "type": "REDEEM", "size": size,
+            "usdcSize": size, "transactionHash": "0x71", "price": "0", "asset": "",
+            "side": "", "outcomeIndex": 999, "outcome": "",
+        }));
+        let sentinel_id = sentinel.group_id.key().clone();
+        let result = engine
+            .commit_read(vec![sentinel], &context(560, true), zero_basis())
+            .unwrap();
+        assert_eq!(result.newly_fenced, None);
+        assert_eq!(state(&engine, MARKET_A, 0).atomic(), 5_000_000);
+        assert_eq!(result.dispositions[&sentinel_id.0], "raw_only");
+        assert!(!paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+        assert_eq!(paper.gate_history().unwrap(), history_before);
+        let entry = position_row("TRADE", "0x73", MARKET_B, 0, "BUY", "2", "0.5", 561);
+        let entry_id = entry.group_id.key().clone();
+        let result = engine
+            .commit_read(vec![entry], &context(561, true), zero_basis())
+            .unwrap();
+        assert_eq!(result.dispositions[&entry_id.0], "decision_pending");
+        assert_eq!(result.pending, vec![entry_id]);
+        assert_eq!(state(&engine, MARKET_A, 0).atomic(), 5_000_000);
+        assert!(!paper.is_wallet_fenced(&wallet()).unwrap());
+        assert!(!paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+        // Only a successful anchor replaces the stale resolved-condition balance.
+        install_anchor(
+            &mut engine,
+            &paper,
+            561,
+            vec![(
+                MarketId(VenueMarketId(MARKET_B.to_owned())),
+                OutcomeId(0),
+                ShareAmount::from_atomic(2_000_000),
             )],
-            &context(559, true),
-            zero_basis(),
-        )
-        .unwrap();
-    let sentinel = aggregate(json!({
-        "timestamp": 560,
-        "conditionId": MARKET_A,
-        "type": "REDEEM",
-        "size": "2",
-        "usdcSize": "2",
-        "transactionHash": "0x71",
-        "price": "0",
-        "asset": "",
-        "side": "",
-        "outcomeIndex": 999,
-        "outcome": "",
-    }));
-    let sentinel_id = sentinel.group_id.key().clone();
-    let sell = position_row("TRADE", "0x72", MARKET_A, 0, "SELL", "1", "0.5", 560);
-    let result = engine
-        .commit_read(vec![sentinel, sell], &context(560, true), zero_basis())
-        .unwrap();
-    assert_eq!(result.newly_fenced, None);
-    assert_eq!(state(&engine, MARKET_A, 0).atomic(), 4_000_000);
-    assert_eq!(
-        result.dispositions[&sentinel_id.0],
-        "reanchor_required_redemption"
-    );
-    assert!(paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
-    assert!(!paper.is_wallet_fenced(&wallet()).unwrap());
-
-    let pending_before = paper.open_decision_pending().unwrap().len();
-    let buy = position_row("TRADE", "0x73", MARKET_A, 0, "BUY", "2", "0.5", 561);
-    let buy_id = buy.group_id.key().clone();
-    let result = engine
-        .commit_read(vec![buy], &context(561, true), zero_basis())
-        .unwrap();
-    assert_eq!(result.newly_fenced, None);
-    assert_eq!(state(&engine, MARKET_A, 0).atomic(), 4_000_000);
-    assert_eq!(
-        result.dispositions[&buy_id.0],
-        "reanchor_required_late_group"
-    );
-    assert!(result.pending.is_empty());
-    assert_eq!(paper.open_decision_pending().unwrap().len(), pending_before);
-    let group = paper
-        .activity_groups_after(&wallet(), 560)
-        .unwrap()
-        .into_iter()
-        .find(|group| group.source_trade_id == buy_id)
-        .unwrap();
-    assert!(matches!(
-        LedgerEffect::from_document(&group.proof_json),
-        Ok(LedgerEffect::RawOnly)
-    ));
-    assert!(!paper.is_wallet_fenced(&wallet()).unwrap());
-
-    install_anchor(
-        &mut engine,
-        &paper,
-        561,
-        vec![(
-            MarketId(VenueMarketId(MARKET_A.to_owned())),
-            OutcomeId(0),
-            ShareAmount::from_atomic(4_000_000),
-        )],
-        562,
-    );
-    assert!(!paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
-    let mut after_anchor = context(562, true);
-    after_anchor.copy_eligible = false;
-    engine
-        .commit_read(
-            vec![position_row(
-                "TRADE", "0x74", MARKET_A, 0, "BUY", "2", "0.5", 562,
-            )],
-            &after_anchor,
-            zero_basis(),
-        )
-        .unwrap();
-    assert_eq!(state(&engine, MARKET_A, 0).atomic(), 6_000_000);
+            562,
+        );
+        assert_eq!(state(&engine, MARKET_A, 0), ShareAmount::ZERO);
+        assert_eq!(state(&engine, MARKET_B, 0).atomic(), 2_000_000);
+    }
 }
 
 #[test]
@@ -3050,7 +3015,7 @@ async fn valid_pending_restart_resumes_once() {
             received_at: pe_core_types::ReceivedAt(at),
             content_type: pe_event_log::ContentType::Json,
             payload: serde_json::to_vec(
-                &pe_service::paper_recovery::PaperLogRecord::QualificationStarted(Box::new(start)),
+                &pe_service::paper_recovery::PaperLogRecord::QualificationStarted(Arc::new(start)),
             )
             .unwrap(),
         })
@@ -3196,10 +3161,10 @@ async fn valid_pending_restart_resumes_once() {
         let seals = pe_service::paper_recovery::scan_paper_log(&paper_path)
             .unwrap()
             .into_iter()
-            .filter_map(|frame| match frame.frame {
+            .filter_map(|frame| match &frame.frame {
                 pe_service::paper_recovery::PaperLogFrame::Record(
                     pe_service::paper_recovery::PaperLogRecord::QualificationSealed(seal),
-                ) => Some(seal),
+                ) => Some(seal.clone()),
                 _ => None,
             })
             .collect::<Vec<_>>();

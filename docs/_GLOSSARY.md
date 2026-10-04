@@ -330,7 +330,7 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `polygon_receipt_rpc_url` | `https://polygon.publicnode.com` | Boot-owned, key-free Polygon JSON-RPC endpoint used only for ordinary-live receipt finality. `ServiceConfig` field set by `PE_POLYGON_RECEIPT_RPC_URL`; the code default is owned by [`default_polygon_receipt_rpc_url`](../crates/service/src/config.rs). |
 | `polymarket_clob_min_interval_ms` | 200 | Minimum interval between CLOB requests (5 req/s sustained limit per rate-limit table above) |
 | `polymarket_clob_poll_interval_ms` | 100 | Interval between GET /order/{id} polls while waiting for terminal status |
-| `clob_book_request_timeout_secs` | 5 | Fixed `crates/service/src/clob_book.rs` constant `CLOB_REQUEST_TIMEOUT_SECS` (no env override): per-request timeout for the public CLOB `/book` liquidity-capture fetch (issue #350 WS2). Deliberately shorter than `polymarket_request_timeout_secs` (10) — the fetch runs off the fill hot path, so a slow book degrades to a partial snapshot rather than blocking a trade. Reuses the existing `polymarket_clob_min_interval_ms` (200) gate. |
+| `clob_book_request_timeout_secs` | 5 | Fixed `crates/service/src/clob_book.rs` constant `CLOB_REQUEST_TIMEOUT_SECS` (no env override): per-request timeout for public CLOB `/book` reads shared by the copy decision and liquidity-capture snapshot worker. The decision runs on the fill hot path under its own whole-fetch `clob_book_hot_path_timeout_secs` budget and fails closed on timeout; the snapshot worker degrades to a partial snapshot. Reuses `polymarket_clob_min_interval_ms`. |
 | `absorbable_depth_bps` | 100 | Fixed `crates/service/src/snapshot_worker.rs` constant `ABSORBABLE_DEPTH_BPS` (no env override): ask-depth band for `absorbable_usd_100bps` (issue #350 WS2 PR-H). Σ price·size over ask levels priced within this many basis points of the best ask. 100 bps = 1 %; baked into the column name `absorbable_usd_100bps`, so it is a constant rather than an operator knob. |
 | `reconciliation_page_limit` | 500 | **Module const** in `source-polymarket-public` (not a TOML/env key). Fixed page size for the #544 activity and current-position proof readers. |
 | `activity_max_offset` | 5,000 | **Module const** in `source-polymarket-public` (not a TOML/env key). A full terminal `/activity` page at this offset is split at an integer-second boundary; a still-full one-second terminal window is typed-incomplete and blocks reconciliation (#544). |
@@ -345,8 +345,30 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 **Late-group re-anchor.** Previously unseen activity groups arriving for a wallet at or before an
 already-committed source epoch are recorded raw-only as `reanchor_required_late_group`; they do not
 mutate the ledger or produce a decision. The existing `reanchor_required` flag selects the wallet at
-its class's next fair refresh turn for a fresh complete history/positions bracket. A bucket mixing
-durable and unseen groups, or a revision of an already-durable group, still fences.
+its class's next fair refresh turn for a fresh complete history/positions bracket. An all-twin
+bucket is the exception: outcome restamps whose unattributed member rows reproduce a recorded
+group's id and semantic revision (and whose outcome agrees with a recorded trade correction) are
+recorded `raw_only`, with no ledger, first-entry history, re-anchor or fence effect, including under
+anchor coverage and beside exact recorded groups. In feed correlation, a twin listed beside its
+recorded original counts with it as one candidate, so an `activity/trades` observation stamped
+like neither binds the original. An observation of either stamp of a pair first seen together
+(neither recorded), or one fitting genuinely distinct candidates, keeps the invalid-mapping fence;
+without a feed observation, such a pair keeps today's routing. A twin mixed with a genuinely new
+group keeps the existing routing. Revisions still fence; partially recorded non-twin buckets retain their fence,
+and covered non-twin arrivals retain `anchor_covered_late` re-anchoring.
+
+Known-condition `RequiresAnchor` redemptions and TRADE/REDEEM combos reaching ordinary routing
+record `raw_only` without a wallet re-anchor. An unexpressible redemption leaves that resolved
+condition's balances and first-entry history unchanged until the next successful anchor; routine
+refresh deferrals can postpone replacement. Late, partially recorded and covered non-twin arrivals,
+unknown-condition redemptions and unresolved non-combo identities retain the existing causal rule.
+Conversion and unknown-type effect precedence is unchanged.
+
+Missing-group confirmation retries add no interval: the attempt becomes eligible when its read
+completes, and the single urgent slot selects the least recently launched eligible wallet. Control
+acknowledgement retains the slot, wallet exclusivity and the attempt deadline remain, and every
+request uses the existing shared reconciliation gate and 429 policy. Only forced refresh reads keep
+the next-whole-second wake; periodic work retains its cadence. A held urgent slot adds no retry wake.
 
 **Installed-boot anchor reuse.** An ordinary installed boot reuses a wallet's `leader_positions`
 mirror only when the wallet is unfenced and history-complete, has a delivery cursor and non-null
@@ -901,6 +923,12 @@ demotion moves the anchor to the next valid mark and resets the promotion growth
 delay, and no-demotion vectors. Normal ranker rotation, capacity change, and score refresh do not.
 There is no extension, interim look, or second window. The report does not arm or disarm ordinary
 live mode; the owner's requested mode alone does that.
+
+Paper daily marks:
+
+| Key | Default | Meaning |
+|---|---:|---|
+| `closed_mark_lookback_secs` | 1,123,200 (13 days) | **Binary const** `CLOSED_MARK_LOOKBACK_SECS` beside the historical-mark rule in `service::risk_inputs`. Only paper daily marks with an empty normal window and recorded Gamma `closed=true`, matching `conditionId`, and `closedTime` at or before the cutoff may select the latest CLOB sample in `[cutoff − closed_mark_lookback_secs, cutoff]`. Production and replay derive the same bounds; the end-anchored response cap preserves the latest sample. Live marks retain the normal historical-mark rule. |
 
 ### Demotion criteria
 

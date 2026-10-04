@@ -105,7 +105,7 @@ pub fn resume_dispatch_seeds(
                 );
                 continue;
             }
-            match frame.frame {
+            match &frame.frame {
                 PaperLogFrame::LegacyFill => {}
                 PaperLogFrame::Record(PaperLogRecord::FinancialPrepared {
                     payload:

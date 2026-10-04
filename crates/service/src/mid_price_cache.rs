@@ -1,4 +1,4 @@
-//! Lazy 60 s-TTL cache of Polymarket Gamma mid prices for **open** markets.
+//! Lazy 60 s-TTL cache of Polymarket Gamma mid prices for held markets.
 //!
 //! Sibling to [`MarketEndCache`](crate::market_end_cache), but for *mutable* mids:
 //! the end-date cache is write-once because a resolution time is immutable, whereas
@@ -10,7 +10,7 @@
 //! `outcomePrices` is simply omitted, so the caller marks that position's unrealized P&L as null.
 //!
 //! Open vs settled classification is the caller's job (via the resolution store) —
-//! this cache only fetches mids for the open markets it is handed.
+//! this cache fetches mids for the held markets it is handed.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -22,7 +22,7 @@ use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn};
 use pe_source_polymarket_public::GAMMA_BATCH_LIMIT_PARAM;
 use pe_source_polymarket_public::{
     FixtureFetcher, GAMMA_MARKETS_PARSER_VERSION, GAMMA_MARKETS_SCHEMA_VERSION,
-    GAMMA_MARKETS_SOURCE_ID, GammaMarketsClient, GammaOpenConditionRequest, MarketFilter,
+    GAMMA_MARKETS_SOURCE_ID, GammaConditionRequest, GammaMarketsClient, MarketFilter,
     MetadataPageEvidence, PageFetcher, ReqwestFetcher,
 };
 use rust_decimal::Decimal;
@@ -184,6 +184,20 @@ pub(crate) fn classify_strict_prices(
     Ok(output)
 }
 
+/// Store `entry` unless the cache already holds a newer recorded row for the market: a slower
+/// overlapping read must not replace it, so a strict price always comes from the market's newest
+/// recorded page, which is the row strict replay selects.
+fn insert_newest(map: &mut HashMap<MarketId, CachedEntry>, id: MarketId, entry: CachedEntry) {
+    let older = map
+        .get(&id)
+        .and_then(|existing| existing.receipt)
+        .zip(entry.receipt)
+        .is_some_and(|(existing, new)| new.sequence.0 < existing.sequence.0);
+    if !older {
+        map.insert(id, entry);
+    }
+}
+
 /// The retained source-log fields needed to replay one strict Gamma price attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct RecordedPriceAttempt {
@@ -262,11 +276,8 @@ where
                 "risk price receipt has the wrong Gamma source contract".to_owned(),
             ));
         }
-        classify_strict_price_time(
-            i128::from(observation.received_unix_ms),
-            evaluated_at_unix_ms,
-        )
-        .map_err(RiskPriceReplayError::Unavailable)?;
+        // A page's own time is not a refusal cause: the rebuilt rows are classified exactly as
+        // acquisition classifies them (conflict before freshness or future).
         let record = serde_json::from_slice::<GammaPriceAttemptRecord>(&observation.payload)
             .map_err(|error| {
                 RiskPriceReplayError::Insufficient(format!(
@@ -303,7 +314,7 @@ where
                 error: _,
             } => (request_url, None),
         };
-        let request = GammaOpenConditionRequest::parse(&request_url).ok_or_else(|| {
+        let request = GammaConditionRequest::parse(&request_url).ok_or_else(|| {
             RiskPriceReplayError::Insufficient(
                 "risk Gamma acquisition has an invalid request identity".to_owned(),
             )
@@ -330,7 +341,7 @@ where
             FixtureFetcher::new(HashMap::from([(request_url.clone(), payload.clone())])),
         )
         .with_batch_size(request.condition_ids.len())
-        .fetch_markets_with_pages(&request.condition_ids, MarketFilter::OpenOnly)
+        .fetch_markets_with_pages(&request.condition_ids, request.filter)
         .await
         .map_err(|error| {
             RiskPriceReplayError::Insufficient(format!(
@@ -351,17 +362,27 @@ where
             .collect::<HashSet<_>>();
         for row in replayed.markets.markets.into_values() {
             let market = MarketId(pe_core_types::VenueMarketId(row.condition_id.clone()));
-            if !wanted_markets.contains(&market) {
+            // The rows acquisition stores: a page's requested markets, and only rows with prices.
+            if !wanted_markets.contains(&market)
+                || !request.condition_ids.contains(&row.condition_id)
+                || row.outcome_prices.is_none()
+            {
                 continue;
             }
             let strict_mids = row.strict_outcome_prices;
             if let Some(existing) = entries.get_mut(&market) {
-                existing.conflicting = existing.conflicting
-                    || conflicting.contains(&row.condition_id)
-                    || existing.strict_mids != strict_mids;
-                existing.strict_mids = strict_mids;
-                existing.observed_at_unix_ms = i128::from(observation.received_unix_ms);
-                existing.receipt = *receipt;
+                // Like acquisition's cache, a market keeps its newest selected page's row; another
+                // selected page's older row for it is obsolete, not a conflict. Repeated rows
+                // inside one page remain a conflict through the demux.
+                if receipt.sequence.0 <= existing.receipt.sequence.0 {
+                    continue;
+                }
+                *existing = StrictPriceInput {
+                    strict_mids,
+                    observed_at_unix_ms: i128::from(observation.received_unix_ms),
+                    receipt: *receipt,
+                    conflicting: conflicting.contains(&row.condition_id),
+                };
             } else {
                 entries.insert(
                     market,
@@ -395,7 +416,7 @@ pub(crate) struct StrictMidPriceAttempt {
     pub result: Result<BTreeMap<(String, u16), MidPriceObservation>, RiskInputsUnavailable>,
 }
 
-/// Thread-safe TTL cache of open-market mid prices. Generic over the fetcher so
+/// Thread-safe TTL cache of market mid prices. Generic over the fetcher so
 /// tests can inject a `FixtureFetcher`; production uses [`ReqwestFetcher`].
 pub struct MidPriceCache<F: PageFetcher = ReqwestFetcher> {
     inner: Arc<Mutex<HashMap<MarketId, CachedEntry>>>,
@@ -569,6 +590,11 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
             }
             classify_strict_prices(ids, unix_timestamp_ms(evaluated_at), &entries)
         };
+        if let Ok(observations) = &result {
+            price_receipts = observations.values().map(|price| price.receipt).collect();
+            price_receipts.sort_by_key(|receipt| receipt.sequence);
+            price_receipts.dedup();
+        }
         StrictMidPriceAttempt {
             evaluated_at,
             price_receipts,
@@ -577,7 +603,7 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
     }
 
     /// Serve fresh [`CachedEntry`]s for `market_ids` from the cache and fetch the stale/missing ones
-    /// via the shared batched [`GammaMarketsClient`] (one `OpenOnly` `/markets` request per
+    /// via the shared batched [`GammaMarketsClient`] (an open query, then a closed query for absent ids, per
     /// [`GAMMA_BATCH_SIZE`](pe_source_polymarket_public::GAMMA_BATCH_SIZE)-id chunk, demuxed by
     /// `conditionId`), storing the results. Both [`fetch_mids`](Self::fetch_mids) and
     /// [`fetch_snapshots`](Self::fetch_snapshots) project from this single fetch path, so the mids
@@ -621,127 +647,131 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
             };
         }
 
-        // Open query (no `&closed=true`) → live mids in `outcomePrices`. The client batches and
-        // demuxes by `conditionId`; the whole call is best-effort (see method doc).
-        let ids: Vec<String> = stale.iter().map(|m| m.to_string()).collect();
-        let fetched = match self
-            .client
-            .fetch_markets_with_pages(&ids, MarketFilter::OpenOnly)
-            .await
-        {
-            Ok(fetched) => fetched,
-            Err(error) => {
-                let missing_receipts = self
-                    .record_pages(
-                        &error.pages,
-                        &error.failed_requests,
-                        false,
-                        quantize_to_millisecond(clock()),
-                    )
-                    .await
-                    .map(|recorded| {
-                        let mut receipts = recorded.page_receipts.into_values().collect::<Vec<_>>();
-                        receipts.extend(
-                            recorded
-                                .failure_receipts
-                                .into_iter()
-                                .map(|(_, receipt)| receipt),
-                        );
-                        receipts
-                    })
-                    .unwrap_or_else(|()| {
-                        warn!("mid-cache: source log closed while recording rejected Gamma pages");
-                        Vec::new()
-                    });
-                warn!(error = %error, stale = stale.len(), "mid-cache: batch fetch error, omitting this tick");
-                return EnsuredEntries {
-                    entries: out,
-                    missing_receipts,
-                };
+        let mut ids = stale.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let mut missing_receipts = Vec::new();
+        for filter in [MarketFilter::OpenOnly, MarketFilter::ClosedOnly] {
+            if ids.is_empty() {
+                break;
             }
-        };
-        let observed = quantize_to_millisecond(clock());
-        let recorded = match self
-            .record_pages(&fetched.pages, &fetched.failed_requests, true, observed)
-            .await
-        {
-            Ok(recorded) => recorded,
-            Err(()) => {
-                warn!("mid-cache: source log closed, omitting unrecorded Gamma prices");
-                return EnsuredEntries {
-                    entries: out,
-                    missing_receipts: Vec::new(),
-                };
-            }
-        };
-        let mut missing_receipts = recorded
-            .failure_receipts
-            .iter()
-            .map(|(_, receipt)| *receipt)
-            .collect::<Vec<_>>();
-        for (evidence, _) in &fetched.pages {
-            let Some(request) = GammaOpenConditionRequest::parse(&evidence.request_url) else {
-                continue;
-            };
-            if request.condition_ids.iter().any(|condition_id| {
-                fetched.condition_page_hashes.get(condition_id) != Some(&evidence.raw_page_hash)
-                    || fetched
-                        .markets
-                        .markets
-                        .get(condition_id)
-                        .is_none_or(|market| market.outcome_prices.is_none())
-            }) && let Some(receipt) = recorded
-                .page_receipts
-                .get(&(evidence.request_url.clone(), evidence.raw_page_hash.clone()))
-            {
-                missing_receipts.push(*receipt);
-            }
-        }
-        let conflicts = fetched
-            .conflicting_condition_ids
-            .into_iter()
-            .collect::<HashSet<_>>();
-
-        let mut map = self.inner.lock().await;
-        for id in stale {
-            // Demux by the echoed `conditionId`: a hit is structurally the requested market, so a
-            // cross-market row (keyed under its own id) can never be attributed here.
-            let Some(m) = fetched.markets.markets.get(&id.to_string()) else {
-                continue; // unknown / 4xx-unfetched / absent → omit (P&L stays null)
-            };
-            // No / malformed `outcomePrices` → skip rather than mis-value the market.
-            let Some(mids) = m.outcome_prices.clone() else {
-                continue;
-            };
-            let snapshot = MidMarketSnapshot {
-                liquidity: m.liquidity,
-                volume: m.volume,
-                clob_token_ids: m.clob_token_ids.clone(),
-            };
-            let entry = CachedEntry {
-                mids,
-                strict_mids: m.strict_outcome_prices.clone(),
-                snapshot,
-                observed_at: observed,
-                receipt: fetched
-                    .condition_page_hashes
-                    .get(&id.to_string())
-                    .and_then(|hash| {
-                        fetched.pages.iter().find_map(|(evidence, _)| {
-                            (evidence.raw_page_hash == *hash
-                                && GammaOpenConditionRequest::parse(&evidence.request_url)
-                                    .is_some_and(|request| {
-                                        request.condition_ids.contains(&id.to_string())
-                                    }))
-                            .then_some((evidence.request_url.clone(), hash.clone()))
+            let fetched = match self.client.fetch_markets_with_pages(&ids, filter).await {
+                Ok(fetched) => fetched,
+                Err(error) => {
+                    let rejected_receipts = self
+                        .record_pages(
+                            &error.pages,
+                            &error.failed_requests,
+                            false,
+                            quantize_to_millisecond(clock()),
+                        )
+                        .await
+                        .map(|recorded| {
+                            let mut receipts =
+                                recorded.page_receipts.into_values().collect::<Vec<_>>();
+                            receipts.extend(
+                                recorded
+                                    .failure_receipts
+                                    .into_iter()
+                                    .map(|(_, receipt)| receipt),
+                            );
+                            receipts
                         })
-                    })
-                    .and_then(|key| recorded.page_receipts.get(&key))
-                    .copied(),
-                conflicting: conflicts.contains(&id.to_string()),
+                        .unwrap_or_else(|()| {
+                            warn!(
+                                "mid-cache: source log closed while recording rejected Gamma pages"
+                            );
+                            Vec::new()
+                        });
+                    warn!(error = %error, stale = stale.len(), "mid-cache: batch fetch error, omitting this tick");
+                    missing_receipts.extend(rejected_receipts);
+                    break;
+                }
             };
-            map.insert(id.clone(), entry.clone());
-            out.insert(id, entry);
+            let observed = quantize_to_millisecond(clock());
+            let recorded = match self
+                .record_pages(&fetched.pages, &fetched.failed_requests, true, observed)
+                .await
+            {
+                Ok(recorded) => recorded,
+                Err(()) => {
+                    warn!("mid-cache: source log closed, omitting unrecorded Gamma prices");
+                    break;
+                }
+            };
+            missing_receipts.extend(
+                recorded
+                    .failure_receipts
+                    .iter()
+                    .map(|(_, receipt)| *receipt),
+            );
+            for (evidence, _) in &fetched.pages {
+                let Some(request) = GammaConditionRequest::parse(&evidence.request_url) else {
+                    continue;
+                };
+                if request.condition_ids.iter().any(|condition_id| {
+                    fetched.condition_page_hashes.get(condition_id) != Some(&evidence.raw_page_hash)
+                        || fetched
+                            .markets
+                            .markets
+                            .get(condition_id)
+                            .is_none_or(|market| market.outcome_prices.is_none())
+                }) && let Some(receipt) = recorded
+                    .page_receipts
+                    .get(&(evidence.request_url.clone(), evidence.raw_page_hash.clone()))
+                {
+                    missing_receipts.push(*receipt);
+                }
+            }
+            let conflicts = fetched
+                .conflicting_condition_ids
+                .into_iter()
+                .collect::<HashSet<_>>();
+
+            let mut map = self.inner.lock().await;
+            for id in &ids {
+                let id = MarketId(pe_core_types::VenueMarketId(id.clone()));
+                // Demux by the echoed `conditionId`: a hit is structurally the requested market, so a
+                // cross-market row (keyed under its own id) can never be attributed here.
+                let Some(m) = fetched.markets.markets.get(&id.to_string()) else {
+                    continue; // unknown / 4xx-unfetched / absent → omit (P&L stays null)
+                };
+                // No / malformed `outcomePrices` → skip rather than mis-value the market.
+                let Some(mids) = m.outcome_prices.clone() else {
+                    continue;
+                };
+                let snapshot = MidMarketSnapshot {
+                    liquidity: m.liquidity,
+                    volume: m.volume,
+                    clob_token_ids: m.clob_token_ids.clone(),
+                };
+                let entry = CachedEntry {
+                    mids,
+                    strict_mids: m.strict_outcome_prices.clone(),
+                    snapshot,
+                    observed_at: observed,
+                    receipt: fetched
+                        .condition_page_hashes
+                        .get(&id.to_string())
+                        .and_then(|hash| {
+                            fetched.pages.iter().find_map(|(evidence, _)| {
+                                (evidence.raw_page_hash == *hash
+                                    && GammaConditionRequest::parse(&evidence.request_url)
+                                        .is_some_and(|request| {
+                                            request.condition_ids.contains(&id.to_string())
+                                        }))
+                                .then_some((evidence.request_url.clone(), hash.clone()))
+                            })
+                        })
+                        .and_then(|key| recorded.page_receipts.get(&key))
+                        .copied(),
+                    conflicting: conflicts.contains(&id.to_string()),
+                };
+                insert_newest(&mut map, id.clone(), entry.clone());
+                out.insert(id, entry);
+            }
+            drop(map);
+            ids.retain(|id| {
+                !fetched.markets.markets.contains_key(id) && !fetched.markets.unfetched.contains(id)
+            });
         }
         EnsuredEntries {
             entries: out,
@@ -846,6 +876,30 @@ mod tests {
         body: Vec<u8>,
     }
 
+    /// The left read (`0xa` with others) answers only after the right read's open request has
+    /// arrived; the right read's open answer is held until the test releases it.
+    struct RacingFetcher {
+        right_arrived: Arc<tokio::sync::Notify>,
+        release_right: Arc<tokio::sync::Notify>,
+        right_open: Vec<u8>,
+        closed: Vec<u8>,
+    }
+
+    impl PageFetcher for RacingFetcher {
+        async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, pe_source_core::SourceError> {
+            if url.contains("condition_ids=0xa") {
+                self.right_arrived.notified().await;
+                return Ok(br#"[{"conditionId":"0xa","outcomePrices":"[\"0.4\",\"0.6\"]"},{"conditionId":"0xb","outcomePrices":"[\"0.5\",\"0.5\"]"}]"#.to_vec());
+            }
+            if url.contains("closed=true") {
+                return Ok(self.closed.clone());
+            }
+            self.right_arrived.notify_one();
+            self.release_right.notified().await;
+            Ok(self.right_open.clone())
+        }
+    }
+
     impl PageFetcher for ControlledResponseFetcher {
         async fn fetch_page(&self, _url: &str) -> Result<Vec<u8>, pe_source_core::SourceError> {
             let body = self.body.clone();
@@ -867,6 +921,778 @@ mod tests {
     }
 
     const BASE: &str = "https://gamma-api.polymarket.com";
+
+    #[tokio::test]
+    async fn closed_price_fallback_selects_exact_receipts_and_reuses_the_cache() {
+        for mixed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("source.log");
+            let (source_log, source_rx) = SourceLogHandle::channel(4);
+            let (trigger_tx, _trigger_rx) = mpsc::channel(1);
+            let ingest = tokio::spawn(
+                ActivityIngest::poll_only(
+                    SourceEventSink::open(&source_path).unwrap(),
+                    source_rx,
+                    trigger_tx,
+                    new_shared_health_with_ws(false, false, 90),
+                )
+                .run(),
+            );
+            let now = datetime!(2026-10-03 00:00 UTC);
+            let mut ids = vec![outcome("0xclosed", 0), outcome("0xclosed", 1)];
+            let open_url = if mixed {
+                ids.push(outcome("0xopen", 0));
+                format!(
+                    "{BASE}/markets?condition_ids=0xclosed&condition_ids=0xopen&limit={GAMMA_BATCH_LIMIT_PARAM}"
+                )
+            } else {
+                url(BASE, "0xclosed")
+            };
+            let closed_url = format!(
+                "{BASE}/markets?condition_ids=0xclosed&closed=true&limit={GAMMA_BATCH_LIMIT_PARAM}"
+            );
+            let open_body = if mixed {
+                br#"[{"conditionId":"0xopen","outcomePrices":"[\"0.6\",\"0.4\"]"}]"#.to_vec()
+            } else {
+                b"[]".to_vec()
+            };
+            let cache = MidPriceCache::with_fetcher(FixtureFetcher::new(HashMap::from([
+                (open_url, open_body),
+                (closed_url, br#"[{"conditionId":"0xclosed","closed":true,"outcomePrices":"[\"0.0005\",\"0.9995\"]"}]"#.to_vec()),
+            ])), BASE.to_owned()).with_source_log(source_log).with_clock(Arc::new(move || now));
+            let attempt = cache.fetch_mids_strict_attempt(&ids).await;
+            let observations = attempt.result.unwrap();
+            let mut selected = observations
+                .values()
+                .map(|row| row.receipt)
+                .collect::<Vec<_>>();
+            selected.sort_by_key(|receipt| receipt.sequence);
+            selected.dedup();
+            assert_eq!(attempt.price_receipts, selected);
+            assert_eq!(selected.len(), if mixed { 2 } else { 1 });
+            assert_eq!(
+                observations[&("0xclosed".to_owned(), 0)].price.0,
+                Decimal::new(5, 4)
+            );
+            let reused = cache.fetch_mids_strict_attempt(&ids).await;
+            assert_eq!(reused.price_receipts, selected);
+            assert_eq!(reused.result.unwrap(), observations);
+            let envelopes = pe_event_log::Reader::replay(&source_path)
+                .unwrap()
+                .map(|entry| entry.unwrap().1)
+                .collect::<Vec<_>>();
+            assert_eq!(envelopes.len(), 2);
+            let replayed = replay_strict_risk_prices(
+                &ids,
+                &selected,
+                i64::try_from(unix_timestamp_ms(now)).unwrap(),
+                |receipt| {
+                    let envelope = envelopes
+                        .iter()
+                        .find(|envelope| {
+                            envelope.seq == receipt.sequence
+                                && envelope.this_hash == receipt.this_hash
+                        })
+                        .unwrap();
+                    Ok(RecordedPriceAttempt {
+                        payload: envelope.payload.clone(),
+                        received_unix_ms: i64::try_from(unix_timestamp_ms(envelope.received_at.0))
+                            .unwrap(),
+                        source_id: envelope.source_id.0.clone(),
+                        schema_version: envelope.schema_version,
+                        parser_version: envelope.parser_version,
+                        content_type: envelope.content_type.clone(),
+                    })
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(replayed, observations);
+            ingest.abort();
+            let _ = ingest.await;
+        }
+    }
+
+    /// PASS: an older overlapping read never replaces a newer recorded row; a newer one does, and a
+    /// row without a recorded receipt keeps the previous replacement behavior.
+    #[test]
+    fn insert_newest_keeps_the_newest_recorded_row() {
+        let entry = |tenths: i64, sequence: Option<u64>| CachedEntry {
+            mids: vec![Decimal::new(tenths, 1)],
+            strict_mids: Some(vec![Price::new(Decimal::new(tenths, 1)).unwrap()]),
+            snapshot: MidMarketSnapshot::default(),
+            observed_at: datetime!(2026-10-03 00:00 UTC),
+            receipt: sequence.map(receipt),
+            conflicting: false,
+        };
+        let mut map = HashMap::new();
+        insert_newest(&mut map, mid("0xm"), entry(5, Some(3)));
+        insert_newest(&mut map, mid("0xm"), entry(4, Some(1)));
+        assert_eq!(map[&mid("0xm")].receipt, Some(receipt(3)));
+        insert_newest(&mut map, mid("0xm"), entry(6, Some(7)));
+        assert_eq!(map[&mid("0xm")].receipt, Some(receipt(7)));
+        insert_newest(&mut map, mid("0xm"), entry(2, None));
+        assert_eq!(map[&mid("0xm")].receipt, None);
+    }
+
+    /// PASS: when an overlapping read publishes a newer row for a market (a closed fallback after
+    /// an open miss), the next strict attempt selects each market's newest recorded row with
+    /// prices, and replay of its receipts reproduces it; a newer page carrying the market without
+    /// prices leaves the older priced row selected on both sides.
+    #[tokio::test]
+    async fn overlapping_reads_replay_each_markets_newest_priced_row() {
+        let cases = [
+            (
+                vec![outcome("0xb", 0)],
+                b"[]".to_vec(),
+                vec![outcome("0xa", 0), outcome("0xb", 0)],
+                Decimal::ONE,
+            ),
+            (
+                vec![outcome("0xb", 0)],
+                br#"[{"conditionId":"0xb","outcomePrices":"[\"0.6\",\"0.4\"]"}]"#.to_vec(),
+                vec![outcome("0xa", 0), outcome("0xb", 0)],
+                Decimal::new(6, 1),
+            ),
+            (
+                vec![outcome("0xb", 0), outcome("0xc", 0)],
+                br#"[{"conditionId":"0xb"},{"conditionId":"0xc","outcomePrices":"[\"0.7\",\"0.3\"]"}]"#
+                    .to_vec(),
+                vec![outcome("0xa", 0), outcome("0xb", 0), outcome("0xc", 0)],
+                Decimal::new(5, 1),
+            ),
+        ];
+        for (right_ids, right_open, next_ids, b_price) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("source.log");
+            let (source_log, source_rx) = SourceLogHandle::channel(8);
+            let (trigger_tx, _trigger_rx) = mpsc::channel(1);
+            let ingest = tokio::spawn(
+                ActivityIngest::poll_only(
+                    SourceEventSink::open(&source_path).unwrap(),
+                    source_rx,
+                    trigger_tx,
+                    new_shared_health_with_ws(false, false, 90),
+                )
+                .run(),
+            );
+            let now = datetime!(2026-10-03 00:00 UTC);
+            let release_right = Arc::new(tokio::sync::Notify::new());
+            let cache = MidPriceCache::with_fetcher(
+                RacingFetcher {
+                    right_arrived: Arc::new(tokio::sync::Notify::new()),
+                    release_right: release_right.clone(),
+                    right_open,
+                    closed:
+                        br#"[{"conditionId":"0xb","closed":true,"outcomePrices":"[\"1\",\"0\"]"}]"#
+                            .to_vec(),
+                },
+                BASE.to_owned(),
+            )
+            .with_source_log(source_log)
+            .with_clock(Arc::new(move || now));
+            let left_ids = [outcome("0xa", 0), outcome("0xb", 0)];
+            let right = cache.clone();
+            let (left, right) = tokio::join!(
+                async {
+                    let left = cache.fetch_mids_strict_attempt(&left_ids).await;
+                    release_right.notify_one();
+                    left
+                },
+                right.fetch_mids_strict_attempt(&right_ids),
+            );
+            assert_eq!(left.price_receipts.len(), 1);
+            assert!(right.result.is_ok());
+            let next = cache.fetch_mids_strict_attempt(&next_ids).await;
+            let observations = next.result.unwrap();
+            assert_eq!(
+                observations[&("0xa".to_owned(), 0)].price.0,
+                Decimal::new(4, 1)
+            );
+            assert_eq!(observations[&("0xb".to_owned(), 0)].price.0, b_price);
+            assert_eq!(next.price_receipts.len(), 2);
+            let envelopes = pe_event_log::Reader::replay(&source_path)
+                .unwrap()
+                .map(|entry| entry.unwrap().1)
+                .collect::<Vec<_>>();
+            let replayed = replay_strict_risk_prices(
+                &next_ids,
+                &next.price_receipts,
+                i64::try_from(unix_timestamp_ms(now)).unwrap(),
+                |receipt| {
+                    let envelope = envelopes
+                        .iter()
+                        .find(|envelope| {
+                            envelope.seq == receipt.sequence
+                                && envelope.this_hash == receipt.this_hash
+                        })
+                        .unwrap();
+                    Ok(RecordedPriceAttempt {
+                        payload: envelope.payload.clone(),
+                        received_unix_ms: i64::try_from(unix_timestamp_ms(envelope.received_at.0))
+                            .unwrap(),
+                        source_id: envelope.source_id.0.clone(),
+                        schema_version: envelope.schema_version,
+                        parser_version: envelope.parser_version,
+                        content_type: envelope.content_type.clone(),
+                    })
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(replayed, observations);
+            drop(right);
+            drop(cache);
+            ingest.abort();
+            let _ = ingest.await;
+        }
+    }
+
+    /// PASS: a page carrying an extra row for a market it did not request leaves that market's
+    /// selected row unchanged in acquisition, and replay ignores the extra row too.
+    #[tokio::test]
+    async fn extra_unrequested_rows_are_ignored_by_acquisition_and_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let (source_log, source_rx) = SourceLogHandle::channel(4);
+        let (trigger_tx, _trigger_rx) = mpsc::channel(1);
+        let ingest = tokio::spawn(
+            ActivityIngest::poll_only(
+                SourceEventSink::open(&source_path).unwrap(),
+                source_rx,
+                trigger_tx,
+                new_shared_health_with_ws(false, false, 90),
+            )
+            .run(),
+        );
+        let now = datetime!(2026-10-03 00:00 UTC);
+        let cache = MidPriceCache::with_fetcher(
+            FixtureFetcher::new(HashMap::from([
+                (
+                    url(BASE, "0xb"),
+                    br#"[{"conditionId":"0xb","outcomePrices":"[\"0.5\",\"0.5\"]"}]"#.to_vec(),
+                ),
+                (
+                    url(BASE, "0xa"),
+                    br#"[{"conditionId":"0xa","outcomePrices":"[\"0.4\",\"0.6\"]"},{"conditionId":"0xb","outcomePrices":"[\"0.9\",\"0.1\"]"}]"#
+                        .to_vec(),
+                ),
+            ])),
+            BASE.to_owned(),
+        )
+        .with_source_log(source_log)
+        .with_clock(Arc::new(move || now));
+        assert!(
+            cache
+                .fetch_mids_strict_attempt(&[outcome("0xb", 0)])
+                .await
+                .result
+                .is_ok()
+        );
+        assert!(
+            cache
+                .fetch_mids_strict_attempt(&[outcome("0xa", 0)])
+                .await
+                .result
+                .is_ok()
+        );
+        let ids = [outcome("0xa", 0), outcome("0xb", 0)];
+        let attempt = cache.fetch_mids_strict_attempt(&ids).await;
+        let observations = attempt.result.unwrap();
+        assert_eq!(
+            observations[&("0xb".to_owned(), 0)].price.0,
+            Decimal::new(5, 1)
+        );
+        assert_eq!(attempt.price_receipts.len(), 2);
+        let envelopes = pe_event_log::Reader::replay(&source_path)
+            .unwrap()
+            .map(|entry| entry.unwrap().1)
+            .collect::<Vec<_>>();
+        let replayed = replay_strict_risk_prices(
+            &ids,
+            &attempt.price_receipts,
+            i64::try_from(unix_timestamp_ms(now)).unwrap(),
+            |receipt| {
+                let envelope = envelopes
+                    .iter()
+                    .find(|envelope| {
+                        envelope.seq == receipt.sequence && envelope.this_hash == receipt.this_hash
+                    })
+                    .unwrap();
+                Ok(RecordedPriceAttempt {
+                    payload: envelope.payload.clone(),
+                    received_unix_ms: i64::try_from(unix_timestamp_ms(envelope.received_at.0))
+                        .unwrap(),
+                    source_id: envelope.source_id.0.clone(),
+                    schema_version: envelope.schema_version,
+                    parser_version: envelope.parser_version,
+                    content_type: envelope.content_type.clone(),
+                })
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(replayed, observations);
+        drop(cache);
+        ingest.abort();
+        let _ = ingest.await;
+    }
+
+    /// The first open read returns conflicting duplicate rows; later open and closed reads miss.
+    struct ConflictThenMissingFetcher {
+        open_calls: AtomicUsize,
+    }
+
+    impl PageFetcher for ConflictThenMissingFetcher {
+        async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, pe_source_core::SourceError> {
+            if url.contains("closed=true") || self.open_calls.fetch_add(1, Ordering::SeqCst) > 0 {
+                return Ok(b"[]".to_vec());
+            }
+            Ok(br#"[{"conditionId":"0xb","outcomePrices":"[\"0.5\",\"0.5\"]"},{"conditionId":"0xb","outcomePrices":"[\"0.6\",\"0.4\"]"}]"#.to_vec())
+        }
+    }
+
+    /// PASS: a failed refresh that leaves a stale conflicting row in the cache refuses with
+    /// `PriceConflict`, and replay of its recorded receipts reproduces that cause, not staleness.
+    #[tokio::test]
+    async fn failed_refresh_replays_the_recorded_refusal_cause() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let (source_log, source_rx) = SourceLogHandle::channel(4);
+        let (trigger_tx, _trigger_rx) = mpsc::channel(1);
+        let ingest = tokio::spawn(
+            ActivityIngest::poll_only(
+                SourceEventSink::open(&source_path).unwrap(),
+                source_rx,
+                trigger_tx,
+                new_shared_health_with_ws(false, false, 90),
+            )
+            .run(),
+        );
+        let start = datetime!(2026-10-03 00:00 UTC);
+        let offset_secs = Arc::new(AtomicUsize::new(0));
+        let clock_offset = offset_secs.clone();
+        let cache = MidPriceCache::with_fetcher(
+            ConflictThenMissingFetcher {
+                open_calls: AtomicUsize::new(0),
+            },
+            BASE.to_owned(),
+        )
+        .with_source_log(source_log)
+        .with_clock(Arc::new(move || {
+            start
+                + time::Duration::seconds(
+                    i64::try_from(clock_offset.load(Ordering::SeqCst)).unwrap(),
+                )
+        }));
+        let ids = [outcome("0xb", 0)];
+        assert_eq!(
+            cache.fetch_mids_strict_attempt(&ids).await.result,
+            Err(RiskInputsUnavailable::PriceConflict)
+        );
+        offset_secs.store(60, Ordering::SeqCst);
+        let attempt = cache.fetch_mids_strict_attempt(&ids).await;
+        assert_eq!(attempt.result, Err(RiskInputsUnavailable::PriceConflict));
+        assert_eq!(attempt.price_receipts.len(), 3);
+        let evaluated_ms = i64::try_from(unix_timestamp_ms(attempt.evaluated_at)).unwrap();
+        let envelopes = pe_event_log::Reader::replay(&source_path)
+            .unwrap()
+            .map(|entry| entry.unwrap().1)
+            .collect::<Vec<_>>();
+        let replayed =
+            replay_strict_risk_prices(&ids, &attempt.price_receipts, evaluated_ms, |receipt| {
+                let envelope = envelopes
+                    .iter()
+                    .find(|envelope| {
+                        envelope.seq == receipt.sequence && envelope.this_hash == receipt.this_hash
+                    })
+                    .unwrap();
+                Ok(RecordedPriceAttempt {
+                    payload: envelope.payload.clone(),
+                    received_unix_ms: i64::try_from(unix_timestamp_ms(envelope.received_at.0))
+                        .unwrap(),
+                    source_id: envelope.source_id.0.clone(),
+                    schema_version: envelope.schema_version,
+                    parser_version: envelope.parser_version,
+                    content_type: envelope.content_type.clone(),
+                })
+            })
+            .await;
+        assert!(matches!(
+            replayed,
+            Err(RiskPriceReplayError::Unavailable(
+                RiskInputsUnavailable::PriceConflict
+            ))
+        ));
+        drop(cache);
+        ingest.abort();
+        let _ = ingest.await;
+    }
+
+    /// PASS: a closed page whose rows for one market are a priced row and an unpriced duplicate
+    /// stores nothing (the stored row is the unpriced one), so acquisition refuses `PriceMissing`
+    /// and replay of its receipts reproduces that cause.
+    #[tokio::test]
+    async fn unpriced_duplicate_row_replays_acquisitions_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let (source_log, source_rx) = SourceLogHandle::channel(4);
+        let (trigger_tx, _trigger_rx) = mpsc::channel(1);
+        let ingest = tokio::spawn(
+            ActivityIngest::poll_only(
+                SourceEventSink::open(&source_path).unwrap(),
+                source_rx,
+                trigger_tx,
+                new_shared_health_with_ws(false, false, 90),
+            )
+            .run(),
+        );
+        let now = datetime!(2026-10-03 00:00 UTC);
+        let cache = MidPriceCache::with_fetcher(
+            FixtureFetcher::new(HashMap::from([
+                (url(BASE, "0xb"), b"[]".to_vec()),
+                (
+                    format!("{BASE}/markets?condition_ids=0xb&closed=true&limit={GAMMA_BATCH_LIMIT_PARAM}"),
+                    br#"[{"conditionId":"0xb","closed":true,"outcomePrices":"[\"0.5\",\"0.5\"]"},{"conditionId":"0xb","closed":true}]"#
+                        .to_vec(),
+                ),
+            ])),
+            BASE.to_owned(),
+        )
+        .with_source_log(source_log)
+        .with_clock(Arc::new(move || now));
+        let ids = [outcome("0xb", 0)];
+        let attempt = cache.fetch_mids_strict_attempt(&ids).await;
+        assert_eq!(attempt.result, Err(RiskInputsUnavailable::PriceMissing));
+        let envelopes = pe_event_log::Reader::replay(&source_path)
+            .unwrap()
+            .map(|entry| entry.unwrap().1)
+            .collect::<Vec<_>>();
+        let replayed = replay_strict_risk_prices(
+            &ids,
+            &attempt.price_receipts,
+            i64::try_from(unix_timestamp_ms(attempt.evaluated_at)).unwrap(),
+            |receipt| {
+                let envelope = envelopes
+                    .iter()
+                    .find(|envelope| {
+                        envelope.seq == receipt.sequence && envelope.this_hash == receipt.this_hash
+                    })
+                    .unwrap();
+                Ok(RecordedPriceAttempt {
+                    payload: envelope.payload.clone(),
+                    received_unix_ms: i64::try_from(unix_timestamp_ms(envelope.received_at.0))
+                        .unwrap(),
+                    source_id: envelope.source_id.0.clone(),
+                    schema_version: envelope.schema_version,
+                    parser_version: envelope.parser_version,
+                    content_type: envelope.content_type.clone(),
+                })
+            },
+        )
+        .await;
+        assert!(matches!(
+            replayed,
+            Err(RiskPriceReplayError::Unavailable(
+                RiskInputsUnavailable::PriceMissing
+            ))
+        ));
+        drop(cache);
+        ingest.abort();
+        let _ = ingest.await;
+    }
+
+    /// Serves fixed bodies; when `hold` is set, that URL answers only after another URL has.
+    struct OrderedFetcher {
+        bodies: HashMap<String, Vec<u8>>,
+        hold: Option<String>,
+        released: Arc<tokio::sync::Notify>,
+    }
+
+    impl PageFetcher for OrderedFetcher {
+        async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, pe_source_core::SourceError> {
+            if self.hold.as_deref() == Some(url) {
+                self.released.notified().await;
+            } else {
+                self.released.notify_one();
+            }
+            Ok(self.bodies[url].clone())
+        }
+    }
+
+    fn replay_from_log(
+        source_path: &std::path::Path,
+    ) -> impl FnMut(AppendReceipt) -> Result<RecordedPriceAttempt, RiskPriceReplayError> {
+        let envelopes = pe_event_log::Reader::replay(source_path)
+            .unwrap()
+            .map(|entry| entry.unwrap().1)
+            .collect::<Vec<_>>();
+        move |receipt| {
+            let envelope = envelopes
+                .iter()
+                .find(|envelope| {
+                    envelope.seq == receipt.sequence && envelope.this_hash == receipt.this_hash
+                })
+                .unwrap();
+            Ok(RecordedPriceAttempt {
+                payload: envelope.payload.clone(),
+                received_unix_ms: i64::try_from(unix_timestamp_ms(envelope.received_at.0)).unwrap(),
+                source_id: envelope.source_id.0.clone(),
+                schema_version: envelope.schema_version,
+                parser_version: envelope.parser_version,
+                content_type: envelope.content_type.clone(),
+            })
+        }
+    }
+
+    /// PASS: across two chunks of one read, the first chunk's unrequested row for a condition the
+    /// second chunk requested is ignored in either completion order, so acquisition prices every
+    /// market from its own chunk and replay of the selected receipts reproduces it.
+    #[tokio::test]
+    async fn cross_chunk_extra_row_is_ignored_in_both_completion_orders() {
+        let many = (0..50).map(|n| format!("0x{n:02}")).collect::<Vec<_>>();
+        let big_url = format!(
+            "{BASE}/markets?{}&limit={GAMMA_BATCH_LIMIT_PARAM}",
+            many.iter()
+                .map(|id| format!("condition_ids={id}"))
+                .collect::<Vec<_>>()
+                .join("&")
+        );
+        let mut big_rows = many
+            .iter()
+            .map(|id| format!(r#"{{"conditionId":"{id}","outcomePrices":"[\"0.4\",\"0.6\"]"}}"#))
+            .collect::<Vec<_>>();
+        big_rows.push(r#"{"conditionId":"0xb","outcomePrices":"[\"0.9\",\"0.1\"]"}"#.to_owned());
+        let big_body = format!("[{}]", big_rows.join(",")).into_bytes();
+        let small_body = br#"[{"conditionId":"0xb","outcomePrices":"[\"0.5\",\"0.5\"]"}]"#.to_vec();
+        for hold_big in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("source.log");
+            let (source_log, source_rx) = SourceLogHandle::channel(4);
+            let (trigger_tx, _trigger_rx) = mpsc::channel(1);
+            let ingest = tokio::spawn(
+                ActivityIngest::poll_only(
+                    SourceEventSink::open(&source_path).unwrap(),
+                    source_rx,
+                    trigger_tx,
+                    new_shared_health_with_ws(false, false, 90),
+                )
+                .run(),
+            );
+            let now = datetime!(2026-10-03 00:00 UTC);
+            let cache = MidPriceCache::with_fetcher(
+                OrderedFetcher {
+                    bodies: HashMap::from([
+                        (big_url.clone(), big_body.clone()),
+                        (url(BASE, "0xb"), small_body.clone()),
+                    ]),
+                    hold: hold_big.then(|| big_url.clone()),
+                    released: Arc::new(tokio::sync::Notify::new()),
+                },
+                BASE.to_owned(),
+            )
+            .with_source_log(source_log)
+            .with_clock(Arc::new(move || now));
+            let ids = many
+                .iter()
+                .map(|id| outcome(id, 0))
+                .chain([outcome("0xb", 0)])
+                .collect::<Vec<_>>();
+            let attempt = cache.fetch_mids_strict_attempt(&ids).await;
+            let observations = attempt.result.unwrap();
+            assert_eq!(
+                observations[&("0xb".to_owned(), 0)].price.0,
+                Decimal::new(5, 1)
+            );
+            assert_eq!(attempt.price_receipts.len(), 2);
+            let replayed = replay_strict_risk_prices(
+                &ids,
+                &attempt.price_receipts,
+                i64::try_from(unix_timestamp_ms(now)).unwrap(),
+                replay_from_log(&source_path),
+            )
+            .await
+            .unwrap();
+            assert_eq!(replayed, observations);
+            drop(cache);
+            ingest.abort();
+            let _ = ingest.await;
+        }
+    }
+
+    /// Fails the big chunk (malformed JSON or a transport error) and never answers any other
+    /// request.
+    struct AbortFirstFetcher {
+        failing: String,
+        transient: bool,
+    }
+
+    impl PageFetcher for AbortFirstFetcher {
+        async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, pe_source_core::SourceError> {
+            if url == self.failing {
+                return if self.transient {
+                    Err(pe_source_core::SourceError::Transient {
+                        message: "HTTP 503".to_owned(),
+                    })
+                } else {
+                    Ok(b"{".to_vec())
+                };
+            }
+            std::future::pending::<()>().await;
+            Ok(Vec::new())
+        }
+    }
+
+    /// PASS: a multi-chunk read that aborts (malformed page or transport error) refuses `PriceMissing`, and replay
+    /// of its recorded receipts, which include the abandoned request, reproduces that cause.
+    #[tokio::test]
+    async fn aborted_multi_chunk_read_replays_price_missing() {
+        let many = (0..50).map(|n| format!("0x{n:02}")).collect::<Vec<_>>();
+        let big_url = format!(
+            "{BASE}/markets?{}&limit={GAMMA_BATCH_LIMIT_PARAM}",
+            many.iter()
+                .map(|id| format!("condition_ids={id}"))
+                .collect::<Vec<_>>()
+                .join("&")
+        );
+        for transient in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("source.log");
+            let (source_log, source_rx) = SourceLogHandle::channel(4);
+            let (trigger_tx, _trigger_rx) = mpsc::channel(1);
+            let ingest = tokio::spawn(
+                ActivityIngest::poll_only(
+                    SourceEventSink::open(&source_path).unwrap(),
+                    source_rx,
+                    trigger_tx,
+                    new_shared_health_with_ws(false, false, 90),
+                )
+                .run(),
+            );
+            let now = datetime!(2026-10-03 00:00 UTC);
+            let cache = MidPriceCache::with_fetcher(
+                AbortFirstFetcher {
+                    failing: big_url.clone(),
+                    transient,
+                },
+                BASE.to_owned(),
+            )
+            .with_source_log(source_log)
+            .with_clock(Arc::new(move || now));
+            let ids = many
+                .iter()
+                .map(|id| outcome(id, 0))
+                .chain([outcome("0xb", 0)])
+                .collect::<Vec<_>>();
+            let attempt = cache.fetch_mids_strict_attempt(&ids).await;
+            assert_eq!(attempt.result, Err(RiskInputsUnavailable::PriceMissing));
+            assert_eq!(attempt.price_receipts.len(), 2);
+            let replayed = replay_strict_risk_prices(
+                &ids,
+                &attempt.price_receipts,
+                i64::try_from(unix_timestamp_ms(attempt.evaluated_at)).unwrap(),
+                replay_from_log(&source_path),
+            )
+            .await;
+            assert!(matches!(
+                replayed,
+                Err(RiskPriceReplayError::Unavailable(
+                    RiskInputsUnavailable::PriceMissing
+                ))
+            ));
+            drop(cache);
+            ingest.abort();
+            let _ = ingest.await;
+        }
+    }
+
+    /// PASS: after a backward clock step, a cached conflicting row recorded in the future refuses
+    /// with `PriceConflict` (conflict precedes time) on both acquisition and replay.
+    #[tokio::test]
+    async fn future_conflicting_row_replays_acquisitions_conflict() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let (source_log, source_rx) = SourceLogHandle::channel(4);
+        let (trigger_tx, _trigger_rx) = mpsc::channel(1);
+        let ingest = tokio::spawn(
+            ActivityIngest::poll_only(
+                SourceEventSink::open(&source_path).unwrap(),
+                source_rx,
+                trigger_tx,
+                new_shared_health_with_ws(false, false, 90),
+            )
+            .run(),
+        );
+        let start = datetime!(2026-10-03 00:00:10 UTC);
+        let back_secs = Arc::new(AtomicUsize::new(0));
+        let clock_back = back_secs.clone();
+        let cache = MidPriceCache::with_fetcher(
+            FixtureFetcher::new(HashMap::from([(
+                url(BASE, "0xb"),
+                br#"[{"conditionId":"0xb","outcomePrices":"[\"0.5\",\"0.5\"]"},{"conditionId":"0xb","outcomePrices":"[\"0.6\",\"0.4\"]"}]"#
+                    .to_vec(),
+            )])),
+            BASE.to_owned(),
+        )
+        .with_source_log(source_log)
+        .with_clock(Arc::new(move || {
+            start
+                - time::Duration::seconds(
+                    i64::try_from(clock_back.load(Ordering::SeqCst)).unwrap(),
+                )
+        }));
+        let ids = [outcome("0xb", 0)];
+        assert_eq!(
+            cache.fetch_mids_strict_attempt(&ids).await.result,
+            Err(RiskInputsUnavailable::PriceConflict)
+        );
+        back_secs.store(1, Ordering::SeqCst);
+        let attempt = cache.fetch_mids_strict_attempt(&ids).await;
+        assert_eq!(attempt.result, Err(RiskInputsUnavailable::PriceConflict));
+        let replayed = replay_strict_risk_prices(
+            &ids,
+            &attempt.price_receipts,
+            i64::try_from(unix_timestamp_ms(attempt.evaluated_at)).unwrap(),
+            replay_from_log(&source_path),
+        )
+        .await;
+        assert!(matches!(
+            replayed,
+            Err(RiskPriceReplayError::Unavailable(
+                RiskInputsUnavailable::PriceConflict
+            ))
+        ));
+        drop(cache);
+        ingest.abort();
+        let _ = ingest.await;
+    }
+
+    #[tokio::test]
+    async fn unsuccessful_closed_price_fallback_retains_both_missing_responses() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let (source_log, source_rx) = SourceLogHandle::channel(4);
+        let (trigger_tx, _trigger_rx) = mpsc::channel(1);
+        let ingest = tokio::spawn(
+            ActivityIngest::poll_only(
+                SourceEventSink::open(&source_path).unwrap(),
+                source_rx,
+                trigger_tx,
+                new_shared_health_with_ws(false, false, 90),
+            )
+            .run(),
+        );
+        let cache = MidPriceCache::with_fetcher(FixtureFetcher::new(HashMap::from([
+            (url(BASE, "0xmissing"), b"[]".to_vec()),
+            (format!("{BASE}/markets?condition_ids=0xmissing&closed=true&limit={GAMMA_BATCH_LIMIT_PARAM}"), b"[]".to_vec()),
+        ])), BASE.to_owned()).with_source_log(source_log);
+        let ids = [outcome("0xmissing", 0)];
+        let attempt = cache.fetch_mids_strict_attempt(&ids).await;
+        assert_eq!(attempt.result, Err(RiskInputsUnavailable::PriceMissing));
+        assert_eq!(attempt.price_receipts.len(), 2);
+        ingest.abort();
+        let _ = ingest.await;
+    }
 
     fn outcome(market: &str, index: u16) -> MarketOutcomeId {
         MarketOutcomeId::new(mid(market), OutcomeId(index))

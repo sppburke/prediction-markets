@@ -852,6 +852,30 @@ rollback.
 
 ## Procedure
 
+**#730 Part 1 ordinary in-era update.** Use the existing locked binary-swap procedure below
+with one service restart. Copying pauses during that restart; the measured 2026-10-01
+restart took 164 s, not a guaranteed bound. This update preserves the existing era and its
+seal. Its additional rollback boundary is the first of three durable writes: a paper mark
+recording a `closure_receipt`; an ordinary-live admission this binary records; or an activity
+read commitment binding a feed observation to the original of a restamp pair listed in the same
+read. Older mark readers reject the added field. Live recovery strictly replays an admission's
+price receipts, which this binary may select from a closed query or from the newest of
+overlapping pages that older readers reject. An older boot's obligation rebuild counts both
+stamps of the pair as candidates and refuses that binding. Before the first such write, reverse
+the swap only if every existing [rollback prerequisite](#rollback) also holds; after it, preserve
+state and fix forward. Live remains dark unless armed.
+A paper decision recording a closed-price request alone does not cross this new boundary:
+paper price receipts are replayed by `--qualify`, which already refuses this era's semantic-1
+Start. Stop and drain before inspecting durable state for any reversal, because shutdown can
+commit queued work. Do not remove receipts or restore stale state to permit a reversal.
+
+The wrapper's TTR provenance line reaches Forge only through the resumable
+[Forge release procedure](26-DATA-REFRESH-AND-REOPTIMIZATION-RUNBOOK.md#forge-release-deployment-and-rollback)
+at a drained cycle boundary, coordinated on #694. Keep prepared requests unchanged: resumed
+requests retain their recorded floor; new requests record the ranking floor. Verify the installed
+checkout/binary pair and restore the recorded run intent. This Forge release needs no
+`pe-service` restart.
+
 Every step is bound to the embedded full Git revision plus exact binary bytes (#544). The binary
 reports `revision=<40-hex> config_identity=runtime-applied`; `--verify-staged-identity` checks that
 revision and the executable's BLAKE3 digest before staging. Continue to use sha256 for the existing
@@ -1031,7 +1055,9 @@ comparisons decide what remains; never guess from memory.
    id=<source_trade_id>
    sqlite3 -readonly -header paper_state.db "select (select count(*) from seen_trades where source_trade_id='$id') as seen, (select count(*) from fills where idempotency_key like 'wf|%|$id|%') as fills, (select count(*) from dispatch_seeds where source_trade_id='$id') as seeds, (select count(*) from no_copy_dispositions where source_trade_id='$id') as no_copy;"
    ``` If the second publication cannot
-   establish two live readers, roll back instead of waiting. Record the readers'
+   establish two live readers, stop and drain, then reverse the swap only if the #730 Part 1
+   and all existing [rollback prerequisites](#rollback) permit it; otherwise preserve state and
+   fix forward instead of waiting. Record the readers'
    `consecutive_reconnects` and drop cadence: a churn pattern is the evidence for any keepalive
    follow-up (the first-party client sends `ping` every 5 s; `pe-service` does not).
 

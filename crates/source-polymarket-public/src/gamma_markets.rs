@@ -93,6 +93,8 @@ pub struct GammaMarket {
     /// Whether Gamma reports the market as closed. `false` when the field is omitted. This metadata
     /// is not Winner-Follow payout evidence.
     pub closed: bool,
+    /// Actual closure time from `closedTime`; unavailable when omitted or unparseable.
+    pub closed_time_unix: Option<i64>,
     /// Outcome prices indexed by `outcome_id`, parsed from Gamma's `outcomePrices` JSON-string array
     /// via [`parse_outcome_prices`] — closed markets can show `[1,0]`/`[0,1]`, while open markets
     /// provide live mids. `None` when Gamma omits the field or the array is malformed. Individual
@@ -149,6 +151,9 @@ pub struct GammaConditionMarketsWithPages {
     /// the exact missing-price observation instead of inferring it from the source-log tail.
     pub failed_requests: Vec<(String, String)>,
     pub conflicting_condition_ids: Vec<String>,
+    /// Conditions whose repeated rows disagree on `closed` or `closedTime`: their closure
+    /// evidence is ambiguous. Price conflicts stay in `conflicting_condition_ids`.
+    pub conflicting_closure_condition_ids: Vec<String>,
     pub condition_page_hashes: HashMap<String, String>,
 }
 
@@ -293,6 +298,12 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
         let fetcher = &self.fetcher;
         let closed = filter.closed_param();
         let limit = self.limit;
+        // Every request of this read, so an abort can retain the ones it abandons.
+        let chunk_urls = chunks
+            .iter()
+            .map(|chunk| build_batch_url(base, chunk, closed, limit))
+            .collect::<Vec<_>>();
+        let mut answered = HashSet::new();
 
         let mut stream = stream::iter(chunks)
             .map(|chunk| async move {
@@ -307,8 +318,10 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
         let mut pages = Vec::new();
         let mut failed_requests = Vec::new();
         let mut conflicting_condition_ids = Vec::new();
+        let mut conflicting_closure_condition_ids = Vec::new();
         let mut condition_page_hashes = HashMap::new();
         while let Some((chunk, url, result)) = stream.next().await {
+            answered.insert(url.clone());
             let bytes = match result {
                 Ok(b) => b,
                 Err(SourceError::Fatal { message }) => {
@@ -323,6 +336,7 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
                 Err(e) => {
                     let message = e.to_string();
                     failed_requests.push((url, message.clone()));
+                    failed_requests.extend(abandoned_requests(&chunk_urls, &answered));
                     return Err(GammaConditionMarketsError {
                         source: GammaMarketsError::Fetch(message),
                         pages,
@@ -336,6 +350,7 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
                 Ok(markets) => markets,
                 Err(error) => {
                     pages.push((evidence, bytes));
+                    failed_requests.extend(abandoned_requests(&chunk_urls, &answered));
                     return Err(GammaConditionMarketsError {
                         source: GammaMarketsError::Parse(error.to_string()),
                         pages,
@@ -346,10 +361,20 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
             pages.push((evidence, bytes));
             for m in markets {
                 let market = gamma_market(m);
-                if out.get(&market.condition_id).is_some_and(|prior| {
-                    prior.strict_outcome_prices != market.strict_outcome_prices
-                }) {
-                    conflicting_condition_ids.push(market.condition_id.clone());
+                // A row the request did not ask for is not evidence for any condition: it can
+                // neither collide with another chunk's requested row nor raise a conflict.
+                if !chunk.contains(&market.condition_id) {
+                    continue;
+                }
+                if let Some(prior) = out.get(&market.condition_id) {
+                    if prior.strict_outcome_prices != market.strict_outcome_prices {
+                        conflicting_condition_ids.push(market.condition_id.clone());
+                    }
+                    if prior.closed != market.closed
+                        || prior.closed_time_unix != market.closed_time_unix
+                    {
+                        conflicting_closure_condition_ids.push(market.condition_id.clone());
+                    }
                 }
                 condition_page_hashes.insert(
                     market.condition_id.clone(),
@@ -368,6 +393,7 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
             pages,
             failed_requests,
             conflicting_condition_ids,
+            conflicting_closure_condition_ids,
             condition_page_hashes,
         })
     }
@@ -470,17 +496,38 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
     }
 }
 
-/// Parsed identity of the canonical open-only condition request emitted by the Gamma client.
+/// The requests an aborted read drops, retained as failures so the caller records that they
+/// produced no usable response.
+fn abandoned_requests(
+    chunk_urls: &[String],
+    answered: &HashSet<String>,
+) -> impl Iterator<Item = (String, String)> {
+    chunk_urls
+        .iter()
+        .filter(|url| !answered.contains(*url))
+        .map(|url| {
+            (
+                url.clone(),
+                "abandoned after another request of this read failed".to_owned(),
+            )
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+}
+
+/// Parsed identity of the canonical condition request emitted by the Gamma client.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GammaOpenConditionRequest {
+pub struct GammaConditionRequest {
     /// Gamma API base URL before the canonical `/markets` path.
     pub base_url: String,
     /// Requested `condition_ids` in canonical repeat-key order.
     pub condition_ids: Vec<String>,
+    /// Open or closed market slice selected by the request.
+    pub filter: MarketFilter,
 }
 
-impl GammaOpenConditionRequest {
-    /// Parse an exact canonical open-only condition request.
+impl GammaConditionRequest {
+    /// Parse an exact canonical open or closed condition request.
     pub fn parse(request_url: &str) -> Option<Self> {
         let (base_url, query) = request_url.split_once("/markets?")?;
         if base_url.is_empty() {
@@ -489,6 +536,17 @@ impl GammaOpenConditionRequest {
         let parts = query.split('&').collect::<Vec<_>>();
         let (limit, conditions) = parts.split_last()?;
         if *limit != format!("limit={GAMMA_BATCH_LIMIT_PARAM}") || conditions.is_empty() {
+            return None;
+        }
+        let (filter, conditions) = if conditions.last() == Some(&"closed=true") {
+            (
+                MarketFilter::ClosedOnly,
+                &conditions[..conditions.len().checked_sub(1)?],
+            )
+        } else {
+            (MarketFilter::OpenOnly, conditions)
+        };
+        if conditions.is_empty() {
             return None;
         }
         let condition_ids = conditions
@@ -501,12 +559,13 @@ impl GammaOpenConditionRequest {
         let request = Self {
             base_url: base_url.to_owned(),
             condition_ids,
+            filter,
         };
         (request_url
             == build_batch_url(
                 &request.base_url,
                 &request.condition_ids,
-                "",
+                request.filter.closed_param(),
                 GAMMA_BATCH_LIMIT_PARAM,
             ))
         .then_some(request)
@@ -698,6 +757,24 @@ fn parse_rfc3339_unix(s: &str) -> Option<i64> {
         .ok()
 }
 
+/// A fractional closure second counts as the next whole second, so `closed_time_unix <= cutoff`
+/// never admits a closure after the cutoff.
+fn parse_closed_time_unix(s: &str) -> Option<i64> {
+    let closed = time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+        .or_else(|_| {
+            time::OffsetDateTime::parse(
+                s,
+                &time::macros::format_description!(
+                    "[year]-[month]-[day] [hour]:[minute]:[second][offset_hour sign:mandatory]"
+                ),
+            )
+        })
+        .ok()?;
+    closed
+        .unix_timestamp()
+        .checked_add(i64::from(closed.nanosecond() > 0))
+}
+
 /// Serde DTO for one element of the `/markets` response array. Extra fields are ignored.
 ///
 /// `#[serde(rename_all = "camelCase")]` maps the snake_case fields to Gamma's camelCase keys
@@ -722,6 +799,7 @@ struct GammaMarketRaw {
     /// Whether the market is resolved. Defaults `false` when omitted (open markets / lean fixtures).
     #[serde(default)]
     closed: bool,
+    closed_time: Option<String>,
     /// Resolved/mid prices as a JSON-encoded decimal-string array, e.g. `"[\"1\",\"0\"]"`. Parsed in
     /// the demux via [`parse_outcome_prices`].
     outcome_prices: Option<String>,
@@ -752,6 +830,10 @@ fn gamma_market(market: GammaMarketRaw) -> GammaMarket {
         created_at_unix,
         liquidity: market.liquidity,
         closed: market.closed,
+        closed_time_unix: market
+            .closed_time
+            .as_deref()
+            .and_then(parse_closed_time_unix),
         outcome_prices,
         strict_outcome_prices,
         volume: market.volume,
@@ -913,31 +995,32 @@ mod tests {
             )
         );
         assert_eq!(
-            GammaOpenConditionRequest::parse(&url),
-            Some(GammaOpenConditionRequest {
+            GammaConditionRequest::parse(&url),
+            Some(GammaConditionRequest {
                 base_url: "https://g".to_owned(),
                 condition_ids: ids(&["0xA", "0xB"]),
+                filter: MarketFilter::OpenOnly,
             })
         );
     }
 
     #[test]
-    fn open_condition_request_rejects_noncanonical_grammar() {
+    fn condition_request_rejects_noncanonical_grammar() {
         let alternate_limit = GAMMA_BATCH_LIMIT_PARAM.checked_add(1).unwrap();
         assert!(
-            GammaOpenConditionRequest::parse(&format!(
-                "https://g/markets?condition_ids=0xA&closed=true&limit={GAMMA_BATCH_LIMIT_PARAM}"
+            GammaConditionRequest::parse(&format!(
+                "https://g/markets?condition_ids=0xA&closed=false&limit={GAMMA_BATCH_LIMIT_PARAM}"
             ))
             .is_none()
         );
         assert!(
-            GammaOpenConditionRequest::parse(&format!(
+            GammaConditionRequest::parse(&format!(
                 "https://g/markets?condition_ids=0xA&limit={GAMMA_BATCH_LIMIT_PARAM}&condition_ids=0xB"
             ))
             .is_none()
         );
         assert!(
-            GammaOpenConditionRequest::parse(&format!(
+            GammaConditionRequest::parse(&format!(
                 "https://g/markets?condition_ids=0xA&limit={alternate_limit}"
             ))
             .is_none()
@@ -954,6 +1037,40 @@ mod tests {
         // condition_ids before closed before limit — deterministic for fixture keying.
         assert!(url.find("condition_ids=").unwrap() < url.find("closed=true").unwrap());
         assert!(url.find("closed=true").unwrap() < url.find("limit=").unwrap());
+        assert_eq!(
+            GammaConditionRequest::parse(&url),
+            Some(GammaConditionRequest {
+                base_url: "https://g".to_owned(),
+                condition_ids: ids(&["0xA"]),
+                filter: MarketFilter::ClosedOnly,
+            }),
+        );
+    }
+
+    #[test]
+    fn gamma_closed_time_parses_the_recorded_london_format() {
+        let raw =
+            include_bytes!("../../service/tests/fixtures/london_closed_mark/gamma_closed.json");
+        let rows: Vec<GammaMarketRaw> = serde_json::from_slice(raw).unwrap();
+        let market = gamma_market(rows.into_iter().next().unwrap());
+        assert!(market.closed);
+        assert_eq!(market.closed_time_unix, Some(1_790_985_062));
+        assert_eq!(
+            parse_closed_time_unix("2026-10-02T23:51:02Z"),
+            market.closed_time_unix
+        );
+        for value in ["", "unknown", "2026-10-02 23:51:02"] {
+            assert_eq!(parse_closed_time_unix(value), None);
+        }
+        // A fractional second rounds up: a closure 500 ms after midnight is after that cutoff.
+        assert_eq!(
+            parse_closed_time_unix("2026-10-03T00:00:00Z"),
+            Some(1_790_985_600)
+        );
+        assert_eq!(
+            parse_closed_time_unix("2026-10-03T00:00:00.500Z"),
+            Some(1_790_985_601)
+        );
     }
 
     #[test]
@@ -1212,6 +1329,114 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.conflicting_condition_ids, vec!["condition"]);
+        assert!(result.conflicting_closure_condition_ids.is_empty());
+    }
+
+    struct StallSecondFetcher {
+        failing: String,
+        transient: bool,
+    }
+
+    impl PageFetcher for StallSecondFetcher {
+        async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+            if url == self.failing {
+                return if self.transient {
+                    Err(SourceError::Transient {
+                        message: "HTTP 503".to_owned(),
+                    })
+                } else {
+                    Ok(b"{".to_vec())
+                };
+            }
+            std::future::pending::<()>().await;
+            Ok(Vec::new())
+        }
+    }
+
+    /// PASS: when one request of a multi-request read fails, the requests it abandons are
+    /// retained as failures beside the failing page.
+    #[tokio::test]
+    async fn condition_batch_abort_retains_abandoned_requests() {
+        let a_url = build_batch_url("https://g", &ids(&["A"]), "", GAMMA_BATCH_LIMIT_PARAM);
+        let b_url = build_batch_url("https://g", &ids(&["B"]), "", GAMMA_BATCH_LIMIT_PARAM);
+        for transient in [false, true] {
+            let error = GammaMarketsClient::new(
+                "https://g".to_owned(),
+                StallSecondFetcher {
+                    failing: a_url.clone(),
+                    transient,
+                },
+            )
+            .with_batch_size(1)
+            .fetch_markets_with_pages(&ids(&["A", "B"]), MarketFilter::OpenOnly)
+            .await
+            .err()
+            .unwrap();
+            let mut failed = error
+                .failed_requests
+                .iter()
+                .map(|(url, _)| url.clone())
+                .collect::<Vec<_>>();
+            if transient {
+                assert!(matches!(error.source, GammaMarketsError::Fetch(_)));
+                assert!(error.pages.is_empty());
+                assert_eq!(failed.remove(0), a_url);
+            } else {
+                assert!(matches!(error.source, GammaMarketsError::Parse(_)));
+                assert_eq!(error.pages.len(), 1);
+                assert_eq!(error.pages[0].0.request_url, a_url);
+            }
+            assert_eq!(failed, vec![b_url.clone()]);
+        }
+    }
+
+    /// PASS: a chunk's row for a condition it did not request is ignored, so the condition keeps
+    /// its own chunk's row, page and conflict state whichever chunk is read first.
+    #[tokio::test]
+    async fn condition_batch_ignores_rows_the_chunk_did_not_request() {
+        let a_url = build_batch_url("https://g", &ids(&["A"]), "", GAMMA_BATCH_LIMIT_PARAM);
+        let b_url = build_batch_url("https://g", &ids(&["B"]), "", GAMMA_BATCH_LIMIT_PARAM);
+        let a_raw = br#"[{"conditionId":"A","outcomePrices":"[\"0.4\",\"0.6\"]"},{"conditionId":"B","outcomePrices":"[\"0.9\",\"0.1\"]"}]"#.to_vec();
+        let b_raw = br#"[{"conditionId":"B","outcomePrices":"[\"0.5\",\"0.5\"]"}]"#.to_vec();
+        for order in [ids(&["A", "B"]), ids(&["B", "A"])] {
+            let fetcher = FixtureFetcher::new(HashMap::from([
+                (a_url.clone(), a_raw.clone()),
+                (b_url.clone(), b_raw.clone()),
+            ]));
+            let result = GammaMarketsClient::new("https://g".to_owned(), fetcher)
+                .with_batch_size(1)
+                .fetch_markets_with_pages(&order, MarketFilter::OpenOnly)
+                .await
+                .unwrap();
+            assert_eq!(
+                result.markets.markets["B"].outcome_prices,
+                Some(vec![Decimal::new(5, 1), Decimal::new(5, 1)])
+            );
+            assert!(result.conflicting_condition_ids.is_empty());
+            assert_eq!(
+                result.condition_page_hashes["B"],
+                blake3::hash(&b_raw).to_hex().to_string()
+            );
+        }
+    }
+
+    /// PASS: repeated rows that disagree on closure are a closure conflict in either order, while
+    /// equal prices keep them out of the price conflicts.
+    #[tokio::test]
+    async fn condition_batch_reports_conflicting_duplicate_closure_in_either_order() {
+        let ids = ids(&["condition"]);
+        let url = build_batch_url("https://g", &ids, "&closed=true", GAMMA_BATCH_LIMIT_PARAM);
+        let early = r#"{"conditionId":"condition","closed":true,"closedTime":"2026-10-02 23:51:02+00","outcomePrices":"[\"0.4\",\"0.6\"]"}"#;
+        let late = r#"{"conditionId":"condition","closed":true,"closedTime":"2026-10-03 00:00:01+00","outcomePrices":"[\"0.4\",\"0.6\"]"}"#;
+        for raw in [format!("[{early},{late}]"), format!("[{late},{early}]")] {
+            let fetcher = FixtureFetcher::new(HashMap::from([(url.clone(), raw.into_bytes())]));
+            let result = GammaMarketsClient::new("https://g".to_owned(), fetcher)
+                .fetch_markets_with_pages(&ids, MarketFilter::ClosedOnly)
+                .await
+                .unwrap();
+            assert_eq!(result.conflicting_closure_condition_ids, vec!["condition"]);
+            assert!(result.conflicting_condition_ids.is_empty());
+        }
     }
 
     /// PASS: a request rejected before a response page retains its exact URL for the caller-owned

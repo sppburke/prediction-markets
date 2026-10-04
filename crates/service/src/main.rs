@@ -12,7 +12,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use axum::{Router, routing::get};
 use pe_core_types::{PolymarketConditionId, ReceivedAt, SourceId, SourceTimestamp, WalletAddress};
-use pe_event_log::{ContentType, EnvelopeIn, Scanner, Writer};
+use pe_event_log::{ContentType, EnvelopeIn, Scanner};
 use pe_execution_core::LiveJournal;
 use pe_paper_state::{MigrationMetadata, MigrationPhase, PaperStateDb};
 use pe_service::asset_identity::AssetIdentityResolver;
@@ -718,7 +718,7 @@ async fn main() -> Result<()> {
 
     // Open the sole paper writer and converge the active financial prefix before reading any
     // bankroll used for sizing or API state.
-    let mut paper_writer = Writer::open(&cfg.event_log_path)
+    let paper_writer = pe_service::paper_recovery::PaperLog::open(&cfg.event_log_path)
         .with_context(|| format!("open event log {}", cfg.event_log_path.display()))?;
     if financial_start.is_some() {
         let authority = supabase_state.as_ref().context(
@@ -732,9 +732,8 @@ async fn main() -> Result<()> {
         let recovered = reconcile_active_financial_frames(
             authority,
             &paper_state,
-            &cfg.event_log_path,
             source_evidence,
-            &mut paper_writer,
+            &paper_writer,
         )
         .await
         .context("recover active paper financial protocol")?;
@@ -1311,11 +1310,14 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_secs(20))
         .build()
         .context("build bounded market-admission HTTP client")?;
-    let boundary_mark_fetcher = Arc::new(pe_service::mark_prices::HistoricalMarkAdapter::new(
-        admission_http_client.clone(),
-        cfg.polymarket_clob_base_url.clone(),
-        orchestrator_source_log.clone(),
-    ));
+    let boundary_mark_fetcher = Arc::new(
+        pe_service::mark_prices::HistoricalMarkAdapter::new(
+            admission_http_client.clone(),
+            cfg.polymarket_clob_base_url.clone(),
+            orchestrator_source_log.clone(),
+        )
+        .with_gamma_base_url(admission_http_client.clone(), cfg.gamma_base_url.clone()),
+    );
     let admission_builder = pe_service::live_venue_adapter::LiveAdmissionBuilder::new(
         admission_http_client,
         cfg.gamma_base_url.clone(),
@@ -1403,6 +1405,7 @@ async fn main() -> Result<()> {
     // mode-0600 sibling of the paper log.
     let mut live_journal_for_staging = None;
     let mut live_fanout_task = None;
+    let live_dispatch_ready = Arc::new(tokio::sync::Notify::new());
     if let Some(live_accounts) = live_accounts.clone() {
         let identity = match pe_service::live_credentials::load_identity_from_credentials_dir() {
             Ok(identity) => Some(identity),
@@ -1456,6 +1459,7 @@ async fn main() -> Result<()> {
         );
         let fanout_config = pe_service::live_fanout::LiveFanoutConfig {
             paper_state: paper_state.clone(),
+            dispatch_ready: live_dispatch_ready.clone(),
             live_accounts,
             live_watchlist: live_watchlist.clone(),
             runtime_config: live_runtime_config.clone(),
@@ -1470,7 +1474,7 @@ async fn main() -> Result<()> {
                 .with_source_log(resolution_source_log.clone()),
             source_log: resolution_source_log.clone(),
             source_receipts: source_receipts.clone(),
-            paper_log_path: cfg.event_log_path.clone(),
+            paper_log: paper_writer.clone(),
             orchestrator_control: control_tx.downgrade(),
             http: live_http_client,
             polygon_receipt_rpc_url: cfg.polygon_receipt_rpc_url.clone(),
@@ -1537,7 +1541,8 @@ async fn main() -> Result<()> {
         book_fetcher,
     )
     .context("build orchestrator")?
-    .with_source_receipt_index(source_receipts.clone());
+    .with_source_receipt_index(source_receipts.clone())
+    .with_live_dispatch_ready(live_dispatch_ready);
     if let Some(task) = live_fanout_task {
         supervisor.spawn(TaskName::LiveFanout, task);
     }

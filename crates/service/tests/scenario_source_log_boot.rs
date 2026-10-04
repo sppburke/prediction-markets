@@ -97,7 +97,7 @@ fn empty_tail() -> TailBinding {
 }
 
 fn start_record() -> PaperLogRecord {
-    PaperLogRecord::QualificationStarted(Box::new(QualificationStarted {
+    PaperLogRecord::QualificationStarted(Arc::new(QualificationStarted {
         starting_bankroll: CollateralAmount::from_decimal_exact(dec!(10)).unwrap(),
         paper_prefix: empty_tail(),
         source_prefix: empty_tail(),
@@ -1374,7 +1374,7 @@ async fn post_start_boot_bankroll_case_with_checkpoint_parity(
         let PaperLogRecord::QualificationStarted(ref mut start) = started else {
             unreachable!()
         };
-        start.membership.clear();
+        Arc::make_mut(start).membership.clear();
     }
     let start = append_paper_record(&paths.paper_log, &started);
     let paper = PaperStateDb::open(&paths.fixed_main).unwrap();
@@ -1736,11 +1736,11 @@ async fn post_start_boot_bankroll_case_with_checkpoint_parity(
             let finals = paper_era(scan_paper_log(&paths.paper_log).unwrap())
                 .frames
                 .into_iter()
-                .filter_map(|frame| match frame.frame {
+                .filter_map(|frame| match &frame.frame {
                     PaperLogFrame::Record(PaperLogRecord::FinancialFinal {
                         prepared_receipt,
                         result,
-                    }) => Some((prepared_receipt, serde_json::to_value(result).unwrap())),
+                    }) => Some((*prepared_receipt, serde_json::to_value(result).unwrap())),
                     _ => None,
                 })
                 .collect::<Vec<_>>();

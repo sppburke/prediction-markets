@@ -20,7 +20,7 @@ use pe_core_types::{
     CollateralAmount, EventSeq, MarketId, OutcomeId, PolymarketConditionId, Price, ReceivedAt,
     ShareAmount, Side, SourceId, SourceTimestamp, SourceTradeId, VenueMarketId, WalletAddress,
 };
-use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, EventEnvelope, Reader, Writer};
+use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, EventEnvelope, Reader};
 use pe_execution_core::EconomicPrepared;
 use pe_paper_state::{FillRecord, FillRow, PaperPositionRow, PaperStateDb, PaperStateError};
 use pe_risk_engine::{BinaryPayout, aggregate_resolution_credit};
@@ -988,12 +988,11 @@ struct PositionRow {
 pub async fn reconcile_active_financial_frames<S: SupabaseStateTrait + ?Sized>(
     supabase: &S,
     paper_state: &PaperStateDb,
-    paper_log_path: &std::path::Path,
     source_evidence: SourceEvidence<'_>,
-    writer: &mut Writer,
+    writer: &crate::paper_recovery::PaperLog,
 ) -> Result<usize, SupabaseStateError> {
     let era =
-        paper_era(scan_paper_log(paper_log_path).map_err(|error| {
+        paper_era(writer.snapshot().map_err(|error| {
             SupabaseStateError::Corrupt(format!("scan active paper log: {error}"))
         })?);
     let (start_receipt, _) = era.start.as_ref().ok_or_else(|| {
@@ -1811,6 +1810,8 @@ where
 mod tests {
     #![allow(clippy::unwrap_used)]
 
+    use pe_event_log::Writer;
+
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
 
@@ -2133,7 +2134,7 @@ mod tests {
         let start = append_test_record(
             &mut writer,
             PAPER_LOG_SCHEMA_VERSION,
-            &PaperLogRecord::QualificationStarted(Box::new(QualificationStarted {
+            &PaperLogRecord::QualificationStarted(Arc::new(QualificationStarted {
                 starting_bankroll: CollateralAmount::from_decimal_exact(Decimal::from(100u32))
                     .unwrap(),
                 paper_prefix: tail.clone(),
@@ -2168,19 +2169,30 @@ mod tests {
             },
         );
 
+        drop(writer);
+        let writer = crate::paper_recovery::PaperLog::open(&paper_path).unwrap();
         let authority = PreparedResolutionAuthority::default();
+        let paper_walks = pe_event_log::scan_metrics::count(&paper_path).unwrap();
         assert_eq!(
-            reconcile_active_financial_frames(
-                &authority,
-                &db,
-                &paper_path,
-                source_evidence,
-                &mut writer,
-            )
-            .await
-            .unwrap(),
+            reconcile_active_financial_frames(&authority, &db, source_evidence, &writer,)
+                .await
+                .unwrap(),
             1
         );
+        assert_eq!(
+            pe_event_log::scan_metrics::count(&paper_path).unwrap(),
+            paper_walks
+        );
+        let snapshot = writer.snapshot().unwrap();
+        let scanned = scan_paper_log(&paper_path).unwrap();
+        assert_eq!(snapshot.len(), scanned.len());
+        for (cached, scanned) in snapshot.iter().zip(&scanned) {
+            assert_eq!(cached.envelope, scanned.envelope);
+            assert_eq!(
+                serde_json::to_vec(&cached.frame).unwrap(),
+                serde_json::to_vec(&scanned.frame).unwrap()
+            );
+        }
         drop(writer);
         assert_eq!(authority.calls.load(Ordering::SeqCst), 1);
         assert_eq!(
@@ -2188,17 +2200,11 @@ mod tests {
             Some(prepared.sequence)
         );
 
-        let mut writer = Writer::open(&paper_path).unwrap();
+        let writer = crate::paper_recovery::PaperLog::open(&paper_path).unwrap();
         assert_eq!(
-            reconcile_active_financial_frames(
-                &authority,
-                &db,
-                &paper_path,
-                source_evidence,
-                &mut writer,
-            )
-            .await
-            .unwrap(),
+            reconcile_active_financial_frames(&authority, &db, source_evidence, &writer,)
+                .await
+                .unwrap(),
             0
         );
         assert_eq!(authority.calls.load(Ordering::SeqCst), 1);

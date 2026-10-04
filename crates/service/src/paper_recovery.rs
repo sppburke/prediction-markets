@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{Context, Result};
 use pe_copy_signal_engine::{PositionSnapshot, PositionState};
@@ -14,7 +15,7 @@ use pe_core_types::{
     PolymarketConditionId, Price, ShareAmount, Side, SourceTimestamp, SourceTradeId, VenueMarketId,
     WalletAddress,
 };
-use pe_event_log::{AppendReceipt, EventEnvelope, LogTailBinding, Reader};
+use pe_event_log::{AppendReceipt, EnvelopeIn, EventEnvelope, LogTailBinding, Reader, Writer};
 use pe_execution_core::EconomicPrepared;
 use pe_paper_pnl::SettlementInfo;
 use pe_paper_state::{FillRecord, FillRow, PaperStateDb, SettledMarketRow};
@@ -112,7 +113,7 @@ pub enum PaperLogRecord {
         state: HaltState,
         evidence: serde_json::Value,
     },
-    QualificationStarted(Box<QualificationStarted>),
+    QualificationStarted(Arc<QualificationStarted>),
     PortfolioMark(Box<PortfolioMark>),
     QualificationSealed(Box<QualificationSealed>),
 }
@@ -1195,6 +1196,8 @@ pub struct PaperMarkPrice {
     pub price: Option<Price>,
     pub sample_unix: Option<i64>,
     pub receipt: Option<AppendReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closure_receipt: Option<AppendReceipt>,
     pub invalid: Option<String>,
 }
 
@@ -1242,6 +1245,8 @@ impl ScannedPaperFrame {
 pub enum PaperLogScanError {
     #[error("source receipt index belongs to a different source log")]
     SourceIndexPathMismatch,
+    #[error("paper log is poisoned; a verified reopen is required")]
+    Poisoned,
     #[error("paper log read failed: {0}")]
     EventLog(#[from] pe_event_log::LogError),
     #[error("paper log schema {schema_version} is unsupported at sequence {sequence}")]
@@ -1257,60 +1262,185 @@ pub enum PaperLogScanError {
     FinancialProtocol { sequence: u64, reason: String },
 }
 
-pub fn scan_paper_log(path: &Path) -> Result<Vec<ScannedPaperFrame>, PaperLogScanError> {
+fn decode_paper_frame(
+    envelope: EventEnvelope,
+) -> Result<Arc<ScannedPaperFrame>, PaperLogScanError> {
+    let sequence = envelope.seq;
+    let (frame, legacy_fill) = match envelope.schema_version {
+        1 => serde_json::from_slice(&envelope.payload)
+            .map(|fill| (PaperLogFrame::LegacyFill, Some(fill)))
+            .map_err(|source| PaperLogScanError::Decode {
+                sequence: sequence.0,
+                source,
+            })?,
+        PAPER_LOG_SCHEMA_VERSION => serde_json::from_slice(&envelope.payload)
+            .map(|record| (PaperLogFrame::Record(record), None))
+            .map_err(|source| PaperLogScanError::Decode {
+                sequence: sequence.0,
+                source,
+            })?,
+        schema_version => {
+            return Err(PaperLogScanError::UnsupportedSchema {
+                sequence: sequence.0,
+                schema_version,
+            });
+        }
+    };
+    let receipt = AppendReceipt {
+        sequence,
+        this_hash: envelope.this_hash,
+    };
+    Ok(Arc::new(ScannedPaperFrame {
+        envelope,
+        receipt,
+        frame,
+        legacy_fill,
+    }))
+}
+
+pub fn scan_paper_log(path: &Path) -> Result<Vec<Arc<ScannedPaperFrame>>, PaperLogScanError> {
     let mut frames = Vec::new();
     for item in Reader::replay(path)? {
-        let (sequence, envelope) = item?;
-        let (frame, legacy_fill) = match envelope.schema_version {
-            1 => serde_json::from_slice(&envelope.payload)
-                .map(|fill| (PaperLogFrame::LegacyFill, Some(fill)))
-                .map_err(|source| PaperLogScanError::Decode {
-                    sequence: sequence.0,
-                    source,
-                })?,
-            PAPER_LOG_SCHEMA_VERSION => serde_json::from_slice(&envelope.payload)
-                .map(|record| (PaperLogFrame::Record(record), None))
-                .map_err(|source| PaperLogScanError::Decode {
-                    sequence: sequence.0,
-                    source,
-                })?,
-            schema_version => {
-                return Err(PaperLogScanError::UnsupportedSchema {
-                    sequence: sequence.0,
-                    schema_version,
-                });
-            }
-        };
-        let receipt = AppendReceipt {
-            sequence,
-            this_hash: envelope.this_hash,
-        };
-        frames.push(ScannedPaperFrame {
-            envelope,
-            receipt,
-            frame,
-            legacy_fill,
-        });
+        let (_, envelope) = item?;
+        frames.push(decode_paper_frame(envelope)?);
     }
     validate_qualification_starts(&frames)?;
     validate_financial_pairs(&frames)?;
     Ok(frames)
 }
 
+/// The sole paper writer and its complete verified physical sequence, including pre-Start frames.
+#[derive(Debug, Clone)]
+pub struct PaperLog {
+    state: Arc<Mutex<PaperLogState>>,
+}
+
+#[derive(Debug)]
+struct PaperLogState {
+    writer: Writer,
+    frames: Vec<Arc<ScannedPaperFrame>>,
+    poisoned: bool,
+}
+
+impl PaperLog {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, PaperLogScanError> {
+        let path = path.as_ref();
+        let mut frames = Vec::new();
+        let mut decode_error = None;
+        let mut observer = |_: u64, envelope: &EventEnvelope| {
+            if decode_error.is_none() {
+                match decode_paper_frame(envelope.clone()) {
+                    Ok(frame) => frames.push(frame),
+                    Err(error) => decode_error = Some(error),
+                }
+            }
+        };
+        let opened = Writer::open_verified(path, None, &mut observer);
+        let (writer, _) = match opened {
+            Err(pe_event_log::LogError::Io(error))
+                if error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                // `open_verified` handles an empty file under the writer lock, but never creates it.
+                std::fs::File::create_new(path).map_err(pe_event_log::LogError::from)?;
+                Writer::open_verified(path, None, &mut observer)?
+            }
+            other => other?,
+        };
+        if let Some(error) = decode_error {
+            return Err(error);
+        }
+        validate_qualification_starts(&frames)?;
+        validate_financial_pairs(&frames)?;
+        Ok(Self {
+            state: Arc::new(Mutex::new(PaperLogState {
+                writer,
+                frames,
+                poisoned: false,
+            })),
+        })
+    }
+
+    fn healthy_state(&self) -> Result<MutexGuard<'_, PaperLogState>, PaperLogScanError> {
+        let state = self.state.lock().map_err(|_| PaperLogScanError::Poisoned)?;
+        if let Some(reason) = state.writer.poisoned() {
+            return Err(pe_event_log::LogError::Poisoned { reason: *reason }.into());
+        }
+        if state.poisoned {
+            return Err(PaperLogScanError::Poisoned);
+        }
+        Ok(state)
+    }
+
+    /// Copy only frame pointers; the guard is dropped before any reader can await.
+    pub fn snapshot(&self) -> Result<Vec<Arc<ScannedPaperFrame>>, PaperLogScanError> {
+        Ok(self.healthy_state()?.frames.clone())
+    }
+
+    pub fn append_synced(&self, input: EnvelopeIn) -> Result<AppendReceipt, PaperLogScanError> {
+        let mut state = self.healthy_state()?;
+        let prev_hash = state
+            .frames
+            .last()
+            .map_or(blake3::Hash::from_bytes([0; 32]), |frame| {
+                frame.receipt.this_hash
+            });
+        let receipt = state.writer.append_synced(EnvelopeIn {
+            source_id: input.source_id.clone(),
+            schema_version: input.schema_version,
+            parser_version: input.parser_version,
+            observed_at: input.observed_at.clone(),
+            received_at: input.received_at.clone(),
+            content_type: input.content_type.clone(),
+            payload: input.payload.clone(),
+        })?;
+        // Until decoding and the same validators used by a fresh scan succeed, this append
+        // cannot be published. A failure leaves every clone closed until a verified reopen.
+        state.poisoned = true;
+        let frame = decode_paper_frame(EventEnvelope {
+            seq: receipt.sequence,
+            source_id: input.source_id,
+            schema_version: input.schema_version,
+            parser_version: input.parser_version,
+            observed_at: input.observed_at,
+            received_at: input.received_at,
+            content_type: input.content_type,
+            raw_payload_hash: blake3::hash(&input.payload),
+            prev_hash,
+            this_hash: receipt.this_hash,
+            payload: input.payload,
+        })?;
+        state.frames.push(frame);
+        validate_qualification_starts(&state.frames)?;
+        validate_financial_pairs(&state.frames)?;
+        state.poisoned = false;
+        Ok(receipt)
+    }
+
+    pub fn verified_tail(&self) -> Result<LogTailBinding, PaperLogScanError> {
+        Ok(self.healthy_state()?.writer.verified_tail()?)
+    }
+
+    #[cfg(feature = "scenario")]
+    pub fn scenario_fail_next_sync(&self) -> Result<(), PaperLogScanError> {
+        self.healthy_state()?.writer.scenario_fail_next_sync();
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub struct PaperEra {
-    pub start: Option<(AppendReceipt, QualificationStarted)>,
-    pub frames: Vec<ScannedPaperFrame>,
+    pub start: Option<(AppendReceipt, Arc<QualificationStarted>)>,
+    pub frames: Vec<Arc<ScannedPaperFrame>>,
 }
 
 #[must_use]
-pub fn paper_era(frames: Vec<ScannedPaperFrame>) -> PaperEra {
-    let mut start = None::<(AppendReceipt, QualificationStarted)>;
+pub fn paper_era(frames: Vec<Arc<ScannedPaperFrame>>) -> PaperEra {
+    let mut start = None::<(AppendReceipt, Arc<QualificationStarted>)>;
     let mut era_frames = Vec::new();
     for frame in frames {
         let candidate = match &frame.frame {
             PaperLogFrame::Record(PaperLogRecord::QualificationStarted(value)) => {
-                Some((frame.receipt, value.as_ref().clone()))
+                Some((frame.receipt, Arc::clone(value)))
             }
             _ => None,
         };
@@ -1330,7 +1460,9 @@ pub fn paper_era(frames: Vec<ScannedPaperFrame>) -> PaperEra {
     }
 }
 
-fn validate_qualification_starts(frames: &[ScannedPaperFrame]) -> Result<(), PaperLogScanError> {
+fn validate_qualification_starts(
+    frames: &[Arc<ScannedPaperFrame>],
+) -> Result<(), PaperLogScanError> {
     let mut start_seen = false;
     for frame in frames {
         let PaperLogFrame::Record(PaperLogRecord::QualificationStarted(_)) = &frame.frame else {
@@ -1344,7 +1476,7 @@ fn validate_qualification_starts(frames: &[ScannedPaperFrame]) -> Result<(), Pap
     Ok(())
 }
 
-fn validate_financial_pairs(frames: &[ScannedPaperFrame]) -> Result<(), PaperLogScanError> {
+fn validate_financial_pairs(frames: &[Arc<ScannedPaperFrame>]) -> Result<(), PaperLogScanError> {
     let mut prepared = Vec::<(AppendReceipt, &FinancialPayload)>::new();
     let mut finalized = Vec::<AppendReceipt>::new();
     let mut unmatched = None::<AppendReceipt>;
@@ -1455,12 +1587,15 @@ pub fn oldest_unmatched_prepared(era: &PaperEra) -> Option<&ScannedPaperFrame> {
             _ => None,
         })
         .collect::<Vec<_>>();
-    era.frames.iter().find(|frame| {
-        matches!(
-            &frame.frame,
-            PaperLogFrame::Record(PaperLogRecord::FinancialPrepared { .. })
-        ) && !completed.contains(&frame.receipt)
-    })
+    era.frames
+        .iter()
+        .find(|frame| {
+            matches!(
+                &frame.frame,
+                PaperLogFrame::Record(PaperLogRecord::FinancialPrepared { .. })
+            ) && !completed.contains(&frame.receipt)
+        })
+        .map(AsRef::as_ref)
 }
 
 #[cfg(test)]
@@ -1645,7 +1780,7 @@ mod paper_log_tests {
                 live_journal: None,
             },
             WinnerFollowStrategy::new(WinnerFollowConfig::default()),
-            Writer::open(dir.path().join("paper.log")).unwrap(),
+            PaperLog::open(dir.path().join("paper.log")).unwrap(),
             paper_state,
             PositionLedger::new(),
             new_shared_health(false),
@@ -1898,6 +2033,199 @@ mod paper_log_tests {
             .unwrap()
     }
 
+    fn paper_input<T: Serialize>(schema_version: u32, value: &T) -> EnvelopeIn {
+        // Nanosecond clocks, as production appends use, must survive the scan round trip.
+        let at = OffsetDateTime::from_unix_timestamp_nanos(1_790_000_000_123_456_789).unwrap();
+        EnvelopeIn {
+            source_id: SourceId("paper-test".to_owned()),
+            schema_version,
+            parser_version: 1,
+            observed_at: SourceTimestamp(at),
+            received_at: ReceivedAt(at),
+            content_type: ContentType::Json,
+            payload: serde_json::to_vec(value).unwrap(),
+        }
+    }
+
+    fn assert_snapshot_matches_scan(log: &PaperLog, path: &Path) {
+        let cached = log.snapshot().unwrap();
+        let scanned = scan_paper_log(path).unwrap();
+        assert_eq!(cached.len(), scanned.len());
+        for (cached, scanned) in cached.iter().zip(&scanned) {
+            assert_eq!(cached.envelope, scanned.envelope);
+            assert_eq!(cached.receipt, scanned.receipt);
+            assert_eq!(
+                serde_json::to_vec(&cached.frame).unwrap(),
+                serde_json::to_vec(&scanned.frame).unwrap(),
+            );
+            assert_eq!(
+                serde_json::to_vec(&cached.legacy_fill).unwrap(),
+                serde_json::to_vec(&scanned.legacy_fill).unwrap(),
+            );
+        }
+        let cached = paper_era(cached);
+        let scanned = paper_era(scanned);
+        assert_eq!(cached.start, scanned.start);
+        assert_eq!(
+            cached
+                .frames
+                .iter()
+                .map(|frame| frame.receipt)
+                .collect::<Vec<_>>(),
+            scanned
+                .frames
+                .iter()
+                .map(|frame| frame.receipt)
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    #[test]
+    fn paper_log_shares_verified_frames_after_mixed_appends_and_reopen() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("paper.log");
+        let log = PaperLog::open(&path).unwrap();
+        assert!(log.snapshot().unwrap().is_empty());
+        log.append_synced(paper_input(1, &legacy_fill())).unwrap();
+        let start_receipt = log
+            .append_synced(paper_input(
+                PAPER_LOG_SCHEMA_VERSION,
+                &PaperLogRecord::QualificationStarted(Arc::new(start("cache"))),
+            ))
+            .unwrap();
+        let snapshot = log.snapshot().unwrap();
+        let shared = log.clone();
+        for record in [
+            PaperLogRecord::MembershipChanged {
+                reason: MembershipReason::FullRerank,
+                removed: Vec::new(),
+                added: vec![wallet()],
+                capacity: 1,
+                ranking_batch_id: Some(7),
+                evidence: serde_json::json!({"batch": 7}),
+            },
+            PaperLogRecord::RiskHaltChanged {
+                owner: RiskHaltOwner::Paper,
+                cause: RiskHaltCause::AbsoluteLoss,
+                state: HaltState::Engaged,
+                evidence: serde_json::json!({"equity": "90"}),
+            },
+            PaperLogRecord::PortfolioMark(Box::new(PortfolioMark {
+                boundary_receipt: receipt(7),
+                cutoff_unix: 20,
+                source_tail: tail(),
+                financial_prefix_seq: None,
+                prices: Vec::new(),
+                cash: dec!(100),
+                equity: dec!(100),
+                invalid: None,
+            })),
+            PaperLogRecord::QualificationSealed(Box::new(QualificationSealed {
+                start_receipt,
+                source_prefix: tail(),
+                financial_prefix: tail(),
+                live_prefix: tail(),
+                decision_evidence_digest: "decisions".to_owned(),
+                sealed_cutoff_unix: 30,
+                reason: SealReason::Complete,
+            })),
+        ] {
+            shared
+                .append_synced(paper_input(PAPER_LOG_SCHEMA_VERSION, &record))
+                .unwrap();
+            assert_snapshot_matches_scan(&log, &path);
+        }
+        let mut prior = None;
+        for id in ["ordinary", "recovered"] {
+            let prepared = log
+                .append_synced(paper_input(
+                    PAPER_LOG_SCHEMA_VERSION,
+                    &prepared_after(start_receipt, prior, id),
+                ))
+                .unwrap();
+            assert_snapshot_matches_scan(&log, &path);
+            shared
+                .append_synced(paper_input(PAPER_LOG_SCHEMA_VERSION, &final_fill(prepared)))
+                .unwrap();
+            prior = Some(prepared.sequence);
+            assert_snapshot_matches_scan(&shared, &path);
+        }
+        assert_eq!(snapshot.len(), 2);
+        let current = shared.snapshot().unwrap();
+        assert!(Arc::ptr_eq(&snapshot[0], &current[0]));
+        assert!(Arc::ptr_eq(&snapshot[1], &current[1]));
+        let era = paper_era(current);
+        let PaperLogFrame::Record(PaperLogRecord::QualificationStarted(start)) = &snapshot[1].frame
+        else {
+            unreachable!();
+        };
+        assert!(Arc::ptr_eq(start, &era.start.as_ref().unwrap().1));
+        assert_eq!(era.frames[0].receipt, start_receipt);
+        let decoded_before = pe_event_log::scan_metrics::decoded_count(&path).unwrap();
+        drop(shared);
+        drop(log);
+        let reopened = PaperLog::open(&path).unwrap();
+        assert_eq!(
+            pe_event_log::scan_metrics::decoded_count(&path).unwrap() - decoded_before,
+            10
+        );
+        assert_snapshot_matches_scan(&reopened, &path);
+    }
+
+    #[cfg(feature = "scenario")]
+    #[test]
+    fn paper_log_sync_uncertainty_blocks_every_clone_until_verified_reopen() {
+        for fail_in_tail in [false, true] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("paper.log");
+            let log = PaperLog::open(&path).unwrap();
+            let shared = log.clone();
+            let record = PaperLogRecord::QualificationStarted(Arc::new(start("sync")));
+            log.scenario_fail_next_sync().unwrap();
+            if fail_in_tail {
+                assert!(log.verified_tail().is_err());
+            } else {
+                assert!(
+                    log.append_synced(paper_input(PAPER_LOG_SCHEMA_VERSION, &record))
+                        .is_err()
+                );
+            }
+            assert!(shared.snapshot().is_err());
+            assert!(shared.verified_tail().is_err());
+            assert!(
+                shared
+                    .append_synced(paper_input(PAPER_LOG_SCHEMA_VERSION, &record))
+                    .is_err()
+            );
+            drop(shared);
+            drop(log);
+            let reopened = PaperLog::open(&path).unwrap();
+            assert_eq!(
+                reopened.snapshot().unwrap().len(),
+                usize::from(!fail_in_tail)
+            );
+            assert_snapshot_matches_scan(&reopened, &path);
+        }
+    }
+
+    #[test]
+    fn paper_log_refuses_snapshots_after_decode_or_protocol_publication_failure() {
+        for invalid in [
+            paper_input(PAPER_LOG_SCHEMA_VERSION, &prepared("before-start")),
+            paper_input(999, &serde_json::json!({})),
+        ] {
+            let dir = tempdir().unwrap();
+            let path = dir.path().join("paper.log");
+            let log = PaperLog::open(&path).unwrap();
+            assert!(log.append_synced(invalid).is_err());
+            assert!(log.snapshot().is_err());
+            assert!(log.verified_tail().is_err());
+            assert!(log.append_synced(paper_input(1, &legacy_fill())).is_err());
+            drop(log);
+            assert!(PaperLog::open(&path).is_err());
+        }
+    }
+
     #[test]
     fn every_paper_record_variant_round_trips() {
         let records = vec![
@@ -1940,7 +2268,7 @@ mod paper_log_tests {
                 state: HaltState::Engaged,
                 evidence: serde_json::json!({"equity": "90"}),
             },
-            PaperLogRecord::QualificationStarted(Box::new(start("activation"))),
+            PaperLogRecord::QualificationStarted(Arc::new(start("activation"))),
             PaperLogRecord::PortfolioMark(Box::new(PortfolioMark {
                 boundary_receipt: receipt(7),
                 cutoff_unix: 20,
@@ -1952,6 +2280,7 @@ mod paper_log_tests {
                     price: Some(Price::new(dec!(0.6)).unwrap()),
                     sample_unix: Some(19),
                     receipt: Some(receipt(8)),
+                    closure_receipt: None,
                     invalid: None,
                 }],
                 cash: dec!(99),
@@ -2075,7 +2404,7 @@ mod paper_log_tests {
         append(
             &mut writer,
             PAPER_LOG_SCHEMA_VERSION,
-            &PaperLogRecord::QualificationStarted(Box::new(start("test-activation"))),
+            &PaperLogRecord::QualificationStarted(Arc::new(start("test-activation"))),
         );
         append(
             &mut writer,
@@ -2116,14 +2445,15 @@ mod paper_log_tests {
         ));
         assert_eq!(missing.len(), 5);
         let mut moved = frame.clone();
-        moved.receipt.sequence = EventSeq(frame.receipt.sequence.0 + 1);
+        Arc::make_mut(&mut moved).receipt.sequence = EventSeq(frame.receipt.sequence.0 + 1);
         let mut wrong_hash = frame.clone();
-        wrong_hash.receipt.this_hash = blake3::hash(b"wrong frame");
+        Arc::make_mut(&mut wrong_hash).receipt.this_hash = blake3::hash(b"wrong frame");
         let mut wrong_payload = frame.clone();
-        wrong_payload.envelope.raw_payload_hash = blake3::hash(b"wrong payload");
+        Arc::make_mut(&mut wrong_payload).envelope.raw_payload_hash =
+            blake3::hash(b"wrong payload");
         let mut wrong_shape = frame.clone();
         if let PaperLogFrame::Record(PaperLogRecord::MembershipChanged { reason, .. }) =
-            &mut wrong_shape.frame
+            &mut Arc::make_mut(&mut wrong_shape).frame
         {
             *reason = MembershipReason::CapacityChange;
         }
@@ -2162,7 +2492,7 @@ mod paper_log_tests {
         append(
             &mut paper_writer,
             PAPER_LOG_SCHEMA_VERSION,
-            &PaperLogRecord::QualificationStarted(Box::new(started)),
+            &PaperLogRecord::QualificationStarted(Arc::new(started)),
         );
 
         let reranked = vec![
@@ -2324,7 +2654,7 @@ mod paper_log_tests {
 
     fn membership_orchestrator(
         live: LiveWatchlist,
-        paper_writer: Writer,
+        paper_writer: PaperLog,
         paper_state: Arc<PaperStateDb>,
         control_rx: mpsc::Receiver<crate::orchestrator_control::OrchestratorControl>,
     ) -> Orchestrator<FixtureFetcher, FixtureClobBookFetcher> {
@@ -2364,10 +2694,13 @@ mod paper_log_tests {
 
     fn spawn_membership_orchestrator(
         live: LiveWatchlist,
-        paper_writer: Writer,
+        mut paper_writer: Writer,
         paper_state: Arc<PaperStateDb>,
         control_rx: mpsc::Receiver<crate::orchestrator_control::OrchestratorControl>,
     ) -> tokio::task::JoinHandle<()> {
+        let paper_path = paper_writer.verified_tail().unwrap().path;
+        drop(paper_writer);
+        let paper_writer = PaperLog::open(paper_path).unwrap();
         tokio::spawn(
             membership_orchestrator(live, paper_writer, paper_state, control_rx)
                 .run(std::future::pending::<()>()),
@@ -2400,7 +2733,7 @@ mod paper_log_tests {
         append(
             &mut paper_writer,
             PAPER_LOG_SCHEMA_VERSION,
-            &PaperLogRecord::QualificationStarted(Box::new(started)),
+            &PaperLogRecord::QualificationStarted(Arc::new(started)),
         );
 
         let replacements = vec![
@@ -2526,7 +2859,7 @@ mod paper_log_tests {
         append(
             &mut paper_writer,
             PAPER_LOG_SCHEMA_VERSION,
-            &PaperLogRecord::QualificationStarted(Box::new(started)),
+            &PaperLogRecord::QualificationStarted(Arc::new(started)),
         );
         let state = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
         let mut source_writer = Writer::open(&source_path).unwrap();
@@ -2776,7 +3109,7 @@ mod paper_log_tests {
             append(
                 &mut paper_writer,
                 PAPER_LOG_SCHEMA_VERSION,
-                &PaperLogRecord::QualificationStarted(Box::new(start("knockout"))),
+                &PaperLogRecord::QualificationStarted(Arc::new(start("knockout"))),
             );
             let state = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
             state
@@ -3058,7 +3391,7 @@ mod paper_log_tests {
                     })
                     .unwrap();
                 let PaperLogFrame::Record(PaperLogRecord::MembershipChanged { evidence, .. }) =
-                    &mut frame.frame
+                    &mut Arc::make_mut(frame).frame
                 else {
                     unreachable!()
                 };
@@ -3201,7 +3534,7 @@ mod paper_log_tests {
             append(
                 &mut paper_writer,
                 PAPER_LOG_SCHEMA_VERSION,
-                &PaperLogRecord::QualificationStarted(Box::new(start("locked-wallet"))),
+                &PaperLogRecord::QualificationStarted(Arc::new(start("locked-wallet"))),
             );
             let state_path = dir.path().join("paper.db");
             let state = Arc::new(PaperStateDb::open(&state_path).unwrap());
@@ -3438,7 +3771,7 @@ mod paper_log_tests {
         append(
             &mut paper_writer,
             PAPER_LOG_SCHEMA_VERSION,
-            &PaperLogRecord::QualificationStarted(Box::new(start("stale-knockout"))),
+            &PaperLogRecord::QualificationStarted(Arc::new(start("stale-knockout"))),
         );
         let state = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
         state
@@ -3741,7 +4074,7 @@ mod paper_log_tests {
             append(
                 &mut paper_writer,
                 PAPER_LOG_SCHEMA_VERSION,
-                &PaperLogRecord::QualificationStarted(Box::new(start("partial-capacity"))),
+                &PaperLogRecord::QualificationStarted(Arc::new(start("partial-capacity"))),
             );
             let state = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
             for wallet in selected {
@@ -4098,7 +4431,7 @@ mod paper_log_tests {
         append(
             &mut writer,
             PAPER_LOG_SCHEMA_VERSION,
-            &PaperLogRecord::QualificationStarted(Box::new(start("activation"))),
+            &PaperLogRecord::QualificationStarted(Arc::new(start("activation"))),
         );
         drop(writer);
 
@@ -4168,7 +4501,7 @@ mod paper_log_tests {
         append(
             &mut paper_writer,
             PAPER_LOG_SCHEMA_VERSION,
-            &PaperLogRecord::QualificationStarted(Box::new(started)),
+            &PaperLogRecord::QualificationStarted(Arc::new(started)),
         );
         let mut source_writer = Writer::open(&source_path).unwrap();
         let ranking = append_membership_artifact(
@@ -4218,7 +4551,7 @@ mod paper_log_tests {
         append(
             &mut writer,
             PAPER_LOG_SCHEMA_VERSION,
-            &PaperLogRecord::QualificationStarted(Box::new(started)),
+            &PaperLogRecord::QualificationStarted(Arc::new(started)),
         );
         drop(writer);
         let era = paper_era(scan_paper_log(&paper_path).unwrap());
@@ -4249,7 +4582,7 @@ mod paper_log_tests {
         append(
             &mut paper_writer,
             PAPER_LOG_SCHEMA_VERSION,
-            &PaperLogRecord::QualificationStarted(Box::new(started)),
+            &PaperLogRecord::QualificationStarted(Arc::new(started)),
         );
         let mut source_writer = Writer::open(&source_path).unwrap();
         let ranking_receipt = append_membership_artifact(
@@ -4263,6 +4596,8 @@ mod paper_log_tests {
         drop(source_writer);
         let state = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
         let (tx, rx) = mpsc::channel(1);
+        drop(paper_writer);
+        let paper_writer = PaperLog::open(&paper_path).unwrap();
         let mut orchestrator =
             membership_orchestrator(live.clone(), paper_writer, state.clone(), rx);
         let hooks = Arc::new(crate::orchestrator::ScenarioHooks::default());
@@ -4333,13 +4668,14 @@ mod paper_log_tests {
         append(
             &mut writer,
             PAPER_LOG_SCHEMA_VERSION,
-            &PaperLogRecord::QualificationStarted(Box::new(start(
+            &PaperLogRecord::QualificationStarted(Arc::new(start(
                 HISTORICAL_MEMBERSHIP_PIN.activation_id,
             ))),
         );
         drop(writer);
         let mut era = paper_era(scan_paper_log(&path).unwrap());
-        era.frames[0].receipt.sequence = EventSeq(HISTORICAL_MEMBERSHIP_PIN.sequence);
+        Arc::make_mut(&mut era.frames[0]).receipt.sequence =
+            EventSeq(HISTORICAL_MEMBERSHIP_PIN.sequence);
         assert!(matches!(
             replay_membership(
                 &era,
@@ -4363,9 +4699,11 @@ mod paper_log_tests {
         append(
             &mut writer,
             PAPER_LOG_SCHEMA_VERSION,
-            &PaperLogRecord::QualificationStarted(Box::new(start("activation"))),
+            &PaperLogRecord::QualificationStarted(Arc::new(start("activation"))),
         );
-        writer.scenario_fail_next_sync();
+        drop(writer);
+        let writer = PaperLog::open(dir.path().join("paper.log")).unwrap();
+        writer.scenario_fail_next_sync().unwrap();
         let (tx, rx) = mpsc::channel(1);
         let orchestrator = membership_orchestrator(live.clone(), writer, paper_state.clone(), rx);
         let runtime = tokio::spawn(orchestrator.run_coordinated(std::future::pending::<()>()));
@@ -4410,7 +4748,7 @@ mod paper_log_tests {
         append(
             &mut writer,
             PAPER_LOG_SCHEMA_VERSION,
-            &PaperLogRecord::QualificationStarted(Box::new(start("activation"))),
+            &PaperLogRecord::QualificationStarted(Arc::new(start("activation"))),
         );
         drop(writer);
 
@@ -4443,12 +4781,12 @@ mod paper_log_tests {
         append(
             &mut one,
             PAPER_LOG_SCHEMA_VERSION,
-            &PaperLogRecord::QualificationStarted(Box::new(start("same"))),
+            &PaperLogRecord::QualificationStarted(Arc::new(start("same"))),
         );
         append(
             &mut one,
             PAPER_LOG_SCHEMA_VERSION,
-            &PaperLogRecord::QualificationStarted(Box::new(start("same"))),
+            &PaperLogRecord::QualificationStarted(Arc::new(start("same"))),
         );
         drop(one);
         assert!(matches!(
@@ -4461,7 +4799,7 @@ mod paper_log_tests {
         let first = append(
             &mut single,
             PAPER_LOG_SCHEMA_VERSION,
-            &PaperLogRecord::QualificationStarted(Box::new(start("same"))),
+            &PaperLogRecord::QualificationStarted(Arc::new(start("same"))),
         );
         drop(single);
         let single = paper_era(scan_paper_log(&single_path).unwrap());
@@ -4474,7 +4812,7 @@ mod paper_log_tests {
             append(
                 &mut conflict,
                 PAPER_LOG_SCHEMA_VERSION,
-                &PaperLogRecord::QualificationStarted(Box::new(start(activation))),
+                &PaperLogRecord::QualificationStarted(Arc::new(start(activation))),
             );
         }
         drop(conflict);
@@ -4497,7 +4835,7 @@ mod paper_log_tests {
         let start_receipt = append(
             &mut writer,
             PAPER_LOG_SCHEMA_VERSION,
-            &PaperLogRecord::QualificationStarted(Box::new(start("era"))),
+            &PaperLogRecord::QualificationStarted(Arc::new(start("era"))),
         );
         let only = append(
             &mut writer,
@@ -4516,7 +4854,7 @@ mod paper_log_tests {
         let start_receipt = append(
             &mut writer,
             PAPER_LOG_SCHEMA_VERSION,
-            &PaperLogRecord::QualificationStarted(Box::new(start("era"))),
+            &PaperLogRecord::QualificationStarted(Arc::new(start("era"))),
         );
         append(
             &mut writer,
@@ -4539,7 +4877,7 @@ mod paper_log_tests {
         let start_receipt = append(
             &mut writer,
             PAPER_LOG_SCHEMA_VERSION,
-            &PaperLogRecord::QualificationStarted(Box::new(start("completed"))),
+            &PaperLogRecord::QualificationStarted(Arc::new(start("completed"))),
         );
         let completed = append(
             &mut writer,
@@ -4564,7 +4902,7 @@ mod paper_log_tests {
         append(
             &mut writer,
             PAPER_LOG_SCHEMA_VERSION,
-            &PaperLogRecord::QualificationStarted(Box::new(start("risk"))),
+            &PaperLogRecord::QualificationStarted(Arc::new(start("risk"))),
         );
         append(
             &mut writer,
