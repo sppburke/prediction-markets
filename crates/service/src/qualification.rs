@@ -2076,7 +2076,7 @@ fn decision_rows_from_sealed_source(
     };
     let history = state.decision_pending_history()?;
     let (mut source_universe, binding_commitments) = source_universe?;
-    let mut disposed_bindings = HashMap::new();
+    let mut disposed_bindings = HashMap::<_, HashSet<_>>::new();
     let mut bound_streams = HashMap::new();
     for receipt in binding_commitments {
         let bindings = crate::bucket_commit::verified_commitment_bindings_with_lookup(
@@ -2103,19 +2103,21 @@ fn decision_rows_from_sealed_source(
             if binding.history_group_id == binding.stream_group_id {
                 continue;
             }
-            // One observation binds one history identity, in either direction.
-            if disposed_bindings
+            // One observation binds one history identity. A history identity may carry several
+            // differently stamped observations, as the commit path's verifier accepts.
+            if bound_streams
                 .insert(
-                    binding.history_group_id.clone(),
                     binding.stream_group_id.clone(),
+                    binding.history_group_id.clone(),
                 )
-                .is_some_and(|previous| previous != binding.stream_group_id)
-                || bound_streams
-                    .insert(binding.stream_group_id, binding.history_group_id.clone())
-                    .is_some_and(|previous| previous != binding.history_group_id)
+                .is_some_and(|previous| previous != binding.history_group_id)
             {
                 return insufficient("complete reads disagree about an observation binding target");
             }
+            disposed_bindings
+                .entry(binding.history_group_id)
+                .or_default()
+                .insert(binding.stream_group_id);
         }
     }
     let terminal_rows = history
@@ -2180,11 +2182,16 @@ fn decision_rows_from_sealed_source(
         let group = match state.activity_group_state(source_trade_id)? {
             Some(group) => group,
             None => {
-                let disposed = match disposed_bindings.get(source_trade_id) {
-                    Some(stream_id) => state.activity_group_state(stream_id)?,
-                    None => None,
-                };
-                if disposed.is_some_and(|group| group.disposition != "decision_pending") {
+                // Every observation bound to the absent history identity must be durable and
+                // disposed without a decision.
+                let streams = disposed_bindings.get(source_trade_id);
+                let mut disposed = streams.is_some();
+                for stream_id in streams.into_iter().flatten() {
+                    disposed &= state
+                        .activity_group_state(stream_id)?
+                        .is_some_and(|group| group.disposition != "decision_pending");
+                }
+                if disposed {
                     continue;
                 }
                 return insufficient(format!(
@@ -14113,6 +14120,47 @@ mod tests {
             "{map}"
         );
         assert_eq!(map.to_string(), indexed.to_string());
+    }
+
+    /// PASS: two authentic, differently stamped observations bound to one history identity in
+    /// separate reads select in both selectors, as the commit path's verifier accepts them.
+    #[test]
+    fn corrected_binding_selection_accepts_two_observations_of_one_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let mut writer = Writer::open(&source_path).unwrap();
+        let (first, _, _) =
+            crate::bucket_commit::continuation_v3_tests::append_binding_read("valid", &mut writer);
+        let (alias, _, _) =
+            crate::bucket_commit::continuation_v3_tests::append_binding_read("alias", &mut writer);
+        assert_eq!(first.facts.source_trade_id, alias.facts.source_trade_id);
+        drop(writer);
+        let state = PaperStateDb::open(&dir.path().join("state.db")).unwrap();
+        store_read_decision(&state, &first, "decision_pending", true);
+        let index = SourceReceiptIndex::replay(&source_path).unwrap();
+        let streams = [&first, &alias].map(|continuation| {
+            let observation = continuation
+                .observation_from_receipt_index(&index)
+                .unwrap()
+                .unwrap();
+            let stream = index.source_envelope(observation.source_receipt).unwrap();
+            parse_activity_trade_observation(&stream.payload)
+                .unwrap()
+                .group_id
+                .key()
+                .clone()
+        });
+        assert_ne!(
+            streams[0], streams[1],
+            "the two observations carry different stamps"
+        );
+        let candidate = Scanner::verify(&source_path).unwrap();
+        let sealed = TailBinding::from(&candidate);
+        let map = decision_rows_for_source_prefix(&state, &source_path, &prefix_at(None), &sealed);
+        let indexed =
+            decision_rows_for_indexed_source_prefix(&state, &index, &candidate, &prefix_at(None));
+        assert!(map.is_ok(), "{map:?}");
+        assert_selection_results_equal(map, indexed, &sealed);
     }
 
     /// PASS: malformed v5 policy and a valid policy substituted into authentic v2 bytes fail both selectors.

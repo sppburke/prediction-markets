@@ -5442,7 +5442,7 @@ pub(crate) mod continuation_v3_tests {
         let disposed = case.starts_with("disposed_");
         let stream_payload = serde_json::to_vec(
             &json!({"proxyWallet":"0x1111111111111111111111111111111111111111",
-        "conditionId":"old", "asset":"123", "side":"BUY", "size":1, "price":0.5,
+        "conditionId":if case == "alias" { "alias" } else { "old" }, "asset":"123", "side":"BUY", "size":1, "price":0.5,
         "timestamp":99, "transactionHash":"tx", "outcomeIndex":if disposed { 0 } else { 1 }}),
         )
         .unwrap();

@@ -4571,9 +4571,10 @@ async fn restamp_twins_single_multirow_and_recorded_siblings_preserve_later_deci
 }
 
 /// AC5 with the activity feed: a restamp read beside its recorded original is one trade. A feed
-/// observation stamped like neither binds the original instead of fencing the wallet; the twin
-/// records `raw_only` with no ledger, re-anchor or fence effect, covered or not; the read's open
-/// decisions re-verify from the source log, and a later first entry in another market decides.
+/// observation stamped like neither binds the original instead of fencing the wallet, and so does
+/// a second, differently stamped observation; the twin records `raw_only` with no ledger,
+/// re-anchor or fence effect, covered or not; boot rebuild and the open decisions re-verify from
+/// the source log, and a later first entry in another market decides.
 #[tokio::test(start_paused = true)]
 async fn feed_observation_of_a_restamp_pair_binds_the_recorded_original() {
     for covered in [false, true] {
@@ -4610,7 +4611,7 @@ async fn feed_observation_of_a_restamp_pair_binds_the_recorded_original() {
         stream["conditionId"] = json!("incorrect-stream-stamp");
         let stream_id = aggregate(stream.clone()).group_id.key().clone();
         running.now.store(EPOCH + 1, Ordering::SeqCst);
-        let stream_receipt = running.observe(stream).await;
+        let stream_receipt = running.observe(stream.clone()).await;
         let entry = activity_row(
             "TRADE",
             "after-restamp",
@@ -4621,13 +4622,28 @@ async fn feed_observation_of_a_restamp_pair_binds_the_recorded_original() {
             EPOCH + 1,
         );
         let entry_id = aggregate(entry.clone()).group_id.key().clone();
+        let read = serde_json::to_vec(&[original, restamp, entry]).unwrap();
         running
             .requests
             .recv()
             .await
             .unwrap()
             .respond
-            .send(serde_json::to_vec(&[original, restamp, entry]).unwrap())
+            .send(read.clone())
+            .unwrap();
+        running.completed(wallet()).await;
+        // A second, differently stamped observation of the same trade binds the same original.
+        let mut alias = stream;
+        alias["outcomeIndex"] = json!(999);
+        let alias_id = aggregate(alias.clone()).group_id.key().clone();
+        let alias_receipt = running.observe(alias).await;
+        running
+            .requests
+            .recv()
+            .await
+            .unwrap()
+            .respond
+            .send(read)
             .unwrap();
         running.completed(wallet()).await;
         let commits = running.finish().await;
@@ -4660,19 +4676,34 @@ async fn feed_observation_of_a_restamp_pair_binds_the_recorded_original() {
         assert_eq!(market_b_positions(), before);
 
         let source = dir.path().join("source.log");
-        let commitment = source_frames(&source)
+        let bindings = source_frames(&source)
             .into_iter()
-            .rfind(|frame| {
+            .filter(|frame| {
                 frame.source_id.0 == pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID
             })
-            .unwrap();
-        let commitment: pe_service::bucket_commit::ActivityReadCommitment =
-            serde_json::from_slice(&commitment.payload).unwrap();
-        let bindings = commitment.bindings.unwrap();
-        assert_eq!(bindings.len(), 1);
-        assert_eq!(bindings[0].stream_group_id, stream_id);
-        assert_eq!(bindings[0].stream_receipt, stream_receipt);
-        assert_eq!(bindings[0].history_group_id, original_id);
+            .flat_map(|frame| {
+                serde_json::from_slice::<pe_service::bucket_commit::ActivityReadCommitment>(
+                    &frame.payload,
+                )
+                .unwrap()
+                .bindings
+                .unwrap_or_default()
+            })
+            .map(|binding| {
+                (
+                    binding.stream_group_id,
+                    binding.stream_receipt,
+                    binding.history_group_id,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            bindings,
+            vec![
+                (stream_id, stream_receipt, original_id.clone()),
+                (alias_id, alias_receipt, original_id.clone()),
+            ]
+        );
         assert!(
             pe_service::trade_poller::rebuild_reconciliation_obligations(&source, &paper)
                 .unwrap()
