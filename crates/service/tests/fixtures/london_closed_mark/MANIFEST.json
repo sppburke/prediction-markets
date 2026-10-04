@@ -1,0 +1,32 @@
+{
+ "prices_history_120s.json": {
+  "url": "https://clob.polymarket.com/prices-history?market=27556300168112004153063282106116891181228462668915873615116883805553394180154&startTs=1790985480&endTs=1790985600&fidelity=1",
+  "status": 200,
+  "bytes": 15,
+  "sha256": "7f8b497c3d718d756d8c2130e657c4c414d5da9bed777aa29bc3221fdbcf0dc5",
+  "fetched_at": "2026-10-03T05:24:00Z"
+ },
+ "prices_history_13d.json": {
+  "url": "https://clob.polymarket.com/prices-history?market=27556300168112004153063282106116891181228462668915873615116883805553394180154&startTs=1789862400&endTs=1790985600&fidelity=1",
+  "status": 200,
+  "bytes": 106929,
+  "sha256": "df3cbf83c1ad0db015d206bb36a23038d931cc77e645d4fc0f888e92f2e84314",
+  "fetched_at": "2026-10-03T05:24:01Z",
+  "points": 4003,
+  "first": {
+   "t": 1790744896,
+   "p": 0.415
+  },
+  "last": {
+   "t": 1790985077,
+   "p": 0.0005
+  }
+ },
+ "gamma_closed.json": {
+  "url": "https://gamma-api.polymarket.com/markets?condition_ids=0x50365ef0731cfa26e35d89b66a91bca5ef1ee8090b02d1ced099acc738868e87&closed=true&limit=500",
+  "status": 200,
+  "bytes": 9779,
+  "sha256": "9450a64742fb0f73707024879093a90327bcd3c1ad7bc8c40bb72ab493bb7b2e",
+  "fetched_at": "2026-10-03T05:24:01Z"
+ }
+}

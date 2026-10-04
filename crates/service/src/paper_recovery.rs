@@ -1196,6 +1196,8 @@ pub struct PaperMarkPrice {
     pub price: Option<Price>,
     pub sample_unix: Option<i64>,
     pub receipt: Option<AppendReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closure_receipt: Option<AppendReceipt>,
     pub invalid: Option<String>,
 }
 
@@ -2278,6 +2280,7 @@ mod paper_log_tests {
                     price: Some(Price::new(dec!(0.6)).unwrap()),
                     sample_unix: Some(19),
                     receipt: Some(receipt(8)),
+                    closure_receipt: None,
                     invalid: None,
                 }],
                 cash: dec!(99),

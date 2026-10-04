@@ -8615,6 +8615,60 @@ mod tests {
         envelope
     }
 
+    #[test]
+    fn live_risk_replay_accepts_the_selected_closed_condition_request() {
+        let (_dir, account_id, events, mut sources, paper_frames, admission) =
+            reconstructed_live_risk_fixture();
+        let receipt = admission.economic.risk.price_receipts[0];
+        let source = sources
+            .iter_mut()
+            .find(|source| source.seq == receipt.sequence)
+            .unwrap();
+        let mut record: GammaPriceAttemptRecord = serde_json::from_slice(&source.payload).unwrap();
+        let GammaPriceAttemptRecord::Page { evidence, .. } = &mut record else {
+            unreachable!()
+        };
+        evidence.request_url = evidence
+            .request_url
+            .replace("&limit=", "&closed=true&limit=");
+        source.payload = serde_json::to_vec(&record).unwrap();
+        verify_replayed_live_risk(&account_id, &events, &admission, &sources, &paper_frames)
+            .unwrap();
+    }
+
+    #[test]
+    fn live_daily_mark_replay_keeps_the_london_empty_window_refusal() {
+        let cutoff = 1_790_985_600;
+        let token = "27556300168112004153063282106116891181228462668915873615116883805553394180154";
+        let receipt = fixture_receipt(1);
+        let price = pe_execution_core::MarkPrice {
+            condition_id: PolymarketConditionId(
+                "0x50365ef0731cfa26e35d89b66a91bca5ef1ee8090b02d1ced099acc738868e87".to_owned(),
+            ),
+            outcome_index: 0,
+            price: Price::new(dec!(0.0005)).unwrap(),
+            observed_unix: 1_790_985_077,
+            receipt,
+        };
+        for payload in [
+            include_bytes!("../tests/fixtures/london_closed_mark/prices_history_120s.json")
+                .as_slice(),
+            include_bytes!("../tests/fixtures/london_closed_mark/prices_history_13d.json")
+                .as_slice(),
+        ] {
+            let source = source_envelope(
+                receipt,
+                "pe-service.clob-prices-history",
+                payload.to_vec(),
+                OffsetDateTime::from_unix_timestamp(cutoff).unwrap(),
+            );
+            assert!(matches!(
+                verify_mark_price(&price, token, cutoff, &[source]),
+                Err(ProjectionReducerError::InvalidPriceEvidence)
+            ));
+        }
+    }
+
     async fn append_recovery_risk_price(
         state: &FanoutState,
         now: OffsetDateTime,

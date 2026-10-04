@@ -1407,6 +1407,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     price: None,
                     sample_unix: None,
                     receipt: None,
+                    closure_receipt: None,
                     invalid: Some(reason),
                 });
                 continue;
@@ -1419,11 +1420,15 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             #[cfg(not(feature = "scenario"))]
             let scenario_mark = None;
             let fetched = match scenario_mark {
-                Some(mark) => Ok(mark),
-                None => mark_fetcher.fetch(token_id, cutoff_unix).await,
+                Some(mark) => Ok((mark, None)),
+                None => {
+                    mark_fetcher
+                        .fetch_paper(&key.0, token_id, cutoff_unix)
+                        .await
+                }
             };
             match fetched {
-                Ok(mark) => {
+                Ok((mark, closure_receipt)) => {
                     let net = position.long.checked_sub(position.short).map_err(|_| {
                         "daily boundary encountered a net-short paper position".to_owned()
                     })?;
@@ -1434,6 +1439,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                         price: Some(mark.price),
                         sample_unix: Some(mark.sample_unix),
                         receipt: Some(mark.receipt),
+                        closure_receipt,
                         invalid: None,
                     });
                 }
@@ -1447,6 +1453,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                         price: None,
                         sample_unix: None,
                         receipt: None,
+                        closure_receipt: None,
                         invalid: Some(reason),
                     });
                 }

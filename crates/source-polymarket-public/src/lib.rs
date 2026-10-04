@@ -57,8 +57,8 @@ pub use fetcher::{
 };
 pub use gamma_markets::{
     GAMMA_BATCH_LIMIT_PARAM, GAMMA_BATCH_SIZE, GAMMA_BROWSER_UA, GAMMA_MARKETS_PARSER_VERSION,
-    GAMMA_MARKETS_SCHEMA_VERSION, GAMMA_MARKETS_SOURCE_ID, GammaMarket, GammaMarkets,
-    GammaMarketsClient, GammaMarketsError, GammaMarketsWithPages, GammaOpenConditionRequest,
+    GAMMA_MARKETS_SCHEMA_VERSION, GAMMA_MARKETS_SOURCE_ID, GammaConditionRequest, GammaMarket,
+    GammaMarkets, GammaMarketsClient, GammaMarketsError, GammaMarketsWithPages,
     GammaTokenMarketsError, MarketFilter, MetadataIdentityError, MetadataPageEvidence,
     VerifiedTokenIdentity, parse_outcome_prices,
 };

@@ -1310,11 +1310,14 @@ async fn main() -> Result<()> {
         .timeout(Duration::from_secs(20))
         .build()
         .context("build bounded market-admission HTTP client")?;
-    let boundary_mark_fetcher = Arc::new(pe_service::mark_prices::HistoricalMarkAdapter::new(
-        admission_http_client.clone(),
-        cfg.polymarket_clob_base_url.clone(),
-        orchestrator_source_log.clone(),
-    ));
+    let boundary_mark_fetcher = Arc::new(
+        pe_service::mark_prices::HistoricalMarkAdapter::new(
+            admission_http_client.clone(),
+            cfg.polymarket_clob_base_url.clone(),
+            orchestrator_source_log.clone(),
+        )
+        .with_gamma_base_url(admission_http_client.clone(), cfg.gamma_base_url.clone()),
+    );
     let admission_builder = pe_service::live_venue_adapter::LiveAdmissionBuilder::new(
         admission_http_client,
         cfg.gamma_base_url.clone(),

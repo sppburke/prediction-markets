@@ -43,7 +43,6 @@ use pe_risk_engine::{
     BinaryPayout, KILL_SWITCH_DRAWDOWN_BPS, RiskDecision, RiskHaltCause,
     aggregate_resolution_credit, evaluate_risk, nearest_rank_p95,
 };
-use pe_source_polymarket_public::ClassifiedPricesHistory;
 #[cfg(test)]
 use pe_source_polymarket_public::{
     ACTIVITY_MAX_OFFSET, GAMMA_BATCH_LIMIT_PARAM, GAMMA_MARKETS_PARSER_VERSION,
@@ -54,8 +53,7 @@ use pe_source_polymarket_public::{
 use pe_source_polymarket_public::{
     ActivityParseContext, ActivityTransport, ActivityType, BinaryPayoutVector,
     CLOB_RESOLUTION_PARSER_VERSION, CLOB_RESOLUTION_SCHEMA_VERSION, ClobPayoutResolution,
-    ClobPricesHistoryClient, FixtureFetcher, parse_activity_row, parse_activity_trade_observation,
-    parse_clob_market,
+    parse_activity_row, parse_activity_trade_observation, parse_clob_market,
 };
 use pe_trader_index::score::lcb_5pct_decimal;
 use rust_decimal::{Decimal, MathematicalOps};
@@ -93,8 +91,8 @@ use crate::paper_recovery::{
 };
 use crate::risk_inputs::{
     PaperExposureBase, RiskInputsUnavailable, SourceReceiptIndex, apply_global_risk_halts,
-    build_paper_risk_base, build_paper_risk_snapshot_from_source_receipts, historical_mark_price,
-    paper_prefix_at_financial_prefix,
+    build_paper_risk_base, build_paper_risk_snapshot_from_source_receipts,
+    paper_prefix_at_financial_prefix, replay_paper_mark_price,
 };
 use crate::runtime_config::{
     ConfigEra, ConfigRow, RISK_HALT_RELEASE_HASH_KEY, RuntimeConfig, parse_config,
@@ -707,6 +705,7 @@ impl FinancialFactState {
 }
 
 struct CausalFinancialState {
+    token_by_position: HashMap<(String, u16), String>,
     cash: Decimal,
     positions: Vec<OpenPosition>,
     last_completed: Option<EventSeq>,
@@ -4173,7 +4172,25 @@ fn causal_financial_state(
             _ => return insufficient("causal mark Prepared/Final kinds disagree"),
         }
     }
+    let token_by_position = facts
+        .iter()
+        .filter_map(|fact| match &fact.payload {
+            FinancialPayload::Fill { economic, .. }
+                if completed_prepared.contains(&fact.prepared_receipt.sequence) =>
+            {
+                Some((
+                    (
+                        economic.market.market_id.clone(),
+                        u16::from(economic.market.outcome_index),
+                    ),
+                    economic.market.token_id.0.clone(),
+                ))
+            }
+            _ => None,
+        })
+        .collect();
     Ok(CausalFinancialState {
+        token_by_position,
         cash: financial.cash,
         positions: financial.positions,
         last_completed: financial.last_completed,
@@ -4270,13 +4287,60 @@ async fn verify_mark(
                 "PortfolioMark price observation disappeared during replay".to_owned(),
             )
         })?;
-        let classified = classify_recorded_prices_history(observation).await?;
-        let selected =
-            historical_mark_price(&classified, mark.cutoff_unix, receipt).map_err(|error| {
-                QualificationError::InsufficientEvidence(format!(
-                    "PortfolioMark historical selection failed: {error}"
-                ))
+        if observation.source_id != "pe-service.clob-prices-history"
+            || observation.schema_version != 1
+            || observation.parser_version != 1
+        {
+            return insufficient("PortfolioMark price receipt has the wrong source contract");
+        }
+        let closure_payload = if let Some(receipt) = price.closure_receipt {
+            let closure = source
+                .get(&receipt.sequence.0)
+                .filter(|observation| observation.receipt == receipt)
+                .ok_or_else(|| {
+                    QualificationError::InsufficientEvidence(
+                        "PortfolioMark closure receipt is absent from sealed source prefix"
+                            .to_owned(),
+                    )
+                })?;
+            if receipt.sequence <= mark.boundary_receipt.sequence
+                || receipt.sequence > source_tail_sequence
+                || !price_receipts.insert(receipt_key(receipt))
+                || closure.source_id != pe_source_polymarket_public::GAMMA_MARKETS_SOURCE_ID
+                || closure.schema_version
+                    != pe_source_polymarket_public::GAMMA_MARKETS_SCHEMA_VERSION
+                || closure.parser_version
+                    != pe_source_polymarket_public::GAMMA_MARKETS_PARSER_VERSION
+            {
+                return insufficient(
+                    "PortfolioMark closure receipt has invalid causal source evidence",
+                );
+            }
+            Some(closure.payload.as_slice())
+        } else {
+            None
+        };
+        let token_id = financial
+            .token_by_position
+            .get(&(price.market_id.clone(), price.outcome_id))
+            .ok_or_else(|| {
+                QualificationError::InsufficientEvidence(
+                    "PortfolioMark position has no causal Prepared token mapping".to_owned(),
+                )
             })?;
+        let selected = replay_paper_mark_price(
+            price,
+            token_id,
+            mark.cutoff_unix,
+            &observation.payload,
+            closure_payload,
+        )
+        .await
+        .map_err(|error| {
+            QualificationError::InsufficientEvidence(format!(
+                "PortfolioMark historical selection failed: {error}",
+            ))
+        })?;
         if selected.price != value
             || Some(selected.sample_unix) != price.sample_unix
             || selected.receipt != receipt
@@ -4319,42 +4383,6 @@ async fn verify_mark(
         cash: mark.cash,
         equity: mark.equity,
     })
-}
-
-async fn classify_recorded_prices_history(
-    observation: &SourceObservation,
-) -> Result<ClassifiedPricesHistory, QualificationError> {
-    if observation.source_id != "pe-service.clob-prices-history"
-        || observation.schema_version != 1
-        || observation.parser_version != 1
-    {
-        return insufficient("PortfolioMark price receipt has the wrong source contract");
-    }
-    let base_url = "https://offline.invalid";
-    let request_url =
-        format!("{base_url}/prices-history?market=recorded&startTs=0&endTs=1&fidelity=1");
-    let replayed = ClobPricesHistoryClient::new(
-        base_url.to_owned(),
-        FixtureFetcher::new(HashMap::from([(request_url, observation.payload.clone())])),
-    )
-    .with_fidelity_minutes(1)
-    .fetch_prices_history_classified("recorded", 0, 1)
-    .await
-    .map_err(|error| {
-        QualificationError::InsufficientEvidence(format!(
-            "PortfolioMark production historical parse failed: {error}"
-        ))
-    })?;
-    if replayed.body != observation.payload {
-        return insufficient("PortfolioMark historical parser did not consume the recorded body");
-    }
-    if let ClassifiedPricesHistory::Points(points) = &replayed.outcome {
-        let mut timestamps = HashSet::new();
-        if points.iter().any(|point| !timestamps.insert(point.t)) {
-            return insufficient("PortfolioMark historical response contains a duplicate sample");
-        }
-    }
-    Ok(replayed.outcome)
 }
 
 fn complete_day_growth(
@@ -11147,6 +11175,155 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn qualification_replays_selected_closed_current_prices() {
+        let market = MarketId(VenueMarketId("condition-closed".to_owned()));
+        let position = PaperPositionRow {
+            market_id: market.clone(),
+            outcome_id: OutcomeId(0),
+            long: ShareAmount::from_whole(1).unwrap(),
+            short: ShareAmount::ZERO,
+        };
+        let url = format!(
+            "https://offline.invalid/markets?condition_ids={market}&closed=true&limit={GAMMA_BATCH_LIMIT_PARAM}"
+        );
+        let payload = gamma_price_page_record(&url, 100_000, br#"[{"conditionId":"condition-closed","closed":true,"outcomePrices":"[\"0.0005\",\"0.9995\"]"}]"#, true);
+        let observation = source_observation(
+            2,
+            100_000,
+            GAMMA_MARKETS_SOURCE_ID,
+            GAMMA_PRICE_ATTEMPT_SCHEMA_VERSION,
+            GAMMA_PRICE_ATTEMPT_PARSER_VERSION,
+            &payload,
+        );
+        let receipt = observation.receipt;
+        let prices = replayed_risk_prices(
+            &[receipt],
+            100_000,
+            &[position],
+            &BTreeMap::from([(2, observation)]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            prices[&(market, OutcomeId(0))],
+            Price::new(dec!(0.0005)).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn qualification_mark_replays_both_rules_and_authenticates_closure() {
+        let cutoff = 1_790_985_600;
+        let condition = "0x50365ef0731cfa26e35d89b66a91bca5ef1ee8090b02d1ced099acc738868e87";
+        let token = "27556300168112004153063282106116891181228462668915873615116883805553394180154";
+        let financial = CausalFinancialState {
+            token_by_position: HashMap::from([((condition.to_owned(), 0), token.to_owned())]),
+            cash: dec!(99),
+            positions: vec![OpenPosition {
+                condition_id: condition.to_owned(),
+                market_id: condition.to_owned(),
+                outcome_index: 0,
+                shares_atomic: 2_000_000,
+            }],
+            last_completed: Some(EventSeq(10)),
+            completed_prepared: HashSet::from([EventSeq(10)]),
+            closed_fill_final_conditions: HashMap::new(),
+        };
+        for closed in [false, true] {
+            let value = if closed { dec!(0.0005) } else { dec!(0.4) };
+            let history = if closed {
+                include_bytes!("../tests/fixtures/london_closed_mark/prices_history_13d.json")
+                    .to_vec()
+            } else {
+                format!(r#"{{"history":[{{"t":{},"p":0.4}}]}}"#, cutoff - 60).into_bytes()
+            };
+            let boundary = source_observation(
+                1,
+                cutoff * 1_000,
+                "pe-service.boundary",
+                1,
+                1,
+                &serde_json::to_vec(
+                    &serde_json::json!({"kind":"daily_boundary","cutoff_unix":cutoff}),
+                )
+                .unwrap(),
+            );
+            let closure = source_observation(
+                3,
+                cutoff * 1_000 + 1_000,
+                GAMMA_MARKETS_SOURCE_ID,
+                GAMMA_MARKETS_SCHEMA_VERSION,
+                GAMMA_MARKETS_PARSER_VERSION,
+                include_bytes!("../tests/fixtures/london_closed_mark/gamma_closed.json"),
+            );
+            let history = source_observation(
+                4,
+                cutoff * 1_000 + 2_000,
+                "pe-service.clob-prices-history",
+                1,
+                1,
+                &history,
+            );
+            let mark = PortfolioMark {
+                boundary_receipt: boundary.receipt,
+                cutoff_unix: cutoff,
+                source_tail: TailBinding {
+                    physical_tail: 0,
+                    last_sequence: Some(history.receipt.sequence),
+                    last_hash: history.receipt.this_hash.to_hex().to_string(),
+                },
+                financial_prefix_seq: financial.last_completed,
+                prices: vec![crate::paper_recovery::PaperMarkPrice {
+                    market_id: condition.to_owned(),
+                    outcome_id: 0,
+                    price: Some(Price::new(value).unwrap()),
+                    sample_unix: Some(if closed { 1_790_985_077 } else { cutoff - 60 }),
+                    receipt: Some(history.receipt),
+                    closure_receipt: closed.then_some(closure.receipt),
+                    invalid: None,
+                }],
+                cash: financial.cash,
+                equity: financial.cash + dec!(2) * value,
+                invalid: None,
+            };
+            let mut source = BTreeMap::from([(1, boundary), (3, closure), (4, history)]);
+            assert_eq!(
+                verify_mark(&mark, &financial, &source)
+                    .await
+                    .unwrap()
+                    .equity,
+                mark.equity
+            );
+            if closed {
+                let mut legacy = mark.clone();
+                legacy.prices[0].closure_receipt = None;
+                assert!(verify_mark(&legacy, &financial, &source).await.is_err());
+                let mut invalid = mark.clone();
+                invalid.prices[0].closure_receipt = Some(test_receipt(100));
+                assert!(verify_mark(&invalid, &financial, &source).await.is_err());
+                for mutation in ["open", "later", "unknown", "wrong_condition"] {
+                    let mut row: serde_json::Value = serde_json::from_slice(include_bytes!(
+                        "../tests/fixtures/london_closed_mark/gamma_closed.json"
+                    ))
+                    .unwrap();
+                    match mutation {
+                        "open" => row[0]["closed"] = serde_json::json!(false),
+                        "later" => {
+                            row[0]["closedTime"] = serde_json::json!("2026-10-03 00:00:01+00")
+                        }
+                        "unknown" => row[0]["closedTime"] = serde_json::Value::Null,
+                        _ => row[0]["conditionId"] = serde_json::json!("other"),
+                    }
+                    source.get_mut(&3).unwrap().payload = serde_json::to_vec(&row).unwrap();
+                    assert!(
+                        verify_mark(&mark, &financial, &source).await.is_err(),
+                        "{mutation}"
+                    );
+                }
+            }
+        }
     }
 
     fn financial_era_live_source_fixture(root: &Path) -> (FinancialEraManifest, ServiceConfig) {

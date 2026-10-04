@@ -15,7 +15,10 @@ use pe_risk_engine::{
     EquityInputs, PnlWindow, RiskHaltCause, RiskMathError, RiskSnapshot, current_equity,
     latency_switch, nearest_rank_p95, pnl_bps,
 };
-use pe_source_polymarket_public::ClassifiedPricesHistory;
+use pe_source_polymarket_public::{
+    ClassifiedPricesHistory, ClobPricesHistoryClient, FixtureFetcher, GAMMA_BATCH_LIMIT_PARAM,
+    GammaConditionRequest, GammaMarket, GammaMarketsClient,
+};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +32,8 @@ use crate::paper_recovery::{
 const SECONDS_PER_HOUR: i64 = 3_600;
 const SECONDS_PER_DAY: i64 = 86_400;
 pub(crate) const MAX_HISTORICAL_MARK_AGE_SECS: i64 = 120;
+/// Canonical `closed_mark_lookback_secs` in `docs/_GLOSSARY.md`.
+pub(crate) const CLOSED_MARK_LOOKBACK_SECS: i64 = 1_123_200;
 
 /// Apply the strategy-wide halt overlay reconstructed from the durable paper prefix. Halt owners
 /// are deliberately ignored here: every active cause gates every new strategy entry.
@@ -122,6 +127,123 @@ pub(crate) fn historical_mark_price(
     cutoff_unix: i64,
     receipt: AppendReceipt,
 ) -> Result<HistoricalMarkPrice, RiskInputsUnavailable> {
+    select_historical_mark_price(
+        classified,
+        cutoff_unix,
+        receipt,
+        MAX_HISTORICAL_MARK_AGE_SECS,
+    )
+}
+
+/// Paper-only rule: recorded closure at or before the cutoff permits the longer history window.
+pub(crate) fn closed_historical_mark_price(
+    classified: &ClassifiedPricesHistory,
+    condition_id: &str,
+    closure: &GammaMarket,
+    cutoff_unix: i64,
+    receipt: AppendReceipt,
+) -> Result<HistoricalMarkPrice, RiskInputsUnavailable> {
+    if closure.condition_id != condition_id
+        || !closure.closed
+        || closure
+            .closed_time_unix
+            .is_none_or(|closed| closed > cutoff_unix)
+    {
+        return Err(RiskInputsUnavailable::MarkInvalid);
+    }
+    select_historical_mark_price(classified, cutoff_unix, receipt, CLOSED_MARK_LOOKBACK_SECS)
+}
+
+/// Replay the paper rule selected by the durable closure receipt, rebuilding both request bounds
+/// from the held identity and cutoff. Receipt/source authentication belongs to the caller.
+pub(crate) async fn replay_paper_mark_price(
+    price: &crate::paper_recovery::PaperMarkPrice,
+    token_id: &str,
+    cutoff_unix: i64,
+    history_payload: &[u8],
+    closure_payload: Option<&[u8]>,
+) -> Result<HistoricalMarkPrice, BoundaryMarkError> {
+    let receipt = price.receipt.ok_or(BoundaryMarkError::Invalid(
+        RiskInputsUnavailable::PriceMissing,
+    ))?;
+    let lookback_secs = if price.closure_receipt.is_some() {
+        CLOSED_MARK_LOOKBACK_SECS
+    } else {
+        MAX_HISTORICAL_MARK_AGE_SECS
+    };
+    let start_unix = cutoff_unix
+        .checked_sub(lookback_secs)
+        .ok_or(BoundaryMarkError::Invalid(RiskInputsUnavailable::Overflow))?;
+    let base_url = "https://offline.invalid";
+    let url = format!(
+        "{base_url}/prices-history?market={token_id}&startTs={start_unix}&endTs={cutoff_unix}&fidelity=1"
+    );
+    let replayed = ClobPricesHistoryClient::new(
+        base_url.to_owned(),
+        FixtureFetcher::new(HashMap::from([(url, history_payload.to_vec())])),
+    )
+    .with_fidelity_minutes(1)
+    .fetch_prices_history_classified(token_id, start_unix, cutoff_unix)
+    .await
+    .map_err(|error| BoundaryMarkError::Classification(error.to_string()))?;
+    if replayed.body != history_payload {
+        return Err(BoundaryMarkError::Invalid(
+            RiskInputsUnavailable::MarkInvalid,
+        ));
+    }
+    if let ClassifiedPricesHistory::Points(points) = &replayed.outcome {
+        let mut timestamps = HashSet::new();
+        if points.iter().any(|point| !timestamps.insert(point.t)) {
+            return Err(BoundaryMarkError::Invalid(
+                RiskInputsUnavailable::PriceConflict,
+            ));
+        }
+    }
+    if price.closure_receipt.is_none() {
+        return historical_mark_price(&replayed.outcome, cutoff_unix, receipt)
+            .map_err(BoundaryMarkError::Invalid);
+    }
+    let payload = closure_payload.ok_or(BoundaryMarkError::Invalid(
+        RiskInputsUnavailable::MarkInvalid,
+    ))?;
+    let url = format!(
+        "{base_url}/markets?condition_ids={}&closed=true&limit={GAMMA_BATCH_LIMIT_PARAM}",
+        price.market_id,
+    );
+    let request = GammaConditionRequest::parse(&url).ok_or(BoundaryMarkError::Invalid(
+        RiskInputsUnavailable::MarkInvalid,
+    ))?;
+    let fetched = GammaMarketsClient::new(
+        request.base_url,
+        FixtureFetcher::new(HashMap::from([(url, payload.to_vec())])),
+    )
+    .fetch_markets_with_pages(&request.condition_ids, request.filter)
+    .await
+    .map_err(|error| BoundaryMarkError::Classification(error.to_string()))?;
+    let closure =
+        fetched
+            .markets
+            .markets
+            .get(&price.market_id)
+            .ok_or(BoundaryMarkError::Invalid(
+                RiskInputsUnavailable::MarkInvalid,
+            ))?;
+    closed_historical_mark_price(
+        &replayed.outcome,
+        &price.market_id,
+        closure,
+        cutoff_unix,
+        receipt,
+    )
+    .map_err(BoundaryMarkError::Invalid)
+}
+
+fn select_historical_mark_price(
+    classified: &ClassifiedPricesHistory,
+    cutoff_unix: i64,
+    receipt: AppendReceipt,
+    max_age_secs: i64,
+) -> Result<HistoricalMarkPrice, RiskInputsUnavailable> {
     let points = match classified {
         ClassifiedPricesHistory::Points(points) => points,
         ClassifiedPricesHistory::Empty => return Err(RiskInputsUnavailable::PriceMissing),
@@ -149,7 +271,7 @@ pub(crate) fn historical_mark_price(
     let age = cutoff_unix
         .checked_sub(latest_unix)
         .ok_or(RiskInputsUnavailable::Overflow)?;
-    if age > MAX_HISTORICAL_MARK_AGE_SECS {
+    if age > max_age_secs {
         return Err(RiskInputsUnavailable::PriceStale);
     }
     let price = Price::new(first.price).map_err(|_| RiskInputsUnavailable::MarkInvalid)?;
@@ -1974,6 +2096,121 @@ mod tests {
                 sample_unix: 880,
                 receipt: receipt(7, 7),
             }
+        );
+    }
+
+    #[tokio::test]
+    async fn paper_mark_replay_selects_closure_rule_only_when_the_receipt_is_present() {
+        let cutoff = 1_790_985_600;
+        let condition = "0x50365ef0731cfa26e35d89b66a91bca5ef1ee8090b02d1ced099acc738868e87";
+        let token = "27556300168112004153063282106116891181228462668915873615116883805553394180154";
+        let history =
+            include_bytes!("../tests/fixtures/london_closed_mark/prices_history_13d.json");
+        let closure = include_bytes!("../tests/fixtures/london_closed_mark/gamma_closed.json");
+        let mut price = crate::paper_recovery::PaperMarkPrice {
+            market_id: condition.to_owned(),
+            outcome_id: 0,
+            price: Some(Price::new(dec!(0.0005)).unwrap()),
+            sample_unix: Some(1_790_985_077),
+            receipt: Some(receipt(4, 4)),
+            closure_receipt: Some(receipt(3, 3)),
+            invalid: None,
+        };
+        let selected = replay_paper_mark_price(&price, token, cutoff, history, Some(closure))
+            .await
+            .unwrap();
+        assert_eq!(selected.price, price.price.unwrap());
+        assert_eq!(selected.sample_unix, price.sample_unix.unwrap());
+        let mut marked = mark(2, cutoff, dec!(99.001), None);
+        let PaperLogFrame::Record(PaperLogRecord::PortfolioMark(mark)) =
+            &mut Arc::make_mut(&mut marked).frame
+        else {
+            unreachable!()
+        };
+        mark.prices.push(price.clone());
+        let era = era_with_marks(vec![marked]);
+        assert_eq!(
+            preceding_midnight_equity(&era, cutoff + 1).unwrap(),
+            Some(dec!(99.001))
+        );
+        price.closure_receipt = None;
+        assert!(matches!(
+            replay_paper_mark_price(&price, token, cutoff, history, Some(closure)).await,
+            Err(BoundaryMarkError::Invalid(
+                RiskInputsUnavailable::PriceStale
+            ))
+        ));
+        let recent = format!(
+            r#"{{"history":[{{"t":{},"p":0.4}}]}}"#,
+            cutoff - MAX_HISTORICAL_MARK_AGE_SECS
+        );
+        assert_eq!(
+            replay_paper_mark_price(&price, token, cutoff, recent.as_bytes(), None)
+                .await
+                .unwrap()
+                .price,
+            Price::new(dec!(0.4)).unwrap()
+        );
+        let encoded = serde_json::to_value(&price).unwrap();
+        assert!(encoded.get("closure_receipt").is_none());
+        assert_eq!(
+            serde_json::from_value::<crate::paper_recovery::PaperMarkPrice>(encoded).unwrap(),
+            price
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_mark_selection_enforces_the_lookback_and_closure_cutoff() {
+        let cutoff = 1_790_985_600;
+        let condition = "0x50365ef0731cfa26e35d89b66a91bca5ef1ee8090b02d1ced099acc738868e87";
+        let url = format!(
+            "https://offline.invalid/markets?condition_ids={condition}&closed=true&limit={GAMMA_BATCH_LIMIT_PARAM}"
+        );
+        let fetched = GammaMarketsClient::new(
+            "https://offline.invalid".to_owned(),
+            FixtureFetcher::new(HashMap::from([(
+                url,
+                include_bytes!("../tests/fixtures/london_closed_mark/gamma_closed.json").to_vec(),
+            )])),
+        )
+        .fetch_markets_with_pages(
+            &[condition.to_owned()],
+            pe_source_polymarket_public::MarketFilter::ClosedOnly,
+        )
+        .await
+        .unwrap();
+        let mut closure = fetched.markets.markets[condition].clone();
+        closure.closed_time_unix = Some(cutoff);
+        let points = |age| {
+            ClassifiedPricesHistory::Points(vec![PricePoint {
+                t: cutoff - age,
+                price: dec!(0.4),
+            }])
+        };
+        assert!(
+            closed_historical_mark_price(
+                &points(CLOSED_MARK_LOOKBACK_SECS),
+                condition,
+                &closure,
+                cutoff,
+                receipt(4, 4)
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            closed_historical_mark_price(
+                &points(CLOSED_MARK_LOOKBACK_SECS + 1),
+                condition,
+                &closure,
+                cutoff,
+                receipt(4, 4)
+            ),
+            Err(RiskInputsUnavailable::PriceStale)
+        );
+        closure.closed_time_unix = Some(cutoff + 1);
+        assert_eq!(
+            closed_historical_mark_price(&points(60), condition, &closure, cutoff, receipt(4, 4)),
+            Err(RiskInputsUnavailable::MarkInvalid)
         );
     }
 

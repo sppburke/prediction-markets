@@ -920,6 +920,12 @@ delay, and no-demotion vectors. Normal ranker rotation, capacity change, and sco
 There is no extension, interim look, or second window. The report does not arm or disarm ordinary
 live mode; the owner's requested mode alone does that.
 
+Paper daily marks:
+
+| Key | Default | Meaning |
+|---|---:|---|
+| `closed_mark_lookback_secs` | 1,123,200 (13 days) | **Binary const** `CLOSED_MARK_LOOKBACK_SECS` beside the historical-mark rule in `service::risk_inputs`. Only paper daily marks with an empty normal window and recorded Gamma `closed=true`, matching `conditionId`, and `closedTime` at or before the cutoff may select the latest CLOB sample in `[cutoff − closed_mark_lookback_secs, cutoff]`. Production and replay derive the same bounds; the end-anchored response cap preserves the latest sample. Live marks retain the normal historical-mark rule. |
+
 ### Demotion criteria
 
 Qualification consumes the typed structural membership reasons. Only

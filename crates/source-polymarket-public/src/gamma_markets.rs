@@ -93,6 +93,8 @@ pub struct GammaMarket {
     /// Whether Gamma reports the market as closed. `false` when the field is omitted. This metadata
     /// is not Winner-Follow payout evidence.
     pub closed: bool,
+    /// Actual closure time from `closedTime`; unavailable when omitted or unparseable.
+    pub closed_time_unix: Option<i64>,
     /// Outcome prices indexed by `outcome_id`, parsed from Gamma's `outcomePrices` JSON-string array
     /// via [`parse_outcome_prices`] — closed markets can show `[1,0]`/`[0,1]`, while open markets
     /// provide live mids. `None` when Gamma omits the field or the array is malformed. Individual
@@ -470,17 +472,19 @@ impl<F: PageFetcher + Send + Sync> GammaMarketsClient<F> {
     }
 }
 
-/// Parsed identity of the canonical open-only condition request emitted by the Gamma client.
+/// Parsed identity of the canonical condition request emitted by the Gamma client.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GammaOpenConditionRequest {
+pub struct GammaConditionRequest {
     /// Gamma API base URL before the canonical `/markets` path.
     pub base_url: String,
     /// Requested `condition_ids` in canonical repeat-key order.
     pub condition_ids: Vec<String>,
+    /// Open or closed market slice selected by the request.
+    pub filter: MarketFilter,
 }
 
-impl GammaOpenConditionRequest {
-    /// Parse an exact canonical open-only condition request.
+impl GammaConditionRequest {
+    /// Parse an exact canonical open or closed condition request.
     pub fn parse(request_url: &str) -> Option<Self> {
         let (base_url, query) = request_url.split_once("/markets?")?;
         if base_url.is_empty() {
@@ -489,6 +493,17 @@ impl GammaOpenConditionRequest {
         let parts = query.split('&').collect::<Vec<_>>();
         let (limit, conditions) = parts.split_last()?;
         if *limit != format!("limit={GAMMA_BATCH_LIMIT_PARAM}") || conditions.is_empty() {
+            return None;
+        }
+        let (filter, conditions) = if conditions.last() == Some(&"closed=true") {
+            (
+                MarketFilter::ClosedOnly,
+                &conditions[..conditions.len().checked_sub(1)?],
+            )
+        } else {
+            (MarketFilter::OpenOnly, conditions)
+        };
+        if conditions.is_empty() {
             return None;
         }
         let condition_ids = conditions
@@ -501,12 +516,13 @@ impl GammaOpenConditionRequest {
         let request = Self {
             base_url: base_url.to_owned(),
             condition_ids,
+            filter,
         };
         (request_url
             == build_batch_url(
                 &request.base_url,
                 &request.condition_ids,
-                "",
+                request.filter.closed_param(),
                 GAMMA_BATCH_LIMIT_PARAM,
             ))
         .then_some(request)
@@ -698,6 +714,19 @@ fn parse_rfc3339_unix(s: &str) -> Option<i64> {
         .ok()
 }
 
+fn parse_closed_time_unix(s: &str) -> Option<i64> {
+    parse_rfc3339_unix(s).or_else(|| {
+        time::OffsetDateTime::parse(
+            s,
+            &time::macros::format_description!(
+                "[year]-[month]-[day] [hour]:[minute]:[second][offset_hour sign:mandatory]"
+            ),
+        )
+        .map(|dt| dt.unix_timestamp())
+        .ok()
+    })
+}
+
 /// Serde DTO for one element of the `/markets` response array. Extra fields are ignored.
 ///
 /// `#[serde(rename_all = "camelCase")]` maps the snake_case fields to Gamma's camelCase keys
@@ -722,6 +751,7 @@ struct GammaMarketRaw {
     /// Whether the market is resolved. Defaults `false` when omitted (open markets / lean fixtures).
     #[serde(default)]
     closed: bool,
+    closed_time: Option<String>,
     /// Resolved/mid prices as a JSON-encoded decimal-string array, e.g. `"[\"1\",\"0\"]"`. Parsed in
     /// the demux via [`parse_outcome_prices`].
     outcome_prices: Option<String>,
@@ -752,6 +782,10 @@ fn gamma_market(market: GammaMarketRaw) -> GammaMarket {
         created_at_unix,
         liquidity: market.liquidity,
         closed: market.closed,
+        closed_time_unix: market
+            .closed_time
+            .as_deref()
+            .and_then(parse_closed_time_unix),
         outcome_prices,
         strict_outcome_prices,
         volume: market.volume,
@@ -913,31 +947,32 @@ mod tests {
             )
         );
         assert_eq!(
-            GammaOpenConditionRequest::parse(&url),
-            Some(GammaOpenConditionRequest {
+            GammaConditionRequest::parse(&url),
+            Some(GammaConditionRequest {
                 base_url: "https://g".to_owned(),
                 condition_ids: ids(&["0xA", "0xB"]),
+                filter: MarketFilter::OpenOnly,
             })
         );
     }
 
     #[test]
-    fn open_condition_request_rejects_noncanonical_grammar() {
+    fn condition_request_rejects_noncanonical_grammar() {
         let alternate_limit = GAMMA_BATCH_LIMIT_PARAM.checked_add(1).unwrap();
         assert!(
-            GammaOpenConditionRequest::parse(&format!(
-                "https://g/markets?condition_ids=0xA&closed=true&limit={GAMMA_BATCH_LIMIT_PARAM}"
+            GammaConditionRequest::parse(&format!(
+                "https://g/markets?condition_ids=0xA&closed=false&limit={GAMMA_BATCH_LIMIT_PARAM}"
             ))
             .is_none()
         );
         assert!(
-            GammaOpenConditionRequest::parse(&format!(
+            GammaConditionRequest::parse(&format!(
                 "https://g/markets?condition_ids=0xA&limit={GAMMA_BATCH_LIMIT_PARAM}&condition_ids=0xB"
             ))
             .is_none()
         );
         assert!(
-            GammaOpenConditionRequest::parse(&format!(
+            GammaConditionRequest::parse(&format!(
                 "https://g/markets?condition_ids=0xA&limit={alternate_limit}"
             ))
             .is_none()
@@ -954,6 +989,31 @@ mod tests {
         // condition_ids before closed before limit — deterministic for fixture keying.
         assert!(url.find("condition_ids=").unwrap() < url.find("closed=true").unwrap());
         assert!(url.find("closed=true").unwrap() < url.find("limit=").unwrap());
+        assert_eq!(
+            GammaConditionRequest::parse(&url),
+            Some(GammaConditionRequest {
+                base_url: "https://g".to_owned(),
+                condition_ids: ids(&["0xA"]),
+                filter: MarketFilter::ClosedOnly,
+            }),
+        );
+    }
+
+    #[test]
+    fn gamma_closed_time_parses_the_recorded_london_format() {
+        let raw =
+            include_bytes!("../../service/tests/fixtures/london_closed_mark/gamma_closed.json");
+        let rows: Vec<GammaMarketRaw> = serde_json::from_slice(raw).unwrap();
+        let market = gamma_market(rows.into_iter().next().unwrap());
+        assert!(market.closed);
+        assert_eq!(market.closed_time_unix, Some(1_790_985_062));
+        assert_eq!(
+            parse_closed_time_unix("2026-10-02T23:51:02Z"),
+            market.closed_time_unix
+        );
+        for value in ["", "unknown", "2026-10-02 23:51:02"] {
+            assert_eq!(parse_closed_time_unix(value), None);
+        }
     }
 
     #[test]
