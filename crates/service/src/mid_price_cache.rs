@@ -367,19 +367,19 @@ where
             .collect::<HashSet<_>>();
         for row in replayed.markets.markets.into_values() {
             let market = MarketId(pe_core_types::VenueMarketId(row.condition_id.clone()));
-            // Acquisition stores only a page's requested markets; an extra row is not evidence.
+            // The rows acquisition stores: a page's requested markets, and only rows with prices.
             if !wanted_markets.contains(&market)
                 || !request.condition_ids.contains(&row.condition_id)
+                || row.outcome_prices.is_none()
             {
                 continue;
             }
             let strict_mids = row.strict_outcome_prices;
             if let Some(existing) = entries.get_mut(&market) {
-                // Like acquisition's cache, a market keeps its newest selected page's row with
-                // prices; another selected page's older row for it is obsolete, not a conflict.
-                // Repeated rows inside one page remain a conflict through the demux.
-                if row.outcome_prices.is_none() || receipt.sequence.0 <= existing.receipt.sequence.0
-                {
+                // Like acquisition's cache, a market keeps its newest selected page's row; another
+                // selected page's older row for it is obsolete, not a conflict. Repeated rows
+                // inside one page remain a conflict through the demux.
+                if receipt.sequence.0 <= existing.receipt.sequence.0 {
                     continue;
                 }
                 *existing = StrictPriceInput {
@@ -1327,6 +1327,79 @@ mod tests {
             replayed,
             Err(RiskPriceReplayError::Unavailable(
                 RiskInputsUnavailable::PriceConflict
+            ))
+        ));
+        drop(cache);
+        ingest.abort();
+        let _ = ingest.await;
+    }
+
+    /// PASS: a closed page whose rows for one market are a priced row and an unpriced duplicate
+    /// stores nothing (the stored row is the unpriced one), so acquisition refuses `PriceMissing`
+    /// and replay of its receipts reproduces that cause.
+    #[tokio::test]
+    async fn unpriced_duplicate_row_replays_acquisitions_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = dir.path().join("source.log");
+        let (source_log, source_rx) = SourceLogHandle::channel(4);
+        let (trigger_tx, _trigger_rx) = mpsc::channel(1);
+        let ingest = tokio::spawn(
+            ActivityIngest::poll_only(
+                SourceEventSink::open(&source_path).unwrap(),
+                source_rx,
+                trigger_tx,
+                new_shared_health_with_ws(false, false, 90),
+            )
+            .run(),
+        );
+        let now = datetime!(2026-10-03 00:00 UTC);
+        let cache = MidPriceCache::with_fetcher(
+            FixtureFetcher::new(HashMap::from([
+                (url(BASE, "0xb"), b"[]".to_vec()),
+                (
+                    format!("{BASE}/markets?condition_ids=0xb&closed=true&limit={GAMMA_BATCH_LIMIT_PARAM}"),
+                    br#"[{"conditionId":"0xb","closed":true,"outcomePrices":"[\"0.5\",\"0.5\"]"},{"conditionId":"0xb","closed":true}]"#
+                        .to_vec(),
+                ),
+            ])),
+            BASE.to_owned(),
+        )
+        .with_source_log(source_log)
+        .with_clock(Arc::new(move || now));
+        let ids = [outcome("0xb", 0)];
+        let attempt = cache.fetch_mids_strict_attempt(&ids).await;
+        assert_eq!(attempt.result, Err(RiskInputsUnavailable::PriceMissing));
+        let envelopes = pe_event_log::Reader::replay(&source_path)
+            .unwrap()
+            .map(|entry| entry.unwrap().1)
+            .collect::<Vec<_>>();
+        let replayed = replay_strict_risk_prices(
+            &ids,
+            &attempt.price_receipts,
+            i64::try_from(unix_timestamp_ms(attempt.evaluated_at)).unwrap(),
+            |receipt| {
+                let envelope = envelopes
+                    .iter()
+                    .find(|envelope| {
+                        envelope.seq == receipt.sequence && envelope.this_hash == receipt.this_hash
+                    })
+                    .unwrap();
+                Ok(RecordedPriceAttempt {
+                    payload: envelope.payload.clone(),
+                    received_unix_ms: i64::try_from(unix_timestamp_ms(envelope.received_at.0))
+                        .unwrap(),
+                    source_id: envelope.source_id.0.clone(),
+                    schema_version: envelope.schema_version,
+                    parser_version: envelope.parser_version,
+                    content_type: envelope.content_type.clone(),
+                })
+            },
+        )
+        .await;
+        assert!(matches!(
+            replayed,
+            Err(RiskPriceReplayError::Unavailable(
+                RiskInputsUnavailable::PriceMissing
             ))
         ));
         drop(cache);
