@@ -349,11 +349,11 @@ its class's next fair refresh turn for a fresh complete history/positions bracke
 bucket is the exception: outcome restamps whose unattributed member rows reproduce a recorded
 group's id and semantic revision (and whose outcome agrees with a recorded trade correction) are
 recorded `raw_only`, with no ledger, first-entry history, re-anchor or fence effect, including under
-anchor coverage and beside exact recorded groups. In feed correlation, a restamp and the
-unattributed original it alone reproduces in the same read count as one candidate, so an
-`activity/trades` observation stamped like neither binds the original; genuinely distinct
-candidates keep the invalid-mapping fence. A twin mixed with a genuinely new group keeps the
-existing routing. Revisions still fence; partially recorded non-twin buckets retain their fence,
+anchor coverage and beside exact recorded groups. In feed correlation, a twin listed beside its
+recorded original counts with it as one candidate, so an `activity/trades` observation stamped
+like neither binds the original. A pair first seen together, or genuinely distinct candidates,
+keep the invalid-mapping fence. A twin mixed with a genuinely new group keeps the existing
+routing. Revisions still fence; partially recorded non-twin buckets retain their fence,
 and covered non-twin arrivals retain `anchor_covered_late` re-anchoring.
 
 Known-condition `RequiresAnchor` redemptions and TRADE/REDEEM combos reaching ordinary routing

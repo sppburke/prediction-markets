@@ -5446,7 +5446,7 @@ pub(crate) mod continuation_v3_tests {
         // An exact stream carries its history row's own stamp; an alias carries another one.
         let (stream_condition, stream_outcome) = match case {
             "alias" | "disposed_alias" => ("alias", if disposed { 0 } else { 1 }),
-            "exact" | "exact_other_target" => ("new", 0),
+            "exact" | "exact_digest" | "exact_other_target" => ("new", 0),
             _ => ("old", if disposed { 0 } else { 1 }),
         };
         let stream_payload = serde_json::to_vec(
@@ -5480,12 +5480,16 @@ pub(crate) mod continuation_v3_tests {
             rows[0]["outcomeIndex"] = json!(999);
             rows[0]["outcome"] = json!("Over");
         }
-        if case == "pair" {
-            // The unattributed original and its restamp, listed together.
+        if matches!(case, "pair" | "original_only") {
+            // The unattributed original, alone or listed with its restamp.
             rows[0]["outcome"] = json!("Over");
             let mut original = rows[0].clone();
             original["outcomeIndex"] = json!(999);
-            rows = json!([original, rows[0].clone()]);
+            rows = if case == "pair" {
+                json!([original, rows[0].clone()])
+            } else {
+                json!([original])
+            };
         }
         if matches!(
             case,
@@ -5593,7 +5597,7 @@ pub(crate) mod continuation_v3_tests {
                     .source_log_sequence = 0
             }
             "metadata_missing" => binding.identity_receipt = None,
-            "exact" => {
+            "exact" | "exact_digest" => {
                 binding.identity_provenance = None;
                 binding.identity_receipt = None;
             }
@@ -5662,9 +5666,9 @@ pub(crate) mod continuation_v3_tests {
             value["digest"] = json!(hasher.finalize().to_hex().to_string());
             payload = serde_json::to_vec(&value).unwrap();
         }
-        if matches!(case, "digest" | "unknown_field") {
+        if matches!(case, "digest" | "exact_digest" | "unknown_field") {
             let mut value: Value = serde_json::from_slice(&payload).unwrap();
-            if case == "digest" {
+            if case != "unknown_field" {
                 value["bindings"][0]["semantic_revision"] = json!("changed");
             } else {
                 value["bindings"][0]["unexpected"] = json!(true);

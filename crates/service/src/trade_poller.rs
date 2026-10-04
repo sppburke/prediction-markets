@@ -1716,6 +1716,7 @@ impl WalletOperation {
             wallet,
             selected,
             &activity.rows,
+            &restamp_twins,
             &buckets,
             &identities,
             &page_occurrences,
@@ -1837,6 +1838,7 @@ impl WalletOperation {
         wallet: WalletAddress,
         selected: &WalletObligations,
         rows: &[NormalizedActivity],
+        restamp_twins: &HashSet<SourceTradeId>,
         buckets: &[Vec<ActivityAggregate>],
         identities: &[BucketIdentities],
         occurrences: &[PageOccurrence],
@@ -1846,8 +1848,13 @@ impl WalletOperation {
         if selected.is_empty() {
             return Ok(result);
         }
-        let restamp_pairs =
-            crate::bucket_commit::read_restamp_pairs(rows).map_err(ActivityReadError::from)?;
+        // A restamp counts with its original only as a twin of a recorded original: a pair first
+        // seen together keeps the ambiguity fence, because bucket routing would apply both.
+        let restamp_pairs = crate::bucket_commit::read_restamp_pairs(rows)
+            .map_err(ActivityReadError::from)?
+            .into_iter()
+            .filter(|(restamp, _)| restamp_twins.contains(restamp))
+            .collect::<HashMap<_, _>>();
         let index = self.source_receipts.as_ref().ok_or_else(|| {
             ReconciliationError::Binding("source receipt index is absent".to_owned())
         })?;
@@ -2203,6 +2210,9 @@ fn raw_only_combo(aggregate: &ActivityAggregate) -> bool {
         )
 }
 
+/// Groups of this read that are restamps of a recorded original (#730 item 5), recorded
+/// themselves or not: bucket routing applies the exemption to unseen ones, and feed correlation
+/// counts any of them with its original.
 fn restamp_twins(
     paper_state: &PaperStateDb,
     rows: &[NormalizedActivity],
@@ -2219,7 +2229,7 @@ fn restamp_twins(
         };
         let originals =
             crate::bucket_commit::unattributed_forms(&members).map_err(ActivityReadError::from)?;
-        if originals.is_empty() || paper_state.activity_group_state(&group)?.is_some() {
+        if originals.is_empty() {
             continue;
         }
         for original in originals {

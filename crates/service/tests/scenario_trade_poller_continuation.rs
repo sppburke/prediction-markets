@@ -4719,6 +4719,71 @@ async fn feed_observation_of_a_restamp_pair_binds_the_recorded_original() {
     }
 }
 
+/// AC5 boundary: a restamp first seen beside its unrecorded original is not a twin. A feed
+/// observation stamped like neither keeps the invalid-mapping fence instead of letting both rows
+/// apply; no position is recorded, and the obligation stays disposed across a rebuild.
+#[tokio::test(start_paused = true)]
+async fn feed_observation_of_a_first_seen_restamp_pair_keeps_the_fence() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut running, paper) = start_recorded_poller(&dir, &[wallet()]);
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    running.round_completed().await;
+    let mut original = stream_row(wallet(), "restamp-first-seen", EPOCH);
+    original["outcomeIndex"] = json!(999);
+    let restamp = stream_row(wallet(), "restamp-first-seen", EPOCH);
+    let restamp_id = aggregate(restamp.clone()).group_id.key().clone();
+    let mut stream = restamp.clone();
+    stream["conditionId"] = json!("incorrect-stream-stamp");
+    running.now.store(EPOCH + 1, Ordering::SeqCst);
+    running.observe(stream).await;
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(serde_json::to_vec(&[original, restamp]).unwrap())
+        .unwrap();
+    running.completed(wallet()).await;
+    let commits = running.finish().await;
+
+    let (_, context, result) = commits
+        .iter()
+        .find(|(aggregates, _, _)| {
+            aggregates
+                .iter()
+                .any(|aggregate| aggregate.group_id.key() == &restamp_id)
+        })
+        .unwrap();
+    assert!(context.restamp_twins.is_empty());
+    assert_eq!(
+        result.newly_fenced,
+        Some(pe_position_ledger::WalletFenceCause::InvalidMapping)
+    );
+    assert!(
+        paper
+            .leader_positions()
+            .unwrap()
+            .iter()
+            .all(|position| position.market_id != market(MARKET_B))
+    );
+    assert!(
+        pe_service::trade_poller::rebuild_reconciliation_obligations(
+            &dir.path().join("source.log"),
+            &paper
+        )
+        .unwrap()
+        .is_empty()
+    );
+}
+
 /// AC5: known-condition unexpressible redemptions and combos have no wallet suppression on
 /// ordinary routing. Combo tokens never enter Gamma lookup; a later independent entry decides.
 #[tokio::test]

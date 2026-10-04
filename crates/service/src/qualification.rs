@@ -2098,7 +2098,7 @@ fn decision_rows_from_sealed_source(
     // binding is authenticated up front; an exact-only commitment only when it can change the
     // selection. A commitment without an authentic complete read counts for nothing.
     let mut verified = HashMap::new();
-    let mut targets = HashMap::<_, (pe_core_types::SourceTradeId, AppendReceipt)>::new();
+    let mut targets = HashMap::<_, (pe_core_types::SourceTradeId, Vec<AppendReceipt>)>::new();
     let mut aliases = HashMap::<_, HashSet<_>>::new();
     let mut exact = HashMap::<_, Vec<AppendReceipt>>::new();
     for (receipt, recorded) in &binding_commitments {
@@ -2114,39 +2114,53 @@ fn decision_rows_from_sealed_source(
             recorded.clone()
         };
         for binding in bindings {
-            if let Some((previous, earlier)) = targets.get(&binding.stream_group_id).cloned()
-                && previous != binding.history_group_id
-            {
-                if verified_commitment(&mut verified, *receipt, &mut lookup).is_none() {
-                    continue;
-                }
-                if verified_commitment(&mut verified, earlier, &mut lookup).is_some() {
-                    let same_trade = [earlier, *receipt].iter().any(|receipt| {
-                        verified
-                            .get(&receipt.sequence)
-                            .and_then(Option::as_ref)
-                            .is_some_and(|commitment: &VerifiedCommitment| {
-                                commitment.restamp_pairs.get(&previous)
-                                    == Some(&binding.history_group_id)
-                                    || commitment.restamp_pairs.get(&binding.history_group_id)
-                                        == Some(&previous)
-                            })
-                    });
-                    if !same_trade {
-                        return insufficient(
-                            "complete reads disagree about an observation binding target",
-                        );
-                    }
-                } else {
+            match targets.get_mut(&binding.stream_group_id) {
+                None => {
                     targets.insert(
                         binding.stream_group_id.clone(),
-                        (binding.history_group_id.clone(), *receipt),
+                        (binding.history_group_id.clone(), vec![*receipt]),
                     );
                 }
-            } else {
-                targets
-                    .entry(binding.stream_group_id.clone())
-                    .or_insert_with(|| (binding.history_group_id.clone(), *receipt));
+                Some((previous, receipts)) if *previous == binding.history_group_id => {
+                    receipts.push(*receipt);
+                }
+                Some((previous, receipts)) => {
+                    // A conflict is decided on authentic evidence only: this binding and every
+                    // recorded receipt of the earlier target.
+                    let (previous, earlier) = (previous.clone(), receipts.clone());
+                    if verified_commitment(&mut verified, *receipt, &mut lookup).is_none() {
+                        continue;
+                    }
+                    let mut authentic = Vec::new();
+                    for earlier in earlier {
+                        if verified_commitment(&mut verified, earlier, &mut lookup).is_some() {
+                            authentic.push(earlier);
+                        }
+                    }
+                    if authentic.is_empty() {
+                        targets.insert(
+                            binding.stream_group_id.clone(),
+                            (binding.history_group_id.clone(), vec![*receipt]),
+                        );
+                    } else {
+                        let same_trade = authentic.iter().chain([receipt]).any(|receipt| {
+                            verified
+                                .get(&receipt.sequence)
+                                .and_then(Option::as_ref)
+                                .is_some_and(|commitment: &VerifiedCommitment| {
+                                    commitment.restamp_pairs.get(&previous)
+                                        == Some(&binding.history_group_id)
+                                        || commitment.restamp_pairs.get(&binding.history_group_id)
+                                            == Some(&previous)
+                                })
+                        });
+                        if !same_trade {
+                            return insufficient(
+                                "complete reads disagree about an observation binding target",
+                            );
+                        }
+                    }
+                }
             }
             if binding.history_group_id == binding.stream_group_id {
                 exact
@@ -14362,12 +14376,25 @@ mod tests {
     }
 
     /// PASS: one observation bound exactly to its own history identity and, after a crash before
-    /// that bucket committed, to a different corrected identity fails both selectors.
+    /// that bucket committed, to a different corrected identity fails both selectors, also when an
+    /// inauthentic exact commitment of the same observation was recorded first.
     #[test]
     fn exact_and_corrected_targets_of_one_observation_disagree() {
+        for masked in [false, true] {
+            exact_and_corrected_targets_disagree(masked);
+        }
+    }
+
+    fn exact_and_corrected_targets_disagree(masked: bool) {
         let dir = tempfile::tempdir().unwrap();
         let source_path = dir.path().join("source.log");
         let mut writer = Writer::open(&source_path).unwrap();
+        if masked {
+            crate::bucket_commit::continuation_v3_tests::append_binding_read(
+                "exact_digest",
+                &mut writer,
+            );
+        }
         let (exact, _, _) =
             crate::bucket_commit::continuation_v3_tests::append_binding_read("exact", &mut writer);
         let (corrected, _, _) = crate::bucket_commit::continuation_v3_tests::append_binding_read(
@@ -14385,33 +14412,50 @@ mod tests {
         assert!(
             matches!(&result, Err(QualificationError::InsufficientEvidence(message))
                 if message.contains("disagree about an observation binding target")),
-            "{result:?}"
+            "masked={masked}: {result:?}"
         );
     }
 
     /// PASS: one observation bound to an unattributed original and, after a crash and the venue's
-    /// restamp, to the restamp is one trade: a pair proven by a read selects and seals.
+    /// restamp, to the restamp is one trade: a pair proven by any read binding either target
+    /// selects and seals, also when an earlier read listed only the original.
     #[test]
     fn restamp_pair_targets_of_one_observation_are_one_trade() {
-        let dir = tempfile::tempdir().unwrap();
-        let source_path = dir.path().join("source.log");
-        let mut writer = Writer::open(&source_path).unwrap();
-        let (original, _, _) =
-            crate::bucket_commit::continuation_v3_tests::append_binding_read("pair", &mut writer);
-        // The later read lists only the restamp.
-        let (restamp, _, _) =
-            crate::bucket_commit::continuation_v3_tests::append_binding_read("valid", &mut writer);
-        drop(writer);
-        let index = SourceReceiptIndex::replay(&source_path).unwrap();
-        assert_eq!(stream_key(&index, &original), stream_key(&index, &restamp));
-        assert_ne!(
-            original.facts.source_trade_id,
-            restamp.facts.source_trade_id
-        );
-        let state = PaperStateDb::open(&dir.path().join("state.db")).unwrap();
-        store_read_decision(&state, &original, "decision_pending", true);
-        store_read_decision(&state, &restamp, "raw_only", false);
-        select_both_and_seal(&state, &source_path).unwrap();
+        for original_only_first in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let source_path = dir.path().join("source.log");
+            let mut writer = Writer::open(&source_path).unwrap();
+            if original_only_first {
+                crate::bucket_commit::continuation_v3_tests::append_binding_read(
+                    "original_only",
+                    &mut writer,
+                );
+            }
+            let (original, _, _) = crate::bucket_commit::continuation_v3_tests::append_binding_read(
+                "pair",
+                &mut writer,
+            );
+            // The later read lists only the restamp.
+            let (restamp, _, _) = crate::bucket_commit::continuation_v3_tests::append_binding_read(
+                "valid",
+                &mut writer,
+            );
+            drop(writer);
+            let index = SourceReceiptIndex::replay(&source_path).unwrap();
+            assert_eq!(stream_key(&index, &original), stream_key(&index, &restamp));
+            assert_ne!(
+                original.facts.source_trade_id,
+                restamp.facts.source_trade_id
+            );
+            let state = PaperStateDb::open(&dir.path().join("state.db")).unwrap();
+            store_read_decision(&state, &original, "decision_pending", true);
+            store_read_decision(&state, &restamp, "raw_only", false);
+            let result = select_both_and_seal(&state, &source_path);
+            assert!(
+                result.is_ok(),
+                "original_only_first={original_only_first}: {result:?}"
+            );
+        }
     }
 
     /// PASS: malformed v5 policy and a valid policy substituted into authentic v2 bytes fail both selectors.
