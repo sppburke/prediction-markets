@@ -4528,7 +4528,12 @@ mod tests {
 
         #[tokio::test]
         async fn pinned_batch_live_reentry_precedes_edge_failure_and_full_capacity_returns() {
-            for full_capacity in [false, true] {
+            // Loaded statistics and a recent clock admit both wallets in one tick. A stale clock
+            // (full capacity) or hidden statistics (edge failure) leaves the stale-ranked wallet
+            // out, unparked, until that evidence recovers within the same batch.
+            for (full_capacity, first_activity) in
+                [(true, NOW - 60), (true, NOW - 300_000), (false, NOW - 60)]
+            {
                 let deferred = wallet(72);
                 // Stale in the pinned batch; only its own activity clock can bring it back.
                 let stale_ranked = wallet(75);
@@ -4551,13 +4556,6 @@ mod tests {
                 h.paper_state
                     .set_cursor(&stale_ranked, NOW - 300_000)
                     .unwrap();
-                // With statistics, its clock starts stale and advances within the batch; without
-                // them, its clock is recent and only the statistics must recover.
-                let first_activity = if full_capacity {
-                    NOW - 300_000
-                } else {
-                    NOW - 60
-                };
                 h.paper_state
                     .set_activity(&stale_ranked, first_activity)
                     .unwrap();
@@ -4582,10 +4580,15 @@ mod tests {
                 };
                 h.tick_synced(MembershipMode::Knockout, &mut HashSet::new(), &mut sync)
                     .await;
-                let mut first_live = vec![deferred];
+                let at_once = full_capacity && first_activity == NOW - 60;
+                let mut first_live = if at_once {
+                    vec![deferred, stale_ranked]
+                } else {
+                    vec![deferred]
+                };
                 first_live.extend(peers.iter().copied());
                 assert_eq!(members(&h.live), set(&first_live));
-                assert_eq!(h.controls().len(), 1);
+                assert_eq!(h.controls().len(), if at_once { 2 } else { 1 });
                 assert!(
                     sync.knockout_deferred.is_empty(),
                     "a retried wallet is never parked"
@@ -4602,7 +4605,11 @@ mod tests {
                     .await;
                 assert_eq!(members(&h.live), set(&initial));
                 assert_eq!(h.controls().len(), 2);
-                assert_eq!(pinned_reads.load(Ordering::SeqCst), 2);
+                // With every structural member live, the second tick reads no ranking.
+                assert_eq!(
+                    pinned_reads.load(Ordering::SeqCst),
+                    if at_once { 1 } else { 2 }
+                );
                 assert_eq!(sync.marker, Some(1));
                 assert!(sync.knockout_deferred.is_empty());
                 assert_eq!(
@@ -4672,13 +4679,7 @@ mod tests {
                 first.deferred[0].class,
                 crate::position_seeder::FailureClass::WalletPersistent
             );
-            record_live_reentry(
-                &h.preparer,
-                &mut sync,
-                MembershipMode::Knockout,
-                Some(first),
-            )
-            .await;
+            record_live_reentry(&h.preparer, &sync, MembershipMode::Knockout, Some(first)).await;
             assert_eq!(sync.knockout_deferred, set(&[missing]));
             let second = live_reentry_tick(
                 &h.live,
