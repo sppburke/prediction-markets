@@ -191,14 +191,8 @@ pub(crate) async fn replay_paper_mark_price(
             RiskInputsUnavailable::MarkInvalid,
         ));
     }
-    if let ClassifiedPricesHistory::Points(points) = &replayed.outcome {
-        let mut timestamps = HashSet::new();
-        if points.iter().any(|point| !timestamps.insert(point.t)) {
-            return Err(BoundaryMarkError::Invalid(
-                RiskInputsUnavailable::PriceConflict,
-            ));
-        }
-    }
+    // Replay applies acquisition's selector unchanged: a repeated timestamp matters only at the
+    // selected sample, where any disagreement is a conflict (as live mark replay does).
     if price.closure_receipt.is_none() {
         return historical_mark_price(&replayed.outcome, cutoff_unix, receipt)
             .map_err(BoundaryMarkError::Invalid);
@@ -2185,6 +2179,105 @@ mod tests {
             serde_json::from_value::<crate::paper_recovery::PaperMarkPrice>(encoded).unwrap(),
             price
         );
+    }
+
+    /// Acquisition and replay share one duplicate-sample rule under both mark rules: repeated
+    /// samples are accepted when they agree or sit before the selected sample, and a disagreement
+    /// at the selected sample is a conflict on both sides.
+    #[tokio::test]
+    async fn paper_mark_acquisition_and_replay_share_the_duplicate_sample_rule() {
+        let cutoff = 1_790_985_600;
+        let condition = "0x50365ef0731cfa26e35d89b66a91bca5ef1ee8090b02d1ced099acc738868e87";
+        let token = "27556300168112004153063282106116891181228462668915873615116883805553394180154";
+        let closure_payload =
+            include_bytes!("../tests/fixtures/london_closed_mark/gamma_closed.json");
+        let url = format!(
+            "https://offline.invalid/markets?condition_ids={condition}&closed=true&limit={GAMMA_BATCH_LIMIT_PARAM}"
+        );
+        let fetched = GammaMarketsClient::new(
+            "https://offline.invalid".to_owned(),
+            FixtureFetcher::new(HashMap::from([(url, closure_payload.to_vec())])),
+        )
+        .fetch_markets_with_pages(
+            &[condition.to_owned()],
+            pe_source_polymarket_public::MarketFilter::ClosedOnly,
+        )
+        .await
+        .unwrap();
+        let closure = fetched.markets.markets[condition].clone();
+        for closed in [false, true] {
+            let latest = if closed { cutoff - 523 } else { cutoff - 60 };
+            for (samples, expected) in [
+                (vec![(latest, "0.4"), (latest, "0.4")], Ok(dec!(0.4))),
+                (
+                    vec![(latest - 60, "0.3"), (latest - 60, "0.3"), (latest, "0.4")],
+                    Ok(dec!(0.4)),
+                ),
+                (
+                    vec![(latest, "0.4"), (latest, "0.5")],
+                    Err(RiskInputsUnavailable::PriceConflict),
+                ),
+            ] {
+                let points = samples
+                    .iter()
+                    .map(|(t, p)| PricePoint {
+                        t: *t,
+                        price: p.parse().unwrap(),
+                    })
+                    .collect();
+                let classified = ClassifiedPricesHistory::Points(points);
+                let acquired = if closed {
+                    closed_historical_mark_price(
+                        &classified,
+                        condition,
+                        &closure,
+                        cutoff,
+                        receipt(4, 4),
+                    )
+                } else {
+                    historical_mark_price(&classified, cutoff, receipt(4, 4))
+                };
+                let body = samples
+                    .iter()
+                    .map(|(t, p)| format!(r#"{{"t":{t},"p":{p}}}"#))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                let history = format!(r#"{{"history":[{body}]}}"#);
+                let price = crate::paper_recovery::PaperMarkPrice {
+                    market_id: condition.to_owned(),
+                    outcome_id: 0,
+                    price: None,
+                    sample_unix: None,
+                    receipt: Some(receipt(4, 4)),
+                    closure_receipt: closed.then(|| receipt(3, 3)),
+                    invalid: None,
+                };
+                let replayed = replay_paper_mark_price(
+                    &price,
+                    token,
+                    cutoff,
+                    history.as_bytes(),
+                    closed.then_some(closure_payload.as_slice()),
+                )
+                .await;
+                match expected {
+                    Ok(value) => {
+                        let acquired = acquired.unwrap();
+                        let replayed = replayed.unwrap();
+                        assert_eq!(acquired.price.0, value);
+                        assert_eq!(replayed.price, acquired.price);
+                        assert_eq!(replayed.sample_unix, acquired.sample_unix);
+                    }
+                    Err(reason) => {
+                        assert_eq!(acquired, Err(reason));
+                        assert!(matches!(
+                            replayed,
+                            Err(BoundaryMarkError::Invalid(replayed)) if replayed == reason
+                        ));
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]
