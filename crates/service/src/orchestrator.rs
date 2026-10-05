@@ -1647,7 +1647,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             ),
             crate::bucket_commit::FrameRoute::Admission(capture) => (
                 crate::frame_admission::FRAME_ADMISSION_SOURCE_ID,
-                crate::frame_admission::canonical_bytes(&capture.0),
+                crate::frame_admission::FrameAdmissionArtifact::from_inputs(&capture.0)
+                    .and_then(|artifact| crate::frame_admission::canonical_bytes(&artifact)),
             ),
         };
         let admission_receipt = source_log
@@ -1700,10 +1701,22 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .as_ref()
             .ok_or_else(|| "feed audit source index is missing".to_owned())?;
         match update {
-            FeedAuditUpdate::Frontier(frontier) => {
-                self.bucket_engine.publish_frontier(frontier, index)
+            FeedAuditUpdate::RetireObservation {
+                receipt,
+                source_trade_id,
+                unbound,
+                verified_read,
+            } => self.bucket_engine.retire_observation(
+                receipt,
+                &source_trade_id,
+                unbound,
+                verified_read.as_deref(),
+            ),
+            FeedAuditUpdate::Frontier(frontier, read) => {
+                self.bucket_engine
+                    .publish_frontier(frontier, index, read.as_deref())
             }
-            FeedAuditUpdate::Incident(incident) => {
+            FeedAuditUpdate::Incident(incident, read) => {
                 let row = self
                     .paper_state
                     .decision_pending_history()
@@ -1718,12 +1731,26 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     .ok_or_else(|| "incident has no durable admitted frame".to_owned())?;
                 let frame =
                     DecisionContinuationV3::from_durable(&row).map_err(|e| e.to_string())?;
-                crate::feed_audit::verify_incident(&frame, &incident, &mut |receipt| {
-                    index
-                        .source_envelope(receipt)
-                        .map(crate::bucket_commit::CompleteActivityPage::from)
-                })
-                .map_err(|e| e.to_string())?;
+                if let Some(read) = read {
+                    frame
+                        .verify_activity_frame_with_index(index)
+                        .map_err(|error| error.to_string())?;
+                    if read.receipt != incident.deciding_commitment_receipt
+                        || frame.observed_source_receipt != Some(incident.frame_receipt)
+                        || incident.engagement_receipt.is_some()
+                    {
+                        return Err("incident differs from authenticated read/frame".to_owned());
+                    }
+                    crate::feed_audit::verify_incident_conclusion(&frame, &incident, &read)
+                        .map_err(|error| error.to_string())?;
+                } else {
+                    crate::feed_audit::verify_incident(&frame, &incident, &mut |receipt| {
+                        index
+                            .source_envelope(receipt)
+                            .map(crate::bucket_commit::CompleteActivityPage::from)
+                    })
+                    .map_err(|error| error.to_string())?;
+                }
                 let era = crate::paper_recovery::paper_era(
                     self.paper_writer.snapshot().map_err(|e| e.to_string())?,
                 );
@@ -2341,8 +2368,6 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .ok_or_else(|| "frame source index missing".to_owned())?;
         self.bucket_engine
             .restore_frame_prefix(all, undelivered, &index)?;
-        crate::frame_admission::restore_frontiers(&self.paper_state, &index)
-            .map_err(|error| error.to_string())?;
         self.refresh_feed_latch()?;
         self.publish_feed_latch_health();
         for receipt in undelivered {

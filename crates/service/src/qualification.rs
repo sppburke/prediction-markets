@@ -3558,9 +3558,6 @@ fn verify_decision_source_inputs(
         })
     };
     if continuation.is_activity_frame() {
-        continuation
-            .verify_activity_frame(&mut lookup)
-            .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
         return Ok(observation);
     }
     let aggregates = continuation
@@ -3749,46 +3746,11 @@ fn recorded_group_was_applied(
     source_trade_id: &pe_core_types::SourceTradeId,
     disposition: &str,
 ) -> Result<bool, QualificationError> {
-    if matches!(
-        disposition,
-        "applied"
-            | "wallet_fenced_applied"
-            | "decision_pending"
-            | crate::bucket_commit::HISTORY_ONLY_BRACKET
-            | "not_copy_eligible"
-            | "not_an_entry"
-            | "not_first_entry"
-            | "not_buy"
-            | "wallet_history_incomplete"
-            | "ambiguous_first_entry_same_second"
-            | "order_dependent_equal_second_action"
-            | "stale_fallback_past_copy_budget"
-            | "stale_activity_ws_past_copy_budget"
-    ) {
-        return Ok(true);
-    }
-    if matches!(
-        disposition,
-        "raw_only"
-            | "reanchor_required_redemption"
-            | "reanchor_required_late_group"
-            | "anchor_covered"
-            | "anchor_covered_late"
-            | "wallet_fenced"
-            | "revised_applied_aggregate"
-            | "late_group_after_bucket_commit"
-            | "invalid_mapping"
-            | "position_underflow"
-            | "position_overflow"
-            | "conversion_unknown_conditions"
-            | "unknown_activity_effect"
-            | "order_dependent_equal_second"
-    ) {
-        return Ok(false);
-    }
-    insufficient(format!(
-        "causal activity group {source_trade_id} has unknown disposition {disposition}"
-    ))
+    crate::paper_recovery::applied_disposition(source_trade_id, disposition).map_err(|_| {
+        QualificationError::InsufficientEvidence(format!(
+            "causal activity group {source_trade_id} has unknown disposition {disposition}"
+        ))
+    })
 }
 
 fn verify_complete_second_action(

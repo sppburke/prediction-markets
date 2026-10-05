@@ -281,7 +281,11 @@ for row in cohort:
     assert frame["source_id"] == "polymarket-activity-ws"
     proof = c["decision_inputs"]; admission = receipt(source, proof["admission_receipt"])
     assert admission["source_id"] == "pe-service.activity-frame-admission"
-    assert payload(admission) == proof["inputs"]
+    artifact = payload(admission)
+    body = json.dumps(proof["inputs"], sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    digest = subprocess.check_output(["b3sum"], input=b"prediction-edge/activity-frame-decision/v1\0" + body).decode().split()[0]
+    assert artifact == {"version": 1, "frame_receipt": proof["inputs"]["frame_receipt"], "capture_digest": digest}
+    assert digest == c["semantic_revision"]
     print(row["source_trade_id"], c["source_authority"], c["applied_configuration_hash"],
           t.get("financial_semantic_version"), proof, row["result"], row["history_consumed"], row["first_epoch"])
     assert t.get("financial_semantic_version") == 3 and row["history_consumed"] == 1
@@ -456,10 +460,11 @@ ledger effects, unaudited frame decisions and unlatched contradictions fail AC16
 
 Admission captures contain only the admitting wallet's preceding unresolved frames, the frame
 market's consumption fact, compact ledger capture and append-only activity row boundary, that
-market's anchor balances and post-anchor effects, and the classified outcome's resulting position.
+market's anchor balances and post-anchor effects; classification uses the rebuilt position.
 Authenticate the scoped balances/effects against the durable anchor and group prefix and verify
 first consumption against `wallet_market_history_v2`'s transaction-written owner. The receipt-ordered
-source admission artifact and continuation retain the same bounded body; configuration, sizing
+continuation alone retains the bounded body; the compact source admission artifact retains
+its version, frame receipt and `capture_digest`, equal to the domain-separated frame revision; configuration, sizing
 basis and quality come from continuation facts, while payload and parser/schema contracts come
 from the authenticated frame. Coverage, eligibility, clocks, frontier and sealed paper latch basis
 remain admission-time evidence. Resolved frames and unrelated wallets, positions and consumed

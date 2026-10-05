@@ -105,8 +105,21 @@ pub enum OrchestratorControl {
 /// Additional audit and release variants extend this enum without a new channel.
 #[derive(Debug, Clone)]
 pub enum FeedAuditUpdate {
-    Frontier(crate::frame_admission::FeedHistoryFrontier),
-    Incident(crate::paper_recovery::FeedIncident),
+    /// The owner checks current admission/disposition before acknowledging barrier removal.
+    RetireObservation {
+        receipt: AppendReceipt,
+        source_trade_id: pe_core_types::SourceTradeId,
+        unbound: bool,
+        verified_read: Option<Arc<crate::bucket_commit::VerifiedCommitment>>,
+    },
+    Frontier(
+        crate::frame_admission::FeedHistoryFrontier,
+        Option<Arc<crate::bucket_commit::VerifiedCommitment>>,
+    ),
+    Incident(
+        crate::paper_recovery::FeedIncident,
+        Option<Arc<crate::bucket_commit::VerifiedCommitment>>,
+    ),
     /// Lookup is advisory; the paper owner rechecks this engagement at application time.
     Release {
         expected_engagement_hash: blake3::Hash,

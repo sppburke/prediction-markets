@@ -913,6 +913,10 @@ fn paper_fill_source_receipts(era: &PaperEra) -> Result<Vec<AppendReceipt>, Risk
 struct SourceReceiptIndexState {
     frames: Vec<SourceFrameMetadata>,
     next_byte_offset: Option<u64>,
+    #[cfg(feature = "scenario")]
+    read_verifications: HashMap<(EventSeq, blake3::Hash), usize>,
+    #[cfg(feature = "scenario")]
+    frame_verifications: HashMap<(EventSeq, blake3::Hash), usize>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -989,6 +993,10 @@ impl SourceReceiptIndexStaging {
             state: Arc::new(RwLock::new(SourceReceiptIndexState {
                 frames: self.frames,
                 next_byte_offset: Some(physical_tail),
+                #[cfg(feature = "scenario")]
+                read_verifications: HashMap::new(),
+                #[cfg(feature = "scenario")]
+                frame_verifications: HashMap::new(),
             })),
             source_log_path: Some(Arc::new(self.canonical_source_log_path)),
         }
@@ -996,6 +1004,52 @@ impl SourceReceiptIndexStaging {
 }
 
 impl SourceReceiptIndex {
+    #[cfg(feature = "scenario")]
+    pub fn read_verification_count(&self, receipt: AppendReceipt) -> usize {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .read_verifications
+            .get(&(receipt.sequence, receipt.this_hash))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    #[cfg(feature = "scenario")]
+    pub(crate) fn record_read_verification(&self, receipt: AppendReceipt) {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *state
+            .read_verifications
+            .entry((receipt.sequence, receipt.this_hash))
+            .or_default() += 1;
+    }
+
+    #[cfg(feature = "scenario")]
+    pub fn frame_verification_count(&self, receipt: AppendReceipt) -> usize {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .frame_verifications
+            .get(&(receipt.sequence, receipt.this_hash))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    #[cfg(feature = "scenario")]
+    pub(crate) fn record_frame_verification(&self, receipt: AppendReceipt) {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *state
+            .frame_verifications
+            .entry((receipt.sequence, receipt.this_hash))
+            .or_default() += 1;
+    }
+
     pub(crate) fn canonical_path(&self) -> Option<&Path> {
         self.source_log_path.as_deref().map(PathBuf::as_path)
     }

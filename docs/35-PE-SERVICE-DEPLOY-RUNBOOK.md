@@ -897,7 +897,7 @@ govern reversal after a reader failure.
 
 **Feed-incident release (no restart).** Inspect the latest unreleased `FeedIncidentChanged`
 engagement in the verified paper era and authenticate its frame, deciding commitment and any
-counterpart identity. Inspect `status.json` `feed_incident` and `feed_latch` and the
+counterpart identity. Inspect `status.json` `source_health.feed_incident` and `source_health.feed_latch` and the
 `feed audit incident engaged; frames wait for history` error line; resolve the cause
 and outstanding audits before releasing. Set the existing optional `service_config` text row
 `risk_halt_release_hash` to that engagement's `this_hash`, using the existing configuration

@@ -724,15 +724,17 @@ async fn main() -> Result<()> {
         let authority = supabase_state.as_ref().context(
             "active financial era requires the authoritative client before paper writer boot",
         )?;
-        let boot_receipts = source_log_boot.as_ref().map(|boot| boot.receipt_index());
-        let source_evidence = match boot_receipts.as_ref() {
-            Some(index) => SourceEvidence::Index(index),
-            None => SourceEvidence::Log(&cfg.source_event_log_path),
+        let boot_receipts = match source_log_boot.as_ref() {
+            Some(boot) => boot.receipt_index(),
+            None => pe_service::risk_inputs::SourceReceiptIndex::replay(&cfg.source_event_log_path)
+                .context("build verified boot source receipt index")?,
         };
+        pe_service::bucket_commit::validate_frame_history(&paper_state, &boot_receipts)
+            .context("validate complete frame history before financial recovery")?;
         let recovered = reconcile_active_financial_frames(
             authority,
             &paper_state,
-            source_evidence,
+            SourceEvidence::Index(&boot_receipts),
             &paper_writer,
         )
         .await
@@ -1088,6 +1090,10 @@ async fn main() -> Result<()> {
         None => pe_service::risk_inputs::SourceReceiptIndex::replay(&cfg.source_event_log_path)
             .context("build verified source receipt index")?,
     };
+    if financial_start.is_none() {
+        pe_service::bucket_commit::validate_frame_history(&paper_state, &source_receipts)
+            .context("validate complete frame history before resume")?;
+    }
     let open_rows =
         pe_service::bucket_commit::validate_open_continuations(&paper_state, &source_receipts)
             .context("validate open decision continuations before resume")?;

@@ -2315,7 +2315,6 @@ fn install_mixed_current_open_continuations(
             .unwrap(),
         ledger_group_boundary: None,
         anchor_balances: Vec::new(),
-        position: Default::default(),
         ledger_groups: Vec::new(),
         market_consumed: false,
         earlier_frames: Vec::new(),
@@ -2354,7 +2353,10 @@ fn install_mixed_current_open_continuations(
             observed_at: SourceTimestamp(at),
             received_at: ReceivedAt(at),
             content_type: ContentType::Json,
-            payload: body,
+            payload: serde_json::to_vec(
+                &pe_service::frame_admission::FrameAdmissionArtifact::from_inputs(&inputs).unwrap(),
+            )
+            .unwrap(),
         })
         .unwrap();
     let rest_row = paper

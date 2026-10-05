@@ -5345,13 +5345,18 @@ pub fn replay_wallet_ledger(
         }
         apply_replayed_groups(
             &mut ledger,
-            paper_state,
+            Some(paper_state),
             wallet,
             &groups[bucket_start..next_group],
         )?;
         install_replayed_anchor(&mut ledger, paper_state, anchor)?;
     }
-    apply_replayed_groups(&mut ledger, paper_state, wallet, &groups[next_group..])?;
+    apply_replayed_groups(
+        &mut ledger,
+        Some(paper_state),
+        wallet,
+        &groups[next_group..],
+    )?;
     Ok(ledger)
 }
 
@@ -5420,24 +5425,13 @@ pub(crate) fn replay_frozen_records(
         })
         .collect();
     ledger.replace_wallet_snapshot(wallet, positions);
-    let mut start = 0;
-    while let Some(first) = groups.get(start) {
-        let mut end = start + 1;
-        while groups
-            .get(end)
-            .is_some_and(|group| group.source_epoch == first.source_epoch)
-        {
-            end += 1;
-        }
-        apply_replayed_bucket(&mut ledger, None, wallet, &groups[start..end])?;
-        start = end;
-    }
+    apply_replayed_groups(&mut ledger, None, wallet, groups)?;
     Ok(ledger)
 }
 
 fn apply_replayed_groups(
     ledger: &mut PositionLedger,
-    paper_state: &PaperStateDb,
+    paper_state: Option<&PaperStateDb>,
     wallet: WalletAddress,
     groups: &[pe_paper_state::ActivityGroupRow],
 ) -> Result<(), WalletLedgerReplayError> {
@@ -5452,7 +5446,7 @@ fn apply_replayed_groups(
         }
         apply_replayed_bucket(
             ledger,
-            Some(paper_state),
+            paper_state,
             wallet,
             &groups[bucket_start..bucket_end],
         )?;

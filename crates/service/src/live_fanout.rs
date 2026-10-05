@@ -4655,6 +4655,7 @@ fn produced_decision_continuation(
         }])
         .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
     let context = crate::bucket_commit::BucketDecisionContext {
+        verified_read: None,
         applied_configuration: configuration,
         decision_inputs_json,
         page_occurrences,
@@ -10028,7 +10029,6 @@ mod tests {
             },
             ledger_group_boundary: None,
             anchor_balances: Vec::new(),
-            position: Default::default(),
             ledger_groups: Vec::new(),
             market_consumed: false,
             earlier_frames: Vec::new(),
@@ -10057,7 +10057,10 @@ mod tests {
         sources.push((
             admission_receipt,
             RecordedEconomicSource {
-                payload: crate::frame_admission::canonical_bytes(&inputs).unwrap(),
+                payload: crate::frame_admission::canonical_bytes(
+                    &crate::frame_admission::FrameAdmissionArtifact::from_inputs(&inputs).unwrap(),
+                )
+                .unwrap(),
                 received_unix_ms: 18_400,
                 source_id: crate::frame_admission::FRAME_ADMISSION_SOURCE_ID.to_owned(),
                 schema_version: 1,
@@ -11339,6 +11342,7 @@ mod tests {
                 }])
                 .unwrap();
             let context = BucketDecisionContext {
+                verified_read: None,
                 applied_configuration: raw.facts.applied_configuration.clone(),
                 decision_inputs_json: raw.facts.decision_inputs.to_string(),
                 page_occurrences: raw.page_occurrences().to_vec(),

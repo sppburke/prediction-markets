@@ -181,7 +181,7 @@ pub fn plan_sized_buy(
                 asks,
                 principal,
                 signed_share_scale,
-                matches!(sizing, BuySizing::DollarUpTo { .. }),
+                matches!(sizing, BuySizing::DollarUpTo { .. }).then_some(minimum_order_size),
                 minimum_price,
                 maximum_price_exclusive,
                 chase_ceiling,
@@ -336,7 +336,7 @@ fn plan_share_buy(
         asks,
         signed_principal,
         signed_share_scale,
-        false,
+        None,
         minimum_price,
         maximum_price_exclusive,
         chase_ceiling,
@@ -443,7 +443,7 @@ fn plan_principal_buy(
         asks,
         principal,
         6,
-        false,
+        None,
         minimum_price,
         maximum_price_exclusive,
         chase_ceiling,
@@ -456,7 +456,7 @@ fn plan_principal_buy_with_scale(
     asks: &[AskLevel],
     principal: CollateralAmount,
     signed_share_scale: u32,
-    accept_partial: bool,
+    partial_minimum: Option<ShareAmount>,
     minimum_price: Price,
     maximum_price_exclusive: Price,
     chase_ceiling: Price,
@@ -469,7 +469,7 @@ fn plan_principal_buy_with_scale(
     let walked = walk_principal(
         asks,
         principal,
-        accept_partial,
+        partial_minimum.is_some(),
         minimum_price,
         maximum_price_exclusive,
         ceiling,
@@ -486,6 +486,9 @@ fn plan_principal_buy_with_scale(
         shares,
         worst_case_debit: principal,
     };
+    if partial_minimum.is_some_and(|minimum| plan.shares < minimum) {
+        return Err(LadderError::BelowMinimum);
+    }
     if plan.signed_price()? < plan.limit_price {
         return Err(LadderError::Amount);
     }
@@ -758,6 +761,40 @@ mod tests {
 
     fn price(value: Decimal) -> Price {
         Price::new(value).unwrap()
+    }
+
+    #[test]
+    fn dollar_up_to_dust_is_below_minimum_before_signed_price_validation() {
+        let asks = [level(dec!(0.84), dec!(0.000199))];
+        let budget = CollateralAmount::from_decimal_exact(dec!(25)).unwrap();
+        let result = plan_sized_buy(
+            &asks,
+            CompactFeeSchedule::Zero,
+            BuySizing::DollarUpTo { budget },
+            &[budget],
+            ShareAmount::from_whole(5).unwrap(),
+            price(dec!(0.01)),
+            price(dec!(0.15)),
+            price(dec!(0.85)),
+            Price::ONE,
+            Price::ONE,
+        );
+        assert_eq!(result, Err(LadderError::BelowMinimum));
+        assert_eq!(
+            plan_sized_buy(
+                &asks,
+                CompactFeeSchedule::Zero,
+                BuySizing::Dollar { budget },
+                &[budget],
+                ShareAmount::from_whole(5).unwrap(),
+                price(dec!(0.01)),
+                price(dec!(0.15)),
+                price(dec!(0.85)),
+                Price::ONE,
+                Price::ONE,
+            ),
+            Err(LadderError::InsufficientDepth)
+        );
     }
 
     proptest::proptest! {

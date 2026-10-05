@@ -2034,6 +2034,7 @@ pub(crate) async fn golden_source_stream_replays_exact_economic_core() {
                 first_admission = Some(recorded.admission.clone());
             }
             let context = BucketDecisionContext {
+                verified_read: None,
                 applied_configuration: runtime_config.clone(),
                 decision_inputs_json: read.decision_inputs_json,
                 page_occurrences: vec![read.page],

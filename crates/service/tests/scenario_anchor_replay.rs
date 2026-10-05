@@ -114,6 +114,7 @@ fn non_trade_aggregate(
 
 fn context(epoch: i64) -> BucketDecisionContext {
     BucketDecisionContext {
+        verified_read: None,
         applied_configuration: pe_service::runtime_config::RuntimeConfig::from_service_config(
             &pe_service::config::ServiceConfig::default(),
         ),

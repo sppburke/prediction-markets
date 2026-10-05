@@ -565,13 +565,15 @@ it neither latches nor changes the decision; genuine late arrivals retain causal
 
 The admission capture retains the frame receipt, source/receive/admission clocks, compact
 `AdmissionLedgerCapture`, append-only activity row boundary, frame-market anchor balances and
-post-anchor groups, the `(market, outcome)` position, a single market-consumption fact, and only
+post-anchor groups, a single market-consumption fact, and only
 the admitting wallet's preceding unresolved BUYs or obligations. Eligibility, history/fence/coverage,
 frontier/staleness and paper-prefix incident/release basis remain frozen. Durable anchor/group
 owners authenticate the scoped rebuild through the recovery reducer; the frame transaction's
 `wallet_market_history_v2` row proves first consumption. Configuration, sizing basis and quality
 live in continuation facts; frame payload/hash and parser/schema contracts resolve from its
-receipt. The source-log admission artifact and continuation each store this scoped body. Resolved
+receipt. The continuation stores the scoped body once; the compact source-log admission artifact stores
+only its version, frame receipt and `capture_digest` (the domain-separated frame revision).
+Classification uses the position rebuilt from these inputs. Resolved
 barriers are pruned at runtime and boot; unrelated wallets/positions/history cannot grow the body.
 
 First-entry history is per wallet and market. Continuation 7 copies each wallet's first entry
@@ -610,7 +612,7 @@ negative audits retain the deciding commitment's proof, including empty bindings
 journals contradiction or absence before the audit ordering barrier retires. The synchronized
 paper era rebuilds one process-wide latch before boot admissions: `Engaged` sets the latest
 incident, and `Released` must reference that latest engagement. While latched, frames wait for
-history; admitted work completes. `status.json` reports `feed_latch` and `feed_incident`, the
+history; admitted work completes. `status.json` reports `source_health.feed_latch` and `source_health.feed_incident`, the
 structured error `feed audit incident engaged; frames wait for history` carries the same
 incident, and qualification checks each frame's frozen latch basis against its paper prefix.
 Release uses
@@ -625,7 +627,14 @@ evaluated `frontier` and `latest_incident_basis`. `FrameFallbackReason` encodes 
 `history_behind`, `earlier_unresolved_buy` or `wallet_not_ready`. Wallet and market are derived
 from the authenticated frame. This artifact consumes no entry and is not a decision input;
 measure routing from the earliest authenticated artifact per frame, never current status.
-`pe-service.activity-frame-admission` authenticates the frozen frame admission inputs.
+`pe-service.activity-frame-admission` authenticates the digest of the frozen frame admission
+inputs in the pending continuation; it does not duplicate the inputs. Ordinary non-admitted
+obligations retire through the owner acknowledgement, retaining their exact receipt and whether
+retirement was unbound under
+`retired_activity_observation:<sequence>` in `meta` so fence clearance and restart cannot
+restore an obsolete ordering barrier. Bound observations still require their authenticated
+disposed target during obligation rebuild. Admitted audits retire only through an authenticated
+disposed match or an acknowledged incident.
 
 **History-only bracket disposition.** `history_only_bracket` (`HISTORY_ONLY_BRACKET`) records an
 admitted first entry whose copying a causal bracket suppresses. It is an applied activity

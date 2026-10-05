@@ -250,6 +250,7 @@ fn zero_basis() -> pe_service::bucket_commit::FrozenDecisionBasis {
 }
 fn context(epoch: i64, complete_history: bool) -> BucketDecisionContext {
     BucketDecisionContext {
+        verified_read: None,
         applied_configuration: pe_service::runtime_config::RuntimeConfig::from_service_config(
             &pe_service::config::ServiceConfig::default(),
         ),

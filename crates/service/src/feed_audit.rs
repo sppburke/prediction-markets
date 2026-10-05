@@ -22,8 +22,6 @@ pub enum FeedAuditError {
     Proof(#[from] crate::bucket_commit::CompleteActivityReadError),
     #[error("frame audit continuation: {0}")]
     Continuation(#[from] crate::bucket_commit::DecisionContinuationError),
-    #[error("frame audit encoding: {0}")]
-    Json(#[from] serde_json::Error),
     #[error("frame audit semantic refusal: {0}")]
     Semantic(&'static str),
 }
@@ -61,14 +59,14 @@ pub(crate) fn disposition(
         .observed_source_receipt
         .ok_or(FeedAuditError::Semantic("frame receipt missing"))?;
     let binding = read
-        .bindings
-        .iter()
-        .find(|binding| binding.stream_receipt == receipt);
+        .binding_indices
+        .get(&(receipt.sequence, receipt.this_hash))
+        .and_then(|index| read.bindings.get(*index));
     if let Some(binding) = binding {
         let target = read
-            .aggregates
-            .iter()
-            .find(|aggregate| aggregate.group_id.key() == &binding.history_group_id)
+            .aggregate_indices
+            .get(&binding.history_group_id)
+            .and_then(|index| read.aggregates.get(*index))
             .ok_or(FeedAuditError::Semantic(
                 "counterpart absent from authenticated read",
             ))?;
@@ -100,12 +98,9 @@ pub(crate) fn disposition(
             AuditDisposition::Contradicted(binding.history_group_id.clone())
         });
     }
-    let proof: crate::frame_admission::FrameDecisionProof =
-        serde_json::from_value(frame.facts.decision_inputs.clone())?;
-    let mature_end = proof
-        .inputs
-        .source_time
-        .unix_timestamp()
+    let mature_end = frame
+        .facts
+        .source_epoch
         .checked_add(
             i64::try_from(
                 frame
@@ -121,12 +116,13 @@ pub(crate) fn disposition(
     let observation_tx = &frame.facts.transaction_hash;
     if read.full_history
         && read.fixed_end >= mature_end
-        && !read.aggregates.iter().any(|aggregate| {
-            let components = aggregate.group_id.components();
-            components.wallet == frame.facts.wallet
-                && &components.transaction_hash == observation_tx
-                && components.activity_type == ActivityType::Trade
-        })
+        && !read
+            .transaction_aggregates
+            .get(observation_tx)
+            .into_iter()
+            .flatten()
+            .filter_map(|index| read.aggregates.get(*index))
+            .any(|aggregate| aggregate.group_id.components().activity_type == ActivityType::Trade)
     {
         Ok(AuditDisposition::Absent)
     } else {
@@ -156,7 +152,7 @@ where
     verify_incident_conclusion(frame, incident, &read)
 }
 
-fn verify_incident_conclusion(
+pub(crate) fn verify_incident_conclusion(
     frame: &DecisionContinuationV3,
     incident: &FeedIncident,
     read: &VerifiedCommitment,

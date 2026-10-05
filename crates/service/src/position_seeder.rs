@@ -1626,6 +1626,7 @@ fn bracket_context(
     let reconstruction_quality =
         ReconstructionQuality::new(100).map_err(|_| CausalPositionError::ReconstructionQuality)?;
     Ok(BucketDecisionContext {
+        verified_read: None,
         applied_configuration: crate::runtime_config::RuntimeConfig::from_service_config(
             &crate::config::ServiceConfig::default(),
         ),

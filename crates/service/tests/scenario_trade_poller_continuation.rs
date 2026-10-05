@@ -154,6 +154,7 @@ fn aggregate(row: Value) -> ActivityAggregate {
 
 fn context(epoch: i64) -> BucketDecisionContext {
     BucketDecisionContext {
+        verified_read: None,
         applied_configuration: RuntimeConfig::from_service_config(
             &pe_service::config::ServiceConfig::default(),
         ),
@@ -325,11 +326,15 @@ async fn late_group_then_strict_decrement_in_one_read_both_become_durable() {
     let fetcher = Arc::new(QueueFetcher::new(activity_page));
 
     let source_sink = SourceEventSink::open(&source_log_path).unwrap();
+    let source_receipts =
+        pe_service::risk_inputs::SourceReceiptIndex::replay(&source_log_path).unwrap();
     let (source_log, source_rx) = SourceLogHandle::channel(8);
     let (trigger_tx, trigger_rx) = mpsc::channel(4);
     let health = new_shared_health_with_ws(false, true, 90);
     let ingest = tokio::spawn(
-        ActivityIngest::poll_only(source_sink, source_rx, trigger_tx, Arc::clone(&health)).run(),
+        ActivityIngest::poll_only(source_sink, source_rx, trigger_tx, Arc::clone(&health))
+            .with_source_receipt_index(source_receipts.clone())
+            .run(),
     );
     let asset_identity = Arc::new(AssetIdentityResolver::new_runtime(
         Arc::new(GammaFetcher),
@@ -383,6 +388,7 @@ async fn late_group_then_strict_decrement_in_one_read_both_become_durable() {
         ReconciliationObligations::default(),
         None,
     )
+    .with_source_receipt_index(source_receipts)
     .with_clock(Arc::new(move || now))
     .with_progress(progress_tx)
     .run_until(async move {
@@ -447,7 +453,7 @@ async fn recorded_poll(
     let health = new_shared_health_with_ws(false, true, 90);
     let ingest = tokio::spawn(
         ActivityIngest::poll_only(source_sink, source_rx, trigger_tx, Arc::clone(&health))
-            .with_source_receipt_index(source_receipts)
+            .with_source_receipt_index(source_receipts.clone())
             .run(),
     );
     let asset_identity = Arc::new(AssetIdentityResolver::new_runtime(
@@ -512,6 +518,7 @@ async fn recorded_poll(
         ReconciliationObligations::default(),
         None,
     )
+    .with_source_receipt_index(source_receipts)
     .with_clock(Arc::new(move || now))
     .with_progress(progress_tx)
     .run_until(async move {
@@ -1064,6 +1071,14 @@ fn start_recorded_poller_with_completion_stop(
                             .await
                             .unwrap();
                     } else {
+                        if let pe_service::orchestrator_control::FeedAuditUpdate::RetireObservation {
+                            receipt, unbound, ..
+                        } = update
+                        {
+                            // This owner fixture mirrors the acknowledged retirement metadata;
+                            // production additionally checks the authenticated disposition.
+                            actor_paper.retire_activity_observation(receipt, unbound).unwrap();
+                        }
                         let _ = acknowledged.send(Ok(()));
                     }
                 }
@@ -3810,14 +3825,15 @@ async fn existing_fence_discharges_new_ambiguity_and_releases_oldest_boundary() 
         .find(|frame| frame.source_id.0 == pe_service::trade_poller::DAILY_BOUNDARY_SOURCE_ID)
         .unwrap();
     assert!(second_receipt.sequence < boundary.seq);
-    // A restart can already use the existing permanent fence, even before another commitment.
-    assert!(
+    // The fence must reach the owner's acknowledged retirement before boot discards this work.
+    assert_eq!(
         pe_service::trade_poller::rebuild_reconciliation_obligations(
             &dir.path().join("source.log"),
             &paper
         )
         .unwrap()
-        .is_empty()
+        .len(),
+        1
     );
 
     let gate = running.bucket_ack_gate.clone();
@@ -4073,9 +4089,9 @@ async fn mixed_exact_and_corrected_legs_keep_individual_bindings() {
 }
 
 /// PASS: a crash after the fence witness but before the revision transaction keeps the fence
-/// and discharges the ambiguous original on reopen; retry preserves the original economic effect.
+/// and retains the unacknowledged observation on reopen; retry preserves the original economic effect.
 #[tokio::test(start_paused = true)]
-async fn restart_between_fence_witness_and_revision_keeps_ambiguity_discharged() {
+async fn restart_between_fence_witness_and_revision_keeps_unacknowledged_obligation() {
     let dir = tempfile::tempdir().unwrap();
     let (mut running, _) = start_recorded_poller(&dir, &[wallet()]);
     let original = stream_row(wallet(), "witness-revision", EPOCH);
@@ -4147,13 +4163,14 @@ async fn restart_between_fence_witness_and_revision_keeps_ambiguity_discharged()
     drop(paper);
     let paper = Arc::new(PaperStateDb::open(&before).unwrap());
     let fence = paper.wallet_fences().unwrap();
-    assert!(
+    assert_eq!(
         pe_service::trade_poller::rebuild_reconciliation_obligations(
             &dir.path().join("source.log"),
             &paper
         )
         .unwrap()
-        .is_empty()
+        .len(),
+        1
     );
     assert_eq!(
         paper

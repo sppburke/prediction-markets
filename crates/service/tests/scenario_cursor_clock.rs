@@ -481,6 +481,8 @@ async fn reader_burst_coalesces_until_the_existing_poll_cadence() {
     let source_log_path = dir.path().join("source.log");
     let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
     let sink = SourceEventSink::open(&source_log_path).unwrap();
+    let source_receipts =
+        pe_service::risk_inputs::SourceReceiptIndex::replay(&source_log_path).unwrap();
     let (source_log, source_rx) = SourceLogHandle::channel(4);
     let asset_identity = Arc::new(AssetIdentityResolver::new_runtime(
         Arc::new(GammaFetcher {
@@ -493,8 +495,11 @@ async fn reader_burst_coalesces_until_the_existing_poll_cadence() {
     let (trigger_tx, trigger_rx) = mpsc::channel(8);
     let trigger_inject = trigger_tx.clone();
     let health = new_shared_health_with_ws(false, true, 90);
-    let ingest =
-        tokio::spawn(ActivityIngest::poll_only(sink, source_rx, trigger_tx, health.clone()).run());
+    let ingest = tokio::spawn(
+        ActivityIngest::poll_only(sink, source_rx, trigger_tx, health.clone())
+            .with_source_receipt_index(source_receipts.clone())
+            .run(),
+    );
     let (control_tx, mut control_rx) = mpsc::channel(1);
     let control = tokio::spawn(async move {
         while let Some(command) = control_rx.recv().await {
@@ -530,6 +535,7 @@ async fn reader_burst_coalesces_until_the_existing_poll_cadence() {
             ReconciliationObligations::default(),
             None,
         )
+        .with_source_receipt_index(source_receipts)
         .with_clock(Arc::new(move || now))
         .run(),
     );

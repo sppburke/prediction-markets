@@ -1,7 +1,7 @@
 //! Frozen frame admission and the wallet's authenticated complete-history frontier.
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use pe_core_types::{MarketId, MarketOutcomeId, SourceTradeId, WalletAddress};
+use pe_core_types::{MarketId, SourceTradeId, WalletAddress};
 use pe_event_log::AppendReceipt;
 use pe_paper_state::{PaperStateDb, WalletCoverage};
 use pe_source_polymarket_public::ReconciliationPageEvidence;
@@ -32,10 +32,6 @@ pub(crate) enum FrameAdmissionError {
     History(Box<crate::paper_recovery::WalletLedgerReplayError>),
     #[error("frame ledger effect: {0}")]
     Effect(#[from] pe_position_ledger::LedgerEffectDocumentError),
-    #[error("frame ledger mutation: {0}")]
-    Ledger(#[from] pe_position_ledger::LedgerError),
-    #[error("frame ledger timestamp: {0}")]
-    Timestamp(#[from] time::error::ComponentRange),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,7 +148,7 @@ pub struct EarlierFrame {
     pub unresolved_obligation: bool,
 }
 
-/// An immutable admission prefix. Canonical source-log bytes authenticate this capture;
+/// An immutable admission prefix. The source artifact authenticates this capture's digest;
 /// classification is reconstructed from its confirmed positions and consumed history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -165,7 +161,6 @@ pub struct FrameAdmissionInputs {
     pub ledger_capture: AdmissionLedgerCapture,
     pub ledger_group_boundary: Option<i64>,
     pub anchor_balances: Vec<(u16, pe_core_types::ShareAmount)>,
-    pub position: pe_copy_signal_engine::PositionState,
     pub ledger_groups: Vec<pe_paper_state::ActivityGroupRow>,
     pub market_consumed: bool,
     pub earlier_frames: Vec<EarlierFrame>,
@@ -184,7 +179,6 @@ impl FrameAdmissionInputs {
         &self,
         wallet: WalletAddress,
         market: &MarketId,
-        outcome: pe_core_types::OutcomeId,
     ) -> Result<pe_copy_signal_engine::PositionSnapshot, FrameAdmissionError> {
         let balances = self
             .anchor_balances
@@ -225,17 +219,6 @@ impl FrameAdmissionInputs {
             .position(&wallet)
             .cloned()
             .ok_or(FrameAdmissionError::InvalidPrefix("market ledger absent"))?;
-        if positions
-            .positions
-            .get(&MarketOutcomeId::new(market.clone(), outcome))
-            .copied()
-            .unwrap_or_default()
-            != self.position
-        {
-            return Err(FrameAdmissionError::InvalidPrefix(
-                "frozen position differs from market rebuild",
-            ));
-        }
         Ok(positions)
     }
 
@@ -395,6 +378,25 @@ pub(crate) fn unique_earlier(earlier: &[EarlierFrame], frame: AppendReceipt) -> 
     earlier.iter().all(|earlier| {
         earlier.receipt.sequence < frame.sequence && sequences.insert(earlier.receipt.sequence)
     })
+}
+
+/// Compact source-log authentication of the continuation-owned admission body.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrameAdmissionArtifact {
+    pub version: u16,
+    pub frame_receipt: AppendReceipt,
+    pub capture_digest: String,
+}
+
+impl FrameAdmissionArtifact {
+    pub fn from_inputs(inputs: &FrameAdmissionInputs) -> Result<Self, serde_json::Error> {
+        Ok(Self {
+            version: 1,
+            frame_receipt: inputs.frame_receipt,
+            capture_digest: frame_revision(inputs)?,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

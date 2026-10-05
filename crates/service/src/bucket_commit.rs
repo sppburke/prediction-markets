@@ -95,6 +95,8 @@ impl PaperFreshnessPolicy {
 /// Decision inputs already read before the atomic bucket commit.
 #[derive(Debug, Clone)]
 pub struct BucketDecisionContext {
+    /// Shared authentication of the whole read. Its private fields prevent unverified construction.
+    pub verified_read: Option<std::sync::Arc<VerifiedCommitment>>,
     pub applied_configuration: RuntimeConfig,
     pub decision_inputs_json: String,
     /// Receipt-bearing page occurrences are frozen in continuation versions 3, 4, and 5. They stay
@@ -614,11 +616,7 @@ impl DecisionContinuationV3 {
             return Err(DecisionContinuationError::DurableMismatch);
         }
         let positions = inputs
-            .positions(
-                self.facts.wallet,
-                &self.facts.market_id,
-                self.facts.outcome_id,
-            )
+            .positions(self.facts.wallet, &self.facts.market_id)
             .map_err(|_| {
                 DecisionContinuationError::FrameAdmissionRefused("market ledger rebuild differs")
             })?;
@@ -640,9 +638,26 @@ impl DecisionContinuationV3 {
             &SignalConfig::default(),
         ) != LeaderAction::Entry
         {
-            return Err(DecisionContinuationError::DurableMismatch);
+            return Err(DecisionContinuationError::FrameAdmissionRefused(
+                "confirmed market position is not an entry",
+            ));
         }
         Ok(())
+    }
+
+    pub(crate) fn verify_activity_frame_with_index(
+        &self,
+        index: &SourceReceiptIndex,
+    ) -> Result<(SourceTimestamp, Option<PolymarketTokenId>), CompleteActivityReadError> {
+        #[cfg(feature = "scenario")]
+        if let Some(receipt) = self.observed_source_receipt {
+            index.record_frame_verification(receipt);
+        }
+        self.verify_activity_frame(&mut |receipt| {
+            index
+                .source_envelope(receipt)
+                .map(CompleteActivityPage::from)
+        })
     }
 
     /// Authenticate the exact frame and prefix before using any frozen decision fact.
@@ -689,9 +704,11 @@ impl DecisionContinuationV3 {
             || admission.content_type != ContentType::Json
             || admission.observed_at.0 != inputs.admitted_at
             || admission.received_at.0 != inputs.admitted_at
-            || serde_json::from_slice::<Value>(&admission.payload)
-                .map_err(|error| complete_activity_read_error(error.to_string()))?
-                != serde_json::to_value(inputs)
+            || serde_json::from_slice::<crate::frame_admission::FrameAdmissionArtifact>(
+                &admission.payload,
+            )
+            .map_err(|error| complete_activity_read_error(error.to_string()))?
+                != crate::frame_admission::FrameAdmissionArtifact::from_inputs(inputs)
                     .map_err(|error| complete_activity_read_error(error.to_string()))?
         {
             return Err(complete_activity_read_error(
@@ -1312,7 +1329,7 @@ impl ActivityReadVerification<'_> {
             let frame_audit = if let Some(receipt) = binding.frame_admission_receipt {
                 let admission = lookup(receipt)
                     .map_err(|error| complete_activity_read_error(error.to_string()))?;
-                let inputs: crate::frame_admission::FrameAdmissionInputs =
+                let artifact: crate::frame_admission::FrameAdmissionArtifact =
                     serde_json::from_slice(&admission.payload)
                         .map_err(|error| complete_activity_read_error(error.to_string()))?;
                 if admission.source_id != crate::frame_admission::FRAME_ADMISSION_SOURCE_ID
@@ -1320,13 +1337,9 @@ impl ActivityReadVerification<'_> {
                     || admission.parser_version != 1
                     || admission.content_type != ContentType::Json
                     || receipt.sequence >= commitment_receipt.sequence
-                    || inputs.version != 1
-                    || !inputs.copy_eligible
-                    || !inputs.history_complete
-                    || inputs.fenced
-                    || inputs.coverage.reanchor_required
-                    || inputs.latch.engaged()
-                    || inputs.frame_receipt != binding.stream_receipt
+                    || artifact.version != 1
+                    || artifact.capture_digest.len() != 64
+                    || artifact.frame_receipt != binding.stream_receipt
                     || observation.is_combo
                     || observation.share_amount == ShareAmount::ZERO
                     || observation.group_id.components().side != Some(Side::Buy)
@@ -1712,12 +1725,8 @@ impl DecisionContinuationV3 {
         source_receipts: &SourceReceiptIndex,
     ) -> Result<Option<ObservationEvidence>, DecisionContinuationError> {
         if self.is_activity_frame() {
-            self.verify_activity_frame(&mut |receipt| {
-                source_receipts
-                    .source_envelope(receipt)
-                    .map(CompleteActivityPage::from)
-            })
-            .map_err(|_| DecisionContinuationError::DurableMismatch)?;
+            self.verify_activity_frame_with_index(source_receipts)
+                .map_err(|_| DecisionContinuationError::DurableMismatch)?;
             let receipt = self
                 .observed_source_receipt
                 .ok_or(DecisionContinuationError::DurableMismatch)?;
@@ -1858,11 +1867,7 @@ impl DecisionContinuationV3 {
     ) -> Result<(), DecisionContinuationError> {
         if self.is_activity_frame() {
             return self
-                .verify_activity_frame(&mut |receipt| {
-                    source_receipts
-                        .source_envelope(receipt)
-                        .map(CompleteActivityPage::from)
-                })
+                .verify_activity_frame_with_index(source_receipts)
                 .map(|_| ())
                 .map_err(|_| DecisionContinuationError::DurableMismatch);
         }
@@ -2224,6 +2229,8 @@ pub(crate) fn verified_commitment_bindings(
     receipt: AppendReceipt,
     source_receipts: &SourceReceiptIndex,
 ) -> Result<VerifiedCommitment, CompleteActivityReadError> {
+    #[cfg(feature = "scenario")]
+    source_receipts.record_read_verification(receipt);
     verified_commitment_bindings_with_lookup(receipt, &mut |receipt| {
         source_receipts
             .source_envelope(receipt)
@@ -2232,14 +2239,114 @@ pub(crate) fn verified_commitment_bindings(
 }
 
 /// An authenticated commitment: its bindings and the restamp pairs its complete read proves.
-pub(crate) struct VerifiedCommitment {
+#[derive(Debug)]
+pub struct VerifiedCommitment {
+    pub(crate) receipt: AppendReceipt,
+    frontier: Option<crate::frame_admission::FeedHistoryFrontier>,
     pub(crate) bindings: Vec<ObservationBinding>,
     pub(crate) restamp_pairs: HashMap<SourceTradeId, SourceTradeId>,
     pub(crate) wallet: WalletAddress,
     pub(crate) fixed_end: i64,
     pub(crate) full_history: bool,
+    pub(crate) transaction_aggregates: HashMap<String, Vec<usize>>,
+    pub(crate) aggregate_indices: HashMap<SourceTradeId, usize>,
+    pub(crate) binding_indices: HashMap<(pe_core_types::EventSeq, blake3::Hash), usize>,
     pub(crate) aggregates: Vec<ActivityAggregate>,
     pub(crate) identities: HashMap<SourceTradeId, MarketOutcomeId>,
+}
+
+fn index_aggregates(aggregates: &[ActivityAggregate]) -> HashMap<SourceTradeId, usize> {
+    aggregates
+        .iter()
+        .enumerate()
+        .map(|(index, aggregate)| (aggregate.group_id.key().clone(), index))
+        .collect()
+}
+
+fn index_bindings(
+    bindings: &[ObservationBinding],
+) -> HashMap<(pe_core_types::EventSeq, blake3::Hash), usize> {
+    bindings
+        .iter()
+        .enumerate()
+        .map(|(index, binding)| {
+            (
+                (
+                    binding.stream_receipt.sequence,
+                    binding.stream_receipt.this_hash,
+                ),
+                index,
+            )
+        })
+        .collect()
+}
+
+fn index_transactions(aggregates: &[ActivityAggregate]) -> HashMap<String, Vec<usize>> {
+    let mut transactions: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, aggregate) in aggregates.iter().enumerate() {
+        transactions
+            .entry(aggregate.group_id.components().transaction_hash.clone())
+            .or_default()
+            .push(index);
+    }
+    transactions
+}
+
+pub fn verified_read_for_routing(
+    receipt: AppendReceipt,
+    wallet: WalletAddress,
+    fixed_end: i64,
+    occurrences: &[PageOccurrence],
+    pages: &[ReconciliationPageEvidence],
+    index: &SourceReceiptIndex,
+) -> Result<VerifiedCommitment, CompleteActivityReadError> {
+    #[cfg(feature = "scenario")]
+    index.record_read_verification(receipt);
+    let inputs = json!({"fixed_end": fixed_end, "pages": pages});
+    let verifier = ActivityReadVerification {
+        version: 7,
+        wallet,
+        decision_inputs: &inputs,
+        page_occurrences: occurrences,
+        read_commitment: Some(receipt),
+    };
+    let read = verifier.reconstruct_verified_activity_read(&mut |receipt| {
+        index
+            .source_envelope(receipt)
+            .map(CompleteActivityPage::from)
+    })?;
+    Ok(VerifiedCommitment {
+        receipt,
+        frontier: Some(crate::frame_admission::FeedHistoryFrontier {
+            version: 1,
+            wallet,
+            fixed_end,
+            commitment: receipt,
+            page_occurrences: occurrences.to_vec(),
+            pages: pages.to_vec(),
+        }),
+        wallet,
+        fixed_end,
+        full_history: pages.iter().any(|page| {
+            page.bounds
+                .is_some_and(|bounds| bounds.start == Some(0) && bounds.end == fixed_end)
+        }),
+        aggregate_indices: index_aggregates(&read.aggregates),
+        binding_indices: index_bindings(
+            read.commitment
+                .as_ref()
+                .and_then(|commitment| commitment.bindings.as_deref())
+                .unwrap_or_default(),
+        ),
+        transaction_aggregates: index_transactions(&read.aggregates),
+        bindings: read
+            .commitment
+            .and_then(|commitment| commitment.bindings)
+            .unwrap_or_default(),
+        aggregates: read.aggregates,
+        restamp_pairs: read.bindings.restamp_pairs,
+        identities: read.bindings.identities,
+    })
 }
 
 /// The same commitment-only authentication for either an indexed or replayed sealed prefix.
@@ -2271,11 +2378,16 @@ where
         .ok_or_else(|| complete_activity_read_error("v2 commitment bindings are absent"))?;
     if bindings.is_empty() && commitment.read_proof.is_none() {
         return Ok(VerifiedCommitment {
+            receipt,
+            frontier: None,
             bindings: Vec::new(),
             restamp_pairs: HashMap::new(),
             wallet: commitment.wallet,
             fixed_end: commitment.fixed_end,
             full_history: false,
+            aggregate_indices: HashMap::new(),
+            binding_indices: HashMap::new(),
+            transaction_aggregates: HashMap::new(),
             aggregates: Vec::new(),
             identities: HashMap::new(),
         });
@@ -2294,6 +2406,15 @@ where
     };
     let read = verifier.reconstruct_verified_activity_read(lookup)?;
     Ok(VerifiedCommitment {
+        receipt,
+        frontier: Some(crate::frame_admission::FeedHistoryFrontier {
+            version: 1,
+            wallet: commitment.wallet,
+            fixed_end: commitment.fixed_end,
+            commitment: receipt,
+            page_occurrences: proof.page_occurrences.clone(),
+            pages: proof.pages.clone(),
+        }),
         bindings: bindings.clone(),
         restamp_pairs: read.bindings.restamp_pairs,
         wallet: commitment.wallet,
@@ -2302,6 +2423,9 @@ where
             page.bounds
                 .is_some_and(|bounds| bounds.start == Some(0) && bounds.end == commitment.fixed_end)
         }),
+        aggregate_indices: index_aggregates(&read.aggregates),
+        binding_indices: index_bindings(bindings),
+        transaction_aggregates: index_transactions(&read.aggregates),
         aggregates: read.aggregates,
         identities: read.bindings.identities,
     })
@@ -2673,6 +2797,37 @@ pub struct ContinuationValidationError {
     pub cause: String,
 }
 
+/// Authenticate complete frame history once at boot, including already terminal decisions.
+/// Normal financial recovery authenticates only the continuation it retries or projects.
+pub fn validate_frame_history(
+    paper_state: &PaperStateDb,
+    source_receipts: &SourceReceiptIndex,
+) -> Result<usize, ContinuationValidationError> {
+    let rows =
+        paper_state
+            .decision_pending_history()
+            .map_err(|error| ContinuationValidationError {
+                source_trade_id: None,
+                cause: error.to_string(),
+            })?;
+    let mut validated = 0;
+    for row in rows {
+        let fail = |cause: String| ContinuationValidationError {
+            source_trade_id: Some(row.source_trade_id.clone()),
+            cause,
+        };
+        let continuation =
+            DecisionContinuationV3::from_durable(&row).map_err(|error| fail(error.to_string()))?;
+        if continuation.is_activity_frame() {
+            continuation
+                .verify_activity_frame_with_index(source_receipts)
+                .map_err(|error| fail(error.to_string()))?;
+            validated += 1;
+        }
+    }
+    Ok(validated)
+}
+
 /// Validate every open continuation before any can resume, reconstructing each shared read once.
 pub fn validate_open_continuations(
     paper_state: &PaperStateDb,
@@ -2712,11 +2867,7 @@ pub(crate) fn validate_continuation_rows(
             DecisionContinuationV3::from_durable(&row).map_err(|error| fail(error.to_string()))?;
         if continuation.is_activity_frame() {
             continuation
-                .verify_activity_frame(&mut |receipt| {
-                    source_receipts
-                        .source_envelope(receipt)
-                        .map(CompleteActivityPage::from)
-                })
+                .verify_activity_frame_with_index(source_receipts)
                 .map_err(|error| fail(error.to_string()))?;
             let proof: crate::frame_admission::FrameDecisionProof =
                 serde_json::from_value(continuation.facts.decision_inputs.clone())
@@ -2957,6 +3108,7 @@ pub(crate) mod continuation_validation_tests {
             }])
             .unwrap();
         let context = BucketDecisionContext {
+            verified_read: None,
             applied_configuration: synthetic_legacy17_runtime_config(),
             decision_inputs_json: json!({"fixed_end": fixed_end, "pages": pages}).to_string(),
             page_occurrences: occurrences,
@@ -3216,6 +3368,9 @@ pub struct BucketCommitEngine {
     fences: HashSet<WalletAddress>,
     earlier_frames: Vec<crate::frame_admission::EarlierFrame>,
     frame_decisions: HashMap<WalletAddress, Vec<DecisionContinuationV3>>,
+    frame_transactions: HashMap<(WalletAddress, String), Vec<usize>>,
+    admitted_frame_receipts:
+        HashMap<(pe_core_types::EventSeq, blake3::Hash), (WalletAddress, usize)>,
     verified_frontiers: Option<HashMap<WalletAddress, crate::frame_admission::FeedHistoryFrontier>>,
     routed_frame_receipts: HashSet<pe_core_types::EventSeq>,
     frame_source_index: Option<SourceReceiptIndex>,
@@ -3246,6 +3401,20 @@ impl BucketCommitEngine {
                     .push(continuation);
             }
         }
+        let mut frame_transactions: HashMap<(WalletAddress, String), Vec<usize>> = HashMap::new();
+        let mut admitted_frame_receipts = HashMap::new();
+        for (wallet, frames) in &frame_decisions {
+            for (index, frame) in frames.iter().enumerate() {
+                frame_transactions
+                    .entry((*wallet, frame.facts.transaction_hash.clone()))
+                    .or_default()
+                    .push(index);
+                if let Some(receipt) = frame.observed_source_receipt {
+                    admitted_frame_receipts
+                        .insert((receipt.sequence, receipt.this_hash), (*wallet, index));
+                }
+            }
+        }
         Ok(Self {
             paper_state,
             ledger,
@@ -3254,10 +3423,52 @@ impl BucketCommitEngine {
             fences,
             earlier_frames: Vec::new(),
             frame_decisions,
+            frame_transactions,
+            admitted_frame_receipts,
             verified_frontiers: None,
             routed_frame_receipts: HashSet::new(),
             frame_source_index: None,
         })
+    }
+
+    /// Select only transactions present in this bucket; leg discovery still uses the whole read.
+    fn frames_for_aggregates(
+        &self,
+        aggregates: &[ActivityAggregate],
+    ) -> Vec<&DecisionContinuationV3> {
+        let transactions = aggregates
+            .iter()
+            .map(|aggregate| {
+                let components = aggregate.group_id.components();
+                (components.wallet, components.transaction_hash.clone())
+            })
+            .collect::<HashSet<_>>();
+        let mut frames = transactions
+            .into_iter()
+            .flat_map(|key| {
+                self.frame_transactions
+                    .get(&key)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(move |index| {
+                        self.frame_decisions
+                            .get(&key.0)
+                            .and_then(|frames| frames.get(*index))
+                    })
+            })
+            .collect::<Vec<_>>();
+        frames.sort_by(|left, right| {
+            left.facts
+                .source_epoch
+                .cmp(&right.facts.source_epoch)
+                .then_with(|| {
+                    left.facts
+                        .source_trade_id
+                        .0
+                        .cmp(&right.facts.source_trade_id.0)
+                })
+        });
+        frames
     }
 
     /// Install the authenticated receipt owner used to discover durable frame counterparts.
@@ -3301,6 +3512,113 @@ impl BucketCommitEngine {
         self.earlier_frames.retain(|frame| frame.receipt != receipt);
     }
 
+    pub(crate) fn retire_observation(
+        &mut self,
+        receipt: AppendReceipt,
+        source_trade_id: &SourceTradeId,
+        unbound: bool,
+        read: Option<&VerifiedCommitment>,
+    ) -> Result<(), String> {
+        let admitted = self
+            .admitted_frame_receipts
+            .get(&(receipt.sequence, receipt.this_hash))
+            .and_then(|(wallet, index)| {
+                self.frame_decisions
+                    .get(wallet)
+                    .and_then(|frames| frames.get(*index))
+            });
+        if let Some(frame) = admitted {
+            if !self
+                .earlier_frames
+                .iter()
+                .any(|earlier| earlier.receipt == receipt)
+            {
+                return Ok(()); // already acknowledged by a matched bucket or incident
+            }
+            let read = read
+                .ok_or_else(|| "admitted audit retirement lacks authenticated match".to_owned())?;
+            let crate::feed_audit::AuditDisposition::Matched(id) =
+                crate::feed_audit::disposition(frame, read).map_err(|error| error.to_string())?
+            else {
+                return Err("admitted audit retirement lacks authenticated match".to_owned());
+            };
+            let target = read
+                .aggregate_indices
+                .get(&id)
+                .and_then(|index| read.aggregates.get(*index))
+                .ok_or_else(|| "matched audit target absent".to_owned())?;
+            if !self
+                .paper_state
+                .activity_revision_disposed(&id, target.semantic_revision.as_str())
+                .map_err(|error| error.to_string())?
+            {
+                return Err("matched audit target is not disposed".to_owned());
+            }
+        } else {
+            let index = self
+                .frame_source_index
+                .as_ref()
+                .ok_or_else(|| "frame source index absent".to_owned())?;
+            let source = index
+                .source_envelope(receipt)
+                .map_err(|error| error.to_string())?;
+            let observation = parse_activity_trade_observation(&source.payload)
+                .map_err(|error| error.to_string())?;
+            let mut bound_disposition = false;
+            if let Some(read) = read
+                && let Some(binding) = read
+                    .binding_indices
+                    .get(&(receipt.sequence, receipt.this_hash))
+                    .and_then(|index| read.bindings.get(*index))
+                && &binding.stream_group_id == source_trade_id
+            {
+                bound_disposition = self
+                    .paper_state
+                    .activity_revision_disposed(
+                        &binding.history_group_id,
+                        &binding.semantic_revision,
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+            if observation.group_id.key() != source_trade_id
+                || (!self
+                    .paper_state
+                    .is_wallet_fenced(&observation.wallet)
+                    .map_err(|error| error.to_string())?
+                    && self
+                        .paper_state
+                        .activity_group_state(source_trade_id)
+                        .map_err(|error| error.to_string())?
+                        .is_none()
+                    && !bound_disposition)
+            {
+                return Err("ordinary observation retirement lacks durable disposition".to_owned());
+            }
+            // Boot infers every other retirement from the durable activity group; only an
+            // observation retired without one needs its own record.
+            if self
+                .paper_state
+                .activity_group_state(source_trade_id)
+                .map_err(|error| error.to_string())?
+                .is_none()
+            {
+                self.paper_state
+                    .retire_activity_observation(
+                        receipt,
+                        unbound
+                            && read.is_none_or(|read| {
+                                !read
+                                    .binding_indices
+                                    .contains_key(&(receipt.sequence, receipt.this_hash))
+                            }),
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        self.retire_frame_audit(receipt);
+        Ok(())
+    }
+
     pub(crate) fn restore_frame_prefix(
         &mut self,
         receipts: &[AppendReceipt],
@@ -3331,19 +3649,18 @@ impl BucketCommitEngine {
                     .clone(),
             ));
             let admitted = self
-                .frame_decisions
-                .get(&observation.wallet)
-                .is_some_and(|frames| {
-                    frames
-                        .iter()
-                        .any(|frame| frame.observed_source_receipt == Some(*receipt))
-                });
+                .admitted_frame_receipts
+                .contains_key(&(receipt.sequence, receipt.this_hash));
             if !admitted
-                && self
+                && (self
                     .paper_state
-                    .activity_group_state(observation.group_id.key())
+                    .activity_observation_retired(*receipt)
                     .map_err(|error| error.to_string())?
-                    .is_some()
+                    || self
+                        .paper_state
+                        .activity_group_state(observation.group_id.key())
+                        .map_err(|error| error.to_string())?
+                        .is_some())
             {
                 continue;
             }
@@ -3368,14 +3685,21 @@ impl BucketCommitEngine {
         &mut self,
         frontier: crate::frame_admission::FeedHistoryFrontier,
         index: &SourceReceiptIndex,
+        read: Option<&VerifiedCommitment>,
     ) -> Result<(), String> {
-        frontier
-            .verify(&mut |receipt| {
-                index
-                    .source_envelope(receipt)
-                    .map(CompleteActivityPage::from)
-            })
-            .map_err(|error| error.to_string())?;
+        if let Some(read) = read {
+            if read.frontier.as_ref() != Some(&frontier) {
+                return Err("frontier differs from authenticated read".to_owned());
+            }
+        } else {
+            frontier
+                .verify(&mut |receipt| {
+                    index
+                        .source_envelope(receipt)
+                        .map(CompleteActivityPage::from)
+                })
+                .map_err(|error| error.to_string())?;
+        }
         self.restore_verified_frontiers(index)?;
         let mut frontiers = self.verified_frontiers.clone().unwrap_or_default();
         if let Some(previous) = frontiers.get(&frontier.wallet) {
@@ -3452,6 +3776,15 @@ impl BucketCommitEngine {
             .decision_pending_for(observation.group_id.key())?
             .is_some()
         {
+            return Ok(FrameRoute::Ignored);
+        }
+        // Any durable REST disposition owns this identity, including raw-only refusals.
+        if self
+            .paper_state
+            .activity_group_state(observation.group_id.key())?
+            .is_some()
+        {
+            self.routed_frame_receipts.insert(receipt.sequence);
             return Ok(FrameRoute::Ignored);
         }
         // REST winning first already consumed history, before this admission capture.
@@ -3569,16 +3902,6 @@ impl BucketCommitEngine {
         })?;
         let ledger_capture = ledger_capture(&self.ledger, &self.paper_state, observation.wallet)
             .map_err(|error| BucketCommitError::Invariant(error.to_string()))?;
-        let position = self
-            .ledger
-            .position(&observation.wallet)
-            .and_then(|snapshot| {
-                snapshot
-                    .positions
-                    .get(&MarketOutcomeId::new(market.clone(), incoming.outcome_id))
-            })
-            .copied()
-            .unwrap_or_default();
         let ledger_anchor = self
             .paper_state
             .position_anchors(&observation.wallet)?
@@ -3619,7 +3942,6 @@ impl BucketCommitEngine {
                 ledger_capture,
                 ledger_group_boundary,
                 anchor_balances,
-                position,
                 ledger_groups,
                 market_consumed,
                 earlier_frames: earlier,
@@ -3690,11 +4012,7 @@ impl BucketCommitEngine {
             read_commitment: None,
         };
         continuation
-            .verify_activity_frame(&mut |receipt| {
-                index
-                    .source_envelope(receipt)
-                    .map(CompleteActivityPage::from)
-            })
+            .verify_activity_frame_with_index(index)
             .map_err(|error| BucketCommitError::Invariant(error.to_string()))?;
         self.paper_state
             .commit_activity_frame(&pe_paper_state::ActivityFrameCommit {
@@ -3722,10 +4040,21 @@ impl BucketCommitEngine {
                 },
             })?;
         self.entry_gate.record_entry(observation.wallet, &market);
-        self.frame_decisions
-            .entry(observation.wallet)
+        let frames = self.frame_decisions.entry(observation.wallet).or_default();
+        self.frame_transactions
+            .entry((
+                observation.wallet,
+                continuation.facts.transaction_hash.clone(),
+            ))
             .or_default()
-            .push(continuation);
+            .push(frames.len());
+        if let Some(receipt) = continuation.observed_source_receipt {
+            self.admitted_frame_receipts.insert(
+                (receipt.sequence, receipt.this_hash),
+                (observation.wallet, frames.len()),
+            );
+        }
+        frames.push(continuation);
         Ok(id)
     }
 
@@ -4011,16 +4340,21 @@ impl BucketCommitEngine {
         paper_freshness_policy: Option<PaperFreshnessPolicy>,
     ) -> Result<BucketCommitResult, BucketCommitError> {
         let mut matched_frames = Vec::new();
-        if let (Some(ActivityReadCommitmentReceipt::BindingsV2(receipt)), Some(index)) =
-            (context.read_commitment, self.frame_source_index.as_ref())
-        {
-            let read = verified_commitment_bindings(receipt, index)
-                .map_err(|error| BucketCommitError::Invariant(error.to_string()))?;
-            for frame in self.frame_decisions.values().flatten() {
-                if read.wallet == frame.facts.wallet
-                    && let crate::feed_audit::AuditDisposition::Matched(id) =
-                        crate::feed_audit::disposition(frame, &read)
-                            .map_err(|error| BucketCommitError::Invariant(error.to_string()))?
+        if let Some(read) = context.verified_read.as_ref() {
+            if context.read_commitment
+                != Some(ActivityReadCommitmentReceipt::BindingsV2(read.receipt))
+                || aggregates
+                    .iter()
+                    .any(|aggregate| aggregate.group_id.components().wallet != read.wallet)
+            {
+                return Err(BucketCommitError::Invariant(
+                    "bucket authenticated read differs".to_owned(),
+                ));
+            }
+            for frame in self.frames_for_aggregates(&aggregates) {
+                if let crate::feed_audit::AuditDisposition::Matched(id) =
+                    crate::feed_audit::disposition(frame, read)
+                        .map_err(|error| BucketCommitError::Invariant(error.to_string()))?
                     && aggregates
                         .iter()
                         .any(|aggregate| aggregate.group_id.key() == &id)
@@ -4036,14 +4370,11 @@ impl BucketCommitEngine {
             frozen_basis,
             paper_freshness_policy,
         )?;
-        let admitted_receipts = self
-            .frame_decisions
-            .values()
-            .flatten()
-            .filter_map(|frame| frame.observed_source_receipt)
-            .collect::<Vec<_>>();
         self.earlier_frames.retain(|frame| {
-            if admitted_receipts.contains(&frame.receipt) {
+            if self
+                .admitted_frame_receipts
+                .contains_key(&(frame.receipt.sequence, frame.receipt.this_hash))
+            {
                 return !matched_frames.contains(&frame.receipt);
             }
             !disposed.iter().any(|aggregate| {
@@ -4066,21 +4397,10 @@ impl BucketCommitEngine {
     ) -> Result<BucketCommitResult, BucketCommitError> {
         // Suppression comes from durable frame decisions and authenticated bindings, and survives
         // terminalization/restart. Audit retirement never deletes this decision authority.
-        let frame_decisions = self
-            .frame_decisions
-            .get(
-                &aggregates
-                    .first()
-                    .ok_or(BucketCommitError::Empty)?
-                    .group_id
-                    .components()
-                    .wallet,
-            )
-            .cloned()
-            .unwrap_or_default();
+        let frame_decisions = self.frames_for_aggregates(&aggregates);
         let mut context = context.clone();
         let mut frame_gate_ids = HashSet::new();
-        for frame in &frame_decisions {
+        for frame in frame_decisions {
             let facts = &frame.facts;
             if let Some(gate) = self.paper_state.entry_gate_result(&facts.source_trade_id)?
                 && gate.wallet == facts.wallet
@@ -4103,7 +4423,31 @@ impl BucketCommitEngine {
                     .map_err(|error| BucketCommitError::Invariant(error.to_string()))?;
                 let observation = parse_activity_trade_observation(&source.payload)
                     .map_err(|error| BucketCommitError::Invariant(error.to_string()))?;
-                for aggregate in crate::feed_audit::counterparts(&observation, &aggregates) {
+                let read = context.verified_read.as_ref().ok_or_else(|| {
+                    BucketCommitError::Invariant(
+                        "frame counterpart read authentication absent".to_owned(),
+                    )
+                })?;
+                let counterparts = crate::feed_audit::counterparts(
+                    &observation,
+                    read.transaction_aggregates
+                        .get(&facts.transaction_hash)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|index| read.aggregates.get(*index))
+                        .filter(|aggregate| {
+                            !read.restamp_pairs.contains_key(aggregate.group_id.key())
+                        }),
+                )
+                .into_iter()
+                .map(|aggregate| aggregate.group_id.key())
+                .collect::<HashSet<_>>();
+                for aggregate in &aggregates {
+                    let id = aggregate.group_id.key();
+                    let canonical = read.restamp_pairs.get(id).unwrap_or(id);
+                    if !counterparts.contains(canonical) {
+                        continue;
+                    }
                     let id = aggregate.group_id.key();
                     context.observed_source_receipts.insert(id.clone(), receipt);
                     if id != &facts.source_trade_id {
@@ -7190,6 +7534,7 @@ pub(crate) mod continuation_v3_tests {
         .aggregates()
         .unwrap();
         let context = BucketDecisionContext {
+            verified_read: None,
             applied_configuration: continuation.facts.applied_configuration.clone(),
             decision_inputs_json: continuation.facts.decision_inputs.to_string(),
             page_occurrences: continuation.page_occurrences.clone(),
@@ -7630,6 +7975,7 @@ mod activity_exemption_tests {
 
     fn context() -> BucketDecisionContext {
         BucketDecisionContext {
+            verified_read: None,
             applied_configuration: synthetic_legacy17_runtime_config(),
             decision_inputs_json: "{}".to_owned(),
             page_occurrences: Vec::new(),

@@ -324,6 +324,8 @@ fn poller_harness_with_fetcher(
     }
     let source_log_path = dir.path().join("source.log");
     let sink = SourceEventSink::open(&source_log_path).unwrap();
+    let source_receipts =
+        pe_service::risk_inputs::SourceReceiptIndex::replay(&source_log_path).unwrap();
     let (source_log, source_rx) = SourceLogHandle::channel(8);
     let asset_identity = Arc::new(AssetIdentityResolver::new_runtime(
         Arc::new(MapFetcher::new(HashMap::new())),
@@ -333,8 +335,11 @@ fn poller_harness_with_fetcher(
     ));
     let (trigger_tx, trigger_rx) = mpsc::channel(8);
     let health = new_shared_health_with_ws(false, true, 90);
-    let ingest =
-        tokio::spawn(ActivityIngest::poll_only(sink, source_rx, trigger_tx, health.clone()).run());
+    let ingest = tokio::spawn(
+        ActivityIngest::poll_only(sink, source_rx, trigger_tx, health.clone())
+            .with_source_receipt_index(source_receipts.clone())
+            .run(),
+    );
     let (control_tx, mut control_rx) = mpsc::channel(4);
     let actor_paper = Arc::clone(&paper);
     let actor_poll_fetcher = Arc::clone(&poll_fetcher);
@@ -446,6 +451,7 @@ fn poller_harness_with_fetcher(
         ReconciliationObligations::default(),
         Some(preparer.as_ref().clone()),
     )
+    .with_source_receipt_index(source_receipts)
     .with_clock(Arc::new(|| {
         OffsetDateTime::from_unix_timestamp(NOW).unwrap()
     }));

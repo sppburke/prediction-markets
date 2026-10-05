@@ -508,6 +508,7 @@ pub fn read_context(
     recorded_at_unix: i64,
 ) -> BucketDecisionContext {
     BucketDecisionContext {
+        verified_read: None,
         applied_configuration: RuntimeConfig::from_service_config(&ServiceConfig::default()),
         decision_inputs_json: read.decision_inputs_json.clone(),
         page_occurrences: vec![read.page.clone()],

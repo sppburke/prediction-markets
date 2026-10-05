@@ -59,6 +59,14 @@ use schema::{
 };
 pub use schema::{LEGACY_EXACT_MIGRATION_VERSION, SCHEMA_VERSION};
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivityObservationRetirement {
+    version: u16,
+    receipt: AppendReceipt,
+    unbound: bool,
+}
+
 /// Errors from the paper-state store.
 #[derive(Debug, thiserror::Error)]
 pub enum PaperStateError {
@@ -1301,6 +1309,19 @@ impl PaperStateDb {
         }
         let mut conn = self.lock();
         let tx = conn.savepoint()?;
+        let disposed = tx
+            .query_row(
+                "SELECT 1 FROM activity_groups WHERE source_trade_id = ?1",
+                params![pending.source_trade_id.0],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if disposed {
+            return Err(PaperStateError::Internal(
+                "frame identity already disposed by REST".to_owned(),
+            ));
+        }
         tx_persist_admission(
             &tx,
             std::slice::from_ref(gate),
@@ -1309,6 +1330,73 @@ impl PaperStateDb {
         )?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// Acknowledged retirement of a non-admitted source observation. Keep its exact receipt
+    /// after fence clearance so boot cannot recreate an ordering barrier for disposed work.
+    pub fn retire_activity_observation(
+        &self,
+        receipt: AppendReceipt,
+        unbound: bool,
+    ) -> Result<(), PaperStateError> {
+        self.lock().execute(
+            "INSERT INTO meta(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO NOTHING",
+            params![
+                format!("retired_activity_observation:{}", receipt.sequence.0),
+                serde_json::to_string(&ActivityObservationRetirement {
+                    version: 1,
+                    receipt,
+                    unbound,
+                })?
+            ],
+        )?;
+        self.activity_observation_retired(receipt)?;
+        Ok(())
+    }
+
+    pub fn activity_observation_retired(
+        &self,
+        receipt: AppendReceipt,
+    ) -> Result<bool, PaperStateError> {
+        Ok(self.activity_observation_retirement(receipt)?.is_some())
+    }
+
+    pub fn activity_observation_unbound_retired(
+        &self,
+        receipt: AppendReceipt,
+    ) -> Result<bool, PaperStateError> {
+        Ok(self
+            .activity_observation_retirement(receipt)?
+            .is_some_and(|retirement| retirement.unbound))
+    }
+
+    fn activity_observation_retirement(
+        &self,
+        receipt: AppendReceipt,
+    ) -> Result<Option<ActivityObservationRetirement>, PaperStateError> {
+        let encoded: Option<String> = self
+            .lock()
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![format!(
+                    "retired_activity_observation:{}",
+                    receipt.sequence.0
+                )],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let retirement = encoded
+            .map(|encoded| serde_json::from_str::<ActivityObservationRetirement>(&encoded))
+            .transpose()?;
+        if retirement
+            .as_ref()
+            .is_some_and(|retirement| retirement.version != 1 || retirement.receipt != receipt)
+        {
+            return Err(PaperStateError::Internal(
+                "retired observation receipt or version differs".to_owned(),
+            ));
+        }
+        Ok(retirement)
     }
 
     /// One versioned collection, stored in the existing metadata owner.
@@ -2186,6 +2274,35 @@ impl PaperStateDb {
             history.push(decision_pending_row(row?)?);
         }
         Ok(history)
+    }
+
+    /// Wallet-scoped frame discovery; ordinary reconciliation never scans other wallets' history.
+    pub fn activity_frame_decisions_for_wallet(
+        &self,
+        wallet: &WalletAddress,
+    ) -> Result<Vec<DecisionPendingRow>, PaperStateError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT source_trade_id, semantic_revision, wallet_hex, source_epoch,
+                    frozen_inputs_json, post_commit_inputs_json, state, terminal_disposition,
+                    updated_at_unix FROM decision_pending
+             WHERE wallet_hex = ?1 AND json_extract(frozen_inputs_json, '$.source_authority') = 'activity_frame'
+             ORDER BY source_epoch, source_trade_id",
+        )?;
+        let rows = statement.query_map(params![wallet.to_string()], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+            ))
+        })?;
+        rows.map(|row| decision_pending_row(row?)).collect()
     }
 
     /// Read one durable decision continuation by its source trade id (`None` when absent).
@@ -6313,6 +6430,33 @@ mod tests {
         );
         assert_eq!(db.gate_history().unwrap()[&wallet()].len(), 1);
         let connection = Connection::open(dir.path().join("paper_state.db")).unwrap();
+        connection.execute(
+            "INSERT INTO activity_groups(source_trade_id, transaction_hash, wallet_hex, source_epoch, semantic_revision, activity_type, disposition, proof_json) VALUES ('rest-disposed', 'rest-zero', ?1, 99, 'rest-revision', 'TRADE', 'raw_only', ?2)",
+            params![wallet().to_string(), "{\"effect\":{\"kind\":\"raw_only\"}}"],
+        ).unwrap();
+        let duplicate = make(
+            "rest-disposed",
+            MarketId(VenueMarketId("rest-market".to_owned())),
+        );
+        for state in [
+            &db,
+            &PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap(),
+        ] {
+            assert!(state.commit_activity_frame(&duplicate).is_err());
+            assert!(
+                state
+                    .entry_gate_result(&duplicate.pending.source_trade_id)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                state
+                    .decision_pending_for(&duplicate.pending.source_trade_id)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(state.gate_history().unwrap()[&wallet()].len(), 1);
+        }
         connection.execute_batch("CREATE TRIGGER reject_frame_pending BEFORE INSERT ON decision_pending WHEN NEW.source_trade_id = 'blocked-frame' BEGIN SELECT RAISE(ABORT, 'injected pending failure'); END;").unwrap();
         let blocked = make(
             "blocked-frame",
