@@ -388,6 +388,20 @@ groups = {r["source_trade_id"]: dict(r) for r in db.execute(
     "SELECT * FROM activity_groups WHERE source_epoch >= ? AND source_epoch < ?",
     (window_start, window_end))}
 keys = {}; matched = set(); legs = {}; buys = {}; frame_rows = []
+admitted = set()
+for row in db.execute("SELECT frozen_inputs_json FROM decision_pending "
+                      "WHERE json_extract(frozen_inputs_json,'$.version')=7 "
+                      "AND json_extract(frozen_inputs_json,'$.source_authority')='activity_frame'"):
+    c = json.loads(row[0]); r = c["observed_source_receipt"]
+    receipt(source, r)  # authenticate the admitted receipt against the captured prefix
+    admitted.add((r["sequence"], r["this_hash"]))
+def frame_row(identity, e):
+    r = payload(e)
+    qualifying = (r.get("side", "").strip().upper() == "BUY"
+                  and Decimal(str(r["size"])) > 0
+                  and not r.get("isCombo", r.get("is_combo", False)))
+    return {"id": identity, "frame_seq": e["seq"], "frame_hash": e["this_hash"],
+            "admitted": (e["seq"], e["this_hash"]) in admitted, "qualifying": qualifying}
 for e in source.values():
     is_frame = e["source_id"] == "polymarket-activity-ws"
     if not is_frame and e["source_id"] != "polymarket-public.activity-reconciliation": continue
@@ -420,7 +434,7 @@ for e in source.values():
                      "page_seq": e["seq"], "page_hash": e["this_hash"]}
             if key not in buys or epoch < buys[key]["epoch"]: buys[key] = entry
         if is_frame:
-            frame_rows.append({"id": key, "frame_seq": e["seq"], "frame_hash": e["this_hash"]})
+            frame_rows.append(frame_row(key, e))
             continue
         if key not in groups: continue
         g = groups[key]; assert g["wallet_hex"] == wallet and g["transaction_hash"] == tx
@@ -439,7 +453,7 @@ for e in source.values():
     for b in payload(e).get("bindings") or []:
         f = receipt(source, b["stream_receipt"])
         assert f["source_id"] == "polymarket-activity-ws"
-        frame_rows.append({"id": b["history_group_id"], "frame_seq": f["seq"], "frame_hash": f["this_hash"]})
+        frame_rows.append(frame_row(b["history_group_id"], f))
 # Replay recorded membership, retaining removed wallets and all prices.
 start = payload(paper[start_seq]); members = set(start["membership"])
 changes = sorted((e for e in paper.values() if e["seq"] > start_seq
@@ -540,7 +554,10 @@ Each command is an autocommit read scoped to the frozen window or decision recei
 
 List **every** continuation-7 complete-read first-entry decision after the deployment source
 boundary in the window. Match frames by full identity and authenticated binding targets from
-the prefix export; select the first receipt for that identity, then its earliest fallback.
+the prefix export. Keep every receipt for feed-presence accounting; for routing choose the
+admitted receipt, otherwise the earliest qualifying positive-share, non-combo BUY, otherwise
+the earliest receipt, then that receipt's earliest fallback. An excluded zero-share observation
+before a qualifying one never owns its routing reason.
 `unexplained` means a recorded frame has no fallback artifact and requires investigation:
 
 ```bash
@@ -549,7 +566,9 @@ WITH p AS (SELECT readfile('ac16-population.json') AS j),
 frames AS (
  SELECT value->>'$.id' AS id, value->>'$.frame_seq' AS seq,
         value->>'$.frame_hash' AS hash,
-        row_number() OVER (PARTITION BY value->>'$.id' ORDER BY value->>'$.frame_seq') AS rn
+        row_number() OVER (PARTITION BY value->>'$.id'
+          ORDER BY value->>'$.admitted' DESC, value->>'$.qualifying' DESC,
+                   value->>'$.frame_seq') AS rn
  FROM p, json_each(p.j,'$.frames')),
 fallbacks AS (SELECT value AS j FROM p, json_each(p.j,'$.fallbacks'))
 SELECT d.source_trade_id, d.wallet_hex, d.source_epoch,
@@ -569,7 +588,9 @@ ORDER BY d.source_epoch, d.source_trade_id;
 SQL
 ```
 
-Emit the unexplained first-entry BUY set, which **must be empty**. The export includes every
+Emit the unexplained first-entry BUY set, which **must be empty**. Join successful BUY fills
+by the exact `wf|<wallet>|<source_trade_id>|` prefix of the canonical idempotency key;
+terminal financial fill evidence leaves its own `idempotency_key` null. The export includes every
 earliest BUY second in each wallet/market from the recorded inputs, without a price screen,
 and replays membership removals/additions. It retains same-second pieces and flags membership
 changes within a venue timestamp's second for investigation. Include frame-only observations
@@ -584,7 +605,9 @@ WITH buys AS (SELECT value AS j FROM json_each(readfile('ac16-population.json'),
 SELECT b.j, g.result, g.history_consumed, h.first_epoch, a.disposition, a.proof_json
 FROM buys b
 LEFT JOIN decision_pending d ON d.source_trade_id=b.j->>'$.id'
-LEFT JOIN fills f ON f.idempotency_key=json_extract(d.post_commit_inputs_json,'$.terminal.fill.idempotency_key')
+LEFT JOIN fills f ON f.side='buy'
+ AND substr(f.idempotency_key,1,length('wf|' || (b.j->>'$.wallet') || '|' || (b.j->>'$.id') || '|'))
+     = 'wf|' || (b.j->>'$.wallet') || '|' || (b.j->>'$.id') || '|'
 LEFT JOIN entry_gate_results g ON g.source_trade_id=b.j->>'$.id'
 LEFT JOIN wallet_market_history_v2 h ON h.wallet_hex=b.j->>'$.wallet' AND h.market_id=b.j->>'$.market'
 LEFT JOIN activity_groups a ON a.source_trade_id=b.j->>'$.id'

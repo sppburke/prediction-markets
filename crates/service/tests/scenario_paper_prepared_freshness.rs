@@ -6494,95 +6494,29 @@ async fn audit_release_recovery_contradiction_queued_during_open_frame_completes
     gate.started.notified().await;
     assert_eq!(h.paper.open_decision_pending().unwrap().len(), 1);
     let bad = h.rest_counterpart(&first, |row| row["side"] = json!("SELL"));
-    // Queue the authenticated incident itself. A poller's preceding read-only owner lookup
-    // is not an incident and cannot stand in for engagement in this ordering scenario.
-    let page = h
-        .source
-        .append(EnvelopeIn {
-            source_id: SourceId(pe_service::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned()),
-            schema_version: pe_service::trade_poller::ACTIVITY_POLL_PAGE_SCHEMA_VERSION,
-            parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
-            observed_at: SourceTimestamp(at()),
-            received_at: ReceivedAt(at()),
-            content_type: ContentType::Json,
-            payload: bad.activity.clone(),
-        })
-        .await
-        .unwrap();
-    let read = support::producer_shaped_read_v2(wallet(), &bad.activity, bad.epoch, EPOCH, page);
-    let proof: Value = serde_json::from_str(&read.decision_inputs_json).unwrap();
-    let binding = pe_service::bucket_commit::ObservationBinding {
-        stream_group_id: first.id.clone(),
-        stream_receipt: receipt,
-        history_group_id: bad.id.clone(),
-        semantic_revision: read.aggregates[0].semantic_revision.as_str().to_owned(),
-        page_raw_hash: read.page.raw_hash.clone(),
-        page_occurrence_index: 0,
-        identity_provenance: None,
-        identity_receipt: None,
-        counterpart_basis_receipt: None,
-        frame_admission_receipt: Some(
-            h.paper
-                .activity_frame_decision(&first.id)
-                .unwrap()
-                .unwrap()
-                .admission_receipt,
-        ),
-    };
-    let commitment = pe_service::bucket_commit::activity_read_commitment_payload_v2(
-        wallet(),
-        bad.epoch,
-        &[read.page],
-        &serde_json::from_value::<Vec<_>>(proof["pages"].clone()).unwrap(),
-        &[binding],
-    )
-    .unwrap();
-    let deciding = h
-        .source
-        .append(EnvelopeIn {
-            source_id: SourceId(
-                pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID.to_owned(),
-            ),
-            schema_version: 2,
-            parser_version: 1,
-            observed_at: SourceTimestamp(at()),
-            received_at: ReceivedAt(at()),
-            content_type: ContentType::Json,
-            payload: commitment,
-        })
-        .await
-        .unwrap();
-    let (acknowledged, mut acknowledgement) = tokio::sync::oneshot::channel();
-    let control = h.control.as_ref().unwrap();
-    control
-        .send(OrchestratorControl::FeedAuditUpdate {
-            update: pe_service::orchestrator_control::FeedAuditUpdate::Incident(
-                pe_service::paper_recovery::FeedIncident {
-                    cause: pe_service::paper_recovery::FeedIncidentCause::Contradiction,
-                    frame_receipt: receipt,
-                    deciding_commitment_receipt: deciding,
-                    counterpart_identity: Some(bad.id.clone()),
-                    engagement_receipt: None,
-                },
-                None,
-            ),
-            acknowledged,
-        })
-        .await
-        .unwrap();
-    assert!(matches!(
-        acknowledgement.try_recv(),
-        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-    ));
-    let later = h.append_frame(&next, |_| {}).await;
-    control
-        .send(OrchestratorControl::ActivityFrameDecision { receipt: later })
-        .await
-        .unwrap();
-    gate.release.notify_one();
-    acknowledgement.await.unwrap().unwrap();
+    let later;
+    {
+        let pending = h.poll(&bad);
+        tokio::pin!(pending);
+        let control = h.control.as_ref().unwrap();
+        tokio::select! {
+            biased;
+            () = async {
+                while control.capacity() == control.max_capacity() {
+                    tokio::task::yield_now().await;
+                }
+            } => {},
+            () = &mut pending => panic!("audit acknowledged while the frame was held"),
+        }
+        later = h.append_frame(&next, |_| {}).await;
+        control
+            .send(OrchestratorControl::ActivityFrameDecision { receipt: later })
+            .await
+            .unwrap();
+        gate.release.notify_one();
+        pending.await;
+    }
     h.boot_barrier_readonly().await;
-    h.poll(&bad).await;
     assert_eq!(
         h.terminal(&first).terminal_disposition.as_deref(),
         Some("fill")
@@ -7063,6 +6997,7 @@ struct HeldPoll {
     waits: mpsc::Receiver<pe_service::trade_poller::PollerWait>,
     stop: tokio::sync::oneshot::Sender<()>,
     task: tokio::task::JoinHandle<Result<(), pe_service::trade_poller::TradePollerOwnerError>>,
+    clock: Arc<AtomicI64>,
 }
 impl HeldPoll {
     async fn finish(mut self, response: support::RequestedPage, payload: Vec<u8>) {
@@ -7088,6 +7023,23 @@ impl Harness {
         recorded: &Recorded,
         receipt: Option<AppendReceipt>,
         source: SourceLogHandle,
+    ) -> HeldPoll {
+        self.held_poll_with_source_and_control(
+            recorded,
+            receipt,
+            source,
+            self.control.as_ref().unwrap().clone(),
+            false,
+        )
+    }
+
+    fn held_poll_with_source_and_control(
+        &self,
+        recorded: &Recorded,
+        receipt: Option<AppendReceipt>,
+        source: SourceLogHandle,
+        control: mpsc::Sender<OrchestratorControl>,
+        activity_ws_enabled: bool,
     ) -> HeldPoll {
         let (requests, pages) = mpsc::channel(4);
         let (progress, completion) = mpsc::channel(8);
@@ -7118,11 +7070,13 @@ impl Harness {
                 receipt,
             });
         }
+        let clock = Arc::new(AtomicI64::new(EPOCH));
+        let poll_clock = clock.clone();
         let poller = TradePoller::new(
             TradePollerConfig {
                 base_url: "fixture://activity".to_owned(),
                 poll_interval_secs: 30,
-                activity_ws_enabled: false,
+                activity_ws_enabled,
                 copy_latency_budget_secs: self.copy_budget_secs,
             },
             self.watchlist.clone(),
@@ -7135,7 +7089,7 @@ impl Harness {
             )),
             source,
             receiver,
-            self.control.as_ref().unwrap().clone(),
+            control,
             self.paper.clone(),
             new_shared_health_with_ws(false, true, 90),
             SignalConfig::default(),
@@ -7144,9 +7098,12 @@ impl Harness {
             None,
         )
         .with_source_receipt_index(self.index.clone())
+        .with_crash_boundary(self.poller_crash.clone())
         .with_progress(progress)
         .with_wait_observer(observer)
-        .with_clock(Arc::new(at));
+        .with_clock(Arc::new(move || {
+            OffsetDateTime::from_unix_timestamp(poll_clock.load(Ordering::SeqCst)).unwrap()
+        }));
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(poller.run_until(async move {
             let _ = stopped.await;
@@ -7158,6 +7115,7 @@ impl Harness {
             waits,
             stop,
             task,
+            clock,
         }
     }
 }
@@ -8316,6 +8274,34 @@ async fn zero_then_qualifying_latched_receipt_keeps_market_barrier_across_restar
             reason,
             pe_service::frame_admission::FrameFallbackReason::EarlierUnresolvedBuy
         );
+        h.attempt(
+            &waiting,
+            OffsetDateTime::from_unix_timestamp(waiting.epoch).unwrap(),
+        );
+        h.poll(&waiting).await;
+        let population = ac16_population(&h, json!([]));
+        let connection = rusqlite::Connection::open(h.dir.path().join("paper.db")).unwrap();
+        let routing = connection
+            .prepare(&ac16_sql(
+                "WITH p AS (SELECT readfile('ac16-population.json') AS j),",
+            ))
+            .unwrap()
+            .query_map([population.to_string()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u64>(3)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let selected = routing
+            .iter()
+            .find(|(id, _, _)| id == &waiting.id.0)
+            .unwrap();
+        assert_eq!(selected.1, qualifying.sequence.0);
+        assert_eq!(selected.2, "latched");
         h.assert_frame_barrier(None).await;
         h.stop().await;
     }
@@ -9649,5 +9635,316 @@ async fn saturated_one_second_read_keeps_frame_frontier_and_obligation_across_re
         assert_eq!(obligations.unresolved_receipts(wallet()), vec![receipt]);
         h.assert_frame_barrier(Some(&[receipt])).await;
     }
+    h.stop().await;
+}
+
+/// One urgent attempt spans both reads; B is admitted while R1 is held but has
+/// no counterpart there. R2's incident must be acknowledged before any bucket routes.
+#[tokio::test(start_paused = true)]
+async fn urgent_attempt_audits_frame_admitted_during_earlier_read_across_restart() {
+    for crash_before_incident in [false, true] {
+        let mut h = Harness::new().await;
+        let a = h.record(1).await;
+        let b = h.record(2).await;
+        h.terminal_clock = OffsetDateTime::from_unix_timestamp(b.epoch).unwrap();
+        h.hooks
+            .financial_clock_unix
+            .store(b.epoch, Ordering::SeqCst);
+        h.start_frames();
+        h.empty_frontier(EPOCH - 1).await;
+        h.attempt(&a, h.terminal_clock);
+        let a_receipt = h.deliver_frame(&a, |_| {}).await;
+        let mut r2 = h.rest_counterpart(&b, |row| row["isCombo"] = json!(true));
+        let mut rows: Value = serde_json::from_slice(&r2.activity).unwrap();
+        rows.as_array_mut()
+            .unwrap()
+            .push(serde_json::from_slice::<Value>(&a.activity).unwrap()[0].clone());
+        r2.activity = serde_json::to_vec(&rows).unwrap();
+        let mut gamma: Value = serde_json::from_slice(&r2.gamma).unwrap();
+        gamma.as_array_mut().unwrap().extend(
+            serde_json::from_slice::<Value>(&a.gamma)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .cloned(),
+        );
+        r2.gamma = serde_json::to_vec(&gamma).unwrap();
+
+        // Forward to the real owner and observe ordering at the control boundary.
+        let (control, mut commands) = mpsc::channel(8);
+        let owner = h.control.as_ref().unwrap().clone();
+        let paper = h.paper.clone();
+        let paper_path = h.dir.path().join("paper.log");
+        let b_id = b.id.clone();
+        let checked_routing = Arc::new(AtomicBool::new(false));
+        let observed = checked_routing.clone();
+        let proxy = tokio::spawn(async move {
+            let mut incident_requested = false;
+            while let Some(command) = commands.recv().await {
+                if !incident_requested
+                    && matches!(
+                        &command,
+                        OrchestratorControl::FeedAuditUpdate {
+                            update: pe_service::orchestrator_control::FeedAuditUpdate::Incident(
+                                _,
+                                _
+                            ),
+                            ..
+                        }
+                    )
+                {
+                    incident_requested = true;
+                    assert!(paper.activity_group_state(&b_id).unwrap().is_none());
+                }
+                if matches!(&command, OrchestratorControl::CommitActivityBucket { .. }) {
+                    let era =
+                        pe_service::paper_recovery::paper_era(scan_paper_log(&paper_path).unwrap());
+                    let incidents = era
+                        .frames
+                        .iter()
+                        .filter(|record| {
+                            matches!(
+                                &record.frame,
+                                PaperLogFrame::Record(PaperLogRecord::FeedIncidentChanged {
+                                    state: pe_service::paper_recovery::HaltState::Engaged,
+                                    ..
+                                })
+                            )
+                        })
+                        .count();
+                    assert_eq!(
+                        incidents, 1,
+                        "routing preceded B's incident acknowledgement"
+                    );
+                    observed.store(true, Ordering::SeqCst);
+                }
+                owner.send(command).await.unwrap();
+            }
+        });
+        let mut held = h.held_poll_with_source_and_control(
+            &r2,
+            Some(a_receipt),
+            h.source.clone(),
+            control,
+            true,
+        );
+        held.clock.store(b.epoch, Ordering::SeqCst);
+        let first_read = held.pages.recv().await.unwrap();
+        assert!(matches!(
+            held.progress.recv().await.unwrap(),
+            pe_service::trade_poller::PollerProgress::Started { urgent: true, .. }
+        ));
+        h.attempt(&b, h.terminal_clock);
+        let b_receipt = h.deliver_frame(&b, |_| {}).await;
+        let b_terminal = h.terminal(&b);
+        assert!(h.feed_edges().is_empty());
+        // Keep both immature frames unresolved in R1, so the same attempt retries.
+        held.clock.store(b.epoch + 1, Ordering::SeqCst);
+        first_read.respond.send(b"[]".to_vec()).unwrap();
+        let second_read = held.pages.recv().await.unwrap();
+        let r1 = read_commitments(&h).last().unwrap().1.clone();
+        assert!(r1.bindings.unwrap_or_default().is_empty());
+        assert!(h.paper.activity_group_state(&a.id).unwrap().is_none());
+        assert!(h.paper.activity_group_state(&b.id).unwrap().is_none());
+        if crash_before_incident {
+            *h.poller_crash.lock().unwrap() =
+                Some(pe_service::trade_poller::ReconciliationCrashBoundary::Commitment);
+        }
+        second_read.respond.send(r2.activity.clone()).unwrap();
+        if crash_before_incident {
+            assert!(held.task.await.unwrap().is_err());
+            proxy.await.unwrap();
+            assert!(h.feed_edges().is_empty());
+            h.restart_frames().await;
+            h.poll(&r2).await;
+        } else {
+            while let Some(progress) = held.progress.recv().await {
+                if let pe_service::trade_poller::PollerProgress::Completed { unresolved, .. } =
+                    progress
+                    && unresolved.is_empty()
+                {
+                    break;
+                }
+            }
+            let _ = held.stop.send(());
+            held.task.await.unwrap().unwrap();
+            proxy.await.unwrap();
+            assert!(checked_routing.load(Ordering::SeqCst));
+        }
+        assert_eq!(h.feed_edges().len(), 1);
+        assert_eq!(h.feed_edges()[0].1.frame_receipt, b_receipt);
+        assert_eq!(h.feed_edges()[0].1.counterpart_identity, Some(b.id.clone()));
+        assert_eq!(h.terminal(&b), b_terminal);
+        h.assert_frame_barrier(Some(&[])).await;
+        h.poll(&r2).await;
+        assert_eq!(h.feed_edges().len(), 1);
+        h.restart_frames().await;
+        h.poll(&r2).await;
+        assert_eq!(h.feed_edges().len(), 1);
+        h.assert_frame_barrier(Some(&[])).await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn retired_frame_changed_combo_revision_journals_once_without_barrier_across_restart() {
+    for crash_before_incident in [false, true] {
+        let mut h = Harness::new().await;
+        let frame = h.record(1).await;
+        h.attempt(&frame, at());
+        h.start_frames();
+        h.empty_frontier(EPOCH - 1).await;
+        let receipt = h.deliver_frame(&frame, |_| {}).await;
+        let terminal = h.terminal(&frame);
+        h.poll(&frame).await;
+        h.assert_frame_barrier(Some(&[])).await;
+        assert!(h.feed_edges().is_empty());
+        let changed = h.rest_counterpart(&frame, |row| row["isCombo"] = json!(true));
+        assert_eq!(changed.id, frame.id);
+        let deciding = if crash_before_incident {
+            *h.poller_crash.lock().unwrap() =
+                Some(pe_service::trade_poller::ReconciliationCrashBoundary::Commitment);
+            assert!(h.poll_source_result(&changed, None, at(), 0).await.is_err());
+            assert!(h.feed_edges().is_empty());
+            let deciding = read_commitments(&h).last().unwrap().0;
+            h.restart_frames().await;
+            h.poll(&changed).await;
+            deciding
+        } else {
+            h.poll(&changed).await;
+            read_commitments(&h).last().unwrap().0
+        };
+        assert_eq!(h.feed_edges().len(), 1);
+        assert_eq!(h.feed_edges()[0].1.frame_receipt, receipt);
+        assert_eq!(h.feed_edges()[0].1.deciding_commitment_receipt, deciding);
+        assert_eq!(
+            h.feed_edges()[0].1.counterpart_identity,
+            Some(frame.id.clone())
+        );
+        h.assert_frame_barrier(Some(&[])).await;
+        assert_eq!(h.terminal(&frame), terminal);
+        assert!(h.paper.is_wallet_fenced(&wallet()).unwrap());
+        // The changed revision follows REST's fence path, so repeat the already
+        // authenticated incident request rather than fetching a fenced wallet.
+        let incident = h.feed_edges()[0].1.clone();
+        h.feed_update(pe_service::orchestrator_control::FeedAuditUpdate::Incident(
+            incident.clone(),
+            None,
+        ))
+        .await;
+        assert_eq!(h.feed_edges().len(), 1);
+        h.restart_frames().await;
+        h.assert_frame_barrier(Some(&[])).await;
+        h.feed_update(pe_service::orchestrator_control::FeedAuditUpdate::Incident(
+            incident, None,
+        ))
+        .await;
+        assert_eq!(h.feed_edges().len(), 1);
+        assert_eq!(h.terminal(&frame), terminal);
+    }
+}
+
+fn ac16_sql(start: &str) -> String {
+    let recipe = include_str!("../../../docs/29-ACTIVITY-LATENCY-MEASUREMENT.md");
+    let begin = recipe.find(start).unwrap();
+    let end = begin + recipe[begin..].find("\nSQL\n").unwrap();
+    recipe[begin..end].replace("readfile('ac16-population.json')", "?1")
+}
+
+/// Export the authenticated fixture receipts in the documented population shape.
+fn ac16_population(h: &Harness, buys: Value) -> Value {
+    let sources = Reader::replay(h.dir.path().join("source.log"))
+        .unwrap()
+        .map(|record| record.unwrap().1)
+        .collect::<Vec<_>>();
+    let admitted = h
+        .paper
+        .activity_frame_decision_index(Some(&wallet()))
+        .unwrap();
+    let frame_row = |id: &SourceTradeId, source: &pe_event_log::EventEnvelope| {
+        let observation =
+            pe_source_polymarket_public::parse_activity_trade_observation(&source.payload).unwrap();
+        json!({"id": id.0, "frame_seq": source.seq.0, "frame_hash": source.this_hash.to_hex().to_string(),
+            "admitted": admitted.iter().any(|frame| frame.observed_source_receipt.is_some_and(|receipt|
+                receipt.sequence == source.seq && receipt.this_hash == source.this_hash)),
+            "qualifying": observation.group_id.components().side == Some(pe_core_types::Side::Buy)
+                && observation.share_amount != pe_core_types::ShareAmount::ZERO && !observation.is_combo})
+    };
+    let mut frames = Vec::new();
+    let mut fallbacks = Vec::new();
+    for source in &sources {
+        if source.source_id.0 == pe_service::activity_ingest::ACTIVITY_WS_SOURCE_ID {
+            let observation =
+                pe_source_polymarket_public::parse_activity_trade_observation(&source.payload)
+                    .unwrap();
+            frames.push(frame_row(observation.group_id.key(), source));
+        } else if source.source_id.0 == pe_service::frame_admission::FRAME_FALLBACK_SOURCE_ID {
+            let artifact: pe_service::frame_admission::FrameFallbackArtifact =
+                serde_json::from_slice(&source.payload).unwrap();
+            fallbacks.push(json!({"frame_seq": artifact.frame_receipt.sequence.0,
+                "frame_hash": artifact.frame_receipt.this_hash.to_hex().to_string(),
+                "artifact_seq": source.seq.0, "reason": artifact.reason}));
+        }
+    }
+    for (_, read) in read_commitments(h) {
+        for binding in read.bindings.unwrap_or_default() {
+            let source = sources
+                .iter()
+                .find(|source| {
+                    source.seq == binding.stream_receipt.sequence
+                        && source.this_hash == binding.stream_receipt.this_hash
+                })
+                .unwrap();
+            frames.push(frame_row(&binding.history_group_id, source));
+        }
+    }
+    json!({"frames": frames, "fallbacks": fallbacks, "buys": buys,
+        "deploy_source_seq": 0, "window_start": EPOCH - 1, "window_end": EPOCH + 100})
+}
+
+#[tokio::test(start_paused = true)]
+async fn ac16_unexplained_buy_query_joins_successful_frame_fill_with_null_terminal_key() {
+    let mut h = Harness::new().await;
+    let frame = h.record(1).await;
+    h.attempt(&frame, at());
+    h.start_frames();
+    h.empty_frontier(EPOCH - 1).await;
+    let zero = h
+        .deliver_frame(&frame, |row| {
+            row["size"] = json!("0");
+            row["usdcSize"] = json!("0");
+        })
+        .await;
+    let receipt = h.deliver_frame(&frame, |_| {}).await;
+    assert_ne!(zero, receipt);
+    assert_eq!(
+        h.terminal(&frame).terminal_disposition.as_deref(),
+        Some("fill")
+    );
+    let connection = rusqlite::Connection::open(h.dir.path().join("paper.db")).unwrap();
+    let key: Option<String> = connection.query_row(
+        "SELECT json_extract(post_commit_inputs_json,'$.terminal.fill.idempotency_key') FROM decision_pending WHERE source_trade_id=?1",
+        [&frame.id.0], |row| row.get(0)).unwrap();
+    assert!(key.is_none());
+    let buy = json!({"id": frame.id.0, "wallet": wallet().to_string(),
+        "market": frame.admission.market.condition_id.0, "epoch": frame.epoch});
+    let population = ac16_population(&h, json!([buy]));
+    let count = connection
+        .prepare(&ac16_sql("WITH buys AS"))
+        .unwrap()
+        .query_map([population.to_string()], |_| Ok(()))
+        .unwrap()
+        .count();
+    assert_eq!(count, 0, "successful frame fill was classified unexplained");
+    // Keep the delimiter boundary: a prefix of a different source ID is not a fill.
+    let mut missing = population.clone();
+    missing["buys"][0]["id"] = json!(&frame.id.0[..frame.id.0.len() - 1]);
+    let count = connection
+        .prepare(&ac16_sql("WITH buys AS"))
+        .unwrap()
+        .query_map([missing.to_string()], |_| Ok(()))
+        .unwrap()
+        .count();
+    assert_eq!(count, 1);
     h.stop().await;
 }

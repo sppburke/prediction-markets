@@ -1833,13 +1833,6 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
 
     async fn apply_control_message(&mut self, message: OrchestratorControl) {
         match message {
-            OrchestratorControl::CaptureFrameDecisionIds {
-                wallet,
-                transactions,
-                captured,
-            } => {
-                let _ = captured.send(self.bucket_engine.frame_decision_ids(wallet, transactions));
-            }
             OrchestratorControl::ActivityFrameDecision { receipt } => {
                 if let Err(error) = self.apply_activity_frame(receipt).await {
                     self.pending_load_failure = Some(error);

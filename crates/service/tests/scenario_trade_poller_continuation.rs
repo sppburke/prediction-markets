@@ -346,10 +346,6 @@ async fn late_group_then_strict_decrement_in_one_read_both_become_durable() {
     let (engine_tx, engine_rx) = oneshot::channel();
     let control = tokio::spawn(async move {
         while let Some(command) = control_rx.recv().await {
-            if let OrchestratorControl::CaptureFrameDecisionIds { captured, .. } = command {
-                let _ = captured.send(Vec::new()); // these owner fixtures have no frame decisions
-                continue;
-            }
             if let OrchestratorControl::FeedAuditUpdate { acknowledged, .. } = command {
                 let _ = acknowledged.send(Ok(
                     pe_service::orchestrator_control::FeedAuditAcknowledgement::Applied,
@@ -472,10 +468,6 @@ async fn recorded_poll(
     let control = tokio::spawn(async move {
         let mut commits = Vec::new();
         while let Some(command) = control_rx.recv().await {
-            if let OrchestratorControl::CaptureFrameDecisionIds { captured, .. } = command {
-                let _ = captured.send(Vec::new()); // these owner fixtures have no frame decisions
-                continue;
-            }
             if let OrchestratorControl::FeedAuditUpdate { acknowledged, .. } = command {
                 let _ = acknowledged.send(Ok(
                     pe_service::orchestrator_control::FeedAuditAcknowledgement::Applied,
@@ -1072,24 +1064,6 @@ fn start_recorded_poller_with_completion_stop(
         let mut captures = 0;
         while let Some(command) = control_rx.recv().await {
             match command {
-                OrchestratorControl::CaptureFrameDecisionIds {
-                    wallet,
-                    transactions,
-                    captured,
-                } => {
-                    if real_owner {
-                        real_tx
-                            .send(OrchestratorControl::CaptureFrameDecisionIds {
-                                wallet,
-                                transactions,
-                                captured,
-                            })
-                            .await
-                            .unwrap();
-                    } else {
-                        let _ = captured.send(Vec::new());
-                    }
-                }
                 OrchestratorControl::FeedAuditUpdate {
                     update,
                     acknowledged,

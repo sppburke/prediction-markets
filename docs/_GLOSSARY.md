@@ -616,9 +616,10 @@ Once authenticated, its counterpart identity stays fixed through commitment-befo
 audit retirement, release and restart; another transaction leg receives its own decision. A different
 identifier is equivalent only through an authenticated restamp pair. Retained authenticated
 counterparts, matched or contradicted, win over later absence and commit their recorded read
-through the bucket owner. An earlier match suppresses only later absence: a contradiction
-concluded before the fixed counterpart group is disposed still engages the latch. Changed
-revisions follow REST's existing revision routing and fence. Production, boot and qualification
+through the bucket owner. An earlier match suppresses only later absence. Any authenticated read binding an admitted
+frame to a contradicting counterpart journals one incident for that frame, before or after
+audit retirement, including a changed revision. Changed revisions follow REST's existing
+revision routing and fence. Production, boot and qualification
 retire the audit once the conclusion is recorded (a negative conclusion acknowledged) and the
 fixed counterpart group has a durable disposition under any revision. A match confirms
 an ordinary positive-share TRADE with the same effective side, condition and outcome; combo,

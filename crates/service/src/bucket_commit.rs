@@ -3703,24 +3703,6 @@ impl BucketCommitEngine {
             .and_then(|(wallet, position)| self.frame_decisions.get(wallet)?.get(*position))
     }
 
-    pub(crate) fn frame_decision_ids(
-        &self,
-        wallet: WalletAddress,
-        transactions: HashSet<String>,
-    ) -> Vec<SourceTradeId> {
-        transactions
-            .into_iter()
-            .flat_map(|transaction| {
-                self.frame_transactions
-                    .get(&(wallet, transaction))
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|position| self.frame_decisions.get(&wallet)?.get(*position))
-                    .map(|frame| frame.source_trade_id.clone())
-            })
-            .collect()
-    }
-
     fn observe_frame(&mut self, incoming: crate::frame_admission::EarlierFrame) {
         let admitted = |receipt: AppendReceipt| {
             self.admitted_frame_receipts
