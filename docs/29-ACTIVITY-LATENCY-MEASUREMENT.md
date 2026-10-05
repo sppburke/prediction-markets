@@ -199,16 +199,20 @@ large writes on the host delay pe-service's durable appends (on 10/5 two AC16 ta
 with such jobs). The read-only capture below copies `paper_state.db` with the SQLite backup API in one
 step (one read transaction; the page copy keeps rowids and committed WAL state; the CLI `.backup`
 steps 100 pages at a time and restarts on every production write), then the source frames from the
-boundary through the last complete frame, filtered to the five source IDs the recipe reads, then the
-whole paper log, so every database reference resolves. The capture starts at the deployment's first
-source sequence and its byte offset, found by walking frame lengths forward from a known receipt such
-as the deploy boot's checkpoint tail; do not infer it from trade epochs. That start must not follow
-the earliest frame receipt of any frame decision or any binding an audited decision needs, so a
-re-measurement keeps the deployment start and passes its own cohort boundary to the inspection
-below. Retain verification receipts and physical prefix bounds with the capture.
+capture start through the last complete frame, filtered to the five source IDs the recipe reads, then
+the whole paper log. The capture start is separate from the cohort boundary. It is the deployment's
+first source sequence, or an earlier receipt when a frame received before the deployment was recovered
+and decided after it: the inspection authenticates the original receipt of every continuation-7 frame
+decision and the frame receipt of every admission or fallback artifact. The capture checks both and
+stops, naming the earliest missing sequence, when one precedes its start; capture again from a known
+receipt at or before that sequence. Find a start's byte offset by walking frame lengths forward from a
+known receipt (the deploy boot's checkpoint tail, an earlier capture's recorded start, or the log
+header at offset 5, sequence 0); do not infer it from trade epochs. A re-measurement uses the same
+capture start and passes its own cohort boundary to the inspection below. Retain verification
+receipts and physical prefix bounds with the capture.
 
 ```bash
-python3 - <live-paper_state.db> <live-source_events.log> <live-paper.log> <capture-dir> <boundary-offset> <boundary-sequence> <<'PY'
+python3 - <live-paper_state.db> <live-source_events.log> <live-paper.log> <capture-dir> <capture-start-offset> <capture-start-sequence> <<'PY'
 import ctypes, ctypes.util, json, os, re, sqlite3, struct, sys, time, zlib
 from pathlib import Path
 
@@ -230,6 +234,14 @@ started = time.time()
 src = sqlite3.connect(Path(live_db).resolve().as_uri() + "?mode=ro", uri=True)
 dst = sqlite3.connect(out / "paper_state.db"); src.backup(dst, pages=-1); dst.close(); src.close()
 print("database copy seconds", round(time.time() - started, 1))
+# The capture must hold the original receipt of every continuation-7 frame decision in the copy.
+copy = sqlite3.connect((out / "paper_state.db").resolve().as_uri() + "?mode=ro", uri=True)
+(earliest,) = copy.execute(
+    "SELECT min(json_extract(frozen_inputs_json,'$.observed_source_receipt.sequence')) FROM decision_pending "
+    "WHERE json_extract(frozen_inputs_json,'$.version')=7 "
+    "AND json_extract(frozen_inputs_json,'$.source_authority')='activity_frame'").fetchone()
+copy.close()
+assert earliest is None or earliest >= start_seq, ("capture again from a receipt at or before", earliest)
 
 def frames(f, offset):
     f.seek(offset)
@@ -242,18 +254,22 @@ def frames(f, offset):
         yield offset, head + block + crc, block
         offset += 4 + size + 4
 
-def source_id(block):
+def envelope(block):
     capacity = z.ZSTD_decompressBound(block, len(block)); buf = ctypes.create_string_buffer(capacity)
     length = z.ZSTD_decompress(buf, capacity, block, len(block)); assert not z.ZSTD_isError(length)
     match = re.match(rb'\{"seq":(\d+),"source_id":"([^"]+)"', buf.raw[:length])
-    return int(match.group(1)), match.group(2)
+    return int(match.group(1)), match.group(2), buf.raw[:length]
 
-# 2. Source frames from the boundary to the last complete frame, filtered to the recipe's IDs.
-#    Captured after the copy, so every database reference resolves.
+# 2. Source frames from the capture start to the last complete frame, filtered to the recipe's IDs.
+#    Captured after the copy; admission and fallback artifacts must reference frames inside it.
+REFERENCING = {b"pe-service.activity-frame-admission", b"pe-service.activity-frame-fallback"}
 with open(live_source, "rb") as f, open(out / "source_filtered.log", "wb") as w:
     w.write(b"EDGE\x01"); expected = start_seq; kept = 0; end = start_offset
     for end, raw, block in frames(f, start_offset):
-        seq, sid = source_id(block); assert seq == expected, (seq, expected); expected += 1
+        seq, sid, text = envelope(block); assert seq == expected, (seq, expected); expected += 1
+        if sid in REFERENCING:
+            r = json.loads(bytes(json.loads(text)["payload"]))["frame_receipt"]
+            assert r["sequence"] >= start_seq, ("capture again from a receipt at or before", r["sequence"])
         if sid in KEEP: w.write(raw); kept += 1
         end += len(raw)
 print("source sequences", start_seq, expected - 1, "end offset", end, "kept", kept)
@@ -270,9 +286,12 @@ sequence (the deployment sequence, or a recorded re-measurement boundary) and co
 for AC15; the AC16 size for latency acceptance). The inspection keeps REST pages compressed and
 decodes them on access. It counts bindings to observations before the capture and fails if one binds
 an admitted frame decision or an audited identity. For first-entry candidates in the window it reads
-BUYs recorded before the capture from `activity_groups` effects: an identity seen in the capture keeps
-its earliest stamp, as the whole-prefix reader does, and any other identity is an earlier entry in that
-market; it reports raw-only groups it cannot attribute to a market.
+earlier recorded BUYs from `activity_groups` effects: an identity seen in the capture keeps its
+earliest stamp, as the whole-prefix reader does, and any other identity is an earlier entry in that
+market. When that earlier entry is itself inside the window, its source evidence lies outside the
+capture: the inspection reports it as unknown and acceptance stays unproven. It also reports raw-only
+groups it cannot attribute to a market. `ac16-population.json` keeps the cohort boundary under its
+historical key `deploy_source_seq`.
 It opens SQLite with `mode=ro` and `query_only`, uses autocommit reads on the captured
 snapshot (no long transaction), and reads finite log prefixes. It prints evidence and writes
 only `ac16-population.json` in the separate audit directory for the scoped queries below.
@@ -572,24 +591,29 @@ intervals.extend((w, at, window_end * 10**9) for w, at in opened.items())
 first = {}
 for b in buys.values():
     k = (b["wallet"], b["market"]); first[k] = min(first.get(k, b["epoch"]), b["epoch"])
-unattributable = {}; restamped = []
+unattributable = {}; restamped = []; unknown = []
 for (wallet, market), epoch in list(first.items()):
     if not window_start <= epoch < window_end: continue
-    # Recorded BUYs before the capture: an identity seen in the capture keeps its earliest stamp,
-    # as the whole-prefix reader does; any other identity is an earlier entry in this market.
-    for sid, recorded in db.execute(
+    # Earlier recorded BUYs: an identity seen in the capture keeps its earliest stamp, as the
+    # whole-prefix reader does; any other identity is an earlier entry in this market.
+    earlier = list(db.execute(
             "SELECT source_trade_id, source_epoch FROM activity_groups WHERE wallet_hex=? AND activity_type='TRADE' "
             "AND json_extract(proof_json,'$.effect.kind')='trade' AND json_extract(proof_json,'$.effect.side')='Buy' "
             "AND json_extract(proof_json,'$.effect.market')=? AND CAST(json_extract(proof_json,'$.effect.amount') AS INTEGER) > 0 "
-            "AND source_epoch < ?", (wallet, market, epoch)):
+            "AND source_epoch < ?", (wallet, market, epoch)))
+    for sid, recorded in earlier:
         if sid in buys:
             restamped.append((sid, buys[sid]["epoch"], recorded)); buys[sid]["epoch"] = min(buys[sid]["epoch"], recorded)
         first[wallet, market] = min(first[wallet, market], recorded)
+    # An in-window first entry recorded only outside the capture has no source evidence here.
+    unknown += [(wallet, market, sid, recorded) for sid, recorded in earlier
+                if sid not in buys and recorded == first[wallet, market] and recorded >= window_start]
     (raw,) = db.execute("SELECT count(*) FROM activity_groups WHERE wallet_hex=? AND activity_type='TRADE' "
                         "AND json_extract(proof_json,'$.effect.kind')='raw_only' AND source_epoch < ?",
                         (wallet, epoch)).fetchone()
     if raw: unattributable[wallet] = max(unattributable.get(wallet, 0), raw)
 print("captured BUY identities with an earlier recorded stamp (identity, captured, recorded)", restamped)
+print("in-window first entries without captured source evidence (unknown; acceptance unproven)", unknown)
 print("earlier raw-only TRADE groups that cannot be attributed to a market, by wallet", unattributable)
 population = []
 for b in buys.values():
@@ -677,8 +701,9 @@ control from the same captured snapshot. The following commands run in the audit
 containing `ac16-population.json`; point `paper_state.db` at that captured snapshot.
 Each command is an autocommit read scoped to the frozen window or decision receipts.
 
-List **every** continuation-7 complete-read first-entry decision after the deployment source
-boundary in the window. Match frames by full identity and authenticated binding targets from
+List **every** continuation-7 complete-read first-entry decision in the window whose read commitment
+is at or after the cohort boundary (`deploy_source_seq`: the deployment sequence, or a recorded
+re-measurement boundary). Match frames by full identity and authenticated binding targets from
 the prefix export. Keep every receipt for feed-presence accounting; for routing choose the
 admitted receipt, otherwise the earliest qualifying positive-share, non-combo BUY, otherwise
 the earliest receipt, then that receipt's earliest fallback. An excluded zero-share observation
