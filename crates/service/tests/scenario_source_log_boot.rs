@@ -32,6 +32,7 @@ use pe_service::trade_poller::{DAILY_BOUNDARY_SOURCE_ID, rebuild_reconciliation_
 use pe_source_polymarket_public::{ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION};
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
 use rusqlite::Connection;
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use time::OffsetDateTime;
 
@@ -852,6 +853,7 @@ fn installed_boot_binding_requires_its_durable_target() {
     >(proof["pages"].clone())
     .unwrap();
     let binding = pe_service::bucket_commit::ObservationBinding {
+        counterpart_basis_receipt: None,
         frame_admission_receipt: None,
         stream_group_id: stream.group_id.key().clone(),
         stream_receipt,
@@ -1306,8 +1308,13 @@ async fn post_start_boot_bankroll_case_with_checkpoint_parity(
         start: AppendReceipt,
         /// The `commit_fill_v2` answer for the Prepared fixture, when one exists.
         commit: Option<serde_json::Value>,
+        progress: Arc<Mutex<(Decimal, Option<u64>)>>,
     }
-    async fn respond(State(authority): State<Authority>, uri: Uri) -> Json<serde_json::Value> {
+    async fn respond(
+        State(authority): State<Authority>,
+        uri: Uri,
+        body: axum::body::Bytes,
+    ) -> Json<serde_json::Value> {
         use serde_json::json;
         authority.requests.lock().unwrap().push(uri.clone());
         let query = uri.query().unwrap_or_default();
@@ -1356,10 +1363,35 @@ async fn post_start_boot_bankroll_case_with_checkpoint_parity(
                 "start_seq": authority.start.sequence.0,
                 "start_hash": authority.start.this_hash.to_hex().to_string(),
             }),
-            "/rest/v1/rpc/commit_fill_v2" => authority
-                .commit
-                .clone()
-                .expect("commit_fill_v2 is reachable only through the Prepared fixture"),
+            "/rest/v1/rpc/commit_fill_v2" => {
+                let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                let existing = authority.commit.as_ref().unwrap();
+                if request["p_prepared_seq"] == existing["applied_prepared_seq"] {
+                    existing.clone()
+                } else {
+                    let mut progress = authority.progress.lock().unwrap();
+                    assert_eq!(request["p_expected_prior_seq"], json!(progress.1));
+                    let principal: Decimal =
+                        request["p_principal"].as_str().unwrap().parse().unwrap();
+                    let fee: Decimal = request["p_fee"].as_str().unwrap().parse().unwrap();
+                    progress.0 -= principal + fee;
+                    progress.1 = request["p_prepared_seq"].as_u64();
+                    json!({
+                        "outcome": "applied", "bankroll": progress.0.to_string(),
+                        "applied_prepared_seq": progress.1,
+                        "row": {
+                            "idempotency_key": request["p_idempotency_key"],
+                            "leader_wallet": request["p_leader_wallet"],
+                            "source_trade_id": request["p_source_trade_id"],
+                            "market_id": request["p_market_id"], "outcome_id": request["p_outcome_id"],
+                            "side": request["p_side"], "quantity": request["p_quantity"],
+                            "fill_price": request["p_fill_price"], "principal": request["p_principal"],
+                            "fee": request["p_fee"], "entry_unix": request["p_entry_unix"],
+                            "prepared_seq": request["p_prepared_seq"]
+                        }
+                    })
+                }
+            }
             _ => panic!("unexpected post-Start boot request {uri}"),
         })
     }
@@ -1631,7 +1663,12 @@ async fn post_start_boot_bankroll_case_with_checkpoint_parity(
     drop(paper);
 
     let requests = Arc::new(Mutex::new(Vec::new()));
+    let financial_progress = Arc::new(Mutex::new((
+        dec!(9),
+        prepared.map(|receipt| receipt.sequence.0),
+    )));
     let authority = Authority {
+        progress: financial_progress.clone(),
         requests: requests.clone(),
         bankroll: authority_progress,
         start,
@@ -1684,12 +1721,14 @@ async fn post_start_boot_bankroll_case_with_checkpoint_parity(
                 std::fs::write(path, bytes).unwrap();
             }
             requests.lock().unwrap().clear();
+            *financial_progress.lock().unwrap() =
+                (dec!(9), prepared.map(|receipt| receipt.sequence.0));
             if checkpoint {
                 assert_eq!(
                     SourceLogBoot::prepare_checkpoint(&paths.fixed_main)
                         .unwrap()
                         .1,
-                    3
+                    4
                 );
             }
             let before = pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap();
@@ -1713,12 +1752,35 @@ async fn post_start_boot_bankroll_case_with_checkpoint_parity(
             );
             assert_eq!(
                 pe_service::bucket_commit::validate_open_continuations(&paper, &index).unwrap(),
-                3
+                4
             );
             let obligations = boot.obligations(&paper, &paths.paper_log).unwrap();
             let pending_before = paper.decision_pending_history().unwrap();
             drop(sink);
             drop(boot);
+            // Drive the production financial reconciler under the fixed terminal clock.
+            // The subprocess boot then checks its existing Final; separate bankroll scenarios
+            // exercise the subprocess's unmatched-Prepared recovery on its wall clock.
+            let authority = pe_service::supabase_state::SupabaseStateClient::new(
+                reqwest::Client::new(),
+                &cfg.supabase_url,
+                "fixture",
+                "fixture",
+            );
+            let writer = pe_service::paper_recovery::PaperLog::open(&paths.paper_log).unwrap();
+            pe_service::orchestrator::SCENARIO_TERMINAL_CLOCK
+                .scope(
+                    OffsetDateTime::from_unix_timestamp(NOW_UNIX + 25_010).unwrap(),
+                    pe_service::supabase_state::reconcile_active_financial_frames(
+                        &authority,
+                        &paper,
+                        pe_service::supabase_state::SourceEvidence::Index(&index),
+                        &writer,
+                    ),
+                )
+                .await
+                .unwrap();
+            drop(writer);
             let output = boot_binary(&config_path, true).await;
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(output.status.success(), "{stderr}");
@@ -1738,22 +1800,46 @@ async fn post_start_boot_bankroll_case_with_checkpoint_parity(
             assert_eq!(paper.bankroll().unwrap(), Some(dec!(9)));
             assert_eq!(paper.decision_pending_history().unwrap(), pending_before);
             let (_tx, rx) = tokio::sync::mpsc::channel(4);
-            let mut orchestrator = support::continuation_orchestrator_with_authority(
+            let (hooks, prices, books) =
+                mixed_continuation_market_evidence(&paths.source_log, &paper);
+            let index = SourceReceiptIndex::replay(&paths.source_log).unwrap();
+            let (source_handle, source_rx) =
+                pe_service::activity_ingest::SourceLogHandle::channel(4);
+            let (trigger, _receiver) = tokio::sync::mpsc::channel(1);
+            let source_actor = tokio::spawn(
+                pe_service::activity_ingest::ActivityIngest::poll_only(
+                    pe_service::source_event_sink::SourceEventSink::open(&paths.source_log)
+                        .unwrap(),
+                    source_rx,
+                    trigger,
+                    pe_service::health::new_shared_health_with_ws(false, true, 90),
+                )
+                .with_source_receipt_index(index.clone())
+                .run(),
+            );
+            let clock = OffsetDateTime::from_unix_timestamp(NOW_UNIX + 25_010).unwrap();
+            let mids = pe_service::mid_price_cache::MidPriceCache::with_fetcher(
+                prices,
+                "https://scenario.test".to_owned(),
+            )
+            .with_source_log(source_handle.clone())
+            .with_clock(Arc::new(move || clock));
+            let mut orchestrator = support::continuation_orchestrator_with_market_evidence(
                 paper.clone(),
                 &paths.paper_log,
                 WalletAddress([0xcc; 20]),
                 rx,
-                support::continuation_hooks(NOW_UNIX + 25_010),
+                hooks,
                 Some(pe_service::supabase_state::SupabaseStateClient::new(
                     reqwest::Client::new(),
                     &cfg.supabase_url,
                     "fixture",
                     "fixture",
                 )),
+                mids,
+                books,
             )
             .with_source_receipt_index(index.clone());
-            let (source_handle, _source_rx) =
-                pe_service::activity_ingest::SourceLogHandle::channel(4);
             orchestrator
                 .configure_financial_log_paths(
                     paths.paper_log.clone(),
@@ -1780,6 +1866,9 @@ async fn post_start_boot_bankroll_case_with_checkpoint_parity(
                 )
                 .await
                 .unwrap();
+            drop(orchestrator);
+            source_actor.abort();
+            let _ = source_actor.await;
             assert!(paper.open_decision_pending().unwrap().is_empty());
             for row in paper.decision_pending_history().unwrap() {
                 let decision = pe_service::decision_replay::replay_decision_pending(&row).unwrap();
@@ -1818,13 +1907,62 @@ async fn post_start_boot_bankroll_case_with_checkpoint_parity(
                     _ => None,
                 })
                 .collect::<Vec<_>>();
-            assert_eq!(finals.len(), 1);
+            assert_eq!(finals.len(), 4);
+            assert_eq!(paper.fills_count().unwrap(), 4);
+            let operations = paper_era(scan_paper_log(&paths.paper_log).unwrap())
+                .frames
+                .into_iter()
+                .filter_map(|frame| match &frame.frame {
+                    PaperLogFrame::Record(PaperLogRecord::FinancialPrepared {
+                        expected_authority,
+                        payload,
+                    }) => Some((frame.receipt, expected_authority.clone(), payload.clone())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(operations.len(), 4);
+            let partial = operations
+                .iter()
+                .find_map(|(_, _, payload)| match payload {
+                    FinancialPayload::Fill {
+                        operation,
+                        economic,
+                    } if operation.leader_wallet == WalletAddress([0xce; 20]) => Some(economic),
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(partial.sizing.principal.to_decimal(), dec!(0.75));
+            assert_eq!(partial.sizing.expected_shares.to_decimal(), dec!(1.5));
+            assert!(
+                paper
+                    .decision_pending_history()
+                    .unwrap()
+                    .iter()
+                    .any(|row| row.wallet == WalletAddress([0xcf; 20])
+                        && row.terminal_disposition.as_deref() == Some("no_fill"))
+            );
+            for wallet in [0xcc, 0xcd, 0xce] {
+                assert!(
+                    paper
+                        .decision_pending_history()
+                        .unwrap()
+                        .iter()
+                        .any(|row| row.wallet == WalletAddress([wallet; 20])
+                            && row.terminal_disposition.as_deref() == Some("fill"))
+                );
+            }
+            assert_eq!(paper.bankroll().unwrap(), Some(dec!(4.25)));
+            assert_eq!(
+                paper.bankroll().unwrap(),
+                Some(financial_progress.lock().unwrap().0)
+            );
             let result = (
                 paper.financial_snapshot(NOW_UNIX + 30_000).unwrap(),
                 paper.decision_pending_history().unwrap(),
                 obligations,
                 paper.gate_history().unwrap(),
                 finals,
+                operations,
             );
             if let Some(expected) = &expected {
                 assert_eq!(&result, expected);
@@ -2194,8 +2332,9 @@ async fn paper_service_rollout_checkpoint_matches_full_walk_financial_and_pendin
     .await;
 }
 
-/// Synthetic current wires are emitted by the bucket owner; the frame capture is authenticated
-/// by the same source and durable owners as production. Only version 6's historical wire is edited.
+/// The bucket owner emits complete-read wires; version 6 is the historical edited wire.
+/// The synthetic frame capture uses production admission hashing and authentication, followed
+/// by the same financial continuation owner as a production frame.
 fn install_mixed_current_open_continuations(
     paper: &Arc<PaperStateDb>,
     source_log: &Path,
@@ -2210,6 +2349,7 @@ fn install_mixed_current_open_continuations(
     for (version, wallet) in [
         (6, WalletAddress([0xcc; 20])),
         (7, WalletAddress([0xcd; 20])),
+        (7, WalletAddress([0xcf; 20])),
     ] {
         support::install_verified_empty_anchor(paper, wallet, 0);
         paper
@@ -2221,8 +2361,8 @@ fn install_mixed_current_open_continuations(
             })
             .unwrap();
         let payload = serde_json::to_vec(&serde_json::json!([{
-            "proxyWallet": wallet, "timestamp": NOW_UNIX + 25_000, "conditionId": format!("0xboot-{version}"), "type": "TRADE", "size": "2.5", "usdcSize": "1.25",
-            "transactionHash": format!("0xboot-{version}"), "price": "0.5", "asset": "boot-token", "side": "BUY", "outcomeIndex": 0, "outcome": "Yes", "isCombo": false
+            "proxyWallet": wallet, "timestamp": NOW_UNIX + 25_000, "conditionId": format!("0x{:064x}", wallet.0[0]), "type": "TRADE", "size": "2.5", "usdcSize": "1.25",
+            "transactionHash": format!("0x{:064x}", wallet.0[0]), "price": "0.5", "asset": wallet.0[0].to_string(), "side": "BUY", "outcomeIndex": 0, "outcome": "Yes", "isCombo": false
         }])).unwrap();
         let mut writer = Writer::open(source_log).unwrap();
         let (read, receipt) = support::append_committed_read_v2(
@@ -2233,7 +2373,20 @@ fn install_mixed_current_open_continuations(
             NOW_UNIX + 25_002,
         );
         drop(writer);
-        let context = support::read_context(&read, receipt, NOW_UNIX + 25_003);
+        let mut context = support::read_context(&read, receipt, NOW_UNIX + 25_003);
+        let mut configuration = context.applied_configuration.clone();
+        configuration.sizing_mode = pe_strategy_winner_follow::SizingMode::Dollar { usd: dec!(2) };
+        configuration.sizing_dollar_usd = dec!(2);
+        configuration.slippage_rate = Decimal::ZERO;
+        configuration.per_trade_cap = pe_strategy_winner_follow::PerTradeCap::Unlimited;
+        configuration.min_resolution_horizon_secs = 0;
+        configuration.max_resolution_horizon_secs = 0;
+        if wallet == WalletAddress([0xcf; 20]) {
+            configuration.sizing_mode =
+                pe_strategy_winner_follow::SizingMode::Contract { contracts: 1000 };
+            configuration.sizing_contracts = 1000;
+        }
+        context.applied_configuration = configuration;
         let mut engine = BucketCommitEngine::load(
             paper.clone(),
             pe_service::paper_recovery::build_leader_ledger(paper).unwrap(),
@@ -2244,7 +2397,7 @@ fn install_mixed_current_open_continuations(
                 read.aggregates,
                 &context,
                 FrozenDecisionBasis {
-                    win_rate_p: pe_core_types::Probability::ZERO,
+                    win_rate_p: pe_core_types::Probability::new(dec!(0.7)).unwrap(),
                     bankroll: dec!(10),
                 },
                 Some(PaperFreshnessPolicy {
@@ -2290,7 +2443,7 @@ fn install_mixed_current_open_continuations(
         NOW_UNIX + 24_999,
         NOW_UNIX + 25_001,
     );
-    let payload = serde_json::to_vec(&serde_json::json!({"proxyWallet": wallet, "timestamp": NOW_UNIX + 25_000, "conditionId": "0xboot-frame", "type": "TRADE", "size": "2.5", "usdcSize": "1.25", "transactionHash": "0xboot-frame", "price": "0.5", "asset": "boot-token", "side": "BUY", "outcomeIndex": 0, "outcome": "Yes", "isCombo": false})).unwrap();
+    let payload = serde_json::to_vec(&serde_json::json!({"proxyWallet": wallet, "timestamp": NOW_UNIX + 25_000, "conditionId": "0x0000000000000000000000000000000000000000000000000000000000000008", "type": "TRADE", "size": "2.5", "usdcSize": "1.25", "transactionHash": "0x0000000000000000000000000000000000000000000000000000000000000008", "price": "0.5", "asset": "206", "side": "BUY", "outcomeIndex": 0, "outcome": "Yes", "isCombo": false})).unwrap();
     let observation =
         pe_source_polymarket_public::parse_activity_trade_observation(&payload).unwrap();
     let frame = writer
@@ -2340,11 +2493,9 @@ fn install_mixed_current_open_continuations(
         latch: FeedLatchBasis::default(),
         paper_prefix: Some(paper_prefix),
     };
-    let body = serde_json::to_vec(&serde_json::to_value(&inputs).unwrap()).unwrap();
-    let mut hash = blake3::Hasher::new();
-    hash.update(b"prediction-edge/activity-frame-decision/v1\0");
-    hash.update(&body);
-    let revision = hash.finalize().to_hex().to_string();
+    let revision = pe_service::frame_admission::FrameAdmissionArtifact::from_inputs(&inputs)
+        .unwrap()
+        .capture_digest;
     let admission = writer
         .append_synced(EnvelopeIn {
             source_id: SourceId(pe_service::frame_admission::FRAME_ADMISSION_SOURCE_ID.to_owned()),
@@ -2371,8 +2522,10 @@ fn install_mixed_current_open_continuations(
     wire["source_trade_id"] = serde_json::json!(id);
     wire["semantic_revision"] = serde_json::json!(revision);
     wire["wallet"] = serde_json::to_value(wallet).unwrap();
-    wire["transaction_hash"] = serde_json::json!("0xboot-frame");
-    wire["market_id"] = serde_json::json!("0xboot-frame");
+    wire["transaction_hash"] =
+        serde_json::json!("0x0000000000000000000000000000000000000000000000000000000000000008");
+    wire["market_id"] =
+        serde_json::json!("0x0000000000000000000000000000000000000000000000000000000000000008");
     wire["provenance"] = serde_json::json!("activity_ws");
     wire["decision_inputs"] = serde_json::to_value(FrameDecisionProof {
         admission_receipt: admission,
@@ -2387,14 +2540,18 @@ fn install_mixed_current_open_continuations(
             gate: pe_paper_state::EntryGateResultRecord {
                 source_trade_id: id.clone(),
                 wallet,
-                market_id: MarketId(VenueMarketId("0xboot-frame".to_owned())),
+                market_id: MarketId(VenueMarketId(
+                    "0x0000000000000000000000000000000000000000000000000000000000000008".to_owned(),
+                )),
                 source_epoch: NOW_UNIX + 25_000,
                 result: "admitted".to_owned(),
                 history_consumed: true,
             },
             history: pe_paper_state::MarketHistoryRecord {
                 wallet,
-                market_id: MarketId(VenueMarketId("0xboot-frame".to_owned())),
+                market_id: MarketId(VenueMarketId(
+                    "0x0000000000000000000000000000000000000000000000000000000000000008".to_owned(),
+                )),
                 first_epoch: NOW_UNIX + 25_000,
                 source_trade_id: id.clone(),
             },
@@ -2408,4 +2565,159 @@ fn install_mixed_current_open_continuations(
             },
         })
         .unwrap();
+}
+
+fn mixed_continuation_market_evidence(
+    source_path: &Path,
+    paper: &PaperStateDb,
+) -> (
+    Arc<pe_service::orchestrator::ScenarioHooks>,
+    support::Prices,
+    std::collections::HashMap<String, pe_service::clob_book::OrderBook>,
+) {
+    use pe_core_types::{PolymarketConditionId, ShareAmount};
+    use pe_execution_core::{AdmissionReceipts, LiveAdmissionArtifact};
+    use pe_resolver_card::{
+        VENUE_SETTLEMENT_SCHEMA_VERSION, VenueResolutionStatus, VenueSettlementRecord,
+    };
+    use pe_source_polymarket_public::validate_paper_market;
+    use pe_venue_polymarket::parse_compact_market;
+    let clock = NOW_UNIX + 25_010;
+    let hooks = support::continuation_hooks(clock);
+    hooks.age_clock.lock().unwrap().clear();
+    hooks.age_clock.lock().unwrap().extend(std::iter::repeat_n(
+        OffsetDateTime::from_unix_timestamp(clock).unwrap(),
+        96,
+    ));
+    hooks.admission_artifacts.lock().unwrap().clear();
+    let prices = support::Prices {
+        gate: Arc::new(support::PriceGate::default()),
+        markets: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+    };
+    for position in paper.open_positions().unwrap() {
+        let market = position.market_id.to_string();
+        prices.markets.lock().unwrap().insert(market.clone(), serde_json::json!({
+            "conditionId": market, "outcomePrices": "[\"0.50\",\"0.50\"]", "active": true, "closed": false
+        }));
+    }
+    let mut books = std::collections::HashMap::new();
+    let mut writer = Writer::open(source_path).unwrap();
+    for row in paper.open_decision_pending().unwrap() {
+        let continuation =
+            pe_service::bucket_commit::DecisionContinuationV3::from_durable(&row).unwrap();
+        let condition = continuation.facts.market_id.to_string();
+        let token = row.wallet.0[0].to_string();
+        let mut gamma: serde_json::Value =
+            serde_json::from_slice(include_bytes!("fixtures/golden_stream_v1/gamma_long.json"))
+                .unwrap();
+        gamma[0]["conditionId"] = serde_json::json!(condition);
+        gamma[0]["clobTokenIds"] =
+            serde_json::json!([token, (u16::from(row.wallet.0[0]) + 1000).to_string()])
+                .to_string()
+                .into();
+        gamma[0]["orderMinSize"] = serde_json::json!("1");
+        gamma[0]["outcomePrices"] = serde_json::json!("[\"0.50\",\"0.50\"]");
+        let mut long: serde_json::Value =
+            serde_json::from_slice(include_bytes!("fixtures/golden_stream_v1/clob_long.json"))
+                .unwrap();
+        long["condition_id"] = serde_json::json!(condition);
+        long["minimum_order_size"] = serde_json::json!("1");
+        long["tokens"][0]["token_id"] = serde_json::json!(token);
+        long["tokens"][1]["token_id"] =
+            serde_json::json!((u16::from(row.wallet.0[0]) + 1000).to_string());
+        let mut compact: serde_json::Value = serde_json::from_slice(include_bytes!(
+            "fixtures/golden_stream_v1/clob_compact.json"
+        ))
+        .unwrap();
+        compact["c"] = serde_json::json!(condition);
+        compact["mos"] = serde_json::json!("1");
+        compact["fd"]["r"] = serde_json::json!(0);
+        compact["t"][0]["t"] = serde_json::json!(token);
+        compact["t"][1]["t"] = serde_json::json!((u16::from(row.wallet.0[0]) + 1000).to_string());
+        let gamma_bytes = serde_json::to_vec(&gamma).unwrap();
+        let long_bytes = serde_json::to_vec(&long).unwrap();
+        let compact_bytes = serde_json::to_vec(&compact).unwrap();
+        let receipts = AdmissionReceipts {
+            gamma: writer
+                .append_synced(envelope(
+                    "polymarket.gamma.markets",
+                    1,
+                    1,
+                    &gamma_bytes,
+                    clock,
+                ))
+                .unwrap(),
+            clob_long: writer
+                .append_synced(envelope(
+                    "polymarket.clob.markets",
+                    1,
+                    1,
+                    &long_bytes,
+                    clock,
+                ))
+                .unwrap(),
+            clob_compact: writer
+                .append_synced(envelope(
+                    "polymarket.clob.compact-market",
+                    1,
+                    1,
+                    &compact_bytes,
+                    clock,
+                ))
+                .unwrap(),
+        };
+        let condition_id = PolymarketConditionId(condition.clone());
+        let market =
+            validate_paper_market(&gamma_bytes, &long_bytes, &condition_id, clock, 60).unwrap();
+        assert_eq!(
+            market.minimum_order_size,
+            ShareAmount::from_whole(1).unwrap()
+        );
+        let fee_schedule = parse_compact_market(
+            &compact_bytes,
+            &condition_id,
+            &market.ordered_outcome_token_ids,
+        )
+        .unwrap()
+        .fee_schedule;
+        hooks
+            .admission_artifacts
+            .lock()
+            .unwrap()
+            .push_back(LiveAdmissionArtifact {
+                market,
+                fee_schedule,
+                receipts,
+                settlement: VenueSettlementRecord {
+                    schema_version: VENUE_SETTLEMENT_SCHEMA_VERSION,
+                    condition_id,
+                    status: VenueResolutionStatus::Unresolved,
+                    raw_evidence_hash: blake3::hash(&long_bytes).to_hex().to_string(),
+                    source_timestamp_unix: None,
+                    observed_at_unix: clock,
+                    parser_version: 1,
+                    freshness_window_secs: 60,
+                },
+            });
+        prices
+            .markets
+            .lock()
+            .unwrap()
+            .insert(condition.clone(), gamma[0].clone());
+        let mut book: serde_json::Value =
+            serde_json::from_slice(include_bytes!("fixtures/golden_stream_v1/book.json")).unwrap();
+        book["market"] = serde_json::json!(condition);
+        book["asset_id"] = serde_json::json!(token);
+        book["min_order_size"] = serde_json::json!("1");
+        book["asks"] = serde_json::json!([{ "price": "0.50", "size": if continuation.is_activity_frame() { "1.5" } else { "100" } }]);
+        let bytes = serde_json::to_vec(&book).unwrap();
+        let receipt = writer
+            .append_synced(envelope("polymarket.clob.book", 1, 1, &bytes, clock))
+            .unwrap();
+        let mut book = pe_service::clob_book::OrderBook::from_book_json(&bytes).unwrap();
+        book.source_receipt = Some(receipt);
+        book.fetched_at_ms = u64::try_from(clock * 1000).unwrap();
+        books.insert(token, book);
+    }
+    (hooks, prices, books)
 }

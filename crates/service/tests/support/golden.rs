@@ -3522,6 +3522,7 @@ impl BracketFinancialHarness {
         let (triggers, receiver) = mpsc::channel(8);
         triggers
             .send(ReconciliationTrigger {
+                qualifying_buy: true,
                 wallet: bodies.wallet,
                 source_time: observation.source_time.0,
                 source_trade_id: observation.group_id.key().clone(),

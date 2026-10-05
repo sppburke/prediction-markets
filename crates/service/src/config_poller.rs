@@ -253,7 +253,8 @@ impl RiskHaltReleaseHandle {
                 })?;
             return response
                 .await
-                .map_err(|_| "orchestrator dropped feed release acknowledgement".to_owned())?;
+                .map_err(|_| "orchestrator dropped feed release acknowledgement".to_owned())?
+                .map(|_| ());
         }
         let active = active_risk_halts(&era);
         let Some(release) = audited_halt_release(&era, &active, release_hash) else {

@@ -11013,6 +11013,7 @@ mod tests {
         >(current.facts.decision_inputs["pages"].clone())
         .unwrap();
         let binding = ObservationBinding {
+            counterpart_basis_receipt: None,
             frame_admission_receipt: None,
             stream_group_id: current.facts.source_trade_id.clone(),
             stream_receipt: receipt,
@@ -11179,6 +11180,7 @@ mod tests {
                 .unwrap();
             let metadata_receipt = gamma.0;
             let mut bindings = vec![ObservationBinding {
+                counterpart_basis_receipt: None,
                 frame_admission_receipt: None,
                 stream_group_id: facts.source_trade_id.clone(),
                 stream_receipt,
@@ -14299,6 +14301,7 @@ mod tests {
             .unwrap();
             let occurrence = &continuation.page_occurrences[0];
             let binding = crate::bucket_commit::ObservationBinding {
+                counterpart_basis_receipt: None,
                 frame_admission_receipt: None,
                 stream_group_id: facts.source_trade_id.clone(),
                 stream_receipt: observation.source_receipt,

@@ -912,8 +912,8 @@ fn paper_fill_source_receipts(era: &PaperEra) -> Result<Vec<AppendReceipt>, Risk
 #[derive(Default)]
 struct SourceReceiptIndexState {
     frames: Vec<SourceFrameMetadata>,
-    frame_bindings: HashMap<(EventSeq, blake3::Hash), SourceTradeId>,
-    frame_incidents: HashMap<(EventSeq, blake3::Hash), Option<SourceTradeId>>,
+    frame_bindings: HashMap<(EventSeq, blake3::Hash), (SourceTradeId, AppendReceipt)>,
+    frame_incidents: HashMap<(EventSeq, blake3::Hash), (Option<SourceTradeId>, AppendReceipt)>,
     next_byte_offset: Option<u64>,
     verified_feed_frontiers:
         HashMap<pe_core_types::WalletAddress, crate::frame_admission::FeedHistoryFrontier>,
@@ -1076,7 +1076,7 @@ impl SourceReceiptIndex {
                 binding.stream_receipt.this_hash,
             );
             if let Some(previous) = state.frame_bindings.get(&key) {
-                let (left, right) = (previous, &binding.history_group_id);
+                let (left, right) = (&previous.0, &binding.history_group_id);
                 if left != right
                     && read.restamp_pairs.get(left) != Some(right)
                     && read.restamp_pairs.get(right) != Some(left)
@@ -1098,7 +1098,7 @@ impl SourceReceiptIndex {
                     binding.stream_receipt.sequence,
                     binding.stream_receipt.this_hash,
                 ))
-                .or_insert_with(|| binding.history_group_id.clone());
+                .or_insert_with(|| (binding.history_group_id.clone(), read.receipt));
         }
         Ok(())
     }
@@ -1113,25 +1113,38 @@ impl SourceReceiptIndex {
                 incident.frame_receipt.sequence,
                 incident.frame_receipt.this_hash,
             ))
-            .or_insert_with(|| incident.counterpart_identity.clone());
+            .or_insert_with(|| {
+                (
+                    incident.counterpart_identity.clone(),
+                    incident.deciding_commitment_receipt,
+                )
+            });
     }
 
-    /// Outer None means unresolved; Some(None) is an authenticated absence with no counterpart.
-    pub(crate) fn frame_counterpart(
+    /// Bindings take precedence over incidents: a late binding fixes an absent frame forever.
+    /// The receipt is the first proof, so later commitments reference a bounded proof chain.
+    pub(crate) fn frame_counterpart_basis(
         &self,
         receipt: AppendReceipt,
-    ) -> Option<Option<SourceTradeId>> {
+    ) -> Option<(Option<SourceTradeId>, AppendReceipt)> {
         let state = self
             .state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let key = (receipt.sequence, receipt.this_hash);
-        state.frame_incidents.get(&key).cloned().or_else(|| {
-            state
-                .frame_bindings
-                .get(&key)
-                .map(|identity| Some(identity.clone()))
-        })
+        state
+            .frame_bindings
+            .get(&key)
+            .map(|(identity, proof)| (Some(identity.clone()), *proof))
+            .or_else(|| state.frame_incidents.get(&key).cloned())
+    }
+
+    pub(crate) fn frame_counterpart(
+        &self,
+        receipt: AppendReceipt,
+    ) -> Option<Option<SourceTradeId>> {
+        self.frame_counterpart_basis(receipt)
+            .map(|(target, _)| target)
     }
 
     pub(crate) fn remember_verified_frontier(

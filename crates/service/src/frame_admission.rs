@@ -137,15 +137,25 @@ impl FeedLatchBasis {
     }
 }
 
-/// One identity keeps its admitted receipt, otherwise its first synchronized receipt.
-/// Shared by the poller's obligations and the serialized owner's ordering barrier.
+/// Same-identity priority: admitted receipt, earliest qualifying BUY, earliest receipt.
+/// Runtime obligations, the serialized barrier and boot recovery use this exact rule.
 pub(crate) fn prefer_observation(
     existing: AppendReceipt,
     existing_admitted: bool,
+    existing_qualifying: bool,
     incoming: AppendReceipt,
     incoming_admitted: bool,
+    incoming_qualifying: bool,
 ) -> bool {
-    !existing_admitted && (incoming_admitted || incoming.sequence < existing.sequence)
+    (
+        incoming_admitted,
+        incoming_qualifying,
+        std::cmp::Reverse(incoming.sequence),
+    ) > (
+        existing_admitted,
+        existing_qualifying,
+        std::cmp::Reverse(existing.sequence),
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -239,10 +249,12 @@ impl FrameAdmissionInputs {
         state: &PaperStateDb,
         facts: &crate::bucket_commit::DecisionContinuationFacts,
     ) -> Result<(), FrameAdmissionError> {
-        let anchor = state
-            .position_anchors(&facts.wallet)?
-            .into_iter()
-            .find(|anchor| Some(anchor.anchor_seq) == self.coverage.anchor_seq);
+        let anchor = self
+            .coverage
+            .anchor_seq
+            .map(|sequence| state.position_anchor(&facts.wallet, sequence))
+            .transpose()?
+            .flatten();
         let balances: Vec<(String, u16, pe_core_types::ShareAmount)> = match anchor {
             Some(anchor) => {
                 if Some(anchor.activity_cutoff_unix) != self.coverage.activity_cutoff_unix

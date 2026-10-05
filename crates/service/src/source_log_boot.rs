@@ -34,8 +34,12 @@ use crate::risk_inputs::{SourceFrameMetadata, SourceReceiptIndex};
 use crate::source_event_sink::SourceEventSink;
 use crate::trade_poller::{
     ActivityCandidates, DailyBoundaryCandidates, ObligationRebuildError, ReconciliationObligations,
-    recover_daily_boundary_anchor, recover_daily_boundary_from_candidates,
+    recover_daily_boundary_anchor_from_era, recover_daily_boundary_from_candidates,
 };
+
+// Version 1 retained only the first non-admitted observation and could discard a
+// later qualifying BUY. Rebuild those checkpoints from the authenticated source log.
+const ACTIVITY_REDUCER_VERSION: u32 = 2;
 
 /// Scenario-only fault seams (absent from ordinary builds).
 #[cfg(feature = "scenario")]
@@ -157,7 +161,7 @@ fn load_checkpoint(
     drop(bytes);
     if data.format_version != 1
         || data.scanner_version != 1
-        || data.reducer_version != 1
+        || data.reducer_version != ACTIVITY_REDUCER_VERSION
         || data.financial_era != financial_era
         || data.activation != *activation
         || data.tail.path != activation.path
@@ -341,7 +345,7 @@ impl SourceLogBoot {
         publish_data(CheckpointData {
             format_version: 1,
             scanner_version: 1,
-            reducer_version: 1,
+            reducer_version: ACTIVITY_REDUCER_VERSION,
             financial_era: frozen.financial_era,
             activation: frozen.activation.clone(),
             tail: frozen.tail.clone(),
@@ -430,7 +434,7 @@ impl SourceLogBoot {
         publish_data(CheckpointData {
             format_version: 1,
             scanner_version: 1,
-            reducer_version: 1,
+            reducer_version: ACTIVITY_REDUCER_VERSION,
             financial_era,
             activation,
             tail: tail.clone(),
@@ -525,7 +529,7 @@ impl SourceLogBoot {
         crate::paper_recovery::feed_latch_basis(&era)?;
         obligations.retire_feed_incidents(&era);
         if let Some(candidates) = self.reducers.daily_boundary.take()
-            && let Some(anchor) = recover_daily_boundary_anchor(paper_log_path, &mut obligations)
+            && let Some(anchor) = recover_daily_boundary_anchor_from_era(&era, &mut obligations)
                 .context("recover causal daily boundary")?
         {
             recover_daily_boundary_from_candidates(candidates, anchor, &mut obligations);

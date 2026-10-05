@@ -419,8 +419,9 @@ audits, join `FeedIncidentChanged.incident.frame_receipt` to the same frame and 
 bindings. A retained authenticated match survives until its recorded target commits, even when a
 later mature full-history read is empty. After a binding or negative counterpart identity is fixed,
 only authenticated restamp equivalence can change its identifier; another leg of the same transaction
-must retain its own routing. An absence records no counterpart and cannot later suppress a distinct
-REST identity by rediscovery. List unresolved audits separately. Reconstruct engagement/release order from the active
+must retain its own routing. After an absence incident, the first later authenticated same-transaction
+group is the frame's late counterpart: one ledger effect, no second decision. Its first binding
+fixes that counterpart durably; only authenticated restamp equivalence can change its identifier. List unresolved audits separately. Reconstruct engagement/release order from the active
 paper era, including each `engagement_receipt`, and compare the frozen admission latch basis;
 current status is supplementary evidence only.
 

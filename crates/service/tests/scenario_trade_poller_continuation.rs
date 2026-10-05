@@ -347,7 +347,9 @@ async fn late_group_then_strict_decrement_in_one_read_both_become_durable() {
     let control = tokio::spawn(async move {
         while let Some(command) = control_rx.recv().await {
             if let OrchestratorControl::FeedAuditUpdate { acknowledged, .. } = command {
-                let _ = acknowledged.send(Ok(()));
+                let _ = acknowledged.send(Ok(
+                    pe_service::orchestrator_control::FeedAuditAcknowledgement::Applied,
+                ));
                 continue;
             }
             if let OrchestratorControl::CommitActivityBucket {
@@ -467,7 +469,9 @@ async fn recorded_poll(
         let mut commits = Vec::new();
         while let Some(command) = control_rx.recv().await {
             if let OrchestratorControl::FeedAuditUpdate { acknowledged, .. } = command {
-                let _ = acknowledged.send(Ok(()));
+                let _ = acknowledged.send(Ok(
+                    pe_service::orchestrator_control::FeedAuditAcknowledgement::Applied,
+                ));
                 continue;
             }
             let OrchestratorControl::CommitActivityBucket {
@@ -868,6 +872,7 @@ impl RunningPoll {
             .unwrap();
         self.triggers
             .send(ReconciliationTrigger {
+                qualifying_buy: true,
                 wallet: parsed.wallet,
                 source_time: parsed.source_time.0,
                 source_trade_id: parsed.group_id.key().clone(),
@@ -1080,7 +1085,9 @@ fn start_recorded_poller_with_completion_stop(
                             // production additionally checks the authenticated disposition.
                             actor_paper.retire_activity_observation(receipt, unbound).unwrap();
                         }
-                        let _ = acknowledged.send(Ok(()));
+                        let _ = acknowledged.send(Ok(
+                            pe_service::orchestrator_control::FeedAuditAcknowledgement::Applied,
+                        ));
                     }
                 }
                 OrchestratorControl::ActivityFrameDecision { receipt } => {

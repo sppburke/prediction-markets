@@ -576,8 +576,8 @@ only its version, frame receipt and `capture_digest` (the domain-separated frame
 Classification uses the position rebuilt from these inputs. Resolved
 barriers retire through the owner's acknowledged match/disposition or incident path at runtime;
 boot rebuilds the same coalesced unresolved receipts. The poller and owner share one same-identity
-rule: retain the admitted receipt, otherwise the earliest synchronized receipt, including across
-source epochs. Admission supersedes an earlier excluded zero-share receipt of that identity.
+rule: retain the admitted receipt, otherwise the earliest positive-share, non-combo BUY, then the earliest synchronized
+receipt, including across source epochs. Admission supersedes an earlier excluded zero-share receipt of that identity.
 Unrelated wallets/positions/history cannot grow the body.
 
 First-entry history is per wallet and market. Continuation 7 copies each wallet's first entry
@@ -621,8 +621,13 @@ negative audits retain the deciding commitment's proof, including empty bindings
 retains only authenticated bindings/restamp pairs for selection and releases reconstructed aggregates,
 effective identities and read indexes after each authentication.
 A match or contradiction fixes the frame's counterpart, so a later read cannot rebind it to
-another transaction leg. After an absence incident, a later group of the same transaction is the
+another transaction leg. After an absence incident, the first later authenticated group of the same transaction is the
 frame's late counterpart: it applies to the leader ledger once and creates no second decision.
+Its first binding fixes that counterpart durably; later reads cannot replace it with another leg.
+Only authenticated restamp equivalence can change its identifier.
+Later frame bindings carry `counterpart_basis_receipt`, referencing the first binding commitment
+or the full-history absence proof for a late counterpart. Synchronization, boot and sealed replay
+authenticate that basis with the same counterpart rule; initial and historical bindings omit it.
 
 **Feed incidents and history fallback.** `PaperLogRecord::FeedIncidentChanged { incident, state }`
 journals contradiction or absence before the audit ordering barrier retires. The synchronized

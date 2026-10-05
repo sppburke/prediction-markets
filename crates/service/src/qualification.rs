@@ -14415,6 +14415,7 @@ mod tests {
                 .as_mut()
                 .unwrap()
                 .push(crate::bucket_commit::ObservationBinding {
+                    counterpart_basis_receipt: None,
                     frame_admission_receipt: None,
                     stream_group_id: stream.group_id.key().clone(),
                     stream_receipt,

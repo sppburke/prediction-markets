@@ -558,6 +558,34 @@ pub fn continuation_orchestrator_with_authority(
     pe_source_polymarket_public::FixtureFetcher,
     pe_service::clob_book::FixtureClobBookFetcher,
 > {
+    continuation_orchestrator_with_market_evidence(
+        paper,
+        paper_path,
+        wallet,
+        control_rx,
+        hooks,
+        authority,
+        pe_service::mid_price_cache::MidPriceCache::with_fetcher(
+            pe_source_polymarket_public::FixtureFetcher::new(HashMap::new()),
+            "https://scenario.test".to_owned(),
+        ),
+        HashMap::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn continuation_orchestrator_with_market_evidence<
+    F: pe_source_polymarket_public::PageFetcher + Send + Sync,
+>(
+    paper: Arc<pe_paper_state::PaperStateDb>,
+    paper_path: &std::path::Path,
+    wallet: WalletAddress,
+    control_rx: mpsc::Receiver<OrchestratorControl>,
+    hooks: Arc<pe_service::orchestrator::ScenarioHooks>,
+    authority: Option<pe_service::supabase_state::SupabaseStateClient>,
+    mids: pe_service::mid_price_cache::MidPriceCache<F>,
+    books: HashMap<String, pe_service::clob_book::OrderBook>,
+) -> pe_service::orchestrator::Orchestrator<F, pe_service::clob_book::FixtureClobBookFetcher> {
     use pe_core_types::{BasisPoints, SourceTimestamp};
     use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
     use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
@@ -600,17 +628,12 @@ pub fn continuation_orchestrator_with_authority(
         paper,
         ledger,
         pe_service::health::new_shared_health(false),
-        pe_service::mid_price_cache::MidPriceCache::with_fetcher(
-            pe_source_polymarket_public::FixtureFetcher::new(HashMap::new()),
-            "https://scenario.test".to_owned(),
-        ),
+        mids,
         control_rx,
         None,
         None,
         authority,
-        Arc::new(pe_service::clob_book::FixtureClobBookFetcher::new(
-            HashMap::new(),
-        )),
+        Arc::new(pe_service::clob_book::FixtureClobBookFetcher::new(books)),
     )
     .unwrap();
     orchestrator.set_scenario_hooks(hooks);

@@ -38,7 +38,7 @@ pub enum OrchestratorControl {
     /// Audit updates are serialized with admissions by the existing owner.
     FeedAuditUpdate {
         update: FeedAuditUpdate,
-        acknowledged: oneshot::Sender<Result<(), String>>,
+        acknowledged: oneshot::Sender<Result<FeedAuditAcknowledgement, String>>,
     },
     /// Durable history/fence checks and Lane D's position bracket completed for
     /// these wallets. The orchestrator rechecks its loaded fence set before ack.
@@ -100,6 +100,13 @@ pub enum OrchestratorControl {
         proposed_financial_semantic_version: u32,
         acknowledged: oneshot::Sender<Result<(), String>>,
     },
+}
+
+/// Retirement acknowledges only the current durable receipt authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FeedAuditAcknowledgement {
+    Applied,
+    Superseded(AppendReceipt),
 }
 
 /// Additional audit and release variants extend this enum without a new channel.

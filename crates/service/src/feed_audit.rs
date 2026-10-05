@@ -24,11 +24,14 @@ pub enum FeedAuditError {
     Semantic(&'static str),
 }
 
-/// Transaction discovery precedes side comparison. An asset identifies the leg when there
-/// are multiple legs; an exact group never hides a disagreeing leg of the same asset.
-pub(crate) fn counterparts<'a>(
+/// Resolve a frame against the whole authenticated read. A binding or contradiction fixes
+/// its target; only read-proven restamps are equivalent. An absence selects the first later
+/// transaction leg in source order, which the next binding then fixes durably.
+pub(crate) fn resolve_frame_counterpart<'a>(
     observation: &ActivityTradeObservation,
+    fixed: Option<Option<&SourceTradeId>>,
     aggregates: impl IntoIterator<Item = &'a ActivityAggregate>,
+    pairs: &std::collections::HashMap<SourceTradeId, SourceTradeId>,
 ) -> Vec<&'a ActivityAggregate> {
     let original = observation.group_id.components();
     let mut candidates = aggregates
@@ -40,8 +43,23 @@ pub(crate) fn counterparts<'a>(
                 && candidate.activity_type == ActivityType::Trade
         })
         .collect::<Vec<_>>();
-    if candidates.len() > 1 {
+    if let Some(Some(target)) = fixed {
+        candidates.retain(|aggregate| {
+            let id = aggregate.group_id.key();
+            id == target || pairs.get(id) == Some(target) || pairs.get(target) == Some(id)
+        });
+    } else if fixed.is_none() && candidates.len() > 1 {
         candidates.retain(|aggregate| aggregate.group_id.components().asset == original.asset);
+    }
+    crate::bucket_commit::collapse_restamp_pairs(&mut candidates, pairs);
+    if fixed == Some(None) {
+        candidates.sort_by(|left, right| {
+            left.source_time
+                .0
+                .cmp(&right.source_time.0)
+                .then_with(|| left.group_id.key().0.cmp(&right.group_id.key().0))
+        });
+        candidates.truncate(1);
     }
     candidates
 }

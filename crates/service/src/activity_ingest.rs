@@ -73,6 +73,7 @@ pub const ACTIVITY_WS_SOURCE_ID: &str = "polymarket-activity-ws";
 /// A durable raw observation that requires complete fixed-end reconciliation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconciliationTrigger {
+    pub qualifying_buy: bool,
     pub wallet: WalletAddress,
     pub source_time: OffsetDateTime,
     pub source_trade_id: SourceTradeId,
@@ -186,6 +187,7 @@ struct Observation {
 
 /// Normalized websocket identity before the coordinator assigns its durable receipt.
 struct PendingReconciliationTrigger {
+    qualifying_buy: bool,
     wallet: WalletAddress,
     source_time: OffsetDateTime,
     source_trade_id: SourceTradeId,
@@ -661,6 +663,10 @@ impl Reader {
                 slot: self.slot,
                 payload: payload.to_vec(),
                 trigger: PendingReconciliationTrigger {
+                    qualifying_buy: activity.group_id.components().side
+                        == Some(pe_core_types::Side::Buy)
+                        && activity.share_amount != pe_core_types::ShareAmount::ZERO
+                        && !activity.is_combo,
                     wallet: activity.wallet,
                     source_time: activity.source_time.0,
                     source_trade_id: activity.group_id.key().clone(),
@@ -811,6 +817,7 @@ impl Coordinator {
                         Err(Shutdown) => return,
                     };
                     let trigger = ReconciliationTrigger {
+                        qualifying_buy: observation.trigger.qualifying_buy,
                         wallet: observation.trigger.wallet,
                         source_time: observation.trigger.source_time,
                         source_trade_id: observation.trigger.source_trade_id,
@@ -1005,6 +1012,7 @@ mod tests {
             slot: 0,
             payload,
             trigger: PendingReconciliationTrigger {
+                qualifying_buy: true,
                 wallet: activity.wallet,
                 source_time: activity.source_time.0,
                 source_trade_id: activity.group_id.key().clone(),
@@ -1265,6 +1273,7 @@ mod tests {
         let queued = observation("0xqueued").trigger;
         trigger_tx
             .try_send(ReconciliationTrigger {
+                qualifying_buy: queued.qualifying_buy,
                 wallet: queued.wallet,
                 source_time: queued.source_time,
                 source_trade_id: queued.source_trade_id,
@@ -1367,6 +1376,7 @@ mod tests {
         let queued = observation("queued").trigger;
         trigger_tx
             .send(ReconciliationTrigger {
+                qualifying_buy: true,
                 wallet: queued.wallet,
                 source_time: queued.source_time,
                 source_trade_id: queued.source_trade_id,

@@ -191,7 +191,9 @@ async fn run_once(
         let mut engine = BucketCommitEngine::load(control_paper, PositionLedger::new()).unwrap();
         while let Some(command) = control_rx.recv().await {
             if let OrchestratorControl::FeedAuditUpdate { acknowledged, .. } = command {
-                let _ = acknowledged.send(Ok(()));
+                let _ = acknowledged.send(Ok(
+                    pe_service::orchestrator_control::FeedAuditAcknowledgement::Applied,
+                ));
                 continue;
             }
             if let OrchestratorControl::CommitActivityBucket {
@@ -504,7 +506,9 @@ async fn reader_burst_coalesces_until_the_existing_poll_cadence() {
     let control = tokio::spawn(async move {
         while let Some(command) = control_rx.recv().await {
             if let OrchestratorControl::FeedAuditUpdate { acknowledged, .. } = command {
-                let _ = acknowledged.send(Ok(()));
+                let _ = acknowledged.send(Ok(
+                    pe_service::orchestrator_control::FeedAuditAcknowledgement::Applied,
+                ));
             }
         }
     });
@@ -544,6 +548,7 @@ async fn reader_burst_coalesces_until_the_existing_poll_cadence() {
     for received_at in [1_900_000_001, 1_900_000_002, 1_900_000_003] {
         trigger_inject
             .send(pe_service::activity_ingest::ReconciliationTrigger {
+                qualifying_buy: true,
                 wallet: wallet(),
                 source_time: OffsetDateTime::from_unix_timestamp(1_900_000_000).unwrap(),
                 source_trade_id: pe_core_types::SourceTradeId("g2:same".to_owned()),

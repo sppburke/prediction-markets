@@ -1696,8 +1696,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
     fn apply_feed_audit_update(
         &mut self,
         update: crate::orchestrator_control::FeedAuditUpdate,
-    ) -> Result<(), String> {
-        use crate::orchestrator_control::FeedAuditUpdate;
+    ) -> Result<crate::orchestrator_control::FeedAuditAcknowledgement, String> {
+        use crate::orchestrator_control::{FeedAuditAcknowledgement, FeedAuditUpdate};
         use crate::paper_recovery::{HaltState, PaperLogRecord};
         let index = self
             .source_receipts
@@ -1715,10 +1715,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 unbound,
                 verified_read.as_deref(),
             ),
-            FeedAuditUpdate::Frontier(frontier, read) => {
-                self.bucket_engine
-                    .publish_frontier(frontier, index, read.as_deref())
-            }
+            FeedAuditUpdate::Frontier(frontier, read) => self
+                .bucket_engine
+                .publish_frontier(frontier, index, read.as_deref())
+                .map(|()| FeedAuditAcknowledgement::Applied),
             FeedAuditUpdate::Incident(incident, read) => {
                 let identity = self
                     .paper_state
@@ -1758,7 +1758,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     self.paper_writer.snapshot().map_err(|e| e.to_string())?,
                 );
                 if crate::feed_audit::audited_receipts(&era).contains(&incident.frame_receipt) {
-                    return Ok(());
+                    return Ok(FeedAuditAcknowledgement::Applied);
                 }
                 let incident_index = index.clone();
                 let receipt = self.append_paper_record(&PaperLogRecord::FeedIncidentChanged {
@@ -1782,7 +1782,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 }
                 error!(cause = ?incident.cause, frame_receipt = ?incident.frame_receipt, deciding_commitment = ?incident.deciding_commitment_receipt,
                     counterpart = ?incident.counterpart_identity, engagement = ?receipt, "feed audit incident engaged; frames wait for history");
-                Ok(())
+                Ok(FeedAuditAcknowledgement::Applied)
             }
             FeedAuditUpdate::Release {
                 expected_engagement_hash,
@@ -1797,7 +1797,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                         .latest_incident
                         .is_none_or(|receipt| receipt.this_hash != expected_engagement_hash)
                 {
-                    return Ok(());
+                    return Ok(FeedAuditAcknowledgement::Applied);
                 }
                 let Some(mut incident) = crate::feed_audit::latest_incident(&era) else {
                     return Err("latest feed engagement is missing".to_owned());
@@ -1812,7 +1812,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     release: Some(release),
                 };
                 self.publish_feed_latch_health();
-                Ok(())
+                Ok(FeedAuditAcknowledgement::Applied)
             }
         }
     }

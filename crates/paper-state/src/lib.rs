@@ -2111,6 +2111,34 @@ impl PaperStateDb {
             .map_err(PaperStateError::from)
     }
 
+    /// Exact immutable anchor selected by an admission or replay capture.
+    pub fn position_anchor(
+        &self,
+        wallet: &WalletAddress,
+        anchor_seq: i64,
+    ) -> Result<Option<PositionAnchorRow>, PaperStateError> {
+        self.lock()
+            .query_row(
+                "SELECT anchor_seq, anchored_at_unix, activity_cutoff_unix, balances_json, \
+                    ledger_hash_after, proof_json FROM position_anchors \
+             WHERE wallet_hex = ?1 AND anchor_seq = ?2",
+                params![wallet.to_string(), anchor_seq],
+                |row| {
+                    Ok(PositionAnchorRow {
+                        wallet: *wallet,
+                        anchor_seq: row.get(0)?,
+                        anchored_at_unix: row.get(1)?,
+                        activity_cutoff_unix: row.get(2)?,
+                        balances_json: row.get(3)?,
+                        ledger_hash_after: row.get(4)?,
+                        proof_json: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(PaperStateError::from)
+    }
+
     /// All position anchors for one wallet in append order.
     pub fn position_anchors(
         &self,
@@ -6692,6 +6720,16 @@ mod tests {
         assert_eq!(first_anchors.len(), 1);
         assert_eq!(first_anchors[0].anchor_seq, 0);
         assert_eq!(first_anchors[0].ledger_hash_after, "ledger-first");
+        assert_eq!(
+            db.position_anchor(&first, 0).unwrap(),
+            Some(first_anchors[0].clone())
+        );
+        assert!(db.position_anchor(&first, 99).unwrap().is_none());
+        assert!(
+            db.position_anchor(&WalletAddress([99; 20]), 0)
+                .unwrap()
+                .is_none()
+        );
         let canonical_balances: Vec<(String, u16, ShareAmount)> =
             serde_json::from_str(&first_anchors[0].balances_json).unwrap();
         assert_eq!(
@@ -6747,6 +6785,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0, 1]
         );
+        for anchor in &first_anchors {
+            assert_eq!(
+                db.position_anchor(&first, anchor.anchor_seq).unwrap(),
+                Some(anchor.clone())
+            );
+        }
         assert_eq!(
             leader_projection(&db)
                 .into_iter()
