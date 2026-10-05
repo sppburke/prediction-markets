@@ -834,7 +834,7 @@ async fn verify_qualification(
         &replayed_decisions
             .iter()
             .filter(|decision| decision.continuation.is_activity_frame())
-            .map(|decision| decision.continuation.clone())
+            .map(|decision| &decision.continuation)
             .collect::<Vec<_>>(),
         &audit_era,
         &audit_commitments,
@@ -2365,12 +2365,14 @@ fn decision_rows_from_sealed_source(
             .verify_activity_frame(&mut lookup)
             .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
         frame_ids.insert(row.source_trade_id.clone());
-        let frame = continuation.observed_source_receipt.ok_or_else(|| {
-            QualificationError::InsufficientEvidence("frame receipt missing".to_owned())
-        })?;
-        if start_sequence.is_none_or(|start| frame.sequence > start) {
+        let proof: crate::frame_admission::FrameDecisionProof =
+            serde_json::from_value(continuation.facts.decision_inputs.clone())?;
+        // A synchronized pre-Start frame can be delivered and admitted after activation.
+        // Admission owns decision selection; the original frame still owns its source facts.
+        let admission = proof.admission_receipt;
+        if start_sequence.is_none_or(|start| admission.sequence > start) {
             frame_required.push((
-                frame.sequence.0,
+                admission.sequence.0,
                 row.source_trade_id.clone(),
                 row.semantic_revision.clone(),
             ));
@@ -4091,7 +4093,8 @@ async fn verify_economic(
                 })?;
             Ok(RecordedEconomicSource {
                 payload: observation.payload.clone(),
-                received_unix_ms: observation.received_unix_ms,
+                observed_at: observation.observed_at.clone(),
+                received_at: observation.received_at.clone(),
                 source_id: observation.source_id.clone(),
                 schema_version: observation.schema_version,
                 parser_version: observation.parser_version,
@@ -7473,7 +7476,14 @@ mod tests {
         let prepared_received_unix_ms = evaluated_at_unix_ms + 1_000;
         let mut source = fixture.source.clone();
         for sequence in RECEIPTS {
-            source.get_mut(&sequence).unwrap().received_unix_ms = evaluated_at_unix_ms;
+            let observation = source.get_mut(&sequence).unwrap();
+            observation.received_unix_ms = evaluated_at_unix_ms;
+            observation.received_at = ReceivedAt(
+                OffsetDateTime::from_unix_timestamp_nanos(
+                    i128::from(evaluated_at_unix_ms) * 1_000_000,
+                )
+                .unwrap(),
+            );
         }
         // The observation's recorded clock must agree with its (moved) selected receipt, and the
         // recorded market/settlement clocks must equal the receipt-derived seconds.
@@ -7544,15 +7554,27 @@ mod tests {
 
         for sequence in RECEIPTS {
             let mut late_source = source.clone();
-            late_source.get_mut(&sequence).unwrap().received_unix_ms = evaluated_at_unix_ms + 1;
+            let observation = late_source.get_mut(&sequence).unwrap();
+            observation.received_unix_ms = evaluated_at_unix_ms + 1;
+            observation.received_at = ReceivedAt(
+                OffsetDateTime::from_unix_timestamp_nanos(
+                    i128::from(evaluated_at_unix_ms + 1) * 1_000_000,
+                )
+                .unwrap(),
+            );
             let late_context = RiskReplayContext {
                 source: &late_source,
                 ..context
             };
-            assert!(matches!(
+            let expected = if sequence == 1005 {
+                "Fill source observation receipts are noncausal"
+            } else {
+                "receipt has the wrong source contract or is noncausal"
+            };
+            assert_qualification_refusal(
                 verify_economic(&operation, &economic, &late_context, None, false).await,
-                Err(QualificationError::InsufficientEvidence(_))
-            ));
+                expected,
+            );
         }
     }
 
@@ -7568,15 +7590,26 @@ mod tests {
         .unwrap();
     }
 
+    fn assert_qualification_refusal<T: std::fmt::Debug>(
+        result: Result<T, QualificationError>,
+        expected: &str,
+    ) {
+        assert!(
+            matches!(&result, Err(QualificationError::InsufficientEvidence(reason))
+            if reason.ends_with(expected)),
+            "expected {expected:?}, got {result:?}"
+        );
+    }
+
     /// PASS: changing only Contract sizing from five to ten fails closed.
     #[tokio::test]
     async fn winner_follow_policy_rejects_tampered_contract_quantity() {
         let fixture = receipt_backed_decline_fixture().await;
         let mut economic = evaluated_economic(&fixture.decision).clone();
         economic.sizing.mode = SizingModeAudit::Contract { contracts: 10 };
-        assert!(
-            verify_winner_follow_economic_policy(&fixture.decision.continuation, &economic,)
-                .is_err()
+        assert_qualification_refusal(
+            verify_winner_follow_economic_policy(&fixture.decision.continuation, &economic),
+            "EconomicPrepared execution policy differs from its frozen configuration and signal",
         );
     }
 
@@ -7586,9 +7619,9 @@ mod tests {
         let fixture = receipt_backed_decline_fixture().await;
         let mut economic = evaluated_economic(&fixture.decision).clone();
         economic.sizing.slippage_rate = dec!(0.01);
-        assert!(
-            verify_winner_follow_economic_policy(&fixture.decision.continuation, &economic,)
-                .is_err()
+        assert_qualification_refusal(
+            verify_winner_follow_economic_policy(&fixture.decision.continuation, &economic),
+            "EconomicPrepared execution policy differs from its frozen configuration and signal",
         );
     }
 
@@ -7598,9 +7631,9 @@ mod tests {
         let fixture = receipt_backed_decline_fixture().await;
         let mut economic = evaluated_economic(&fixture.decision).clone();
         economic.balance.price_impact_cap_bps = 10_000;
-        assert!(
-            verify_winner_follow_economic_policy(&fixture.decision.continuation, &economic,)
-                .is_err()
+        assert_qualification_refusal(
+            verify_winner_follow_economic_policy(&fixture.decision.continuation, &economic),
+            "EconomicPrepared execution policy differs from its frozen configuration and signal",
         );
     }
 
@@ -7610,9 +7643,9 @@ mod tests {
         let fixture = receipt_backed_decline_fixture().await;
         let mut economic = evaluated_economic(&fixture.decision).clone();
         economic.balance.band_floor = Price::ZERO;
-        assert!(
-            verify_winner_follow_economic_policy(&fixture.decision.continuation, &economic,)
-                .is_err()
+        assert_qualification_refusal(
+            verify_winner_follow_economic_policy(&fixture.decision.continuation, &economic),
+            "EconomicPrepared execution policy differs from its frozen configuration and signal",
         );
     }
 
@@ -7622,9 +7655,9 @@ mod tests {
         let fixture = receipt_backed_decline_fixture().await;
         let mut economic = evaluated_economic(&fixture.decision).clone();
         economic.balance.band_ceiling_exclusive = Price::ONE;
-        assert!(
-            verify_winner_follow_economic_policy(&fixture.decision.continuation, &economic,)
-                .is_err()
+        assert_qualification_refusal(
+            verify_winner_follow_economic_policy(&fixture.decision.continuation, &economic),
+            "EconomicPrepared execution policy differs from its frozen configuration and signal",
         );
     }
 
@@ -7634,9 +7667,9 @@ mod tests {
         let fixture = receipt_backed_decline_fixture().await;
         let mut economic = evaluated_economic(&fixture.decision).clone();
         economic.balance.chase_ceiling = Price::new(dec!(0.90)).unwrap();
-        assert!(
-            verify_winner_follow_economic_policy(&fixture.decision.continuation, &economic,)
-                .is_err()
+        assert_qualification_refusal(
+            verify_winner_follow_economic_policy(&fixture.decision.continuation, &economic),
+            "EconomicPrepared execution policy differs from its frozen configuration and signal",
         );
     }
 
@@ -7651,7 +7684,10 @@ mod tests {
         if let SizingModeAudit::Kelly { fraction, .. } = &mut economic.sizing.mode {
             *fraction = KELLY_NORMAL;
         }
-        assert!(verify_winner_follow_economic_policy(&continuation, &economic).is_err());
+        assert_qualification_refusal(
+            verify_winner_follow_economic_policy(&continuation, &economic),
+            "EconomicPrepared execution policy differs from its frozen configuration and signal",
+        );
     }
 
     /// PASS: changing only the copied Kelly probability fails closed.
@@ -7665,7 +7701,10 @@ mod tests {
         if let SizingModeAudit::Kelly { probability, .. } = &mut economic.sizing.mode {
             *probability = Probability::new(dec!(0.70)).unwrap();
         }
-        assert!(verify_winner_follow_economic_policy(&continuation, &economic).is_err());
+        assert_qualification_refusal(
+            verify_winner_follow_economic_policy(&continuation, &economic),
+            "EconomicPrepared execution policy differs from its frozen configuration and signal",
+        );
     }
 
     /// PASS: the strategy's five-contract allocation equals the signed economic plan.
@@ -7699,14 +7738,14 @@ mod tests {
         .unwrap();
 
         economic.sizing.minimum_shares = ShareAmount::from_whole(10).unwrap();
-        assert!(
+        assert_qualification_refusal(
             verify_winner_follow_intent_plan(
                 &intent,
                 &economic,
                 6,
                 &continuation.facts.source_trade_id,
-            )
-            .is_err()
+            ),
+            "Winner-Follow allocation or limit differs from its sized economic plan",
         );
     }
 
@@ -7747,14 +7786,14 @@ mod tests {
         .unwrap();
         intent.contracts = pe_core_types::ContractQty(6);
         assert!(Decimal::from(intent.contracts.0) * economic.sizing.all_in_price.0 < dec!(25));
-        assert!(
+        assert_qualification_refusal(
             verify_winner_follow_intent_plan(
                 &intent,
                 &economic,
                 7,
-                &continuation.facts.source_trade_id
-            )
-            .is_err()
+                &continuation.facts.source_trade_id,
+            ),
+            "Winner-Follow allocation or limit differs from its sized economic plan",
         );
     }
 
@@ -7795,17 +7834,20 @@ mod tests {
         )
         .unwrap();
         economic.balance.chase_ceiling = signal.leader_price;
-        assert!(verify_winner_follow_economic_policy(&continuation, &economic).is_err());
+        assert_qualification_refusal(
+            verify_winner_follow_economic_policy(&continuation, &economic),
+            "EconomicPrepared execution policy differs from its frozen configuration and signal",
+        );
         economic.balance.chase_ceiling = Price::ONE;
         economic.ladder.limit_price = Price::new(dec!(0.51)).unwrap();
-        assert!(
+        assert_qualification_refusal(
             verify_winner_follow_intent_plan(
                 &intent,
                 &economic,
                 6,
-                &continuation.facts.source_trade_id
-            )
-            .is_err()
+                &continuation.facts.source_trade_id,
+            ),
+            "Winner-Follow allocation or limit differs from its sized economic plan",
         );
     }
 
@@ -7829,16 +7871,25 @@ mod tests {
             .unwrap();
         }
         economic.version = 3;
-        assert!(verify_winner_follow_economic_policy(&current, &economic).is_err());
-        assert!(
-            verify_economic_configuration(&economic, &economic.applied_configuration_hash, 3)
-                .is_err()
+        assert_qualification_refusal(
+            verify_winner_follow_economic_policy(&current, &economic),
+            "EconomicPrepared execution policy differs from its frozen configuration and signal",
+        );
+        assert_qualification_refusal(
+            verify_economic_configuration(&economic, &economic.applied_configuration_hash, 3),
+            "EconomicPrepared version differs from QualificationStarted financial semantics",
         );
         let mut frame = current;
         frame.source_authority = Some(crate::bucket_commit::SourceAuthority::ActivityFrame);
         economic.version = 2;
-        assert!(verify_winner_follow_economic_policy(&frame, &economic).is_err());
-        assert!(decision_observation_from_source(&frame, &BTreeMap::new()).is_err());
+        assert_qualification_refusal(
+            verify_winner_follow_economic_policy(&frame, &economic),
+            "frozen continuation does not match durable row",
+        );
+        assert_qualification_refusal(
+            decision_observation_from_source(&frame, &BTreeMap::new()),
+            "frozen continuation does not match durable row",
+        );
     }
 
     /// PASS: the strategy limit bounds the exact economic ladder limit.
@@ -7872,14 +7923,14 @@ mod tests {
         .unwrap();
 
         economic.ladder.limit_price = Price::new(dec!(0.51)).unwrap();
-        assert!(
+        assert_qualification_refusal(
             verify_winner_follow_intent_plan(
                 &intent,
                 &economic,
                 6,
                 &continuation.facts.source_trade_id,
-            )
-            .is_err()
+            ),
+            "Winner-Follow allocation or limit differs from its sized economic plan",
         );
     }
 
@@ -8412,23 +8463,25 @@ mod tests {
         verify_complete_second_action(&ledger, &continuation, &mutations, &expected).unwrap();
         let mut wrong_representative = continuation.clone();
         wrong_representative.facts.source_trade_id = mutations[0].source_trade_id.clone();
-        assert!(
-            verify_complete_second_action(&ledger, &wrong_representative, &mutations, &expected)
-                .is_err()
+        assert_qualification_refusal(
+            verify_complete_second_action(&ledger, &wrong_representative, &mutations, &expected),
+            "classification differs from complete-second replay",
         );
         wire["version"] = serde_json::json!(6);
         wire.as_object_mut().unwrap().remove("source_authority");
         let historical = serde_json::from_value(wire).unwrap();
-        assert!(
-            verify_complete_second_action(&ledger, &historical, &mutations, &expected).is_err()
+        assert_qualification_refusal(
+            verify_complete_second_action(&ledger, &historical, &mutations, &expected),
+            "classification differs from complete-second replay",
         );
         if let pe_position_ledger::LedgerEffect::Trade { outcome_id, .. } = &mut mutations[0].effect
         {
             *outcome_id = OutcomeId(1);
         }
         let (_, expected) = ledger.simulate_all_or_none(&mutations).unwrap();
-        assert!(
-            verify_complete_second_action(&ledger, &continuation, &mutations, &expected).is_err()
+        assert_qualification_refusal(
+            verify_complete_second_action(&ledger, &continuation, &mutations, &expected),
+            "classification differs from complete-second replay",
         );
     }
 
@@ -15010,17 +15063,27 @@ mod tests {
             verified: MarketOutcomeId::new(frozen.market_id.clone(), frozen.outcome_id),
             evidence_hash: "metadata-proof".to_owned(),
         };
-        assert!(verify_decision_continuation_facts(&aggregate, &frozen, None).is_err());
+        assert_qualification_refusal(
+            verify_decision_continuation_facts(&aggregate, &frozen, None),
+            "decision continuation differs from its raw activity aggregate",
+        );
         verify_decision_continuation_facts(&aggregate, &frozen, Some(&correction)).unwrap();
         let mut wrong = correction.clone();
         wrong.stamped = wrong.verified.clone();
-        assert!(verify_decision_continuation_facts(&aggregate, &frozen, Some(&wrong)).is_err());
+        assert_qualification_refusal(
+            verify_decision_continuation_facts(&aggregate, &frozen, Some(&wrong)),
+            "decision continuation differs from its raw activity aggregate",
+        );
         wrong = correction.clone();
         wrong.verified = wrong.stamped.clone();
-        assert!(verify_decision_continuation_facts(&aggregate, &frozen, Some(&wrong)).is_err());
+        assert_qualification_refusal(
+            verify_decision_continuation_facts(&aggregate, &frozen, Some(&wrong)),
+            "decision continuation differs from its raw activity aggregate",
+        );
         frozen.share_amount = ShareAmount::from_whole(2).unwrap();
-        assert!(
-            verify_decision_continuation_facts(&aggregate, &frozen, Some(&correction)).is_err()
+        assert_qualification_refusal(
+            verify_decision_continuation_facts(&aggregate, &frozen, Some(&correction)),
+            "decision continuation differs from its raw activity aggregate",
         );
     }
     #[test]
@@ -15035,7 +15098,10 @@ mod tests {
         for covered in ["anchor_covered", "anchor_covered_late"] {
             assert!(!recorded_group_was_applied(&id, covered).unwrap());
         }
-        assert!(recorded_group_was_applied(&id, "unknown_bracket_reason").is_err());
+        assert_qualification_refusal(
+            recorded_group_was_applied(&id, "unknown_bracket_reason"),
+            "has unknown disposition unknown_bracket_reason",
+        );
     }
     #[test]
     fn membership_tampering_is_rejected() {
@@ -15301,7 +15367,10 @@ mod tests {
                         crate::decision_replay::replay_decision_pending(&rehashed_row),
                         Err(crate::decision_replay::ReplayDecisionError::AuthorityBinding)
                     ));
-                    assert!(verify_paper_prepared_freshness(&contradictory, &source).is_err());
+                    assert_qualification_refusal(
+                        verify_paper_prepared_freshness(&contradictory, &source),
+                        "paper Prepared expiry contradicts the terminal authority",
+                    );
                 }
             }
             if enabled {
@@ -15320,7 +15389,10 @@ mod tests {
                     1,
                 )
                 .unwrap();
-                assert!(verify_paper_prepared_freshness(&decision, &source).is_err());
+                assert_qualification_refusal(
+                    verify_paper_prepared_freshness(&decision, &source),
+                    "paper Prepared freshness predicate contradicts the terminal disposition",
+                );
             } else {
                 decision.post_boundary.body.clocks[0].submillisecond_nanos = Some(1);
                 decision.post_boundary = DecisionPostBoundaryEvidence::from_body_with_semantic(

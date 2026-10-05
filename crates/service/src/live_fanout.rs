@@ -3344,14 +3344,18 @@ fn sorted_price_receipts(
 }
 
 /// Receipt payload retained by the shared admission/book economic replay owner.
-#[derive(Debug, Clone)]
-pub(crate) struct RecordedEconomicSource {
-    pub payload: Vec<u8>,
-    pub received_unix_ms: i64,
-    pub source_id: String,
-    pub schema_version: u32,
-    pub parser_version: u32,
-    pub content_type: ContentType,
+pub(crate) type RecordedEconomicSource = CompleteActivityPage;
+
+impl CompleteActivityPage {
+    fn received_unix_ms(&self) -> Result<i64, EconomicReplayError> {
+        i64::try_from(
+            self.received_at
+                .0
+                .unix_timestamp_nanos()
+                .div_euclid(1_000_000),
+        )
+        .map_err(|_| economic_replay_error("economic source clock overflow"))
+    }
 }
 
 /// Fail-closed source-backed economic reconstruction error shared by qualification and live replay.
@@ -3459,7 +3463,7 @@ where
             && observation.parser_version == parser_version
             && observation.content_type == ContentType::Json
     };
-    if !contract_matches || observation.received_unix_ms > evidence_cutoff_unix_ms {
+    if !contract_matches || observation.received_unix_ms()? > evidence_cutoff_unix_ms {
         return Err(economic_replay_error(format!(
             "{source_id} receipt has the wrong source contract or is noncausal"
         )));
@@ -3637,6 +3641,7 @@ where
         .ok_or_else(|| "verified copy deadline overflows".to_owned())
 }
 
+#[cfg(test)]
 fn source_time_from_millis(received_unix_ms: i64) -> Result<OffsetDateTime, EconomicReplayError> {
     OffsetDateTime::from_unix_timestamp_nanos(
         i128::from(received_unix_ms)
@@ -3803,7 +3808,7 @@ where
             evidence_cutoff_unix_ms,
             lookup,
         )?;
-        if selected.received_unix_ms != observation.observed_unix_ms {
+        if selected.received_unix_ms()? != observation.observed_unix_ms {
             return Err(economic_replay_error("frame observation clock differs"));
         }
         let frame = parse_activity_trade_observation(&selected.payload)
@@ -3840,66 +3845,7 @@ where
                 ));
             }
             continuation
-                .verify_activity_frame(&mut |receipt| {
-                    let source = lookup(receipt)?;
-                    let mut received_at = source_time_from_millis(source.received_unix_ms)?;
-                    let mut observed_at = received_at;
-                    if receipt == proof.inputs.frame_receipt {
-                        if source.received_unix_ms
-                            != i64::try_from(
-                                proof.inputs.received_at.unix_timestamp_nanos() / 1_000_000,
-                            )
-                            .map_err(|_| economic_replay_error("frame receive clock overflow"))?
-                        {
-                            return Err(economic_replay_error("frame receive clock differs"));
-                        }
-                        received_at = proof.inputs.received_at;
-                        observed_at = frame.source_time.0;
-                    } else if receipt == proof.admission_receipt {
-                        if source.received_unix_ms
-                            != i64::try_from(
-                                proof.inputs.admitted_at.unix_timestamp_nanos() / 1_000_000,
-                            )
-                            .map_err(|_| economic_replay_error("frame admission clock overflow"))?
-                        {
-                            return Err(economic_replay_error(
-                                "frame admission receive clock differs",
-                            ));
-                        }
-                        received_at = proof.inputs.admitted_at;
-                        observed_at = proof.inputs.admitted_at;
-                    } else if let Some(earlier) = proof
-                        .inputs
-                        .earlier_frames
-                        .iter()
-                        .find(|frame| frame.receipt == receipt)
-                    {
-                        if source.received_unix_ms
-                            != i64::try_from(earlier.received_at.unix_timestamp_nanos() / 1_000_000)
-                                .map_err(|_| {
-                                    economic_replay_error("earlier frame clock overflow")
-                                })?
-                        {
-                            return Err(economic_replay_error(
-                                "earlier frame receive clock differs",
-                            ));
-                        }
-                        received_at = earlier.received_at;
-                        observed_at = parse_activity_trade_observation(&source.payload)
-                            .map_err(|error| economic_replay_error(error.to_string()))?
-                            .source_time
-                            .0;
-                    }
-                    Ok::<_, EconomicReplayError>(CompleteActivityPage {
-                        payload: source.payload,
-                        observed_at: SourceTimestamp(observed_at),
-                        received_at: ReceivedAt(received_at),
-                        source_id: source.source_id,
-                        schema_version: source.schema_version,
-                        parser_version: source.parser_version,
-                        content_type: source.content_type,
-                    })
-                })
+                .verify_activity_frame(lookup)
                 .map_err(|error| economic_replay_error(error.to_string()))?;
         }
         if let Some(binding) = live_binding {
@@ -3967,12 +3913,12 @@ where
             ));
         }
     };
-    if selected.received_unix_ms != observation.observed_unix_ms {
+    if selected.received_unix_ms()? != observation.observed_unix_ms {
         return Err(economic_replay_error(
             "economic observation receive clock is inconsistent with its receipts",
         ));
     }
-    if selected.received_unix_ms > complete_bound.received_unix_ms {
+    if selected.received_unix_ms()? > complete_bound.received_unix_ms()? {
         return Err(economic_replay_error(
             "economic observation receive clock is after its complete-read bound",
         ));
@@ -3987,7 +3933,7 @@ where
         }
         let mut activity_page_lookup = |receipt| -> Result<_, EconomicReplayError> {
             let source = lookup(receipt)?;
-            if source.received_unix_ms > evidence_cutoff_unix_ms {
+            if source.received_unix_ms()? > evidence_cutoff_unix_ms {
                 return Err(economic_replay_error(
                     "economic binding receipt differs or exceeds its evidence cutoff",
                 ));
@@ -4009,16 +3955,7 @@ where
                     ));
                 }
             }
-            let received_at = source_time_from_millis(source.received_unix_ms)?;
-            Ok(CompleteActivityPage {
-                payload: source.payload,
-                observed_at: SourceTimestamp(received_at),
-                received_at: ReceivedAt(received_at),
-                source_id: source.source_id,
-                schema_version: source.schema_version,
-                parser_version: source.parser_version,
-                content_type: source.content_type,
-            })
+            Ok(source)
         };
         let aggregates = binding
             .continuation
@@ -4134,10 +4071,10 @@ where
         &mut lookup,
     )?;
     let market_observed_at_unix = gamma
-        .received_unix_ms
-        .max(clob_long.received_unix_ms)
+        .received_unix_ms()?
+        .max(clob_long.received_unix_ms()?)
         .div_euclid(1_000);
-    let settlement_observed_at_unix = clob_long.received_unix_ms.div_euclid(1_000);
+    let settlement_observed_at_unix = clob_long.received_unix_ms()?.div_euclid(1_000);
     if economic.admission.market.freshness_window_secs != LIVE_MARKET_FRESHNESS_SECS
         || market_observed_at_unix < 0
         || settlement_observed_at_unix < 0
@@ -4468,17 +4405,10 @@ fn verify_replayed_live_risk_with_index(
                         )
                     })?,
             };
-            let received_unix_ms = i64::try_from(
-                envelope
-                    .received_at
-                    .0
-                    .unix_timestamp_nanos()
-                    .div_euclid(1_000_000),
-            )
-            .map_err(|_| EconomicReplayError("economic source clock overflow".to_owned()))?;
             Ok(RecordedEconomicSource {
                 payload: envelope.payload,
-                received_unix_ms,
+                observed_at: envelope.observed_at,
+                received_at: envelope.received_at,
                 source_id: envelope.source_id.0,
                 schema_version: envelope.schema_version,
                 parser_version: envelope.parser_version,
@@ -9245,7 +9175,10 @@ mod tests {
                     receipt,
                     RecordedEconomicSource {
                         payload,
-                        received_unix_ms,
+                        observed_at: SourceTimestamp(
+                            source_time_from_millis(received_unix_ms).unwrap(),
+                        ),
+                        received_at: ReceivedAt(source_time_from_millis(received_unix_ms).unwrap()),
                         source_id: source_id.to_owned(),
                         schema_version: 1,
                         parser_version: 1,
@@ -9302,11 +9235,22 @@ mod tests {
                     receipt,
                     RecordedEconomicSource {
                         payload,
-                        received_unix_ms: if source_id == CLOB_BOOK_SOURCE_ID {
-                            20_100
-                        } else {
-                            20_900
-                        },
+                        observed_at: SourceTimestamp(
+                            source_time_from_millis(if source_id == CLOB_BOOK_SOURCE_ID {
+                                20_100
+                            } else {
+                                20_900
+                            })
+                            .unwrap(),
+                        ),
+                        received_at: ReceivedAt(
+                            source_time_from_millis(if source_id == CLOB_BOOK_SOURCE_ID {
+                                20_100
+                            } else {
+                                20_900
+                            })
+                            .unwrap(),
+                        ),
                         source_id: source_id.to_owned(),
                         schema_version: 1,
                         parser_version: 1,
@@ -9384,7 +9328,8 @@ mod tests {
                         receipt,
                         RecordedEconomicSource {
                             payload,
-                            received_unix_ms: 20_100,
+                            observed_at: SourceTimestamp(source_time_from_millis(20_100).unwrap()),
+                            received_at: ReceivedAt(source_time_from_millis(20_100).unwrap()),
                             source_id: source_id.to_owned(),
                             schema_version: 1,
                             parser_version: 1,
@@ -9451,12 +9396,8 @@ mod tests {
                             .clone();
                         Ok::<_, EconomicReplayError>(CompleteActivityPage {
                             payload: source.payload,
-                            observed_at: SourceTimestamp(
-                                source_time_from_millis(source.received_unix_ms).unwrap(),
-                            ),
-                            received_at: ReceivedAt(
-                                source_time_from_millis(source.received_unix_ms).unwrap(),
-                            ),
+                            observed_at: source.observed_at,
+                            received_at: source.received_at,
                             source_id: source.source_id,
                             schema_version: source.schema_version,
                             parser_version: source.parser_version,
@@ -9667,7 +9608,7 @@ mod tests {
                 .find(|(known, _)| *known == receipt)
                 .map(|(_, source)| source)
                 .ok_or("missing source receipt")?;
-            let received_at = source_time_from_millis(source.received_unix_ms)
+            let received_at = source_time_from_millis(source.received_unix_ms().unwrap())
                 .map_err(|_| "invalid source clock")?;
             Ok::<_, &'static str>(CompleteActivityPage {
                 payload: source.payload.clone(),
@@ -9905,7 +9846,8 @@ mod tests {
                     receipt,
                     RecordedEconomicSource {
                         payload,
-                        received_unix_ms: 20_000,
+                        observed_at: SourceTimestamp(source_time_from_millis(20_000).unwrap()),
+                        received_at: ReceivedAt(source_time_from_millis(20_000).unwrap()),
                         source_id: source_id.to_owned(),
                         schema_version: 1,
                         parser_version: 1,
@@ -9919,7 +9861,8 @@ mod tests {
                 source_receipt,
                 RecordedEconomicSource {
                     payload: websocket,
-                    received_unix_ms: 19_000,
+                    observed_at: SourceTimestamp(source_time_from_millis(19_000).unwrap()),
+                    received_at: ReceivedAt(source_time_from_millis(19_000).unwrap()),
                     source_id: crate::activity_ingest::ACTIVITY_WS_SOURCE_ID.to_owned(),
                     schema_version: pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
                     parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
@@ -9930,7 +9873,8 @@ mod tests {
                 complete_bound_receipt,
                 RecordedEconomicSource {
                     payload: rest.clone(),
-                    received_unix_ms: 20_000,
+                    observed_at: SourceTimestamp(source_time_from_millis(20_000).unwrap()),
+                    received_at: ReceivedAt(source_time_from_millis(20_000).unwrap()),
                     source_id: crate::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned(),
                     schema_version: pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
                     parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
@@ -9973,12 +9917,13 @@ mod tests {
         let commitment = fixture_receipt(7);
         let admission_receipt = fixture_receipt(8);
         sources.retain(|(receipt, _)| receipt.sequence.0 <= 5);
-        sources
+        let source = &mut sources
             .iter_mut()
             .find(|(receipt, _)| *receipt == frame_receipt)
             .unwrap()
-            .1
-            .received_unix_ms = 18_300;
+            .1;
+        source.received_at = ReceivedAt(received);
+        source.observed_at = SourceTimestamp(at);
         let (occurrence, page) = activity_page_fixture(page_receipt, b"[]", Some(0), 18, 0, at);
         let payload = crate::bucket_commit::activity_read_commitment_payload_v2(
             continuation.facts.wallet,
@@ -9992,7 +9937,8 @@ mod tests {
             page_receipt,
             RecordedEconomicSource {
                 payload: b"[]".to_vec(),
-                received_unix_ms: 18_000,
+                observed_at: SourceTimestamp(source_time_from_millis(18_000).unwrap()),
+                received_at: ReceivedAt(source_time_from_millis(18_000).unwrap()),
                 source_id: crate::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned(),
                 schema_version: 3,
                 parser_version: 2,
@@ -10003,7 +9949,8 @@ mod tests {
             commitment,
             RecordedEconomicSource {
                 payload,
-                received_unix_ms: 18_000,
+                observed_at: SourceTimestamp(source_time_from_millis(18_000).unwrap()),
+                received_at: ReceivedAt(source_time_from_millis(18_000).unwrap()),
                 source_id: crate::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID.to_owned(),
                 schema_version: 2,
                 parser_version: 1,
@@ -10061,7 +10008,8 @@ mod tests {
                     &crate::frame_admission::FrameAdmissionArtifact::from_inputs(&inputs).unwrap(),
                 )
                 .unwrap(),
-                received_unix_ms: 18_400,
+                observed_at: SourceTimestamp(source_time_from_millis(18_400).unwrap()),
+                received_at: ReceivedAt(source_time_from_millis(18_400).unwrap()),
                 source_id: crate::frame_admission::FRAME_ADMISSION_SOURCE_ID.to_owned(),
                 schema_version: 1,
                 parser_version: 1,
@@ -10133,7 +10081,7 @@ mod tests {
                     .find(|(known, _)| *known == receipt)
                     .map(|(_, source)| source)
                     .ok_or("fixture receipt missing")?;
-                let received = source_time_from_millis(source.received_unix_ms)
+                let received = source_time_from_millis(source.received_unix_ms().unwrap())
                     .map_err(|_| "fixture clock invalid")?;
                 let observed = if source.source_id == crate::activity_ingest::ACTIVITY_WS_SOURCE_ID
                 {
@@ -10165,6 +10113,87 @@ mod tests {
         assert_eq!(
             trade.received_at - trade.observed_at,
             time::Duration::milliseconds(300)
+        );
+    }
+
+    #[test]
+    fn frame_economic_replay_rejects_submillisecond_capture_clock_substitution() {
+        let (mut prepared, _, mut sources, mut continuation) = frame_observation_replay_fixture();
+        let mut proof: crate::frame_admission::FrameDecisionProof =
+            serde_json::from_value(continuation.facts.decision_inputs.clone()).unwrap();
+        let received = proof.inputs.source_time + time::Duration::nanoseconds(123_900_000);
+        sources
+            .iter_mut()
+            .find(|(receipt, _)| *receipt == proof.inputs.frame_receipt)
+            .unwrap()
+            .1
+            .received_at = ReceivedAt(received);
+        proof.inputs.received_at = received;
+        let refresh = |continuation: &mut DecisionContinuationV3,
+                       sources: &mut Vec<(AppendReceipt, RecordedEconomicSource)>,
+                       proof: &crate::frame_admission::FrameDecisionProof| {
+            continuation.facts.semantic_revision =
+                crate::frame_admission::frame_revision(&proof.inputs).unwrap();
+            continuation.facts.decision_inputs = serde_json::to_value(proof).unwrap();
+            sources
+                .iter_mut()
+                .find(|(receipt, _)| *receipt == proof.admission_receipt)
+                .unwrap()
+                .1
+                .payload = crate::frame_admission::canonical_bytes(
+                &crate::frame_admission::FrameAdmissionArtifact::from_inputs(&proof.inputs)
+                    .unwrap(),
+            )
+            .unwrap();
+        };
+        refresh(&mut continuation, &mut sources, &proof);
+        prepared
+            .economic
+            .observation
+            .as_mut()
+            .unwrap()
+            .observed_unix_ms = 18_123;
+        let replay = |continuation: &DecisionContinuationV3,
+                      sources: &[(AppendReceipt, RecordedEconomicSource)]| {
+            replay_source_backed_economic(
+                &prepared.economic,
+                21_000,
+                CollateralAmount::from_atomic(10_000_000),
+                Some(continuation),
+                |receipt| {
+                    sources
+                        .iter()
+                        .find(|(known, _)| *known == receipt)
+                        .map(|(_, source)| source.clone())
+                        .ok_or_else(|| EconomicReplayError("fixture receipt missing".to_owned()))
+                },
+            )
+        };
+        replay(&continuation, &sources).unwrap();
+        proof.inputs.received_at =
+            proof.inputs.source_time + time::Duration::nanoseconds(123_100_000);
+        refresh(&mut continuation, &mut sources, &proof);
+        let error = replay(&continuation, &sources).err().unwrap();
+        assert!(
+            error
+                .0
+                .contains("frame facts differ from authenticated envelope"),
+            "{error}"
+        );
+        let error = continuation
+            .verify_activity_frame(&mut |receipt| {
+                sources
+                    .iter()
+                    .find(|(known, _)| *known == receipt)
+                    .map(|(_, source)| source.clone())
+                    .ok_or("fixture receipt missing")
+            })
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("frame facts differ from authenticated envelope")
         );
     }
 
@@ -10279,14 +10308,32 @@ mod tests {
             continuation.read_commitment.unwrap(),
             RecordedEconomicSource {
                 payload,
-                received_unix_ms: pages
-                    .iter()
-                    .map(|page| {
-                        i64::try_from(page.received_at.0.unix_timestamp_nanos() / 1_000_000)
-                            .unwrap()
-                    })
-                    .max()
+                observed_at: SourceTimestamp(
+                    source_time_from_millis(
+                        pages
+                            .iter()
+                            .map(|page| {
+                                i64::try_from(page.received_at.0.unix_timestamp_nanos() / 1_000_000)
+                                    .unwrap()
+                            })
+                            .max()
+                            .unwrap(),
+                    )
                     .unwrap(),
+                ),
+                received_at: ReceivedAt(
+                    source_time_from_millis(
+                        pages
+                            .iter()
+                            .map(|page| {
+                                i64::try_from(page.received_at.0.unix_timestamp_nanos() / 1_000_000)
+                                    .unwrap()
+                            })
+                            .max()
+                            .unwrap(),
+                    )
+                    .unwrap(),
+                ),
                 source_id: crate::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID.to_owned(),
                 schema_version: continuation.commitment_contract().unwrap().0,
                 parser_version: crate::bucket_commit::ACTIVITY_READ_COMMITMENT_PARSER_VERSION,
@@ -10329,7 +10376,7 @@ mod tests {
             }
         }
         let (receipt, source) = read_commitment_source(continuation);
-        let at = source_time_from_millis(source.received_unix_ms).unwrap();
+        let at = source_time_from_millis(source.received_unix_ms().unwrap()).unwrap();
         let mut envelope = source_envelope(receipt, &source.source_id, source.payload, at);
         envelope.schema_version = source.schema_version;
         envelope.parser_version = source.parser_version;
@@ -10657,7 +10704,8 @@ mod tests {
                 websocket_receipt,
                 RecordedEconomicSource {
                     payload: graph.websocket_payload.clone(),
-                    received_unix_ms: 19_000,
+                    observed_at: SourceTimestamp(source_time_from_millis(19_000).unwrap()),
+                    received_at: ReceivedAt(source_time_from_millis(19_000).unwrap()),
                     source_id: crate::activity_ingest::ACTIVITY_WS_SOURCE_ID.to_owned(),
                     schema_version: pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
                     parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
@@ -10670,7 +10718,8 @@ mod tests {
                 *receipt,
                 RecordedEconomicSource {
                     payload: payload.clone(),
-                    received_unix_ms: 20_000,
+                    observed_at: SourceTimestamp(source_time_from_millis(20_000).unwrap()),
+                    received_at: ReceivedAt(source_time_from_millis(20_000).unwrap()),
                     source_id: crate::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned(),
                     schema_version: pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
                     parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
@@ -10797,7 +10846,8 @@ mod tests {
         let final_receipt = fixture_receipt(original_bound.sequence.0 + 1);
         let page_source = |payload, received_unix_ms| RecordedEconomicSource {
             payload,
-            received_unix_ms,
+            observed_at: SourceTimestamp(source_time_from_millis(received_unix_ms).unwrap()),
+            received_at: ReceivedAt(source_time_from_millis(received_unix_ms).unwrap()),
             source_id: crate::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned(),
             schema_version: pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
             parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
@@ -11017,7 +11067,7 @@ mod tests {
                         .find(|(known, _)| *known == candidate)
                         .map(|(_, source)| source)
                         .ok_or("missing source receipt")?;
-                    let received_at = source_time_from_millis(source.received_unix_ms)
+                    let received_at = source_time_from_millis(source.received_unix_ms().unwrap())
                         .map_err(|_| "invalid receipt clock")?;
                     Ok::<_, &'static str>(crate::bucket_commit::CompleteActivityPage {
                         payload: source.payload.clone(),
@@ -11101,7 +11151,7 @@ mod tests {
             let mut writer = pe_event_log::Writer::open(&path).unwrap();
             let mut mapped = HashMap::new();
             for (old, source) in &mut sources {
-                let at = source_time_from_millis(source.received_unix_ms).unwrap();
+                let at = source_time_from_millis(source.received_unix_ms().unwrap()).unwrap();
                 let receipt = writer
                     .append_synced(pe_event_log::EnvelopeIn {
                         source_id: SourceId(source.source_id.clone()),
@@ -11228,7 +11278,8 @@ mod tests {
                     schema_version: source.schema_version,
                     parser_version: source.parser_version,
                     content_type: source.content_type.clone(),
-                    received_unix_ms: 20_000,
+                    observed_at: source.observed_at,
+                    received_at: source.received_at,
                 },
             ));
             for (receipt, source) in &sources {
@@ -11304,7 +11355,7 @@ mod tests {
                 rest.schema_version,
                 crate::trade_poller::ACTIVITY_POLL_PAGE_SCHEMA_VERSION
             );
-            let at = source_time_from_millis(rest.received_unix_ms).unwrap();
+            let at = source_time_from_millis(rest.received_unix_ms().unwrap()).unwrap();
             let aggregate = pe_source_polymarket_public::parse_activity_response(
                 &rest.payload,
                 wallet,
@@ -11868,7 +11919,8 @@ mod tests {
             terminal_receipt,
             RecordedEconomicSource {
                 payload: terminal_payload.clone(),
-                received_unix_ms: 22_000,
+                observed_at: SourceTimestamp(source_time_from_millis(22_000).unwrap()),
+                received_at: ReceivedAt(source_time_from_millis(22_000).unwrap()),
                 source_id: crate::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned(),
                 schema_version: pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
                 parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
@@ -12043,7 +12095,9 @@ mod tests {
                 .find(|(receipt, _)| *receipt == future_receipt)
                 .unwrap()
                 .1
-                .received_unix_ms = prepared.economic.risk.evaluated_at_unix_ms + 1;
+                .received_at = ReceivedAt(
+                source_time_from_millis(prepared.economic.risk.evaluated_at_unix_ms + 1).unwrap(),
+            );
             assert!(
                 replay_observation_fixture(&prepared, &account_id, &future_source, &continuation,)
                     .is_err()

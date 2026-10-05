@@ -1717,18 +1717,18 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     .publish_frontier(frontier, index, read.as_deref())
             }
             FeedAuditUpdate::Incident(incident, read) => {
+                let identity = self
+                    .paper_state
+                    .activity_frame_decision_index(None)
+                    .map_err(|error| error.to_string())?
+                    .into_iter()
+                    .find(|frame| frame.observed_source_receipt == Some(incident.frame_receipt))
+                    .ok_or_else(|| "incident has no durable admitted frame".to_owned())?;
                 let row = self
                     .paper_state
-                    .decision_pending_history()
-                    .map_err(|e| e.to_string())?
-                    .into_iter()
-                    .find(|row| {
-                        DecisionContinuationV3::from_durable(row).is_ok_and(|frame| {
-                            frame.is_activity_frame()
-                                && frame.observed_source_receipt == Some(incident.frame_receipt)
-                        })
-                    })
-                    .ok_or_else(|| "incident has no durable admitted frame".to_owned())?;
+                    .decision_pending_for(&identity.source_trade_id)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| "incident decision missing".to_owned())?;
                 let frame =
                     DecisionContinuationV3::from_durable(&row).map_err(|e| e.to_string())?;
                 if let Some(read) = read {
@@ -3330,12 +3330,16 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     .source_receipts
                     .as_ref()
                     .ok_or_else(|| "paper source receipt index is missing".to_owned())?;
-                continuation
-                    .verified_source_time(&mut |receipt| {
+                let authenticated = if continuation.is_activity_frame() {
+                    continuation.verify_activity_frame_with_index(source_receipts)
+                } else {
+                    continuation.verified_source_time(&mut |receipt| {
                         source_receipts
                             .source_envelope(receipt)
                             .map(crate::bucket_commit::CompleteActivityPage::from)
                     })
+                };
+                authenticated
                     .map(|(source_time, asset)| (policy, source_time, asset))
                     .map_err(|error| error.to_string())
             })

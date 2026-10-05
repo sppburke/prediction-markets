@@ -48,15 +48,64 @@ pub(crate) fn counterparts<'a>(
     candidates
 }
 
+pub(crate) struct FrameAuditFacts<'a> {
+    wallet: pe_core_types::WalletAddress,
+    source_epoch: i64,
+    transaction_hash: &'a str,
+    market_id: &'a MarketId,
+    outcome_id: pe_core_types::OutcomeId,
+    receipt: Option<AppendReceipt>,
+    copy_budget: Option<u64>,
+    frame_authority: bool,
+}
+
+pub(crate) trait FrameAuditIdentity {
+    fn audit_facts(&self) -> FrameAuditFacts<'_>;
+}
+
+impl FrameAuditIdentity for DecisionContinuationV3 {
+    fn audit_facts(&self) -> FrameAuditFacts<'_> {
+        FrameAuditFacts {
+            wallet: self.facts.wallet,
+            source_epoch: self.facts.source_epoch,
+            transaction_hash: &self.facts.transaction_hash,
+            market_id: &self.facts.market_id,
+            outcome_id: self.facts.outcome_id,
+            receipt: self.observed_source_receipt,
+            copy_budget: self
+                .facts
+                .paper_freshness_policy
+                .map(|policy| policy.copy_latency_budget_secs),
+            frame_authority: self.is_activity_frame(),
+        }
+    }
+}
+
+impl FrameAuditIdentity for pe_paper_state::ActivityFrameDecisionIndex {
+    fn audit_facts(&self) -> FrameAuditFacts<'_> {
+        FrameAuditFacts {
+            wallet: self.wallet,
+            source_epoch: self.source_epoch,
+            transaction_hash: &self.transaction_hash,
+            market_id: &self.market_id,
+            outcome_id: self.outcome_id,
+            receipt: self.observed_source_receipt,
+            copy_budget: Some(self.copy_latency_budget_secs),
+            frame_authority: true,
+        }
+    }
+}
+
 pub(crate) fn disposition(
-    frame: &DecisionContinuationV3,
+    frame: &impl FrameAuditIdentity,
     read: &VerifiedCommitment,
 ) -> Result<AuditDisposition, FeedAuditError> {
-    if !frame.is_activity_frame() || read.wallet != frame.facts.wallet {
+    let frame = frame.audit_facts();
+    if !frame.frame_authority || read.wallet != frame.wallet {
         return Err(FeedAuditError::Semantic("audit wallet/authority differs"));
     }
     let receipt = frame
-        .observed_source_receipt
+        .receipt
         .ok_or(FeedAuditError::Semantic("frame receipt missing"))?;
     let binding = read
         .binding_indices
@@ -89,8 +138,8 @@ pub(crate) fn disposition(
             && components.side == Some(Side::Buy)
             && identity
                 == Some(MarketOutcomeId::new(
-                    frame.facts.market_id.clone(),
-                    frame.facts.outcome_id,
+                    frame.market_id.clone(),
+                    frame.outcome_id,
                 ));
         return Ok(if agrees {
             AuditDisposition::Matched(binding.history_group_id.clone())
@@ -99,21 +148,18 @@ pub(crate) fn disposition(
         });
     }
     let mature_end = frame
-        .facts
         .source_epoch
         .checked_add(
             i64::try_from(
                 frame
-                    .facts
-                    .paper_freshness_policy
-                    .ok_or(FeedAuditError::Semantic("frozen copy budget missing"))?
-                    .copy_latency_budget_secs,
+                    .copy_budget
+                    .ok_or(FeedAuditError::Semantic("frozen copy budget missing"))?,
             )
             .map_err(|_| FeedAuditError::Semantic("copy budget overflow"))?,
         )
         .ok_or(FeedAuditError::Semantic("maturity overflow"))?;
     // An unbound transaction, including an ambiguous pair, cannot prove absence.
-    let observation_tx = &frame.facts.transaction_hash;
+    let observation_tx = frame.transaction_hash;
     if read.full_history
         && read.fixed_end >= mature_end
         && !read
@@ -204,7 +250,7 @@ pub(crate) fn audited_receipts(era: &PaperEra) -> Vec<AppendReceipt> {
 /// Verify every journaled incident and expose admissions still lacking a disposed REST audit.
 pub(crate) fn verify_recorded_audits<L, E>(
     state: &pe_paper_state::PaperStateDb,
-    frames: &[DecisionContinuationV3],
+    frames: &[&DecisionContinuationV3],
     era: &PaperEra,
     commitments: &[AppendReceipt],
     lookup: &mut L,
@@ -213,88 +259,98 @@ where
     L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
     E: std::fmt::Display,
 {
-    let mut receipts = Vec::new();
-    for receipt in commitments {
-        if !receipts.contains(receipt) {
-            receipts.push(*receipt);
-        }
-    }
-    for record in &era.frames {
-        if let PaperLogFrame::Record(PaperLogRecord::FeedIncidentChanged {
-            incident,
-            state: HaltState::Engaged,
-        }) = &record.frame
-            && !receipts.contains(&incident.deciding_commitment_receipt)
-        {
-            receipts.push(incident.deciding_commitment_receipt);
-        }
-    }
-    let reads = receipts
+    use std::collections::{HashMap, HashSet};
+    let key = |receipt: AppendReceipt| (receipt.sequence, receipt.this_hash);
+    let commitment_keys = commitments
         .iter()
-        .map(|receipt| {
-            crate::bucket_commit::verified_commitment_bindings_with_lookup(*receipt, lookup)
-                .map(|read| (*receipt, read))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(|receipt| key(*receipt))
+        .collect::<HashSet<_>>();
+    let mut receipt_keys = HashSet::new();
+    let mut receipts = commitments
+        .iter()
+        .copied()
+        .filter(|receipt| receipt_keys.insert(key(*receipt)))
+        .collect::<Vec<_>>();
+    let mut incidents = HashMap::<_, Vec<_>>::new();
+    let mut frames_by_receipt = HashMap::new();
+    for frame in frames {
+        if let Some(receipt) = frame.observed_source_receipt {
+            frames_by_receipt.insert(key(receipt), *frame);
+        }
+    }
     for record in &era.frames {
         if let PaperLogFrame::Record(PaperLogRecord::FeedIncidentChanged {
             incident,
             state: HaltState::Engaged,
         }) = &record.frame
         {
-            let frame = frames
-                .iter()
-                .find(|frame| frame.observed_source_receipt == Some(incident.frame_receipt))
-                .ok_or(FeedAuditError::Semantic(
-                    "incident has no durable admitted frame",
-                ))?;
+            let frame = frames_by_receipt.get(&key(incident.frame_receipt)).ok_or(
+                FeedAuditError::Semantic("incident has no durable admitted frame"),
+            )?;
             frame.verify_activity_frame(lookup)?;
-            if frame.observed_source_receipt != Some(incident.frame_receipt)
-                || incident.engagement_receipt.is_some()
-            {
+            if incident.engagement_receipt.is_some() {
                 return Err(FeedAuditError::Semantic("incident frame receipt differs"));
             }
-            let read = reads
-                .iter()
-                .find(|(receipt, _)| *receipt == incident.deciding_commitment_receipt)
-                .ok_or(FeedAuditError::Semantic("incident commitment missing"))?;
-            verify_incident_conclusion(frame, incident, &read.1)?;
+            if receipt_keys.insert(key(incident.deciding_commitment_receipt)) {
+                receipts.push(incident.deciding_commitment_receipt);
+            }
+            incidents
+                .entry(key(incident.deciding_commitment_receipt))
+                .or_default()
+                .push(incident);
         }
     }
-    let retired = audited_receipts(era);
-    let mut unresolved = Vec::new();
-    for frame in frames {
-        if frame
-            .observed_source_receipt
-            .is_some_and(|receipt| retired.contains(&receipt))
-        {
+    let retired = audited_receipts(era)
+        .into_iter()
+        .map(key)
+        .collect::<HashSet<_>>();
+    let mut matched = HashSet::new();
+    // Release each reconstructed full-history read before authenticating the next one.
+    receipts.sort_by_key(|receipt| receipt.sequence);
+    for receipt in receipts {
+        let read = crate::bucket_commit::verified_commitment_bindings_with_lookup(receipt, lookup)?;
+        for incident in incidents.get(&key(receipt)).into_iter().flatten() {
+            let frame = frames_by_receipt.get(&key(incident.frame_receipt)).ok_or(
+                FeedAuditError::Semantic("incident has no durable admitted frame"),
+            )?;
+            verify_incident_conclusion(frame, incident, &read)?;
+        }
+        if !commitment_keys.contains(&key(receipt)) {
             continue;
         }
-        let mut matched = false;
-        for (receipt, read) in &reads {
-            if !commitments.contains(receipt) {
+        for frame in frames {
+            if frame.facts.wallet != read.wallet {
                 continue;
             }
-            if read.wallet != frame.facts.wallet {
+            let frame_receipt = frame
+                .observed_source_receipt
+                .ok_or(FeedAuditError::Semantic("frame receipt missing"))?;
+            if retired.contains(&key(frame_receipt)) || matched.contains(&key(frame_receipt)) {
                 continue;
             }
-            if let AuditDisposition::Matched(id) = disposition(frame, read)? {
+            if let AuditDisposition::Matched(id) = disposition(*frame, &read)? {
                 let binding = read
-                    .bindings
-                    .iter()
-                    .find(|binding| {
-                        binding.history_group_id == id
-                            && Some(binding.stream_receipt) == frame.observed_source_receipt
-                    })
+                    .binding_indices
+                    .get(&(frame_receipt.sequence, frame_receipt.this_hash))
+                    .and_then(|index| read.bindings.get(*index))
+                    .filter(|binding| binding.history_group_id == id)
                     .ok_or(FeedAuditError::Semantic("matched audit binding missing"))?;
-                matched |= state
+                if state
                     .activity_revision_disposed(&id, &binding.semantic_revision)
-                    .map_err(|_| FeedAuditError::Semantic("audit disposition unavailable"))?;
+                    .map_err(|_| FeedAuditError::Semantic("audit disposition unavailable"))?
+                {
+                    matched.insert(key(frame_receipt));
+                }
             }
-        }
-        if !matched {
-            unresolved.push(frame.facts.source_trade_id.clone());
         }
     }
-    Ok(unresolved)
+    Ok(frames
+        .iter()
+        .filter(|frame| {
+            frame.observed_source_receipt.is_none_or(|receipt| {
+                !retired.contains(&key(receipt)) && !matched.contains(&key(receipt))
+            })
+        })
+        .map(|frame| frame.facts.source_trade_id.clone())
+        .collect())
 }

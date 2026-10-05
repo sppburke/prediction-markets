@@ -105,6 +105,7 @@ pub(crate) fn restore_frontiers(
                 .source_envelope(receipt)
                 .map(CompleteActivityPage::from)
         })?;
+        index.remember_verified_frontier(&frontier);
         if result.insert(frontier.wallet, frontier).is_some() {
             return Err(FrameAdmissionError::InvalidPrefix(
                 "duplicate wallet frontier",
@@ -145,7 +146,6 @@ pub struct EarlierFrame {
     pub market: MarketId,
     pub received_at: OffsetDateTime,
     pub unresolved_buy: bool,
-    pub unresolved_obligation: bool,
 }
 
 /// An immutable admission prefix. The source artifact authenticates this capture's digest;
@@ -463,7 +463,6 @@ mod tests {
             market: market.clone(),
             received_at: at(100),
             unresolved_buy: true,
-            unresolved_obligation: true,
         }];
         assert!(frame_prefix_blocks(&frames, wallet, &market));
         assert!(!frame_prefix_blocks(

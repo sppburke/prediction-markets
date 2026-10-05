@@ -327,19 +327,16 @@ impl ActivityCandidates {
                 .map_err(|error| ObligationRebuildError::Binding(error.to_string()))?;
             retained.entry(read.wallet).or_default().push(receipt);
             for binding in &read.bindings {
-                if let Some(row) = paper_state.decision_pending_for(&binding.stream_group_id)? {
-                    let frame = crate::bucket_commit::DecisionContinuationV3::from_durable(&row)
-                        .map_err(|error| ObligationRebuildError::Binding(error.to_string()))?;
-                    if frame.is_activity_frame()
-                        && matches!(
-                            crate::feed_audit::disposition(&frame, &read).map_err(|error| {
-                                ObligationRebuildError::Binding(error.to_string())
-                            })?,
-                            crate::feed_audit::AuditDisposition::Matched(_)
-                        )
-                    {
-                        matched_frames.push(binding.stream_receipt);
-                    }
+                if let Some(frame) =
+                    paper_state.activity_frame_decision(&binding.stream_group_id)?
+                    && matches!(
+                        crate::feed_audit::disposition(&frame, &read).map_err(|error| {
+                            ObligationRebuildError::Binding(error.to_string())
+                        })?,
+                        crate::feed_audit::AuditDisposition::Matched(_)
+                    )
+                {
+                    matched_frames.push(binding.stream_receipt);
                 }
                 bindings
                     .entry((
@@ -1930,14 +1927,12 @@ impl WalletOperation {
                     .values()
                     .filter(|obligation| obligation.frame_admission_receipt.is_some())
                 {
-                    let row = self
+                    let frame = self
                         .paper_state
-                        .decision_pending_for(&obligation.group_id)?
+                        .activity_frame_decision(&obligation.group_id)?
                         .ok_or_else(|| {
                             ReconciliationError::Binding("admitted frame disappeared".to_owned())
                         })?;
-                    let frame = crate::bucket_commit::DecisionContinuationV3::from_durable(&row)
-                        .map_err(|error| ReconciliationError::Binding(error.to_string()))?;
                     for receipt in &obligation.retained_commitments {
                         let read = std::sync::Arc::new(
                             crate::bucket_commit::verified_commitment_bindings_with_lookup(
@@ -2124,32 +2119,15 @@ impl WalletOperation {
             {
                 continue;
             }
-            let row = self
+            let frame = self
                 .paper_state
-                .decision_pending_for(&obligation.group_id)?
+                .activity_frame_decision(&obligation.group_id)?
                 .ok_or_else(|| {
                     ReconciliationError::Binding("admitted frame disappeared".to_owned())
                 })?;
-            let frame = crate::bucket_commit::DecisionContinuationV3::from_durable(&row)
-                .map_err(|error| ReconciliationError::Binding(error.to_string()))?;
-            let proof: crate::frame_admission::FrameDecisionProof =
-                serde_json::from_value(frame.facts.decision_inputs.clone())?;
-            let budget = frame
-                .facts
-                .paper_freshness_policy
-                .ok_or_else(|| {
-                    ReconciliationError::Binding("frozen copy budget missing".to_owned())
-                })?
-                .copy_latency_budget_secs;
-            let maturity = i64::try_from(budget)
+            let maturity = i64::try_from(frame.copy_latency_budget_secs)
                 .ok()
-                .and_then(|budget| {
-                    proof
-                        .inputs
-                        .source_time
-                        .unix_timestamp()
-                        .checked_add(budget)
-                })
+                .and_then(|budget| frame.source_epoch.checked_add(budget))
                 .ok_or_else(|| {
                     ReconciliationError::Binding("audit maturity overflow".to_owned())
                 })?;
@@ -2158,7 +2136,7 @@ impl WalletOperation {
                 && !buckets.iter().flatten().any(|aggregate| {
                     let components = aggregate.group_id.components();
                     components.wallet == wallet
-                        && components.transaction_hash == frame.facts.transaction_hash
+                        && components.transaction_hash == frame.transaction_hash
                         && components.activity_type == ActivityType::Trade
                 });
         }
@@ -2215,14 +2193,12 @@ impl WalletOperation {
                     .values()
                     .filter(|obligation| obligation.frame_admission_receipt.is_some())
                 {
-                    let row = self
+                    let frame = self
                         .paper_state
-                        .decision_pending_for(&obligation.group_id)?
+                        .activity_frame_decision(&obligation.group_id)?
                         .ok_or_else(|| {
                             ReconciliationError::Binding("admitted frame disappeared".to_owned())
                         })?;
-                    let frame = crate::bucket_commit::DecisionContinuationV3::from_durable(&row)
-                        .map_err(|error| ReconciliationError::Binding(error.to_string()))?;
                     let conclusion = crate::feed_audit::disposition(&frame, &verified)
                         .map_err(|error| ReconciliationError::Binding(error.to_string()))?;
                     if !self
@@ -2419,29 +2395,24 @@ impl WalletOperation {
         let mut resolved = Vec::new();
         for (epoch, groups) in selected {
             for obligation in groups.values() {
-                if let Some(row) = self
+                if let Some(frame) = self
                     .paper_state
-                    .decision_pending_for(&obligation.group_id)?
+                    .activity_frame_decision(&obligation.group_id)?
+                    && frame.observed_source_receipt == Some(obligation.receipt)
                 {
-                    let frame = crate::bucket_commit::DecisionContinuationV3::from_durable(&row)
-                        .map_err(|error| ReconciliationError::Binding(error.to_string()))?;
-                    if frame.is_activity_frame()
-                        && frame.observed_source_receipt == Some(obligation.receipt)
+                    if let crate::feed_audit::AuditDisposition::Matched(id) =
+                        crate::feed_audit::disposition(&frame, read)
+                            .map_err(|error| ReconciliationError::Binding(error.to_string()))?
+                        && let Some(binding) = read
+                            .binding_indices
+                            .get(&(obligation.receipt.sequence, obligation.receipt.this_hash))
+                            .and_then(|index| read.bindings.get(*index))
+                        && binding.history_group_id == id
+                        && binding_target_disposed(&self.paper_state, binding)?
                     {
-                        if let crate::feed_audit::AuditDisposition::Matched(id) =
-                            crate::feed_audit::disposition(&frame, read)
-                                .map_err(|error| ReconciliationError::Binding(error.to_string()))?
-                            && let Some(binding) = read
-                                .binding_indices
-                                .get(&(obligation.receipt.sequence, obligation.receipt.this_hash))
-                                .and_then(|index| read.bindings.get(*index))
-                            && binding.history_group_id == id
-                            && binding_target_disposed(&self.paper_state, binding)?
-                        {
-                            resolved.push((*epoch, obligation.clone()));
-                        }
-                        continue;
+                        resolved.push((*epoch, obligation.clone()));
                     }
+                    continue;
                 }
                 if obligation_disposed(
                     &self.paper_state,
@@ -2985,28 +2956,19 @@ fn admitted_frame_obligations(
     wallet: Option<WalletAddress>,
 ) -> Result<Vec<(WalletAddress, i64, Obligation)>, pe_paper_state::PaperStateError> {
     let mut result = Vec::new();
-    let rows = match wallet {
-        Some(wallet) => state.activity_frame_decisions_for_wallet(&wallet)?,
-        None => state.decision_pending_history()?,
-    };
-    for row in rows {
-        let wire: serde_json::Value = serde_json::from_str(&row.frozen_inputs_json)?;
-        if wire["source_authority"] != "activity_frame" {
-            continue;
-        }
-        let frame = crate::bucket_commit::DecisionContinuationV3::from_durable(&row)
-            .map_err(|error| pe_paper_state::PaperStateError::Internal(error.to_string()))?;
-        let proof: crate::frame_admission::FrameDecisionProof =
-            serde_json::from_value(frame.facts.decision_inputs.clone())?;
+    for frame in state.activity_frame_decision_index(wallet.as_ref())? {
+        let receipt = frame.observed_source_receipt.ok_or_else(|| {
+            pe_paper_state::PaperStateError::Internal("frame receipt missing".to_owned())
+        })?;
         result.push((
-            frame.facts.wallet,
-            frame.facts.source_epoch,
+            frame.wallet,
+            frame.source_epoch,
             Obligation {
-                group_id: frame.facts.source_trade_id,
-                receipt: proof.inputs.frame_receipt,
-                received_at: proof.inputs.received_at,
+                group_id: frame.source_trade_id,
+                receipt,
+                received_at: frame.received_at,
                 bindings: Vec::new(),
-                frame_admission_receipt: Some(proof.admission_receipt),
+                frame_admission_receipt: Some(frame.admission_receipt),
                 retained_commitments: Vec::new(),
             },
         ));
@@ -3057,35 +3019,30 @@ fn obligation_disposed(
     obligation: &Obligation,
 ) -> Result<bool, pe_paper_state::PaperStateError> {
     // The current durable receipt, not the pre-await obligation tag, owns retirement.
-    if let Some(row) = paper_state.decision_pending_for(&obligation.group_id)? {
-        let frame = crate::bucket_commit::DecisionContinuationV3::from_durable(&row)
-            .map_err(|error| pe_paper_state::PaperStateError::Internal(error.to_string()))?;
-        if frame.is_activity_frame() && frame.observed_source_receipt == Some(obligation.receipt) {
-            let Some(index) = index else {
-                return Ok(false);
-            };
-            for receipt in &obligation.retained_commitments {
-                let read = crate::bucket_commit::verified_commitment_bindings(*receipt, index)
-                    .map_err(|error| {
-                        pe_paper_state::PaperStateError::Internal(error.to_string())
-                    })?;
-                if let crate::feed_audit::AuditDisposition::Matched(id) =
-                    crate::feed_audit::disposition(&frame, &read).map_err(|error| {
-                        pe_paper_state::PaperStateError::Internal(error.to_string())
-                    })?
-                {
-                    for binding in &read.bindings {
-                        if binding.stream_receipt == obligation.receipt
-                            && binding.history_group_id == id
-                            && binding_target_disposed(paper_state, binding)?
-                        {
-                            return Ok(true);
-                        }
+    if let Some(frame) = paper_state.activity_frame_decision(&obligation.group_id)?
+        && frame.observed_source_receipt == Some(obligation.receipt)
+    {
+        let Some(index) = index else {
+            return Ok(false);
+        };
+        for receipt in &obligation.retained_commitments {
+            let read = crate::bucket_commit::verified_commitment_bindings(*receipt, index)
+                .map_err(|error| pe_paper_state::PaperStateError::Internal(error.to_string()))?;
+            if let crate::feed_audit::AuditDisposition::Matched(id) =
+                crate::feed_audit::disposition(&frame, &read)
+                    .map_err(|error| pe_paper_state::PaperStateError::Internal(error.to_string()))?
+            {
+                for binding in &read.bindings {
+                    if binding.stream_receipt == obligation.receipt
+                        && binding.history_group_id == id
+                        && binding_target_disposed(paper_state, binding)?
+                    {
+                        return Ok(true);
                     }
                 }
             }
-            return Ok(false);
         }
+        return Ok(false);
     }
     if obligation.bindings.is_empty() {
         return Ok(

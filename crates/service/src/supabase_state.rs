@@ -1079,7 +1079,7 @@ pub async fn reconcile_active_financial_frames<S: SupabaseStateTrait + ?Sized>(
                     }
                 };
                 continuation
-                    .verify_activity_frame_with_index(index)
+                    .verify_activity_frame_fully_with_index(index)
                     .map_err(|error| SupabaseStateError::Corrupt(error.to_string()))?;
             }
         }

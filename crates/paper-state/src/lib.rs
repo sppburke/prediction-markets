@@ -203,13 +203,31 @@ pub struct NoCopyDisposition {
     pub recorded_at_unix: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeaderPositionRow {
     pub wallet: WalletAddress,
     pub market_id: MarketId,
     pub outcome_id: OutcomeId,
     pub long_contracts: ShareAmount,
     pub short_contracts: ShareAmount,
+}
+
+/// Immutable compact index of a frame decision. Full continuation evidence remains in
+/// `decision_pending` and is loaded only for execution or proof verification.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ActivityFrameDecisionIndex {
+    pub version: u16,
+    pub semantic_revision: String,
+    pub source_trade_id: SourceTradeId,
+    pub wallet: WalletAddress,
+    pub source_epoch: i64,
+    pub transaction_hash: String,
+    pub market_id: MarketId,
+    pub outcome_id: OutcomeId,
+    pub observed_source_receipt: Option<AppendReceipt>,
+    pub admission_receipt: AppendReceipt,
+    pub received_at: time::OffsetDateTime,
+    pub copy_latency_budget_secs: u64,
 }
 
 /// Durable terminal/apply record for one reconciled activity group (#544).
@@ -312,7 +330,7 @@ pub struct WalletCoverage {
 }
 
 /// One append-only venue-authoritative position anchor.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PositionAnchorRow {
     pub wallet: WalletAddress,
     pub anchor_seq: i64,
@@ -2276,33 +2294,84 @@ impl PaperStateDb {
         Ok(history)
     }
 
-    /// Wallet-scoped frame discovery; ordinary reconciliation never scans other wallets' history.
-    pub fn activity_frame_decisions_for_wallet(
+    /// Compact frame authority for suppression/audit discovery. SQLite projects only immutable
+    /// identity and clock fields; settled admission captures and checkpoints are never loaded.
+    pub fn activity_frame_decision_index(
         &self,
-        wallet: &WalletAddress,
-    ) -> Result<Vec<DecisionPendingRow>, PaperStateError> {
+        wallet: Option<&WalletAddress>,
+    ) -> Result<Vec<ActivityFrameDecisionIndex>, PaperStateError> {
+        self.activity_frame_decision_index_filtered(wallet, None)
+    }
+
+    /// Read one compact frame identity through the existing source-trade primary key.
+    pub fn activity_frame_decision(
+        &self,
+        id: &SourceTradeId,
+    ) -> Result<Option<ActivityFrameDecisionIndex>, PaperStateError> {
+        Ok(self
+            .activity_frame_decision_index_filtered(None, Some(id))?
+            .pop())
+    }
+
+    fn activity_frame_decision_index_filtered(
+        &self,
+        wallet: Option<&WalletAddress>,
+        id: Option<&SourceTradeId>,
+    ) -> Result<Vec<ActivityFrameDecisionIndex>, PaperStateError> {
+        let (predicate, value) = if let Some(id) = id {
+            ("source_trade_id = ?1", Some(id.0.clone()))
+        } else if let Some(wallet) = wallet {
+            ("wallet_hex = ?1", Some(wallet.to_string()))
+        } else {
+            ("?1 IS NULL", None)
+        };
         let conn = self.lock();
-        let mut statement = conn.prepare(
-            "SELECT source_trade_id, semantic_revision, wallet_hex, source_epoch,
-                    frozen_inputs_json, post_commit_inputs_json, state, terminal_disposition,
-                    updated_at_unix FROM decision_pending
-             WHERE wallet_hex = ?1 AND json_extract(frozen_inputs_json, '$.source_authority') = 'activity_frame'
+        let sql = format!(
+            "SELECT json_object(
+                'version', json_extract(frozen_inputs_json, '$.version'),
+                'semantic_revision', json_extract(frozen_inputs_json, '$.semantic_revision'),
+                'source_trade_id', json_extract(frozen_inputs_json, '$.source_trade_id'),
+                'wallet', json_extract(frozen_inputs_json, '$.wallet'),
+                'source_epoch', json_extract(frozen_inputs_json, '$.source_epoch'),
+                'transaction_hash', json_extract(frozen_inputs_json, '$.transaction_hash'),
+                'market_id', json_extract(frozen_inputs_json, '$.market_id'),
+                'outcome_id', json_extract(frozen_inputs_json, '$.outcome_id'),
+                'observed_source_receipt', json_extract(frozen_inputs_json, '$.observed_source_receipt'),
+                'admission_receipt', json_extract(frozen_inputs_json, '$.decision_inputs.admission_receipt'),
+                'received_at', json_extract(frozen_inputs_json, '$.decision_inputs.inputs.received_at'),
+                'copy_latency_budget_secs', json_extract(frozen_inputs_json, '$.paper_freshness_policy.copy_latency_budget_secs')),
+                source_trade_id, wallet_hex, source_epoch, semantic_revision
+             FROM decision_pending
+             WHERE {predicate}
+               AND json_extract(frozen_inputs_json, '$.source_authority') = 'activity_frame'
              ORDER BY source_epoch, source_trade_id",
-        )?;
-        let rows = statement.query_map(params![wallet.to_string()], |row| {
+        );
+        let mut statement = conn.prepare(&sql)?;
+        let rows = statement.query_map(params![value], |row| {
             Ok((
-                row.get(0)?,
-                row.get(1)?,
-                row.get(2)?,
-                row.get(3)?,
-                row.get(4)?,
-                row.get(5)?,
-                row.get(6)?,
-                row.get(7)?,
-                row.get(8)?,
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
             ))
         })?;
-        rows.map(|row| decision_pending_row(row?)).collect()
+        rows.map(|row| {
+            let (json, id, wallet, epoch, revision) = row?;
+            let frame: ActivityFrameDecisionIndex = serde_json::from_str(&json)?;
+            if frame.version != 7
+                || frame.source_trade_id.0 != id
+                || frame.wallet != parse_wallet(&wallet)?
+                || frame.source_epoch != epoch
+                || frame.semantic_revision != revision
+            {
+                return Err(PaperStateError::Internal(
+                    "frame index differs from durable row".to_owned(),
+                ));
+            }
+            Ok(frame)
+        })
+        .collect()
     }
 
     /// Read one durable decision continuation by its source trade id (`None` when absent).

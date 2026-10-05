@@ -913,6 +913,8 @@ fn paper_fill_source_receipts(era: &PaperEra) -> Result<Vec<AppendReceipt>, Risk
 struct SourceReceiptIndexState {
     frames: Vec<SourceFrameMetadata>,
     next_byte_offset: Option<u64>,
+    verified_feed_frontiers:
+        HashMap<pe_core_types::WalletAddress, crate::frame_admission::FeedHistoryFrontier>,
     #[cfg(feature = "scenario")]
     read_verifications: HashMap<(EventSeq, blake3::Hash), usize>,
     #[cfg(feature = "scenario")]
@@ -993,6 +995,7 @@ impl SourceReceiptIndexStaging {
             state: Arc::new(RwLock::new(SourceReceiptIndexState {
                 frames: self.frames,
                 next_byte_offset: Some(physical_tail),
+                verified_feed_frontiers: HashMap::new(),
                 #[cfg(feature = "scenario")]
                 read_verifications: HashMap::new(),
                 #[cfg(feature = "scenario")]
@@ -1048,6 +1051,41 @@ impl SourceReceiptIndex {
             .frame_verifications
             .entry((receipt.sequence, receipt.this_hash))
             .or_default() += 1;
+    }
+
+    pub(crate) fn remember_verified_frontier(
+        &self,
+        frontier: &crate::frame_admission::FeedHistoryFrontier,
+    ) {
+        self.state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .verified_feed_frontiers
+            .insert(frontier.wallet, frontier.clone());
+    }
+
+    pub(crate) fn verify_frame_frontier(
+        &self,
+        frontier: &crate::frame_admission::FeedHistoryFrontier,
+    ) -> Result<(), crate::frame_admission::FrameAdmissionError> {
+        if self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .verified_feed_frontiers
+            .get(&frontier.wallet)
+            == Some(frontier)
+        {
+            return Ok(());
+        }
+        #[cfg(feature = "scenario")]
+        self.record_read_verification(frontier.commitment);
+        frontier.verify(&mut |receipt| {
+            self.source_envelope(receipt)
+                .map(crate::bucket_commit::CompleteActivityPage::from)
+        })?;
+        self.remember_verified_frontier(frontier);
+        Ok(())
     }
 
     pub(crate) fn canonical_path(&self) -> Option<&Path> {
