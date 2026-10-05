@@ -1095,7 +1095,11 @@ async fn main() {
                     tracing::error!("activate-next: --batch-id is required");
                     std::process::exit(1);
                 };
-                match pile::activate_next(&mut cache, batch_id) {
+                match pile::activate_next(
+                    &mut cache,
+                    batch_id,
+                    bootstrap_config.activation_batch_wallets,
+                ) {
                     Ok(batch) => {
                         if let Some(path) = audit_csv.as_deref()
                             && let Err(e) = pile::write_activation_audit_csv(&batch, path)
@@ -1110,7 +1114,13 @@ async fn main() {
                             std::process::exit(1);
                         }
                         let activated = batch.wallet_hexes.len();
-                        if activated == 0 {
+                        if batch.requested_count == 0 {
+                            tracing::info!(
+                                batch_id = batch.batch_id,
+                                reused = batch.reused,
+                                "activate-next: activation batch size is 0; admitting no new wallets"
+                            );
+                        } else if activated == 0 {
                             tracing::warn!(
                                 batch_id = batch.batch_id,
                                 "activate-next: no inactive non-infrastructure wallets remain; skipping"

@@ -104,7 +104,10 @@ behaviour of the `SRC_502_GAP` (64) and `SRC_DATADASH` (128) bits.
   writes `data/eval-results/rank_and_push.cycle` before discovery or activation.
   If a transient pre-publication stage fails, the next zero-argument retry
   reuses that run directory, its deterministic activation batch ID, and the
-  already-committed cohort; it does not admit another 20,000 wallets.
+  already-committed cohort; it does not admit another batch. The batch size
+  (`PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS`, default 20,000, `0` admits none) must
+  not change between the attempt and its retry: the committed batch reloads only
+  under the count it recorded, and a changed count stops `activate-next`.
 - **Bounded inside the wrapper.** `--skip-discovery` skips both discovery and
   controlled activation. Backfill launched by the wrapper always defers global
   activation, so no wrapper override can silently activate an unbounded cohort.

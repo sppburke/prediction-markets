@@ -469,7 +469,10 @@ bash scripts/rank_and_push.sh
 
 In order it runs: **Step 0** data refresh — `winner-discovery
 --defer-activation` (leaderboard + datadash ingest) → one transactionally
-audited `activate-next` batch (`bootstrap_pipeline_activation_batch_wallets`) →
+audited `activate-next` batch (`bootstrap_pipeline_activation_batch_wallets`;
+`PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` admits none; keep the value unchanged
+while a cycle is in flight, because a resumed `activate-next` stops on a changed
+count) →
 `backfill --defer-activation` (trades only) → `events` → `resolutions` →
 The production wrapper performs no infrastructure or ordinary purge; exclusions gate
 acquisition (discovery, activation, and backfill), and production rank/export applies

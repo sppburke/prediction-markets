@@ -14,7 +14,7 @@
 # What `bash scripts/rank_and_push.sh` does (no args), in order:
 #   Step 0  refresh data (always-on; --skip-discovery / --skip-backfill to bypass):
 #     discover     pe-bootstrap winner-discovery --defer-activation  ingest without bulk activation
-#     activate     pe-bootstrap activate-next     at most the next audited 20,000 non-infra wallets
+#     activate     pe-bootstrap activate-next     at most the next audited batch of non-infra wallets (default 20,000)
 #     backfill     pe-bootstrap backfill --defer-activation  trade history for every active wallet
 #     events       pe-bootstrap events            condition→event + fee maps (eligibility gate)
 #     resolutions  pe-bootstrap resolutions       CLOB→Gamma resolutions + schedule end_dates, run
@@ -756,7 +756,7 @@ refresh_data() {
   # the ranker reads.
   export PE_BOOTSTRAP_CACHE_PATH="$DB"
 
-  echo "── Step 0: data refresh (discover → activate 20,000 → backfill → events → resolutions) ──"
+  echo "── Step 0: data refresh (discover → activate the next batch → backfill → events → resolutions) ──"
 
   if [[ "$SKIP_DISCOVERY" == "1" ]]; then
     echo "   discovery skipped (--skip-discovery)"

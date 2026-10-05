@@ -32,7 +32,8 @@ use crate::error::BootstrapError;
 /// `docs/_GLOSSARY.md` "Bootstrap defaults" as `pile_activation_min_trades`.
 pub const PILE_ACTIVATION_MIN_TRADES: i64 = 100;
 
-/// Number of inactive wallets admitted by each full rank-and-push cycle.
+/// Default number of inactive wallets admitted by each full rank-and-push cycle;
+/// `BootstrapConfig::activation_batch_wallets` overrides it.
 pub const PIPELINE_ACTIVATION_BATCH_WALLETS: usize = 20_000;
 
 /// Whether a discovery/backfill caller applies the legacy unbounded activation
@@ -90,14 +91,16 @@ pub fn apply_activation_policy(
     }
 }
 
-/// Activate (or idempotently reload) the canonical next pipeline batch.
+/// Activate (or idempotently reload) the canonical next pipeline batch of at most
+/// `batch_wallets` wallets; `0` admits none and still records the batch.
 pub fn activate_next(
     cache: &mut WalletCache,
     batch_id: &str,
+    batch_wallets: usize,
 ) -> Result<ActivationBatch, BootstrapError> {
     cache.activate_next_batch(
         batch_id,
-        PIPELINE_ACTIVATION_BATCH_WALLETS,
+        batch_wallets,
         PILE_ACTIVATION_MIN_TRADES,
         OffsetDateTime::now_utc().unix_timestamp(),
     )
@@ -236,6 +239,39 @@ mod tests {
             .activate_next_batch("batch-3", 2, PILE_ACTIVATION_MIN_TRADES, 1_700_000_004)
             .unwrap();
         assert!(empty.wallet_hexes.is_empty());
+    }
+
+    /// The requested count is the caller's: zero admits no wallet and is recorded,
+    /// a positive count admits exactly that many, and a recorded batch reloads only
+    /// under the count it was recorded with.
+    #[test]
+    fn activate_next_admits_the_requested_count_and_pins_it_per_batch() {
+        let (_dir, mut cache) = tmp_cache();
+        for seed in 40..43 {
+            cache
+                .upsert_wallet(&hex(seed), SRC_TRADES, false, None, None, None)
+                .unwrap();
+        }
+
+        let none = activate_next(&mut cache, "batch-zero", 0).unwrap();
+        assert_eq!(none.requested_count, 0);
+        assert!(none.wallet_hexes.is_empty());
+        assert_eq!(cache.active_wallet_count().unwrap(), 0);
+
+        let reloaded = activate_next(&mut cache, "batch-zero", 0).unwrap();
+        assert!(reloaded.reused);
+        assert!(reloaded.wallet_hexes.is_empty());
+        let mismatch = activate_next(&mut cache, "batch-zero", 2).unwrap_err();
+        assert!(
+            mismatch.to_string().contains("requested_count mismatch"),
+            "{mismatch}"
+        );
+        assert_eq!(cache.active_wallet_count().unwrap(), 0);
+
+        let two = activate_next(&mut cache, "batch-two", 2).unwrap();
+        assert_eq!(two.requested_count, 2);
+        assert_eq!(two.wallet_hexes.len(), 2);
+        assert_eq!(cache.active_wallet_count().unwrap(), 2);
     }
 
     #[test]
