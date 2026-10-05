@@ -14,7 +14,7 @@
 # What `bash scripts/rank_and_push.sh` does (no args), in order:
 #   Step 0  refresh data (always-on; --skip-discovery / --skip-backfill to bypass):
 #     discover     pe-bootstrap winner-discovery --defer-activation  ingest without bulk activation
-#     activate     pe-bootstrap activate-next     at most the next audited batch of non-infra wallets (default 20,000)
+#     activate     pe-bootstrap activate-next     at most the next audited batch of non-infra wallets (glossary default)
 #     backfill     pe-bootstrap backfill --defer-activation  trade history for every active wallet
 #     events       pe-bootstrap events            condition→event + fee maps (eligibility gate)
 #     resolutions  pe-bootstrap resolutions       CLOB→Gamma resolutions + schedule end_dates, run

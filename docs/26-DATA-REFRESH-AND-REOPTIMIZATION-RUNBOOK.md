@@ -1312,7 +1312,7 @@ checking the run flag once per second, then:
 - Otherwise, if `rank_and_push.cycle` exists, the loop invokes the normal
   zero-argument command. The one-shot reuses the pointed run directory and
   deterministic activation batch, so retrying discovery, activation, backfill,
-  events, or ranking cannot admit another 20,000-wallet cohort.
+  events, or ranking cannot admit another activation batch.
 - Exit 75 without either pointer is fatal. Any nonzero code other than 75 is a
   permanent failure and stops the loop with the applicable pointer retained for
   diagnosis and an operator-directed retry.
