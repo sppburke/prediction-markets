@@ -59,7 +59,7 @@ use pe_service::supabase_state::{
     FillV2Outcome, PreparedFillRequest, SourceEvidence, SupabaseStateError, SupabaseStateTrait,
     reconcile_active_financial_frames,
 };
-use pe_service::trade_poller::{ReconciliationObligations, TradePoller, TradePollerConfig};
+use pe_service::trade_poller::{TradePoller, TradePollerConfig};
 use pe_source_polymarket_public::{GAMMA_BATCH_SIZE, validate_live_market, validate_paper_market};
 use pe_strategy_winner_follow::{ExecutionMode, PerTradeCap, SizingMode, WinnerFollowStrategy};
 use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
@@ -136,6 +136,7 @@ struct BookEconomics {
 }
 struct DelayedPage {
     page: Vec<u8>,
+    failed: bool,
     misses: AtomicUsize,
     reads: AtomicUsize,
 }
@@ -147,6 +148,11 @@ impl pe_source_polymarket_public::ReconciliationFetcher for DelayedPage {
     {
         Box::pin(async move {
             self.reads.fetch_add(1, Ordering::SeqCst);
+            if self.failed {
+                return Err(pe_source_core::SourceError::Transient {
+                    message: "injected read failure".to_owned(),
+                });
+            }
             let remaining =
                 self.misses
                     .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
@@ -248,6 +254,7 @@ impl SupabaseStateTrait for Authority {
     }
 }
 
+#[derive(Clone)]
 struct Recorded {
     epoch: i64,
     activity: Vec<u8>,
@@ -264,6 +271,11 @@ struct Harness {
     source: SourceLogHandle,
     index: SourceReceiptIndex,
     hooks: Arc<ScenarioHooks>,
+    health: pe_service::health::SharedHealth,
+    terminal_clock: OffsetDateTime,
+    poller_crash: Arc<Mutex<Option<pe_service::trade_poller::ReconciliationCrashBoundary>>>,
+    poller_boot_rebuild: bool,
+    poller_fetch_failed: bool,
     books: Arc<Books>,
     prices: Prices,
     mid_requests: Arc<AtomicUsize>,
@@ -391,6 +403,11 @@ impl Harness {
             source,
             index,
             hooks,
+            health: new_shared_health_with_ws(false, true, 90),
+            terminal_clock: at(),
+            poller_crash: Arc::new(Mutex::new(None)),
+            poller_boot_rebuild: false,
+            poller_fetch_failed: false,
             books: Arc::new(Books::default()),
             prices: Prices {
                 gate: Arc::new(PriceGate::default()),
@@ -600,6 +617,8 @@ impl Harness {
     }
     fn start_owner(&mut self, enabled: bool, frames: bool) {
         let (control, receiver) = mpsc::channel(4);
+        let risk_clock = self.hooks.clone();
+        let terminal_clock = self.terminal_clock;
         let mut owner = Orchestrator::new_with_authority(
             self.watchlist.clone(),
             OrchestratorConfig {
@@ -633,7 +652,7 @@ impl Harness {
             pe_service::paper_recovery::PaperLog::open(self.dir.path().join("paper.log")).unwrap(),
             self.paper.clone(),
             build_leader_ledger(&self.paper).unwrap(),
-            new_shared_health_with_ws(false, true, 90),
+            self.health.clone(),
             MidPriceCache::with_fetcher(
                 CountingPrices {
                     inner: self.prices.clone(),
@@ -642,7 +661,16 @@ impl Harness {
                 "fixture://gamma".to_owned(),
             )
             .with_source_log(self.source.clone())
-            .with_clock(Arc::new(at)),
+            .with_clock(Arc::new(move || {
+                if frames {
+                    OffsetDateTime::from_unix_timestamp(
+                        risk_clock.financial_clock_unix.load(Ordering::SeqCst),
+                    )
+                    .unwrap()
+                } else {
+                    at()
+                }
+            })),
             receiver,
             None,
             self.authority.clone(),
@@ -672,16 +700,19 @@ impl Harness {
             )
             .unwrap();
         let recovery = frames.then(|| {
-            pe_service::trade_poller::rebuild_reconciliation_obligations(
+            let mut obligations = pe_service::trade_poller::rebuild_reconciliation_obligations(
                 &self.dir.path().join("source.log"),
                 &self.paper,
             )
-            .unwrap()
-            .frame_recovery_receipts()
+            .unwrap();
+            obligations.retire_feed_incidents(&pe_service::paper_recovery::paper_era(
+                scan_paper_log(&self.dir.path().join("paper.log")).unwrap(),
+            ));
+            obligations.frame_recovery_receipts()
         });
         self.control = Some(control);
         self.task = Some(tokio::spawn(
-            pe_service::orchestrator::SCENARIO_TERMINAL_CLOCK.scope(at(), async move {
+            pe_service::orchestrator::SCENARIO_TERMINAL_CLOCK.scope(terminal_clock, async move {
                 if let Some((prefix, undelivered)) = recovery {
                     owner
                         .resume_pending_before_producers()
@@ -797,11 +828,40 @@ impl Harness {
         let (progress, mut completed) = mpsc::channel(8);
         let delayed = Arc::new(DelayedPage {
             page: recorded.activity.clone(),
+            failed: self.poller_fetch_failed,
             misses: AtomicUsize::new(misses),
             reads: AtomicUsize::new(0),
         });
         let clock = Arc::new(AtomicI64::new(now.unix_timestamp()));
         let poll_clock = Arc::clone(&clock);
+        let mut obligations = pe_service::trade_poller::ReconciliationObligations::default();
+        for row in self.paper.decision_pending_history().unwrap() {
+            let continuation =
+                pe_service::bucket_commit::DecisionContinuationV3::from_durable(&row).unwrap();
+            if !continuation.is_activity_frame() {
+                continue;
+            }
+            let proof: pe_service::frame_admission::FrameDecisionProof =
+                serde_json::from_value(continuation.facts.decision_inputs.clone()).unwrap();
+            obligations.insert(pe_service::activity_ingest::ReconciliationTrigger {
+                wallet: row.wallet,
+                source_time: proof.inputs.source_time,
+                source_trade_id: row.source_trade_id,
+                provenance: pe_copy_signal_engine::TradeProvenance::ActivityWs,
+                received_at: proof.inputs.received_at,
+                receipt: proof.inputs.frame_receipt,
+            });
+        }
+        if self.poller_boot_rebuild {
+            obligations = pe_service::trade_poller::rebuild_reconciliation_obligations(
+                &self.dir.path().join("source.log"),
+                &self.paper,
+            )
+            .unwrap();
+        }
+        obligations.retire_feed_incidents(&pe_service::paper_recovery::paper_era(
+            scan_paper_log(&self.dir.path().join("paper.log")).unwrap(),
+        ));
         let poller = TradePoller::new(
             TradePollerConfig {
                 base_url: "fixture://activity".to_owned(),
@@ -824,11 +884,12 @@ impl Harness {
             new_shared_health_with_ws(false, true, 90),
             SignalConfig::default(),
             LiveRuntimeConfig::new(self.config.clone()),
-            ReconciliationObligations::default(),
+            obligations,
             None,
         )
         .with_source_receipt_index(self.index.clone())
         .with_progress(progress)
+        .with_crash_boundary(self.poller_crash.clone())
         .with_clock(Arc::new(move || {
             OffsetDateTime::from_unix_timestamp(poll_clock.load(Ordering::SeqCst)).unwrap()
         }));
@@ -3529,6 +3590,67 @@ async fn admission_response(
 }
 
 impl Harness {
+    async fn requalify_current_rows(&self) -> pe_service::qualification::QualificationReport {
+        let paper_path = self.dir.path().join("paper.log");
+        let source_path = self.dir.path().join("source.log");
+        let live_path = self.dir.path().join("live_journal.log");
+        let mut seal = scan_paper_log(&paper_path)
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|frame| match &frame.frame {
+                PaperLogFrame::Record(PaperLogRecord::QualificationSealed(seal)) => {
+                    Some((**seal).clone())
+                }
+                _ => None,
+            })
+            .unwrap();
+        seal.source_prefix = TailBinding::from(&Scanner::verify(&source_path).unwrap());
+        seal.financial_prefix = TailBinding::from(&Scanner::verify(&paper_path).unwrap());
+        let keys = self
+            .paper
+            .decision_pending_history()
+            .unwrap()
+            .into_iter()
+            .map(|row| (row.source_trade_id, row.semantic_revision))
+            .collect::<Vec<_>>();
+        let digest = self
+            .paper
+            .seal_decision_evidence_for_source_prefix(
+                &keys,
+                &keys,
+                seal.source_prefix.last_sequence,
+            )
+            .unwrap();
+        seal.decision_evidence_digest = blake3::hash(&digest).to_hex().to_string();
+        let timestamp = OffsetDateTime::from_unix_timestamp(seal.sealed_cutoff_unix).unwrap();
+        let receipt = Writer::open(&paper_path)
+            .unwrap()
+            .append_synced(EnvelopeIn {
+                source_id: SourceId("pe-service.paper".to_owned()),
+                schema_version: 2,
+                parser_version: 1,
+                observed_at: SourceTimestamp(timestamp),
+                received_at: ReceivedAt(timestamp),
+                content_type: ContentType::Json,
+                payload: serde_json::to_vec(&PaperLogRecord::QualificationSealed(Box::new(seal)))
+                    .unwrap(),
+            })
+            .unwrap();
+        let options = pe_service::qualification::QualifyOptions {
+            paper_log: paper_path,
+            source_log: source_path,
+            live_journal: Some(live_path),
+            paper_state: self.dir.path().join("paper.db"),
+            seal_hash: receipt.this_hash.to_hex().to_string(),
+            output: self.dir.path().join("altered-qualification.json"),
+        };
+        pe_service::qualification::run_qualify(&options)
+            .await
+            .unwrap();
+        serde_json::from_slice(&std::fs::read(options.output).unwrap()).unwrap()
+    }
+
     async fn qualify_one_fill(&mut self) -> pe_service::qualification::QualificationReport {
         let source_path = self.dir.path().join("source.log");
         let scans_before_mark = pe_event_log::scan_metrics::count(&source_path).unwrap();
@@ -3550,26 +3672,30 @@ impl Harness {
             })
             .await
             .unwrap();
-        let price = self
-            .source
-            .append(EnvelopeIn {
-                source_id: SourceId("pe-service.clob-prices-history".to_owned()),
-                schema_version: 1,
-                parser_version: 1,
-                observed_at: SourceTimestamp(timestamp),
-                received_at: ReceivedAt(timestamp),
-                content_type: ContentType::Json,
-                payload: serde_json::to_vec(&json!({"history":[{"t":cutoff,"p":"0.50"}]})).unwrap(),
-            })
-            .await
-            .unwrap();
-        self.hooks.boundary_mark_prices.lock().unwrap().push_back(
-            pe_service::risk_inputs::HistoricalMarkPrice {
-                price: pe_core_types::Price::new(dec!(0.50)).unwrap(),
-                sample_unix: cutoff,
-                receipt: price,
-            },
-        );
+        let position_count = self.paper.open_positions().unwrap().len();
+        for _ in 0..position_count {
+            let price = self
+                .source
+                .append(EnvelopeIn {
+                    source_id: SourceId("pe-service.clob-prices-history".to_owned()),
+                    schema_version: 1,
+                    parser_version: 1,
+                    observed_at: SourceTimestamp(timestamp),
+                    received_at: ReceivedAt(timestamp),
+                    content_type: ContentType::Json,
+                    payload: serde_json::to_vec(&json!({"history":[{"t":cutoff,"p":"0.50"}]}))
+                        .unwrap(),
+                })
+                .await
+                .unwrap();
+            self.hooks.boundary_mark_prices.lock().unwrap().push_back(
+                pe_service::risk_inputs::HistoricalMarkPrice {
+                    price: pe_core_types::Price::new(dec!(0.50)).unwrap(),
+                    sample_unix: cutoff,
+                    receipt: price,
+                },
+            );
+        }
         self.hooks
             .financial_clock_unix
             .store(cutoff, Ordering::SeqCst);
@@ -3597,7 +3723,7 @@ impl Harness {
                 _ => None,
             })
             .unwrap();
-        assert_eq!(mark.prices.len(), 1);
+        assert_eq!(mark.prices.len(), position_count);
         assert!(mark.prices[0].receipt.is_some());
         let mut verified_mark = *mark.clone();
         verified_mark.source_tail =
@@ -3994,9 +4120,9 @@ async fn homogeneous_same_second_production_and_qualification() {
 }
 
 #[tokio::test]
-async fn held_market_across_leaders_and_outcomes() {
+async fn second_leader_first_entry_is_copied() {
     let other = WalletAddress::from_hex("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
-    for version in [7, 6] {
+    for (version, outcome) in [(7, 0), (7, 1), (6, 0), (6, 1)] {
         let mut h = Harness::new_with_leaders(
             if version == 7 { 3 } else { 2 },
             runtime(),
@@ -4007,7 +4133,9 @@ async fn held_market_across_leaders_and_outcomes() {
         h.freeze(&held, true).await;
         h.set_continuation_version(&held, version);
         let market = held.admission.market.condition_id.0.clone();
-        let token = held.admission.market.ordered_outcome_token_ids[1].0.clone();
+        let token = held.admission.market.ordered_outcome_token_ids[outcome]
+            .0
+            .clone();
         let payload = serde_json::to_vec(
             &json!({"market":market,"asset_id":token,"asks":[{"price":"0.50","size":"100"}]}),
         )
@@ -4020,8 +4148,8 @@ async fn held_market_across_leaders_and_outcomes() {
         let mut activity: Value = serde_json::from_slice(&held.activity).unwrap();
         activity[0]["proxyWallet"] = other.to_string().into();
         activity[0]["asset"] = token.into();
-        activity[0]["outcomeIndex"] = json!(1);
-        activity[0]["outcome"] = json!("No");
+        activity[0]["outcomeIndex"] = json!(outcome);
+        activity[0]["outcome"] = json!(if outcome == 0 { "Yes" } else { "No" });
         activity[0]["timestamp"] = json!(EPOCH + 1);
         activity[0]["transactionHash"] = format!("0x{:064x}", 901).into();
         let activity = serde_json::to_vec(&activity).unwrap();
@@ -4058,19 +4186,32 @@ async fn held_market_across_leaders_and_outcomes() {
             ))
         );
         assert_eq!(h.paper.decision_pending_history().unwrap().len(), 2);
-        if version == 7 {
+        if version == 6 && outcome == 0 {
             assert_eq!(row.terminal_disposition.as_deref(), Some("no_fill"));
-            assert_eq!(
-                replay.post_boundary.body.terminal.reason,
-                "paper_held_market"
-            );
+            assert_eq!(replay.post_boundary.body.terminal.reason, "paper_held");
             assert_eq!(h.prepared_count(), 1);
             assert_eq!(h.paper.open_positions().unwrap().len(), 1);
             assert!(replay.post_boundary.body.terminal.dispatch_id.is_some());
         } else {
             assert_eq!(row.terminal_disposition.as_deref(), Some("fill"));
             assert_eq!(h.prepared_count(), 2);
-            assert_eq!(h.paper.open_positions().unwrap().len(), 2);
+            assert_eq!(
+                h.paper.open_positions().unwrap().len(),
+                if outcome == 0 { 1 } else { 2 }
+            );
+            if outcome == 0 {
+                let total = h
+                    .paper
+                    .list_fills()
+                    .unwrap()
+                    .iter()
+                    .map(|fill| fill.quantity.to_decimal())
+                    .sum::<rust_decimal::Decimal>();
+                assert_eq!(
+                    h.paper.open_positions().unwrap()[0].long.to_decimal(),
+                    total
+                );
+            }
         }
         h.stop().await;
     }
@@ -4179,6 +4320,10 @@ impl Harness {
     }
 
     async fn empty_frontier(&self, fixed_end: i64) {
+        self.empty_frontier_for(wallet(), fixed_end).await;
+    }
+
+    async fn empty_frontier_for(&self, source_wallet: WalletAddress, fixed_end: i64) {
         let page = self
             .source
             .append(EnvelopeIn {
@@ -4192,7 +4337,7 @@ impl Harness {
             })
             .await
             .unwrap();
-        let read = support::producer_shaped_read_v2(wallet(), b"[]", fixed_end, EPOCH, page);
+        let read = support::producer_shaped_read_v2(source_wallet, b"[]", fixed_end, EPOCH, page);
         let commitment = self
             .source
             .append(EnvelopeIn {
@@ -4217,7 +4362,7 @@ impl Harness {
                 update: pe_service::orchestrator_control::FeedAuditUpdate::Frontier(
                     pe_service::frame_admission::FeedHistoryFrontier {
                         version: 1,
-                        wallet: wallet(),
+                        wallet: source_wallet,
                         fixed_end,
                         commitment,
                         page_occurrences: vec![read.page],
@@ -4248,7 +4393,12 @@ impl Harness {
                 observed_at: SourceTimestamp(
                     OffsetDateTime::from_unix_timestamp(timestamp).unwrap(),
                 ),
-                received_at: ReceivedAt(at()),
+                received_at: ReceivedAt(
+                    OffsetDateTime::from_unix_timestamp(
+                        self.hooks.financial_clock_unix.load(Ordering::SeqCst),
+                    )
+                    .unwrap(),
+                ),
                 content_type: ContentType::Json,
                 payload: serde_json::to_vec(&frame).unwrap(),
             })
@@ -4287,6 +4437,13 @@ impl Harness {
     }
 }
 
+fn identifier_counts(h: &Harness, id: &SourceTradeId) -> (i64, i64, i64, i64) {
+    rusqlite::Connection::open(h.dir.path().join("paper.db")).unwrap().query_row(
+        "SELECT (SELECT count(*) FROM seen_trades WHERE source_trade_id=?1), (SELECT count(*) FROM fills WHERE idempotency_key LIKE 'wf|%|' || ?1 || '|%'), (SELECT count(*) FROM dispatch_seeds WHERE source_trade_id=?1), (SELECT count(*) FROM no_copy_dispositions WHERE source_trade_id=?1)",
+        [&id.0], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    ).unwrap()
+}
+
 #[tokio::test]
 async fn frame_final_before_rest_then_reconcile() {
     let mut h = Harness::new().await;
@@ -4317,6 +4474,9 @@ async fn frame_final_before_rest_then_reconcile() {
             .unwrap()
             .is_none()
     );
+    let counts = identifier_counts(&h, &recorded.id);
+    assert_eq!((counts.0, counts.1, counts.3), (0, 1, 0));
+    assert!(counts.2 <= 1);
     let history = h.paper.gate_history().unwrap();
     let financial = h.paper.financial_snapshot(EPOCH).unwrap();
     h.stop().await;
@@ -4344,6 +4504,7 @@ async fn frame_final_before_rest_then_reconcile() {
         admission: recorded.admission.clone(),
     };
     h.poll(&echo).await;
+    assert_eq!(identifier_counts(&h, &recorded.id), (1, 1, counts.2, 0));
     assert_eq!(h.terminal(&recorded), before);
     assert_eq!(h.paper.gate_history().unwrap(), history);
     assert_eq!(h.paper.financial_snapshot(EPOCH).unwrap(), financial);
@@ -4364,6 +4525,53 @@ async fn frame_final_before_rest_then_reconcile() {
     assert!(report.replay.exact, "{:?}", report.replay);
     assert_eq!(report.replay.fills, 1);
     h.stop().await;
+    // Equal identifiers also retain their original late and fenced route pairings.
+    for route in ["late", "fenced"] {
+        let mut echo_owner = Harness::new().await;
+        let frame = echo_owner.record(1).await;
+        echo_owner.attempt(&frame, at());
+        echo_owner.start_frames();
+        echo_owner.empty_frontier(EPOCH - 1).await;
+        echo_owner.deliver_frame(&frame, |_| {}).await;
+        let terminal = echo_owner.terminal(&frame);
+        echo_owner.stop().await;
+        if route == "late" {
+            echo_owner.paper.set_cursor(&wallet(), EPOCH + 10).unwrap();
+            rusqlite::Connection::open(echo_owner.dir.path().join("paper.db")).unwrap().execute(
+                "INSERT INTO activity_groups(source_trade_id,transaction_hash,wallet_hex,source_epoch,semantic_revision,activity_type,disposition,proof_json) VALUES ('fixture-future','future',?1,?2,'future','REDEEM','raw_only',?3)",
+                rusqlite::params![wallet().to_string(), EPOCH + 10, "{\"effect\":{\"kind\":\"raw_only\"}}"],
+            ).unwrap();
+        } else {
+            rusqlite::Connection::open(echo_owner.dir.path().join("paper.db")).unwrap().execute(
+                "INSERT INTO wallet_fences(wallet_hex,source_trade_id,cause,proof_json,fenced_at_unix) VALUES (?1,?2,'ineligible_mapping','{}',?3)",
+                rusqlite::params![wallet().to_string(), "fixture-fence", EPOCH],
+            ).unwrap();
+        }
+        echo_owner.start_frames();
+        echo_owner.boot_barrier().await;
+        echo_owner.poll(&frame).await;
+        assert_eq!(echo_owner.terminal(&frame), terminal);
+        assert_eq!(identifier_counts(&echo_owner, &frame.id), (1, 1, 0, 0));
+        let group = echo_owner
+            .paper
+            .activity_group_state(&frame.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            group.disposition,
+            if route == "late" {
+                "reanchor_required_late_group"
+            } else {
+                "wallet_fenced_applied"
+            }
+        );
+        assert_eq!(
+            echo_owner.paper.leader_positions().unwrap().len(),
+            usize::from(route == "fenced")
+        );
+        assert!(echo_owner.feed_edges().is_empty());
+        echo_owner.stop().await;
+    }
 }
 
 #[tokio::test]
@@ -4443,7 +4651,7 @@ async fn frontier_fallback_artifact_survives_empty_refresh_and_restart() {
 
 #[tokio::test]
 async fn frame_frontier_bound_stale_wallets_and_empty_poller_restart() {
-    for stale in [90, 91, 27 * 3600, 5 * 86400] {
+    for stale in [90, 91, 5 * 86400] {
         let mut h = Harness::new().await;
         let recorded = h.record(1).await;
         h.attempt(&recorded, at());
@@ -4637,6 +4845,7 @@ async fn frame_pending_checkpoint_boot_and_prepared_recovery_skip_leader() {
     assert_eq!(h.prepared_count(), 1);
     assert!(h.paper.leader_positions().unwrap().is_empty());
     assert_eq!(h.paper.gate_history().unwrap()[&wallet()].len(), 1);
+    h.poll(&recorded).await;
     let report = h.qualify_one_fill().await;
     assert!(
         report.replay.exact,
@@ -4657,75 +4866,1503 @@ async fn frame_validation_rejects_each_altered_admission_input() {
     h.stop().await;
     let connection = rusqlite::Connection::open(h.dir.path().join("paper.db")).unwrap();
     let original_wire: Value = serde_json::from_str(&original.frozen_inputs_json).unwrap();
-    let changes = [
-        ("/price", json!("0.60")),
-        ("/share_amount", json!("7")),
-        ("/decision_inputs/inputs/payload_hash", json!("altered")),
-        ("/decision_inputs/inputs/parser_version", json!(99)),
-        ("/decision_inputs/inputs/schema_version", json!(99)),
-        ("/decision_inputs/inputs/poll_round_stale_secs", json!(91)),
-        ("/decision_inputs/inputs/copy_eligible", json!(false)),
-        ("/decision_inputs/inputs/history_complete", json!(false)),
-        ("/decision_inputs/inputs/fenced", json!(true)),
+    connection
+        .execute(
+            "UPDATE decision_pending SET state = 'open' WHERE source_trade_id = ?1",
+            [&recorded.id.0],
+        )
+        .unwrap();
+    pe_service::bucket_commit::validate_open_continuations(&h.paper, &h.index).unwrap();
+    let mut fact = original_wire.clone();
+    fact["price"] = json!("0.60");
+    connection
+        .execute(
+            "UPDATE decision_pending SET frozen_inputs_json = ?1 WHERE source_trade_id = ?2",
+            rusqlite::params![fact.to_string(), recorded.id.0],
+        )
+        .unwrap();
+    let error =
+        pe_service::bucket_commit::validate_open_continuations(&h.paper, &h.index).unwrap_err();
+    assert!(
+        error
+            .cause
+            .contains("frame facts differ from authenticated envelope"),
+        "{error}"
+    );
+    // Each negative is a fresh valid source envelope, with its frame revision recomputed.
+    // The refusal is a semantic admission invariant, never a decode or receipt-hash error.
+    for (pointer, changed, refusal) in [
+        (
+            "/decision_inputs/inputs/copy_eligible",
+            json!(false),
+            "wallet not copy eligible",
+        ),
+        (
+            "/decision_inputs/inputs/history_complete",
+            json!(false),
+            "wallet history incomplete",
+        ),
+        (
+            "/decision_inputs/inputs/fenced",
+            json!(true),
+            "wallet fenced",
+        ),
         (
             "/decision_inputs/inputs/coverage/reanchor_required",
             json!(true),
-        ),
-        (
-            "/decision_inputs/inputs/ledger_capture/hash",
-            json!("altered"),
-        ),
-        (
-            "/decision_inputs/inputs/ledger_anchor/balances_json",
-            json!("[] "),
-        ),
-        (
-            "/decision_inputs/inputs/ledger_groups",
-            json!([{"altered":true}]),
+            "wallet requires reanchor",
         ),
         (
             "/decision_inputs/inputs/consumed_history",
             json!([recorded.admission.market.condition_id.0.clone()]),
+            "market history consumed",
+        ),
+        (
+            "/decision_inputs/inputs/admitted_at",
+            serde_json::to_value(at() + time::Duration::seconds(91)).unwrap(),
+            "history frontier not current",
         ),
         (
             "/decision_inputs/inputs/frontier/fixed_end",
             json!(EPOCH - 2),
-        ),
-        ("/decision_inputs/inputs/frontier/pages", json!([])),
-        (
-            "/decision_inputs/inputs/frontier/page_occurrences",
-            json!([]),
-        ),
-        (
-            "/decision_inputs/inputs/frontier/commitment/this_hash",
-            json!("00".repeat(32)),
+            "complete activity read commitment differs from its frozen proof",
         ),
         (
             "/decision_inputs/inputs/latch/latest_incident",
             original_wire["observed_source_receipt"].clone(),
+            "feed latch engaged",
         ),
-        (
-            "/decision_inputs/inputs/paper_prefix",
-            original_wire["observed_source_receipt"].clone(),
-        ),
-    ];
-    for (pointer, changed) in changes {
+    ] {
+        connection.execute("UPDATE decision_pending SET state = 'open', semantic_revision = ?1, frozen_inputs_json = ?2 WHERE source_trade_id = ?3", rusqlite::params![original.semantic_revision, original.frozen_inputs_json, recorded.id.0]).unwrap();
+        pe_service::bucket_commit::validate_open_continuations(&h.paper, &h.index).unwrap();
         let mut wire = original_wire.clone();
         *wire.pointer_mut(pointer).unwrap() = changed;
-        // Recompute the revision as an attacker could; authentication must still reject it.
+        let inputs: pe_service::frame_admission::FrameAdmissionInputs =
+            serde_json::from_value(wire["decision_inputs"]["inputs"].clone()).unwrap();
+        let admission_receipt = h
+            .source
+            .append(EnvelopeIn {
+                source_id: SourceId(
+                    pe_service::frame_admission::FRAME_ADMISSION_SOURCE_ID.to_owned(),
+                ),
+                schema_version: 1,
+                parser_version: 1,
+                observed_at: SourceTimestamp(inputs.admitted_at),
+                received_at: ReceivedAt(inputs.admitted_at),
+                content_type: ContentType::Json,
+                payload: serde_json::to_vec(&wire["decision_inputs"]["inputs"]).unwrap(),
+            })
+            .await
+            .unwrap();
+        wire["decision_inputs"]["admission_receipt"] =
+            serde_json::to_value(admission_receipt).unwrap();
         let mut hash = blake3::Hasher::new();
         hash.update(b"prediction-edge/activity-frame-decision/v1\0");
         hash.update(&serde_json::to_vec(&wire["decision_inputs"]["inputs"]).unwrap());
         let revision = hash.finalize().to_hex().to_string();
         wire["semantic_revision"] = revision.clone().into();
-        connection.execute("UPDATE decision_pending SET state = 'open', semantic_revision = ?1, frozen_inputs_json = ?2 WHERE source_trade_id = ?3", rusqlite::params![revision, wire.to_string(), recorded.id.0]).unwrap();
-        assert!(
-            pe_service::bucket_commit::validate_open_continuations(&h.paper, &h.index).is_err(),
-            "accepted altered {pointer}"
-        );
+        connection.execute("UPDATE decision_pending SET semantic_revision = ?1, frozen_inputs_json = ?2 WHERE source_trade_id = ?3", rusqlite::params![revision, wire.to_string(), recorded.id.0]).unwrap();
+        let error =
+            pe_service::bucket_commit::validate_open_continuations(&h.paper, &h.index).unwrap_err();
+        assert!(error.cause.contains(refusal), "{pointer}: {error}");
     }
     connection.execute("UPDATE decision_pending SET state = 'terminal', semantic_revision = ?1, frozen_inputs_json = ?2 WHERE source_trade_id = ?3", rusqlite::params![original.semantic_revision, original.frozen_inputs_json, recorded.id.0]).unwrap();
     h.start_frames();
     h.boot_barrier().await;
+    h.poll(&recorded).await;
     assert!(h.qualify_one_fill().await.replay.exact);
+}
+
+impl Harness {
+    fn feed_era(&self) -> pe_service::paper_recovery::PaperEra {
+        pe_service::paper_recovery::paper_era(
+            scan_paper_log(&self.dir.path().join("paper.log")).unwrap(),
+        )
+    }
+
+    fn feed_edges(
+        &self,
+    ) -> Vec<(
+        AppendReceipt,
+        pe_service::paper_recovery::FeedIncident,
+        pe_service::paper_recovery::HaltState,
+    )> {
+        self.feed_era()
+            .frames
+            .iter()
+            .filter_map(|frame| match &frame.frame {
+                PaperLogFrame::Record(PaperLogRecord::FeedIncidentChanged { incident, state }) => {
+                    Some((frame.receipt, incident.clone(), *state))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    async fn feed_update(&self, update: pe_service::orchestrator_control::FeedAuditUpdate) {
+        let (acknowledged, response) = tokio::sync::oneshot::channel();
+        self.control
+            .as_ref()
+            .unwrap()
+            .send(OrchestratorControl::FeedAuditUpdate {
+                update,
+                acknowledged,
+            })
+            .await
+            .unwrap();
+        response.await.unwrap().unwrap();
+    }
+
+    async fn release_feed(&self, hash: &str) {
+        pe_service::config_poller::RiskHaltReleaseHandle::new(
+            self.dir.path().join("paper.log"),
+            self.index.clone(),
+            self.control.as_ref().unwrap().clone(),
+        )
+        .apply(hash)
+        .await
+        .unwrap();
+    }
+
+    fn rest_counterpart(&self, recorded: &Recorded, change: impl FnOnce(&mut Value)) -> Recorded {
+        let mut rows: Value = serde_json::from_slice(&recorded.activity).unwrap();
+        change(&mut rows[0]);
+        let activity = serde_json::to_vec(&rows).unwrap();
+        let read = support::producer_shaped_read_v2(
+            wallet(),
+            &activity,
+            recorded.epoch,
+            recorded.epoch,
+            support::scenario_receipt(1),
+        );
+        Recorded {
+            epoch: recorded.epoch,
+            activity,
+            gamma: recorded.gamma.clone(),
+            id: read.aggregates[0].group_id.key().clone(),
+            admission: recorded.admission.clone(),
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn audit_release_recovery() {
+    for restart in [false, true] {
+        for case in [
+            "matched",
+            "side",
+            "condition",
+            "outcome",
+            "combo",
+            "zero",
+            "absent",
+        ] {
+            let mut h = Harness::new().await;
+            h.copy_budget_secs = 120;
+            let recorded = h.record(1).await;
+            h.attempt(&recorded, at());
+            h.start_frames();
+            h.empty_frontier(EPOCH - 1).await;
+            let admitted = h.deliver_frame(&recorded, |_| {}).await;
+            let terminal = h.terminal(&recorded);
+            if restart {
+                h.stop().await;
+                h.start_frames();
+                h.boot_barrier().await;
+            }
+            let mut counterpart = match case {
+                "side" => h.rest_counterpart(&recorded, |row| row["side"] = json!("SELL")),
+                "condition" => h.rest_counterpart(&recorded, |row| {
+                    row["conditionId"] = json!(format!("0x{:064x}", 999))
+                }),
+                "outcome" => h.rest_counterpart(&recorded, |row| {
+                    row["asset"] = json!("456");
+                    row["outcomeIndex"] = json!(1);
+                    row["outcome"] = json!("No");
+                }),
+                "combo" => h.rest_counterpart(&recorded, |row| row["isCombo"] = json!(true)),
+                "zero" => h.rest_counterpart(&recorded, |row| {
+                    row["size"] = json!("0");
+                    row["usdcSize"] = json!("0");
+                }),
+                _ => h.rest_counterpart(&recorded, |row| {
+                    row["size"] = json!("11");
+                    row["usdcSize"] = json!("5.5");
+                    row["timestamp"] = json!(EPOCH + 1);
+                }),
+            };
+            if case == "condition" {
+                let mut gamma: Value = serde_json::from_slice(&counterpart.gamma).unwrap();
+                gamma[0]["conditionId"] = json!(format!("0x{:064x}", 999));
+                counterpart.gamma = serde_json::to_vec(&gamma).unwrap();
+            }
+            if case == "absent" {
+                counterpart.activity = b"[]".to_vec();
+                counterpart.epoch = EPOCH + 120;
+            }
+            h.poll(&counterpart).await;
+            assert_eq!(h.terminal(&recorded), terminal, "{case}, restart={restart}");
+            assert_eq!(h.paper.decision_pending_history().unwrap().len(), 1);
+            let edges = h.feed_edges();
+            if case == "matched" {
+                assert!(edges.is_empty());
+            } else {
+                assert_eq!(edges.len(), 1, "{case}, restart={restart}");
+                assert_eq!(edges[0].1.frame_receipt, admitted);
+                let status = pe_service::status_writer::SourceHealthStatus::from_health(
+                    &h.health.lock().unwrap(),
+                    at(),
+                    tokio::time::Instant::now(),
+                );
+                assert_eq!(status.feed_incident, Some(edges[0].1.clone()));
+                assert_eq!(status.feed_latch.latest_incident, Some(edges[0].0));
+                assert_eq!(
+                    edges[0].1.cause,
+                    if case == "absent" {
+                        pe_service::paper_recovery::FeedIncidentCause::Absence
+                    } else {
+                        pe_service::paper_recovery::FeedIncidentCause::Contradiction
+                    }
+                );
+                assert!(
+                    pe_service::paper_recovery::feed_latch_basis(&h.feed_era())
+                        .unwrap()
+                        .engaged()
+                );
+                h.stop().await;
+                h.start_frames();
+                h.boot_barrier().await;
+                assert!(
+                    pe_service::paper_recovery::feed_latch_basis(&h.feed_era())
+                        .unwrap()
+                        .engaged()
+                );
+                for invalid in ["", "malformed", &"00".repeat(32)] {
+                    h.release_feed(invalid).await;
+                }
+                assert_eq!(h.feed_edges().len(), 1);
+                h.release_feed(edges[0].0.this_hash.to_hex().as_str()).await;
+                h.release_feed(edges[0].0.this_hash.to_hex().as_str()).await;
+                assert_eq!(h.feed_edges().len(), 2);
+                assert!(
+                    !pe_service::paper_recovery::feed_latch_basis(&h.feed_era())
+                        .unwrap()
+                        .engaged()
+                );
+                h.stop().await;
+                h.start_frames();
+                h.boot_barrier().await;
+                assert!(
+                    !pe_service::paper_recovery::feed_latch_basis(&h.feed_era())
+                        .unwrap()
+                        .engaged()
+                );
+            }
+            h.stop().await;
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn audit_release_recovery_admitted_receipt_survives_excluded_zero() {
+    for restart in [false, true] {
+        let mut h = Harness::new().await;
+        let recorded = h.record(1).await;
+        h.attempt(&recorded, at());
+        h.start_frames();
+        h.empty_frontier(EPOCH - 1).await;
+        let excluded = h
+            .deliver_frame(&recorded, |row| {
+                row["size"] = json!("0");
+                row["usdcSize"] = json!("0");
+            })
+            .await;
+        let admitted = h.deliver_frame(&recorded, |_| {}).await;
+        assert_ne!(excluded, admitted);
+        if restart {
+            h.stop().await;
+            h.start_frames();
+            h.boot_barrier().await;
+        }
+        let echo = h.rest_counterpart(&recorded, |row| row["side"] = json!("SELL"));
+        h.poll(&echo).await;
+        assert_eq!(h.feed_edges().len(), 1);
+        assert_eq!(h.feed_edges()[0].1.frame_receipt, admitted);
+        h.stop().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn audit_release_recovery_absence_maturity_and_late_market_echo() {
+    for restart in [false, true] {
+        let mut h = Harness::new().await;
+        h.copy_budget_secs = 120;
+        let recorded = h.record(1).await;
+        h.attempt(&recorded, at());
+        h.start_frames();
+        h.empty_frontier(EPOCH - 1).await;
+        h.deliver_frame(&recorded, |_| {}).await;
+        h.paper.set_cursor(&wallet(), EPOCH + 500).unwrap();
+        let mut empty = recorded.clone();
+        empty.activity = b"[]".to_vec();
+        empty.epoch = EPOCH + 119;
+        h.poll(&empty).await;
+        assert!(h.feed_edges().is_empty());
+        if restart {
+            h.stop().await;
+            h.start_frames();
+            h.boot_barrier().await;
+        }
+        empty.epoch = EPOCH + 120;
+        h.poll(&empty).await;
+        assert_eq!(h.feed_edges().len(), 1);
+        let engagement = h.feed_edges()[0].0;
+        h.release_feed(engagement.this_hash.to_hex().as_str()).await;
+        let echo = h.rest_counterpart(&recorded, |row| {
+            row["conditionId"] = json!(format!("0x{:064x}", 888));
+            row["timestamp"] = json!(EPOCH + 501);
+        });
+        let mut echo = echo;
+        echo.epoch = EPOCH + 501;
+        let mut gamma: Value = serde_json::from_slice(&echo.gamma).unwrap();
+        gamma[0]["conditionId"] = json!(format!("0x{:064x}", 888));
+        echo.gamma = serde_json::to_vec(&gamma).unwrap();
+        h.poll(&echo).await;
+        assert_eq!(h.paper.decision_pending_history().unwrap().len(), 1);
+        assert_eq!(h.feed_edges().len(), 2);
+        assert_eq!(
+            h.paper
+                .activity_group_state(&echo.id)
+                .unwrap()
+                .unwrap()
+                .disposition,
+            "applied"
+        );
+        h.stop().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn audit_release_recovery_two_incidents_and_two_cycles() {
+    for restart in [false, true] {
+        let mut h = Harness::new().await;
+        let first = h.record(1).await;
+        let second = h.record(2).await;
+        h.attempt(&first, at());
+        h.attempt(&second, at());
+        h.start_frames();
+        h.empty_frontier(EPOCH - 1).await;
+        h.deliver_frame(&first, |_| {}).await;
+        h.deliver_frame(&second, |_| {}).await;
+        let bad_first = h.rest_counterpart(&first, |row| row["side"] = json!("SELL"));
+        h.poll(&bad_first).await;
+        let old = h.feed_edges()[0].0;
+        // This request models the config lookup captured before a newer engagement.
+        let queued_old_release = pe_service::orchestrator_control::FeedAuditUpdate::Release {
+            expected_engagement_hash: old.this_hash,
+        };
+        let bad_second = h.rest_counterpart(&second, |row| row["side"] = json!("SELL"));
+        h.poll(&bad_second).await;
+        assert_eq!(h.feed_edges().len(), 2);
+        let latest = h.feed_edges()[1].0;
+        if restart {
+            h.stop().await;
+            h.start_frames();
+            h.boot_barrier().await;
+        }
+        h.feed_update(queued_old_release).await;
+        h.release_feed(old.this_hash.to_hex().as_str()).await;
+        assert_eq!(h.feed_edges().len(), 2);
+        h.release_feed(latest.this_hash.to_hex().as_str()).await;
+        assert_eq!(h.feed_edges().len(), 3);
+        assert!(
+            !pe_service::paper_recovery::feed_latch_basis(&h.feed_era())
+                .unwrap()
+                .engaged()
+        );
+        // A second incident/release cycle preserves every earlier edge.
+        h.empty_frontier(EPOCH + 1).await;
+        let third = h.record(3).await;
+        h.hooks
+            .financial_clock_unix
+            .store(third.epoch, Ordering::SeqCst);
+        h.terminal_clock = at() + time::Duration::seconds(2);
+        h.stop().await;
+        h.start_frames();
+        h.boot_barrier().await;
+        h.attempt(&third, at() + time::Duration::seconds(2));
+        h.deliver_frame(&third, |_| {}).await;
+        let bad_third = h.rest_counterpart(&third, |row| row["side"] = json!("SELL"));
+        h.poll(&bad_third).await;
+        assert_eq!(h.feed_edges().len(), 4);
+        let next = h.feed_edges()[3].0;
+        h.release_feed(next.this_hash.to_hex().as_str()).await;
+        assert_eq!(h.feed_edges().len(), 5);
+        h.stop().await;
+        h.start_frames();
+        h.boot_barrier().await;
+        assert_eq!(h.feed_edges().len(), 5);
+        assert!(
+            !pe_service::paper_recovery::feed_latch_basis(&h.feed_era())
+                .unwrap()
+                .engaged()
+        );
+        let report = h.qualify_one_fill().await;
+        assert!(
+            report.replay.exact,
+            "{}",
+            serde_json::to_string(&report).unwrap()
+        );
+        assert_eq!(report.replay.fills, 3);
+        h.stop().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn audit_release_recovery_risk_halts_are_independent() {
+    let mut h = Harness::new().await;
+    let recorded = h.record(1).await;
+    h.attempt(&recorded, at());
+    h.start_frames();
+    h.empty_frontier(EPOCH - 1).await;
+    h.deliver_frame(&recorded, |_| {}).await;
+    let bad = h.rest_counterpart(&recorded, |row| row["side"] = json!("SELL"));
+    h.poll(&bad).await;
+    let engagement = h.feed_edges()[0].0;
+    let (acknowledged, response) = tokio::sync::oneshot::channel();
+    h.control
+        .as_ref()
+        .unwrap()
+        .send(OrchestratorControl::RiskHaltChange {
+            owner: pe_service::paper_recovery::RiskHaltOwner::Paper,
+            cause: pe_risk_engine::RiskHaltCause::AbsoluteLoss,
+            state: pe_service::paper_recovery::HaltState::Engaged,
+            evidence: json!({"fixture":"independent cause"}),
+            acknowledged,
+        })
+        .await
+        .unwrap();
+    let risk = response.await.unwrap().unwrap();
+    h.release_feed(risk.this_hash.to_hex().as_str()).await;
+    assert!(pe_service::paper_recovery::active_risk_halts(&h.feed_era()).is_empty());
+    assert!(
+        pe_service::paper_recovery::feed_latch_basis(&h.feed_era())
+            .unwrap()
+            .engaged()
+    );
+    // Re-engage the risk cause, then release only the feed incident.
+    let (acknowledged, response) = tokio::sync::oneshot::channel();
+    h.control
+        .as_ref()
+        .unwrap()
+        .send(OrchestratorControl::RiskHaltChange {
+            owner: pe_service::paper_recovery::RiskHaltOwner::Paper,
+            cause: pe_risk_engine::RiskHaltCause::AbsoluteLoss,
+            state: pe_service::paper_recovery::HaltState::Engaged,
+            evidence: json!({"fixture":"second risk cause"}),
+            acknowledged,
+        })
+        .await
+        .unwrap();
+    response.await.unwrap().unwrap();
+    h.release_feed(engagement.this_hash.to_hex().as_str()).await;
+    assert_eq!(
+        pe_service::paper_recovery::active_risk_halts(&h.feed_era()).len(),
+        1
+    );
+    assert!(
+        !pe_service::paper_recovery::feed_latch_basis(&h.feed_era())
+            .unwrap()
+            .engaged()
+    );
+    h.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn frontier_fallback_five_day_wallet_beside_current_wallet() {
+    let other = WalletAddress::from_hex("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+    let mut h = Harness::new_with_leaders(3, runtime(), vec![wallet(), other]).await;
+    let stale = h.record(1).await;
+    let mut current = stale.clone();
+    let mut rows: Value = serde_json::from_slice(&current.activity).unwrap();
+    rows[0]["proxyWallet"] = json!(other.to_string());
+    rows[0]["transactionHash"] = json!("current-wallet");
+    current.activity = serde_json::to_vec(&rows).unwrap();
+    current.id = support::producer_shaped_read_v2(
+        other,
+        &current.activity,
+        EPOCH,
+        EPOCH,
+        support::scenario_receipt(1),
+    )
+    .aggregates[0]
+        .group_id
+        .key()
+        .clone();
+    h.start_frames();
+    h.empty_frontier(EPOCH - 5 * 86400).await;
+    h.empty_frontier_for(other, EPOCH - 1).await;
+    h.deliver_frame(&stale, |_| {}).await;
+    h.attempt(&current, at());
+    h.deliver_frame(&current, |_| {}).await;
+    assert!(h.paper.decision_pending_for(&stale.id).unwrap().is_none());
+    assert_eq!(
+        h.terminal(&current).terminal_disposition.as_deref(),
+        Some("fill")
+    );
+    h.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn queue_shutdown_crashes() {
+    use pe_service::orchestrator::FrameCrashBoundary;
+    for boundary in [
+        FrameCrashBoundary::FrameCommit,
+        FrameCrashBoundary::Staging,
+        FrameCrashBoundary::Prepared,
+        FrameCrashBoundary::Authority,
+        FrameCrashBoundary::Final,
+    ] {
+        let mut h = Harness::new().await;
+        let recorded = h.record(1).await;
+        h.arm();
+        h.attempt(&recorded, at());
+        h.start_frames();
+        h.empty_frontier(EPOCH - 1).await;
+        *h.hooks.frame_crash_boundary.lock().unwrap() = Some(boundary);
+        let receipt = h.append_frame(&recorded, |_| {}).await;
+        h.control
+            .as_ref()
+            .unwrap()
+            .send(OrchestratorControl::ActivityFrameDecision { receipt })
+            .await
+            .unwrap();
+        assert!(
+            h.task.take().unwrap().await.unwrap().is_err(),
+            "{boundary:?}"
+        );
+        assert_eq!(h.paper.open_decision_pending().unwrap().len(), 1);
+        assert!(h.paper.leader_positions().unwrap().is_empty());
+        h.stop().await;
+        let writer =
+            pe_service::paper_recovery::PaperLog::open(h.dir.path().join("paper.log")).unwrap();
+        pe_service::orchestrator::SCENARIO_TERMINAL_CLOCK
+            .scope(
+                at(),
+                reconcile_active_financial_frames(
+                    &h.authority,
+                    &h.paper,
+                    SourceEvidence::Index(&h.index),
+                    &writer,
+                ),
+            )
+            .await
+            .unwrap();
+        drop(writer);
+        h.hooks.age_clock.lock().unwrap().clear();
+        h.hooks.admission_artifacts.lock().unwrap().clear();
+        h.attempt(&recorded, at());
+        h.start_frames();
+        h.boot_barrier().await;
+        assert_eq!(
+            h.terminal(&recorded).terminal_disposition.as_deref(),
+            Some("fill"),
+            "{boundary:?}"
+        );
+        assert_eq!(h.prepared_count(), 1, "{boundary:?}");
+        assert_eq!(h.authority.inner.lock().unwrap().fills.len(), 1);
+        assert_eq!(identifier_counts(&h, &recorded.id), (0, 1, 1, 0));
+        h.poll(&recorded).await;
+        assert_eq!(identifier_counts(&h, &recorded.id), (1, 1, 1, 0));
+        assert!(h.qualify_one_fill().await.replay.exact);
+    }
+    for boundary in [
+        pe_service::trade_poller::ReconciliationCrashBoundary::Commitment,
+        pe_service::trade_poller::ReconciliationCrashBoundary::Bucket,
+    ] {
+        let mut h = Harness::new().await;
+        h.poller_boot_rebuild = true;
+        let recorded = h.record(1).await;
+        h.attempt(&recorded, at());
+        h.start_frames();
+        h.empty_frontier(EPOCH - 1).await;
+        h.deliver_frame(&recorded, |_| {}).await;
+        let terminal = h.terminal(&recorded);
+        *h.poller_crash.lock().unwrap() = Some(boundary);
+        assert!(
+            h.poll_source_result(&recorded, None, at(), 0)
+                .await
+                .is_err()
+        );
+        h.stop().await;
+        h.start_frames();
+        h.boot_barrier().await;
+        h.poll(&recorded).await;
+        assert_eq!(h.terminal(&recorded), terminal);
+        assert_eq!(
+            h.paper.leader_positions().unwrap()[0]
+                .long_contracts
+                .to_decimal(),
+            dec!(5)
+        );
+        assert_eq!(h.paper.decision_pending_history().unwrap().len(), 1);
+        assert_eq!(identifier_counts(&h, &recorded.id), (1, 1, 0, 0));
+        assert!(h.qualify_one_fill().await.replay.exact);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn equal_identifier_reconciliation_preserves_later_frame_no_copy_reason() {
+    let mut h = Harness::new().await;
+    let recorded = h.record(1).await;
+    h.start_frames();
+    h.empty_frontier(EPOCH - 1).await;
+    *h.hooks.frame_crash_boundary.lock().unwrap() =
+        Some(pe_service::orchestrator::FrameCrashBoundary::FrameCommit);
+    let receipt = h.append_frame(&recorded, |_| {}).await;
+    h.control
+        .as_ref()
+        .unwrap()
+        .send(OrchestratorControl::ActivityFrameDecision { receipt })
+        .await
+        .unwrap();
+    assert!(h.task.take().unwrap().await.unwrap().is_err());
+    h.stop().await;
+    let page = h
+        .source
+        .append(EnvelopeIn {
+            source_id: SourceId(pe_service::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned()),
+            schema_version: 3,
+            parser_version: 2,
+            observed_at: SourceTimestamp(at()),
+            received_at: ReceivedAt(at()),
+            content_type: ContentType::Json,
+            payload: recorded.activity.clone(),
+        })
+        .await
+        .unwrap();
+    let read = support::producer_shaped_read_v2(wallet(), &recorded.activity, EPOCH, EPOCH, page);
+    let commitment = h
+        .source
+        .append(EnvelopeIn {
+            source_id: SourceId(
+                pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID.to_owned(),
+            ),
+            schema_version: 2,
+            parser_version: 1,
+            observed_at: SourceTimestamp(at()),
+            received_at: ReceivedAt(at()),
+            content_type: ContentType::Json,
+            payload: read.commitment_payload.clone(),
+        })
+        .await
+        .unwrap();
+    let mut context = support::read_context(&read, commitment, EPOCH);
+    context.applied_configuration = h.config.clone();
+    let mut engine =
+        BucketCommitEngine::load(h.paper.clone(), build_leader_ledger(&h.paper).unwrap()).unwrap();
+    engine
+        .commit_with_freshness_policy(
+            read.aggregates,
+            &context,
+            FrozenDecisionBasis {
+                win_rate_p: h.probability,
+                bankroll: CASH,
+            },
+            Some(PaperFreshnessPolicy {
+                activity_ws_enabled: true,
+                copy_latency_budget_secs: h.copy_budget_secs,
+            }),
+        )
+        .unwrap();
+    assert_eq!(identifier_counts(&h, &recorded.id), (1, 0, 0, 0));
+    h.attempt(&recorded, at());
+    h.hooks.age_clock.lock().unwrap().clear();
+    h.hooks
+        .age_clock
+        .lock()
+        .unwrap()
+        .push_back(at() + time::Duration::seconds(3));
+    h.start_frames();
+    h.boot_barrier().await;
+    let terminal = h.terminal(&recorded);
+    let reason = replay_decision_pending(&terminal)
+        .unwrap()
+        .post_boundary
+        .body
+        .terminal
+        .reason;
+    assert_eq!(reason, "stale_activity_ws_past_copy_budget");
+    assert_eq!(
+        h.paper
+            .no_copy_disposition(&recorded.id)
+            .unwrap()
+            .unwrap()
+            .2,
+        reason
+    );
+    assert_eq!(identifier_counts(&h, &recorded.id), (1, 0, 0, 1));
+    h.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn audit_binding_semantic_refusals_keep_valid_commitments() {
+    let mut h = Harness::new().await;
+    let recorded = h.record(1).await;
+    h.attempt(&recorded, at());
+    h.start_frames();
+    h.empty_frontier(EPOCH - 1).await;
+    h.deliver_frame(&recorded, |_| {}).await;
+    let bad = h.rest_counterpart(&recorded, |row| row["side"] = json!("SELL"));
+    h.poll(&bad).await;
+    let incident = h.feed_edges()[0].1.clone();
+    h.feed_update(pe_service::orchestrator_control::FeedAuditUpdate::Incident(
+        incident.clone(),
+    ))
+    .await;
+    let source = pe_event_log::Reader::replay(h.dir.path().join("source.log"))
+        .unwrap()
+        .map(|frame| frame.unwrap().1)
+        .find(|frame| frame.seq == incident.deciding_commitment_receipt.sequence)
+        .unwrap();
+    let original: pe_service::bucket_commit::ActivityReadCommitment =
+        serde_json::from_slice(&source.payload).unwrap();
+    let proof = original.read_proof.as_ref().unwrap();
+    for (fact, refusal) in [
+        (
+            "identity",
+            "binding target is absent from the complete read",
+        ),
+        ("revision", "binding target revision differs"),
+        (
+            "side_rule",
+            "binding history identity is absent or ambiguous",
+        ),
+    ] {
+        let mut bindings = original.bindings.clone().unwrap();
+        match fact {
+            "identity" => {
+                bindings[0].history_group_id = SourceTradeId("g2:another-target".to_owned())
+            }
+            "revision" => bindings[0].semantic_revision = "another-revision".to_owned(),
+            _ => bindings[0].frame_admission_receipt = None,
+        }
+        let payload = pe_service::bucket_commit::activity_read_commitment_payload_v2(
+            original.wallet,
+            original.fixed_end,
+            &proof.page_occurrences,
+            &proof.pages,
+            &bindings,
+        )
+        .unwrap();
+        let commitment = h
+            .source
+            .append(EnvelopeIn {
+                source_id: SourceId(
+                    pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID.to_owned(),
+                ),
+                schema_version: 2,
+                parser_version: 1,
+                observed_at: SourceTimestamp(at()),
+                received_at: ReceivedAt(at()),
+                content_type: ContentType::Json,
+                payload,
+            })
+            .await
+            .unwrap();
+        let mut altered = incident.clone();
+        altered.deciding_commitment_receipt = commitment;
+        let (acknowledged, response) = tokio::sync::oneshot::channel();
+        h.control
+            .as_ref()
+            .unwrap()
+            .send(OrchestratorControl::FeedAuditUpdate {
+                update: pe_service::orchestrator_control::FeedAuditUpdate::Incident(altered),
+                acknowledged,
+            })
+            .await
+            .unwrap();
+        let error = response.await.unwrap().unwrap_err();
+        assert!(error.contains(refusal), "{fact}: {error}");
+        assert_eq!(h.feed_edges().len(), 1);
+    }
+    h.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn audit_release_recovery_latched_history_entry_within_budget() {
+    for restart in [false, true] {
+        let mut h = Harness::new().await;
+        let recorded = h.record(1).await;
+        h.attempt(&recorded, at());
+        h.start_frames();
+        h.empty_frontier(EPOCH - 1).await;
+        h.deliver_frame(&recorded, |_| {}).await;
+        let bad = h.rest_counterpart(&recorded, |row| row["side"] = json!("SELL"));
+        h.poll(&bad).await;
+        if restart {
+            h.stop().await;
+            h.start_frames();
+            h.boot_barrier().await;
+        }
+        let missed = h.record(2).await;
+        h.attempt(&missed, at());
+        h.poll(&missed).await;
+        assert_eq!(
+            h.terminal(&missed).terminal_disposition.as_deref(),
+            Some("fill")
+        );
+        assert!(
+            !replay_decision_pending(&h.terminal(&missed))
+                .unwrap()
+                .continuation
+                .is_activity_frame()
+        );
+        assert_eq!(h.feed_edges().len(), 1);
+        assert!(
+            pe_service::paper_recovery::feed_latch_basis(&h.feed_era())
+                .unwrap()
+                .engaged()
+        );
+        h.stop().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn audit_release_recovery_failed_read_exposes_unresolved_audit() {
+    for restart in [false, true] {
+        let mut h = Harness::new().await;
+        h.copy_budget_secs = 120;
+        h.poller_boot_rebuild = true;
+        let recorded = h.record(1).await;
+        h.attempt(&recorded, at());
+        h.start_frames();
+        h.empty_frontier(EPOCH - 1).await;
+        h.deliver_frame(&recorded, |_| {}).await;
+        let before = h.paper.feed_history_frontiers().unwrap();
+        let mut incomplete = recorded.clone();
+        incomplete.epoch = EPOCH + 120;
+        h.poller_fetch_failed = true;
+        h.poll(&incomplete).await;
+        h.poller_fetch_failed = false;
+        assert!(h.feed_edges().is_empty());
+        assert_eq!(h.paper.feed_history_frontiers().unwrap(), before);
+        if restart {
+            h.stop().await;
+            h.start_frames();
+            h.boot_barrier().await;
+        }
+        let obligations = pe_service::trade_poller::rebuild_reconciliation_obligations(
+            &h.dir.path().join("source.log"),
+            &h.paper,
+        )
+        .unwrap();
+        assert_eq!(obligations.len(), 1);
+        let report = h.qualify_one_fill().await;
+        assert_eq!(
+            report.verdict,
+            pe_service::qualification::QualificationVerdict::InsufficientEvidence
+        );
+        assert!(
+            report
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("unresolved frame audits")),
+            "{:?}",
+            report.reasons
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn audit_release_recovery_matched_duplicate_never_reopens_absence() {
+    for restart in [false, true] {
+        let mut h = Harness::new().await;
+        h.copy_budget_secs = 120;
+        h.poller_boot_rebuild = true;
+        let recorded = h.record(1).await;
+        h.attempt(&recorded, at());
+        h.start_frames();
+        h.empty_frontier(EPOCH - 1).await;
+        h.deliver_frame(&recorded, |_| {}).await;
+        h.poll(&recorded).await;
+        if restart {
+            h.stop().await;
+            h.start_frames();
+            h.boot_barrier().await;
+        }
+        // A new synchronized observation of a retired identity cannot turn a later
+        // empty read into an absence for the already matched admission.
+        h.append_frame(&recorded, |_| {}).await;
+        let mut empty = recorded.clone();
+        empty.activity = b"[]".to_vec();
+        empty.epoch = EPOCH + 120;
+        h.poll(&empty).await;
+        assert!(h.feed_edges().is_empty());
+        assert_eq!(identifier_counts(&h, &recorded.id), (1, 1, 0, 0));
+        assert!(
+            pe_service::trade_poller::rebuild_reconciliation_obligations(
+                &h.dir.path().join("source.log"),
+                &h.paper,
+            )
+            .unwrap()
+            .is_empty()
+        );
+        h.stop().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn audit_release_recovery_retained_negative_precedes_failed_fetch() {
+    for cause in ["contradicted", "absent"] {
+        let mut h = Harness::new().await;
+        h.copy_budget_secs = 120;
+        h.poller_boot_rebuild = true;
+        let recorded = h.record(1).await;
+        h.attempt(&recorded, at());
+        h.start_frames();
+        h.empty_frontier(EPOCH - 1).await;
+        let receipt = h.deliver_frame(&recorded, |_| {}).await;
+        let mut deciding = h.rest_counterpart(&recorded, |row| row["side"] = json!("SELL"));
+        if cause == "absent" {
+            deciding.activity = b"[]".to_vec();
+            deciding.epoch = EPOCH + 120;
+        }
+        *h.poller_crash.lock().unwrap() =
+            Some(pe_service::trade_poller::ReconciliationCrashBoundary::Commitment);
+        assert!(
+            h.poll_source_result(
+                &deciding,
+                None,
+                OffsetDateTime::from_unix_timestamp(deciding.epoch).unwrap(),
+                0,
+            )
+            .await
+            .is_err()
+        );
+        assert!(h.feed_edges().is_empty());
+        h.stop().await;
+        h.start_frames();
+        h.boot_barrier().await;
+        h.poller_fetch_failed = true;
+        h.poll(&deciding).await;
+        assert_eq!(h.feed_edges().len(), 1);
+        assert_eq!(h.feed_edges()[0].1.frame_receipt, receipt);
+        let mut obligations = pe_service::trade_poller::rebuild_reconciliation_obligations(
+            &h.dir.path().join("source.log"),
+            &h.paper,
+        )
+        .unwrap();
+        obligations.retire_feed_incidents(&h.feed_era());
+        assert!(obligations.is_empty());
+        h.poller_fetch_failed = false;
+        h.poll(&deciding).await;
+        assert_eq!(h.feed_edges().len(), 1);
+        assert_eq!(h.paper.decision_pending_history().unwrap().len(), 1);
+        assert!(h.qualify_one_fill().await.replay.exact);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn audit_release_recovery_fence_after_admission_keeps_exactly_one_audit() {
+    for cause in ["matched", "contradicted", "absent"] {
+        let mut h = Harness::new().await;
+        h.copy_budget_secs = 120;
+        h.poller_boot_rebuild = true;
+        let recorded = h.record(1).await;
+        h.start_frames();
+        h.empty_frontier(EPOCH - 1).await;
+        *h.hooks.frame_crash_boundary.lock().unwrap() =
+            Some(pe_service::orchestrator::FrameCrashBoundary::FrameCommit);
+        let receipt = h.append_frame(&recorded, |_| {}).await;
+        h.control
+            .as_ref()
+            .unwrap()
+            .send(OrchestratorControl::ActivityFrameDecision { receipt })
+            .await
+            .unwrap();
+        assert!(h.task.take().unwrap().await.unwrap().is_err());
+        h.stop().await;
+        rusqlite::Connection::open(h.dir.path().join("paper.db")).unwrap().execute(
+            "INSERT INTO wallet_fences(wallet_hex,source_trade_id,cause,proof_json,fenced_at_unix) VALUES (?1,?2,'ineligible_mapping','{}',?3)",
+            rusqlite::params![wallet().to_string(), "fixture-fence", EPOCH],
+        ).unwrap();
+        h.start_frames();
+        h.boot_barrier().await;
+        assert_eq!(
+            h.terminal(&recorded).terminal_disposition.as_deref(),
+            Some("no_copy:wallet_fenced_before_dispatch")
+        );
+        assert!(h.paper.leader_positions().unwrap().is_empty());
+        assert_eq!(h.prepared_count(), 0);
+        let mut counterpart = h.rest_counterpart(&recorded, |row| {
+            if cause == "contradicted" {
+                row["side"] = json!("SELL");
+            }
+        });
+        if cause == "absent" {
+            counterpart.activity = b"[]".to_vec();
+            counterpart.epoch = EPOCH + 120;
+        }
+        h.poll(&counterpart).await;
+        assert_eq!(h.feed_edges().len(), usize::from(cause != "matched"));
+        if cause != "matched" {
+            assert_eq!(h.feed_edges()[0].1.frame_receipt, receipt);
+        }
+        h.stop().await;
+        h.start_frames();
+        h.boot_barrier().await;
+        h.poll(&counterpart).await;
+        assert_eq!(h.feed_edges().len(), usize::from(cause != "matched"));
+        assert_eq!(h.paper.decision_pending_history().unwrap().len(), 1);
+        assert!(h.paper.open_positions().unwrap().is_empty());
+        assert_eq!(h.prepared_count(), 0);
+        let mut obligations = pe_service::trade_poller::rebuild_reconciliation_obligations(
+            &h.dir.path().join("source.log"),
+            &h.paper,
+        )
+        .unwrap();
+        obligations.retire_feed_incidents(&h.feed_era());
+        assert!(obligations.is_empty());
+        h.stop().await;
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn historical_mixed_buy_corrected_sell_checkpoint_boot_and_qualification() {
+    let mut h = Harness::new().await;
+    h.poller_boot_rebuild = true;
+    h.install_checkpoint_metadata();
+    let recorded = h.record(1).await;
+    h.start(true);
+    let buy = h.append_frame(&recorded, |_| {}).await;
+    let sell = h
+        .append_frame(&recorded, |row| {
+            row["side"] = json!("SELL");
+            row["conditionId"] = json!(format!("0x{:064x}", 999));
+        })
+        .await;
+    let mut mixed = recorded.clone();
+    let mut rows: Value = serde_json::from_slice(&recorded.activity).unwrap();
+    let mut sold = rows[0].clone();
+    sold["side"] = json!("SELL");
+    rows.as_array_mut().unwrap().push(sold);
+    mixed.activity = serde_json::to_vec(&rows).unwrap();
+    h.poll(&mixed).await;
+    let bindings = pe_event_log::Reader::replay(h.dir.path().join("source.log"))
+        .unwrap()
+        .map(|frame| frame.unwrap().1)
+        .filter(|frame| {
+            frame.source_id.0 == pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID
+        })
+        .flat_map(|frame| {
+            serde_json::from_slice::<pe_service::bucket_commit::ActivityReadCommitment>(
+                &frame.payload,
+            )
+            .unwrap()
+            .bindings
+            .unwrap_or_default()
+        })
+        .collect::<Vec<_>>();
+    let exact = bindings
+        .iter()
+        .find(|binding| binding.stream_receipt == buy)
+        .unwrap();
+    let corrected = bindings
+        .iter()
+        .find(|binding| binding.stream_receipt == sell)
+        .unwrap();
+    assert!(exact.frame_admission_receipt.is_none());
+    assert!(corrected.frame_admission_receipt.is_none());
+    assert!(exact.identity_receipt.is_none());
+    assert!(corrected.identity_receipt.is_some());
+    assert_ne!(exact.history_group_id, corrected.history_group_id);
+    assert!(h.feed_edges().is_empty());
+    let next = h.record(2).await;
+    h.stop().await;
+    h.hooks
+        .financial_clock_unix
+        .store(next.epoch, Ordering::SeqCst);
+    h.terminal_clock = OffsetDateTime::from_unix_timestamp(next.epoch).unwrap();
+    h.start_frames();
+    h.boot_barrier().await;
+    h.attempt(&next, h.terminal_clock);
+    h.poll(&next).await;
+    assert_eq!(
+        h.terminal(&next).terminal_disposition.as_deref(),
+        Some("fill")
+    );
+    pe_service::source_log_boot::SourceLogBoot::prepare_checkpoint(&h.dir.path().join("paper.db"))
+        .unwrap();
+    let report = h.qualify_one_fill().await;
+    assert!(
+        report.replay.exact,
+        "{}",
+        serde_json::to_string(&report).unwrap()
+    );
+    h.coordinator.abort();
+    let _ = (&mut h.coordinator).await;
+    // Remove only the generated test checkpoint to exercise the complete source walk.
+    std::fs::remove_file(h.dir.path().join("source.log.boot-checkpoint")).unwrap();
+    let paths = pe_service::paper_migration::PaperMigrationPaths {
+        fixed_main: h.dir.path().join("paper.db"),
+        source_log: h.dir.path().join("source.log"),
+        paper_log: h.dir.path().join("paper.log"),
+        live_journal: h.dir.path().join("live_journal.log"),
+        legacy_history: h.dir.path().join("wallet_market_history.json"),
+        binary_identity: "mixed-leg-scenario".to_owned(),
+    };
+    h.paper
+        .record_migration_activation_facts(
+            &json!({"fixture":"synthetic mixed-leg activation"}),
+            &paths.binary_identity,
+        )
+        .unwrap();
+    let mut opened = pe_service::source_log_boot::SourceLogBoot::open(&paths, true)
+        .unwrap()
+        .unwrap();
+    opened.boot.extend(&mut opened.sink).unwrap();
+    let obligations = opened.boot.obligations(&h.paper, &paths.paper_log).unwrap();
+    assert!(obligations.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn audit_release_recovery_contradiction_queued_during_open_frame_completes_it() {
+    let mut h = Harness::new().await;
+    let first = h.record(1).await;
+    let next = h.record(2).await;
+    h.attempt(&first, at());
+    h.start_frames();
+    h.empty_frontier(EPOCH - 1).await;
+    *h.books.gate.market.lock().unwrap() = Some(first.admission.market.condition_id.0.clone());
+    h.books.gate.blocked.store(true, Ordering::SeqCst);
+    let gate = h.books.gate.clone();
+    let receipt = h.append_frame(&first, |_| {}).await;
+    h.control
+        .as_ref()
+        .unwrap()
+        .send(OrchestratorControl::ActivityFrameDecision { receipt })
+        .await
+        .unwrap();
+    gate.started.notified().await;
+    assert_eq!(h.paper.open_decision_pending().unwrap().len(), 1);
+    let bad = h.rest_counterpart(&first, |row| row["side"] = json!("SELL"));
+    let later;
+    {
+        let pending = h.poll(&bad);
+        tokio::pin!(pending);
+        let control = h.control.as_ref().unwrap();
+        tokio::select! {
+            biased;
+            () = async {
+                while control.capacity() == control.max_capacity() {
+                    tokio::task::yield_now().await;
+                }
+            } => {},
+            () = &mut pending => panic!("audit acknowledged while the frame was held"),
+        }
+        later = h.append_frame(&next, |_| {}).await;
+        control
+            .send(OrchestratorControl::ActivityFrameDecision { receipt: later })
+            .await
+            .unwrap();
+        gate.release.notify_one();
+        pending.await;
+    }
+    h.boot_barrier_readonly().await;
+    assert_eq!(
+        h.terminal(&first).terminal_disposition.as_deref(),
+        Some("fill")
+    );
+    assert_eq!(h.prepared_count(), 1);
+    assert_eq!(h.feed_edges().len(), 1);
+    assert!(h.paper.decision_pending_for(&next.id).unwrap().is_none());
+    let artifact = pe_event_log::Reader::replay(h.dir.path().join("source.log"))
+        .unwrap()
+        .map(|frame| frame.unwrap().1)
+        .filter(|frame| frame.source_id.0 == pe_service::frame_admission::FRAME_FALLBACK_SOURCE_ID)
+        .map(|frame| {
+            serde_json::from_slice::<pe_service::frame_admission::FrameFallbackArtifact>(
+                &frame.payload,
+            )
+            .unwrap()
+        })
+        .find(|artifact| artifact.frame_receipt == later)
+        .unwrap();
+    assert_eq!(
+        artifact.reason,
+        pe_service::frame_admission::FrameFallbackReason::Latched
+    );
+    h.stop().await;
+    h.hooks
+        .financial_clock_unix
+        .store(next.epoch, Ordering::SeqCst);
+    h.terminal_clock = OffsetDateTime::from_unix_timestamp(next.epoch).unwrap();
+    h.start_frames();
+    h.boot_barrier().await;
+    h.attempt(&next, h.terminal_clock);
+    h.poll(&next).await;
+    assert_eq!(
+        h.terminal(&next).terminal_disposition.as_deref(),
+        Some("fill")
+    );
+    let report = h.qualify_one_fill().await;
+    assert!(
+        report.replay.exact,
+        "{}",
+        serde_json::to_string(&report).unwrap()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn audit_release_recovery_restamps_redemption_and_unrelated_combo() {
+    for first_seen in [false, true] {
+        let mut h = Harness::new().await;
+        h.poller_boot_rebuild = true;
+        let recorded = h.record(1).await;
+        h.attempt(&recorded, at());
+        h.start_frames();
+        h.empty_frontier(EPOCH - 1).await;
+        h.deliver_frame(&recorded, |_| {}).await;
+        let terminal = h.terminal(&recorded);
+        if !first_seen {
+            h.poll(&recorded).await;
+        }
+        let mut restamped = recorded.clone();
+        let mut rows: Value = serde_json::from_slice(&recorded.activity).unwrap();
+        let mut twin = rows[0].clone();
+        twin["outcomeIndex"] = json!(999);
+        rows.as_array_mut().unwrap().push(twin);
+        if !first_seen {
+            let mut redeem = rows[0].clone();
+            redeem["type"] = json!("REDEEM");
+            redeem["side"] = json!("");
+            redeem["asset"] = json!("");
+            rows.as_array_mut().unwrap().push(redeem);
+            let mut combo = rows[0].clone();
+            combo["transactionHash"] = json!("unrelated-combo");
+            combo["isCombo"] = json!(true);
+            rows.as_array_mut().unwrap().push(combo);
+        }
+        restamped.activity = serde_json::to_vec(&rows).unwrap();
+        h.poll(&restamped).await;
+        assert!(h.feed_edges().is_empty());
+        assert_eq!(h.terminal(&recorded), terminal);
+        assert_eq!(h.paper.decision_pending_history().unwrap().len(), 1);
+        h.stop().await;
+        h.start_frames();
+        h.boot_barrier().await;
+        let obligations = pe_service::trade_poller::rebuild_reconciliation_obligations(
+            &h.dir.path().join("source.log"),
+            &h.paper,
+        )
+        .unwrap();
+        assert_eq!(obligations.len(), usize::from(first_seen));
+        // First-seen pairs remain unresolved; a later unambiguous ordinary read
+        // supplies the match even though ambiguity fenced the wallet.
+        if first_seen {
+            h.poll(&recorded).await;
+        }
+        assert!(h.feed_edges().is_empty());
+        assert_eq!(h.terminal(&recorded), terminal);
+        assert_eq!(h.paper.decision_pending_history().unwrap().len(), 1);
+        let report = h.qualify_one_fill().await;
+        assert!(
+            report.replay.exact,
+            "{}",
+            serde_json::to_string(&report).unwrap()
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn audit_release_recovery_exact_identifier_uses_effective_metadata() {
+    let mut h = Harness::new().await;
+    let recorded = h.record(1).await;
+    h.attempt(&recorded, at());
+    h.start_frames();
+    h.empty_frontier(EPOCH - 1).await;
+    h.deliver_frame(&recorded, |_| {}).await;
+    let terminal = h.terminal(&recorded);
+    let mut echo = recorded.clone();
+    let mut metadata: Value = serde_json::from_slice(&echo.gamma).unwrap();
+    metadata[0]["conditionId"] = json!(format!("0x{:064x}", 999));
+    echo.gamma = serde_json::to_vec(&metadata).unwrap();
+    h.poll(&echo).await;
+    assert_eq!(h.feed_edges().len(), 1);
+    assert_eq!(
+        h.feed_edges()[0].1.cause,
+        pe_service::paper_recovery::FeedIncidentCause::Contradiction
+    );
+    assert_eq!(
+        h.feed_edges()[0].1.counterpart_identity,
+        Some(recorded.id.clone())
+    );
+    assert_eq!(h.terminal(&recorded), terminal);
+    assert_eq!(identifier_counts(&h, &recorded.id), (1, 1, 0, 0));
+    assert!(h.qualify_one_fill().await.replay.exact);
+}
+
+#[tokio::test(start_paused = true)]
+async fn audit_release_recovery_alias_prefers_admitted_receipt_over_excluded_stamp() {
+    for restart in [false, true] {
+        let mut h = Harness::new().await;
+        h.poller_boot_rebuild = true;
+        let recorded = h.record(1).await;
+        h.attempt(&recorded, at());
+        h.start_frames();
+        h.empty_frontier(EPOCH - 1).await;
+        h.deliver_frame(&recorded, |row| {
+            row["size"] = json!("0");
+            row["usdcSize"] = json!("0");
+            row["conditionId"] = json!(format!("0x{:064x}", 888));
+        })
+        .await;
+        let admitted = h.deliver_frame(&recorded, |_| {}).await;
+        if restart {
+            h.stop().await;
+            h.start_frames();
+            h.boot_barrier().await;
+        }
+        let mut alias = h.rest_counterpart(&recorded, |row| {
+            row["conditionId"] = json!(format!("0x{:064x}", 999));
+        });
+        let mut metadata: Value = serde_json::from_slice(&alias.gamma).unwrap();
+        metadata[0]["conditionId"] = json!(format!("0x{:064x}", 999));
+        alias.gamma = serde_json::to_vec(&metadata).unwrap();
+        h.poll(&alias).await;
+        assert_eq!(h.feed_edges().len(), 1);
+        assert_eq!(h.feed_edges()[0].1.frame_receipt, admitted);
+        assert_eq!(h.paper.decision_pending_history().unwrap().len(), 1);
+        assert_eq!(h.paper.leader_positions().unwrap().len(), 1);
+        assert_eq!(
+            h.paper
+                .activity_group_state(&alias.id)
+                .unwrap()
+                .unwrap()
+                .disposition,
+            "applied"
+        );
+        let report = h.qualify_one_fill().await;
+        assert!(
+            report.replay.exact,
+            "{}",
+            serde_json::to_string(&report).unwrap()
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn qualification_semantic_negatives_keep_valid_frame_admission_frontier_and_binding_hashes() {
+    for (fact, refusal) in [
+        ("frame", "frame facts differ from authenticated envelope"),
+        ("admission", "wallet not copy eligible"),
+        (
+            "frontier",
+            "complete activity read commitment differs from its frozen proof",
+        ),
+        ("binding", "binding target is absent from the complete read"),
+    ] {
+        let mut h = Harness::new().await;
+        let recorded = h.record(1).await;
+        h.attempt(&recorded, at());
+        h.start_frames();
+        h.empty_frontier(EPOCH - 1).await;
+        h.deliver_frame(&recorded, |_| {}).await;
+        h.poll(&recorded).await;
+        assert!(h.qualify_one_fill().await.replay.exact);
+        let original = h.terminal(&recorded);
+        let mut wire: Value = serde_json::from_str(&original.frozen_inputs_json).unwrap();
+        if fact == "binding" {
+            let source = Reader::replay(h.dir.path().join("source.log"))
+                .unwrap()
+                .map(|frame| frame.unwrap().1)
+                .filter(|frame| {
+                    frame.source_id.0
+                        == pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID
+                })
+                .find(|frame| {
+                    serde_json::from_slice::<pe_service::bucket_commit::ActivityReadCommitment>(
+                        &frame.payload,
+                    )
+                    .unwrap()
+                    .bindings
+                    .is_some_and(|bindings| !bindings.is_empty())
+                })
+                .unwrap();
+            let commitment: pe_service::bucket_commit::ActivityReadCommitment =
+                serde_json::from_slice(&source.payload).unwrap();
+            let mut bindings = commitment.bindings.unwrap();
+            bindings[0].history_group_id = SourceTradeId("g2:another-target".to_owned());
+            let proof = commitment.read_proof.unwrap();
+            let payload = pe_service::bucket_commit::activity_read_commitment_payload_v2(
+                commitment.wallet,
+                commitment.fixed_end,
+                &proof.page_occurrences,
+                &proof.pages,
+                &bindings,
+            )
+            .unwrap();
+            h.source
+                .append(EnvelopeIn {
+                    source_id: SourceId(
+                        pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID.to_owned(),
+                    ),
+                    schema_version: 2,
+                    parser_version: 1,
+                    observed_at: SourceTimestamp(at()),
+                    received_at: ReceivedAt(at()),
+                    content_type: ContentType::Json,
+                    payload,
+                })
+                .await
+                .unwrap();
+        } else {
+            if fact == "frame" {
+                wire["price"] = json!("0.60");
+            } else {
+                if fact == "admission" {
+                    wire["decision_inputs"]["inputs"]["copy_eligible"] = json!(false);
+                } else {
+                    wire["decision_inputs"]["inputs"]["frontier"]["fixed_end"] = json!(EPOCH - 2);
+                }
+                let payload = serde_json::to_vec(&wire["decision_inputs"]["inputs"]).unwrap();
+                let admission = h
+                    .source
+                    .append(EnvelopeIn {
+                        source_id: SourceId(
+                            pe_service::frame_admission::FRAME_ADMISSION_SOURCE_ID.to_owned(),
+                        ),
+                        schema_version: 1,
+                        parser_version: 1,
+                        observed_at: SourceTimestamp(at()),
+                        received_at: ReceivedAt(at()),
+                        content_type: ContentType::Json,
+                        payload: payload.clone(),
+                    })
+                    .await
+                    .unwrap();
+                wire["decision_inputs"]["admission_receipt"] =
+                    serde_json::to_value(admission).unwrap();
+                let mut hash = blake3::Hasher::new();
+                hash.update(b"prediction-edge/activity-frame-decision/v1\0");
+                hash.update(&payload);
+                wire["semantic_revision"] = json!(hash.finalize().to_hex().to_string());
+            }
+            rusqlite::Connection::open(h.dir.path().join("paper.db")).unwrap().execute(
+                "UPDATE decision_pending SET semantic_revision=?1, frozen_inputs_json=?2 WHERE source_trade_id=?3",
+                rusqlite::params![wire["semantic_revision"].as_str().unwrap(), wire.to_string(), recorded.id.0],
+            ).unwrap();
+        }
+        let report = h.requalify_current_rows().await;
+        assert_eq!(
+            report.verdict,
+            pe_service::qualification::QualificationVerdict::InsufficientEvidence
+        );
+        assert!(
+            report.reasons.iter().any(|reason| reason.contains(refusal)),
+            "{fact}: {:?}",
+            report.reasons
+        );
+    }
 }

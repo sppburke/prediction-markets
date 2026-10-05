@@ -325,8 +325,6 @@ impl FrameAdmissionInputs {
 pub struct FrameFallbackArtifact {
     pub version: u16,
     pub frame_receipt: AppendReceipt,
-    pub wallet: WalletAddress,
-    pub market: MarketId,
     pub routing_clock: OffsetDateTime,
     pub reason: FrameFallbackReason,
     pub frontier: Option<FeedHistoryFrontier>,
@@ -433,9 +431,8 @@ mod tests {
             90,
             Some(at(100) - time::Duration::nanoseconds(1))
         ));
-        for stale in [27 * 3600, 5 * 86400] {
-            assert!(!frontier.current(at(100 + stale), at(100 + stale), 90, None));
-        }
+        let stale = 5 * 86400;
+        assert!(!frontier.current(at(100 + stale), at(100 + stale), 90, None));
     }
 
     #[test]

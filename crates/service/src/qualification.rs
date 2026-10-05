@@ -812,6 +812,49 @@ async fn verify_qualification(
         .map_err(|error| {
             QualificationError::InsufficientEvidence(format!("decision replay mismatch: {error}"))
         })?;
+    let audit_era = paper_era(frames[..=financial_prefix_index].to_vec());
+    crate::paper_recovery::feed_latch_basis(&audit_era)
+        .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+    let audit_commitments = source_observations
+        .values()
+        .filter(|observation| {
+            observation.source_id == crate::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID
+        })
+        .filter_map(|observation| {
+            serde_json::from_slice::<crate::bucket_commit::ActivityReadCommitment>(
+                &observation.payload,
+            )
+            .ok()
+            .filter(|commitment| commitment.version == 2 && commitment.read_proof.is_some())
+            .map(|_| observation.receipt)
+        })
+        .collect::<Vec<_>>();
+    let unresolved = crate::feed_audit::verify_recorded_audits(
+        &state,
+        &replayed_decisions
+            .iter()
+            .filter(|decision| decision.continuation.is_activity_frame())
+            .map(|decision| decision.continuation.clone())
+            .collect::<Vec<_>>(),
+        &audit_era,
+        &audit_commitments,
+        &mut |receipt| {
+            let source = decision_source_receipt(&source_observations, receipt)?;
+            Ok::<_, QualificationError>(CompleteActivityPage {
+                payload: source.payload.clone(),
+                observed_at: source.observed_at.clone(),
+                received_at: source.received_at.clone(),
+                source_id: source.source_id.clone(),
+                schema_version: source.schema_version,
+                parser_version: source.parser_version,
+                content_type: source.content_type.clone(),
+            })
+        },
+    )
+    .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+    if !unresolved.is_empty() {
+        return insufficient(format!("unresolved frame audits: {unresolved:?}"));
+    }
     verify_decision_configurations(&replayed_decisions, &start)?;
     let mut decision_observations = HashMap::new();
     for decision in &replayed_decisions {
@@ -14344,6 +14387,7 @@ mod tests {
                 .as_mut()
                 .unwrap()
                 .push(crate::bucket_commit::ObservationBinding {
+                    frame_admission_receipt: None,
                     stream_group_id: stream.group_id.key().clone(),
                     stream_receipt,
                     history_group_id: aggregate.group_id.key().clone(),

@@ -1427,6 +1427,10 @@ impl PaperStateDb {
                 )?;
             }
             tx_mark_seen(&tx, &record.source_trade_id, Some(&record.transaction_hash))?;
+            // The frame owns this identifier's terminal, even for late/covered/fenced echoes.
+            if tx_is_frame_decision(&tx, &record.source_trade_id)? {
+                continue;
+            }
             if let Some(disposition) = &record.no_copy {
                 tx_record_no_copy_disposition(&tx, &record.source_trade_id, disposition)?;
             } else if record.disposition != "applied"

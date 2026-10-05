@@ -106,4 +106,9 @@ pub enum OrchestratorControl {
 #[derive(Debug, Clone)]
 pub enum FeedAuditUpdate {
     Frontier(crate::frame_admission::FeedHistoryFrontier),
+    Incident(crate::paper_recovery::FeedIncident),
+    /// Lookup is advisory; the paper owner rechecks this engagement at application time.
+    Release {
+        expected_engagement_hash: blake3::Hash,
+    },
 }

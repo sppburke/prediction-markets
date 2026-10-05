@@ -519,6 +519,11 @@ impl SourceLogBoot {
         let mut obligations = activity
             .into_obligations(paper_state, &self.receipt_index)
             .context("rebuild durable activity reconciliation obligations")?;
+        let era = crate::paper_recovery::paper_era(crate::paper_recovery::scan_paper_log(
+            paper_log_path,
+        )?);
+        crate::paper_recovery::feed_latch_basis(&era)?;
+        obligations.retire_feed_incidents(&era);
         if let Some(candidates) = self.reducers.daily_boundary.take()
             && let Some(anchor) = recover_daily_boundary_anchor(paper_log_path, &mut obligations)
                 .context("recover causal daily boundary")?

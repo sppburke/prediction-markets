@@ -325,6 +325,16 @@ impl From<Arc<pe_execution_core::LiveJournal>> for LiveJournalAccess {
     }
 }
 
+#[cfg(feature = "scenario")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameCrashBoundary {
+    FrameCommit,
+    Staging,
+    Prepared,
+    Authority,
+    Final,
+}
+
 /// Scenario-only deterministic seams (#546): fixed admission-clock instants and historical mark
 /// results consumed in order, plus one-shot faults immediately before the durable writes whose
 /// rollback the fan-in acceptance suite must prove. Compiled only with the `scenario` feature;
@@ -332,6 +342,7 @@ impl From<Arc<pe_execution_core::LiveJournal>> for LiveJournalAccess {
 #[cfg(feature = "scenario")]
 #[derive(Debug, Default)]
 pub struct ScenarioHooks {
+    pub frame_crash_boundary: std::sync::Mutex<Option<FrameCrashBoundary>>,
     pub age_clock: std::sync::Mutex<std::collections::VecDeque<OffsetDateTime>>,
     /// Deterministically advance the next queued age sample after one successful observation
     /// resolution. This models receipt I/O latency without sleeping in scenario tests.
@@ -1062,6 +1073,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             expected_authority: expected.clone(),
             payload: payload.clone(),
         })?;
+        #[cfg(feature = "scenario")]
+        if self.crash_after_frame_boundary(FrameCrashBoundary::Prepared) {
+            return Err("injected crash after frame Prepared".to_owned());
+        }
         let crate::paper_recovery::FinancialPayload::Fill {
             operation,
             economic,
@@ -1079,6 +1094,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .commit_prepared_fill(&request)
             .await
             .map_err(|error| error.to_string())?;
+        #[cfg(feature = "scenario")]
+        if self.crash_after_frame_boundary(FrameCrashBoundary::Authority) {
+            return Err("injected crash after frame authority".to_owned());
+        }
         let result = crate::paper_recovery::FinancialResult::Fill { canonical };
         apply_financial_result(
             &self.paper_state,
@@ -1094,6 +1113,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             prepared_receipt,
             result: result.clone(),
         })?;
+        #[cfg(feature = "scenario")]
+        if self.crash_after_frame_boundary(FrameCrashBoundary::Final) {
+            return Err("injected crash after frame Final".to_owned());
+        }
         terminalize_final_fill_decision(&self.paper_state, &payload, &result, final_receipt)
             .map_err(|error| error.to_string())?;
         if let Some(dispatch_id) = dispatch_id {
@@ -1529,6 +1552,22 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         Ok(())
     }
 
+    #[cfg(feature = "scenario")]
+    fn crash_after_frame_boundary(&self, boundary: FrameCrashBoundary) -> bool {
+        self.scenario_hooks.as_ref().is_some_and(|hooks| {
+            let mut selected = hooks
+                .frame_crash_boundary
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *selected == Some(boundary) {
+                *selected = None;
+                true
+            } else {
+                false
+            }
+        })
+    }
+
     async fn apply_activity_frame(
         &mut self,
         receipt: pe_event_log::AppendReceipt,
@@ -1641,7 +1680,125 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             )
             .map_err(|error| error.to_string())?;
         drop(guard);
+        #[cfg(feature = "scenario")]
+        if self.crash_after_frame_boundary(FrameCrashBoundary::FrameCommit) {
+            return Err("injected crash after frame commit".to_owned());
+        }
         self.resume_committed_rows(&[id]).await
+    }
+
+    fn apply_feed_audit_update(
+        &mut self,
+        update: crate::orchestrator_control::FeedAuditUpdate,
+    ) -> Result<(), String> {
+        use crate::orchestrator_control::FeedAuditUpdate;
+        use crate::paper_recovery::{HaltState, PaperLogFrame, PaperLogRecord};
+        let index = self
+            .source_receipts
+            .as_ref()
+            .ok_or_else(|| "feed audit source index is missing".to_owned())?;
+        match update {
+            FeedAuditUpdate::Frontier(frontier) => {
+                self.bucket_engine.publish_frontier(frontier, index)
+            }
+            FeedAuditUpdate::Incident(incident) => {
+                let row = self
+                    .paper_state
+                    .decision_pending_history()
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .find(|row| {
+                        DecisionContinuationV3::from_durable(row).is_ok_and(|frame| {
+                            frame.is_activity_frame()
+                                && frame.observed_source_receipt == Some(incident.frame_receipt)
+                        })
+                    })
+                    .ok_or_else(|| "incident has no durable admitted frame".to_owned())?;
+                let frame =
+                    DecisionContinuationV3::from_durable(&row).map_err(|e| e.to_string())?;
+                crate::feed_audit::verify_incident(&frame, &incident, &mut |receipt| {
+                    index
+                        .source_envelope(receipt)
+                        .map(crate::bucket_commit::CompleteActivityPage::from)
+                })
+                .map_err(|e| e.to_string())?;
+                let era = crate::paper_recovery::paper_era(
+                    self.paper_writer.snapshot().map_err(|e| e.to_string())?,
+                );
+                if crate::feed_audit::audited_receipts(&era).contains(&incident.frame_receipt) {
+                    return Ok(());
+                }
+                let receipt = self.append_paper_record(&PaperLogRecord::FeedIncidentChanged {
+                    incident: incident.clone(),
+                    state: HaltState::Engaged,
+                })?;
+                self.feed_latch = crate::frame_admission::FeedLatchBasis {
+                    latest_incident: Some(receipt),
+                    release: None,
+                };
+                self.bucket_engine
+                    .retire_frame_audit(incident.frame_receipt);
+                {
+                    let mut health = self
+                        .health
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    health.feed_latch = self.feed_latch.clone();
+                    health.feed_incident = Some(incident.clone());
+                }
+                error!(cause = ?incident.cause, frame_receipt = ?incident.frame_receipt, deciding_commitment = ?incident.deciding_commitment_receipt,
+                    counterpart = ?incident.counterpart_identity, engagement = ?receipt, "feed audit incident engaged; frames wait for history");
+                Ok(())
+            }
+            FeedAuditUpdate::Release {
+                expected_engagement_hash,
+            } => {
+                let era = crate::paper_recovery::paper_era(
+                    self.paper_writer.snapshot().map_err(|e| e.to_string())?,
+                );
+                let basis =
+                    crate::paper_recovery::feed_latch_basis(&era).map_err(|e| e.to_string())?;
+                if !basis.engaged()
+                    || basis
+                        .latest_incident
+                        .is_none_or(|receipt| receipt.this_hash != expected_engagement_hash)
+                {
+                    return Ok(());
+                }
+                let Some(mut incident) =
+                    era.frames
+                        .iter()
+                        .rev()
+                        .find_map(|frame| match &frame.frame {
+                            PaperLogFrame::Record(PaperLogRecord::FeedIncidentChanged {
+                                incident,
+                                state: HaltState::Engaged,
+                            }) => Some(incident.clone()),
+                            _ => None,
+                        })
+                else {
+                    return Err("latest feed engagement is missing".to_owned());
+                };
+                incident.engagement_receipt = basis.latest_incident;
+                let release = self.append_paper_record(&PaperLogRecord::FeedIncidentChanged {
+                    incident,
+                    state: HaltState::Released,
+                })?;
+                self.feed_latch = crate::frame_admission::FeedLatchBasis {
+                    latest_incident: basis.latest_incident,
+                    release: Some(release),
+                };
+                self.publish_feed_latch_health();
+                Ok(())
+            }
+        }
+    }
+
+    fn publish_feed_latch_health(&self) {
+        self.health
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .feed_latch = self.feed_latch.clone();
     }
 
     async fn apply_control_message(&mut self, message: OrchestratorControl) {
@@ -1656,13 +1813,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 update,
                 acknowledged,
             } => {
-                let result = match (update, self.source_receipts.as_ref()) {
-                    (
-                        crate::orchestrator_control::FeedAuditUpdate::Frontier(frontier),
-                        Some(index),
-                    ) => self.bucket_engine.publish_frontier(frontier, index),
-                    (_, None) => Err("feed audit source index is missing".to_owned()),
-                };
+                let result = self.apply_feed_audit_update(update);
                 let _ = acknowledged.send(result);
             }
             OrchestratorControl::PrepareAdmissions {
@@ -2108,9 +2259,15 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
 
         let bucket_engine = BucketCommitEngine::load(paper_state.clone(), leader_ledger)
             .map_err(|error| anyhow::anyhow!("load bucket commit engine: {error}"))?;
-        let feed_latch = crate::paper_recovery::feed_latch_basis(
-            &crate::paper_recovery::paper_era(paper_writer.snapshot()?),
-        )?;
+        let feed_era = crate::paper_recovery::paper_era(paper_writer.snapshot()?);
+        let feed_latch = crate::paper_recovery::feed_latch_basis(&feed_era)?;
+        {
+            let mut health = health
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            health.feed_latch = feed_latch.clone();
+            health.feed_incident = crate::feed_audit::latest_incident(&feed_era);
+        }
         verify_retained_terminal_decisions(
             &paper_state,
             config.live_journal.as_ref().map(LiveJournalAccess::path),
@@ -2196,6 +2353,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         crate::frame_admission::restore_frontiers(&self.paper_state, &index)
             .map_err(|error| error.to_string())?;
         self.refresh_feed_latch()?;
+        self.publish_feed_latch_health();
         for receipt in undelivered {
             self.apply_activity_frame(*receipt).await?;
         }
@@ -2204,13 +2362,20 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
 
     /// Refresh after a synchronized incident/release edge; boot uses this same era reducer.
     pub(crate) fn refresh_feed_latch(&mut self) -> Result<(), String> {
+        let era = crate::paper_recovery::paper_era(
+            self.paper_writer
+                .snapshot()
+                .map_err(|error| error.to_string())?,
+        );
+        if let Some(index) = &self.source_receipts {
+            self.bucket_engine.verify_feed_incidents(&era, index)?;
+        }
         self.feed_latch =
-            crate::paper_recovery::feed_latch_basis(&crate::paper_recovery::paper_era(
-                self.paper_writer
-                    .snapshot()
-                    .map_err(|error| error.to_string())?,
-            ))
-            .map_err(|error| error.to_string())?;
+            crate::paper_recovery::feed_latch_basis(&era).map_err(|error| error.to_string())?;
+        self.health
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .feed_incident = crate::feed_audit::latest_incident(&era);
         Ok(())
     }
 
@@ -2268,6 +2433,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         )?);
         self.active_risk_halts = crate::paper_recovery::active_risk_halts(&era);
         self.feed_latch = crate::paper_recovery::feed_latch_basis(&era)?;
+        self.publish_feed_latch_health();
         self.qualification_start = era.start.as_ref().map(|(receipt, _)| *receipt);
         self.financial_log_paths = Some((paper_log_path, source_log_path));
         self.source_receipts = Some(source_receipts);
@@ -3993,17 +4159,16 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         // Relocated hold/already-filled gate (#508; historically pre-first-BUY): a paper
         // position we already hold skips the PAPER order only — live targets in the staged
         // aggregate still execute against their own venue state.
+        #[cfg(feature = "scenario")]
+        if self.crash_after_frame_boundary(FrameCrashBoundary::Staging) {
+            self.intake_stopped = true;
+            return;
+        }
         let pos_key = MarketOutcomeId::new(signal.market_id.clone(), signal.outcome_id);
-        let held = if continuation_seven {
-            self.filled_positions
-                .iter()
-                .any(|held| held.market() == &signal.market_id)
-        } else {
-            self.filled_positions.contains(&pos_key)
-        };
+        let held = !continuation_seven && self.filled_positions.contains(&pos_key);
         if held {
             info!(
-                reason = if continuation_seven { "already hold position in this market (paper-only)" } else { "already hold position in this market outcome (paper-only)" },
+                reason = "already hold position in this market outcome (paper-only)",
                 market = %signal.market_id,
                 outcome = signal.outcome_id.0,
                 "signal did not produce order",
@@ -4012,11 +4177,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 &trade,
                 &leader_row,
                 dispatch_id.as_deref(),
-                if continuation_seven {
-                    "paper_held_market"
-                } else {
-                    "paper_held"
-                },
+                "paper_held",
                 &rb,
                 Some(&signal.market_id),
                 decision_evidence.as_ref(),

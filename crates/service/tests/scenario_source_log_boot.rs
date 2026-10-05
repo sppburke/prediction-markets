@@ -852,6 +852,7 @@ fn installed_boot_binding_requires_its_durable_target() {
     >(proof["pages"].clone())
     .unwrap();
     let binding = pe_service::bucket_commit::ObservationBinding {
+        frame_admission_receipt: None,
         stream_group_id: stream.group_id.key().clone(),
         stream_receipt,
         history_group_id: target.group_id.key().clone(),
