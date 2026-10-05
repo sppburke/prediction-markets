@@ -476,6 +476,10 @@ fn plan_principal_buy_with_scale(
     )?;
     let principal = walked.principal;
     let shares = shares_for_principal(principal, walked.limit_price, signed_share_scale)?;
+    // Partial capacity that rounds to zero shares is still below the admission minimum.
+    if partial_minimum.is_some_and(|minimum| shares < minimum) {
+        return Err(LadderError::BelowMinimum);
+    }
     if shares == ShareAmount::ZERO {
         return Err(LadderError::NothingAffordable);
     }
@@ -486,9 +490,6 @@ fn plan_principal_buy_with_scale(
         shares,
         worst_case_debit: principal,
     };
-    if partial_minimum.is_some_and(|minimum| plan.shares < minimum) {
-        return Err(LadderError::BelowMinimum);
-    }
     if plan.signed_price()? < plan.limit_price {
         return Err(LadderError::Amount);
     }
@@ -794,6 +795,28 @@ mod tests {
                 Price::ONE,
             ),
             Err(LadderError::InsufficientDepth)
+        );
+    }
+
+    #[test]
+    fn dollar_up_to_zero_rounded_capacity_is_below_minimum() {
+        // 0.000001 shares at 0.15 is 0.00000015 of capacity, which floors to zero collateral.
+        let asks = [level(dec!(0.15), dec!(0.000001))];
+        let budget = CollateralAmount::from_decimal_exact(dec!(25)).unwrap();
+        assert_eq!(
+            plan_sized_buy(
+                &asks,
+                CompactFeeSchedule::Zero,
+                BuySizing::DollarUpTo { budget },
+                &[budget],
+                ShareAmount::from_whole(5).unwrap(),
+                price(dec!(0.01)),
+                price(dec!(0.15)),
+                price(dec!(0.85)),
+                Price::ONE,
+                Price::ONE,
+            ),
+            Err(LadderError::BelowMinimum)
         );
     }
 

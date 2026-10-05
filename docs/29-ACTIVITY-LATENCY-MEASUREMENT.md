@@ -282,6 +282,13 @@ WHERE json_extract(d.frozen_inputs_json,'$.version') = 7
 ORDER BY f.prepared_seq, f.idempotency_key LIMIT ?
 """, (int(sys.argv[4]), int(sys.argv[5]))))
 print("FROZEN COHORT", [(r["source_trade_id"], r["idempotency_key"], r["prepared_seq"]) for r in cohort])
+# The earlier-entry listing covers every in-window frame admission, not only the latency cohort.
+admissions = list(db.execute("""
+SELECT source_trade_id, wallet_hex, frozen_inputs_json FROM decision_pending
+WHERE json_extract(frozen_inputs_json,'$.version') = 7
+  AND json_extract(frozen_inputs_json,'$.source_authority') = 'activity_frame'
+  AND json_extract(frozen_inputs_json,'$.decision_inputs.admission_receipt.sequence') >= ?
+""", (int(sys.argv[4]),)))
 assert len(cohort) == int(sys.argv[5]), "cohort incomplete; acceptance unproven"
 spans = {p: [] for p in ("initial_staleness_gate", "book_staleness_check", "terminal_transition")}
 book_use = []; book_receipt_spans = []; trade_time_spans = []
@@ -429,7 +436,7 @@ for e in source.values():
         key = keys[encoded]
         if (parts[7] == b"BUY" and parts[4] is not None and Decimal(str(r["size"])) > 0
             and not r.get("isCombo", r.get("is_combo", False))):
-            epoch = int(r["timestamp"])
+            epoch = int(r["timestamp"]); epoch = epoch // 1000 if epoch > 9_999_999_999 else epoch  # production normalization
             entry = {"id": key, "wallet": wallet, "market": parts[4].decode(), "epoch": epoch,
                      "page_seq": e["seq"], "page_hash": e["this_hash"]}
             if key not in buys or epoch < buys[key]["epoch"]: buys[key] = entry
@@ -440,7 +447,7 @@ for e in source.values():
         g = groups[key]; assert g["wallet_hex"] == wallet and g["transaction_hash"] == tx
         matched.add(key); legs.setdefault((wallet, tx), set()).add(key)
         print("REST full-identity join", key, e["seq"], e["this_hash"], g, r)
-        for row in cohort:
+        for row in admissions:
             c = json.loads(row["frozen_inputs_json"])
             if (wallet == row["wallet_hex"] and parts[4] == c["market_id"].encode()
                 and parts[7] == b"BUY" and key != row["source_trade_id"] and g["source_epoch"] < c["source_epoch"]):
