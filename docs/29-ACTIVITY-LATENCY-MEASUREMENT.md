@@ -416,17 +416,22 @@ to its frozen frame receipt and `history_group_id` to `activity_groups.source_tr
 `read_proof`. Authenticate each indexed page occurrence against its source envelope. For negative
 audits, join `FeedIncidentChanged.incident.frame_receipt` to the same frame and authenticate
 `deciding_commitment_receipt` plus any `counterpart_identity`; preserve the proof even with empty
-bindings. A retained authenticated match survives until its recorded target commits, even when a
-later mature full-history read is empty. After a binding or negative counterpart identity is fixed,
+bindings. A retained authenticated counterpart, matched or contradicted, survives until its recorded
+target is durably disposed, even when a later mature full-history read is empty. Incident engagement
+is separate from completion of that target's disposition and late-group re-anchor. After a binding or negative counterpart identity is fixed,
 only authenticated restamp equivalence can change its identifier; another leg of the same transaction
-must retain its own routing. After an absence incident, the first later authenticated same-transaction
-group is the frame's late counterpart: one ledger effect, no second decision. Its first binding
-fixes that counterpart durably; only authenticated restamp equivalence can change its identifier. List unresolved audits separately. Reconstruct engagement/release order from the active
+must retain its own routing. After an absence incident, the first uniquely resolved later
+authenticated same-transaction group is the frame's late counterpart, using the canonical glossary's asset-disambiguation and
+ambiguity rule: one ledger effect, no second decision. Its first binding fixes that counterpart
+durably; only authenticated restamp equivalence can change its identifier. List unresolved audits
+separately. Reconstruct engagement/release order from the active
 paper era, including each `engagement_receipt`, and compare the frozen admission latch basis;
 current status is supplementary evidence only.
 
 For REST-decided first entries, search the verified source prefix for the trade's frame, including
-authenticated corrections/restamp equivalence. No recorded frame means **feed-missed**. Otherwise
+authenticated corrections/restamp equivalence. A REST-first trade's delayed frame is an acknowledged
+duplicate, including a different group identifier or market; count the original REST decision once
+using its authenticated read and the ignored frame's durable unbound-observation retirement. No recorded frame means **feed-missed**. Otherwise
 use the earliest authenticated `pe-service.activity-frame-fallback` artifact per `frame_receipt`,
 ordered by artifact source sequence: report its `reason`, `routing_clock`, evaluated `frontier`
 and `latest_incident_basis`. Derive wallet/market from the referenced frame, not artifact fields.
@@ -478,9 +483,9 @@ remain admission-time evidence. Resolved frames and unrelated wallets, positions
 markets do not contribute to capture size.
 
 The poller's coalesced unresolved receipts and the bucket owner's ordering barrier must agree after
-admission, audit, release and restart: an admitted receipt supersedes earlier same-identity excluded
-observations; otherwise the first synchronized receipt remains. Every retirement is acknowledged by
-the owner. Frontier publication rechecks this barrier for all observations with authenticated source
+admission, audit, release and restart, using the canonical
+[receipt-priority rule](_GLOSSARY.md#continuation-and-commitment-compatibility-588) in
+`_GLOSSARY.md`. Every retirement is acknowledged by the owner. Frontier publication rechecks this barrier for all observations with authenticated source
 time at or before the fixed end, including fallbacks without a decision row. An empty read alone
 cannot advance past an unresolved fallback. Qualification authenticates one reconstructed read at a
 time and retains only bindings and restamp pairs for cohort selection.

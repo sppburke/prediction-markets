@@ -1734,54 +1734,76 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     .ok_or_else(|| "incident decision missing".to_owned())?;
                 let frame =
                     DecisionContinuationV3::from_durable(&row).map_err(|e| e.to_string())?;
-                if let Some(read) = read {
-                    frame
-                        .verify_activity_frame_with_index(index)
-                        .map_err(|error| error.to_string())?;
-                    if read.receipt != incident.deciding_commitment_receipt
-                        || frame.observed_source_receipt != Some(incident.frame_receipt)
-                        || incident.engagement_receipt.is_some()
-                    {
-                        return Err("incident differs from authenticated read/frame".to_owned());
-                    }
-                    crate::feed_audit::verify_incident_conclusion(&frame, &incident, &read)
-                        .map_err(|error| error.to_string())?;
-                } else {
-                    crate::feed_audit::verify_incident(&frame, &incident, &mut |receipt| {
-                        index
-                            .source_envelope(receipt)
-                            .map(crate::bucket_commit::CompleteActivityPage::from)
-                    })
+                frame
+                    .verify_activity_frame_with_index(index)
                     .map_err(|error| error.to_string())?;
+                let read = match read {
+                    Some(read) => read,
+                    None => Arc::new(
+                        crate::bucket_commit::verified_commitment_bindings(
+                            incident.deciding_commitment_receipt,
+                            index,
+                        )
+                        .map_err(|error| error.to_string())?,
+                    ),
+                };
+                if read.receipt != incident.deciding_commitment_receipt
+                    || frame.observed_source_receipt != Some(incident.frame_receipt)
+                    || incident.engagement_receipt.is_some()
+                {
+                    return Err("incident differs from authenticated read/frame".to_owned());
                 }
+                crate::feed_audit::verify_incident_conclusion(&frame, &incident, &read)
+                    .map_err(|error| error.to_string())?;
                 let era = crate::paper_recovery::paper_era(
                     self.paper_writer.snapshot().map_err(|e| e.to_string())?,
                 );
-                if crate::feed_audit::audited_receipts(&era).contains(&incident.frame_receipt) {
-                    return Ok(FeedAuditAcknowledgement::Applied);
-                }
-                let incident_index = index.clone();
-                let receipt = self.append_paper_record(&PaperLogRecord::FeedIncidentChanged {
-                    incident: incident.clone(),
-                    state: HaltState::Engaged,
-                })?;
-                incident_index.remember_frame_incident(&incident);
-                self.feed_latch = crate::frame_admission::FeedLatchBasis {
-                    latest_incident: Some(receipt),
-                    release: None,
+                // Engagement trips the latch immediately; a contradicted REST target
+                // keeps its ordering work until its exact revision is disposed.
+                let disposed = match &incident.counterpart_identity {
+                    None => true,
+                    Some(id) => {
+                        let binding = read
+                            .binding_indices
+                            .get(&(
+                                incident.frame_receipt.sequence,
+                                incident.frame_receipt.this_hash,
+                            ))
+                            .and_then(|position| read.bindings.get(*position))
+                            .filter(|binding| &binding.history_group_id == id)
+                            .ok_or_else(|| "incident counterpart binding missing".to_owned())?;
+                        self.paper_state
+                            .activity_revision_disposed(id, &binding.semantic_revision)
+                            .map_err(|error| error.to_string())?
+                    }
                 };
-                self.bucket_engine
-                    .retire_frame_audit(incident.frame_receipt);
-                {
-                    let mut health = self
-                        .health
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    health.feed_latch = self.feed_latch.clone();
-                    health.feed_incident = Some(incident.clone());
-                }
-                error!(cause = ?incident.cause, frame_receipt = ?incident.frame_receipt, deciding_commitment = ?incident.deciding_commitment_receipt,
+                if !crate::feed_audit::audited_receipts(&era).contains(&incident.frame_receipt) {
+                    let incident_index = index.clone();
+                    let receipt =
+                        self.append_paper_record(&PaperLogRecord::FeedIncidentChanged {
+                            incident: incident.clone(),
+                            state: HaltState::Engaged,
+                        })?;
+                    incident_index.remember_frame_incident(&incident);
+                    self.feed_latch = crate::frame_admission::FeedLatchBasis {
+                        latest_incident: Some(receipt),
+                        release: None,
+                    };
+                    {
+                        let mut health = self
+                            .health
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        health.feed_latch = self.feed_latch.clone();
+                        health.feed_incident = Some(incident.clone());
+                    }
+                    error!(cause = ?incident.cause, frame_receipt = ?incident.frame_receipt, deciding_commitment = ?incident.deciding_commitment_receipt,
                     counterpart = ?incident.counterpart_identity, engagement = ?receipt, "feed audit incident engaged; frames wait for history");
+                }
+                if disposed {
+                    self.bucket_engine
+                        .retire_frame_audit(incident.frame_receipt);
+                }
                 Ok(FeedAuditAcknowledgement::Applied)
             }
             FeedAuditUpdate::Release {

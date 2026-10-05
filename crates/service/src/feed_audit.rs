@@ -25,8 +25,8 @@ pub enum FeedAuditError {
 }
 
 /// Resolve a frame against the whole authenticated read. A binding or contradiction fixes
-/// its target; only read-proven restamps are equivalent. An absence selects the first later
-/// transaction leg in source order, which the next binding then fixes durably.
+/// its target; only read-proven restamps are equivalent. After absence, discovery keeps
+/// asset disambiguation and ambiguity until a unique later counterpart can be fixed.
 pub(crate) fn resolve_frame_counterpart<'a>(
     observation: &ActivityTradeObservation,
     fixed: Option<Option<&SourceTradeId>>,
@@ -48,19 +48,10 @@ pub(crate) fn resolve_frame_counterpart<'a>(
             let id = aggregate.group_id.key();
             id == target || pairs.get(id) == Some(target) || pairs.get(target) == Some(id)
         });
-    } else if fixed.is_none() && candidates.len() > 1 {
+    } else if candidates.len() > 1 {
         candidates.retain(|aggregate| aggregate.group_id.components().asset == original.asset);
     }
     crate::bucket_commit::collapse_restamp_pairs(&mut candidates, pairs);
-    if fixed == Some(None) {
-        candidates.sort_by(|left, right| {
-            left.source_time
-                .0
-                .cmp(&right.source_time.0)
-                .then_with(|| left.group_id.key().0.cmp(&right.group_id.key().0))
-        });
-        candidates.truncate(1);
-    }
     candidates
 }
 
@@ -190,28 +181,6 @@ pub(crate) fn disposition(
     } else {
         Ok(AuditDisposition::Unresolved)
     }
-}
-
-pub(crate) fn verify_incident<L, E>(
-    frame: &DecisionContinuationV3,
-    incident: &FeedIncident,
-    lookup: &mut L,
-) -> Result<(), FeedAuditError>
-where
-    L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
-    E: std::fmt::Display,
-{
-    frame.verify_activity_frame(lookup)?;
-    if frame.observed_source_receipt != Some(incident.frame_receipt)
-        || incident.engagement_receipt.is_some()
-    {
-        return Err(FeedAuditError::Semantic("incident frame receipt differs"));
-    }
-    let read = crate::bucket_commit::verified_commitment_bindings_with_lookup(
-        incident.deciding_commitment_receipt,
-        lookup,
-    )?;
-    verify_incident_conclusion(frame, incident, &read)
 }
 
 pub(crate) fn verify_incident_conclusion(
@@ -369,4 +338,61 @@ where
         })
         .map(|frame| frame.facts.source_trade_id.clone())
         .collect())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use pe_core_types::{ReceivedAt, SourceId, SourceTimestamp, WalletAddress};
+    use pe_source_polymarket_public::{
+        ActivityParseContext, ActivityTransport, parse_activity_response,
+        parse_activity_trade_observation,
+    };
+    use serde_json::json;
+    use time::OffsetDateTime;
+
+    #[test]
+    fn post_absence_counterpart_keeps_asset_disambiguation_and_ambiguity() {
+        let now = OffsetDateTime::from_unix_timestamp(100).unwrap();
+        let wallet = WalletAddress([1; 20]);
+        let original = json!({"proxyWallet": wallet.to_string(), "timestamp": 100,
+            "type": "TRADE", "conditionId": "market-a", "asset": "asset-a",
+            "transactionHash": "tx", "side": "BUY", "outcomeIndex": 0,
+            "outcome": "Yes", "size": "5", "usdcSize": "2.5", "price": "0.5", "isCombo": false});
+        let observation =
+            parse_activity_trade_observation(&serde_json::to_vec(&original).unwrap()).unwrap();
+        let mut late = original.clone();
+        late["timestamp"] = json!(221);
+        let mut other = original.clone();
+        other["timestamp"] = json!(220);
+        other["conditionId"] = json!("market-b");
+        for ambiguous in [false, true] {
+            other["asset"] = json!(if ambiguous { "asset-a" } else { "asset-b" });
+            let read = parse_activity_response(
+                &serde_json::to_vec(&json!([other, late])).unwrap(),
+                wallet,
+                &ActivityParseContext {
+                    source_id: SourceId("fixture".to_owned()),
+                    observed_at: SourceTimestamp(now),
+                    received_at: ReceivedAt(now),
+                    transport: ActivityTransport::Replay,
+                },
+            )
+            .unwrap();
+            let aggregates = read.aggregates().unwrap();
+            for fixed in [None, Some(None)] {
+                let candidates = resolve_frame_counterpart(
+                    &observation,
+                    fixed,
+                    &aggregates,
+                    &std::collections::HashMap::new(),
+                );
+                assert_eq!(candidates.len(), if ambiguous { 2 } else { 1 });
+                if !ambiguous {
+                    assert_eq!(candidates[0].group_id.key(), observation.group_id.key());
+                }
+            }
+        }
+    }
 }

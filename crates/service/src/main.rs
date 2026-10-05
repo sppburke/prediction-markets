@@ -1139,6 +1139,7 @@ async fn main() -> Result<()> {
                     &cfg.source_event_log_path,
                     &cfg.event_log_path,
                     &mut obligations,
+                    &paper_state,
                 )
                 .context("recover causal daily boundary")?;
             }

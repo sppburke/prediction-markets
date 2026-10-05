@@ -603,15 +603,15 @@ wallet obligation has waited longer than that bound. `poll_round_stale_secs` is 
 3 × `trade_poll_interval_secs` and frozen in `FrameAdmissionInputs`; equality passes. It is not a
 new configuration key.
 
-An admitted frame remains an audit obligation, even after fencing, until matched, contradicted
-or absent. Its frozen receipt cannot be replaced by another observation of the same identity.
+An admitted frame remains an audit obligation, even after fencing, until its matched, contradicted
+or absent conclusion is acknowledged and any bound REST target is durably disposed. Its frozen receipt cannot be replaced by another observation of the same identity.
 For a still-unbound frame, discover counterparts by authenticated wallet/transaction and asset
 disambiguation before side comparison, preserving verified bindings, restamp equivalence and ambiguity.
 Once authenticated, its counterpart identity stays fixed through commitment-before-bucket crashes,
 audit retirement, release and restart; another transaction leg receives its own decision. A different
-identifier is equivalent only through an authenticated restamp pair. Retained authenticated matches
-win over later absence, commit their recorded read through the bucket owner, and retire only after
-its target disposition and retirement acknowledgement. A match confirms
+identifier is equivalent only through an authenticated restamp pair. Retained authenticated
+counterparts, matched or contradicted, win over later absence, commit their recorded read through
+the bucket owner, and retire only after target disposition and retirement acknowledgement. A match confirms
 an ordinary positive-share TRADE with the same effective side, condition and outcome; combo,
 zero-share or disagreeing counterparts contradict. Positive quantity, price and time differences
 are audit facts. Absence matures at frozen frame source time + `copy_latency_budget_secs`:
@@ -621,16 +621,27 @@ negative audits retain the deciding commitment's proof, including empty bindings
 retains only authenticated bindings/restamp pairs for selection and releases reconstructed aggregates,
 effective identities and read indexes after each authentication.
 A match or contradiction fixes the frame's counterpart, so a later read cannot rebind it to
-another transaction leg. After an absence incident, the first later authenticated group of the same transaction is the
-frame's late counterpart: it applies to the leader ledger once and creates no second decision.
+another transaction leg. After an absence incident, counterpart discovery still disambiguates
+multiple same-transaction groups by the frame's asset and leaves multiple remaining candidates
+unresolved. The first uniquely resolved later authenticated group becomes the frame's late
+counterpart: it applies to the leader ledger once and creates no second decision.
 Its first binding fixes that counterpart durably; later reads cannot replace it with another leg.
 Only authenticated restamp equivalence can change its identifier.
+A prior disposed REST counterpart prevents admission of a delayed frame of that trade even when
+its group identifier or market differs; independent transaction legs retain their own decisions.
+The owner records the existing unbound-observation retirement for this ignored duplicate, preserving
+acknowledged retirement across restart.
+Once a read commitment is enqueued, reconciliation drains its acknowledgement, authenticates it
+and retains its binding/proof before honoring preemption.
 Later frame bindings carry `counterpart_basis_receipt`, referencing the first binding commitment
 or the full-history absence proof for a late counterpart. Synchronization, boot and sealed replay
 authenticate that basis with the same counterpart rule; initial and historical bindings omit it.
 
 **Feed incidents and history fallback.** `PaperLogRecord::FeedIncidentChanged { incident, state }`
-journals contradiction or absence before the audit ordering barrier retires. The synchronized
+journals contradiction or absence before the audit ordering barrier retires. A contradiction
+engages the latch immediately but retains reconciliation and ordering work across acknowledgement
+and restart until its exact REST target revision has a durable disposition, including late-group
+re-anchor handling. Repeated engagement requests acknowledge the existing incident once. The synchronized
 paper era rebuilds one process-wide latch before boot admissions: `Engaged` sets the latest
 incident, and `Released` must reference that latest engagement. While latched, frames wait for
 history; admitted work completes. `status.json` reports `source_health.feed_latch` and `source_health.feed_incident`, the

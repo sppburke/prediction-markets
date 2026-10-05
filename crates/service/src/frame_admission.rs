@@ -100,12 +100,7 @@ pub(crate) fn restore_frontiers(
     }
     let mut result = HashMap::new();
     for frontier in collection.frontiers {
-        frontier.verify(&mut |receipt| {
-            index
-                .source_envelope(receipt)
-                .map(CompleteActivityPage::from)
-        })?;
-        index.remember_verified_frontier(&frontier);
+        index.verify_frame_frontier(&frontier)?;
         if result.insert(frontier.wallet, frontier).is_some() {
             return Err(FrameAdmissionError::InvalidPrefix(
                 "duplicate wallet frontier",

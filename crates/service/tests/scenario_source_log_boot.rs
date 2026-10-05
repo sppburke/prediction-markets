@@ -574,6 +574,7 @@ fn financial_boot_replays_start_membership_through_the_index_and_recovers_the_bo
         &paths.source_log,
         &paths.paper_log,
         &mut rebuilt,
+        &paper_state,
     )
     .unwrap();
     assert_eq!(published, rebuilt);

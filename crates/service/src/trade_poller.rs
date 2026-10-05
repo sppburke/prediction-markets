@@ -460,8 +460,27 @@ impl ReconciliationObligations {
     }
 
     /// Retire synchronized incident receipts from the coalesced unresolved work.
-    pub fn retire_feed_incidents(&mut self, era: &crate::paper_recovery::PaperEra) {
-        let retired = crate::feed_audit::audited_receipts(era);
+    pub fn retire_feed_incidents(
+        &mut self,
+        era: &crate::paper_recovery::PaperEra,
+        paper_state: &PaperStateDb,
+    ) -> Result<(), pe_paper_state::PaperStateError> {
+        let mut retired = crate::feed_audit::audited_receipts(era);
+        for obligation in self
+            .by_wallet
+            .values()
+            .flat_map(BTreeMap::values)
+            .flat_map(BTreeMap::values)
+        {
+            if retired.contains(&obligation.receipt) {
+                for binding in &obligation.bindings {
+                    if !binding_target_disposed(paper_state, binding)? {
+                        retired.retain(|receipt| *receipt != obligation.receipt);
+                        break;
+                    }
+                }
+            }
+        }
         for receipt in &retired {
             if !self.retired_frame_receipts.contains(receipt) {
                 self.retired_frame_receipts.push(*receipt);
@@ -486,6 +505,7 @@ impl ReconciliationObligations {
             epochs.retain(|_, groups| !groups.is_empty());
         }
         self.by_wallet.retain(|_, epochs| !epochs.is_empty());
+        Ok(())
     }
 
     pub fn insert(&mut self, trigger: ReconciliationTrigger) {
@@ -718,11 +738,12 @@ impl DailyBoundaryCandidates {
 pub(crate) fn recover_daily_boundary_anchor(
     paper_log_path: &Path,
     obligations: &mut ReconciliationObligations,
+    paper_state: &PaperStateDb,
 ) -> Result<Option<i64>, ObligationRebuildError> {
     let frames = crate::paper_recovery::scan_paper_log(paper_log_path)
         .map_err(|error| ObligationRebuildError::PaperLog(error.to_string()))?;
     let era = crate::paper_recovery::paper_era(frames);
-    obligations.retire_feed_incidents(&era);
+    obligations.retire_feed_incidents(&era, paper_state)?;
     recover_daily_boundary_anchor_from_era(&era, obligations)
 }
 
@@ -781,8 +802,10 @@ pub fn recover_daily_boundary(
     source_log_path: &Path,
     paper_log_path: &Path,
     obligations: &mut ReconciliationObligations,
+    paper_state: &PaperStateDb,
 ) -> Result<(), ObligationRebuildError> {
-    let Some(anchor) = recover_daily_boundary_anchor(paper_log_path, obligations)? else {
+    let Some(anchor) = recover_daily_boundary_anchor(paper_log_path, obligations, paper_state)?
+    else {
         return Ok(());
     };
     let mut candidates = DailyBoundaryCandidates::default();
@@ -2034,11 +2057,12 @@ impl WalletOperation {
                     }
                 }
                 let mut needs_commit = false;
-                for (_, obligation, id) in &matches {
-                    for binding in read.bindings.iter().filter(|binding| {
-                        binding.stream_receipt == obligation.receipt
-                            && &binding.history_group_id == id
-                    }) {
+                for (_, obligation) in &obligations {
+                    for binding in read
+                        .bindings
+                        .iter()
+                        .filter(|binding| binding.stream_receipt == obligation.receipt)
+                    {
                         needs_commit |= !binding_target_disposed(&self.paper_state, binding)?;
                     }
                 }
@@ -2119,6 +2143,7 @@ impl WalletOperation {
                             Some(read.clone()),
                         )
                         .await?
+                        && self.negative_target_disposed(&obligation, &conclusion, &read)?
                     {
                         acknowledged_audits.push((epoch, obligation.clone()));
                         negative_resolved.push((epoch, obligation));
@@ -2168,12 +2193,8 @@ impl WalletOperation {
                 .iter()
                 .find(|frontier| frontier.wallet == wallet)
             {
-                frontier
-                    .verify(&mut |receipt| {
-                        index
-                            .source_envelope(receipt)
-                            .map(crate::bucket_commit::CompleteActivityPage::from)
-                    })
+                index
+                    .verify_frame_frontier(frontier)
                     .map_err(|error| ReconciliationError::Binding(error.to_string()))?;
                 start = start.map(|start| start.min(frontier.fixed_end.saturating_sub(1)));
             }
@@ -2285,30 +2306,20 @@ impl WalletOperation {
                         && components.activity_type == ActivityType::Trade
                 });
         }
-        let read_commitment = Self::cancellable(
-            self.append_read_commitment(
+        // Once queued, the coordinator owns the append. Drain and authenticate its
+        // acknowledgement before yielding, just as for a sent bucket commit.
+        let read_commitment = self
+            .append_read_commitment(
                 wallet,
                 fixed_end,
                 &page_occurrences,
                 &activity.pages,
                 &bindings,
                 retain_proof,
-            ),
-            cancel,
-        )
-        .await??;
+            )
+            .await?;
         #[cfg(feature = "scenario")]
         self.crash_after(ReconciliationCrashBoundary::Commitment)?;
-        for matched in &correlation.matched {
-            if let Some(obligation) = selected
-                .get_mut(&matched.epoch)
-                .and_then(|groups| groups.get_mut(&matched.binding.stream_group_id.0))
-                && !obligation.bindings.contains(&matched.binding)
-            {
-                obligation.bindings.push(matched.binding.clone());
-                obligation.retained_commitments.push(read_commitment);
-            }
-        }
         let index = self.source_receipts.as_ref().ok_or_else(|| {
             ReconciliationError::Binding("source receipt index missing".to_owned())
         })?;
@@ -2323,6 +2334,16 @@ impl WalletOperation {
             )
             .map_err(|error| ReconciliationError::Binding(error.to_string()))?,
         );
+        for matched in &correlation.matched {
+            if let Some(obligation) = selected
+                .get_mut(&matched.epoch)
+                .and_then(|groups| groups.get_mut(&matched.binding.stream_group_id.0))
+                && !obligation.bindings.contains(&matched.binding)
+            {
+                obligation.bindings.push(matched.binding.clone());
+                obligation.retained_commitments.push(read_commitment);
+            }
+        }
         if has_frame_audit {
             if retain_proof || !bindings.is_empty() {
                 for obligation in selected
@@ -2332,6 +2353,9 @@ impl WalletOperation {
                 {
                     obligation.retained_commitments.push(read_commitment);
                 }
+            }
+            if cancel.as_ref().is_some_and(|cancel| *cancel.borrow()) {
+                return Err(ReconciliationError::Preempted);
             }
             for (epoch, groups) in selected.iter() {
                 for obligation in groups
@@ -2364,8 +2388,10 @@ impl WalletOperation {
                     {
                         continue;
                     }
-                    acknowledged_audits.push((*epoch, obligation.clone()));
-                    negative_resolved.push((*epoch, obligation.clone()));
+                    if self.negative_target_disposed(obligation, &conclusion, &verified)? {
+                        acknowledged_audits.push((*epoch, obligation.clone()));
+                        negative_resolved.push((*epoch, obligation.clone()));
+                    }
                 }
             }
         }
@@ -2409,6 +2435,40 @@ impl WalletOperation {
         // Admission can synchronize during commitment append or any bucket await. Promote
         // before considering disposal, then let the serialized owner reject a stale receipt.
         self.promote_selected_admissions(wallet, selected)?;
+        if has_frame_audit {
+            for (epoch, groups) in selected.iter() {
+                for obligation in groups.values() {
+                    if obligation.frame_admission_receipt.is_none()
+                        || negative_resolved
+                            .iter()
+                            .any(|(_, resolved)| resolved.receipt == obligation.receipt)
+                    {
+                        continue;
+                    }
+                    let frame = self
+                        .paper_state
+                        .activity_frame_decision(&obligation.group_id)?
+                        .ok_or_else(|| {
+                            ReconciliationError::Binding("admitted frame disappeared".to_owned())
+                        })?;
+                    let conclusion = crate::feed_audit::disposition(&frame, &verified)
+                        .map_err(|error| ReconciliationError::Binding(error.to_string()))?;
+                    if self.negative_target_disposed(obligation, &conclusion, &verified)?
+                        && self
+                            .request_negative_audit(
+                                obligation.receipt,
+                                verified.receipt,
+                                &conclusion,
+                                Some(verified.clone()),
+                            )
+                            .await?
+                    {
+                        acknowledged_audits.push((*epoch, obligation.clone()));
+                        negative_resolved.push((*epoch, obligation.clone()));
+                    }
+                }
+            }
+        }
         let disposed = self.disposed_obligations(wallet, selected, &verified)?;
         let mut resolved = Vec::new();
         for (epoch, obligation) in disposed {
@@ -2682,6 +2742,31 @@ impl WalletOperation {
                 )
             })
             .map_err(ReconciliationError::BucketCommit)
+    }
+
+    fn negative_target_disposed(
+        &self,
+        obligation: &Obligation,
+        conclusion: &crate::feed_audit::AuditDisposition,
+        read: &crate::bucket_commit::VerifiedCommitment,
+    ) -> Result<bool, ReconciliationError> {
+        match conclusion {
+            crate::feed_audit::AuditDisposition::Absent => Ok(true),
+            crate::feed_audit::AuditDisposition::Contradicted(id) => {
+                let binding = read
+                    .binding_indices
+                    .get(&(obligation.receipt.sequence, obligation.receipt.this_hash))
+                    .and_then(|position| read.bindings.get(*position))
+                    .filter(|binding| &binding.history_group_id == id)
+                    .ok_or_else(|| {
+                        ReconciliationError::Binding(
+                            "contradicted audit binding missing".to_owned(),
+                        )
+                    })?;
+                binding_target_disposed(&self.paper_state, binding).map_err(Into::into)
+            }
+            _ => Ok(false),
+        }
     }
 
     async fn request_negative_audit(
@@ -4484,13 +4569,23 @@ mod tests {
             candidates.observe_daily_boundary(&item.unwrap().1).unwrap();
         }
         let mut split = ReconciliationObligations::default();
-        let anchor = recover_daily_boundary_anchor(&paper_path, &mut split)
-            .unwrap()
-            .unwrap();
+        let anchor = recover_daily_boundary_anchor(
+            &paper_path,
+            &mut split,
+            &PaperStateDb::open(&dir.path().join("paper.sqlite")).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
         recover_daily_boundary_from_candidates(candidates, anchor, &mut split);
 
         let mut recovered = ReconciliationObligations::default();
-        recover_daily_boundary(&source_path, &paper_path, &mut recovered).unwrap();
+        recover_daily_boundary(
+            &source_path,
+            &paper_path,
+            &mut recovered,
+            &PaperStateDb::open(&dir.path().join("paper.sqlite")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(split, recovered);
         assert_eq!(split.boundary_anchor(), Some(200));
         assert_eq!(
@@ -4541,7 +4636,13 @@ mod tests {
         drop(Writer::open(&paper_path).unwrap());
 
         let mut obligations = ReconciliationObligations::default();
-        recover_daily_boundary(&missing_source_path, &paper_path, &mut obligations).unwrap();
+        recover_daily_boundary(
+            &missing_source_path,
+            &paper_path,
+            &mut obligations,
+            &PaperStateDb::open(&dir.path().join("paper.sqlite")).unwrap(),
+        )
+        .unwrap();
 
         assert!(obligations.boundary_anchor().is_none());
         assert!(obligations.pending_boundary().is_none());

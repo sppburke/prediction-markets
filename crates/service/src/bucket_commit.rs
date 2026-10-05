@@ -669,22 +669,6 @@ impl DecisionContinuationV3 {
         )
     }
 
-    /// Recovery authenticates the complete frozen frontier even if runtime cached its proof.
-    pub(crate) fn verify_activity_frame_fully_with_index(
-        &self,
-        index: &SourceReceiptIndex,
-    ) -> Result<(SourceTimestamp, Option<PolymarketTokenId>), CompleteActivityReadError> {
-        #[cfg(feature = "scenario")]
-        if let Some(receipt) = self.observed_source_receipt {
-            index.record_frame_verification(receipt);
-        }
-        self.verify_activity_frame(&mut |receipt| {
-            index
-                .source_envelope(receipt)
-                .map(CompleteActivityPage::from)
-        })
-    }
-
     /// Authenticate the exact frame and prefix before using any frozen decision fact.
     pub(crate) fn verify_activity_frame<L, E>(
         &self,
@@ -3013,7 +2997,7 @@ pub fn validate_frame_history(
         let continuation =
             DecisionContinuationV3::from_durable(&row).map_err(|error| fail(error.to_string()))?;
         continuation
-            .verify_activity_frame_fully_with_index(source_receipts)
+            .verify_activity_frame_with_index(source_receipts)
             .map_err(|error| fail(error.to_string()))?;
         validated += 1;
     }
@@ -3059,7 +3043,7 @@ pub(crate) fn validate_continuation_rows(
             DecisionContinuationV3::from_durable(&row).map_err(|error| fail(error.to_string()))?;
         if continuation.is_activity_frame() {
             continuation
-                .verify_activity_frame_fully_with_index(source_receipts)
+                .verify_activity_frame_with_index(source_receipts)
                 .map_err(|error| fail(error.to_string()))?;
             let proof: crate::frame_admission::FrameDecisionProof =
                 serde_json::from_value(continuation.facts.decision_inputs.clone())
@@ -3694,12 +3678,18 @@ impl BucketCommitEngine {
                 .ok_or_else(|| "incident decision missing".to_owned())?;
             let frame =
                 DecisionContinuationV3::from_durable(&row).map_err(|error| error.to_string())?;
-            crate::feed_audit::verify_incident(&frame, incident, &mut |receipt| {
-                index
-                    .source_envelope(receipt)
-                    .map(CompleteActivityPage::from)
-            })
-            .map_err(|error| error.to_string())?;
+            frame
+                .verify_activity_frame_with_index(index)
+                .map_err(|error| error.to_string())?;
+            let read = verified_commitment_bindings(incident.deciding_commitment_receipt, index)
+                .map_err(|error| error.to_string())?;
+            if frame.observed_source_receipt != Some(incident.frame_receipt)
+                || incident.engagement_receipt.is_some()
+            {
+                return Err("incident differs from authenticated frame".to_owned());
+            }
+            crate::feed_audit::verify_incident_conclusion(&frame, incident, &read)
+                .map_err(|error| error.to_string())?;
             index.remember_frame_incident(incident);
         }
         Ok(())
@@ -3832,7 +3822,11 @@ impl BucketCommitEngine {
                         .activity_group_state(source_trade_id)
                         .map_err(|error| error.to_string())?
                         .is_none()
-                    && !bound_disposition)
+                    && !bound_disposition
+                    && !self
+                        .paper_state
+                        .activity_observation_unbound_retired(receipt)
+                        .map_err(|error| error.to_string())?)
             {
                 return Err("ordinary observation retirement lacks durable disposition".to_owned());
             }
@@ -4039,6 +4033,92 @@ impl BucketCommitEngine {
         {
             self.routed_frame_receipts.insert(receipt.sequence);
             return Ok(FrameRoute::Ignored);
+        }
+        // A REST disposition may precede a frame with a different group key/market.
+        // Recover components from authenticated raw evidence: raw-only disposition
+        // documents deliberately contain no market/asset identity. This exceptional
+        // duplicate path walks only until the disposed transaction identities are found.
+        let disposed = self
+            .paper_state
+            .disposed_activity_transaction_groups(&observation.wallet, &parts.transaction_hash)?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        if !disposed.is_empty() {
+            let path = index.canonical_path().ok_or_else(|| {
+                BucketCommitError::Invariant("REST counterpart source path absent".to_owned())
+            })?;
+            let mut evidence = HashMap::new();
+            for item in pe_event_log::Reader::replay(path)
+                .map_err(|error| BucketCommitError::Invariant(error.to_string()))?
+            {
+                let (_, source) =
+                    item.map_err(|error| BucketCommitError::Invariant(error.to_string()))?;
+                if source.seq >= receipt.sequence {
+                    break;
+                }
+                if source.source_id.0 != crate::trade_poller::ACTIVITY_POLL_SOURCE_ID {
+                    continue;
+                }
+                activity_page_generation(
+                    &source.source_id.0,
+                    source.schema_version,
+                    source.parser_version,
+                    &source.content_type,
+                )
+                .map_err(|error| BucketCommitError::Invariant(error.to_string()))?;
+                let context = ActivityParseContext {
+                    source_id: source.source_id.clone(),
+                    observed_at: source.observed_at.clone(),
+                    received_at: source.received_at.clone(),
+                    transport: ActivityTransport::Replay,
+                };
+                let rows: Vec<Box<serde_json::value::RawValue>> =
+                    serde_json::from_slice(&source.payload)?;
+                let mut candidates = Vec::new();
+                for row in rows {
+                    let row = pe_source_polymarket_public::parse_activity_row(
+                        row.get().as_bytes(),
+                        None,
+                        &context,
+                    )
+                    .map_err(|error| BucketCommitError::Invariant(error.to_string()))?;
+                    if disposed.contains(
+                        row.group_id()
+                            .map_err(|error| BucketCommitError::Invariant(error.to_string()))?
+                            .key(),
+                    ) {
+                        candidates.push(row);
+                    }
+                }
+                for aggregate in aggregate_activity_rows(&candidates)
+                    .map_err(|error| BucketCommitError::Invariant(error.to_string()))?
+                {
+                    evidence
+                        .entry(aggregate.group_id.key().clone())
+                        .or_insert(aggregate);
+                }
+                if evidence.len() == disposed.len() {
+                    break;
+                }
+            }
+            if evidence.len() != disposed.len() {
+                return Err(BucketCommitError::Invariant(
+                    "disposed REST counterpart evidence absent".to_owned(),
+                ));
+            }
+            if !crate::feed_audit::resolve_frame_counterpart(
+                &observation,
+                None,
+                evidence.values(),
+                &HashMap::new(),
+            )
+            .is_empty()
+            {
+                self.paper_state
+                    .retire_activity_observation(receipt, true)?;
+                self.routed_frame_receipts.insert(receipt.sequence);
+                return Ok(FrameRoute::Ignored);
+            }
         }
         // REST winning first already consumed history, before this admission capture.
         let market_consumed = self

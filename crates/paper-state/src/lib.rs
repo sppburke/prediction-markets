@@ -959,6 +959,24 @@ impl PaperStateDb {
         .map_err(PaperStateError::from)
     }
 
+    /// REST identities already disposed for this wallet/transaction, including raw-only groups.
+    pub fn disposed_activity_transaction_groups(
+        &self,
+        wallet: &WalletAddress,
+        transaction_hash: &str,
+    ) -> Result<Vec<SourceTradeId>, PaperStateError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT source_trade_id FROM activity_groups WHERE wallet_hex = ?1 \
+             AND transaction_hash = ?2 AND activity_type = 'TRADE' ORDER BY source_trade_id",
+        )?;
+        let rows = statement.query_map(params![wallet.to_string(), transaction_hash], |row| {
+            Ok(SourceTradeId(row.get(0)?))
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(PaperStateError::from)
+    }
+
     /// Whether this exact aggregate revision has a durable disposition, including a refused
     /// revision whose predecessor remains the immutable `activity_groups` row.
     pub fn activity_revision_disposed(
@@ -7250,6 +7268,53 @@ mod tests {
                 .filter(|statement| statement.starts_with("ROLLBACK"))
                 .count(),
             0
+        );
+    }
+
+    #[test]
+    fn disposed_transaction_groups_include_raw_only_and_scope_wallet_and_trade() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("paper.db");
+        let db = PaperStateDb::open(&path).unwrap();
+        let connection = Connection::open(&path).unwrap();
+        for (id, owner, transaction, activity_type) in [
+            ("raw-counterpart", wallet(), "tx", "TRADE"),
+            ("other-leg", wallet(), "tx", "TRADE"),
+            ("other-wallet", WalletAddress([99; 20]), "tx", "TRADE"),
+            ("other-tx", wallet(), "tx-other", "TRADE"),
+            ("non-trade", wallet(), "tx", "REDEEM"),
+        ] {
+            connection.execute("INSERT INTO activity_groups(source_trade_id, transaction_hash, wallet_hex, source_epoch, semantic_revision, activity_type, disposition, proof_json) VALUES (?1, ?2, ?3, 100, 'revision', ?4, 'raw_only', '{}')",
+                params![id, transaction, owner.to_string(), activity_type]).unwrap();
+        }
+        assert_eq!(
+            db.disposed_activity_transaction_groups(&wallet(), "tx")
+                .unwrap(),
+            vec![
+                SourceTradeId("other-leg".to_owned()),
+                SourceTradeId("raw-counterpart".to_owned())
+            ]
+        );
+        assert!(
+            db.disposed_activity_transaction_groups(&wallet(), "missing")
+                .unwrap()
+                .is_empty()
+        );
+        let plan: String = connection.query_row("EXPLAIN QUERY PLAN SELECT source_trade_id FROM activity_groups WHERE wallet_hex = ?1 AND transaction_hash = ?2 AND activity_type = 'TRADE' ORDER BY source_trade_id",
+            params![wallet().to_string(), "tx"], |row| row.get(3)).unwrap();
+        assert!(
+            plan.contains("idx_activity_groups_wallet_transaction_trade"),
+            "{plan}"
+        );
+        drop(connection);
+        drop(db);
+        let reopened = PaperStateDb::open_read_only(&path).unwrap();
+        assert_eq!(
+            reopened
+                .disposed_activity_transaction_groups(&wallet(), "tx")
+                .unwrap()
+                .len(),
+            2
         );
     }
 

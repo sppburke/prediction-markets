@@ -527,7 +527,7 @@ impl SourceLogBoot {
             paper_log_path,
         )?);
         crate::paper_recovery::feed_latch_basis(&era)?;
-        obligations.retire_feed_incidents(&era);
+        obligations.retire_feed_incidents(&era, paper_state)?;
         if let Some(candidates) = self.reducers.daily_boundary.take()
             && let Some(anchor) = recover_daily_boundary_anchor_from_era(&era, &mut obligations)
                 .context("recover causal daily boundary")?
