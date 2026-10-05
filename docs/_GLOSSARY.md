@@ -627,10 +627,10 @@ unresolved. The first uniquely resolved later authenticated group becomes the fr
 counterpart: it applies to the leader ledger once and creates no second decision.
 Its first binding fixes that counterpart durably; later reads cannot replace it with another leg.
 Only authenticated restamp equivalence can change its identifier.
-A prior disposed REST counterpart prevents admission of a delayed frame of that trade even when
-its group identifier or market differs; independent transaction legs retain their own decisions.
-The owner records the existing unbound-observation retirement for this ignored duplicate, preserving
-acknowledged retirement across restart.
+A frame whose transaction REST already decided for that wallet under another identifier is
+admitted like any frame. Its audit matches an independent leg to that leg's own group through
+the equal-ID branch, with no second decision; a market/asset misreport contradicts and latches.
+Admission performs no source-log counterpart search.
 Once a read commitment is enqueued, reconciliation drains its acknowledgement, authenticates it
 and retains its binding/proof before honoring preemption.
 Later frame bindings carry `counterpart_basis_receipt`, referencing the first binding commitment
@@ -639,9 +639,12 @@ authenticate that basis with the same counterpart rule; initial and historical b
 
 **Feed incidents and history fallback.** `PaperLogRecord::FeedIncidentChanged { incident, state }`
 journals contradiction or absence before the audit ordering barrier retires. A contradiction
-engages the latch immediately but retains reconciliation and ordering work across acknowledgement
+engages the latch as soon as the audit concludes, before any routing of that read (including
+retained-read recovery), but retains reconciliation and ordering work across acknowledgement
 and restart until its exact REST target revision has a durable disposition, including late-group
-re-anchor handling. Repeated engagement requests acknowledge the existing incident once. The synchronized
+re-anchor handling. Qualification lists an engaged contradiction as unresolved until that exact
+revision is disposed; an engaged absence retires immediately. Repeated engagement requests
+acknowledge the existing incident once. The synchronized
 paper era rebuilds one process-wide latch before boot admissions: `Engaged` sets the latest
 incident, and `Released` must reference that latest engagement. While latched, frames wait for
 history; admitted work completes. `status.json` reports `source_health.feed_latch` and `source_health.feed_incident`, the

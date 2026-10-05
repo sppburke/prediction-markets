@@ -128,9 +128,6 @@ CREATE TABLE IF NOT EXISTS activity_groups (
 );
 CREATE INDEX IF NOT EXISTS idx_activity_groups_wallet_epoch_trade
 ON activity_groups(wallet_hex, source_epoch, source_trade_id);
--- Frame admission probes disposed REST identities without scanning the wallet's history.
-CREATE INDEX IF NOT EXISTS idx_activity_groups_wallet_transaction_trade
-ON activity_groups(wallet_hex, transaction_hash, source_trade_id) WHERE activity_type = 'TRADE';
 
 -- Immutable semantic revisions observed for a group. The first row mirrors
 -- `activity_groups`; a later changed revision is retained here while fencing

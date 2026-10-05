@@ -1760,23 +1760,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 );
                 // Engagement trips the latch immediately; a contradicted REST target
                 // keeps its ordering work until its exact revision is disposed.
-                let disposed = match &incident.counterpart_identity {
-                    None => true,
-                    Some(id) => {
-                        let binding = read
-                            .binding_indices
-                            .get(&(
-                                incident.frame_receipt.sequence,
-                                incident.frame_receipt.this_hash,
-                            ))
-                            .and_then(|position| read.bindings.get(*position))
-                            .filter(|binding| &binding.history_group_id == id)
-                            .ok_or_else(|| "incident counterpart binding missing".to_owned())?;
-                        self.paper_state
-                            .activity_revision_disposed(id, &binding.semantic_revision)
-                            .map_err(|error| error.to_string())?
-                    }
-                };
+                let disposed = crate::feed_audit::negative_target_disposed(
+                    &self.paper_state,
+                    incident.frame_receipt,
+                    incident.counterpart_identity.as_ref(),
+                    &read,
+                )
+                .map_err(|error| error.to_string())?;
                 if !crate::feed_audit::audited_receipts(&era).contains(&incident.frame_receipt) {
                     let incident_index = index.clone();
                     let receipt =

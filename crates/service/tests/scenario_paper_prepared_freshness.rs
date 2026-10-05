@@ -166,6 +166,33 @@ impl pe_source_polymarket_public::ReconciliationFetcher for DelayedPage {
         })
     }
 }
+struct MetadataPage {
+    page: Vec<u8>,
+    failures: Arc<AtomicUsize>,
+}
+impl pe_source_polymarket_public::ReconciliationFetcher for MetadataPage {
+    fn fetch<'a>(
+        &'a self,
+        _: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, pe_source_core::SourceError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            if self
+                .failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                Err(pe_source_core::SourceError::Transient {
+                    message: "injected retained-routing metadata failure".to_owned(),
+                })
+            } else {
+                Ok(self.page.clone())
+            }
+        })
+    }
+}
 impl ClobBookFetcher for Books {
     async fn fetch_book(&self, condition: &str, token: &str) -> Result<OrderBook, ClobBookError> {
         if self.gate.market.lock().unwrap().as_deref() == Some(condition)
@@ -277,6 +304,7 @@ struct Harness {
     poller_boot_rebuild: bool,
     frame_owner: bool,
     poller_fetch_failed: bool,
+    poller_metadata_failures: Arc<AtomicUsize>,
     poller_trigger: Mutex<Option<mpsc::Sender<pe_service::activity_ingest::ReconciliationTrigger>>>,
     books: Arc<Books>,
     prices: Prices,
@@ -439,6 +467,7 @@ impl Harness {
             poller_boot_rebuild: false,
             frame_owner: false,
             poller_fetch_failed: false,
+            poller_metadata_failures: Arc::new(AtomicUsize::new(0)),
             poller_trigger: Mutex::new(None),
             books: Arc::new(Books::default()),
             prices: Prices {
@@ -868,6 +897,7 @@ impl Harness {
                 .unwrap();
         }
         let (progress, mut completed) = mpsc::channel(8);
+        let metadata_failure_expected = self.poller_metadata_failures.load(Ordering::SeqCst) > 0;
         let delayed = Arc::new(DelayedPage {
             page: recorded.activity.clone(),
             failed: self.poller_fetch_failed,
@@ -921,7 +951,10 @@ impl Harness {
             self.watchlist.clone(),
             delayed.clone(),
             Arc::new(AssetIdentityResolver::new_runtime(
-                Arc::new(Page(recorded.gamma.clone())),
+                Arc::new(MetadataPage {
+                    page: recorded.gamma.clone(),
+                    failures: self.poller_metadata_failures.clone(),
+                }),
                 "fixture://gamma".to_owned(),
                 GAMMA_BATCH_SIZE,
                 self.source.clone(),
@@ -983,7 +1016,11 @@ impl Harness {
                 tokio::time::advance(std::time::Duration::from_secs(1)).await;
             }
         }
-        assert!(delayed.reads.load(Ordering::SeqCst) > misses);
+        assert!(
+            delayed.reads.load(Ordering::SeqCst) > misses
+                || (metadata_failure_expected
+                    && self.poller_metadata_failures.load(Ordering::SeqCst) == 0)
+        );
         let _ = stop.send(());
         let result = task.await.unwrap();
         self.poller_trigger.lock().unwrap().take();
@@ -5372,13 +5409,17 @@ async fn audit_release_recovery() {
 
 #[tokio::test(start_paused = true)]
 async fn matched_frame_binding_does_not_suppress_another_transaction_leg() {
-    for restart in [false, true] {
+    for (rest_first, restart) in [(false, false), (false, true), (true, false), (true, true)] {
         let mut h = Harness::new().await;
         let first = h.record(1).await;
         h.attempt(&first, at());
         h.start_frames();
         h.empty_frontier(EPOCH - 1).await;
-        let first_receipt = h.deliver_frame(&first, |_| {}).await;
+        let first_receipt = if rest_first {
+            None
+        } else {
+            Some(h.deliver_frame(&first, |_| {}).await)
+        };
         h.poll(&first).await;
         h.assert_frame_barrier(None).await;
         let first_terminal = h.terminal(&first);
@@ -5398,8 +5439,51 @@ async fn matched_frame_binding_does_not_suppress_another_transaction_leg() {
             &next,
             OffsetDateTime::from_unix_timestamp(next.epoch).unwrap(),
         );
-        // This cursor-bounded complete read contains B only: A's durable binding stays on A.
-        h.poll(&next).await;
+        let mut read = next.clone();
+        let next_receipt = if rest_first {
+            let receipt = h.deliver_frame(&next, |_| {}).await;
+            assert!(
+                replay_decision_pending(&h.terminal(&next))
+                    .unwrap()
+                    .continuation
+                    .is_activity_frame()
+            );
+            let mut rows: Value = serde_json::from_slice(&read.activity).unwrap();
+            rows.as_array_mut().unwrap().push(first_rows[0].clone());
+            read.activity = serde_json::to_vec(&rows).unwrap();
+            let mut gamma: Value = serde_json::from_slice(&next.gamma).unwrap();
+            gamma.as_array_mut().unwrap().extend(
+                serde_json::from_slice::<Value>(&first.gamma)
+                    .unwrap()
+                    .as_array()
+                    .unwrap()
+                    .clone(),
+            );
+            read.gamma = serde_json::to_vec(&gamma).unwrap();
+            Some(receipt)
+        } else {
+            // Cursor-bounded B-only read: A's durable binding stays on A.
+            None
+        };
+        let next_terminal = rest_first.then(|| h.terminal(&next));
+        h.poll(&read).await;
+        if rest_first {
+            assert_eq!(
+                h.paper
+                    .activity_group_state(&next.id)
+                    .unwrap()
+                    .unwrap()
+                    .disposition,
+                "applied"
+            );
+            assert_eq!(h.terminal(&next), next_terminal.unwrap());
+            h.assert_frame_barrier(None).await;
+            h.restart_frames().await;
+            h.poll(&read).await;
+            assert_eq!(h.paper.decision_pending_history().unwrap().len(), 2);
+            assert!(h.feed_edges().is_empty());
+            assert_eq!(h.paper.leader_positions().unwrap().len(), 2);
+        }
         assert!(h.feed_edges().is_empty());
         assert_eq!(h.terminal(&first), first_terminal);
         assert_eq!(h.paper.decision_pending_history().unwrap().len(), 2);
@@ -5425,9 +5509,22 @@ async fn matched_frame_binding_does_not_suppress_another_transaction_leg() {
             commitments
                 .iter()
                 .flat_map(|read| read.bindings.iter().flatten())
-                .filter(|binding| binding.stream_receipt == first_receipt)
+                .filter(|binding| Some(binding.stream_receipt) == first_receipt)
                 .all(|binding| binding.history_group_id == first.id)
         );
+        if let Some(receipt) = next_receipt {
+            let bindings = commitments
+                .iter()
+                .flat_map(|read| read.bindings.iter().flatten())
+                .filter(|binding| binding.stream_receipt == receipt)
+                .collect::<Vec<_>>();
+            assert!(!bindings.is_empty());
+            assert!(
+                bindings
+                    .iter()
+                    .all(|binding| binding.history_group_id == next.id)
+            );
+        }
         let report = h.qualify_one_fill().await;
         assert!(report.replay.exact, "restart={restart}: {report:?}");
         assert_eq!(report.replay.fills, 2);
@@ -8417,7 +8514,8 @@ fn read_commitments(
 #[tokio::test(start_paused = true)]
 async fn retained_contradiction_disposes_late_target_after_commitment_crash_and_incident() {
     for engage_before_restart in [false, true] {
-        let mut h = Harness::new().await;
+        let other_wallet = WalletAddress([0xbb; 20]);
+        let mut h = Harness::new_with_leaders(3, runtime(), vec![wallet(), other_wallet]).await;
         h.copy_budget_secs = 120;
         let frame = h.record(1).await;
         let other = h.record(2).await;
@@ -8445,6 +8543,13 @@ async fn retained_contradiction_disposes_late_target_after_commitment_crash_and_
         });
         counterpart.gamma = other.gamma.clone();
         counterpart.epoch = EPOCH + 5;
+        // The bound contradiction needs no new metadata. Routing the unbound marker
+        // still resolves it, so a transient failure here precedes all bucket application.
+        let mut rows: Value = serde_json::from_slice(&counterpart.activity).unwrap();
+        rows.as_array_mut()
+            .unwrap()
+            .push(serde_json::from_slice::<Value>(&marker.activity).unwrap()[0].clone());
+        counterpart.activity = serde_json::to_vec(&rows).unwrap();
         *h.poller_crash.lock().unwrap() =
             Some(pe_service::trade_poller::ReconciliationCrashBoundary::Commitment);
         assert!(
@@ -8474,6 +8579,69 @@ async fn retained_contradiction_disposes_late_target_after_commitment_crash_and_
         }
         h.restart_frames().await;
         h.poller_fetch_failed = true; // retained routing must finish before this failing read
+        h.poller_metadata_failures.store(1, Ordering::SeqCst);
+        h.poll(&counterpart).await;
+        assert_eq!(h.poller_metadata_failures.load(Ordering::SeqCst), 0);
+        assert!(
+            h.paper
+                .activity_group_state(&counterpart.id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(h.feed_edges().len(), 1);
+        assert!(
+            pe_service::paper_recovery::feed_latch_basis(&h.feed_era())
+                .unwrap()
+                .engaged()
+        );
+        let obligations = pe_service::trade_poller::rebuild_reconciliation_obligations_with_index(
+            &h.dir.path().join("source.log"),
+            &h.paper,
+            &h.index,
+        )
+        .unwrap();
+        assert_eq!(
+            obligations.unresolved_receipts(wallet()),
+            vec![frame_receipt]
+        );
+        h.empty_frontier_for(other_wallet, EPOCH + 5).await;
+        let mut incoming = frame.clone();
+        let mut rows: Value = serde_json::from_slice(&incoming.activity).unwrap();
+        rows[0]["proxyWallet"] = json!(other_wallet.to_string());
+        rows[0]["transactionHash"] = json!("other-wallet-during-retry");
+        incoming.activity = serde_json::to_vec(&rows).unwrap();
+        incoming.id = pe_source_polymarket_public::parse_activity_trade_observation(
+            &serde_json::to_vec(&rows[0]).unwrap(),
+        )
+        .unwrap()
+        .group_id
+        .key()
+        .clone();
+        let incoming_receipt = h.deliver_frame(&incoming, |_| {}).await;
+        assert!(
+            h.paper
+                .decision_pending_for(&incoming.id)
+                .unwrap()
+                .is_none()
+        );
+        let fallback = Reader::replay(h.dir.path().join("source.log"))
+            .unwrap()
+            .map(|frame| frame.unwrap().1)
+            .filter(|frame| {
+                frame.source_id.0 == pe_service::frame_admission::FRAME_FALLBACK_SOURCE_ID
+            })
+            .map(|frame| {
+                serde_json::from_slice::<pe_service::frame_admission::FrameFallbackArtifact>(
+                    &frame.payload,
+                )
+                .unwrap()
+            })
+            .find(|artifact| artifact.frame_receipt == incoming_receipt)
+            .unwrap();
+        assert_eq!(
+            fallback.reason,
+            pe_service::frame_admission::FrameFallbackReason::Latched
+        );
         h.poll(&counterpart).await;
         let disposed = h
             .paper
@@ -8506,7 +8674,7 @@ async fn retained_contradiction_disposes_late_target_after_commitment_crash_and_
 }
 
 #[tokio::test(start_paused = true)]
-async fn rest_first_counterpart_blocks_different_market_frame_across_restart() {
+async fn rest_first_misreport_is_admitted_then_contradicts_across_restart() {
     for restart in [false, true] {
         let mut h = Harness::new().await;
         let frame = h.record(1).await;
@@ -8522,24 +8690,53 @@ async fn rest_first_counterpart_blocks_different_market_frame_across_restart() {
         h.attempt(&counterpart, at());
         h.poll(&counterpart).await;
         let terminal = h.terminal(&counterpart);
+        let leaders = h.paper.leader_positions().unwrap();
+        let group = h.paper.activity_group_state(&counterpart.id).unwrap();
         assert_eq!(terminal.terminal_disposition.as_deref(), Some("fill"));
         if restart {
             h.restart_frames().await;
         }
+        h.attempt(&frame, at());
         let receipt = h.deliver_frame(&frame, |_| {}).await;
         assert!(
-            h.paper
+            !h.paper
                 .activity_observation_unbound_retired(receipt)
                 .unwrap()
         );
-        assert!(h.paper.decision_pending_for(&frame.id).unwrap().is_none());
+        let frame_terminal = h.terminal(&frame);
+        assert!(
+            replay_decision_pending(&frame_terminal)
+                .unwrap()
+                .continuation
+                .is_activity_frame()
+        );
+        assert_eq!(h.paper.decision_pending_history().unwrap().len(), 2);
         assert!(h.feed_edges().is_empty());
         h.poll(&counterpart).await;
+        assert_eq!(h.feed_edges().len(), 1);
+        assert_eq!(h.feed_edges()[0].1.frame_receipt, receipt);
+        assert_eq!(
+            h.feed_edges()[0].1.counterpart_identity,
+            Some(counterpart.id.clone())
+        );
+        assert!(
+            pe_service::paper_recovery::feed_latch_basis(&h.feed_era())
+                .unwrap()
+                .engaged()
+        );
         h.assert_frame_barrier(None).await;
         h.restart_frames().await;
         h.deliver_frame(&frame, |_| {}).await;
-        assert_eq!(h.paper.decision_pending_history().unwrap().len(), 1);
+        h.poll(&counterpart).await;
+        assert_eq!(h.feed_edges().len(), 1);
+        assert_eq!(h.paper.decision_pending_history().unwrap().len(), 2);
         assert_eq!(h.terminal(&counterpart), terminal);
+        assert_eq!(h.terminal(&frame), frame_terminal);
+        assert_eq!(h.paper.leader_positions().unwrap(), leaders);
+        assert_eq!(
+            h.paper.activity_group_state(&counterpart.id).unwrap(),
+            group
+        );
         assert_eq!(
             h.paper
                 .activity_groups_after(&wallet(), i64::MIN)
@@ -8549,6 +8746,7 @@ async fn rest_first_counterpart_blocks_different_market_frame_across_restart() {
         );
         let report = h.qualify_one_fill().await;
         assert!(report.replay.exact, "{report:?}");
+        assert_eq!(report.replay.fills, 2);
     }
 }
 
@@ -8724,4 +8922,198 @@ async fn commitment_preemption_drains_ack_and_keeps_fixed_binding_before_urgent_
     h.restart_frames().await;
     h.assert_frame_barrier(None).await;
     assert_eq!(h.paper.decision_pending_history().unwrap().len(), 1);
+}
+
+/// Journaled contradiction evidence alone does not prove the exact REST revision completed.
+#[tokio::test(start_paused = true)]
+async fn qualification_keeps_engaged_undisposed_contradiction_unresolved() {
+    for dispose in [false, true] {
+        let mut h = Harness::new().await;
+        let frame = h.record(1).await;
+        h.attempt(&frame, at());
+        h.start_frames();
+        h.empty_frontier(EPOCH - 1).await;
+        let frame_receipt = h.deliver_frame(&frame, |_| {}).await;
+        let terminal = h.terminal(&frame);
+        // Combo changes the revision but preserves the exact group identifier, so
+        // qualification selects the admitted frame even before the REST group exists.
+        let counterpart = h.rest_counterpart(&frame, |row| row["isCombo"] = json!(true));
+        assert_eq!(counterpart.id, frame.id);
+        *h.poller_crash.lock().unwrap() =
+            Some(pe_service::trade_poller::ReconciliationCrashBoundary::Commitment);
+        assert!(
+            h.poll_source_result(&counterpart, None, at(), 0)
+                .await
+                .is_err()
+        );
+        h.feed_update(pe_service::orchestrator_control::FeedAuditUpdate::Incident(
+            pe_service::paper_recovery::FeedIncident {
+                cause: pe_service::paper_recovery::FeedIncidentCause::Contradiction,
+                frame_receipt,
+                deciding_commitment_receipt: read_commitments(&h).last().unwrap().0,
+                counterpart_identity: Some(counterpart.id.clone()),
+                engagement_receipt: None,
+            },
+            None,
+        ))
+        .await;
+        assert!(
+            h.paper
+                .activity_group_state(&counterpart.id)
+                .unwrap()
+                .is_none()
+        );
+        h.restart_frames().await;
+        let obligations = pe_service::trade_poller::rebuild_reconciliation_obligations_with_index(
+            &h.dir.path().join("source.log"),
+            &h.paper,
+            &h.index,
+        )
+        .unwrap();
+        assert_eq!(
+            obligations.unresolved_receipts(wallet()),
+            vec![frame_receipt]
+        );
+        if dispose {
+            h.poll(&counterpart).await;
+            assert!(
+                h.paper
+                    .activity_group_state(&counterpart.id)
+                    .unwrap()
+                    .is_some()
+            );
+            let mut obligations =
+                pe_service::trade_poller::rebuild_reconciliation_obligations_with_index(
+                    &h.dir.path().join("source.log"),
+                    &h.paper,
+                    &h.index,
+                )
+                .unwrap();
+            obligations
+                .retire_feed_incidents(&h.feed_era(), &h.paper)
+                .unwrap();
+            assert!(obligations.unresolved_receipts(wallet()).is_empty());
+        }
+        assert_eq!(h.feed_edges().len(), 1);
+        assert_eq!(h.terminal(&frame), terminal);
+        let report = h.qualify_one_fill().await;
+        if dispose {
+            assert!(report.replay.exact, "{report:?}");
+            assert!(
+                !report
+                    .reasons
+                    .iter()
+                    .any(|reason| reason.contains("unresolved frame audits"))
+            );
+        } else {
+            assert_eq!(
+                report.verdict,
+                pe_service::qualification::QualificationVerdict::InsufficientEvidence
+            );
+            assert!(
+                report.reasons.iter().any(|reason| {
+                    reason.contains("unresolved frame audits") && reason.contains(&frame.id.0)
+                }),
+                "{report:?}"
+            );
+        }
+    }
+}
+
+/// Full pages within one second never establish a frontier or a negative frame audit.
+#[tokio::test(start_paused = true)]
+async fn saturated_one_second_read_keeps_frame_frontier_and_obligation_across_restart() {
+    use pe_source_polymarket_public::{
+        ACTIVITY_MAX_OFFSET, ActivityReadError, RECONCILIATION_PAGE_LIMIT, fetch_complete_activity,
+    };
+    let mut h = Harness::new().await;
+    let frame = h.record(1).await;
+    let original: Value = serde_json::from_slice(&frame.activity).unwrap();
+    let rows = (0..RECONCILIATION_PAGE_LIMIT)
+        .map(|index| {
+            let mut row = original[0].clone();
+            row["transactionHash"] = json!(format!("0xterminal{index}"));
+            row["asset"] = json!(format!("asset-terminal-{index}"));
+            row
+        })
+        .collect::<Vec<_>>();
+    let page = serde_json::to_vec(&rows).unwrap();
+    // The source fixture's typed completeness refusal, exercised with the same page shape.
+    let error = fetch_complete_activity(
+        &Page(page.clone()),
+        "fixture://activity",
+        wallet(),
+        Some(EPOCH - 1),
+        EPOCH,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        ActivityReadError::SaturatedTerminalSecond {
+            end: EPOCH,
+            offset: ACTIVITY_MAX_OFFSET,
+        }
+    ));
+    h.attempt(&frame, at());
+    h.start_frames();
+    h.empty_frontier(EPOCH - 1).await;
+    let receipt = h.deliver_frame(&frame, |_| {}).await;
+    let frontier = h.paper.feed_history_frontiers().unwrap();
+    let commitments_before = read_commitments(&h).len();
+    let terminal = h.terminal(&frame);
+    for restart in [false, true] {
+        if restart {
+            h.restart_frames().await;
+        }
+        let mut held = h.held_poll(&frame, Some(receipt));
+        let mut terminal_offset_seen = false;
+        let mut unresolved = None;
+        loop {
+            tokio::select! {
+                request = held.pages.recv() => {
+                    let request = request.unwrap();
+                    let url = reqwest::Url::parse(&request.url).unwrap();
+                    let query = url.query_pairs().collect::<HashMap<_, _>>();
+                    let end = query["end"].parse::<i64>().unwrap();
+                    if end == EPOCH {
+                        if query["start"] == EPOCH.to_string()
+                            && query["offset"] == ACTIVITY_MAX_OFFSET.to_string() {
+                            terminal_offset_seen = true;
+                        }
+                        request.respond.send(page.clone()).unwrap();
+                    } else {
+                        assert_eq!(end, EPOCH - 1);
+                        request.respond.send(b"[]".to_vec()).unwrap();
+                    }
+                }
+                progress = held.progress.recv() => {
+                    match progress.unwrap() {
+                        pe_service::trade_poller::PollerProgress::Completed { unresolved: receipts, .. } => {
+                            unresolved = Some(receipts);
+                        }
+                        pe_service::trade_poller::PollerProgress::RoundCompleted => break,
+                        _ => {}
+                    }
+                }
+            }
+        }
+        let _ = held.stop.send(());
+        held.task.await.unwrap().unwrap();
+        assert!(terminal_offset_seen);
+        assert_eq!(unresolved.unwrap(), vec![receipt]);
+        assert_eq!(h.paper.feed_history_frontiers().unwrap(), frontier);
+        assert_eq!(read_commitments(&h).len(), commitments_before);
+        assert!(h.feed_edges().is_empty());
+        assert_eq!(h.terminal(&frame), terminal);
+        let obligations = pe_service::trade_poller::rebuild_reconciliation_obligations_with_index(
+            &h.dir.path().join("source.log"),
+            &h.paper,
+            &h.index,
+        )
+        .unwrap();
+        assert_eq!(obligations.unresolved_receipts(wallet()), vec![receipt]);
+        h.assert_frame_barrier(Some(&[receipt])).await;
+    }
+    h.stop().await;
 }

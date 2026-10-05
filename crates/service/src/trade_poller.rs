@@ -2002,7 +2002,7 @@ impl WalletOperation {
                 replace_admitted_obligation(selected, *epoch, obligation.clone(), false);
             }
         }
-        let mut negative_resolved = Vec::new();
+        let mut negative_resolved: Vec<(i64, Obligation)> = Vec::new();
         let mut retained_matched = Vec::new();
         if let Some(index) = &self.source_receipts {
             let frames = self
@@ -2027,17 +2027,22 @@ impl WalletOperation {
             receipts.sort_by_key(|receipt| receipt.sequence);
             receipts.dedup();
             let mut matched = HashSet::new();
-            let mut negatives = Vec::new();
             // Authenticate each retained read once, then release its reconstructed history.
-            // Matches are applied before any retained or later absence is considered.
+            // An earlier match wins over later absence. Negative conclusions engage the
+            // latch before routing, including metadata resolution of unrelated aggregates.
             for receipt in receipts {
                 let read = Arc::new(
                     crate::bucket_commit::verified_commitment_bindings(receipt, index)
                         .map_err(|error| ReconciliationError::Binding(error.to_string()))?,
                 );
                 let mut matches = Vec::new();
+                let mut negatives = Vec::new();
                 for (epoch, obligation) in &obligations {
-                    if matched.contains(&obligation.receipt.sequence) {
+                    if matched.contains(&obligation.receipt.sequence)
+                        || negative_resolved
+                            .iter()
+                            .any(|(_, resolved)| resolved.receipt == obligation.receipt)
+                    {
                         continue;
                     }
                     let frame = frames.get(&obligation.group_id).ok_or_else(|| {
@@ -2047,11 +2052,27 @@ impl WalletOperation {
                         .map_err(|error| ReconciliationError::Binding(error.to_string()))?;
                     match conclusion {
                         crate::feed_audit::AuditDisposition::Matched(id) => {
+                            matched.insert(obligation.receipt.sequence);
                             matches.push((*epoch, obligation.clone(), id))
                         }
                         crate::feed_audit::AuditDisposition::Absent
                         | crate::feed_audit::AuditDisposition::Contradicted(_) => {
-                            negatives.push((*epoch, obligation.clone(), receipt, conclusion));
+                            if self
+                                .request_negative_audit(
+                                    obligation.receipt,
+                                    receipt,
+                                    &conclusion,
+                                    Some(read.clone()),
+                                )
+                                .await?
+                            {
+                                if self.negative_target_disposed(obligation, &conclusion, &read)? {
+                                    acknowledged_audits.push((*epoch, obligation.clone()));
+                                    negative_resolved.push((*epoch, obligation.clone()));
+                                } else {
+                                    negatives.push((*epoch, obligation.clone(), conclusion));
+                                }
+                            }
                         }
                         crate::feed_audit::AuditDisposition::Unresolved => {}
                     }
@@ -2108,42 +2129,19 @@ impl WalletOperation {
                         self.promote_selected_admissions(wallet, selected)?;
                         continue;
                     }
-                    matched.insert(obligation.receipt.sequence);
                     acknowledged_audits.push((epoch, obligation.clone()));
                     retained_matched.push((epoch, obligation));
                 }
-            }
-            let mut negative_receipts = HashSet::new();
-            negatives.retain(|(_, obligation, _, _)| {
-                !matched.contains(&obligation.receipt.sequence)
-                    && negative_receipts.insert(obligation.receipt.sequence)
-            });
-            // A negative keeps only its deciding receipt while match search is in progress.
-            // Group by read to avoid reconstructing a deciding proof per obligation.
-            negatives.sort_by_key(|(_, _, receipt, _)| receipt.sequence);
-            let mut pending = negatives.into_iter().peekable();
-            while let Some((_, _, receipt, _)) = pending.peek() {
-                let receipt = *receipt;
-                let read = Arc::new(
-                    crate::bucket_commit::verified_commitment_bindings(receipt, index)
-                        .map_err(|error| ReconciliationError::Binding(error.to_string()))?,
-                );
-                while pending
-                    .peek()
-                    .is_some_and(|(_, _, deciding, _)| *deciding == receipt)
-                {
-                    let Some((epoch, obligation, _, conclusion)) = pending.next() else {
-                        break;
-                    };
-                    if self
-                        .request_negative_audit(
-                            obligation.receipt,
-                            receipt,
-                            &conclusion,
-                            Some(read.clone()),
-                        )
-                        .await?
-                        && self.negative_target_disposed(&obligation, &conclusion, &read)?
+                for (epoch, obligation, conclusion) in negatives {
+                    if self.negative_target_disposed(&obligation, &conclusion, &read)?
+                        && self
+                            .request_negative_audit(
+                                obligation.receipt,
+                                receipt,
+                                &conclusion,
+                                Some(read.clone()),
+                            )
+                            .await?
                     {
                         acknowledged_audits.push((epoch, obligation.clone()));
                         negative_resolved.push((epoch, obligation));
@@ -2750,23 +2748,18 @@ impl WalletOperation {
         conclusion: &crate::feed_audit::AuditDisposition,
         read: &crate::bucket_commit::VerifiedCommitment,
     ) -> Result<bool, ReconciliationError> {
-        match conclusion {
-            crate::feed_audit::AuditDisposition::Absent => Ok(true),
-            crate::feed_audit::AuditDisposition::Contradicted(id) => {
-                let binding = read
-                    .binding_indices
-                    .get(&(obligation.receipt.sequence, obligation.receipt.this_hash))
-                    .and_then(|position| read.bindings.get(*position))
-                    .filter(|binding| &binding.history_group_id == id)
-                    .ok_or_else(|| {
-                        ReconciliationError::Binding(
-                            "contradicted audit binding missing".to_owned(),
-                        )
-                    })?;
-                binding_target_disposed(&self.paper_state, binding).map_err(Into::into)
-            }
-            _ => Ok(false),
-        }
+        let counterpart = match conclusion {
+            crate::feed_audit::AuditDisposition::Absent => None,
+            crate::feed_audit::AuditDisposition::Contradicted(id) => Some(id),
+            _ => return Ok(false),
+        };
+        crate::feed_audit::negative_target_disposed(
+            &self.paper_state,
+            obligation.receipt,
+            counterpart,
+            read,
+        )
+        .map_err(|error| ReconciliationError::Binding(error.to_string()))
     }
 
     async fn request_negative_audit(

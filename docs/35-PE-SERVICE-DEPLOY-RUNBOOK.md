@@ -885,9 +885,7 @@ neither a second Start nor a second seal. Open continuation-6 work resumes under
 semantic 2 before the semantic-3 seal check; continuation 7 selects semantic 3. Verify boot
 replay before and after REST reconciliation before deployment, then capture the first frame
 fill's AC15 evidence and the frozen AC16 cohort using
-[the read-only recipe](29-ACTIVITY-LATENCY-MEASUREMENT.md#730-acceptance-measurement). The first Phase 2 boot builds one additional partial index on `activity_groups`
-(transaction lookups for frame admission; about 1.2 million rows in production, seconds of extra
-boot time); staged preparation opens the database read-only and does not build it.
+[the read-only recipe](29-ACTIVITY-LATENCY-MEASUREMENT.md#730-acceptance-measurement).
 
 Reversal to a compatible Phase 1 binary ends at the first continuation-7 pending row or
 incompatible paper-log record, including `FeedIncidentChanged`. A frontier-only metadata write

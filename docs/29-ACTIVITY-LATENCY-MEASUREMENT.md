@@ -417,8 +417,10 @@ to its frozen frame receipt and `history_group_id` to `activity_groups.source_tr
 audits, join `FeedIncidentChanged.incident.frame_receipt` to the same frame and authenticate
 `deciding_commitment_receipt` plus any `counterpart_identity`; preserve the proof even with empty
 bindings. A retained authenticated counterpart, matched or contradicted, survives until its recorded
-target is durably disposed, even when a later mature full-history read is empty. Incident engagement
-is separate from completion of that target's disposition and late-group re-anchor. After a binding or negative counterpart identity is fixed,
+target is durably disposed, even when a later mature full-history read is empty. Incident engagement precedes routing of the deciding read, including retained-read recovery,
+and is separate from completion of that target's disposition and late-group re-anchor.
+Qualification keeps an engaged contradiction unresolved until its binding's exact revision is
+disposed; an engaged absence retires immediately. After a binding or negative counterpart identity is fixed,
 only authenticated restamp equivalence can change its identifier; another leg of the same transaction
 must retain its own routing. After an absence incident, the first uniquely resolved later
 authenticated same-transaction group is the frame's late counterpart, using the canonical glossary's asset-disambiguation and
@@ -429,9 +431,10 @@ paper era, including each `engagement_receipt`, and compare the frozen admission
 current status is supplementary evidence only.
 
 For REST-decided first entries, search the verified source prefix for the trade's frame, including
-authenticated corrections/restamp equivalence. A REST-first trade's delayed frame is an acknowledged
-duplicate, including a different group identifier or market; count the original REST decision once
-using its authenticated read and the ignored frame's durable unbound-observation retirement. No recorded frame means **feed-missed**. Otherwise
+authenticated corrections/restamp equivalence. A delayed frame whose transaction REST already
+decided under another identifier is admitted like any frame, without an admission-time counterpart
+search. Its audit matches an independent leg to that leg's own group through the equal-ID branch
+without a second decision; a market/asset misreport contradicts and latches. No recorded frame means **feed-missed**. Otherwise
 use the earliest authenticated `pe-service.activity-frame-fallback` artifact per `frame_receipt`,
 ordered by artifact source sequence: report its `reason`, `routing_clock`, evaluated `frontier`
 and `latest_incident_basis`. Derive wallet/market from the referenced frame, not artifact fields.

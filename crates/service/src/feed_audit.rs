@@ -22,6 +22,8 @@ pub enum FeedAuditError {
     Proof(#[from] crate::bucket_commit::CompleteActivityReadError),
     #[error("frame audit semantic refusal: {0}")]
     Semantic(&'static str),
+    #[error("frame audit disposition: {0}")]
+    State(#[from] pe_paper_state::PaperStateError),
 }
 
 /// Resolve a frame against the whole authenticated read. A binding or contradiction fixes
@@ -232,6 +234,28 @@ pub(crate) fn audited_receipts(era: &PaperEra) -> Vec<AppendReceipt> {
         .collect()
 }
 
+/// Negative audits retire only after their exact authenticated target revision is disposed.
+/// Absence has no REST target and retires immediately on engagement.
+pub(crate) fn negative_target_disposed(
+    state: &pe_paper_state::PaperStateDb,
+    frame_receipt: AppendReceipt,
+    counterpart: Option<&SourceTradeId>,
+    read: &VerifiedCommitment,
+) -> Result<bool, FeedAuditError> {
+    let Some(id) = counterpart else {
+        return Ok(true);
+    };
+    let binding = read
+        .binding_indices
+        .get(&(frame_receipt.sequence, frame_receipt.this_hash))
+        .and_then(|position| read.bindings.get(*position))
+        .filter(|binding| &binding.history_group_id == id)
+        .ok_or(FeedAuditError::Semantic(
+            "negative audit counterpart binding missing",
+        ))?;
+    Ok(state.activity_revision_disposed(id, &binding.semantic_revision)?)
+}
+
 /// Verify every journaled incident and expose admissions still lacking a disposed REST audit.
 pub(crate) fn verify_recorded_audits<L, E>(
     state: &pe_paper_state::PaperStateDb,
@@ -285,10 +309,7 @@ where
                 .push(incident);
         }
     }
-    let retired = audited_receipts(era)
-        .into_iter()
-        .map(key)
-        .collect::<HashSet<_>>();
+    let mut retired = HashSet::new();
     let mut matched = HashSet::new();
     // Release each reconstructed full-history read before authenticating the next one.
     receipts.sort_by_key(|receipt| receipt.sequence);
@@ -299,6 +320,14 @@ where
                 FeedAuditError::Semantic("incident has no durable admitted frame"),
             )?;
             verify_incident_conclusion(frame, incident, &read)?;
+            if negative_target_disposed(
+                state,
+                incident.frame_receipt,
+                incident.counterpart_identity.as_ref(),
+                &read,
+            )? {
+                retired.insert(key(incident.frame_receipt));
+            }
         }
         if !commitment_keys.contains(&key(receipt)) {
             continue;
