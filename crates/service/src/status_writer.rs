@@ -48,8 +48,7 @@ pub struct SourceHealthStatus {
     pub ws_readers: Vec<ReaderStatus>,
     pub poll_last_round_age_secs: Option<i64>,
     pub poll_error_streak: u32,
-    /// Durable websocket observations whose best-effort reconciliation enqueue
-    /// found the bounded queue full.
+    /// Compatibility field; retained delivery never drops an obligation.
     pub reconciliation_obligations_dropped_total: u64,
     pub copy_admission_blocked: bool,
 }
@@ -70,12 +69,7 @@ impl SourceHealthStatus {
     /// Project the shared health state (pure; unit-tested for the aggregate
     /// derivations). `now` is the wall clock for poll ages; `now_mono` is the
     /// monotonic clock reader timestamps are stamped on.
-    pub fn from_health(
-        h: &HealthState,
-        now: OffsetDateTime,
-        now_mono: Instant,
-        reconciliation_obligations_dropped_total: u64,
-    ) -> Self {
+    pub fn from_health(h: &HealthState, now: OffsetDateTime, now_mono: Instant) -> Self {
         let age = |t: Option<OffsetDateTime>| t.map(|t| (now - t).whole_seconds());
         let age_mono = |t: Option<Instant>| {
             t.map(|t| {
@@ -117,7 +111,7 @@ impl SourceHealthStatus {
                 .collect(),
             poll_last_round_age_secs: age(h.poll_last_round_at),
             poll_error_streak: h.poll_error_streak,
-            reconciliation_obligations_dropped_total,
+            reconciliation_obligations_dropped_total: 0,
             copy_admission_blocked: h.copy_admission_blocked(now, now_mono),
         }
     }
@@ -354,7 +348,6 @@ pub async fn run_status_writer(
     supabase_rpc_calls: Option<Arc<AtomicU64>>,
     live_accounts: Option<crate::live_accounts::LiveAccounts>,
     health: Option<SharedHealth>,
-    reconciliation_obligations_dropped: Option<Arc<AtomicU64>>,
     task_status: TaskStatus,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<(), StatusWriterError> {
@@ -379,15 +372,7 @@ pub async fn run_status_writer(
         let source_health = health.as_ref().and_then(|h| {
             let h = h.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             h.activity_ws_enabled.then(|| {
-                SourceHealthStatus::from_health(
-                    &h,
-                    OffsetDateTime::now_utc(),
-                    Instant::now(),
-                    reconciliation_obligations_dropped
-                        .as_ref()
-                        .map(|counter| counter.load(Ordering::Relaxed))
-                        .unwrap_or(0),
-                )
+                SourceHealthStatus::from_health(&h, OffsetDateTime::now_utc(), Instant::now())
             })
         });
         let applied_config = runtime_config.snapshot();
@@ -487,7 +472,7 @@ mod tests {
             };
         }
         let h = health.lock().unwrap();
-        let s = SourceHealthStatus::from_health(&h, now, now_mono, 11);
+        let s = SourceHealthStatus::from_health(&h, now, now_mono);
         assert!(s.ws_connected, "any connected reader");
         assert_eq!(s.ws_last_frame_age_secs, Some(5), "newest wire frame");
         assert_eq!(
@@ -509,7 +494,7 @@ mod tests {
         assert_eq!(s.ws_readers[2].last_normalized_activity_age_secs, Some(1));
         assert_eq!(s.ws_readers[1].last_wire_frame_age_secs, None);
         assert!(!s.copy_admission_blocked);
-        assert_eq!(s.reconciliation_obligations_dropped_total, 11);
+        assert_eq!(s.reconciliation_obligations_dropped_total, 0);
 
         let json = serde_json::to_value(&s).unwrap();
         for key in [
@@ -583,7 +568,6 @@ mod tests {
             runtime_status.clone(),
             WatchlistProjectionStatus::default(),
             false,
-            None,
             None,
             None,
             None,

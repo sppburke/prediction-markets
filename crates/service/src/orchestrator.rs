@@ -201,16 +201,19 @@ pub(crate) fn render_pending_evidence(
     let Some(evidence) = evidence else {
         return Ok(None);
     };
-    #[cfg(feature = "scenario")]
-    let terminal_at = SCENARIO_TERMINAL_CLOCK
-        .try_with(|at| *at)
-        .unwrap_or_else(|_| OffsetDateTime::now_utc());
-    #[cfg(not(feature = "scenario"))]
-    let terminal_at = OffsetDateTime::now_utc();
+    let terminal_at = terminal_now();
     let mut complete = evidence.clone();
     complete.record_clock("terminal_transition", unix_millis(terminal_at));
     let json = complete.render(authority, terminal)?;
     Ok(Some((json, terminal_at.unix_timestamp())))
+}
+
+pub(crate) fn terminal_now() -> OffsetDateTime {
+    #[cfg(feature = "scenario")]
+    if let Ok(at) = SCENARIO_TERMINAL_CLOCK.try_with(|at| *at) {
+        return at;
+    }
+    OffsetDateTime::now_utc()
 }
 
 #[cfg(feature = "scenario")]
@@ -428,6 +431,8 @@ pub struct Orchestrator<
     resuming_boot: bool,
     financial_log_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
     source_receipts: Option<SourceReceiptIndex>,
+    frame_source_log: Option<crate::activity_ingest::SourceLogHandle>,
+    frame_stale_secs: i64,
     qualification_start: Option<pe_event_log::AppendReceipt>,
     admission_builder: Option<crate::live_venue_adapter::LiveAdmissionBuilder>,
     boundary_mark_fetcher: Option<Arc<HistoricalMarkAdapter>>,
@@ -435,6 +440,7 @@ pub struct Orchestrator<
         crate::paper_recovery::RiskHaltOwner,
         pe_risk_engine::RiskHaltCause,
     )>,
+    feed_latch: crate::frame_admission::FeedLatchBasis,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1523,8 +1529,142 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         Ok(())
     }
 
+    async fn apply_activity_frame(
+        &mut self,
+        receipt: pe_event_log::AppendReceipt,
+    ) -> Result<(), String> {
+        let index = self
+            .source_receipts
+            .clone()
+            .ok_or_else(|| "frame source index missing".to_owned())?;
+        let source_log = self
+            .frame_source_log
+            .clone()
+            .ok_or_else(|| "frame source writer missing".to_owned())?;
+        let writer_lock = self.watchlist_writer_lock.clone();
+        let guard = match &writer_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        let source = index
+            .source_envelope(receipt)
+            .map_err(|error| error.to_string())?;
+        let observation =
+            pe_source_polymarket_public::parse_activity_trade_observation(&source.payload)
+                .map_err(|error| error.to_string())?;
+        let watchlist = self.live_watchlist.snapshot();
+        let entry = watchlist
+            .entries
+            .iter()
+            .find(|entry| entry.wallet == observation.wallet);
+        let configuration = self
+            .runtime_config
+            .as_ref()
+            .map(|config| config.snapshot().as_ref().clone())
+            .ok_or_else(|| "frame configuration snapshot missing".to_owned())?;
+        let tail = self
+            .paper_writer
+            .verified_tail()
+            .map_err(|error| error.to_string())?;
+        let paper_prefix = tail
+            .last_sequence
+            .map(|sequence| pe_event_log::AppendReceipt {
+                sequence,
+                this_hash: tail.last_hash,
+            });
+        let latch = self.feed_latch.clone();
+        let admitted_at = self.financial_now();
+        let route = self
+            .bucket_engine
+            .prepare_activity_frame(
+                receipt,
+                &index,
+                crate::bucket_commit::FrameAdmissionContext {
+                    admitted_at,
+                    stale_secs: self.frame_stale_secs,
+                    quality: entry.map_or(
+                        pe_core_types::ReconstructionQuality::new(0)
+                            .map_err(|error| error.to_string())?,
+                        |entry| entry.reconstruction_quality,
+                    ),
+                    signal_config: self.signal_config.clone(),
+                    copy_eligible: entry
+                        .is_some_and(|entry| entry.tier == pe_trader_index::WatchlistTier::Active),
+                    configuration,
+                    basis: crate::bucket_commit::FrozenDecisionBasis {
+                        win_rate_p: self.win_rate_p_for(&watchlist, &TraderId(observation.wallet)),
+                        bankroll: self.bankroll,
+                    },
+                    latch,
+                    paper_prefix,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        let (source_id, payload) = match &route {
+            crate::bucket_commit::FrameRoute::Ignored => return Ok(()),
+            crate::bucket_commit::FrameRoute::Fallback(artifact) => (
+                crate::frame_admission::FRAME_FALLBACK_SOURCE_ID,
+                crate::frame_admission::canonical_bytes(artifact),
+            ),
+            crate::bucket_commit::FrameRoute::Admission(inputs) => (
+                crate::frame_admission::FRAME_ADMISSION_SOURCE_ID,
+                crate::frame_admission::canonical_bytes(inputs),
+            ),
+        };
+        let admission_receipt = source_log
+            .append(EnvelopeIn {
+                source_id: SourceId(source_id.to_owned()),
+                schema_version: 1,
+                parser_version: 1,
+                observed_at: pe_core_types::SourceTimestamp(admitted_at),
+                received_at: pe_core_types::ReceivedAt(admitted_at),
+                content_type: pe_event_log::ContentType::Json,
+                payload: payload.map_err(|error| error.to_string())?,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        let crate::bucket_commit::FrameRoute::Admission(inputs) = route else {
+            return Ok(());
+        };
+        let id = self
+            .bucket_engine
+            .commit_activity_frame(
+                crate::frame_admission::FrameDecisionProof {
+                    admission_receipt,
+                    inputs: *inputs,
+                },
+                PaperFreshnessPolicy {
+                    activity_ws_enabled: self.activity_ws_enabled,
+                    copy_latency_budget_secs: self.copy_latency_budget_secs,
+                },
+                &index,
+            )
+            .map_err(|error| error.to_string())?;
+        drop(guard);
+        self.resume_committed_rows(&[id]).await
+    }
+
     async fn apply_control_message(&mut self, message: OrchestratorControl) {
         match message {
+            OrchestratorControl::ActivityFrameDecision { receipt } => {
+                if let Err(error) = self.apply_activity_frame(receipt).await {
+                    self.pending_load_failure = Some(error);
+                    self.intake_stopped = true;
+                }
+            }
+            OrchestratorControl::FeedAuditUpdate {
+                update,
+                acknowledged,
+            } => {
+                let result = match (update, self.source_receipts.as_ref()) {
+                    (
+                        crate::orchestrator_control::FeedAuditUpdate::Frontier(frontier),
+                        Some(index),
+                    ) => self.bucket_engine.publish_frontier(frontier, index),
+                    (_, None) => Err("feed audit source index is missing".to_owned()),
+                };
+                let _ = acknowledged.send(result);
+            }
             OrchestratorControl::PrepareAdmissions {
                 wallets,
                 acknowledged,
@@ -1968,6 +2108,9 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
 
         let bucket_engine = BucketCommitEngine::load(paper_state.clone(), leader_ledger)
             .map_err(|error| anyhow::anyhow!("load bucket commit engine: {error}"))?;
+        let feed_latch = crate::paper_recovery::feed_latch_basis(
+            &crate::paper_recovery::paper_era(paper_writer.snapshot()?),
+        )?;
         verify_retained_terminal_decisions(
             &paper_state,
             config.live_journal.as_ref().map(LiveJournalAccess::path),
@@ -2028,11 +2171,59 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             resuming_boot: false,
             financial_log_paths: None,
             source_receipts: None,
+            frame_source_log: None,
+            frame_stale_secs: 0,
             qualification_start: None,
             admission_builder: None,
             boundary_mark_fetcher: None,
             active_risk_halts: HashSet::new(),
+            feed_latch,
         })
+    }
+
+    /// Restore unresolved ordering barriers and route only unfinished synchronized frames.
+    pub async fn resume_activity_frames_before_producers(
+        &mut self,
+        all: &[pe_event_log::AppendReceipt],
+        undelivered: &[pe_event_log::AppendReceipt],
+    ) -> Result<(), String> {
+        let index = self
+            .source_receipts
+            .clone()
+            .ok_or_else(|| "frame source index missing".to_owned())?;
+        self.bucket_engine
+            .restore_frame_prefix(all, undelivered, &index)?;
+        crate::frame_admission::restore_frontiers(&self.paper_state, &index)
+            .map_err(|error| error.to_string())?;
+        self.refresh_feed_latch()?;
+        for receipt in undelivered {
+            self.apply_activity_frame(*receipt).await?;
+        }
+        Ok(())
+    }
+
+    /// Refresh after a synchronized incident/release edge; boot uses this same era reducer.
+    pub(crate) fn refresh_feed_latch(&mut self) -> Result<(), String> {
+        self.feed_latch =
+            crate::paper_recovery::feed_latch_basis(&crate::paper_recovery::paper_era(
+                self.paper_writer
+                    .snapshot()
+                    .map_err(|error| error.to_string())?,
+            ))
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    /// Install the source writer and the boot-resolved poll-round bound once.
+    #[must_use]
+    pub fn with_activity_frames(
+        mut self,
+        source_log: crate::activity_ingest::SourceLogHandle,
+        poll_round_stale_secs: i64,
+    ) -> Self {
+        self.frame_source_log = Some(source_log);
+        self.frame_stale_secs = poll_round_stale_secs;
+        self
     }
 
     /// Share the process source receipt index. Every generation-5 attempt authenticates its
@@ -2076,6 +2267,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             &paper_log_path,
         )?);
         self.active_risk_halts = crate::paper_recovery::active_risk_halts(&era);
+        self.feed_latch = crate::paper_recovery::feed_latch_basis(&era)?;
         self.qualification_start = era.start.as_ref().map(|(receipt, _)| *receipt);
         self.financial_log_paths = Some((paper_log_path, source_log_path));
         self.source_receipts = Some(source_receipts);

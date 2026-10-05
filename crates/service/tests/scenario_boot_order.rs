@@ -164,8 +164,6 @@ impl IngestOwner {
             ActivityIngest::poll_only(sink, source_rx, trigger_tx, health.clone())
         }
         .with_source_receipt_index(index.clone());
-        let dropped = ingest.reconciliation_triggers_dropped_counter();
-        assert_eq!(dropped.load(Ordering::Relaxed), 0);
         assert_eq!(
             TaskName::ActivityIngest.stop_phase(),
             ShutdownPhase::StopSinks

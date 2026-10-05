@@ -190,6 +190,10 @@ async fn run_once(
     let control = tokio::spawn(async move {
         let mut engine = BucketCommitEngine::load(control_paper, PositionLedger::new()).unwrap();
         while let Some(command) = control_rx.recv().await {
+            if let OrchestratorControl::FeedAuditUpdate { acknowledged, .. } = command {
+                let _ = acknowledged.send(Ok(()));
+                continue;
+            }
             if let OrchestratorControl::CommitActivityBucket {
                 aggregates,
                 context,
@@ -491,7 +495,14 @@ async fn reader_burst_coalesces_until_the_existing_poll_cadence() {
     let health = new_shared_health_with_ws(false, true, 90);
     let ingest =
         tokio::spawn(ActivityIngest::poll_only(sink, source_rx, trigger_tx, health.clone()).run());
-    let (control_tx, _control_rx) = mpsc::channel(1);
+    let (control_tx, mut control_rx) = mpsc::channel(1);
+    let control = tokio::spawn(async move {
+        while let Some(command) = control_rx.recv().await {
+            if let OrchestratorControl::FeedAuditUpdate { acknowledged, .. } = command {
+                let _ = acknowledged.send(Ok(()));
+            }
+        }
+    });
     let fetcher = Arc::new(QueueFetcher::new([b"[]".to_vec(), b"[]".to_vec()]));
     let now = OffsetDateTime::from_unix_timestamp(1_900_000_003).unwrap();
     let poller = tokio::spawn(
@@ -554,4 +565,5 @@ async fn reader_burst_coalesces_until_the_existing_poll_cadence() {
 
     poller.abort();
     ingest.abort();
+    control.abort();
 }

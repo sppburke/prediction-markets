@@ -991,6 +991,37 @@ pub async fn reconcile_active_financial_frames<S: SupabaseStateTrait + ?Sized>(
     source_evidence: SourceEvidence<'_>,
     writer: &crate::paper_recovery::PaperLog,
 ) -> Result<usize, SupabaseStateError> {
+    // Authenticate frame authority before retrying a financial mutation or projecting its Final.
+    // The log fallback builds one verified index for the whole recovery, never one scan per receipt.
+    let frame_rows = paper_state
+        .decision_pending_history()?
+        .into_iter()
+        .filter_map(|row| {
+            match serde_json::from_str::<serde_json::Value>(&row.frozen_inputs_json) {
+                Ok(wire) if wire["source_authority"] == "activity_frame" => Some(Ok(row)),
+                Ok(_) => None,
+                Err(error) => Some(Err(SupabaseStateError::Serialize(error))),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !frame_rows.is_empty() {
+        let index = match source_evidence {
+            SourceEvidence::Index(index) => index.clone(),
+            SourceEvidence::Log(path) => SourceReceiptIndex::replay(path)
+                .map_err(|error| SupabaseStateError::Corrupt(error.to_string()))?,
+        };
+        for row in frame_rows {
+            let continuation = crate::bucket_commit::DecisionContinuationV3::from_durable(&row)
+                .map_err(|error| SupabaseStateError::Corrupt(error.to_string()))?;
+            continuation
+                .verify_activity_frame(&mut |receipt| {
+                    index
+                        .source_envelope(receipt)
+                        .map(crate::bucket_commit::CompleteActivityPage::from)
+                })
+                .map_err(|error| SupabaseStateError::Corrupt(error.to_string()))?;
+        }
+    }
     let era =
         paper_era(writer.snapshot().map_err(|error| {
             SupabaseStateError::Corrupt(format!("scan active paper log: {error}"))
@@ -1159,7 +1190,7 @@ pub async fn reconcile_active_financial_frames<S: SupabaseStateTrait + ?Sized>(
             terminalize_final_fill_decision(paper_state, payload, &result, final_receipt)?;
             continue;
         }
-        let now = time::OffsetDateTime::now_utc();
+        let now = crate::orchestrator::terminal_now();
         let final_payload = serde_json::to_vec(&PaperLogRecord::FinancialFinal {
             prepared_receipt: frame.receipt,
             result: result.clone(),

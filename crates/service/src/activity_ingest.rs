@@ -15,7 +15,7 @@
 //! Watched rows travel `(slot, exact raw bytes, normalized trigger)` over ONE
 //! bounded fan-in channel (capacity = the trigger channel's) to the coordinator,
 //! which keeps the pre-#546 order: durable source-log append+sync, then a
-//! best-effort reconciliation-trigger enqueue. Public polling pages enter that
+//! retained reconciliation-trigger enqueue. Public polling pages enter that
 //! same coordinator through a second bounded input and wait for the same durable
 //! acknowledgement. Reader copies are never coalesced before recording; the
 //! reconciliation owner coalesces their durable obligations per wallet.
@@ -24,9 +24,8 @@
 //! - full fan-in → the sender blocks holding its one item (`fan_in_blocked` in
 //!   health) and reads no further wire frame, so backpressure reaches the
 //!   socket. Once delivery succeeds, the fresh post-delivery instant credits
-//!   liveness. A full reconciliation-trigger queue drops only that durable
-//!   obligation and increments the source-health counter; polling and restart
-//!   replay recover it from the source log. A closed receiver is orderly
+//!   liveness. Full control/trigger queues retain one synchronized frame while REST appends
+//!   continue to acknowledge. A closed receiver is orderly
 //!   shutdown. Owner abort or process failure may discard in-memory pre-log
 //!   work (the declared whole-process boundary; polling and #544 own recovery).
 //! - source-log append/sync failure → the sink poisons and the coordinator
@@ -43,7 +42,6 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
@@ -204,7 +202,7 @@ pub struct ActivityIngest {
     source_rx: SourceLogReceiver,
     trigger_tx: mpsc::Sender<ReconciliationTrigger>,
     health: SharedHealth,
-    reconciliation_triggers_dropped: Arc<AtomicU64>,
+    control_tx: Option<mpsc::WeakSender<crate::orchestrator_control::OrchestratorControl>>,
     source_receipts: SourceReceiptIndex,
     #[cfg(feature = "scenario")]
     reader_append_gate: Option<Arc<Semaphore>>,
@@ -233,6 +231,8 @@ struct ReaderConfig {
     live_watchlist: LiveWatchlist,
     dialer: Dialer,
     start: Option<watch::Receiver<bool>>,
+    #[cfg(feature = "scenario")]
+    receive_clock: Option<Arc<dyn Fn() -> OffsetDateTime + Send + Sync>>,
 }
 
 impl ActivityIngest {
@@ -248,12 +248,14 @@ impl ActivityIngest {
                 live_watchlist,
                 dialer: Arc::new(|_slot| Box::pin(ActivityWsStream::connect_and_subscribe())),
                 start: None,
+                #[cfg(feature = "scenario")]
+                receive_clock: None,
             }),
             sink,
             source_rx,
             trigger_tx,
             health,
-            reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
+            control_tx: None,
             source_receipts: SourceReceiptIndex::default(),
             #[cfg(feature = "scenario")]
             reader_append_gate: None,
@@ -273,7 +275,7 @@ impl ActivityIngest {
             source_rx,
             trigger_tx,
             health,
-            reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
+            control_tx: None,
             source_receipts: SourceReceiptIndex::default(),
             #[cfg(feature = "scenario")]
             reader_append_gate: None,
@@ -296,12 +298,13 @@ impl ActivityIngest {
                 live_watchlist,
                 dialer,
                 start: None,
+                receive_clock: None,
             }),
             sink,
             source_rx,
             trigger_tx,
             health,
-            reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
+            control_tx: None,
             source_receipts: SourceReceiptIndex::default(),
             reader_append_gate: None,
         }
@@ -317,6 +320,19 @@ impl ActivityIngest {
         self
     }
 
+    /// Fixed receive clock for production-reader scenarios; absent from production builds.
+    #[cfg(feature = "scenario")]
+    #[must_use]
+    pub fn with_scenario_receive_clock(
+        mut self,
+        clock: Arc<dyn Fn() -> OffsetDateTime + Send + Sync>,
+    ) -> Self {
+        if let Some(reader) = self.reader.as_mut() {
+            reader.receive_clock = Some(clock);
+        }
+        self
+    }
+
     /// Install the verified boot projection extended by this ingest's synchronized appends.
     #[must_use]
     pub fn with_source_receipt_index(mut self, source_receipts: SourceReceiptIndex) -> Self {
@@ -324,10 +340,14 @@ impl ActivityIngest {
         self
     }
 
-    /// Counter projected into `source_health` by the status writer.
+    /// Retain no strong control sender: shutdown remains owned by producers.
     #[must_use]
-    pub fn reconciliation_triggers_dropped_counter(&self) -> Arc<AtomicU64> {
-        Arc::clone(&self.reconciliation_triggers_dropped)
+    pub fn with_control_sender(
+        mut self,
+        sender: mpsc::WeakSender<crate::orchestrator_control::OrchestratorControl>,
+    ) -> Self {
+        self.control_tx = Some(sender);
+        self
     }
 
     /// Deterministic scenario seam for a delayed reader append/fsync.
@@ -377,6 +397,8 @@ impl ActivityIngest {
                 let reader_health = health.clone();
                 let fan_in = fan_in_tx.clone();
                 let mut start = reader.start.clone();
+                #[cfg(feature = "scenario")]
+                let receive_clock = reader.receive_clock.clone();
                 tasks.spawn(async move {
                     if let Some(start) = start.as_mut()
                         && start.wait_for(|started| *started).await.is_err()
@@ -389,6 +411,8 @@ impl ActivityIngest {
                         live_watchlist,
                         health: reader_health,
                         fan_in,
+                        #[cfg(feature = "scenario")]
+                        receive_clock,
                     }
                     .run()
                     .await;
@@ -409,7 +433,7 @@ impl ActivityIngest {
                 health: self.health,
                 fan_in: fan_in_rx,
                 source_rx: self.source_rx.rx,
-                reconciliation_triggers_dropped: self.reconciliation_triggers_dropped,
+                control_tx: self.control_tx,
                 source_receipts: self.source_receipts,
                 #[cfg(feature = "scenario")]
                 reader_append_gate: self.reader_append_gate,
@@ -461,6 +485,8 @@ struct Reader {
     live_watchlist: LiveWatchlist,
     health: SharedHealth,
     fan_in: mpsc::Sender<Observation>,
+    #[cfg(feature = "scenario")]
+    receive_clock: Option<Arc<dyn Fn() -> OffsetDateTime + Send + Sync>>,
 }
 
 impl Reader {
@@ -585,6 +611,12 @@ impl Reader {
         deadline: &mut Instant,
         backoff: &mut ReconnectBackoff,
     ) -> Result<(), Shutdown> {
+        #[cfg(feature = "scenario")]
+        let received_at = self
+            .receive_clock
+            .as_ref()
+            .map_or_else(OffsetDateTime::now_utc, |clock| clock());
+        #[cfg(not(feature = "scenario"))]
         let received_at = OffsetDateTime::now_utc();
         self.set_health(|r| r.last_wire_frame_at = Some(now));
         let (payloads, missing) = match parse_activity_frame(text) {
@@ -700,7 +732,7 @@ struct Coordinator {
     health: SharedHealth,
     fan_in: mpsc::Receiver<Observation>,
     source_rx: mpsc::Receiver<SourceLogRequest>,
-    reconciliation_triggers_dropped: Arc<AtomicU64>,
+    control_tx: Option<mpsc::WeakSender<crate::orchestrator_control::OrchestratorControl>>,
     source_receipts: SourceReceiptIndex,
     #[cfg(feature = "scenario")]
     reader_append_gate: Option<Arc<Semaphore>>,
@@ -786,19 +818,8 @@ impl Coordinator {
                         received_at: observation.trigger.received_at,
                         receipt,
                     };
-                    // Trigger delivery follows sync. A full queue drops only this
-                    // durable obligation; polling and restart replay recover it.
-                    match self.trigger_tx.try_send(trigger) {
-                        Ok(()) => {}
-                        Err(TrySendError::Full(_)) => {
-                            self.reconciliation_triggers_dropped
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(TrySendError::Closed(_)) => {
-                            if !drain_sources {
-                                return;
-                            }
-                        }
+                    if self.deliver_frame(trigger, drain_sources).await.is_err() && !drain_sources {
+                        return;
                     }
                 }
                 Input::Source(request) => {
@@ -811,6 +832,54 @@ impl Coordinator {
                         Err(Shutdown) => return,
                     };
                     let _ = request.appended.send(seq);
+                }
+            }
+        }
+    }
+
+    // Exactly one synchronized frame is retained here. While either bounded destination is
+    // saturated, public REST appends still synchronize and acknowledge; no later frame passes it.
+    async fn deliver_frame(
+        &mut self,
+        trigger: ReconciliationTrigger,
+        drain_sources: bool,
+    ) -> Result<(), Shutdown> {
+        if let Some(sender) = self.control_tx.as_ref().and_then(mpsc::WeakSender::upgrade) {
+            let reserved = sender.reserve_owned();
+            tokio::pin!(reserved);
+            loop {
+                tokio::select! {
+                    biased;
+                    () = self.trigger_tx.closed() => return Err(Shutdown),
+                    permit = &mut reserved => {
+                        permit.map_err(|_| Shutdown)?.send(crate::orchestrator_control::OrchestratorControl::ActivityFrameDecision { receipt: trigger.receipt });
+                        break;
+                    }
+                    Some(request) = self.source_rx.recv() => {
+                        let label = SourceTradeId(request.envelope.source_id.0.clone());
+                        let receipt = self.append_with_recovery(request.envelope, &label, None, drain_sources).await?;
+                        let _ = request.appended.send(receipt);
+                    }
+                }
+            }
+        } else if self.control_tx.is_some() {
+            return Err(Shutdown);
+        }
+        let sender = self.trigger_tx.clone();
+        let reserved = sender.reserve_owned();
+        tokio::pin!(reserved);
+        loop {
+            tokio::select! {
+                biased;
+                () = self.trigger_tx.closed() => return Err(Shutdown),
+                permit = &mut reserved => {
+                    permit.map_err(|_| Shutdown)?.send(trigger);
+                    return Ok(());
+                }
+                Some(request) = self.source_rx.recv() => {
+                    let label = SourceTradeId(request.envelope.source_id.0.clone());
+                    let receipt = self.append_with_recovery(request.envelope, &label, None, drain_sources).await?;
+                    let _ = request.appended.send(receipt);
                 }
             }
         }
@@ -986,7 +1055,7 @@ mod tests {
                 health: health.clone(),
                 fan_in: fan_in_rx,
                 source_rx: source_rx.rx,
-                reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
+                control_tx: None,
                 source_receipts: SourceReceiptIndex::default(),
                 #[cfg(feature = "scenario")]
                 reader_append_gate: None,
@@ -1057,7 +1126,7 @@ mod tests {
                 health: health.clone(),
                 fan_in: fan_in_rx,
                 source_rx: source_rx.rx,
-                reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
+                control_tx: None,
                 source_receipts: SourceReceiptIndex::default(),
                 #[cfg(feature = "scenario")]
                 reader_append_gate: None,
@@ -1132,7 +1201,7 @@ mod tests {
                 health: health.clone(),
                 fan_in: fan_in_rx,
                 source_rx: source_rx.rx,
-                reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
+                control_tx: None,
                 source_receipts: source_receipts.clone(),
                 #[cfg(feature = "scenario")]
                 reader_append_gate: None,
@@ -1185,7 +1254,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn full_trigger_queue_drops_obligation_and_releases_poll_page_append() {
+    async fn full_trigger_queue_retains_obligation_and_releases_poll_page_append() {
         let dir = tempfile::tempdir().unwrap();
         let mut sink = SourceEventSink::open(dir.path().join("source.log")).unwrap();
         sink.fail_next_append();
@@ -1193,7 +1262,6 @@ mod tests {
         let (trigger_tx, mut trigger_rx) = mpsc::channel(1);
         let (source_log, source_rx) = SourceLogHandle::channel(1);
         let health = new_shared_health_with_ws(false, true, 90);
-        let dropped = Arc::new(AtomicU64::new(0));
         let queued = observation("0xqueued").trigger;
         trigger_tx
             .try_send(ReconciliationTrigger {
@@ -1215,7 +1283,7 @@ mod tests {
                 health: health.clone(),
                 fan_in: fan_in_rx,
                 source_rx: source_rx.rx,
-                reconciliation_triggers_dropped: Arc::clone(&dropped),
+                control_tx: None,
                 source_receipts: SourceReceiptIndex::default(),
                 #[cfg(feature = "scenario")]
                 reader_append_gate: None,
@@ -1252,7 +1320,6 @@ mod tests {
             appending.await.unwrap().unwrap().sequence,
             pe_core_types::EventSeq(1)
         );
-        assert_eq!(dropped.load(Ordering::Relaxed), 1);
         assert_eq!(
             trigger_rx.try_recv().unwrap().source_trade_id,
             observation("0xqueued").trigger.source_trade_id
@@ -1265,13 +1332,107 @@ mod tests {
         assert_eq!(
             recorded.len(),
             2,
-            "dropped wakeups retain raw evidence and do not block a polling page"
+            "retained wakeups do not block a polling page"
         );
         assert_eq!(recorded[1].source_id.0, "poll-test");
 
+        assert_eq!(
+            trigger_rx.recv().await.unwrap().source_trade_id,
+            observation("0xreader").trigger.source_trade_id
+        );
         drop(source_log);
         drop(fan_in_tx);
         task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn both_queues_full_retain_frame_while_rest_acks_and_shutdown_drains() {
+        use crate::orchestrator_control::OrchestratorControl;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let sink = SourceEventSink::open(&path).unwrap();
+        let (fan_in, fan_in_rx) = mpsc::channel(1);
+        let (trigger_tx, mut triggers) = mpsc::channel(1);
+        let (control, mut controls) = mpsc::channel(1);
+        let queued_receipt = AppendReceipt {
+            sequence: pe_core_types::EventSeq(99),
+            this_hash: blake3::hash(b"queued"),
+        };
+        control
+            .send(OrchestratorControl::ActivityFrameDecision {
+                receipt: queued_receipt,
+            })
+            .await
+            .unwrap();
+        let queued = observation("queued").trigger;
+        trigger_tx
+            .send(ReconciliationTrigger {
+                wallet: queued.wallet,
+                source_time: queued.source_time,
+                source_trade_id: queued.source_trade_id,
+                provenance: queued.provenance,
+                received_at: queued.received_at,
+                receipt: queued_receipt,
+            })
+            .await
+            .unwrap();
+        let (source, receiver) = SourceLogHandle::channel(1);
+        let task = tokio::spawn(
+            Coordinator {
+                sink,
+                trigger_tx,
+                health: new_shared_health_with_ws(false, true, 90),
+                fan_in: fan_in_rx,
+                source_rx: receiver.rx,
+                control_tx: Some(control.downgrade()),
+                source_receipts: SourceReceiptIndex::default(),
+                #[cfg(feature = "scenario")]
+                reader_append_gate: None,
+            }
+            .run_with_source_drain(true),
+        );
+        fan_in.send(observation("retained")).await.unwrap();
+        settle().await;
+        let append_rest = || {
+            source.append(EnvelopeIn {
+                source_id: SourceId("poll-test".to_owned()),
+                schema_version: 1,
+                parser_version: 1,
+                observed_at: SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
+                received_at: ReceivedAt(OffsetDateTime::UNIX_EPOCH),
+                content_type: ContentType::Json,
+                payload: b"[]".to_vec(),
+            })
+        };
+        assert_eq!(append_rest().await.unwrap().sequence.0, 1);
+        assert!(
+            matches!(controls.recv().await, Some(OrchestratorControl::ActivityFrameDecision { receipt }) if receipt == queued_receipt)
+        );
+        let frame = match controls.recv().await.unwrap() {
+            OrchestratorControl::ActivityFrameDecision { receipt } => receipt,
+            _ => unreachable!(),
+        };
+        assert_eq!(frame.sequence.0, 0);
+        assert_eq!(append_rest().await.unwrap().sequence.0, 2);
+        assert_eq!(triggers.recv().await.unwrap().receipt, queued_receipt);
+        assert_eq!(triggers.recv().await.unwrap().receipt, frame);
+        // Retain another synchronized frame behind a full control queue, then close trigger
+        // intake. Its raw evidence remains, and the sink still serves the control drain.
+        control
+            .send(OrchestratorControl::ActivityFrameDecision {
+                receipt: queued_receipt,
+            })
+            .await
+            .unwrap();
+        fan_in.send(observation("shutdown-retained")).await.unwrap();
+        settle().await;
+        drop(triggers);
+        assert_eq!(append_rest().await.unwrap().sequence.0, 4);
+        drop(source);
+        drop(fan_in);
+        drop(control);
+        task.await.unwrap();
+        assert_eq!(pe_event_log::Reader::replay(&path).unwrap().count(), 5);
     }
 
     /// A receiver closed before the coordinator runs wins over buffered fan-in
@@ -1292,7 +1453,7 @@ mod tests {
             health: new_shared_health_with_ws(false, true, 90),
             fan_in: fan_in_rx,
             source_rx: source_rx.rx,
-            reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
+            control_tx: None,
             source_receipts: SourceReceiptIndex::default(),
             #[cfg(feature = "scenario")]
             reader_append_gate: None,
@@ -1319,7 +1480,7 @@ mod tests {
                 health,
                 fan_in: fan_in_rx,
                 source_rx: source_rx.rx,
-                reconciliation_triggers_dropped: Arc::new(AtomicU64::new(0)),
+                control_tx: None,
                 source_receipts: SourceReceiptIndex::default(),
                 #[cfg(feature = "scenario")]
                 reader_append_gate: None,

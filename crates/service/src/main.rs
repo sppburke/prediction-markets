@@ -1049,10 +1049,12 @@ async fn main() -> Result<()> {
         pe_service::dispatch_recovery::resume_dispatch_seeds(&cfg.event_log_path, &paper_state)
             .context("resume active-era dispatch seeds after financial recovery")?;
     }
+    let poll_round_stale_secs =
+        i64::try_from(cfg.trade_poll_interval_secs.saturating_mul(3)).unwrap_or(i64::MAX);
     let health = new_shared_health_with_ws(
         false,
         cfg.polymarket_activity_ws_enabled,
-        i64::try_from(cfg.trade_poll_interval_secs.saturating_mul(3)).unwrap_or(i64::MAX),
+        poll_round_stale_secs,
     );
     let task_status = health
         .lock()
@@ -1138,6 +1140,8 @@ async fn main() -> Result<()> {
         "activity obligations rebuilt"
     );
 
+    let (boot_frame_prefix, boot_frame_deliveries) = obligations.frame_recovery_receipts();
+
     // One bounded single-writer coordinator owns both websocket rows and every
     // fixed-end public page. Append acknowledgement precedes all triggers/apply.
     let sink = match (source_log_boot.as_ref(), boot_sink.take()) {
@@ -1181,8 +1185,7 @@ async fn main() -> Result<()> {
         )
         .with_source_receipt_index(source_receipts.clone())
     };
-    let reconciliation_obligations_dropped =
-        activity_ingest.reconciliation_triggers_dropped_counter();
+    let activity_ingest = activity_ingest.with_control_sender(control_tx.downgrade());
     supervisor.spawn(TaskName::ActivityIngest, async move {
         // Recovery may append admission evidence before observation producers start.
         match activity_ingest
@@ -1322,7 +1325,7 @@ async fn main() -> Result<()> {
         admission_http_client,
         cfg.gamma_base_url.clone(),
         cfg.polymarket_clob_base_url.clone(),
-        orchestrator_source_log,
+        orchestrator_source_log.clone(),
     );
 
     let snapshot_handle = if cfg.supabase_sink_enabled && !cfg.supabase_url.is_empty() {
@@ -1542,6 +1545,7 @@ async fn main() -> Result<()> {
     )
     .context("build orchestrator")?
     .with_source_receipt_index(source_receipts.clone())
+    .with_activity_frames(orchestrator_source_log.clone(), poll_round_stale_secs)
     .with_live_dispatch_ready(live_dispatch_ready);
     if let Some(task) = live_fanout_task {
         supervisor.spawn(TaskName::LiveFanout, task);
@@ -1566,6 +1570,13 @@ async fn main() -> Result<()> {
     orch.resume_pending_before_producers()
         .await
         .context("resume decision_pending before source producers")?;
+    if cfg.polymarket_activity_ws_enabled {
+        orch.resume_activity_frames_before_producers(&boot_frame_prefix, &boot_frame_deliveries)
+            .await
+            .map_err(anyhow::Error::msg)
+            .context("resume synchronized activity frames before producers")?;
+    }
+
     let orchestrator_shutdown = shutdown.subscribe();
     supervisor.spawn(TaskName::Orchestrator, async move {
         orch.run_coordinated(orchestrator_shutdown.wait_for(ShutdownPhase::DrainOrchestrator))
@@ -1760,7 +1771,6 @@ async fn main() -> Result<()> {
         supabase_rpc_calls,
         live_accounts.clone(),
         Some(health.clone()),
-        Some(reconciliation_obligations_dropped),
         task_status.clone(),
         shutdown.subscribe().wait_for(ShutdownPhase::FinalStatus),
     );

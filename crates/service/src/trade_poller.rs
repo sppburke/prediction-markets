@@ -179,6 +179,8 @@ pub struct ReconciliationObligations {
     by_wallet: CoalescedObligations,
     boundary: Option<PendingBoundary>,
     last_boundary_cutoff: Option<i64>,
+    routed_frames: HashSet<pe_core_types::EventSeq>,
+    frame_candidates: HashMap<SourceTradeId, AppendReceipt>,
 }
 
 /// Log-pure websocket candidates awaiting one durable-state filter (#572).
@@ -186,6 +188,10 @@ pub struct ReconciliationObligations {
 pub(crate) struct ActivityCandidates {
     by_wallet: CoalescedObligations,
     binding_commitments: Vec<AppendReceipt>,
+    #[serde(default)]
+    routed_frames: HashSet<pe_core_types::EventSeq>,
+    #[serde(default)]
+    frame_candidates: HashMap<SourceTradeId, AppendReceipt>,
 }
 
 impl ActivityCandidates {
@@ -194,6 +200,22 @@ impl ActivityCandidates {
         &mut self,
         envelope: &EventEnvelope,
     ) -> Result<(), ObligationRebuildError> {
+        if envelope.source_id.0 == crate::frame_admission::FRAME_FALLBACK_SOURCE_ID {
+            let artifact: crate::frame_admission::FrameFallbackArtifact =
+                serde_json::from_slice(&envelope.payload)
+                    .map_err(|error| ObligationRebuildError::Binding(error.to_string()))?;
+            if envelope.schema_version != 1
+                || envelope.parser_version != 1
+                || artifact.version != 1
+                || artifact.frame_receipt.sequence >= envelope.seq
+            {
+                return Err(ObligationRebuildError::Binding(
+                    "invalid frame fallback artifact".to_owned(),
+                ));
+            }
+            self.routed_frames.insert(artifact.frame_receipt.sequence);
+            return Ok(());
+        }
         if envelope.source_id.0 == ACTIVITY_READ_COMMITMENT_SOURCE_ID {
             let commitment: crate::bucket_commit::ActivityReadCommitment =
                 serde_json::from_slice(&envelope.payload)
@@ -232,6 +254,17 @@ impl ActivityCandidates {
             return Ok(());
         }
         let activity = parse_activity_trade_observation(&envelope.payload)?;
+        if activity.group_id.components().side == Some(pe_core_types::Side::Buy)
+            && activity.share_amount != pe_core_types::ShareAmount::ZERO
+            && !activity.is_combo
+        {
+            self.frame_candidates
+                .entry(activity.group_id.key().clone())
+                .or_insert(AppendReceipt {
+                    sequence: envelope.seq,
+                    this_hash: envelope.this_hash,
+                });
+        }
         insert_reconciliation_trigger(
             &mut self.by_wallet,
             ReconciliationTrigger {
@@ -282,7 +315,11 @@ impl ActivityCandidates {
                     .push(binding);
             }
         }
-        let mut obligations = ReconciliationObligations::default();
+        let mut obligations = ReconciliationObligations {
+            routed_frames: self.routed_frames,
+            frame_candidates: self.frame_candidates,
+            ..ReconciliationObligations::default()
+        };
         for (wallet, epochs) in self.by_wallet {
             let fenced = paper_state.is_wallet_fenced(&wallet)?;
             for (epoch, groups) in epochs {
@@ -317,6 +354,43 @@ pub struct PendingBoundary {
 }
 
 impl ReconciliationObligations {
+    /// Receipt-ordered unfinished frame work. Fallbacks stay reconciliation obligations but
+    /// are not routed a second time at boot.
+    #[must_use]
+    pub fn frame_recovery_receipts(&self) -> (Vec<AppendReceipt>, Vec<AppendReceipt>) {
+        let outstanding = self
+            .by_wallet
+            .values()
+            .flat_map(BTreeMap::values)
+            .flat_map(BTreeMap::values)
+            .map(|obligation| obligation.group_id.clone())
+            .collect::<HashSet<_>>();
+        let mut all = self
+            .frame_candidates
+            .iter()
+            .filter(|(id, _)| outstanding.contains(*id))
+            .map(|(_, receipt)| *receipt)
+            .collect::<Vec<_>>();
+        // Wallet-age evidence and recovery include SELL/raw-only receipts and checkpoints written
+        // before frame_candidates existed. Admission uses the authenticated payload to ignore
+        // those that cannot qualify; a later ordinary BUY candidate retains its own first receipt.
+        all.extend(
+            self.by_wallet
+                .values()
+                .flat_map(BTreeMap::values)
+                .flat_map(BTreeMap::values)
+                .map(|obligation| obligation.receipt),
+        );
+        all.sort_by_key(|receipt| receipt.sequence);
+        all.dedup();
+        let undelivered = all
+            .iter()
+            .filter(|receipt| !self.routed_frames.contains(&receipt.sequence))
+            .copied()
+            .collect();
+        (all, undelivered)
+    }
+
     /// Add one already-durable reader observation. Reader duplicates coalesce
     /// by wallet, source second, and version-two group identity.
     pub fn insert(&mut self, trigger: ReconciliationTrigger) {
@@ -1705,6 +1779,19 @@ impl WalletOperation {
         let buckets = activity.buckets()?;
         let restamp_twins = restamp_twins(&self.paper_state, &activity.rows)?;
         if buckets.is_empty() {
+            let commitment = self
+                .append_read_commitment(wallet, fixed_end, &page_occurrences, &activity.pages, &[])
+                .await?;
+            if selected.is_empty() {
+                self.publish_feed_frontier(
+                    wallet,
+                    fixed_end,
+                    commitment,
+                    &page_occurrences,
+                    &activity.pages,
+                )
+                .await?;
+            }
             return self.disposed_obligations(wallet, selected);
         }
         // Resolve every required token and record its metadata before freezing the read commitment.
@@ -1763,6 +1850,7 @@ impl WalletOperation {
         let copy_eligible = entry.is_some_and(|entry| entry.tier == WatchlistTier::Active);
         // Only unmatched observations block ordering. Matched observations use the endpoint's
         // bucket clock; the original stream second remains in the binding and the age check.
+        let mut all_acknowledged = true;
         for (bucket, identities) in buckets.into_iter().zip(identities) {
             if cancel.as_ref().is_some_and(|cancel| *cancel.borrow()) {
                 return Err(ReconciliationError::Preempted);
@@ -1773,6 +1861,7 @@ impl WalletOperation {
                 .is_some_and(|epoch| source_epoch >= epoch)
                 && correlation.ambiguous.is_empty()
             {
+                all_acknowledged = false;
                 break;
             }
             let mut context = self.context(
@@ -1806,11 +1895,25 @@ impl WalletOperation {
                 return Err(ReconciliationError::Preempted);
             }
             if result.newly_fenced.is_some() {
+                all_acknowledged = false;
                 break;
             }
         }
         if cancel.as_ref().is_some_and(|cancel| *cancel.borrow()) {
             return Err(ReconciliationError::Preempted);
+        }
+        if all_acknowledged
+            && correlation.unmatched_epoch.is_none()
+            && correlation.ambiguous.is_empty()
+        {
+            self.publish_feed_frontier(
+                wallet,
+                fixed_end,
+                read_commitment,
+                &page_occurrences,
+                &activity.pages,
+            )
+            .await?;
         }
         self.disposed_obligations(wallet, selected)
     }
@@ -2195,6 +2298,37 @@ impl WalletOperation {
         Ok(identities)
     }
 
+    async fn publish_feed_frontier(
+        &self,
+        wallet: WalletAddress,
+        fixed_end: i64,
+        commitment: AppendReceipt,
+        page_occurrences: &[PageOccurrence],
+        pages: &[pe_source_polymarket_public::ReconciliationPageEvidence],
+    ) -> Result<(), ReconciliationError> {
+        let (acknowledged, received) = oneshot::channel();
+        self.control_tx
+            .send(OrchestratorControl::FeedAuditUpdate {
+                update: crate::orchestrator_control::FeedAuditUpdate::Frontier(
+                    crate::frame_admission::FeedHistoryFrontier {
+                        version: 1,
+                        wallet,
+                        fixed_end,
+                        commitment,
+                        page_occurrences: page_occurrences.to_vec(),
+                        pages: pages.to_vec(),
+                    },
+                ),
+                acknowledged,
+            })
+            .await
+            .map_err(|_| ReconciliationError::ControlClosed)?;
+        received
+            .await
+            .map_err(|_| ReconciliationError::ControlClosed)?
+            .map_err(ReconciliationError::BucketCommit)
+    }
+
     async fn commit_bucket(
         &self,
         aggregates: Vec<ActivityAggregate>,
@@ -2295,10 +2429,16 @@ fn obligation_disposed(
     fenced: bool,
     obligation: &Obligation,
 ) -> Result<bool, pe_paper_state::PaperStateError> {
+    let admitted_frame = paper_state
+        .decision_pending_for(&obligation.group_id)?
+        .is_some_and(|row| {
+            crate::bucket_commit::DecisionContinuationV3::from_durable(&row)
+                .is_ok_and(|continuation| continuation.is_activity_frame())
+        });
     if obligation.bindings.is_empty() {
         // Historical exact-ID receipts retain their existing acknowledgement contract.
         // A permanent fence refuses only observations that never acquired a binding.
-        return Ok(fenced
+        return Ok((fenced && !admitted_frame)
             || paper_state
                 .activity_group_state(&obligation.group_id)?
                 .is_some());

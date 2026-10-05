@@ -22,7 +22,7 @@ use crate::position_seeder::AnchorInstall;
 use crate::watchlist_maintenance::MembershipCommit;
 
 /// Exact single-owner ledger capture used by the causal bracket.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct AdmissionLedgerCapture {
     pub wallet: WalletAddress,
     pub hash: String,
@@ -33,6 +33,13 @@ pub struct AdmissionLedgerCapture {
 
 /// A control-plane update consumed ahead of trade events by the orchestrator's biased select.
 pub enum OrchestratorControl {
+    /// A synchronized frame, delivered in source receipt order.
+    ActivityFrameDecision { receipt: AppendReceipt },
+    /// Audit updates are serialized with admissions by the existing owner.
+    FeedAuditUpdate {
+        update: FeedAuditUpdate,
+        acknowledged: oneshot::Sender<Result<(), String>>,
+    },
     /// Durable history/fence checks and Lane D's position bracket completed for
     /// these wallets. The orchestrator rechecks its loaded fence set before ack.
     PrepareAdmissions {
@@ -93,4 +100,10 @@ pub enum OrchestratorControl {
         proposed_financial_semantic_version: u32,
         acknowledged: oneshot::Sender<Result<(), String>>,
     },
+}
+
+/// Additional audit and release variants extend this enum without a new channel.
+#[derive(Debug, Clone)]
+pub enum FeedAuditUpdate {
+    Frontier(crate::frame_admission::FeedHistoryFrontier),
 }

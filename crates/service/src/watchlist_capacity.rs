@@ -1292,7 +1292,9 @@ mod tests {
                             }))
                             .unwrap();
                     }
-                    OrchestratorControl::ResolutionCandidate { .. }
+                    OrchestratorControl::ActivityFrameDecision { .. }
+                    | OrchestratorControl::FeedAuditUpdate { .. }
+                    | OrchestratorControl::ResolutionCandidate { .. }
                     | OrchestratorControl::RiskHaltChange { .. }
                     | OrchestratorControl::DailyBoundary { .. }
                     | OrchestratorControl::SealCheck { .. } => {

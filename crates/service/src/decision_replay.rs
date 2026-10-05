@@ -323,7 +323,7 @@ impl DecisionPostBoundaryEvidence {
         body: DecisionPostBoundaryEvidenceBody,
         continuation: &DecisionContinuationV3,
     ) -> Result<Self, ReplayDecisionError> {
-        continuation.require_complete_read()?;
+        continuation.validate_authority()?;
         Ok(Self::from_body_with_semantic(
             body,
             continuation.financial_semantic(),
@@ -669,7 +669,7 @@ impl DecisionEvidenceAccumulator {
 
     fn from_checkpoint(row: &DecisionPendingRow) -> Result<Self, ReplayDecisionError> {
         let continuation = DecisionContinuationV3::from_durable(row)?;
-        continuation.require_complete_read()?;
+        continuation.validate_authority()?;
         let frozen = &continuation.facts;
         let checkpoint = decode_checkpoint(&row.post_commit_inputs_json)?;
         if checkpoint.body.owners
@@ -876,7 +876,7 @@ pub fn replay_decision_pending(
         return Err(ReplayDecisionError::OpenRow);
     }
     let continuation = DecisionContinuationV3::from_durable(row)?;
-    continuation.require_complete_read()?;
+    continuation.validate_authority()?;
     let frozen = &continuation.facts;
     let decoded = decode_decision_evidence(&row.post_commit_inputs_json)?;
     let post_boundary = decoded.evidence;

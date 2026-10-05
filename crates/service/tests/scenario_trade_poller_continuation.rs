@@ -341,6 +341,10 @@ async fn late_group_then_strict_decrement_in_one_read_both_become_durable() {
     let (engine_tx, engine_rx) = oneshot::channel();
     let control = tokio::spawn(async move {
         while let Some(command) = control_rx.recv().await {
+            if let OrchestratorControl::FeedAuditUpdate { acknowledged, .. } = command {
+                let _ = acknowledged.send(Ok(()));
+                continue;
+            }
             if let OrchestratorControl::CommitActivityBucket {
                 aggregates,
                 context,
@@ -455,12 +459,19 @@ async fn recorded_poll(
     let (control_tx, mut control_rx) = mpsc::channel(4);
     let control = tokio::spawn(async move {
         let mut commits = Vec::new();
-        while let Some(OrchestratorControl::CommitActivityBucket {
-            aggregates,
-            context,
-            committed,
-        }) = control_rx.recv().await
-        {
+        while let Some(command) = control_rx.recv().await {
+            if let OrchestratorControl::FeedAuditUpdate { acknowledged, .. } = command {
+                let _ = acknowledged.send(Ok(()));
+                continue;
+            }
+            let OrchestratorControl::CommitActivityBucket {
+                aggregates,
+                context,
+                committed,
+            } = command
+            else {
+                break;
+            };
             let result = engine
                 .commit_with_freshness_policy(
                     aggregates.clone(),
@@ -728,7 +739,7 @@ async fn poller_multipage_commitment_survives_restart() {
         groups_before
     );
     assert_eq!(paper.leader_positions().unwrap(), positions_before);
-    // An empty next read has no bucket and must not mint a commitment.
+    // An empty next read has no bucket and records one proofless frontier commitment.
     let empty_commits = recorded_poll(
         Arc::clone(&paper),
         &source_path,
@@ -741,8 +752,17 @@ async fn poller_multipage_commitment_survives_restart() {
             .iter()
             .filter(|frame| frame.source_id.0 == ACTIVITY_READ_COMMITMENT_SOURCE_ID)
             .count(),
-        1
+        2
     );
+    let empty_frame = source_frames(&source_path)
+        .into_iter()
+        .rfind(|frame| frame.source_id.0 == ACTIVITY_READ_COMMITMENT_SOURCE_ID)
+        .unwrap();
+    let empty_commitment: pe_service::bucket_commit::ActivityReadCommitment =
+        serde_json::from_slice(&empty_frame.payload).unwrap();
+    assert_eq!(empty_commitment.version, 2);
+    assert_eq!(empty_commitment.bindings, Some(Vec::new()));
+    assert!(empty_commitment.read_proof.is_none());
     // Cursor overlap re-observes the latest second: the engine must report already_committed.
     let repeat = recorded_poll(
         Arc::clone(&paper),
@@ -758,7 +778,7 @@ async fn poller_multipage_commitment_survives_restart() {
             .iter()
             .filter(|frame| frame.source_id.0 == ACTIVITY_READ_COMMITMENT_SOURCE_ID)
             .count(),
-        2,
+        3,
         "a repeat read with a bucket commits its own read commitment; the already-committed bucket references none"
     );
     assert_eq!(
@@ -1031,6 +1051,30 @@ fn start_recorded_poller_with_completion_stop(
         let mut captures = 0;
         while let Some(command) = control_rx.recv().await {
             match command {
+                OrchestratorControl::FeedAuditUpdate {
+                    update,
+                    acknowledged,
+                } => {
+                    if real_owner {
+                        real_tx
+                            .send(OrchestratorControl::FeedAuditUpdate {
+                                update,
+                                acknowledged,
+                            })
+                            .await
+                            .unwrap();
+                    } else {
+                        let _ = acknowledged.send(Ok(()));
+                    }
+                }
+                OrchestratorControl::ActivityFrameDecision { receipt } => {
+                    if real_owner {
+                        real_tx
+                            .send(OrchestratorControl::ActivityFrameDecision { receipt })
+                            .await
+                            .unwrap();
+                    }
+                }
                 OrchestratorControl::CommitActivityBucket {
                     aggregates,
                     context,
@@ -2707,6 +2751,12 @@ async fn cross_second_binding_preserves_history_order_and_oldest_age() {
             .into_iter()
             .find(|frame| {
                 frame.source_id.0 == pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID
+                    && serde_json::from_slice::<pe_service::bucket_commit::ActivityReadCommitment>(
+                        &frame.payload,
+                    )
+                    .unwrap()
+                    .read_proof
+                    .is_some()
             })
             .unwrap();
         let commitment: pe_service::bucket_commit::ActivityReadCommitment =
@@ -3063,7 +3113,9 @@ async fn binding_tamper_and_generation_substitution_are_rejected() {
     let commitment_frame = original
         .iter()
         .find(|frame| {
-            frame.source_id.0 == pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID
+            continuation.read_commitment.is_some_and(|receipt| {
+                frame.seq == receipt.sequence && frame.this_hash == receipt.this_hash
+            })
         })
         .unwrap();
     let original_commitment: pe_service::bucket_commit::ActivityReadCommitment =
@@ -4165,6 +4217,12 @@ async fn boot_binding_index_preserves_every_target_revision() {
         .into_iter()
         .find(|frame| {
             frame.source_id.0 == pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID
+                && serde_json::from_slice::<pe_service::bucket_commit::ActivityReadCommitment>(
+                    &frame.payload,
+                )
+                .unwrap()
+                .read_proof
+                .is_some()
         })
         .unwrap();
     let first: pe_service::bucket_commit::ActivityReadCommitment =

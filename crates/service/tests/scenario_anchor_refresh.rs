@@ -346,6 +346,9 @@ fn poller_harness_with_fetcher(
         let mut hold_admission = hold_admission;
         while let Some(command) = control_rx.recv().await {
             match command {
+                OrchestratorControl::FeedAuditUpdate { acknowledged, .. } => {
+                    let _ = acknowledged.send(Ok(()));
+                }
                 OrchestratorControl::PrepareAdmissions { acknowledged, .. } => {
                     let _ = acknowledged.send(());
                 }
@@ -372,14 +375,18 @@ fn poller_harness_with_fetcher(
                     );
                 }
                 OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
+                    let capture = ledger_capture(engine.ledger(), &actor_paper, wallet)
+                        .map_err(|error| error.to_string());
                     if let Some((entered, release)) = hold_admission.take() {
+                        // Hold this admission response without blocking the control owner.
                         let _ = entered.send(());
-                        let _ = release.await;
+                        tokio::spawn(async move {
+                            let _ = release.await;
+                            let _ = captured.send(capture);
+                        });
+                    } else {
+                        let _ = captured.send(capture);
                     }
-                    let _ = captured.send(
-                        ledger_capture(engine.ledger(), &actor_paper, wallet)
-                            .map_err(|error| error.to_string()),
-                    );
                 }
                 OrchestratorControl::InstallAnchors {
                     installs,
@@ -475,6 +482,9 @@ async fn refresh_outcome_for_install_rejection(
         let mut rejection = Some(rejection);
         while let Some(command) = control_rx.recv().await {
             match command {
+                OrchestratorControl::FeedAuditUpdate { acknowledged, .. } => {
+                    let _ = acknowledged.send(Ok(()));
+                }
                 OrchestratorControl::PrepareAdmissions { acknowledged, .. } => {
                     let _ = acknowledged.send(());
                 }

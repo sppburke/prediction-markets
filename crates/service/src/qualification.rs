@@ -570,8 +570,33 @@ fn decision_observation_from_source(
     source: &BTreeMap<u64, SourceObservation>,
 ) -> Result<Option<pe_execution_core::ObservationEvidence>, QualificationError> {
     continuation
-        .require_complete_read()
+        .validate_authority()
         .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+    if continuation.is_activity_frame() {
+        continuation
+            .verify_activity_frame(&mut |receipt| {
+                let source = decision_source_receipt(source, receipt)?;
+                Ok::<_, QualificationError>(CompleteActivityPage {
+                    payload: source.payload.clone(),
+                    observed_at: source.observed_at.clone(),
+                    received_at: source.received_at.clone(),
+                    source_id: source.source_id.clone(),
+                    schema_version: source.schema_version,
+                    parser_version: source.parser_version,
+                    content_type: source.content_type.clone(),
+                })
+            })
+            .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+        let receipt = continuation.observed_source_receipt.ok_or_else(|| {
+            QualificationError::InsufficientEvidence("frame receipt missing".to_owned())
+        })?;
+        return Ok(Some(pe_execution_core::ObservationEvidence {
+            source_receipt: receipt,
+            complete_bound_receipt: receipt,
+            observed_unix_ms: decision_source_receipt(source, receipt)?.received_unix_ms,
+            provenance: "activity_ws".to_owned(),
+        }));
+    }
     let Some(selected_receipt) = continuation.observation_receipt() else {
         return Ok(None);
     };
@@ -793,6 +818,30 @@ async fn verify_qualification(
         let observation = verify_decision_source_inputs(&state, decision, &source_observations)?;
         verify_paper_prepared_freshness(decision, &source_observations)?;
         verify_decision_classification(&state, decision)?;
+        if decision.continuation.is_activity_frame() {
+            let proof: crate::frame_admission::FrameDecisionProof =
+                serde_json::from_value(decision.continuation.facts.decision_inputs.clone())?;
+            let prefix = match proof.inputs.paper_prefix {
+                None => Vec::new(),
+                Some(receipt) => {
+                    let position = frames
+                        .iter()
+                        .position(|frame| frame.receipt == receipt)
+                        .ok_or_else(|| {
+                            QualificationError::InsufficientEvidence(
+                                "frame paper prefix receipt is missing".to_owned(),
+                            )
+                        })?;
+                    frames[..=position].to_vec()
+                }
+            };
+            let basis = crate::paper_recovery::feed_latch_basis(&paper_era(prefix))
+                .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+            if basis != proof.inputs.latch {
+                return insufficient("frame incident basis differs from sealed paper prefix");
+            }
+        }
+
         if decision_observations
             .insert(
                 decision.continuation.facts.source_trade_id.clone(),
@@ -902,6 +951,13 @@ async fn verify_qualification(
                                         "Fill has no frozen continuation".to_owned(),
                                     )
                                 })?,
+                            replayed_decisions
+                                .iter()
+                                .find(|decision| {
+                                    decision.continuation.facts.source_trade_id
+                                        == operation.source_trade_id
+                                })
+                                .map(|decision| &decision.continuation),
                             true,
                         )
                         .await?;
@@ -1140,7 +1196,8 @@ async fn verify_qualification(
             PaperLogRecord::QualificationSealed(_) => {
                 return insufficient("QualificationSealed occurs inside its financial prefix");
             }
-            PaperLogRecord::RiskHaltChanged { .. } => {}
+            PaperLogRecord::RiskHaltChanged { .. } | PaperLogRecord::FeedIncidentChanged { .. } => {
+            }
         }
     }
     if prepared.len() != financial_final_count {
@@ -2233,8 +2290,49 @@ fn decision_rows_from_sealed_source(
     } else {
         None
     };
+    let mut frame_required = Vec::new();
+    let mut frame_ids = HashSet::new();
+    for row in &history {
+        // Preserve the complete-read selector's established validation order and errors.
+        if !serde_json::from_str::<serde_json::Value>(&row.frozen_inputs_json)
+            .is_ok_and(|wire| wire["source_authority"] == "activity_frame")
+        {
+            continue;
+        }
+        let continuation = DecisionContinuationV3::from_durable(row)
+            .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+        if !continuation.is_activity_frame() {
+            continue;
+        }
+        let receipts = continuation
+            .authority_receipts()
+            .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+        if receipts
+            .iter()
+            .any(|receipt| receipt.sequence > sealed_sequence)
+        {
+            continue;
+        }
+        continuation
+            .verify_activity_frame(&mut lookup)
+            .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+        frame_ids.insert(row.source_trade_id.clone());
+        let frame = continuation.observed_source_receipt.ok_or_else(|| {
+            QualificationError::InsufficientEvidence("frame receipt missing".to_owned())
+        })?;
+        if start_sequence.is_none_or(|start| frame.sequence > start) {
+            frame_required.push((
+                frame.sequence.0,
+                row.source_trade_id.clone(),
+                row.semantic_revision.clone(),
+            ));
+        }
+    }
     let mut pending_groups = Vec::new();
     for (source_trade_id, first_sequence) in &source_universe {
+        if frame_ids.contains(source_trade_id) {
+            continue;
+        }
         if start_sequence.is_some_and(|start| *first_sequence <= start.0) {
             continue;
         }
@@ -2296,12 +2394,14 @@ fn decision_rows_from_sealed_source(
             ));
         }
     }
-    let required = decision_keys_from_source_observations(
+    let mut required = decision_keys_from_source_observations(
         start_sequence,
         source,
         &source_universe,
         &complete_reads,
     )?;
+    required.extend(frame_required);
+    required.sort_by_key(|(sequence, id, _)| (*sequence, id.0.clone()));
     let required_by_trade = required
         .iter()
         .map(|(_, source_trade_id, semantic_revision)| {
@@ -2317,12 +2417,8 @@ fn decision_rows_from_sealed_source(
             ))
         })?;
         let receipts = continuation
-            .page_occurrences()
-            .iter()
-            .map(|page| page.receipt)
-            .chain(continuation.observed_source_receipt)
-            .chain(continuation.read_commitment)
-            .collect::<Vec<_>>();
+            .authority_receipts()
+            .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
         if receipts.is_empty()
             || receipts
                 .iter()
@@ -2391,8 +2487,11 @@ fn complete_activity_read_scopes(
             ))
         })?;
         continuation
-            .require_complete_read()
+            .validate_authority()
             .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+        if continuation.is_activity_frame() {
+            continue;
+        }
         if continuation.page_occurrences().is_empty() {
             continue;
         }
@@ -3410,6 +3509,12 @@ fn verify_decision_source_inputs(
             content_type: source.content_type.clone(),
         })
     };
+    if continuation.is_activity_frame() {
+        continuation
+            .verify_activity_frame(&mut lookup)
+            .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+        return Ok(observation);
+    }
     let aggregates = continuation
         .reconstruct_complete_activity_read(&mut lookup)
         .map_err(|error| {
@@ -3444,6 +3549,12 @@ fn verify_decision_classification(
     state: &PaperStateDb,
     decision: &crate::decision_replay::ReplayedDecision,
 ) -> Result<(), QualificationError> {
+    if decision.continuation.is_activity_frame() {
+        return decision
+            .continuation
+            .validate_authority()
+            .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()));
+    }
     let frozen = &decision.continuation.facts;
     let anchors = state.position_anchors(&frozen.wallet)?;
     let anchor = anchors
@@ -3883,6 +3994,7 @@ async fn verify_economic(
     economic: &EconomicPrepared,
     context: &RiskReplayContext<'_>,
     continuation_version: u16,
+    continuation: Option<&DecisionContinuationV3>,
     require_risk_approval: bool,
 ) -> Result<EconomicPrepared, QualificationError> {
     verify_economic_configuration(
@@ -3952,6 +4064,7 @@ async fn verify_economic(
         economic.risk.evaluated_at_unix_ms,
         cash_before,
         continuation_version,
+        continuation,
         |receipt| {
             let observation = context
                 .source
@@ -4629,6 +4742,7 @@ fn qualification_completion_inner(
             PaperLogRecord::QualificationStarted(_)
             | PaperLogRecord::QualificationSealed(_)
             | PaperLogRecord::RiskHaltChanged { .. }
+            | PaperLogRecord::FeedIncidentChanged { .. }
             | PaperLogRecord::MembershipChanged { .. }
             | PaperLogRecord::FinancialFinal { .. } => {}
         }
@@ -4888,7 +5002,7 @@ fn verify_winner_follow_economic_policy(
     economic: &EconomicPrepared,
 ) -> Result<(LeaderSignal, pe_strategy_winner_follow::ExecutionMode), QualificationError> {
     continuation
-        .require_complete_read()
+        .validate_authority()
         .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
     let frozen = &continuation.facts;
     let configuration = &frozen.applied_configuration;
@@ -5140,9 +5254,15 @@ async fn verify_winner_follow_decline_decision(
                 source_trade_id: frozen.source_trade_id.clone(),
                 observed_at_bucket: frozen.source_epoch,
             };
-            let reconstructed =
-                verify_economic(&operation, economic, &replay, continuation.version(), false)
-                    .await?;
+            let reconstructed = verify_economic(
+                &operation,
+                economic,
+                &replay,
+                continuation.version(),
+                Some(continuation),
+                false,
+            )
+            .await?;
             match pe_strategy_winner_follow::WinnerFollowStrategy::new(
                 frozen.applied_configuration.winner_follow_config(),
             )
@@ -7411,7 +7531,7 @@ mod tests {
             source: &source,
             ..initial_context
         };
-        verify_economic(&operation, &economic, &context, 5, false)
+        verify_economic(&operation, &economic, &context, 5, None, false)
             .await
             .unwrap();
 
@@ -7423,7 +7543,7 @@ mod tests {
                 ..context
             };
             assert!(matches!(
-                verify_economic(&operation, &economic, &late_context, 5, false).await,
+                verify_economic(&operation, &economic, &late_context, 5, None, false).await,
                 Err(QualificationError::InsufficientEvidence(_))
             ));
         }
@@ -7893,13 +8013,13 @@ mod tests {
             financial_semantic_version: fixture.start.financial_semantic_version,
         };
         assert_eq!(
-            verify_economic(&operation, &economic, &replay, 5, false)
+            verify_economic(&operation, &economic, &replay, 5, None, false)
                 .await
                 .unwrap(),
             economic
         );
         assert!(matches!(
-            verify_economic(&operation, &economic, &replay, 5, true).await,
+            verify_economic(&operation, &economic, &replay, 5, None, true).await,
             Err(QualificationError::InsufficientEvidence(reason))
                 if reason.contains("risk decision is not an approval")
         ));
@@ -8022,7 +8142,7 @@ mod tests {
             };
 
             assert_eq!(
-                verify_economic(&operation, &economic, &replay, 5, false)
+                verify_economic(&operation, &economic, &replay, 5, None, false)
                     .await
                     .unwrap(),
                 economic
@@ -8094,7 +8214,7 @@ mod tests {
                 start_hot_config_hash: &fixture.start.hot_config_hash,
                 financial_semantic_version: if continuation.version() == 6 { 2 } else { 1 },
             };
-            let verified = verify_economic(&operation, &economic, &replay, 5, false)
+            let verified = verify_economic(&operation, &economic, &replay, 5, None, false)
                 .await
                 .unwrap();
             assert_eq!(verified.risk, economic.risk);
@@ -8232,7 +8352,7 @@ mod tests {
         };
 
         assert_eq!(
-            verify_economic(&operation, &released, &replay, 5, false)
+            verify_economic(&operation, &released, &replay, 5, None, false)
                 .await
                 .unwrap(),
             released,
@@ -8251,7 +8371,7 @@ mod tests {
         };
         assert_ne!(clamped.risk.snapshot, released.risk.snapshot);
         assert!(matches!(
-            verify_economic(&operation, &clamped, &replay, 5, false).await,
+            verify_economic(&operation, &clamped, &replay, 5, None, false).await,
             Err(QualificationError::InsufficientEvidence(reason))
                 if reason == "EconomicPrepared risk snapshot differs from causal replay"
         ));

@@ -3515,15 +3515,22 @@ fn live_observation_page_index(
         let continuation = DecisionContinuationV3::from_durable(&row)
             .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
         continuation
-            .require_complete_read()
+            .validate_authority()
             .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
-        let applied = continuation
-            .facts
-            .durable_group_effect(paper_state)
-            .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
+        let correction = if continuation.is_activity_frame() {
+            None
+        } else {
+            continuation
+                .facts
+                .durable_group_effect(paper_state)
+                .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?
+                .effect
+                .correction()
+                .cloned()
+        };
         pages.insert(
             continuation.facts.source_trade_id.clone(),
-            (continuation, applied.effect.correction().cloned()),
+            (continuation, correction),
         );
     }
     Ok(pages)
@@ -3647,7 +3654,7 @@ fn validate_live_observation_trade(
 ) -> Result<(), EconomicReplayError> {
     binding
         .continuation
-        .require_complete_read()
+        .validate_authority()
         .map_err(|error| economic_replay_error(error.to_string()))?;
     let projection =
         binding.identity.fill_projection.as_deref().ok_or_else(|| {
@@ -3771,11 +3778,134 @@ fn validate_economic_observation<L>(
     observation: &ObservationEvidence,
     evidence_cutoff_unix_ms: i64,
     live_binding: Option<LiveObservationBinding<'_>>,
+    paper_continuation: Option<&DecisionContinuationV3>,
     lookup: &mut L,
 ) -> Result<(), EconomicReplayError>
 where
     L: FnMut(AppendReceipt) -> Result<RecordedEconomicSource, EconomicReplayError>,
 {
+    if observation.provenance == "activity_ws"
+        && observation.source_receipt == observation.complete_bound_receipt
+    {
+        if paper_continuation.is_none_or(|continuation| !continuation.is_activity_frame())
+            && live_binding.is_none_or(|binding| !binding.continuation.is_activity_frame())
+        {
+            return Err(economic_replay_error(
+                "frame observation requires continuation 7 frame authority",
+            ));
+        }
+        let selected = exact_economic_source(
+            observation.source_receipt,
+            crate::activity_ingest::ACTIVITY_WS_SOURCE_ID,
+            pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION,
+            pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+            evidence_cutoff_unix_ms,
+            lookup,
+        )?;
+        if selected.received_unix_ms != observation.observed_unix_ms {
+            return Err(economic_replay_error("frame observation clock differs"));
+        }
+        let frame = parse_activity_trade_observation(&selected.payload)
+            .map_err(|error| economic_replay_error(error.to_string()))?;
+        if frame.is_combo
+            || frame.share_amount == ShareAmount::ZERO
+            || frame.group_id.components().side != Some(Side::Buy)
+        {
+            return Err(economic_replay_error("invalid economic frame observation"));
+        }
+        let continuation = live_binding
+            .map(|binding| binding.continuation)
+            .or(paper_continuation)
+            .ok_or_else(|| economic_replay_error("frame continuation missing"))?;
+        {
+            let proof: crate::frame_admission::FrameDecisionProof =
+                serde_json::from_value(continuation.facts.decision_inputs.clone())
+                    .map_err(|error| economic_replay_error(error.to_string()))?;
+            continuation
+                .verify_activity_frame(&mut |receipt| {
+                    let source = lookup(receipt)?;
+                    let mut received_at = source_time_from_millis(source.received_unix_ms)?;
+                    let mut observed_at = received_at;
+                    if receipt == proof.inputs.frame_receipt {
+                        if source.received_unix_ms
+                            != i64::try_from(
+                                proof.inputs.received_at.unix_timestamp_nanos() / 1_000_000,
+                            )
+                            .map_err(|_| economic_replay_error("frame receive clock overflow"))?
+                        {
+                            return Err(economic_replay_error("frame receive clock differs"));
+                        }
+                        received_at = proof.inputs.received_at;
+                        observed_at = frame.source_time.0;
+                    } else if receipt == proof.admission_receipt {
+                        if source.received_unix_ms
+                            != i64::try_from(
+                                proof.inputs.admitted_at.unix_timestamp_nanos() / 1_000_000,
+                            )
+                            .map_err(|_| economic_replay_error("frame admission clock overflow"))?
+                        {
+                            return Err(economic_replay_error(
+                                "frame admission receive clock differs",
+                            ));
+                        }
+                        received_at = proof.inputs.admitted_at;
+                        observed_at = proof.inputs.admitted_at;
+                    } else if let Some(earlier) = proof
+                        .inputs
+                        .earlier_frames
+                        .iter()
+                        .find(|frame| frame.receipt == receipt)
+                    {
+                        if source.received_unix_ms
+                            != i64::try_from(earlier.received_at.unix_timestamp_nanos() / 1_000_000)
+                                .map_err(|_| {
+                                    economic_replay_error("earlier frame clock overflow")
+                                })?
+                        {
+                            return Err(economic_replay_error(
+                                "earlier frame receive clock differs",
+                            ));
+                        }
+                        received_at = earlier.received_at;
+                        observed_at = parse_activity_trade_observation(&source.payload)
+                            .map_err(|error| economic_replay_error(error.to_string()))?
+                            .source_time
+                            .0;
+                    }
+                    Ok::<_, EconomicReplayError>(CompleteActivityPage {
+                        payload: source.payload,
+                        observed_at: SourceTimestamp(observed_at),
+                        received_at: ReceivedAt(received_at),
+                        source_id: source.source_id,
+                        schema_version: source.schema_version,
+                        parser_version: source.parser_version,
+                        content_type: source.content_type,
+                    })
+                })
+                .map_err(|error| economic_replay_error(error.to_string()))?;
+        }
+        if let Some(binding) = live_binding {
+            let projection = binding
+                .identity
+                .fill_projection
+                .as_ref()
+                .ok_or_else(|| economic_replay_error("frame live projection missing"))?;
+            if projection.source_trade_id.as_deref()
+                != Some(binding.continuation.facts.source_trade_id.0.as_str())
+                || projection.leader_wallet != binding.continuation.facts.wallet.to_string()
+                || projection.market_id != binding.continuation.facts.market_id.to_string()
+                || projection.outcome_id != i64::from(binding.continuation.facts.outcome_id.0)
+            {
+                return Err(economic_replay_error("frame live projection differs"));
+            }
+            verify_live_decision_hash(
+                binding.continuation,
+                binding.account_id.as_str(),
+                binding.identity,
+            )?;
+        }
+        return Ok(());
+    }
     if observation.source_receipt.sequence > observation.complete_bound_receipt.sequence {
         return Err(economic_replay_error(
             "economic observation receipt is after its complete-read bound",
@@ -3905,6 +4035,7 @@ fn replay_source_backed_economic_with_live_binding<L>(
     evidence_cutoff_unix_ms: i64,
     cash_before: CollateralAmount,
     paper_continuation_version: Option<u16>,
+    paper_continuation: Option<&DecisionContinuationV3>,
     live_binding: Option<LiveObservationBinding<'_>>,
     mut lookup: L,
 ) -> Result<SourceBackedEconomicReplay, EconomicReplayError>
@@ -3933,6 +4064,7 @@ where
             observation,
             evidence_cutoff_unix_ms,
             live_binding,
+            paper_continuation,
             &mut lookup,
         )?;
     }
@@ -4149,6 +4281,7 @@ pub(crate) fn replay_source_backed_economic<L>(
     evidence_cutoff_unix_ms: i64,
     cash_before: CollateralAmount,
     paper_continuation_version: u16,
+    paper_continuation: Option<&DecisionContinuationV3>,
     lookup: L,
 ) -> Result<SourceBackedEconomicReplay, EconomicReplayError>
 where
@@ -4159,6 +4292,7 @@ where
         evidence_cutoff_unix_ms,
         cash_before,
         Some(paper_continuation_version),
+        paper_continuation,
         None,
         lookup,
     )
@@ -4292,6 +4426,7 @@ fn verify_replayed_live_risk_with_index(
         &admission.economic,
         evaluated_at_unix_ms,
         cash_before,
+        None,
         None,
         Some(LiveObservationBinding {
             account_id,
@@ -9107,6 +9242,7 @@ mod tests {
             clob_long_received_unix_ms.saturating_add(10_000),
             CollateralAmount::from_atomic(10_000_000),
             6,
+            None,
             |receipt| {
                 observations
                     .iter()
@@ -9168,6 +9304,7 @@ mod tests {
             21_000,
             CollateralAmount::from_atomic(10_000_000),
             6,
+            None,
             |receipt| {
                 sources
                     .iter()
@@ -9247,6 +9384,7 @@ mod tests {
                     21_000,
                     CollateralAmount::from_atomic(10_000_000),
                     6,
+                    None,
                     |receipt| {
                         sources
                             .iter()
@@ -9321,14 +9459,15 @@ mod tests {
                 .ok_or_else(|| EconomicReplayError("fixture receipt missing".to_owned()))
         };
         let cash = CollateralAmount::from_decimal_exact(dec!(1000)).unwrap();
-        let partial = replay_source_backed_economic(&economic, 21_000, cash, 7, lookup).unwrap();
+        let partial =
+            replay_source_backed_economic(&economic, 21_000, cash, 7, None, lookup).unwrap();
         assert_eq!(
             partial.sized.ladder.worst_case_debit.to_decimal(),
             dec!(2.5)
         );
         assert!(partial.sized.ladder.shares.to_decimal() >= dec!(1));
         assert!(
-            replay_source_backed_economic(&economic, 21_000, cash, 6, lookup)
+            replay_source_backed_economic(&economic, 21_000, cash, 6, None, lookup)
                 .err()
                 .unwrap()
                 .0
@@ -9337,7 +9476,7 @@ mod tests {
         // Ordinary live supplies no paper continuation, even when its source continuation is 7.
         assert!(
             replay_source_backed_economic_with_live_binding(
-                &economic, 21_000, cash, None, None, lookup
+                &economic, 21_000, cash, None, None, None, lookup
             )
             .err()
             .unwrap()
@@ -9362,7 +9501,8 @@ mod tests {
             applied_configuration_hash: economic.applied_configuration_hash.clone(),
         })
         .unwrap();
-        let replayed = replay_source_backed_economic(&recomposed, 21_000, cash, 7, lookup).unwrap();
+        let replayed =
+            replay_source_backed_economic(&recomposed, 21_000, cash, 7, None, lookup).unwrap();
         replayed
             .recompose(
                 &recomposed,
@@ -9925,6 +10065,7 @@ mod tests {
             economic,
             economic.risk.evaluated_at_unix_ms,
             CollateralAmount::from_atomic(10_000_000),
+            None,
             None,
             Some(LiveObservationBinding {
                 account_id,
@@ -11093,6 +11234,7 @@ mod tests {
                 economic,
                 economic.risk.evaluated_at_unix_ms,
                 CollateralAmount::from_atomic(10_000_000),
+                None,
                 None,
                 Some(LiveObservationBinding {
                     account_id: &account_id,
