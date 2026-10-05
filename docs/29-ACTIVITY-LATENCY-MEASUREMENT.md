@@ -301,8 +301,8 @@ snapshot (no long transaction), and reads finite log prefixes. It prints evidenc
 only `ac16-population.json` in the separate audit directory for the scoped queries below.
 Supply explicit Central window bounds with offsets, for example `2026-10-05T08:00:00-05:00`
 and `2026-10-05T09:00:00-05:00`; use `-06:00` when Central standard time applies. The window end
-must not follow the database snapshot start the capture prints: a trade after it has no decision in
-the copy and would look like a miss.
+must not follow the database snapshot start the capture prints (a conservative cutoff): trades in the
+later-captured logs may lack decisions in the database copy and appear as misses.
 The decoder requires system `libzstd`; it checks framing/CRC, joins ordinary TRADE rows by the
 canonical `g2:` component encoding (using `b3sum`), and preserves envelope receipts. It does not
 replace the Rust log verifier or authority-specific semantic verification. Do not run normal service boot, `--report`, recovery or checkpoint
