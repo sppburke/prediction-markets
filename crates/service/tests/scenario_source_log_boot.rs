@@ -673,7 +673,9 @@ fn installed_boot_reads_the_source_log_once() {
             writer
                 .append(activity_envelope(
                     &format!("0x{index:064x}"),
-                    NOW_UNIX + 1 + index,
+                    // Coalescing scans a wallet's distinct seconds. One wallet holds thousands in
+                    // a production month, not 20,000, so 100 trades share each second.
+                    NOW_UNIX + 1 + index / 100,
                 ))
                 .unwrap();
         }
