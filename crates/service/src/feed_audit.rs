@@ -153,9 +153,17 @@ where
         incident.deciding_commitment_receipt,
         lookup,
     )?;
+    verify_incident_conclusion(frame, incident, &read)
+}
+
+fn verify_incident_conclusion(
+    frame: &DecisionContinuationV3,
+    incident: &FeedIncident,
+    read: &VerifiedCommitment,
+) -> Result<(), FeedAuditError> {
     match (
         incident.cause.clone(),
-        disposition(frame, &read)?,
+        disposition(frame, read)?,
         &incident.counterpart_identity,
     ) {
         (FeedIncidentCause::Contradiction, AuditDisposition::Contradicted(id), Some(expected))
@@ -209,6 +217,29 @@ where
     L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
     E: std::fmt::Display,
 {
+    let mut receipts = Vec::new();
+    for receipt in commitments {
+        if !receipts.contains(receipt) {
+            receipts.push(*receipt);
+        }
+    }
+    for record in &era.frames {
+        if let PaperLogFrame::Record(PaperLogRecord::FeedIncidentChanged {
+            incident,
+            state: HaltState::Engaged,
+        }) = &record.frame
+            && !receipts.contains(&incident.deciding_commitment_receipt)
+        {
+            receipts.push(incident.deciding_commitment_receipt);
+        }
+    }
+    let reads = receipts
+        .iter()
+        .map(|receipt| {
+            crate::bucket_commit::verified_commitment_bindings_with_lookup(*receipt, lookup)
+                .map(|read| (*receipt, read))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
     for record in &era.frames {
         if let PaperLogFrame::Record(PaperLogRecord::FeedIncidentChanged {
             incident,
@@ -221,7 +252,17 @@ where
                 .ok_or(FeedAuditError::Semantic(
                     "incident has no durable admitted frame",
                 ))?;
-            verify_incident(frame, incident, lookup)?;
+            frame.verify_activity_frame(lookup)?;
+            if frame.observed_source_receipt != Some(incident.frame_receipt)
+                || incident.engagement_receipt.is_some()
+            {
+                return Err(FeedAuditError::Semantic("incident frame receipt differs"));
+            }
+            let read = reads
+                .iter()
+                .find(|(receipt, _)| *receipt == incident.deciding_commitment_receipt)
+                .ok_or(FeedAuditError::Semantic("incident commitment missing"))?;
+            verify_incident_conclusion(frame, incident, &read.1)?;
         }
     }
     let retired = audited_receipts(era);
@@ -234,13 +275,14 @@ where
             continue;
         }
         let mut matched = false;
-        for receipt in commitments {
-            let read =
-                crate::bucket_commit::verified_commitment_bindings_with_lookup(*receipt, lookup)?;
+        for (receipt, read) in &reads {
+            if !commitments.contains(receipt) {
+                continue;
+            }
             if read.wallet != frame.facts.wallet {
                 continue;
             }
-            if let AuditDisposition::Matched(id) = disposition(frame, &read)? {
+            if let AuditDisposition::Matched(id) = disposition(frame, read)? {
                 let binding = read
                     .bindings
                     .iter()

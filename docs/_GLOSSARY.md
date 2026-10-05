@@ -563,6 +563,17 @@ survives negative audits, release and restart; equal identifiers retain the fram
 single terminal. A later-discovered earlier BUY with a different verified identity is audit-only:
 it neither latches nor changes the decision; genuine late arrivals retain causal re-anchoring.
 
+The admission capture retains the frame receipt, source/receive/admission clocks, compact
+`AdmissionLedgerCapture`, append-only activity row boundary, frame-market anchor balances and
+post-anchor groups, the `(market, outcome)` position, a single market-consumption fact, and only
+the admitting wallet's preceding unresolved BUYs or obligations. Eligibility, history/fence/coverage,
+frontier/staleness and paper-prefix incident/release basis remain frozen. Durable anchor/group
+owners authenticate the scoped rebuild through the recovery reducer; the frame transaction's
+`wallet_market_history_v2` row proves first consumption. Configuration, sizing basis and quality
+live in continuation facts; frame payload/hash and parser/schema contracts resolve from its
+receipt. The source-log admission artifact and continuation each store this scoped body. Resolved
+barriers are pruned at runtime and boot; unrelated wallets/positions/history cannot grow the body.
+
 First-entry history is per wallet and market. Continuation 7 copies each wallet's first entry
 whatever the paper book holds there, on the same or opposite outcome; a held-outcome fill
 accumulates and leader statistics remain per fill. Continuations through 6 retain the
@@ -676,7 +687,7 @@ the exact hot or removal sets stops `scripts/migrate_service_config_544.sql` bef
 | Key | Default | Meaning |
 |---|---:|---|
 | `max_fill_price` | `0.85` | Hot decimal value. The signed ladder's worst accepted tick must be strictly below this ceiling. Paper semantics 2 and 3 and ordinary live use the applied best-ask price-impact ceiling without a leader-price ceiling. `0` disables this band edge, not the mandatory book gate. |
-| `min_fill_price` | `0.15` | Hot decimal value, added at the 2026-07-03 run28 cutover. Skip a BUY copy whose resolved fill basis is `<` this so selection and deployment share the entry band. The boundary itself fills (strict `<` skip). `0` disables this band edge, not the mandatory book gate. |
+| `min_fill_price` | `0.15` | Hot decimal value, added at the 2026-07-03 run28 cutover. Continuations through 6 skip a BUY whose resolved VWAP fill basis is `<` this. Continuation 7 applies the inclusive floor to each accepted ask, without a subsequent VWAP-floor refusal. The boundary itself fills. `0` disables this band edge, not the mandatory book gate. |
 
 Paper semantics 2 and 3 admit otherwise valid markets with positive or absent matching delay. Ordinary
 live re-reads each staged target through strict admission and refuses either delay before an order

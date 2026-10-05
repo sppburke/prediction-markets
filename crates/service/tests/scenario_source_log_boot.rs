@@ -1378,6 +1378,26 @@ async fn post_start_boot_bankroll_case_with_checkpoint_parity(
         Arc::make_mut(start).membership.clear();
     }
     let start = append_paper_record(&paths.paper_log, &started);
+    let preserved_seal = checkpoint_parity.then(|| {
+        append_paper_record(
+            &paths.paper_log,
+            &PaperLogRecord::QualificationSealed(Box::new(
+                pe_service::paper_recovery::QualificationSealed {
+                    start_receipt: start,
+                    source_prefix: TailBinding::from(&Scanner::verify(&paths.source_log).unwrap()),
+                    financial_prefix: TailBinding::from(
+                        &Scanner::verify(&paths.paper_log).unwrap(),
+                    ),
+                    live_prefix: TailBinding::from(&Scanner::verify(&paths.live_journal).unwrap()),
+                    decision_evidence_digest: blake3::hash(b"[]").to_hex().to_string(),
+                    sealed_cutoff_unix: NOW_UNIX,
+                    reason: pe_service::paper_recovery::SealReason::InsufficientEvidence(
+                        "synthetic historical closed era".to_owned(),
+                    ),
+                },
+            )),
+        )
+    });
     let paper = PaperStateDb::open(&paths.fixed_main).unwrap();
     // A reusable anchor keeps the boot bracket off the network: the case is about the bankroll
     // gate, not the venue walk, and `--exit-after-anchors` exits right after the reuse census.
@@ -1602,10 +1622,10 @@ async fn post_start_boot_bankroll_case_with_checkpoint_parity(
     }
     if checkpoint_parity {
         let pending_paper = Arc::new(PaperStateDb::open(&paths.fixed_main).unwrap());
-        install_committed_open_read_for_wallet(
+        install_mixed_current_open_continuations(
             &pending_paper,
             &paths.source_log,
-            WalletAddress([0xcc; 20]),
+            preserved_seal.unwrap(),
         );
     }
     drop(paper);
@@ -1669,7 +1689,7 @@ async fn post_start_boot_bankroll_case_with_checkpoint_parity(
                     SourceLogBoot::prepare_checkpoint(&paths.fixed_main)
                         .unwrap()
                         .1,
-                    1
+                    3
                 );
             }
             let before = pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap();
@@ -1693,7 +1713,7 @@ async fn post_start_boot_bankroll_case_with_checkpoint_parity(
             );
             assert_eq!(
                 pe_service::bucket_commit::validate_open_continuations(&paper, &index).unwrap(),
-                1
+                3
             );
             let obligations = boot.obligations(&paper, &paths.paper_log).unwrap();
             let pending_before = paper.decision_pending_history().unwrap();
@@ -1718,14 +1738,41 @@ async fn post_start_boot_bankroll_case_with_checkpoint_parity(
             assert_eq!(paper.bankroll().unwrap(), Some(dec!(9)));
             assert_eq!(paper.decision_pending_history().unwrap(), pending_before);
             let (_tx, rx) = tokio::sync::mpsc::channel(4);
-            let mut orchestrator = support::continuation_orchestrator(
+            let mut orchestrator = support::continuation_orchestrator_with_authority(
                 paper.clone(),
                 &paths.paper_log,
                 WalletAddress([0xcc; 20]),
                 rx,
                 support::continuation_hooks(NOW_UNIX + 25_010),
+                Some(pe_service::supabase_state::SupabaseStateClient::new(
+                    reqwest::Client::new(),
+                    &cfg.supabase_url,
+                    "fixture",
+                    "fixture",
+                )),
             )
-            .with_source_receipt_index(index);
+            .with_source_receipt_index(index.clone());
+            let (source_handle, _source_rx) =
+                pe_service::activity_ingest::SourceLogHandle::channel(4);
+            orchestrator
+                .configure_financial_log_paths(
+                    paths.paper_log.clone(),
+                    paths.source_log.clone(),
+                    pe_service::live_venue_adapter::LiveAdmissionBuilder::new(
+                        reqwest::Client::new(),
+                        "http://unused.invalid",
+                        "http://unused.invalid",
+                        source_handle.clone(),
+                    ),
+                    Arc::new(pe_service::mark_prices::HistoricalMarkAdapter::new(
+                        reqwest::Client::new(),
+                        "http://unused.invalid",
+                        source_handle,
+                    )),
+                    index,
+                )
+                .unwrap();
+            orchestrator.seal_before_resume("config", 3).await.unwrap();
             pe_service::orchestrator::SCENARIO_TERMINAL_CLOCK
                 .scope(
                     OffsetDateTime::from_unix_timestamp(NOW_UNIX + 25_010).unwrap(),
@@ -1734,6 +1781,32 @@ async fn post_start_boot_bankroll_case_with_checkpoint_parity(
                 .await
                 .unwrap();
             assert!(paper.open_decision_pending().unwrap().is_empty());
+            for row in paper.decision_pending_history().unwrap() {
+                let decision = pe_service::decision_replay::replay_decision_pending(&row).unwrap();
+                assert_eq!(
+                    decision.post_boundary.financial_semantic_version,
+                    if decision.continuation.version() == 6 {
+                        2
+                    } else {
+                        3
+                    }
+                );
+            }
+            let receipts = scan_paper_log(&paths.paper_log)
+                .unwrap()
+                .iter()
+                .filter(|frame| {
+                    matches!(
+                        &frame.frame,
+                        PaperLogFrame::Record(
+                            PaperLogRecord::QualificationStarted(_)
+                                | PaperLogRecord::QualificationSealed(_)
+                        )
+                    )
+                })
+                .map(|frame| frame.receipt)
+                .collect::<Vec<_>>();
+            assert_eq!(receipts, vec![start, preserved_seal.unwrap()]);
             let finals = paper_era(scan_paper_log(&paths.paper_log).unwrap())
                 .frames
                 .into_iter()
@@ -1750,6 +1823,7 @@ async fn post_start_boot_bankroll_case_with_checkpoint_parity(
                 paper.financial_snapshot(NOW_UNIX + 30_000).unwrap(),
                 paper.decision_pending_history().unwrap(),
                 obligations,
+                paper.gate_history().unwrap(),
                 finals,
             );
             if let Some(expected) = &expected {
@@ -2118,4 +2192,218 @@ async fn paper_service_rollout_checkpoint_matches_full_walk_financial_and_pendin
         true,
     )
     .await;
+}
+
+/// Synthetic current wires are emitted by the bucket owner; the frame capture is authenticated
+/// by the same source and durable owners as production. Only version 6's historical wire is edited.
+fn install_mixed_current_open_continuations(
+    paper: &Arc<PaperStateDb>,
+    source_log: &Path,
+    paper_prefix: AppendReceipt,
+) {
+    use pe_service::bucket_commit::{
+        BucketCommitEngine, FrozenDecisionBasis, PaperFreshnessPolicy,
+    };
+    use pe_service::frame_admission::{
+        FeedHistoryFrontier, FeedLatchBasis, FrameAdmissionInputs, FrameDecisionProof,
+    };
+    for (version, wallet) in [
+        (6, WalletAddress([0xcc; 20])),
+        (7, WalletAddress([0xcd; 20])),
+    ] {
+        support::install_verified_empty_anchor(paper, wallet, 0);
+        paper
+            .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
+                wallet,
+                complete: true,
+                proof_json: "{}".to_owned(),
+                updated_at_unix: NOW_UNIX,
+            })
+            .unwrap();
+        let payload = serde_json::to_vec(&serde_json::json!([{
+            "proxyWallet": wallet, "timestamp": NOW_UNIX + 25_000, "conditionId": format!("0xboot-{version}"), "type": "TRADE", "size": "2.5", "usdcSize": "1.25",
+            "transactionHash": format!("0xboot-{version}"), "price": "0.5", "asset": "boot-token", "side": "BUY", "outcomeIndex": 0, "outcome": "Yes", "isCombo": false
+        }])).unwrap();
+        let mut writer = Writer::open(source_log).unwrap();
+        let (read, receipt) = support::append_committed_read_v2(
+            &mut writer,
+            wallet,
+            &payload,
+            NOW_UNIX + 25_001,
+            NOW_UNIX + 25_002,
+        );
+        drop(writer);
+        let context = support::read_context(&read, receipt, NOW_UNIX + 25_003);
+        let mut engine = BucketCommitEngine::load(
+            paper.clone(),
+            pe_service::paper_recovery::build_leader_ledger(paper).unwrap(),
+        )
+        .unwrap();
+        let result = engine
+            .commit_with_freshness_policy(
+                read.aggregates,
+                &context,
+                FrozenDecisionBasis {
+                    win_rate_p: pe_core_types::Probability::ZERO,
+                    bankroll: dec!(10),
+                },
+                Some(PaperFreshnessPolicy {
+                    activity_ws_enabled: true,
+                    copy_latency_budget_secs: 120,
+                }),
+            )
+            .unwrap();
+        if version == 6 {
+            let row = paper
+                .decision_pending_for(&result.pending[0])
+                .unwrap()
+                .unwrap();
+            let mut wire: serde_json::Value =
+                serde_json::from_str(&row.frozen_inputs_json).unwrap();
+            wire["version"] = serde_json::json!(6);
+            wire.as_object_mut().unwrap().remove("source_authority");
+            let connection = Connection::open(source_log.with_file_name("paper_state.db")).unwrap();
+            connection
+                .execute(
+                    "UPDATE decision_pending SET frozen_inputs_json=?1 WHERE source_trade_id=?2",
+                    rusqlite::params![wire.to_string(), row.source_trade_id.0],
+                )
+                .unwrap();
+        }
+    }
+    let wallet = WalletAddress([0xce; 20]);
+    support::install_verified_empty_anchor(paper, wallet, 0);
+    paper
+        .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
+            wallet,
+            complete: true,
+            proof_json: "{}".to_owned(),
+            updated_at_unix: NOW_UNIX,
+        })
+        .unwrap();
+    let at = OffsetDateTime::from_unix_timestamp(NOW_UNIX + 25_002).unwrap();
+    let mut writer = Writer::open(source_log).unwrap();
+    let (frontier_read, commitment) = support::append_committed_read_v2(
+        &mut writer,
+        wallet,
+        b"[]",
+        NOW_UNIX + 24_999,
+        NOW_UNIX + 25_001,
+    );
+    let payload = serde_json::to_vec(&serde_json::json!({"proxyWallet": wallet, "timestamp": NOW_UNIX + 25_000, "conditionId": "0xboot-frame", "type": "TRADE", "size": "2.5", "usdcSize": "1.25", "transactionHash": "0xboot-frame", "price": "0.5", "asset": "boot-token", "side": "BUY", "outcomeIndex": 0, "outcome": "Yes", "isCombo": false})).unwrap();
+    let observation =
+        pe_source_polymarket_public::parse_activity_trade_observation(&payload).unwrap();
+    let frame = writer
+        .append_synced(EnvelopeIn {
+            source_id: SourceId(ACTIVITY_WS_SOURCE_ID.to_owned()),
+            schema_version: 2,
+            parser_version: 2,
+            observed_at: observation.source_time.clone(),
+            received_at: ReceivedAt(at),
+            content_type: ContentType::Json,
+            payload,
+        })
+        .unwrap();
+    let ledger = pe_service::paper_recovery::build_leader_ledger(paper).unwrap();
+    let inputs = FrameAdmissionInputs {
+        version: 1,
+        frame_receipt: frame,
+        admitted_at: at,
+        received_at: at,
+        source_time: observation.source_time.0,
+        ledger_capture: pe_service::position_seeder::ledger_capture(&ledger, paper, wallet)
+            .unwrap(),
+        ledger_group_boundary: None,
+        anchor_balances: Vec::new(),
+        position: Default::default(),
+        ledger_groups: Vec::new(),
+        market_consumed: false,
+        earlier_frames: Vec::new(),
+        copy_eligible: true,
+        history_complete: true,
+        fenced: false,
+        coverage: paper.wallet_coverage(&wallet).unwrap(),
+        frontier: FeedHistoryFrontier {
+            version: 1,
+            wallet,
+            fixed_end: NOW_UNIX + 24_999,
+            commitment,
+            page_occurrences: vec![frontier_read.page],
+            pages: serde_json::from_str::<serde_json::Value>(&frontier_read.decision_inputs_json)
+                .unwrap()["pages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|page| serde_json::from_value(page.clone()).unwrap())
+                .collect(),
+        },
+        poll_round_stale_secs: 90,
+        latch: FeedLatchBasis::default(),
+        paper_prefix: Some(paper_prefix),
+    };
+    let body = serde_json::to_vec(&serde_json::to_value(&inputs).unwrap()).unwrap();
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"prediction-edge/activity-frame-decision/v1\0");
+    hash.update(&body);
+    let revision = hash.finalize().to_hex().to_string();
+    let admission = writer
+        .append_synced(EnvelopeIn {
+            source_id: SourceId(pe_service::frame_admission::FRAME_ADMISSION_SOURCE_ID.to_owned()),
+            schema_version: 1,
+            parser_version: 1,
+            observed_at: SourceTimestamp(at),
+            received_at: ReceivedAt(at),
+            content_type: ContentType::Json,
+            payload: body,
+        })
+        .unwrap();
+    let rest_row = paper
+        .decision_pending_history()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.wallet == WalletAddress([0xcd; 20]))
+        .unwrap();
+    let mut wire: serde_json::Value = serde_json::from_str(&rest_row.frozen_inputs_json).unwrap();
+    let id = observation.group_id.key().clone();
+    wire["source_authority"] = serde_json::json!("activity_frame");
+    wire["source_trade_id"] = serde_json::json!(id);
+    wire["semantic_revision"] = serde_json::json!(revision);
+    wire["wallet"] = serde_json::to_value(wallet).unwrap();
+    wire["transaction_hash"] = serde_json::json!("0xboot-frame");
+    wire["market_id"] = serde_json::json!("0xboot-frame");
+    wire["provenance"] = serde_json::json!("activity_ws");
+    wire["decision_inputs"] = serde_json::to_value(FrameDecisionProof {
+        admission_receipt: admission,
+        inputs,
+    })
+    .unwrap();
+    wire["observed_source_receipt"] = serde_json::to_value(frame).unwrap();
+    wire["page_occurrences"] = serde_json::json!([]);
+    wire.as_object_mut().unwrap().remove("read_commitment");
+    paper
+        .commit_activity_frame(&pe_paper_state::ActivityFrameCommit {
+            gate: pe_paper_state::EntryGateResultRecord {
+                source_trade_id: id.clone(),
+                wallet,
+                market_id: MarketId(VenueMarketId("0xboot-frame".to_owned())),
+                source_epoch: NOW_UNIX + 25_000,
+                result: "admitted".to_owned(),
+                history_consumed: true,
+            },
+            history: pe_paper_state::MarketHistoryRecord {
+                wallet,
+                market_id: MarketId(VenueMarketId("0xboot-frame".to_owned())),
+                first_epoch: NOW_UNIX + 25_000,
+                source_trade_id: id.clone(),
+            },
+            pending: pe_paper_state::DecisionPendingRecord {
+                source_trade_id: id,
+                semantic_revision: revision,
+                wallet,
+                source_epoch: NOW_UNIX + 25_000,
+                frozen_inputs_json: wire.to_string(),
+                updated_at_unix: NOW_UNIX + 25_002,
+            },
+        })
+        .unwrap();
 }

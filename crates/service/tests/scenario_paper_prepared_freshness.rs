@@ -1604,7 +1604,8 @@ async fn priced_mark_resolved_before_completion_seal_verifies() {
         h.terminal(&recorded).terminal_disposition.as_deref(),
         Some("fill")
     );
-    assert!(h.qualify_one_fill().await.replay.exact);
+    let report = h.qualify_one_fill().await;
+    assert!(report.replay.exact, "{:?}", report);
 
     let paper_path = h.dir.path().join("paper.log");
     let source_path = h.dir.path().join("source.log");
@@ -1805,7 +1806,8 @@ async fn priced_completion_seal_rejects_altered_price_and_receipt() {
         h.terminal(&recorded).terminal_disposition.as_deref(),
         Some("fill")
     );
-    assert!(h.qualify_one_fill().await.replay.exact);
+    let report = h.qualify_one_fill().await;
+    assert!(report.replay.exact, "{:?}", report);
 
     let original = h.dir.path().join("paper.log");
     let frames = Reader::replay(&original)
@@ -2965,8 +2967,7 @@ async fn continuation_six_policy_and_clock_shape_rejects_invalid_evidence() {
             _ => unreachable!(),
         }
         row.post_commit_inputs_json =
-            serde_json::to_string(&DecisionPostBoundaryEvidence::from_body(document.body).unwrap())
-                .unwrap();
+            serde_json::to_string(&support::terminal_evidence(document.body).unwrap()).unwrap();
         assert!(replay_decision_pending(&row).is_err(), "{mutation}");
     }
 }
@@ -3039,7 +3040,7 @@ fn stage_legacy_decision(h: &Harness) -> DecisionPendingRow {
         "authority": {"kind": "not_read", "outcome": "dispatch_staged_before_fill_authority", "bankroll": null},
         "terminal": {"disposition": "dispatch_staged", "reason": "live_targets_staged", "fill": null, "dispatch_id": dispatch_id}
     })).unwrap();
-    let mut historical = DecisionPostBoundaryEvidence::from_body(body).unwrap();
+    let mut historical = support::terminal_evidence(body).unwrap();
     historical.financial_semantic_version = 1;
     historical.document_blake3 =
         blake3::hash(&serde_json::to_vec(&(1u32, &historical.body)).unwrap())
@@ -4893,6 +4894,26 @@ async fn frame_validation_rejects_each_altered_admission_input() {
     // The refusal is a semantic admission invariant, never a decode or receipt-hash error.
     for (pointer, changed, refusal) in [
         (
+            "/decision_inputs/inputs/position/long_contracts",
+            json!(1),
+            "market ledger rebuild differs",
+        ),
+        (
+            "/decision_inputs/inputs/ledger_capture/hash",
+            json!("altered"),
+            "frozen ledger capture hash differs",
+        ),
+        (
+            "/decision_inputs/inputs/ledger_capture/cursor",
+            json!(999),
+            "frozen ledger boundary differs",
+        ),
+        (
+            "/decision_inputs/inputs/anchor_balances",
+            json!([[0, 1]]),
+            "market ledger rebuild differs",
+        ),
+        (
             "/decision_inputs/inputs/copy_eligible",
             json!(false),
             "wallet not copy eligible",
@@ -4913,8 +4934,8 @@ async fn frame_validation_rejects_each_altered_admission_input() {
             "wallet requires reanchor",
         ),
         (
-            "/decision_inputs/inputs/consumed_history",
-            json!([recorded.admission.market.condition_id.0.clone()]),
+            "/decision_inputs/inputs/market_consumed",
+            json!(true),
             "market history consumed",
         ),
         (
@@ -4937,30 +4958,8 @@ async fn frame_validation_rejects_each_altered_admission_input() {
         pe_service::bucket_commit::validate_open_continuations(&h.paper, &h.index).unwrap();
         let mut wire = original_wire.clone();
         *wire.pointer_mut(pointer).unwrap() = changed;
-        let inputs: pe_service::frame_admission::FrameAdmissionInputs =
-            serde_json::from_value(wire["decision_inputs"]["inputs"].clone()).unwrap();
-        let admission_receipt = h
-            .source
-            .append(EnvelopeIn {
-                source_id: SourceId(
-                    pe_service::frame_admission::FRAME_ADMISSION_SOURCE_ID.to_owned(),
-                ),
-                schema_version: 1,
-                parser_version: 1,
-                observed_at: SourceTimestamp(inputs.admitted_at),
-                received_at: ReceivedAt(inputs.admitted_at),
-                content_type: ContentType::Json,
-                payload: serde_json::to_vec(&wire["decision_inputs"]["inputs"]).unwrap(),
-            })
-            .await
-            .unwrap();
-        wire["decision_inputs"]["admission_receipt"] =
-            serde_json::to_value(admission_receipt).unwrap();
-        let mut hash = blake3::Hasher::new();
-        hash.update(b"prediction-edge/activity-frame-decision/v1\0");
-        hash.update(&serde_json::to_vec(&wire["decision_inputs"]["inputs"]).unwrap());
-        let revision = hash.finalize().to_hex().to_string();
-        wire["semantic_revision"] = revision.clone().into();
+        h.authenticate_frame_wire(&mut wire).await;
+        let revision = wire["semantic_revision"].as_str().unwrap();
         connection.execute("UPDATE decision_pending SET semantic_revision = ?1, frozen_inputs_json = ?2 WHERE source_trade_id = ?3", rusqlite::params![revision, wire.to_string(), recorded.id.0]).unwrap();
         let error =
             pe_service::bucket_commit::validate_open_continuations(&h.paper, &h.index).unwrap_err();
@@ -4970,7 +4969,8 @@ async fn frame_validation_rejects_each_altered_admission_input() {
     h.start_frames();
     h.boot_barrier().await;
     h.poll(&recorded).await;
-    assert!(h.qualify_one_fill().await.replay.exact);
+    let report = h.qualify_one_fill().await;
+    assert!(report.replay.exact, "{:?}", report);
 }
 
 impl Harness {
@@ -5474,7 +5474,8 @@ async fn queue_shutdown_crashes() {
         assert_eq!(identifier_counts(&h, &recorded.id), (0, 1, 1, 0));
         h.poll(&recorded).await;
         assert_eq!(identifier_counts(&h, &recorded.id), (1, 1, 1, 0));
-        assert!(h.qualify_one_fill().await.replay.exact);
+        let report = h.qualify_one_fill().await;
+        assert!(report.replay.exact, "{:?}", report);
     }
     for boundary in [
         pe_service::trade_poller::ReconciliationCrashBoundary::Commitment,
@@ -5507,7 +5508,8 @@ async fn queue_shutdown_crashes() {
         );
         assert_eq!(h.paper.decision_pending_history().unwrap().len(), 1);
         assert_eq!(identifier_counts(&h, &recorded.id), (1, 1, 0, 0));
-        assert!(h.qualify_one_fill().await.replay.exact);
+        let report = h.qualify_one_fill().await;
+        assert!(report.replay.exact, "{:?}", report);
     }
 }
 
@@ -5560,7 +5562,9 @@ async fn equal_identifier_reconciliation_preserves_later_frame_no_copy_reason() 
     let mut context = support::read_context(&read, commitment, EPOCH);
     context.applied_configuration = h.config.clone();
     let mut engine =
-        BucketCommitEngine::load(h.paper.clone(), build_leader_ledger(&h.paper).unwrap()).unwrap();
+        BucketCommitEngine::load(h.paper.clone(), build_leader_ledger(&h.paper).unwrap())
+            .unwrap()
+            .with_source_receipt_index(h.index.clone());
     engine
         .commit_with_freshness_policy(
             read.aggregates,
@@ -5859,7 +5863,8 @@ async fn audit_release_recovery_retained_negative_precedes_failed_fetch() {
         h.poll(&deciding).await;
         assert_eq!(h.feed_edges().len(), 1);
         assert_eq!(h.paper.decision_pending_history().unwrap().len(), 1);
-        assert!(h.qualify_one_fill().await.replay.exact);
+        let report = h.qualify_one_fill().await;
+        assert!(report.replay.exact, "{:?}", report);
     }
 }
 
@@ -6200,7 +6205,8 @@ async fn audit_release_recovery_exact_identifier_uses_effective_metadata() {
     );
     assert_eq!(h.terminal(&recorded), terminal);
     assert_eq!(identifier_counts(&h, &recorded.id), (1, 1, 0, 0));
-    assert!(h.qualify_one_fill().await.replay.exact);
+    let report = h.qualify_one_fill().await;
+    assert!(report.replay.exact, "{:?}", report);
 }
 
 #[tokio::test(start_paused = true)]
@@ -6262,6 +6268,10 @@ async fn qualification_semantic_negatives_keep_valid_frame_admission_frontier_an
             "complete activity read commitment differs from its frozen proof",
         ),
         ("binding", "binding target is absent from the complete read"),
+        (
+            "paper_prefix",
+            "empty frame paper prefix follows existing paper evidence",
+        ),
     ] {
         let mut h = Harness::new().await;
         let recorded = h.record(1).await;
@@ -6270,7 +6280,8 @@ async fn qualification_semantic_negatives_keep_valid_frame_admission_frontier_an
         h.empty_frontier(EPOCH - 1).await;
         h.deliver_frame(&recorded, |_| {}).await;
         h.poll(&recorded).await;
-        assert!(h.qualify_one_fill().await.replay.exact);
+        let report = h.qualify_one_fill().await;
+        assert!(report.replay.exact, "{:?}", report);
         let original = h.terminal(&recorded);
         let mut wire: Value = serde_json::from_str(&original.frozen_inputs_json).unwrap();
         if fact == "binding" {
@@ -6323,31 +6334,12 @@ async fn qualification_semantic_negatives_keep_valid_frame_admission_frontier_an
             } else {
                 if fact == "admission" {
                     wire["decision_inputs"]["inputs"]["copy_eligible"] = json!(false);
+                } else if fact == "paper_prefix" {
+                    wire["decision_inputs"]["inputs"]["paper_prefix"] = Value::Null;
                 } else {
                     wire["decision_inputs"]["inputs"]["frontier"]["fixed_end"] = json!(EPOCH - 2);
                 }
-                let payload = serde_json::to_vec(&wire["decision_inputs"]["inputs"]).unwrap();
-                let admission = h
-                    .source
-                    .append(EnvelopeIn {
-                        source_id: SourceId(
-                            pe_service::frame_admission::FRAME_ADMISSION_SOURCE_ID.to_owned(),
-                        ),
-                        schema_version: 1,
-                        parser_version: 1,
-                        observed_at: SourceTimestamp(at()),
-                        received_at: ReceivedAt(at()),
-                        content_type: ContentType::Json,
-                        payload: payload.clone(),
-                    })
-                    .await
-                    .unwrap();
-                wire["decision_inputs"]["admission_receipt"] =
-                    serde_json::to_value(admission).unwrap();
-                let mut hash = blake3::Hasher::new();
-                hash.update(b"prediction-edge/activity-frame-decision/v1\0");
-                hash.update(&payload);
-                wire["semantic_revision"] = json!(hash.finalize().to_hex().to_string());
+                h.authenticate_frame_wire(&mut wire).await;
             }
             rusqlite::Connection::open(h.dir.path().join("paper.db")).unwrap().execute(
                 "UPDATE decision_pending SET semantic_revision=?1, frozen_inputs_json=?2 WHERE source_trade_id=?3",
@@ -6364,5 +6356,607 @@ async fn qualification_semantic_negatives_keep_valid_frame_admission_frontier_an
             "{fact}: {:?}",
             report.reasons
         );
+    }
+}
+
+impl Harness {
+    async fn authenticate_frame_wire(&self, wire: &mut Value) {
+        let inputs: pe_service::frame_admission::FrameAdmissionInputs =
+            serde_json::from_value(wire["decision_inputs"]["inputs"].clone()).unwrap();
+        let payload = serde_json::to_vec(&wire["decision_inputs"]["inputs"]).unwrap();
+        let admission = self
+            .source
+            .append(EnvelopeIn {
+                source_id: SourceId(
+                    pe_service::frame_admission::FRAME_ADMISSION_SOURCE_ID.to_owned(),
+                ),
+                schema_version: 1,
+                parser_version: 1,
+                observed_at: SourceTimestamp(inputs.admitted_at),
+                received_at: ReceivedAt(inputs.admitted_at),
+                content_type: ContentType::Json,
+                payload: payload.clone(),
+            })
+            .await
+            .unwrap();
+        wire["decision_inputs"]["admission_receipt"] = serde_json::to_value(admission).unwrap();
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"prediction-edge/activity-frame-decision/v1\0");
+        hash.update(&payload);
+        wire["semantic_revision"] = json!(hash.finalize().to_hex().to_string());
+    }
+}
+#[tokio::test(start_paused = true)]
+async fn semantic_three_frame_partial_replay() {
+    let mut h = Harness::new_with_configuration(3, dollar_runtime()).await;
+    let recorded = h
+        .record_with_economics(
+            1,
+            Some((dec!(0.50), dec!(0.50), Some(0))),
+            Some(BookEconomics {
+                depth: dec!(20.123457),
+                fee_free: false,
+            }),
+        )
+        .await;
+    h.attempt(&recorded, at());
+    h.start_frames();
+    h.empty_frontier(EPOCH - 1).await;
+    h.deliver_frame(&recorded, |_| {}).await;
+    assert!(h.paper.leader_positions().unwrap().is_empty());
+    h.poll(&recorded).await;
+    assert_eq!(
+        h.terminal(&recorded).terminal_disposition.as_deref(),
+        Some("fill")
+    );
+    let replay = replay_decision_pending(&h.terminal(&recorded)).unwrap();
+    assert!(replay.continuation.is_activity_frame());
+    assert_eq!(replay.continuation.version(), 7);
+    assert_eq!(replay.post_boundary.financial_semantic_version, 3);
+    let fills = h.authority.inner.lock().unwrap().fills.clone();
+    assert_eq!(fills.len(), 1);
+    assert!(fills[0].0.principal.to_decimal() < dec!(25));
+    assert!(fills[0].0.fee.to_decimal() > Decimal::ZERO);
+    let report = h.qualify_one_fill().await;
+    assert!(report.replay.exact, "{:?}", report.replay);
+    assert_eq!(report.replay.fills, 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn latched_homogeneous_rest_pieces_consume_once() {
+    let mut h = Harness::new().await;
+    let first = h.record(1).await;
+    h.attempt(&first, at());
+    h.start_frames();
+    h.empty_frontier(EPOCH - 1).await;
+    h.deliver_frame(&first, |_| {}).await;
+    let bad = h.rest_counterpart(&first, |row| row["side"] = json!("SELL"));
+    h.poll(&bad).await;
+    let mut next = h.record(2).await;
+    let mut rows: Value = serde_json::from_slice(&next.activity).unwrap();
+    let mut piece = rows[0].clone();
+    piece["transactionHash"] = json!(format!("0x{:064x}", 900));
+    rows.as_array_mut().unwrap().push(piece);
+    next.activity = serde_json::to_vec(&rows).unwrap();
+    let read = support::producer_shaped_read_v2(
+        wallet(),
+        &next.activity,
+        next.epoch,
+        next.epoch,
+        support::scenario_receipt(1),
+    );
+    next.id = read
+        .aggregates
+        .iter()
+        .map(|aggregate| aggregate.group_id.key().clone())
+        .min_by(|a, b| a.0.cmp(&b.0))
+        .unwrap();
+    h.stop().await;
+    h.hooks
+        .financial_clock_unix
+        .store(next.epoch, Ordering::SeqCst);
+    h.terminal_clock = OffsetDateTime::from_unix_timestamp(next.epoch).unwrap();
+    h.start_frames();
+    h.boot_barrier().await;
+    h.attempt(&next, h.terminal_clock);
+    h.poll(&next).await;
+    assert_eq!(h.paper.decision_pending_history().unwrap().len(), 2);
+    assert_eq!(h.paper.gate_history().unwrap()[&wallet()].len(), 2);
+    assert_eq!(
+        h.terminal(&next).terminal_disposition.as_deref(),
+        Some("fill")
+    );
+    assert!(
+        !replay_decision_pending(&h.terminal(&next))
+            .unwrap()
+            .continuation
+            .is_activity_frame()
+    );
+    assert_eq!(h.prepared_count(), 2);
+    let report = h.qualify_one_fill().await;
+    assert!(report.replay.exact, "{:?}", report);
+}
+
+#[tokio::test(start_paused = true)]
+async fn latched_fallback_reason_survives_release_before_rest_and_restart() {
+    let mut h = Harness::new().await;
+    let first = h.record(1).await;
+    h.attempt(&first, at());
+    h.start_frames();
+    h.empty_frontier(EPOCH - 1).await;
+    h.deliver_frame(&first, |_| {}).await;
+    let bad = h.rest_counterpart(&first, |row| row["side"] = json!("SELL"));
+    h.poll(&bad).await;
+    let next = h.record(2).await;
+    let receipt = h.deliver_frame(&next, |_| {}).await;
+    let artifacts = || {
+        Reader::replay(h.dir.path().join("source.log"))
+            .unwrap()
+            .map(|frame| frame.unwrap().1)
+            .filter(|frame| {
+                frame.source_id.0 == pe_service::frame_admission::FRAME_FALLBACK_SOURCE_ID
+            })
+            .map(|frame| {
+                serde_json::from_slice::<pe_service::frame_admission::FrameFallbackArtifact>(
+                    &frame.payload,
+                )
+                .unwrap()
+            })
+            .filter(|artifact| artifact.frame_receipt == receipt)
+            .collect::<Vec<_>>()
+    };
+    let before = serde_json::to_value(artifacts()).unwrap();
+    assert_eq!(before[0]["reason"], "latched");
+    let mut held = h.held_poll(&next, Some(receipt));
+    let response = held.pages.recv().await.unwrap();
+    h.release_feed(h.feed_edges()[0].0.this_hash.to_hex().as_str())
+        .await;
+    // The read was selected while latched, but finishes after the acknowledged release.
+    held.finish(response, next.activity.clone()).await;
+    assert!(
+        !pe_service::paper_recovery::feed_latch_basis(&h.feed_era())
+            .unwrap()
+            .engaged()
+    );
+    h.stop().await;
+    h.hooks
+        .financial_clock_unix
+        .store(next.epoch, Ordering::SeqCst);
+    h.terminal_clock = OffsetDateTime::from_unix_timestamp(next.epoch).unwrap();
+    h.start_frames();
+    h.boot_barrier().await;
+    h.attempt(&next, h.terminal_clock);
+    h.poll(&next).await;
+    let after = Reader::replay(h.dir.path().join("source.log"))
+        .unwrap()
+        .map(|frame| frame.unwrap().1)
+        .filter(|frame| frame.source_id.0 == pe_service::frame_admission::FRAME_FALLBACK_SOURCE_ID)
+        .map(|frame| {
+            serde_json::from_slice::<pe_service::frame_admission::FrameFallbackArtifact>(
+                &frame.payload,
+            )
+            .unwrap()
+        })
+        .filter(|artifact| artifact.frame_receipt == receipt)
+        .collect::<Vec<_>>();
+    assert_eq!(serde_json::to_value(after).unwrap(), before);
+    assert_eq!(
+        h.terminal(&next).terminal_disposition.as_deref(),
+        Some("fill")
+    );
+    let report = h.qualify_one_fill().await;
+    assert!(report.replay.exact, "{:?}", report);
+}
+
+struct HeldPoll {
+    _triggers: mpsc::Sender<pe_service::activity_ingest::ReconciliationTrigger>,
+    pages: mpsc::Receiver<support::RequestedPage>,
+    progress: mpsc::Receiver<pe_service::trade_poller::PollerProgress>,
+    stop: tokio::sync::oneshot::Sender<()>,
+    task: tokio::task::JoinHandle<Result<(), pe_service::trade_poller::TradePollerOwnerError>>,
+}
+impl HeldPoll {
+    async fn finish(mut self, response: support::RequestedPage, payload: Vec<u8>) {
+        response.respond.send(payload).unwrap();
+        while let Some(progress) = self.progress.recv().await {
+            if matches!(
+                progress,
+                pe_service::trade_poller::PollerProgress::RoundCompleted
+            ) {
+                break;
+            }
+        }
+        let _ = self.stop.send(());
+        self.task.await.unwrap().unwrap();
+    }
+}
+impl Harness {
+    fn held_poll(&self, recorded: &Recorded, receipt: Option<AppendReceipt>) -> HeldPoll {
+        let (requests, pages) = mpsc::channel(4);
+        let (progress, completion) = mpsc::channel(8);
+        let (triggers, receiver) = mpsc::channel(1);
+        let mut obligations = pe_service::trade_poller::ReconciliationObligations::default();
+        if let Some(receipt) = receipt {
+            let source = Reader::replay(self.dir.path().join("source.log"))
+                .unwrap()
+                .map(|frame| frame.unwrap().1)
+                .find(|source| {
+                    source.seq == receipt.sequence && source.this_hash == receipt.this_hash
+                })
+                .unwrap();
+            let observation =
+                pe_source_polymarket_public::parse_activity_trade_observation(&source.payload)
+                    .unwrap();
+            obligations.insert(pe_service::activity_ingest::ReconciliationTrigger {
+                wallet: wallet(),
+                source_time: observation.source_time.0,
+                source_trade_id: observation.group_id.key().clone(),
+                provenance: pe_copy_signal_engine::TradeProvenance::ActivityWs,
+                received_at: source.received_at.0,
+                receipt,
+            });
+        }
+        let poller = TradePoller::new(
+            TradePollerConfig {
+                base_url: "fixture://activity".to_owned(),
+                poll_interval_secs: 30,
+                activity_ws_enabled: false,
+                copy_latency_budget_secs: self.copy_budget_secs,
+            },
+            self.watchlist.clone(),
+            Arc::new(support::GatedFetcher { requests }),
+            Arc::new(AssetIdentityResolver::new_runtime(
+                Arc::new(Page(recorded.gamma.clone())),
+                "fixture://gamma".to_owned(),
+                GAMMA_BATCH_SIZE,
+                self.source.clone(),
+            )),
+            self.source.clone(),
+            receiver,
+            self.control.as_ref().unwrap().clone(),
+            self.paper.clone(),
+            new_shared_health_with_ws(false, true, 90),
+            SignalConfig::default(),
+            LiveRuntimeConfig::new(self.config.clone()),
+            obligations,
+            None,
+        )
+        .with_source_receipt_index(self.index.clone())
+        .with_progress(progress)
+        .with_clock(Arc::new(at));
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(poller.run_until(async move {
+            let _ = stopped.await;
+        }));
+        HeldPoll {
+            _triggers: triggers,
+            pages,
+            progress: completion,
+            stop,
+            task,
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn admission_during_rest_read_suppresses_other_market_and_concludes_audit() {
+    for trigger_first in [false, true] {
+        let mut h = Harness::new().await;
+        let recorded = h.record(1).await;
+        let other = h.record(2).await;
+        h.attempt(&recorded, at());
+        h.start_frames();
+        h.empty_frontier(EPOCH - 1).await;
+        let receipt = h.append_frame(&recorded, |_| {}).await;
+        let mut counterpart = h.rest_counterpart(&recorded, |row| {
+            row["conditionId"] = json!(other.admission.market.condition_id.0);
+            row["asset"] = json!(other.admission.market.ordered_outcome_token_ids[0].0);
+        });
+        counterpart.gamma = other.gamma;
+        let mut held = h.held_poll(&counterpart, trigger_first.then_some(receipt));
+        let response = held.pages.recv().await.unwrap();
+        assert!(
+            h.paper
+                .decision_pending_for(&recorded.id)
+                .unwrap()
+                .is_none()
+        );
+        h.control
+            .as_ref()
+            .unwrap()
+            .send(OrchestratorControl::ActivityFrameDecision { receipt })
+            .await
+            .unwrap();
+        h.boot_barrier_readonly().await;
+        assert_eq!(h.paper.decision_pending_history().unwrap().len(), 1);
+        held.finish(response, counterpart.activity.clone()).await;
+        assert_eq!(h.paper.decision_pending_history().unwrap().len(), 1);
+        assert_eq!(h.paper.leader_positions().unwrap().len(), 1);
+        assert_eq!(
+            h.paper.leader_positions().unwrap()[0]
+                .long_contracts
+                .to_decimal(),
+            dec!(5)
+        );
+        assert_eq!(h.feed_edges().len(), 1);
+        assert_eq!(
+            h.feed_edges()[0].1.cause,
+            pe_service::paper_recovery::FeedIncidentCause::Contradiction
+        );
+        let mut obligations = pe_service::trade_poller::rebuild_reconciliation_obligations(
+            &h.dir.path().join("source.log"),
+            &h.paper,
+        )
+        .unwrap();
+        obligations.retire_feed_incidents(&h.feed_era());
+        assert_eq!(obligations.len(), 0);
+        let terminal = h.terminal(&recorded);
+        h.stop().await;
+        h.start_frames();
+        h.boot_barrier().await;
+        assert_eq!(h.terminal(&recorded), terminal);
+        assert_eq!(h.paper.decision_pending_history().unwrap().len(), 1);
+        assert_eq!(h.paper.leader_positions().unwrap().len(), 1);
+        let report = h.qualify_one_fill().await;
+        assert!(report.replay.exact, "{:?}", report);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn frame_capture_size_is_independent_of_unrelated_wallet_state() {
+    let mut sizes = Vec::new();
+    for large in [false, true] {
+        let mut h = Harness::new().await;
+        let recorded = h.record(1).await;
+        if large {
+            let mut engine =
+                BucketCommitEngine::load(h.paper.clone(), build_leader_ledger(&h.paper).unwrap())
+                    .unwrap();
+            let capture =
+                pe_service::position_seeder::ledger_capture(engine.ledger(), &h.paper, wallet())
+                    .unwrap();
+            engine
+                .install_anchors(&[pe_service::position_seeder::AnchorInstall {
+                    wallet: wallet(),
+                    balances: (0..4000)
+                        .map(|ordinal| {
+                            (
+                                pe_core_types::MarketId(pe_core_types::VenueMarketId(format!(
+                                    "unrelated-position-{ordinal}"
+                                ))),
+                                pe_core_types::OutcomeId(0),
+                                pe_core_types::ShareAmount::from_whole(1).unwrap(),
+                            )
+                        })
+                        .collect(),
+                    cutoff: 0,
+                    fresh_history: Vec::new(),
+                    expected_fence: None,
+                    history_status: None,
+                    expected: pe_service::position_seeder::AnchorExpectation {
+                        ledger_hash: capture.hash,
+                        cursor: capture.cursor,
+                        anchor_seq: capture.anchor_seq,
+                        coverage_generation: capture.coverage_generation,
+                    },
+                    proof: pe_service::position_seeder::AnchorProof {
+                        positions_proof_hash: "synthetic-large".to_owned(),
+                        activity_bounds_json: "[]".to_owned(),
+                        source_log_generation: "scenario".to_owned(),
+                        document: "{}".to_owned(),
+                        recorded_at_unix: 0,
+                    },
+                }])
+                .unwrap();
+            let mut connection = rusqlite::Connection::open(h.dir.path().join("paper.db")).unwrap();
+            let transaction = connection.transaction().unwrap();
+            for ordinal in 0..30_000 {
+                transaction.execute("INSERT INTO wallet_market_history_v2(wallet_hex,market_id,first_epoch,source_trade_id,origin) VALUES (?1,?2,0,'synthetic-history','activity_v2')", rusqlite::params![wallet().to_string(), format!("unrelated-consumed-{ordinal}")]).unwrap();
+            }
+            transaction.commit().unwrap();
+            let other = WalletAddress([0xbb; 20]);
+            for ordinal in 0..1000 {
+                let rows: Value = serde_json::from_slice(&recorded.activity).unwrap();
+                let mut frame = rows[0].clone();
+                frame["proxyWallet"] = serde_json::to_value(other).unwrap();
+                frame["transactionHash"] = json!(format!("0xresolved-{ordinal}"));
+                let payload = serde_json::to_vec(&frame).unwrap();
+                let observation =
+                    pe_source_polymarket_public::parse_activity_trade_observation(&payload)
+                        .unwrap();
+                h.source
+                    .append(EnvelopeIn {
+                        source_id: SourceId(
+                            pe_service::activity_ingest::ACTIVITY_WS_SOURCE_ID.to_owned(),
+                        ),
+                        schema_version: 2,
+                        parser_version: 2,
+                        observed_at: SourceTimestamp(at()),
+                        received_at: ReceivedAt(at()),
+                        content_type: ContentType::Json,
+                        payload,
+                    })
+                    .await
+                    .unwrap();
+                connection.execute("INSERT INTO activity_groups(source_trade_id,transaction_hash,wallet_hex,source_epoch,semantic_revision,activity_type,disposition,proof_json) VALUES (?1,?2,?3,?4,'synthetic-resolved','TRADE','raw_only',?5)",
+                    rusqlite::params![observation.group_id.key().0, observation.group_id.components().transaction_hash, other.to_string(), EPOCH, r#"{"effect":{"kind":"raw_only"}}"#]).unwrap();
+            }
+        }
+        h.attempt(&recorded, at());
+        h.start_frames();
+        h.empty_frontier(EPOCH - 1).await;
+        h.deliver_frame(&recorded, |_| {}).await;
+        let wire: Value = serde_json::from_str(&h.terminal(&recorded).frozen_inputs_json).unwrap();
+        let capture = &wire["decision_inputs"]["inputs"];
+        assert_eq!(capture["anchor_balances"], json!([]));
+        assert_eq!(capture["ledger_groups"], json!([]));
+        assert_eq!(capture["earlier_frames"], json!([]));
+        sizes.push(serde_json::to_vec(capture).unwrap().len());
+        h.poll(&recorded).await;
+        let report = h.qualify_one_fill().await;
+        assert!(report.replay.exact, "{report:?}");
+    }
+    assert!(sizes[1] <= sizes[0] + 256, "capture sizes: {sizes:?}");
+}
+
+impl Harness {
+    async fn install_runtime_anchor(
+        &self,
+        cutoff: i64,
+        balances: Vec<(
+            pe_core_types::MarketId,
+            pe_core_types::OutcomeId,
+            pe_core_types::ShareAmount,
+        )>,
+    ) {
+        let (captured, received) = tokio::sync::oneshot::channel();
+        self.control
+            .as_ref()
+            .unwrap()
+            .send(OrchestratorControl::CaptureAdmissionLedger {
+                wallet: wallet(),
+                captured,
+            })
+            .await
+            .unwrap();
+        let capture = received.await.unwrap().unwrap();
+        let (acknowledged, response) = tokio::sync::oneshot::channel();
+        self.control
+            .as_ref()
+            .unwrap()
+            .send(OrchestratorControl::InstallAnchors {
+                installs: vec![pe_service::position_seeder::AnchorInstall {
+                    wallet: wallet(),
+                    balances,
+                    cutoff,
+                    fresh_history: Vec::new(),
+                    expected_fence: self.paper.wallet_fence(&wallet()).unwrap(),
+                    history_status: Some(pe_paper_state::WalletHistoryStatusRecord {
+                        wallet: wallet(),
+                        complete: true,
+                        proof_json: "{}".to_owned(),
+                        updated_at_unix: cutoff,
+                    }),
+                    expected: pe_service::position_seeder::AnchorExpectation {
+                        ledger_hash: capture.hash,
+                        cursor: capture.cursor,
+                        anchor_seq: capture.anchor_seq,
+                        coverage_generation: capture.coverage_generation,
+                    },
+                    proof: pe_service::position_seeder::AnchorProof {
+                        positions_proof_hash: "synthetic-anchor".to_owned(),
+                        activity_bounds_json: "[]".to_owned(),
+                        source_log_generation: "scenario".to_owned(),
+                        document: "{}".to_owned(),
+                        recorded_at_unix: cutoff,
+                    },
+                }],
+                acknowledged,
+            })
+            .await
+            .unwrap();
+        response.await.unwrap().unwrap();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn covered_and_fenced_matches_retire_barriers_before_later_wallet_frame() {
+    for route in ["covered", "fenced"] {
+        for restart in [false, true] {
+            let mut h = Harness::new().await;
+            let first = h.record(1).await;
+            h.attempt(&first, at());
+            h.start_frames();
+            h.empty_frontier(EPOCH - 1).await;
+            h.deliver_frame(&first, |_| {}).await;
+            if route == "covered" {
+                h.install_runtime_anchor(
+                    EPOCH,
+                    vec![(
+                        pe_core_types::MarketId(pe_core_types::VenueMarketId(
+                            first.admission.market.condition_id.0.clone(),
+                        )),
+                        pe_core_types::OutcomeId(0),
+                        pe_core_types::ShareAmount::from_whole(5).unwrap(),
+                    )],
+                )
+                .await;
+            } else {
+                h.stop().await;
+                rusqlite::Connection::open(h.dir.path().join("paper.db")).unwrap().execute(
+                    "INSERT INTO wallet_fences(wallet_hex,source_trade_id,cause,proof_json,fenced_at_unix) VALUES (?1,?2,'position_underflow',?3,?4)",
+                    rusqlite::params![wallet().to_string(), first.id.0, json!({"bucket_epoch": EPOCH}).to_string(), EPOCH],
+                ).unwrap();
+                h.start_frames();
+                h.boot_barrier().await;
+            }
+            h.poll(&first).await;
+            assert_eq!(
+                h.paper
+                    .activity_group_state(&first.id)
+                    .unwrap()
+                    .unwrap()
+                    .disposition,
+                if route == "covered" {
+                    "anchor_covered_late"
+                } else {
+                    "wallet_fenced_applied"
+                }
+            );
+            assert_eq!(
+                pe_service::trade_poller::rebuild_reconciliation_obligations(
+                    &h.dir.path().join("source.log"),
+                    &h.paper
+                )
+                .unwrap()
+                .len(),
+                0
+            );
+            // A late covered match requests reanchoring; a recoverable fence does too.
+            // Restore readiness through the production anchor owner before testing ordering.
+            let balances = h
+                .paper
+                .leader_positions()
+                .unwrap()
+                .into_iter()
+                .map(|row| (row.market_id, row.outcome_id, row.long_contracts))
+                .collect();
+            h.install_runtime_anchor(EPOCH + 1, balances).await;
+            assert!(!h.paper.is_wallet_fenced(&wallet()).unwrap());
+            assert!(
+                !h.paper
+                    .wallet_coverage(&wallet())
+                    .unwrap()
+                    .reanchor_required
+            );
+            if restart {
+                h.stop().await;
+                h.start_frames();
+                h.boot_barrier().await;
+            }
+            // A fresh frontier after the old observation's stale bound exposes any surviving
+            // wallet-age barrier even though the next market has no BUY barrier of its own.
+            h.hooks
+                .financial_clock_unix
+                .store(EPOCH + 100, Ordering::SeqCst);
+            h.empty_frontier(EPOCH + 99).await;
+            let next = h.record(101).await;
+            h.attempt(&next, at() + time::Duration::seconds(100));
+            h.deliver_frame(&next, |_| {}).await;
+            let row = h
+                .paper
+                .decision_pending_for(&next.id)
+                .unwrap()
+                .unwrap_or_else(|| {
+                    panic!("{route}, restart={restart}: later frame was not admitted")
+                });
+            assert!(
+                replay_decision_pending(&row)
+                    .unwrap()
+                    .continuation
+                    .is_activity_frame(),
+                "{route}, restart={restart}"
+            );
+        }
     }
 }

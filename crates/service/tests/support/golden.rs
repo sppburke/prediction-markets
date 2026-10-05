@@ -1065,10 +1065,9 @@ fn rewrite_state_receipts(
         }
         let post_commit_evidence: DecisionPostBoundaryEvidence =
             serde_json::from_value(post_commit).unwrap();
-        let post_commit = serde_json::to_value(
-            DecisionPostBoundaryEvidence::from_body(post_commit_evidence.body).unwrap(),
-        )
-        .unwrap();
+        let post_commit =
+            serde_json::to_value(support::terminal_evidence(post_commit_evidence.body).unwrap())
+                .unwrap();
         connection
             .execute(
                 "UPDATE decision_pending SET frozen_inputs_json = ?2, \
@@ -3253,7 +3252,7 @@ fn qualification_replays_source_age_and_seal_binds_policy_and_clock(
         connection.execute(
             "UPDATE decision_pending SET frozen_inputs_json = ?2, post_commit_inputs_json = ?3 WHERE source_trade_id = ?1",
             rusqlite::params![source_trade_id.0, serde_json::to_string(&continuation).unwrap(),
-                serde_json::to_string(&DecisionPostBoundaryEvidence::from_body(evidence.body).unwrap()).unwrap()],
+                serde_json::to_string(&support::terminal_evidence(evidence.body).unwrap()).unwrap()],
         ).unwrap();
         drop(connection);
         let state = PaperStateDb::open_read_only(&cloned_state).unwrap();

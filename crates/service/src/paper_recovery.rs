@@ -5399,6 +5399,42 @@ fn install_replayed_anchor(
     Ok(())
 }
 
+/// Reuse recovery's all-or-none bucket reducer for authenticated frozen records.
+/// Callers authenticate balances and records against their durable owners separately.
+pub(crate) fn replay_frozen_records(
+    wallet: WalletAddress,
+    balances: &[(String, u16, ShareAmount)],
+    groups: &[pe_paper_state::ActivityGroupRow],
+) -> Result<PositionLedger, WalletLedgerReplayError> {
+    let mut ledger = PositionLedger::new();
+    let positions = balances
+        .iter()
+        .map(|(market, outcome, amount)| {
+            (
+                MarketOutcomeId::new(MarketId(VenueMarketId(market.clone())), OutcomeId(*outcome)),
+                PositionState {
+                    long_contracts: *amount,
+                    short_contracts: ShareAmount::ZERO,
+                },
+            )
+        })
+        .collect();
+    ledger.replace_wallet_snapshot(wallet, positions);
+    let mut start = 0;
+    while let Some(first) = groups.get(start) {
+        let mut end = start + 1;
+        while groups
+            .get(end)
+            .is_some_and(|group| group.source_epoch == first.source_epoch)
+        {
+            end += 1;
+        }
+        apply_replayed_bucket(&mut ledger, None, wallet, &groups[start..end])?;
+        start = end;
+    }
+    Ok(ledger)
+}
+
 fn apply_replayed_groups(
     ledger: &mut PositionLedger,
     paper_state: &PaperStateDb,
@@ -5416,7 +5452,7 @@ fn apply_replayed_groups(
         }
         apply_replayed_bucket(
             ledger,
-            paper_state,
+            Some(paper_state),
             wallet,
             &groups[bucket_start..bucket_end],
         )?;
@@ -5427,7 +5463,7 @@ fn apply_replayed_groups(
 
 fn apply_replayed_bucket(
     ledger: &mut PositionLedger,
-    paper_state: &PaperStateDb,
+    paper_state: Option<&PaperStateDb>,
     wallet: WalletAddress,
     groups: &[pe_paper_state::ActivityGroupRow],
 ) -> Result<(), WalletLedgerReplayError> {
@@ -5444,8 +5480,10 @@ fn apply_replayed_bucket(
     let mut mutations = Vec::new();
     let mut expected = Vec::new();
     for group in groups {
-        let durable = paper_state.activity_group_state(&group.source_trade_id)?;
-        verify_replayed_group_revision(durable.as_ref(), group)?;
+        if let Some(paper_state) = paper_state {
+            let durable = paper_state.activity_group_state(&group.source_trade_id)?;
+            verify_replayed_group_revision(durable.as_ref(), group)?;
+        }
         let applied_effect = AppliedEffect::from_document(&group.proof_json).map_err(|source| {
             WalletLedgerReplayError::EffectDocument {
                 source_trade_id: group.source_trade_id.clone(),

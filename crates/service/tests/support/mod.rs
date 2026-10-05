@@ -1138,3 +1138,18 @@ pub async fn bounded_command_output(mut command: std::process::Command) -> std::
     );
     output
 }
+
+/// Historical/current terminal rehashing belongs to synthetic fixtures only.
+pub fn terminal_evidence(
+    body: pe_service::decision_replay::DecisionPostBoundaryEvidenceBody,
+) -> Result<pe_service::decision_replay::DecisionPostBoundaryEvidence, serde_json::Error> {
+    let financial_semantic_version = pe_service::paper_recovery::FINANCIAL_SEMANTIC_VERSION;
+    let document_blake3 = blake3::hash(&serde_json::to_vec(&(financial_semantic_version, &body))?)
+        .to_hex()
+        .to_string();
+    Ok(pe_service::decision_replay::DecisionPostBoundaryEvidence {
+        body,
+        financial_semantic_version,
+        document_blake3,
+    })
+}

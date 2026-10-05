@@ -353,7 +353,10 @@ groups = {r["source_trade_id"]: dict(r) for r in db.execute("SELECT * FROM activ
 keys = {}; matched = set(); legs = {}
 for e in source.values():
     if e["source_id"] != "polymarket-public.activity-reconciliation": continue
-    assert e["schema_version"] == 3 and e["parser_version"] == 2
+    # Dispatch by the recorded contract; historical pages remain identity-join evidence.
+    contract = (e["schema_version"], e["parser_version"])
+    if contract not in ((2, 2), (3, 2)):
+        raise ValueError(f"unsupported reconciliation page contract {contract}")
     for r in payload(e):
         if r.get("type", r.get("activity_type", "")).strip().upper() != "TRADE": continue
         wallet = r.get("proxyWallet", r.get("proxy_wallet", "")).strip().lower()
@@ -450,3 +453,14 @@ outcomes, both-outcome exposure and all routing/refusal causes for every first-e
 membership, including removed wallets and all prices. Unexplained misses, duplicate history or
 ledger effects, unaudited frame decisions and unlatched contradictions fail AC16. Post results to
 #588 and #530 and close #730 only after AC16.
+
+Admission captures contain only the admitting wallet's preceding unresolved frames, the frame
+market's consumption fact, compact ledger capture and append-only activity row boundary, that
+market's anchor balances and post-anchor effects, and the classified outcome's resulting position.
+Authenticate the scoped balances/effects against the durable anchor and group prefix and verify
+first consumption against `wallet_market_history_v2`'s transaction-written owner. The receipt-ordered
+source admission artifact and continuation retain the same bounded body; configuration, sizing
+basis and quality come from continuation facts, while payload and parser/schema contracts come
+from the authenticated frame. Coverage, eligibility, clocks, frontier and sealed paper latch basis
+remain admission-time evidence. Resolved frames and unrelated wallets, positions and consumed
+markets do not contribute to capture size.

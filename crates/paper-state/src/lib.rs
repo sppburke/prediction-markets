@@ -1081,6 +1081,56 @@ impl PaperStateDb {
         Ok(groups)
     }
 
+    /// Append-only activity row boundary for a receipt-ordered admission capture.
+    pub fn activity_group_boundary(
+        &self,
+        wallet: &WalletAddress,
+    ) -> Result<Option<i64>, PaperStateError> {
+        self.lock()
+            .query_row(
+                "SELECT MAX(rowid) FROM activity_groups WHERE wallet_hex = ?1",
+                params![wallet.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// Frozen append prefix; later same-second rows cannot change this boundary.
+    pub fn activity_groups_at_boundary(
+        &self,
+        wallet: &WalletAddress,
+        cutoff: i64,
+        boundary: Option<i64>,
+    ) -> Result<Vec<ActivityGroupRow>, PaperStateError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare("SELECT source_trade_id, source_epoch, semantic_revision, disposition, proof_json FROM activity_groups WHERE wallet_hex = ?1 AND source_epoch > ?2 AND rowid <= ?3 ORDER BY source_epoch, source_trade_id")?;
+        let rows = statement.query_map(
+            params![wallet.to_string(), cutoff, boundary.unwrap_or(0)],
+            |row| {
+                Ok(ActivityGroupRow {
+                    source_trade_id: SourceTradeId(row.get(0)?),
+                    source_epoch: row.get(1)?,
+                    semantic_revision: row.get(2)?,
+                    disposition: row.get(3)?,
+                    proof_json: row.get(4)?,
+                })
+            },
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// First consumption owner, written atomically with the admission transaction.
+    pub fn market_history_record(
+        &self,
+        wallet: &WalletAddress,
+        market: &MarketId,
+    ) -> Result<Option<MarketHistoryRecord>, PaperStateError> {
+        self.lock().query_row("SELECT first_epoch, source_trade_id FROM wallet_market_history_v2 WHERE wallet_hex = ?1 AND market_id = ?2",
+            params![wallet.to_string(), market.to_string()], |row| Ok(MarketHistoryRecord {
+                wallet: *wallet, market_id: market.clone(), first_epoch: row.get(0)?, source_trade_id: SourceTradeId(row.get(1)?)
+            })).optional().map_err(Into::into)
+    }
+
     // ── Write shapes ─────────────────────────────────────────────────────────
 
     /// Commit a processed trade that produced **no** order (classify-`None`,

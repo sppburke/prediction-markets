@@ -1645,9 +1645,9 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 crate::frame_admission::FRAME_FALLBACK_SOURCE_ID,
                 crate::frame_admission::canonical_bytes(artifact),
             ),
-            crate::bucket_commit::FrameRoute::Admission(inputs) => (
+            crate::bucket_commit::FrameRoute::Admission(capture) => (
                 crate::frame_admission::FRAME_ADMISSION_SOURCE_ID,
-                crate::frame_admission::canonical_bytes(inputs),
+                crate::frame_admission::canonical_bytes(&capture.0),
             ),
         };
         let admission_receipt = source_log
@@ -1662,20 +1662,22 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             })
             .await
             .map_err(|error| error.to_string())?;
-        let crate::bucket_commit::FrameRoute::Admission(inputs) = route else {
+        let crate::bucket_commit::FrameRoute::Admission(capture) = route else {
             return Ok(());
         };
+        let (inputs, context) = *capture;
         let id = self
             .bucket_engine
             .commit_activity_frame(
                 crate::frame_admission::FrameDecisionProof {
                     admission_receipt,
-                    inputs: *inputs,
+                    inputs,
                 },
                 PaperFreshnessPolicy {
                     activity_ws_enabled: self.activity_ws_enabled,
                     copy_latency_budget_secs: self.copy_latency_budget_secs,
                 },
+                context,
                 &index,
             )
             .map_err(|error| error.to_string())?;
@@ -1692,7 +1694,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         update: crate::orchestrator_control::FeedAuditUpdate,
     ) -> Result<(), String> {
         use crate::orchestrator_control::FeedAuditUpdate;
-        use crate::paper_recovery::{HaltState, PaperLogFrame, PaperLogRecord};
+        use crate::paper_recovery::{HaltState, PaperLogRecord};
         let index = self
             .source_receipts
             .as_ref()
@@ -1765,18 +1767,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 {
                     return Ok(());
                 }
-                let Some(mut incident) =
-                    era.frames
-                        .iter()
-                        .rev()
-                        .find_map(|frame| match &frame.frame {
-                            PaperLogFrame::Record(PaperLogRecord::FeedIncidentChanged {
-                                incident,
-                                state: HaltState::Engaged,
-                            }) => Some(incident.clone()),
-                            _ => None,
-                        })
-                else {
+                let Some(mut incident) = crate::feed_audit::latest_incident(&era) else {
                     return Err("latest feed engagement is missing".to_owned());
                 };
                 incident.engagement_receipt = basis.latest_incident;
@@ -2396,6 +2387,9 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
     /// financial posture; the Start-bound protocol installs the same index again with its logs.
     #[must_use]
     pub fn with_source_receipt_index(mut self, source_receipts: SourceReceiptIndex) -> Self {
+        self.bucket_engine = self
+            .bucket_engine
+            .with_source_receipt_index(source_receipts.clone());
         self.source_receipts = Some(source_receipts);
         self
     }
@@ -2436,6 +2430,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         self.publish_feed_latch_health();
         self.qualification_start = era.start.as_ref().map(|(receipt, _)| *receipt);
         self.financial_log_paths = Some((paper_log_path, source_log_path));
+        self.bucket_engine
+            .set_source_receipt_index(source_receipts.clone());
         self.source_receipts = Some(source_receipts);
         self.admission_builder = Some(admission_builder);
         self.boundary_mark_fetcher = Some(boundary_mark_fetcher);

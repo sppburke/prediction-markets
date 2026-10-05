@@ -865,9 +865,18 @@ async fn verify_qualification(
             let proof: crate::frame_admission::FrameDecisionProof =
                 serde_json::from_value(decision.continuation.facts.decision_inputs.clone())?;
             let prefix = match proof.inputs.paper_prefix {
-                None => Vec::new(),
+                None => {
+                    // A qualification-selected frame is post-Start. The verified sealed
+                    // paper boundary contains that Start even if the wall clock moved back.
+                    if !frames[..=financial_prefix_index].is_empty() {
+                        return insufficient(
+                            "empty frame paper prefix follows existing paper evidence",
+                        );
+                    }
+                    Vec::new()
+                }
                 Some(receipt) => {
-                    let position = frames
+                    let position = frames[..=financial_prefix_index]
                         .iter()
                         .position(|frame| frame.receipt == receipt)
                         .ok_or_else(|| {
@@ -875,6 +884,9 @@ async fn verify_qualification(
                                 "frame paper prefix receipt is missing".to_owned(),
                             )
                         })?;
+                    if frames[position].envelope.received_at.0 > proof.inputs.admitted_at {
+                        return insufficient("frame paper prefix follows admission clock");
+                    }
                     frames[..=position].to_vec()
                 }
             };
@@ -966,6 +978,17 @@ async fn verify_qualification(
                             &completed_financial_facts,
                             economic.risk.financial_prefix,
                         )?;
+                        let continuation = replayed_decisions
+                            .iter()
+                            .find(|decision| {
+                                decision.continuation.facts.source_trade_id
+                                    == operation.source_trade_id
+                            })
+                            .ok_or_else(|| {
+                                QualificationError::InsufficientEvidence(
+                                    "Fill has no frozen continuation".to_owned(),
+                                )
+                            })?;
                         verify_economic(
                             operation,
                             economic,
@@ -982,25 +1005,7 @@ async fn verify_qualification(
                                 start_hot_config_hash: &start.hot_config_hash,
                                 financial_semantic_version: start.financial_semantic_version,
                             },
-                            replayed_decisions
-                                .iter()
-                                .find(|decision| {
-                                    decision.continuation.facts.source_trade_id
-                                        == operation.source_trade_id
-                                })
-                                .map(|decision| decision.continuation.version())
-                                .ok_or_else(|| {
-                                    QualificationError::InsufficientEvidence(
-                                        "Fill has no frozen continuation".to_owned(),
-                                    )
-                                })?,
-                            replayed_decisions
-                                .iter()
-                                .find(|decision| {
-                                    decision.continuation.facts.source_trade_id
-                                        == operation.source_trade_id
-                                })
-                                .map(|decision| &decision.continuation),
+                            Some(&continuation.continuation),
                             true,
                         )
                         .await?;
@@ -3593,6 +3598,12 @@ fn verify_decision_classification(
     decision: &crate::decision_replay::ReplayedDecision,
 ) -> Result<(), QualificationError> {
     if decision.continuation.is_activity_frame() {
+        let proof: crate::frame_admission::FrameDecisionProof =
+            serde_json::from_value(decision.continuation.facts.decision_inputs.clone())?;
+        proof
+            .inputs
+            .verify_durable(state, &decision.continuation.facts)
+            .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
         return decision
             .continuation
             .validate_authority()
@@ -4036,7 +4047,6 @@ async fn verify_economic(
     operation: &crate::paper_recovery::PaperFillOperationIdentity,
     economic: &EconomicPrepared,
     context: &RiskReplayContext<'_>,
-    continuation_version: u16,
     continuation: Option<&DecisionContinuationV3>,
     require_risk_approval: bool,
 ) -> Result<EconomicPrepared, QualificationError> {
@@ -4106,7 +4116,6 @@ async fn verify_economic(
         economic,
         economic.risk.evaluated_at_unix_ms,
         cash_before,
-        continuation_version,
         continuation,
         |receipt| {
             let observation = context
@@ -5297,15 +5306,8 @@ async fn verify_winner_follow_decline_decision(
                 source_trade_id: frozen.source_trade_id.clone(),
                 observed_at_bucket: frozen.source_epoch,
             };
-            let reconstructed = verify_economic(
-                &operation,
-                economic,
-                &replay,
-                continuation.version(),
-                Some(continuation),
-                false,
-            )
-            .await?;
+            let reconstructed =
+                verify_economic(&operation, economic, &replay, Some(continuation), false).await?;
             match pe_strategy_winner_follow::WinnerFollowStrategy::new(
                 frozen.applied_configuration.winner_follow_config(),
             )
@@ -7574,7 +7576,7 @@ mod tests {
             source: &source,
             ..initial_context
         };
-        verify_economic(&operation, &economic, &context, 5, None, false)
+        verify_economic(&operation, &economic, &context, None, false)
             .await
             .unwrap();
 
@@ -7586,7 +7588,7 @@ mod tests {
                 ..context
             };
             assert!(matches!(
-                verify_economic(&operation, &economic, &late_context, 5, None, false).await,
+                verify_economic(&operation, &economic, &late_context, None, false).await,
                 Err(QualificationError::InsufficientEvidence(_))
             ));
         }
@@ -8056,13 +8058,13 @@ mod tests {
             financial_semantic_version: fixture.start.financial_semantic_version,
         };
         assert_eq!(
-            verify_economic(&operation, &economic, &replay, 5, None, false)
+            verify_economic(&operation, &economic, &replay, None, false)
                 .await
                 .unwrap(),
             economic
         );
         assert!(matches!(
-            verify_economic(&operation, &economic, &replay, 5, None, true).await,
+            verify_economic(&operation, &economic, &replay, None, true).await,
             Err(QualificationError::InsufficientEvidence(reason))
                 if reason.contains("risk decision is not an approval")
         ));
@@ -8185,7 +8187,7 @@ mod tests {
             };
 
             assert_eq!(
-                verify_economic(&operation, &economic, &replay, 5, None, false)
+                verify_economic(&operation, &economic, &replay, None, false)
                     .await
                     .unwrap(),
                 economic
@@ -8257,7 +8259,7 @@ mod tests {
                 start_hot_config_hash: &fixture.start.hot_config_hash,
                 financial_semantic_version: if continuation.version() == 6 { 2 } else { 1 },
             };
-            let verified = verify_economic(&operation, &economic, &replay, 5, None, false)
+            let verified = verify_economic(&operation, &economic, &replay, None, false)
                 .await
                 .unwrap();
             assert_eq!(verified.risk, economic.risk);
@@ -8395,7 +8397,7 @@ mod tests {
         };
 
         assert_eq!(
-            verify_economic(&operation, &released, &replay, 5, None, false)
+            verify_economic(&operation, &released, &replay, None, false)
                 .await
                 .unwrap(),
             released,
@@ -8414,7 +8416,7 @@ mod tests {
         };
         assert_ne!(clamped.risk.snapshot, released.risk.snapshot);
         assert!(matches!(
-            verify_economic(&operation, &clamped, &replay, 5, None, false).await,
+            verify_economic(&operation, &clamped, &replay, None, false).await,
             Err(QualificationError::InsufficientEvidence(reason))
                 if reason == "EconomicPrepared risk snapshot differs from causal replay"
         ));

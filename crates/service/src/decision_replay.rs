@@ -313,11 +313,6 @@ pub struct DecisionPostBoundaryEvidence {
 }
 
 impl DecisionPostBoundaryEvidence {
-    /// Seal one post-boundary evidence body with its canonical BLAKE3 identity.
-    pub fn from_body(body: DecisionPostBoundaryEvidenceBody) -> Result<Self, serde_json::Error> {
-        Self::from_body_with_semantic(body, crate::paper_recovery::FINANCIAL_SEMANTIC_VERSION)
-    }
-
     /// Seal a terminal fixture using the frozen continuation's financial era.
     pub fn from_body_for_continuation(
         body: DecisionPostBoundaryEvidenceBody,
@@ -669,7 +664,6 @@ impl DecisionEvidenceAccumulator {
 
     fn from_checkpoint(row: &DecisionPendingRow) -> Result<Self, ReplayDecisionError> {
         let continuation = DecisionContinuationV3::from_durable(row)?;
-        continuation.validate_authority()?;
         let frozen = &continuation.facts;
         let checkpoint = decode_checkpoint(&row.post_commit_inputs_json)?;
         if checkpoint.body.owners
@@ -876,7 +870,6 @@ pub fn replay_decision_pending(
         return Err(ReplayDecisionError::OpenRow);
     }
     let continuation = DecisionContinuationV3::from_durable(row)?;
-    continuation.validate_authority()?;
     let frozen = &continuation.facts;
     let decoded = decode_decision_evidence(&row.post_commit_inputs_json)?;
     let post_boundary = decoded.evidence;

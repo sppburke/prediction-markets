@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use pe_core_types::{MarketId, MarketOutcomeId, SourceTradeId, WalletAddress};
 use pe_event_log::AppendReceipt;
-use pe_paper_state::{LeaderPositionRow, PaperStateDb, WalletCoverage};
+use pe_paper_state::{PaperStateDb, WalletCoverage};
 use pe_source_polymarket_public::ReconciliationPageEvidence;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -159,17 +159,15 @@ pub struct EarlierFrame {
 pub struct FrameAdmissionInputs {
     pub version: u16,
     pub frame_receipt: AppendReceipt,
-    pub payload_hash: String,
-    pub parser_version: u32,
-    pub schema_version: u32,
     pub admitted_at: OffsetDateTime,
     pub received_at: OffsetDateTime,
     pub source_time: OffsetDateTime,
     pub ledger_capture: AdmissionLedgerCapture,
-    pub ledger_rows: Vec<LeaderPositionRow>,
-    pub ledger_anchor: Option<pe_paper_state::PositionAnchorRow>,
+    pub ledger_group_boundary: Option<i64>,
+    pub anchor_balances: Vec<(u16, pe_core_types::ShareAmount)>,
+    pub position: pe_copy_signal_engine::PositionState,
     pub ledger_groups: Vec<pe_paper_state::ActivityGroupRow>,
-    pub consumed_history: Vec<MarketId>,
+    pub market_consumed: bool,
     pub earlier_frames: Vec<EarlierFrame>,
     pub copy_eligible: bool,
     pub history_complete: bool,
@@ -179,145 +177,176 @@ pub struct FrameAdmissionInputs {
     pub poll_round_stale_secs: i64,
     pub latch: FeedLatchBasis,
     pub paper_prefix: Option<AppendReceipt>,
-    pub signal_config: pe_copy_signal_engine::SignalConfig,
-    pub applied_configuration: crate::runtime_config::RuntimeConfig,
-    pub frozen_basis: crate::bucket_commit::FrozenDecisionBasis,
-    pub reconstruction_quality: pe_core_types::ReconstructionQuality,
 }
 
 impl FrameAdmissionInputs {
-    /// Rebuild the confirmed prefix, using the same effects and disposition policy as recovery.
-    pub(crate) fn rebuild_ledger(
-        &self,
-        wallet: WalletAddress,
-    ) -> Result<pe_position_ledger::PositionLedger, FrameAdmissionError> {
-        use pe_copy_signal_engine::{PositionSnapshot, PositionState};
-        use pe_core_types::{OutcomeId, SourceTimestamp, VenueMarketId};
-        use pe_position_ledger::{AppliedEffect, LedgerMutation, PositionLedger};
-        let mut positions = HashMap::new();
-        if let Some(anchor) = &self.ledger_anchor {
-            if anchor.wallet != wallet
-                || Some(anchor.anchor_seq) != self.coverage.anchor_seq
-                || Some(anchor.activity_cutoff_unix) != self.coverage.activity_cutoff_unix
-                || Some(anchor.anchored_at_unix) != self.coverage.anchored_at_unix
-            {
-                return Err(FrameAdmissionError::InvalidPrefix(
-                    "anchor differs from frozen coverage",
-                ));
-            }
-            let balances: Vec<(String, u16, pe_core_types::ShareAmount)> =
-                serde_json::from_str(&anchor.balances_json)?;
-            for (market, outcome, amount) in balances {
-                if positions
-                    .insert(
-                        MarketOutcomeId::new(MarketId(VenueMarketId(market)), OutcomeId(outcome)),
-                        PositionState {
-                            long_contracts: amount,
-                            short_contracts: pe_core_types::ShareAmount::ZERO,
-                        },
-                    )
-                    .is_some()
-                {
-                    return Err(FrameAdmissionError::InvalidPrefix(
-                        "anchor repeats a balance",
-                    ));
-                }
-            }
-        } else if self.coverage.anchor_seq.is_some() {
-            return Err(FrameAdmissionError::InvalidPrefix(
-                "coverage has no frozen anchor",
-            ));
-        }
-        let mut ledger = PositionLedger::from_snapshots(HashMap::from([(
-            wallet,
-            PositionSnapshot { wallet, positions },
-        )]));
-        if let Some(anchor) = &self.ledger_anchor
-            && crate::position_seeder::wallet_ledger_hash(&ledger, wallet)
-                .map_err(|error| FrameAdmissionError::Capture(Box::new(error)))?
-                != anchor.ledger_hash_after
-        {
-            return Err(FrameAdmissionError::InvalidPrefix(
-                "anchor balance hash differs",
-            ));
-        }
-        let mut previous = None;
-        let mut start = 0;
-        while let Some(first) = self.ledger_groups.get(start) {
-            let mut end = start + 1;
-            while self
-                .ledger_groups
-                .get(end)
-                .is_some_and(|group| group.source_epoch == first.source_epoch)
-            {
-                end += 1;
-            }
-            let mut mutations = Vec::new();
-            let mut expected = Vec::new();
-            for group in &self.ledger_groups[start..end] {
-                let key = (group.source_epoch, &group.source_trade_id.0);
-                if previous.is_some_and(|previous| key <= previous)
-                    || self
-                        .coverage
-                        .activity_cutoff_unix
-                        .is_some_and(|cutoff| group.source_epoch <= cutoff)
-                {
-                    return Err(FrameAdmissionError::InvalidPrefix(
-                        "ledger groups are outside their ordered prefix",
-                    ));
-                }
-                previous = Some(key);
-                if !crate::paper_recovery::applied_disposition(
-                    &group.source_trade_id,
-                    &group.disposition,
-                )
-                .map_err(|error| FrameAdmissionError::History(Box::new(error)))?
-                {
-                    continue;
-                }
-                let applied = AppliedEffect::from_document(&group.proof_json)?;
-                let source_time = OffsetDateTime::from_unix_timestamp(group.source_epoch)?;
-                mutations.push(LedgerMutation {
-                    source_trade_id: group.source_trade_id.clone(),
-                    transaction_hash: group.source_trade_id.0.clone(),
-                    wallet,
-                    source_time: SourceTimestamp(source_time),
-                    effect: applied.effect.clone(),
-                });
-                expected.push(applied);
-            }
-            if ledger.apply_all_or_none(&mutations)? != expected {
-                return Err(FrameAdmissionError::InvalidPrefix(
-                    "ledger effects differ from frozen history",
-                ));
-            }
-            start = end;
-        }
-        Ok(ledger)
-    }
-
     pub(crate) fn positions(
         &self,
         wallet: WalletAddress,
+        market: &MarketId,
+        outcome: pe_core_types::OutcomeId,
     ) -> Result<pe_copy_signal_engine::PositionSnapshot, FrameAdmissionError> {
-        let mut positions = HashMap::new();
-        for row in &self.ledger_rows {
-            if row.wallet != wallet
-                || positions
-                    .insert(
-                        MarketOutcomeId::new(row.market_id.clone(), row.outcome_id),
-                        pe_copy_signal_engine::PositionState {
-                            long_contracts: row.long_contracts,
-                            short_contracts: row.short_contracts,
-                        },
-                    )
-                    .is_some()
+        let balances = self
+            .anchor_balances
+            .iter()
+            .map(|(outcome, amount)| (market.to_string(), *outcome, *amount))
+            .collect::<Vec<_>>();
+        let mut outcomes = HashSet::new();
+        if !self
+            .anchor_balances
+            .iter()
+            .all(|(outcome, _)| outcomes.insert(*outcome))
+            || (self.coverage.anchor_seq.is_none() && !balances.is_empty())
+            || self.ledger_groups.windows(2).any(|rows| {
+                (rows[0].source_epoch, &rows[0].source_trade_id.0)
+                    >= (rows[1].source_epoch, &rows[1].source_trade_id.0)
+            })
+        {
+            return Err(FrameAdmissionError::InvalidPrefix(
+                "invalid market ledger prefix",
+            ));
+        }
+        for group in &self.ledger_groups {
+            if self
+                .coverage
+                .activity_cutoff_unix
+                .is_some_and(|cutoff| group.source_epoch <= cutoff)
+                || !group_affects_market(group, market)?
             {
-                return Err(FrameAdmissionError::InvalidPrefix("invalid ledger capture"));
+                return Err(FrameAdmissionError::InvalidPrefix(
+                    "ledger group outside frozen market prefix",
+                ));
             }
         }
-        Ok(pe_copy_signal_engine::PositionSnapshot { wallet, positions })
+        let ledger =
+            crate::paper_recovery::replay_frozen_records(wallet, &balances, &self.ledger_groups)
+                .map_err(|error| FrameAdmissionError::History(Box::new(error)))?;
+        let positions = ledger
+            .position(&wallet)
+            .cloned()
+            .ok_or(FrameAdmissionError::InvalidPrefix("market ledger absent"))?;
+        if positions
+            .positions
+            .get(&MarketOutcomeId::new(market.clone(), outcome))
+            .copied()
+            .unwrap_or_default()
+            != self.position
+        {
+            return Err(FrameAdmissionError::InvalidPrefix(
+                "frozen position differs from market rebuild",
+            ));
+        }
+        Ok(positions)
     }
+
+    /// Authenticate a scoped capture against the append-only anchor and group owners.
+    pub(crate) fn verify_durable(
+        &self,
+        state: &PaperStateDb,
+        facts: &crate::bucket_commit::DecisionContinuationFacts,
+    ) -> Result<(), FrameAdmissionError> {
+        let anchor = state
+            .position_anchors(&facts.wallet)?
+            .into_iter()
+            .find(|anchor| Some(anchor.anchor_seq) == self.coverage.anchor_seq);
+        let balances: Vec<(String, u16, pe_core_types::ShareAmount)> = match anchor {
+            Some(anchor) => {
+                if Some(anchor.activity_cutoff_unix) != self.coverage.activity_cutoff_unix
+                    || Some(anchor.anchored_at_unix) != self.coverage.anchored_at_unix
+                {
+                    return Err(FrameAdmissionError::InvalidPrefix(
+                        "anchor differs from frozen coverage",
+                    ));
+                }
+                serde_json::from_str(&anchor.balances_json)?
+            }
+            None if self.coverage.anchor_seq.is_none() => Vec::new(),
+            None => {
+                return Err(FrameAdmissionError::InvalidPrefix(
+                    "frozen anchor owner absent",
+                ));
+            }
+        };
+        let scoped = balances
+            .iter()
+            .filter(|(market, _, _)| market == &facts.market_id.to_string())
+            .map(|(_, outcome, amount)| (*outcome, *amount))
+            .collect::<Vec<_>>();
+        if scoped != self.anchor_balances {
+            return Err(FrameAdmissionError::InvalidPrefix(
+                "frozen anchor market balances differ",
+            ));
+        }
+        let groups = state.activity_groups_at_boundary(
+            &facts.wallet,
+            self.coverage.activity_cutoff_unix.unwrap_or(i64::MIN),
+            self.ledger_group_boundary,
+        )?;
+        let last_applied_epoch = groups.iter().map(|group| group.source_epoch).max();
+        let current_cursor = state.cursor(&facts.wallet)?;
+        if self.ledger_capture.cursor.is_some_and(|cursor| {
+            last_applied_epoch.is_some_and(|epoch| cursor < epoch)
+                || current_cursor.is_none_or(|current| cursor > current)
+        }) || self
+            .ledger_group_boundary
+            .is_some_and(|boundary| boundary <= 0)
+            || self.ledger_group_boundary > state.activity_group_boundary(&facts.wallet)?
+        {
+            return Err(FrameAdmissionError::InvalidPrefix(
+                "frozen ledger boundary differs",
+            ));
+        }
+        let mut scoped_groups = Vec::new();
+        for group in &groups {
+            if group_affects_market(group, &facts.market_id)? {
+                scoped_groups.push(group.clone());
+            }
+        }
+        if scoped_groups != self.ledger_groups {
+            return Err(FrameAdmissionError::InvalidPrefix(
+                "frozen market groups differ from durable prefix",
+            ));
+        }
+        let ledger = crate::paper_recovery::replay_frozen_records(facts.wallet, &balances, &groups)
+            .map_err(|error| FrameAdmissionError::History(Box::new(error)))?;
+        if crate::position_seeder::wallet_ledger_hash(&ledger, facts.wallet)
+            .map_err(|error| FrameAdmissionError::Capture(Box::new(error)))?
+            != self.ledger_capture.hash
+        {
+            return Err(FrameAdmissionError::InvalidPrefix(
+                "frozen ledger capture hash differs",
+            ));
+        }
+        let history = state.market_history_record(&facts.wallet, &facts.market_id)?;
+        if history.is_none_or(|history| {
+            history.source_trade_id != facts.source_trade_id
+                || history.first_epoch != facts.source_epoch
+        }) {
+            return Err(FrameAdmissionError::InvalidPrefix(
+                "frame does not own first market consumption",
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn group_affects_market(
+    group: &pe_paper_state::ActivityGroupRow,
+    market: &MarketId,
+) -> Result<bool, FrameAdmissionError> {
+    use pe_position_ledger::{AppliedEffect, LedgerEffect};
+    Ok(
+        match AppliedEffect::from_document(&group.proof_json)?
+            .effect
+            .effective()
+        {
+            LedgerEffect::Trade { market_id, .. }
+            | LedgerEffect::Split { market_id, .. }
+            | LedgerEffect::Merge { market_id, .. }
+            | LedgerEffect::Redeem { market_id, .. } => market_id == market,
+            _ => false,
+        },
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -333,20 +362,6 @@ pub struct FrameFallbackArtifact {
 
 pub(crate) fn canonical_bytes(value: &impl Serialize) -> Result<Vec<u8>, serde_json::Error> {
     serde_json::to_vec(&serde_json::to_value(value)?)
-}
-
-pub(crate) fn consumed_history(
-    state: &PaperStateDb,
-    wallet: WalletAddress,
-) -> Result<Vec<MarketId>, pe_paper_state::PaperStateError> {
-    let mut markets = state
-        .gate_history()?
-        .remove(&wallet)
-        .unwrap_or_default()
-        .into_iter()
-        .collect::<Vec<_>>();
-    markets.sort_by_key(ToString::to_string);
-    Ok(markets)
 }
 
 pub(crate) fn persist_frontiers(

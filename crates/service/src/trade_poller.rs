@@ -373,7 +373,12 @@ impl ActivityCandidates {
                     }
                     if (obligation.frame_admission_receipt.is_some()
                         && !matched_frames.contains(&obligation.receipt))
-                        || !obligation_disposed(paper_state, fenced, &obligation)?
+                        || !obligation_disposed(
+                            paper_state,
+                            Some(source_receipts),
+                            fenced,
+                            &obligation,
+                        )?
                     {
                         insert_coalesced_obligation(
                             &mut obligations.by_wallet,
@@ -1902,8 +1907,8 @@ impl WalletOperation {
         cancel: &mut Option<watch::Receiver<bool>>,
         acknowledged_audits: &mut Vec<(i64, Obligation)>,
     ) -> Result<Vec<(i64, Obligation)>, ReconciliationError> {
-        let frames = admitted_frame_obligations(&self.paper_state)?;
-        for (frame_wallet, epoch, obligation) in &frames {
+        let initial_frames = admitted_frame_obligations(&self.paper_state)?;
+        for (frame_wallet, epoch, obligation) in &initial_frames {
             if *frame_wallet == wallet {
                 replace_admitted_obligation(selected, *epoch, obligation.clone(), false);
             }
@@ -1963,7 +1968,7 @@ impl WalletOperation {
                 }
             }
         }
-        let has_frame_audit = selected
+        let mut has_frame_audit = selected
             .values()
             .flat_map(BTreeMap::values)
             .any(|obligation| {
@@ -2043,6 +2048,27 @@ impl WalletOperation {
         for bucket in &buckets {
             identities.push(Self::cancellable(self.resolve_bucket(bucket), cancel).await??);
         }
+        // Admission can commit during either network acquisition. Refresh the durable
+        // authority before correlating this read, including triggers selected before commit.
+        let frames = admitted_frame_obligations(&self.paper_state)?;
+        for (frame_wallet, epoch, obligation) in &frames {
+            if *frame_wallet == wallet {
+                let newly_admitted = !initial_frames
+                    .iter()
+                    .any(|(_, _, initial)| initial.receipt == obligation.receipt);
+                replace_admitted_obligation(selected, *epoch, obligation.clone(), newly_admitted);
+            }
+        }
+        has_frame_audit |= selected
+            .values()
+            .flat_map(BTreeMap::values)
+            .any(|obligation| {
+                obligation.frame_admission_receipt.is_some()
+                    && !negative_resolved
+                        .iter()
+                        .chain(&retained_matched)
+                        .any(|(_, resolved)| resolved.receipt == obligation.receipt)
+            });
         let mut correlation_candidates = selected.clone();
         for (frame_wallet, epoch, obligation) in frames {
             if frame_wallet == wallet {
@@ -2139,6 +2165,7 @@ impl WalletOperation {
                 && !obligation.bindings.contains(&matched.binding)
             {
                 obligation.bindings.push(matched.binding.clone());
+                obligation.retained_commitments.push(read_commitment);
             }
         }
         if has_frame_audit {
@@ -2334,7 +2361,12 @@ impl WalletOperation {
         let mut resolved = Vec::new();
         for (epoch, groups) in selected {
             for obligation in groups.values() {
-                if obligation_disposed(&self.paper_state, fenced, obligation)? {
+                if obligation_disposed(
+                    &self.paper_state,
+                    self.source_receipts.as_ref(),
+                    fenced,
+                    obligation,
+                )? {
                     resolved.push((*epoch, obligation.clone()));
                 }
             }
@@ -2930,22 +2962,43 @@ fn replace_admitted_obligation(
 
 fn obligation_disposed(
     paper_state: &PaperStateDb,
+    index: Option<&SourceReceiptIndex>,
     fenced: bool,
     obligation: &Obligation,
 ) -> Result<bool, pe_paper_state::PaperStateError> {
-    let admitted_frame = paper_state
-        .decision_pending_for(&obligation.group_id)?
-        .is_some_and(|row| {
-            crate::bucket_commit::DecisionContinuationV3::from_durable(&row)
-                .is_ok_and(|continuation| continuation.is_activity_frame())
-        });
-    if admitted_frame && obligation.bindings.is_empty() {
-        return Ok(false);
+    // The current durable receipt, not the pre-await obligation tag, owns retirement.
+    if let Some(row) = paper_state.decision_pending_for(&obligation.group_id)? {
+        let frame = crate::bucket_commit::DecisionContinuationV3::from_durable(&row)
+            .map_err(|error| pe_paper_state::PaperStateError::Internal(error.to_string()))?;
+        if frame.is_activity_frame() && frame.observed_source_receipt == Some(obligation.receipt) {
+            let Some(index) = index else {
+                return Ok(false);
+            };
+            for receipt in &obligation.retained_commitments {
+                let read = crate::bucket_commit::verified_commitment_bindings(*receipt, index)
+                    .map_err(|error| {
+                        pe_paper_state::PaperStateError::Internal(error.to_string())
+                    })?;
+                if let crate::feed_audit::AuditDisposition::Matched(id) =
+                    crate::feed_audit::disposition(&frame, &read).map_err(|error| {
+                        pe_paper_state::PaperStateError::Internal(error.to_string())
+                    })?
+                {
+                    for binding in &read.bindings {
+                        if binding.stream_receipt == obligation.receipt
+                            && binding.history_group_id == id
+                            && binding_target_disposed(paper_state, binding)?
+                        {
+                            return Ok(true);
+                        }
+                    }
+                }
+            }
+            return Ok(false);
+        }
     }
     if obligation.bindings.is_empty() {
-        // Historical exact-ID receipts retain their existing acknowledgement contract.
-        // A permanent fence refuses only observations that never acquired a binding.
-        return Ok((fenced && !admitted_frame)
+        return Ok(fenced
             || paper_state
                 .activity_group_state(&obligation.group_id)?
                 .is_some());
