@@ -9388,21 +9388,14 @@ mod tests {
                 record_read_commitment(&mut sources, &continuation);
                 continuation
                     .reconstruct_complete_activity_read(&mut |receipt| {
-                        let source = sources
-                            .iter()
-                            .find(|(candidate, _)| *candidate == receipt)
-                            .unwrap()
-                            .1
-                            .clone();
-                        Ok::<_, EconomicReplayError>(CompleteActivityPage {
-                            payload: source.payload,
-                            observed_at: source.observed_at,
-                            received_at: source.received_at,
-                            source_id: source.source_id,
-                            schema_version: source.schema_version,
-                            parser_version: source.parser_version,
-                            content_type: source.content_type,
-                        })
+                        Ok::<_, EconomicReplayError>(
+                            sources
+                                .iter()
+                                .find(|(candidate, _)| *candidate == receipt)
+                                .unwrap()
+                                .1
+                                .clone(),
+                        )
                     })
                     .unwrap();
             }
@@ -9608,17 +9601,7 @@ mod tests {
                 .find(|(known, _)| *known == receipt)
                 .map(|(_, source)| source)
                 .ok_or("missing source receipt")?;
-            let received_at = source_time_from_millis(source.received_unix_ms().unwrap())
-                .map_err(|_| "invalid source clock")?;
-            Ok::<_, &'static str>(CompleteActivityPage {
-                payload: source.payload.clone(),
-                observed_at: SourceTimestamp(received_at),
-                received_at: ReceivedAt(received_at),
-                source_id: source.source_id.clone(),
-                schema_version: source.schema_version,
-                parser_version: source.parser_version,
-                content_type: source.content_type.clone(),
-            })
+            Ok::<_, &'static str>(source.clone())
         };
         assert!(
             verified_copy_deadline_for_continuation(

@@ -182,7 +182,9 @@ AC16. This recipe authorizes no production mutation or live order.
 AC15 checks the first post-deploy continuation-7 frame fill before and after its REST counterpart
 commits. AC16 freezes the earliest qualifying post-deploy frame-fill cohort **before** inspecting
 clocks; cohort size and stage bounds come from [#730 AC16](https://github.com/sppburke/prediction-markets/issues/730).
-Do not replace a cohort member with a later fill when evidence is missing or a span is invalid.
+Apply the deployment sequence cutoff to `decision_inputs.admission_receipt.sequence`, including a
+pre-deployment frame recovered and admitted after deployment. Keep that frame's original synchronized
+receipt as the latency origin. Do not replace a cohort member with a later fill when evidence is missing or a span is invalid.
 Keep each row's continuation, source authority, applied configuration hash, Start identity and
 source/paper prefix identities. Preserve the Part 1 population and causal audit above, with the
 [continuation-7 authority rules](_GLOSSARY.md#continuation-and-commitment-compatibility-588):
@@ -267,7 +269,7 @@ LEFT JOIN wallet_market_history_v2 AS h
   ON h.wallet_hex = d.wallet_hex AND h.market_id = f.market_id
 WHERE json_extract(d.frozen_inputs_json,'$.version') = 7
   AND json_extract(d.frozen_inputs_json,'$.source_authority') = 'activity_frame'
-  AND f.source_receipt_seq >= ?
+  AND json_extract(d.frozen_inputs_json,'$.decision_inputs.admission_receipt.sequence') >= ?
 ORDER BY f.prepared_seq, f.idempotency_key LIMIT ?
 """, (int(sys.argv[4]), int(sys.argv[5]))))
 print("FROZEN COHORT", [(r["source_trade_id"], r["idempotency_key"], r["prepared_seq"]) for r in cohort])
@@ -414,7 +416,11 @@ to its frozen frame receipt and `history_group_id` to `activity_groups.source_tr
 `read_proof`. Authenticate each indexed page occurrence against its source envelope. For negative
 audits, join `FeedIncidentChanged.incident.frame_receipt` to the same frame and authenticate
 `deciding_commitment_receipt` plus any `counterpart_identity`; preserve the proof even with empty
-bindings. List unresolved audits separately. Reconstruct engagement/release order from the active
+bindings. A retained authenticated match survives until its recorded target commits, even when a
+later mature full-history read is empty. After a binding or negative counterpart identity is fixed,
+only authenticated restamp equivalence can change its identifier; another leg of the same transaction
+must retain its own routing. An absence records no counterpart and cannot later suppress a distinct
+REST identity by rediscovery. List unresolved audits separately. Reconstruct engagement/release order from the active
 paper era, including each `engagement_receipt`, and compare the frozen admission latch basis;
 current status is supplementary evidence only.
 
@@ -469,3 +475,11 @@ basis and quality come from continuation facts, while payload and parser/schema 
 from the authenticated frame. Coverage, eligibility, clocks, frontier and sealed paper latch basis
 remain admission-time evidence. Resolved frames and unrelated wallets, positions and consumed
 markets do not contribute to capture size.
+
+The poller's coalesced unresolved receipts and the bucket owner's ordering barrier must agree after
+admission, audit, release and restart: an admitted receipt supersedes earlier same-identity excluded
+observations; otherwise the first synchronized receipt remains. Every retirement is acknowledged by
+the owner. Frontier publication rechecks this barrier for all observations with authenticated source
+time at or before the fixed end, including fallbacks without a decision row. An empty read alone
+cannot advance past an unresolved fallback. Qualification authenticates one reconstructed read at a
+time and retains only bindings and restamp pairs for cohort selection.

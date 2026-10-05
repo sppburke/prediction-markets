@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use pe_core_types::{EventSeq, MarketId, OutcomeId, Price, ReceivedAt};
+use pe_core_types::{EventSeq, MarketId, OutcomeId, Price, ReceivedAt, SourceTradeId};
 use pe_event_log::{AppendReceipt, EventEnvelope, LogTailBinding, Reader};
 use pe_paper_state::FinancialSnapshot;
 use pe_risk_engine::{
@@ -912,6 +912,8 @@ fn paper_fill_source_receipts(era: &PaperEra) -> Result<Vec<AppendReceipt>, Risk
 #[derive(Default)]
 struct SourceReceiptIndexState {
     frames: Vec<SourceFrameMetadata>,
+    frame_bindings: HashMap<(EventSeq, blake3::Hash), SourceTradeId>,
+    frame_incidents: HashMap<(EventSeq, blake3::Hash), Option<SourceTradeId>>,
     next_byte_offset: Option<u64>,
     verified_feed_frontiers:
         HashMap<pe_core_types::WalletAddress, crate::frame_admission::FeedHistoryFrontier>,
@@ -994,6 +996,8 @@ impl SourceReceiptIndexStaging {
         SourceReceiptIndex {
             state: Arc::new(RwLock::new(SourceReceiptIndexState {
                 frames: self.frames,
+                frame_bindings: HashMap::new(),
+                frame_incidents: HashMap::new(),
                 next_byte_offset: Some(physical_tail),
                 verified_feed_frontiers: HashMap::new(),
                 #[cfg(feature = "scenario")]
@@ -1051,6 +1055,83 @@ impl SourceReceiptIndex {
             .frame_verifications
             .entry((receipt.sequence, receipt.this_hash))
             .or_default() += 1;
+    }
+
+    /// First authenticated counterpart owns this receipt. Later stamps need read-proven equivalence.
+    pub(crate) fn remember_frame_bindings(
+        &self,
+        read: &crate::bucket_commit::VerifiedCommitment,
+    ) -> Result<(), crate::bucket_commit::CompleteActivityReadError> {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for binding in read
+            .bindings
+            .iter()
+            .filter(|binding| binding.frame_admission_receipt.is_some())
+        {
+            let key = (
+                binding.stream_receipt.sequence,
+                binding.stream_receipt.this_hash,
+            );
+            if let Some(previous) = state.frame_bindings.get(&key) {
+                let (left, right) = (previous, &binding.history_group_id);
+                if left != right
+                    && read.restamp_pairs.get(left) != Some(right)
+                    && read.restamp_pairs.get(right) != Some(left)
+                {
+                    return Err(crate::bucket_commit::complete_activity_read_error(
+                        "authenticated frame counterpart changed without restamp equivalence",
+                    ));
+                }
+            }
+        }
+        for binding in read
+            .bindings
+            .iter()
+            .filter(|binding| binding.frame_admission_receipt.is_some())
+        {
+            state
+                .frame_bindings
+                .entry((
+                    binding.stream_receipt.sequence,
+                    binding.stream_receipt.this_hash,
+                ))
+                .or_insert_with(|| binding.history_group_id.clone());
+        }
+        Ok(())
+    }
+
+    /// An authenticated incident fixes the counterpart, including an absence with no target.
+    pub(crate) fn remember_frame_incident(&self, incident: &crate::paper_recovery::FeedIncident) {
+        self.state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .frame_incidents
+            .entry((
+                incident.frame_receipt.sequence,
+                incident.frame_receipt.this_hash,
+            ))
+            .or_insert_with(|| incident.counterpart_identity.clone());
+    }
+
+    /// Outer None means unresolved; Some(None) is an authenticated absence with no counterpart.
+    pub(crate) fn frame_counterpart(
+        &self,
+        receipt: AppendReceipt,
+    ) -> Option<Option<SourceTradeId>> {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = (receipt.sequence, receipt.this_hash);
+        state.frame_incidents.get(&key).cloned().or_else(|| {
+            state
+                .frame_bindings
+                .get(&key)
+                .map(|identity| Some(identity.clone()))
+        })
     }
 
     pub(crate) fn remember_verified_frontier(

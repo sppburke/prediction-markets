@@ -574,7 +574,11 @@ live in continuation facts; frame payload/hash and parser/schema contracts resol
 receipt. The continuation stores the scoped body once; the compact source-log admission artifact stores
 only its version, frame receipt and `capture_digest` (the domain-separated frame revision).
 Classification uses the position rebuilt from these inputs. Resolved
-barriers are pruned at runtime and boot; unrelated wallets/positions/history cannot grow the body.
+barriers retire through the owner's acknowledged match/disposition or incident path at runtime;
+boot rebuilds the same coalesced unresolved receipts. The poller and owner share one same-identity
+rule: retain the admitted receipt, otherwise the earliest synchronized receipt, including across
+source epochs. Admission supersedes an earlier excluded zero-share receipt of that identity.
+Unrelated wallets/positions/history cannot grow the body.
 
 First-entry history is per wallet and market. Continuation 7 copies each wallet's first entry
 whatever the paper book holds there, on the same or opposite outcome; a held-outcome fill
@@ -588,8 +592,10 @@ exact-or-decline. Economic wire 2 alone never selects partial sizing.
 
 **Feed history frontier and audit.** Versioned `FeedHistoryFrontier` values under the
 `feed_history_frontiers` key in `meta` authenticate the latest contiguous complete read's fixed end H,
-commitment, pages and occurrences. Publish only after every bucket acknowledgement, without
-crossing unmatched obligations; launches, failed acknowledgements and incomplete reads never
+commitment, pages and occurrences. Publish only after every bucket and observation-retirement
+acknowledgement. The serialized owner's current ordering barrier is the authority: H cannot cross
+any unresolved wallet observation whose authenticated source time is at or before H, including a
+qualifying frame routed to history without admission. Launches, failed acknowledgements and incomplete reads never
 advance H. Empty reads first persist a proofless payload-2 commitment. Authenticate restored
 frontiers and freeze their bounds in admission inputs. For frame receipt r and admission a,
 history is required if H is absent, H > r, a − H exceeds `poll_round_stale_secs`, or an earlier
@@ -599,14 +605,24 @@ new configuration key.
 
 An admitted frame remains an audit obligation, even after fencing, until matched, contradicted
 or absent. Its frozen receipt cannot be replaced by another observation of the same identity.
-Discover counterparts by authenticated wallet/transaction and asset disambiguation before side
-comparison, preserving verified bindings, restamp equivalence and ambiguity. A match confirms
+For a still-unbound frame, discover counterparts by authenticated wallet/transaction and asset
+disambiguation before side comparison, preserving verified bindings, restamp equivalence and ambiguity.
+Once authenticated, its counterpart identity stays fixed through commitment-before-bucket crashes,
+audit retirement, release and restart; another transaction leg receives its own decision. A different
+identifier is equivalent only through an authenticated restamp pair. Retained authenticated matches
+win over later absence, commit their recorded read through the bucket owner, and retire only after
+its target disposition and retirement acknowledgement. A match confirms
 an ordinary positive-share TRADE with the same effective side, condition and outcome; combo,
 zero-share or disagreeing counterparts contradict. Positive quantity, price and time differences
 are audit facts. Absence matures at frozen frame source time + `copy_latency_budget_secs`:
 search retained authenticated counterparts first, then require a successful complete `(0, fixed_end]`
 read ending at or after maturity. Cursor-bounded, immature or failed reads prove no absence;
-negative audits retain the deciding commitment's proof, including empty bindings.
+negative audits retain the deciding commitment's proof, including empty bindings. Qualification
+retains only authenticated bindings/restamp pairs for selection and releases reconstructed aggregates,
+effective identities and read indexes after each authentication.
+A match or contradiction fixes the frame's counterpart, so a later read cannot rebind it to
+another transaction leg. After an absence incident, a later group of the same transaction is the
+frame's late counterpart: it applies to the leader ledger once and creates no second decision.
 
 **Feed incidents and history fallback.** `PaperLogRecord::FeedIncidentChanged { incident, state }`
 journals contradiction or absence before the audit ordering barrier retires. The synchronized

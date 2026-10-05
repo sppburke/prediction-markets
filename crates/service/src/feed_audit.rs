@@ -20,8 +20,6 @@ pub enum AuditDisposition {
 pub enum FeedAuditError {
     #[error("frame audit source proof: {0}")]
     Proof(#[from] crate::bucket_commit::CompleteActivityReadError),
-    #[error("frame audit continuation: {0}")]
-    Continuation(#[from] crate::bucket_commit::DecisionContinuationError),
     #[error("frame audit semantic refusal: {0}")]
     Semantic(&'static str),
 }

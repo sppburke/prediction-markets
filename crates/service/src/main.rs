@@ -72,7 +72,8 @@ use pe_service::supervisor::{
     TaskName, TaskResult, TaskSupervisor, cancel_at, cancel_result_at,
 };
 use pe_service::trade_poller::{
-    TradePoller, TradePollerConfig, rebuild_reconciliation_obligations, recover_daily_boundary,
+    TradePoller, TradePollerConfig, rebuild_reconciliation_obligations,
+    rebuild_reconciliation_obligations_with_index, recover_daily_boundary,
 };
 use pe_service::watchlist_admission::{AdmissionPreparer, anchor_refresh_due};
 use pe_service::watchlist_capacity::SupabaseWatchlistCapacity;
@@ -1127,9 +1128,12 @@ async fn main() -> Result<()> {
             .obligations(&paper_state, &cfg.event_log_path)
             .context("rebuild activity obligations from the boot walk")?,
         None => {
-            let mut obligations =
-                rebuild_reconciliation_obligations(&cfg.source_event_log_path, &paper_state)
-                    .context("rebuild durable activity reconciliation obligations")?;
+            let mut obligations = rebuild_reconciliation_obligations_with_index(
+                &cfg.source_event_log_path,
+                &paper_state,
+                &source_receipts,
+            )
+            .context("rebuild durable activity reconciliation obligations")?;
             if financial_start.is_some() {
                 recover_daily_boundary(
                     &cfg.source_event_log_path,

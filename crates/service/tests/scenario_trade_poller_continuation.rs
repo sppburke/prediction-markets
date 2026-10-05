@@ -883,8 +883,9 @@ impl RunningPoll {
     async fn completed(&mut self, target: WalletAddress) -> Vec<pe_event_log::AppendReceipt> {
         while let Some(progress) = self.progress.recv().await {
             self.track(&progress);
-            if let pe_service::trade_poller::PollerProgress::Completed { wallet, selected } =
-                progress
+            if let pe_service::trade_poller::PollerProgress::Completed {
+                wallet, selected, ..
+            } = progress
                 && wallet == target
             {
                 return selected;

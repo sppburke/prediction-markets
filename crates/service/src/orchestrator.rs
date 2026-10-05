@@ -342,6 +342,9 @@ pub enum FrameCrashBoundary {
 #[cfg(feature = "scenario")]
 #[derive(Debug, Default)]
 pub struct ScenarioHooks {
+    pub frame_barriers: std::sync::Mutex<
+        std::collections::HashMap<WalletAddress, Vec<pe_event_log::AppendReceipt>>,
+    >,
     pub frame_crash_boundary: std::sync::Mutex<Option<FrameCrashBoundary>>,
     pub age_clock: std::sync::Mutex<std::collections::VecDeque<OffsetDateTime>>,
     /// Deterministically advance the next queued age sample after one successful observation
@@ -1757,10 +1760,12 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 if crate::feed_audit::audited_receipts(&era).contains(&incident.frame_receipt) {
                     return Ok(());
                 }
+                let incident_index = index.clone();
                 let receipt = self.append_paper_record(&PaperLogRecord::FeedIncidentChanged {
                     incident: incident.clone(),
                     state: HaltState::Engaged,
                 })?;
+                incident_index.remember_frame_incident(&incident);
                 self.feed_latch = crate::frame_admission::FeedLatchBasis {
                     latest_incident: Some(receipt),
                     release: None,
@@ -1858,6 +1863,14 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 let _ = acknowledged.send(result);
             }
             OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
+                #[cfg(feature = "scenario")]
+                if let Some(hooks) = &self.scenario_hooks {
+                    hooks
+                        .frame_barriers
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(wallet, self.bucket_engine.unresolved_receipts(wallet));
+                }
                 let result = crate::position_seeder::ledger_capture(
                     self.bucket_engine.ledger(),
                     &self.paper_state,

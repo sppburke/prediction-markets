@@ -63,7 +63,7 @@ use time::OffsetDateTime;
 #[cfg(test)]
 use crate::bucket_commit::PageOccurrence;
 use crate::bucket_commit::{
-    CompleteActivityPage, DecisionContinuationFacts, DecisionContinuationV3, VerifiedCommitment,
+    CompleteActivityPage, DecisionContinuationFacts, DecisionContinuationV3,
     VerifiedObservationBindings,
 };
 use crate::config::ServiceConfig;
@@ -2267,7 +2267,7 @@ fn decision_rows_from_sealed_source(
                             verified
                                 .get(&receipt.sequence)
                                 .and_then(Option::as_ref)
-                                .is_some_and(|commitment: &VerifiedCommitment| {
+                                .is_some_and(|commitment: &AuthenticatedBindings| {
                                     commitment.restamp_pairs.get(&previous)
                                         == Some(&binding.history_group_id)
                                         || commitment.restamp_pairs.get(&binding.history_group_id)
@@ -2652,12 +2652,18 @@ fn source_trade_universe(
 /// Commitments that record observation bindings, with their bindings as recorded.
 type BindingCommitments = Vec<(AppendReceipt, Vec<crate::bucket_commit::ObservationBinding>)>;
 
+/// Retain only selection evidence; a reconstructed wallet history dies after authentication.
+struct AuthenticatedBindings {
+    bindings: Vec<crate::bucket_commit::ObservationBinding>,
+    restamp_pairs: HashMap<pe_core_types::SourceTradeId, pe_core_types::SourceTradeId>,
+}
+
 /// Authenticate one binding commitment once per selection; an inauthentic one yields `None`.
 fn verified_commitment<'a, L, E>(
-    verified: &'a mut HashMap<EventSeq, Option<VerifiedCommitment>>,
+    verified: &'a mut HashMap<EventSeq, Option<AuthenticatedBindings>>,
     receipt: AppendReceipt,
     lookup: &mut L,
-) -> Option<&'a VerifiedCommitment>
+) -> Option<&'a AuthenticatedBindings>
 where
     L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
     E: std::fmt::Display,
@@ -2665,7 +2671,12 @@ where
     verified
         .entry(receipt.sequence)
         .or_insert_with(|| {
-            crate::bucket_commit::verified_commitment_bindings_with_lookup(receipt, lookup).ok()
+            crate::bucket_commit::verified_commitment_bindings_with_lookup(receipt, lookup)
+                .ok()
+                .map(|read| AuthenticatedBindings {
+                    bindings: read.bindings,
+                    restamp_pairs: read.restamp_pairs,
+                })
         })
         .as_ref()
 }

@@ -407,7 +407,9 @@ pub(crate) fn collapse_restamp_pairs(
     });
 }
 
-fn complete_activity_read_error(message: impl Into<String>) -> CompleteActivityReadError {
+pub(crate) fn complete_activity_read_error(
+    message: impl Into<String>,
+) -> CompleteActivityReadError {
     CompleteActivityReadError(message.into())
 }
 
@@ -1397,7 +1399,13 @@ impl ActivityReadVerification<'_> {
             if frame_audit {
                 let mut candidates = crate::feed_audit::counterparts(&observation, aggregates);
                 collapse_restamp_pairs(&mut candidates, &restamp_pairs);
-                if candidates.len() != 1 || candidates[0].group_id != target.group_id {
+                if candidates.len() != 1
+                    || !(candidates[0].group_id == target.group_id
+                        || restamp_pairs.get(candidates[0].group_id.key())
+                            == Some(target.group_id.key())
+                        || restamp_pairs.get(target.group_id.key())
+                            == Some(candidates[0].group_id.key()))
+                {
                     return Err(complete_activity_read_error(
                         "frame audit counterpart is absent or ambiguous",
                     ));
@@ -1902,12 +1910,6 @@ impl DecisionContinuationV3 {
         &self,
         source_receipts: &SourceReceiptIndex,
     ) -> Result<(), DecisionContinuationError> {
-        if self.is_activity_frame() {
-            return self
-                .verify_activity_frame_with_index(source_receipts)
-                .map(|_| ())
-                .map_err(|_| DecisionContinuationError::DurableMismatch);
-        }
         self.require_complete_read()?;
         let Some(websocket) = self.observed_source_receipt else {
             return Ok(());
@@ -2268,18 +2270,20 @@ pub(crate) fn verified_commitment_bindings(
 ) -> Result<VerifiedCommitment, CompleteActivityReadError> {
     #[cfg(feature = "scenario")]
     source_receipts.record_read_verification(receipt);
-    verified_commitment_bindings_with_lookup(receipt, &mut |receipt| {
+    let read = verified_commitment_bindings_with_lookup(receipt, &mut |receipt| {
         source_receipts
             .source_envelope(receipt)
             .map(CompleteActivityPage::from)
-    })
+    })?;
+    source_receipts.remember_frame_bindings(&read)?;
+    Ok(read)
 }
 
 /// An authenticated commitment: its bindings and the restamp pairs its complete read proves.
 #[derive(Debug)]
 pub struct VerifiedCommitment {
     pub(crate) receipt: AppendReceipt,
-    frontier: Option<crate::frame_admission::FeedHistoryFrontier>,
+    pub(crate) frontier: Option<crate::frame_admission::FeedHistoryFrontier>,
     pub(crate) bindings: Vec<ObservationBinding>,
     pub(crate) restamp_pairs: HashMap<SourceTradeId, SourceTradeId>,
     pub(crate) wallet: WalletAddress,
@@ -2352,7 +2356,7 @@ pub fn verified_read_for_routing(
             .source_envelope(receipt)
             .map(CompleteActivityPage::from)
     })?;
-    Ok(VerifiedCommitment {
+    let read = VerifiedCommitment {
         receipt,
         frontier: Some(crate::frame_admission::FeedHistoryFrontier {
             version: 1,
@@ -2383,7 +2387,9 @@ pub fn verified_read_for_routing(
         aggregates: read.aggregates,
         restamp_pairs: read.bindings.restamp_pairs,
         identities: read.bindings.identities,
-    })
+    };
+    index.remember_frame_bindings(&read)?;
+    Ok(read)
 }
 
 /// The same commitment-only authentication for either an indexed or replayed sealed prefix.
@@ -2840,27 +2846,28 @@ pub fn validate_frame_history(
     paper_state: &PaperStateDb,
     source_receipts: &SourceReceiptIndex,
 ) -> Result<usize, ContinuationValidationError> {
-    let rows =
-        paper_state
-            .decision_pending_history()
-            .map_err(|error| ContinuationValidationError {
-                source_trade_id: None,
-                cause: error.to_string(),
-            })?;
+    let frames = paper_state
+        .activity_frame_decision_index(None)
+        .map_err(|error| ContinuationValidationError {
+            source_trade_id: None,
+            cause: error.to_string(),
+        })?;
     let mut validated = 0;
-    for row in rows {
+    for frame in frames {
         let fail = |cause: String| ContinuationValidationError {
-            source_trade_id: Some(row.source_trade_id.clone()),
+            source_trade_id: Some(frame.source_trade_id.clone()),
             cause,
         };
+        let row = paper_state
+            .decision_pending_for(&frame.source_trade_id)
+            .map_err(|error| fail(error.to_string()))?
+            .ok_or_else(|| fail("indexed frame decision missing".to_owned()))?;
         let continuation =
             DecisionContinuationV3::from_durable(&row).map_err(|error| fail(error.to_string()))?;
-        if continuation.is_activity_frame() {
-            continuation
-                .verify_activity_frame_fully_with_index(source_receipts)
-                .map_err(|error| fail(error.to_string()))?;
-            validated += 1;
-        }
+        continuation
+            .verify_activity_frame_fully_with_index(source_receipts)
+            .map_err(|error| fail(error.to_string()))?;
+        validated += 1;
     }
     Ok(validated)
 }
@@ -3545,8 +3552,42 @@ impl BucketCommitEngine {
                     .map(CompleteActivityPage::from)
             })
             .map_err(|error| error.to_string())?;
+            index.remember_frame_incident(incident);
         }
         Ok(())
+    }
+
+    fn observe_frame(&mut self, incoming: crate::frame_admission::EarlierFrame) {
+        let admitted = |receipt: AppendReceipt| {
+            self.admitted_frame_receipts
+                .contains_key(&(receipt.sequence, receipt.this_hash))
+        };
+        if let Some(existing) = self.earlier_frames.iter_mut().find(|frame| {
+            frame.wallet == incoming.wallet && frame.source_trade_id == incoming.source_trade_id
+        }) {
+            if crate::frame_admission::prefer_observation(
+                existing.receipt,
+                admitted(existing.receipt),
+                incoming.receipt,
+                admitted(incoming.receipt),
+            ) {
+                *existing = incoming;
+            }
+        } else {
+            self.earlier_frames.push(incoming);
+        }
+    }
+
+    #[cfg(feature = "scenario")]
+    pub(crate) fn unresolved_receipts(&self, wallet: WalletAddress) -> Vec<AppendReceipt> {
+        let mut receipts = self
+            .earlier_frames
+            .iter()
+            .filter(|frame| frame.wallet == wallet)
+            .map(|frame| frame.receipt)
+            .collect::<Vec<_>>();
+        receipts.sort_by_key(|receipt| receipt.sequence);
+        receipts
     }
 
     pub(crate) fn retire_frame_audit(&mut self, receipt: AppendReceipt) {
@@ -3705,17 +3746,16 @@ impl BucketCommitEngine {
             {
                 continue;
             }
-            self.earlier_frames
-                .push(crate::frame_admission::EarlierFrame {
-                    receipt: *receipt,
-                    wallet: observation.wallet,
-                    source_trade_id: observation.group_id.key().clone(),
-                    market,
-                    received_at: source.received_at.0,
-                    unresolved_buy: parts.side == Some(Side::Buy)
-                        && observation.share_amount != ShareAmount::ZERO
-                        && !observation.is_combo,
-                });
+            self.observe_frame(crate::frame_admission::EarlierFrame {
+                receipt: *receipt,
+                wallet: observation.wallet,
+                source_trade_id: observation.group_id.key().clone(),
+                market,
+                received_at: source.received_at.0,
+                unresolved_buy: parts.side == Some(Side::Buy)
+                    && observation.share_amount != ShareAmount::ZERO
+                    && !observation.is_combo,
+            });
         }
         Ok(())
     }
@@ -3739,19 +3779,19 @@ impl BucketCommitEngine {
         self.restore_verified_frontiers(index)?;
         // Admissions may have committed while the poller awaited persistence/acknowledgements.
         // Recheck the serialized owner's current barrier immediately before publishing H.
-        if self.earlier_frames.iter().any(|frame| {
-            frame.wallet == frontier.wallet
-                && self
-                    .admitted_frame_receipts
-                    .get(&(frame.receipt.sequence, frame.receipt.this_hash))
-                    .and_then(|(wallet, position)| {
-                        self.frame_decisions
-                            .get(wallet)
-                            .and_then(|frames| frames.get(*position))
-                    })
-                    .is_some_and(|decision| decision.source_epoch <= frontier.fixed_end)
-        }) {
-            return Ok(());
+        for frame in self
+            .earlier_frames
+            .iter()
+            .filter(|frame| frame.wallet == frontier.wallet)
+        {
+            let source = index
+                .source_envelope(frame.receipt)
+                .map_err(|error| error.to_string())?;
+            let observation = parse_activity_trade_observation(&source.payload)
+                .map_err(|error| error.to_string())?;
+            if observation.source_time.0.unix_timestamp() <= frontier.fixed_end {
+                return Ok(());
+            }
         }
         let mut frontiers = self.verified_frontiers.clone().unwrap_or_default();
         if let Some(previous) = frontiers.get(&frontier.wallet) {
@@ -3881,8 +3921,7 @@ impl BucketCommitEngine {
         let unresolved = incoming.side == Side::Buy
             && observation.share_amount != ShareAmount::ZERO
             && !observation.is_combo;
-        self.earlier_frames.retain(|frame| frame.receipt != receipt);
-        self.earlier_frames.push(EarlierFrame {
+        self.observe_frame(EarlierFrame {
             receipt,
             wallet: observation.wallet,
             source_trade_id: observation.group_id.key().clone(),
@@ -4109,6 +4148,14 @@ impl BucketCommitEngine {
             admission_receipt: proof.admission_receipt,
             received_at: proof.inputs.received_at,
             copy_latency_budget_secs: policy.copy_latency_budget_secs,
+        });
+        self.observe_frame(crate::frame_admission::EarlierFrame {
+            receipt: proof.inputs.frame_receipt,
+            wallet: observation.wallet,
+            source_trade_id: id.clone(),
+            market: continuation.facts.market_id,
+            received_at: proof.inputs.received_at,
+            unresolved_buy: true,
         });
         Ok(id)
     }
@@ -4394,53 +4441,23 @@ impl BucketCommitEngine {
         frozen_basis: FrozenDecisionBasis,
         paper_freshness_policy: Option<PaperFreshnessPolicy>,
     ) -> Result<BucketCommitResult, BucketCommitError> {
-        let mut matched_frames = Vec::new();
-        if let Some(read) = context.verified_read.as_ref() {
-            if context.read_commitment
+        if let Some(read) = context.verified_read.as_ref()
+            && (context.read_commitment
                 != Some(ActivityReadCommitmentReceipt::BindingsV2(read.receipt))
                 || aggregates
                     .iter()
-                    .any(|aggregate| aggregate.group_id.components().wallet != read.wallet)
-            {
-                return Err(BucketCommitError::Invariant(
-                    "bucket authenticated read differs".to_owned(),
-                ));
-            }
-            for frame in self.frames_for_aggregates(&aggregates) {
-                if let crate::feed_audit::AuditDisposition::Matched(id) =
-                    crate::feed_audit::disposition(frame, read)
-                        .map_err(|error| BucketCommitError::Invariant(error.to_string()))?
-                    && aggregates
-                        .iter()
-                        .any(|aggregate| aggregate.group_id.key() == &id)
-                {
-                    matched_frames.extend(frame.observed_source_receipt);
-                }
-            }
+                    .any(|aggregate| aggregate.group_id.components().wallet != read.wallet))
+        {
+            return Err(BucketCommitError::Invariant(
+                "bucket authenticated read differs".to_owned(),
+            ));
         }
-        let disposed = aggregates.clone();
-        let result = self.commit_with_freshness_policy_inner(
+        self.commit_with_freshness_policy_inner(
             aggregates,
             context,
             frozen_basis,
             paper_freshness_policy,
-        )?;
-        self.earlier_frames.retain(|frame| {
-            if self
-                .admitted_frame_receipts
-                .contains_key(&(frame.receipt.sequence, frame.receipt.this_hash))
-            {
-                return !matched_frames.contains(&frame.receipt);
-            }
-            !disposed.iter().any(|aggregate| {
-                aggregate.group_id.key() == &frame.source_trade_id
-                    || context
-                        .observed_source_receipts
-                        .get(aggregate.group_id.key())
-                        == Some(&frame.receipt)
-            })
-        });
-        Ok(result)
+        )
     }
 
     fn commit_with_freshness_policy_inner(
@@ -4488,24 +4505,41 @@ impl BucketCommitEngine {
                         "frame counterpart read authentication absent".to_owned(),
                     )
                 })?;
-                let counterparts = crate::feed_audit::counterparts(
-                    &observation,
-                    read.transaction_aggregates
-                        .get(&facts.transaction_hash)
+                let index = self.frame_source_index.as_ref().ok_or_else(|| {
+                    BucketCommitError::Invariant("frame source index absent".to_owned())
+                })?;
+                // A match or contradiction fixes the counterpart. An unresolved frame, or one whose
+                // audit proved absence, discovers a later same-transaction group as its (late)
+                // counterpart, so it never creates a second decision (plan item 17).
+                let counterparts: HashSet<SourceTradeId> =
+                    if let Some(Some(target)) = index.frame_counterpart(receipt) {
+                        std::iter::once(target).collect()
+                    } else {
+                        crate::feed_audit::counterparts(
+                            &observation,
+                            read.transaction_aggregates
+                                .get(&facts.transaction_hash)
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|index| read.aggregates.get(*index))
+                                .filter(|aggregate| {
+                                    !read.restamp_pairs.contains_key(aggregate.group_id.key())
+                                }),
+                        )
                         .into_iter()
-                        .flatten()
-                        .filter_map(|index| read.aggregates.get(*index))
-                        .filter(|aggregate| {
-                            !read.restamp_pairs.contains_key(aggregate.group_id.key())
-                        }),
-                )
-                .into_iter()
-                .map(|aggregate| aggregate.group_id.key())
-                .collect::<HashSet<_>>();
+                        .map(|aggregate| aggregate.group_id.key().clone())
+                        .collect()
+                    };
                 for aggregate in &aggregates {
                     let id = aggregate.group_id.key();
                     let canonical = read.restamp_pairs.get(id).unwrap_or(id);
-                    if !counterparts.contains(canonical) {
+                    if !counterparts.contains(canonical)
+                        && !counterparts.contains(id)
+                        && !read.restamp_pairs.iter().any(|(alias, original)| {
+                            (alias == id && counterparts.contains(original))
+                                || (original == id && counterparts.contains(alias))
+                        })
+                    {
                         continue;
                     }
                     let id = aggregate.group_id.key();

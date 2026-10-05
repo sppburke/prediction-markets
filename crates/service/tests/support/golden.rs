@@ -3597,7 +3597,9 @@ impl BracketFinancialHarness {
                     maximum = maximum.max(active.len());
                     assert!(active.len() <= TRADE_RECONCILIATION_CONCURRENCY);
                 }
-                PollerProgress::Completed { wallet, selected } => {
+                PollerProgress::Completed {
+                    wallet, selected, ..
+                } => {
                     assert!(active.remove(&wallet));
                     assert_eq!(
                         wallet, bodies.wallet,

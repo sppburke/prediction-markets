@@ -137,6 +137,17 @@ impl FeedLatchBasis {
     }
 }
 
+/// One identity keeps its admitted receipt, otherwise its first synchronized receipt.
+/// Shared by the poller's obligations and the serialized owner's ordering barrier.
+pub(crate) fn prefer_observation(
+    existing: AppendReceipt,
+    existing_admitted: bool,
+    incoming: AppendReceipt,
+    incoming_admitted: bool,
+) -> bool {
+    !existing_admitted && (incoming_admitted || incoming.sequence < existing.sequence)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EarlierFrame {
