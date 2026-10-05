@@ -234,26 +234,16 @@ pub(crate) fn audited_receipts(era: &PaperEra) -> Vec<AppendReceipt> {
         .collect()
 }
 
-/// Negative audits retire only after their exact authenticated target revision is disposed.
-/// Absence has no REST target and retires immediately on engagement.
-pub(crate) fn negative_target_disposed(
+/// A concluded frame audit retires once its fixed counterpart group is disposed.
+/// Absence has no counterpart and retires on incident acknowledgement.
+pub(crate) fn counterpart_disposed(
     state: &pe_paper_state::PaperStateDb,
-    frame_receipt: AppendReceipt,
     counterpart: Option<&SourceTradeId>,
-    read: &VerifiedCommitment,
-) -> Result<bool, FeedAuditError> {
-    let Some(id) = counterpart else {
-        return Ok(true);
-    };
-    let binding = read
-        .binding_indices
-        .get(&(frame_receipt.sequence, frame_receipt.this_hash))
-        .and_then(|position| read.bindings.get(*position))
-        .filter(|binding| &binding.history_group_id == id)
-        .ok_or(FeedAuditError::Semantic(
-            "negative audit counterpart binding missing",
-        ))?;
-    Ok(state.activity_revision_disposed(id, &binding.semantic_revision)?)
+) -> Result<bool, pe_paper_state::PaperStateError> {
+    match counterpart {
+        Some(id) => Ok(state.activity_group_state(id)?.is_some()),
+        None => Ok(true),
+    }
 }
 
 /// Verify every journaled incident and expose admissions still lacking a disposed REST audit.
@@ -320,12 +310,7 @@ where
                 FeedAuditError::Semantic("incident has no durable admitted frame"),
             )?;
             verify_incident_conclusion(frame, incident, &read)?;
-            if negative_target_disposed(
-                state,
-                incident.frame_receipt,
-                incident.counterpart_identity.as_ref(),
-                &read,
-            )? {
+            if counterpart_disposed(state, incident.counterpart_identity.as_ref())? {
                 retired.insert(key(incident.frame_receipt));
             }
         }
@@ -342,19 +327,10 @@ where
             if retired.contains(&key(frame_receipt)) || matched.contains(&key(frame_receipt)) {
                 continue;
             }
-            if let AuditDisposition::Matched(id) = disposition(*frame, &read)? {
-                let binding = read
-                    .binding_indices
-                    .get(&(frame_receipt.sequence, frame_receipt.this_hash))
-                    .and_then(|index| read.bindings.get(*index))
-                    .filter(|binding| binding.history_group_id == id)
-                    .ok_or(FeedAuditError::Semantic("matched audit binding missing"))?;
-                if state
-                    .activity_revision_disposed(&id, &binding.semantic_revision)
-                    .map_err(|_| FeedAuditError::Semantic("audit disposition unavailable"))?
-                {
-                    matched.insert(key(frame_receipt));
-                }
+            if let AuditDisposition::Matched(id) = disposition(*frame, &read)?
+                && counterpart_disposed(state, Some(&id))?
+            {
+                matched.insert(key(frame_receipt));
             }
         }
     }

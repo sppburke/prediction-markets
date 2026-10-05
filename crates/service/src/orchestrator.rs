@@ -1646,12 +1646,12 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             crate::bucket_commit::FrameRoute::Ignored => return Ok(()),
             crate::bucket_commit::FrameRoute::Fallback(artifact) => (
                 crate::frame_admission::FRAME_FALLBACK_SOURCE_ID,
-                crate::frame_admission::canonical_bytes(artifact),
+                crate::bucket_commit::canonical_json(artifact),
             ),
             crate::bucket_commit::FrameRoute::Admission(capture) => (
                 crate::frame_admission::FRAME_ADMISSION_SOURCE_ID,
                 crate::frame_admission::FrameAdmissionArtifact::from_inputs(&capture.0)
-                    .and_then(|artifact| crate::frame_admission::canonical_bytes(&artifact)),
+                    .and_then(|artifact| crate::bucket_commit::canonical_json(&artifact)),
             ),
         };
         let admission_receipt = source_log
@@ -1759,12 +1759,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     self.paper_writer.snapshot().map_err(|e| e.to_string())?,
                 );
                 // Engagement trips the latch immediately; a contradicted REST target
-                // keeps its ordering work until its exact revision is disposed.
-                let disposed = crate::feed_audit::negative_target_disposed(
+                // keeps its ordering work until its group has a durable disposition.
+                let disposed = crate::feed_audit::counterpart_disposed(
                     &self.paper_state,
-                    incident.frame_receipt,
                     incident.counterpart_identity.as_ref(),
-                    &read,
                 )
                 .map_err(|error| error.to_string())?;
                 if !crate::feed_audit::audited_receipts(&era).contains(&incident.frame_receipt) {

@@ -98,12 +98,12 @@
 > (transport/envelope/constants) and `pe-service::activity_ingest` (readers, liveness,
 > fan-in); the service's `trade_parser` normalizes identically to the REST path. The CLOB
 > market channel remains wallet-anonymous — the note below stands for THAT feed.
-> Last checked: 2026-10-04 (`scripts/probe_activity_ws.py`: the activity subscription delivered
-> 2,694 `trades` frames in 60 s with envelope keys `connection_id`, `payload`, `timestamp`,
-> `topic` and `type`, and `payload.proxyWallet` present; rerun at 8:20 PM CT: 1,970 `trades`
-> frames in 60 s, same envelope keys). A 45 s payload-key capture the same evening (2,726 payloads) found `asset`,
+> Last checked: 2026-10-05 (`scripts/probe_activity_ws.py` at 6:09 AM CT: the activity subscription
+> delivered 2,002 `trades` frames in 60 s with envelope keys `connection_id`, `payload`, `timestamp`,
+> `topic` and `type`, and `payload.proxyWallet` present; 2026-10-04: 2,694 and 1,970 frames in 60 s,
+> same keys). A 45 s payload-key capture at 6:11 AM CT (1,816 payloads; 2,726 on 2026-10-04) found `asset`,
 > `conditionId`, `outcome`, `outcomeIndex`, `price`, `proxyWallet`, `side`, `size`, `timestamp` and
-> `transactionHash` on every payload (plus display fields, and `fee` on 950) and **no combo flag**:
+> `transactionHash` on every payload (plus display fields, and `fee` on 694) and **no combo flag**:
 > frame admission therefore treats feed trades as non-combo; none of the 4 combo BUYs in watched
 > wallets' public history for 2026-09-04→10-03 appeared on the feed, and a combo REST
 > counterpart contradicts an admitted frame.

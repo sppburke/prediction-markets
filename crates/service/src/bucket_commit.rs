@@ -2198,12 +2198,8 @@ struct ActivityReadPreimage<'a> {
     pages: Vec<(&'a PageOccurrence, &'a ReconciliationPageEvidence)>,
 }
 
-fn canonical_json(value: &impl Serialize) -> Result<Vec<u8>, CompleteActivityReadError> {
-    serde_json::to_value(value)
-        .and_then(|value| serde_json::to_vec(&value))
-        .map_err(|error| {
-            complete_activity_read_error(format!("commitment encoding failed: {error}"))
-        })
+pub(crate) fn canonical_json(value: &impl Serialize) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_value(value).and_then(|value| serde_json::to_vec(&value))
 }
 
 fn canonical_bindings(
@@ -2211,7 +2207,13 @@ fn canonical_bindings(
 ) -> Result<Vec<ObservationBinding>, CompleteActivityReadError> {
     let mut encoded = bindings
         .iter()
-        .map(|binding| canonical_json(binding).map(|bytes| (bytes, binding.clone())))
+        .map(|binding| {
+            canonical_json(binding)
+                .map(|bytes| (bytes, binding.clone()))
+                .map_err(|error| {
+                    complete_activity_read_error(format!("commitment encoding failed: {error}"))
+                })
+        })
         .collect::<Result<Vec<_>, _>>()?;
     encoded.sort_by(|left, right| left.0.cmp(&right.0));
     let mut receipts = HashSet::new();
@@ -2241,7 +2243,7 @@ fn activity_read_digest_versioned(
     let (domain, canonical) = match bindings {
         None => (
             ACTIVITY_READ_COMMITMENT_V1_DOMAIN,
-            canonical_json(&preimage)?,
+            canonical_json(&preimage),
         ),
         Some(bindings) => {
             #[derive(Serialize)]
@@ -2255,10 +2257,13 @@ fn activity_read_digest_versioned(
                 canonical_json(&PreimageV2 {
                     read: preimage,
                     bindings: canonical_bindings(bindings)?,
-                })?,
+                }),
             )
         }
     };
+    let canonical = canonical.map_err(|error| {
+        complete_activity_read_error(format!("commitment encoding failed: {error}"))
+    })?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(domain);
     hasher.update(&canonical);
@@ -3774,14 +3779,7 @@ impl BucketCommitEngine {
             else {
                 return Err("admitted audit retirement lacks authenticated match".to_owned());
             };
-            let target = read
-                .aggregate_indices
-                .get(&id)
-                .and_then(|index| read.aggregates.get(*index))
-                .ok_or_else(|| "matched audit target absent".to_owned())?;
-            if !self
-                .paper_state
-                .activity_revision_disposed(&id, target.semantic_revision.as_str())
+            if !crate::feed_audit::counterpart_disposed(&self.paper_state, Some(&id))
                 .map_err(|error| error.to_string())?
             {
                 return Err("matched audit target is not disposed".to_owned());
@@ -4591,7 +4589,7 @@ impl BucketCommitEngine {
     /// Commit current decisions with the policy captured by the orchestrator at the bucket boundary.
     pub fn commit_with_freshness_policy(
         &mut self,
-        aggregates: Vec<ActivityAggregate>,
+        mut aggregates: Vec<ActivityAggregate>,
         context: &BucketDecisionContext,
         frozen_basis: FrozenDecisionBasis,
         paper_freshness_policy: Option<PaperFreshnessPolicy>,
@@ -4607,21 +4605,6 @@ impl BucketCommitEngine {
                 "bucket authenticated read differs".to_owned(),
             ));
         }
-        self.commit_with_freshness_policy_inner(
-            aggregates,
-            context,
-            frozen_basis,
-            paper_freshness_policy,
-        )
-    }
-
-    fn commit_with_freshness_policy_inner(
-        &mut self,
-        mut aggregates: Vec<ActivityAggregate>,
-        context: &BucketDecisionContext,
-        frozen_basis: FrozenDecisionBasis,
-        paper_freshness_policy: Option<PaperFreshnessPolicy>,
-    ) -> Result<BucketCommitResult, BucketCommitError> {
         // Suppression comes from durable frame decisions and authenticated bindings, and survives
         // terminalization/restart. Audit retirement never deletes this decision authority.
         let frame_decisions = self.frames_for_aggregates(&aggregates);

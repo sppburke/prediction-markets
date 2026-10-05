@@ -465,20 +465,20 @@ impl ReconciliationObligations {
         era: &crate::paper_recovery::PaperEra,
         paper_state: &PaperStateDb,
     ) -> Result<(), pe_paper_state::PaperStateError> {
-        let mut retired = crate::feed_audit::audited_receipts(era);
-        for obligation in self
-            .by_wallet
-            .values()
-            .flat_map(BTreeMap::values)
-            .flat_map(BTreeMap::values)
-        {
-            if retired.contains(&obligation.receipt) {
-                for binding in &obligation.bindings {
-                    if !binding_target_disposed(paper_state, binding)? {
-                        retired.retain(|receipt| *receipt != obligation.receipt);
-                        break;
-                    }
-                }
+        let mut retired = Vec::new();
+        for frame in &era.frames {
+            if let crate::paper_recovery::PaperLogFrame::Record(
+                crate::paper_recovery::PaperLogRecord::FeedIncidentChanged {
+                    incident,
+                    state: crate::paper_recovery::HaltState::Engaged,
+                },
+            ) = &frame.frame
+                && crate::feed_audit::counterpart_disposed(
+                    paper_state,
+                    incident.counterpart_identity.as_ref(),
+                )?
+            {
+                retired.push(incident.frame_receipt);
             }
         }
         for receipt in &retired {
@@ -2003,7 +2003,8 @@ impl WalletOperation {
             }
         }
         let mut negative_resolved: Vec<(i64, Obligation)> = Vec::new();
-        let mut retained_matched = Vec::new();
+        let mut retained_matched: Vec<(i64, Obligation)> = Vec::new();
+        let mut counterparts = HashSet::new();
         if let Some(index) = &self.source_receipts {
             let frames = self
                 .paper_state
@@ -2026,10 +2027,9 @@ impl WalletOperation {
                 .collect::<Vec<_>>();
             receipts.sort_by_key(|receipt| receipt.sequence);
             receipts.dedup();
-            let mut matched = HashSet::new();
             // Authenticate each retained read once, then release its reconstructed history.
-            // An earlier match wins over later absence. Negative conclusions engage the
-            // latch before routing, including metadata resolution of unrelated aggregates.
+            // A fixed counterpart wins over later absence, but its later contradiction
+            // still engages the latch before routing, including unrelated metadata resolution.
             for receipt in receipts {
                 let read = Arc::new(
                     crate::bucket_commit::verified_commitment_bindings(receipt, index)
@@ -2038,7 +2038,9 @@ impl WalletOperation {
                 let mut matches = Vec::new();
                 let mut negatives = Vec::new();
                 for (epoch, obligation) in &obligations {
-                    if matched.contains(&obligation.receipt.sequence)
+                    if retained_matched
+                        .iter()
+                        .any(|(_, resolved)| resolved.receipt == obligation.receipt)
                         || negative_resolved
                             .iter()
                             .any(|(_, resolved)| resolved.receipt == obligation.receipt)
@@ -2052,11 +2054,19 @@ impl WalletOperation {
                         .map_err(|error| ReconciliationError::Binding(error.to_string()))?;
                     match conclusion {
                         crate::feed_audit::AuditDisposition::Matched(id) => {
-                            matched.insert(obligation.receipt.sequence);
+                            counterparts.insert(obligation.receipt.sequence);
                             matches.push((*epoch, obligation.clone(), id))
                         }
                         crate::feed_audit::AuditDisposition::Absent
+                            if counterparts.contains(&obligation.receipt.sequence) => {}
+                        crate::feed_audit::AuditDisposition::Absent
                         | crate::feed_audit::AuditDisposition::Contradicted(_) => {
+                            if matches!(
+                                conclusion,
+                                crate::feed_audit::AuditDisposition::Contradicted(_)
+                            ) {
+                                counterparts.insert(obligation.receipt.sequence);
+                            }
                             if self
                                 .request_negative_audit(
                                     obligation.receipt,
@@ -2066,7 +2076,7 @@ impl WalletOperation {
                                 )
                                 .await?
                             {
-                                if self.negative_target_disposed(obligation, &conclusion, &read)? {
+                                if self.negative_target_disposed(&conclusion)? {
                                     acknowledged_audits.push((*epoch, obligation.clone()));
                                     negative_resolved.push((*epoch, obligation.clone()));
                                 } else {
@@ -2109,17 +2119,7 @@ impl WalletOperation {
                 }
                 self.promote_selected_admissions(wallet, selected)?;
                 for (epoch, obligation, id) in matches {
-                    let binding = read
-                        .binding_indices
-                        .get(&(obligation.receipt.sequence, obligation.receipt.this_hash))
-                        .and_then(|index| read.bindings.get(*index))
-                        .filter(|binding| binding.history_group_id == id)
-                        .ok_or_else(|| {
-                            ReconciliationError::Binding(
-                                "retained match binding missing".to_owned(),
-                            )
-                        })?;
-                    if !binding_target_disposed(&self.paper_state, binding)? {
+                    if !crate::feed_audit::counterpart_disposed(&self.paper_state, Some(&id))? {
                         continue; // ordinary routing stopped at an unresolved observation or fence
                     }
                     if !self
@@ -2133,7 +2133,7 @@ impl WalletOperation {
                     retained_matched.push((epoch, obligation));
                 }
                 for (epoch, obligation, conclusion) in negatives {
-                    if self.negative_target_disposed(&obligation, &conclusion, &read)?
+                    if self.negative_target_disposed(&conclusion)?
                         && self
                             .request_negative_audit(
                                 obligation.receipt,
@@ -2375,6 +2375,11 @@ impl WalletOperation {
                         })?;
                     let conclusion = crate::feed_audit::disposition(&frame, &verified)
                         .map_err(|error| ReconciliationError::Binding(error.to_string()))?;
+                    if conclusion == crate::feed_audit::AuditDisposition::Absent
+                        && counterparts.contains(&obligation.receipt.sequence)
+                    {
+                        continue;
+                    }
                     if !self
                         .request_negative_audit(
                             obligation.receipt,
@@ -2386,7 +2391,7 @@ impl WalletOperation {
                     {
                         continue;
                     }
-                    if self.negative_target_disposed(obligation, &conclusion, &verified)? {
+                    if self.negative_target_disposed(&conclusion)? {
                         acknowledged_audits.push((*epoch, obligation.clone()));
                         negative_resolved.push((*epoch, obligation.clone()));
                     }
@@ -2451,7 +2456,12 @@ impl WalletOperation {
                         })?;
                     let conclusion = crate::feed_audit::disposition(&frame, &verified)
                         .map_err(|error| ReconciliationError::Binding(error.to_string()))?;
-                    if self.negative_target_disposed(obligation, &conclusion, &verified)?
+                    if conclusion == crate::feed_audit::AuditDisposition::Absent
+                        && counterparts.contains(&obligation.receipt.sequence)
+                    {
+                        continue;
+                    }
+                    if self.negative_target_disposed(&conclusion)?
                         && self
                             .request_negative_audit(
                                 obligation.receipt,
@@ -2744,22 +2754,14 @@ impl WalletOperation {
 
     fn negative_target_disposed(
         &self,
-        obligation: &Obligation,
         conclusion: &crate::feed_audit::AuditDisposition,
-        read: &crate::bucket_commit::VerifiedCommitment,
     ) -> Result<bool, ReconciliationError> {
         let counterpart = match conclusion {
             crate::feed_audit::AuditDisposition::Absent => None,
             crate::feed_audit::AuditDisposition::Contradicted(id) => Some(id),
             _ => return Ok(false),
         };
-        crate::feed_audit::negative_target_disposed(
-            &self.paper_state,
-            obligation.receipt,
-            counterpart,
-            read,
-        )
-        .map_err(|error| ReconciliationError::Binding(error.to_string()))
+        crate::feed_audit::counterpart_disposed(&self.paper_state, counterpart).map_err(Into::into)
     }
 
     async fn request_negative_audit(
@@ -2832,12 +2834,7 @@ impl WalletOperation {
                     if let crate::feed_audit::AuditDisposition::Matched(id) =
                         crate::feed_audit::disposition(&frame, read)
                             .map_err(|error| ReconciliationError::Binding(error.to_string()))?
-                        && let Some(binding) = read
-                            .binding_indices
-                            .get(&(obligation.receipt.sequence, obligation.receipt.this_hash))
-                            .and_then(|index| read.bindings.get(*index))
-                        && binding.history_group_id == id
-                        && binding_target_disposed(&self.paper_state, binding)?
+                        && crate::feed_audit::counterpart_disposed(&self.paper_state, Some(&id))?
                     {
                         resolved.push((*epoch, obligation.clone()));
                     }
@@ -3491,7 +3488,10 @@ fn obligation_disposed(
         }
         for binding in &obligation.bindings {
             if binding.stream_receipt == obligation.receipt
-                && binding_target_disposed(paper_state, binding)?
+                && crate::feed_audit::counterpart_disposed(
+                    paper_state,
+                    Some(&binding.history_group_id),
+                )?
             {
                 return Ok(true);
             }

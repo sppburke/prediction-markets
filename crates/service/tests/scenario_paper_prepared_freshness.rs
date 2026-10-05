@@ -8924,15 +8924,236 @@ async fn commitment_preemption_drains_ack_and_keeps_fixed_binding_before_urgent_
     assert_eq!(h.paper.decision_pending_history().unwrap().len(), 1);
 }
 
-/// Journaled contradiction evidence alone does not prove the exact REST revision completed.
+/// R1 fixes the counterpart while an earlier observation holds routing; R2 may replace
+/// that revision before either is disposed. Audit completion is per group in every owner.
+#[tokio::test(start_paused = true)]
+async fn frame_audit_changed_revision_retires_group_across_restart() {
+    for contradiction_first in [true, false] {
+        for restart in [false, true] {
+            let mut h = Harness::new().await;
+            let earlier = h.record(1).await;
+            let frame = h.record(2).await;
+            h.terminal_clock = OffsetDateTime::from_unix_timestamp(frame.epoch).unwrap();
+            h.hooks
+                .financial_clock_unix
+                .store(frame.epoch, Ordering::SeqCst);
+            h.start_frames();
+            let earlier_receipt = h.deliver_frame(&earlier, |_| {}).await;
+            h.empty_frontier(EPOCH - 1).await;
+            h.attempt(&frame, h.terminal_clock);
+            let frame_receipt = h.deliver_frame(&frame, |_| {}).await;
+            let terminal = h.terminal(&frame);
+            let r1 = h.rest_counterpart(&frame, |row| {
+                row["isCombo"] = json!(contradiction_first);
+            });
+            h.poll(&r1).await;
+            assert!(h.paper.activity_group_state(&frame.id).unwrap().is_none());
+            assert_eq!(h.feed_edges().len(), usize::from(contradiction_first));
+            h.assert_frame_barrier(Some(&[earlier_receipt, frame_receipt]))
+                .await;
+
+            let mut r2 = h.rest_counterpart(&frame, |row| {
+                row["isCombo"] = json!(!contradiction_first);
+                row["size"] = json!("6");
+                row["usdcSize"] = json!("3");
+            });
+            let mut rows: Value = serde_json::from_slice(&r2.activity).unwrap();
+            let earlier_rows: Value = serde_json::from_slice(&earlier.activity).unwrap();
+            rows.as_array_mut().unwrap().push(earlier_rows[0].clone());
+            // An unbound raw-only row makes retained metadata resolution an observable
+            // barrier before any bucket, proving the incident is requested first.
+            let mut marker = earlier_rows[0].clone();
+            marker["transactionHash"] = json!("retained-revision-marker");
+            marker["size"] = json!("0");
+            marker["usdcSize"] = json!("0");
+            rows.as_array_mut().unwrap().push(marker);
+            r2.activity = serde_json::to_vec(&rows).unwrap();
+            let mut gamma: Value = serde_json::from_slice(&r2.gamma).unwrap();
+            gamma.as_array_mut().unwrap().extend(
+                serde_json::from_slice::<Value>(&earlier.gamma)
+                    .unwrap()
+                    .as_array()
+                    .unwrap()
+                    .clone(),
+            );
+            r2.gamma = serde_json::to_vec(&gamma).unwrap();
+            *h.poller_crash.lock().unwrap() =
+                Some(pe_service::trade_poller::ReconciliationCrashBoundary::Commitment);
+            assert!(
+                h.poll_source_result(
+                    &r2,
+                    None,
+                    OffsetDateTime::from_unix_timestamp(r2.epoch).unwrap(),
+                    0
+                )
+                .await
+                .is_err()
+            );
+            let reads = read_commitments(&h);
+            let r1_receipt = reads[reads.len() - 2].0;
+            let r2_receipt = reads.last().unwrap().0;
+            let r1_revision = reads[reads.len() - 2].1.bindings.as_ref().unwrap()[0]
+                .semantic_revision
+                .clone();
+            let r2_revision = reads
+                .last()
+                .unwrap()
+                .1
+                .bindings
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|binding| binding.stream_receipt == frame_receipt)
+                .unwrap()
+                .semantic_revision
+                .clone();
+            assert_ne!(r1_revision, r2_revision);
+            if restart {
+                h.restart_frames().await;
+            }
+            h.poller_fetch_failed = true;
+            h.poller_metadata_failures.store(1, Ordering::SeqCst);
+            h.poll(&r2).await;
+            assert_eq!(h.poller_metadata_failures.load(Ordering::SeqCst), 0);
+            assert!(h.paper.activity_group_state(&earlier.id).unwrap().is_none());
+            assert!(h.paper.activity_group_state(&frame.id).unwrap().is_none());
+            assert_eq!(h.feed_edges().len(), 1);
+            let incident = h.feed_edges()[0].1.clone();
+            assert_eq!(incident.frame_receipt, frame_receipt);
+            assert_eq!(incident.counterpart_identity, Some(frame.id.clone()));
+            assert_eq!(
+                incident.deciding_commitment_receipt,
+                if contradiction_first {
+                    r1_receipt
+                } else {
+                    r2_receipt
+                }
+            );
+            assert!(
+                pe_service::paper_recovery::feed_latch_basis(&h.feed_era())
+                    .unwrap()
+                    .engaged()
+            );
+
+            h.attempt(&earlier, h.terminal_clock);
+            h.poll(&r2).await; // Both reads recover before the new fetch fails.
+            let disposed = h.paper.activity_group_state(&frame.id).unwrap().unwrap();
+            assert_eq!(disposed.semantic_revision, r2_revision);
+            assert!(
+                !h.paper
+                    .activity_revision_disposed(&frame.id, &r1_revision)
+                    .unwrap()
+            );
+            assert_eq!(
+                h.paper
+                    .activity_groups_after(&wallet(), i64::MIN)
+                    .unwrap()
+                    .iter()
+                    .filter(|group| group.source_trade_id == frame.id)
+                    .count(),
+                1
+            );
+            assert_eq!(h.feed_edges().len(), 1);
+            assert_eq!(h.terminal(&frame), terminal);
+            h.assert_frame_barrier(Some(&[])).await;
+            h.restart_frames().await;
+            h.assert_frame_barrier(Some(&[])).await;
+            assert!(
+                pe_service::paper_recovery::feed_latch_basis(&h.feed_era())
+                    .unwrap()
+                    .engaged()
+            );
+            let report = h.qualify_one_fill().await;
+            assert!(report.replay.exact, "{report:?}");
+            assert!(
+                !report
+                    .reasons
+                    .iter()
+                    .any(|reason| reason.contains("unresolved frame audits")),
+                "{report:?}"
+            );
+        }
+    }
+}
+
+/// A retained counterpart outranks a mature absence even while an earlier observation
+/// still prevents its group from being disposed; only a contradiction engages the latch.
+#[tokio::test(start_paused = true)]
+async fn retained_undisposed_counterpart_outranks_later_absence_across_restart() {
+    for contradiction in [false, true] {
+        for restart in [false, true] {
+            let mut h = Harness::new().await;
+            h.copy_budget_secs = 120;
+            let earlier = h.record(1).await;
+            let frame = h.record(2).await;
+            h.terminal_clock = OffsetDateTime::from_unix_timestamp(frame.epoch).unwrap();
+            h.hooks
+                .financial_clock_unix
+                .store(frame.epoch, Ordering::SeqCst);
+            h.start_frames();
+            let earlier_receipt = h.deliver_frame(&earlier, |_| {}).await;
+            h.empty_frontier(EPOCH - 1).await;
+            h.attempt(&frame, h.terminal_clock);
+            let frame_receipt = h.deliver_frame(&frame, |_| {}).await;
+            let counterpart =
+                h.rest_counterpart(&frame, |row| row["isCombo"] = json!(contradiction));
+            h.poll(&counterpart).await;
+            let mut absent = frame.clone();
+            absent.activity = b"[]".to_vec();
+            absent.epoch = frame.epoch + 120;
+            *h.poller_crash.lock().unwrap() =
+                Some(pe_service::trade_poller::ReconciliationCrashBoundary::Commitment);
+            assert!(
+                h.poll_source_result(
+                    &absent,
+                    None,
+                    OffsetDateTime::from_unix_timestamp(absent.epoch).unwrap(),
+                    0
+                )
+                .await
+                .is_err()
+            );
+            if restart {
+                h.restart_frames().await;
+            }
+            h.poller_fetch_failed = true;
+            h.poll(&absent).await;
+            assert_eq!(h.feed_edges().len(), usize::from(contradiction));
+            assert!(h.paper.activity_group_state(&frame.id).unwrap().is_none());
+            h.assert_frame_barrier(Some(&[earlier_receipt, frame_receipt]))
+                .await;
+            h.poller_fetch_failed = false;
+            h.poll(&absent).await; // A newly fetched mature absence obeys the same precedence.
+            assert_eq!(h.feed_edges().len(), usize::from(contradiction));
+            h.assert_frame_barrier(Some(&[earlier_receipt, frame_receipt]))
+                .await;
+            let report = h.qualify_one_fill().await;
+            assert!(
+                report
+                    .reasons
+                    .iter()
+                    .any(|reason| reason.contains("unresolved frame audits")),
+                "{report:?}"
+            );
+        }
+    }
+}
+
+/// Journaled contradiction evidence retires only after its counterpart group is disposed.
 #[tokio::test(start_paused = true)]
 async fn qualification_keeps_engaged_undisposed_contradiction_unresolved() {
     for dispose in [false, true] {
         let mut h = Harness::new().await;
-        let frame = h.record(1).await;
-        h.attempt(&frame, at());
+        let earlier = h.record(1).await;
+        let frame = h.record(2).await;
+        h.terminal_clock = OffsetDateTime::from_unix_timestamp(frame.epoch).unwrap();
+        h.hooks
+            .financial_clock_unix
+            .store(frame.epoch, Ordering::SeqCst);
         h.start_frames();
+        let earlier_receipt = h.deliver_frame(&earlier, |_| {}).await;
         h.empty_frontier(EPOCH - 1).await;
+        h.attempt(&frame, h.terminal_clock);
         let frame_receipt = h.deliver_frame(&frame, |_| {}).await;
         let terminal = h.terminal(&frame);
         // Combo changes the revision but preserves the exact group identifier, so
@@ -8942,7 +9163,7 @@ async fn qualification_keeps_engaged_undisposed_contradiction_unresolved() {
         *h.poller_crash.lock().unwrap() =
             Some(pe_service::trade_poller::ReconciliationCrashBoundary::Commitment);
         assert!(
-            h.poll_source_result(&counterpart, None, at(), 0)
+            h.poll_source_result(&counterpart, None, h.terminal_clock, 0)
                 .await
                 .is_err()
         );
@@ -8972,10 +9193,46 @@ async fn qualification_keeps_engaged_undisposed_contradiction_unresolved() {
         .unwrap();
         assert_eq!(
             obligations.unresolved_receipts(wallet()),
-            vec![frame_receipt]
+            vec![earlier_receipt, frame_receipt]
         );
         if dispose {
-            h.poll(&counterpart).await;
+            let mut changed = h.rest_counterpart(&counterpart, |row| {
+                row["size"] = json!("6");
+                row["usdcSize"] = json!("3");
+            });
+            let mut rows: Value = serde_json::from_slice(&changed.activity).unwrap();
+            rows.as_array_mut()
+                .unwrap()
+                .push(serde_json::from_slice::<Value>(&earlier.activity).unwrap()[0].clone());
+            changed.activity = serde_json::to_vec(&rows).unwrap();
+            let mut gamma: Value = serde_json::from_slice(&changed.gamma).unwrap();
+            gamma.as_array_mut().unwrap().extend(
+                serde_json::from_slice::<Value>(&earlier.gamma)
+                    .unwrap()
+                    .as_array()
+                    .unwrap()
+                    .clone(),
+            );
+            changed.gamma = serde_json::to_vec(&gamma).unwrap();
+            h.attempt(&earlier, h.terminal_clock);
+            h.poll(&changed).await; // R1 is never disposed; a later revision disposes its group.
+            let incident_binding = read_commitments(&h)
+                .iter()
+                .find(|(receipt, _)| *receipt == h.feed_edges()[0].1.deciding_commitment_receipt)
+                .unwrap()
+                .1
+                .bindings
+                .as_ref()
+                .unwrap()[0]
+                .clone();
+            assert!(
+                !h.paper
+                    .activity_revision_disposed(
+                        &counterpart.id,
+                        &incident_binding.semantic_revision
+                    )
+                    .unwrap()
+            );
             assert!(
                 h.paper
                     .activity_group_state(&counterpart.id)
@@ -8993,6 +9250,49 @@ async fn qualification_keeps_engaged_undisposed_contradiction_unresolved() {
                 .retire_feed_incidents(&h.feed_era(), &h.paper)
                 .unwrap();
             assert!(obligations.unresolved_receipts(wallet()).is_empty());
+            // Boot must use the incident's fixed counterpart, not require every
+            // retained binding revision to be disposed. R3 synchronizes but never routes.
+            let later = h.rest_counterpart(&counterpart, |row| {
+                row["size"] = json!("7");
+                row["usdcSize"] = json!("3.5");
+            });
+            *h.poller_crash.lock().unwrap() =
+                Some(pe_service::trade_poller::ReconciliationCrashBoundary::Commitment);
+            assert!(
+                h.poll_source_result(&later, None, h.terminal_clock, 0)
+                    .await
+                    .is_err()
+            );
+            let later_binding = read_commitments(&h)
+                .last()
+                .unwrap()
+                .1
+                .bindings
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|binding| binding.stream_receipt == frame_receipt)
+                .unwrap()
+                .clone();
+            assert_eq!(later_binding.history_group_id, counterpart.id);
+            assert!(
+                !h.paper
+                    .activity_revision_disposed(&counterpart.id, &later_binding.semantic_revision)
+                    .unwrap()
+            );
+            h.restart_frames().await;
+            let mut obligations =
+                pe_service::trade_poller::rebuild_reconciliation_obligations_with_index(
+                    &h.dir.path().join("source.log"),
+                    &h.paper,
+                    &h.index,
+                )
+                .unwrap();
+            obligations
+                .retire_feed_incidents(&h.feed_era(), &h.paper)
+                .unwrap();
+            assert!(obligations.unresolved_receipts(wallet()).is_empty());
+            h.assert_frame_barrier(Some(&[])).await;
         }
         assert_eq!(h.feed_edges().len(), 1);
         assert_eq!(h.terminal(&frame), terminal);
@@ -9023,9 +9323,7 @@ async fn qualification_keeps_engaged_undisposed_contradiction_unresolved() {
 /// Full pages within one second never establish a frontier or a negative frame audit.
 #[tokio::test(start_paused = true)]
 async fn saturated_one_second_read_keeps_frame_frontier_and_obligation_across_restart() {
-    use pe_source_polymarket_public::{
-        ACTIVITY_MAX_OFFSET, ActivityReadError, RECONCILIATION_PAGE_LIMIT, fetch_complete_activity,
-    };
+    use pe_source_polymarket_public::{ACTIVITY_MAX_OFFSET, RECONCILIATION_PAGE_LIMIT};
     let mut h = Harness::new().await;
     let frame = h.record(1).await;
     let original: Value = serde_json::from_slice(&frame.activity).unwrap();
@@ -9038,23 +9336,6 @@ async fn saturated_one_second_read_keeps_frame_frontier_and_obligation_across_re
         })
         .collect::<Vec<_>>();
     let page = serde_json::to_vec(&rows).unwrap();
-    // The source fixture's typed completeness refusal, exercised with the same page shape.
-    let error = fetch_complete_activity(
-        &Page(page.clone()),
-        "fixture://activity",
-        wallet(),
-        Some(EPOCH - 1),
-        EPOCH,
-    )
-    .await
-    .unwrap_err();
-    assert!(matches!(
-        error,
-        ActivityReadError::SaturatedTerminalSecond {
-            end: EPOCH,
-            offset: ACTIVITY_MAX_OFFSET,
-        }
-    ));
     h.attempt(&frame, at());
     h.start_frames();
     h.empty_frontier(EPOCH - 1).await;

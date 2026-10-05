@@ -361,10 +361,6 @@ pub struct FrameFallbackArtifact {
     pub latest_incident_basis: FeedLatchBasis,
 }
 
-pub(crate) fn canonical_bytes(value: &impl Serialize) -> Result<Vec<u8>, serde_json::Error> {
-    serde_json::to_vec(&serde_json::to_value(value)?)
-}
-
 pub(crate) fn persist_frontiers(
     state: &PaperStateDb,
     frontiers: &HashMap<WalletAddress, FeedHistoryFrontier>,
@@ -427,7 +423,7 @@ pub struct FrameDecisionProof {
 pub(crate) fn frame_revision(inputs: &FrameAdmissionInputs) -> Result<String, serde_json::Error> {
     let mut hash = blake3::Hasher::new();
     hash.update(b"prediction-edge/activity-frame-decision/v1\0");
-    hash.update(&canonical_bytes(inputs)?);
+    hash.update(&crate::bucket_commit::canonical_json(inputs)?);
     Ok(hash.finalize().to_hex().to_string())
 }
 

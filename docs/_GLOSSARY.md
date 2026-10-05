@@ -604,14 +604,21 @@ wallet obligation has waited longer than that bound. `poll_round_stale_secs` is 
 new configuration key.
 
 An admitted frame remains an audit obligation, even after fencing, until its matched, contradicted
-or absent conclusion is acknowledged and any bound REST target is durably disposed. Its frozen receipt cannot be replaced by another observation of the same identity.
+or absent conclusion is recorded (a negative conclusion acknowledged by the orchestrator) and
+its fixed counterpart group has a durable disposition under any revision. Absence has no
+counterpart and retires on acknowledgement. Its frozen receipt cannot be replaced by another
+observation of the same identity.
 For a still-unbound frame, discover counterparts by authenticated wallet/transaction and asset
 disambiguation before side comparison, preserving verified bindings, restamp equivalence and ambiguity.
 Once authenticated, its counterpart identity stays fixed through commitment-before-bucket crashes,
 audit retirement, release and restart; another transaction leg receives its own decision. A different
 identifier is equivalent only through an authenticated restamp pair. Retained authenticated
-counterparts, matched or contradicted, win over later absence, commit their recorded read through
-the bucket owner, and retire only after target disposition and retirement acknowledgement. A match confirms
+counterparts, matched or contradicted, win over later absence and commit their recorded read
+through the bucket owner. An earlier match suppresses only later absence: a contradiction
+concluded before the fixed counterpart group is disposed still engages the latch. Changed
+revisions follow REST's existing revision routing and fence. Production, boot and qualification
+retire the audit once the conclusion is recorded (a negative conclusion acknowledged) and the
+fixed counterpart group has a durable disposition under any revision. A match confirms
 an ordinary positive-share TRADE with the same effective side, condition and outcome; combo,
 zero-share or disagreeing counterparts contradict. Positive quantity, price and time differences
 are audit facts. Absence matures at frozen frame source time + `copy_latency_budget_secs`:
@@ -641,10 +648,10 @@ authenticate that basis with the same counterpart rule; initial and historical b
 journals contradiction or absence before the audit ordering barrier retires. A contradiction
 engages the latch as soon as the audit concludes, before any routing of that read (including
 retained-read recovery), but retains reconciliation and ordering work across acknowledgement
-and restart until its exact REST target revision has a durable disposition, including late-group
-re-anchor handling. Qualification lists an engaged contradiction as unresolved until that exact
-revision is disposed; an engaged absence retires immediately. Repeated engagement requests
-acknowledge the existing incident once. The synchronized
+and restart until its fixed counterpart group has a durable disposition under any revision,
+including late-group re-anchor handling. Qualification applies the same group-disposition rule;
+an acknowledged absence retires immediately because it has no counterpart. Repeated engagement
+requests acknowledge the existing incident once. The synchronized
 paper era rebuilds one process-wide latch before boot admissions: `Engaged` sets the latest
 incident, and `Released` must reference that latest engagement. While latched, frames wait for
 history; admitted work completes. `status.json` reports `source_health.feed_latch` and `source_health.feed_incident`, the

@@ -416,12 +416,16 @@ to its frozen frame receipt and `history_group_id` to `activity_groups.source_tr
 `read_proof`. Authenticate each indexed page occurrence against its source envelope. For negative
 audits, join `FeedIncidentChanged.incident.frame_receipt` to the same frame and authenticate
 `deciding_commitment_receipt` plus any `counterpart_identity`; preserve the proof even with empty
-bindings. A retained authenticated counterpart, matched or contradicted, survives until its recorded
-target is durably disposed, even when a later mature full-history read is empty. Incident engagement precedes routing of the deciding read, including retained-read recovery,
-and is separate from completion of that target's disposition and late-group re-anchor.
-Qualification keeps an engaged contradiction unresolved until its binding's exact revision is
-disposed; an engaged absence retires immediately. After a binding or negative counterpart identity is fixed,
-only authenticated restamp equivalence can change its identifier; another leg of the same transaction
+bindings. A retained authenticated counterpart, matched or contradicted, stays fixed even when a
+later mature full-history read is empty. Its audit retires once the conclusion is recorded
+(a negative conclusion acknowledged by the orchestrator) and that counterpart group has a durable
+disposition under any revision. Incident engagement precedes routing of the deciding read,
+including retained-read recovery, and is separate from completion of that target's disposition and late-group re-anchor.
+Production, boot and qualification apply this same group-disposition rule. An authenticated
+match outranks a later absence, but a contradiction concluded before the counterpart group is
+disposed still engages the latch. Changed revisions follow REST's existing revision routing and
+fence. An acknowledged absence retires immediately because it has no counterpart. After a binding
+or negative counterpart identity is fixed, only authenticated restamp equivalence can change its identifier; another leg of the same transaction
 must retain its own routing. After an absence incident, the first uniquely resolved later
 authenticated same-transaction group is the frame's late counterpart, using the canonical glossary's asset-disambiguation and
 ambiguity rule: one ledger effect, no second decision. Its first binding fixes that counterpart

@@ -9987,7 +9987,7 @@ mod tests {
         sources.push((
             admission_receipt,
             RecordedEconomicSource {
-                payload: crate::frame_admission::canonical_bytes(
+                payload: crate::bucket_commit::canonical_json(
                     &crate::frame_admission::FrameAdmissionArtifact::from_inputs(&inputs).unwrap(),
                 )
                 .unwrap(),
@@ -10123,7 +10123,7 @@ mod tests {
                 .find(|(receipt, _)| *receipt == proof.admission_receipt)
                 .unwrap()
                 .1
-                .payload = crate::frame_admission::canonical_bytes(
+                .payload = crate::bucket_commit::canonical_json(
                 &crate::frame_admission::FrameAdmissionArtifact::from_inputs(&proof.inputs)
                     .unwrap(),
             )
