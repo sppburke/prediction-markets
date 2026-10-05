@@ -876,6 +876,39 @@ requests retain their recorded floor; new requests record the ranking floor. Ver
 checkout/binary pair and restore the recorded run intent. This Forge release needs no
 `pe-service` restart.
 
+**#730 Part 2 / Phase 2 cutover.** Deploy only after recorded Phase 1 acceptance and the
+owner's consent for this restart. Re-run `scripts/probe_activity_ws.py` and record the source
+re-verification in [15-SOURCES.md](15-SOURCES.md) before deployment. Use the same locked,
+identity-bound swap below: prepare the source checkpoint with the staged binary while the old
+service runs, then activate with one restart. Preserve the existing Start and seal; create
+neither a second Start nor a second seal. Open continuation-6 work resumes under financial
+semantic 2 before the semantic-3 seal check; continuation 7 selects semantic 3. Verify boot
+replay before and after REST reconciliation before deployment, then capture the first frame
+fill's AC15 evidence and the frozen AC16 cohort using
+[the read-only recipe](29-ACTIVITY-LATENCY-MEASUREMENT.md#730-acceptance-measurement).
+
+Reversal to a compatible Phase 1 binary ends at the first continuation-7 pending row or
+incompatible paper-log record, including `FeedIncidentChanged`. A frontier-only metadata write
+or proofless empty-read commitment creates no new reader boundary. Older targets additionally
+require every existing boundary, including Part 1 closure receipts, ordinary-live admissions
+and restamp-pair commitments. Stop and drain before inspecting any boundary: queued shutdown
+work can cross it. After a boundary, preserve all state and fix forward. These conditions also
+govern reversal after a reader failure.
+
+**Feed-incident release (no restart).** Inspect the latest unreleased `FeedIncidentChanged`
+engagement in the verified paper era and authenticate its frame, deciding commitment and any
+counterpart identity. Inspect `status.json` `feed_incident` and `feed_latch` and the
+`feed audit incident engaged; frames wait for history` error line; resolve the cause
+and outstanding audits before releasing. Set the existing optional `service_config` text row
+`risk_halt_release_hash` to that engagement's `this_hash`, using the existing configuration
+editor. A successful economically valid poll with a successful seal check routes the release
+through `RiskHaltReleaseHandle::apply`; the owner rechecks the expected engagement immediately
+before synchronizing `FeedIncidentChanged` with `Released`. Verify its `engagement_receipt`
+names the inspected latest engagement and the durable latch is clear, then delete the release
+row. Do not restart. If a newer incident intervenes, the queued older release changes nothing;
+inspect and resolve the new incident before setting its hash. Malformed, stale or repeated
+values cannot release, and independent risk halts require their own matching release.
+
 Every step is bound to the embedded full Git revision plus exact binary bytes (#544). The binary
 reports `revision=<40-hex> config_identity=runtime-applied`; `--verify-staged-identity` checks that
 revision and the executable's BLAKE3 digest before staging. Continue to use sha256 for the existing
@@ -1048,14 +1081,18 @@ comparisons decide what remains; never guess from memory.
    `wf|leader|source_trade_id|…` idempotency key), and `dispatch_seeds` (keyed by the dispatch id
    derived from it) are all primary-keyed on the trade's own identity, and acceptance scenario R6
    proves three copies produce one row each — so the post-deploy check is identifier-bound: for any
-   watched `source_trade_id` observed after activation, expect `seen=1`, `fills<=1`, `seeds<=1`, and
-   `no_copy<=1` with `fills+no_copy<=1`; otherwise record `not observed`.
+   watched `source_trade_id` observed after activation, expect `seen=1`, except that a
+   continuation-7 frame fill keeps `seen=0` until an equal-identifier REST group commits (frame
+   no-fill and no-copy terminals mark it seen); an aliased counterpart is seen under its own
+   identifier. In every case the bounds remain `fills<=1`, `seeds<=1`, `no_copy<=1` and
+   `fills+no_copy<=1`; a frame decision owns its single terminal even when its equal-ID echo arrives before that terminal. Otherwise record
+   `not observed`.
 
    ```bash
    id=<source_trade_id>
    sqlite3 -readonly -header paper_state.db "select (select count(*) from seen_trades where source_trade_id='$id') as seen, (select count(*) from fills where idempotency_key like 'wf|%|$id|%') as fills, (select count(*) from dispatch_seeds where source_trade_id='$id') as seeds, (select count(*) from no_copy_dispositions where source_trade_id='$id') as no_copy;"
    ``` If the second publication cannot
-   establish two live readers, stop and drain, then reverse the swap only if the #730 Part 1
+   establish two live readers, stop and drain, then reverse the swap only if the #730 Part 2, Part 1
    and all existing [rollback prerequisites](#rollback) permit it; otherwise preserve state and
    fix forward instead of waiting. Record the readers'
    `consecutive_reconnects` and drop cadence: a churn pattern is the evidence for any keepalive
@@ -1225,6 +1262,14 @@ Credential, venue, financial, resolver, source, risk, and redemption checks appl
 do not change the owner's requested mode.
 
 ## Rollback
+
+**#730 Part 2 compatibility prerequisite:** stop and drain before inspection. A compatible
+Phase 1 target is available only before the first continuation-7 pending row or incompatible
+paper-log record, including a feed incident. Frontier-only metadata and proofless empty-read
+commitments do not cross this boundary. An older target must also satisfy the Part 1
+closure-receipt, ordinary-live-admission and restamp-pair boundaries and every prerequisite
+below. Reader failures do not waive these conditions; after a boundary preserve state and fix
+forward without deleting records or restoring stale state.
 
 **#595 paper-service compatibility boundary:** preserve state and fix forward for this rollout
 until boot compatibility with the previous executable is proved. A filtered membership record

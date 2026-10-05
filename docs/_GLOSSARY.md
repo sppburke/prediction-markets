@@ -454,7 +454,7 @@ Campaign financial limits and eligibility are canonical in
 
 ### Copy-entry gate (first-ever BUY entry; issues #290, #339)
 
-Copies only a leader's first-ever BUY entry into a market that resolves within the configured horizon. Version-two `wallet_market_history_v2`, `entry_gate_results`, and `wallet_history_status_v2` rows in paper-state are the sole runtime history owner; `CopyEntryGate` is rebuilt from them before producers. Missing or incomplete reconciled history blocks membership publication. The captured legacy history file is a one-time migration input selected by boot-owned `legacy_wallet_history_path`: its source hash and import result are durable; it must stay present and unchanged until the migration reaches phase `installed`, after which file edits are inert. It is not a runtime sidecar. SELLs remain non-consuming.
+Copies only a leader's first BUY entry into a market that resolves within the configured horizon. Complete-read authority proves the first-ever entry from attributable history; continuation-7 `activity_frame` authority uses the first qualifying admission-time knowledge described below. Version-two `wallet_market_history_v2`, `entry_gate_results`, and `wallet_history_status_v2` rows in paper-state are the sole runtime history owner; `CopyEntryGate` is rebuilt from them before producers. Missing or incomplete reconciled history blocks membership publication. The captured legacy history file is a one-time migration input selected by boot-owned `legacy_wallet_history_path`: its source hash and import result are durable; it must stay present and unchanged until the migration reaches phase `installed`, after which file edits are inert. It is not a runtime sidecar. SELLs remain non-consuming.
 
 “History complete” means complete over attributable rows: rows whose asset no configured metadata authority can verify are recorded `raw_only` and cannot contribute a market to first-entry history.
 
@@ -494,15 +494,19 @@ Validator-free admission still requires complete history. Direct boot retains se
 promotion through `mark_seeded_history_validated`; installing an anchor alone does not complete
 an unseeded wallet's history.
 
-Activity groups in one wallet/epoch bucket commit atomically against immutable pre-bucket gate
-state. A single first BUY consumes history even if a later copy gate rejects it; multiple
-same-market candidates in one second are all recorded as ambiguous. `decision_pending` bridges
+Complete-read activity groups in one wallet/epoch bucket commit atomically against immutable pre-bucket gate
+state. A single first BUY consumes history even if a later copy gate rejects it. Continuations
+through 6 record multiple same-market candidates in one second as ambiguous. Continuation-7
+complete reads treat homogeneous same-wallet, market, second and outcome BUY pieces as one entry:
+only the minimum-source-ID representative is admitted, its order-dependent suppression is cleared,
+every real aggregate applies once, and history is consumed once. Mixed outcomes remain
+`AmbiguousFirstEntrySameSecond`. `decision_pending` bridges
 the durable ledger/gate/history commit to the later production-only continuation: `open` is
 closed only by a terminal disposition, and replay consumes the recorded transition without
 executing the continuation. Receipt-bearing continuations pair `ActivityWs` provenance with a
 websocket source receipt exactly; REST provenance has no websocket receipt. A changed semantic
 revision, unprovable activity, invalid mapping,
-or ledger arithmetic failure creates a durable `wallet_fences` row. Fenced wallets are removed
+or ledger arithmetic failure in history reconciliation creates a durable `wallet_fences` row. Fenced wallets are removed
 from effective membership/projection and cannot copy. Only the atomic anchor recovery described
 above can clear an eligible fence; unsafe or unprovable fences remain quarantined.
 
@@ -515,6 +519,7 @@ above can clear an eligible fence; unsafe or unprovable fences remain quarantine
 | 4 | Activity-page schema 3 / parser 2 | Envelope schema 1 / parser 1 / payload 1 / domain `prediction-edge/activity-read-commitment/v1` | Legacy complete-second proof. |
 | 5 | Activity-page schema 3 / parser 2 | Envelope schema 2 / parser 1 / payload 2 / domain `prediction-edge/activity-read-commitment/v2`, with observation bindings | Frozen `PaperFreshnessPolicy`, repaired complete-second proof, and precise final paper Prepared freshness clock. |
 | 6 | Same source and commitment contract as 5 | Same payload-2 commitment and authenticated observation bindings as 5 | Paper financial semantic 2: delay-tolerant paper admission, current-book ladder without a leader-price ceiling, signed ladder intent limit, and economic wire 2. Checkpoint and terminal-evidence wire numbers remain unchanged. |
+| 7 | `source_authority` is required: `activity_frame` or `complete_read`; historical encodings omit it | Complete reads retain the payload-2 contract; frames freeze their authenticated receipt and admission prefix without decision-time REST pages or target | Paper financial semantic 3: receipt-order frame decisions, per-wallet first entries without a cross-leader paper hold, partial Dollar sizing, one per-ask band check and no decision mid gate. |
 
 The first durable payload-2 commitment is itself a compatibility-boundary write: the poller
 appends it before bucket application and boot authenticates it, so a reader without the v2
@@ -533,13 +538,83 @@ strict budget comparison.
 
 Pre-Start continuation 2 retains its field-free semantic-0 evidence bytes and legacy hash.
 Start-bound continuations 2–5 retain semantic 1 and their recorded price and admission policy.
-Continuation 6 binds semantic 2 in checkpoint and terminal evidence; a pre-economic no-fill
-contains no economic record. Paper semantic 2 and ordinary live select economic wire 2 and hash
-that exact wire; historical live records retain economic wire 1. A later fresh-generation seal can
+`DecisionContinuationV3::financial_semantic` owns the mapping: continuations 2–5 → 1, 6 → 2,
+7 → 3. Legacy field-free evidence retains semantic 0. Continuations 6 and 7 bind their semantic
+in checkpoint and terminal evidence; a pre-economic no-fill contains no economic record.
+Paper semantics 2 and 3 and ordinary live select economic wire 2 and hash
+that exact wire; historical live records retain economic wire 1. Checkpoint wire 4,
+terminal-evidence wire 5 and economic wires 1/2 are unchanged. A later fresh-generation seal can
 select continuation-6 receipt proof under the same source-prefix rules as continuation 5.
 The isolated live-wrapper qualification check compares historical wire-1 economics with the same
 recorded paper fields expressed as wire 1, and compares wire-2 economics directly with paper wire 2.
 The paper wire-2 core hash remains separately bound in both cases.
+
+**Frame authority (#730 Part 2).** After source synchronization, the first qualifying frame in
+receipt order is classified against the admission-time confirmed ledger, consumed history and
+earlier frames. Only positive-share, non-combo BUY Entries from copy-eligible, history-complete,
+unfenced wallets without a re-anchor requirement can enter, with a current frontier and clear
+feed latch. An earlier unresolved BUY blocks later frames of that wallet/market only; REST
+winning first consumes history before frame admission. The frame transaction writes gate,
+wallet-market history and pending decision together. Later declines never undo consumption.
+Frames create no activity-group/revision rows, leader-balance effects or delivery-cursor progress.
+REST applies and binds each authenticated counterpart once, including aliases, without another
+decision or any change to the frame's pending row, terminal or Prepared inputs. This suppression
+survives negative audits, release and restart; equal identifiers retain the frame-owned gate and
+single terminal. A later-discovered earlier BUY with a different verified identity is audit-only:
+it neither latches nor changes the decision; genuine late arrivals retain causal re-anchoring.
+
+First-entry history is per wallet and market. Continuation 7 copies each wallet's first entry
+whatever the paper book holds there, on the same or opposite outcome; a held-outcome fill
+accumulates and leader statistics remain per fill. Continuations through 6 retain the
+outcome-keyed `paper_held` check. Only continuation-7 paper Dollar decisions use `BuySizing::DollarUpTo`:
+sign the lesser of requested principal and collateral-rounded in-band capacity once, preserving
+fee reserve, affordability, caps and the admission minimum. Below-minimum signed shares return
+`BelowMinimum`; intent contracts must equal the checked whole-contract conversion of signed
+shares. Historical paper, ordinary live and backtest retain `Dollar`; Kelly and Contract remain
+exact-or-decline. Economic wire 2 alone never selects partial sizing.
+
+**Feed history frontier and audit.** Versioned `FeedHistoryFrontier` values under the
+`feed_history_frontiers` key in `meta` authenticate the latest contiguous complete read's fixed end H,
+commitment, pages and occurrences. Publish only after every bucket acknowledgement, without
+crossing unmatched obligations; launches, failed acknowledgements and incomplete reads never
+advance H. Empty reads first persist a proofless payload-2 commitment. Authenticate restored
+frontiers and freeze their bounds in admission inputs. For frame receipt r and admission a,
+history is required if H is absent, H > r, a − H exceeds `poll_round_stale_secs`, or an earlier
+wallet obligation has waited longer than that bound. `poll_round_stale_secs` is boot-resolved as
+3 × `trade_poll_interval_secs` and frozen in `FrameAdmissionInputs`; equality passes. It is not a
+new configuration key.
+
+An admitted frame remains an audit obligation, even after fencing, until matched, contradicted
+or absent. Its frozen receipt cannot be replaced by another observation of the same identity.
+Discover counterparts by authenticated wallet/transaction and asset disambiguation before side
+comparison, preserving verified bindings, restamp equivalence and ambiguity. A match confirms
+an ordinary positive-share TRADE with the same effective side, condition and outcome; combo,
+zero-share or disagreeing counterparts contradict. Positive quantity, price and time differences
+are audit facts. Absence matures at frozen frame source time + `copy_latency_budget_secs`:
+search retained authenticated counterparts first, then require a successful complete `(0, fixed_end]`
+read ending at or after maturity. Cursor-bounded, immature or failed reads prove no absence;
+negative audits retain the deciding commitment's proof, including empty bindings.
+
+**Feed incidents and history fallback.** `PaperLogRecord::FeedIncidentChanged { incident, state }`
+journals contradiction or absence before the audit ordering barrier retires. The synchronized
+paper era rebuilds one process-wide latch before boot admissions: `Engaged` sets the latest
+incident, and `Released` must reference that latest engagement. While latched, frames wait for
+history; admitted work completes. `status.json` reports `feed_latch` and `feed_incident`, the
+structured error `feed audit incident engaged; frames wait for history` carries the same
+incident, and qualification checks each frame's frozen latch basis against its paper prefix.
+Release uses
+only the existing `risk_halt_release_hash` row and the latest unreleased engagement's `this_hash`.
+The owner rechecks that identity immediately before durable release; a newer incident makes a
+queued older release a no-op. Independent risk halts retain their own release path; malformed,
+stale or repeated values and restart cannot clear the latch.
+
+A qualifying frame routed to history appends one versioned audit-only artifact under
+`pe-service.activity-frame-fallback`, with `frame_receipt`, `routing_clock`, typed `reason`,
+evaluated `frontier` and `latest_incident_basis`. `FrameFallbackReason` encodes `latched`,
+`history_behind`, `earlier_unresolved_buy` or `wallet_not_ready`. Wallet and market are derived
+from the authenticated frame. This artifact consumes no entry and is not a decision input;
+measure routing from the earliest authenticated artifact per frame, never current status.
+`pe-service.activity-frame-admission` authenticates the frozen frame admission inputs.
 
 **History-only bracket disposition.** `history_only_bracket` (`HISTORY_ONLY_BRACKET`) records an
 admitted first entry whose copying a causal bracket suppresses. It is an applied activity
@@ -580,9 +655,10 @@ their typed error are status evidence, not a second revision.
 After `QualificationStarted`, optional text row `risk_halt_release_hash` is incident control, not
 economic configuration. The boot and poll paths partition it before exact-key parsing and exclude
 it from the applied economic hash. A value must be exactly 64 lowercase hexadecimal characters
-and name the append hash of the currently active `RiskHaltChanged` engagement. It may release only
-that same absolute-loss cause, or a latency cause held by a missing sample; the synchronized
-release consumes it. Missing, empty, malformed, stale, already-consumed, or cause-mismatched
+and name the append hash of the latest unreleased feed engagement or a currently active
+`RiskHaltChanged` engagement. A feed release clears only the process-wide feed latch; a risk
+release may release only that same absolute-loss cause, or a latency cause held by a missing
+sample; the synchronized release consumes it. Missing, empty, malformed, stale, already-consumed, or cause-mismatched
 values only warn and change neither economics nor halt state.
 
 The guarded operator migration removes these database rows while preserving the corresponding
@@ -599,10 +675,10 @@ the exact hot or removal sets stops `scripts/migrate_service_config_544.sql` bef
 
 | Key | Default | Meaning |
 |---|---:|---|
-| `max_fill_price` | `0.85` | Hot decimal value. The signed ladder's worst accepted tick must be strictly below this ceiling. Paper semantic 2 and ordinary live use the applied best-ask price-impact ceiling without a leader-price ceiling. `0` disables this band edge, not the mandatory book gate. |
+| `max_fill_price` | `0.85` | Hot decimal value. The signed ladder's worst accepted tick must be strictly below this ceiling. Paper semantics 2 and 3 and ordinary live use the applied best-ask price-impact ceiling without a leader-price ceiling. `0` disables this band edge, not the mandatory book gate. |
 | `min_fill_price` | `0.15` | Hot decimal value, added at the 2026-07-03 run28 cutover. Skip a BUY copy whose resolved fill basis is `<` this so selection and deployment share the entry band. The boundary itself fills (strict `<` skip). `0` disables this band edge, not the mandatory book gate. |
 
-Paper semantic 2 admits otherwise valid markets with positive or absent matching delay. Ordinary
+Paper semantics 2 and 3 admit otherwise valid markets with positive or absent matching delay. Ordinary
 live re-reads each staged target through strict admission and refuses either delay before an order
 request. Both paths retain state, token mapping, minimum size, tick, freshness, and compact-fee
 checks. The isolated V2 canary keeps its separate admission and price contract.

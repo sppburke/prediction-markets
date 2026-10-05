@@ -108,7 +108,7 @@ Harnesses: `scripts/probe_activity_ws.py` (feed discovery/attribution re-check),
 relying on the feed (officially listed endpoint; the first-party client publishes
 the subscription/payload contract; no published continuity guarantee — `docs/15`).
 
-## #730 Part 1 acceptance measurement
+## #730 acceptance measurement
 
 Use [#730 AC10](https://github.com/sppburke/prediction-markets/issues/730) for the fill-cohort
 size and latency acceptance bounds. The measurements below are the audit recipe, not a claim
@@ -176,3 +176,277 @@ canonical closed-mark rule. A usable in-lookback sample with valid closure proof
 an invalid midnight mark; cases lacking that evidence retain their recorded fail-closed cause.
 Post the audit results to #730, then the final results to #588 and #530; issue closure waits for
 AC16. This recipe authorizes no production mutation or live order.
+
+**Part 2 AC15/AC16.**
+
+AC15 checks the first post-deploy continuation-7 frame fill before and after its REST counterpart
+commits. AC16 freezes the earliest qualifying post-deploy frame-fill cohort **before** inspecting
+clocks; cohort size and stage bounds come from [#730 AC16](https://github.com/sppburke/prediction-markets/issues/730).
+Do not replace a cohort member with a later fill when evidence is missing or a span is invalid.
+Keep each row's continuation, source authority, applied configuration hash, Start identity and
+source/paper prefix identities. Preserve the Part 1 population and causal audit above, with the
+[continuation-7 authority rules](_GLOSSARY.md#continuation-and-commitment-compatibility-588):
+frame fills prove admission-time first-entry knowledge; REST fills prove complete-history first
+entry. Replaced thin-book/VWAP refusals and a cross-leader paper hold cannot excuse Phase 2 misses.
+
+Use captured, verified finite log prefixes and a consistent `paper_state.db` snapshot containing
+its committed WAL state. The deployment capture must identify the first source sequence after
+activation; do not infer it from trade epochs. Retain verification receipts and physical prefix
+bounds with the capture. Record identities and run this inspection, substituting the deployment
+source sequence and cohort size (one fill for AC15; the AC16 size for latency acceptance).
+It opens SQLite with `mode=ro` and `query_only`, reads logs as bytes, and prints to stdout.
+The decoder requires system `libzstd`; it checks framing/CRC, joins ordinary TRADE rows by the
+canonical `g2:` component encoding (using `b3sum`), and preserves envelope receipts. It does not
+replace the Rust log verifier or authority-specific semantic verification. Do not run normal service boot, `--report`, recovery or checkpoint
+preparation as part of this read-only audit.
+
+```bash
+sha256sum paper_state.db source_events.log paper.log
+stat -c '%s %n' paper_state.db source_events.log paper.log
+python3 - paper_state.db source_events.log paper.log <deploy-source-sequence> <AC16-cohort-size> <<'PY'
+import calendar, ctypes, ctypes.util, hashlib, json, re, sqlite3, statistics, struct, subprocess, sys, time, zlib
+from datetime import datetime
+from decimal import Decimal
+from pathlib import Path
+
+z = ctypes.CDLL(ctypes.util.find_library("zstd"))
+for name, args in (("ZSTD_decompressBound", [ctypes.c_void_p, ctypes.c_size_t]),
+                   ("ZSTD_decompress", [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t]),
+                   ("ZSTD_isError", [ctypes.c_size_t])):
+    fn = getattr(z, name); fn.argtypes = args; fn.restype = ctypes.c_size_t
+
+def read_prefix(path):
+    raw = Path(path).read_bytes(); assert raw[:5] == b"EDGE\x01", (path, "header")
+    offset = 5; envelopes = {}
+    while offset < len(raw):
+        assert offset + 4 <= len(raw), (path, "incomplete header", offset)
+        size = struct.unpack_from("<I", raw, offset)[0]; end = offset + 4 + size
+        assert end + 4 <= len(raw), (path, "incomplete frame", offset)
+        block = raw[offset + 4:end]
+        assert zlib.crc32(block) == struct.unpack_from("<I", raw, end)[0], (path, offset)
+        capacity = z.ZSTD_decompressBound(block, len(block))
+        assert not z.ZSTD_isError(capacity), (path, offset)
+        out = ctypes.create_string_buffer(capacity)
+        length = z.ZSTD_decompress(out, capacity, block, len(block))
+        assert not z.ZSTD_isError(length), (path, offset)
+        e = json.loads(out.raw[:length]); assert e["seq"] not in envelopes
+        envelopes[e["seq"]] = e; offset = end + 4
+    tail = envelopes[max(envelopes)] if envelopes else None
+    print(path, len(raw), hashlib.sha256(raw).hexdigest(),
+          None if tail is None else (tail["seq"], tail["this_hash"]))
+    return envelopes
+
+def payload(e):
+    return json.loads(bytes(e["payload"]), parse_float=Decimal)
+
+def receipt(index, r):
+    e = index[r["sequence"]]; assert e["this_hash"] == r["this_hash"]
+    return e
+
+def ns(value):
+    base, fraction, zone = re.fullmatch(r"(.{19})(?:\.(\d+))?(Z|[+-]\d\d:\d\d)", value).groups()
+    d = datetime.fromisoformat(base + ("+00:00" if zone == "Z" else zone))
+    return calendar.timegm(d.utctimetuple()) * 10**9 + int((fraction or "").ljust(9, "0"))
+
+audit_unix_ns = time.time_ns(); print("audit clock", audit_unix_ns)
+source = read_prefix(sys.argv[2]); paper = read_prefix(sys.argv[3])
+db = sqlite3.connect(Path(sys.argv[1]).resolve().as_uri() + "?mode=ro", uri=True)
+db.row_factory = sqlite3.Row; db.execute("PRAGMA query_only=ON"); db.execute("BEGIN")
+print("Start", [tuple(r) for r in db.execute(
+    "SELECT key,value FROM meta WHERE key IN ('financial_start_seq','financial_start_hash')")])
+cohort = list(db.execute("""
+SELECT f.*, d.source_trade_id, d.semantic_revision, d.wallet_hex,
+       d.frozen_inputs_json, d.post_commit_inputs_json, d.state, d.terminal_disposition,
+       g.result, g.history_consumed, h.first_epoch
+FROM fills AS f
+JOIN decision_pending AS d
+  ON f.source_receipt_seq = json_extract(d.frozen_inputs_json,'$.observed_source_receipt.sequence')
+ AND f.source_receipt_hash = json_extract(d.frozen_inputs_json,'$.observed_source_receipt.this_hash')
+LEFT JOIN entry_gate_results AS g ON g.source_trade_id = d.source_trade_id
+LEFT JOIN wallet_market_history_v2 AS h
+  ON h.wallet_hex = d.wallet_hex AND h.market_id = f.market_id
+WHERE json_extract(d.frozen_inputs_json,'$.version') = 7
+  AND json_extract(d.frozen_inputs_json,'$.source_authority') = 'activity_frame'
+  AND f.source_receipt_seq >= ?
+ORDER BY f.prepared_seq, f.idempotency_key LIMIT ?
+""", (int(sys.argv[4]), int(sys.argv[5]))))
+print("FROZEN COHORT", [(r["source_trade_id"], r["idempotency_key"], r["prepared_seq"]) for r in cohort])
+assert len(cohort) == int(sys.argv[5]), "cohort incomplete; acceptance unproven"
+spans = {p: [] for p in ("initial_staleness_gate", "book_staleness_check", "terminal_transition")}
+book_use = []
+for row in cohort:
+    print("decision/fill snapshot", dict(row))
+    c = json.loads(row["frozen_inputs_json"]); t = json.loads(row["post_commit_inputs_json"])
+    frame = receipt(source, c["observed_source_receipt"])
+    assert frame["source_id"] == "polymarket-activity-ws"
+    proof = c["decision_inputs"]; admission = receipt(source, proof["admission_receipt"])
+    assert admission["source_id"] == "pe-service.activity-frame-admission"
+    assert payload(admission) == proof["inputs"]
+    print(row["source_trade_id"], c["source_authority"], c["applied_configuration_hash"],
+          t.get("financial_semantic_version"), proof, row["result"], row["history_consumed"], row["first_epoch"])
+    assert t.get("financial_semantic_version") == 3 and row["history_consumed"] == 1
+    prepared = paper[row["prepared_seq"]]; pp = payload(prepared)
+    final_ref = t.get("terminal", {}).get("final_receipt")
+    if final_ref is None:
+        print(row["source_trade_id"], "missing Final receipt; AC15 unproven")
+    else:
+        final = receipt(paper, final_ref); fp = payload(final)
+        assert pp["record"] == "financial_prepared" and fp["record"] == "financial_final"
+        assert receipt(paper, fp["prepared_receipt"]) == prepared
+        economic = pp["payload"]["economic"]; canonical = fp["result"]["canonical"]
+        assert pp["payload"]["operation"]["source_trade_id"] == row["source_trade_id"]
+        assert canonical["outcome"] in ("applied", "existing")
+        assert canonical["applied_prepared_seq"] == row["prepared_seq"]
+        assert canonical["quantity"] == economic["sizing"]["expected_shares"]
+        assert canonical["principal"] == economic["sizing"]["principal"]
+        assert canonical["fee"] == economic["fee"]["expected_fee"]
+        assert Decimal(canonical["fill_price"]) == Decimal(economic["sizing"]["expected_vwap"])
+        for column, field in (("quantity_str", "quantity"), ("principal_str", "principal"), ("fee_str", "fee")):
+            assert Decimal(row[column]) == Decimal(canonical[field]) / 10**6
+        assert Decimal(row["fill_price_str"]) == Decimal(canonical["fill_price"])
+        assert economic["applied_configuration_hash"] == c["applied_configuration_hash"]
+        assert receipt(source, economic["observation"]["source_receipt"]) == frame
+        assert receipt(source, economic["observation"]["complete_bound_receipt"]) == frame
+        print(row["source_trade_id"], "Prepared/Final equal", final_ref, economic["book_receipt"])
+    times = {}
+    for purpose in spans:
+        clocks = [v for v in t.get("clocks", []) if v["purpose"] == purpose]
+        if len(clocks) != 1:
+            print(row["source_trade_id"], purpose, "missing/duplicate clock"); continue
+        clock = clocks[0]
+        instant = clock["unix_millis"] * 10**6 + (clock.get("submillisecond_nanos") or 0)
+        value = instant - ns(frame["received_at"])
+        if value < 0 or instant > audit_unix_ns or (purpose == "terminal_transition" and final_ref is None):
+            print(row["source_trade_id"], purpose, "invalid span", value); continue
+        times[purpose] = instant; spans[purpose].append(Decimal(value) / 10**6)
+    if all(p in times for p in ("initial_staleness_gate", "book_staleness_check")):
+        value = times["book_staleness_check"] - times["initial_staleness_gate"]
+        if value >= 0: book_use.append(Decimal(value) / 10**6)
+        else: print(row["source_trade_id"], "invalid decision-start to book-use span", value)
+    print(row["source_trade_id"], "feed delay ms",
+          Decimal(ns(frame["received_at"]) - ns(frame["observed_at"])) / 10**6)
+for purpose, values in spans.items():
+    values.sort(); n = len(values)
+    print(purpose, "n", n, "missing/invalid", len(cohort) - n,
+          "median/p95/max ms", None if not n else
+          (statistics.median(values), values[(95 * n + 99) // 100 - 1], values[-1]))
+print("decision-start to book-use ms", len(book_use),
+      None if not book_use else statistics.median(book_use), "missing/invalid", len(cohort) - len(book_use))
+fallbacks = {}
+for e in sorted(source.values(), key=lambda e: e["seq"]):
+    if e["source_id"] == "pe-service.activity-frame-fallback":
+        a = payload(e); r = a["frame_receipt"]; frame = receipt(source, r)
+        assert e["schema_version"] == 1 and e["parser_version"] == 1 and a["version"] == 1
+        assert frame["source_id"] == "polymarket-activity-ws"
+        assert a["reason"] in ("latched", "history_behind", "earlier_unresolved_buy", "wallet_not_ready")
+        key = (r["sequence"], r["this_hash"])
+        if key not in fallbacks:
+            fallbacks[key] = a
+            print("earliest fallback", e["seq"], e["this_hash"], a, payload(frame))
+    elif e["source_id"] in ("pe-service.activity-read-commitment", "polymarket-public.activity-reconciliation"):
+        print(e["seq"], e["this_hash"], e["source_id"], payload(e))
+start_seq = int(db.execute("SELECT value FROM meta WHERE key='financial_start_seq'").fetchone()[0])
+for e in paper.values():
+    if e["seq"] > start_seq and payload(e).get("record") == "feed_incident_changed":
+        print(e["seq"], e["this_hash"], payload(e))
+groups = {r["source_trade_id"]: dict(r) for r in db.execute("SELECT * FROM activity_groups")}
+keys = {}; matched = set(); legs = {}
+for e in source.values():
+    if e["source_id"] != "polymarket-public.activity-reconciliation": continue
+    assert e["schema_version"] == 3 and e["parser_version"] == 2
+    for r in payload(e):
+        if r.get("type", r.get("activity_type", "")).strip().upper() != "TRADE": continue
+        wallet = r.get("proxyWallet", r.get("proxy_wallet", "")).strip().lower()
+        tx = r.get("transactionHash", r.get("transaction_hash", "")).strip().lower()
+        condition = r.get("conditionId", r.get("condition_id"))
+        condition = None if condition is None else condition.strip() or None
+        asset = r.get("asset"); asset = None if asset is None else asset.strip() or None
+        outcome = r.get("outcomeIndex", r.get("outcome_index")); label = (r.get("outcome") or "").strip()
+        side = r.get("side"); side = None if side is None else side.strip() or None
+        parts = [b"prediction-edge/source-polymarket-public/activity-group/v2\0", b"TRADE",
+                 wallet.encode(), tx.encode(), None if not condition else condition.strip().lower().encode(),
+                 None if not asset else asset.strip().encode(),
+                 None if outcome is None or (int(outcome) == 999 and not label)
+                 else int(outcome).to_bytes(2, "big"), None if not side else side.strip().upper().encode()]
+        encoded = b"".join((b"\0" + bytes(8)) if v is None else b"\1" + len(v).to_bytes(8, "big") + v for v in parts)
+        if encoded not in keys:
+            keys[encoded] = "g2:" + subprocess.check_output(["b3sum"], input=encoded).decode().split()[0]
+        key = keys[encoded]
+        if key not in groups: continue
+        g = groups[key]; assert g["wallet_hex"] == wallet and g["transaction_hash"] == tx
+        matched.add(key); legs.setdefault((wallet, tx), set()).add(key)
+        print("REST full-identity join", key, e["seq"], e["this_hash"], g, r)
+        for row in cohort:
+            c = json.loads(row["frozen_inputs_json"])
+            if (wallet == row["wallet_hex"] and parts[4] == c["market_id"].encode()
+                and parts[7] == b"BUY" and key != row["source_trade_id"] and g["source_epoch"] < c["source_epoch"]):
+                print("earlier BUY candidate; verify restamp equivalence", row["source_trade_id"], key, g, r)
+print("unmatched group identities; resolve from authenticated corrections or report unknown", sorted(set(groups) - matched))
+print("multi-leg controls", [(w, tx, sorted(ids)) for (w, tx), ids in legs.items() if len(ids) > 1])
+db.close()
+PY
+```
+
+The `FROZEN COHORT` line is the identity list to retain for all later calculations. Report every
+stage's available count, median, nearest-rank p95 (rank `ceil(0.95 × n)`) and maximum, missing
+clocks and invalid spans. A short cohort or any missing required span leaves latency acceptance
+unproven. Separately report frame-to-book receipt from the authenticated `book_receipt`,
+decision-start to `book_staleness_check`, trade-time spans and feed delay; do not substitute
+whole-second epochs, revision times, admission clocks, Prepared or Final envelope timestamps
+for missing stage clocks. `terminal_transition` is the post-sync fill endpoint. Annotate recovered
+work and queueing; retain the first synchronized frame receipt rather than another reader's echo.
+
+For AC15, retain the first row's full frozen continuation, terminal, gate/history rows, Prepared
+receipt, Final receipt and exact financial values on both captures. After REST, compare those
+same identities and bytes; one authenticated binding and one leader-ledger effect may be added,
+with no second decision, consumption or financial operation. Before deployment, the production
+recovery scenarios must prove boot replay both before and after reconciliation; this inspection
+never invokes mutating recovery. For each frame audit, join `stream_receipt` (sequence **and** hash)
+to its frozen frame receipt and `history_group_id` to `activity_groups.source_trade_id`, retaining
+`semantic_revision`, `page_occurrence_index`, `page_raw_hash`, the commitment receipt and its
+`read_proof`. Authenticate each indexed page occurrence against its source envelope. For negative
+audits, join `FeedIncidentChanged.incident.frame_receipt` to the same frame and authenticate
+`deciding_commitment_receipt` plus any `counterpart_identity`; preserve the proof even with empty
+bindings. List unresolved audits separately. Reconstruct engagement/release order from the active
+paper era, including each `engagement_receipt`, and compare the frozen admission latch basis;
+current status is supplementary evidence only.
+
+For REST-decided first entries, search the verified source prefix for the trade's frame, including
+authenticated corrections/restamp equivalence. No recorded frame means **feed-missed**. Otherwise
+use the earliest authenticated `pe-service.activity-frame-fallback` artifact per `frame_receipt`,
+ordered by artifact source sequence: report its `reason`, `routing_clock`, evaluated `frontier`
+and `latest_incident_basis`. Derive wallet/market from the referenced frame, not artifact fields.
+Keep `latched`, `history_behind`, `earlier_unresolved_buy` and `wallet_not_ready` separate;
+a frame with no justified routing artifact is unexplained, never inferred from current status.
+
+Later-discovered earlier entries require `activity_groups` **and** recorded REST page rows, because
+late/raw-only `proof_json` can omit market and side. Read the candidate groups and a multi-leg
+control from the same snapshot:
+
+```bash
+sqlite3 -readonly -header -json paper_state.db <<'SQL'
+BEGIN;
+SELECT source_trade_id, activity_type, wallet_hex, transaction_hash, source_epoch,
+       semantic_revision, disposition, proof_json FROM activity_groups ORDER BY rowid;
+SELECT wallet_hex, transaction_hash, count(DISTINCT source_trade_id) AS legs
+FROM activity_groups GROUP BY wallet_hex, transaction_hash
+HAVING count(DISTINCT source_trade_id) > 1 ORDER BY wallet_hex, transaction_hash;
+COMMIT;
+SQL
+```
+
+Decode the referenced authenticated `polymarket-public.activity-reconciliation` pages with the
+same prefix reader. Normalize through the recorded parser/schema contract and derive the full
+`g2:` identity with `SourceActivityGroupId::derive`: activity type, wallet, transaction hash,
+condition, asset, outcome and side. Join that key to `activity_groups.source_trade_id`; never
+join on transaction hash alone. Keep page receipt and row identity alongside each match, using
+verified bindings/restamp pairs for corrected identities and equivalent twins. Before using this
+join, check a printed `multi-leg controls` transaction against the control query: each distinct
+leg must match only its own full identity; retain the transaction, pages and resulting keys as evidence.
+Without that control the earlier-entry audit is unproven. List same-wallet, frame-consumed-market
+BUYs whose verified identity differs from the admitted trade and whose REST epoch precedes it;
+they neither latch nor change that frame decision. List homogeneous same-second pieces, mixed
+outcomes, both-outcome exposure and all routing/refusal causes for every first-entry BUY in recorded
+membership, including removed wallets and all prices. Unexplained misses, duplicate history or
+ledger effects, unaudited frame decisions and unlatched contradictions fail AC16. Post results to
+#588 and #530 and close #730 only after AC16.
