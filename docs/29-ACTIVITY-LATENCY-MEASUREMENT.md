@@ -288,7 +288,8 @@ SELECT source_trade_id, wallet_hex, frozen_inputs_json FROM decision_pending
 WHERE json_extract(frozen_inputs_json,'$.version') = 7
   AND json_extract(frozen_inputs_json,'$.source_authority') = 'activity_frame'
   AND json_extract(frozen_inputs_json,'$.decision_inputs.admission_receipt.sequence') >= ?
-""", (int(sys.argv[4]),)))
+  AND source_epoch >= ? AND source_epoch < ?
+""", (int(sys.argv[4]), window_start, window_end)))
 assert len(cohort) == int(sys.argv[5]), "cohort incomplete; acceptance unproven"
 spans = {p: [] for p in ("initial_staleness_gate", "book_staleness_check", "terminal_transition")}
 book_use = []; book_receipt_spans = []; trade_time_spans = []

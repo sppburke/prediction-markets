@@ -801,16 +801,15 @@ mod tests {
     #[test]
     fn dollar_up_to_zero_rounded_capacity_is_below_minimum() {
         // 0.000001 shares at 0.15 is 0.00000015 of capacity, which floors to zero collateral.
+        // Assert the planner itself: `plan_sized_buy` also maps `NothingAffordable` upward.
         let asks = [level(dec!(0.15), dec!(0.000001))];
         let budget = CollateralAmount::from_decimal_exact(dec!(25)).unwrap();
         assert_eq!(
-            plan_sized_buy(
+            plan_principal_buy_with_scale(
                 &asks,
-                CompactFeeSchedule::Zero,
-                BuySizing::DollarUpTo { budget },
-                &[budget],
-                ShareAmount::from_whole(5).unwrap(),
-                price(dec!(0.01)),
+                budget,
+                4, // signed-share scale for a 0.01 tick (tick scale 2 + 2)
+                Some(ShareAmount::from_whole(5).unwrap()),
                 price(dec!(0.15)),
                 price(dec!(0.85)),
                 Price::ONE,
