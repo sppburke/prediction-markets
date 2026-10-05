@@ -289,9 +289,10 @@ decodes them on access. It counts bindings to observations before the capture an
 an admitted frame decision or an audited identity. For each market whose earliest captured BUY is not
 before the window, it reads recorded BUYs at or before that stamp from `activity_groups` effects
 before applying the window: an identity seen in the capture keeps its earliest stamp, as the
-whole-prefix reader does, and any other identity is an earlier or same-second entry in that market.
-When such an entry is the market's first entry inside the window, its source evidence lies outside
-the capture: the inspection reports it as unknown and acceptance stays unproven. It also reports raw-only
+whole-prefix reader does, and any other identity, including a captured one whose recorded effect
+corrects it to this market, is an earlier or same-second entry in that market. When such an entry is
+the market's first entry inside the window, the capture holds no source evidence for it in that
+market: the inspection reports it as unknown and acceptance stays unproven. It also reports raw-only
 groups it cannot attribute to a market. `ac16-population.json` keeps the cohort boundary under its
 historical key `deploy_source_seq`.
 It opens SQLite with `mode=ro` and `query_only`, uses autocommit reads on the captured
@@ -594,6 +595,9 @@ first = {}
 for b in buys.values():
     k = (b["wallet"], b["market"]); first[k] = min(first.get(k, b["epoch"]), b["epoch"])
 unattributable = {}; restamped = []; unknown = []
+def captured(sid, wallet, market):
+    # Captured evidence for this pair: a recorded market correction is not the captured identity.
+    b = buys.get(sid); return b is not None and (b["wallet"], b["market"]) == (wallet, market)
 for (wallet, market), epoch in list(first.items()):
     if epoch < window_start: continue  # stamps only move earlier: this first entry precedes the window
     # Recorded BUYs at or before the captured first stamp: an identity seen in the capture keeps its
@@ -605,14 +609,14 @@ for (wallet, market), epoch in list(first.items()):
             "AND json_extract(proof_json,'$.effect.market')=? AND CAST(json_extract(proof_json,'$.effect.amount') AS INTEGER) > 0 "
             "AND source_epoch <= ?", (wallet, market, epoch)))
     for sid, recorded in earlier:
-        if sid in buys and recorded < buys[sid]["epoch"]:
+        if captured(sid, wallet, market) and recorded < buys[sid]["epoch"]:
             restamped.append((sid, buys[sid]["epoch"], recorded)); buys[sid]["epoch"] = recorded
         first[wallet, market] = min(first[wallet, market], recorded)
     entry = first[wallet, market]
     if not window_start <= entry < window_end: continue
     # An in-window first entry recorded only outside the capture has no source evidence here.
     unknown += [(wallet, market, sid, recorded) for sid, recorded in earlier
-                if sid not in buys and recorded == entry]
+                if recorded == entry and not captured(sid, wallet, market)]
     (raw,) = db.execute("SELECT count(*) FROM activity_groups WHERE wallet_hex=? AND activity_type='TRADE' "
                         "AND json_extract(proof_json,'$.effect.kind')='raw_only' AND source_epoch < ?",
                         (wallet, entry)).fetchone()
