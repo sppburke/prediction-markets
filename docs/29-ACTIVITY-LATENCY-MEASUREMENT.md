@@ -233,7 +233,8 @@ KEEP = {b"pe-service.activity-frame-admission", b"pe-service.activity-frame-fall
 started = time.time()
 src = sqlite3.connect(Path(live_db).resolve().as_uri() + "?mode=ro", uri=True)
 dst = sqlite3.connect(out / "paper_state.db"); src.backup(dst, pages=-1); dst.close(); src.close()
-print("database copy seconds", round(time.time() - started, 1))
+print("database copy seconds", round(time.time() - started, 1),
+      "snapshot started", time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(started)))
 # The capture must hold the original receipt of every continuation-7 frame decision in the copy.
 copy = sqlite3.connect((out / "paper_state.db").resolve().as_uri() + "?mode=ro", uri=True)
 (earliest,) = copy.execute(
@@ -299,7 +300,9 @@ It opens SQLite with `mode=ro` and `query_only`, uses autocommit reads on the ca
 snapshot (no long transaction), and reads finite log prefixes. It prints evidence and writes
 only `ac16-population.json` in the separate audit directory for the scoped queries below.
 Supply explicit Central window bounds with offsets, for example `2026-10-05T08:00:00-05:00`
-and `2026-10-05T09:00:00-05:00`; use `-06:00` when Central standard time applies.
+and `2026-10-05T09:00:00-05:00`; use `-06:00` when Central standard time applies. The window end
+must not follow the database snapshot start the capture prints: a trade after it has no decision in
+the copy and would look like a miss.
 The decoder requires system `libzstd`; it checks framing/CRC, joins ordinary TRADE rows by the
 canonical `g2:` component encoding (using `b3sum`), and preserves envelope receipts. It does not
 replace the Rust log verifier or authority-specific semantic verification. Do not run normal service boot, `--report`, recovery or checkpoint
