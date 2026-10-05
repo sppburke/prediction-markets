@@ -297,7 +297,7 @@ pub fn post_snapshot_invalid_continuation(
             pe_service::bucket_commit::DecisionContinuationV3::from_durable(&row)
                 .unwrap()
                 .version(),
-            6
+            7
         );
         let index = pe_service::risk_inputs::SourceReceiptIndex::replay(source_path).unwrap();
         assert_eq!(
@@ -508,6 +508,7 @@ pub fn read_context(
     recorded_at_unix: i64,
 ) -> BucketDecisionContext {
     BucketDecisionContext {
+        verified_read: None,
         applied_configuration: RuntimeConfig::from_service_config(&ServiceConfig::default()),
         decision_inputs_json: read.decision_inputs_json.clone(),
         page_occurrences: vec![read.page.clone()],
@@ -557,6 +558,34 @@ pub fn continuation_orchestrator_with_authority(
     pe_source_polymarket_public::FixtureFetcher,
     pe_service::clob_book::FixtureClobBookFetcher,
 > {
+    continuation_orchestrator_with_market_evidence(
+        paper,
+        paper_path,
+        wallet,
+        control_rx,
+        hooks,
+        authority,
+        pe_service::mid_price_cache::MidPriceCache::with_fetcher(
+            pe_source_polymarket_public::FixtureFetcher::new(HashMap::new()),
+            "https://scenario.test".to_owned(),
+        ),
+        HashMap::new(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn continuation_orchestrator_with_market_evidence<
+    F: pe_source_polymarket_public::PageFetcher + Send + Sync,
+>(
+    paper: Arc<pe_paper_state::PaperStateDb>,
+    paper_path: &std::path::Path,
+    wallet: WalletAddress,
+    control_rx: mpsc::Receiver<OrchestratorControl>,
+    hooks: Arc<pe_service::orchestrator::ScenarioHooks>,
+    authority: Option<pe_service::supabase_state::SupabaseStateClient>,
+    mids: pe_service::mid_price_cache::MidPriceCache<F>,
+    books: HashMap<String, pe_service::clob_book::OrderBook>,
+) -> pe_service::orchestrator::Orchestrator<F, pe_service::clob_book::FixtureClobBookFetcher> {
     use pe_core_types::{BasisPoints, SourceTimestamp};
     use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
     use pe_trader_index::{Watchlist, WatchlistEntry, WatchlistTier};
@@ -599,17 +628,12 @@ pub fn continuation_orchestrator_with_authority(
         paper,
         ledger,
         pe_service::health::new_shared_health(false),
-        pe_service::mid_price_cache::MidPriceCache::with_fetcher(
-            pe_source_polymarket_public::FixtureFetcher::new(HashMap::new()),
-            "https://scenario.test".to_owned(),
-        ),
+        mids,
         control_rx,
         None,
         None,
         authority,
-        Arc::new(pe_service::clob_book::FixtureClobBookFetcher::new(
-            HashMap::new(),
-        )),
+        Arc::new(pe_service::clob_book::FixtureClobBookFetcher::new(books)),
     )
     .unwrap();
     orchestrator.set_scenario_hooks(hooks);
@@ -1137,4 +1161,19 @@ pub async fn bounded_command_output(mut command: std::process::Command) -> std::
         "command exceeded its completion bound: {output:?}"
     );
     output
+}
+
+/// Historical/current terminal rehashing belongs to synthetic fixtures only.
+pub fn terminal_evidence(
+    body: pe_service::decision_replay::DecisionPostBoundaryEvidenceBody,
+) -> Result<pe_service::decision_replay::DecisionPostBoundaryEvidence, serde_json::Error> {
+    let financial_semantic_version = pe_service::paper_recovery::FINANCIAL_SEMANTIC_VERSION;
+    let document_blake3 = blake3::hash(&serde_json::to_vec(&(financial_semantic_version, &body))?)
+        .to_hex()
+        .to_string();
+    Ok(pe_service::decision_replay::DecisionPostBoundaryEvidence {
+        body,
+        financial_semantic_version,
+        document_blake3,
+    })
 }

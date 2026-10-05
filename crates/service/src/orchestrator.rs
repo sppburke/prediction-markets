@@ -201,16 +201,19 @@ pub(crate) fn render_pending_evidence(
     let Some(evidence) = evidence else {
         return Ok(None);
     };
-    #[cfg(feature = "scenario")]
-    let terminal_at = SCENARIO_TERMINAL_CLOCK
-        .try_with(|at| *at)
-        .unwrap_or_else(|_| OffsetDateTime::now_utc());
-    #[cfg(not(feature = "scenario"))]
-    let terminal_at = OffsetDateTime::now_utc();
+    let terminal_at = terminal_now();
     let mut complete = evidence.clone();
     complete.record_clock("terminal_transition", unix_millis(terminal_at));
     let json = complete.render(authority, terminal)?;
     Ok(Some((json, terminal_at.unix_timestamp())))
+}
+
+pub(crate) fn terminal_now() -> OffsetDateTime {
+    #[cfg(feature = "scenario")]
+    if let Ok(at) = SCENARIO_TERMINAL_CLOCK.try_with(|at| *at) {
+        return at;
+    }
+    OffsetDateTime::now_utc()
 }
 
 #[cfg(feature = "scenario")]
@@ -322,6 +325,16 @@ impl From<Arc<pe_execution_core::LiveJournal>> for LiveJournalAccess {
     }
 }
 
+#[cfg(feature = "scenario")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameCrashBoundary {
+    FrameCommit,
+    Staging,
+    Prepared,
+    Authority,
+    Final,
+}
+
 /// Scenario-only deterministic seams (#546): fixed admission-clock instants and historical mark
 /// results consumed in order, plus one-shot faults immediately before the durable writes whose
 /// rollback the fan-in acceptance suite must prove. Compiled only with the `scenario` feature;
@@ -329,6 +342,10 @@ impl From<Arc<pe_execution_core::LiveJournal>> for LiveJournalAccess {
 #[cfg(feature = "scenario")]
 #[derive(Debug, Default)]
 pub struct ScenarioHooks {
+    pub frame_barriers: std::sync::Mutex<
+        std::collections::HashMap<WalletAddress, Vec<pe_event_log::AppendReceipt>>,
+    >,
+    pub frame_crash_boundary: std::sync::Mutex<Option<FrameCrashBoundary>>,
     pub age_clock: std::sync::Mutex<std::collections::VecDeque<OffsetDateTime>>,
     /// Deterministically advance the next queued age sample after one successful observation
     /// resolution. This models receipt I/O latency without sleeping in scenario tests.
@@ -428,6 +445,8 @@ pub struct Orchestrator<
     resuming_boot: bool,
     financial_log_paths: Option<(std::path::PathBuf, std::path::PathBuf)>,
     source_receipts: Option<SourceReceiptIndex>,
+    frame_source_log: Option<crate::activity_ingest::SourceLogHandle>,
+    frame_stale_secs: i64,
     qualification_start: Option<pe_event_log::AppendReceipt>,
     admission_builder: Option<crate::live_venue_adapter::LiveAdmissionBuilder>,
     boundary_mark_fetcher: Option<Arc<HistoricalMarkAdapter>>,
@@ -435,6 +454,7 @@ pub struct Orchestrator<
         crate::paper_recovery::RiskHaltOwner,
         pe_risk_engine::RiskHaltCause,
     )>,
+    feed_latch: crate::frame_admission::FeedLatchBasis,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -809,11 +829,11 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         if seal_needed && !self.pending_boot.is_empty() {
             // The seal digest requires terminal decisions. Finish only the preceding
             // generation's frozen continuations before sealing; no new source producer is
-            // running yet, and continuation 6 may never be decided under an unsealed Start.
+            // running yet, and continuation 7 may never be decided under an unsealed Start.
             if self
                 .pending_continuations
                 .values()
-                .any(|continuation| continuation.version() >= 6)
+                .any(|continuation| continuation.version() == 7)
             {
                 return Err(
                     "current-semantic continuation is open before qualification seal".to_owned(),
@@ -1056,6 +1076,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             expected_authority: expected.clone(),
             payload: payload.clone(),
         })?;
+        #[cfg(feature = "scenario")]
+        if self.crash_after_frame_boundary(FrameCrashBoundary::Prepared) {
+            return Err("injected crash after frame Prepared".to_owned());
+        }
         let crate::paper_recovery::FinancialPayload::Fill {
             operation,
             economic,
@@ -1073,6 +1097,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .commit_prepared_fill(&request)
             .await
             .map_err(|error| error.to_string())?;
+        #[cfg(feature = "scenario")]
+        if self.crash_after_frame_boundary(FrameCrashBoundary::Authority) {
+            return Err("injected crash after frame authority".to_owned());
+        }
         let result = crate::paper_recovery::FinancialResult::Fill { canonical };
         apply_financial_result(
             &self.paper_state,
@@ -1088,6 +1116,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             prepared_receipt,
             result: result.clone(),
         })?;
+        #[cfg(feature = "scenario")]
+        if self.crash_after_frame_boundary(FrameCrashBoundary::Final) {
+            return Err("injected crash after frame Final".to_owned());
+        }
         terminalize_final_fill_decision(&self.paper_state, &payload, &result, final_receipt)
             .map_err(|error| error.to_string())?;
         if let Some(dispatch_id) = dispatch_id {
@@ -1245,7 +1277,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
     fn compose_active_paper_economic(
         &self,
         signal: &LeaderSignal,
-        semantic2: bool,
+        current_book_policy: bool,
         admission: &pe_execution_core::LiveAdmissionArtifact,
         plan: &LadderPlan,
         book_receipt: pe_event_log::AppendReceipt,
@@ -1308,7 +1340,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             risk,
             cash_before,
             price_impact_cap_bps: self.price_impact_cap_bps,
-            chase_ceiling: if semantic2 {
+            chase_ceiling: if current_book_policy {
                 Price::ONE
             } else {
                 signal.leader_price
@@ -1317,7 +1349,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             band_ceiling_exclusive,
             applied_configuration_hash,
         };
-        if semantic2 {
+        if current_book_policy {
             pe_execution_core::EconomicPrepared::compose_wire_two(inputs)
         } else {
             pe_execution_core::EconomicPrepared::compose(inputs)
@@ -1523,8 +1555,297 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         Ok(())
     }
 
+    #[cfg(feature = "scenario")]
+    fn crash_after_frame_boundary(&self, boundary: FrameCrashBoundary) -> bool {
+        self.scenario_hooks.as_ref().is_some_and(|hooks| {
+            let mut selected = hooks
+                .frame_crash_boundary
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if *selected == Some(boundary) {
+                *selected = None;
+                true
+            } else {
+                false
+            }
+        })
+    }
+
+    async fn apply_activity_frame(
+        &mut self,
+        receipt: pe_event_log::AppendReceipt,
+    ) -> Result<(), String> {
+        let index = self
+            .source_receipts
+            .clone()
+            .ok_or_else(|| "frame source index missing".to_owned())?;
+        let source_log = self
+            .frame_source_log
+            .clone()
+            .ok_or_else(|| "frame source writer missing".to_owned())?;
+        let writer_lock = self.watchlist_writer_lock.clone();
+        let guard = match &writer_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
+        let source = index
+            .source_envelope(receipt)
+            .map_err(|error| error.to_string())?;
+        let observation =
+            pe_source_polymarket_public::parse_activity_trade_observation(&source.payload)
+                .map_err(|error| error.to_string())?;
+        let watchlist = self.live_watchlist.snapshot();
+        let entry = watchlist
+            .entries
+            .iter()
+            .find(|entry| entry.wallet == observation.wallet);
+        let configuration = self
+            .runtime_config
+            .as_ref()
+            .map(|config| config.snapshot().as_ref().clone())
+            .ok_or_else(|| "frame configuration snapshot missing".to_owned())?;
+        let tail = self
+            .paper_writer
+            .verified_tail()
+            .map_err(|error| error.to_string())?;
+        let paper_prefix = tail
+            .last_sequence
+            .map(|sequence| pe_event_log::AppendReceipt {
+                sequence,
+                this_hash: tail.last_hash,
+            });
+        let latch = self.feed_latch.clone();
+        let admitted_at = self.financial_now();
+        let route = self
+            .bucket_engine
+            .prepare_activity_frame(
+                receipt,
+                &index,
+                crate::bucket_commit::FrameAdmissionContext {
+                    admitted_at,
+                    stale_secs: self.frame_stale_secs,
+                    quality: entry.map_or(
+                        pe_core_types::ReconstructionQuality::new(0)
+                            .map_err(|error| error.to_string())?,
+                        |entry| entry.reconstruction_quality,
+                    ),
+                    signal_config: self.signal_config.clone(),
+                    copy_eligible: entry
+                        .is_some_and(|entry| entry.tier == pe_trader_index::WatchlistTier::Active),
+                    configuration,
+                    basis: crate::bucket_commit::FrozenDecisionBasis {
+                        win_rate_p: self.win_rate_p_for(&watchlist, &TraderId(observation.wallet)),
+                        bankroll: self.bankroll,
+                    },
+                    latch,
+                    paper_prefix,
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        let (source_id, payload) = match &route {
+            crate::bucket_commit::FrameRoute::Ignored => return Ok(()),
+            crate::bucket_commit::FrameRoute::Fallback(artifact) => (
+                crate::frame_admission::FRAME_FALLBACK_SOURCE_ID,
+                crate::bucket_commit::canonical_json(artifact),
+            ),
+            crate::bucket_commit::FrameRoute::Admission(capture) => (
+                crate::frame_admission::FRAME_ADMISSION_SOURCE_ID,
+                crate::frame_admission::FrameAdmissionArtifact::from_inputs(&capture.0)
+                    .and_then(|artifact| crate::bucket_commit::canonical_json(&artifact)),
+            ),
+        };
+        let admission_receipt = source_log
+            .append(EnvelopeIn {
+                source_id: SourceId(source_id.to_owned()),
+                schema_version: 1,
+                parser_version: 1,
+                observed_at: pe_core_types::SourceTimestamp(admitted_at),
+                received_at: pe_core_types::ReceivedAt(admitted_at),
+                content_type: pe_event_log::ContentType::Json,
+                payload: payload.map_err(|error| error.to_string())?,
+            })
+            .await
+            .map_err(|error| error.to_string())?;
+        let crate::bucket_commit::FrameRoute::Admission(capture) = route else {
+            return Ok(());
+        };
+        let (inputs, context) = *capture;
+        let id = self
+            .bucket_engine
+            .commit_activity_frame(
+                crate::frame_admission::FrameDecisionProof {
+                    admission_receipt,
+                    inputs,
+                },
+                PaperFreshnessPolicy {
+                    activity_ws_enabled: self.activity_ws_enabled,
+                    copy_latency_budget_secs: self.copy_latency_budget_secs,
+                },
+                context,
+                &index,
+            )
+            .map_err(|error| error.to_string())?;
+        drop(guard);
+        #[cfg(feature = "scenario")]
+        if self.crash_after_frame_boundary(FrameCrashBoundary::FrameCommit) {
+            return Err("injected crash after frame commit".to_owned());
+        }
+        self.resume_committed_rows(&[id]).await
+    }
+
+    fn apply_feed_audit_update(
+        &mut self,
+        update: crate::orchestrator_control::FeedAuditUpdate,
+    ) -> Result<crate::orchestrator_control::FeedAuditAcknowledgement, String> {
+        use crate::orchestrator_control::{FeedAuditAcknowledgement, FeedAuditUpdate};
+        use crate::paper_recovery::{HaltState, PaperLogRecord};
+        let index = self
+            .source_receipts
+            .as_ref()
+            .ok_or_else(|| "feed audit source index is missing".to_owned())?;
+        match update {
+            FeedAuditUpdate::RetireObservation {
+                receipt,
+                source_trade_id,
+                unbound,
+                verified_read,
+            } => self.bucket_engine.retire_observation(
+                receipt,
+                &source_trade_id,
+                unbound,
+                verified_read.as_deref(),
+            ),
+            FeedAuditUpdate::Frontier(frontier, read) => self
+                .bucket_engine
+                .publish_frontier(frontier, index, read.as_deref())
+                .map(|()| FeedAuditAcknowledgement::Applied),
+            FeedAuditUpdate::Incident(incident, read) => {
+                let identity = self
+                    .bucket_engine
+                    .admitted_frame(incident.frame_receipt)
+                    .ok_or_else(|| "incident has no durable admitted frame".to_owned())?;
+                let row = self
+                    .paper_state
+                    .decision_pending_for(&identity.source_trade_id)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| "incident decision missing".to_owned())?;
+                let frame =
+                    DecisionContinuationV3::from_durable(&row).map_err(|e| e.to_string())?;
+                frame
+                    .verify_activity_frame_with_index(index)
+                    .map_err(|error| error.to_string())?;
+                let read = match read {
+                    Some(read) => read,
+                    None => Arc::new(
+                        crate::bucket_commit::verified_commitment_bindings(
+                            incident.deciding_commitment_receipt,
+                            index,
+                        )
+                        .map_err(|error| error.to_string())?,
+                    ),
+                };
+                if read.receipt != incident.deciding_commitment_receipt
+                    || frame.observed_source_receipt != Some(incident.frame_receipt)
+                    || incident.engagement_receipt.is_some()
+                {
+                    return Err("incident differs from authenticated read/frame".to_owned());
+                }
+                crate::feed_audit::verify_incident_conclusion(&frame, &incident, &read)
+                    .map_err(|error| error.to_string())?;
+                let era = crate::paper_recovery::paper_era(
+                    self.paper_writer.snapshot().map_err(|e| e.to_string())?,
+                );
+                // Engagement trips the latch immediately; a contradicted REST target
+                // keeps its ordering work until its group has a durable disposition.
+                let disposed = crate::feed_audit::counterpart_disposed(
+                    &self.paper_state,
+                    incident.counterpart_identity.as_ref(),
+                )
+                .map_err(|error| error.to_string())?;
+                if !crate::feed_audit::audited_receipts(&era).contains(&incident.frame_receipt) {
+                    let incident_index = index.clone();
+                    let receipt =
+                        self.append_paper_record(&PaperLogRecord::FeedIncidentChanged {
+                            incident: incident.clone(),
+                            state: HaltState::Engaged,
+                        })?;
+                    incident_index.remember_frame_incident(&incident);
+                    self.feed_latch = crate::frame_admission::FeedLatchBasis {
+                        latest_incident: Some(receipt),
+                        release: None,
+                    };
+                    {
+                        let mut health = self
+                            .health
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        health.feed_latch = self.feed_latch.clone();
+                        health.feed_incident = Some(incident.clone());
+                    }
+                    error!(cause = ?incident.cause, frame_receipt = ?incident.frame_receipt, deciding_commitment = ?incident.deciding_commitment_receipt,
+                    counterpart = ?incident.counterpart_identity, engagement = ?receipt, "feed audit incident engaged; frames wait for history");
+                }
+                if disposed {
+                    self.bucket_engine
+                        .retire_frame_audit(incident.frame_receipt);
+                }
+                Ok(FeedAuditAcknowledgement::Applied)
+            }
+            FeedAuditUpdate::Release {
+                expected_engagement_hash,
+            } => {
+                let era = crate::paper_recovery::paper_era(
+                    self.paper_writer.snapshot().map_err(|e| e.to_string())?,
+                );
+                let basis =
+                    crate::paper_recovery::feed_latch_basis(&era).map_err(|e| e.to_string())?;
+                if !basis.engaged()
+                    || basis
+                        .latest_incident
+                        .is_none_or(|receipt| receipt.this_hash != expected_engagement_hash)
+                {
+                    return Ok(FeedAuditAcknowledgement::Applied);
+                }
+                let Some(mut incident) = crate::feed_audit::latest_incident(&era) else {
+                    return Err("latest feed engagement is missing".to_owned());
+                };
+                incident.engagement_receipt = basis.latest_incident;
+                let release = self.append_paper_record(&PaperLogRecord::FeedIncidentChanged {
+                    incident,
+                    state: HaltState::Released,
+                })?;
+                self.feed_latch = crate::frame_admission::FeedLatchBasis {
+                    latest_incident: basis.latest_incident,
+                    release: Some(release),
+                };
+                self.publish_feed_latch_health();
+                Ok(FeedAuditAcknowledgement::Applied)
+            }
+        }
+    }
+
+    fn publish_feed_latch_health(&self) {
+        self.health
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .feed_latch = self.feed_latch.clone();
+    }
+
     async fn apply_control_message(&mut self, message: OrchestratorControl) {
         match message {
+            OrchestratorControl::ActivityFrameDecision { receipt } => {
+                if let Err(error) = self.apply_activity_frame(receipt).await {
+                    self.pending_load_failure = Some(error);
+                    self.intake_stopped = true;
+                }
+            }
+            OrchestratorControl::FeedAuditUpdate {
+                update,
+                acknowledged,
+            } => {
+                let result = self.apply_feed_audit_update(update);
+                let _ = acknowledged.send(result);
+            }
             OrchestratorControl::PrepareAdmissions {
                 wallets,
                 acknowledged,
@@ -1549,6 +1870,14 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 let _ = acknowledged.send(result);
             }
             OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
+                #[cfg(feature = "scenario")]
+                if let Some(hooks) = &self.scenario_hooks {
+                    hooks
+                        .frame_barriers
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(wallet, self.bucket_engine.unresolved_receipts(wallet));
+                }
                 let result = crate::position_seeder::ledger_capture(
                     self.bucket_engine.ledger(),
                     &self.paper_state,
@@ -1968,6 +2297,15 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
 
         let bucket_engine = BucketCommitEngine::load(paper_state.clone(), leader_ledger)
             .map_err(|error| anyhow::anyhow!("load bucket commit engine: {error}"))?;
+        let feed_era = crate::paper_recovery::paper_era(paper_writer.snapshot()?);
+        let feed_latch = crate::paper_recovery::feed_latch_basis(&feed_era)?;
+        {
+            let mut health = health
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            health.feed_latch = feed_latch.clone();
+            health.feed_incident = crate::feed_audit::latest_incident(&feed_era);
+        }
         verify_retained_terminal_decisions(
             &paper_state,
             config.live_journal.as_ref().map(LiveJournalAccess::path),
@@ -2028,11 +2366,65 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             resuming_boot: false,
             financial_log_paths: None,
             source_receipts: None,
+            frame_source_log: None,
+            frame_stale_secs: 0,
             qualification_start: None,
             admission_builder: None,
             boundary_mark_fetcher: None,
             active_risk_halts: HashSet::new(),
+            feed_latch,
         })
+    }
+
+    /// Restore unresolved ordering barriers and route only unfinished synchronized frames.
+    pub async fn resume_activity_frames_before_producers(
+        &mut self,
+        all: &[pe_event_log::AppendReceipt],
+        undelivered: &[pe_event_log::AppendReceipt],
+    ) -> Result<(), String> {
+        let index = self
+            .source_receipts
+            .clone()
+            .ok_or_else(|| "frame source index missing".to_owned())?;
+        self.bucket_engine
+            .restore_frame_prefix(all, undelivered, &index)?;
+        self.refresh_feed_latch()?;
+        self.publish_feed_latch_health();
+        for receipt in undelivered {
+            self.apply_activity_frame(*receipt).await?;
+        }
+        Ok(())
+    }
+
+    /// Refresh after a synchronized incident/release edge; boot uses this same era reducer.
+    pub(crate) fn refresh_feed_latch(&mut self) -> Result<(), String> {
+        let era = crate::paper_recovery::paper_era(
+            self.paper_writer
+                .snapshot()
+                .map_err(|error| error.to_string())?,
+        );
+        if let Some(index) = &self.source_receipts {
+            self.bucket_engine.verify_feed_incidents(&era, index)?;
+        }
+        self.feed_latch =
+            crate::paper_recovery::feed_latch_basis(&era).map_err(|error| error.to_string())?;
+        self.health
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .feed_incident = crate::feed_audit::latest_incident(&era);
+        Ok(())
+    }
+
+    /// Install the source writer and the boot-resolved poll-round bound once.
+    #[must_use]
+    pub fn with_activity_frames(
+        mut self,
+        source_log: crate::activity_ingest::SourceLogHandle,
+        poll_round_stale_secs: i64,
+    ) -> Self {
+        self.frame_source_log = Some(source_log);
+        self.frame_stale_secs = poll_round_stale_secs;
+        self
     }
 
     /// Share the process source receipt index. Every generation-5 attempt authenticates its
@@ -2040,6 +2432,9 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
     /// financial posture; the Start-bound protocol installs the same index again with its logs.
     #[must_use]
     pub fn with_source_receipt_index(mut self, source_receipts: SourceReceiptIndex) -> Self {
+        self.bucket_engine = self
+            .bucket_engine
+            .with_source_receipt_index(source_receipts.clone());
         self.source_receipts = Some(source_receipts);
         self
     }
@@ -2076,8 +2471,12 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             &paper_log_path,
         )?);
         self.active_risk_halts = crate::paper_recovery::active_risk_halts(&era);
+        self.feed_latch = crate::paper_recovery::feed_latch_basis(&era)?;
+        self.publish_feed_latch_health();
         self.qualification_start = era.start.as_ref().map(|(receipt, _)| *receipt);
         self.financial_log_paths = Some((paper_log_path, source_log_path));
+        self.bucket_engine
+            .set_source_receipt_index(source_receipts.clone());
         self.source_receipts = Some(source_receipts);
         self.admission_builder = Some(admission_builder);
         self.boundary_mark_fetcher = Some(boundary_mark_fetcher);
@@ -2278,12 +2677,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
     async fn plan_impact_gate(
         &self,
         signal: &LeaderSignal,
-        semantic2: bool,
+        continuation_version: u16,
         probability: Probability,
         sizing_bankroll: Decimal,
         admission: &pe_execution_core::LiveAdmissionArtifact,
         early_book: Option<BookReadResult>,
     ) -> Result<GatePlanEvidence, GatePlanFailure> {
+        let current_book_policy = matches!(continuation_version, 6 | 7);
         let cap_bps = u64::try_from(self.price_impact_cap_bps).map_err(|_| GatePlanFailure {
             reason: "impact gate cap invalid",
             book: Box::new(book_failure(
@@ -2405,7 +2805,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 checked_at_unix_ms: Some(checked_at_unix_ms),
             });
         }
-        let ceiling = (if semantic2 {
+        let ceiling = (if current_book_policy {
             pe_execution_core::economic::current_book_impact_ceiling(
                 best,
                 self.price_impact_cap_bps,
@@ -2484,9 +2884,14 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             ShareAmount::from_whole(quantity.0).map_err(|_| LadderError::Amount)
         };
         let sizing = match self.strategy.config().sizing_mode {
-            SizingMode::Dollar { usd } => BuySizing::Dollar {
-                budget: to_budget(usd)?,
-            },
+            SizingMode::Dollar { usd } => {
+                let budget = to_budget(usd)?;
+                if continuation_version == 7 {
+                    BuySizing::DollarUpTo { budget }
+                } else {
+                    BuySizing::Dollar { budget }
+                }
+            }
             SizingMode::Contract { contracts } => BuySizing::Contract { contracts },
             SizingMode::Kelly => BuySizing::Kelly {
                 allocate: &allocate,
@@ -2535,7 +2940,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             minimum_tick_size,
             minimum_price,
             maximum_price_exclusive,
-            if semantic2 {
+            if current_book_policy {
                 Price::ONE
             } else {
                 signal.leader_price
@@ -2816,7 +3221,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 "scenario fault: dispatch seed staging failed; abandoning the trade unseen");
             return Err(());
         }
-        let checkpoint = matches!(continuation_version, 5 | 6);
+        let checkpoint = matches!(continuation_version, 5..=7);
         let pending = if checkpoint {
             evidence
                 .as_ref()
@@ -2945,12 +3350,16 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     .source_receipts
                     .as_ref()
                     .ok_or_else(|| "paper source receipt index is missing".to_owned())?;
-                continuation
-                    .verified_source_time(&mut |receipt| {
+                let authenticated = if continuation.is_activity_frame() {
+                    continuation.verify_activity_frame_with_index(source_receipts)
+                } else {
+                    continuation.verified_source_time(&mut |receipt| {
                         source_receipts
                             .source_envelope(receipt)
                             .map(crate::bucket_commit::CompleteActivityPage::from)
                     })
+                };
+                authenticated
                     .map(|(source_time, asset)| (policy, source_time, asset))
                     .map_err(|error| error.to_string())
             })
@@ -2972,7 +3381,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .map(DecisionEvidenceAccumulator::for_continuation);
         if pending
             .as_ref()
-            .is_some_and(|continuation| matches!(continuation.version(), 5 | 6))
+            .is_some_and(|continuation| matches!(continuation.version(), 5..=7))
         {
             let restored = self
                 .paper_state
@@ -3306,9 +3715,12 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .and_then(|hooks| hooks.admission_artifacts.lock().ok()?.pop_front());
         #[cfg(not(feature = "scenario"))]
         let scenario_admission = None;
-        let semantic2 = pending
+        let financial_semantic_version = pending
             .as_ref()
-            .is_some_and(|continuation| continuation.version() == 6);
+            .map_or(1, DecisionContinuationV3::financial_semantic);
+        let continuation_version = pending.as_ref().map_or(0, DecisionContinuationV3::version);
+        let continuation_seven = continuation_version == 7;
+        let current_book_policy = matches!(financial_semantic_version, 2 | 3);
         let mut early_book = authenticated_asset.map(|token_id| {
             let fetcher = Arc::clone(&self.book_fetcher);
             let condition = condition_id.clone();
@@ -3348,7 +3760,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             if let Some(admission) = scenario_admission {
                 Some(Ok(admission))
             } else if let Some(builder) = &self.admission_builder {
-                Some(if semantic2 {
+                Some(if current_book_policy {
                     builder
                         .build_paper(&condition_id, OffsetDateTime::now_utc())
                         .await
@@ -3474,8 +3886,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         // uncontrolled notional and let fills slip outside the band. We keep fetching it
         // only to (a) confirm the market is open/priced and (b) log the divergence for
         // diagnosis; sizing and gating below use `fill_basis` instead. Fail closed on an
-        // absent mid (unchanged liveness behaviour).
-        let _market_mid = {
+        // absent mid. Continuation 7 relies on admission and the mandatory fresh book.
+        if !continuation_seven {
             let mid_read = self
                 .mid_price_cache
                 .fetch_mids(std::slice::from_ref(&signal.market_id));
@@ -3496,7 +3908,6 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                             source: "gamma.outcome_prices".to_owned(),
                         });
                     }
-                    p
                 }
                 None => {
                     if let Some(evidence) = decision_evidence.as_mut() {
@@ -3562,7 +3973,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         let gate_evidence = match self
             .plan_impact_gate(
                 &signal,
-                semantic2,
+                continuation_version,
                 p,
                 sizing_bankroll,
                 &admission,
@@ -3659,7 +4070,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         // max_fill_price safety rail (#142 parity): skip BUYs whose FILL price is at or
         // above the cap (catastrophic payoff geometry near $1). ZERO disables. Gated on
         // `fill_basis` (the price paid), matching the backtest's fill-price cap.
-        if signal.leader_side == Side::Buy
+        if !continuation_seven
+            && signal.leader_side == Side::Buy
             && self.max_fill_price > Decimal::ZERO
             && fill_basis.0 >= self.max_fill_price
         {
@@ -3688,7 +4100,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         // skip BUYs whose FILL price is below the entry-band lower bound. Strictly `<` so
         // the boundary value fills, mirroring the backtest `min_signal_price` floor (also
         // gated on the fill price). ZERO disables.
-        if signal.leader_side == Side::Buy
+        if !continuation_seven
+            && signal.leader_side == Side::Buy
             && self.min_fill_price > Decimal::ZERO
             && fill_basis.0 < self.min_fill_price
         {
@@ -3791,8 +4204,14 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         // Relocated hold/already-filled gate (#508; historically pre-first-BUY): a paper
         // position we already hold skips the PAPER order only — live targets in the staged
         // aggregate still execute against their own venue state.
+        #[cfg(feature = "scenario")]
+        if self.crash_after_frame_boundary(FrameCrashBoundary::Staging) {
+            self.intake_stopped = true;
+            return;
+        }
         let pos_key = MarketOutcomeId::new(signal.market_id.clone(), signal.outcome_id);
-        if self.filled_positions.contains(&pos_key) {
+        let held = !continuation_seven && self.filled_positions.contains(&pos_key);
+        if held {
             info!(
                 reason = "already hold position in this market outcome (paper-only)",
                 market = %signal.market_id,
@@ -3853,7 +4272,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 &signal,
                 planned_worst_case_all_in_debit,
                 per_trade_cap_bps,
-                if semantic2 { 2 } else { 1 },
+                financial_semantic_version,
             )
             .await
         {
@@ -3895,7 +4314,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         let applied_configuration_hash = applied_runtime.canonical_hash();
         let economic = match self.compose_active_paper_economic(
             &signal,
-            semantic2,
+            current_book_policy,
             &admission,
             plan,
             book_receipt,
@@ -3915,7 +4334,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         match self.strategy.evaluate_at_price_with_limit(
             &signal,
             economic.sizing.all_in_price,
-            if semantic2 {
+            if current_book_policy {
                 plan.limit_price
             } else {
                 signal.leader_price
@@ -3943,10 +4362,27 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 )
                 .await;
             }
-            Ok(intent) => {
+            Ok(mut intent) => {
+                if continuation_seven
+                    && matches!(
+                        self.strategy.config().sizing_mode,
+                        SizingMode::Dollar { .. }
+                    )
+                {
+                    intent.contracts = match pe_venue_polymarket::ladder::signed_share_contracts(
+                        plan.shares,
+                    ) {
+                        Ok(contracts) => contracts,
+                        Err(error) => {
+                            error!(%error, trade = %trade.source_trade_id, "signed quantity cannot convert to whole contracts");
+                            self.intake_stopped = true;
+                            return;
+                        }
+                    };
+                }
                 if pending
                     .as_ref()
-                    .is_none_or(|continuation| !matches!(continuation.version(), 5 | 6))
+                    .is_none_or(|continuation| !matches!(continuation.version(), 5..=7))
                 {
                     let execution_at = OffsetDateTime::now_utc();
                     record_clock(&mut decision_evidence, "paper_dispatch", execution_at);
@@ -4718,8 +5154,8 @@ mod tests {
                 let evidence = harness.evidence();
                 let book = evidence.body.book.unwrap();
                 assert_eq!(book.request_token_id.as_deref(), Some("123"));
-                assert_eq!(book.outcome, "ladder_rejected");
-                assert_eq!(book.reason.as_deref(), Some("InsufficientDepth"));
+                assert_eq!(book.outcome, "below_minimum");
+                assert_eq!(book.reason.as_deref(), Some("BelowMinimum"));
                 assert_eq!(book.best_ask.as_deref(), Some("0.5"));
             }
         }
@@ -6107,6 +6543,70 @@ mod tests {
         assert_eq!(sealed_records(&paper_path), seals);
     }
 
+    #[tokio::test]
+    async fn boot_semantic_three_resumes_open_six_but_refuses_open_seven_before_seal() {
+        for version in [6_u16, 7] {
+            let StartedSealFixture {
+                _dir: dir,
+                paper_path,
+                source_path,
+                state,
+                paper_writer,
+                ..
+            } = started_seal_fixture_with_semantic("start-hash", 2);
+            let fixture = crate::bucket_commit::continuation_v3_tests::binding_fixture("poll_only");
+            std::fs::copy(fixture.dir.path().join("binding.log"), &source_path).unwrap();
+            let continuation = fixture.continuation.current_paper();
+            let facts = &continuation.facts;
+            let source_trade_id = facts.source_trade_id.clone();
+            let mut frozen = serde_json::to_value(&continuation).unwrap();
+            frozen["version"] = serde_json::json!(version);
+            if version == 6 {
+                frozen.as_object_mut().unwrap().remove("source_authority");
+            }
+            rusqlite::Connection::open(dir.path().join("paper.db"))
+                .unwrap()
+                .execute(
+                    "INSERT INTO decision_pending (source_trade_id, semantic_revision, wallet_hex, source_epoch, frozen_inputs_json, post_commit_inputs_json, state, updated_at_unix) VALUES (?1, ?2, ?3, ?4, ?5, '[]', 'open', ?4)",
+                    rusqlite::params![facts.source_trade_id.0, facts.semantic_revision, facts.wallet.to_string(), facts.source_epoch, frozen.to_string()],
+                )
+                .unwrap();
+            let source_receipts = SourceReceiptIndex::replay(&source_path).unwrap();
+            let mut orchestrator = test_orchestrator(
+                paper_path.clone(),
+                source_path,
+                paper_writer,
+                Arc::clone(&state),
+                source_receipts,
+            );
+            assert_eq!(orchestrator.pending_boot.len(), 1);
+            let result = orchestrator
+                .seal_before_resume("start-hash", FINANCIAL_SEMANTIC_VERSION)
+                .await;
+            if version == 7 {
+                assert_eq!(
+                    result.unwrap_err(),
+                    "current-semantic continuation is open before qualification seal"
+                );
+                assert_eq!(orchestrator.pending_boot.len(), 1);
+                assert_eq!(state.open_decision_pending().unwrap().len(), 1);
+                assert!(sealed_records(&paper_path).is_empty());
+            } else {
+                result.unwrap();
+                assert!(orchestrator.pending_boot.is_empty());
+                assert!(state.open_decision_pending().unwrap().is_empty());
+                assert_eq!(sealed_records(&paper_path).len(), 1);
+                let terminal = state
+                    .decision_pending_for(&source_trade_id)
+                    .unwrap()
+                    .unwrap();
+                let replay = crate::decision_replay::replay_decision_pending(&terminal).unwrap();
+                assert_eq!(replay.continuation.version(), 6);
+                assert_eq!(replay.post_boundary.financial_semantic_version, 2);
+            }
+        }
+    }
+
     /// PASS: a bracket whose install never committed leaves a recorded activity page with a trade
     /// that has no durable group; the semantic-change seal still closes the verified prefix.
     #[tokio::test]
@@ -6157,7 +6657,7 @@ mod tests {
         assert_eq!(seals.len(), 1);
         assert!(
             matches!(&seals[0].reason, SealReason::InsufficientEvidence(detail)
-                if detail.contains("financial semantic version changed from 1 to 2")
+                if detail.contains("financial semantic version changed from 1 to 3")
                     && detail.contains("decision evidence unavailable")
                     && detail.contains("has no durable activity group")),
             "{:?}",

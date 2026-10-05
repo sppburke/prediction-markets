@@ -1065,10 +1065,9 @@ fn rewrite_state_receipts(
         }
         let post_commit_evidence: DecisionPostBoundaryEvidence =
             serde_json::from_value(post_commit).unwrap();
-        let post_commit = serde_json::to_value(
-            DecisionPostBoundaryEvidence::from_body(post_commit_evidence.body).unwrap(),
-        )
-        .unwrap();
+        let post_commit =
+            serde_json::to_value(support::terminal_evidence(post_commit_evidence.body).unwrap())
+                .unwrap();
         connection
             .execute(
                 "UPDATE decision_pending SET frozen_inputs_json = ?2, \
@@ -2035,6 +2034,7 @@ pub(crate) async fn golden_source_stream_replays_exact_economic_core() {
                 first_admission = Some(recorded.admission.clone());
             }
             let context = BucketDecisionContext {
+                verified_read: None,
                 applied_configuration: runtime_config.clone(),
                 decision_inputs_json: read.decision_inputs_json,
                 page_occurrences: vec![read.page],
@@ -2569,7 +2569,7 @@ pub(crate) async fn golden_source_stream_replays_exact_economic_core() {
     assert!(decision_rows.iter().all(|row| {
         replay_decision_pending(row).is_ok_and(|decision| {
             decision.continuation.facts.gate_result == "admitted"
-                && decision.continuation.version() == 6
+                && decision.continuation.version() == 7
                 && decision.continuation.read_commitment.is_some()
                 && decision.continuation.facts.provenance == TradeProvenance::ActivityWs
                 && decision.post_boundary.body.terminal.final_receipt.is_some()
@@ -3253,7 +3253,7 @@ fn qualification_replays_source_age_and_seal_binds_policy_and_clock(
         connection.execute(
             "UPDATE decision_pending SET frozen_inputs_json = ?2, post_commit_inputs_json = ?3 WHERE source_trade_id = ?1",
             rusqlite::params![source_trade_id.0, serde_json::to_string(&continuation).unwrap(),
-                serde_json::to_string(&DecisionPostBoundaryEvidence::from_body(evidence.body).unwrap()).unwrap()],
+                serde_json::to_string(&support::terminal_evidence(evidence.body).unwrap()).unwrap()],
         ).unwrap();
         drop(connection);
         let state = PaperStateDb::open_read_only(&cloned_state).unwrap();
@@ -3522,6 +3522,7 @@ impl BracketFinancialHarness {
         let (triggers, receiver) = mpsc::channel(8);
         triggers
             .send(ReconciliationTrigger {
+                qualifying_buy: true,
                 wallet: bodies.wallet,
                 source_time: observation.source_time.0,
                 source_trade_id: observation.group_id.key().clone(),
@@ -3597,7 +3598,9 @@ impl BracketFinancialHarness {
                     maximum = maximum.max(active.len());
                     assert!(active.len() <= TRADE_RECONCILIATION_CONCURRENCY);
                 }
-                PollerProgress::Completed { wallet, selected } => {
+                PollerProgress::Completed {
+                    wallet, selected, ..
+                } => {
                     assert!(active.remove(&wallet));
                     assert_eq!(
                         wallet, bodies.wallet,
@@ -3627,7 +3630,7 @@ impl BracketFinancialHarness {
             .unwrap();
         assert_eq!(row.state, pe_paper_state::DecisionPendingState::Terminal);
         let replay = replay_decision_pending(&row).unwrap();
-        assert_eq!(replay.continuation.version(), 6);
+        assert_eq!(replay.continuation.version(), 7);
         assert_eq!(row.updated_at_unix, self.terminal_at.unix_timestamp());
         assert_eq!(
             replay

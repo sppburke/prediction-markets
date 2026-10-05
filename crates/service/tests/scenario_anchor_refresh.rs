@@ -324,6 +324,8 @@ fn poller_harness_with_fetcher(
     }
     let source_log_path = dir.path().join("source.log");
     let sink = SourceEventSink::open(&source_log_path).unwrap();
+    let source_receipts =
+        pe_service::risk_inputs::SourceReceiptIndex::replay(&source_log_path).unwrap();
     let (source_log, source_rx) = SourceLogHandle::channel(8);
     let asset_identity = Arc::new(AssetIdentityResolver::new_runtime(
         Arc::new(MapFetcher::new(HashMap::new())),
@@ -333,8 +335,11 @@ fn poller_harness_with_fetcher(
     ));
     let (trigger_tx, trigger_rx) = mpsc::channel(8);
     let health = new_shared_health_with_ws(false, true, 90);
-    let ingest =
-        tokio::spawn(ActivityIngest::poll_only(sink, source_rx, trigger_tx, health.clone()).run());
+    let ingest = tokio::spawn(
+        ActivityIngest::poll_only(sink, source_rx, trigger_tx, health.clone())
+            .with_source_receipt_index(source_receipts.clone())
+            .run(),
+    );
     let (control_tx, mut control_rx) = mpsc::channel(4);
     let actor_paper = Arc::clone(&paper);
     let actor_poll_fetcher = Arc::clone(&poll_fetcher);
@@ -346,6 +351,11 @@ fn poller_harness_with_fetcher(
         let mut hold_admission = hold_admission;
         while let Some(command) = control_rx.recv().await {
             match command {
+                OrchestratorControl::FeedAuditUpdate { acknowledged, .. } => {
+                    let _ = acknowledged.send(Ok(
+                        pe_service::orchestrator_control::FeedAuditAcknowledgement::Applied,
+                    ));
+                }
                 OrchestratorControl::PrepareAdmissions { acknowledged, .. } => {
                     let _ = acknowledged.send(());
                 }
@@ -372,14 +382,18 @@ fn poller_harness_with_fetcher(
                     );
                 }
                 OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
+                    let capture = ledger_capture(engine.ledger(), &actor_paper, wallet)
+                        .map_err(|error| error.to_string());
                     if let Some((entered, release)) = hold_admission.take() {
+                        // Hold this admission response without blocking the control owner.
                         let _ = entered.send(());
-                        let _ = release.await;
+                        tokio::spawn(async move {
+                            let _ = release.await;
+                            let _ = captured.send(capture);
+                        });
+                    } else {
+                        let _ = captured.send(capture);
                     }
-                    let _ = captured.send(
-                        ledger_capture(engine.ledger(), &actor_paper, wallet)
-                            .map_err(|error| error.to_string()),
-                    );
                 }
                 OrchestratorControl::InstallAnchors {
                     installs,
@@ -439,6 +453,7 @@ fn poller_harness_with_fetcher(
         ReconciliationObligations::default(),
         Some(preparer.as_ref().clone()),
     )
+    .with_source_receipt_index(source_receipts)
     .with_clock(Arc::new(|| {
         OffsetDateTime::from_unix_timestamp(NOW).unwrap()
     }));
@@ -475,6 +490,11 @@ async fn refresh_outcome_for_install_rejection(
         let mut rejection = Some(rejection);
         while let Some(command) = control_rx.recv().await {
             match command {
+                OrchestratorControl::FeedAuditUpdate { acknowledged, .. } => {
+                    let _ = acknowledged.send(Ok(
+                        pe_service::orchestrator_control::FeedAuditAcknowledgement::Applied,
+                    ));
+                }
                 OrchestratorControl::PrepareAdmissions { acknowledged, .. } => {
                     let _ = acknowledged.send(());
                 }

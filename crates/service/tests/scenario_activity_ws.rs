@@ -1726,6 +1726,7 @@ async fn r9_observation_resolution_precedes_the_final_dispatch_age_sample() {
             pe_service::orchestrator_control::OrchestratorControl::CommitActivityBucket {
                 aggregates,
                 context: Arc::new(BucketDecisionContext {
+                    verified_read: None,
                     applied_configuration: runtime,
                     decision_inputs_json,
                     page_occurrences: vec![occurrence],
@@ -2068,6 +2069,7 @@ async fn clob_book_wrong_market_with_right_asset_stops_before_dispatch_or_prepar
             pe_service::orchestrator_control::OrchestratorControl::CommitActivityBucket {
                 aggregates,
                 context: Arc::new(BucketDecisionContext {
+                    verified_read: None,
                     applied_configuration: runtime,
                     decision_inputs_json,
                     page_occurrences: vec![occurrence],

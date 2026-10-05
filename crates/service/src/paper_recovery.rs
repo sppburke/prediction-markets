@@ -66,7 +66,7 @@ pub fn check_start_baseline_bankroll(
 
 pub const PAPER_LOG_SCHEMA_VERSION: u32 = 2;
 /// Current paper financial meaning. A changed value seals the active qualification before use.
-pub const FINANCIAL_SEMANTIC_VERSION: u32 = 2;
+pub const FINANCIAL_SEMANTIC_VERSION: u32 = 3;
 
 /// Schema-one price provenance retained only by the service's legacy decoder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -112,6 +112,10 @@ pub enum PaperLogRecord {
         cause: RiskHaltCause,
         state: HaltState,
         evidence: serde_json::Value,
+    },
+    FeedIncidentChanged {
+        incident: FeedIncident,
+        state: HaltState,
     },
     QualificationStarted(Arc<QualificationStarted>),
     PortfolioMark(Box<PortfolioMark>),
@@ -798,6 +802,64 @@ pub enum HaltState {
     Released,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FeedIncidentCause {
+    Contradiction,
+    Absence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FeedIncident {
+    pub cause: FeedIncidentCause,
+    pub frame_receipt: AppendReceipt,
+    pub deciding_commitment_receipt: AppendReceipt,
+    pub counterpart_identity: Option<SourceTradeId>,
+    /// Release records must name the latest engagement exactly.
+    pub engagement_receipt: Option<AppendReceipt>,
+}
+
+/// The synchronized paper era is the sole authority for this process-wide latch.
+pub fn feed_latch_basis(
+    era: &PaperEra,
+) -> Result<crate::frame_admission::FeedLatchBasis, PaperLogScanError> {
+    let mut basis = crate::frame_admission::FeedLatchBasis::default();
+    let mut latest = None::<FeedIncident>;
+    for frame in &era.frames {
+        if let PaperLogFrame::Record(PaperLogRecord::FeedIncidentChanged { incident, state }) =
+            &frame.frame
+        {
+            match state {
+                HaltState::Engaged if incident.engagement_receipt.is_none() => {
+                    latest = Some(incident.clone());
+                    basis.latest_incident = Some(frame.receipt);
+                    basis.release = None;
+                }
+                HaltState::Released
+                    if basis.engaged()
+                        && incident.engagement_receipt == basis.latest_incident
+                        && latest.as_ref().is_some_and(|latest| {
+                            latest.cause == incident.cause
+                                && latest.frame_receipt == incident.frame_receipt
+                                && latest.deciding_commitment_receipt
+                                    == incident.deciding_commitment_receipt
+                                && latest.counterpart_identity == incident.counterpart_identity
+                        }) =>
+                {
+                    basis.release = Some(frame.receipt);
+                }
+                _ => {
+                    return Err(PaperLogScanError::FeedIncidentProtocol(
+                        "invalid feed incident/release chain".to_owned(),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(basis)
+}
+
 /// Rebuild the active risk-cause set from the current financial era. SQLite metadata is
 /// deliberately not involved; the synchronized paper prefix remains the sole owner.
 #[must_use]
@@ -1243,6 +1305,8 @@ impl ScannedPaperFrame {
 
 #[derive(Debug, thiserror::Error)]
 pub enum PaperLogScanError {
+    #[error("paper feed incident protocol is invalid: {0}")]
+    FeedIncidentProtocol(String),
     #[error("source receipt index belongs to a different source log")]
     SourceIndexPathMismatch,
     #[error("paper log is poisoned; a verified reopen is required")]
@@ -4895,6 +4959,105 @@ mod paper_log_tests {
     }
 
     #[test]
+    fn feed_latch_rebuilds_latest_incident_and_two_release_cycles() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("feed.log");
+        let mut writer = Writer::open(&path).unwrap();
+        append(
+            &mut writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &PaperLogRecord::QualificationStarted(Arc::new(start("feed"))),
+        );
+        let incident = |seq| FeedIncident {
+            cause: FeedIncidentCause::Contradiction,
+            frame_receipt: receipt(seq),
+            deciding_commitment_receipt: receipt(seq + 1),
+            counterpart_identity: Some(SourceTradeId(format!("counterpart-{seq}"))),
+            engagement_receipt: None,
+        };
+        let first = incident(10);
+        let first_receipt = append(
+            &mut writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &PaperLogRecord::FeedIncidentChanged {
+                incident: first.clone(),
+                state: HaltState::Engaged,
+            },
+        );
+        let second = incident(20);
+        let second_receipt = append(
+            &mut writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &PaperLogRecord::FeedIncidentChanged {
+                incident: second.clone(),
+                state: HaltState::Engaged,
+            },
+        );
+        let era = paper_era(scan_paper_log(&path).unwrap());
+        let basis = feed_latch_basis(&era).unwrap();
+        assert_eq!(basis.latest_incident, Some(second_receipt));
+        assert!(basis.engaged());
+        // A release lookup from before the newer engagement cannot release this era.
+        let mut stale = first;
+        stale.engagement_receipt = Some(first_receipt);
+        let stale_path = dir.path().join("stale.log");
+        std::fs::copy(&path, &stale_path).unwrap();
+        let mut stale_writer = Writer::open(&stale_path).unwrap();
+        append(
+            &mut stale_writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &PaperLogRecord::FeedIncidentChanged {
+                incident: stale,
+                state: HaltState::Released,
+            },
+        );
+        drop(stale_writer);
+        assert!(feed_latch_basis(&paper_era(scan_paper_log(&stale_path).unwrap())).is_err());
+        let mut released = second;
+        released.engagement_receipt = Some(second_receipt);
+        let release_receipt = append(
+            &mut writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &PaperLogRecord::FeedIncidentChanged {
+                incident: released,
+                state: HaltState::Released,
+            },
+        );
+        let basis = feed_latch_basis(&paper_era(scan_paper_log(&path).unwrap())).unwrap();
+        assert!(!basis.engaged());
+        assert_eq!(basis.release, Some(release_receipt));
+        let third = incident(30);
+        let third_receipt = append(
+            &mut writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &PaperLogRecord::FeedIncidentChanged {
+                incident: third.clone(),
+                state: HaltState::Engaged,
+            },
+        );
+        assert!(
+            feed_latch_basis(&paper_era(scan_paper_log(&path).unwrap()))
+                .unwrap()
+                .engaged()
+        );
+        let mut third_release = third;
+        third_release.engagement_receipt = Some(third_receipt);
+        append(
+            &mut writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &PaperLogRecord::FeedIncidentChanged {
+                incident: third_release,
+                state: HaltState::Released,
+            },
+        );
+        drop(writer);
+        let basis = feed_latch_basis(&paper_era(scan_paper_log(&path).unwrap())).unwrap();
+        assert_eq!(basis.latest_incident, Some(third_receipt));
+        assert!(!basis.engaged());
+        assert!(active_risk_halts(&paper_era(scan_paper_log(&path).unwrap())).is_empty());
+    }
+
+    #[test]
     fn active_risk_causes_rebuild_from_edges_after_start() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("risk.log");
@@ -5011,16 +5174,28 @@ pub fn reconcile_paper_state(event_log_path: &Path, paper_state: &PaperStateDb) 
                 .context("decode pending paper-log continuation")?;
             let evidence = DecisionEvidenceAccumulator::from_pending_checkpoint(pending_row)
                 .context("decode pending paper-log evidence checkpoint")?;
-            let leader = paper_state
-                .leader_positions()
-                .context("load pending paper-log leader mirror")?
-                .into_iter()
-                .find(|leader| {
-                    leader.wallet == continuation.facts.wallet
-                        && leader.market_id == continuation.facts.market_id
-                        && leader.outcome_id == continuation.facts.outcome_id
-                })
-                .context("pending paper-log continuation has no leader mirror")?;
+            let leader = if continuation.is_activity_frame() {
+                // The terminal API retains its historical argument shape; frame authority
+                // ignores this row transactionally and never requires a REST leader mirror.
+                pe_paper_state::LeaderPositionRow {
+                    wallet: continuation.facts.wallet,
+                    market_id: continuation.facts.market_id.clone(),
+                    outcome_id: continuation.facts.outcome_id,
+                    long_contracts: ShareAmount::ZERO,
+                    short_contracts: ShareAmount::ZERO,
+                }
+            } else {
+                paper_state
+                    .leader_positions()
+                    .context("load pending paper-log leader mirror")?
+                    .into_iter()
+                    .find(|leader| {
+                        leader.wallet == continuation.facts.wallet
+                            && leader.market_id == continuation.facts.market_id
+                            && leader.outcome_id == continuation.facts.outcome_id
+                    })
+                    .context("pending paper-log continuation has no leader mirror")?
+            };
             let fill_pending = render_pending_evidence(
                 Some(&evidence),
                 AuthorityEvidence::local("recovered_from_paper_log"),
@@ -5170,13 +5345,18 @@ pub fn replay_wallet_ledger(
         }
         apply_replayed_groups(
             &mut ledger,
-            paper_state,
+            Some(paper_state),
             wallet,
             &groups[bucket_start..next_group],
         )?;
         install_replayed_anchor(&mut ledger, paper_state, anchor)?;
     }
-    apply_replayed_groups(&mut ledger, paper_state, wallet, &groups[next_group..])?;
+    apply_replayed_groups(
+        &mut ledger,
+        Some(paper_state),
+        wallet,
+        &groups[next_group..],
+    )?;
     Ok(ledger)
 }
 
@@ -5224,9 +5404,34 @@ fn install_replayed_anchor(
     Ok(())
 }
 
+/// Reuse recovery's all-or-none bucket reducer for authenticated frozen records.
+/// Callers authenticate balances and records against their durable owners separately.
+pub(crate) fn replay_frozen_records(
+    wallet: WalletAddress,
+    balances: &[(String, u16, ShareAmount)],
+    groups: &[pe_paper_state::ActivityGroupRow],
+) -> Result<PositionLedger, WalletLedgerReplayError> {
+    let mut ledger = PositionLedger::new();
+    let positions = balances
+        .iter()
+        .map(|(market, outcome, amount)| {
+            (
+                MarketOutcomeId::new(MarketId(VenueMarketId(market.clone())), OutcomeId(*outcome)),
+                PositionState {
+                    long_contracts: *amount,
+                    short_contracts: ShareAmount::ZERO,
+                },
+            )
+        })
+        .collect();
+    ledger.replace_wallet_snapshot(wallet, positions);
+    apply_replayed_groups(&mut ledger, None, wallet, groups)?;
+    Ok(ledger)
+}
+
 fn apply_replayed_groups(
     ledger: &mut PositionLedger,
-    paper_state: &PaperStateDb,
+    paper_state: Option<&PaperStateDb>,
     wallet: WalletAddress,
     groups: &[pe_paper_state::ActivityGroupRow],
 ) -> Result<(), WalletLedgerReplayError> {
@@ -5252,7 +5457,7 @@ fn apply_replayed_groups(
 
 fn apply_replayed_bucket(
     ledger: &mut PositionLedger,
-    paper_state: &PaperStateDb,
+    paper_state: Option<&PaperStateDb>,
     wallet: WalletAddress,
     groups: &[pe_paper_state::ActivityGroupRow],
 ) -> Result<(), WalletLedgerReplayError> {
@@ -5269,8 +5474,10 @@ fn apply_replayed_bucket(
     let mut mutations = Vec::new();
     let mut expected = Vec::new();
     for group in groups {
-        let durable = paper_state.activity_group_state(&group.source_trade_id)?;
-        verify_replayed_group_revision(durable.as_ref(), group)?;
+        if let Some(paper_state) = paper_state {
+            let durable = paper_state.activity_group_state(&group.source_trade_id)?;
+            verify_replayed_group_revision(durable.as_ref(), group)?;
+        }
         let applied_effect = AppliedEffect::from_document(&group.proof_json).map_err(|source| {
             WalletLedgerReplayError::EffectDocument {
                 source_trade_id: group.source_trade_id.clone(),
@@ -5337,7 +5544,7 @@ fn verify_replayed_group_revision(
     Ok(())
 }
 
-fn applied_disposition(
+pub(crate) fn applied_disposition(
     source_trade_id: &SourceTradeId,
     disposition: &str,
 ) -> Result<bool, WalletLedgerReplayError> {

@@ -95,6 +95,8 @@ impl PaperFreshnessPolicy {
 /// Decision inputs already read before the atomic bucket commit.
 #[derive(Debug, Clone)]
 pub struct BucketDecisionContext {
+    /// Shared authentication of the whole read. Its private fields prevent unverified construction.
+    pub verified_read: Option<std::sync::Arc<VerifiedCommitment>>,
     pub applied_configuration: RuntimeConfig,
     pub decision_inputs_json: String,
     /// Receipt-bearing page occurrences are frozen in continuation versions 3, 4, and 5. They stay
@@ -200,15 +202,25 @@ pub struct PageOccurrence {
     pub receipt: AppendReceipt,
 }
 
+/// The recorded source contract authorizing a version-seven decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceAuthority {
+    CompleteRead,
+    ActivityFrame,
+}
+
 /// Durable receipt-bearing successor and runtime owner of a frozen continuation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DecisionContinuationV3 {
     version: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_authority: Option<SourceAuthority>,
     #[serde(flatten)]
     pub facts: DecisionContinuationFacts,
     pub observed_source_receipt: Option<AppendReceipt>,
     pub page_occurrences: Vec<PageOccurrence>,
-    /// Receipt of the complete-read commitment record; present exactly in versions 4 and 5.
+    /// Receipt of the complete-read commitment; required for complete reads from version 4.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_commitment: Option<AppendReceipt>,
 }
@@ -395,7 +407,9 @@ pub(crate) fn collapse_restamp_pairs(
     });
 }
 
-fn complete_activity_read_error(message: impl Into<String>) -> CompleteActivityReadError {
+pub(crate) fn complete_activity_read_error(
+    message: impl Into<String>,
+) -> CompleteActivityReadError {
     CompleteActivityReadError(message.into())
 }
 
@@ -452,6 +466,32 @@ impl VerifiedObservationBindings {
     }
 }
 
+fn complete_read_version(commitment: Option<ActivityReadCommitmentReceipt>) -> u16 {
+    match commitment {
+        None => 3,
+        Some(ActivityReadCommitmentReceipt::LegacyV1(_)) => 4,
+        Some(ActivityReadCommitmentReceipt::BindingsV2(_)) => 5,
+    }
+}
+
+fn current_paper_version(version: u16) -> u16 {
+    if matches!(version, 5..=7) { 7 } else { version }
+}
+
+/// Complete reads emit wire 7 exactly for payload-2 commitments; older read contracts emit
+/// their historical wire. Use that emitted wire for bucket classification and read it back from
+/// the recorded decision in qualification. Dispositions retain every other piece, so both owners
+/// reconstruct the same whole second without consulting today's configuration.
+pub(crate) fn complete_read_entry_policy(
+    version: u16,
+) -> pe_position_ledger::SameSecondEntryPolicy {
+    if version == 7 {
+        pe_position_ledger::SameSecondEntryPolicy::HomogeneousPieces
+    } else {
+        pe_position_ledger::SameSecondEntryPolicy::Legacy
+    }
+}
+
 impl DecisionContinuationV3 {
     /// Wire version 5 for commitment v2, version 4 for v1, and version 3 without a commitment.
     pub(crate) fn new(
@@ -461,11 +501,8 @@ impl DecisionContinuationV3 {
         read_commitment: Option<ActivityReadCommitmentReceipt>,
     ) -> Self {
         Self {
-            version: match read_commitment {
-                None => 3,
-                Some(ActivityReadCommitmentReceipt::LegacyV1(_)) => 4,
-                Some(ActivityReadCommitmentReceipt::BindingsV2(_)) => 5,
-            },
+            version: complete_read_version(read_commitment),
+            source_authority: None,
             facts,
             observed_source_receipt,
             page_occurrences,
@@ -473,18 +510,300 @@ impl DecisionContinuationV3 {
         }
     }
 
-    /// New paper writes retain the v5 source contract under continuation wire 6.
+    /// New REST paper writes retain the v5 source contract under continuation wire 7.
     pub(crate) fn current_paper(mut self) -> Self {
-        if matches!(self.version, 5 | 6) {
-            self.version = 6;
+        self.version = current_paper_version(self.version);
+        if self.version == 7 {
+            self.source_authority = Some(SourceAuthority::CompleteRead);
         }
         self
     }
 
-    /// Durable wire version (2 through 6).
+    /// Durable wire version (2 through 7).
     #[must_use]
     pub fn version(&self) -> u16 {
         self.version
+    }
+
+    /// Financial era of the frozen continuation, independently of economic wire version.
+    #[must_use]
+    pub fn financial_semantic(&self) -> u32 {
+        match self.version {
+            2..=5 => 1,
+            6 => 2,
+            7 => 3,
+            _ => 0,
+        }
+    }
+
+    /// REST-only operations require complete-read authority.
+    pub(crate) fn require_complete_read(&self) -> Result<(), DecisionContinuationError> {
+        match (self.version, self.source_authority) {
+            (2..=6, None) | (7, Some(SourceAuthority::CompleteRead)) => Ok(()),
+            _ => Err(DecisionContinuationError::DurableMismatch),
+        }
+    }
+
+    #[must_use]
+    pub fn is_activity_frame(&self) -> bool {
+        self.version == 7 && self.source_authority == Some(SourceAuthority::ActivityFrame)
+    }
+
+    /// Receipt-independent structural validation; source verification authenticates the prefix.
+    pub(crate) fn validate_authority(&self) -> Result<(), DecisionContinuationError> {
+        if !self.is_activity_frame() {
+            return self.require_complete_read();
+        }
+        let proof: crate::frame_admission::FrameDecisionProof =
+            serde_json::from_value(self.facts.decision_inputs.clone())
+                .map_err(|_| DecisionContinuationError::DurableMismatch)?;
+        let inputs = &proof.inputs;
+        for (refused, fact) in [
+            (!inputs.copy_eligible, "wallet not copy eligible"),
+            (!inputs.history_complete, "wallet history incomplete"),
+            (inputs.fenced, "wallet fenced"),
+            (
+                inputs.coverage.reanchor_required,
+                "wallet requires reanchor",
+            ),
+            (inputs.latch.engaged(), "feed latch engaged"),
+            (inputs.market_consumed, "market history consumed"),
+            (
+                !inputs.frontier.current(
+                    inputs.received_at,
+                    inputs.admitted_at,
+                    inputs.poll_round_stale_secs,
+                    inputs
+                        .earlier_frames
+                        .iter()
+                        .filter(|frame| frame.wallet == self.facts.wallet)
+                        .map(|frame| frame.received_at)
+                        .min(),
+                ),
+                "history frontier not current",
+            ),
+            (
+                crate::frame_admission::frame_prefix_blocks(
+                    &inputs.earlier_frames,
+                    self.facts.wallet,
+                    &self.facts.market_id,
+                ),
+                "earlier unresolved buy",
+            ),
+        ] {
+            if refused {
+                return Err(DecisionContinuationError::FrameAdmissionRefused(fact));
+            }
+        }
+        if inputs.admitted_at < inputs.received_at
+            || inputs.frontier.commitment.sequence >= proof.admission_receipt.sequence
+            || self.facts.action_confidence_ppm
+                != ProbabilityPpm(u32::from(self.facts.reconstruction_quality.get()) * 10_000)
+            || inputs.version != 1
+            || self.observed_source_receipt != Some(inputs.frame_receipt)
+            || !self.page_occurrences.is_empty()
+            || self.read_commitment.is_some()
+            || self.facts.provenance != TradeProvenance::ActivityWs
+            || self.facts.side != Side::Buy
+            || self.facts.share_amount == ShareAmount::ZERO
+            || inputs.frontier.wallet != self.facts.wallet
+            || inputs.source_time.unix_timestamp() != self.facts.source_epoch
+            || inputs.ledger_capture.wallet != self.facts.wallet
+            || proof.admission_receipt.sequence <= inputs.frame_receipt.sequence
+            || !crate::frame_admission::unique_earlier(&inputs.earlier_frames, inputs.frame_receipt)
+            || crate::frame_admission::frame_revision(inputs)? != self.facts.semantic_revision
+        {
+            return Err(DecisionContinuationError::DurableMismatch);
+        }
+        let positions = inputs
+            .positions(self.facts.wallet, &self.facts.market_id)
+            .map_err(|_| {
+                DecisionContinuationError::FrameAdmissionRefused("market ledger rebuild differs")
+            })?;
+        if inputs.ledger_capture.anchor_seq != inputs.coverage.anchor_seq
+            || inputs.ledger_capture.coverage_generation != inputs.coverage.coverage_generation
+            || inputs
+                .earlier_frames
+                .iter()
+                .any(|frame| frame.wallet != self.facts.wallet)
+        {
+            return Err(DecisionContinuationError::DurableMismatch);
+        }
+
+        let trade = self.incoming_trade_unchecked()?;
+        if pe_copy_signal_engine::classify_leader_action(
+            &trade,
+            Some(&positions),
+            self.facts.reconstruction_quality,
+            &SignalConfig::default(),
+        ) != LeaderAction::Entry
+        {
+            return Err(DecisionContinuationError::FrameAdmissionRefused(
+                "confirmed market position is not an entry",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn verify_activity_frame_with_index(
+        &self,
+        index: &SourceReceiptIndex,
+    ) -> Result<(SourceTimestamp, Option<PolymarketTokenId>), CompleteActivityReadError> {
+        #[cfg(feature = "scenario")]
+        if let Some(receipt) = self.observed_source_receipt {
+            index.record_frame_verification(receipt);
+        }
+        let proof: crate::frame_admission::FrameDecisionProof =
+            serde_json::from_value(self.facts.decision_inputs.clone())
+                .map_err(|error| complete_activity_read_error(error.to_string()))?;
+        index
+            .verify_frame_frontier(&proof.inputs.frontier)
+            .map_err(|error| complete_activity_read_error(error.to_string()))?;
+        self.verify_activity_frame_inner(
+            &mut |receipt| {
+                index
+                    .source_envelope(receipt)
+                    .map(CompleteActivityPage::from)
+            },
+            Some(&proof.inputs.frontier),
+        )
+    }
+
+    /// Authenticate the exact frame and prefix before using any frozen decision fact.
+    pub(crate) fn verify_activity_frame<L, E>(
+        &self,
+        lookup: &mut L,
+    ) -> Result<(SourceTimestamp, Option<PolymarketTokenId>), CompleteActivityReadError>
+    where
+        L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
+        E: Display,
+    {
+        self.verify_activity_frame_inner(lookup, None)
+    }
+
+    fn verify_activity_frame_inner<L, E>(
+        &self,
+        lookup: &mut L,
+        verified_frontier: Option<&crate::frame_admission::FeedHistoryFrontier>,
+    ) -> Result<(SourceTimestamp, Option<PolymarketTokenId>), CompleteActivityReadError>
+    where
+        L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
+        E: Display,
+    {
+        self.validate_authority()
+            .map_err(|error| complete_activity_read_error(error.to_string()))?;
+        let proof: crate::frame_admission::FrameDecisionProof =
+            serde_json::from_value(self.facts.decision_inputs.clone())
+                .map_err(|error| complete_activity_read_error(error.to_string()))?;
+        let inputs = &proof.inputs;
+        let source = lookup(inputs.frame_receipt)
+            .map_err(|error| complete_activity_read_error(error.to_string()))?;
+        let observation = verified_stream_observation(&source, self.facts.wallet)?;
+        let components = observation.group_id.components();
+        if observation.group_id.key() != &self.facts.source_trade_id
+            || observation.is_combo
+            || observation.share_amount != self.facts.share_amount
+            || observation.price != self.facts.price
+            || observation.source_time.0 != inputs.source_time
+            || source.observed_at.0 != inputs.source_time
+            || source.received_at.0 != inputs.received_at
+            || components.transaction_hash != self.facts.transaction_hash
+            || components.condition_id.as_ref().map(|id| id.0.as_str())
+                != Some(self.facts.market_id.0.0.as_str())
+            || components.outcome != Some(self.facts.outcome_id)
+            || components.side != Some(self.facts.side)
+        {
+            return Err(complete_activity_read_error(
+                "frame facts differ from authenticated envelope",
+            ));
+        }
+        let admission = lookup(proof.admission_receipt)
+            .map_err(|error| complete_activity_read_error(error.to_string()))?;
+        if admission.source_id != crate::frame_admission::FRAME_ADMISSION_SOURCE_ID
+            || admission.schema_version != 1
+            || admission.parser_version != 1
+            || admission.content_type != ContentType::Json
+            || admission.observed_at.0 != inputs.admitted_at
+            || admission.received_at.0 != inputs.admitted_at
+            || serde_json::from_slice::<crate::frame_admission::FrameAdmissionArtifact>(
+                &admission.payload,
+            )
+            .map_err(|error| complete_activity_read_error(error.to_string()))?
+                != crate::frame_admission::FrameAdmissionArtifact::from_inputs(inputs)
+                    .map_err(|error| complete_activity_read_error(error.to_string()))?
+        {
+            return Err(complete_activity_read_error(
+                "frame admission prefix differs from authenticated capture",
+            ));
+        }
+        if verified_frontier != Some(&inputs.frontier) {
+            inputs
+                .frontier
+                .verify(lookup)
+                .map_err(|error| complete_activity_read_error(error.to_string()))?;
+        }
+        // Every earlier frame is authenticated, rather than accepting caller-supplied identities.
+        for earlier in &inputs.earlier_frames {
+            let source = lookup(earlier.receipt)
+                .map_err(|error| complete_activity_read_error(error.to_string()))?;
+            let observation = verified_stream_observation(&source, earlier.wallet)?;
+            if observation.group_id.key() != &earlier.source_trade_id
+                || observation
+                    .group_id
+                    .components()
+                    .condition_id
+                    .as_ref()
+                    .map(|id| id.0.as_str())
+                    != Some(earlier.market.0.0.as_str())
+                || source.received_at.0 != earlier.received_at
+                || (earlier.unresolved_buy
+                    && (observation.is_combo
+                        || observation.share_amount == ShareAmount::ZERO
+                        || observation.group_id.components().side != Some(Side::Buy)))
+            {
+                return Err(complete_activity_read_error(
+                    "earlier frame differs from admission prefix",
+                ));
+            }
+        }
+        Ok((
+            SourceTimestamp(inputs.source_time),
+            components.asset.clone(),
+        ))
+    }
+
+    pub(crate) fn authority_receipts(
+        &self,
+    ) -> Result<Vec<AppendReceipt>, DecisionContinuationError> {
+        let mut receipts = self
+            .page_occurrences
+            .iter()
+            .map(|page| page.receipt)
+            .chain(self.observed_source_receipt)
+            .chain(self.read_commitment)
+            .collect::<Vec<_>>();
+        if self.is_activity_frame() {
+            let proof: crate::frame_admission::FrameDecisionProof =
+                serde_json::from_value(self.facts.decision_inputs.clone())?;
+            receipts.push(proof.admission_receipt);
+            receipts.push(proof.inputs.frontier.commitment);
+            receipts.extend(
+                proof
+                    .inputs
+                    .frontier
+                    .page_occurrences
+                    .iter()
+                    .map(|page| page.receipt),
+            );
+            receipts.extend(
+                proof
+                    .inputs
+                    .earlier_frames
+                    .iter()
+                    .map(|frame| frame.receipt),
+            );
+        }
+        Ok(receipts)
     }
 
     /// Whether both continuations describe one complete read: equal wallet, logical read proof,
@@ -493,6 +812,7 @@ impl DecisionContinuationV3 {
     #[must_use]
     pub(crate) fn same_complete_read(&self, other: &Self) -> bool {
         self.version == other.version
+            && self.source_authority == other.source_authority
             && self.facts.wallet == other.facts.wallet
             && self.facts.decision_inputs == other.facts.decision_inputs
             && self.page_occurrences == other.page_occurrences
@@ -502,6 +822,10 @@ impl DecisionContinuationV3 {
     /// Greatest synchronized activity-page receipt in this complete read.
     #[must_use]
     pub fn complete_bound(&self) -> Option<AppendReceipt> {
+        if self.is_activity_frame() {
+            return self.observed_source_receipt;
+        }
+        self.require_complete_read().ok()?;
         self.page_occurrences
             .iter()
             .map(|page| page.receipt)
@@ -552,6 +876,8 @@ impl DecisionContinuationV3 {
 
     fn read_verification(&self) -> ActivityReadVerification<'_> {
         ActivityReadVerification {
+            binding_filter: None,
+            counterpart_depth: 0,
             version: self.version,
             wallet: self.facts.wallet,
             decision_inputs: &self.facts.decision_inputs,
@@ -593,6 +919,8 @@ impl DecisionContinuationV3 {
         L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
         E: Display,
     {
+        self.require_complete_read()
+            .map_err(|error| complete_activity_read_error(error.to_string()))?;
         let read = self
             .read_verification()
             .reconstruct_verified_activity_read(lookup)?;
@@ -611,6 +939,8 @@ impl DecisionContinuationV3 {
         L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
         E: Display,
     {
+        self.require_complete_read()
+            .map_err(|error| complete_activity_read_error(error.to_string()))?;
         let read = self
             .read_verification()
             .reconstruct_verified_activity_read_parts(fixed_end, pages, commitment, lookup)?;
@@ -629,12 +959,15 @@ impl DecisionContinuationV3 {
         L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
         E: Display,
     {
+        self.require_complete_read()
+            .map_err(|error| complete_activity_read_error(error.to_string()))?;
         read.bindings.verify_facts(&self.facts)?;
         self.read_verification()
             .verify_stream_binding_in_read(target_id, receipt, read, lookup)
     }
 
     pub(crate) fn commitment_contract(&self) -> Option<(u32, u32)> {
+        self.require_complete_read().ok()?;
         self.read_verification().commitment_contract()
     }
 
@@ -648,6 +981,8 @@ impl DecisionContinuationV3 {
         L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
         E: Display,
     {
+        self.require_complete_read()
+            .map_err(|error| complete_activity_read_error(error.to_string()))?;
         self.read_verification()
             .verify_read_commitment(fixed_end, pages, lookup)
     }
@@ -662,7 +997,9 @@ impl DecisionContinuationV3 {
         L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
         E: Display,
     {
-        if matches!(self.version, 5 | 6) {
+        self.require_complete_read()
+            .map_err(|error| complete_activity_read_error(error.to_string()))?;
+        if matches!(self.version, 5..=7) {
             let read = self.reconstruct_verified_activity_read(lookup)?;
             return self.verify_stream_binding_in_read(target_id, receipt, &read, lookup);
         }
@@ -671,10 +1008,34 @@ impl DecisionContinuationV3 {
     }
 }
 
+pub(crate) fn verify_feed_frontier<L, E>(
+    frontier: &crate::frame_admission::FeedHistoryFrontier,
+    lookup: &mut L,
+) -> Result<(), CompleteActivityReadError>
+where
+    L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
+    E: Display,
+{
+    let inputs = json!({"fixed_end": frontier.fixed_end, "pages": frontier.pages});
+    let verifier = ActivityReadVerification {
+        binding_filter: None,
+        counterpart_depth: 0,
+        version: 7,
+        wallet: frontier.wallet,
+        decision_inputs: &inputs,
+        page_occurrences: &frontier.page_occurrences,
+        read_commitment: Some(frontier.commitment),
+    };
+    verifier.reconstruct_verified_activity_read(lookup)?;
+    Ok(())
+}
+
 // The same read verifier serves a continuation and a commitment-only boot candidate. It owns
 // no decision, defaults, financial state, or persistence; all inputs are borrowed recorded proof.
 struct ActivityReadVerification<'a> {
     version: u16,
+    counterpart_depth: u8,
+    binding_filter: Option<AppendReceipt>,
     wallet: WalletAddress,
     decision_inputs: &'a Value,
     page_occurrences: &'a [PageOccurrence],
@@ -736,6 +1097,13 @@ impl ActivityReadVerification<'_> {
     {
         let mut sources =
             HashMap::<(pe_core_types::EventSeq, blake3::Hash), CompleteActivityPage>::new();
+        // Keep only this read's pages. A counterpart basis owns and releases its own
+        // page cache instead of retaining every historical full read in the outer one.
+        let current_pages = self
+            .page_occurrences
+            .iter()
+            .map(|page| (page.receipt.sequence, page.receipt.this_hash))
+            .collect::<HashSet<_>>();
         let mut cached_lookup = |receipt: AppendReceipt| {
             let key = (receipt.sequence, receipt.this_hash);
             if let Some(source) = sources.get(&key) {
@@ -743,7 +1111,9 @@ impl ActivityReadVerification<'_> {
             }
             let source =
                 lookup(receipt).map_err(|error| complete_activity_read_error(error.to_string()))?;
-            sources.insert(key, source.clone());
+            if current_pages.contains(&key) {
+                sources.insert(key, source.clone());
+            }
             Ok(source)
         };
         let lookup = &mut cached_lookup;
@@ -772,7 +1142,7 @@ impl ActivityReadVerification<'_> {
                 ACTIVITY_READ_COMMITMENT_V1_SCHEMA_VERSION,
                 ACTIVITY_READ_COMMITMENT_PARSER_VERSION,
             )),
-            5 | 6 => Some((
+            5..=7 => Some((
                 ACTIVITY_READ_COMMITMENT_SCHEMA_VERSION,
                 ACTIVITY_READ_COMMITMENT_PARSER_VERSION,
             )),
@@ -828,7 +1198,7 @@ impl ActivityReadVerification<'_> {
                 "complete activity read commitment is invalid: {error}"
             ))
         })?;
-        if (matches!(self.version, 5 | 6)) != value.get("bindings").is_some() {
+        if (matches!(self.version, 5..=7)) != value.get("bindings").is_some() {
             return Err(complete_activity_read_error(
                 "complete activity read commitment has inconsistent binding generation",
             ));
@@ -848,7 +1218,7 @@ impl ActivityReadVerification<'_> {
                 "observation bindings have noncanonical or unknown fields",
             ));
         }
-        let expected_version = if matches!(self.version, 5 | 6) { 2 } else { 1 };
+        let expected_version = if matches!(self.version, 5..=7) { 2 } else { 1 };
         if commitment.version != expected_version
             || (expected_version == 2) != commitment.bindings.is_some()
             || commitment.wallet != self.wallet
@@ -869,7 +1239,7 @@ impl ActivityReadVerification<'_> {
             ));
         }
         if let Some(proof) = &commitment.read_proof
-            && (!matches!(self.version, 5 | 6)
+            && (!matches!(self.version, 5..=7)
                 || proof.page_occurrences != self.page_occurrences
                 || proof.pages != pages)
         {
@@ -912,6 +1282,7 @@ impl ActivityReadVerification<'_> {
     {
         let mut verified = VerifiedObservationBindings::default();
         let mut identities = HashMap::new();
+        let mut counterpart_proofs = HashMap::new();
         let Some(bindings) = &commitment.bindings else {
             return Ok(verified);
         };
@@ -929,7 +1300,10 @@ impl ActivityReadVerification<'_> {
             .pages
             .ok_or_else(|| complete_activity_read_error("binding read pages are absent"))?;
         let joined = joined_read_pages(self.page_occurrences, &pages)?;
-        for binding in bindings {
+        for binding in bindings.iter().filter(|binding| {
+            self.binding_filter
+                .is_none_or(|receipt| receipt == binding.stream_receipt)
+        }) {
             if binding.stream_receipt.sequence >= commitment_receipt.sequence
                 || binding
                     .identity_receipt
@@ -994,12 +1368,118 @@ impl ActivityReadVerification<'_> {
                     "binding target does not occur on its page",
                 ));
             }
+            let frame_audit = if let Some(receipt) = binding.frame_admission_receipt {
+                let admission = lookup(receipt)
+                    .map_err(|error| complete_activity_read_error(error.to_string()))?;
+                let artifact: crate::frame_admission::FrameAdmissionArtifact =
+                    serde_json::from_slice(&admission.payload)
+                        .map_err(|error| complete_activity_read_error(error.to_string()))?;
+                if admission.source_id != crate::frame_admission::FRAME_ADMISSION_SOURCE_ID
+                    || admission.schema_version != 1
+                    || admission.parser_version != 1
+                    || admission.content_type != ContentType::Json
+                    || receipt.sequence >= commitment_receipt.sequence
+                    || artifact.version != 1
+                    || artifact.capture_digest.len() != 64
+                    || artifact.frame_receipt != binding.stream_receipt
+                    || observation.is_combo
+                    || observation.share_amount == ShareAmount::ZERO
+                    || observation.group_id.components().side != Some(Side::Buy)
+                {
+                    return Err(complete_activity_read_error(
+                        "frame audit admission differs from its observation",
+                    ));
+                }
+                true
+            } else {
+                false
+            };
             let original = observation.group_id.components();
             let history = target.group_id.components();
             let exact = aggregates
                 .iter()
                 .find(|aggregate| aggregate.group_id.key() == observation.group_id.key());
-            if let Some(exact) = exact {
+            if frame_audit {
+                let fixed = if let Some(basis) = binding.counterpart_basis_receipt {
+                    if basis.sequence >= commitment_receipt.sequence {
+                        return Err(complete_activity_read_error(
+                            "frame counterpart basis is not before commitment",
+                        ));
+                    }
+                    let key = (
+                        basis.sequence,
+                        basis.this_hash,
+                        binding.stream_receipt.sequence,
+                        binding.stream_receipt.this_hash,
+                    );
+                    let target = match counterpart_proofs.entry(key) {
+                        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                        std::collections::hash_map::Entry::Vacant(entry) => {
+                            // Authenticate one basis at a time; retain only its compact target.
+                            let previous = verified_commitment_bindings_at_depth(
+                                basis,
+                                &mut |receipt| {
+                                    lookup(receipt).map_err(|error| {
+                                        complete_activity_read_error(error.to_string())
+                                    })
+                                },
+                                self.counterpart_depth + 1,
+                                Some(binding.stream_receipt),
+                            )?;
+                            if previous.wallet != self.wallet {
+                                return Err(complete_activity_read_error(
+                                    "frame counterpart basis wallet differs",
+                                ));
+                            }
+                            let target = if let Some(prior) = previous.bindings.first() {
+                                if prior.frame_admission_receipt != binding.frame_admission_receipt
+                                {
+                                    return Err(complete_activity_read_error(
+                                        "frame counterpart basis admission differs",
+                                    ));
+                                }
+                                Some(prior.history_group_id.clone())
+                            } else if previous.full_history
+                                && !previous
+                                    .transaction_aggregates
+                                    .get(&original.transaction_hash)
+                                    .into_iter()
+                                    .flatten()
+                                    .filter_map(|position| previous.aggregates.get(*position))
+                                    .any(|aggregate| {
+                                        aggregate.group_id.components().activity_type
+                                            == ActivityType::Trade
+                                    })
+                            {
+                                None
+                            } else {
+                                return Err(complete_activity_read_error(
+                                    "frame counterpart basis has no binding or absence",
+                                ));
+                            };
+                            entry.insert(target)
+                        }
+                    };
+                    Some(target.as_ref())
+                } else {
+                    None
+                };
+                let candidates = crate::feed_audit::resolve_frame_counterpart(
+                    &observation,
+                    fixed,
+                    aggregates,
+                    &restamp_pairs,
+                );
+                if candidates.len() != 1 || candidates[0].group_id != target.group_id {
+                    return Err(complete_activity_read_error(
+                        "frame audit counterpart is absent or ambiguous",
+                    ));
+                }
+            } else if binding.counterpart_basis_receipt.is_some() {
+                return Err(complete_activity_read_error(
+                    "ordinary binding has frame counterpart basis",
+                ));
+            } else if let Some(exact) = exact {
                 if exact.group_id != target.group_id {
                     return Err(complete_activity_read_error(
                         "binding substitutes an exact history match",
@@ -1028,7 +1508,7 @@ impl ActivityReadVerification<'_> {
                 }
             }
             match (&binding.identity_provenance, binding.identity_receipt) {
-                (None, None) if original == history => {}
+                (None, None) if original == history || frame_audit => {}
                 (Some(provenance), Some(receipt)) => {
                     if receipt.sequence.0 != provenance.source_log_sequence
                         || history.asset.as_ref() != Some(&provenance.asset)
@@ -1097,7 +1577,7 @@ impl ActivityReadVerification<'_> {
         L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
         E: Display,
     {
-        if matches!(self.version, 5 | 6) {
+        if matches!(self.version, 5..=7) {
             let read = self.reconstruct_verified_activity_read(lookup)?;
             return self.verify_stream_binding_in_read(target_id, receipt, &read, lookup);
         }
@@ -1135,7 +1615,7 @@ impl ActivityReadVerification<'_> {
             })?;
             verified_stream_observation(&source, self.wallet)?
         };
-        if !matches!(self.version, 5 | 6) {
+        if !matches!(self.version, 5..=7) {
             if observation.group_id.key() != target_id {
                 return Err(complete_activity_read_error(
                     "websocket differs from the reconciled trade",
@@ -1358,10 +1838,24 @@ impl DecisionContinuationV3 {
         &self,
         source_receipts: &SourceReceiptIndex,
     ) -> Result<Option<ObservationEvidence>, DecisionContinuationError> {
+        if self.is_activity_frame() {
+            self.verify_activity_frame_with_index(source_receipts)
+                .map_err(|_| DecisionContinuationError::DurableMismatch)?;
+            let receipt = self
+                .observed_source_receipt
+                .ok_or(DecisionContinuationError::DurableMismatch)?;
+            return Ok(Some(ObservationEvidence {
+                source_receipt: receipt,
+                complete_bound_receipt: receipt,
+                observed_unix_ms: source_receipts.received_millis(receipt)?,
+                provenance: "activity_ws".to_owned(),
+            }));
+        }
+        self.require_complete_read()?;
         let Some(selected) = self.observation_receipt() else {
             return Ok(None);
         };
-        if matches!(self.version, 5 | 6) {
+        if matches!(self.version, 5..=7) {
             let mut lookup = |receipt| {
                 #[cfg(test)]
                 continuation_validation_tests::LOOKUPS.with(|count| count.set(count.get() + 1));
@@ -1485,6 +1979,7 @@ impl DecisionContinuationV3 {
         &self,
         source_receipts: &SourceReceiptIndex,
     ) -> Result<(), DecisionContinuationError> {
+        self.require_complete_read()?;
         let Some(websocket) = self.observed_source_receipt else {
             return Ok(());
         };
@@ -1509,6 +2004,9 @@ impl DecisionContinuationV3 {
         L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
         E: Display,
     {
+        if self.is_activity_frame() {
+            return self.verify_activity_frame(lookup);
+        }
         let aggregates = self.reconstruct_complete_activity_read(lookup)?;
         let target = aggregates
             .iter()
@@ -1521,7 +2019,7 @@ impl DecisionContinuationV3 {
                 complete_activity_read_error("source clock target differs from continuation")
             })?;
         let mut earliest = target.source_time.clone();
-        if matches!(self.version, 5 | 6) {
+        if matches!(self.version, 5..=7) {
             let wire: CompleteActivityReadWire =
                 serde_json::from_value(self.facts.decision_inputs.clone())
                     .map_err(|error| complete_activity_read_error(error.to_string()))?;
@@ -1588,7 +2086,7 @@ impl PageGeneration {
     pub(crate) fn matches_continuation(self, version: u16) -> bool {
         matches!(
             (self, version),
-            (Self::Historical, 3) | (Self::Committed, 4..=6)
+            (Self::Historical, 3) | (Self::Committed, 4..=7)
         )
     }
 }
@@ -1635,6 +2133,13 @@ pub struct ObservationBinding {
     #[serde(deserialize_with = "deserialize_binding_provenance")]
     pub identity_provenance: Option<crate::asset_identity::IdentityProvenance>,
     pub identity_receipt: Option<AppendReceipt>,
+    /// First binding, or the full-history absence proof preceding a late counterpart.
+    /// Omitted on initial discovery and historical bindings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counterpart_basis_receipt: Option<AppendReceipt>,
+    /// Only admitted frame audits use transaction/asset discovery before comparing sides.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frame_admission_receipt: Option<AppendReceipt>,
 }
 
 fn deserialize_binding_provenance<'de, D>(
@@ -1673,7 +2178,7 @@ pub struct ActivityReadCommitment {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bindings: Option<Vec<ObservationBinding>>,
     /// Existing digest inputs retained for binding authentication without a pending decision.
-    /// Absent on legacy and empty-binding commitments.
+    /// Absent on legacy and frontier-only commitments; negative audits retain it even without bindings.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_proof: Option<CommittedReadProof>,
 }
@@ -1693,12 +2198,8 @@ struct ActivityReadPreimage<'a> {
     pages: Vec<(&'a PageOccurrence, &'a ReconciliationPageEvidence)>,
 }
 
-fn canonical_json(value: &impl Serialize) -> Result<Vec<u8>, CompleteActivityReadError> {
-    serde_json::to_value(value)
-        .and_then(|value| serde_json::to_vec(&value))
-        .map_err(|error| {
-            complete_activity_read_error(format!("commitment encoding failed: {error}"))
-        })
+pub(crate) fn canonical_json(value: &impl Serialize) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_value(value).and_then(|value| serde_json::to_vec(&value))
 }
 
 fn canonical_bindings(
@@ -1706,7 +2207,13 @@ fn canonical_bindings(
 ) -> Result<Vec<ObservationBinding>, CompleteActivityReadError> {
     let mut encoded = bindings
         .iter()
-        .map(|binding| canonical_json(binding).map(|bytes| (bytes, binding.clone())))
+        .map(|binding| {
+            canonical_json(binding)
+                .map(|bytes| (bytes, binding.clone()))
+                .map_err(|error| {
+                    complete_activity_read_error(format!("commitment encoding failed: {error}"))
+                })
+        })
         .collect::<Result<Vec<_>, _>>()?;
     encoded.sort_by(|left, right| left.0.cmp(&right.0));
     let mut receipts = HashSet::new();
@@ -1736,7 +2243,7 @@ fn activity_read_digest_versioned(
     let (domain, canonical) = match bindings {
         None => (
             ACTIVITY_READ_COMMITMENT_V1_DOMAIN,
-            canonical_json(&preimage)?,
+            canonical_json(&preimage),
         ),
         Some(bindings) => {
             #[derive(Serialize)]
@@ -1750,10 +2257,13 @@ fn activity_read_digest_versioned(
                 canonical_json(&PreimageV2 {
                     read: preimage,
                     bindings: canonical_bindings(bindings)?,
-                })?,
+                }),
             )
         }
     };
+    let canonical = canonical.map_err(|error| {
+        complete_activity_read_error(format!("commitment encoding failed: {error}"))
+    })?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(domain);
     hasher.update(&canonical);
@@ -1835,19 +2345,158 @@ fn encode_activity_read_commitment(
 pub(crate) fn verified_commitment_bindings(
     receipt: AppendReceipt,
     source_receipts: &SourceReceiptIndex,
-) -> Result<Vec<ObservationBinding>, CompleteActivityReadError> {
-    verified_commitment_bindings_with_lookup(receipt, &mut |receipt| {
+) -> Result<VerifiedCommitment, CompleteActivityReadError> {
+    #[cfg(feature = "scenario")]
+    source_receipts.record_read_verification(receipt);
+    let read = verified_commitment_bindings_with_lookup(receipt, &mut |receipt| {
         source_receipts
             .source_envelope(receipt)
             .map(CompleteActivityPage::from)
-    })
-    .map(|commitment| commitment.bindings)
+    })?;
+    source_receipts.remember_frame_bindings(&read)?;
+    Ok(read)
 }
 
 /// An authenticated commitment: its bindings and the restamp pairs its complete read proves.
-pub(crate) struct VerifiedCommitment {
+#[derive(Debug)]
+pub struct VerifiedCommitment {
+    pub(crate) receipt: AppendReceipt,
+    pub(crate) frontier: Option<crate::frame_admission::FeedHistoryFrontier>,
     pub(crate) bindings: Vec<ObservationBinding>,
     pub(crate) restamp_pairs: HashMap<SourceTradeId, SourceTradeId>,
+    pub(crate) wallet: WalletAddress,
+    pub(crate) fixed_end: i64,
+    pub(crate) full_history: bool,
+    pub(crate) transaction_aggregates: HashMap<String, Vec<usize>>,
+    pub(crate) aggregate_indices: HashMap<SourceTradeId, usize>,
+    pub(crate) binding_indices: HashMap<(pe_core_types::EventSeq, blake3::Hash), usize>,
+    pub(crate) aggregates: Vec<ActivityAggregate>,
+    pub(crate) identities: HashMap<SourceTradeId, MarketOutcomeId>,
+}
+
+fn index_aggregates(aggregates: &[ActivityAggregate]) -> HashMap<SourceTradeId, usize> {
+    aggregates
+        .iter()
+        .enumerate()
+        .map(|(index, aggregate)| (aggregate.group_id.key().clone(), index))
+        .collect()
+}
+
+fn index_bindings(
+    bindings: &[ObservationBinding],
+) -> HashMap<(pe_core_types::EventSeq, blake3::Hash), usize> {
+    bindings
+        .iter()
+        .enumerate()
+        .map(|(index, binding)| {
+            (
+                (
+                    binding.stream_receipt.sequence,
+                    binding.stream_receipt.this_hash,
+                ),
+                index,
+            )
+        })
+        .collect()
+}
+
+fn index_transactions(aggregates: &[ActivityAggregate]) -> HashMap<String, Vec<usize>> {
+    let mut transactions: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, aggregate) in aggregates.iter().enumerate() {
+        transactions
+            .entry(aggregate.group_id.components().transaction_hash.clone())
+            .or_default()
+            .push(index);
+    }
+    transactions
+}
+
+pub fn verified_read_for_routing(
+    receipt: AppendReceipt,
+    wallet: WalletAddress,
+    fixed_end: i64,
+    occurrences: &[PageOccurrence],
+    pages: &[ReconciliationPageEvidence],
+    index: &SourceReceiptIndex,
+) -> Result<VerifiedCommitment, CompleteActivityReadError> {
+    #[cfg(feature = "scenario")]
+    index.record_read_verification(receipt);
+    let inputs = json!({"fixed_end": fixed_end, "pages": pages});
+    let verifier = ActivityReadVerification {
+        binding_filter: None,
+        counterpart_depth: 0,
+        version: 7,
+        wallet,
+        decision_inputs: &inputs,
+        page_occurrences: occurrences,
+        read_commitment: Some(receipt),
+    };
+    let read = verifier.reconstruct_verified_activity_read(&mut |receipt| {
+        index
+            .source_envelope(receipt)
+            .map(CompleteActivityPage::from)
+    })?;
+    let read = VerifiedCommitment {
+        receipt,
+        frontier: Some(crate::frame_admission::FeedHistoryFrontier {
+            version: 1,
+            wallet,
+            fixed_end,
+            commitment: receipt,
+            page_occurrences: occurrences.to_vec(),
+            pages: pages.to_vec(),
+        }),
+        wallet,
+        fixed_end,
+        full_history: pages.iter().any(|page| {
+            page.bounds
+                .is_some_and(|bounds| bounds.start == Some(0) && bounds.end == fixed_end)
+        }),
+        aggregate_indices: index_aggregates(&read.aggregates),
+        binding_indices: index_bindings(
+            read.commitment
+                .as_ref()
+                .and_then(|commitment| commitment.bindings.as_deref())
+                .unwrap_or_default(),
+        ),
+        transaction_aggregates: index_transactions(&read.aggregates),
+        bindings: read
+            .commitment
+            .and_then(|commitment| commitment.bindings)
+            .unwrap_or_default(),
+        aggregates: read.aggregates,
+        restamp_pairs: read.bindings.restamp_pairs,
+        identities: read.bindings.identities,
+    };
+    index.remember_frame_bindings(&read)?;
+    Ok(read)
+}
+
+/// Recover the authenticated leaf rows for ordinary routing of a retained commitment.
+/// This delegates split/saturation handling to the same read verifier used at synchronization.
+pub(crate) fn retained_read_rows(
+    read: &VerifiedCommitment,
+    index: &SourceReceiptIndex,
+) -> Result<Vec<NormalizedActivity>, CompleteActivityReadError> {
+    let frontier = read
+        .frontier
+        .as_ref()
+        .ok_or_else(|| complete_activity_read_error("retained read proof absent"))?;
+    let inputs = json!({"fixed_end": read.fixed_end, "pages": frontier.pages});
+    ActivityReadVerification {
+        binding_filter: None,
+        counterpart_depth: 0,
+        version: 7,
+        wallet: read.wallet,
+        decision_inputs: &inputs,
+        page_occurrences: &frontier.page_occurrences,
+        read_commitment: Some(read.receipt),
+    }
+    .reconstruct_rich_activity_read(read.fixed_end, &frontier.pages, &mut |receipt| {
+        index
+            .source_envelope(receipt)
+            .map(CompleteActivityPage::from)
+    })
 }
 
 /// The same commitment-only authentication for either an indexed or replayed sealed prefix.
@@ -1859,6 +2508,29 @@ where
     L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
     E: Display,
 {
+    verified_commitment_bindings_at_depth(
+        receipt,
+        &mut |receipt| {
+            lookup(receipt).map_err(|error| complete_activity_read_error(error.to_string()))
+        },
+        0,
+        None,
+    )
+}
+
+fn verified_commitment_bindings_at_depth(
+    receipt: AppendReceipt,
+    mut lookup: &mut dyn FnMut(
+        AppendReceipt,
+    ) -> Result<CompleteActivityPage, CompleteActivityReadError>,
+    counterpart_depth: u8,
+    binding_filter: Option<AppendReceipt>,
+) -> Result<VerifiedCommitment, CompleteActivityReadError> {
+    if counterpart_depth > 2 {
+        return Err(complete_activity_read_error(
+            "frame counterpart proof chain exceeds its first binding/absence basis",
+        ));
+    }
     let source =
         lookup(receipt).map_err(|error| complete_activity_read_error(error.to_string()))?;
     let commitment: ActivityReadCommitment = serde_json::from_slice(&source.payload)
@@ -1879,8 +2551,18 @@ where
         .ok_or_else(|| complete_activity_read_error("v2 commitment bindings are absent"))?;
     if bindings.is_empty() && commitment.read_proof.is_none() {
         return Ok(VerifiedCommitment {
+            receipt,
+            frontier: None,
             bindings: Vec::new(),
             restamp_pairs: HashMap::new(),
+            wallet: commitment.wallet,
+            fixed_end: commitment.fixed_end,
+            full_history: false,
+            aggregate_indices: HashMap::new(),
+            binding_indices: HashMap::new(),
+            transaction_aggregates: HashMap::new(),
+            aggregates: Vec::new(),
+            identities: HashMap::new(),
         });
     }
     let proof = commitment
@@ -1889,16 +2571,43 @@ where
         .ok_or_else(|| complete_activity_read_error("binding commitment read proof is absent"))?;
     let inputs = json!({ "fixed_end": commitment.fixed_end, "pages": proof.pages });
     let verifier = ActivityReadVerification {
+        binding_filter,
+        counterpart_depth,
         version: 5,
         wallet: commitment.wallet,
         decision_inputs: &inputs,
         page_occurrences: &proof.page_occurrences,
         read_commitment: Some(receipt),
     };
-    let read = verifier.reconstruct_verified_activity_read(lookup)?;
+    let read = verifier.reconstruct_verified_activity_read(&mut lookup)?;
+    let selected_bindings = bindings
+        .iter()
+        .filter(|binding| binding_filter.is_none_or(|receipt| receipt == binding.stream_receipt))
+        .cloned()
+        .collect::<Vec<_>>();
     Ok(VerifiedCommitment {
-        bindings: bindings.clone(),
+        receipt,
+        frontier: Some(crate::frame_admission::FeedHistoryFrontier {
+            version: 1,
+            wallet: commitment.wallet,
+            fixed_end: commitment.fixed_end,
+            commitment: receipt,
+            page_occurrences: proof.page_occurrences.clone(),
+            pages: proof.pages.clone(),
+        }),
+        binding_indices: index_bindings(&selected_bindings),
+        bindings: selected_bindings,
         restamp_pairs: read.bindings.restamp_pairs,
+        wallet: commitment.wallet,
+        fixed_end: commitment.fixed_end,
+        full_history: proof.pages.iter().any(|page| {
+            page.bounds
+                .is_some_and(|bounds| bounds.start == Some(0) && bounds.end == commitment.fixed_end)
+        }),
+        aggregate_indices: index_aggregates(&read.aggregates),
+        transaction_aggregates: index_transactions(&read.aggregates),
+        aggregates: read.aggregates,
+        identities: read.bindings.identities,
     })
 }
 
@@ -2112,6 +2821,8 @@ fn validate_complete_activity_segment_graph(
 
 #[derive(Debug, thiserror::Error)]
 pub enum DecisionContinuationError {
+    #[error("frame admission refused: {0}")]
+    FrameAdmissionRefused(&'static str),
     #[error("invalid frozen continuation json: {0}")]
     Json(#[from] serde_json::Error),
     #[error("unsupported frozen continuation version {0}")]
@@ -2136,6 +2847,10 @@ impl DecisionContinuationV3 {
             .and_then(|value| u16::try_from(value).ok())
             .ok_or(DecisionContinuationError::Version(0))?;
         let policy_present = value.get("paper_freshness_policy").is_some();
+        let authority_present = value.get("source_authority").is_some();
+        if (version == 7) != authority_present {
+            return Err(DecisionContinuationError::DurableMismatch);
+        }
         let continuation = match version {
             2 => {
                 let applied_configuration =
@@ -2150,15 +2865,19 @@ impl DecisionContinuationV3 {
                 let legacy: DecisionContinuationV2Wire = serde_json::from_value(value)?;
                 Self {
                     version: legacy.version,
+                    source_authority: None,
                     facts: legacy.facts,
                     observed_source_receipt: None,
                     page_occurrences: Vec::new(),
                     read_commitment: None,
                 }
             }
-            3..=6 => serde_json::from_value(value)?,
+            3..=7 => serde_json::from_value(value)?,
             version => return Err(DecisionContinuationError::Version(version)),
         };
+        if (version == 7) != continuation.source_authority.is_some() {
+            return Err(DecisionContinuationError::DurableMismatch);
+        }
         let frozen = &continuation.facts;
         if frozen.source_trade_id != row.source_trade_id
             || frozen.semantic_revision != row.semantic_revision
@@ -2170,18 +2889,20 @@ impl DecisionContinuationV3 {
         {
             return Err(DecisionContinuationError::DurableMismatch);
         }
-        if (matches!(version, 5 | 6)) != policy_present
-            || (matches!(version, 5 | 6)) != frozen.paper_freshness_policy.is_some()
+        if (matches!(version, 5..=7)) != policy_present
+            || (matches!(version, 5..=7)) != frozen.paper_freshness_policy.is_some()
             || frozen
                 .paper_freshness_policy
                 .is_some_and(|policy| !policy.valid())
         {
             return Err(DecisionContinuationError::DurableMismatch);
         }
-        if matches!(version, 3..=6) {
+        if matches!(version, 3..=7)
+            && continuation.source_authority != Some(SourceAuthority::ActivityFrame)
+        {
             if (frozen.provenance == TradeProvenance::ActivityWs)
                 != continuation.observed_source_receipt.is_some()
-                || matches!(version, 4..=6) != continuation.read_commitment.is_some()
+                || matches!(version, 4..=7) != continuation.read_commitment.is_some()
                 || continuation.read_commitment.is_some_and(|receipt| {
                     continuation
                         .page_occurrences
@@ -2208,12 +2929,20 @@ impl DecisionContinuationV3 {
                 previous = Some(page.receipt.sequence);
             }
         }
+        if continuation.is_activity_frame() {
+            continuation.validate_authority()?;
+        }
         Ok(continuation)
     }
 
     /// Reconstruct only the transport-neutral trade facts needed by the existing
     /// idempotent decision continuation. Ledger/classification/gate are not rerun.
     pub fn incoming_trade(&self) -> Result<IncomingTrade, DecisionContinuationError> {
+        self.validate_authority()?;
+        self.incoming_trade_unchecked()
+    }
+
+    fn incoming_trade_unchecked(&self) -> Result<IncomingTrade, DecisionContinuationError> {
         let observed_at = time::OffsetDateTime::from_unix_timestamp(self.facts.source_epoch)
             .map_err(|_| DecisionContinuationError::SourceEpoch(self.facts.source_epoch))?;
         Ok(IncomingTrade {
@@ -2224,7 +2953,15 @@ impl DecisionContinuationV3 {
             price: self.facts.price,
             contracts: self.facts.share_amount,
             observed_at,
-            received_at: observed_at,
+            received_at: if self.is_activity_frame() {
+                serde_json::from_value::<crate::frame_admission::FrameDecisionProof>(
+                    self.facts.decision_inputs.clone(),
+                )?
+                .inputs
+                .received_at
+            } else {
+                observed_at
+            },
             source_trade_id: self.facts.source_trade_id.clone(),
             transaction_hash: Some(self.facts.transaction_hash.clone()),
             provenance: self.facts.provenance,
@@ -2238,6 +2975,38 @@ impl DecisionContinuationV3 {
 pub struct ContinuationValidationError {
     pub source_trade_id: Option<SourceTradeId>,
     pub cause: String,
+}
+
+/// Authenticate complete frame history once at boot, including already terminal decisions.
+/// Normal financial recovery authenticates only the continuation it retries or projects.
+pub fn validate_frame_history(
+    paper_state: &PaperStateDb,
+    source_receipts: &SourceReceiptIndex,
+) -> Result<usize, ContinuationValidationError> {
+    let frames = paper_state
+        .activity_frame_decision_index(None)
+        .map_err(|error| ContinuationValidationError {
+            source_trade_id: None,
+            cause: error.to_string(),
+        })?;
+    let mut validated = 0;
+    for frame in frames {
+        let fail = |cause: String| ContinuationValidationError {
+            source_trade_id: Some(frame.source_trade_id.clone()),
+            cause,
+        };
+        let row = paper_state
+            .decision_pending_for(&frame.source_trade_id)
+            .map_err(|error| fail(error.to_string()))?
+            .ok_or_else(|| fail("indexed frame decision missing".to_owned()))?;
+        let continuation =
+            DecisionContinuationV3::from_durable(&row).map_err(|error| fail(error.to_string()))?;
+        continuation
+            .verify_activity_frame_with_index(source_receipts)
+            .map_err(|error| fail(error.to_string()))?;
+        validated += 1;
+    }
+    Ok(validated)
 }
 
 /// Validate every open continuation before any can resume, reconstructing each shared read once.
@@ -2261,6 +3030,12 @@ pub(crate) fn validate_continuation_rows(
     rows: Vec<DecisionPendingRow>,
     source_receipts: &SourceReceiptIndex,
 ) -> Result<usize, ContinuationValidationError> {
+    crate::frame_admission::restore_frontiers(paper_state, source_receipts).map_err(|cause| {
+        ContinuationValidationError {
+            source_trade_id: None,
+            cause: cause.to_string(),
+        }
+    })?;
     let validated = rows.len();
     let mut reads = Vec::<(DecisionContinuationV3, Vec<DecisionContinuationV3>)>::new();
     let mut page_reads = HashMap::<pe_core_types::EventSeq, usize>::new();
@@ -2271,6 +3046,22 @@ pub(crate) fn validate_continuation_rows(
         };
         let continuation =
             DecisionContinuationV3::from_durable(&row).map_err(|error| fail(error.to_string()))?;
+        if continuation.is_activity_frame() {
+            continuation
+                .verify_activity_frame_with_index(source_receipts)
+                .map_err(|error| fail(error.to_string()))?;
+            let proof: crate::frame_admission::FrameDecisionProof =
+                serde_json::from_value(continuation.facts.decision_inputs.clone())
+                    .map_err(|error| fail(error.to_string()))?;
+            proof
+                .inputs
+                .verify_durable(paper_state, &continuation.facts)
+                .map_err(|error| fail(error.to_string()))?;
+            continue;
+        }
+        continuation
+            .require_complete_read()
+            .map_err(|error| fail(error.to_string()))?;
         if continuation.page_occurrences().is_empty() {
             return Err(fail(
                 "open decision continuation has no receipt-bearing activity read".to_owned(),
@@ -2498,6 +3289,7 @@ pub(crate) mod continuation_validation_tests {
             }])
             .unwrap();
         let context = BucketDecisionContext {
+            verified_read: None,
             applied_configuration: synthetic_legacy17_runtime_config(),
             decision_inputs_json: json!({"fixed_end": fixed_end, "pages": pages}).to_string(),
             page_occurrences: occurrences,
@@ -2606,6 +3398,8 @@ pub(crate) mod continuation_validation_tests {
             "page_occurrences",
             "observed_source_receipt",
             "read_commitment",
+            "source_authority",
+            "paper_freshness_policy",
         ] {
             legacy.as_object_mut().unwrap().remove(key);
         }
@@ -2722,6 +3516,29 @@ impl From<pe_paper_state::PaperStateError> for AnchorInstallError {
     }
 }
 
+pub(crate) struct FrameAdmissionContext {
+    pub admitted_at: time::OffsetDateTime,
+    pub stale_secs: i64,
+    pub quality: ReconstructionQuality,
+    pub signal_config: SignalConfig,
+    pub copy_eligible: bool,
+    pub configuration: RuntimeConfig,
+    pub basis: FrozenDecisionBasis,
+    pub latch: crate::frame_admission::FeedLatchBasis,
+    pub paper_prefix: Option<AppendReceipt>,
+}
+
+pub(crate) enum FrameRoute {
+    Ignored,
+    Fallback(Box<crate::frame_admission::FrameFallbackArtifact>),
+    Admission(
+        Box<(
+            crate::frame_admission::FrameAdmissionInputs,
+            FrameAdmissionContext,
+        )>,
+    ),
+}
+
 /// Single runtime owner for the exact leader ledger, durable gate projection,
 /// wallet fences, and decision admission.
 pub struct BucketCommitEngine {
@@ -2730,6 +3547,14 @@ pub struct BucketCommitEngine {
     entry_gate: CopyEntryGate,
     complete_history: HashSet<WalletAddress>,
     fences: HashSet<WalletAddress>,
+    earlier_frames: Vec<crate::frame_admission::EarlierFrame>,
+    frame_decisions: HashMap<WalletAddress, Vec<pe_paper_state::ActivityFrameDecisionIndex>>,
+    frame_transactions: HashMap<(WalletAddress, String), Vec<usize>>,
+    admitted_frame_receipts:
+        HashMap<(pe_core_types::EventSeq, blake3::Hash), (WalletAddress, usize)>,
+    verified_frontiers: Option<HashMap<WalletAddress, crate::frame_admission::FeedHistoryFrontier>>,
+    routed_frame_receipts: HashSet<pe_core_types::EventSeq>,
+    frame_source_index: Option<SourceReceiptIndex>,
 }
 
 impl BucketCommitEngine {
@@ -2745,13 +3570,745 @@ impl BucketCommitEngine {
             .into_iter()
             .map(|fence| fence.wallet)
             .collect();
+        let mut frame_decisions =
+            HashMap::<WalletAddress, Vec<pe_paper_state::ActivityFrameDecisionIndex>>::new();
+        for frame in paper_state.activity_frame_decision_index(None)? {
+            frame_decisions.entry(frame.wallet).or_default().push(frame);
+        }
+        let mut frame_transactions: HashMap<(WalletAddress, String), Vec<usize>> = HashMap::new();
+        let mut admitted_frame_receipts = HashMap::new();
+        for (wallet, frames) in &frame_decisions {
+            for (index, frame) in frames.iter().enumerate() {
+                frame_transactions
+                    .entry((*wallet, frame.transaction_hash.clone()))
+                    .or_default()
+                    .push(index);
+                if let Some(receipt) = frame.observed_source_receipt {
+                    admitted_frame_receipts
+                        .insert((receipt.sequence, receipt.this_hash), (*wallet, index));
+                }
+            }
+        }
         Ok(Self {
             paper_state,
             ledger,
             entry_gate,
             complete_history,
             fences,
+            earlier_frames: Vec::new(),
+            frame_decisions,
+            frame_transactions,
+            admitted_frame_receipts,
+            verified_frontiers: None,
+            routed_frame_receipts: HashSet::new(),
+            frame_source_index: None,
         })
+    }
+
+    /// Select only transactions present in this bucket; leg discovery still uses the whole read.
+    fn frames_for_aggregates(
+        &self,
+        aggregates: &[ActivityAggregate],
+    ) -> Vec<&pe_paper_state::ActivityFrameDecisionIndex> {
+        let transactions = aggregates
+            .iter()
+            .map(|aggregate| {
+                let components = aggregate.group_id.components();
+                (components.wallet, components.transaction_hash.clone())
+            })
+            .collect::<HashSet<_>>();
+        let mut frames = transactions
+            .into_iter()
+            .flat_map(|key| {
+                self.frame_transactions
+                    .get(&key)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(move |index| {
+                        self.frame_decisions
+                            .get(&key.0)
+                            .and_then(|frames| frames.get(*index))
+                    })
+            })
+            .collect::<Vec<_>>();
+        frames.sort_by(|left, right| {
+            left.source_epoch
+                .cmp(&right.source_epoch)
+                .then_with(|| left.source_trade_id.0.cmp(&right.source_trade_id.0))
+        });
+        frames
+    }
+
+    /// Install the authenticated receipt owner used to discover durable frame counterparts.
+    #[must_use]
+    pub fn with_source_receipt_index(mut self, index: SourceReceiptIndex) -> Self {
+        self.set_source_receipt_index(index);
+        self
+    }
+
+    pub(crate) fn set_source_receipt_index(&mut self, index: SourceReceiptIndex) {
+        self.frame_source_index = Some(index);
+    }
+
+    pub(crate) fn verify_feed_incidents(
+        &self,
+        era: &crate::paper_recovery::PaperEra,
+        index: &SourceReceiptIndex,
+    ) -> Result<(), String> {
+        // Incident-only boot verification holds one continuation/read at a time.
+        for record in &era.frames {
+            let crate::paper_recovery::PaperLogFrame::Record(
+                crate::paper_recovery::PaperLogRecord::FeedIncidentChanged {
+                    incident,
+                    state: crate::paper_recovery::HaltState::Engaged,
+                },
+            ) = &record.frame
+            else {
+                continue;
+            };
+            let receipt = incident.frame_receipt;
+            let identity = self
+                .admitted_frame(receipt)
+                .ok_or_else(|| "incident has no durable admitted frame".to_owned())?;
+            let row = self
+                .paper_state
+                .decision_pending_for(&identity.source_trade_id)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "incident decision missing".to_owned())?;
+            let frame =
+                DecisionContinuationV3::from_durable(&row).map_err(|error| error.to_string())?;
+            frame
+                .verify_activity_frame_with_index(index)
+                .map_err(|error| error.to_string())?;
+            let read = verified_commitment_bindings(incident.deciding_commitment_receipt, index)
+                .map_err(|error| error.to_string())?;
+            if frame.observed_source_receipt != Some(incident.frame_receipt)
+                || incident.engagement_receipt.is_some()
+            {
+                return Err("incident differs from authenticated frame".to_owned());
+            }
+            crate::feed_audit::verify_incident_conclusion(&frame, incident, &read)
+                .map_err(|error| error.to_string())?;
+            index.remember_frame_incident(incident);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn admitted_frame(
+        &self,
+        receipt: AppendReceipt,
+    ) -> Option<&pe_paper_state::ActivityFrameDecisionIndex> {
+        self.admitted_frame_receipts
+            .get(&(receipt.sequence, receipt.this_hash))
+            .and_then(|(wallet, position)| self.frame_decisions.get(wallet)?.get(*position))
+    }
+
+    fn observe_frame(&mut self, incoming: crate::frame_admission::EarlierFrame) {
+        let admitted = |receipt: AppendReceipt| {
+            self.admitted_frame_receipts
+                .contains_key(&(receipt.sequence, receipt.this_hash))
+        };
+        if let Some(existing) = self.earlier_frames.iter_mut().find(|frame| {
+            frame.wallet == incoming.wallet && frame.source_trade_id == incoming.source_trade_id
+        }) {
+            if crate::frame_admission::prefer_observation(
+                existing.receipt,
+                admitted(existing.receipt),
+                existing.unresolved_buy,
+                incoming.receipt,
+                admitted(incoming.receipt),
+                incoming.unresolved_buy,
+            ) {
+                *existing = incoming;
+            }
+        } else {
+            self.earlier_frames.push(incoming);
+        }
+    }
+
+    #[cfg(feature = "scenario")]
+    pub(crate) fn unresolved_receipts(&self, wallet: WalletAddress) -> Vec<AppendReceipt> {
+        let mut receipts = self
+            .earlier_frames
+            .iter()
+            .filter(|frame| frame.wallet == wallet)
+            .map(|frame| frame.receipt)
+            .collect::<Vec<_>>();
+        receipts.sort_by_key(|receipt| receipt.sequence);
+        receipts
+    }
+
+    pub(crate) fn retire_frame_audit(&mut self, receipt: AppendReceipt) {
+        self.earlier_frames.retain(|frame| frame.receipt != receipt);
+    }
+
+    pub(crate) fn retire_observation(
+        &mut self,
+        receipt: AppendReceipt,
+        source_trade_id: &SourceTradeId,
+        unbound: bool,
+        read: Option<&VerifiedCommitment>,
+    ) -> Result<crate::orchestrator_control::FeedAuditAcknowledgement, String> {
+        use crate::orchestrator_control::FeedAuditAcknowledgement;
+        if let Some(frame) = self
+            .paper_state
+            .activity_frame_decision(source_trade_id)
+            .map_err(|error| error.to_string())?
+            && let Some(authority) = frame.observed_source_receipt
+            && authority != receipt
+        {
+            return Ok(FeedAuditAcknowledgement::Superseded);
+        }
+        let admitted = self.admitted_frame(receipt);
+        if let Some(frame) = admitted {
+            if !self
+                .earlier_frames
+                .iter()
+                .any(|earlier| earlier.receipt == receipt)
+            {
+                return Ok(FeedAuditAcknowledgement::Applied); // already acknowledged by a matched bucket or incident
+            }
+            let read = read
+                .ok_or_else(|| "admitted audit retirement lacks authenticated match".to_owned())?;
+            let crate::feed_audit::AuditDisposition::Matched(id) =
+                crate::feed_audit::disposition(frame, read).map_err(|error| error.to_string())?
+            else {
+                return Err("admitted audit retirement lacks authenticated match".to_owned());
+            };
+            if !crate::feed_audit::counterpart_disposed(&self.paper_state, Some(&id))
+                .map_err(|error| error.to_string())?
+            {
+                return Err("matched audit target is not disposed".to_owned());
+            }
+        } else {
+            let index = self
+                .frame_source_index
+                .as_ref()
+                .ok_or_else(|| "frame source index absent".to_owned())?;
+            let source = index
+                .source_envelope(receipt)
+                .map_err(|error| error.to_string())?;
+            let observation = parse_activity_trade_observation(&source.payload)
+                .map_err(|error| error.to_string())?;
+            let mut bound_disposition = false;
+            if let Some(read) = read
+                && let Some(binding) = read
+                    .binding_indices
+                    .get(&(receipt.sequence, receipt.this_hash))
+                    .and_then(|index| read.bindings.get(*index))
+                && &binding.stream_group_id == source_trade_id
+            {
+                bound_disposition = self
+                    .paper_state
+                    .activity_revision_disposed(
+                        &binding.history_group_id,
+                        &binding.semantic_revision,
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+            if observation.group_id.key() != source_trade_id
+                || (!self
+                    .paper_state
+                    .is_wallet_fenced(&observation.wallet)
+                    .map_err(|error| error.to_string())?
+                    && self
+                        .paper_state
+                        .activity_group_state(source_trade_id)
+                        .map_err(|error| error.to_string())?
+                        .is_none()
+                    && !bound_disposition
+                    && !self
+                        .paper_state
+                        .activity_observation_unbound_retired(receipt)
+                        .map_err(|error| error.to_string())?)
+            {
+                return Err("ordinary observation retirement lacks durable disposition".to_owned());
+            }
+            // Boot infers every other retirement from the durable activity group; only an
+            // observation retired without one needs its own record.
+            if self
+                .paper_state
+                .activity_group_state(source_trade_id)
+                .map_err(|error| error.to_string())?
+                .is_none()
+            {
+                self.paper_state
+                    .retire_activity_observation(
+                        receipt,
+                        unbound
+                            && read.is_none_or(|read| {
+                                !read
+                                    .binding_indices
+                                    .contains_key(&(receipt.sequence, receipt.this_hash))
+                            }),
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+        }
+        self.retire_frame_audit(receipt);
+        Ok(FeedAuditAcknowledgement::Applied)
+    }
+
+    pub(crate) fn restore_frame_prefix(
+        &mut self,
+        receipts: &[AppendReceipt],
+        undelivered: &[AppendReceipt],
+        index: &SourceReceiptIndex,
+    ) -> Result<(), String> {
+        self.frame_source_index = Some(index.clone());
+        self.restore_verified_frontiers(index)?;
+        self.routed_frame_receipts = receipts
+            .iter()
+            .filter(|receipt| !undelivered.contains(receipt))
+            .map(|receipt| receipt.sequence)
+            .collect();
+        self.earlier_frames.clear();
+        for receipt in receipts {
+            let source = index
+                .source_envelope(*receipt)
+                .map_err(|error| error.to_string())?;
+            let observation = parse_activity_trade_observation(&source.payload)
+                .map_err(|error| error.to_string())?;
+            let parts = observation.group_id.components();
+            let market = MarketId(pe_core_types::VenueMarketId(
+                parts
+                    .condition_id
+                    .as_ref()
+                    .ok_or_else(|| "frame condition missing".to_owned())?
+                    .0
+                    .clone(),
+            ));
+            let admitted = self
+                .admitted_frame_receipts
+                .contains_key(&(receipt.sequence, receipt.this_hash));
+            if !admitted
+                && (self
+                    .paper_state
+                    .activity_observation_retired(*receipt)
+                    .map_err(|error| error.to_string())?
+                    || self
+                        .paper_state
+                        .activity_group_state(observation.group_id.key())
+                        .map_err(|error| error.to_string())?
+                        .is_some())
+            {
+                continue;
+            }
+            self.observe_frame(crate::frame_admission::EarlierFrame {
+                receipt: *receipt,
+                wallet: observation.wallet,
+                source_trade_id: observation.group_id.key().clone(),
+                market,
+                received_at: source.received_at.0,
+                unresolved_buy: parts.side == Some(Side::Buy)
+                    && observation.share_amount != ShareAmount::ZERO
+                    && !observation.is_combo,
+            });
+        }
+        Ok(())
+    }
+
+    /// Publish only a verified, contiguous completed read, after all bucket acknowledgements.
+    pub(crate) fn publish_frontier(
+        &mut self,
+        frontier: crate::frame_admission::FeedHistoryFrontier,
+        index: &SourceReceiptIndex,
+        read: Option<&VerifiedCommitment>,
+    ) -> Result<(), String> {
+        if let Some(read) = read {
+            if read.frontier.as_ref() != Some(&frontier) {
+                return Err("frontier differs from authenticated read".to_owned());
+            }
+        } else {
+            index
+                .verify_frame_frontier(&frontier)
+                .map_err(|error| error.to_string())?;
+        }
+        self.restore_verified_frontiers(index)?;
+        // Admissions may have committed while the poller awaited persistence/acknowledgements.
+        // Recheck the serialized owner's current barrier immediately before publishing H.
+        for frame in self
+            .earlier_frames
+            .iter()
+            .filter(|frame| frame.wallet == frontier.wallet)
+        {
+            let source = index
+                .source_envelope(frame.receipt)
+                .map_err(|error| error.to_string())?;
+            let observation = parse_activity_trade_observation(&source.payload)
+                .map_err(|error| error.to_string())?;
+            if observation.source_time.0.unix_timestamp() <= frontier.fixed_end {
+                return Ok(());
+            }
+        }
+        let mut frontiers = self.verified_frontiers.clone().unwrap_or_default();
+        if let Some(previous) = frontiers.get(&frontier.wallet) {
+            if frontier.fixed_end < previous.fixed_end
+                || frontier.commitment.sequence <= previous.commitment.sequence
+            {
+                return Ok(());
+            }
+            if frontier
+                .pages
+                .iter()
+                .filter_map(|page| page.bounds.and_then(|bounds| bounds.start))
+                .min()
+                .is_some_and(|start| start > previous.fixed_end)
+            {
+                return Err("frontier read skips the previous fixed end".to_owned());
+            }
+        }
+        index.remember_verified_frontier(&frontier);
+        frontiers.insert(frontier.wallet, frontier);
+        crate::frame_admission::persist_frontiers(&self.paper_state, &frontiers)
+            .map_err(|error| error.to_string())?;
+        self.verified_frontiers = Some(frontiers);
+        Ok(())
+    }
+
+    fn restore_verified_frontiers(&mut self, index: &SourceReceiptIndex) -> Result<(), String> {
+        if self.verified_frontiers.is_none() {
+            self.verified_frontiers = Some(
+                crate::frame_admission::restore_frontiers(&self.paper_state, index)
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        Ok(())
+    }
+
+    /// Capture admission state under the orchestrator's structural writer lock.
+    pub(crate) fn prepare_activity_frame(
+        &mut self,
+        receipt: AppendReceipt,
+        index: &SourceReceiptIndex,
+        context: FrameAdmissionContext,
+    ) -> Result<FrameRoute, BucketCommitError> {
+        self.frame_source_index = Some(index.clone());
+        use crate::frame_admission::*;
+        if self.routed_frame_receipts.contains(&receipt.sequence) {
+            return Ok(FrameRoute::Ignored);
+        }
+        let source = index
+            .source_envelope(receipt)
+            .map_err(|error| BucketCommitError::Invariant(error.to_string()))?;
+        let observation = parse_activity_trade_observation(&source.payload)
+            .map_err(|error| BucketCommitError::Invariant(error.to_string()))?;
+        let parts = observation.group_id.components();
+        if source.source_id.0 != crate::activity_ingest::ACTIVITY_WS_SOURCE_ID
+            || source.schema_version != ACTIVITY_SCHEMA_VERSION
+            || source.parser_version != ACTIVITY_PARSER_VERSION
+            || source.content_type != ContentType::Json
+        {
+            return Err(BucketCommitError::Invariant(
+                "invalid frame source contract".to_owned(),
+            ));
+        }
+        let condition = parts
+            .condition_id
+            .as_ref()
+            .ok_or_else(|| BucketCommitError::Invariant("frame condition absent".to_owned()))?;
+        let market = MarketId(pe_core_types::VenueMarketId(condition.0.clone()));
+        if self.earlier_frames.iter().any(|frame| {
+            frame.source_trade_id == *observation.group_id.key()
+                && frame.receipt.sequence < receipt.sequence
+                && frame.unresolved_buy
+        }) || self
+            .paper_state
+            .decision_pending_for(observation.group_id.key())?
+            .is_some()
+        {
+            return Ok(FrameRoute::Ignored);
+        }
+        // Any durable REST disposition owns this identity, including raw-only refusals.
+        if self
+            .paper_state
+            .activity_group_state(observation.group_id.key())?
+            .is_some()
+        {
+            self.routed_frame_receipts.insert(receipt.sequence);
+            return Ok(FrameRoute::Ignored);
+        }
+        // REST winning first already consumed history, before this admission capture.
+        let market_consumed = self
+            .paper_state
+            .market_history_record(&observation.wallet, &market)?
+            .is_some();
+        let incoming = IncomingTrade {
+            wallet: observation.wallet,
+            market_id: market.clone(),
+            outcome_id: parts.outcome.ok_or(BucketCommitError::Empty)?,
+            side: parts.side.ok_or(BucketCommitError::Empty)?,
+            price: observation.price,
+            contracts: observation.share_amount,
+            observed_at: observation.source_time.0,
+            received_at: source.received_at.0,
+            source_trade_id: observation.group_id.key().clone(),
+            transaction_hash: Some(parts.transaction_hash.clone()),
+            provenance: TradeProvenance::ActivityWs,
+        };
+        let action = pe_copy_signal_engine::classify_leader_action(
+            &incoming,
+            self.ledger.position(&observation.wallet),
+            context.quality,
+            &context.signal_config,
+        );
+        let earlier = self
+            .earlier_frames
+            .iter()
+            .filter(|frame| {
+                frame.wallet == observation.wallet && frame.receipt.sequence < receipt.sequence
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let qualifying = incoming.side == Side::Buy
+            && observation.share_amount != ShareAmount::ZERO
+            && !observation.is_combo
+            && action == LeaderAction::Entry
+            && !self.entry_gate.has_market(&observation.wallet, &market)
+            && context.copy_eligible;
+        let unresolved = incoming.side == Side::Buy
+            && observation.share_amount != ShareAmount::ZERO
+            && !observation.is_combo;
+        self.observe_frame(EarlierFrame {
+            receipt,
+            wallet: observation.wallet,
+            source_trade_id: observation.group_id.key().clone(),
+            market: market.clone(),
+            received_at: source.received_at.0,
+            unresolved_buy: unresolved,
+        });
+        self.routed_frame_receipts.insert(receipt.sequence);
+        if !qualifying {
+            return Ok(FrameRoute::Ignored);
+        }
+        self.restore_verified_frontiers(index)
+            .map_err(BucketCommitError::Invariant)?;
+        let frontier = self
+            .verified_frontiers
+            .as_ref()
+            .and_then(|frontiers| frontiers.get(&observation.wallet))
+            .cloned();
+        let coverage = self.paper_state.wallet_coverage(&observation.wallet)?;
+        let wallet_ready = self.entry_gate.has_wallet(&observation.wallet)
+            && self.complete_history.contains(&observation.wallet)
+            && !self.fences.contains(&observation.wallet)
+            && !coverage.reanchor_required;
+        let reason = if context.latch.engaged() {
+            Some(FrameFallbackReason::Latched)
+        } else if !wallet_ready {
+            Some(FrameFallbackReason::WalletNotReady)
+        } else if frame_prefix_blocks(&earlier, observation.wallet, &market) {
+            Some(FrameFallbackReason::EarlierUnresolvedBuy)
+        } else if frontier.as_ref().is_none_or(|frontier| {
+            !frontier.current(
+                source.received_at.0,
+                context.admitted_at,
+                context.stale_secs,
+                earlier
+                    .iter()
+                    .filter(|frame| frame.wallet == observation.wallet)
+                    .map(|frame| frame.received_at)
+                    .min(),
+            )
+        }) {
+            Some(FrameFallbackReason::HistoryBehind)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Ok(FrameRoute::Fallback(Box::new(FrameFallbackArtifact {
+                version: 1,
+                frame_receipt: receipt,
+                routing_clock: context.admitted_at,
+                reason,
+                frontier,
+                latest_incident_basis: context.latch,
+            })));
+        }
+        let frontier = frontier.ok_or_else(|| {
+            BucketCommitError::Invariant("admitted frame has no frontier".to_owned())
+        })?;
+        let ledger_capture = ledger_capture(&self.ledger, &self.paper_state, observation.wallet)
+            .map_err(|error| BucketCommitError::Invariant(error.to_string()))?;
+        let ledger_anchor = coverage
+            .anchor_seq
+            .map(|sequence| {
+                self.paper_state
+                    .position_anchor(&observation.wallet, sequence)
+            })
+            .transpose()?
+            .flatten();
+        let anchor_balances = match ledger_anchor {
+            Some(anchor) => {
+                serde_json::from_str::<Vec<(String, u16, ShareAmount)>>(&anchor.balances_json)?
+                    .into_iter()
+                    .filter(|(id, _, _)| id == &market.to_string())
+                    .map(|(_, outcome, amount)| (outcome, amount))
+                    .collect()
+            }
+            None => Vec::new(),
+        };
+        let ledger_group_boundary = self
+            .paper_state
+            .activity_group_boundary(&observation.wallet)?;
+        let mut ledger_groups = Vec::new();
+        for group in self.paper_state.activity_groups_at_boundary(
+            &observation.wallet,
+            coverage.activity_cutoff_unix.unwrap_or(i64::MIN),
+            ledger_group_boundary,
+        )? {
+            if crate::frame_admission::group_affects_market(&group, &market)
+                .map_err(|error| BucketCommitError::Invariant(error.to_string()))?
+            {
+                ledger_groups.push(group);
+            }
+        }
+        Ok(FrameRoute::Admission(Box::new((
+            FrameAdmissionInputs {
+                version: 1,
+                frame_receipt: receipt,
+                admitted_at: context.admitted_at,
+                received_at: source.received_at.0,
+                source_time: observation.source_time.0,
+                ledger_capture,
+                ledger_group_boundary,
+                anchor_balances,
+                ledger_groups,
+                market_consumed,
+                earlier_frames: earlier,
+                copy_eligible: context.copy_eligible,
+                history_complete: wallet_ready,
+                fenced: false,
+                coverage,
+                frontier,
+                poll_round_stale_secs: context.stale_secs,
+                latch: context.latch.clone(),
+                paper_prefix: context.paper_prefix,
+            },
+            context,
+        ))))
+    }
+
+    pub(crate) fn commit_activity_frame(
+        &mut self,
+        proof: crate::frame_admission::FrameDecisionProof,
+        policy: PaperFreshnessPolicy,
+        context: FrameAdmissionContext,
+        index: &SourceReceiptIndex,
+    ) -> Result<SourceTradeId, BucketCommitError> {
+        let source = index
+            .source_envelope(proof.inputs.frame_receipt)
+            .map_err(|error| BucketCommitError::Invariant(error.to_string()))?;
+        let observation = parse_activity_trade_observation(&source.payload)
+            .map_err(|error| BucketCommitError::Invariant(error.to_string()))?;
+        let parts = observation.group_id.components();
+        let id = observation.group_id.key().clone();
+        let market = MarketId(pe_core_types::VenueMarketId(
+            parts
+                .condition_id
+                .as_ref()
+                .ok_or(BucketCommitError::Empty)?
+                .0
+                .clone(),
+        ));
+        let revision = crate::frame_admission::frame_revision(&proof.inputs)?;
+        let facts = DecisionContinuationFacts {
+            paper_freshness_policy: Some(policy),
+            source_trade_id: id.clone(),
+            semantic_revision: revision.clone(),
+            transaction_hash: parts.transaction_hash.clone(),
+            wallet: observation.wallet,
+            source_epoch: observation.source_time.0.unix_timestamp(),
+            market_id: market.clone(),
+            outcome_id: parts.outcome.ok_or(BucketCommitError::Empty)?,
+            side: parts.side.ok_or(BucketCommitError::Empty)?,
+            price: observation.price,
+            share_amount: observation.share_amount,
+            provenance: TradeProvenance::ActivityWs,
+            pre_bucket_action: LeaderAction::Entry,
+            reconstruction_quality: context.quality,
+            action_confidence_ppm: ProbabilityPpm(u32::from(context.quality.get()) * 10_000),
+            gate_result: "admitted".to_owned(),
+            applied_configuration_hash: context.configuration.canonical_hash(),
+            applied_configuration: context.configuration.clone(),
+            frozen_basis: context.basis,
+            decision_inputs: serde_json::to_value(&proof)?,
+        };
+        let continuation = DecisionContinuationV3 {
+            version: 7,
+            source_authority: Some(SourceAuthority::ActivityFrame),
+            facts,
+            observed_source_receipt: Some(proof.inputs.frame_receipt),
+            page_occurrences: Vec::new(),
+            read_commitment: None,
+        };
+        continuation
+            .verify_activity_frame_with_index(index)
+            .map_err(|error| BucketCommitError::Invariant(error.to_string()))?;
+        self.paper_state
+            .commit_activity_frame(&pe_paper_state::ActivityFrameCommit {
+                gate: EntryGateResultRecord {
+                    source_trade_id: id.clone(),
+                    wallet: observation.wallet,
+                    market_id: market.clone(),
+                    source_epoch: observation.source_time.0.unix_timestamp(),
+                    result: "admitted".to_owned(),
+                    history_consumed: true,
+                },
+                history: MarketHistoryRecord {
+                    wallet: observation.wallet,
+                    market_id: market.clone(),
+                    first_epoch: observation.source_time.0.unix_timestamp(),
+                    source_trade_id: id.clone(),
+                },
+                pending: DecisionPendingRecord {
+                    source_trade_id: id.clone(),
+                    semantic_revision: revision,
+                    wallet: observation.wallet,
+                    source_epoch: observation.source_time.0.unix_timestamp(),
+                    frozen_inputs_json: serde_json::to_string(&continuation)?,
+                    updated_at_unix: proof.inputs.admitted_at.unix_timestamp(),
+                },
+            })?;
+        self.entry_gate.record_entry(observation.wallet, &market);
+        let frames = self.frame_decisions.entry(observation.wallet).or_default();
+        self.frame_transactions
+            .entry((
+                observation.wallet,
+                continuation.facts.transaction_hash.clone(),
+            ))
+            .or_default()
+            .push(frames.len());
+        self.admitted_frame_receipts.insert(
+            (
+                proof.inputs.frame_receipt.sequence,
+                proof.inputs.frame_receipt.this_hash,
+            ),
+            (observation.wallet, frames.len()),
+        );
+        frames.push(pe_paper_state::ActivityFrameDecisionIndex {
+            version: 7,
+            semantic_revision: continuation.facts.semantic_revision,
+            source_trade_id: id.clone(),
+            wallet: observation.wallet,
+            source_epoch: continuation.facts.source_epoch,
+            transaction_hash: continuation.facts.transaction_hash,
+            market_id: market,
+            outcome_id: continuation.facts.outcome_id,
+            observed_source_receipt: continuation.observed_source_receipt,
+            admission_receipt: proof.admission_receipt,
+            received_at: proof.inputs.received_at,
+            copy_latency_budget_secs: policy.copy_latency_budget_secs,
+        });
+        self.observe_frame(crate::frame_admission::EarlierFrame {
+            receipt: proof.inputs.frame_receipt,
+            wallet: observation.wallet,
+            source_trade_id: id.clone(),
+            market: continuation.facts.market_id,
+            received_at: proof.inputs.received_at,
+            unresolved_buy: true,
+        });
+        Ok(id)
     }
 
     #[must_use]
@@ -3033,6 +4590,109 @@ impl BucketCommitEngine {
         frozen_basis: FrozenDecisionBasis,
         paper_freshness_policy: Option<PaperFreshnessPolicy>,
     ) -> Result<BucketCommitResult, BucketCommitError> {
+        if let Some(read) = context.verified_read.as_ref()
+            && (context.read_commitment
+                != Some(ActivityReadCommitmentReceipt::BindingsV2(read.receipt))
+                || aggregates
+                    .iter()
+                    .any(|aggregate| aggregate.group_id.components().wallet != read.wallet))
+        {
+            return Err(BucketCommitError::Invariant(
+                "bucket authenticated read differs".to_owned(),
+            ));
+        }
+        // Suppression comes from durable frame decisions and authenticated bindings, and survives
+        // terminalization/restart. Audit retirement never deletes this decision authority.
+        let frame_decisions = self.frames_for_aggregates(&aggregates);
+        let mut context = context.clone();
+        let mut frame_gate_ids = HashSet::new();
+        for frame in frame_decisions {
+            let facts = frame;
+            if let Some(gate) = self.paper_state.entry_gate_result(&facts.source_trade_id)?
+                && gate.wallet == facts.wallet
+                && gate.market_id == facts.market_id
+                && gate.source_epoch == facts.source_epoch
+                && gate.result == "admitted"
+                && gate.history_consumed
+            {
+                frame_gate_ids.insert(facts.source_trade_id.clone());
+                // Brackets apply history and anchors only; they never discover counterparts or
+                // create continuations. Preserve the frame-owned gate without a source index.
+                if context.bracket_commit {
+                    continue;
+                }
+                let receipt = frame.observed_source_receipt.ok_or_else(|| {
+                    BucketCommitError::Invariant("frame receipt absent".to_owned())
+                })?;
+                let source = self
+                    .frame_source_index
+                    .as_ref()
+                    .ok_or_else(|| {
+                        BucketCommitError::Invariant("frame source index absent".to_owned())
+                    })?
+                    .source_envelope(receipt)
+                    .map_err(|error| BucketCommitError::Invariant(error.to_string()))?;
+                let observation = parse_activity_trade_observation(&source.payload)
+                    .map_err(|error| BucketCommitError::Invariant(error.to_string()))?;
+                let read = context.verified_read.as_ref().ok_or_else(|| {
+                    BucketCommitError::Invariant(
+                        "frame counterpart read authentication absent".to_owned(),
+                    )
+                })?;
+                let index = self.frame_source_index.as_ref().ok_or_else(|| {
+                    BucketCommitError::Invariant("frame source index absent".to_owned())
+                })?;
+                let fixed = index.frame_counterpart(receipt);
+                let counterparts: HashSet<SourceTradeId> =
+                    crate::feed_audit::resolve_frame_counterpart(
+                        &observation,
+                        fixed.as_ref().map(|target| target.as_ref()),
+                        read.transaction_aggregates
+                            .get(&facts.transaction_hash)
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|position| read.aggregates.get(*position)),
+                        &read.restamp_pairs,
+                    )
+                    .into_iter()
+                    .map(|aggregate| aggregate.group_id.key().clone())
+                    .collect();
+                for aggregate in &aggregates {
+                    let id = aggregate.group_id.key();
+                    let canonical = read.restamp_pairs.get(id).unwrap_or(id);
+                    if !counterparts.contains(canonical)
+                        && !counterparts.contains(id)
+                        && !read.restamp_pairs.iter().any(|(alias, original)| {
+                            (alias == id && counterparts.contains(original))
+                                || (original == id && counterparts.contains(alias))
+                        })
+                    {
+                        continue;
+                    }
+                    let id = aggregate.group_id.key();
+                    context.observed_source_receipts.insert(id.clone(), receipt);
+                    if id != &facts.source_trade_id {
+                        context.no_copy_dispositions.insert(
+                            id.clone(),
+                            NoCopyDisposition {
+                                provenance: "reconciled_rest".to_owned(),
+                                age_secs: context
+                                    .recorded_at_unix
+                                    .saturating_sub(aggregate.source_time.0.unix_timestamp())
+                                    .max(0),
+                                reason: "applied".to_owned(),
+                                recorded_at_unix: context.recorded_at_unix,
+                            },
+                        );
+                    }
+                }
+            } else {
+                return Err(BucketCommitError::Invariant(
+                    "durable frame admission gate is missing or invalid".to_owned(),
+                ));
+            }
+        }
+        let context = &context;
         let first = aggregates.first().ok_or(BucketCommitError::Empty)?;
         let wallet = first.group_id.components().wallet;
         let source_epoch = first.source_time.0.unix_timestamp();
@@ -3366,6 +5026,9 @@ impl BucketCommitEngine {
                 |status| status.complete,
             );
         let (applied, trade_decisions, first_entries) = match classify_complete_second(
+            complete_read_entry_policy(current_paper_version(complete_read_version(
+                context.read_commitment,
+            ))),
             &self.ledger,
             wallet,
             &mutations,
@@ -3423,8 +5086,10 @@ impl BucketCommitEngine {
                 context,
             );
         }
-        let (gate_results, history_effects, gate_outcomes) =
+        let (mut gate_results, history_effects, gate_outcomes) =
             Self::derive_gate_results(wallet, source_epoch, &trade_decisions, &first_entries);
+        // IDs omit epochs. Only an already authenticated durable frame gate owns this exception.
+        gate_results.retain(|gate| !frame_gate_ids.contains(&gate.source_trade_id));
 
         let mut pending = Vec::new();
         let mut dispositions = BTreeMap::new();
@@ -3449,6 +5114,8 @@ impl BucketCommitEngine {
                         .unwrap_or_else(|| "not_an_entry".to_owned());
                     if let Some(no_copy) = context.no_copy_dispositions.get(&source_trade_id) {
                         no_copy.reason.clone()
+                    } else if frame_gate_ids.contains(&source_trade_id) {
+                        "applied".to_owned()
                     } else if outcome == "admitted"
                         && context.copy_eligible
                         && !coverage.reanchor_required
@@ -4238,6 +5905,7 @@ impl BucketCommitEngine {
                 |status| status.complete,
             );
         let applied_outcomes = match classify_complete_second(
+            pe_position_ledger::SameSecondEntryPolicy::Legacy,
             &self.ledger,
             wallet,
             &known,
@@ -4872,6 +6540,7 @@ pub(crate) mod continuation_v3_tests {
 
         let version_two = DecisionContinuationV3 {
             version: 2,
+            source_authority: None,
             facts: facts(json!({"legacy": true})),
             observed_source_receipt: None,
             page_occurrences: vec![occurrence],
@@ -5368,6 +7037,8 @@ pub(crate) mod continuation_v3_tests {
         )
         .unwrap();
         let first = ObservationBinding {
+            counterpart_basis_receipt: None,
+            frame_admission_receipt: None,
             stream_group_id: SourceTradeId(format!("g2:{}", "1".repeat(64))),
             stream_receipt: receipt(0),
             history_group_id: SourceTradeId(format!("g2:{}", "2".repeat(64))),
@@ -5560,6 +7231,8 @@ pub(crate) mod continuation_v3_tests {
             metadata.clone(),
         );
         let mut binding = ObservationBinding {
+            counterpart_basis_receipt: None,
+            frame_admission_receipt: None,
             stream_group_id: stream.group_id.key().clone(),
             stream_receipt,
             history_group_id: aggregate.group_id.key().clone(),
@@ -5944,7 +7617,7 @@ pub(crate) mod continuation_v3_tests {
     }
 
     #[test]
-    fn continuation_six_inherits_corrected_binding_and_earliest_source_time() {
+    fn continuation_seven_inherits_corrected_binding_and_earliest_source_time() {
         let fixture = binding_fixture("valid");
         let historical_time = fixture
             .continuation
@@ -5956,7 +7629,7 @@ pub(crate) mod continuation_v3_tests {
             })
             .unwrap();
         let current = fixture.continuation.clone().current_paper();
-        assert_eq!(current.version(), 6);
+        assert_eq!(current.version(), 7);
         let decoded = DecisionContinuationV3::from_durable(&durable(&current)).unwrap();
         assert_eq!(
             decoded
@@ -5982,6 +7655,70 @@ pub(crate) mod continuation_v3_tests {
         let mut incompatible = current;
         incompatible.read_commitment = None;
         assert!(DecisionContinuationV3::from_durable(&durable(&incompatible)).is_err());
+    }
+
+    #[test]
+    fn continuation_authority_round_trip_preserves_historical_bytes() {
+        let (mut historical, _) = committed_empty_read_v2();
+        for version in 2..=6 {
+            historical.version = version;
+            historical.source_authority = None;
+            let json = serde_json::to_string(&historical).unwrap();
+            assert!(!json.contains("source_authority"));
+            let decoded: DecisionContinuationV3 = serde_json::from_str(&json).unwrap();
+            assert_eq!(serde_json::to_string(&decoded).unwrap(), json);
+            assert_eq!(
+                decoded.financial_semantic(),
+                if version == 6 { 2 } else { 1 }
+            );
+        }
+        DecisionContinuationV3::from_durable(&durable(&historical)).unwrap();
+        let legacy_bytes = serde_json::to_string(&historical).unwrap();
+        for authority in [SourceAuthority::CompleteRead] {
+            let mut current = historical.clone().current_paper();
+            current.source_authority = Some(authority);
+            let json = serde_json::to_string(&current).unwrap();
+            let decoded = DecisionContinuationV3::from_durable(&durable(&current)).unwrap();
+            assert_eq!(decoded, current);
+            assert_eq!(decoded.financial_semantic(), 3);
+            assert_eq!(serde_json::to_string(&decoded).unwrap(), json);
+            assert!(json.contains(match authority {
+                SourceAuthority::CompleteRead => "\"source_authority\":\"complete_read\"",
+                SourceAuthority::ActivityFrame => "\"source_authority\":\"activity_frame\"",
+            }));
+            for version in 2..=6 {
+                let mut mismatched = serde_json::to_value(&current).unwrap();
+                mismatched["version"] = json!(version);
+                assert!(matches!(
+                    DecisionContinuationV3::from_durable(&durable(&mismatched)),
+                    Err(DecisionContinuationError::DurableMismatch)
+                ));
+            }
+        }
+        let mut missing = historical.current_paper();
+        missing.source_authority = None;
+        assert!(matches!(
+            DecisionContinuationV3::from_durable(&durable(&missing)),
+            Err(DecisionContinuationError::DurableMismatch)
+        ));
+        let mut null = serde_json::to_value(&missing).unwrap();
+        null["source_authority"] = Value::Null;
+        assert!(matches!(
+            DecisionContinuationV3::from_durable(&durable(&null)),
+            Err(DecisionContinuationError::DurableMismatch)
+        ));
+        assert!(!legacy_bytes.contains("source_authority"));
+    }
+
+    #[test]
+    fn activity_frame_without_admission_evidence_fails_closed() {
+        let fixture = binding_fixture("valid");
+        let mut frame = fixture.continuation.current_paper();
+        frame.source_authority = Some(SourceAuthority::ActivityFrame);
+        frame.page_occurrences.clear();
+        frame.read_commitment = None;
+        frame.facts.decision_inputs = json!({});
+        assert!(DecisionContinuationV3::from_durable(&durable(&frame)).is_err());
     }
 
     pub(crate) fn binding_state(fixture: &BindingFixture) -> Arc<PaperStateDb> {
@@ -6020,6 +7757,7 @@ pub(crate) mod continuation_v3_tests {
         .aggregates()
         .unwrap();
         let context = BucketDecisionContext {
+            verified_read: None,
             applied_configuration: continuation.facts.applied_configuration.clone(),
             decision_inputs_json: continuation.facts.decision_inputs.to_string(),
             page_occurrences: continuation.page_occurrences.clone(),
@@ -6460,6 +8198,7 @@ mod activity_exemption_tests {
 
     fn context() -> BucketDecisionContext {
         BucketDecisionContext {
+            verified_read: None,
             applied_configuration: synthetic_legacy17_runtime_config(),
             decision_inputs_json: "{}".to_owned(),
             page_occurrences: Vec::new(),

@@ -250,6 +250,7 @@ fn zero_basis() -> pe_service::bucket_commit::FrozenDecisionBasis {
 }
 fn context(epoch: i64, complete_history: bool) -> BucketDecisionContext {
     BucketDecisionContext {
+        verified_read: None,
         applied_configuration: pe_service::runtime_config::RuntimeConfig::from_service_config(
             &pe_service::config::ServiceConfig::default(),
         ),
@@ -3077,8 +3078,12 @@ async fn valid_pending_restart_resumes_once() {
     let connection = rusqlite::Connection::open(&state_path).unwrap();
     for legacy in legacy_rows {
         let mut historical: Value = serde_json::from_str(&legacy.frozen_inputs_json).unwrap();
-        assert_eq!(historical["version"], json!(6));
+        assert_eq!(historical["version"], json!(7));
         historical["version"] = json!(5);
+        historical
+            .as_object_mut()
+            .unwrap()
+            .remove("source_authority");
         assert_eq!(
             connection
                 .execute(

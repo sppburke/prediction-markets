@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use pe_core_types::{EventSeq, MarketId, OutcomeId, Price, ReceivedAt};
+use pe_core_types::{EventSeq, MarketId, OutcomeId, Price, ReceivedAt, SourceTradeId};
 use pe_event_log::{AppendReceipt, EventEnvelope, LogTailBinding, Reader};
 use pe_paper_state::FinancialSnapshot;
 use pe_risk_engine::{
@@ -912,7 +912,15 @@ fn paper_fill_source_receipts(era: &PaperEra) -> Result<Vec<AppendReceipt>, Risk
 #[derive(Default)]
 struct SourceReceiptIndexState {
     frames: Vec<SourceFrameMetadata>,
+    frame_bindings: HashMap<(EventSeq, blake3::Hash), (SourceTradeId, AppendReceipt)>,
+    frame_incidents: HashMap<(EventSeq, blake3::Hash), (Option<SourceTradeId>, AppendReceipt)>,
     next_byte_offset: Option<u64>,
+    verified_feed_frontiers:
+        HashMap<pe_core_types::WalletAddress, crate::frame_admission::FeedHistoryFrontier>,
+    #[cfg(feature = "scenario")]
+    read_verifications: HashMap<(EventSeq, blake3::Hash), usize>,
+    #[cfg(feature = "scenario")]
+    frame_verifications: HashMap<(EventSeq, blake3::Hash), usize>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -988,7 +996,14 @@ impl SourceReceiptIndexStaging {
         SourceReceiptIndex {
             state: Arc::new(RwLock::new(SourceReceiptIndexState {
                 frames: self.frames,
+                frame_bindings: HashMap::new(),
+                frame_incidents: HashMap::new(),
                 next_byte_offset: Some(physical_tail),
+                verified_feed_frontiers: HashMap::new(),
+                #[cfg(feature = "scenario")]
+                read_verifications: HashMap::new(),
+                #[cfg(feature = "scenario")]
+                frame_verifications: HashMap::new(),
             })),
             source_log_path: Some(Arc::new(self.canonical_source_log_path)),
         }
@@ -996,6 +1011,177 @@ impl SourceReceiptIndexStaging {
 }
 
 impl SourceReceiptIndex {
+    #[cfg(feature = "scenario")]
+    pub fn read_verification_count(&self, receipt: AppendReceipt) -> usize {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .read_verifications
+            .get(&(receipt.sequence, receipt.this_hash))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    #[cfg(feature = "scenario")]
+    pub(crate) fn record_read_verification(&self, receipt: AppendReceipt) {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *state
+            .read_verifications
+            .entry((receipt.sequence, receipt.this_hash))
+            .or_default() += 1;
+    }
+
+    #[cfg(feature = "scenario")]
+    pub fn frame_verification_count(&self, receipt: AppendReceipt) -> usize {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .frame_verifications
+            .get(&(receipt.sequence, receipt.this_hash))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    #[cfg(feature = "scenario")]
+    pub(crate) fn record_frame_verification(&self, receipt: AppendReceipt) {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *state
+            .frame_verifications
+            .entry((receipt.sequence, receipt.this_hash))
+            .or_default() += 1;
+    }
+
+    /// First authenticated counterpart owns this receipt. Later stamps need read-proven equivalence.
+    pub(crate) fn remember_frame_bindings(
+        &self,
+        read: &crate::bucket_commit::VerifiedCommitment,
+    ) -> Result<(), crate::bucket_commit::CompleteActivityReadError> {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for binding in read
+            .bindings
+            .iter()
+            .filter(|binding| binding.frame_admission_receipt.is_some())
+        {
+            let key = (
+                binding.stream_receipt.sequence,
+                binding.stream_receipt.this_hash,
+            );
+            if let Some(previous) = state.frame_bindings.get(&key) {
+                let (left, right) = (&previous.0, &binding.history_group_id);
+                if left != right
+                    && read.restamp_pairs.get(left) != Some(right)
+                    && read.restamp_pairs.get(right) != Some(left)
+                {
+                    return Err(crate::bucket_commit::complete_activity_read_error(
+                        "authenticated frame counterpart changed without restamp equivalence",
+                    ));
+                }
+            }
+        }
+        for binding in read
+            .bindings
+            .iter()
+            .filter(|binding| binding.frame_admission_receipt.is_some())
+        {
+            state
+                .frame_bindings
+                .entry((
+                    binding.stream_receipt.sequence,
+                    binding.stream_receipt.this_hash,
+                ))
+                .or_insert_with(|| (binding.history_group_id.clone(), read.receipt));
+        }
+        Ok(())
+    }
+
+    /// An authenticated incident fixes the counterpart, including an absence with no target.
+    pub(crate) fn remember_frame_incident(&self, incident: &crate::paper_recovery::FeedIncident) {
+        self.state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .frame_incidents
+            .entry((
+                incident.frame_receipt.sequence,
+                incident.frame_receipt.this_hash,
+            ))
+            .or_insert_with(|| {
+                (
+                    incident.counterpart_identity.clone(),
+                    incident.deciding_commitment_receipt,
+                )
+            });
+    }
+
+    /// Bindings take precedence over incidents: a late binding fixes an absent frame forever.
+    /// The receipt is the first proof, so later commitments reference a bounded proof chain.
+    pub(crate) fn frame_counterpart_basis(
+        &self,
+        receipt: AppendReceipt,
+    ) -> Option<(Option<SourceTradeId>, AppendReceipt)> {
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let key = (receipt.sequence, receipt.this_hash);
+        state
+            .frame_bindings
+            .get(&key)
+            .map(|(identity, proof)| (Some(identity.clone()), *proof))
+            .or_else(|| state.frame_incidents.get(&key).cloned())
+    }
+
+    pub(crate) fn frame_counterpart(
+        &self,
+        receipt: AppendReceipt,
+    ) -> Option<Option<SourceTradeId>> {
+        self.frame_counterpart_basis(receipt)
+            .map(|(target, _)| target)
+    }
+
+    pub(crate) fn remember_verified_frontier(
+        &self,
+        frontier: &crate::frame_admission::FeedHistoryFrontier,
+    ) {
+        self.state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .verified_feed_frontiers
+            .insert(frontier.wallet, frontier.clone());
+    }
+
+    pub(crate) fn verify_frame_frontier(
+        &self,
+        frontier: &crate::frame_admission::FeedHistoryFrontier,
+    ) -> Result<(), crate::frame_admission::FrameAdmissionError> {
+        if self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .verified_feed_frontiers
+            .get(&frontier.wallet)
+            == Some(frontier)
+        {
+            return Ok(());
+        }
+        #[cfg(feature = "scenario")]
+        self.record_read_verification(frontier.commitment);
+        frontier.verify(&mut |receipt| {
+            self.source_envelope(receipt)
+                .map(crate::bucket_commit::CompleteActivityPage::from)
+        })?;
+        self.remember_verified_frontier(frontier);
+        Ok(())
+    }
+
     pub(crate) fn canonical_path(&self) -> Option<&Path> {
         self.source_log_path.as_deref().map(PathBuf::as_path)
     }

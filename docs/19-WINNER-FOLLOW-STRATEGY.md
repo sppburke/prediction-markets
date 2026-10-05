@@ -300,10 +300,12 @@ snapshot and strict replay reuses that recorded value (#545), so a later edit ne
 earlier admission unreplayable.
 
 The venue planner alone evaluates the requested allocation against the current ask ladder, venue
-minimum, and resolved monetary bounds. It returns `InsufficientDepth` when the complete request cannot
-fill inside its price bounds and `CapExceeded` when signed principal plus fee reserve exceeds a
-monetary bound. In particular, Contract mode either plans exactly the configured quantity or declines;
-it never silently reduces an over-cap or under-depth request.
+minimum, and resolved monetary bounds. Historical paper, ordinary live and backtest return
+`InsufficientDepth` when the complete request cannot fill inside its price bounds. Only
+continuation-7 paper Dollar sizing uses `BuySizing::DollarUpTo` to sign the principal that fits,
+subject to the admission minimum. All policies return `CapExceeded` when signed principal plus
+fee reserve exceeds a monetary bound. Contract mode either plans exactly the configured quantity
+or declines; it never silently reduces an over-cap or under-depth request.
 
 The risk engine retains `PerTradeSizeExceeded` as an independent proposal gate. The proposal supplied
 to it is derived from the exact sized plan rather than from a preliminary strategy-side notional.
@@ -325,10 +327,12 @@ signed price; signed principal is exact collateral and minimum shares use tick s
 decimals. The fee is computed once for the final aggregate quantity at that price and truncated to
 five decimals. Kelly first derives a candidate from the one-share all-in cost, recomputes the
 aggregate all-in cost for that candidate, resizes once, and takes the smaller size. Dollar mode
-derives conservative principal from its monetary budget; Contract passes exactly its configured
-shares. Every monetary cap bounds principal plus the conservative fee reserve. Quantity below the
-venue minimum, unusable depth, stale evidence, or an invalid all-in price is a typed rejection with
-no fallback or fixed-point loop.
+derives conservative principal from its monetary budget; continuation-7 paper can reduce that
+principal to available in-band capacity once. Historical paper, ordinary live and backtest retain
+the complete-request Dollar policy; economic wire 2 does not select partial sizing. Contract passes
+exactly its configured shares, and Kelly remains exact-or-decline. Every monetary cap bounds
+principal plus the conservative fee reserve. Quantity below the admission minimum, unusable depth,
+stale evidence, or an invalid all-in price is a typed rejection with no fixed-point loop.
 
 **When to use `Dollar`/`Contract`:** when the Kelly `p` input is a per-leader constant with no per-trade information (e.g. a blended historical win rate). A constant `p` collapses Kelly to a pure function of price, which is noise with respect to per-trade edge; the fixed modes eliminate that noise and also eliminate bankroll compounding — position size does not grow with bankroll.
 
@@ -400,16 +404,16 @@ The TOML above is the only authoritative copy. README, `04-PHASE-TRADING-STRATEG
 
 ## Copy-scope gates (service-side, issue #290)
 
-These gates live in `crates/service` (the orchestrator copy path), fire **before** the strategy-level gates below: a copied trade must be a **first-ever BUY entry** into a market, resolving **within `[min, max]` of now**, **held to resolution**, with usable current market and mandatory book evidence whose resolved fill basis is inside `[min_fill_price, max_fill_price)`. They are production-only (the orchestrator path is not exercised in backtest, which uses `simulation.rs`). The leader-price band of the original 72hr cohort was **removed in #339**; a **current fill-basis floor returned at the 2026-07-03 run28 cutover** (`min_fill_price`, #468 selection↔deployment parity — the run28 eval filtered forward copies to the band) alongside the pre-existing `max_fill_price` cap.
+These gates live in `crates/service` (the orchestrator copy path), fire **before** the strategy-level gates below: a copied trade must be a **per-wallet first BUY entry** under its frozen source authority, resolving **within `[min, max]` of now**, **held to resolution**, with usable current market and mandatory book evidence inside `[min_fill_price, max_fill_price)`. They are production-only (the orchestrator path is not exercised in backtest, which uses `simulation.rs`). The leader-price band of the original 72hr cohort was **removed in #339**; a **current fill-basis floor returned at the 2026-07-03 run28 cutover** (`min_fill_price`, #468 selection↔deployment parity — the run28 eval filtered forward copies to the band) alongside the pre-existing `max_fill_price` cap.
 
 Gate order in `orchestrator.rs::handle_trade`, after dedup → watchlist → classify:
 
 | # | Gate | Condition (copy iff …) | Source | Rationale |
 |---|---|---|---|---|
-| A | Hold-to-resolution | `(market, outcome)` not already held | the coherent exact financial snapshot, rebuilt before producers | The cohort wallets sell winners early; dropping every later signal on a held contract (including the leader's own exits) reproduces copy-and-hold. Prepared/Final authority, exact positions, and causal Resolution Finals establish durable state. |
-| B | BUY-only first-ever entry | `signal.leader_side == Buy` **and** `signal.action == Entry` **and** `signal.market_id ∉ history[leader]` | wallet-second bucket commit + durable `entry_gate_results` / `wallet_market_history_v2`; `CopyEntryGate` is the rebuilt in-memory projection | The cohort was selected on first-ever BUYs. Drops every SELL, `Add`/`Trim`/`Exit`/`Flip`, and re-entry. Equal-second candidates are decided together from immutable pre-bucket state: two candidates in one market are all `ambiguous_first_entry_same_second`; one candidate consumes history even when a later gate rejects it (#544). |
+| A | Hold-to-resolution | continuation 7 applies no cross-leader paper hold; continuations through 6 require `(market, outcome)` not already held | frozen continuation and coherent exact financial snapshot | Each wallet's first entry can copy into a held market on either outcome; same-outcome fills accumulate. Per-wallet history still prevents a second entry. Older paper decisions keep the outcome-keyed `paper_held` check. SELLs remain ignored and copied BUYs are held to resolution. |
+| B | BUY-only first-ever entry | `signal.leader_side == Buy` **and** `signal.action == Entry` **and** `signal.market_id ∉ history[leader]` | authority-specific frame or wallet-second commit + durable `entry_gate_results` / `wallet_market_history_v2`; `CopyEntryGate` is the rebuilt projection | Frame authority takes the first qualifying admission-time Entry in receipt order; complete reads prove the first-ever BUY from history. Continuation-7 homogeneous same-second same-outcome BUY pieces admit only the minimum-source-ID representative; mixed outcomes remain ambiguous. Older continuations retain their ambiguity rule. SELL, `Add`/`Trim`/`Exit`/`Flip` and re-entry never copy; admission consumes history despite later rejection. See the [authority contract](_GLOSSARY.md#continuation-and-commitment-compatibility-588). |
 | C | Resolution horizon | `now + min_resolution_horizon_secs ≤` market resolution `≤ now + max_resolution_horizon_secs` | admission's recorded CLOB-long `scheduled_end_unix` | Too far out locks capital for months; too soon (< 60 s) cannot be filled and held (`docs/29` copy floor). The same admission read supplies the horizon and economic evidence; the dashboard market-end cache is not consulted by this path. Each bound's `0` disables it; **unknown** resolution time **fails closed** (skipped). |
-| D | Signed-price band | current admission and book evidence are usable, and the signed ladder's worst accepted tick is `≥ min_fill_price` and `< max_fill_price` | shared venue ladder/economic-preparation owner | Paper and ordinary live use the same signed principal, minimum shares, fee schedule, and all-in price. Gamma mid is liveness/mark evidence only. The upper boundary skips and the lower boundary fills. |
+| D | Signed-price band | current admission and book evidence are usable, and the signed ladder's worst accepted tick is `≥ min_fill_price` and `< max_fill_price` | shared venue ladder/economic-preparation owner | Continuation 7 checks accepted asks once: inclusive floor, exclusive ceiling and impact ceiling; no later VWAP band refusal or decision mid acquisition/refusal. Horizon, admission, book freshness and risk remain mandatory. Accounting retains VWAP; older paper checks and ordinary-live policy remain frozen. The upper boundary skips and the lower boundary fills. |
 
 **Copy-latency budget (both provenances).** The owner permits copies through 120 s after
 the leader trade while the ranker's Δ stays 2 s. REST poll and activity-websocket observations pass an
@@ -432,14 +436,17 @@ pending and stops submission.
 
 “History complete” means complete over attributable rows: rows whose asset no configured metadata authority can verify are recorded `raw_only` and cannot contribute a market to first-entry history.
 
-A rejected copy-scope gate logs the typed reason and commits a no-fill (the leader ledger is still mirrored, matching the existing no-edge path). SELL-only and non-entry buckets do not consume history. Defaults for the remaining gate config keys (`min_resolution_horizon_secs`, `max_resolution_horizon_secs`, `min_fill_price`, `max_fill_price`) live in `_GLOSSARY.md` "Copy-entry gate".
+A rejected copy-scope gate logs the typed reason and commits a no-fill. Complete-read routing mirrors the leader ledger; a frame decision creates no leader effect, and its later authenticated REST counterpart applies once without another decision. SELL-only and non-entry buckets do not consume history. Defaults for the remaining gate config keys (`min_resolution_horizon_secs`, `max_resolution_horizon_secs`, `min_fill_price`, `max_fill_price`) live in `_GLOSSARY.md` "Copy-entry gate".
 
 **Current economic sizing (#545).** Production and replay consume the same `EconomicPrepared` value:
 market/admission receipts, signed ladder, exact sizing, compact fee and reserve, risk decision,
 balance proof, applied configuration hash, and source observation. The signal's leader execution is
-frozen audit evidence and cannot substitute for current-book evidence. Paper semantic 2 walks the
+frozen audit evidence and cannot substitute for current-book evidence. Paper semantics 2 and 3 walk the
 current ask ladder up to the applied best-ask impact cap, inside `[min_fill_price, max_fill_price)`,
-and signs the ladder's tick-aligned limit without a leader-price ceiling. Paper admission permits
+and sign the ladder's tick-aligned limit without a leader-price ceiling. Semantic 3 selects
+continuation-7 paper partial Dollar sizing only; intent contracts equal the checked whole-contract
+conversion of signed shares. Its per-ask band check has no subsequent VWAP refusal or decision
+mid gate. Semantic 2 retains its historical policy. Paper admission permits
 positive or absent matching delay. Ordinary live uses the same current-book impact cap and neutral
 chase ceiling, with a strict zero-delay check on a fresh target-specific admission read. The
 isolated V2 canary has its own contract.

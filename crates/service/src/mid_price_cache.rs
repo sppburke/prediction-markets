@@ -791,6 +791,11 @@ impl<F: PageFetcher + Send + Sync> MidPriceCache<F> {
         };
         let mut recorded = RecordedGammaPages::default();
         for (evidence, payload) in pages {
+            // The acquisition envelope and its embedded metadata share the cache's clock.
+            // In scenarios this also keeps the complete receipt deterministic, rather than
+            // retaining the client's wall-clock timestamp inside an otherwise fixed record.
+            let mut evidence = evidence.clone();
+            evidence.received_at = ReceivedAt(observed);
             let payload = serde_json::to_vec(&GammaPriceAttemptRecord::Page {
                 evidence: evidence.clone(),
                 payload: payload.clone(),
@@ -1958,6 +1963,14 @@ mod tests {
                 .expect("the consulted attempt is durably appended");
             assert_eq!(recorded.observed_at.0, base);
             assert_eq!(recorded.received_at.0, base);
+            if succeeds {
+                let page: GammaPriceAttemptRecord =
+                    serde_json::from_slice(&recorded.payload).unwrap();
+                assert!(matches!(&page, GammaPriceAttemptRecord::Page { .. }));
+                if let GammaPriceAttemptRecord::Page { evidence, .. } = page {
+                    assert_eq!(evidence.received_at.0, base);
+                }
+            }
             drop(cache);
             ingest.abort();
             let _ = ingest.await;

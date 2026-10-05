@@ -259,15 +259,18 @@ pub struct NormalizedActivity {
 
 /// Identity carried by one accepted `activity/trades` websocket observation.
 ///
-/// The websocket payload is only a reconciliation trigger: it cannot supply a
-/// semantic aggregate or mutate the ledger. Its documented envelope fixes the
-/// activity type to `TRADE`, while the payload supplies the remaining version-two
-/// group components and exact source second (#544).
+/// Validated feed facts used for frame admission and later REST reconciliation.
+/// A frame never mutates the confirmed leader ledger or supplies a REST aggregate.
+/// The documented envelope fixes the type to `TRADE`; identity and exact decimal
+/// facts remain authenticated by the synchronized raw source envelope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivityTradeObservation {
     pub wallet: WalletAddress,
     pub group_id: SourceActivityGroupId,
     pub source_time: SourceTimestamp,
+    pub price: Price,
+    pub share_amount: ShareAmount,
+    pub is_combo: bool,
 }
 
 impl NormalizedActivity {
@@ -714,16 +717,17 @@ fn normalize_trade_observation(
         .price
         .ok_or(ActivityValidationError::MissingField { field: "price" })?
         .0;
-    Price::new(price_decimal).map_err(|error| ActivityValidationError::InvalidPrice {
-        value: price_decimal,
-        reason: error.to_string(),
-    })?;
+    let price =
+        Price::new(price_decimal).map_err(|error| ActivityValidationError::InvalidPrice {
+            value: price_decimal,
+            reason: error.to_string(),
+        })?;
     let share_decimal = raw
         .size
         .ok_or(ActivityValidationError::MissingField { field: "size" })?
         .0;
     // Exactness is still validated; zero is allowed (raw-only, #544 fix 2).
-    let _share_amount = ShareAmount::from_decimal_exact(share_decimal).map_err(|error| {
+    let share_amount = ShareAmount::from_decimal_exact(share_decimal).map_err(|error| {
         ActivityValidationError::InvalidShareAmount {
             value: share_decimal,
             reason: error.to_string(),
@@ -752,6 +756,9 @@ fn normalize_trade_observation(
         wallet,
         group_id,
         source_time,
+        price,
+        share_amount,
+        is_combo: raw.is_combo.unwrap_or(false),
     })
 }
 

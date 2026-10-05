@@ -72,7 +72,8 @@ use pe_service::supervisor::{
     TaskName, TaskResult, TaskSupervisor, cancel_at, cancel_result_at,
 };
 use pe_service::trade_poller::{
-    TradePoller, TradePollerConfig, rebuild_reconciliation_obligations, recover_daily_boundary,
+    TradePoller, TradePollerConfig, rebuild_reconciliation_obligations,
+    rebuild_reconciliation_obligations_with_index, recover_daily_boundary,
 };
 use pe_service::watchlist_admission::{AdmissionPreparer, anchor_refresh_due};
 use pe_service::watchlist_capacity::SupabaseWatchlistCapacity;
@@ -724,15 +725,17 @@ async fn main() -> Result<()> {
         let authority = supabase_state.as_ref().context(
             "active financial era requires the authoritative client before paper writer boot",
         )?;
-        let boot_receipts = source_log_boot.as_ref().map(|boot| boot.receipt_index());
-        let source_evidence = match boot_receipts.as_ref() {
-            Some(index) => SourceEvidence::Index(index),
-            None => SourceEvidence::Log(&cfg.source_event_log_path),
+        let boot_receipts = match source_log_boot.as_ref() {
+            Some(boot) => boot.receipt_index(),
+            None => pe_service::risk_inputs::SourceReceiptIndex::replay(&cfg.source_event_log_path)
+                .context("build verified boot source receipt index")?,
         };
+        pe_service::bucket_commit::validate_frame_history(&paper_state, &boot_receipts)
+            .context("validate complete frame history before financial recovery")?;
         let recovered = reconcile_active_financial_frames(
             authority,
             &paper_state,
-            source_evidence,
+            SourceEvidence::Index(&boot_receipts),
             &paper_writer,
         )
         .await
@@ -1049,10 +1052,12 @@ async fn main() -> Result<()> {
         pe_service::dispatch_recovery::resume_dispatch_seeds(&cfg.event_log_path, &paper_state)
             .context("resume active-era dispatch seeds after financial recovery")?;
     }
+    let poll_round_stale_secs =
+        i64::try_from(cfg.trade_poll_interval_secs.saturating_mul(3)).unwrap_or(i64::MAX);
     let health = new_shared_health_with_ws(
         false,
         cfg.polymarket_activity_ws_enabled,
-        i64::try_from(cfg.trade_poll_interval_secs.saturating_mul(3)).unwrap_or(i64::MAX),
+        poll_round_stale_secs,
     );
     let task_status = health
         .lock()
@@ -1086,6 +1091,10 @@ async fn main() -> Result<()> {
         None => pe_service::risk_inputs::SourceReceiptIndex::replay(&cfg.source_event_log_path)
             .context("build verified source receipt index")?,
     };
+    if financial_start.is_none() {
+        pe_service::bucket_commit::validate_frame_history(&paper_state, &source_receipts)
+            .context("validate complete frame history before resume")?;
+    }
     let open_rows =
         pe_service::bucket_commit::validate_open_continuations(&paper_state, &source_receipts)
             .context("validate open decision continuations before resume")?;
@@ -1119,14 +1128,18 @@ async fn main() -> Result<()> {
             .obligations(&paper_state, &cfg.event_log_path)
             .context("rebuild activity obligations from the boot walk")?,
         None => {
-            let mut obligations =
-                rebuild_reconciliation_obligations(&cfg.source_event_log_path, &paper_state)
-                    .context("rebuild durable activity reconciliation obligations")?;
+            let mut obligations = rebuild_reconciliation_obligations_with_index(
+                &cfg.source_event_log_path,
+                &paper_state,
+                &source_receipts,
+            )
+            .context("rebuild durable activity reconciliation obligations")?;
             if financial_start.is_some() {
                 recover_daily_boundary(
                     &cfg.source_event_log_path,
                     &cfg.event_log_path,
                     &mut obligations,
+                    &paper_state,
                 )
                 .context("recover causal daily boundary")?;
             }
@@ -1137,6 +1150,8 @@ async fn main() -> Result<()> {
         obligations = obligations.len(),
         "activity obligations rebuilt"
     );
+
+    let (boot_frame_prefix, boot_frame_deliveries) = obligations.frame_recovery_receipts();
 
     // One bounded single-writer coordinator owns both websocket rows and every
     // fixed-end public page. Append acknowledgement precedes all triggers/apply.
@@ -1181,8 +1196,11 @@ async fn main() -> Result<()> {
         )
         .with_source_receipt_index(source_receipts.clone())
     };
-    let reconciliation_obligations_dropped =
-        activity_ingest.reconciliation_triggers_dropped_counter();
+    let activity_ingest = if financial_start.is_some() {
+        activity_ingest.with_control_sender(control_tx.downgrade())
+    } else {
+        activity_ingest
+    };
     supervisor.spawn(TaskName::ActivityIngest, async move {
         // Recovery may append admission evidence before observation producers start.
         match activity_ingest
@@ -1322,7 +1340,7 @@ async fn main() -> Result<()> {
         admission_http_client,
         cfg.gamma_base_url.clone(),
         cfg.polymarket_clob_base_url.clone(),
-        orchestrator_source_log,
+        orchestrator_source_log.clone(),
     );
 
     let snapshot_handle = if cfg.supabase_sink_enabled && !cfg.supabase_url.is_empty() {
@@ -1547,6 +1565,7 @@ async fn main() -> Result<()> {
         supervisor.spawn(TaskName::LiveFanout, task);
     }
     if financial_start.is_some() {
+        orch = orch.with_activity_frames(orchestrator_source_log.clone(), poll_round_stale_secs);
         orch.configure_financial_log_paths(
             cfg.event_log_path.clone(),
             cfg.source_event_log_path.clone(),
@@ -1566,6 +1585,13 @@ async fn main() -> Result<()> {
     orch.resume_pending_before_producers()
         .await
         .context("resume decision_pending before source producers")?;
+    if cfg.polymarket_activity_ws_enabled && financial_start.is_some() {
+        orch.resume_activity_frames_before_producers(&boot_frame_prefix, &boot_frame_deliveries)
+            .await
+            .map_err(anyhow::Error::msg)
+            .context("resume synchronized activity frames before producers")?;
+    }
+
     let orchestrator_shutdown = shutdown.subscribe();
     supervisor.spawn(TaskName::Orchestrator, async move {
         orch.run_coordinated(orchestrator_shutdown.wait_for(ShutdownPhase::DrainOrchestrator))
@@ -1760,7 +1786,6 @@ async fn main() -> Result<()> {
         supabase_rpc_calls,
         live_accounts.clone(),
         Some(health.clone()),
-        Some(reconciliation_obligations_dropped),
         task_status.clone(),
         shutdown.subscribe().wait_for(ShutdownPhase::FinalStatus),
     );

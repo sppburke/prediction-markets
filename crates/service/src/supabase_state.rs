@@ -991,6 +991,9 @@ pub async fn reconcile_active_financial_frames<S: SupabaseStateTrait + ?Sized>(
     source_evidence: SourceEvidence<'_>,
     writer: &crate::paper_recovery::PaperLog,
 ) -> Result<usize, SupabaseStateError> {
+    // Only continuations requiring financial work are authenticated here. Boot and sealing
+    // own comprehensive validation of completed frame history.
+    let mut recovery_index = None;
     let era =
         paper_era(writer.snapshot().map_err(|error| {
             SupabaseStateError::Corrupt(format!("scan active paper log: {error}"))
@@ -1022,6 +1025,22 @@ pub async fn reconcile_active_financial_frames<S: SupabaseStateTrait + ?Sized>(
         )));
     }
 
+    let open_ids = paper_state
+        .open_decision_pending()?
+        .into_iter()
+        .map(|row| row.source_trade_id)
+        .collect::<std::collections::HashSet<_>>();
+    let finals = era
+        .frames
+        .iter()
+        .filter_map(|frame| match &frame.frame {
+            PaperLogFrame::Record(PaperLogRecord::FinancialFinal {
+                prepared_receipt,
+                result,
+            }) => Some((prepared_receipt.sequence, (result, frame.receipt))),
+            _ => None,
+        })
+        .collect::<std::collections::HashMap<_, _>>();
     let mut appended_finals = 0usize;
     for frame in &era.frames {
         let PaperLogFrame::Record(PaperLogRecord::FinancialPrepared {
@@ -1031,31 +1050,56 @@ pub async fn reconcile_active_financial_frames<S: SupabaseStateTrait + ?Sized>(
         else {
             continue;
         };
-        let existing_final = era
-            .frames
-            .iter()
-            .find_map(|candidate| match &candidate.frame {
-                PaperLogFrame::Record(PaperLogRecord::FinancialFinal {
-                    prepared_receipt,
-                    result,
-                }) if prepared_receipt == &frame.receipt => {
-                    Some((result.clone(), candidate.receipt))
-                }
-                _ => None,
-            });
+        let existing_final = finals
+            .get(&frame.receipt.sequence)
+            .map(|(result, receipt)| ((*result).clone(), *receipt));
+        let needs_terminal = matches!(payload, FinancialPayload::Fill { operation, .. }
+            if open_ids.contains(&operation.source_trade_id));
+        if (local_last.is_none_or(|last| frame.receipt.sequence > last)
+            || existing_final.is_none()
+            || needs_terminal)
+            && let FinancialPayload::Fill { operation, .. } = payload
+            && let Some(row) = paper_state.decision_pending_for(&operation.source_trade_id)?
+        {
+            let continuation = crate::bucket_commit::DecisionContinuationV3::from_durable(&row)
+                .map_err(|error| SupabaseStateError::Corrupt(error.to_string()))?;
+            if continuation.is_activity_frame() {
+                let index = match source_evidence {
+                    SourceEvidence::Index(index) => index,
+                    SourceEvidence::Log(path) => {
+                        if recovery_index.is_none() {
+                            recovery_index =
+                                Some(SourceReceiptIndex::replay(path).map_err(|error| {
+                                    SupabaseStateError::Corrupt(error.to_string())
+                                })?);
+                        }
+                        recovery_index.as_ref().ok_or_else(|| {
+                            SupabaseStateError::Corrupt("recovery source index missing".to_owned())
+                        })?
+                    }
+                };
+                continuation
+                    .verify_activity_frame_with_index(index)
+                    .map_err(|error| SupabaseStateError::Corrupt(error.to_string()))?;
+            }
+        }
         if local_last.is_some_and(|last| frame.receipt.sequence < last) {
             let Some((result, final_receipt)) = &existing_final else {
                 return Err(SupabaseStateError::Corrupt(
                     "local projection advanced beyond an unmatched Prepared".to_owned(),
                 ));
             };
-            terminalize_final_fill_decision(paper_state, payload, result, *final_receipt)?;
+            if needs_terminal {
+                terminalize_final_fill_decision(paper_state, payload, result, *final_receipt)?;
+            }
             continue;
         }
         if local_last == Some(frame.receipt.sequence)
             && let Some((result, final_receipt)) = &existing_final
         {
-            terminalize_final_fill_decision(paper_state, payload, result, *final_receipt)?;
+            if needs_terminal {
+                terminalize_final_fill_decision(paper_state, payload, result, *final_receipt)?;
+            }
             continue;
         }
 
@@ -1159,7 +1203,7 @@ pub async fn reconcile_active_financial_frames<S: SupabaseStateTrait + ?Sized>(
             terminalize_final_fill_decision(paper_state, payload, &result, final_receipt)?;
             continue;
         }
-        let now = time::OffsetDateTime::now_utc();
+        let now = crate::orchestrator::terminal_now();
         let final_payload = serde_json::to_vec(&PaperLogRecord::FinancialFinal {
             prepared_receipt: frame.receipt,
             result: result.clone(),
@@ -1195,9 +1239,8 @@ pub(crate) fn terminalize_final_fill_decision(
         return Ok(());
     };
     let row = paper_state
-        .open_decision_pending()?
-        .into_iter()
-        .find(|row| row.source_trade_id == operation.source_trade_id);
+        .decision_pending_for(&operation.source_trade_id)?
+        .filter(|row| row.state == pe_paper_state::DecisionPendingState::Open);
     let Some(row) = row else {
         return Ok(());
     };

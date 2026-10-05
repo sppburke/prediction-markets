@@ -1626,6 +1626,7 @@ fn bracket_context(
     let reconstruction_quality =
         ReconstructionQuality::new(100).map_err(|_| CausalPositionError::ReconstructionQuality)?;
     Ok(BucketDecisionContext {
+        verified_read: None,
         applied_configuration: crate::runtime_config::RuntimeConfig::from_service_config(
             &crate::config::ServiceConfig::default(),
         ),
@@ -1713,6 +1714,21 @@ pub fn ledger_capture(
     paper_state: &PaperStateDb,
     wallet: WalletAddress,
 ) -> Result<AdmissionLedgerCapture, CausalPositionError> {
+    let hash = wallet_ledger_hash(ledger, wallet)?;
+    let coverage = paper_state.wallet_coverage(&wallet)?;
+    Ok(AdmissionLedgerCapture {
+        wallet,
+        hash,
+        cursor: paper_state.cursor(&wallet)?,
+        anchor_seq: coverage.anchor_seq,
+        coverage_generation: coverage.coverage_generation,
+    })
+}
+
+pub(crate) fn wallet_ledger_hash(
+    ledger: &PositionLedger,
+    wallet: WalletAddress,
+) -> Result<String, CausalPositionError> {
     let mut all = BTreeMap::<(String, u16), (ShareAmount, ShareAmount)>::new();
     if let Some(snapshot) = ledger.position(&wallet) {
         for (key, state) in &snapshot.positions {
@@ -1731,14 +1747,7 @@ pub fn ledger_capture(
         hash_part(&mut hasher, &long.atomic().to_be_bytes())?;
         hash_part(&mut hasher, &short.atomic().to_be_bytes())?;
     }
-    let coverage = paper_state.wallet_coverage(&wallet)?;
-    Ok(AdmissionLedgerCapture {
-        wallet,
-        hash: hasher.finalize().to_hex().to_string(),
-        cursor: paper_state.cursor(&wallet)?,
-        anchor_seq: coverage.anchor_seq,
-        coverage_generation: coverage.coverage_generation,
-    })
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 fn ordinary_position_balances(

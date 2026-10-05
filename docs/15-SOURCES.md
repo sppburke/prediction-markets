@@ -88,13 +88,25 @@
 > `pe-service` deliberately does not send — no evidence ties it to delivery), **without
 > published completeness, uptime, ordering, continuity, or resume guarantees**: re-check the
 > endpoint, subscription shape, and payload keys before each deploy that relies on it
-> (`scripts/probe_activity_ws.py`). Owner: `source-polymarket-public::activity_ws`
+> (`scripts/probe_activity_ws.py`). Continuation-7 paper entries are decided from synchronized
+> activity frames without waiting for REST; complete history still audits each admitted frame and
+> supplies missed entries and leader balances. A process-wide incident latch routes frames back
+> to history after contradiction or mature absence; a stale wallet frontier falls back per wallet
+> (see the [frontier and incident contract](_GLOSSARY.md#continuation-and-commitment-compatibility-588)).
+> Re-run the probe and record source verification before the Part 2 deploy; update `Last checked`
+> only after that re-verification. Owner: `source-polymarket-public::activity_ws`
 > (transport/envelope/constants) and `pe-service::activity_ingest` (readers, liveness,
 > fan-in); the service's `trade_parser` normalizes identically to the REST path. The CLOB
 > market channel remains wallet-anonymous — the note below stands for THAT feed.
-> Last checked: 2026-10-04 (`scripts/probe_activity_ws.py`: the activity subscription delivered
-> 2,694 `trades` frames in 60 s with envelope keys `connection_id`, `payload`, `timestamp`,
-> `topic` and `type`, and `payload.proxyWallet` present).
+> Last checked: 2026-10-05 (`scripts/probe_activity_ws.py` at 6:09 AM CT: the activity subscription
+> delivered 2,002 `trades` frames in 60 s with envelope keys `connection_id`, `payload`, `timestamp`,
+> `topic` and `type`, and `payload.proxyWallet` present; 2026-10-04: 2,694 and 1,970 frames in 60 s,
+> same keys). A 45 s payload-key capture at 6:11 AM CT (1,816 payloads; 2,726 on 2026-10-04) found `asset`,
+> `conditionId`, `outcome`, `outcomeIndex`, `price`, `proxyWallet`, `side`, `size`, `timestamp` and
+> `transactionHash` on every payload (plus display fields, and `fee` on 694) and **no combo flag**:
+> frame admission therefore treats feed trades as non-combo; none of the 4 combo BUYs in watched
+> wallets' public history for 2026-09-04→10-03 appeared on the feed, and a combo REST
+> counterpart contradicts an admitted frame.
 >
 > **Historical (2026-06-03, issue #282 Phase 2 verification — CLOB channel still true; RTDS part superseded above).**
 > `wss://ws-subscriptions-clob.polymarket.com/ws/market` (`last_trade_price` events) does not include the **wallet address**; wallet-level trade identification is impossible from the frame alone.

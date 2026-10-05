@@ -59,6 +59,14 @@ use schema::{
 };
 pub use schema::{LEGACY_EXACT_MIGRATION_VERSION, SCHEMA_VERSION};
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ActivityObservationRetirement {
+    version: u16,
+    receipt: AppendReceipt,
+    unbound: bool,
+}
+
 /// Errors from the paper-state store.
 #[derive(Debug, thiserror::Error)]
 pub enum PaperStateError {
@@ -204,6 +212,24 @@ pub struct LeaderPositionRow {
     pub short_contracts: ShareAmount,
 }
 
+/// Immutable compact index of a frame decision. Full continuation evidence remains in
+/// `decision_pending` and is loaded only for execution or proof verification.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ActivityFrameDecisionIndex {
+    pub version: u16,
+    pub semantic_revision: String,
+    pub source_trade_id: SourceTradeId,
+    pub wallet: WalletAddress,
+    pub source_epoch: i64,
+    pub transaction_hash: String,
+    pub market_id: MarketId,
+    pub outcome_id: OutcomeId,
+    pub observed_source_receipt: Option<AppendReceipt>,
+    pub admission_receipt: AppendReceipt,
+    pub received_at: time::OffsetDateTime,
+    pub copy_latency_budget_secs: u64,
+}
+
 /// Durable terminal/apply record for one reconciled activity group (#544).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivityDispositionRecord {
@@ -294,7 +320,7 @@ pub struct AnchorInstallRecord {
 }
 
 /// Durable coverage state for one wallet's latest installed anchor.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WalletCoverage {
     pub activity_cutoff_unix: Option<i64>,
     pub coverage_generation: i64,
@@ -316,7 +342,7 @@ pub struct PositionAnchorRow {
 }
 
 /// One replayable activity group after an anchor cutoff.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActivityGroupRow {
     pub source_trade_id: SourceTradeId,
     pub source_epoch: i64,
@@ -405,8 +431,10 @@ struct SealDecisionEvidenceDocument {
 struct SealDecisionEvidenceRow {
     source_trade_id: String,
     semantic_revision: String,
-    activity_group: SealActivityGroup,
-    activity_group_revision: SealActivityGroupRevision,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activity_group: Option<SealActivityGroup>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activity_group_revision: Option<SealActivityGroupRevision>,
     entry_gate_result: SealEntryGateResult,
     no_copy_disposition: Option<SealNoCopyDisposition>,
     terminal_decision: SealTerminalDecision,
@@ -472,11 +500,15 @@ struct SelectedSealTerminal {
 struct SealDecisionScope {
     version: u16,
     #[serde(default)]
+    source_authority: Option<String>,
+    #[serde(default)]
     observed_source_receipt: Option<AppendReceipt>,
     #[serde(default)]
     page_occurrences: Vec<SealPageOccurrence>,
     #[serde(default)]
     read_commitment: Option<AppendReceipt>,
+    #[serde(default)]
+    decision_inputs: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -557,6 +589,14 @@ pub struct ActivityBucketCommit {
     pub fence: Option<WalletFenceRecord>,
     pub reanchor: Option<ReanchorRecord>,
     pub advance_cursor: bool,
+}
+
+/// Frame admission has no leader, activity-group, revision, or cursor effects.
+#[derive(Debug, Clone)]
+pub struct ActivityFrameCommit {
+    pub gate: EntryGateResultRecord,
+    pub history: MarketHistoryRecord,
+    pub pending: DecisionPendingRecord,
 }
 
 /// Stored proof of the one-time legacy sidecar import.
@@ -1067,6 +1107,56 @@ impl PaperStateDb {
         Ok(groups)
     }
 
+    /// Append-only activity row boundary for a receipt-ordered admission capture.
+    pub fn activity_group_boundary(
+        &self,
+        wallet: &WalletAddress,
+    ) -> Result<Option<i64>, PaperStateError> {
+        self.lock()
+            .query_row(
+                "SELECT MAX(rowid) FROM activity_groups WHERE wallet_hex = ?1",
+                params![wallet.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    /// Frozen append prefix; later same-second rows cannot change this boundary.
+    pub fn activity_groups_at_boundary(
+        &self,
+        wallet: &WalletAddress,
+        cutoff: i64,
+        boundary: Option<i64>,
+    ) -> Result<Vec<ActivityGroupRow>, PaperStateError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare("SELECT source_trade_id, source_epoch, semantic_revision, disposition, proof_json FROM activity_groups WHERE wallet_hex = ?1 AND source_epoch > ?2 AND rowid <= ?3 ORDER BY source_epoch, source_trade_id")?;
+        let rows = statement.query_map(
+            params![wallet.to_string(), cutoff, boundary.unwrap_or(0)],
+            |row| {
+                Ok(ActivityGroupRow {
+                    source_trade_id: SourceTradeId(row.get(0)?),
+                    source_epoch: row.get(1)?,
+                    semantic_revision: row.get(2)?,
+                    disposition: row.get(3)?,
+                    proof_json: row.get(4)?,
+                })
+            },
+        )?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// First consumption owner, written atomically with the admission transaction.
+    pub fn market_history_record(
+        &self,
+        wallet: &WalletAddress,
+        market: &MarketId,
+    ) -> Result<Option<MarketHistoryRecord>, PaperStateError> {
+        self.lock().query_row("SELECT first_epoch, source_trade_id FROM wallet_market_history_v2 WHERE wallet_hex = ?1 AND market_id = ?2",
+            params![wallet.to_string(), market.to_string()], |row| Ok(MarketHistoryRecord {
+                wallet: *wallet, market_id: market.clone(), first_epoch: row.get(0)?, source_trade_id: SourceTradeId(row.get(1)?)
+            })).optional().map_err(Into::into)
+    }
+
     // ── Write shapes ─────────────────────────────────────────────────────────
 
     /// Commit a processed trade that produced **no** order (classify-`None`,
@@ -1104,7 +1194,9 @@ impl PaperStateDb {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         tx_mark_seen(&tx, source_trade_id, None)?;
-        tx_upsert_leader(&tx, leader)?;
+        if !tx_is_frame_decision(&tx, source_trade_id)? {
+            tx_upsert_leader(&tx, leader)?;
+        }
         if let Some(flip) = flip {
             tx_flip_dispatch_ready(&tx, flip)?;
         }
@@ -1154,7 +1246,9 @@ impl PaperStateDb {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         tx_mark_seen(&tx, source_trade_id, None)?;
-        tx_upsert_leader(&tx, leader)?;
+        if !tx_is_frame_decision(&tx, source_trade_id)? {
+            tx_upsert_leader(&tx, leader)?;
+        }
         tx_record_no_copy_disposition(&tx, source_trade_id, disposition)?;
         if let Some(flip) = flip {
             tx_flip_dispatch_ready(&tx, flip)?;
@@ -1184,6 +1278,169 @@ impl PaperStateDb {
             Some(row) => Ok(Some((row.get(0)?, row.get(1)?, row.get(2)?))),
             None => Ok(None),
         }
+    }
+
+    pub fn entry_gate_result(
+        &self,
+        id: &SourceTradeId,
+    ) -> Result<Option<EntryGateResultRecord>, PaperStateError> {
+        let tuple: Option<(String, String, i64, String, i64)> = self.lock().query_row("SELECT wallet_hex, market_id, source_epoch, result, history_consumed FROM entry_gate_results WHERE source_trade_id = ?1", params![id.0], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?))).optional()?;
+        tuple
+            .map(|(wallet, market, epoch, result, consumed)| {
+                Ok(EntryGateResultRecord {
+                    source_trade_id: id.clone(),
+                    wallet: WalletAddress::from_hex(&wallet)
+                        .map_err(|error| PaperStateError::Internal(error.to_string()))?,
+                    market_id: MarketId(pe_core_types::VenueMarketId(market)),
+                    source_epoch: epoch,
+                    result,
+                    history_consumed: consumed == 1,
+                })
+            })
+            .transpose()
+    }
+
+    /// Atomically consume one frame entry and create its immutable continuation.
+    pub fn commit_activity_frame(
+        &self,
+        frame: &ActivityFrameCommit,
+    ) -> Result<(), PaperStateError> {
+        let gate = &frame.gate;
+        let history = &frame.history;
+        let pending = &frame.pending;
+        let wire: serde_json::Value = serde_json::from_str(&pending.frozen_inputs_json)?;
+        if gate.source_trade_id != pending.source_trade_id
+            || history.source_trade_id != pending.source_trade_id
+            || gate.wallet != pending.wallet
+            || history.wallet != pending.wallet
+            || gate.source_epoch != pending.source_epoch
+            || history.first_epoch != pending.source_epoch
+            || history.market_id != gate.market_id
+            || gate.result != "admitted"
+            || !gate.history_consumed
+            || wire["version"] != 7
+            || wire["source_authority"] != "activity_frame"
+        {
+            return Err(PaperStateError::Internal(
+                "invalid frame admission transaction".to_owned(),
+            ));
+        }
+        let mut conn = self.lock();
+        let tx = conn.savepoint()?;
+        let disposed = tx
+            .query_row(
+                "SELECT 1 FROM activity_groups WHERE source_trade_id = ?1",
+                params![pending.source_trade_id.0],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .is_some();
+        if disposed {
+            return Err(PaperStateError::Internal(
+                "frame identity already disposed by REST".to_owned(),
+            ));
+        }
+        tx_persist_admission(
+            &tx,
+            std::slice::from_ref(gate),
+            std::slice::from_ref(history),
+            std::slice::from_ref(pending),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Acknowledged retirement of a non-admitted source observation. Keep its exact receipt
+    /// after fence clearance so boot cannot recreate an ordering barrier for disposed work.
+    pub fn retire_activity_observation(
+        &self,
+        receipt: AppendReceipt,
+        unbound: bool,
+    ) -> Result<(), PaperStateError> {
+        self.lock().execute(
+            "INSERT INTO meta(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO NOTHING",
+            params![
+                format!("retired_activity_observation:{}", receipt.sequence.0),
+                serde_json::to_string(&ActivityObservationRetirement {
+                    version: 1,
+                    receipt,
+                    unbound,
+                })?
+            ],
+        )?;
+        self.activity_observation_retired(receipt)?;
+        Ok(())
+    }
+
+    pub fn activity_observation_retired(
+        &self,
+        receipt: AppendReceipt,
+    ) -> Result<bool, PaperStateError> {
+        Ok(self.activity_observation_retirement(receipt)?.is_some())
+    }
+
+    pub fn activity_observation_unbound_retired(
+        &self,
+        receipt: AppendReceipt,
+    ) -> Result<bool, PaperStateError> {
+        Ok(self
+            .activity_observation_retirement(receipt)?
+            .is_some_and(|retirement| retirement.unbound))
+    }
+
+    fn activity_observation_retirement(
+        &self,
+        receipt: AppendReceipt,
+    ) -> Result<Option<ActivityObservationRetirement>, PaperStateError> {
+        let encoded: Option<String> = self
+            .lock()
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params![format!(
+                    "retired_activity_observation:{}",
+                    receipt.sequence.0
+                )],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let retirement = encoded
+            .map(|encoded| serde_json::from_str::<ActivityObservationRetirement>(&encoded))
+            .transpose()?;
+        if retirement
+            .as_ref()
+            .is_some_and(|retirement| retirement.version != 1 || retirement.receipt != receipt)
+        {
+            return Err(PaperStateError::Internal(
+                "retired observation receipt or version differs".to_owned(),
+            ));
+        }
+        Ok(retirement)
+    }
+
+    /// One versioned collection, stored in the existing metadata owner.
+    pub fn feed_history_frontiers(&self) -> Result<serde_json::Value, PaperStateError> {
+        let conn = self.lock();
+        let bytes: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'feed_history_frontiers'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        bytes.map_or_else(
+            || Ok(serde_json::json!({"version": 1, "frontiers": []})),
+            |bytes| Ok(serde_json::from_slice(&bytes)?),
+        )
+    }
+
+    /// Call only after authenticating the complete-read evidence and all bucket acknowledgements.
+    pub fn publish_feed_history_frontiers(
+        &self,
+        value: &serde_json::Value,
+    ) -> Result<(), PaperStateError> {
+        let bytes = serde_json::to_vec(value)?;
+        self.lock().execute("INSERT INTO meta (key, value) VALUES ('feed_history_frontiers', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value", params![bytes])?;
+        Ok(())
     }
 
     /// Commit one complete wallet epoch-second atomically (#544).
@@ -1326,6 +1583,10 @@ impl PaperStateDb {
                 )?;
             }
             tx_mark_seen(&tx, &record.source_trade_id, Some(&record.transaction_hash))?;
+            // The frame owns this identifier's terminal, even for late/covered/fenced echoes.
+            if tx_is_frame_decision(&tx, &record.source_trade_id)? {
+                continue;
+            }
             if let Some(disposition) = &record.no_copy {
                 tx_record_no_copy_disposition(&tx, &record.source_trade_id, disposition)?;
             } else if record.disposition != "applied"
@@ -1370,106 +1631,14 @@ impl PaperStateDb {
         for leader in &bucket.leader_positions {
             tx_upsert_leader(&tx, leader)?;
         }
-        for gate in &bucket.gate_results {
-            let durable: Option<(String, String, i64, String, i64)> = tx
-                .query_row(
-                    "SELECT wallet_hex, market_id, source_epoch, result, history_consumed \
-                     FROM entry_gate_results WHERE source_trade_id = ?1",
-                    params![gate.source_trade_id.0],
-                    |row| {
-                        Ok((
-                            row.get(0)?,
-                            row.get(1)?,
-                            row.get(2)?,
-                            row.get(3)?,
-                            row.get(4)?,
-                        ))
-                    },
-                )
-                .optional()?;
-            let requested = (
-                gate.wallet.to_string(),
-                gate.market_id.to_string(),
-                gate.source_epoch,
-                gate.result.clone(),
-                i64::from(gate.history_consumed),
-            );
-            if let Some(durable) = durable {
-                if durable != requested {
-                    return Err(PaperStateError::ActivityRevisionConflict(
-                        gate.source_trade_id.0.clone(),
-                    ));
-                }
-            } else {
-                tx.execute(
-                    "INSERT INTO entry_gate_results \
-                         (source_trade_id, wallet_hex, market_id, source_epoch, result, history_consumed) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![
-                        gate.source_trade_id.0,
-                        requested.0,
-                        requested.1,
-                        requested.2,
-                        requested.3,
-                        requested.4,
-                    ],
-                )?;
-            }
-        }
-        for history in &bucket.history_effects {
-            tx.execute(
-                "INSERT OR IGNORE INTO wallet_market_history_v2 \
-                     (wallet_hex, market_id, first_epoch, source_trade_id, origin) \
-                 VALUES (?1, ?2, ?3, ?4, 'activity_v2')",
-                params![
-                    history.wallet.to_string(),
-                    history.market_id.to_string(),
-                    history.first_epoch,
-                    history.source_trade_id.0,
-                ],
-            )?;
-        }
+        tx_persist_admission(
+            &tx,
+            &bucket.gate_results,
+            &bucket.history_effects,
+            &bucket.pending,
+        )?;
         if let Some(status) = &bucket.history_status {
             upsert_history_status(&tx, status, false)?;
-        }
-        for pending in &bucket.pending {
-            let durable: Option<(String, String, i64, String)> = tx
-                .query_row(
-                    "SELECT semantic_revision, wallet_hex, source_epoch, frozen_inputs_json \
-                     FROM decision_pending WHERE source_trade_id = ?1",
-                    params![pending.source_trade_id.0],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-                )
-                .optional()?;
-            let requested = (
-                pending.semantic_revision.clone(),
-                pending.wallet.to_string(),
-                pending.source_epoch,
-                pending.frozen_inputs_json.clone(),
-            );
-            if let Some(durable) = durable {
-                if durable != requested {
-                    return Err(PaperStateError::DecisionPendingConflict(
-                        pending.source_trade_id.0.clone(),
-                    ));
-                }
-            } else {
-                tx.execute(
-                    "INSERT INTO decision_pending \
-                         (source_trade_id, semantic_revision, wallet_hex, source_epoch, \
-                          frozen_inputs_json, post_commit_inputs_json, state, terminal_disposition, \
-                          updated_at_unix) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, '[]', 'open', NULL, ?6)",
-                    params![
-                        pending.source_trade_id.0,
-                        requested.0,
-                        requested.1,
-                        requested.2,
-                        requested.3,
-                        pending.updated_at_unix,
-                    ],
-                )?;
-            }
         }
         if let Some(fence) = &bucket.fence {
             let durable: Option<(String, String, String, i64)> = tx
@@ -1942,6 +2111,34 @@ impl PaperStateDb {
             .map_err(PaperStateError::from)
     }
 
+    /// Exact immutable anchor selected by an admission or replay capture.
+    pub fn position_anchor(
+        &self,
+        wallet: &WalletAddress,
+        anchor_seq: i64,
+    ) -> Result<Option<PositionAnchorRow>, PaperStateError> {
+        self.lock()
+            .query_row(
+                "SELECT anchor_seq, anchored_at_unix, activity_cutoff_unix, balances_json, \
+                    ledger_hash_after, proof_json FROM position_anchors \
+             WHERE wallet_hex = ?1 AND anchor_seq = ?2",
+                params![wallet.to_string(), anchor_seq],
+                |row| {
+                    Ok(PositionAnchorRow {
+                        wallet: *wallet,
+                        anchor_seq: row.get(0)?,
+                        anchored_at_unix: row.get(1)?,
+                        activity_cutoff_unix: row.get(2)?,
+                        balances_json: row.get(3)?,
+                        ledger_hash_after: row.get(4)?,
+                        proof_json: row.get(5)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(PaperStateError::from)
+    }
+
     /// All position anchors for one wallet in append order.
     pub fn position_anchors(
         &self,
@@ -2125,6 +2322,86 @@ impl PaperStateDb {
         Ok(history)
     }
 
+    /// Compact frame authority for suppression/audit discovery. SQLite projects only immutable
+    /// identity and clock fields; settled admission captures and checkpoints are never loaded.
+    pub fn activity_frame_decision_index(
+        &self,
+        wallet: Option<&WalletAddress>,
+    ) -> Result<Vec<ActivityFrameDecisionIndex>, PaperStateError> {
+        self.activity_frame_decision_index_filtered(wallet, None)
+    }
+
+    /// Read one compact frame identity through the existing source-trade primary key.
+    pub fn activity_frame_decision(
+        &self,
+        id: &SourceTradeId,
+    ) -> Result<Option<ActivityFrameDecisionIndex>, PaperStateError> {
+        Ok(self
+            .activity_frame_decision_index_filtered(None, Some(id))?
+            .pop())
+    }
+
+    fn activity_frame_decision_index_filtered(
+        &self,
+        wallet: Option<&WalletAddress>,
+        id: Option<&SourceTradeId>,
+    ) -> Result<Vec<ActivityFrameDecisionIndex>, PaperStateError> {
+        let (predicate, value) = if let Some(id) = id {
+            ("source_trade_id = ?1", Some(id.0.clone()))
+        } else if let Some(wallet) = wallet {
+            ("wallet_hex = ?1", Some(wallet.to_string()))
+        } else {
+            ("?1 IS NULL", None)
+        };
+        let conn = self.lock();
+        let sql = format!(
+            "SELECT json_object(
+                'version', json_extract(frozen_inputs_json, '$.version'),
+                'semantic_revision', json_extract(frozen_inputs_json, '$.semantic_revision'),
+                'source_trade_id', json_extract(frozen_inputs_json, '$.source_trade_id'),
+                'wallet', json_extract(frozen_inputs_json, '$.wallet'),
+                'source_epoch', json_extract(frozen_inputs_json, '$.source_epoch'),
+                'transaction_hash', json_extract(frozen_inputs_json, '$.transaction_hash'),
+                'market_id', json_extract(frozen_inputs_json, '$.market_id'),
+                'outcome_id', json_extract(frozen_inputs_json, '$.outcome_id'),
+                'observed_source_receipt', json_extract(frozen_inputs_json, '$.observed_source_receipt'),
+                'admission_receipt', json_extract(frozen_inputs_json, '$.decision_inputs.admission_receipt'),
+                'received_at', json_extract(frozen_inputs_json, '$.decision_inputs.inputs.received_at'),
+                'copy_latency_budget_secs', json_extract(frozen_inputs_json, '$.paper_freshness_policy.copy_latency_budget_secs')),
+                source_trade_id, wallet_hex, source_epoch, semantic_revision
+             FROM decision_pending
+             WHERE {predicate}
+               AND json_extract(frozen_inputs_json, '$.source_authority') = 'activity_frame'
+             ORDER BY source_epoch, source_trade_id",
+        );
+        let mut statement = conn.prepare(&sql)?;
+        let rows = statement.query_map(params![value], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        rows.map(|row| {
+            let (json, id, wallet, epoch, revision) = row?;
+            let frame: ActivityFrameDecisionIndex = serde_json::from_str(&json)?;
+            if frame.version != 7
+                || frame.source_trade_id.0 != id
+                || frame.wallet != parse_wallet(&wallet)?
+                || frame.source_epoch != epoch
+                || frame.semantic_revision != revision
+            {
+                return Err(PaperStateError::Internal(
+                    "frame index differs from durable row".to_owned(),
+                ));
+            }
+            Ok(frame)
+        })
+        .collect()
+    }
+
     /// Read one durable decision continuation by its source trade id (`None` when absent).
     pub fn decision_pending_for(
         &self,
@@ -2204,14 +2481,53 @@ impl PaperStateDb {
         for candidate in candidates {
             let (source_trade_id, semantic_revision, frozen_inputs_json) = candidate?;
             let scope: SealDecisionScope = serde_json::from_str(&frozen_inputs_json)?;
-            let receipts = scope
+            match (scope.version, scope.source_authority.as_deref()) {
+                (2..=6, None) | (7, Some("complete_read" | "activity_frame")) => {}
+                _ => {
+                    return Err(PaperStateError::SealEvidenceSelectionMismatch {
+                        requested: requested.len(),
+                        stored: stored.len(),
+                    });
+                }
+            }
+            let mut receipts = scope
                 .page_occurrences
                 .iter()
                 .map(|page| page.receipt)
                 .chain(scope.observed_source_receipt)
                 .chain(scope.read_commitment)
                 .collect::<Vec<_>>();
-            let in_scope = matches!(scope.version, 3..=6)
+            if scope.source_authority.as_deref() == Some("activity_frame") {
+                if !scope.page_occurrences.is_empty()
+                    || scope.read_commitment.is_some()
+                    || scope.observed_source_receipt.is_none()
+                {
+                    return Err(PaperStateError::SealEvidenceSelectionMismatch {
+                        requested: requested.len(),
+                        stored: stored.len(),
+                    });
+                }
+                let admission: AppendReceipt =
+                    serde_json::from_value(scope.decision_inputs["admission_receipt"].clone())?;
+                receipts.push(admission);
+                let frontier = &scope.decision_inputs["inputs"]["frontier"];
+                receipts.push(serde_json::from_value(frontier["commitment"].clone())?);
+                for page in frontier["page_occurrences"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                {
+                    receipts.push(serde_json::from_value(page["receipt"].clone())?);
+                }
+                for earlier in scope.decision_inputs["inputs"]["earlier_frames"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                {
+                    receipts.push(serde_json::from_value(earlier["receipt"].clone())?);
+                }
+            }
+            let in_scope = matches!(scope.version, 3..=7)
                 && !receipts.is_empty()
                 && receipts.iter().all(|receipt| {
                     sealed_inclusive.is_some_and(|sealed| receipt.sequence <= sealed)
@@ -2238,6 +2554,52 @@ impl PaperStateDb {
     ) -> Result<Vec<u8>, PaperStateError> {
         let mut evidence_rows = Vec::with_capacity(keys.len());
         for (source_trade_id, requested_revision) in keys {
+            if tx_is_frame_decision(tx, source_trade_id)? {
+                let terminal = tx.query_row(
+                    "SELECT semantic_revision, wallet_hex, source_epoch, frozen_inputs_json, post_commit_inputs_json, state, terminal_disposition, updated_at_unix FROM decision_pending WHERE source_trade_id = ?1",
+                    params![source_trade_id.0], |row| Ok(SelectedSealTerminal { semantic_revision: row.get(0)?, wallet_hex: row.get(1)?, source_epoch: row.get(2)?, frozen_inputs_json: row.get(3)?, post_commit_inputs_json: row.get(4)?, state: row.get(5)?, terminal_disposition: row.get(6)?, updated_at_unix: row.get(7)? }))?;
+                if terminal.semantic_revision != *requested_revision {
+                    return Err(PaperStateError::SealEvidenceRevisionMismatch {
+                        source_trade_id: source_trade_id.0.clone(),
+                        requested: requested_revision.clone(),
+                        stored: terminal.semantic_revision,
+                    });
+                }
+                let disposition = terminal
+                    .terminal_disposition
+                    .filter(|_| terminal.state == "terminal")
+                    .ok_or_else(|| PaperStateError::SealEvidenceMissing {
+                        table: "terminal decision_pending",
+                        source_trade_id: source_trade_id.0.clone(),
+                    })?;
+                let gate = tx.query_row("SELECT wallet_hex, market_id, source_epoch, result, history_consumed FROM entry_gate_results WHERE source_trade_id = ?1", params![source_trade_id.0], |row| Ok(SealEntryGateResult { wallet_hex: row.get(0)?, market_id: row.get(1)?, source_epoch: row.get(2)?, result: row.get(3)?, history_consumed: row.get(4)? }))?;
+                if gate.wallet_hex != terminal.wallet_hex
+                    || gate.source_epoch != terminal.source_epoch
+                    || gate.result != "admitted"
+                    || gate.history_consumed != 1
+                {
+                    return Err(PaperStateError::Internal(
+                        "frame seal gate differs from continuation".to_owned(),
+                    ));
+                }
+                evidence_rows.push(SealDecisionEvidenceRow {
+                    source_trade_id: source_trade_id.0.clone(),
+                    semantic_revision: requested_revision.clone(),
+                    activity_group: None,
+                    activity_group_revision: None,
+                    entry_gate_result: gate,
+                    no_copy_disposition: None,
+                    terminal_decision: SealTerminalDecision {
+                        wallet_hex: terminal.wallet_hex,
+                        source_epoch: terminal.source_epoch,
+                        frozen_inputs_json: terminal.frozen_inputs_json,
+                        post_commit_inputs_json: terminal.post_commit_inputs_json,
+                        terminal_disposition: disposition,
+                        updated_at_unix: terminal.updated_at_unix,
+                    },
+                });
+                continue;
+            }
             let group: Option<(String, String, i64, String, String, String, String)> = tx
                 .query_row(
                     "SELECT transaction_hash, wallet_hex, source_epoch, semantic_revision, \
@@ -2384,20 +2746,20 @@ impl PaperStateDb {
             evidence_rows.push(SealDecisionEvidenceRow {
                 source_trade_id: source_trade_id.0.clone(),
                 semantic_revision: requested_revision.clone(),
-                activity_group: SealActivityGroup {
+                activity_group: Some(SealActivityGroup {
                     transaction_hash: group_transaction_hash,
                     wallet_hex: group_wallet,
                     source_epoch: group_epoch,
                     activity_type,
                     disposition: group_disposition,
                     proof_json: group_proof,
-                },
-                activity_group_revision: SealActivityGroupRevision {
+                }),
+                activity_group_revision: Some(SealActivityGroupRevision {
                     transaction_hash: revision_transaction_hash,
                     disposition: revision_disposition,
                     proof_json: revision_proof,
                     recorded_at_unix: recorded,
-                },
+                }),
                 entry_gate_result: SealEntryGateResult {
                     wallet_hex: gate_wallet,
                     market_id,
@@ -2711,7 +3073,9 @@ impl PaperStateDb {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         tx_mark_seen(&tx, source_trade_id, None)?;
-        tx_upsert_leader(&tx, leader)?;
+        if !tx_is_frame_decision(&tx, source_trade_id)? {
+            tx_upsert_leader(&tx, leader)?;
+        }
         // #511: no fill may enter a settled market — the resolution for it already ran
         // and can never credit the position (`settle_and_credit` retries credit zero).
         // Checked INSIDE the transaction: the single-connection mutex serializes this
@@ -2782,7 +3146,9 @@ impl PaperStateDb {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
         tx_mark_seen(&tx, source_trade_id, None)?;
-        if let Some(leader) = leader {
+        if let Some(leader) = leader
+            && !tx_is_frame_decision(&tx, source_trade_id)?
+        {
             tx_upsert_leader(&tx, leader)?;
         }
         if let Some(flip) = flip {
@@ -2841,7 +3207,12 @@ impl PaperStateDb {
         if let Some(id) = source_trade_id {
             tx_mark_seen(&tx, id, None)?;
         }
-        if let Some(leader) = leader {
+        if let Some(leader) = leader
+            && !source_trade_id
+                .map(|id| tx_is_frame_decision(&tx, id))
+                .transpose()?
+                .unwrap_or(false)
+        {
             tx_upsert_leader(&tx, leader)?;
         }
         let inserted = tx_record_fill(&tx, fill, canonical_seq)?;
@@ -4712,6 +5083,127 @@ fn tx_mark_seen(
     Ok(())
 }
 
+fn tx_persist_admission(
+    tx: &Connection,
+    gates: &[EntryGateResultRecord],
+    histories: &[MarketHistoryRecord],
+    pending_rows: &[DecisionPendingRecord],
+) -> Result<(), PaperStateError> {
+    for gate in gates {
+        let durable: Option<(String, String, i64, String, i64)> = tx
+            .query_row(
+                "SELECT wallet_hex, market_id, source_epoch, result, history_consumed \
+                     FROM entry_gate_results WHERE source_trade_id = ?1",
+                params![gate.source_trade_id.0],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let requested = (
+            gate.wallet.to_string(),
+            gate.market_id.to_string(),
+            gate.source_epoch,
+            gate.result.clone(),
+            i64::from(gate.history_consumed),
+        );
+        if let Some(durable) = durable {
+            if durable != requested {
+                return Err(PaperStateError::ActivityRevisionConflict(
+                    gate.source_trade_id.0.clone(),
+                ));
+            }
+        } else {
+            tx.execute(
+                    "INSERT INTO entry_gate_results \
+                         (source_trade_id, wallet_hex, market_id, source_epoch, result, history_consumed) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        gate.source_trade_id.0,
+                        requested.0,
+                        requested.1,
+                        requested.2,
+                        requested.3,
+                        requested.4,
+                    ],
+                )?;
+        }
+    }
+    for history in histories {
+        tx.execute(
+            "INSERT OR IGNORE INTO wallet_market_history_v2 \
+                     (wallet_hex, market_id, first_epoch, source_trade_id, origin) \
+                 VALUES (?1, ?2, ?3, ?4, 'activity_v2')",
+            params![
+                history.wallet.to_string(),
+                history.market_id.to_string(),
+                history.first_epoch,
+                history.source_trade_id.0,
+            ],
+        )?;
+    }
+    for pending in pending_rows {
+        let durable: Option<(String, String, i64, String)> = tx
+            .query_row(
+                "SELECT semantic_revision, wallet_hex, source_epoch, frozen_inputs_json \
+                     FROM decision_pending WHERE source_trade_id = ?1",
+                params![pending.source_trade_id.0],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()?;
+        let requested = (
+            pending.semantic_revision.clone(),
+            pending.wallet.to_string(),
+            pending.source_epoch,
+            pending.frozen_inputs_json.clone(),
+        );
+        if let Some(durable) = durable {
+            if durable != requested {
+                return Err(PaperStateError::DecisionPendingConflict(
+                    pending.source_trade_id.0.clone(),
+                ));
+            }
+        } else {
+            tx.execute(
+                    "INSERT INTO decision_pending \
+                         (source_trade_id, semantic_revision, wallet_hex, source_epoch, \
+                          frozen_inputs_json, post_commit_inputs_json, state, terminal_disposition, \
+                          updated_at_unix) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, '[]', 'open', NULL, ?6)",
+                    params![
+                        pending.source_trade_id.0,
+                        requested.0,
+                        requested.1,
+                        requested.2,
+                        requested.3,
+                        pending.updated_at_unix,
+                    ],
+                )?;
+        }
+    }
+    Ok(())
+}
+
+fn tx_is_frame_decision(tx: &Connection, id: &SourceTradeId) -> Result<bool, PaperStateError> {
+    let frozen: Option<String> = tx
+        .query_row(
+            "SELECT frozen_inputs_json FROM decision_pending WHERE source_trade_id = ?1",
+            params![id.0],
+            |row| row.get(0),
+        )
+        .optional()?;
+    frozen.map_or(Ok(false), |json| {
+        let value: serde_json::Value = serde_json::from_str(&json)?;
+        Ok(value["version"] == 7 && value["source_authority"] == "activity_frame")
+    })
+}
+
 fn tx_upsert_leader(tx: &Connection, leader: &LeaderPositionRow) -> Result<(), PaperStateError> {
     tx.execute(
         "INSERT INTO leader_positions \
@@ -5976,6 +6468,125 @@ mod tests {
     }
 
     #[test]
+    fn frame_transaction_rolls_back_and_terminals_preserve_rest_projection() {
+        let (dir, db) = db();
+        let make = |id: &str, target: MarketId| ActivityFrameCommit {
+            gate: EntryGateResultRecord {
+                source_trade_id: SourceTradeId(id.to_owned()),
+                wallet: wallet(),
+                market_id: target.clone(),
+                source_epoch: 100,
+                result: "admitted".to_owned(),
+                history_consumed: true,
+            },
+            history: MarketHistoryRecord {
+                source_trade_id: SourceTradeId(id.to_owned()),
+                wallet: wallet(),
+                market_id: target,
+                first_epoch: 100,
+            },
+            pending: DecisionPendingRecord {
+                source_trade_id: SourceTradeId(id.to_owned()),
+                semantic_revision: "frame-revision".to_owned(),
+                wallet: wallet(),
+                source_epoch: 100,
+                frozen_inputs_json: "{\"version\":7,\"source_authority\":\"activity_frame\"}"
+                    .to_owned(),
+                updated_at_unix: 100,
+            },
+        };
+        let frame = make("first-frame", market());
+        db.commit_activity_frame(&frame).unwrap();
+        db.commit_activity_frame(&frame).unwrap();
+        assert_eq!(db.open_decision_pending().unwrap().len(), 1);
+        assert!(db.leader_positions().unwrap().is_empty());
+        assert!(
+            db.activity_group_state(&frame.pending.source_trade_id)
+                .unwrap()
+                .is_none()
+        );
+        db.stage_dispatch_seed(&seed("frame-dispatch", &["primary"]))
+            .unwrap();
+        db.commit_seen_no_fill_with_flip_pending(
+            &frame.pending.source_trade_id,
+            &leader(99, 0),
+            Some(DispatchFlip {
+                dispatch_id: "frame-dispatch",
+                paper_outcome: "no_fill:no_edge",
+            }),
+            Some(PendingTerminalEvidence {
+                post_commit_inputs_json: "{}",
+                updated_at_unix: 100,
+            }),
+        )
+        .unwrap();
+        assert!(db.leader_positions().unwrap().is_empty());
+        assert_eq!(
+            db.dispatch_seed("frame-dispatch").unwrap().unwrap().state,
+            "ready"
+        );
+        assert_eq!(db.gate_history().unwrap()[&wallet()].len(), 1);
+        let connection = Connection::open(dir.path().join("paper_state.db")).unwrap();
+        connection.execute(
+            "INSERT INTO activity_groups(source_trade_id, transaction_hash, wallet_hex, source_epoch, semantic_revision, activity_type, disposition, proof_json) VALUES ('rest-disposed', 'rest-zero', ?1, 99, 'rest-revision', 'TRADE', 'raw_only', ?2)",
+            params![wallet().to_string(), "{\"effect\":{\"kind\":\"raw_only\"}}"],
+        ).unwrap();
+        let duplicate = make(
+            "rest-disposed",
+            MarketId(VenueMarketId("rest-market".to_owned())),
+        );
+        for state in [
+            &db,
+            &PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap(),
+        ] {
+            assert!(state.commit_activity_frame(&duplicate).is_err());
+            assert!(
+                state
+                    .entry_gate_result(&duplicate.pending.source_trade_id)
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                state
+                    .decision_pending_for(&duplicate.pending.source_trade_id)
+                    .unwrap()
+                    .is_none()
+            );
+            assert_eq!(state.gate_history().unwrap()[&wallet()].len(), 1);
+        }
+        connection.execute_batch("CREATE TRIGGER reject_frame_pending BEFORE INSERT ON decision_pending WHEN NEW.source_trade_id = 'blocked-frame' BEGIN SELECT RAISE(ABORT, 'injected pending failure'); END;").unwrap();
+        let blocked = make(
+            "blocked-frame",
+            MarketId(VenueMarketId("other-market".to_owned())),
+        );
+        assert!(db.commit_activity_frame(&blocked).is_err());
+        assert!(
+            db.entry_gate_result(&blocked.pending.source_trade_id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(db.gate_history().unwrap()[&wallet()].len(), 1);
+        assert!(
+            db.decision_pending_for(&blocked.pending.source_trade_id)
+                .unwrap()
+                .is_none()
+        );
+        drop(connection);
+        drop(db);
+        let reopened = PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap();
+        assert!(reopened.leader_positions().unwrap().is_empty());
+        assert_eq!(reopened.gate_history().unwrap()[&wallet()].len(), 1);
+        assert_eq!(
+            reopened
+                .decision_pending_for(&frame.pending.source_trade_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            DecisionPendingState::Terminal
+        );
+    }
+
+    #[test]
     fn fresh_db_stamps_schema_version() {
         let (dir, _db) = db();
         let conn = Connection::open(dir.path().join("paper_state.db")).unwrap();
@@ -6109,6 +6720,16 @@ mod tests {
         assert_eq!(first_anchors.len(), 1);
         assert_eq!(first_anchors[0].anchor_seq, 0);
         assert_eq!(first_anchors[0].ledger_hash_after, "ledger-first");
+        assert_eq!(
+            db.position_anchor(&first, 0).unwrap(),
+            Some(first_anchors[0].clone())
+        );
+        assert!(db.position_anchor(&first, 99).unwrap().is_none());
+        assert!(
+            db.position_anchor(&WalletAddress([99; 20]), 0)
+                .unwrap()
+                .is_none()
+        );
         let canonical_balances: Vec<(String, u16, ShareAmount)> =
             serde_json::from_str(&first_anchors[0].balances_json).unwrap();
         assert_eq!(
@@ -6164,6 +6785,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![0, 1]
         );
+        for anchor in &first_anchors {
+            assert_eq!(
+                db.position_anchor(&first, anchor.anchor_seq).unwrap(),
+                Some(anchor.clone())
+            );
+        }
         assert_eq!(
             leader_projection(&db)
                 .into_iter()
@@ -7751,13 +8378,16 @@ mod tests {
         let (_dir, db) = db();
         insert_seal_fixture(&db, "rev-1");
         let keys = vec![(SourceTradeId("g2:seal".to_owned()), "rev-1".to_owned())];
-        for version in [3, 4, 5, 6] {
-            let frozen = serde_json::json!({
+        for version in [3, 4, 5, 6, 7] {
+            let mut frozen = serde_json::json!({
                 "version": version,
                 "observed_source_receipt": append_receipt(1, 1),
                 "page_occurrences": [{"receipt": append_receipt(2, 2)}],
-                "read_commitment": if matches!(version, 4..=6) { Some(append_receipt(3, 3)) } else { None },
+                "read_commitment": if matches!(version, 4..=7) { Some(append_receipt(3, 3)) } else { None },
             });
+            if version == 7 {
+                frozen["source_authority"] = serde_json::json!("complete_read");
+            }
             db.lock()
                 .execute(
                     "UPDATE decision_pending SET frozen_inputs_json = ?1",
@@ -7789,7 +8419,7 @@ mod tests {
                 db.seal_decision_evidence_for_source_prefix(&extra, &keys, Some(EventSeq(3))),
                 Err(PaperStateError::SealEvidenceSelectionMismatch { .. })
             ));
-            if matches!(version, 4..=6) {
+            if matches!(version, 4..=7) {
                 assert!(
                     db.seal_decision_evidence_for_source_prefix(&keys, &keys, Some(EventSeq(2)))
                         .is_err()
@@ -7797,6 +8427,36 @@ mod tests {
                 db.seal_decision_evidence_for_source_prefix(&[], &[], Some(EventSeq(2)))
                     .unwrap();
             }
+        }
+    }
+
+    #[test]
+    fn source_prefix_seal_refuses_frame_authority_and_authority_mismatches() {
+        let (_dir, db) = db();
+        insert_seal_fixture(&db, "rev-1");
+        let keys = vec![(SourceTradeId("g2:seal".to_owned()), "rev-1".to_owned())];
+        for (version, authority) in [
+            (7, Some("activity_frame")),
+            (7, None),
+            (6, Some("complete_read")),
+        ] {
+            let mut frozen = serde_json::json!({
+                "version": version,
+                "page_occurrences": [{"receipt": append_receipt(2, 2)}],
+            });
+            if let Some(authority) = authority {
+                frozen["source_authority"] = serde_json::json!(authority);
+            }
+            db.lock()
+                .execute(
+                    "UPDATE decision_pending SET frozen_inputs_json = ?1",
+                    [frozen.to_string()],
+                )
+                .unwrap();
+            assert!(matches!(
+                db.seal_decision_evidence_for_source_prefix(&keys, &keys, Some(EventSeq(3))),
+                Err(PaperStateError::SealEvidenceSelectionMismatch { .. })
+            ));
         }
     }
 

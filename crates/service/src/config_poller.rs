@@ -228,6 +228,34 @@ impl RiskHaltReleaseHandle {
     pub async fn apply(&self, release_hash: &str) -> Result<(), String> {
         let era =
             paper_era(scan_paper_log(&self.paper_log_path).map_err(|error| error.to_string())?);
+        let basis =
+            crate::paper_recovery::feed_latch_basis(&era).map_err(|error| error.to_string())?;
+        if basis.engaged()
+            && basis
+                .latest_incident
+                .is_some_and(|receipt| receipt.this_hash.to_hex().as_str() == release_hash)
+        {
+            let (acknowledged, response) = tokio::sync::oneshot::channel();
+            let expected_engagement_hash = basis
+                .latest_incident
+                .ok_or_else(|| "feed engagement missing".to_owned())?
+                .this_hash;
+            self.control
+                .send(OrchestratorControl::FeedAuditUpdate {
+                    update: crate::orchestrator_control::FeedAuditUpdate::Release {
+                        expected_engagement_hash,
+                    },
+                    acknowledged,
+                })
+                .await
+                .map_err(|_| {
+                    "orchestrator control channel closed during feed release".to_owned()
+                })?;
+            return response
+                .await
+                .map_err(|_| "orchestrator dropped feed release acknowledgement".to_owned())?
+                .map(|_| ());
+        }
         let active = active_risk_halts(&era);
         let Some(release) = audited_halt_release(&era, &active, release_hash) else {
             return Ok(());

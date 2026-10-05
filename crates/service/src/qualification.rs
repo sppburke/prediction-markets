@@ -63,7 +63,7 @@ use time::OffsetDateTime;
 #[cfg(test)]
 use crate::bucket_commit::PageOccurrence;
 use crate::bucket_commit::{
-    CompleteActivityPage, DecisionContinuationFacts, DecisionContinuationV3, VerifiedCommitment,
+    CompleteActivityPage, DecisionContinuationFacts, DecisionContinuationV3,
     VerifiedObservationBindings,
 };
 use crate::config::ServiceConfig;
@@ -569,6 +569,34 @@ fn decision_observation_from_source(
     continuation: &DecisionContinuationV3,
     source: &BTreeMap<u64, SourceObservation>,
 ) -> Result<Option<pe_execution_core::ObservationEvidence>, QualificationError> {
+    continuation
+        .validate_authority()
+        .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+    if continuation.is_activity_frame() {
+        continuation
+            .verify_activity_frame(&mut |receipt| {
+                let source = decision_source_receipt(source, receipt)?;
+                Ok::<_, QualificationError>(CompleteActivityPage {
+                    payload: source.payload.clone(),
+                    observed_at: source.observed_at.clone(),
+                    received_at: source.received_at.clone(),
+                    source_id: source.source_id.clone(),
+                    schema_version: source.schema_version,
+                    parser_version: source.parser_version,
+                    content_type: source.content_type.clone(),
+                })
+            })
+            .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+        let receipt = continuation.observed_source_receipt.ok_or_else(|| {
+            QualificationError::InsufficientEvidence("frame receipt missing".to_owned())
+        })?;
+        return Ok(Some(pe_execution_core::ObservationEvidence {
+            source_receipt: receipt,
+            complete_bound_receipt: receipt,
+            observed_unix_ms: decision_source_receipt(source, receipt)?.received_unix_ms,
+            provenance: "activity_ws".to_owned(),
+        }));
+    }
     let Some(selected_receipt) = continuation.observation_receipt() else {
         return Ok(None);
     };
@@ -590,7 +618,7 @@ fn decision_observation_from_source(
         }
     }
     if let Some(websocket_receipt) = continuation.observed_source_receipt {
-        if !matches!(continuation.version(), 5 | 6) {
+        if !matches!(continuation.version(), 5..=7) {
             let observation = decision_source_receipt(source, websocket_receipt)?;
             let activity = parse_activity_trade_observation(&observation.payload).map_err(|_| {
             QualificationError::InsufficientEvidence(format!(
@@ -784,12 +812,91 @@ async fn verify_qualification(
         .map_err(|error| {
             QualificationError::InsufficientEvidence(format!("decision replay mismatch: {error}"))
         })?;
+    let audit_era = paper_era(frames[..=financial_prefix_index].to_vec());
+    crate::paper_recovery::feed_latch_basis(&audit_era)
+        .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+    let audit_commitments = source_observations
+        .values()
+        .filter(|observation| {
+            observation.source_id == crate::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID
+        })
+        .filter_map(|observation| {
+            serde_json::from_slice::<crate::bucket_commit::ActivityReadCommitment>(
+                &observation.payload,
+            )
+            .ok()
+            .filter(|commitment| commitment.version == 2 && commitment.read_proof.is_some())
+            .map(|_| observation.receipt)
+        })
+        .collect::<Vec<_>>();
+    let unresolved = crate::feed_audit::verify_recorded_audits(
+        &state,
+        &replayed_decisions
+            .iter()
+            .filter(|decision| decision.continuation.is_activity_frame())
+            .map(|decision| &decision.continuation)
+            .collect::<Vec<_>>(),
+        &audit_era,
+        &audit_commitments,
+        &mut |receipt| {
+            let source = decision_source_receipt(&source_observations, receipt)?;
+            Ok::<_, QualificationError>(CompleteActivityPage {
+                payload: source.payload.clone(),
+                observed_at: source.observed_at.clone(),
+                received_at: source.received_at.clone(),
+                source_id: source.source_id.clone(),
+                schema_version: source.schema_version,
+                parser_version: source.parser_version,
+                content_type: source.content_type.clone(),
+            })
+        },
+    )
+    .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+    if !unresolved.is_empty() {
+        return insufficient(format!("unresolved frame audits: {unresolved:?}"));
+    }
     verify_decision_configurations(&replayed_decisions, &start)?;
     let mut decision_observations = HashMap::new();
     for decision in &replayed_decisions {
         let observation = verify_decision_source_inputs(&state, decision, &source_observations)?;
         verify_paper_prepared_freshness(decision, &source_observations)?;
         verify_decision_classification(&state, decision)?;
+        if decision.continuation.is_activity_frame() {
+            let proof: crate::frame_admission::FrameDecisionProof =
+                serde_json::from_value(decision.continuation.facts.decision_inputs.clone())?;
+            let prefix = match proof.inputs.paper_prefix {
+                None => {
+                    // A qualification-selected frame is post-Start. The verified sealed
+                    // paper boundary contains that Start even if the wall clock moved back.
+                    if !frames[..=financial_prefix_index].is_empty() {
+                        return insufficient(
+                            "empty frame paper prefix follows existing paper evidence",
+                        );
+                    }
+                    Vec::new()
+                }
+                Some(receipt) => {
+                    let position = frames[..=financial_prefix_index]
+                        .iter()
+                        .position(|frame| frame.receipt == receipt)
+                        .ok_or_else(|| {
+                            QualificationError::InsufficientEvidence(
+                                "frame paper prefix receipt is missing".to_owned(),
+                            )
+                        })?;
+                    if frames[position].envelope.received_at.0 > proof.inputs.admitted_at {
+                        return insufficient("frame paper prefix follows admission clock");
+                    }
+                    frames[..=position].to_vec()
+                }
+            };
+            let basis = crate::paper_recovery::feed_latch_basis(&paper_era(prefix))
+                .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+            if basis != proof.inputs.latch {
+                return insufficient("frame incident basis differs from sealed paper prefix");
+            }
+        }
+
         if decision_observations
             .insert(
                 decision.continuation.facts.source_trade_id.clone(),
@@ -871,6 +978,17 @@ async fn verify_qualification(
                             &completed_financial_facts,
                             economic.risk.financial_prefix,
                         )?;
+                        let continuation = replayed_decisions
+                            .iter()
+                            .find(|decision| {
+                                decision.continuation.facts.source_trade_id
+                                    == operation.source_trade_id
+                            })
+                            .ok_or_else(|| {
+                                QualificationError::InsufficientEvidence(
+                                    "Fill has no frozen continuation".to_owned(),
+                                )
+                            })?;
                         verify_economic(
                             operation,
                             economic,
@@ -887,6 +1005,7 @@ async fn verify_qualification(
                                 start_hot_config_hash: &start.hot_config_hash,
                                 financial_semantic_version: start.financial_semantic_version,
                             },
+                            Some(&continuation.continuation),
                             true,
                         )
                         .await?;
@@ -1125,7 +1244,8 @@ async fn verify_qualification(
             PaperLogRecord::QualificationSealed(_) => {
                 return insufficient("QualificationSealed occurs inside its financial prefix");
             }
-            PaperLogRecord::RiskHaltChanged { .. } => {}
+            PaperLogRecord::RiskHaltChanged { .. } | PaperLogRecord::FeedIncidentChanged { .. } => {
+            }
         }
     }
     if prepared.len() != financial_final_count {
@@ -2147,7 +2267,7 @@ fn decision_rows_from_sealed_source(
                             verified
                                 .get(&receipt.sequence)
                                 .and_then(Option::as_ref)
-                                .is_some_and(|commitment: &VerifiedCommitment| {
+                                .is_some_and(|commitment: &AuthenticatedBindings| {
                                     commitment.restamp_pairs.get(&previous)
                                         == Some(&binding.history_group_id)
                                         || commitment.restamp_pairs.get(&binding.history_group_id)
@@ -2189,11 +2309,11 @@ fn decision_rows_from_sealed_source(
     // receipts to the durable history identity before requiring group dispositions.
     let current_reads = if history.iter().any(|row| {
         DecisionContinuationV3::from_durable(row)
-            .is_ok_and(|continuation| matches!(continuation.version(), 5 | 6))
+            .is_ok_and(|continuation| matches!(continuation.version(), 5..=7))
     }) {
         let reads = complete_activity_read_scopes(&history, sealed_sequence, source)?;
         for read in &reads {
-            if !matches!(read.continuation.version(), 5 | 6) {
+            if !matches!(read.continuation.version(), 5..=7) {
                 continue;
             }
             let receipt = read.continuation.read_commitment.ok_or_else(|| {
@@ -2218,8 +2338,51 @@ fn decision_rows_from_sealed_source(
     } else {
         None
     };
+    let mut frame_required = Vec::new();
+    let mut frame_ids = HashSet::new();
+    for row in &history {
+        // Preserve the complete-read selector's established validation order and errors.
+        if !serde_json::from_str::<serde_json::Value>(&row.frozen_inputs_json)
+            .is_ok_and(|wire| wire["source_authority"] == "activity_frame")
+        {
+            continue;
+        }
+        let continuation = DecisionContinuationV3::from_durable(row)
+            .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+        if !continuation.is_activity_frame() {
+            continue;
+        }
+        let receipts = continuation
+            .authority_receipts()
+            .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+        if receipts
+            .iter()
+            .any(|receipt| receipt.sequence > sealed_sequence)
+        {
+            continue;
+        }
+        continuation
+            .verify_activity_frame(&mut lookup)
+            .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+        frame_ids.insert(row.source_trade_id.clone());
+        let proof: crate::frame_admission::FrameDecisionProof =
+            serde_json::from_value(continuation.facts.decision_inputs.clone())?;
+        // A synchronized pre-Start frame can be delivered and admitted after activation.
+        // Admission owns decision selection; the original frame still owns its source facts.
+        let admission = proof.admission_receipt;
+        if start_sequence.is_none_or(|start| admission.sequence > start) {
+            frame_required.push((
+                admission.sequence.0,
+                row.source_trade_id.clone(),
+                row.semantic_revision.clone(),
+            ));
+        }
+    }
     let mut pending_groups = Vec::new();
     for (source_trade_id, first_sequence) in &source_universe {
+        if frame_ids.contains(source_trade_id) {
+            continue;
+        }
         if start_sequence.is_some_and(|start| *first_sequence <= start.0) {
             continue;
         }
@@ -2255,7 +2418,7 @@ fn decision_rows_from_sealed_source(
                 terminal_rows.get(&(source_trade_id.clone(), group.semantic_revision.clone()));
             let receipt_bearing = row
                 .and_then(|row| DecisionContinuationV3::from_durable(row).ok())
-                .is_some_and(|continuation| matches!(continuation.version(), 3..=6));
+                .is_some_and(|continuation| matches!(continuation.version(), 3..=7));
             if !receipt_bearing {
                 return insufficient(format!(
                     "source-log trade {source_trade_id} has no reconstructable receipt-bearing decision"
@@ -2281,12 +2444,14 @@ fn decision_rows_from_sealed_source(
             ));
         }
     }
-    let required = decision_keys_from_source_observations(
+    let mut required = decision_keys_from_source_observations(
         start_sequence,
         source,
         &source_universe,
         &complete_reads,
     )?;
+    required.extend(frame_required);
+    required.sort_by_key(|(sequence, id, _)| (*sequence, id.0.clone()));
     let required_by_trade = required
         .iter()
         .map(|(_, source_trade_id, semantic_revision)| {
@@ -2302,12 +2467,8 @@ fn decision_rows_from_sealed_source(
             ))
         })?;
         let receipts = continuation
-            .page_occurrences()
-            .iter()
-            .map(|page| page.receipt)
-            .chain(continuation.observed_source_receipt)
-            .chain(continuation.read_commitment)
-            .collect::<Vec<_>>();
+            .authority_receipts()
+            .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
         if receipts.is_empty()
             || receipts
                 .iter()
@@ -2375,6 +2536,12 @@ fn complete_activity_read_scopes(
                 "decision source receipt link is invalid: {error}"
             ))
         })?;
+        continuation
+            .validate_authority()
+            .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+        if continuation.is_activity_frame() {
+            continue;
+        }
         if continuation.page_occurrences().is_empty() {
             continue;
         }
@@ -2485,12 +2652,18 @@ fn source_trade_universe(
 /// Commitments that record observation bindings, with their bindings as recorded.
 type BindingCommitments = Vec<(AppendReceipt, Vec<crate::bucket_commit::ObservationBinding>)>;
 
+/// Retain only selection evidence; a reconstructed wallet history dies after authentication.
+struct AuthenticatedBindings {
+    bindings: Vec<crate::bucket_commit::ObservationBinding>,
+    restamp_pairs: HashMap<pe_core_types::SourceTradeId, pe_core_types::SourceTradeId>,
+}
+
 /// Authenticate one binding commitment once per selection; an inauthentic one yields `None`.
 fn verified_commitment<'a, L, E>(
-    verified: &'a mut HashMap<EventSeq, Option<VerifiedCommitment>>,
+    verified: &'a mut HashMap<EventSeq, Option<AuthenticatedBindings>>,
     receipt: AppendReceipt,
     lookup: &mut L,
-) -> Option<&'a VerifiedCommitment>
+) -> Option<&'a AuthenticatedBindings>
 where
     L: FnMut(AppendReceipt) -> Result<CompleteActivityPage, E>,
     E: std::fmt::Display,
@@ -2498,7 +2671,12 @@ where
     verified
         .entry(receipt.sequence)
         .or_insert_with(|| {
-            crate::bucket_commit::verified_commitment_bindings_with_lookup(receipt, lookup).ok()
+            crate::bucket_commit::verified_commitment_bindings_with_lookup(receipt, lookup)
+                .ok()
+                .map(|read| AuthenticatedBindings {
+                    bindings: read.bindings,
+                    restamp_pairs: read.restamp_pairs,
+                })
         })
         .as_ref()
 }
@@ -2687,7 +2865,7 @@ fn decision_keys_from_source_observations(
             let Some(receipt) = *receipt else {
                 continue;
             };
-            if !matches!(read.continuation.version(), 5 | 6) {
+            if !matches!(read.continuation.version(), 5..=7) {
                 let observation = source.observation(receipt)?;
                 let activity =
                     parse_activity_trade_observation(&observation.payload).map_err(|_| {
@@ -3392,6 +3570,9 @@ fn verify_decision_source_inputs(
             content_type: source.content_type.clone(),
         })
     };
+    if continuation.is_activity_frame() {
+        return Ok(observation);
+    }
     let aggregates = continuation
         .reconstruct_complete_activity_read(&mut lookup)
         .map_err(|error| {
@@ -3426,6 +3607,18 @@ fn verify_decision_classification(
     state: &PaperStateDb,
     decision: &crate::decision_replay::ReplayedDecision,
 ) -> Result<(), QualificationError> {
+    if decision.continuation.is_activity_frame() {
+        let proof: crate::frame_admission::FrameDecisionProof =
+            serde_json::from_value(decision.continuation.facts.decision_inputs.clone())?;
+        proof
+            .inputs
+            .verify_durable(state, &decision.continuation.facts)
+            .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+        return decision
+            .continuation
+            .validate_authority()
+            .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()));
+    }
     let frozen = &decision.continuation.facts;
     let anchors = state.position_anchors(&frozen.wallet)?;
     let anchor = anchors
@@ -3566,46 +3759,11 @@ fn recorded_group_was_applied(
     source_trade_id: &pe_core_types::SourceTradeId,
     disposition: &str,
 ) -> Result<bool, QualificationError> {
-    if matches!(
-        disposition,
-        "applied"
-            | "wallet_fenced_applied"
-            | "decision_pending"
-            | crate::bucket_commit::HISTORY_ONLY_BRACKET
-            | "not_copy_eligible"
-            | "not_an_entry"
-            | "not_first_entry"
-            | "not_buy"
-            | "wallet_history_incomplete"
-            | "ambiguous_first_entry_same_second"
-            | "order_dependent_equal_second_action"
-            | "stale_fallback_past_copy_budget"
-            | "stale_activity_ws_past_copy_budget"
-    ) {
-        return Ok(true);
-    }
-    if matches!(
-        disposition,
-        "raw_only"
-            | "reanchor_required_redemption"
-            | "reanchor_required_late_group"
-            | "anchor_covered"
-            | "anchor_covered_late"
-            | "wallet_fenced"
-            | "revised_applied_aggregate"
-            | "late_group_after_bucket_commit"
-            | "invalid_mapping"
-            | "position_underflow"
-            | "position_overflow"
-            | "conversion_unknown_conditions"
-            | "unknown_activity_effect"
-            | "order_dependent_equal_second"
-    ) {
-        return Ok(false);
-    }
-    insufficient(format!(
-        "causal activity group {source_trade_id} has unknown disposition {disposition}"
-    ))
+    crate::paper_recovery::applied_disposition(source_trade_id, disposition).map_err(|_| {
+        QualificationError::InsufficientEvidence(format!(
+            "causal activity group {source_trade_id} has unknown disposition {disposition}"
+        ))
+    })
 }
 
 fn verify_complete_second_action(
@@ -3615,10 +3773,29 @@ fn verify_complete_second_action(
     expected: &[AppliedEffect],
 ) -> Result<(), QualificationError> {
     let frozen = &continuation.facts;
-    let classify = if matches!(continuation.version(), 5 | 6) {
-        classify_complete_second
-    } else {
-        pe_position_ledger::classify_complete_second_legacy
+    let classify = |ledger, wallet, mutations, quality, config, history_complete, has_market| {
+        if matches!(continuation.version(), 5..=7) {
+            classify_complete_second(
+                crate::bucket_commit::complete_read_entry_policy(continuation.version()),
+                ledger,
+                wallet,
+                mutations,
+                quality,
+                config,
+                history_complete,
+                has_market,
+            )
+        } else {
+            pe_position_ledger::classify_complete_second_legacy(
+                ledger,
+                wallet,
+                mutations,
+                quality,
+                config,
+                history_complete,
+                has_market,
+            )
+        }
     };
     let verdict = classify(
         ledger,
@@ -3669,6 +3846,8 @@ fn verify_complete_second_action(
         || classified.price != frozen.price
         || classified.action != frozen.pre_bucket_action
         || classified.action_order_dependent
+        || (continuation.version() == 7
+            && classified.entry != pe_position_ledger::EntryClassification::Admitted)
         || frozen.action_confidence_ppm != expected_confidence
     {
         return insufficient(format!(
@@ -3825,7 +4004,13 @@ fn verify_economic_configuration(
     if economic.applied_configuration_hash != start_hot_config_hash {
         return insufficient("EconomicPrepared configuration differs from QualificationStarted");
     }
-    if u32::from(economic.version) != financial_semantic_version {
+    if u32::from(economic.version)
+        != if matches!(financial_semantic_version, 2 | 3) {
+            2
+        } else {
+            financial_semantic_version
+        }
+    {
         return insufficient(
             "EconomicPrepared version differs from QualificationStarted financial semantics",
         );
@@ -3837,6 +4022,7 @@ async fn verify_economic(
     operation: &crate::paper_recovery::PaperFillOperationIdentity,
     economic: &EconomicPrepared,
     context: &RiskReplayContext<'_>,
+    continuation: Option<&DecisionContinuationV3>,
     require_risk_approval: bool,
 ) -> Result<EconomicPrepared, QualificationError> {
     verify_economic_configuration(
@@ -3905,6 +4091,7 @@ async fn verify_economic(
         economic,
         economic.risk.evaluated_at_unix_ms,
         cash_before,
+        continuation,
         |receipt| {
             let observation = context
                 .source
@@ -3917,7 +4104,8 @@ async fn verify_economic(
                 })?;
             Ok(RecordedEconomicSource {
                 payload: observation.payload.clone(),
-                received_unix_ms: observation.received_unix_ms,
+                observed_at: observation.observed_at.clone(),
+                received_at: observation.received_at.clone(),
                 source_id: observation.source_id.clone(),
                 schema_version: observation.schema_version,
                 parser_version: observation.parser_version,
@@ -4582,6 +4770,7 @@ fn qualification_completion_inner(
             PaperLogRecord::QualificationStarted(_)
             | PaperLogRecord::QualificationSealed(_)
             | PaperLogRecord::RiskHaltChanged { .. }
+            | PaperLogRecord::FeedIncidentChanged { .. }
             | PaperLogRecord::MembershipChanged { .. }
             | PaperLogRecord::FinancialFinal { .. } => {}
         }
@@ -4732,12 +4921,17 @@ async fn bind_final_receipts(
             || continuation.applied_configuration_hash != fill.economic.applied_configuration_hash
             || continuation.applied_configuration_hash != started.hot_config_hash
             || fill.economic.version
-                != if decision.continuation.version() == 6 {
+                != if matches!(decision.continuation.financial_semantic(), 2 | 3) {
                     2
                 } else {
                     1
                 }
-            || u32::from(fill.economic.version) != started.financial_semantic_version
+            || u32::from(fill.economic.version)
+                != if matches!(started.financial_semantic_version, 2 | 3) {
+                    2
+                } else {
+                    started.financial_semantic_version
+                }
         {
             return insufficient(
                 "fill decision, Prepared economics, and FinancialFinal identity/configuration disagree",
@@ -4770,12 +4964,12 @@ fn verify_winner_follow_fill_decision(
     }
 
     let (signal, mode) = verify_winner_follow_economic_policy(continuation, economic)?;
-    let intent =
+    let mut intent =
         pe_strategy_winner_follow::WinnerFollowStrategy::new(configuration.winner_follow_config())
             .evaluate_at_price_with_limit(
                 &signal,
                 economic.sizing.all_in_price,
-                if continuation.version() == 6 {
+                if matches!(continuation.financial_semantic(), 2 | 3) {
                     economic.ladder.limit_price
                 } else {
                     signal.leader_price
@@ -4792,12 +4986,23 @@ fn verify_winner_follow_fill_decision(
                     pe_strategy_winner_follow::WinnerFollowDeclineAudit::from(&error)
                 ))
             })?;
-    verify_winner_follow_intent_plan(&intent, economic, &frozen.source_trade_id)?;
+    if continuation.version() == 7 && matches!(economic.sizing.mode, SizingModeAudit::Dollar { .. })
+    {
+        intent.contracts =
+            pe_venue_polymarket::ladder::signed_share_contracts(economic.ladder.minimum_shares)
+                .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+    }
+    verify_winner_follow_intent_plan(
+        &intent,
+        economic,
+        continuation.version(),
+        &frozen.source_trade_id,
+    )?;
     if intent.market_id != frozen.market_id
         || intent.outcome_id != frozen.outcome_id
         || intent.side != frozen.side
         || intent.limit_price
-            != if continuation.version() == 6 {
+            != if matches!(continuation.financial_semantic(), 2 | 3) {
                 economic.ladder.limit_price
             } else {
                 frozen.price
@@ -4824,6 +5029,9 @@ fn verify_winner_follow_economic_policy(
     continuation: &DecisionContinuationV3,
     economic: &EconomicPrepared,
 ) -> Result<(LeaderSignal, pe_strategy_winner_follow::ExecutionMode), QualificationError> {
+    continuation
+        .validate_authority()
+        .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
     let frozen = &continuation.facts;
     let configuration = &frozen.applied_configuration;
     let (signal, mode) = reconstruct_winner_follow_signal(continuation)?;
@@ -4863,12 +5071,17 @@ fn verify_winner_follow_economic_policy(
         || economic.balance.band_floor != band_floor
         || economic.balance.band_ceiling_exclusive != band_ceiling_exclusive
         || economic.balance.chase_ceiling
-            != if continuation.version() == 6 {
+            != if matches!(continuation.financial_semantic(), 2 | 3) {
                 Price::ONE
             } else {
                 signal.leader_price
             }
-        || economic.version != if continuation.version() == 6 { 2 } else { 1 }
+        || economic.version
+            != if matches!(continuation.financial_semantic(), 2 | 3) {
+                2
+            } else {
+                1
+            }
     {
         return insufficient(format!(
             "decision {} EconomicPrepared execution policy differs from its frozen configuration and signal",
@@ -4881,6 +5094,7 @@ fn verify_winner_follow_economic_policy(
 fn verify_winner_follow_intent_plan(
     intent: &pe_venue_core::OrderIntent,
     economic: &EconomicPrepared,
+    continuation_version: u16,
     source_trade_id: &SourceTradeId,
 ) -> Result<(), QualificationError> {
     let allocation_matches = match economic.sizing.mode {
@@ -4890,6 +5104,10 @@ fn verify_winner_follow_intent_plan(
             intent.contracts.0 == contracts
                 && ShareAmount::from_whole(intent.contracts.0)
                     .is_ok_and(|shares| shares == economic.ladder.minimum_shares)
+        }
+        SizingModeAudit::Dollar { .. } if continuation_version == 7 => {
+            pe_venue_polymarket::ladder::signed_share_contracts(economic.ladder.minimum_shares)
+                .is_ok_and(|contracts| contracts == intent.contracts)
         }
         SizingModeAudit::Dollar { usd } => {
             usd.checked_div(economic.sizing.all_in_price.0)
@@ -4993,7 +5211,7 @@ async fn replay_unavailable_risk_inputs(
         },
         evaluated_at_unix,
         latency_was_active,
-        if continuation.version() == 6 { 2 } else { 1 },
+        continuation.financial_semantic(),
     ) {
         Ok(_) => Ok(None),
         Err(cause) => Ok(Some(cause)),
@@ -5064,14 +5282,15 @@ async fn verify_winner_follow_decline_decision(
                 source_trade_id: frozen.source_trade_id.clone(),
                 observed_at_bucket: frozen.source_epoch,
             };
-            let reconstructed = verify_economic(&operation, economic, &replay, false).await?;
+            let reconstructed =
+                verify_economic(&operation, economic, &replay, Some(continuation), false).await?;
             match pe_strategy_winner_follow::WinnerFollowStrategy::new(
                 frozen.applied_configuration.winner_follow_config(),
             )
             .evaluate_at_price_with_limit(
                 &signal,
                 reconstructed.sizing.all_in_price,
-                if continuation.version() == 6 {
+                if matches!(continuation.financial_semantic(), 2 | 3) {
                     reconstructed.ladder.limit_price
                 } else {
                     signal.leader_price
@@ -5870,7 +6089,7 @@ fn verify_paper_prepared_freshness(
     decision: &crate::decision_replay::ReplayedDecision,
     source: &BTreeMap<u64, SourceObservation>,
 ) -> Result<(), QualificationError> {
-    if !matches!(decision.continuation.version(), 5 | 6) {
+    if !matches!(decision.continuation.version(), 5..=7) {
         return Ok(());
     }
     if decision.post_boundary.body.terminal.reason == "paper_stale_before_prepared"
@@ -7268,7 +7487,14 @@ mod tests {
         let prepared_received_unix_ms = evaluated_at_unix_ms + 1_000;
         let mut source = fixture.source.clone();
         for sequence in RECEIPTS {
-            source.get_mut(&sequence).unwrap().received_unix_ms = evaluated_at_unix_ms;
+            let observation = source.get_mut(&sequence).unwrap();
+            observation.received_unix_ms = evaluated_at_unix_ms;
+            observation.received_at = ReceivedAt(
+                OffsetDateTime::from_unix_timestamp_nanos(
+                    i128::from(evaluated_at_unix_ms) * 1_000_000,
+                )
+                .unwrap(),
+            );
         }
         // The observation's recorded clock must agree with its (moved) selected receipt, and the
         // recorded market/settlement clocks must equal the receipt-derived seconds.
@@ -7333,21 +7559,33 @@ mod tests {
             source: &source,
             ..initial_context
         };
-        verify_economic(&operation, &economic, &context, false)
+        verify_economic(&operation, &economic, &context, None, false)
             .await
             .unwrap();
 
         for sequence in RECEIPTS {
             let mut late_source = source.clone();
-            late_source.get_mut(&sequence).unwrap().received_unix_ms = evaluated_at_unix_ms + 1;
+            let observation = late_source.get_mut(&sequence).unwrap();
+            observation.received_unix_ms = evaluated_at_unix_ms + 1;
+            observation.received_at = ReceivedAt(
+                OffsetDateTime::from_unix_timestamp_nanos(
+                    i128::from(evaluated_at_unix_ms + 1) * 1_000_000,
+                )
+                .unwrap(),
+            );
             let late_context = RiskReplayContext {
                 source: &late_source,
                 ..context
             };
-            assert!(matches!(
-                verify_economic(&operation, &economic, &late_context, false).await,
-                Err(QualificationError::InsufficientEvidence(_))
-            ));
+            let expected = if sequence == 1005 {
+                "Fill source observation receipts are noncausal"
+            } else {
+                "receipt has the wrong source contract or is noncausal"
+            };
+            assert_qualification_refusal(
+                verify_economic(&operation, &economic, &late_context, None, false).await,
+                expected,
+            );
         }
     }
 
@@ -7363,15 +7601,26 @@ mod tests {
         .unwrap();
     }
 
+    fn assert_qualification_refusal<T: std::fmt::Debug>(
+        result: Result<T, QualificationError>,
+        expected: &str,
+    ) {
+        assert!(
+            matches!(&result, Err(QualificationError::InsufficientEvidence(reason))
+            if reason.ends_with(expected)),
+            "expected {expected:?}, got {result:?}"
+        );
+    }
+
     /// PASS: changing only Contract sizing from five to ten fails closed.
     #[tokio::test]
     async fn winner_follow_policy_rejects_tampered_contract_quantity() {
         let fixture = receipt_backed_decline_fixture().await;
         let mut economic = evaluated_economic(&fixture.decision).clone();
         economic.sizing.mode = SizingModeAudit::Contract { contracts: 10 };
-        assert!(
-            verify_winner_follow_economic_policy(&fixture.decision.continuation, &economic,)
-                .is_err()
+        assert_qualification_refusal(
+            verify_winner_follow_economic_policy(&fixture.decision.continuation, &economic),
+            "EconomicPrepared execution policy differs from its frozen configuration and signal",
         );
     }
 
@@ -7381,9 +7630,9 @@ mod tests {
         let fixture = receipt_backed_decline_fixture().await;
         let mut economic = evaluated_economic(&fixture.decision).clone();
         economic.sizing.slippage_rate = dec!(0.01);
-        assert!(
-            verify_winner_follow_economic_policy(&fixture.decision.continuation, &economic,)
-                .is_err()
+        assert_qualification_refusal(
+            verify_winner_follow_economic_policy(&fixture.decision.continuation, &economic),
+            "EconomicPrepared execution policy differs from its frozen configuration and signal",
         );
     }
 
@@ -7393,9 +7642,9 @@ mod tests {
         let fixture = receipt_backed_decline_fixture().await;
         let mut economic = evaluated_economic(&fixture.decision).clone();
         economic.balance.price_impact_cap_bps = 10_000;
-        assert!(
-            verify_winner_follow_economic_policy(&fixture.decision.continuation, &economic,)
-                .is_err()
+        assert_qualification_refusal(
+            verify_winner_follow_economic_policy(&fixture.decision.continuation, &economic),
+            "EconomicPrepared execution policy differs from its frozen configuration and signal",
         );
     }
 
@@ -7405,9 +7654,9 @@ mod tests {
         let fixture = receipt_backed_decline_fixture().await;
         let mut economic = evaluated_economic(&fixture.decision).clone();
         economic.balance.band_floor = Price::ZERO;
-        assert!(
-            verify_winner_follow_economic_policy(&fixture.decision.continuation, &economic,)
-                .is_err()
+        assert_qualification_refusal(
+            verify_winner_follow_economic_policy(&fixture.decision.continuation, &economic),
+            "EconomicPrepared execution policy differs from its frozen configuration and signal",
         );
     }
 
@@ -7417,9 +7666,9 @@ mod tests {
         let fixture = receipt_backed_decline_fixture().await;
         let mut economic = evaluated_economic(&fixture.decision).clone();
         economic.balance.band_ceiling_exclusive = Price::ONE;
-        assert!(
-            verify_winner_follow_economic_policy(&fixture.decision.continuation, &economic,)
-                .is_err()
+        assert_qualification_refusal(
+            verify_winner_follow_economic_policy(&fixture.decision.continuation, &economic),
+            "EconomicPrepared execution policy differs from its frozen configuration and signal",
         );
     }
 
@@ -7429,9 +7678,9 @@ mod tests {
         let fixture = receipt_backed_decline_fixture().await;
         let mut economic = evaluated_economic(&fixture.decision).clone();
         economic.balance.chase_ceiling = Price::new(dec!(0.90)).unwrap();
-        assert!(
-            verify_winner_follow_economic_policy(&fixture.decision.continuation, &economic,)
-                .is_err()
+        assert_qualification_refusal(
+            verify_winner_follow_economic_policy(&fixture.decision.continuation, &economic),
+            "EconomicPrepared execution policy differs from its frozen configuration and signal",
         );
     }
 
@@ -7446,7 +7695,10 @@ mod tests {
         if let SizingModeAudit::Kelly { fraction, .. } = &mut economic.sizing.mode {
             *fraction = KELLY_NORMAL;
         }
-        assert!(verify_winner_follow_economic_policy(&continuation, &economic).is_err());
+        assert_qualification_refusal(
+            verify_winner_follow_economic_policy(&continuation, &economic),
+            "EconomicPrepared execution policy differs from its frozen configuration and signal",
+        );
     }
 
     /// PASS: changing only the copied Kelly probability fails closed.
@@ -7460,7 +7712,10 @@ mod tests {
         if let SizingModeAudit::Kelly { probability, .. } = &mut economic.sizing.mode {
             *probability = Probability::new(dec!(0.70)).unwrap();
         }
-        assert!(verify_winner_follow_economic_policy(&continuation, &economic).is_err());
+        assert_qualification_refusal(
+            verify_winner_follow_economic_policy(&continuation, &economic),
+            "EconomicPrepared execution policy differs from its frozen configuration and signal",
+        );
     }
 
     /// PASS: the strategy's five-contract allocation equals the signed economic plan.
@@ -7485,17 +7740,71 @@ mod tests {
             mode,
         )
         .unwrap();
-        verify_winner_follow_intent_plan(&intent, &economic, &continuation.facts.source_trade_id)
-            .unwrap();
+        verify_winner_follow_intent_plan(
+            &intent,
+            &economic,
+            6,
+            &continuation.facts.source_trade_id,
+        )
+        .unwrap();
 
         economic.sizing.minimum_shares = ShareAmount::from_whole(10).unwrap();
-        assert!(
+        assert_qualification_refusal(
             verify_winner_follow_intent_plan(
                 &intent,
                 &economic,
+                6,
                 &continuation.facts.source_trade_id,
-            )
-            .is_err()
+            ),
+            "Winner-Follow allocation or limit differs from its sized economic plan",
+        );
+    }
+
+    #[test]
+    fn semantic_three_dollar_intent_requires_signed_plan_conversion() {
+        let (continuation, mut economic) = winner_follow_policy_fixture();
+        economic.version = 2;
+        economic.balance.chase_ceiling = Price::ONE;
+        economic.sizing.mode = SizingModeAudit::Dollar { usd: dec!(25) };
+        economic.ladder.minimum_shares = ShareAmount::from_decimal_exact(dec!(7.123456)).unwrap();
+        economic.sizing.minimum_shares = economic.ladder.minimum_shares;
+        let (signal, mode) = reconstruct_winner_follow_signal(&continuation).unwrap();
+        let mut intent = pe_strategy_winner_follow::WinnerFollowStrategy::new(
+            continuation
+                .facts
+                .applied_configuration
+                .winner_follow_config(),
+        )
+        .evaluate_at_price_with_limit(
+            &signal,
+            economic.sizing.all_in_price,
+            economic.ladder.limit_price,
+            continuation.facts.frozen_basis.win_rate_p,
+            economic.risk.snapshot.clone(),
+            continuation.facts.frozen_basis.bankroll,
+            mode,
+        )
+        .unwrap();
+        intent.contracts =
+            pe_venue_polymarket::ladder::signed_share_contracts(economic.ladder.minimum_shares)
+                .unwrap();
+        verify_winner_follow_intent_plan(
+            &intent,
+            &economic,
+            7,
+            &continuation.facts.source_trade_id,
+        )
+        .unwrap();
+        intent.contracts = pe_core_types::ContractQty(6);
+        assert!(Decimal::from(intent.contracts.0) * economic.sizing.all_in_price.0 < dec!(25));
+        assert_qualification_refusal(
+            verify_winner_follow_intent_plan(
+                &intent,
+                &economic,
+                7,
+                &continuation.facts.source_trade_id,
+            ),
+            "Winner-Follow allocation or limit differs from its sized economic plan",
         );
     }
 
@@ -7528,19 +7837,69 @@ mod tests {
             )
             .unwrap();
         assert_ne!(intent.limit_price, signal.leader_price);
-        verify_winner_follow_intent_plan(&intent, &economic, &continuation.facts.source_trade_id)
-            .unwrap();
+        verify_winner_follow_intent_plan(
+            &intent,
+            &economic,
+            6,
+            &continuation.facts.source_trade_id,
+        )
+        .unwrap();
         economic.balance.chase_ceiling = signal.leader_price;
-        assert!(verify_winner_follow_economic_policy(&continuation, &economic).is_err());
+        assert_qualification_refusal(
+            verify_winner_follow_economic_policy(&continuation, &economic),
+            "EconomicPrepared execution policy differs from its frozen configuration and signal",
+        );
         economic.balance.chase_ceiling = Price::ONE;
         economic.ladder.limit_price = Price::new(dec!(0.51)).unwrap();
-        assert!(
+        assert_qualification_refusal(
             verify_winner_follow_intent_plan(
                 &intent,
                 &economic,
-                &continuation.facts.source_trade_id
+                6,
+                &continuation.facts.source_trade_id,
+            ),
+            "Winner-Follow allocation or limit differs from its sized economic plan",
+        );
+    }
+
+    #[test]
+    fn semantic_three_uses_economic_wire_two_and_complete_read_policy() {
+        let (continuation, mut economic) = winner_follow_policy_fixture();
+        let mut wire = serde_json::to_value(&continuation).unwrap();
+        wire["version"] = serde_json::json!(7);
+        wire["source_authority"] = serde_json::json!("complete_read");
+        let current: DecisionContinuationV3 = serde_json::from_value(wire).unwrap();
+        assert_eq!(current.financial_semantic(), 3);
+        economic.version = 2;
+        economic.balance.chase_ceiling = Price::ONE;
+        verify_winner_follow_economic_policy(&current, &economic).unwrap();
+        for semantic in [2, 3] {
+            verify_economic_configuration(
+                &economic,
+                &economic.applied_configuration_hash,
+                semantic,
             )
-            .is_err()
+            .unwrap();
+        }
+        economic.version = 3;
+        assert_qualification_refusal(
+            verify_winner_follow_economic_policy(&current, &economic),
+            "EconomicPrepared execution policy differs from its frozen configuration and signal",
+        );
+        assert_qualification_refusal(
+            verify_economic_configuration(&economic, &economic.applied_configuration_hash, 3),
+            "EconomicPrepared version differs from QualificationStarted financial semantics",
+        );
+        let mut frame = current;
+        frame.source_authority = Some(crate::bucket_commit::SourceAuthority::ActivityFrame);
+        economic.version = 2;
+        assert_qualification_refusal(
+            verify_winner_follow_economic_policy(&frame, &economic),
+            "frozen continuation does not match durable row",
+        );
+        assert_qualification_refusal(
+            decision_observation_from_source(&frame, &BTreeMap::new()),
+            "frozen continuation does not match durable row",
         );
     }
 
@@ -7566,17 +7925,23 @@ mod tests {
             mode,
         )
         .unwrap();
-        verify_winner_follow_intent_plan(&intent, &economic, &continuation.facts.source_trade_id)
-            .unwrap();
+        verify_winner_follow_intent_plan(
+            &intent,
+            &economic,
+            6,
+            &continuation.facts.source_trade_id,
+        )
+        .unwrap();
 
         economic.ladder.limit_price = Price::new(dec!(0.51)).unwrap();
-        assert!(
+        assert_qualification_refusal(
             verify_winner_follow_intent_plan(
                 &intent,
                 &economic,
+                6,
                 &continuation.facts.source_trade_id,
-            )
-            .is_err()
+            ),
+            "Winner-Follow allocation or limit differs from its sized economic plan",
         );
     }
 
@@ -7717,13 +8082,13 @@ mod tests {
             financial_semantic_version: fixture.start.financial_semantic_version,
         };
         assert_eq!(
-            verify_economic(&operation, &economic, &replay, false)
+            verify_economic(&operation, &economic, &replay, None, false)
                 .await
                 .unwrap(),
             economic
         );
         assert!(matches!(
-            verify_economic(&operation, &economic, &replay, true).await,
+            verify_economic(&operation, &economic, &replay, None, true).await,
             Err(QualificationError::InsufficientEvidence(reason))
                 if reason.contains("risk decision is not an approval")
         ));
@@ -7846,7 +8211,7 @@ mod tests {
             };
 
             assert_eq!(
-                verify_economic(&operation, &economic, &replay, false)
+                verify_economic(&operation, &economic, &replay, None, false)
                     .await
                     .unwrap(),
                 economic
@@ -7918,7 +8283,7 @@ mod tests {
                 start_hot_config_hash: &fixture.start.hot_config_hash,
                 financial_semantic_version: if continuation.version() == 6 { 2 } else { 1 },
             };
-            let verified = verify_economic(&operation, &economic, &replay, false)
+            let verified = verify_economic(&operation, &economic, &replay, None, false)
                 .await
                 .unwrap();
             assert_eq!(verified.risk, economic.risk);
@@ -8056,7 +8421,7 @@ mod tests {
         };
 
         assert_eq!(
-            verify_economic(&operation, &released, &replay, false)
+            verify_economic(&operation, &released, &replay, None, false)
                 .await
                 .unwrap(),
             released,
@@ -8075,7 +8440,7 @@ mod tests {
         };
         assert_ne!(clamped.risk.snapshot, released.risk.snapshot);
         assert!(matches!(
-            verify_economic(&operation, &clamped, &replay, false).await,
+            verify_economic(&operation, &clamped, &replay, None, false).await,
             Err(QualificationError::InsufficientEvidence(reason))
                 if reason == "EconomicPrepared risk snapshot differs from causal replay"
         ));
@@ -8092,6 +8457,43 @@ mod tests {
             .unwrap();
 
         verify_complete_second_action(&ledger, &continuation, &[mutation], &expected).unwrap();
+    }
+
+    #[test]
+    fn same_second_piece_replay_selects_the_recorded_continuation() {
+        let (mut continuation, mutation) = classification_fixture();
+        let ledger = PositionLedger::new();
+        let mut second = mutation.clone();
+        second.source_trade_id = SourceTradeId(format!("{}z", mutation.source_trade_id.0));
+        let mut mutations = vec![second, mutation];
+        let (_, expected) = ledger.simulate_all_or_none(&mutations).unwrap();
+        let mut wire = serde_json::to_value(&continuation).unwrap();
+        wire["version"] = serde_json::json!(7);
+        wire["source_authority"] = serde_json::json!("complete_read");
+        continuation = serde_json::from_value(wire.clone()).unwrap();
+        verify_complete_second_action(&ledger, &continuation, &mutations, &expected).unwrap();
+        let mut wrong_representative = continuation.clone();
+        wrong_representative.facts.source_trade_id = mutations[0].source_trade_id.clone();
+        assert_qualification_refusal(
+            verify_complete_second_action(&ledger, &wrong_representative, &mutations, &expected),
+            "classification differs from complete-second replay",
+        );
+        wire["version"] = serde_json::json!(6);
+        wire.as_object_mut().unwrap().remove("source_authority");
+        let historical = serde_json::from_value(wire).unwrap();
+        assert_qualification_refusal(
+            verify_complete_second_action(&ledger, &historical, &mutations, &expected),
+            "classification differs from complete-second replay",
+        );
+        if let pe_position_ledger::LedgerEffect::Trade { outcome_id, .. } = &mut mutations[0].effect
+        {
+            *outcome_id = OutcomeId(1);
+        }
+        let (_, expected) = ledger.simulate_all_or_none(&mutations).unwrap();
+        assert_qualification_refusal(
+            verify_complete_second_action(&ledger, &continuation, &mutations, &expected),
+            "classification differs from complete-second replay",
+        );
     }
 
     #[test]
@@ -13369,7 +13771,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        for generation in [3, 4, 5, 6] {
+        for generation in [3, 4, 5, 6, 7] {
             let committed = generation >= 4;
             for pre_start_ws in [false, true] {
                 let (mut continuation, mut observations) =
@@ -13377,6 +13779,10 @@ mod tests {
                 if generation >= 5 {
                     commit_read_fixture_v2(&mut continuation, &mut observations);
                     if generation == 6 {
+                        let mut encoded = serde_json::to_value(&continuation).unwrap();
+                        encoded["version"] = serde_json::json!(6);
+                        continuation = serde_json::from_value(encoded).unwrap();
+                    } else if generation == 7 {
                         continuation = continuation.current_paper();
                     }
                 }
@@ -13426,6 +13832,7 @@ mod tests {
                     for version in [2, 3] {
                         let mut erased = serde_json::to_value(&continuation).unwrap();
                         erased["version"] = serde_json::json!(version);
+                        erased.as_object_mut().unwrap().remove("source_authority");
                         erased.as_object_mut().unwrap().remove("read_commitment");
                         erased
                             .as_object_mut()
@@ -14008,6 +14415,8 @@ mod tests {
                 .as_mut()
                 .unwrap()
                 .push(crate::bucket_commit::ObservationBinding {
+                    counterpart_basis_receipt: None,
+                    frame_admission_receipt: None,
                     stream_group_id: stream.group_id.key().clone(),
                     stream_receipt,
                     history_group_id: aggregate.group_id.key().clone(),
@@ -14666,17 +15075,27 @@ mod tests {
             verified: MarketOutcomeId::new(frozen.market_id.clone(), frozen.outcome_id),
             evidence_hash: "metadata-proof".to_owned(),
         };
-        assert!(verify_decision_continuation_facts(&aggregate, &frozen, None).is_err());
+        assert_qualification_refusal(
+            verify_decision_continuation_facts(&aggregate, &frozen, None),
+            "decision continuation differs from its raw activity aggregate",
+        );
         verify_decision_continuation_facts(&aggregate, &frozen, Some(&correction)).unwrap();
         let mut wrong = correction.clone();
         wrong.stamped = wrong.verified.clone();
-        assert!(verify_decision_continuation_facts(&aggregate, &frozen, Some(&wrong)).is_err());
+        assert_qualification_refusal(
+            verify_decision_continuation_facts(&aggregate, &frozen, Some(&wrong)),
+            "decision continuation differs from its raw activity aggregate",
+        );
         wrong = correction.clone();
         wrong.verified = wrong.stamped.clone();
-        assert!(verify_decision_continuation_facts(&aggregate, &frozen, Some(&wrong)).is_err());
+        assert_qualification_refusal(
+            verify_decision_continuation_facts(&aggregate, &frozen, Some(&wrong)),
+            "decision continuation differs from its raw activity aggregate",
+        );
         frozen.share_amount = ShareAmount::from_whole(2).unwrap();
-        assert!(
-            verify_decision_continuation_facts(&aggregate, &frozen, Some(&correction)).is_err()
+        assert_qualification_refusal(
+            verify_decision_continuation_facts(&aggregate, &frozen, Some(&correction)),
+            "decision continuation differs from its raw activity aggregate",
         );
     }
     #[test]
@@ -14691,7 +15110,10 @@ mod tests {
         for covered in ["anchor_covered", "anchor_covered_late"] {
             assert!(!recorded_group_was_applied(&id, covered).unwrap());
         }
-        assert!(recorded_group_was_applied(&id, "unknown_bracket_reason").is_err());
+        assert_qualification_refusal(
+            recorded_group_was_applied(&id, "unknown_bracket_reason"),
+            "has unknown disposition unknown_bracket_reason",
+        );
     }
     #[test]
     fn membership_tampering_is_rejected() {
@@ -14957,7 +15379,10 @@ mod tests {
                         crate::decision_replay::replay_decision_pending(&rehashed_row),
                         Err(crate::decision_replay::ReplayDecisionError::AuthorityBinding)
                     ));
-                    assert!(verify_paper_prepared_freshness(&contradictory, &source).is_err());
+                    assert_qualification_refusal(
+                        verify_paper_prepared_freshness(&contradictory, &source),
+                        "paper Prepared expiry contradicts the terminal authority",
+                    );
                 }
             }
             if enabled {
@@ -14976,7 +15401,10 @@ mod tests {
                     1,
                 )
                 .unwrap();
-                assert!(verify_paper_prepared_freshness(&decision, &source).is_err());
+                assert_qualification_refusal(
+                    verify_paper_prepared_freshness(&decision, &source),
+                    "paper Prepared freshness predicate contradicts the terminal disposition",
+                );
             } else {
                 decision.post_boundary.body.clocks[0].submillisecond_nanos = Some(1);
                 decision.post_boundary = DecisionPostBoundaryEvidence::from_body_with_semantic(

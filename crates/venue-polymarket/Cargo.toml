@@ -26,5 +26,6 @@ time.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+proptest.workspace = true
 axum.workspace = true
 rust_decimal_macros.workspace = true

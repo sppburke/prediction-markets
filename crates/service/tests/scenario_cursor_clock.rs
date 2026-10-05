@@ -190,6 +190,12 @@ async fn run_once(
     let control = tokio::spawn(async move {
         let mut engine = BucketCommitEngine::load(control_paper, PositionLedger::new()).unwrap();
         while let Some(command) = control_rx.recv().await {
+            if let OrchestratorControl::FeedAuditUpdate { acknowledged, .. } = command {
+                let _ = acknowledged.send(Ok(
+                    pe_service::orchestrator_control::FeedAuditAcknowledgement::Applied,
+                ));
+                continue;
+            }
             if let OrchestratorControl::CommitActivityBucket {
                 aggregates,
                 context,
@@ -477,6 +483,8 @@ async fn reader_burst_coalesces_until_the_existing_poll_cadence() {
     let source_log_path = dir.path().join("source.log");
     let paper_state = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
     let sink = SourceEventSink::open(&source_log_path).unwrap();
+    let source_receipts =
+        pe_service::risk_inputs::SourceReceiptIndex::replay(&source_log_path).unwrap();
     let (source_log, source_rx) = SourceLogHandle::channel(4);
     let asset_identity = Arc::new(AssetIdentityResolver::new_runtime(
         Arc::new(GammaFetcher {
@@ -489,9 +497,21 @@ async fn reader_burst_coalesces_until_the_existing_poll_cadence() {
     let (trigger_tx, trigger_rx) = mpsc::channel(8);
     let trigger_inject = trigger_tx.clone();
     let health = new_shared_health_with_ws(false, true, 90);
-    let ingest =
-        tokio::spawn(ActivityIngest::poll_only(sink, source_rx, trigger_tx, health.clone()).run());
-    let (control_tx, _control_rx) = mpsc::channel(1);
+    let ingest = tokio::spawn(
+        ActivityIngest::poll_only(sink, source_rx, trigger_tx, health.clone())
+            .with_source_receipt_index(source_receipts.clone())
+            .run(),
+    );
+    let (control_tx, mut control_rx) = mpsc::channel(1);
+    let control = tokio::spawn(async move {
+        while let Some(command) = control_rx.recv().await {
+            if let OrchestratorControl::FeedAuditUpdate { acknowledged, .. } = command {
+                let _ = acknowledged.send(Ok(
+                    pe_service::orchestrator_control::FeedAuditAcknowledgement::Applied,
+                ));
+            }
+        }
+    });
     let fetcher = Arc::new(QueueFetcher::new([b"[]".to_vec(), b"[]".to_vec()]));
     let now = OffsetDateTime::from_unix_timestamp(1_900_000_003).unwrap();
     let poller = tokio::spawn(
@@ -519,6 +539,7 @@ async fn reader_burst_coalesces_until_the_existing_poll_cadence() {
             ReconciliationObligations::default(),
             None,
         )
+        .with_source_receipt_index(source_receipts)
         .with_clock(Arc::new(move || now))
         .run(),
     );
@@ -527,6 +548,7 @@ async fn reader_burst_coalesces_until_the_existing_poll_cadence() {
     for received_at in [1_900_000_001, 1_900_000_002, 1_900_000_003] {
         trigger_inject
             .send(pe_service::activity_ingest::ReconciliationTrigger {
+                qualifying_buy: true,
                 wallet: wallet(),
                 source_time: OffsetDateTime::from_unix_timestamp(1_900_000_000).unwrap(),
                 source_trade_id: pe_core_types::SourceTradeId("g2:same".to_owned()),
@@ -554,4 +576,5 @@ async fn reader_burst_coalesces_until_the_existing_poll_cadence() {
 
     poller.abort();
     ingest.abort();
+    control.abort();
 }

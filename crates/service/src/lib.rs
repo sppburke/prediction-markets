@@ -54,3 +54,7 @@ pub mod trade_poller;
 pub mod watchlist_admission;
 pub mod watchlist_capacity;
 pub mod watchlist_maintenance;
+
+pub mod frame_admission;
+
+pub mod feed_audit;
