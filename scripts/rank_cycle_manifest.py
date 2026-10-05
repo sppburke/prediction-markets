@@ -11,7 +11,6 @@ import stat
 import tempfile
 from pathlib import Path
 
-from latency_shift_rerank import ORACLE_VERSION
 from partial_backfill_wallets import partial_backfill_wallets
 
 MANIFEST_VERSION = 1
@@ -82,6 +81,10 @@ def _wallet_universe(connection: sqlite3.Connection) -> dict:
 
 
 def snapshot(db_path: Path, day_utc: str, versions: dict, configuration: dict) -> dict:
+    # Imported here: the reranker pulls in NumPy, and the publisher's pure re-push
+    # imports this module for `newest_trade_unix` without analytics installed.
+    from latency_shift_rerank import ORACLE_VERSION
+
     versions = {**versions, "ranker": ORACLE_VERSION}
     connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:

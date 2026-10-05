@@ -980,6 +980,7 @@ class RankAndPushScenario(unittest.TestCase):
         try:
             import importlib
             rank_cycle_manifest = importlib.import_module("rank_cycle_manifest")
+            importlib.import_module("latency_shift_rerank")  # the stub `snapshot` imports
         finally:
             sys.path.pop(0)
         manifest = rank_cycle_manifest.snapshot(
@@ -1004,6 +1005,8 @@ class RankAndPushScenario(unittest.TestCase):
         # identity at all counts the rows, whose carry may have moved them.
         with sqlite3.connect(db) as connection:
             connection.execute("UPDATE activity_coverage_manifests_v2 SET group_count = 5")
+        reused = rank_cycle_manifest.snapshot(db, "2026-09-15", {}, {"top_n": "200"})
+        self.assertEqual(reused["source_watermark"]["activity"]["count"], 5)
         for phase, identity in (("finalized", '{"generation":2}'), ("schema_sealed", '{"generation":1}'),
                                 ("finalized", None)):
             with self.subTest(phase=phase, identity=identity):
@@ -3040,6 +3043,10 @@ raise SystemExit(real_ranker.main())
         # Pure re-push and its guard must import no analytics, including transitively.
         blocker=self.root/"blocked";blocker.mkdir()
         (blocker/"sitecustomize.py").write_text('import sys\nclass Block:\n def find_spec(self,name,*args):\n  if name.split(".")[0] in ("numpy","pandas"): raise ImportError("analytics forbidden")\nsys.meta_path.insert(0,Block())\n')
+        # The real reranker imports NumPy when loaded; the stub does too, so a transitive
+        # import of it from the pure path is caught.
+        stub=self.root/"scripts"/"latency_shift_rerank.py";shebang,body=stub.read_text().split("\n",1)
+        stub.write_text(shebang+"\nimport numpy\n"+body)
         args=("--skip-rank","--skip-discovery","--skip-backfill","--out-dir",str(out),"--top-n","1")
         result=self._run(*args,exit_env={"PYTHONPATH":str(blocker)})
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)
