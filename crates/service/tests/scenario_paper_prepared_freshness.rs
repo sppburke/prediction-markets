@@ -411,21 +411,28 @@ impl Harness {
             financial_semantic_version,
         }));
         let mut writer = Writer::open(dir.path().join("paper.log")).unwrap();
-        let start = writer
-            .append_synced(EnvelopeIn {
-                source_id: SourceId("pe-service.paper".to_owned()),
-                schema_version: 2,
-                parser_version: 1,
-                observed_at: SourceTimestamp(at()),
-                received_at: ReceivedAt(at()),
-                content_type: ContentType::Json,
-                payload: serde_json::to_vec(&record).unwrap(),
-            })
-            .unwrap();
+        let start = if financial_semantic_version == 0 {
+            // Pre-Start fixtures exercise source delivery with no financial protocol.
+            support::scenario_receipt(0)
+        } else {
+            writer
+                .append_synced(EnvelopeIn {
+                    source_id: SourceId("pe-service.paper".to_owned()),
+                    schema_version: 2,
+                    parser_version: 1,
+                    observed_at: SourceTimestamp(at()),
+                    received_at: ReceivedAt(at()),
+                    content_type: ContentType::Json,
+                    payload: serde_json::to_vec(&record).unwrap(),
+                })
+                .unwrap()
+        };
         drop(writer);
-        paper
-            .reset_financial_era(start, CollateralAmount::from_decimal_exact(CASH).unwrap())
-            .unwrap();
+        if financial_semantic_version != 0 {
+            paper
+                .reset_financial_era(start, CollateralAmount::from_decimal_exact(CASH).unwrap())
+                .unwrap();
+        }
         let sink = SourceEventSink::open(dir.path().join("source.log")).unwrap();
         let index = SourceReceiptIndex::replay(&dir.path().join("source.log")).unwrap();
         let (source, receiver) = SourceLogHandle::channel(8);
@@ -739,29 +746,34 @@ impl Harness {
             self.books.clone(),
         )
         .unwrap();
-        owner = owner.with_activity_frames(self.source.clone(), 90);
+        let started = self.paper.financial_start().unwrap().is_some();
+        if started {
+            owner = owner.with_activity_frames(self.source.clone(), 90);
+        }
         owner.set_scenario_hooks(self.hooks.clone());
-        owner
-            .configure_financial_log_paths(
-                self.dir.path().join("paper.log"),
-                self.dir.path().join("source.log"),
-                self.admission_builder.clone().unwrap_or_else(|| {
-                    LiveAdmissionBuilder::new(
+        if started {
+            owner
+                .configure_financial_log_paths(
+                    self.dir.path().join("paper.log"),
+                    self.dir.path().join("source.log"),
+                    self.admission_builder.clone().unwrap_or_else(|| {
+                        LiveAdmissionBuilder::new(
+                            reqwest::Client::new(),
+                            "http://unused.invalid",
+                            "http://unused.invalid",
+                            self.source.clone(),
+                        )
+                    }),
+                    Arc::new(HistoricalMarkAdapter::new(
                         reqwest::Client::new(),
                         "http://unused.invalid",
-                        "http://unused.invalid",
                         self.source.clone(),
-                    )
-                }),
-                Arc::new(HistoricalMarkAdapter::new(
-                    reqwest::Client::new(),
-                    "http://unused.invalid",
-                    self.source.clone(),
-                )),
-                self.index.clone(),
-            )
-            .unwrap();
-        let recovery = frames.then(|| {
+                    )),
+                    self.index.clone(),
+                )
+                .unwrap();
+        }
+        let recovery = (frames && started).then(|| {
             let mut obligations =
                 pe_service::trade_poller::rebuild_reconciliation_obligations_with_index(
                     &self.dir.path().join("source.log"),
@@ -1016,14 +1028,15 @@ impl Harness {
                 tokio::time::advance(std::time::Duration::from_secs(1)).await;
             }
         }
-        assert!(
-            delayed.reads.load(Ordering::SeqCst) > misses
-                || (metadata_failure_expected
-                    && self.poller_metadata_failures.load(Ordering::SeqCst) == 0)
-        );
         let _ = stop.send(());
         let result = task.await.unwrap();
         self.poller_trigger.lock().unwrap().take();
+        assert!(
+            delayed.reads.load(Ordering::SeqCst) > misses
+                || (metadata_failure_expected
+                    && self.poller_metadata_failures.load(Ordering::SeqCst) == 0),
+            "poll did not reach acquisition: {result:?}, unresolved={unresolved:?}, now={now}"
+        );
         result?;
         if self.frame_owner {
             self.assert_frame_barrier(unresolved.as_deref()).await;
@@ -4417,21 +4430,23 @@ impl Harness {
                 Ok(client)
             })
         });
-        self.coordinator = tokio::spawn(
-            ActivityIngest::with_dialer(
-                self.watchlist.clone(),
-                SourceEventSink::open(self.dir.path().join("source.log")).unwrap(),
-                source_rx,
-                trigger_tx,
-                new_shared_health_with_ws(false, true, 90),
-                dialer,
-            )
-            .with_source_receipt_index(self.index.clone())
-            .with_control_sender(self.control.as_ref().unwrap().downgrade())
-            .with_reader_start_gate(start)
-            .with_scenario_receive_clock(Arc::new(at))
-            .run(),
-        );
+        let ingest = ActivityIngest::with_dialer(
+            self.watchlist.clone(),
+            SourceEventSink::open(self.dir.path().join("source.log")).unwrap(),
+            source_rx,
+            trigger_tx,
+            new_shared_health_with_ws(false, true, 90),
+            dialer,
+        )
+        .with_source_receipt_index(self.index.clone())
+        .with_reader_start_gate(start)
+        .with_scenario_receive_clock(Arc::new(at));
+        let ingest = if self.paper.financial_start().unwrap().is_some() {
+            ingest.with_control_sender(self.control.as_ref().unwrap().downgrade())
+        } else {
+            ingest
+        };
+        self.coordinator = tokio::spawn(ingest.run());
         (started, ready)
     }
 
@@ -6479,29 +6494,95 @@ async fn audit_release_recovery_contradiction_queued_during_open_frame_completes
     gate.started.notified().await;
     assert_eq!(h.paper.open_decision_pending().unwrap().len(), 1);
     let bad = h.rest_counterpart(&first, |row| row["side"] = json!("SELL"));
-    let later;
-    {
-        let pending = h.poll(&bad);
-        tokio::pin!(pending);
-        let control = h.control.as_ref().unwrap();
-        tokio::select! {
-            biased;
-            () = async {
-                while control.capacity() == control.max_capacity() {
-                    tokio::task::yield_now().await;
-                }
-            } => {},
-            () = &mut pending => panic!("audit acknowledged while the frame was held"),
-        }
-        later = h.append_frame(&next, |_| {}).await;
-        control
-            .send(OrchestratorControl::ActivityFrameDecision { receipt: later })
-            .await
-            .unwrap();
-        gate.release.notify_one();
-        pending.await;
-    }
+    // Queue the authenticated incident itself. A poller's preceding read-only owner lookup
+    // is not an incident and cannot stand in for engagement in this ordering scenario.
+    let page = h
+        .source
+        .append(EnvelopeIn {
+            source_id: SourceId(pe_service::trade_poller::ACTIVITY_POLL_SOURCE_ID.to_owned()),
+            schema_version: pe_service::trade_poller::ACTIVITY_POLL_PAGE_SCHEMA_VERSION,
+            parser_version: pe_source_polymarket_public::ACTIVITY_PARSER_VERSION,
+            observed_at: SourceTimestamp(at()),
+            received_at: ReceivedAt(at()),
+            content_type: ContentType::Json,
+            payload: bad.activity.clone(),
+        })
+        .await
+        .unwrap();
+    let read = support::producer_shaped_read_v2(wallet(), &bad.activity, bad.epoch, EPOCH, page);
+    let proof: Value = serde_json::from_str(&read.decision_inputs_json).unwrap();
+    let binding = pe_service::bucket_commit::ObservationBinding {
+        stream_group_id: first.id.clone(),
+        stream_receipt: receipt,
+        history_group_id: bad.id.clone(),
+        semantic_revision: read.aggregates[0].semantic_revision.as_str().to_owned(),
+        page_raw_hash: read.page.raw_hash.clone(),
+        page_occurrence_index: 0,
+        identity_provenance: None,
+        identity_receipt: None,
+        counterpart_basis_receipt: None,
+        frame_admission_receipt: Some(
+            h.paper
+                .activity_frame_decision(&first.id)
+                .unwrap()
+                .unwrap()
+                .admission_receipt,
+        ),
+    };
+    let commitment = pe_service::bucket_commit::activity_read_commitment_payload_v2(
+        wallet(),
+        bad.epoch,
+        &[read.page],
+        &serde_json::from_value::<Vec<_>>(proof["pages"].clone()).unwrap(),
+        &[binding],
+    )
+    .unwrap();
+    let deciding = h
+        .source
+        .append(EnvelopeIn {
+            source_id: SourceId(
+                pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID.to_owned(),
+            ),
+            schema_version: 2,
+            parser_version: 1,
+            observed_at: SourceTimestamp(at()),
+            received_at: ReceivedAt(at()),
+            content_type: ContentType::Json,
+            payload: commitment,
+        })
+        .await
+        .unwrap();
+    let (acknowledged, mut acknowledgement) = tokio::sync::oneshot::channel();
+    let control = h.control.as_ref().unwrap();
+    control
+        .send(OrchestratorControl::FeedAuditUpdate {
+            update: pe_service::orchestrator_control::FeedAuditUpdate::Incident(
+                pe_service::paper_recovery::FeedIncident {
+                    cause: pe_service::paper_recovery::FeedIncidentCause::Contradiction,
+                    frame_receipt: receipt,
+                    deciding_commitment_receipt: deciding,
+                    counterpart_identity: Some(bad.id.clone()),
+                    engagement_receipt: None,
+                },
+                None,
+            ),
+            acknowledged,
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        acknowledgement.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+    ));
+    let later = h.append_frame(&next, |_| {}).await;
+    control
+        .send(OrchestratorControl::ActivityFrameDecision { receipt: later })
+        .await
+        .unwrap();
+    gate.release.notify_one();
+    acknowledgement.await.unwrap().unwrap();
     h.boot_barrier_readonly().await;
+    h.poll(&bad).await;
     assert_eq!(
         h.terminal(&first).terminal_disposition.as_deref(),
         Some("fill")
@@ -8922,6 +9003,178 @@ async fn commitment_preemption_drains_ack_and_keeps_fixed_binding_before_urgent_
     h.restart_frames().await;
     h.assert_frame_barrier(None).await;
     assert_eq!(h.paper.decision_pending_history().unwrap().len(), 1);
+}
+
+/// A later fixed counterpart cannot remove an older read's barrier. Boot catch-up
+/// disposal cannot hide a retained contradiction whose incident was not acknowledged.
+#[tokio::test(start_paused = true)]
+async fn retained_frame_reads_keep_order_and_pending_incident_across_restart() {
+    for (restart, boot_catch_up) in [(false, false), (true, false), (true, true)] {
+        let mut h = Harness::new().await;
+        let a = h.record(1).await;
+        let b = h.record(2).await;
+        h.terminal_clock = OffsetDateTime::from_unix_timestamp(b.epoch).unwrap();
+        h.hooks
+            .financial_clock_unix
+            .store(b.epoch, Ordering::SeqCst);
+        h.start_frames();
+        h.empty_frontier(EPOCH - 1).await;
+        h.attempt(&a, h.terminal_clock);
+        let a_receipt = h.deliver_frame(&a, |_| {}).await;
+        h.attempt(&b, h.terminal_clock);
+        let b_receipt = h.deliver_frame(&b, |_| {}).await;
+        let b_terminal = h.terminal(&b);
+        // A is immature and absent from R1. B must remain behind its barrier.
+        h.poll(&b).await;
+        assert!(h.paper.activity_group_state(&a.id).unwrap().is_none());
+        assert!(h.paper.activity_group_state(&b.id).unwrap().is_none());
+        h.assert_frame_barrier(Some(&[a_receipt, b_receipt])).await;
+        let mut r2 = h.rest_counterpart(&b, |row| row["isCombo"] = json!(true));
+        let mut rows: Value = serde_json::from_slice(&r2.activity).unwrap();
+        rows.as_array_mut()
+            .unwrap()
+            .push(serde_json::from_slice::<Value>(&a.activity).unwrap()[0].clone());
+        if !boot_catch_up {
+            let mut marker = rows[1].clone();
+            marker["transactionHash"] = json!("incident-before-disposal-marker");
+            marker["size"] = json!("0");
+            marker["usdcSize"] = json!("0");
+            rows.as_array_mut().unwrap().push(marker);
+        }
+        r2.activity = serde_json::to_vec(&rows).unwrap();
+        let mut gamma: Value = serde_json::from_slice(&r2.gamma).unwrap();
+        gamma.as_array_mut().unwrap().extend(
+            serde_json::from_slice::<Value>(&a.gamma)
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .clone(),
+        );
+        r2.gamma = serde_json::to_vec(&gamma).unwrap();
+        *h.poller_crash.lock().unwrap() =
+            Some(pe_service::trade_poller::ReconciliationCrashBoundary::Commitment);
+        assert!(
+            h.poll_source_result(&r2, None, h.terminal_clock, 0)
+                .await
+                .is_err()
+        );
+        let deciding = read_commitments(&h).last().unwrap().0;
+        assert!(h.feed_edges().is_empty());
+
+        if boot_catch_up {
+            h.stop().await;
+            let validator = pe_service::position_seeder::CausalPositionValidator::new(
+                Arc::new(Page(r2.activity.clone())),
+                "fixture://activity",
+                "retained-frame-boot",
+                Arc::new(AssetIdentityResolver::new_runtime(
+                    Arc::new(Page(r2.gamma.clone())),
+                    "fixture://gamma".to_owned(),
+                    GAMMA_BATCH_SIZE,
+                    h.source.clone(),
+                )),
+            )
+            .with_clock(Arc::new(|| EPOCH + 10));
+            let mut engine =
+                BucketCommitEngine::load(h.paper.clone(), build_leader_ledger(&h.paper).unwrap())
+                    .unwrap()
+                    .with_source_receipt_index(h.index.clone());
+            // The activity read commits through the boot owner before this fixture's
+            // intentionally unusable positions response stops anchor installation.
+            assert!(matches!(
+                validator
+                    .validate_direct_with_deferrals(&[wallet()], &mut engine, &h.paper)
+                    .await,
+                Err(pe_service::position_seeder::CausalPositionError::Positions { .. })
+            ));
+            assert!(h.paper.activity_group_state(&b.id).unwrap().is_some());
+            assert!(h.feed_edges().is_empty());
+        }
+        if restart {
+            h.restart_frames().await;
+        }
+        let expected = if boot_catch_up {
+            vec![b_receipt]
+        } else {
+            vec![a_receipt, b_receipt]
+        };
+        h.assert_frame_barrier(Some(&expected)).await;
+        h.poller_fetch_failed = true;
+        let retry_clock =
+            OffsetDateTime::from_unix_timestamp(if boot_catch_up { EPOCH + 11 } else { r2.epoch })
+                .unwrap();
+        if !boot_catch_up {
+            h.poller_metadata_failures.store(1, Ordering::SeqCst);
+            h.poll_source(&r2, None, retry_clock).await;
+            assert_eq!(h.feed_edges().len(), 1);
+            assert!(h.paper.activity_group_state(&a.id).unwrap().is_none());
+            assert!(h.paper.activity_group_state(&b.id).unwrap().is_none());
+        }
+        h.poll_source(&r2, None, retry_clock).await;
+        assert_eq!(h.feed_edges().len(), 1);
+        assert_eq!(h.feed_edges()[0].1.frame_receipt, b_receipt);
+        assert_eq!(h.feed_edges()[0].1.deciding_commitment_receipt, deciding);
+        assert_eq!(h.terminal(&b), b_terminal);
+        let groups = h.paper.activity_groups_after(&wallet(), i64::MIN).unwrap();
+        assert_eq!(groups.len(), if boot_catch_up { 2 } else { 3 });
+        let a_group = groups
+            .iter()
+            .find(|group| group.source_trade_id == a.id)
+            .unwrap();
+        assert_eq!(a_group.disposition, "applied");
+        assert!(
+            h.paper
+                .leader_positions()
+                .unwrap()
+                .iter()
+                .any(
+                    |position| position.market_id.0.0 == a.admission.market.condition_id.0
+                        && position.long_contracts.to_decimal() == dec!(5)
+                )
+        );
+        h.assert_frame_barrier(Some(&[])).await;
+        h.restart_frames().await;
+        h.assert_frame_barrier(Some(&[])).await;
+        assert_eq!(h.feed_edges().len(), 1);
+        let report = h.qualify_one_fill().await;
+        assert!(report.replay.exact, "{report:?}");
+        assert!(
+            !report
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("unresolved frame audits")),
+            "{report:?}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn before_start_frame_only_triggers_reconciliation() {
+    let mut h = Harness::new_with_semantic(0).await;
+    let recorded = h.record(1).await;
+    let (started, mut peers) = h.start_frames_with_reader().await;
+    started.send(true).unwrap();
+    let mut peer = peers.recv().await.unwrap();
+    let rows: Value = serde_json::from_slice(&recorded.activity).unwrap();
+    peer.send_text(&json!({"topic":"activity", "type":"trades", "payload":rows[0]}).to_string())
+        .await
+        .unwrap();
+    let trigger = h._trigger_rx.recv().await.unwrap();
+    assert_eq!(trigger.source_trade_id, recorded.id);
+    h.boot_barrier_readonly().await;
+    assert!(h.paper.financial_start().unwrap().is_none());
+    assert!(h.paper.decision_pending_history().unwrap().is_empty());
+    assert!(h.feed_edges().is_empty());
+    assert_eq!(h.prepared_count(), 0);
+    assert!(
+        Reader::replay(h.dir.path().join("source.log"))
+            .unwrap()
+            .all(|record| !matches!(
+                record.unwrap().1.source_id.0.as_str(),
+                "pe-service.activity-frame-admission" | "pe-service.activity-frame-fallback"
+            ))
+    );
+    h.stop().await;
 }
 
 /// R1 fixes the counterpart while an earlier observation holds routing; R2 may replace

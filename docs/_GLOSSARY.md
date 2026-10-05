@@ -553,7 +553,9 @@ The paper wire-2 core hash remains separately bound in both cases.
 receipt order is classified against the admission-time confirmed ledger, consumed history and
 earlier frames. Only positive-share, non-combo BUY Entries from copy-eligible, history-complete,
 unfenced wallets without a re-anchor requirement can enter, with a current frontier and clear
-feed latch. An earlier unresolved BUY blocks later frames of that wallet/market only; REST
+feed latch, after the financial Start. Before Start, synchronized frames only trigger
+reconciliation, as in Part 1; they create no admission, decision or incident.
+An earlier unresolved BUY blocks later frames of that wallet/market only; REST
 winning first consumes history before frame admission. The frame transaction writes gate,
 wallet-market history and pending decision together. Later declines never undo consumption.
 Frames create no activity-group/revision rows, leader-balance effects or delivery-cursor progress.
@@ -627,6 +629,14 @@ read ending at or after maturity. Cursor-bounded, immature or failed reads prove
 negative audits retain the deciding commitment's proof, including empty bindings. Qualification
 retains only authenticated bindings/restamp pairs for selection and releases reconstructed aggregates,
 effective identities and read indexes after each authentication.
+Boot keeps a frame's obligation while any retained commitment concludes negatively without a
+journaled incident for that frame, even if catch-up already disposed a group matched by an
+earlier commitment. The first retained-read attempt journals the pending negative before retirement.
+Replaying an older retained read keeps the ordering barrier unless the counterpart is matched
+in that read or its group is already disposed; a counterpart learned from a later read alone
+cannot release it. Qualification verifies every recorded incident against its deciding read
+and exposes unresolved audits. Incident completeness is proven by production scenarios and
+audited on deployed data using [AC16's recipe](29-ACTIVITY-LATENCY-MEASUREMENT.md#730-acceptance-measurement).
 A match or contradiction fixes the frame's counterpart, so a later read cannot rebind it to
 another transaction leg. After an absence incident, counterpart discovery still disambiguates
 multiple same-transaction groups by the frame's asset and leaves multiple remaining candidates

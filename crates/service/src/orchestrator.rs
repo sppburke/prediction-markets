@@ -1721,11 +1721,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 .map(|()| FeedAuditAcknowledgement::Applied),
             FeedAuditUpdate::Incident(incident, read) => {
                 let identity = self
-                    .paper_state
-                    .activity_frame_decision_index(None)
-                    .map_err(|error| error.to_string())?
-                    .into_iter()
-                    .find(|frame| frame.observed_source_receipt == Some(incident.frame_receipt))
+                    .bucket_engine
+                    .admitted_frame(incident.frame_receipt)
                     .ok_or_else(|| "incident has no durable admitted frame".to_owned())?;
                 let row = self
                     .paper_state
@@ -1836,6 +1833,13 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
 
     async fn apply_control_message(&mut self, message: OrchestratorControl) {
         match message {
+            OrchestratorControl::CaptureFrameDecisionIds {
+                wallet,
+                transactions,
+                captured,
+            } => {
+                let _ = captured.send(self.bucket_engine.frame_decision_ids(wallet, transactions));
+            }
             OrchestratorControl::ActivityFrameDecision { receipt } => {
                 if let Err(error) = self.apply_activity_frame(receipt).await {
                     self.pending_load_failure = Some(error);

@@ -3667,15 +3667,9 @@ impl BucketCommitEngine {
                 continue;
             };
             let receipt = incident.frame_receipt;
-            let (wallet, position) = self
-                .admitted_frame_receipts
-                .get(&(receipt.sequence, receipt.this_hash))
-                .ok_or_else(|| "incident has no durable admitted frame".to_owned())?;
             let identity = self
-                .frame_decisions
-                .get(wallet)
-                .and_then(|frames| frames.get(*position))
-                .ok_or_else(|| "incident frame index missing".to_owned())?;
+                .admitted_frame(receipt)
+                .ok_or_else(|| "incident has no durable admitted frame".to_owned())?;
             let row = self
                 .paper_state
                 .decision_pending_for(&identity.source_trade_id)
@@ -3698,6 +3692,33 @@ impl BucketCommitEngine {
             index.remember_frame_incident(incident);
         }
         Ok(())
+    }
+
+    pub(crate) fn admitted_frame(
+        &self,
+        receipt: AppendReceipt,
+    ) -> Option<&pe_paper_state::ActivityFrameDecisionIndex> {
+        self.admitted_frame_receipts
+            .get(&(receipt.sequence, receipt.this_hash))
+            .and_then(|(wallet, position)| self.frame_decisions.get(wallet)?.get(*position))
+    }
+
+    pub(crate) fn frame_decision_ids(
+        &self,
+        wallet: WalletAddress,
+        transactions: HashSet<String>,
+    ) -> Vec<SourceTradeId> {
+        transactions
+            .into_iter()
+            .flat_map(|transaction| {
+                self.frame_transactions
+                    .get(&(wallet, transaction))
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|position| self.frame_decisions.get(&wallet)?.get(*position))
+                    .map(|frame| frame.source_trade_id.clone())
+            })
+            .collect()
     }
 
     fn observe_frame(&mut self, incoming: crate::frame_admission::EarlierFrame) {
@@ -3754,16 +3775,9 @@ impl BucketCommitEngine {
             && let Some(authority) = frame.observed_source_receipt
             && authority != receipt
         {
-            return Ok(FeedAuditAcknowledgement::Superseded(authority));
+            return Ok(FeedAuditAcknowledgement::Superseded);
         }
-        let admitted = self
-            .admitted_frame_receipts
-            .get(&(receipt.sequence, receipt.this_hash))
-            .and_then(|(wallet, index)| {
-                self.frame_decisions
-                    .get(wallet)
-                    .and_then(|frames| frames.get(*index))
-            });
+        let admitted = self.admitted_frame(receipt);
         if let Some(frame) = admitted {
             if !self
                 .earlier_frames

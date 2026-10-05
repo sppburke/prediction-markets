@@ -1293,6 +1293,7 @@ mod tests {
                             .unwrap();
                     }
                     OrchestratorControl::ActivityFrameDecision { .. }
+                    | OrchestratorControl::CaptureFrameDecisionIds { .. }
                     | OrchestratorControl::FeedAuditUpdate { .. }
                     | OrchestratorControl::ResolutionCandidate { .. }
                     | OrchestratorControl::RiskHaltChange { .. }

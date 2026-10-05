@@ -190,13 +190,19 @@ source/paper prefix identities. Preserve the Part 1 population and causal audit 
 [continuation-7 authority rules](_GLOSSARY.md#continuation-and-commitment-compatibility-588):
 frame fills prove admission-time first-entry knowledge; REST fills prove complete-history first
 entry. Replaced thin-book/VWAP refusals and a cross-leader paper hold cannot excuse Phase 2 misses.
+Frame admission requires the financial Start; before Start a synchronized frame only triggers
+Part 1 reconciliation and creates no admission, decision or incident.
 
 Use captured, verified finite log prefixes and a consistent `paper_state.db` snapshot containing
 its committed WAL state. The deployment capture must identify the first source sequence after
 activation; do not infer it from trade epochs. Retain verification receipts and physical prefix
 bounds with the capture. Record identities and run this inspection, substituting the deployment
 source sequence and cohort size (one fill for AC15; the AC16 size for latency acceptance).
-It opens SQLite with `mode=ro` and `query_only`, reads logs as bytes, and prints to stdout.
+It opens SQLite with `mode=ro` and `query_only`, uses autocommit reads on the captured
+snapshot (no long transaction), and reads finite log prefixes. It prints evidence and writes
+only `ac16-population.json` in the separate audit directory for the scoped queries below.
+Supply explicit Central window bounds with offsets, for example `2026-10-05T08:00:00-05:00`
+and `2026-10-05T09:00:00-05:00`; use `-06:00` when Central standard time applies.
 The decoder requires system `libzstd`; it checks framing/CRC, joins ordinary TRADE rows by the
 canonical `g2:` component encoding (using `b3sum`), and preserves envelope receipts. It does not
 replace the Rust log verifier or authority-specific semantic verification. Do not run normal service boot, `--report`, recovery or checkpoint
@@ -205,7 +211,7 @@ preparation as part of this read-only audit.
 ```bash
 sha256sum paper_state.db source_events.log paper.log
 stat -c '%s %n' paper_state.db source_events.log paper.log
-python3 - paper_state.db source_events.log paper.log <deploy-source-sequence> <AC16-cohort-size> <<'PY'
+python3 - paper_state.db source_events.log paper.log <deploy-source-sequence> <AC16-cohort-size> <window-start-CT> <window-end-CT> <audit-directory> <<'PY'
 import calendar, ctypes, ctypes.util, hashlib, json, re, sqlite3, statistics, struct, subprocess, sys, time, zlib
 from datetime import datetime
 from decimal import Decimal
@@ -252,8 +258,11 @@ def ns(value):
 
 audit_unix_ns = time.time_ns(); print("audit clock", audit_unix_ns)
 source = read_prefix(sys.argv[2]); paper = read_prefix(sys.argv[3])
-db = sqlite3.connect(Path(sys.argv[1]).resolve().as_uri() + "?mode=ro", uri=True)
-db.row_factory = sqlite3.Row; db.execute("PRAGMA query_only=ON"); db.execute("BEGIN")
+window_start = ns(sys.argv[6]) // 10**9; window_end = ns(sys.argv[7]) // 10**9
+assert window_start < window_end
+audit_dir = Path(sys.argv[8]).resolve(); assert audit_dir.is_dir()
+db = sqlite3.connect(Path(sys.argv[1]).resolve().as_uri() + "?mode=ro", uri=True, isolation_level=None)
+db.row_factory = sqlite3.Row; db.execute("PRAGMA query_only=ON")
 print("Start", [tuple(r) for r in db.execute(
     "SELECT key,value FROM meta WHERE key IN ('financial_start_seq','financial_start_hash')")])
 cohort = list(db.execute("""
@@ -275,7 +284,7 @@ ORDER BY f.prepared_seq, f.idempotency_key LIMIT ?
 print("FROZEN COHORT", [(r["source_trade_id"], r["idempotency_key"], r["prepared_seq"]) for r in cohort])
 assert len(cohort) == int(sys.argv[5]), "cohort incomplete; acceptance unproven"
 spans = {p: [] for p in ("initial_staleness_gate", "book_staleness_check", "terminal_transition")}
-book_use = []
+book_use = []; book_receipt_spans = []; trade_time_spans = []
 for row in cohort:
     print("decision/fill snapshot", dict(row))
     c = json.loads(row["frozen_inputs_json"]); t = json.loads(row["post_commit_inputs_json"])
@@ -329,8 +338,22 @@ for row in cohort:
         value = times["book_staleness_check"] - times["initial_staleness_gate"]
         if value >= 0: book_use.append(Decimal(value) / 10**6)
         else: print(row["source_trade_id"], "invalid decision-start to book-use span", value)
-    print(row["source_trade_id"], "feed delay ms",
-          Decimal(ns(frame["received_at"]) - ns(frame["observed_at"])) / 10**6)
+    trade_span = Decimal(ns(frame["received_at"]) - ns(frame["observed_at"])) / 10**6
+    if trade_span < 0 or ns(frame["received_at"]) > audit_unix_ns:
+        print(row["source_trade_id"], "invalid trade-time span", trade_span)
+    else:
+        trade_time_spans.append(trade_span)
+    book = (t.get("book") or {}).get("fetched_at_unix_ms")
+    if book is None:
+        print(row["source_trade_id"], "missing book-receipt span")
+    else:
+        span = Decimal(book * 10**6 - ns(frame["received_at"])) / 10**6
+        if span < 0 or book * 10**6 > audit_unix_ns:
+            print(row["source_trade_id"], "invalid book-receipt span", span)
+        else:
+            book_receipt_spans.append(span)
+            print(row["source_trade_id"], "frame-to-book receipt ms", span)
+    print(row["source_trade_id"], "frame receipt minus source time / feed delay ms", trade_span)
 for purpose, values in spans.items():
     values.sort(); n = len(values)
     print(purpose, "n", n, "missing/invalid", len(cohort) - n,
@@ -338,7 +361,11 @@ for purpose, values in spans.items():
           (statistics.median(values), values[(95 * n + 99) // 100 - 1], values[-1]))
 print("decision-start to book-use ms", len(book_use),
       None if not book_use else statistics.median(book_use), "missing/invalid", len(cohort) - len(book_use))
-fallbacks = {}
+for purpose, values in (("book receipt", book_receipt_spans), ("trade time / feed delay", trade_time_spans)):
+    values.sort(); n = len(values)
+    print(purpose, "n", n, "missing/invalid", len(cohort) - n, "median/p95/max ms",
+          None if not n else (statistics.median(values), values[(95*n+99)//100-1], values[-1]))
+fallbacks = {}; fallback_rows = []
 for e in sorted(source.values(), key=lambda e: e["seq"]):
     if e["source_id"] == "pe-service.activity-frame-fallback":
         a = payload(e); r = a["frame_receipt"]; frame = receipt(source, r)
@@ -348,6 +375,8 @@ for e in sorted(source.values(), key=lambda e: e["seq"]):
         key = (r["sequence"], r["this_hash"])
         if key not in fallbacks:
             fallbacks[key] = a
+            fallback_rows.append({"frame_seq": r["sequence"], "frame_hash": r["this_hash"],
+                                  "artifact_seq": e["seq"], "reason": a["reason"]})
             print("earliest fallback", e["seq"], e["this_hash"], a, payload(frame))
     elif e["source_id"] in ("pe-service.activity-read-commitment", "polymarket-public.activity-reconciliation"):
         print(e["seq"], e["this_hash"], e["source_id"], payload(e))
@@ -355,16 +384,19 @@ start_seq = int(db.execute("SELECT value FROM meta WHERE key='financial_start_se
 for e in paper.values():
     if e["seq"] > start_seq and payload(e).get("record") == "feed_incident_changed":
         print(e["seq"], e["this_hash"], payload(e))
-groups = {r["source_trade_id"]: dict(r) for r in db.execute("SELECT * FROM activity_groups")}
-keys = {}; matched = set(); legs = {}
+groups = {r["source_trade_id"]: dict(r) for r in db.execute(
+    "SELECT * FROM activity_groups WHERE source_epoch >= ? AND source_epoch < ?",
+    (window_start, window_end))}
+keys = {}; matched = set(); legs = {}; buys = {}; frame_rows = []
 for e in source.values():
-    if e["source_id"] != "polymarket-public.activity-reconciliation": continue
+    is_frame = e["source_id"] == "polymarket-activity-ws"
+    if not is_frame and e["source_id"] != "polymarket-public.activity-reconciliation": continue
     # Dispatch by the recorded contract; historical pages remain identity-join evidence.
     contract = (e["schema_version"], e["parser_version"])
     if contract not in ((2, 2), (3, 2)):
         raise ValueError(f"unsupported reconciliation page contract {contract}")
-    for r in payload(e):
-        if r.get("type", r.get("activity_type", "")).strip().upper() != "TRADE": continue
+    for r in ([payload(e)] if is_frame else payload(e)):
+        if r.get("type", r.get("activity_type", "TRADE" if is_frame else "")).strip().upper() != "TRADE": continue
         wallet = r.get("proxyWallet", r.get("proxy_wallet", "")).strip().lower()
         tx = r.get("transactionHash", r.get("transaction_hash", "")).strip().lower()
         condition = r.get("conditionId", r.get("condition_id"))
@@ -381,6 +413,15 @@ for e in source.values():
         if encoded not in keys:
             keys[encoded] = "g2:" + subprocess.check_output(["b3sum"], input=encoded).decode().split()[0]
         key = keys[encoded]
+        if (parts[7] == b"BUY" and parts[4] is not None and Decimal(str(r["size"])) > 0
+            and not r.get("isCombo", r.get("is_combo", False))):
+            epoch = int(r["timestamp"])
+            entry = {"id": key, "wallet": wallet, "market": parts[4].decode(), "epoch": epoch,
+                     "page_seq": e["seq"], "page_hash": e["this_hash"]}
+            if key not in buys or epoch < buys[key]["epoch"]: buys[key] = entry
+        if is_frame:
+            frame_rows.append({"id": key, "frame_seq": e["seq"], "frame_hash": e["this_hash"]})
+            continue
         if key not in groups: continue
         g = groups[key]; assert g["wallet_hex"] == wallet and g["transaction_hash"] == tx
         matched.add(key); legs.setdefault((wallet, tx), set()).add(key)
@@ -392,6 +433,44 @@ for e in source.values():
                 print("earlier BUY candidate; verify restamp equivalence", row["source_trade_id"], key, g, r)
 print("unmatched group identities; resolve from authenticated corrections or report unknown", sorted(set(groups) - matched))
 print("multi-leg controls", [(w, tx, sorted(ids)) for (w, tx), ids in legs.items() if len(ids) > 1])
+# Bind corrected/aliased frame identities using authenticated commitment receipts.
+for e in source.values():
+    if e["source_id"] != "pe-service.activity-read-commitment": continue
+    for b in payload(e).get("bindings") or []:
+        f = receipt(source, b["stream_receipt"])
+        assert f["source_id"] == "polymarket-activity-ws"
+        frame_rows.append({"id": b["history_group_id"], "frame_seq": f["seq"], "frame_hash": f["this_hash"]})
+# Replay recorded membership, retaining removed wallets and all prices.
+start = payload(paper[start_seq]); members = set(start["membership"])
+changes = sorted((e for e in paper.values() if e["seq"] > start_seq
+                  and payload(e).get("record") == "membership_changed"), key=lambda e: e["seq"])
+intervals = []; opened = {w: ns(paper[start_seq]["received_at"]) for w in members}
+for e in changes:
+    at = ns(e["received_at"]); c = payload(e)
+    for w in c["removed"]: intervals.append((w, opened.pop(w), at)); members.remove(w)
+    for w in c["added"]: assert w not in members; members.add(w); opened[w] = at
+intervals.extend((w, at, window_end * 10**9) for w, at in opened.items())
+first = {}
+for b in buys.values():
+    k = (b["wallet"], b["market"]); first[k] = min(first.get(k, b["epoch"]), b["epoch"])
+population = []
+for b in buys.values():
+    if not window_start <= b["epoch"] < window_end or b["epoch"] != first[b["wallet"], b["market"]]: continue
+    overlaps = [(lo, hi) for w, lo, hi in intervals if w == b["wallet"]
+                and lo < (b["epoch"] + 1)*10**9 and hi > b["epoch"]*10**9]
+    if overlaps:
+        b["membership_boundary_ambiguous"] = not any(lo <= b["epoch"]*10**9 and hi >= (b["epoch"]+1)*10**9 for lo, hi in overlaps)
+        population.append(b)
+audited_ids = {r[0] for r in db.execute(
+    "SELECT source_trade_id FROM decision_pending WHERE source_epoch >= ? AND source_epoch < ? "
+    "AND json_extract(frozen_inputs_json,'$.version')=7", (window_start, window_end))}
+audited_ids.update(b["id"] for b in population)
+frame_rows = [f for f in frame_rows if f["id"] in audited_ids]
+frame_keys = {(f["frame_seq"], f["frame_hash"]) for f in frame_rows}
+fallback_rows = [f for f in fallback_rows if (f["frame_seq"], f["frame_hash"]) in frame_keys]
+(audit_dir / "ac16-population.json").write_text(json.dumps({
+    "deploy_source_seq": int(sys.argv[4]), "window_start": window_start, "window_end": window_end,
+    "frames": frame_rows, "fallbacks": fallback_rows, "buys": population}, sort_keys=True))
 db.close()
 PY
 ```
@@ -433,6 +512,14 @@ durably; only authenticated restamp equivalence can change its identifier. List 
 separately. Reconstruct engagement/release order from the active
 paper era, including each `engagement_receipt`, and compare the frozen admission latch basis;
 current status is supplementary evidence only.
+Boot retains a frame's obligation while any retained commitment concludes negatively without
+a journaled incident for that frame, including when catch-up disposed an earlier matched group.
+The first retained-read attempt journals that negative before retirement. Replaying an older
+retained read keeps the ordering barrier unless its counterpart is matched in that read or its
+group is already disposed; a counterpart learned from a later read alone cannot release it.
+Qualification verifies every recorded incident against its deciding read and exposes unresolved
+audits. Incident completeness is proven by production scenarios and audited on deployed data
+with this AC16 recipe.
 
 For REST-decided first entries, search the verified source prefix for the trade's frame, including
 authenticated corrections/restamp equivalence. A delayed frame whose transaction REST already
@@ -447,17 +534,85 @@ a frame with no justified routing artifact is unexplained, never inferred from c
 
 Later-discovered earlier entries require `activity_groups` **and** recorded REST page rows, because
 late/raw-only `proof_json` can omit market and side. Read the candidate groups and a multi-leg
-control from the same snapshot:
+control from the same captured snapshot. The following commands run in the audit directory
+containing `ac16-population.json`; point `paper_state.db` at that captured snapshot.
+Each command is an autocommit read scoped to the frozen window or decision receipts.
+
+List **every** continuation-7 complete-read first-entry decision after the deployment source
+boundary in the window. Match frames by full identity and authenticated binding targets from
+the prefix export; select the first receipt for that identity, then its earliest fallback.
+`unexplained` means a recorded frame has no fallback artifact and requires investigation:
 
 ```bash
 sqlite3 -readonly -header -json paper_state.db <<'SQL'
-BEGIN;
+WITH p AS (SELECT readfile('ac16-population.json') AS j),
+frames AS (
+ SELECT value->>'$.id' AS id, value->>'$.frame_seq' AS seq,
+        value->>'$.frame_hash' AS hash,
+        row_number() OVER (PARTITION BY value->>'$.id' ORDER BY value->>'$.frame_seq') AS rn
+ FROM p, json_each(p.j,'$.frames')),
+fallbacks AS (SELECT value AS j FROM p, json_each(p.j,'$.fallbacks'))
+SELECT d.source_trade_id, d.wallet_hex, d.source_epoch,
+       f.seq AS frame_seq, f.hash AS frame_hash,
+       CASE WHEN f.id IS NULL THEN 'feed-missed' ELSE coalesce((
+         SELECT j->>'$.reason' FROM fallbacks
+         WHERE j->>'$.frame_seq'=f.seq AND j->>'$.frame_hash'=f.hash
+         ORDER BY j->>'$.artifact_seq' LIMIT 1), 'unexplained') END AS routing
+FROM p, decision_pending d
+JOIN entry_gate_results g ON g.source_trade_id=d.source_trade_id AND g.result='admitted'
+LEFT JOIN frames f ON f.id=d.source_trade_id AND f.rn=1
+WHERE json_extract(d.frozen_inputs_json,'$.version')=7
+  AND json_extract(d.frozen_inputs_json,'$.source_authority')='complete_read'
+  AND json_extract(d.frozen_inputs_json,'$.read_commitment.sequence') >= p.j->>'$.deploy_source_seq'
+  AND d.source_epoch >= p.j->>'$.window_start' AND d.source_epoch < p.j->>'$.window_end'
+ORDER BY d.source_epoch, d.source_trade_id;
+SQL
+```
+
+Emit the unexplained first-entry BUY set, which **must be empty**. The export includes every
+earliest BUY second in each wallet/market from the recorded inputs, without a price screen,
+and replays membership removals/additions. It retains same-second pieces and flags membership
+changes within a venue timestamp's second for investigation. Include frame-only observations
+before their REST echo. Prove complete attributable history for this population using the
+recorded full-read bounds; absent coverage is unknown and cannot establish acceptance.
+Inspect every joined refusal or suppression separately for correctness under its frozen authority;
+neither an obsolete thin-book/VWAP rule nor an unjustified causal disposition excuses a miss.
+
+```bash
+sqlite3 -readonly -header -json paper_state.db <<'SQL'
+WITH buys AS (SELECT value AS j FROM json_each(readfile('ac16-population.json'),'$.buys'))
+SELECT b.j, g.result, g.history_consumed, h.first_epoch, a.disposition, a.proof_json
+FROM buys b
+LEFT JOIN decision_pending d ON d.source_trade_id=b.j->>'$.id'
+LEFT JOIN fills f ON f.idempotency_key=json_extract(d.post_commit_inputs_json,'$.terminal.fill.idempotency_key')
+LEFT JOIN entry_gate_results g ON g.source_trade_id=b.j->>'$.id'
+LEFT JOIN wallet_market_history_v2 h ON h.wallet_hex=b.j->>'$.wallet' AND h.market_id=b.j->>'$.market'
+LEFT JOIN activity_groups a ON a.source_trade_id=b.j->>'$.id'
+LEFT JOIN no_copy_dispositions n ON n.source_trade_id=b.j->>'$.id'
+WHERE f.idempotency_key IS NULL
+  AND (d.state='terminal' AND (d.terminal_disposition='no_fill' OR d.terminal_disposition LIKE 'no_copy:%')) IS NOT TRUE
+  AND coalesce(n.reason,'')=''
+  AND (g.result IS NULL OR g.result='admitted')
+  AND coalesce(a.disposition,'') NOT IN ('reanchor_required_late_group','anchor_covered_late')
+ORDER BY b.j->>'$.epoch', b.j->>'$.wallet', b.j->>'$.id';
+SQL
+```
+
+Inspect bounded group and multi-leg controls from the same window:
+
+```bash
+sqlite3 -readonly -header -json paper_state.db <<'SQL'
+WITH p AS (SELECT readfile('ac16-population.json') AS j)
 SELECT source_trade_id, activity_type, wallet_hex, transaction_hash, source_epoch,
-       semantic_revision, disposition, proof_json FROM activity_groups ORDER BY rowid;
+       semantic_revision, disposition, proof_json FROM activity_groups, p
+WHERE source_epoch >= p.j->>'$.window_start' AND source_epoch < p.j->>'$.window_end'
+ORDER BY activity_groups.rowid;
+WITH p AS (SELECT readfile('ac16-population.json') AS j)
 SELECT wallet_hex, transaction_hash, count(DISTINCT source_trade_id) AS legs
-FROM activity_groups GROUP BY wallet_hex, transaction_hash
+FROM activity_groups, p
+WHERE source_epoch >= p.j->>'$.window_start' AND source_epoch < p.j->>'$.window_end'
+GROUP BY wallet_hex, transaction_hash
 HAVING count(DISTINCT source_trade_id) > 1 ORDER BY wallet_hex, transaction_hash;
-COMMIT;
 SQL
 ```
 

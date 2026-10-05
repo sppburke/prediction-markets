@@ -190,6 +190,10 @@ async fn run_once(
     let control = tokio::spawn(async move {
         let mut engine = BucketCommitEngine::load(control_paper, PositionLedger::new()).unwrap();
         while let Some(command) = control_rx.recv().await {
+            if let OrchestratorControl::CaptureFrameDecisionIds { captured, .. } = command {
+                let _ = captured.send(Vec::new()); // these owner fixtures have no frame decisions
+                continue;
+            }
             if let OrchestratorControl::FeedAuditUpdate { acknowledged, .. } = command {
                 let _ = acknowledged.send(Ok(
                     pe_service::orchestrator_control::FeedAuditAcknowledgement::Applied,
@@ -505,6 +509,10 @@ async fn reader_burst_coalesces_until_the_existing_poll_cadence() {
     let (control_tx, mut control_rx) = mpsc::channel(1);
     let control = tokio::spawn(async move {
         while let Some(command) = control_rx.recv().await {
+            if let OrchestratorControl::CaptureFrameDecisionIds { captured, .. } = command {
+                let _ = captured.send(Vec::new()); // these owner fixtures have no frame decisions
+                continue;
+            }
             if let OrchestratorControl::FeedAuditUpdate { acknowledged, .. } = command {
                 let _ = acknowledged.send(Ok(
                     pe_service::orchestrator_control::FeedAuditAcknowledgement::Applied,

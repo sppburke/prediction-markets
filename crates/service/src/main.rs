@@ -1196,7 +1196,11 @@ async fn main() -> Result<()> {
         )
         .with_source_receipt_index(source_receipts.clone())
     };
-    let activity_ingest = activity_ingest.with_control_sender(control_tx.downgrade());
+    let activity_ingest = if financial_start.is_some() {
+        activity_ingest.with_control_sender(control_tx.downgrade())
+    } else {
+        activity_ingest
+    };
     supervisor.spawn(TaskName::ActivityIngest, async move {
         // Recovery may append admission evidence before observation producers start.
         match activity_ingest
@@ -1556,12 +1560,12 @@ async fn main() -> Result<()> {
     )
     .context("build orchestrator")?
     .with_source_receipt_index(source_receipts.clone())
-    .with_activity_frames(orchestrator_source_log.clone(), poll_round_stale_secs)
     .with_live_dispatch_ready(live_dispatch_ready);
     if let Some(task) = live_fanout_task {
         supervisor.spawn(TaskName::LiveFanout, task);
     }
     if financial_start.is_some() {
+        orch = orch.with_activity_frames(orchestrator_source_log.clone(), poll_round_stale_secs);
         orch.configure_financial_log_paths(
             cfg.event_log_path.clone(),
             cfg.source_event_log_path.clone(),
@@ -1581,7 +1585,7 @@ async fn main() -> Result<()> {
     orch.resume_pending_before_producers()
         .await
         .context("resume decision_pending before source producers")?;
-    if cfg.polymarket_activity_ws_enabled {
+    if cfg.polymarket_activity_ws_enabled && financial_start.is_some() {
         orch.resume_activity_frames_before_producers(&boot_frame_prefix, &boot_frame_deliveries)
             .await
             .map_err(anyhow::Error::msg)

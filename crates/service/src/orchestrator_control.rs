@@ -57,6 +57,12 @@ pub enum OrchestratorControl {
         wallet: WalletAddress,
         captured: oneshot::Sender<Result<AdmissionLedgerCapture, String>>,
     },
+    /// Select frame authorities for only the transactions in an authenticated read.
+    CaptureFrameDecisionIds {
+        wallet: WalletAddress,
+        transactions: std::collections::HashSet<String>,
+        captured: oneshot::Sender<Vec<pe_core_types::SourceTradeId>>,
+    },
     /// Complete fixed-end reconciliation bucket. `#544 Lane E integration`:
     /// source routing closes obligations before sending this command.
     CommitActivityBucket {
@@ -106,7 +112,7 @@ pub enum OrchestratorControl {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FeedAuditAcknowledgement {
     Applied,
-    Superseded(AppendReceipt),
+    Superseded,
 }
 
 /// Additional audit and release variants extend this enum without a new channel.
