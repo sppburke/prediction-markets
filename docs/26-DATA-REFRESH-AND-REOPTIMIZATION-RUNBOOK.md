@@ -747,9 +747,10 @@ the digest; it refuses a record of another format, schema, path or hash. Candida
 content and receipts, payout coverage, projection count and classifier agreement still run.
 For a schema-two outgoing cache, the wrapper passes the newest accepted candidate-lane request.
 When that cycle's accepted activation installed exactly the outgoing fixed main at staging's H0,
-activation skips its activity-manifest verification; otherwise it runs in full. The outgoing
-projection digest is always recomputed from the same eight read-only readers while activation
-holds its write lock without writing (#675). Without the final-stage record, activation also
+activation skips its activity-manifest verification and the outgoing projection digest, checking
+only the stored projection summary's form, count and classifier; the H0 hash still binds the bytes.
+Otherwise both run in full, the digest recomputed from the same eight read-only readers while
+activation holds its write lock without writing (#675). Without the final-stage record, activation also
 recomputes the candidate's digest (#682).
 
 Before the bound corrected batch becomes current, restore that exact prior cache by its recorded
@@ -822,12 +823,15 @@ predecessor interval, using the [canonical quiet/due/deferred rule and constants
 Due complete wallets read incrementally; due `dormant_deferred` wallets read full history. Roots,
 new wallets, genuine exclusions and repairs never defer. Top-ups use the same rule, resume keeps
 the frozen list, and admission/completion logs report deferrals separately from failures.
+A pause lengthens the next collection's interval, so the collection after it also reads in full
+every deferred wallet whose instant fell in that interval — all of them once it reaches a week.
 
 Admission preserves activity rows, receipts and historical manifests, clears the derived projection
 and its recorded `ranker_projection_inputs_json` binding and invalidates finalization. Each successful
 wallet atomically re-stamps its verified predecessor rows, strictly inserts delta rows and commits complete-history counts/digest plus acquisition proof.
-The bounded carry batches use the existing wallet/time/ID index and advance by key; all batches stay
-in one wallet transaction. A full read replaces every retained row for that wallet, including an empty
+The carry verifies the predecessor rows through the shared decode pool (the certification read: same
+rows, order and bytes), then re-stamps them with one update whose change count must equal the receipt
+count, all in the wallet's transaction. A full read replaces every retained row for that wallet, including an empty
 replacement. Historical manifests in the mutated candidate are commitments, not physical snapshots.
 Keep staging evidence; activation preserves the old fixed bytes at `D` for eligible restoration.
 A resumed stage returns the original `H0`, leaves candidate progress intact, and never recaptures
@@ -948,7 +952,7 @@ completed selected head skips the collection invocation. Incomplete and unsealed
 collect; standalone Rust collection still certifies content. The wrapper always calls
 `--after-collection`, including after a skip, so freshness equality and the single-top-up allowance
 are unchanged. Activation still rejects corrupt receipts and nonprojected content before publication.
-If the completed initial head's age exceeds the
+If the completed initial head's age plus `candidate_top_up_reserve_hours` exceeds the
 publisher's unchanged `max_cache_staleness_hours`, the wrapper admits one linked top-up. Its persisted
 base link consumes that allowance across restarts; a stale top-up stops before ranking and never
 starts another. Actual trade/payout source times still govern preparation after downstream work.
@@ -1186,8 +1190,8 @@ retains its guarded opener and busy timeout, then applies the configured cache a
 through `WalletCache::apply_connection_tuning`, including on resume. Use this writer log to verify
 effective settings; a separate SQLite shell has its own connection-local settings. Per-wallet commits,
 `synchronous=FULL` and automatic checkpoint settings remain unchanged.
-Enable the `pe_bootstrap::cache_migration` debug log for wallet transaction elapsed time and advancing
-carry counts/batches. Record all of:
+Enable the `pe_bootstrap::cache_migration` debug log for wallet transaction elapsed time and carried
+row counts (`activity predecessor verified`). Record all of:
 
 - `/proc/<collector-pid>/io` read/write-byte deltas, device-counter deltas and elapsed time;
 - WAL peak space and checkpoint progress/time across completed wallet transactions, including the

@@ -10,7 +10,7 @@ import sys
 import tempfile
 import unittest
 
-from rank_cycle_manifest import _fresh_identity, candidate_targets
+from rank_cycle_manifest import TOP_UP_RESERVE_HOURS, _fresh_identity, candidate_targets
 import test_rank_and_push as wrapper_tests
 
 
@@ -92,6 +92,12 @@ class CandidateTargetsTest(unittest.TestCase):
         self.assertEqual(self.targets(), (3, 1, 0, 0, 1))
         self.assertEqual(self.targets(after_collection=True, now=100, max_staleness_hours=24),
                          (3, 1, 0, 0, 1))
+        # The used top-up is the last head: it proceeds while it can still pass the
+        # publisher, reserve or not, and is refused only once it cannot.
+        self.assertEqual(self.targets(after_collection=True, now=100 + 86400, max_staleness_hours=24),
+                         (3, 1, 0, 0, 1))
+        with self.assertRaisesRegex(ValueError, "activity top-up is stale"):
+            self.targets(after_collection=True, now=101 + 86400, max_staleness_hours=24)
         for head, message in ((identity(3, 1, version=3), "single top-up"),
                               (identity(2, None, version=3), "initial activity head")):
             with self.subTest(head=head):
@@ -128,7 +134,7 @@ class CandidateTargetsTest(unittest.TestCase):
     def test_each_fresh_admission_exclusion(self):
         mutations = (
             "INSERT INTO activity_groups_v2(source_trade_id) VALUES ('row')",
-            "INSERT INTO activity_wallet_coverage_staging_v2 VALUES (1)",
+            "INSERT INTO activity_wallet_coverage_staging_v2(generation) VALUES (1)",
             "INSERT INTO activity_coverage_manifests_v2(generation) VALUES (1)",
             "INSERT INTO cache_frozen_payload_verifications VALUES (1)",
             "INSERT INTO ranker_entries_v2 VALUES ('row')",
@@ -186,7 +192,7 @@ class CandidateTargetsTest(unittest.TestCase):
             c.executescript("""PRAGMA user_version=-2;
                 DROP INDEX idx_activity_groups_v2_source_trade_id;
                 INSERT INTO activity_groups_v2(source_trade_id) VALUES ('retained');
-                INSERT INTO activity_wallet_coverage_staging_v2 VALUES (1);""")
+                INSERT INTO activity_wallet_coverage_staging_v2(generation) VALUES (1);""")
             c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (identity(),))
         self.assertEqual(self.targets(), (1, 1, 0, 1, 0))
         with self.assertRaisesRegex(ValueError, "unfinished bulk root"):
@@ -207,7 +213,12 @@ class CandidateTargetsTest(unittest.TestCase):
         self.assertEqual(self.targets(), (1, 1, 1, 0, 1))
         self.assertEqual(self.targets(after_collection=True, now=100, max_staleness_hours=24), (1, 1, 1, 0, 1))
         self.assertEqual(self.targets(after_collection=True, now=90000, max_staleness_hours=24), (2, 1, 0, 0, 0))
-        self.assertEqual(self.targets(after_collection=True, now=86500, max_staleness_hours=24), (1, 1, 1, 0, 1))
+        # The initial head tops up once it cannot also cover the rest of the cycle.
+        reserve = TOP_UP_RESERVE_HOURS * 3600
+        self.assertEqual(self.targets(after_collection=True, now=100 + 86400 - reserve,
+                                      max_staleness_hours=24), (1, 1, 1, 0, 1))
+        self.assertEqual(self.targets(after_collection=True, now=101 + 86400 - reserve,
+                                      max_staleness_hours=24), (2, 1, 0, 0, 0))
         with sqlite3.connect(self.side) as c:
             c.execute("UPDATE activity_coverage_manifests_v2 SET reference_sha256=?", ("b" * 64,))
         self.assertEqual(self.targets(), (1, 1, 1, 0, 0))

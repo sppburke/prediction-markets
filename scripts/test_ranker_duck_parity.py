@@ -233,7 +233,7 @@ def build_certified_cache(db: str) -> tuple[list[dict], int, str]:
         "CREATE TABLE activity_coverage_manifests_v2 (generation INTEGER PRIMARY KEY, "
         "reference_sha256 TEXT, wallet_count INTEGER, receipt_set_digest TEXT, "
         "aggregate_digest TEXT, source_row_count INTEGER, cursors_json TEXT, page_hashes_json TEXT, "
-        "completed_at_unix INTEGER)"
+        "completed_at_unix INTEGER, group_count INTEGER)"
     )
     conn.execute(
         "CREATE TABLE clob_payout_coverage_manifests_v2 "
@@ -243,7 +243,7 @@ def build_certified_cache(db: str) -> tuple[list[dict], int, str]:
     conn.execute(
         "CREATE TABLE cache_v2_migration_state (singleton INTEGER PRIMARY KEY, "
         "phase TEXT, ranker_projection_count INTEGER, ranker_projection_digest TEXT, "
-        "ranker_classifier_version INTEGER)"
+        "ranker_classifier_version INTEGER, fresh_collection_json TEXT)"
     )
     gid = "g2:" + "a" * 64
     entry = ts(2026, 2, 5)
@@ -259,8 +259,8 @@ def build_certified_cache(db: str) -> tuple[list[dict], int, str]:
     )
     marker = json.dumps({"receipt_storage": "activity_wallet_coverage_staging_v2", "version": 1},
                         sort_keys=True, separators=(",", ":"))
-    conn.execute("INSERT INTO activity_coverage_manifests_v2 VALUES (?,?,?,?,?,?,?,?,?)",
-                 (7, "b" * 64, 1, "c" * 64, "d" * 64, 5, marker, "[]", entry))
+    conn.execute("INSERT INTO activity_coverage_manifests_v2 VALUES (?,?,?,?,?,?,?,?,?,?)",
+                 (7, "b" * 64, 1, "c" * 64, "d" * 64, 5, marker, "[]", entry, 5))
     conn.execute("INSERT INTO clob_payout_coverage_manifests_v2 VALUES (?,?,?,?,?)",
                  (8, "end_cursor", entry, "{}", "e" * 64))
     rows = [{
@@ -285,10 +285,14 @@ def build_certified_cache(db: str) -> tuple[list[dict], int, str]:
                      (row["source_trade_id"], 7, W("b"), "condition", row["asset"], 1,
                       "buy", "1.250000", "0.500000000000", "0.490000", entry))
     rows.sort(key=lambda row: row["source_trade_id"])
-    conn.execute("INSERT INTO cache_v2_migration_state VALUES (?,?,?,?,?)",
-                 (1, "finalized", len(rows), whole_projection_digest(rows), 1))
-    # Watermark-only columns and acquisition view; no receipt table is
-    # needed by either the watermark or the Parquet exporter.
+    conn.execute("INSERT INTO cache_v2_migration_state VALUES (?,?,?,?,?,?)",
+                 (1, "finalized", len(rows), whole_projection_digest(rows), 1, '{"generation":7}'))
+    # Watermark-only columns, receipts and acquisition view; the Parquet
+    # exporter needs none of them.
+    conn.execute("CREATE TABLE activity_wallet_coverage_staging_v2 (generation INTEGER, "
+                 "wallet_hex TEXT, aggregate_count INTEGER, PRIMARY KEY (generation, wallet_hex))")
+    conn.execute("INSERT INTO activity_wallet_coverage_staging_v2 VALUES (7, ?, 1), (7, ?, 4)",
+                 (W("a"), W("b")))
     conn.execute("CREATE VIEW active_tradeable_wallets AS SELECT DISTINCT wallet_hex FROM activity_groups_v2")
     conn.execute("ALTER TABLE activity_groups_v2 ADD COLUMN activity_type TEXT DEFAULT 'TRADE'")
     conn.execute("ALTER TABLE clob_payout_evidence_v2 ADD COLUMN coverage_generation INTEGER DEFAULT 8")
@@ -382,7 +386,7 @@ def assert_certified_full_incremental_equivalence(full: str, incremental: str) -
             with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as sqlite:
                 all_wallets = [row[0] for row in sqlite.execute("SELECT DISTINCT wallet_hex FROM activity_groups_v2")]
                 last = publisher._wallet_last_trade(sqlite, all_wallets)
-                newest = publisher._newest_trade_unix(sqlite)
+                newest = cycle.newest_trade_unix(sqlite)
             positions = pd.concat(ranker_duck.duck_extract_positions_v2(engine, wallets, 0, 2**62),
                                   ignore_index=True)
             engine.close()
@@ -474,6 +478,7 @@ class DuckParityTest(unittest.TestCase):
     def test_certified_subset_matches_full_export_through_publication(self):
         import latency_shift_rerank as latency
         import push_ranking_to_supabase as publisher
+        import rank_cycle_manifest
         from test_latency_shift_ref_oracle import FIXTURE_DDL
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -528,8 +533,8 @@ class DuckParityTest(unittest.TestCase):
                 conn.execute("UPDATE cache_v2_migration_state SET ranker_projection_digest=?",
                              (whole_projection_digest(rows),))
                 conn.execute("UPDATE clob_payout_coverage_manifests_v2 SET completed_at_unix=?", (now,))
-                conn.execute("ALTER TABLE activity_coverage_manifests_v2 ADD COLUMN group_count INTEGER")
                 conn.execute("UPDATE activity_coverage_manifests_v2 SET group_count=7")
+                conn.execute("UPDATE activity_wallet_coverage_staging_v2 SET aggregate_count = aggregate_count + 1")
 
             # Authentic version-one reference: SELECT * for every table, with
             # the original manifest shape. Never use the narrowed export helper.
@@ -621,7 +626,7 @@ class DuckParityTest(unittest.TestCase):
             self.assertEqual({r["wallet_hex"]: r["last_trade_unix"] for r in results[0][1]},
                              {W("a"): now - 10, W("b"): now - 11})
             with sqlite3.connect(db) as conn:
-                self.assertEqual(publisher._newest_trade_unix(conn), now - 10)
+                self.assertEqual(rank_cycle_manifest.newest_trade_unix(conn), now - 10)
             # The universe is the certified projection's wallets under either
             # export shape; full history's uncertified wallets, even one that
             # sorts first, never enter it.

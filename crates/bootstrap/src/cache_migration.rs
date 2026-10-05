@@ -5,7 +5,7 @@
 //! unions the generations. This makes a cross-generation ranking/state read a
 //! schema/API error instead of a filter callers can forget.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::future::Future;
 use std::io::{Read as _, Write as _};
@@ -1606,19 +1606,36 @@ async fn collect_activity_v2(
     let writer = std::thread::Builder::new()
         .name("activity-cache-writer".to_owned())
         .spawn(move || {
-            while let Some(completion) = receiver.blocking_recv() {
-                if let Err(error) = commit_activity_wallet_v2(
-                    &mut connection,
-                    generation,
-                    &writer_reference,
-                    fixed_end_unix,
-                    completed_at_unix,
-                    &completion,
-                    writer_proof.as_ref(),
-                ) {
-                    let _ = writer_error.set(error);
-                    break;
+            // One decode pool serves every carried wallet of this collection. A
+            // commit failure is recorded where it happens, before the pool stops.
+            let pool = aggregate_scan::scoped(|scan| {
+                while let Some(completion) = receiver.blocking_recv() {
+                    let committed = match writer_proof.as_ref() {
+                        Some(proof) => commit_incremental_wallet(
+                            scan,
+                            &mut connection,
+                            proof,
+                            completed_at_unix,
+                            &completion,
+                        ),
+                        None => commit_activity_wallet_v2(
+                            &mut connection,
+                            generation,
+                            &writer_reference,
+                            fixed_end_unix,
+                            completed_at_unix,
+                            &completion,
+                        ),
+                    };
+                    if let Err(error) = committed {
+                        let _ = writer_error.set(error);
+                        break;
+                    }
                 }
+                Ok(())
+            });
+            if let Err(error) = pool {
+                let _ = writer_error.set(error);
             }
             // Free any queued completions before signalling, so the collector's
             // synchronous join never waits on their destruction.
@@ -1776,7 +1793,9 @@ pub fn commit_activity_batch_for_test(
         aggregation_status: AggregationStatus::Complete,
         exclusion_reason: None,
     };
-    commit_incremental_wallet(connection, &proof, 0, &completion)
+    aggregate_scan::scoped(|scan| {
+        commit_incremental_wallet(scan, connection, &proof, 0, &completion)
+    })
 }
 
 // A source read that exhausted the fetcher's transient retries, or that the
@@ -2189,17 +2208,23 @@ impl ActivityValidation {
         mut retain: impl FnMut(ActivityAggregate),
     ) -> Result<(), BootstrapError> {
         let mut wallet = WalletCommitments::new(receipt, &mut self.aggregates);
-        let unserializable = scan.for_each(
-            connection,
-            generation,
-            &receipt.wallet_hex,
-            |aggregate, json| {
-                wallet.push(&aggregate, json);
-                retain(aggregate);
-                Ok(())
-            },
-        )?;
-        wallet.hold(unserializable);
+        // A receipt without aggregates (an exclusion or a deferred quiet wallet)
+        // owns no row of this generation. Its retained history is older, and the
+        // generation's row count, checked against the receipts' total, proves no
+        // unreceipted row exists; walking that history would read it all to find none.
+        if receipt.aggregate_count > 0 {
+            let unserializable = scan.for_each(
+                connection,
+                generation,
+                &receipt.wallet_hex,
+                |aggregate, json| {
+                    wallet.push(&aggregate, json);
+                    retain(aggregate);
+                    Ok(())
+                },
+            )?;
+            wallet.hold(unserializable);
+        }
         let source_rows = wallet.finish()?;
         self.record(receipt, source_rows)
     }
@@ -2361,11 +2386,7 @@ fn commit_activity_wallet_v2(
     fixed_end_unix: i64,
     completed_at_unix: i64,
     completion: &WalletActivityCompletion,
-    proof: Option<&CollectionProof>,
 ) -> Result<(), BootstrapError> {
-    if let Some(proof) = proof {
-        return commit_incremental_wallet(connection, proof, completed_at_unix, completion);
-    }
     let generation_i64 = to_i64(generation, "activity generation")?;
     let aggregate_count =
         u64::try_from(completion.aggregates.len()).map_err(|_| BootstrapError::Invalid {
@@ -2687,21 +2708,38 @@ fn validate_activity_staging_with(
     {
         return invalid("activity coverage is missing frozen wallets".to_owned());
     }
+    check_generation_rows(
+        connection,
+        generation_i64,
+        generation_rows,
+        validation.group_count,
+    )?;
+    Ok(validation.finish())
+}
+
+/// Equal totals prove every row of the generation belongs to a receipt, which
+/// is what lets `ActivityValidation::visit` skip receipts without aggregates.
+fn check_generation_rows(
+    connection: &Connection,
+    generation: i64,
+    generation_rows: Option<u64>,
+    receipted: u64,
+) -> Result<(), BootstrapError> {
     let actual = match generation_rows {
         Some(count) => count,
         None => {
             let count: i64 = connection.query_row(
                 "SELECT COUNT(*) FROM activity_groups_v2 WHERE coverage_generation = ?1",
-                params![generation_i64],
+                params![generation],
                 |row| row.get(0),
             )?;
             to_u64(count, "generation rows")?
         }
     };
-    if actual != validation.group_count {
+    if actual != receipted {
         return invalid("activity generation contains unreceipted rows".to_owned());
     }
-    Ok(validation.finish())
+    Ok(())
 }
 
 type StoredActivityRow = (
@@ -2986,6 +3024,12 @@ fn verify_activity_manifest_with(
             }
             visit(&mut validation, &receipt)?;
         }
+        check_generation_rows(
+            connection,
+            to_i64(manifest.generation, "activity generation")?,
+            generation_rows,
+            validation.group_count,
+        )?;
         validation.finish()
     };
     if manifest.receipt_set_digest != validated.receipt_set_digest {
@@ -3354,7 +3398,10 @@ fn classify_loaded_wallet(
     let wallet = WalletAddress::from_hex(wallet_hex).map_err(|error| BootstrapError::Invalid {
         message: format!("frozen universe contains invalid wallet {wallet_hex}: {error}"),
     })?;
-    let mut ledger = PositionLedger::new();
+    // Classification and application read and write only the keys a second
+    // touches, so each second runs against those balances alone; cloning the
+    // wallet's whole map every second is quadratic in its history.
+    let mut positions = HashMap::new();
     let mut history = HashSet::<String>::new();
     let mut admitted_ids = Vec::new();
     for aggregates in aggregates.chunk_by(|a, b| a.source_time == b.source_time) {
@@ -3372,6 +3419,17 @@ fn classify_loaded_wallet(
         {
             break;
         }
+        let keys = mutations
+            .iter()
+            .flat_map(LedgerMutation::touched_keys)
+            .collect::<HashSet<_>>();
+        let mut ledger = PositionLedger::new();
+        ledger.replace_wallet_snapshot(
+            wallet,
+            keys.iter()
+                .filter_map(|key| positions.get(key).map(|state| (key.clone(), *state)))
+                .collect(),
+        );
         let (decisions, first_entries) = match classify_complete_historical_second(
             &ledger,
             wallet,
@@ -3410,6 +3468,14 @@ fn classify_loaded_wallet(
         }
         if ledger.apply_all_or_none(&mutations).is_err() {
             break;
+        }
+        if let Some(snapshot) = ledger.position(&wallet) {
+            positions.extend(
+                snapshot
+                    .positions
+                    .iter()
+                    .map(|(key, state)| (key.clone(), *state)),
+            );
         }
         // Only a first entry consumes its market's history; sells, splits, merges
         // and redemptions do not (docs/_GLOSSARY.md).
@@ -4565,8 +4631,8 @@ fn activate_two_file_cycle(
             }
             let mut current = open_existing_rw(fixed)?;
             checkpoint_truncate(&current)?;
-            // An accepted activation already verified the activity at H0; the
-            // H0 comparison below binds that proof to these bytes (#692).
+            // An accepted activation already verified the activity and the projection
+            // digest at H0; the H0 comparison below binds that proof to these bytes (#692).
             let activity_proven = evidence.source_schema == CACHE_SCHEMA_VERSION_V2
                 && installed_by(installed_request, fixed, &evidence.source_sha256)?;
             match evidence.source_schema {
@@ -4579,7 +4645,11 @@ fn activate_two_file_cycle(
                     verify_finalized_v2_manifests(
                         &hold,
                         ClassifierGeneration::Historical,
-                        ProjectionDigest::Committed(fixed),
+                        if activity_proven {
+                            ProjectionDigest::Installed
+                        } else {
+                            ProjectionDigest::Committed(fixed)
+                        },
                         activity_proven,
                     )?;
                     hold.rollback()?;
@@ -5313,6 +5383,9 @@ enum ProjectionDigest<'a> {
     /// Recompute it from readers on their own connections to this file; the
     /// caller holds the write lock and has written nothing.
     Committed(&'a Path),
+    /// An accepted activation installed exactly these bytes after proving their
+    /// digest; only the stored summary is checked.
+    Installed,
 }
 
 /// The finalization record proving an activation candidate's projection digest.
@@ -5414,6 +5487,15 @@ fn verify_finalized_v2_manifests(
                 && u64::try_from(actual_projection_count).ok()
                     == Some(record.ranker_projection_count)
                 && classifier_version == Some(i64::from(record.ranker_classifier_version))
+        }
+        ProjectionDigest::Installed => {
+            let stored = projection_digest
+                .as_deref()
+                .ok_or_else(|| BootstrapError::Invalid {
+                    message: "installed cache omitted its ranker projection digest".to_owned(),
+                })?;
+            validate_hex_sha256(stored, "stored ranker projection digest")?;
+            true
         }
     };
     let classifier_matches = match generation {

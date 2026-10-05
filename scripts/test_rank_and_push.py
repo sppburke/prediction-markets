@@ -937,7 +937,10 @@ class RankAndPushScenario(unittest.TestCase):
                     generation INTEGER PRIMARY KEY, cursors_json TEXT,
                     completed_at_unix INTEGER, reference_sha256 TEXT,
                     wallet_count INTEGER, receipt_set_digest TEXT,
-                    aggregate_digest TEXT, source_row_count INTEGER
+                    aggregate_digest TEXT, source_row_count INTEGER, group_count INTEGER
+                );
+                CREATE TABLE activity_wallet_coverage_staging_v2 (
+                    generation INTEGER, wallet_hex TEXT, aggregate_count INTEGER
                 );
                 CREATE TABLE activity_groups_v2 (
                     wallet_hex TEXT, source_time_unix INTEGER, activity_type TEXT,
@@ -953,11 +956,13 @@ class RankAndPushScenario(unittest.TestCase):
                 );
                 CREATE TABLE cache_v2_migration_state (
                     singleton INTEGER PRIMARY KEY, ranker_projection_count INTEGER,
-                    ranker_projection_digest TEXT, ranker_classifier_version INTEGER
+                    ranker_projection_digest TEXT, ranker_classifier_version INTEGER,
+                    phase TEXT, fresh_collection_json TEXT
                 );
                 INSERT INTO wallets VALUES ('0xabc', 1, 0);
-                INSERT INTO activity_coverage_manifests_v2 (generation, cursors_json, completed_at_unix, reference_sha256, wallet_count, receipt_set_digest, aggregate_digest, source_row_count) VALUES
-                    (1, '{"0xabc":10}', 20, 'aa', 1, 'bb', 'cc', 2);
+                INSERT INTO activity_coverage_manifests_v2 (generation, cursors_json, completed_at_unix, reference_sha256, wallet_count, receipt_set_digest, aggregate_digest, source_row_count, group_count) VALUES
+                    (1, '{"0xabc":10}', 20, 'aa', 1, 'bb', 'cc', 2, 2);
+                INSERT INTO activity_wallet_coverage_staging_v2 VALUES (1, '0xabc', 2);
                 INSERT INTO activity_groups_v2 VALUES ('0xabc', 10, 'TRADE', 1);
                 INSERT INTO activity_groups_v2 VALUES ('0xignored', 99, 'TRADE', 2);
                 INSERT INTO activity_groups_v2 VALUES ('0xabc', 98, 'REDEEM', 1);
@@ -965,7 +970,7 @@ class RankAndPushScenario(unittest.TestCase):
                     (3, 'end_cursor', 30, '{}', 'dd');
                 INSERT INTO clob_payout_evidence_v2 VALUES (3, 29);
                 INSERT INTO clob_payout_evidence_v2 VALUES (2, 97);
-                INSERT INTO cache_v2_migration_state VALUES (1, 1, 'ee', 1);
+                INSERT INTO cache_v2_migration_state VALUES (1, 1, 'ee', 1, 'finalized', '{"generation":1}');
                 """
             )
 
@@ -994,6 +999,25 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertEqual(manifest["source_watermark"]["resolution"]["generation"], 3)
         self.assertEqual(manifest["source_watermark"]["resolution"]["count"], 1)
         self.assertEqual(manifest["source_watermark"]["resolution"]["newest_fetch_unix"], 29)
+        # Only a finalized fresh identity of the latest generation reuses the
+        # manifest's count. A successor's identity, an unfinalized phase or no fresh
+        # identity at all counts the rows, whose carry may have moved them.
+        with sqlite3.connect(db) as connection:
+            connection.execute("UPDATE activity_coverage_manifests_v2 SET group_count = 5")
+        for phase, identity in (("finalized", '{"generation":2}'), ("schema_sealed", '{"generation":1}'),
+                                ("finalized", None)):
+            with self.subTest(phase=phase, identity=identity):
+                with sqlite3.connect(db) as connection:
+                    connection.execute("UPDATE cache_v2_migration_state SET phase = ?, fresh_collection_json = ?",
+                                       (phase, identity))
+                counted = rank_cycle_manifest.snapshot(db, "2026-09-15", {}, {"top_n": "200"})
+                self.assertEqual(counted["source_watermark"]["activity"]["count"], 2)
+        # A cache finalized before #588 has no identity column and keeps counting.
+        with sqlite3.connect(db) as connection:
+            connection.execute("UPDATE cache_v2_migration_state SET phase = 'finalized'")
+            connection.execute("ALTER TABLE cache_v2_migration_state DROP COLUMN fresh_collection_json")
+        historical = rank_cycle_manifest.snapshot(db, "2026-09-15", {}, {"top_n": "200"})
+        self.assertEqual(historical["source_watermark"]["activity"]["count"], 2)
         self.assertEqual(
             manifest["source_watermark"]["resolution"]["terminal_page_sha256"], "dd"
         )
@@ -1161,7 +1185,10 @@ class RankAndPushScenario(unittest.TestCase):
                 CREATE TABLE activity_coverage_manifests_v2 (
                     generation INTEGER PRIMARY KEY, cursors_json TEXT, completed_at_unix INTEGER,
                     reference_sha256 TEXT, wallet_count INTEGER, receipt_set_digest TEXT,
-                    aggregate_digest TEXT, source_row_count INTEGER, collection_identity_json TEXT);
+                    aggregate_digest TEXT, source_row_count INTEGER, collection_identity_json TEXT,
+                    group_count INTEGER);
+                CREATE TABLE activity_wallet_coverage_staging_v2 (
+                    generation INTEGER, wallet_hex TEXT, aggregate_count INTEGER);
                 CREATE TABLE activity_groups_v2 (
                     wallet_hex TEXT, source_time_unix INTEGER, activity_type TEXT,
                     coverage_generation INTEGER);
@@ -1172,15 +1199,17 @@ class RankAndPushScenario(unittest.TestCase):
                     coverage_generation INTEGER, fetched_at_unix INTEGER);
                 CREATE TABLE cache_v2_migration_state (
                     singleton INTEGER PRIMARY KEY, ranker_projection_count INTEGER,
-                    ranker_projection_digest TEXT, ranker_classifier_version INTEGER);
+                    ranker_projection_digest TEXT, ranker_classifier_version INTEGER,
+                    phase TEXT, fresh_collection_json TEXT);
                 INSERT INTO wallets VALUES ('0xabc', 1, 0);
-                INSERT INTO activity_coverage_manifests_v2 (generation, cursors_json, completed_at_unix, reference_sha256, wallet_count, receipt_set_digest, aggregate_digest, source_row_count) VALUES
-                    (1, '[]', 20, 'aa', 1, 'bb', 'cc', 1);
+                INSERT INTO activity_coverage_manifests_v2 (generation, cursors_json, completed_at_unix, reference_sha256, wallet_count, receipt_set_digest, aggregate_digest, source_row_count, group_count) VALUES
+                    (1, '[]', 20, 'aa', 1, 'bb', 'cc', 1, 1);
+                INSERT INTO activity_wallet_coverage_staging_v2 VALUES (1, '0xabc', 1);
                 INSERT INTO activity_groups_v2 VALUES ('0xabc', 10, 'TRADE', 1);
                 INSERT INTO clob_payout_coverage_manifests_v2 VALUES
                     (1, 'end_cursor', 30, '{}', 'dd');
                 INSERT INTO clob_payout_evidence_v2 VALUES (1, 29);
-                INSERT INTO cache_v2_migration_state VALUES (1, 1, 'ee', 1);
+                INSERT INTO cache_v2_migration_state VALUES (1, 1, 'ee', 1, 'finalized', '{"generation":1}');
                 """
             )
         stage = self.root / "data" / "cache-stage.json"
@@ -1617,7 +1646,8 @@ class RankAndPushScenario(unittest.TestCase):
         CREATE TABLE IF NOT EXISTS activity_coverage_manifests_v2 (
             generation INTEGER PRIMARY KEY, cursors_json TEXT, completed_at_unix INTEGER,
             reference_sha256 TEXT, wallet_count INTEGER, receipt_set_digest TEXT,
-            aggregate_digest TEXT, source_row_count INTEGER, collection_identity_json TEXT);
+            aggregate_digest TEXT, source_row_count INTEGER, collection_identity_json TEXT,
+            group_count INTEGER);
         CREATE TABLE IF NOT EXISTS activity_groups_v2 (
             wallet_hex TEXT, source_time_unix INTEGER, activity_type TEXT,
             coverage_generation INTEGER, source_trade_id TEXT);
@@ -1635,7 +1665,8 @@ class RankAndPushScenario(unittest.TestCase):
             ranker_projection_inputs_json TEXT);
         CREATE UNIQUE INDEX IF NOT EXISTS idx_activity_groups_v2_source_trade_id
             ON activity_groups_v2(source_trade_id);
-        CREATE TABLE IF NOT EXISTS activity_wallet_coverage_staging_v2 (generation INTEGER);
+        CREATE TABLE IF NOT EXISTS activity_wallet_coverage_staging_v2 (
+            generation INTEGER, wallet_hex TEXT, aggregate_count INTEGER);
         CREATE TABLE IF NOT EXISTS cache_frozen_payload_verifications (activity_generation INTEGER);
         CREATE TABLE IF NOT EXISTS ranker_entries_v2 (source_trade_id TEXT);
     """
@@ -1657,8 +1688,9 @@ class RankAndPushScenario(unittest.TestCase):
                     """
                     PRAGMA user_version = 2;
                     DROP TABLE trades; DROP TABLE market_resolutions; DROP TABLE source_cursor;
-                    INSERT INTO activity_coverage_manifests_v2 (generation, cursors_json, completed_at_unix, reference_sha256, wallet_count, receipt_set_digest, aggregate_digest, source_row_count) VALUES
-                        (1, '[]', 20, 'fresh-1', 1, 'bb', 'cc', 1);
+                    INSERT INTO activity_coverage_manifests_v2 (generation, cursors_json, completed_at_unix, reference_sha256, wallet_count, receipt_set_digest, aggregate_digest, source_row_count, group_count) VALUES
+                        (1, '[]', 20, 'fresh-1', 1, 'bb', 'cc', 1, 1);
+                    INSERT INTO activity_wallet_coverage_staging_v2 VALUES (1, '0xabc', 1);
                     INSERT INTO activity_groups_v2 (wallet_hex, source_time_unix, activity_type, coverage_generation) VALUES ('0xabc', 10, 'TRADE', 1);
                     INSERT INTO clob_payout_coverage_manifests_v2 VALUES
                         (1, 'end_cursor', 30, '{}', 'dd');
@@ -1740,7 +1772,8 @@ class RankAndPushScenario(unittest.TestCase):
             "                recorded = {'version': 2, 'generation': 1, 'fixed_end_unix': now - int(os.environ.get('STUB_PRIOR_AGE', '100000')), 'wallets': ['0xabc'], 'base_generation': None, 'base_manifest_sha256': None, 'start_exclusive': 0, 'full_read_wallets': ['0xabc']}\n"
             "                recorded['digest'] = hashlib.sha256(json.dumps(recorded, sort_keys=True, separators=(',', ':')).encode()).hexdigest()\n"
             "                c.execute('INSERT INTO activity_groups_v2 (wallet_hex, source_time_unix, activity_type, coverage_generation) VALUES (?, ?, ?, ?)', ('0xabc', recorded['fixed_end_unix'], 'TRADE', 1))\n"
-            "                c.execute('INSERT INTO activity_coverage_manifests_v2 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', (1, '{}', now, recorded['digest'], 1, 'bb', 'cc', 1, json.dumps(recorded)))\n"
+            "                c.execute('INSERT INTO activity_coverage_manifests_v2 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', (1, '{}', now, recorded['digest'], 1, 'bb', 'cc', 1, json.dumps(recorded), 1))\n"
+            "                c.execute('INSERT INTO activity_wallet_coverage_staging_v2 VALUES (1, ?, 1)', ('0xabc',))\n"
             "                c.execute('INSERT OR IGNORE INTO cache_v2_migration_state (singleton, ranker_projection_count, ranker_projection_digest, ranker_classifier_version, fresh_collection_json) VALUES (1, NULL, NULL, NULL, NULL)')\n"
             "                c.execute('UPDATE cache_v2_migration_state SET fresh_collection_json = ?', (json.dumps(recorded),))\n"
             "    shutil.copyfile(prior, side)\n"
@@ -1777,7 +1810,9 @@ class RankAndPushScenario(unittest.TestCase):
             "        if not c.execute('SELECT 1 FROM activity_coverage_manifests_v2 WHERE generation = ?', (generation,)).fetchone():\n"
             "            c.execute('UPDATE activity_groups_v2 SET coverage_generation = ?', (generation,))\n"
             "            c.execute('INSERT INTO activity_groups_v2 (wallet_hex, source_time_unix, activity_type, coverage_generation) VALUES (?, ?, ?, ?)', ('0xabc', recorded['fixed_end_unix'], 'TRADE', generation))\n"
-            "            c.execute('INSERT INTO activity_coverage_manifests_v2 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', (generation, '{}', now, recorded['digest'], 1, 'bb', 'cc', 1, json.dumps(recorded)))\n"
+            "            rows = c.execute('SELECT COUNT(*) FROM activity_groups_v2 WHERE coverage_generation = ?', (generation,)).fetchone()[0]\n"
+            "            c.execute('INSERT INTO activity_coverage_manifests_v2 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', (generation, '{}', now, recorded['digest'], 1, 'bb', 'cc', 1, json.dumps(recorded), rows))\n"
+            "            c.execute('INSERT INTO activity_wallet_coverage_staging_v2 VALUES (?, ?, ?)', (generation, '0xabc', rows))\n"
             "        if '--bulk-root' in a:\n"
             "            c.execute('CREATE UNIQUE INDEX idx_activity_groups_v2_source_trade_id ON activity_groups_v2(source_trade_id)')\n"
             "            c.execute('PRAGMA user_version = 2')\n"
@@ -1793,7 +1828,9 @@ class RankAndPushScenario(unittest.TestCase):
             "elif sub == 'cache-finalize-v2':\n"
             "    with sqlite3.connect(db) as c:\n"
             "        generation = json.loads(c.execute('SELECT fresh_collection_json FROM cache_v2_migration_state').fetchone()[0])['generation']\n"
-            "        c.execute('INSERT OR IGNORE INTO activity_coverage_manifests_v2 (generation, cursors_json, completed_at_unix, reference_sha256, wallet_count, receipt_set_digest, aggregate_digest, source_row_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?)', (generation, '[]', now, f'fresh-{generation}', 1, 'bb', 'cc', 1))\n"
+            "        rows = c.execute('SELECT COUNT(*) FROM activity_groups_v2 WHERE coverage_generation = ?', (generation,)).fetchone()[0]\n"
+            "        if c.execute('INSERT OR IGNORE INTO activity_coverage_manifests_v2 (generation, cursors_json, completed_at_unix, reference_sha256, wallet_count, receipt_set_digest, aggregate_digest, source_row_count, group_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', (generation, '[]', now, f'fresh-{generation}', 1, 'bb', 'cc', 1, rows)).rowcount:\n"
+            "            c.execute('INSERT INTO activity_wallet_coverage_staging_v2 VALUES (?, ?, ?)', (generation, '0xabc', rows))\n"
             "        c.execute('UPDATE cache_v2_migration_state SET ranker_projection_count = 1, ranker_projection_digest = ?, ranker_classifier_version = 2', (f'digest-{generation}',))\n"
             "    if opt('--stage-record'): json.dump({'cache_path': os.path.abspath(db), 'cache_sha256': sha(db)}, open(opt('--stage-record'), 'w'))\n"
             "elif sub == 'cache-activate':\n"

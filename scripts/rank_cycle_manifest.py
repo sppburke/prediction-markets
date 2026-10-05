@@ -15,11 +15,56 @@ from latency_shift_rerank import ORACLE_VERSION
 from partial_backfill_wallets import partial_backfill_wallets
 
 MANIFEST_VERSION = 1
+# Payout, finalize, export, both ranking passes and re-finalize after a completed
+# collection; a head that cannot also cover them takes the cycle's one top-up
+# (`candidate_top_up_reserve_hours` in docs/_GLOSSARY.md).
+TOP_UP_RESERVE_HOURS = 7
 
 
 def _one(connection: sqlite3.Connection, query: str, args=()):
     row = connection.execute(query, args).fetchone()
     return None if row is None else row[0]
+
+
+# A wallet's newest trade in the latest completed activity generation: one
+# descending walk of `idx_activity_groups_v2_wallet_time` that stops at the
+# first match instead of reading the wallet's history.
+WALLET_NEWEST_TRADE_V2 = (
+    "SELECT g.source_time_unix FROM activity_groups_v2 g "
+    "WHERE g.wallet_hex = {wallet} AND g.activity_type = 'TRADE' "
+    "AND g.coverage_generation = (SELECT MAX(generation) FROM activity_coverage_manifests_v2) "
+    "ORDER BY g.source_time_unix DESC LIMIT 1"
+)
+
+
+def newest_trade_unix(connection: sqlite3.Connection) -> int | None:
+    """The cache's newest trade, the watermark the publisher's freshness gate reads.
+
+    Schema one reads ``trades``. Schema two reads only ``TRADE`` groups of its
+    latest completed generation (#544). Certification admits that generation's
+    rows only under its wallet receipts with aggregates, so the newest of those
+    wallets' newest trades is the generation's newest trade. Receipts are
+    retained in the staging table, or embedded in an authentic legacy manifest.
+    """
+    schema = int(_one(connection, "PRAGMA user_version") or 0)
+    if schema == -2:
+        raise ValueError("unfinished bulk root (schema -2); resume cache-populate-activity-v2 --bulk-root before any other command")
+    if schema >= 2:
+        value = _one(
+            connection,
+            "WITH latest AS (SELECT generation, cursors_json FROM activity_coverage_manifests_v2 "
+            "ORDER BY generation DESC LIMIT 1), "
+            "wallets(wallet_hex) AS ("
+            "SELECT r.wallet_hex FROM activity_wallet_coverage_staging_v2 r, latest "
+            "WHERE r.generation = latest.generation AND r.aggregate_count > 0 "
+            "UNION ALL SELECT json_extract(e.value, '$.wallet_hex') FROM latest, json_each(latest.cursors_json) e "
+            "WHERE json_type(latest.cursors_json) = 'array' "
+            "AND json_extract(e.value, '$.aggregate_count') > 0) "
+            "SELECT MAX((" + WALLET_NEWEST_TRADE_V2.format(wallet="wallets.wallet_hex") + ")) FROM wallets",
+        )
+    else:
+        value = _one(connection, "SELECT MAX(timestamp_unix) FROM trades")
+    return None if value is None else int(value)
 
 
 def _wallet_universe(connection: sqlite3.Connection) -> dict:
@@ -54,19 +99,32 @@ def snapshot(db_path: Path, day_utc: str, versions: dict, configuration: dict) -
                 connection,
                 "SELECT MAX(generation) FROM clob_payout_coverage_manifests_v2",
             )
-            # One pass over the generation instead of two: at the cutover's scale
-            # each full scan of the activity table is roughly half an hour, and
-            # this snapshot runs inside the publication freshness window (#588).
-            activity_count, activity_newest = connection.execute(
-                "SELECT COUNT(*), MAX(CASE WHEN activity_type = 'TRADE' "
-                "THEN source_time_unix END) "
-                "FROM activity_groups_v2 WHERE coverage_generation = ?",
+            # This snapshot runs inside the publication freshness window (#588).
+            # Finalize certified the latest generation's row count as its
+            # manifest's group count. A finalized fresh identity of that generation
+            # proves no row has moved since: fresh admission clears `finalized`
+            # before any carry, and the frozen collector refuses a fresh identity.
+            # Any other cache, including one from before #588 without the identity
+            # column, counts its rows; the newest trade is read per wallet.
+            certified = any(
+                row[1] == "fresh_collection_json"
+                for row in connection.execute("PRAGMA table_info(cache_v2_migration_state)")
+            ) and _one(
+                connection,
+                "SELECT phase = 'finalized' AND json_extract(fresh_collection_json, '$.generation') = ? "
+                "FROM cache_v2_migration_state WHERE singleton = 1",
                 (activity_generation,),
-            ).fetchone()
+            )
             activity = {
                 "generation": activity_generation,
-                "count": activity_count,
-                "newest_source_unix": activity_newest,
+                "count": _one(
+                    connection,
+                    "SELECT group_count FROM activity_coverage_manifests_v2 WHERE generation = ?"
+                    if certified
+                    else "SELECT COUNT(*) FROM activity_groups_v2 WHERE coverage_generation = ?",
+                    (activity_generation,),
+                ),
+                "newest_source_unix": newest_trade_unix(connection),
                 "cursor": _one(
                     connection,
                     "SELECT cursors_json FROM activity_coverage_manifests_v2 "
@@ -168,9 +226,7 @@ def snapshot(db_path: Path, day_utc: str, versions: dict, configuration: dict) -
             activity = {
                 "generation": 1,
                 "count": _one(connection, "SELECT COUNT(*) FROM trades"),
-                "newest_source_unix": _one(
-                    connection, "SELECT MAX(timestamp_unix) FROM trades"
-                ),
+                "newest_source_unix": newest_trade_unix(connection),
                 "cursor": None,
             }
             cursor = connection.execute(
@@ -506,9 +562,11 @@ def candidate_targets(prior_path: Path | None, side_path: Path, *, after_collect
             age = now - head["fixed_end_unix"]
             if age < 0:
                 raise ValueError("activity head fixed end is in the future")
-            if age > max_staleness_hours * 3600:
-                if top_up_used:
+            if top_up_used:
+                # The last allowed head proceeds while it can still pass the publisher.
+                if age > max_staleness_hours * 3600:
                     raise ValueError("activity top-up is stale; preserve the cycle, no second top-up is permitted")
+            elif age + TOP_UP_RESERVE_HOURS * 3600 > max_staleness_hours * 3600:
                 generation = initial + 1
         return targets(generation)
 

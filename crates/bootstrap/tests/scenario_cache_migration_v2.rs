@@ -2449,7 +2449,8 @@ async fn refinalization_takes_the_write_lock_before_verifying_the_committed_proj
 }
 
 /// PASS: a two-file activation whose outgoing schema-two cache is still at F
-/// skips activity content only when an accepted request binds its staged H0.
+/// skips activity content and the projection digest only when an accepted
+/// request binds its staged H0.
 #[tokio::test]
 async fn accepted_outgoing_activity_skips_verification_but_h0_still_binds_activation() {
     use pe_bootstrap::cache_migration::{cache_stage_evidence_path, stage_cache_cycle_v2};
@@ -2467,15 +2468,17 @@ async fn accepted_outgoing_activity_skips_verification_but_h0_still_binds_activa
         .unwrap();
         let pristine = dir.path().join("pristine.db");
         std::fs::copy(&fixed, &pristine).unwrap();
-        let connection = Connection::open(&fixed).unwrap();
-        connection
-            .execute(
+        assert!(count(&fixed, "SELECT COUNT(*) FROM ranker_entries_v2") > 0);
+        // Content and projection changes the accepted activation's digests never saw.
+        Connection::open(&fixed)
+            .unwrap()
+            .execute_batch(
                 "UPDATE activity_groups_v2 SET share_amount_str = '9.000001'
-             WHERE wallet_hex = '0x2222222222222222222222222222222222222222'",
-                [],
+             WHERE wallet_hex = '0x2222222222222222222222222222222222222222';
+             UPDATE ranker_entries_v2 SET source_trade_id = 'g2:' || printf('%064d', 0)
+             WHERE source_trade_id = (SELECT MIN(source_trade_id) FROM ranker_entries_v2);",
             )
             .unwrap();
-        drop(connection);
         let h0 = sha256_file(&fixed).unwrap();
         let accepted_cycle = "cron-20260923T000000Z";
         let accepted = dir.path().join(accepted_cycle);
@@ -7179,6 +7182,14 @@ async fn retained_receipts_and_legacy_manifests_fail_closed_on_corruption() {
              WHERE wallet_hex = '0x2222222222222222222222222222222222222222'",
         ),
         (
+            "stray",
+            "CREATE TEMP TABLE stray AS SELECT * FROM activity_groups_v2
+                 WHERE rowid = (SELECT MIN(rowid) FROM activity_groups_v2);
+             UPDATE stray SET wallet_hex = '0x5555555555555555555555555555555555555555',
+                              source_trade_id = 'g2:' || printf('%064d', 7);
+             INSERT INTO activity_groups_v2 SELECT * FROM stray;",
+        ),
+        (
             "count",
             "UPDATE activity_groups_v2 SET row_count = row_count + 1",
         ),
@@ -7196,6 +7207,7 @@ async fn retained_receipts_and_legacy_manifests_fail_closed_on_corruption() {
                     "amount",
                     "unprojected_amount",
                     "unprojected_delete",
+                    "stray",
                     "count",
                     "aggregate_digest",
                 ]
@@ -8806,8 +8818,7 @@ async fn incremental_wallet_and_manifest_transactions_roll_back_at_every_write_b
 }
 
 #[tokio::test]
-async fn incremental_carry_uses_advancing_wallet_index_and_preserves_rowids_across_integer_widths()
-{
+async fn incremental_carry_uses_the_wallet_index_and_preserves_rowids_across_integer_widths() {
     let dir = TempDir::new().unwrap();
     let side = dataset_candidate(&dir, "carry-progress.db", &[WALLET_B]);
     let mut source = DatasetFetcher::default();
@@ -8839,9 +8850,11 @@ async fn incremental_carry_uses_advancing_wallet_index_and_preserves_rowids_acro
         CREATE TABLE carry_updates(source_trade_id TEXT, old_rowid INTEGER, new_rowid INTEGER, generation INTEGER);
         CREATE TRIGGER record_carry AFTER UPDATE OF coverage_generation ON activity_groups_v2
         BEGIN INSERT INTO carry_updates VALUES (NEW.source_trade_id, OLD.rowid, NEW.rowid, NEW.coverage_generation); END;").unwrap();
+    // The carry reads through the decode pool's ordered wallet scan, then
+    // re-stamps the verified rows with one update.
     for query in [
-        "SELECT source_trade_id FROM activity_groups_v2 WHERE wallet_hex = 'wallet' AND coverage_generation = 1 AND (source_time_unix, source_trade_id) > (10, 'id') ORDER BY source_time_unix, source_trade_id LIMIT 512",
-        "UPDATE activity_groups_v2 SET coverage_generation = 2 WHERE wallet_hex = 'wallet' AND coverage_generation = 1 AND (source_time_unix, source_trade_id) > (10, 'id') AND (source_time_unix, source_trade_id) <= (20, 'last')",
+        "SELECT source_trade_id, semantic_revision, components_json, row_count, share_amount_str, price_weighted_share_amount_str, source_usdc_amount_str, source_time_unix, is_combo FROM activity_groups_v2 WHERE coverage_generation = 1 AND wallet_hex = 'wallet' ORDER BY source_time_unix, source_trade_id",
+        "UPDATE activity_groups_v2 SET coverage_generation = 2 WHERE wallet_hex = 'wallet' AND coverage_generation = 1",
     ] {
         let plan = connection
             .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
@@ -12334,7 +12347,7 @@ async fn quiet_wallet_deferral_rejects_forged_evidence() {
             format!(
                 "UPDATE activity_groups_v2 SET coverage_generation = 3 WHERE wallet_hex = '{WALLET}'"
             ),
-            "aggregate",
+            "unreceipted rows",
         ),
     ] {
         conn.execute(&sql, []).unwrap();

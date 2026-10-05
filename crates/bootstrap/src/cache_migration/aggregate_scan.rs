@@ -21,7 +21,7 @@ use rusqlite::{Connection, Row, Rows, params};
 
 use super::{ActivityAggregate, BootstrapError, StoredActivityRow, decode_activity_aggregate};
 
-/// The carry loop's keyset window and this pipeline's measured knee agree.
+/// This pipeline's measured knee (#670).
 const BATCH_ROWS: usize = 512;
 /// A four-core host runs this many workers beside its reader and consumer.
 const MAX_WORKERS: usize = 3;

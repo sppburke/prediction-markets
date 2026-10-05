@@ -27,6 +27,7 @@ from unittest import mock
 # Import the push script as a module (its work is guarded behind `if __name__`).
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import push_ranking_to_supabase as pr  # noqa: E402
+import rank_cycle_manifest  # noqa: E402
 
 HOUR = 3600
 NOW = 1_700_000_000  # fixed clock — determinism (no time.time() in assertions)
@@ -78,11 +79,18 @@ def _make_v2_cache(path: str) -> None:
             key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at INTEGER NOT NULL
         );
         CREATE TABLE activity_coverage_manifests_v2 (
-            generation INTEGER PRIMARY KEY, completed_at_unix INTEGER
+            generation INTEGER PRIMARY KEY, completed_at_unix INTEGER,
+            cursors_json TEXT NOT NULL DEFAULT '{{}}'
         );
         CREATE TABLE activity_groups_v2 (
             wallet_hex TEXT, source_time_unix INTEGER, activity_type TEXT,
             coverage_generation INTEGER
+        );
+        CREATE INDEX idx_activity_groups_v2_wallet_time
+            ON activity_groups_v2(wallet_hex, source_time_unix);
+        CREATE TABLE activity_wallet_coverage_staging_v2 (
+            generation INTEGER, wallet_hex TEXT, aggregate_count INTEGER,
+            PRIMARY KEY (generation, wallet_hex)
         );
         CREATE TABLE clob_payout_coverage_manifests_v2 (
             generation INTEGER PRIMARY KEY, terminal_kind TEXT, completed_at_unix INTEGER
@@ -90,10 +98,12 @@ def _make_v2_cache(path: str) -> None:
         INSERT INTO trades_v1_sealed VALUES ('0xsealed', {NOW});
         INSERT INTO market_resolutions_v1_sealed VALUES ({NOW});
         INSERT INTO source_cursor_v1_sealed VALUES ('clob_closed', '', {NOW});
-        INSERT INTO activity_coverage_manifests_v2 VALUES (1, {NOW - HOUR});
+        INSERT INTO activity_coverage_manifests_v2 (generation, completed_at_unix)
+            VALUES (1, {NOW - HOUR});
         INSERT INTO activity_groups_v2 VALUES ('0xaaa', {NOW - HOUR}, 'TRADE', 1);
         INSERT INTO activity_groups_v2 VALUES ('0xbbb', {NOW}, 'REDEEM', 1);
         INSERT INTO activity_groups_v2 VALUES ('0xpartial', {NOW}, 'TRADE', 2);
+        INSERT INTO activity_wallet_coverage_staging_v2 VALUES (1, '0xaaa', 1), (1, '0xbbb', 1);
         INSERT INTO clob_payout_coverage_manifests_v2
             VALUES (1, 'end_cursor', {NOW - HOUR});
         """
@@ -295,7 +305,8 @@ class ActiveFilterTest(unittest.TestCase):
             con.execute("DELETE FROM activity_groups_v2 WHERE coverage_generation = 2")
             con.execute("UPDATE activity_groups_v2 SET coverage_generation = 7, source_time_unix = ? WHERE wallet_hex = '0xaaa'", (NOW - 24 * HOUR,))
             con.execute("INSERT INTO activity_groups_v2 VALUES ('0xexcluded', ?, 'TRADE', 1)", (NOW,))
-            con.execute("INSERT INTO activity_coverage_manifests_v2 VALUES (7, ?)", (NOW,))
+            con.execute("INSERT INTO activity_coverage_manifests_v2 (generation, completed_at_unix) VALUES (7, ?)", (NOW,))
+            con.execute("INSERT INTO activity_wallet_coverage_staging_v2 VALUES (7, '0xaaa', 1), (7, '0xexcluded', 0)")
         rows = [{"wallet": "0xaaa"}, {"wallet": "0xexcluded"}]
         kept, dropped, last = pr.filter_active_rows(rows, self.db, 72, 24, NOW)
         self.assertEqual((kept, dropped, last), ([rows[0]], 1, {"0xaaa": NOW - 24 * HOUR}))
@@ -303,6 +314,30 @@ class ActiveFilterTest(unittest.TestCase):
         # can make an old effective trade pass the unchanged source-time gate.
         with self.assertRaises(pr.CacheStaleError):
             pr.filter_active_rows(rows, self.db, 72, 24, NOW + 1)
+
+    def test_newest_trade_reads_receipted_wallets_in_both_receipt_formats(self) -> None:
+        # The index-end lookup must equal the generation-wide scan it replaced:
+        # a newer non-trade row, a deferred wallet's newer older-generation trade
+        # and an excluded wallet's row never count, for either receipt format.
+        _make_v2_cache(self.db)
+        receipts = [("0xaaa", 2), ("0xccc", 1), ("0xdeferred", 0)]
+        with sqlite3.connect(self.db) as con:
+            con.executemany(
+                "INSERT INTO activity_groups_v2 VALUES (?, ?, ?, ?)",
+                [("0xaaa", NOW - 3 * HOUR, "TRADE", 7), ("0xaaa", NOW - HOUR, "REDEEM", 7),
+                 ("0xccc", NOW - 2 * HOUR, "TRADE", 7), ("0xdeferred", NOW, "TRADE", 1)],
+            )
+            con.execute("INSERT INTO activity_coverage_manifests_v2 (generation, completed_at_unix) VALUES (7, ?)", (NOW,))
+            scan = "SELECT MAX(source_time_unix) FROM activity_groups_v2 WHERE activity_type = 'TRADE' AND coverage_generation = 7"
+            expected = con.execute(scan).fetchone()[0]
+            self.assertEqual(expected, NOW - 2 * HOUR)
+            con.executemany("INSERT INTO activity_wallet_coverage_staging_v2 VALUES (7, ?, ?)", receipts)
+            self.assertEqual(rank_cycle_manifest.newest_trade_unix(con), expected)
+            con.execute("DELETE FROM activity_wallet_coverage_staging_v2 WHERE generation = 7")
+            embedded = [{"wallet_hex": wallet, "aggregate_count": count} for wallet, count in receipts]
+            con.execute("UPDATE activity_coverage_manifests_v2 SET cursors_json = ? WHERE generation = 7",
+                        (json.dumps(embedded),))
+            self.assertEqual(rank_cycle_manifest.newest_trade_unix(con), expected)
 
     def test_v2_filter_reads_only_latest_completed_trade_and_payout_generations(self) -> None:
         _make_v2_cache(self.db)
@@ -319,7 +354,7 @@ class ActiveFilterTest(unittest.TestCase):
         self.assertEqual(dropped, 3)
         self.assertEqual(last, {"0xaaa": NOW - HOUR})
         with sqlite3.connect(self.db) as con:
-            self.assertEqual(pr._newest_trade_unix(con), NOW - HOUR)
+            self.assertEqual(rank_cycle_manifest.newest_trade_unix(con), NOW - HOUR)
             self.assertEqual(pr._newest_resolution_fetch(con), NOW - HOUR)
             self.assertEqual(pr._clob_sweep_completed_at(con), ("", NOW - HOUR))
 

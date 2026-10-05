@@ -845,10 +845,11 @@ fn validate_partitions(
     Ok(())
 }
 
-// One bounded batch is resident; every batch stays in the same wallet transaction.
-const CARRY_BATCH_SIZE: i64 = 512;
-
+// The carry reads, decodes and serializes on the certification path's worker
+// pool (`aggregate_scan`), which bounds the rows held in memory; the writer
+// keeps the ordered digests and the one re-stamp inside the wallet transaction.
 fn verify_and_carry_wallet(
+    scan: &mut aggregate_scan::Scan,
     transaction: &rusqlite::Transaction<'_>,
     wallet: &str,
     generation: Option<i64>,
@@ -856,109 +857,24 @@ fn verify_and_carry_wallet(
     base: &ActivityPredecessor,
     history: &mut JsonArrayDigest,
 ) -> Result<(), BootstrapError> {
-    let mut previous: Option<(i64, String)> = None;
+    let base_generation = to_i64(base.generation, "base generation")?;
     let mut digest = JsonArrayDigest::new();
-    let (mut count, mut source_rows, mut batches) = (0, 0, 0_u64);
-    loop {
-        let lower = if previous.is_some() {
-            "AND (source_time_unix, source_trade_id) > (?3, ?4)"
-        } else {
-            ""
-        };
-        let sql = format!("SELECT source_trade_id, semantic_revision, components_json, row_count,
-            share_amount_str, price_weighted_share_amount_str, source_usdc_amount_str, source_time_unix, is_combo
-            FROM activity_groups_v2 WHERE wallet_hex = ?1 AND coverage_generation = ?2 {lower}
-            ORDER BY source_time_unix, source_trade_id LIMIT {CARRY_BATCH_SIZE}");
-        let mut statement = transaction.prepare_cached(&sql)?;
-        let mut rows = if let Some((time, id)) = &previous {
-            statement.query(params![
-                wallet,
-                to_i64(base.generation, "base generation")?,
-                time,
-                id
-            ])?
-        } else {
-            statement.query(params![wallet, to_i64(base.generation, "base generation")?])?
-        };
-        let mut batch = Vec::new();
-        while let Some(row) = rows.next()? {
-            batch.push(decode_activity_aggregate(
-                (
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
-                ),
-                wallet,
-            )?);
+    let (mut count, mut source_rows) = (0, 0);
+    let unserializable = scan.for_each(transaction, base_generation, wallet, |row, json| {
+        if row.source_time.0.unix_timestamp() <= 0 || row.source_time.0.unix_timestamp() > end {
+            return invalid("carried activity outside predecessor window".to_owned());
         }
-        drop(rows);
-        drop(statement);
-        let Some(last) = batch.last() else {
-            break;
-        };
-        let last_key = (
-            last.source_time.0.unix_timestamp(),
-            last.group_id.key().0.clone(),
-        );
-        for row in &batch {
-            if row.source_time.0.unix_timestamp() <= 0 || row.source_time.0.unix_timestamp() > end {
-                return invalid("carried activity outside predecessor window".to_owned());
-            }
-            // One serialization feeds both commitments (#670).
-            let json = canonical_json(row)?;
-            digest.push_json(json.as_bytes());
-            history.push_json(json.as_bytes());
-            count = checked_activity_count(count, 1)?;
-            source_rows = checked_activity_count(source_rows, row.row_count)?;
+        // One serialization feeds both commitments (#670).
+        if let Some(json) = json {
+            digest.push_json(json);
+            history.push_json(json);
         }
-        if let Some(generation) = generation {
-            let lower = if previous.is_some() {
-                "AND (source_time_unix, source_trade_id) > (?6, ?7)"
-            } else {
-                ""
-            };
-            let update = format!(
-                "UPDATE activity_groups_v2 SET coverage_generation = ?1
-            WHERE wallet_hex = ?2 AND coverage_generation = ?3
-            AND (source_time_unix, source_trade_id) <= (?4, ?5) {lower}"
-            );
-            let changed = if let Some((time, id)) = &previous {
-                transaction.execute(
-                    &update,
-                    params![
-                        generation,
-                        wallet,
-                        to_i64(base.generation, "base generation")?,
-                        last_key.0,
-                        last_key.1,
-                        time,
-                        id
-                    ],
-                )?
-            } else {
-                transaction.execute(
-                    &update,
-                    params![
-                        generation,
-                        wallet,
-                        to_i64(base.generation, "base generation")?,
-                        last_key.0,
-                        last_key.1
-                    ],
-                )?
-            };
-            if changed != batch.len() {
-                return invalid("carry update count changed".to_owned());
-            }
-        }
-        batches = checked_activity_count(batches, 1)?;
-        previous = Some(last_key);
+        count = checked_activity_count(count, 1)?;
+        source_rows = checked_activity_count(source_rows, row.row_count)?;
+        Ok(())
+    })?;
+    if let Some(error) = unserializable {
+        return Err(error);
     }
     if digest.finish() != base.ordered_aggregate_digest
         || count != base.aggregate_count
@@ -966,12 +882,21 @@ fn verify_and_carry_wallet(
     {
         return invalid("carried history does not match predecessor receipt".to_owned());
     }
+    if let Some(generation) = generation {
+        let changed = transaction.execute(
+            "UPDATE activity_groups_v2 SET coverage_generation = ?1
+             WHERE wallet_hex = ?2 AND coverage_generation = ?3",
+            params![generation, wallet, base_generation],
+        )?;
+        if u64::try_from(changed).ok() != Some(count) {
+            return invalid("carry update count changed".to_owned());
+        }
+    }
     tracing::debug!(
         wallet,
         count,
-        batches,
         carried = generation.is_some(),
-        "activity predecessor verified with advancing wallet batches"
+        "activity predecessor verified"
     );
     Ok(())
 }
@@ -1016,6 +941,7 @@ fn check_collisions(
 }
 
 pub(super) fn commit_incremental_wallet(
+    scan: &mut aggregate_scan::Scan,
     connection: &mut Connection,
     proof: &CollectionProof,
     completed_at: i64,
@@ -1118,6 +1044,7 @@ pub(super) fn commit_incremental_wallet(
         // An exclusion must not hide damaged predecessor history on restart.
         // Verify the same bounded bytes, but leave all retained rows untouched.
         verify_and_carry_wallet(
+            scan,
             &transaction,
             wallet,
             None,
@@ -1144,6 +1071,7 @@ pub(super) fn commit_incremental_wallet(
                 .as_ref()
                 .ok_or(BootstrapError::Internal)?;
             verify_and_carry_wallet(
+                scan,
                 &transaction,
                 wallet,
                 Some(generation),

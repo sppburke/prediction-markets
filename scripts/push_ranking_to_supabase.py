@@ -67,24 +67,6 @@ class TransientRetriesExhausted(Exception):
     """A retryable Supabase request exhausted its bounded retry budget."""
 
 
-def _newest_trade_unix(con: sqlite3.Connection) -> int | None:
-    """Global newest trade over the active cache generation (the freshness probe).
-
-    Schema v1 reads ``trades``. Schema v2 can read only normalized ``TRADE``
-    groups in its latest completed coverage generation; sealed v1 rows are not
-    part of this query surface (#544).
-    """
-    if _cache_schema(con) >= 2:
-        row = con.execute(
-            "SELECT MAX(source_time_unix) FROM activity_groups_v2 "
-            "WHERE activity_type = 'TRADE' AND coverage_generation = "
-            "(SELECT MAX(generation) FROM activity_coverage_manifests_v2)"
-        ).fetchone()
-    else:
-        row = con.execute("SELECT MAX(timestamp_unix) FROM trades").fetchone()
-    return None if row is None or row[0] is None else int(row[0])
-
-
 def _newest_resolution_fetch(con: sqlite3.Connection) -> int | None:
     """Global resolution-content heartbeat from the active cache generation."""
     if _cache_schema(con) >= 2:
@@ -117,30 +99,31 @@ def _clob_sweep_completed_at(con: sqlite3.Connection) -> tuple[str, int] | None:
 def _wallet_last_trade(con: sqlite3.Connection, wallets_lower: list[str]) -> dict[str, int]:
     """Map lowercased ``wallet_hex`` -> its most recent ``timestamp_unix`` in the cache.
 
-    ``wallet_hex`` is stored lowercase (verified 2026-06-16), so the IN-list is matched
-    against the raw column and served by the covering index ``idx_trades_wallet_ts``.
-    Wrapping ``lower(wallet_hex)`` would defeat that index and force a full-table scan of
-    ~269M rows. Chunked to stay under SQLite's bound-parameter limit.
+    ``wallet_hex`` is stored lowercase (verified 2026-06-16), so wallets are matched
+    against the raw column and served by the wallet/time index; wrapping
+    ``lower(wallet_hex)`` would defeat it. Schema v1 chunks an IN-list under SQLite's
+    bound-parameter limit.
     """
     out: dict[str, int] = {}
-    schema = _cache_schema(con)
+    if _cache_schema(con) >= 2:
+        from rank_cycle_manifest import WALLET_NEWEST_TRADE_V2
+
+        query = (
+            "SELECT w.value, (" + WALLET_NEWEST_TRADE_V2.format(wallet="w.value") + ") "
+            "FROM json_each(?) w"
+        )
+        for hexv, ts in con.execute(query, (json.dumps(wallets_lower),)):
+            if ts is not None:
+                out[hexv.lower()] = int(ts)
+        return out
     chunk_size = 500
     for i in range(0, len(wallets_lower), chunk_size):
         chunk = wallets_lower[i : i + chunk_size]
         placeholders = ",".join("?" * len(chunk))
-        if schema >= 2:
-            q = (
-                "SELECT wallet_hex, MAX(source_time_unix) FROM activity_groups_v2 "
-                f"WHERE activity_type = 'TRADE' AND wallet_hex IN ({placeholders}) "
-                "AND coverage_generation = "
-                "(SELECT MAX(generation) FROM activity_coverage_manifests_v2) "
-                "GROUP BY wallet_hex"
-            )
-        else:
-            q = (
-                f"SELECT wallet_hex, MAX(timestamp_unix) FROM trades "
-                f"WHERE wallet_hex IN ({placeholders}) GROUP BY wallet_hex"
-            )
+        q = (
+            f"SELECT wallet_hex, MAX(timestamp_unix) FROM trades "
+            f"WHERE wallet_hex IN ({placeholders}) GROUP BY wallet_hex"
+        )
         for hexv, ts in con.execute(q, chunk):
             if ts is not None:
                 out[hexv.lower()] = int(ts)
@@ -179,7 +162,9 @@ def filter_active_rows(rows, db_path, active_window_hours, max_staleness_hours, 
         # block the writer.
         con.execute("BEGIN")
         partial = partial_backfill_wallets(con)
-        newest = _newest_trade_unix(con)
+        from rank_cycle_manifest import newest_trade_unix
+
+        newest = newest_trade_unix(con)
         if newest is None or now - newest > max_staleness_hours * 3600:
             age = "unknown" if newest is None else f"{(now - newest) / 3600:.1f}"
             error_type = RankingUnavailableError if _cache_schema(con) < 2 else CacheStaleError
