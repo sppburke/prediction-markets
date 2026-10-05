@@ -241,7 +241,7 @@ copy = sqlite3.connect((out / "paper_state.db").resolve().as_uri() + "?mode=ro",
     "WHERE json_extract(frozen_inputs_json,'$.version')=7 "
     "AND json_extract(frozen_inputs_json,'$.source_authority')='activity_frame'").fetchone()
 copy.close()
-assert earliest is None or earliest >= start_seq, ("capture again from a receipt at or before", earliest)
+missing = [] if earliest is None or earliest >= start_seq else [earliest]
 
 def frames(f, offset):
     f.seek(offset)
@@ -269,10 +269,11 @@ with open(live_source, "rb") as f, open(out / "source_filtered.log", "wb") as w:
         seq, sid, text = envelope(block); assert seq == expected, (seq, expected); expected += 1
         if sid in REFERENCING:
             r = json.loads(bytes(json.loads(text)["payload"]))["frame_receipt"]
-            assert r["sequence"] >= start_seq, ("capture again from a receipt at or before", r["sequence"])
+            if r["sequence"] < start_seq: missing.append(r["sequence"])
         if sid in KEEP: w.write(raw); kept += 1
         end += len(raw)
 print("source sequences", start_seq, expected - 1, "end offset", end, "kept", kept)
+assert not missing, ("capture again from a receipt at or before", min(missing))
 
 # 3. The whole paper log through its last complete frame.
 with open(live_paper, "rb") as f, open(out / "paper.log", "wb") as w:
@@ -285,11 +286,12 @@ Record identities and run this inspection on the capture, substituting the cohor
 sequence (the deployment sequence, or a recorded re-measurement boundary) and cohort size (one fill
 for AC15; the AC16 size for latency acceptance). The inspection keeps REST pages compressed and
 decodes them on access. It counts bindings to observations before the capture and fails if one binds
-an admitted frame decision or an audited identity. For first-entry candidates in the window it reads
-earlier recorded BUYs from `activity_groups` effects: an identity seen in the capture keeps its
-earliest stamp, as the whole-prefix reader does, and any other identity is an earlier entry in that
-market. When that earlier entry is itself inside the window, its source evidence lies outside the
-capture: the inspection reports it as unknown and acceptance stays unproven. It also reports raw-only
+an admitted frame decision or an audited identity. For each market whose earliest captured BUY is not
+before the window, it reads recorded BUYs at or before that stamp from `activity_groups` effects
+before applying the window: an identity seen in the capture keeps its earliest stamp, as the
+whole-prefix reader does, and any other identity is an earlier or same-second entry in that market.
+When such an entry is the market's first entry inside the window, its source evidence lies outside
+the capture: the inspection reports it as unknown and acceptance stays unproven. It also reports raw-only
 groups it cannot attribute to a market. `ac16-population.json` keeps the cohort boundary under its
 historical key `deploy_source_seq`.
 It opens SQLite with `mode=ro` and `query_only`, uses autocommit reads on the captured
@@ -593,24 +595,27 @@ for b in buys.values():
     k = (b["wallet"], b["market"]); first[k] = min(first.get(k, b["epoch"]), b["epoch"])
 unattributable = {}; restamped = []; unknown = []
 for (wallet, market), epoch in list(first.items()):
-    if not window_start <= epoch < window_end: continue
-    # Earlier recorded BUYs: an identity seen in the capture keeps its earliest stamp, as the
-    # whole-prefix reader does; any other identity is an earlier entry in this market.
+    if epoch < window_start: continue  # stamps only move earlier: this first entry precedes the window
+    # Recorded BUYs at or before the captured first stamp: an identity seen in the capture keeps its
+    # earliest stamp, as the whole-prefix reader does; any other identity is an earlier or
+    # same-second entry in this market.
     earlier = list(db.execute(
             "SELECT source_trade_id, source_epoch FROM activity_groups WHERE wallet_hex=? AND activity_type='TRADE' "
             "AND json_extract(proof_json,'$.effect.kind')='trade' AND json_extract(proof_json,'$.effect.side')='Buy' "
             "AND json_extract(proof_json,'$.effect.market')=? AND CAST(json_extract(proof_json,'$.effect.amount') AS INTEGER) > 0 "
-            "AND source_epoch < ?", (wallet, market, epoch)))
+            "AND source_epoch <= ?", (wallet, market, epoch)))
     for sid, recorded in earlier:
-        if sid in buys:
-            restamped.append((sid, buys[sid]["epoch"], recorded)); buys[sid]["epoch"] = min(buys[sid]["epoch"], recorded)
+        if sid in buys and recorded < buys[sid]["epoch"]:
+            restamped.append((sid, buys[sid]["epoch"], recorded)); buys[sid]["epoch"] = recorded
         first[wallet, market] = min(first[wallet, market], recorded)
+    entry = first[wallet, market]
+    if not window_start <= entry < window_end: continue
     # An in-window first entry recorded only outside the capture has no source evidence here.
     unknown += [(wallet, market, sid, recorded) for sid, recorded in earlier
-                if sid not in buys and recorded == first[wallet, market] and recorded >= window_start]
+                if sid not in buys and recorded == entry]
     (raw,) = db.execute("SELECT count(*) FROM activity_groups WHERE wallet_hex=? AND activity_type='TRADE' "
                         "AND json_extract(proof_json,'$.effect.kind')='raw_only' AND source_epoch < ?",
-                        (wallet, epoch)).fetchone()
+                        (wallet, entry)).fetchone()
     if raw: unattributable[wallet] = max(unattributable.get(wallet, 0), raw)
 print("captured BUY identities with an earlier recorded stamp (identity, captured, recorded)", restamped)
 print("in-window first entries without captured source evidence (unknown; acceptance unproven)", unknown)
