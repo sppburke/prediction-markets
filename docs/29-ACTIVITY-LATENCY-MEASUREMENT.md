@@ -200,10 +200,12 @@ with such jobs). The read-only capture below copies `paper_state.db` with the SQ
 step (one read transaction; the page copy keeps rowids and committed WAL state; the CLI `.backup`
 steps 100 pages at a time and restarts on every production write), then the source frames from the
 boundary through the last complete frame, filtered to the five source IDs the recipe reads, then the
-whole paper log, so every database reference resolves. The boundary is the deployment's first source
-sequence (or a recorded re-measurement boundary) and its byte offset, found by walking frame lengths
-forward from a known receipt such as the deploy boot's checkpoint tail; do not infer it from trade
-epochs. Retain verification receipts and physical prefix bounds with the capture.
+whole paper log, so every database reference resolves. The capture starts at the deployment's first
+source sequence and its byte offset, found by walking frame lengths forward from a known receipt such
+as the deploy boot's checkpoint tail; do not infer it from trade epochs. That start must not follow
+the earliest frame receipt of any frame decision or any binding an audited decision needs, so a
+re-measurement keeps the deployment start and passes its own cohort boundary to the inspection
+below. Retain verification receipts and physical prefix bounds with the capture.
 
 ```bash
 python3 - <live-paper_state.db> <live-source_events.log> <live-paper.log> <capture-dir> <boundary-offset> <boundary-sequence> <<'PY'
@@ -263,13 +265,14 @@ with open(live_paper, "rb") as f, open(out / "paper.log", "wb") as w:
 PY
 ```
 
-Record identities and run this inspection on the capture, substituting the boundary sequence and
-cohort size (one fill for AC15; the AC16 size for latency acceptance). The inspection keeps REST pages
-compressed and decodes them on access; it counts bindings to observations before the capture, and
-fails if one binds an audited frame decision; it adds earlier BUYs recorded before the capture from
-`activity_groups` effects, excluding same-transaction groups, and reports raw-only groups it cannot
-attribute to a market. On the 10/5 AC15 capture it printed the same output as the whole-file reader
-except those two report lines, in about 350 MB instead of over 2 GB.
+Record identities and run this inspection on the capture, substituting the cohort boundary
+sequence (the deployment sequence, or a recorded re-measurement boundary) and cohort size (one fill
+for AC15; the AC16 size for latency acceptance). The inspection keeps REST pages compressed and
+decodes them on access. It counts bindings to observations before the capture and fails if one binds
+an admitted frame decision or an audited identity. For first-entry candidates in the window it reads
+BUYs recorded before the capture from `activity_groups` effects: an identity seen in the capture keeps
+its earliest stamp, as the whole-prefix reader does, and any other identity is an earlier entry in that
+market; it reports raw-only groups it cannot attribute to a market.
 It opens SQLite with `mode=ro` and `query_only`, uses autocommit reads on the captured
 snapshot (no long transaction), and reads finite log prefixes. It prints evidence and writes
 only `ac16-population.json` in the separate audit directory for the scoped queries below.
@@ -544,18 +547,18 @@ for e in source.values():
 print("unmatched group identities; resolve from authenticated corrections or report unknown", sorted(set(groups) - matched))
 print("multi-leg controls", [(w, tx, sorted(ids)) for (w, tx), ids in legs.items() if len(ids) > 1])
 # Bind corrected/aliased frame identities using authenticated commitment receipts.
-first_captured = min(source); outside = 0
+first_captured = min(source); outside = 0; outside_ids = set()
 for e in source.values():
     if e["source_id"] != "pe-service.activity-read-commitment": continue
     for b in payload(e).get("bindings") or []:
         r = b["stream_receipt"]
         if r["sequence"] < first_captured:
             assert (r["sequence"], r["this_hash"]) not in admitted, ("audited frame outside the capture", r)
-            outside += 1; continue
+            outside += 1; outside_ids.add(b["history_group_id"]); continue
         f = receipt(source, r)
         assert f["source_id"] == "polymarket-activity-ws"
         frame_rows.append(frame_row(b["history_group_id"], f))
-print("bindings to observations before the capture (not audited decisions)", outside)
+print("bindings to observations before the capture", outside)
 # Replay recorded membership, retaining removed wallets and all prices.
 start = payload(paper[start_seq]); members = set(start["membership"])
 changes = sorted((e for e in paper.values() if e["seq"] > start_seq
@@ -569,24 +572,24 @@ intervals.extend((w, at, window_end * 10**9) for w, at in opened.items())
 first = {}
 for b in buys.values():
     k = (b["wallet"], b["market"]); first[k] = min(first.get(k, b["epoch"]), b["epoch"])
-unattributable = {}; window_pairs = {}
-for b in buys.values():
-    if window_start <= b["epoch"] < window_end:
-        window_pairs.setdefault((b["wallet"], b["market"]), set()).add(b["tx"])
-for (wallet, market), txs in window_pairs.items():
-    # Same-transaction groups are the same trade or its legs (restamps keep the transaction), never earlier entries.
-    epoch = first[wallet, market]; marks = ",".join("?" * len(txs))
-    (earlier,) = db.execute(
-        "SELECT min(source_epoch) FROM activity_groups WHERE wallet_hex=? AND activity_type='TRADE' "
-        "AND json_extract(proof_json,'$.effect.kind')='trade' AND json_extract(proof_json,'$.effect.side')='Buy' "
-        "AND json_extract(proof_json,'$.effect.market')=? AND CAST(json_extract(proof_json,'$.effect.amount') AS INTEGER) > 0 "
-        f"AND source_epoch < ? AND lower(transaction_hash) NOT IN ({marks})", (wallet, market, epoch, *txs)).fetchone()
-    if earlier is not None:
-        first[wallet, market] = earlier
+unattributable = {}; restamped = []
+for (wallet, market), epoch in list(first.items()):
+    if not window_start <= epoch < window_end: continue
+    # Recorded BUYs before the capture: an identity seen in the capture keeps its earliest stamp,
+    # as the whole-prefix reader does; any other identity is an earlier entry in this market.
+    for sid, recorded in db.execute(
+            "SELECT source_trade_id, source_epoch FROM activity_groups WHERE wallet_hex=? AND activity_type='TRADE' "
+            "AND json_extract(proof_json,'$.effect.kind')='trade' AND json_extract(proof_json,'$.effect.side')='Buy' "
+            "AND json_extract(proof_json,'$.effect.market')=? AND CAST(json_extract(proof_json,'$.effect.amount') AS INTEGER) > 0 "
+            "AND source_epoch < ?", (wallet, market, epoch)):
+        if sid in buys:
+            restamped.append((sid, buys[sid]["epoch"], recorded)); buys[sid]["epoch"] = min(buys[sid]["epoch"], recorded)
+        first[wallet, market] = min(first[wallet, market], recorded)
     (raw,) = db.execute("SELECT count(*) FROM activity_groups WHERE wallet_hex=? AND activity_type='TRADE' "
                         "AND json_extract(proof_json,'$.effect.kind')='raw_only' AND source_epoch < ?",
                         (wallet, epoch)).fetchone()
     if raw: unattributable[wallet] = max(unattributable.get(wallet, 0), raw)
+print("captured BUY identities with an earlier recorded stamp (identity, captured, recorded)", restamped)
 print("earlier raw-only TRADE groups that cannot be attributed to a market, by wallet", unattributable)
 population = []
 for b in buys.values():
@@ -600,6 +603,7 @@ audited_ids = {r[0] for r in db.execute(
     "SELECT source_trade_id FROM decision_pending WHERE source_epoch >= ? AND source_epoch < ? "
     "AND json_extract(frozen_inputs_json,'$.version')=7", (window_start, window_end))}
 audited_ids.update(b["id"] for b in population)
+assert not outside_ids & audited_ids, ("capture starts after bindings audited identities need", sorted(outside_ids & audited_ids)[:5])
 frame_rows = [f for f in frame_rows if f["id"] in audited_ids]
 frame_keys = {(f["frame_seq"], f["frame_hash"]) for f in frame_rows}
 fallback_rows = [f for f in fallback_rows if (f["frame_seq"], f["frame_hash"]) in frame_keys]
