@@ -5,7 +5,8 @@ use pe_bootstrap::{
         CacheActivationRequest, PriorCacheBinding, SupabasePublicationProbe,
         activate_cache_v2_with_handoff, finalize_cache_v2, migrate_cache_v2,
         populate_activity_bulk_root_v2_with_clock, populate_activity_fresh_v2_with_clock,
-        populate_activity_v2, restore_prior_cache, stage_cache_cycle_v2, verify_frozen_payload_v1,
+        populate_activity_v2, restore_prior_cache_with_final_stage_record, stage_cache_cycle_v2,
+        verify_frozen_payload_v1,
     },
     config, coverage,
     error::BootstrapError,
@@ -651,7 +652,7 @@ async fn main() {
                     match prepared {
                         Ok((fixed, backup, displaced, sha256, schema_version,
                             publication_request, pending_pointer, probe)) => {
-                            restore_prior_cache(
+                            restore_prior_cache_with_final_stage_record(
                             &fixed,
                             &backup,
                             &displaced,
@@ -659,6 +660,7 @@ async fn main() {
                             &publication_request,
                             &pending_pointer,
                             &probe,
+                            final_stage_record_arg.as_deref(),
                         )
                             .await
                             .map(|()| serde_json::json!({"restored": fixed}))

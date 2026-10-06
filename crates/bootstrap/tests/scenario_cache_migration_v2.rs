@@ -13569,3 +13569,1198 @@ async fn real_wrapper_two_cycles_publish_and_defer_quiet_wallet() {
     stopped.store(true, Ordering::SeqCst);
     server.join().unwrap();
 }
+
+// ── #739: format-three history and admission ────────────────────────────────
+
+fn history_v3_freeze_legacy_root(side: &std::path::Path, wallets: &[&str]) {
+    let mut wallets = wallets
+        .iter()
+        .map(|wallet| (*wallet).to_owned())
+        .collect::<Vec<_>>();
+    wallets.sort();
+    let mut identity = serde_json::json!({
+        "version": 2, "generation": 1, "fixed_end_unix": FRESH_END,
+        "wallets": wallets, "base_generation": null, "base_manifest_sha256": null,
+        "start_exclusive": 0, "full_read_wallets": wallets,
+    });
+    identity["digest"] = Value::from(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&identity).unwrap())
+    ));
+    Connection::open(side)
+        .unwrap()
+        .execute(
+            "UPDATE cache_v2_migration_state SET fresh_collection_json = ?1",
+            [identity.to_string()],
+        )
+        .unwrap();
+}
+
+async fn history_v3_collect(
+    side: &std::path::Path,
+    source: &DatasetFetcher,
+    generation: u64,
+    end: i64,
+    repairs: &[String],
+) -> Result<
+    pe_bootstrap::cache_migration::ActivityCoverageManifestV2,
+    pe_bootstrap::error::BootstrapError,
+> {
+    pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
+        &BootstrapConfig {
+            cache_path: side.to_owned(),
+            ..Default::default()
+        },
+        source,
+        "https://data.example",
+        generation,
+        repairs,
+        || Ok(end),
+        end + 1,
+        None,
+    )
+    .await
+}
+
+async fn history_v3_legacy_seed(
+    dir: &TempDir,
+    rows: Vec<Value>,
+) -> (std::path::PathBuf, DatasetFetcher) {
+    let side = dataset_candidate(dir, "history.db", &[]);
+    history_v3_freeze_legacy_root(&side, &[WALLET]);
+    let source = DatasetFetcher {
+        rows,
+        ..Default::default()
+    };
+    history_v3_collect(&side, &source, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    assert_eq!(fresh_record(&side)["version"], 2);
+    (side, source)
+}
+
+// Explicitly registering this function is outside the production guard. These
+// connections model logical damage independently of ordinary-SQL refusal tests.
+fn history_v3_damage_connection(side: &std::path::Path) -> Connection {
+    let connection = Connection::open(side).unwrap();
+    connection
+        .create_scalar_function(
+            "pe_history_write_authorized",
+            0,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+            |_| Ok(true),
+        )
+        .unwrap();
+    connection
+}
+
+fn history_v3_wallet_count(side: &std::path::Path) -> i64 {
+    count(
+        side,
+        &format!("SELECT COUNT(*) FROM activity_groups_v2 WHERE wallet_hex = '{WALLET}'"),
+    )
+}
+
+fn history_v3_bad_row(epoch: i64) -> Value {
+    let mut row = dataset_row(WALLET, "0xa", "bad-price", "BUY", epoch);
+    row["price"] = Value::from("3");
+    row
+}
+
+#[tokio::test]
+async fn history_v3_transition_is_atomic_resumable_and_certifies_empty_complete_wallets() {
+    let dir = TempDir::new().unwrap();
+    let (side, source) = history_v3_legacy_seed(&dir, Vec::new()).await;
+    let before = fresh_record(&side);
+    let config = BootstrapConfig {
+        cache_path: side.clone(),
+        ..Default::default()
+    };
+    let failed = pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
+        &config,
+        &source,
+        "https://data.example",
+        2,
+        &[],
+        || {
+            Err(pe_bootstrap::error::BootstrapError::Invalid {
+                message: "stop before admission commit".to_owned(),
+            })
+        },
+        FRESH_END + 2,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(failed.to_string().contains("stop before admission commit"));
+    assert_eq!(fresh_record(&side), before);
+    assert_eq!(
+        count(
+            &side,
+            "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'activity_wallet_history_v3'"
+        ),
+        0
+    );
+    let next = history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    let identity = fresh_record(&side);
+    assert_eq!(identity["version"], 4);
+    assert_eq!(identity["repair_wallets"], serde_json::json!([]));
+    assert_eq!(
+        count(
+            &side,
+            "SELECT COUNT(*) FROM activity_wallet_history_v3 WHERE aggregate_count = 0 AND newest_source_unix IS NULL AND newest_trade_unix IS NULL AND scope_drops_json = '[]'"
+        ),
+        1
+    );
+    assert_eq!(next.group_count, 0);
+    source.calls.lock().unwrap().clear();
+    assert_eq!(
+        history_v3_collect(&side, &source, 2, FRESH_END + 99, &[])
+            .await
+            .unwrap(),
+        next
+    );
+    assert_eq!(fresh_record(&side), identity);
+    assert!(source.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn history_v3_incremental_history_keeps_insertion_provenance_and_fetched_receipts() {
+    let dir = TempDir::new().unwrap();
+    let a = dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END);
+    let (side, mut source) = history_v3_legacy_seed(&dir, vec![a]).await;
+    source
+        .rows
+        .push(dataset_row(WALLET, "0xb", "b", "BUY", FRESH_END + 1));
+    let next = history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    assert_eq!(next.group_count, 1, "manifest commits fetched rows only");
+    assert_eq!(generation_rows(&side, 1), 1);
+    assert_eq!(generation_rows(&side, 2), 1);
+    assert_eq!(history_v3_wallet_count(&side), 2);
+    let proof = stored_receipt_proofs(&Connection::open(&side).unwrap(), 2).remove(0);
+    assert_eq!(proof["acquisition"]["version"], 3);
+    assert_eq!(proof["aggregate_count"], 1);
+    assert_eq!(proof["acquisition"]["predecessor"]["aggregate_count"], 1);
+    source
+        .rows
+        .push(dataset_row(WALLET, "0xc", "c", "BUY", FRESH_END + 2));
+    history_v3_collect(&side, &source, 3, FRESH_END + 2, &[])
+        .await
+        .unwrap();
+    assert_eq!(history_v3_wallet_count(&side), 3);
+    assert_eq!(generation_rows(&side, 1), 1);
+    assert_eq!(generation_rows(&side, 2), 1);
+    assert_eq!(generation_rows(&side, 3), 1);
+}
+
+#[tokio::test]
+async fn history_v3_automatic_full_read_checks_effective_prefix_and_replaces_source_deletions() {
+    let dir = TempDir::new().unwrap();
+    let a = dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END);
+    let (side, mut source) = history_v3_legacy_seed(&dir, vec![a.clone()]).await;
+    source
+        .rows
+        .push(dataset_row(WALLET, "0xb", "b", "BUY", FRESH_END + 1));
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    source.rows.push(history_v3_bad_row(FRESH_END + 2));
+    history_v3_collect(&side, &source, 3, FRESH_END + 2, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        history_v3_wallet_count(&side),
+        2,
+        "failure preserves effective history"
+    );
+    source
+        .rows
+        .retain(|row| row["transactionHash"] != "bad-price");
+    source
+        .rows
+        .push(dataset_row(WALLET, "0xc", "c", "BUY", FRESH_END + 3));
+    history_v3_collect(&side, &source, 4, FRESH_END + 3, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        history_v3_wallet_count(&side),
+        3,
+        "full [a,b,c] replaces [a,b]"
+    );
+    assert_eq!(generation_rows(&side, 4), 3);
+    source.rows.push(history_v3_bad_row(FRESH_END + 4));
+    history_v3_collect(&side, &source, 5, FRESH_END + 4, &[])
+        .await
+        .unwrap();
+    source.rows = vec![a];
+    history_v3_collect(&side, &source, 6, FRESH_END + 5, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        history_v3_wallet_count(&side),
+        1,
+        "full [a] removes b and c"
+    );
+    assert_eq!(generation_rows(&side, 6), 1);
+}
+
+#[tokio::test]
+async fn history_v3_every_failed_full_read_rechecks_retained_history_and_failed_repair_deletes_it()
+{
+    let dir = TempDir::new().unwrap();
+    let (side, mut source) = history_v3_legacy_seed(
+        &dir,
+        vec![dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END)],
+    )
+    .await;
+    source.rows.push(history_v3_bad_row(FRESH_END + 1));
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    history_v3_collect(&side, &source, 3, FRESH_END + 2, &[])
+        .await
+        .unwrap();
+    history_v3_damage_connection(&side)
+        .execute(
+            "UPDATE activity_groups_v2 SET share_amount_str = '2.250001'",
+            [],
+        )
+        .unwrap();
+    let error = history_v3_collect(&side, &source, 4, FRESH_END + 3, &[])
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("activity history chain mismatch"),
+        "{error}"
+    );
+    assert!(error.to_string().contains(WALLET), "{error}");
+    assert!(receipt(&side, 4, WALLET).is_none());
+    // Abandonment/restaging keeps this failed candidate untouched. A copy of
+    // the preceding installed head is represented by removing the uncommitted
+    // admission under an explicit test authority, then admitting the repair.
+    let connection = history_v3_damage_connection(&side);
+    let predecessor: String = connection.query_row("SELECT collection_identity_json FROM activity_coverage_manifests_v2 WHERE generation = 3", [], |row| row.get(0)).unwrap();
+    connection
+        .execute(
+            "UPDATE cache_v2_migration_state SET fresh_collection_json = ?1",
+            [predecessor],
+        )
+        .unwrap();
+    connection
+        .execute("UPDATE activity_groups_v2 SET share_amount_str = x'00'", [])
+        .unwrap();
+    drop(connection);
+    history_v3_collect(&side, &source, 4, FRESH_END + 3, &[WALLET.to_owned()])
+        .await
+        .unwrap();
+    assert_eq!(history_v3_wallet_count(&side), 0);
+    history_v3_collect(&side, &source, 5, FRESH_END + 4, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        history_v3_wallet_count(&side),
+        0,
+        "later failed read accepts the repair's empty history"
+    );
+    source
+        .rows
+        .retain(|row| row["transactionHash"] != "bad-price");
+    history_v3_collect(&side, &source, 6, FRESH_END + 5, &[])
+        .await
+        .unwrap();
+    assert_eq!(history_v3_wallet_count(&side), 1);
+}
+
+#[tokio::test]
+async fn history_v3_guards_each_table_from_another_connection_and_refuses_legacy_frozen_verification()
+ {
+    let dir = TempDir::new().unwrap();
+    let (side, source) = history_v3_legacy_seed(
+        &dir,
+        vec![dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END)],
+    )
+    .await;
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    for table in [
+        "activity_groups_v2",
+        "activity_wallet_coverage_staging_v2",
+        "activity_coverage_manifests_v2",
+        "activity_wallet_history_v3",
+        "cache_v2_migration_state",
+    ] {
+        for sql in [
+            format!("INSERT INTO {table} SELECT * FROM {table} LIMIT 1"),
+            format!("UPDATE {table} SET rowid = rowid"),
+            format!("DELETE FROM {table}"),
+        ] {
+            let connection = Connection::open(&side).unwrap();
+            let before = count(&side, &format!("SELECT COUNT(*) FROM {table}"));
+            let error = connection.execute(&sql, []).unwrap_err();
+            assert!(
+                error.to_string().contains("pe_history_write_authorized"),
+                "{sql}: {error}"
+            );
+            connection.close().unwrap();
+            assert_eq!(
+                count(&side, &format!("SELECT COUNT(*) FROM {table}")),
+                before
+            );
+        }
+    }
+    let reference = FrozenPayloadReference {
+        version: 1,
+        process_now_unix: FRESH_END,
+        active_window_hours: 72,
+        max_cache_staleness_hours: 48,
+        ranked_wallets: vec![WALLET.to_owned()],
+        active_wallets: vec![WALLET.to_owned()],
+        freshness: FrozenCacheFreshness {
+            newest_trade_unix: FRESH_END,
+            newest_resolution_fetch_unix: FRESH_END,
+            clob_cursor: "fixture".to_owned(),
+            clob_cursor_updated_at: FRESH_END,
+        },
+    };
+    let path = dir.path().join("frozen.json");
+    std::fs::write(&path, serde_json::to_vec(&reference).unwrap()).unwrap();
+    let before = query_values(&side, "SELECT * FROM cache_v2_migration_state");
+    let proofs = count(
+        &side,
+        "SELECT COUNT(*) FROM cache_frozen_payload_verifications",
+    );
+    let error = verify_frozen_payload_v1(&side, &path, FRESH_END + 2).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("legacy frozen verification refuses history format three"),
+        "{error}"
+    );
+    assert_eq!(
+        query_values(&side, "SELECT * FROM cache_v2_migration_state"),
+        before
+    );
+    assert_eq!(
+        count(
+            &side,
+            "SELECT COUNT(*) FROM cache_frozen_payload_verifications"
+        ),
+        proofs
+    );
+}
+
+struct HistoryV3StopFetcher;
+impl PageFetcher for HistoryV3StopFetcher {
+    async fn fetch_page(&self, _: &str) -> Result<Vec<u8>, SourceError> {
+        Err(SourceError::Transient {
+            message: "stop after admission".to_owned(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn history_v3_unchanged_full_after_increment_neither_reads_writes_nor_probes_history() {
+    let dir = TempDir::new().unwrap();
+    let (side, mut source) = history_v3_legacy_seed(
+        &dir,
+        vec![dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END)],
+    )
+    .await;
+    source
+        .rows
+        .push(dataset_row(WALLET, "0xb", "b", "BUY", FRESH_END + 1));
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    source.rows.push(history_v3_bad_row(FRESH_END + 2));
+    history_v3_collect(&side, &source, 3, FRESH_END + 2, &[])
+        .await
+        .unwrap();
+    source
+        .rows
+        .retain(|row| row["transactionHash"] != "bad-price");
+    let error = populate_activity_fresh_v2(
+        &side,
+        &HistoryV3StopFetcher,
+        "https://data.example",
+        4,
+        FRESH_END + 3,
+        FRESH_END + 4,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.exit_code(), 75);
+    let connection = Connection::open(&side).unwrap();
+    connection.authorizer(Some(|context: rusqlite::hooks::AuthContext<'_>| {
+        use rusqlite::hooks::{AuthAction, Authorization};
+        match context.action {
+            AuthAction::Read {
+                table_name: "activity_groups_v2",
+                ..
+            }
+            | AuthAction::Insert {
+                table_name: "activity_groups_v2",
+            }
+            | AuthAction::Update {
+                table_name: "activity_groups_v2",
+                ..
+            }
+            | AuthAction::Delete {
+                table_name: "activity_groups_v2",
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }
+    }));
+    pe_bootstrap::cache_migration::collect_activity_v2_for_test(
+        connection,
+        &source,
+        "https://data.example",
+        FRESH_END + 4,
+    )
+    .await
+    .unwrap();
+    assert_eq!(history_v3_wallet_count(&side), 2);
+    assert_eq!(generation_rows(&side, 1), 1);
+    assert_eq!(generation_rows(&side, 2), 1);
+    assert_eq!(generation_rows(&side, 4), 0);
+    assert_eq!(
+        receipt(&side, 4, WALLET).unwrap().0,
+        2,
+        "full receipt commits [a,b]"
+    );
+}
+
+#[tokio::test]
+async fn history_v3_differing_full_after_exclusion_refuses_damage_atomically() {
+    let dir = TempDir::new().unwrap();
+    let (side, mut source) = history_v3_legacy_seed(
+        &dir,
+        vec![dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END)],
+    )
+    .await;
+    source.rows.push(history_v3_bad_row(FRESH_END + 1));
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    source
+        .rows
+        .retain(|row| row["transactionHash"] != "bad-price");
+    history_v3_collect(&side, &source, 3, FRESH_END + 2, &[])
+        .await
+        .unwrap();
+    source
+        .rows
+        .push(dataset_row(WALLET, "0xb", "b", "BUY", FRESH_END + 3));
+    history_v3_collect(&side, &source, 4, FRESH_END + 3, &[])
+        .await
+        .unwrap();
+    source.rows.push(history_v3_bad_row(FRESH_END + 4));
+    history_v3_collect(&side, &source, 5, FRESH_END + 4, &[])
+        .await
+        .unwrap();
+    source
+        .rows
+        .retain(|row| row["transactionHash"] != "bad-price");
+    source
+        .rows
+        .push(dataset_row(WALLET, "0xc", "c", "BUY", FRESH_END + 5));
+    history_v3_damage_connection(&side).execute(
+        "UPDATE activity_groups_v2 SET share_amount_str = '2.250001' WHERE source_time_unix = ?1", [FRESH_END + 3],
+    ).unwrap();
+    let before = query_values(
+        &side,
+        "SELECT * FROM activity_groups_v2 ORDER BY source_trade_id",
+    );
+    let error = history_v3_collect(&side, &source, 6, FRESH_END + 5, &[])
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("activity history chain mismatch"),
+        "{error}"
+    );
+    assert!(error.to_string().contains(WALLET), "{error}");
+    assert_eq!(
+        query_values(
+            &side,
+            "SELECT * FROM activity_groups_v2 ORDER BY source_trade_id"
+        ),
+        before
+    );
+    assert!(receipt(&side, 6, WALLET).is_none());
+}
+
+#[tokio::test]
+async fn history_v3_certificate_phase_checks_and_mirrors_do_not_change_admission() {
+    let dir = TempDir::new().unwrap();
+    let (side, source) = history_v3_legacy_seed(
+        &dir,
+        vec![dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END)],
+    )
+    .await;
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    let connection = history_v3_damage_connection(&side);
+    assert_eq!(
+        digests::certificate_digest(&connection).unwrap(),
+        fresh_record(&side)["certified_digest"]
+    );
+    connection
+        .execute(
+            "UPDATE activity_groups_v2 SET activity_type = 'MERGE', coverage_generation = 99",
+            [],
+        )
+        .unwrap();
+    history_v3_collect(&side, &source, 3, FRESH_END + 2, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        fresh_record(&side)["deferred_wallets"],
+        serde_json::json!([])
+    );
+    connection
+        .execute("UPDATE activity_wallet_history_v3 SET generation = 3", [])
+        .unwrap();
+    let error = history_v3_collect(&side, &source, 3, FRESH_END + 99, &[])
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("activity_wallet_history_v3 certificate digest mismatch"),
+        "{error}"
+    );
+    assert!(
+        !error.to_string().contains(WALLET),
+        "certificate failure names its table"
+    );
+    // Model B2b's atomic certificate/state handoff, then authenticate the same
+    // acquisition snapshots without regenerating them from the advanced row.
+    let digest = digests::certificate_digest(&connection).unwrap();
+    connection.execute("UPDATE cache_v2_migration_state SET phase = 'finalized', ranker_projection_inputs_json = ?1",
+        [serde_json::json!({"certificate_digest": digest}).to_string()]).unwrap();
+    source.calls.lock().unwrap().clear();
+    history_v3_collect(&side, &source, 4, FRESH_END + 3, &[])
+        .await
+        .unwrap();
+    assert_eq!(fresh_record(&side)["certified_digest"], digest);
+    assert_eq!(history_v3_wallet_count(&side), 1);
+}
+
+#[tokio::test]
+async fn history_v3_root_is_format_three_and_receipt_universe_survives_before_finalize() {
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "root-three.db", &[WALLET_B]);
+    let source = DatasetFetcher {
+        rows: vec![
+            dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END),
+            dataset_row(WALLET_B, "0xb", "b", "BUY", FRESH_END),
+        ],
+        ..Default::default()
+    };
+    history_v3_collect(&side, &source, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    let identity = fresh_record(&side);
+    assert_eq!(identity["version"], 4);
+    assert!(identity["base_generation"].is_null());
+    assert!(identity["base_manifest_sha256"].is_null());
+    assert_eq!(identity["start_exclusive"], 0);
+    assert_eq!(identity["deferred_wallets"], serde_json::json!([]));
+    assert_eq!(
+        count(&side, "SELECT COUNT(*) FROM activity_wallet_history_v3"),
+        0
+    );
+    Connection::open(&side)
+        .unwrap()
+        .execute("DELETE FROM wallets WHERE wallet_hex = ?1", [WALLET_B])
+        .unwrap();
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        fresh_record(&side)["wallets"],
+        serde_json::json!([WALLET, WALLET_B])
+    );
+    assert_eq!(
+        fresh_record(&side)["deferred_wallets"],
+        serde_json::json!([])
+    );
+    assert_eq!(generation_rows(&side, 1), 2);
+    assert_eq!(generation_rows(&side, 2), 0);
+}
+
+#[tokio::test]
+async fn history_v3_quiet_rule_uses_certificates_and_unfinalized_receipts() {
+    let dir = TempDir::new().unwrap();
+    let old = FRESH_END - 2_592_000 - 1;
+    let (side, source) =
+        history_v3_legacy_seed(&dir, vec![dataset_row(WALLET, "0xa", "a", "BUY", old)]).await;
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    history_v3_damage_connection(&side)
+        .execute(
+            "UPDATE activity_groups_v2 SET activity_type = 'MERGE', coverage_generation = 99",
+            [],
+        )
+        .unwrap();
+    source.calls.lock().unwrap().clear();
+    history_v3_collect(&side, &source, 3, FRESH_END + 2, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        fresh_record(&side)["deferred_wallets"],
+        serde_json::json!([WALLET])
+    );
+    assert!(source.calls.lock().unwrap().is_empty());
+    assert_eq!(receipt(&side, 3, WALLET).unwrap().0, 0);
+    assert_eq!(generation_rows(&side, 3), 0);
+    assert_eq!(history_v3_wallet_count(&side), 1);
+
+    let dir = TempDir::new().unwrap();
+    let (side, mut source) =
+        history_v3_legacy_seed(&dir, vec![dataset_row(WALLET, "0xa", "a", "BUY", old)]).await;
+    source
+        .rows
+        .push(dataset_row(WALLET, "0xb", "b", "BUY", FRESH_END + 1));
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    source.calls.lock().unwrap().clear();
+    history_v3_collect(&side, &source, 3, FRESH_END + 2, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        fresh_record(&side)["deferred_wallets"],
+        serde_json::json!([])
+    );
+    assert!(!source.calls.lock().unwrap().is_empty());
+    assert_eq!(history_v3_wallet_count(&side), 2);
+}
+
+#[tokio::test]
+async fn history_v3_transition_certifies_prior_complete_exclusions_and_leaves_proofless_ones_empty()
+{
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "transition-classes.db", &[WALLET_B, WALLET_C]);
+    history_v3_freeze_legacy_root(&side, &[WALLET, WALLET_B, WALLET_C]);
+    let mut bad_c = dataset_row(WALLET_C, "0xc", "bad-c", "BUY", FRESH_END);
+    bad_c["price"] = Value::from("3");
+    let mut source = DatasetFetcher {
+        rows: vec![
+            dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END),
+            dataset_row(WALLET_B, "0xb", "b", "BUY", FRESH_END),
+            bad_c,
+        ],
+        ..Default::default()
+    };
+    let manifest = history_v3_collect(&side, &source, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    let prior = fresh_record(&side);
+    let link = whole_json_digest(
+        &serde_json::json!({"version":1, "manifest":manifest, "collection_identity":prior}),
+    );
+    let mut identity = serde_json::json!({
+        "version":3, "generation":2, "fixed_end_unix":FRESH_END + 1,
+        "wallets":[WALLET,WALLET_B,WALLET_C], "base_generation":1, "base_manifest_sha256":link,
+        "start_exclusive":FRESH_END, "full_read_wallets":[WALLET_B,WALLET_C],
+        "deferred_wallets":[], "quiet_after_secs":2_592_000, "repoll_period_secs":604_800,
+    });
+    identity["digest"] = Value::from(whole_json_digest(&identity));
+    Connection::open(&side)
+        .unwrap()
+        .execute(
+            "UPDATE cache_v2_migration_state SET fresh_collection_json = ?1",
+            [identity.to_string()],
+        )
+        .unwrap();
+    let mut bad_b = dataset_row(WALLET_B, "0xb", "bad-b", "BUY", FRESH_END + 1);
+    bad_b["price"] = Value::from("3");
+    source.rows.push(bad_b);
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    history_v3_collect(&side, &source, 3, FRESH_END + 2, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        count(&side, "SELECT COUNT(*) FROM activity_wallet_history_v3"),
+        2
+    );
+    assert_eq!(
+        count(
+            &side,
+            &format!(
+                "SELECT COUNT(*) FROM activity_wallet_history_v3 WHERE wallet_hex = '{WALLET}' AND generation = 2 AND newest_source_unix = {FRESH_END} AND aggregate_count = 1"
+            )
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &side,
+            &format!(
+                "SELECT COUNT(*) FROM activity_wallet_history_v3 WHERE wallet_hex = '{WALLET_B}' AND generation = 1 AND newest_source_unix IS NULL AND newest_trade_unix IS NULL AND aggregate_count = 1"
+            )
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &side,
+            &format!(
+                "SELECT COUNT(*) FROM activity_wallet_history_v3 WHERE wallet_hex = '{WALLET_C}'"
+            )
+        ),
+        0
+    );
+    assert_eq!(
+        count(
+            &side,
+            &format!("SELECT COUNT(*) FROM activity_groups_v2 WHERE wallet_hex = '{WALLET_C}'")
+        ),
+        0
+    );
+    assert_eq!(
+        fresh_record(&side)["wallets"],
+        serde_json::json!([WALLET, WALLET_B, WALLET_C])
+    );
+    assert_eq!(
+        fresh_record(&side)["full_read_wallets"],
+        serde_json::json!([WALLET_B, WALLET_C])
+    );
+}
+
+#[tokio::test]
+async fn history_v3_wallet_rows_and_receipt_roll_back_together_and_authorization_closes() {
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "atomic-root.db", &[]);
+    populate_activity_fresh_v2(
+        &side,
+        &HistoryV3StopFetcher,
+        "https://data.example",
+        1,
+        FRESH_END,
+        FRESH_END + 1,
+    )
+    .await
+    .unwrap_err();
+    let time = time::OffsetDateTime::from_unix_timestamp(FRESH_END).unwrap();
+    let aggregate = parse_activity_response(
+        &serde_json::to_vec(&vec![dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END)]).unwrap(),
+        WalletAddress::from_hex(WALLET).unwrap(),
+        &ActivityParseContext {
+            source_id: SourceId("fixture".to_owned()),
+            observed_at: SourceTimestamp(time),
+            received_at: ReceivedAt(time),
+            transport: ActivityTransport::Rest,
+        },
+    )
+    .unwrap()
+    .aggregates()
+    .unwrap()
+    .remove(0);
+    let mut connection = Connection::open(&side).unwrap();
+    let error = pe_bootstrap::cache_migration::commit_activity_batch_for_test(
+        &mut connection,
+        WALLET.to_owned(),
+        Vec::new(),
+        vec![aggregate],
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("proof omitted original read window"),
+        "{error}"
+    );
+    assert_eq!(history_v3_wallet_count(&side), 0);
+    assert!(receipt(&side, 1, WALLET).is_none());
+    let authorized: bool = connection
+        .query_row("SELECT pe_history_write_authorized()", [], |row| row.get(0))
+        .unwrap();
+    assert!(!authorized);
+    let error = connection
+        .execute(
+            "UPDATE cache_v2_migration_state SET phase = 'schema_sealed'",
+            [],
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("unauthorized history write"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn history_v3_differing_full_foreign_identity_is_fatal_and_rolls_back_replacement() {
+    let dir = TempDir::new().unwrap();
+    let (side, mut source) = history_v3_legacy_seed(
+        &dir,
+        vec![dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END)],
+    )
+    .await;
+    source.rows.push(history_v3_bad_row(FRESH_END + 1));
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    source
+        .rows
+        .retain(|row| row["transactionHash"] != "bad-price");
+    let row = dataset_row(WALLET, "0xc", "c", "BUY", FRESH_END + 2);
+    let time = time::OffsetDateTime::from_unix_timestamp(FRESH_END + 2).unwrap();
+    let aggregate = parse_activity_response(
+        &serde_json::to_vec(&vec![row.clone()]).unwrap(),
+        WalletAddress::from_hex(WALLET).unwrap(),
+        &ActivityParseContext {
+            source_id: SourceId("fixture".to_owned()),
+            observed_at: SourceTimestamp(time),
+            received_at: ReceivedAt(time),
+            transport: ActivityTransport::Rest,
+        },
+    )
+    .unwrap()
+    .aggregates()
+    .unwrap()
+    .remove(0);
+    history_v3_damage_connection(&side)
+        .execute(
+            "INSERT INTO activity_groups_v2 SELECT ?1, coverage_generation, semantic_revision,
+         components_json, ?2, transaction_hash, activity_type, condition_id, asset,
+         outcome_id, side, row_count, share_amount_str, price_weighted_share_amount_str,
+         source_usdc_amount_str, source_time_unix, is_combo, schema_version, parser_version
+         FROM activity_groups_v2 WHERE wallet_hex = ?3 LIMIT 1",
+            params![aggregate.group_id.key().0, WALLET_B, WALLET],
+        )
+        .unwrap();
+    source.rows.push(row);
+    let before = query_values(
+        &side,
+        "SELECT * FROM activity_groups_v2 ORDER BY source_trade_id",
+    );
+    let error = history_v3_collect(&side, &source, 3, FRESH_END + 2, &[])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, pe_bootstrap::error::BootstrapError::Sqlite(_)),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("UNIQUE constraint failed"),
+        "{error}"
+    );
+    assert_eq!(
+        query_values(
+            &side,
+            "SELECT * FROM activity_groups_v2 ORDER BY source_trade_id"
+        ),
+        before
+    );
+    assert!(receipt(&side, 3, WALLET).is_none());
+}
+
+#[tokio::test]
+async fn history_v3_incremental_probe_ignores_provenance_but_excludes_same_wallet_repeat() {
+    let dir = TempDir::new().unwrap();
+    let row = dataset_row(WALLET, "0xa", "repeat", "BUY", FRESH_END);
+    let (side, mut source) = history_v3_legacy_seed(&dir, vec![row.clone()]).await;
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    history_v3_damage_connection(&side)
+        .execute("UPDATE activity_groups_v2 SET coverage_generation = 99", [])
+        .unwrap();
+    let mut repeated = row;
+    repeated["timestamp"] = Value::from(FRESH_END + 2);
+    source.rows = vec![repeated];
+    history_v3_collect(&side, &source, 3, FRESH_END + 2, &[])
+        .await
+        .unwrap();
+    let receipt = stored_receipt_proofs(&Connection::open(&side).unwrap(), 3).remove(0);
+    assert_eq!(receipt["aggregate_count"], 0);
+    assert_eq!(
+        receipt["acquisition"]["exclusion_reason"],
+        "cross_boundary_collision"
+    );
+    assert_eq!(receipt["acquisition"]["fetched_aggregate_count"], 1);
+    assert_eq!(history_v3_wallet_count(&side), 1);
+    assert_eq!(generation_rows(&side, 99), 1);
+}
+
+#[tokio::test]
+async fn history_v3_record_chain_damage_is_refused_before_fetch() {
+    let dir = TempDir::new().unwrap();
+    let (side, source) = history_v3_legacy_seed(
+        &dir,
+        vec![dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END)],
+    )
+    .await;
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    history_v3_damage_connection(&side).execute(
+        "UPDATE activity_wallet_coverage_staging_v2 SET completed_at_unix = completed_at_unix + 1, source_row_count = source_row_count + 1 WHERE generation = 1", [],
+    ).unwrap();
+    source.calls.lock().unwrap().clear();
+    let error = history_v3_collect(&side, &source, 3, FRESH_END + 2, &[])
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("historical receipt-set commitment mismatch"),
+        "{error}"
+    );
+    assert!(source.calls.lock().unwrap().is_empty());
+    assert_eq!(fresh_record(&side)["generation"], 2);
+}
+
+#[tokio::test]
+async fn history_v3_interrupted_restore_requires_matching_final_stage_record_in_both_states() {
+    use pe_bootstrap::cache_migration::{
+        restore_prior_cache_with_final_stage_record, stage_cache_cycle_v2,
+    };
+    for prior_still_present in [true, false] {
+        let dir = tempfile::Builder::new()
+            .prefix("pe-history-restore-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
+        std::fs::create_dir(dir.path().join("eval-results")).unwrap();
+        let fixed = dir.path().join("fixed.db");
+        let side = dir.path().join("cycle.side.db");
+        let prior = dir.path().join("cycle.prior.db");
+        let displaced = dir.path().join("cycle.displaced.db");
+        drop(seed_v1(&fixed, FRESH_END));
+        let h0 = sha256_file(&fixed).unwrap();
+        stage_cache_cycle_v2(&fixed, &prior, &side, None, None).unwrap();
+        migrate_cache_v2(&side, &write_build_manifest(&dir, &side)).unwrap();
+        let source = DatasetFetcher {
+            rows: vec![dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END)],
+            ..Default::default()
+        };
+        history_v3_collect(&side, &source, 1, FRESH_END, &[])
+            .await
+            .unwrap();
+        Connection::open(&side)
+            .unwrap()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+        let h1 = sha256_file(&side).unwrap();
+        std::fs::rename(&fixed, &displaced).unwrap();
+        std::fs::rename(&side, &fixed).unwrap();
+        let (publication, pending) =
+            write_pending_publication(&dir, "restore-three", &side, &fixed, &fixed, &displaced);
+        let request: Value = serde_json::from_slice(&std::fs::read(&publication).unwrap()).unwrap();
+        std::fs::write(
+            side.with_extension("restore.json"),
+            serde_json::to_vec(&request["publish_key"]).unwrap(),
+        )
+        .unwrap();
+        std::fs::rename(&fixed, &side).unwrap();
+        if !prior_still_present {
+            std::fs::rename(&displaced, &fixed).unwrap();
+        }
+        let record_path = dir.path().join("final-stage.json");
+        for mismatch in [None, Some("path"), Some("hash")] {
+            if let Some(mismatch) = mismatch {
+                let record = CacheFinalStageRecord {
+                    version: 2,
+                    cache_path: if mismatch == "path" {
+                        dir.path().join("other.side.db")
+                    } else {
+                        side.clone()
+                    },
+                    cache_sha256: if mismatch == "hash" {
+                        "0".repeat(64)
+                    } else {
+                        h1.clone()
+                    },
+                    schema_version: 2,
+                    sealed_generation: 1,
+                    activity_coverage_generation: 1,
+                    payout_coverage_generation: 1,
+                    ranker_projection_count: 0,
+                    ranker_projection_digest: whole_json_digest(&serde_json::json!([])),
+                    ranker_classifier_version: 3,
+                };
+                std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+            }
+            let error = restore_prior_cache_with_final_stage_record(
+                &fixed,
+                &displaced,
+                &side,
+                &PriorCacheBinding {
+                    sha256: h0.clone(),
+                    schema_version: 1,
+                },
+                &publication,
+                &pending,
+                &FixedPublicationProbe(false),
+                mismatch.map(|_| record_path.as_path()),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains(if mismatch.is_none() {
+                    "requires --final-stage-record"
+                } else {
+                    "does not describe the activation candidate"
+                }),
+                "{error}"
+            );
+            assert_eq!(sha256_file(&side).unwrap(), h1);
+            if prior_still_present {
+                assert!(!fixed.exists());
+                assert_eq!(sha256_file(&displaced).unwrap(), h0);
+            } else {
+                assert!(!displaced.exists());
+                assert_eq!(sha256_file(&fixed).unwrap(), h0);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn history_v3_bulk_root_freezes_format_three_and_resumes_under_acquisition_three() {
+    let fixture = BulkRootFixture::new();
+    fixture.admit().await;
+    let frozen = fresh_record(&fixture.side);
+    assert_eq!(frozen["version"], 4);
+    assert_eq!(frozen["repair_wallets"], serde_json::json!([]));
+    assert_eq!(
+        digests::certificate_digest(&Connection::open(&fixture.side).unwrap()).unwrap(),
+        frozen["certified_digest"]
+    );
+    let source = bulk_source();
+    let manifest = fixture.collect(&source).await.unwrap();
+    assert_eq!(manifest.group_count, 2);
+    assert_eq!(count(&fixture.side, "PRAGMA user_version"), 2);
+    assert_eq!(fresh_record(&fixture.side), frozen);
+    for receipt in stored_receipt_proofs(&Connection::open(&fixture.side).unwrap(), 1) {
+        assert_eq!(receipt["acquisition"]["version"], 3);
+        assert_eq!(receipt["acquisition"]["mode"], "full");
+        assert!(receipt["acquisition"]["predecessor"].is_null());
+    }
+    source.calls.lock().unwrap().clear();
+    assert_eq!(fixture.collect(&source).await.unwrap(), manifest);
+    assert!(source.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn history_v3_unfinished_identity_two_bulk_root_seals_unchanged_then_transitions() {
+    let fixture = BulkRootFixture::new();
+    history_v3_freeze_legacy_root(&fixture.side, &[WALLET, WALLET_B]);
+    Connection::open(&fixture.side)
+        .unwrap()
+        .execute_batch(
+            "DROP INDEX idx_activity_groups_v2_source_trade_id; PRAGMA user_version = -2",
+        )
+        .unwrap();
+    let frozen = fresh_record(&fixture.side);
+    let source = bulk_source();
+    fixture.collect(&source).await.unwrap();
+    assert_eq!(count(&fixture.side, "PRAGMA user_version"), 2);
+    assert_eq!(fresh_record(&fixture.side), frozen);
+    assert_eq!(
+        count(
+            &fixture.side,
+            "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'activity_wallet_history_v3'"
+        ),
+        0
+    );
+    for receipt in stored_receipt_proofs(&Connection::open(&fixture.side).unwrap(), 1) {
+        assert_eq!(receipt["acquisition"]["version"], 2);
+    }
+    history_v3_collect(&fixture.side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    assert_eq!(fresh_record(&fixture.side)["version"], 4);
+    assert_eq!(
+        count(
+            &fixture.side,
+            "SELECT COUNT(*) FROM activity_wallet_history_v3 WHERE generation = 1 AND aggregate_count = 1 AND scope_drops_json = '[]'"
+        ),
+        2
+    );
+}
+
+#[tokio::test]
+async fn history_v3_fetched_partition_damage_is_refused_before_full_replacement() {
+    let dir = TempDir::new().unwrap();
+    let (side, mut source) = history_v3_legacy_seed(
+        &dir,
+        vec![dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END)],
+    )
+    .await;
+    source
+        .rows
+        .push(dataset_row(WALLET, "0xb", "b", "BUY", FRESH_END + 1));
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    source.rows.push(history_v3_bad_row(FRESH_END + 2));
+    history_v3_collect(&side, &source, 3, FRESH_END + 2, &[])
+        .await
+        .unwrap();
+    history_v3_damage_connection(&side).execute(
+        "UPDATE activity_groups_v2 SET share_amount_str = '2.250001' WHERE source_time_unix = ?1", [FRESH_END + 1],
+    ).unwrap();
+    source
+        .rows
+        .retain(|row| row["transactionHash"] != "bad-price");
+    source
+        .rows
+        .push(dataset_row(WALLET, "0xc", "c", "BUY", FRESH_END + 3));
+    let error = history_v3_collect(&side, &source, 4, FRESH_END + 3, &[])
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("activity history chain mismatch"),
+        "{error}"
+    );
+    assert!(error.to_string().contains(WALLET), "{error}");
+    assert!(receipt(&side, 4, WALLET).is_none());
+    assert_eq!(history_v3_wallet_count(&side), 2);
+}
+
+#[tokio::test]
+async fn history_v3_decoding_failure_names_the_wallet_before_an_exclusion_commit() {
+    let dir = TempDir::new().unwrap();
+    let (side, mut source) = history_v3_legacy_seed(
+        &dir,
+        vec![dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END)],
+    )
+    .await;
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    history_v3_damage_connection(&side)
+        .execute("UPDATE activity_groups_v2 SET components_json = '{}'", [])
+        .unwrap();
+    source.rows.push(history_v3_bad_row(FRESH_END + 2));
+    let error = history_v3_collect(&side, &source, 3, FRESH_END + 2, &[])
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("activity history decoding failed"),
+        "{error}"
+    );
+    assert!(error.to_string().contains(WALLET), "{error}");
+    assert!(receipt(&side, 3, WALLET).is_none());
+    assert_eq!(history_v3_wallet_count(&side), 1);
+}
