@@ -19,10 +19,11 @@ use std::time::{Duration, Instant};
 
 use futures::{StreamExt as _, stream};
 use pe_core_types::{
-    CollateralAmount, MarketId, ReconstructionQuality, ShareAmount, SourceTimestamp, WalletAddress,
+    CollateralAmount, MarketId, MarketOutcomeId, OutcomeId, ReconstructionQuality, ShareAmount,
+    Side, SourceTimestamp, VenueMarketId, WalletAddress,
 };
 use pe_position_ledger::{
-    EntryClassification, LedgerEffect, LedgerMutation, PositionLedger, SecondVerdict,
+    EntryClassification, LedgerEffect, LedgerError, LedgerMutation, PositionLedger, SecondVerdict,
     classify_complete_historical_second,
 };
 use pe_source_core::SourceError;
@@ -33,7 +34,7 @@ use pe_source_polymarket_public::{
 };
 use pe_source_polymarket_public::{
     ActivityReadError, CLOB_RESOLUTION_PARSER_VERSION, CLOB_RESOLUTION_SCHEMA_VERSION,
-    ClobCoverageManifest, ReconciliationFetcher, aggregate_activity_rows,
+    ClobCoverageManifest, ClobToken, ReconciliationFetcher, aggregate_activity_rows,
     fetch_complete_activity_semantic,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
@@ -69,7 +70,7 @@ use crate::reclamation_evidence::{
 const CACHE_BUILD_MANIFEST_VERSION: u32 = 1;
 const FROZEN_PAYLOAD_REFERENCE_VERSION: u32 = 1;
 const FINAL_STAGE_RECORD_VERSION: u32 = 2;
-const RANKER_CLASSIFIER_VERSION: u32 = 3;
+const RANKER_CLASSIFIER_VERSION: u32 = 6;
 const FRESH_COLLECTION_VERSION: u32 = 1;
 /// Wallet reads in flight during activity collection (`activity_collection_wallet_fetches`
 /// in `docs/_GLOSSARY.md`). Each wallet pages serially, so this width sets throughput
@@ -273,7 +274,8 @@ impl RankerProjectionInputs {
         // Like the rebuild, read the whole payout table without a generation
         // filter. No activity rows are needed for this commitment.
         let mut statement = connection.prepare(
-            "SELECT market_id, end_date_unix, payout_status, payout_vector_json
+            "SELECT market_id, end_date_unix, payout_status, payout_vector_json, tokens_json,
+                    raw_page_sha256
              FROM clob_payout_evidence_v2 ORDER BY market_id",
         )?;
         let rows = statement.query_map([], |row| {
@@ -282,6 +284,8 @@ impl RankerProjectionInputs {
                 row.get::<_, Option<i64>>(1)?,
                 row.get::<_, String>(2)?,
                 row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
             ))
         })?;
         let mut payout_evidence_digest = JsonArrayDigest::new();
@@ -3273,14 +3277,30 @@ fn rebuild_ranker_projection(
     let projection = (|| -> Result<_, BootstrapError> {
         let payout_markets = transaction
             .prepare(
-                "SELECT market_id FROM clob_payout_evidence_v2
-             WHERE end_date_unix IS NOT NULL
-               AND payout_status = 'resolved'
-               AND payout_vector_json IN ('[\"1\",\"0\"]','[\"0\",\"1\"]','[\"0.5\",\"0.5\"]')
-             ORDER BY market_id",
+                "SELECT market_id, tokens_json, raw_page_sha256,
+                        CASE WHEN end_date_unix IS NOT NULL
+                          AND payout_status = 'resolved'
+                          AND payout_vector_json IN ('[\"1\",\"0\"]','[\"0\",\"1\"]','[\"0.5\",\"0.5\"]')
+                        THEN 1 ELSE 0 END
+                 FROM clob_payout_evidence_v2 ORDER BY market_id",
             )?
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<Result<BTreeSet<_>, _>>()?;
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                ))
+            })?
+            .map(|row| {
+                let (market, tokens, page, eligible) = row?;
+                let tokens = serde_json::from_str::<Vec<ClobToken>>(&tokens)?
+                    .into_iter()
+                    .map(|token| token.token_id.unwrap_or_default())
+                    .collect();
+                Ok((market, (tokens, page, eligible)))
+            })
+            .collect::<Result<PayoutTokens, BootstrapError>>()?;
         let quality = ReconstructionQuality::new(100).map_err(|error| BootstrapError::Invalid {
             message: format!("bootstrap reconstruction quality is invalid: {error}"),
         })?;
@@ -3303,7 +3323,7 @@ fn rebuild_ranker_projection(
         };
         let (send_input, input) = sync_channel::<(String, Vec<ActivityAggregate>)>(1);
         let (send_output, output) = sync_channel::<Result<Vec<String>, BootstrapError>>(1);
-        let payout_markets: &BTreeSet<String> = payout_markets;
+        let payout_markets: &PayoutTokens = payout_markets;
         let quality = *quality;
         if let Err(error) = thread::Builder::new()
             .name("projection-classify".to_owned())
@@ -3387,12 +3407,16 @@ fn insert_classified_wallet(
     Ok(())
 }
 
+// Every payout market's token ids in payout-vector order, the venue page that
+// lists them, and eligibility for admission. Identity rebinding uses all markets.
+type PayoutTokens = BTreeMap<String, (Vec<String>, String, bool)>;
+
 // Aggregates retain the loader's (source_time_unix, source_trade_id) order.
 // Borrow contiguous seconds so classification uses the validated vector itself.
 fn classify_loaded_wallet(
     wallet_hex: &str,
     aggregates: &[ActivityAggregate],
-    payout_markets: &BTreeSet<String>,
+    payout_markets: &PayoutTokens,
     quality: ReconstructionQuality,
 ) -> Result<Vec<String>, BootstrapError> {
     let wallet = WalletAddress::from_hex(wallet_hex).map_err(|error| BootstrapError::Invalid {
@@ -3405,17 +3429,22 @@ fn classify_loaded_wallet(
     let mut history = HashSet::<String>::new();
     let mut admitted_ids = Vec::new();
     for aggregates in aggregates.chunk_by(|a, b| a.source_time == b.source_time) {
-        let mutations = match aggregates
+        let Ok(mutations) = aggregates
             .iter()
-            .map(LedgerMutation::from_activity)
+            .map(|aggregate| verified_mutation(aggregate, payout_markets))
             .collect::<Result<Vec<_>, _>>()
-        {
-            Ok(mutations) => mutations,
-            Err(_) => break,
+        else {
+            break;
         };
-        if mutations
+        // Known-condition anchor effects are ledger no-ops, just as in live
+        // bucket routing. Only an unknown condition makes live re-anchor.
+        if aggregates
             .iter()
-            .any(|mutation| matches!(mutation.effect.effective(), LedgerEffect::RequiresAnchor))
+            .zip(&mutations)
+            .any(|(aggregate, mutation)| {
+                matches!(mutation.effect.effective(), LedgerEffect::RequiresAnchor)
+                    && aggregate.group_id.components().condition_id.is_none()
+            })
         {
             break;
         }
@@ -3430,27 +3459,25 @@ fn classify_loaded_wallet(
                 .filter_map(|key| positions.get(key).map(|state| (key.clone(), *state)))
                 .collect(),
         );
-        let (decisions, first_entries) = match classify_complete_historical_second(
+        let decisions = match classify_complete_historical_second(
             &ledger,
             wallet,
             &mutations,
             quality,
             &|market: &MarketId| history.contains(&market.to_string()),
         ) {
-            Ok(SecondVerdict::OrderIndependent {
-                decisions,
-                first_entries,
-                ..
-            }) => (decisions, first_entries),
+            Ok(SecondVerdict::OrderIndependent { decisions, .. }) => decisions,
             Ok(SecondVerdict::OrderDependent { .. }) | Err(_) => break,
         };
-        for decision in decisions {
-            // The live copy path refuses an entry whose action depends on the
-            // order of its second's mutations (bucket_commit.rs).
+        for decision in &decisions {
+            // Live refuses an entry whose action depends on the order of its
+            // second's mutations (bucket_commit.rs).
             if decision.entry != EntryClassification::Admitted
                 || decision.action_order_dependent
                 || decision.amount == ShareAmount::ZERO
-                || !payout_markets.contains(&decision.market_id.to_string())
+                || !payout_markets
+                    .get(&decision.market_id.to_string())
+                    .is_some_and(|(_, _, eligible)| *eligible)
             {
                 continue;
             }
@@ -3477,15 +3504,57 @@ fn classify_loaded_wallet(
                     .map(|(key, state)| (key.clone(), *state)),
             );
         }
-        // Only a first entry consumes its market's history; sells, splits, merges
-        // and redemptions do not (docs/_GLOSSARY.md).
+        // Every live anchor, about hourly for a followed wallet, records each bought
+        // market (bucket_commit.rs covered_history_effects); sells, splits, merges
+        // and redemptions consume none (docs/_GLOSSARY.md).
         history.extend(
-            first_entries
-                .into_iter()
-                .map(|(market, _)| market.to_string()),
+            decisions
+                .iter()
+                .filter(|decision| decision.side == Side::Buy)
+                .map(|decision| decision.market_id.to_string()),
         );
     }
     Ok(admitted_ids)
+}
+
+// As live does with token metadata, rebind a trade or redemption to its asset's
+// position in its market's payout tokens; an asset missing there is raw-only. A
+// redemption needing an anchor carries no outcome and is never rebound.
+fn verified_mutation(
+    aggregate: &ActivityAggregate,
+    payout_markets: &PayoutTokens,
+) -> Result<LedgerMutation, LedgerError> {
+    let mutation = LedgerMutation::from_activity(aggregate)?;
+    let components = aggregate.group_id.components();
+    let (Some(asset), Some(condition)) = (&components.asset, &components.condition_id) else {
+        return Ok(mutation);
+    };
+    let Some((tokens, page, _)) = payout_markets.get(&condition.0) else {
+        return Ok(mutation);
+    };
+    if !matches!(
+        mutation.effect.effective(),
+        LedgerEffect::Trade { .. } | LedgerEffect::Redeem { .. }
+    ) {
+        return Ok(mutation);
+    }
+    let outcome = tokens
+        .iter()
+        .position(|token| *token == asset.0)
+        .and_then(|index| u16::try_from(index).ok());
+    Ok(match outcome {
+        Some(outcome) => mutation.with_verified_identity(
+            MarketOutcomeId::new(
+                MarketId(VenueMarketId(condition.0.clone())),
+                OutcomeId(outcome),
+            ),
+            page.clone(),
+        ),
+        None => LedgerMutation {
+            effect: LedgerEffect::RawOnly,
+            ..mutation
+        },
+    })
 }
 
 // Keep the projection as the outer loop even with stale SQLite statistics.
@@ -5502,8 +5571,8 @@ fn verify_finalized_v2_manifests(
         ClassifierGeneration::Current => {
             classifier_version == Some(i64::from(RANKER_CLASSIFIER_VERSION))
         }
-        // Explicit, so a revert of the current version still accepts version three.
-        ClassifierGeneration::Historical => matches!(classifier_version, Some(1..=3)),
+        // Classifiers four and five were never published; retain authentic historical generations.
+        ClassifierGeneration::Historical => matches!(classifier_version, Some(1..=3 | 6)),
     };
     let mismatched_rows: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM ranker_entries_v2 WHERE classifier_version IS NOT ?1)",
