@@ -1844,18 +1844,18 @@ fn log_collection_run(
     producer_blocked: Duration,
     counts: &CollectionWriteCounts,
 ) -> Result<(), BootstrapError> {
+    let fetch_completed_ms =
+        u64::try_from(fetch_completed.as_millis()).map_err(|_| BootstrapError::Internal)?;
+    let writer_completed_ms =
+        u64::try_from(writer_completed.as_millis()).map_err(|_| BootstrapError::Internal)?;
     tracing::info!(
         generation,
         run_started_at_unix,
-        fetch_completed_ms =
-            u64::try_from(fetch_completed.as_millis()).map_err(|_| BootstrapError::Internal)?,
-        writer_completed_ms =
-            u64::try_from(writer_completed.as_millis()).map_err(|_| BootstrapError::Internal)?,
+        fetch_completed_ms,
+        writer_completed_ms,
         producer_blocked_ms =
             u64::try_from(producer_blocked.as_millis()).map_err(|_| BootstrapError::Internal)?,
-        final_drain_ms =
-            u64::try_from(writer_completed.saturating_sub(fetch_completed).as_millis())
-                .map_err(|_| BootstrapError::Internal)?,
+        final_drain_ms = writer_completed_ms.saturating_sub(fetch_completed_ms),
         incremental_wallets = counts.incremental_wallets,
         differing_full_wallets = counts.differing_full_wallets,
         unchanged_full_wallets = counts.unchanged_full_wallets,
@@ -1903,7 +1903,7 @@ async fn collect_activity_v2(
             log_collection_run(
                 generation,
                 run_started_at_unix,
-                began.elapsed(),
+                Duration::ZERO,
                 began.elapsed(),
                 Duration::ZERO,
                 &CollectionWriteCounts::default(),
@@ -2071,6 +2071,10 @@ async fn collect_activity_v2(
             exclusion_reason,
         })
     }))
+    .map(|read| async move {
+        let completion = read.await;
+        (completion, Instant::now())
+    })
     .buffer_unordered(MAX_ACTIVITY_WALLET_FETCHES);
     // One reader batch can queue behind the serial writer. A full queue pauses
     // polling the bounded reader stream; no wallet completion is dropped on success.
@@ -2130,10 +2134,12 @@ async fn collect_activity_v2(
         })?;
     let mut producer_blocked = Duration::ZERO;
     let mut producer_wait_started = None;
+    let mut fetch_completed = began;
     let writer_finished = {
         let produce = async {
             futures::pin_mut!(reads);
-            while let Some(completion) = reads.next().await {
+            while let Some((completion, read_completed)) = reads.next().await {
+                fetch_completed = fetch_completed.max(read_completed);
                 match completion {
                     Ok(completion) => {
                         let waiting = Instant::now();
@@ -2161,7 +2167,7 @@ async fn collect_activity_v2(
     if let Some(waiting) = producer_wait_started {
         producer_blocked += waiting.elapsed();
     }
-    let fetch_completed = began.elapsed();
+    let fetch_completed = fetch_completed.duration_since(began);
     // Stop reads, close the queue and drain accepted wallets after a read error.
     // Await termination before joining so SQLite cannot block the async runtime.
     // No return path after spawn may bypass this join: the caller holds the lock.

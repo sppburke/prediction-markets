@@ -17003,8 +17003,8 @@ async fn historical_classifier_three_reuses_four_field_payout_commitment() {
 }
 
 // PASS: each collection invocation reports its own commit modes, row I/O and separate fetch/drain times,
-// including a sealed resume and a failed verification after the writer drains accepted work.
-// FAIL: counters include earlier runs, unchanged full reads touch history, or an error suppresses the event.
+// including a sealed resume, a failed verification and a full queue behind a slow writer.
+// FAIL: counters include earlier runs, send waits extend fetching, or an error suppresses the event.
 #[tokio::test]
 async fn history_v3_collection_reports_run_timing_and_writer_counts() {
     let dir = TempDir::new().unwrap();
@@ -17052,7 +17052,7 @@ async fn history_v3_collection_reports_run_timing_and_writer_counts() {
             .as_u64()
             .unwrap()
             .saturating_sub(fields["fetch_completed_ms"].as_u64().unwrap());
-        assert!(difference.saturating_sub(fields["final_drain_ms"].as_u64().unwrap()) <= 1);
+        assert_eq!(difference, fields["final_drain_ms"].as_u64().unwrap());
         assert_eq!(fields["incremental_wallets"], incremental);
         assert_eq!(fields["differing_full_wallets"], full);
         assert_eq!(fields["unchanged_full_wallets"], unchanged);
@@ -17061,12 +17061,14 @@ async fn history_v3_collection_reports_run_timing_and_writer_counts() {
         assert_eq!(fields["rows_inserted"], inserted);
         assert_eq!(fields["rows_deleted"], deleted);
         assert_eq!(fields["rows_verified"], verified);
+        fields.clone()
     };
     take(2, 1, 1, 0, 0, 2, 0, 0);
     history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
         .await
         .unwrap();
-    take(2, 0, 0, 0, 0, 0, 0, 0);
+    let fields = take(2, 0, 0, 0, 0, 0, 0, 0);
+    assert_eq!(fields["fetch_completed_ms"], 0);
     source.rows.push(history_v3_bad_row(FRESH_END + 2));
     history_v3_collect(&side, &source, 3, FRESH_END + 2, &[])
         .await
@@ -17120,4 +17122,84 @@ async fn history_v3_collection_reports_run_timing_and_writer_counts() {
         .await
         .unwrap();
     take(6, 1 - already_committed, 0, 0, 1, 0, 0, 2);
+
+    // Thirty-four instant reads leave one writer, a full thirty-two-slot queue
+    // and the final send waiting. Fetch completion must precede that send wait.
+    for index in 1..=32 {
+        admit_dataset_wallet(&side, &format!("0x{index:040x}"));
+    }
+    populate_activity_fresh_v2(
+        &side,
+        &HistoryV3StopFetcher,
+        "https://data.example",
+        7,
+        FRESH_END + 6,
+        FRESH_END + 7,
+    )
+    .await
+    .unwrap_err();
+    log.take_named("activity collection run completed");
+    source.calls.lock().unwrap().clear();
+    struct LastReadFetcher<'a> {
+        source: &'a DatasetFetcher,
+        barrier: Arc<std::sync::Barrier>,
+    }
+    impl PageFetcher for LastReadFetcher<'_> {
+        async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+            let bytes = self.source.fetch_page(url).await?;
+            if self.source.calls.lock().unwrap().len() == 34 {
+                self.barrier.wait();
+            }
+            Ok(bytes)
+        }
+    }
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let fetcher = LastReadFetcher {
+        source: &source,
+        barrier: Arc::clone(&barrier),
+    };
+    let connection = Connection::open(&side).unwrap();
+    let commit_delay = std::time::Duration::from_millis(250);
+    let measured_drain = Arc::new(Mutex::new(std::time::Duration::ZERO));
+    let observed = Arc::clone(&measured_drain);
+    let mut commits = 0;
+    let mut commit_started = None;
+    connection.commit_hook(Some(move || {
+        if commits == 0 {
+            barrier.wait();
+            commit_started = Some(std::time::Instant::now());
+        }
+        std::thread::sleep(commit_delay);
+        commits += 1;
+        if commits == 34 {
+            *observed.lock().unwrap() = commit_started.unwrap().elapsed();
+        }
+        false
+    }));
+    pe_bootstrap::cache_migration::collect_activity_v2_for_test(
+        connection,
+        &fetcher,
+        "https://data.example",
+        FRESH_END + 7,
+    )
+    .await
+    .unwrap();
+    assert_eq!(source.calls.lock().unwrap().len(), 34);
+    let fields = take(7, 1, 32, 0, 1, 0, 0, 2);
+    assert!(
+        fields["producer_blocked_ms"].as_u64().unwrap() > 0,
+        "{fields}"
+    );
+    let drain = fields["writer_completed_ms"].as_u64().unwrap()
+        - fields["fetch_completed_ms"].as_u64().unwrap();
+    let delay_ms = u64::try_from(commit_delay.as_millis()).unwrap();
+    assert!(drain >= delay_ms * 33, "{fields}");
+    // Compare with the measured writer span so SQLite overhead cannot mask
+    // the missing send wait; allow half a commit for the last read's processing.
+    let measured_ms = u64::try_from(measured_drain.lock().unwrap().as_millis()).unwrap();
+    assert!(
+        drain + delay_ms / 2 >= measured_ms,
+        "{fields}; measured drain: {measured_ms} ms"
+    );
+    assert_eq!(fields["final_drain_ms"], drain);
 }
