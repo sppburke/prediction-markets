@@ -1358,6 +1358,80 @@ run_driver_traced() {
 }
 
 if shard_owns 1; then
+# Scenario REHEARSAL-CHECKPOINT-INVALIDATION-01
+# Preconditions: invalidation holds the checkpoint lock after renaming the manifest and removing
+# receipts, before writing the final authority record.
+# PASS: capture waits without copying companions, then copies only the final authority and hashes it.
+# FAIL: capture copies transient bytes, omits the authority, or records the wrong hash inventory.
+root=$TEST_TMP/rehearsal-checkpoint-invalidation
+setup_rehearsal_fixture "$root" true none
+checkpoint_path=$root/prediction-markets/gen/g557/source_events.log.boot-checkpoint
+cp "$checkpoint_path.invalidation" "$root/test-state/checkpoint-invalidation.final"
+exec 9<>"$checkpoint_path.lock"
+flock -x 9
+mv "$checkpoint_path" "$checkpoint_path.invalidation"
+rm "$checkpoint_path.receipts"
+cat > "$root/bin/flock" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1-}" == -x ]]; then
+  if /usr/bin/flock -n "$@"; then
+    echo 'checkpoint capture did not contend with invalidation' >&2
+    exit 98
+  fi
+  : > "$PE_ACTIVATION_TEST_ROOT/test-state/checkpoint-capture-blocked"
+fi
+exec /usr/bin/flock "$@"
+SH
+chmod +x "$root/bin/flock"
+(
+  exec 9>&-
+  run_rehearsal_fixture "$root"
+) > "$root/rehearsal.out" 2>&1 &
+rehearsal_pid=$!
+if ! python3 - "$root/test-state/checkpoint-capture-blocked" "$root/rehearsal/copy" <<'PY'
+import os, sys, time
+marker, copy = sys.argv[1:]
+deadline = time.monotonic() + 10
+while True:
+    for suffix in ("", ".receipts", ".invalidation"):
+        assert not os.path.lexists(os.path.join(copy, "source_events.log.boot-checkpoint" + suffix)), "companion copied while invalidation held the lock"
+    if os.path.exists(marker):
+        break
+    if time.monotonic() >= deadline:
+        raise SystemExit("capture did not reach the checkpoint lock barrier")
+    time.sleep(0.01)
+PY
+then
+  flock -u 9
+  exec 9>&-
+  wait "$rehearsal_pid" || true
+  fail "rehearsal did not wait for checkpoint invalidation: $(cat "$root/rehearsal.out")"
+fi
+cat "$root/test-state/checkpoint-invalidation.final" > "$checkpoint_path.invalidation"
+flock -u 9
+exec 9>&-
+wait "$rehearsal_pid" || fail "rehearsal after checkpoint invalidation failed: $(cat "$root/rehearsal.out")"
+output=$(cat "$root/rehearsal.out")
+[[ "$output" == *REHEARSAL545_PASS* ]] || fail "rehearsal after checkpoint invalidation did not pass: $output"
+for name in source_events.log.boot-checkpoint{,.receipts}; do
+  [[ ! -e "$root/rehearsal/copy/$name" && ! -L "$root/rehearsal/copy/$name" ]] ||
+    fail "rehearsal copied invalidated checkpoint companion $name"
+done
+cmp "$root/test-state/checkpoint-invalidation.final" \
+  "$root/rehearsal/copy/source_events.log.boot-checkpoint.invalidation" ||
+  fail "rehearsal copied transient invalidation bytes"
+python3 - "$root/rehearsal/copy" <<'PY' || fail "invalidation capture hash inventory mismatched"
+import hashlib, os, sys
+copy = sys.argv[1]
+name = "source_events.log.boot-checkpoint.invalidation"
+expected = {"paper_state.db", "paper.log", "source_events.log", "live_journal.log",
+            "wallet_market_history.json", "source.identity", name}
+rows = [line.rstrip("\n").split("  ", 1) for line in open(os.path.join(copy, "copied.sha256"))]
+assert len(rows) == len(expected) and {entry[1] for entry in rows} == expected
+assert dict((path, digest) for digest, path in rows)[name] == hashlib.sha256(open(os.path.join(copy, name), "rb").read()).hexdigest()
+PY
+
 # Scenario REHEARSAL-BINDINGS-01
 # Preconditions: authoritative reviewed config/environment and a clean copied generation.
 # PASS: outer and result evidence bind all C2/C3 identities plus the exact final scan.
