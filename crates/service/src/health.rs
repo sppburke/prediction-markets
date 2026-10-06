@@ -72,6 +72,8 @@ pub struct HealthState {
     pub live_durability_uncertain: bool,
     /// A requested capacity generation has not yet been atomically published.
     pub configuration_generation_pending: bool,
+    /// At least one durable filesystem is below the compiled free-space warning threshold.
+    pub disk_low: bool,
     /// Named owner lifecycle and sticky failures.
     pub task_status: TaskStatus,
     /// Whether the live Polygon WS source is configured. When `false` (empty
@@ -180,6 +182,7 @@ pub fn new_shared_health_with_ws(
         paper_durability_uncertain: false,
         live_durability_uncertain: false,
         configuration_generation_pending: false,
+        disk_low: false,
         task_status: TaskStatus::new(),
         polygon_enabled,
         activity_ws_enabled,
@@ -248,6 +251,9 @@ pub fn readiness_issues(
     }
     if h.configuration_generation_pending {
         issues.push("configuration_generation_pending");
+    }
+    if h.disk_low {
+        issues.push("disk_low");
     }
     if h.task_status.critical_failed() {
         issues.push("critical_task_failed");
@@ -377,6 +383,7 @@ mod tests {
             paper_durability_uncertain: false,
             live_durability_uncertain: false,
             configuration_generation_pending: false,
+            disk_low: false,
             task_status: TaskStatus::new(),
             polygon_enabled: false,
             activity_ws_enabled: true,

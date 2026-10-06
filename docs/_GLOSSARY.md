@@ -374,7 +374,7 @@ the next-whole-second wake; periodic work retains its cadence. A held urgent slo
 
 **Installed-boot anchor reuse.** An ordinary installed boot reuses a wallet's `leader_positions`
 mirror only when the wallet is unfenced and history-complete, has a delivery cursor and non-null
-activity cutoff, has an installed anchor no older than `ANCHOR_REFRESH_SECS`, and has
+activity cutoff, has an installed anchor regardless of age, and has
 `reanchor_required = false`. Any failed condition selects the wallet for `validate_direct`.
 The durable `position_anchors` proof selected by coverage must also retain all three full-history
 activity walks: each walk includes its original page-zero request with exclusive start zero and
@@ -385,8 +385,10 @@ temporary projection without deleting the durable anchor. Only reused wallets an
 by direct validation can enter the boot universe; a deferred walk cannot reuse an old complete flag.
 When Supabase is configured and `maintenance_interval_secs` is positive, an ordinary progressive
 boot skips validation waves if a post-Start membership record has replayed, even when all anchors
-are stale. Stale-anchor structural members await runtime admission, whose first maintenance tick
-runs at startup. Without that record, an eligible reused wallet still skips fresh boot validation;
+are stale. Reusable stale anchors stay live while the unchanged runtime refresh rechecks them in
+the background. Structural members that fail the reuse conditions await runtime admission, whose
+first maintenance tick runs at startup. Without that record, an eligible reused wallet still skips
+fresh boot validation;
 otherwise boot validates `BRACKET_CONCURRENCY`-sized waves until a wallet passes the final fence,
 durable-history and acceptance filters. A successful bracket without seeded history does not stop
 the waves. Migration, `--exit-after-anchors` and disabled maintenance retain complete validation.
@@ -395,7 +397,7 @@ When a required `validate_direct` walk fails, boot defers every wallet-scoped fa
 the legacy deferral predicate (including the invalid-price row observed in #594, transient and
 rate-limited source reads). Only accepted wallets install anchors atomically, and only their seeded
 history promotes to complete. Deferred wallets stay unvalidated for runtime admission; a wallet
-reused on a fresh anchor is not re-read at boot. Shared infrastructure and consistency failures
+reused on an installed anchor is not re-read at boot. Shared infrastructure and consistency failures
 outside the legacy predicate retain their boot failure policy. Runtime-refresh error conversion is
 unchanged: a deferred refresh keeps the current anchor usable under existing eligibility rules and
 starts the refresh-only cooldown (#597). A deferred routine refresh still gets its immediate
@@ -858,6 +860,14 @@ call count.
 | Key | Default | Meaning |
 |---|---:|---|
 | `source_freshness_window_seconds` | 60 | Seconds without an event before a source is considered stale in `/health/ready` |
+| `DISK_FREE_WARN_BYTES` | 15,000,000,000 bytes (15 GB) | Compiled `disk_monitor` constant, no TOML/env key. Below this on any durable filesystem, readiness reports `disk_low` and one ERROR logs the transition; recovery to at least this clears the issue and logs INFO. |
+| `DISK_FREE_FLOOR_BYTES` | 5,000,000,000 bytes (5 GB) | Compiled `disk_monitor` constant, no TOML/env key. Startup refuses before writable initialization below this; a runtime sample below it fails the critical owner and requests coordinated shutdown. |
+| `DISK_SAMPLE_SECS` | 60 s | Compiled `disk_monitor` constant, no TOML/env key. The named critical owner samples immediately, then at this cadence regardless of `status_interval_secs`; sampling errors WARN and retry at the next tick without initiating shutdown. |
+
+Disk checks cover the parent directories of `source_event_log_path`, `paper_state_db_path`,
+`event_log_path`, `status_path`, and `jsonl_log_path`, once per device. Before a parent exists,
+its nearest existing directory supplies the filesystem sample; startup creates no directory for
+this check.
 
 ### Agent-friendly log layout
 
@@ -886,8 +896,20 @@ synchronized under the exclusive writer lock; interior corruption and every othe
 fatal. Append, flush, or synchronization uncertainty poisons the writer. The account-tagged
 `live_journal.log` uses its native verified replay for the same binding fields. An ordinary
 installed boot holds that lock while binding the recorded activation prefix. A compatible
-`<source-log>.boot-checkpoint` restores receipt metadata and raw activity/boundary candidates after
-checksum, version, mode, path, activation and tail checks. With readable inactive authority,
+`<source-log>.boot-checkpoint` is the format-2 manifest: scanner/reducer versions, mode,
+activation, generation, path/tail/offset, prefix hash, reducer projections and `receipt_count`,
+without a receipt list. `<source-log>.boot-checkpoint.receipts` holds fixed 80-byte records:
+32-byte receipt hash, little-endian receive milliseconds (`i64`), little-endian byte offset
+(`u64`, absent encoded as `u64::MAX`), and BLAKE3 of the preceding 48 bytes. Record position i
+implies source sequence i, matching the dense in-memory receipt index. Boot reads the named
+records sequentially into that index, validating every checksum, offset bound/order and the
+manifest's last sequence/hash. Invalid receipt records quarantine both the manifest and receipts
+file under the existing invalidation lock and select a full verified walk; the next publication
+creates a fresh receipts file from record zero using that rebuilt index. Bytes beyond `receipt_count`
+are uncommitted garbage. A format-1 manifest converts once, synchronizing its sidecar before
+atomically replacing the manifest; failed conversion retains format 1 and its boot index.
+Compatibility still requires checksum, version, mode, path, activation and tail checks. With
+readable inactive authority,
 boot defers the exact raw-prefix BLAKE3 check and scanner-verifies only the suffix; its completion
 line records `prefix_verification="deferred"`, the loaded binding and `prefix_blake3`. Missing,
 damaged or incompatible artifacts, shortened files, and active or unreadable authority select a
@@ -896,7 +918,8 @@ incomplete-tail repair remain unchanged. Runtime indexed reads verify individual
 
 The critical `source_checkpoint` owner starts after HTTP listening. Its single cancellable blocking
 job slot verifies the loaded prefix, continues the same hasher to the frozen boot tail, then
-serializes and publishes the frozen initial receipt prefix and pre-consumption reducers. A mismatch,
+serializes and publishes the frozen initial manifest and pre-consumption reducers, capturing
+only receipts beyond the installed manifest count. A mismatch,
 read error or binding inequality quarantines checkpoint use and triggers coordinated restart. A
 failure before the quarantine is durable (checkpoint lock, invalidation-record read, quarantine
 rename or its directory sync) carries `CheckpointInvalidationFailed` and exits 78; with no
@@ -909,13 +932,19 @@ no further publication; an already-started publication finishes.
 
 All publishers share one persistent `<checkpoint>.lock` inode and the durable
 `<checkpoint>.invalidation` record (`generation`, `active`; absence means generation zero/inactive).
-Invalidation atomically quarantines the artifact before advancing active authority. Publication
+Invalidation quarantines the manifest and discards the receipts file, synchronizing their directory
+before advancing active authority. Publication
 compares artifact applicability, reducer version, tail, binding and prefix under the lock and
-installs only an authorized candidate; a verified current-generation publication clears active
+installs only an authorized candidate. Under that lock it writes only new receipt records at
+their positions, preserving committed bytes, then fsyncs the sidecar before the manifest's
+existing temporary-file/fsync/rename/directory-fsync install. A crash before manifest installation
+leaves the previous manifest and its receipt prefix valid. `--prepare-source-checkpoint` uses
+the same format-2 publication path. A verified current-generation publication clears active
 only after durable installation. Clearance is automatic on a verified current-generation
 publication, whether by the next boot's full walk or `--prepare-source-checkpoint`; there is no
 separate clearance command. Unreadable authority makes boots full-walk and refuses publication
-until quiesced recovery removes and syncs the checkpoint before removing and syncing the record.
+until quiesced recovery removes both checkpoint files and syncs their directory before removing
+and syncing the record. The persistent lock remains; raw logs are unchanged.
 Preparation reads authority first, captures open rows before its finite source
 bound, and full-walks when the record is active or undecodable. A proven wrong prefix digest
 invalidates only the still-current artifact and generation; if either changed, preparation starts
@@ -950,9 +979,10 @@ side main; path, prefix, hash, identity, or phase drift fails closed. Pre-bounda
 audit/replay history and cannot create v2 state. Once v2 input has appended or active state has
 committed, rollback to v1 is refused; restart the v2-compatible binary to resume roll-forward.
 
-Ordinary production has one named supervisor over 17 retained owners. Activity ingest, public
+Ordinary production has one named supervisor over 18 retained owners. Activity ingest, public
 poll/reconciliation, orchestrator, resolution poller, configured live-account/fan-out owners,
-watchlist refresh/projection, maintenance, capacity/config workers, source checkpoint, status writer, and HTTP server
+watchlist refresh/projection, maintenance, capacity/config workers, source checkpoint, disk monitor,
+status writer, and HTTP server
 are critical: an unexpected typed error, early return, channel close, or join failure sticks in
 readiness/status and initiates ordered shutdown. Supabase analytics, liquidity snapshots, and JSON
 tracing appenders are best-effort and degrade status without failing trading readiness. Shutdown

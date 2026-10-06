@@ -75,7 +75,7 @@ use pe_service::trade_poller::{
     TradePoller, TradePollerConfig, rebuild_reconciliation_obligations,
     rebuild_reconciliation_obligations_with_index, recover_daily_boundary,
 };
-use pe_service::watchlist_admission::{AdmissionPreparer, anchor_refresh_due};
+use pe_service::watchlist_admission::AdmissionPreparer;
 use pe_service::watchlist_capacity::SupabaseWatchlistCapacity;
 use pe_service::watchlist_maintenance::{MaintenanceConfig, MembershipMode, run_maintenance_loop};
 use time::OffsetDateTime;
@@ -90,7 +90,6 @@ fn select_boot_anchor_wallets(
     paper_state: &PaperStateDb,
     wallets: &[WalletAddress],
     first_migration_boot: bool,
-    now_unix: i64,
 ) -> Result<BootAnchorSelection, pe_paper_state::PaperStateError> {
     if first_migration_boot {
         return Ok(BootAnchorSelection {
@@ -109,11 +108,7 @@ fn select_boot_anchor_wallets(
             && paper_state.cursor(wallet)?.is_some()
             && coverage.activity_cutoff_unix.is_some()
             && coverage.anchor_seq.is_some()
-            && !anchor_refresh_due(
-                &coverage,
-                now_unix,
-                pe_service::trade_poller::ANCHOR_REFRESH_SECS,
-            );
+            && !coverage.reanchor_required;
         let full_history = if reusable {
             match coverage.anchor_seq {
                 Some(sequence) => paper_state
@@ -169,6 +164,16 @@ fn boot_wave_has_eligible_wallet<'a>(
     Ok(false)
 }
 
+fn effective_live_wallet_list(live: &LiveWatchlist, paper: &PaperStateDb) -> Result<Vec<String>> {
+    let mut wallets = pe_service::supabase_refresh::effective_projection_entries(live, paper)
+        .context("read effective live wallets at listening")?
+        .into_iter()
+        .map(|entry| entry.wallet_hex)
+        .collect::<Vec<_>>();
+    wallets.sort_unstable();
+    Ok(wallets)
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -204,7 +209,7 @@ async fn main() -> Result<()> {
             std::path::Path::new(paper),
         )?;
         println!(
-            "source checkpoint published offset={} sequence={} hash={} prefix_blake3={} capture_unix_ms={} published_unix_ms={} validated={validated}",
+            "source checkpoint published offset={} sequence={} hash={} prefix_blake3={} capture_unix_ms={} published_unix_ms={} validated={validated} receipts={}",
             receipt.tail.physical_tail,
             receipt
                 .tail
@@ -213,7 +218,8 @@ async fn main() -> Result<()> {
             receipt.tail.last_hash.to_hex(),
             receipt.prefix_blake3,
             receipt.capture_unix_ms,
-            receipt.published_unix_ms
+            receipt.published_unix_ms,
+            pe_service::source_checkpoint::receipts_path(&receipt.tail.path).display()
         );
         return Ok(());
     }
@@ -231,9 +237,11 @@ async fn main() -> Result<()> {
         let receipt =
             pe_service::source_checkpoint::recover_installed(std::path::Path::new(paper))?;
         println!(
-            "source checkpoint recovery checkpoint={} removed={} record={} removed={}",
+            "source checkpoint recovery checkpoint={} removed={} receipts={} removed={} record={} removed={}",
             receipt.checkpoint.display(),
             receipt.checkpoint_removed,
+            receipt.receipts.display(),
+            receipt.receipts_removed,
             receipt.record.display(),
             receipt.record_removed
         );
@@ -392,6 +400,8 @@ async fn main() -> Result<()> {
     }
 
     let cfg = load_config()?;
+    let disk_monitor = pe_service::disk_monitor::DiskMonitor::from_config(&cfg)?;
+    disk_monitor.check_startup()?;
 
     // Derive the financial era exactly once, from the verified paper log, before constructing
     // any HTTP client. A Start has no local-authority interpretation: credentials and the
@@ -474,6 +484,16 @@ async fn main() -> Result<()> {
             &migration_paths,
             financial_start.is_some(),
         )
+        .map_err(|error| {
+            if matches!(
+                error.downcast_ref::<pe_service::source_checkpoint::InvalidationError>(),
+                Some(pe_service::source_checkpoint::InvalidationError::QuarantineFailed(_))
+            ) {
+                eprintln!("pe-service: {error:#}");
+                std::process::exit(78);
+            }
+            error
+        })
         .context("walk the installed source event log")?
         {
             Some(opened) => (Some(opened.boot), Some(opened.sink), Some(opened.binding)),
@@ -924,7 +944,6 @@ async fn main() -> Result<()> {
         &paper_state,
         &boot_wallets,
         migration_boot.session.is_some(),
-        OffsetDateTime::now_utc().unix_timestamp(),
     )
     .context("select reusable boot anchors")?;
     info!(
@@ -1021,8 +1040,8 @@ async fn main() -> Result<()> {
         .map(|entry| entry.wallet)
         .collect();
     live_watchlist.remove_fenced(&history_incomplete);
-    // Live at boot means accepted by this boot's bracket. Deferred wallets
-    // re-enter only through the runtime admission preparer; fenced wallets stay
+    // Live at boot means a reusable installed anchor or acceptance by this boot's bracket.
+    // Deferred wallets re-enter only through the runtime admission preparer; fenced wallets stay
     // excluded. On a resumed side main an earlier bracket's promoted history
     // would otherwise keep a now-deferred wallet live.
     let anchored_wallets: Vec<_> = anchored.iter().map(|install| install.wallet).collect();
@@ -1132,6 +1151,10 @@ async fn main() -> Result<()> {
     let mut supervisor = TaskSupervisor::new(task_status.clone());
     supervisor.register_external(TaskName::JsonTracingFullAppender);
     supervisor.register_external(TaskName::JsonTracingErrorAppender);
+    supervisor.spawn(
+        TaskName::DiskMonitor,
+        disk_monitor.run(health.clone(), shutdown.subscribe()),
+    );
     let listener = tokio::net::TcpListener::bind(&cfg.bind)
         .await
         .with_context(|| format!("bind {}", cfg.bind))?;
@@ -1881,7 +1904,22 @@ async fn main() -> Result<()> {
         .route("/paper/status", get(pe_service::paper_api::status))
         .with_state(health.clone())
         .layer(axum::Extension(paper_api_state));
-    info!(bind = %cfg.bind, "pe-service listening");
+    {
+        let _writer = watchlist_writer_lock.lock().await;
+        match effective_live_wallet_list(&live_watchlist, &paper_state) {
+            Ok(live_wallet_list) => info!(
+                bind = %cfg.bind,
+                live_wallets = live_wallet_list.len(),
+                ?live_wallet_list,
+                "pe-service listening"
+            ),
+            // A census read failure is reported as such, never as an empty census.
+            Err(error) => {
+                warn!(error = %format!("{error:#}"), "listening census unavailable");
+                info!(bind = %cfg.bind, "pe-service listening");
+            }
+        }
+    }
     let http_shutdown = shutdown.subscribe();
     supervisor.spawn(TaskName::HttpServer, async move {
         http_server::serve(
@@ -1936,6 +1974,7 @@ async fn main() -> Result<()> {
     advance_shutdown(&shutdown, &task_status, ShutdownPhase::StopProducers);
     checkpoint_slot.cancel();
     let producers = [
+        TaskName::DiskMonitor,
         TaskName::SourceCheckpoint,
         TaskName::PublicActivityPoll,
         TaskName::ResolutionPoller,
@@ -2611,7 +2650,7 @@ mod tests {
                     params![proof.to_string(), wallet.to_string()],
                 )
                 .unwrap();
-            let selection = select_boot_anchor_wallets(&paper, &[wallet], false, NOW).unwrap();
+            let selection = select_boot_anchor_wallets(&paper, &[wallet], false).unwrap();
             assert!(selection.reused.is_empty(), "{proof}");
             assert_eq!(selection.walked, vec![wallet]);
             assert!(paper.wallet_history_complete(&wallet).unwrap());
@@ -2627,7 +2666,7 @@ mod tests {
             "{}"
         );
         assert_eq!(
-            select_boot_anchor_wallets(&paper, &[wallet], false, NOW)
+            select_boot_anchor_wallets(&paper, &[wallet], false)
                 .unwrap()
                 .reused,
             vec![wallet]
@@ -2635,7 +2674,7 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_boot_reuses_only_wallets_matching_runtime_anchor_rule() {
+    fn ordinary_boot_reuses_only_wallets_matching_installed_anchor_rule() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("paper.db");
         let paper_state = PaperStateDb::open(&path).unwrap();
@@ -2715,12 +2754,14 @@ mod tests {
             without_cursor,
             without_cutoff,
         ];
-        let selection = select_boot_anchor_wallets(&paper_state, &wallets, false, NOW).unwrap();
-        assert_eq!(selection.reused, vec![with_validation, without_validation]);
+        let selection = select_boot_anchor_wallets(&paper_state, &wallets, false).unwrap();
+        assert_eq!(
+            selection.reused,
+            vec![with_validation, without_validation, aged]
+        );
         assert_eq!(
             selection.walked,
             vec![
-                aged,
                 reanchor_required,
                 fenced,
                 history_incomplete,
@@ -2729,10 +2770,75 @@ mod tests {
             ]
         );
 
-        let migration =
-            select_boot_anchor_wallets(&paper_state, &[with_validation], true, NOW).unwrap();
+        let migration = select_boot_anchor_wallets(&paper_state, &[with_validation], true).unwrap();
         assert!(migration.reused.is_empty());
         assert_eq!(migration.walked, vec![with_validation]);
+    }
+
+    #[test]
+    fn ordinary_boot_reuses_aged_anchor_but_not_reanchor_required_wallet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("paper.db");
+        let paper = PaperStateDb::open(&path).unwrap();
+        let aged = wallet(1);
+        let reanchor_required = wallet(2);
+        let age = i64::try_from(pe_service::trade_poller::ANCHOR_REFRESH_SECS).unwrap() + 1;
+        for wallet in [aged, reanchor_required] {
+            install_reusable_facts(&paper, wallet, NOW - age);
+        }
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "UPDATE poll_cursors SET reanchor_required = 1 WHERE wallet_hex = ?1",
+                params![reanchor_required.to_string()],
+            )
+            .unwrap();
+        drop(paper);
+        let paper = PaperStateDb::open(&path).unwrap();
+        let selection =
+            select_boot_anchor_wallets(&paper, &[aged, reanchor_required], false).unwrap();
+        assert_eq!(selection.reused, vec![aged]);
+        assert_eq!(selection.walked, vec![reanchor_required]);
+        assert!(pe_service::watchlist_admission::anchor_refresh_due(
+            &paper.wallet_coverage(&aged).unwrap(),
+            NOW,
+            pe_service::trade_poller::ANCHOR_REFRESH_SECS,
+        ));
+    }
+
+    #[test]
+    fn listening_wallet_census_reports_sorted_effective_set() {
+        use pe_core_types::{BasisPoints, ReconstructionQuality};
+        use pe_trader_index::{WatchlistEntry, WatchlistTier};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("paper.db");
+        let paper = PaperStateDb::open(&path).unwrap();
+        let wallets = [wallet(3), wallet(2), wallet(1)];
+        let live = LiveWatchlist::new(Watchlist {
+            entries: wallets
+                .iter()
+                .map(|wallet| WatchlistEntry {
+                    wallet: *wallet,
+                    tier: WatchlistTier::Active,
+                    leader_score_bps: BasisPoints(0),
+                    lcb_5pct_bps: BasisPoints(0),
+                    win_rate_bps: BasisPoints(0),
+                    closed_trades_in_window: 0,
+                    reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+                })
+                .collect(),
+            snapshot_at: SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
+            active_count: wallets.len(),
+            incubator_count: 0,
+        });
+        rusqlite::Connection::open(&path).unwrap().execute(
+            "INSERT INTO wallet_fences (wallet_hex, source_trade_id, cause, proof_json, fenced_at_unix) VALUES (?1, 'census', 'test', '{}', ?2)",
+            params![wallet(2).to_string(), NOW],
+        ).unwrap();
+        assert_eq!(
+            effective_live_wallet_list(&live, &paper).unwrap(),
+            vec![wallet(1).to_string(), wallet(3).to_string()]
+        );
     }
     #[test]
     fn paper_service_rollout_boot_requires_an_eligible_wave_and_preserves_complete_modes() {
