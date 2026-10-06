@@ -809,7 +809,7 @@ env PE_ACTIVATION_TEST_HOLD_LOCK_FILE="$hold" PROC_ROOT="$root/proc" \
     --site-confirmed \
     >"$root/holder.out" 2>"$root/holder.err" &
 holder=$!
-for _ in {1..100}; do [[ -e "$hold.ready" ]] && break; sleep 0.02; done
+for _ in {1..500}; do [[ -e "$hold.ready" ]] && break; sleep 0.02; done
 [[ -e "$hold.ready" ]] || fail "lock holder did not reach its test seam"
 set +e
 activate "$root" activation-557 >"$root/contender.out" 2>"$root/contender.err"

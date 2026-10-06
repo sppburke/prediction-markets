@@ -4008,31 +4008,69 @@ impl BucketCommitEngine {
             .as_ref()
             .ok_or_else(|| BucketCommitError::Invariant("frame condition absent".to_owned()))?;
         let market = MarketId(pe_core_types::VenueMarketId(condition.0.clone()));
-        if self.earlier_frames.iter().any(|frame| {
+        let candidate_shaped = parts.side == Some(Side::Buy)
+            && observation.share_amount != ShareAmount::ZERO
+            && !observation.is_combo;
+        let earlier_identity = self.earlier_frames.iter().find(|frame| {
             frame.source_trade_id == *observation.group_id.key()
                 && frame.receipt.sequence < receipt.sequence
                 && frame.unresolved_buy
-        }) || self
-            .paper_state
-            .decision_pending_for(observation.group_id.key())?
-            .is_some()
-        {
+        });
+        // Preserve the guard's short circuit: an earlier receipt needs no continuation read.
+        let continuation = if earlier_identity.is_none() {
+            self.paper_state
+                .decision_pending_for(observation.group_id.key())?
+        } else {
+            None
+        };
+        if earlier_identity.is_some() || continuation.is_some() {
+            if candidate_shaped {
+                let earlier_hash =
+                    earlier_identity.map(|frame| frame.receipt.this_hash.to_hex().to_string());
+                tracing::info!(
+                    receipt_sequence = receipt.sequence.0,
+                    receipt_hash = %receipt.this_hash,
+                    wallet = %observation.wallet,
+                    market = %market,
+                    outcome = parts.outcome.map(|outcome| outcome.0),
+                    source_trade_id = %observation.group_id.key(),
+                    reason = "identity_seen",
+                    earlier_receipt_sequence = earlier_identity.map(|frame| frame.receipt.sequence.0),
+                    earlier_receipt_hash = earlier_hash.as_deref(),
+                    continuation_source_trade_id = continuation.as_ref().map(|row| row.source_trade_id.0.as_str()),
+                    continuation_semantic_revision = continuation.as_ref().map(|row| row.semantic_revision.as_str()),
+                    "frame admission ignored"
+                );
+            }
             return Ok(FrameRoute::Ignored);
         }
         // Any durable REST disposition owns this identity, including raw-only refusals.
-        if self
+        if let Some(group) = self
             .paper_state
             .activity_group_state(observation.group_id.key())?
-            .is_some()
         {
+            if candidate_shaped {
+                tracing::info!(
+                    receipt_sequence = receipt.sequence.0,
+                    receipt_hash = %receipt.this_hash,
+                    wallet = %observation.wallet,
+                    market = %market,
+                    outcome = parts.outcome.map(|outcome| outcome.0),
+                    source_trade_id = %observation.group_id.key(),
+                    reason = "rest_owned",
+                    semantic_revision = %group.semantic_revision,
+                    disposition = %group.disposition,
+                    "frame admission ignored"
+                );
+            }
             self.routed_frame_receipts.insert(receipt.sequence);
             return Ok(FrameRoute::Ignored);
         }
         // REST winning first already consumed history, before this admission capture.
-        let market_consumed = self
+        let market_history = self
             .paper_state
-            .market_history_record(&observation.wallet, &market)?
-            .is_some();
+            .market_history_record(&observation.wallet, &market)?;
+        let market_consumed = market_history.is_some();
         let incoming = IncomingTrade {
             wallet: observation.wallet,
             market_id: market.clone(),
@@ -4046,12 +4084,22 @@ impl BucketCommitEngine {
             transaction_hash: Some(parts.transaction_hash.clone()),
             provenance: TradeProvenance::ActivityWs,
         };
+        let position = self.ledger.position(&observation.wallet);
         let action = pe_copy_signal_engine::classify_leader_action(
             &incoming,
-            self.ledger.position(&observation.wallet),
+            position,
             context.quality,
             &context.signal_config,
         );
+        let balance = position
+            .and_then(|snapshot| {
+                snapshot
+                    .positions
+                    .get(&MarketOutcomeId::new(market.clone(), incoming.outcome_id))
+            })
+            .copied()
+            .unwrap_or_default();
+        let entry_market_consumed = self.entry_gate.has_market(&observation.wallet, &market);
         let earlier = self
             .earlier_frames
             .iter()
@@ -4064,7 +4112,7 @@ impl BucketCommitEngine {
             && observation.share_amount != ShareAmount::ZERO
             && !observation.is_combo
             && action == LeaderAction::Entry
-            && !self.entry_gate.has_market(&observation.wallet, &market)
+            && !entry_market_consumed
             && context.copy_eligible;
         let unresolved = incoming.side == Side::Buy
             && observation.share_amount != ShareAmount::ZERO
@@ -4079,6 +4127,30 @@ impl BucketCommitEngine {
         });
         self.routed_frame_receipts.insert(receipt.sequence);
         if !qualifying {
+            if candidate_shaped {
+                let reason = if entry_market_consumed {
+                    "market_consumed"
+                } else if action != LeaderAction::Entry {
+                    "not_entry"
+                } else {
+                    "not_copy_eligible"
+                };
+                tracing::info!(
+                    receipt_sequence = receipt.sequence.0,
+                    receipt_hash = %receipt.this_hash,
+                    wallet = %observation.wallet,
+                    market = %market,
+                    outcome = incoming.outcome_id.0,
+                    source_trade_id = %incoming.source_trade_id,
+                    reason,
+                    consuming_source_trade_id = market_history.as_ref().map(|row| row.source_trade_id.0.as_str()),
+                    first_epoch = market_history.as_ref().map(|row| row.first_epoch),
+                    action = ?action,
+                    balance = %balance.long_contracts,
+                    short_balance = %balance.short_contracts,
+                    "frame admission ignored"
+                );
+            }
             return Ok(FrameRoute::Ignored);
         }
         self.restore_verified_frontiers(index)
@@ -8222,6 +8294,308 @@ mod activity_exemption_tests {
         FrozenDecisionBasis {
             win_rate_p: pe_core_types::Probability::ZERO,
             bankroll: rust_decimal::Decimal::ZERO,
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[test]
+    fn frame_admission_ignored_lines() {
+        use crate::frame_admission::{EarlierFrame, FeedLatchBasis};
+        use pe_event_log::{EnvelopeIn, Writer};
+
+        for case in [
+            "earlier_receipt",
+            "open_continuation",
+            "terminal_continuation",
+            "rest_owned",
+            "market_consumed",
+            "not_entry",
+            "not_copy_eligible",
+        ] {
+            for shape in ["buy", "sell", "zero", "combo"] {
+                let (dir, paper, mut engine) = fixture();
+                let wallet = WalletAddress([0xaa; 20]);
+                let market = MarketId(VenueMarketId("market".to_owned()));
+                let at = time::OffsetDateTime::from_unix_timestamp(100).unwrap();
+                let live = crate::live_watchlist::LiveWatchlist::new(pe_trader_index::Watchlist {
+                    entries: vec![pe_trader_index::WatchlistEntry {
+                        wallet,
+                        tier: pe_trader_index::WatchlistTier::Active,
+                        leader_score_bps: pe_core_types::BasisPoints(100),
+                        lcb_5pct_bps: pe_core_types::BasisPoints(100),
+                        win_rate_bps: pe_core_types::BasisPoints(7000),
+                        closed_trades_in_window: 90,
+                        reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+                    }],
+                    snapshot_at: SourceTimestamp(at),
+                    active_count: 1,
+                    incubator_count: 0,
+                });
+                let raw = json!({
+                    "proxyWallet": wallet.to_string(), "timestamp": 100, "conditionId": "market",
+                    "type": "TRADE", "size": if shape == "zero" { "0" } else { "2" },
+                    "usdcSize": "1", "transactionHash": "frame", "price": "0.5", "asset": "asset",
+                    "side": if shape == "sell" { "SELL" } else { "BUY" }, "outcomeIndex": 0,
+                    "outcome": "Yes", "isCombo": shape == "combo",
+                });
+                let payload = serde_json::to_vec(&raw).unwrap();
+                let observation = parse_activity_trade_observation(&payload).unwrap();
+                let id = observation.group_id.key().clone();
+                let source_path = dir.path().join("frames.log");
+                let mut writer = Writer::open(&source_path).unwrap();
+                let envelope = || EnvelopeIn {
+                    source_id: SourceId(crate::activity_ingest::ACTIVITY_WS_SOURCE_ID.to_owned()),
+                    schema_version: ACTIVITY_SCHEMA_VERSION,
+                    parser_version: ACTIVITY_PARSER_VERSION,
+                    observed_at: SourceTimestamp(at),
+                    received_at: ReceivedAt(at),
+                    content_type: ContentType::Json,
+                    payload: payload.clone(),
+                };
+                let earlier_receipt = writer.append_synced(envelope()).unwrap();
+                let receipt = writer.append_synced(envelope()).unwrap();
+                if case == "not_copy_eligible" {
+                    assert_eq!(live.snapshot().entries.len(), 1);
+                    live.remove_fenced(&HashSet::from([wallet]));
+                    assert!(live.snapshot().entries.is_empty());
+                }
+                drop(writer);
+                let index = SourceReceiptIndex::replay(&source_path).unwrap();
+
+                if matches!(
+                    case,
+                    "earlier_receipt"
+                        | "open_continuation"
+                        | "terminal_continuation"
+                        | "rest_owned"
+                        | "market_consumed"
+                ) {
+                    let consumed = case == "market_consumed";
+                    let durable_id = if consumed {
+                        group("TRADE", "consuming", 100, 0, false, "market")
+                            .group_id
+                            .key()
+                            .clone()
+                    } else {
+                        id.clone()
+                    };
+                    let pending = case.ends_with("continuation") || case == "earlier_receipt";
+                    paper
+                        .commit_activity_bucket(&ActivityBucketCommit {
+                            wallet,
+                            source_epoch: 100,
+                            dispositions: vec![ActivityDispositionRecord {
+                                source_trade_id: durable_id.clone(),
+                                transaction_hash: if consumed { "consuming" } else { "frame" }
+                                    .to_owned(),
+                                wallet,
+                                source_epoch: 100,
+                                semantic_revision: "rest-revision".to_owned(),
+                                activity_type: "TRADE".to_owned(),
+                                disposition: "raw_only".to_owned(),
+                                proof_json: "{}".to_owned(),
+                                no_copy: None,
+                            }],
+                            leader_positions: Vec::new(),
+                            gate_results: Vec::new(),
+                            history_effects: if consumed {
+                                vec![MarketHistoryRecord {
+                                    wallet,
+                                    market_id: market.clone(),
+                                    first_epoch: 100,
+                                    source_trade_id: durable_id.clone(),
+                                }]
+                            } else {
+                                Vec::new()
+                            },
+                            history_status: None,
+                            pending: if pending {
+                                vec![DecisionPendingRecord {
+                                    source_trade_id: durable_id,
+                                    semantic_revision: "continuation-revision".to_owned(),
+                                    wallet,
+                                    source_epoch: 100,
+                                    frozen_inputs_json: "{}".to_owned(),
+                                    updated_at_unix: 100,
+                                }]
+                            } else {
+                                Vec::new()
+                            },
+                            fence: None,
+                            reanchor: None,
+                            advance_cursor: false,
+                        })
+                        .unwrap();
+                    if case == "terminal_continuation" {
+                        paper
+                            .close_decision_pending(&id, "{}", "no_copy:fixture", 100)
+                            .unwrap();
+                    }
+                    engine.entry_gate =
+                        CopyEntryGate::new(CopyEntryGateConfig, paper.gate_history().unwrap());
+                }
+                if case == "earlier_receipt" {
+                    engine.observe_frame(EarlierFrame {
+                        receipt: earlier_receipt,
+                        wallet,
+                        source_trade_id: id.clone(),
+                        market: market.clone(),
+                        received_at: at,
+                        unresolved_buy: true,
+                    });
+                }
+                // Empty confirmed inventory keeps Entry classification after membership removal
+                // changes the orchestrator context to quality zero and copy_eligible false.
+                let mut positions = HashMap::new();
+                if matches!(case, "market_consumed" | "not_entry") {
+                    positions.insert(
+                        MarketOutcomeId::new(market.clone(), OutcomeId(0)),
+                        PositionState {
+                            long_contracts: ShareAmount::from_atomic(3_000_000),
+                            short_contracts: ShareAmount::ZERO,
+                        },
+                    );
+                }
+                engine.ledger.replace_wallet_snapshot(wallet, positions);
+                let quality = live
+                    .snapshot()
+                    .entries
+                    .first()
+                    .map_or(ReconstructionQuality::new(0).unwrap(), |entry| {
+                        entry.reconstruction_quality
+                    });
+                let context = || FrameAdmissionContext {
+                    admitted_at: at,
+                    stale_secs: 90,
+                    quality,
+                    signal_config: SignalConfig::default(),
+                    copy_eligible: false,
+                    configuration: synthetic_legacy17_runtime_config(),
+                    basis: basis(),
+                    latch: FeedLatchBasis::default(),
+                    paper_prefix: None,
+                };
+                let logs = CapturedLogs::default();
+                let subscriber = tracing_subscriber::fmt()
+                    .json()
+                    .without_time()
+                    .with_ansi(false)
+                    .with_writer(logs.clone())
+                    .finish();
+                tracing::subscriber::with_default(subscriber, || {
+                    assert!(matches!(
+                        engine
+                            .prepare_activity_frame(receipt, &index, context())
+                            .unwrap(),
+                        FrameRoute::Ignored
+                    ));
+                    let lines = String::from_utf8(logs.0.lock().unwrap().clone())
+                        .unwrap()
+                        .lines()
+                        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                        .filter(|line| line["fields"]["message"] == "frame admission ignored")
+                        .collect::<Vec<_>>();
+                    if shape == "buy" {
+                        assert_eq!(lines.len(), 1, "{case}");
+                        let fields = &lines[0]["fields"];
+                        let reason = if case == "earlier_receipt" || case.ends_with("continuation")
+                        {
+                            "identity_seen"
+                        } else {
+                            case
+                        };
+                        assert_eq!(lines[0]["level"], "INFO");
+                        assert_eq!(fields["reason"], reason);
+                        assert_eq!(fields["receipt_sequence"], receipt.sequence.0);
+                        assert_eq!(
+                            fields["receipt_hash"],
+                            receipt.this_hash.to_hex().to_string()
+                        );
+                        assert_eq!(fields["wallet"], wallet.to_string());
+                        assert_eq!(fields["market"], market.to_string());
+                        assert_eq!(fields["outcome"], 0);
+                        assert_eq!(fields["source_trade_id"], id.0);
+                        match case {
+                            "earlier_receipt" => {
+                                assert_eq!(
+                                    fields["earlier_receipt_sequence"],
+                                    earlier_receipt.sequence.0
+                                );
+                                assert_eq!(
+                                    fields["earlier_receipt_hash"],
+                                    earlier_receipt.this_hash.to_hex().to_string()
+                                );
+                                assert!(fields["continuation_source_trade_id"].is_null());
+                            }
+                            "open_continuation" | "terminal_continuation" => {
+                                assert_eq!(fields["continuation_source_trade_id"], id.0);
+                                assert_eq!(
+                                    fields["continuation_semantic_revision"],
+                                    "continuation-revision"
+                                );
+                            }
+                            "rest_owned" => {
+                                assert_eq!(fields["semantic_revision"], "rest-revision");
+                                assert_eq!(fields["disposition"], "raw_only");
+                            }
+                            "market_consumed" => {
+                                let history = paper
+                                    .market_history_record(&wallet, &market)
+                                    .unwrap()
+                                    .unwrap();
+                                assert_eq!(
+                                    fields["consuming_source_trade_id"],
+                                    history.source_trade_id.0
+                                );
+                                assert_eq!(fields["first_epoch"], history.first_epoch);
+                            }
+                            "not_entry" => {
+                                assert_eq!(fields["action"], "Add");
+                                assert_eq!(fields["balance"], "3");
+                                assert_eq!(fields["short_balance"], "0");
+                            }
+                            _ => assert_eq!(fields["action"], "Entry"),
+                        }
+                    } else {
+                        assert!(lines.is_empty(), "{case}/{shape}: {lines:?}");
+                    }
+                    logs.0.lock().unwrap().clear();
+                    engine.routed_frame_receipts.insert(receipt.sequence);
+                    assert!(matches!(
+                        engine
+                            .prepare_activity_frame(receipt, &index, context())
+                            .unwrap(),
+                        FrameRoute::Ignored
+                    ));
+                    assert!(
+                        logs.0.lock().unwrap().is_empty(),
+                        "already routed {case}/{shape}"
+                    );
+                });
+            }
         }
     }
 

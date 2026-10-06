@@ -115,6 +115,22 @@ impl AssetIdentityResolver {
         &self,
         tokens: impl IntoIterator<Item = PolymarketTokenId>,
     ) -> Result<ResolvedIdentities, SourceError> {
+        self.resolve_inner(tokens, false).await
+    }
+
+    /// Keep a bracket's completed history reads while retrying exhausted transient chunks.
+    pub async fn resolve_for_bracket(
+        &self,
+        tokens: impl IntoIterator<Item = PolymarketTokenId>,
+    ) -> Result<ResolvedIdentities, SourceError> {
+        self.resolve_inner(tokens, true).await
+    }
+
+    async fn resolve_inner(
+        &self,
+        tokens: impl IntoIterator<Item = PolymarketTokenId>,
+        retry_chunks: bool,
+    ) -> Result<ResolvedIdentities, SourceError> {
         let requested = tokens.into_iter().collect::<BTreeSet<_>>();
         let mut resolved = self.cached(&requested).await;
         let misses = requested
@@ -135,6 +151,7 @@ impl AssetIdentityResolver {
             "gamma token lookup rejected",
             &mut pages,
             &mut sequences,
+            retry_chunks,
         )
         .await?;
         let open_identities = verify_token_identities(&misses, &pages);
@@ -151,6 +168,7 @@ impl AssetIdentityResolver {
                 "gamma closed-token lookup rejected",
                 &mut pages,
                 &mut sequences,
+                retry_chunks,
             )
             .await?;
         }
@@ -192,25 +210,37 @@ impl AssetIdentityResolver {
         rejected_message: &str,
         pages: &mut Vec<(MetadataPageEvidence, Vec<u8>)>,
         sequences: &mut HashMap<String, u64>,
+        retry_chunks: bool,
     ) -> Result<(), SourceError> {
         for chunk in tokens.chunks(self.gamma_batch_size) {
-            let fetched = match self
-                .client
-                .fetch_markets_by_token_ids(
-                    &chunk
-                        .iter()
-                        .map(|token| token.0.clone())
-                        .collect::<Vec<_>>(),
-                    filter,
-                )
-                .await
-            {
-                Ok(fetched) => fetched,
-                Err(error) => {
-                    if let Some(page) = &error.page {
-                        self.record_page(page).await?;
+            let retry_delays: &[u64] = if retry_chunks { &[2, 4, 8, 16] } else { &[] };
+            let mut retry_delays = retry_delays.iter();
+            let fetched = loop {
+                match self
+                    .client
+                    .fetch_markets_by_token_ids(
+                        &chunk
+                            .iter()
+                            .map(|token| token.0.clone())
+                            .collect::<Vec<_>>(),
+                        filter,
+                    )
+                    .await
+                {
+                    Ok(fetched) => break fetched,
+                    Err(error) => {
+                        if let Some(page) = &error.page {
+                            self.record_page(page).await?;
+                        }
+                        let error = map_gamma_error(error.source);
+                        if matches!(error, SourceError::Transient { .. })
+                            && let Some(delay) = retry_delays.next()
+                        {
+                            tokio::time::sleep(std::time::Duration::from_secs(*delay)).await;
+                            continue;
+                        }
+                        return Err(error);
                     }
-                    return Err(map_gamma_error(error.source));
                 }
             };
             if let Some(page) = fetched.page {
@@ -379,6 +409,7 @@ mod tests {
 
     struct MixedChunkFixture {
         calls: AtomicUsize,
+        attempts: StdMutex<Vec<tokio::time::Instant>>,
     }
 
     impl ReconciliationFetcher for MixedChunkFixture {
@@ -388,6 +419,10 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
             Box::pin(async move {
                 self.calls.fetch_add(1, Ordering::SeqCst);
+                self.attempts
+                    .lock()
+                    .unwrap()
+                    .push(tokio::time::Instant::now());
                 if url.contains("clob_token_ids=token-b") {
                     Err(SourceError::Transient {
                         message: "injected second chunk failure".to_owned(),
@@ -424,6 +459,271 @@ mod tests {
                     Ok(self.open.clone())
                 }
             })
+        }
+    }
+
+    struct RetryFixture {
+        attempts: StdMutex<Vec<(bool, tokio::time::Instant)>>,
+    }
+
+    impl ReconciliationFetcher for RetryFixture {
+        fn fetch<'a>(
+            &'a self,
+            url: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
+            Box::pin(async move {
+                let closed = url.contains("closed=true");
+                let mut attempts = self.attempts.lock().unwrap();
+                let count = attempts.iter().filter(|(pass, _)| *pass == closed).count();
+                attempts.push((closed, tokio::time::Instant::now()));
+                if count < 2 {
+                    Err(SourceError::Transient {
+                        message: "exhausted fetcher".to_owned(),
+                    })
+                } else if closed {
+                    Ok(
+                        br#"[{"conditionId":"condition-closed","clobTokenIds":["token-a"]}]"#
+                            .to_vec(),
+                    )
+                } else {
+                    Ok(b"[]".to_vec())
+                }
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bracket_chunk_retry_recovers() {
+        let fetcher = Arc::new(RetryFixture {
+            attempts: StdMutex::new(Vec::new()),
+        });
+        let (_dir, path, _sink, resolver) = boot_resolver(fetcher.clone());
+        let start = tokio::time::Instant::now();
+        let token = PolymarketTokenId("token-a".to_owned());
+        let resolved = resolver.resolve_for_bracket([token.clone()]).await.unwrap();
+        assert_eq!(resolved.verified[&token].condition_id.0, "condition-closed");
+        assert_eq!(resolved.provenance[&token].source_log_sequence, 1);
+        assert_eq!(
+            fetcher
+                .attempts
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(closed, at)| (*closed, at.duration_since(start).as_secs()))
+                .collect::<Vec<_>>(),
+            [
+                (false, 0),
+                (false, 2),
+                (false, 6),
+                (true, 6),
+                (true, 8),
+                (true, 12)
+            ]
+        );
+        assert_eq!(Reader::replay(path).unwrap().count(), 2);
+        let cached = resolver.resolve_for_bracket([token]).await.unwrap();
+        assert_eq!(cached.provenance, resolved.provenance);
+        assert_eq!(fetcher.attempts.lock().unwrap().len(), 6);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bracket_chunk_retry_exhausts() {
+        let fetcher = Arc::new(MixedChunkFixture {
+            calls: AtomicUsize::new(0),
+            attempts: StdMutex::new(Vec::new()),
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let sink = Arc::new(Mutex::new(SourceEventSink::open(&path).unwrap()));
+        let resolver = AssetIdentityResolver::new(fetcher.clone(), BASE.to_owned(), 1, sink);
+        let start = tokio::time::Instant::now();
+        assert!(matches!(
+            resolver
+                .resolve_for_bracket([
+                    PolymarketTokenId("token-a".to_owned()),
+                    PolymarketTokenId("token-b".to_owned())
+                ])
+                .await,
+            Err(SourceError::Transient { .. })
+        ));
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 6);
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(start).as_secs(),
+            30
+        );
+        assert_eq!(
+            fetcher
+                .attempts
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|at| at.duration_since(start).as_secs())
+                .collect::<Vec<_>>(),
+            [0, 0, 2, 6, 14, 30]
+        );
+        assert!(resolver.cache.read().await.is_empty());
+        assert_eq!(Reader::replay(&path).unwrap().count(), 1);
+        resolver
+            .resolve_for_bracket([PolymarketTokenId("token-a".to_owned())])
+            .await
+            .unwrap();
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 7);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn poller_resolve_single_attempt() {
+        let fetcher = Arc::new(RetryFixture {
+            attempts: StdMutex::new(Vec::new()),
+        });
+        let (_dir, _path, _sink, resolver) = boot_resolver(fetcher.clone());
+        let start = tokio::time::Instant::now();
+        assert!(matches!(
+            resolver
+                .resolve([PolymarketTokenId("token-a".to_owned())])
+                .await,
+            Err(SourceError::Transient { .. })
+        ));
+        assert_eq!(fetcher.attempts.lock().unwrap().len(), 1);
+        assert_eq!(tokio::time::Instant::now(), start);
+        assert!(resolver.cache.read().await.is_empty());
+    }
+
+    async fn http_resolver(
+        responses: Vec<(axum::http::StatusCode, &'static str)>,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        BootSourceLog,
+        AssetIdentityResolver,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let app = axum::Router::new().route(
+            "/markets",
+            axum::routing::get(move || {
+                let counter = counter.clone();
+                let responses = responses.clone();
+                async move {
+                    let hit = counter.fetch_add(1, Ordering::SeqCst);
+                    let (status, body) = responses[hit.min(responses.len() - 1)];
+                    (status, [("retry-after", "1")], body)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let fetcher = Arc::new(
+            pe_source_polymarket_public::ReqwestFetcher::new(reqwest::Client::new())
+                .with_min_interval_ms(0)
+                .with_rate_limit_retry_max_secs(1),
+        );
+        let (dir, path, sink, _) = boot_resolver(fetcher.clone());
+        let resolver =
+            AssetIdentityResolver::new(fetcher, format!("http://{address}"), 50, sink.clone());
+        (dir, path, sink, resolver, hits, server)
+    }
+
+    // Keep local socket I/O runnable while advancing only the deterministic test clock.
+    async fn resolve_http(
+        resolver: &AssetIdentityResolver,
+    ) -> Result<ResolvedIdentities, SourceError> {
+        let resolve = resolver.resolve_for_bracket([PolymarketTokenId("token-a".to_owned())]);
+        tokio::pin!(resolve);
+        loop {
+            tokio::select! {
+                biased;
+                result = &mut resolve => return result,
+                () = tokio::task::yield_now() => tokio::time::advance(std::time::Duration::from_millis(1)).await,
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bracket_http_attempts_bounded() {
+        use axum::http::StatusCode;
+        for mixed in [false, true] {
+            let mut responses = Vec::new();
+            for _ in 0..5 {
+                // Interleave all ten short 429s with the four exhausted 5xx attempts.
+                for attempt in 0..4 {
+                    if mixed {
+                        responses.extend(vec![
+                            (StatusCode::TOO_MANY_REQUESTS, "{}");
+                            if attempt < 2 { 3 } else { 2 }
+                        ]);
+                    }
+                    responses.push((StatusCode::INTERNAL_SERVER_ERROR, "{}"));
+                }
+            }
+            let expected = if mixed { 70 } else { 20 };
+            let (_dir, _path, _sink, resolver, hits, server) = http_resolver(responses).await;
+            assert!(
+                matches!(resolve_http(&resolver).await, Err(SourceError::Transient { message }) if message.contains("HTTP 500"))
+            );
+            assert_eq!(hits.load(Ordering::SeqCst), expected);
+            assert!(resolver.cache.read().await.is_empty());
+            server.abort();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bracket_non_transient_failures_not_retried() {
+        use axum::http::StatusCode;
+        for case in [
+            "fatal",
+            "parse",
+            "rate_limit",
+            "record_success",
+            "record_error",
+        ] {
+            let response = match case {
+                "fatal" => (StatusCode::FORBIDDEN, "{}"),
+                "parse" | "record_error" => (StatusCode::OK, "not-json"),
+                "rate_limit" => (StatusCode::TOO_MANY_REQUESTS, "{}"),
+                _ => (
+                    StatusCode::OK,
+                    r#"[{"conditionId":"condition-a","clobTokenIds":["token-a"]}]"#,
+                ),
+            };
+            let (_dir, path, sink, resolver, hits, server) = http_resolver(vec![response]).await;
+            if case.starts_with("record_") {
+                sink.lock().await.fail_next_append();
+            }
+            let result = resolve_http(&resolver).await;
+            match case {
+                "rate_limit" => assert!(matches!(
+                    result,
+                    Err(SourceError::RateLimited {
+                        retry_after_secs: 1
+                    })
+                )),
+                "fatal" => assert!(
+                    matches!(result, Err(SourceError::Fatal { message }) if message.contains("gamma token lookup rejected"))
+                ),
+                "parse" => assert!(
+                    matches!(result, Err(SourceError::Fatal { message }) if message.contains("gamma metadata parse failed"))
+                ),
+                _ => assert!(
+                    matches!(result, Err(SourceError::Fatal { message }) if message.contains("source-log append failed"))
+                ),
+            }
+            assert_eq!(
+                hits.load(Ordering::SeqCst),
+                if case == "rate_limit" { 11 } else { 1 },
+                "{case}"
+            );
+            assert!(resolver.cache.read().await.is_empty(), "{case}");
+            assert_eq!(
+                Reader::replay(path).unwrap().count(),
+                usize::from(case == "parse"),
+                "{case}"
+            );
+            server.abort();
         }
     }
 
@@ -528,6 +828,7 @@ mod tests {
     async fn successful_chunk_is_recorded_before_later_transient_and_no_identity_is_cached() {
         let fetcher = Arc::new(MixedChunkFixture {
             calls: AtomicUsize::new(0),
+            attempts: StdMutex::new(Vec::new()),
         });
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("source.log");
