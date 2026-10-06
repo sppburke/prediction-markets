@@ -642,6 +642,9 @@ ENV
   printf '%s\n' '["0x0000000000000000000000000000000000000545"]' > "$target/membership.json"
   printf 'EDGE\001paper-before\n' > "$service/gen/g557/paper.log"
   printf 'EDGE\001source-before\n' > "$service/gen/g557/source_events.log"
+  for name in boot-checkpoint boot-checkpoint.receipts boot-checkpoint.invalidation; do
+    printf '%s\n' "checkpoint-$name" > "$service/gen/g557/source_events.log.$name"
+  done
   printf 'EDGE\001live-before\n' > "$service/gen/g557/live_journal.log"
   printf '%s\n' '{}' > "$service/gen/g557/wallet_market_history.json"
   python3 -c 'import json,sqlite3,sys
@@ -1363,6 +1366,13 @@ root=$TEST_TMP/rehearsal-bindings
 setup_rehearsal_fixture "$root" true none
 output=$(run_rehearsal_fixture "$root" 2>&1)
 [[ "$output" == *REHEARSAL545_PASS* ]] || fail "bound rehearsal did not pass: $output"
+for name in boot-checkpoint boot-checkpoint.receipts boot-checkpoint.invalidation; do
+  cmp "$root/prediction-markets/gen/g557/source_events.log.$name" \
+    "$root/rehearsal/copy/source_events.log.$name" ||
+    fail "rehearsal omitted or changed checkpoint companion $name"
+  grep -Fq "  source_events.log.$name" "$root/rehearsal/copy/copied.sha256" ||
+    fail "rehearsal hash inventory omitted checkpoint companion $name"
+done
 [[ "$(cat "$root/test-state/paths-updated")" == "$root/rehearsal/copy/paper_state.db" ]] ||
   fail "rehearsal did not update the copy's migration paths before starting the child"
 [[ "$output" == *"rehearsal copy migration paths: paper migration paths updated"* ]] ||

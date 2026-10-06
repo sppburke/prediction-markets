@@ -929,8 +929,20 @@ synchronized under the exclusive writer lock; interior corruption and every othe
 fatal. Append, flush, or synchronization uncertainty poisons the writer. The account-tagged
 `live_journal.log` uses its native verified replay for the same binding fields. An ordinary
 installed boot holds that lock while binding the recorded activation prefix. A compatible
-`<source-log>.boot-checkpoint` restores receipt metadata and raw activity/boundary candidates after
-checksum, version, mode, path, activation and tail checks. With readable inactive authority,
+`<source-log>.boot-checkpoint` is the format-2 manifest: scanner/reducer versions, mode,
+activation, generation, path/tail/offset, prefix hash, reducer projections and `receipt_count`,
+without a receipt list. `<source-log>.boot-checkpoint.receipts` holds fixed 80-byte records:
+32-byte receipt hash, little-endian receive milliseconds (`i64`), little-endian byte offset
+(`u64`, absent encoded as `u64::MAX`), and BLAKE3 of the preceding 48 bytes. Record position i
+implies source sequence i, matching the dense in-memory receipt index. Boot reads the named
+records sequentially into that index, validating every checksum, offset bound/order and the
+manifest's last sequence/hash. Invalid receipt records quarantine both the manifest and receipts
+file under the existing invalidation lock and select a full verified walk; the next publication
+creates a fresh receipts file from record zero using that rebuilt index. Bytes beyond `receipt_count`
+are uncommitted garbage. A format-1 manifest converts once, synchronizing its sidecar before
+atomically replacing the manifest; failed conversion retains format 1 and its boot index.
+Compatibility still requires checksum, version, mode, path, activation and tail checks. With
+readable inactive authority,
 boot defers the exact raw-prefix BLAKE3 check and scanner-verifies only the suffix; its completion
 line records `prefix_verification="deferred"`, the loaded binding and `prefix_blake3`. Missing,
 damaged or incompatible artifacts, shortened files, and active or unreadable authority select a
@@ -939,7 +951,8 @@ incomplete-tail repair remain unchanged. Runtime indexed reads verify individual
 
 The critical `source_checkpoint` owner starts after HTTP listening. Its single cancellable blocking
 job slot verifies the loaded prefix, continues the same hasher to the frozen boot tail, then
-serializes and publishes the frozen initial receipt prefix and pre-consumption reducers. A mismatch,
+serializes and publishes the frozen initial manifest and pre-consumption reducers, capturing
+only receipts beyond the installed manifest count. A mismatch,
 read error or binding inequality quarantines checkpoint use and triggers coordinated restart. A
 failure before the quarantine is durable (checkpoint lock, invalidation-record read, quarantine
 rename or its directory sync) carries `CheckpointInvalidationFailed` and exits 78; with no
@@ -952,13 +965,19 @@ no further publication; an already-started publication finishes.
 
 All publishers share one persistent `<checkpoint>.lock` inode and the durable
 `<checkpoint>.invalidation` record (`generation`, `active`; absence means generation zero/inactive).
-Invalidation atomically quarantines the artifact before advancing active authority. Publication
+Invalidation quarantines the manifest and discards the receipts file, synchronizing their directory
+before advancing active authority. Publication
 compares artifact applicability, reducer version, tail, binding and prefix under the lock and
-installs only an authorized candidate; a verified current-generation publication clears active
+installs only an authorized candidate. Under that lock it writes only new receipt records at
+their positions, preserving committed bytes, then fsyncs the sidecar before the manifest's
+existing temporary-file/fsync/rename/directory-fsync install. A crash before manifest installation
+leaves the previous manifest and its receipt prefix valid. `--prepare-source-checkpoint` uses
+the same format-2 publication path. A verified current-generation publication clears active
 only after durable installation. Clearance is automatic on a verified current-generation
 publication, whether by the next boot's full walk or `--prepare-source-checkpoint`; there is no
 separate clearance command. Unreadable authority makes boots full-walk and refuses publication
-until quiesced recovery removes and syncs the checkpoint before removing and syncing the record.
+until quiesced recovery removes both checkpoint files and syncs their directory before removing
+and syncing the record. The persistent lock remains; raw logs are unchanged.
 Preparation reads authority first, captures open rows and feed frontiers before its finite source
 bound, and full-walks when the record is active or undecodable. A proven wrong prefix digest
 invalidates only the still-current artifact and generation; if either changed, preparation starts

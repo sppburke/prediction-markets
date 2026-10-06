@@ -648,6 +648,11 @@ copy_pre_t0_files() {
     [[ -f "$source" ]] || die "missing pre-T0 $name: $source"
     atomic_adopt "$source" "$archive/$name" 0600 "archive-$name"
   done
+  source=$(manifest_get old_paths.source_log)
+  for name in boot-checkpoint boot-checkpoint.receipts boot-checkpoint.invalidation; do
+    [[ ! -f "$source.$name" ]] ||
+      atomic_adopt "$source.$name" "$archive/source_log.$name" 0600 "archive-$name"
+  done
   [[ -f "$SERVICE_CONFIG" && -f "$SERVICE_ENV" && -f "$SERVICE_BINARY" ]] ||
     die "one or more installed service artifacts are absent"
   atomic_adopt "$SERVICE_CONFIG" "$archive/service.toml" 0600 archive-config

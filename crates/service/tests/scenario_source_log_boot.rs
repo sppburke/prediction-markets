@@ -2202,9 +2202,11 @@ fn paper_service_rollout_checkpoint_freezes_prefix_and_replays_suffix_exactly() 
         frozen_tail.physical_tail
     );
     assert_eq!(
-        projection["receipts"].as_array().unwrap().len(),
-        usize::try_from(frozen_tail.last_sequence.unwrap().0 + 1).unwrap()
+        projection["receipt_count"].as_u64().unwrap(),
+        frozen_tail.last_sequence.unwrap().0 + 1
     );
+    assert_eq!(projection["format_version"], 2);
+    assert!(projection.get("receipts").is_none());
     drop(sink);
     let before = pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap();
     let opened = SourceLogBoot::open(&paths, false).unwrap().unwrap();
@@ -2229,12 +2231,72 @@ fn paper_service_rollout_checkpoint_freezes_prefix_and_replays_suffix_exactly() 
 }
 
 #[test]
+fn paper_service_rollout_checkpoint_v1_conversion_preserves_boot_index() {
+    let (_dir, paths) = installed_fixture();
+    append(
+        &paths.source_log,
+        activity_envelope("0xlegacy-checkpoint", NOW_UNIX + 1),
+    );
+    SourceLogBoot::prepare_checkpoint(&paths.fixed_main).unwrap();
+    let expected = SourceReceiptIndex::replay(&paths.source_log).unwrap();
+    let manifest = pe_service::source_checkpoint::checkpoint_path(&paths.source_log);
+    let receipts: Vec<_> = pe_event_log::Reader::replay_with_offsets(&paths.source_log).unwrap()
+        .map(|item| {
+            let (offset, sequence, envelope) = item.unwrap();
+            serde_json::json!({
+                "receipt": AppendReceipt { sequence, this_hash: envelope.this_hash },
+                "received_millis": i64::try_from(envelope.received_at.0.unix_timestamp_nanos() / 1_000_000).unwrap(),
+                "byte_offset": offset,
+            })
+        }).collect();
+    rewrite_boot_checkpoint(&manifest, |data| {
+        data["format_version"] = serde_json::json!(1);
+        data["receipts"] = serde_json::json!(receipts);
+        data.as_object_mut().unwrap().remove("receipt_count");
+        data.as_object_mut().unwrap().remove("generation");
+    });
+    std::fs::remove_file(checkpoint_sidecar(&paths.source_log, ".receipts")).unwrap();
+    let before = pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap();
+    let first = SourceLogBoot::open(&paths, false).unwrap().unwrap();
+    assert_eq!(
+        pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap(),
+        before
+    );
+    assert_same_receipts(
+        &first.boot.receipt_index(),
+        &expected,
+        first.binding.last_sequence.unwrap().0,
+    );
+    assert_eq!(checkpoint_json(&paths.source_log)["format_version"], 2);
+    let converted = std::fs::read(&manifest).unwrap();
+    let sidecar = std::fs::read(checkpoint_sidecar(&paths.source_log, ".receipts")).unwrap();
+    drop(first);
+    let second = SourceLogBoot::open(&paths, false).unwrap().unwrap();
+    assert_same_receipts(
+        &second.boot.receipt_index(),
+        &expected,
+        second.binding.last_sequence.unwrap().0,
+    );
+    assert_eq!(std::fs::read(manifest).unwrap(), converted);
+    assert_eq!(
+        std::fs::read(checkpoint_sidecar(&paths.source_log, ".receipts")).unwrap(),
+        sidecar
+    );
+}
+
+#[test]
 fn paper_service_rollout_checkpoint_damage_incompatibility_and_prefix_drift_fall_back() {
     for fault in [
         "checksum",
         "mode",
         "version",
         "receipt",
+        "receipt_count",
+        "receipt_offset_missing",
+        "receipt_offset_order",
+        "receipt_checksum",
+        "torn_receipts",
+        "receipt_tail",
         "shortened",
         "corruption",
     ] {
@@ -2251,7 +2313,43 @@ fn paper_service_rollout_checkpoint_damage_incompatibility_and_prefix_drift_fall
             "checksum" => artifact[0] ^= 1,
             "mode" => data["financial_era"] = serde_json::json!(true),
             "version" => data["scanner_version"] = serde_json::json!(99),
-            "receipt" => data["receipts"][0]["byte_offset"] = serde_json::json!(99999),
+            "receipt" => damage_checkpoint_receipt(&paths.source_log, 0, |bytes| {
+                bytes[40..48].copy_from_slice(&99999_u64.to_le_bytes());
+            }),
+            "receipt_count" => {
+                data["receipt_count"] =
+                    serde_json::json!(data["receipt_count"].as_u64().unwrap() + 1);
+            }
+            "receipt_offset_missing" => damage_checkpoint_receipt(&paths.source_log, 0, |bytes| {
+                bytes[40..48].copy_from_slice(&u64::MAX.to_le_bytes());
+            }),
+            "receipt_offset_order" => damage_checkpoint_receipt(&paths.source_log, 1, |bytes| {
+                bytes[40..48].copy_from_slice(&pe_event_log::HEADER_LEN.to_le_bytes());
+            }),
+            "receipt_checksum" => {
+                let receipts = checkpoint_sidecar(&paths.source_log, ".receipts");
+                let mut bytes = std::fs::read(&receipts).unwrap();
+                bytes[0] ^= 1;
+                std::fs::write(receipts, bytes).unwrap();
+            }
+            "torn_receipts" => {
+                let receipts = checkpoint_sidecar(&paths.source_log, ".receipts");
+                let file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(receipts)
+                    .unwrap();
+                file.set_len(file.metadata().unwrap().len() - 1).unwrap();
+            }
+            "receipt_tail" => {
+                let last = data["receipt_count"].as_u64().unwrap() - 1;
+                damage_checkpoint_receipt(
+                    &paths.source_log,
+                    usize::try_from(last).unwrap(),
+                    |bytes| {
+                        bytes[0] ^= 1;
+                    },
+                );
+            }
             "shortened" => {
                 std::fs::OpenOptions::new()
                     .write(true)
@@ -2268,7 +2366,7 @@ fn paper_service_rollout_checkpoint_damage_incompatibility_and_prefix_drift_fall
             }
             _ => unreachable!(),
         }
-        if matches!(fault, "mode" | "version" | "receipt") {
+        if matches!(fault, "mode" | "version" | "receipt_count") {
             let projections = serde_json::to_vec(&data).unwrap();
             artifact = blake3::hash(&projections).to_hex().as_bytes().to_vec();
             artifact.push(b'\n');
@@ -2296,9 +2394,96 @@ fn paper_service_rollout_checkpoint_damage_incompatibility_and_prefix_drift_fall
             let opened = opened.unwrap().unwrap();
             assert_eq!(opened.binding, Scanner::verify(&paths.source_log).unwrap());
         }
+        if fault.starts_with("receipt") || fault == "torn_receipts" {
+            assert!(!sidecar.exists());
+            assert!(!checkpoint_sidecar(&paths.source_log, ".receipts").exists());
+            assert!(
+                !pe_service::source_checkpoint::read_authority(&paths.source_log)
+                    .unwrap()
+                    .permits_checkpoint()
+            );
+            let expected = SourceReceiptIndex::replay(&paths.source_log).unwrap();
+            let opened = SourceLogBoot::open(&paths, false).unwrap().unwrap();
+            assert_same_receipts(
+                &opened.boot.receipt_index(),
+                &expected,
+                opened.binding.last_sequence.unwrap().0,
+            );
+        }
         if fault != "corruption" {
             assert!(pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap() > before);
         }
+    }
+}
+
+#[test]
+fn checkpoint_corrupt_receipt_quarantines_both_rebuilds_and_boots_cleanly() {
+    use pe_service::source_checkpoint::{Authority, InvalidationRecord};
+    use std::io::Read;
+
+    for publisher in ["runtime", "preparation"] {
+        let (_dir, paths) = installed_fixture();
+        append(
+            &paths.source_log,
+            activity_envelope("0xcheckpoint-recovery", NOW_UNIX + 1),
+        );
+        let (prepared, _) = SourceLogBoot::prepare_checkpoint(&paths.fixed_main).unwrap();
+        let manifest = pe_service::source_checkpoint::checkpoint_path(&paths.source_log);
+        let receipts = checkpoint_sidecar(&paths.source_log, ".receipts");
+        let original_records = std::fs::read(&receipts).unwrap();
+        let mut corrupt_records = original_records.clone();
+        corrupt_records[0] ^= 1;
+        corrupt_records.extend_from_slice(&[0; 80]);
+        std::fs::write(&receipts, &corrupt_records).unwrap();
+        let mut quarantined_file = std::fs::File::open(&receipts).unwrap();
+        let source_bytes = std::fs::read(&paths.source_log).unwrap();
+        let expected = SourceReceiptIndex::replay(&paths.source_log).unwrap();
+        let before = pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap();
+
+        let opened = SourceLogBoot::open(&paths, false).unwrap().unwrap();
+        assert!(!manifest.exists());
+        assert!(!receipts.exists());
+        assert_eq!(
+            pe_service::source_checkpoint::read_authority(&paths.source_log).unwrap(),
+            Authority::Readable(InvalidationRecord {
+                generation: 1,
+                active: true
+            })
+        );
+        assert!(pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap() > before);
+        assert_same_receipts(
+            &opened.boot.receipt_index(),
+            &expected,
+            opened.binding.last_sequence.unwrap().0,
+        );
+        if publisher == "runtime" {
+            publish_owner_initial(opened.boot).unwrap();
+            drop(opened.sink);
+        } else {
+            drop(opened);
+            SourceLogBoot::prepare_checkpoint(&paths.fixed_main).unwrap();
+        }
+
+        assert_eq!(std::fs::read(&receipts).unwrap(), original_records);
+        let mut discarded_bytes = Vec::new();
+        quarantined_file.read_to_end(&mut discarded_bytes).unwrap();
+        assert_eq!(discarded_bytes, corrupt_records);
+        assert_eq!(std::fs::read(&paths.source_log).unwrap(), source_bytes);
+        assert_eq!(checkpoint_json(&paths.source_log)["generation"], 1);
+        assert_eq!(
+            pe_service::source_checkpoint::read_authority(&paths.source_log).unwrap(),
+            Authority::Readable(InvalidationRecord {
+                generation: 1,
+                active: false
+            })
+        );
+        assert_checkpoint_assisted_boot(&paths, &prepared);
+        let restored = SourceLogBoot::open(&paths, false).unwrap().unwrap();
+        assert_same_receipts(
+            &restored.boot.receipt_index(),
+            &expected,
+            restored.binding.last_sequence.unwrap().0,
+        );
     }
 }
 
@@ -3010,7 +3195,7 @@ fn unusable_checkpoint_replaced_by_verified_candidate() {
                 "format" => data["format_version"] = serde_json::json!(99),
                 "scanner" => data["scanner_version"] = serde_json::json!(99),
                 "reducer" => data["reducer_version"] = serde_json::json!(1),
-                "receipt" => data["receipts"][0]["byte_offset"] = serde_json::json!(999999),
+                "receipt" => data["receipt_count"] = serde_json::json!(0),
                 "long_tail" => {
                     data["tail"]["physical_tail"] =
                         serde_json::json!(file_len(&paths.source_log) + 1)
@@ -3105,6 +3290,8 @@ async fn checkpoint_failed_quarantine_sync_durable_image_recovers_with_full_walk
     let (receipt, _) = SourceLogBoot::prepare_checkpoint(&paths.fixed_main).unwrap();
     let sidecar = pe_service::source_checkpoint::checkpoint_path(&paths.source_log);
     let durable_checkpoint = std::fs::read(&sidecar).unwrap();
+    let receipts = checkpoint_sidecar(&paths.source_log, ".receipts");
+    let durable_receipts = std::fs::read(&receipts).unwrap();
     write_checkpoint_record(&paths.source_log, 3, false);
     let durable_record = std::fs::read(checkpoint_record_path(&paths.source_log)).unwrap();
     let hooks = InvalidationHooks::default();
@@ -3113,8 +3300,9 @@ async fn checkpoint_failed_quarantine_sync_durable_image_recovers_with_full_walk
         pe_service::source_checkpoint::invalidate_with_hooks(&paths.source_log, &hooks),
         Err(InvalidationError::QuarantineFailed(_))
     ));
-    // Model loss of the unsynced rename: both original names and their preceding contents survive.
+    // Model loss of the unsynced rename and removal: the preceding files all survive.
     std::fs::write(&sidecar, &durable_checkpoint).unwrap();
+    std::fs::write(&receipts, &durable_receipts).unwrap();
     std::fs::write(checkpoint_record_path(&paths.source_log), &durable_record).unwrap();
     let before_db = std::fs::read(&paths.fixed_main).unwrap();
     let before_log = std::fs::read(&paths.source_log).unwrap();
@@ -3133,8 +3321,9 @@ async fn checkpoint_failed_quarantine_sync_durable_image_recovers_with_full_walk
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.starts_with("source checkpoint recovery checkpoint="));
-    assert_eq!(stdout.matches("removed=true").count(), 2);
+    assert_eq!(stdout.matches("removed=true").count(), 3);
     assert!(!sidecar.exists());
+    assert!(!checkpoint_sidecar(&paths.source_log, ".receipts").exists());
     assert!(!checkpoint_record_path(&paths.source_log).exists());
     assert_eq!(std::fs::read(&paths.fixed_main).unwrap(), before_db);
     assert_eq!(std::fs::read(&paths.source_log).unwrap(), before_log);
@@ -3421,6 +3610,15 @@ async fn prepared_checkpoint_receipt_matches_boot() {
         .split_whitespace()
         .filter_map(|part| part.split_once('='))
         .collect::<std::collections::HashMap<_, _>>();
+    let receipts = pe_service::source_checkpoint::receipts_path(&fixture.cfg.source_event_log_path);
+    assert_eq!(fields["receipts"], receipts.to_str().unwrap());
+    assert_eq!(
+        std::fs::metadata(&receipts).unwrap().len(),
+        checkpoint_json(&fixture.cfg.source_event_log_path)["receipt_count"]
+            .as_u64()
+            .unwrap()
+            * 80
+    );
     let child = checkpoint_rollout::Child::start_checkpoint(
         &fixture.config_path,
         Path::new(env!("CARGO_BIN_EXE_pe-service")),
@@ -3496,7 +3694,7 @@ async fn hourly_checkpoint_matches_staged_preparation() {
             "financial_era",
             "activation",
             "tail",
-            "receipts",
+            "receipt_count",
             "prefix_blake3",
         ] {
             assert_eq!(hourly[field], prepared[field], "{field}");
@@ -4011,6 +4209,16 @@ async fn boot_binary_at(config: &Path, binary: &Path) -> std::process::Output {
         .current_dir(config.parent().unwrap())
         .arg(config);
     support::bounded_command_output(command).await
+}
+
+fn damage_checkpoint_receipt(source: &Path, index: usize, edit: impl FnOnce(&mut [u8])) {
+    let path = checkpoint_sidecar(source, ".receipts");
+    let mut bytes = std::fs::read(&path).unwrap();
+    let record = &mut bytes[index * 80..(index + 1) * 80];
+    edit(&mut record[..48]);
+    let checksum = blake3::hash(&record[..48]);
+    record[48..].copy_from_slice(checksum.as_bytes());
+    std::fs::write(path, bytes).unwrap();
 }
 
 fn corrupt_checkpoint_prefix(source: &Path) {

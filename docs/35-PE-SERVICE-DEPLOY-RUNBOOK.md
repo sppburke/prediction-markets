@@ -305,7 +305,10 @@ and strand the installed binary's rollback, so never run the reviewed binary's `
 starting the child, the harness runs the reviewed binary's `--update-paper-migration-paths` on the
 private copy, which verifies the recorded activation prefixes against the copied logs and rewrites
 only the copy's recorded log paths (the installed migration record binds absolute paths, #570); the
-production record is never touched. A new or reused checkpoint must have the exact six-entry `copied.sha256` inventory and pass
+production record is never touched. A new or reused copy must have a `copied.sha256` inventory
+containing `paper_state.db`, the three framed logs, `wallet_market_history.json`, `source.identity`,
+and every present checkpoint manifest, `.receipts` companion and `.invalidation` authority file,
+and pass
 `sha256sum --strict -c` before use. `PE_REHEARSAL_BIND` is mandatory and must be a numeric loopback
 address with a nonzero port different from the installed service's port; the harness passes it to
 the child as `PE_BIND`, derives the readiness URL from it, and runs against real first-party venue
@@ -696,7 +699,7 @@ publishes no checkpoint and blocks replacement, without repairing rows or the lo
 census, perform only the required restart; skip it if the exact desired binary already runs.
 
 Record stdout, stderr, and the exit status. Success prints
-`source checkpoint published offset=<offset> sequence=<sequence> hash=<hash> prefix_blake3=<digest> capture_unix_ms=<capture> published_unix_ms=<publication> validated=<count>` and
+`source checkpoint published offset=<offset> sequence=<sequence> hash=<hash> prefix_blake3=<digest> capture_unix_ms=<capture> published_unix_ms=<publication> validated=<count> receipts=<path>` and
 exits zero.
 A continuation validation failure exits nonzero with `open decision continuation <source_trade_id>: <cause>`;
 it blocks the swap for diagnosis without repairing rows or fabricating dispositions. Normal boot
@@ -1058,9 +1061,9 @@ comparisons decide what remains; never guess from memory.
    Verify an eligible paper copy and one exact settlement, the recovered wallet's old-market
    first-entry refusal, unsafe-wallet quarantine, later progressive admissions and Supabase
    projection convergence. Full/checkpoint restart must preserve history, ledger and financial
-   state. Before committed clearance, prior-reader rollback follows existing era boundaries and
-   ignores the sidecar. The #737 matrix below is required for the release-1 checkpoint authority
-   states; an allowed matrix row does not override the existing financial-era boundaries.
+   state. Format-2 checkpoints require fix-forward recovery as documented in the #737 section
+   below. Its historical format-1 rollback matrix does not authorize reversal of this release
+   or override existing financial-era boundaries.
    After financial clearance, recover forward with a compatible implementation. Stop
    and drain before assessing this boundary: queued controls can commit during shutdown. Never
    restore stale state or delete fences manually.
@@ -1361,20 +1364,22 @@ finish or terminate every preparation before running recovery while quiesced:
 pe-service --recover-source-checkpoint --paper-state <installed-path>
 ```
 
-The command removes the installed source log's checkpoint and syncs its directory, then removes
-its invalidation record and syncs that directory. The persistent checkpoint lock remains. Its stdout
-line is `source checkpoint recovery checkpoint={} removed={} record={} removed={}`, with paths and
+The command removes the installed source log's manifest and receipts sidecar and syncs their
+directory, then removes its invalidation record and syncs that directory. The persistent checkpoint
+lock remains. The next full-walk publication creates a fresh receipts file from record zero before
+installing its manifest through the normal durable path. Its stdout
+line is `source checkpoint recovery checkpoint={} removed={} receipts={} removed={} record={} removed={}`, with paths and
 removal booleans substituted. Preserve the database and event logs. A manual start or host reboot
 before recovery can boot with the checkpoint once more; its deferred check then re-detects the
 mismatch. With no checkpoint present, failure to write the invalidation record is also a quarantine
 failure selecting status 78.
 
 Retain the successful `--prepare-source-checkpoint` stdout before deployment: offset, sequence,
-hash, `prefix_blake3`, `capture_unix_ms`, `published_unix_ms` and validated continuation count. The
-actual printed form is:
+hash, `prefix_blake3`, `capture_unix_ms`, `published_unix_ms`, validated continuation count and
+receipts-file path. The actual printed form is:
 
 ```text
-source checkpoint published offset={} sequence={} hash={} prefix_blake3={} capture_unix_ms={} published_unix_ms={} validated={validated}
+source checkpoint published offset={} sequence={} hash={} prefix_blake3={} capture_unix_ms={} published_unix_ms={} validated={validated} receipts={}
 ```
 
 The restart's `source checkpoint verification completed` event must report `checkpoint_used=true`
@@ -1390,7 +1395,21 @@ following boot can use its checkpoint.
 The runtime owner extends only the newly captured suffix at the compiled intervals in
 [`_GLOSSARY.md`](_GLOSSARY.md#durable-log-migration-and-supervisor-boundaries-544). Each attempt logs
 `source checkpoint publication attempt`; successful installation logs `source checkpoint published`
-and rewrites the whole artifact under its persistent lock. I/O failures log ERROR
+and appends only new 80-byte receipt records to `<source-log>.boot-checkpoint.receipts` under
+its persistent lock. After fsyncing those records it atomically replaces the smaller format-2
+manifest at the existing `<source-log>.boot-checkpoint` path; the manifest contains `receipt_count`
+and reducer projections, with no receipt list. Preserve both files together in rehearsal snapshots.
+A crash before manifest installation leaves its previous named receipt prefix valid; uncommitted
+sidecar bytes are ignored. Boot converts a format-1 manifest once, sidecar first; a failed conversion
+keeps format 1 usable. Bad record checksums, torn named records or a tail mismatch quarantine the
+manifest and discard the receipts file together under the existing invalidation lock, then force
+a full walk. The next publication creates a fresh receipts file from the rebuilt index; the next
+boot validates that file through the normal checkpoint loader. Deploy snapshot and archive
+inventories preserve the manifest, `.receipts` companion and any `.invalidation` record together.
+The exact format is canonical in
+[`_GLOSSARY.md`](_GLOSSARY.md#durable-log-migration-and-supervisor-boundaries-544).
+This release uses fix-forward recovery: `d998fbf` cannot read the format-2 checkpoint. I/O failures
+log ERROR
 `source checkpoint publication retry`, retain identical
 bytes and capture time, and retry without another reducer walk. The next hourly candidate replaces
 that pending candidate. Protocol refusals log `source checkpoint candidate refused`. A generation
@@ -1407,8 +1426,8 @@ Audit the invocation's flattened JSON journal lines for `source checkpoint publi
 receipt lag is `published_unix_ms - capture_unix_ms`; last-published age and pending-candidate age
 are separate. Missing receipt/binding evidence or a failed publication leaves AC-A incomplete.
 
-Before deployment, run the fixed rollback matrix on the exact release head against the previous
-production binary built from `e224e32`:
+The matrix below documents the historical format-1 rollback gate against `e224e32`. Format 2
+uses the fix-forward policy above; retain this command for format-1 compatibility work:
 
 ```bash
 PE_ROLLBACK_SERVICE_BINARY='<absolute path to the previous production binary built from e224e32>' cargo nextest run -p pe-service --all-features --test scenario_source_log_boot previous_binary_rollback_matrix --nocapture

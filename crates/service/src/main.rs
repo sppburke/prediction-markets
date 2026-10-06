@@ -209,7 +209,7 @@ async fn main() -> Result<()> {
             std::path::Path::new(paper),
         )?;
         println!(
-            "source checkpoint published offset={} sequence={} hash={} prefix_blake3={} capture_unix_ms={} published_unix_ms={} validated={validated}",
+            "source checkpoint published offset={} sequence={} hash={} prefix_blake3={} capture_unix_ms={} published_unix_ms={} validated={validated} receipts={}",
             receipt.tail.physical_tail,
             receipt
                 .tail
@@ -218,7 +218,8 @@ async fn main() -> Result<()> {
             receipt.tail.last_hash.to_hex(),
             receipt.prefix_blake3,
             receipt.capture_unix_ms,
-            receipt.published_unix_ms
+            receipt.published_unix_ms,
+            pe_service::source_checkpoint::receipts_path(&receipt.tail.path).display()
         );
         return Ok(());
     }
@@ -236,9 +237,11 @@ async fn main() -> Result<()> {
         let receipt =
             pe_service::source_checkpoint::recover_installed(std::path::Path::new(paper))?;
         println!(
-            "source checkpoint recovery checkpoint={} removed={} record={} removed={}",
+            "source checkpoint recovery checkpoint={} removed={} receipts={} removed={} record={} removed={}",
             receipt.checkpoint.display(),
             receipt.checkpoint_removed,
+            receipt.receipts.display(),
+            receipt.receipts_removed,
             receipt.record.display(),
             receipt.record_removed
         );
@@ -481,6 +484,16 @@ async fn main() -> Result<()> {
             &migration_paths,
             financial_start.is_some(),
         )
+        .map_err(|error| {
+            if matches!(
+                error.downcast_ref::<pe_service::source_checkpoint::InvalidationError>(),
+                Some(pe_service::source_checkpoint::InvalidationError::QuarantineFailed(_))
+            ) {
+                eprintln!("pe-service: {error:#}");
+                std::process::exit(78);
+            }
+            error
+        })
         .context("walk the installed source event log")?
         {
             Some(opened) => (Some(opened.boot), Some(opened.sink), Some(opened.binding)),

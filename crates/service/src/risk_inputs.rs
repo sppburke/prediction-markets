@@ -925,9 +925,9 @@ struct SourceReceiptIndexState {
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct SourceFrameMetadata {
-    receipt: AppendReceipt,
-    received_millis: i64,
-    byte_offset: Option<u64>,
+    pub(crate) receipt: AppendReceipt,
+    pub(crate) received_millis: i64,
+    pub(crate) byte_offset: Option<u64>,
 }
 
 #[derive(Clone, Default)]
@@ -946,6 +946,43 @@ pub(crate) struct SourceReceiptIndexStaging {
 }
 
 impl SourceReceiptIndexStaging {
+    pub(crate) fn restore_record(
+        &mut self,
+        frame: SourceFrameMetadata,
+        binding: &LogTailBinding,
+    ) -> Result<(), RiskInputsUnavailable> {
+        let sequence =
+            u64::try_from(self.frames.len()).map_err(|_| RiskInputsUnavailable::Overflow)?;
+        if frame.receipt.sequence.0 != sequence
+            || frame.byte_offset.is_none_or(|offset| {
+                offset < pe_event_log::HEADER_LEN
+                    || offset >= binding.physical_tail
+                    || self.frames.last().is_some_and(|previous| {
+                        previous
+                            .byte_offset
+                            .is_none_or(|previous| offset <= previous)
+                    })
+            })
+            || (sequence == 0 && frame.byte_offset != Some(pe_event_log::HEADER_LEN))
+        {
+            return Err(RiskInputsUnavailable::PriceConflict);
+        }
+        self.frames.push(frame);
+        Ok(())
+    }
+
+    pub(crate) fn validate_checkpoint(
+        &self,
+        binding: &LogTailBinding,
+    ) -> Result<(), RiskInputsUnavailable> {
+        SourceReceiptIndex::checkpoint_metadata_valid(
+            &self.canonical_source_log_path,
+            &self.frames,
+            binding,
+        )?;
+        Ok(())
+    }
+
     /// Observe one verified source frame while constructing an external projection (#572).
     pub(crate) fn observe(
         &mut self,
@@ -1186,8 +1223,9 @@ impl SourceReceiptIndex {
         self.source_log_path.as_deref().map(PathBuf::as_path)
     }
 
-    pub(crate) fn checkpoint_prefix(
+    pub(crate) fn checkpoint_suffix(
         &self,
+        start: usize,
         count: usize,
         binding: &LogTailBinding,
     ) -> Result<Vec<SourceFrameMetadata>, RiskInputsUnavailable> {
@@ -1198,8 +1236,7 @@ impl SourceReceiptIndex {
         let frames = state
             .frames
             .get(..count)
-            .ok_or(RiskInputsUnavailable::PriceConflict)?
-            .to_vec();
+            .ok_or(RiskInputsUnavailable::PriceConflict)?;
         if frames.last().map(|frame| frame.receipt.sequence) != binding.last_sequence
             || frames
                 .last()
@@ -1210,7 +1247,10 @@ impl SourceReceiptIndex {
         {
             return Err(RiskInputsUnavailable::PriceConflict);
         }
-        Ok(frames)
+        Ok(frames
+            .get(start..)
+            .ok_or(RiskInputsUnavailable::PriceConflict)?
+            .to_vec())
     }
 
     pub(crate) fn checkpoint_metadata_valid(

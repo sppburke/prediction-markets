@@ -519,9 +519,12 @@ fn candidate(
             usize::try_from(seq.0).ok().and_then(|n| n.checked_add(1))
         })
         .ok_or_else(|| anyhow::anyhow!("checkpoint receipt count overflow"))?;
+    let start = super::capture_start(&frozen.activation, frozen.financial_era, count);
     Ok(Some(super::serialize(
         CheckpointData {
-            format_version: 1,
+            format_version: 2,
+            generation,
+            receipt_count: Some(count),
             scanner_version: 1,
             reducer_version: ACTIVITY_REDUCER_VERSION,
             financial_era: frozen.financial_era,
@@ -529,7 +532,7 @@ fn candidate(
             tail: frozen.tail.clone(),
             prefix_blake3: digest.finalize().to_hex().to_string(),
             receipts: receipts
-                .checkpoint_prefix(count, &frozen.tail)
+                .checkpoint_suffix(start, count, &frozen.tail)
                 .map_err(anyhow::Error::from)?,
             activity: frozen.reducers.activity.clone(),
             daily_boundary: frozen.reducers.daily_boundary.clone(),
@@ -726,6 +729,7 @@ mod tests {
         assert_eq!(
             super::super::load_checkpoint(&tail.path, &fixture.activation, false)
                 .unwrap()
+                .unwrap()
                 .data
                 .tail,
             candidate.tail
@@ -735,6 +739,7 @@ mod tests {
         restarted.initialize_for_scenario().await.unwrap();
         assert_eq!(
             super::super::load_checkpoint(&tail.path, &fixture.activation, false)
+                .unwrap()
                 .unwrap()
                 .data
                 .tail,
@@ -968,13 +973,11 @@ mod tests {
             );
             let loaded = super::super::load_checkpoint(&tail.path, &fixture.activation, false)
                 .unwrap()
-                .data;
+                .unwrap();
+            let staging = loaded.staging;
+            let loaded = loaded.data;
             assert_eq!(loaded.tail, tail);
-            let receipts =
-                SourceReceiptIndex::restore_staging(&tail.path, loaded.receipts, &loaded.tail)
-                    .unwrap()
-                    .complete(&loaded.tail)
-                    .unwrap();
+            let receipts = staging.complete(&loaded.tail).unwrap();
             let mut reducers = Reducers::new(loaded.financial_era);
             reducers.activity = loaded.activity;
             reducers.daily_boundary = loaded.daily_boundary;
@@ -998,6 +1001,7 @@ mod tests {
             restarted.initialize_for_scenario().await.unwrap();
             assert_eq!(
                 super::super::load_checkpoint(&tail.path, &fixture.activation, false)
+                    .unwrap()
                     .unwrap()
                     .data
                     .tail,
