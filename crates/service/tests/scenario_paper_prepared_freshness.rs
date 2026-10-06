@@ -10188,6 +10188,12 @@ fn ac_b_closing_batch_query() {
     differing["publications"] = json!([{"batch_id": 87, "committed_unix_ms": 1001,
         "evidence": "retained transaction commit acknowledgement and checksum"}]);
     check(differing.clone(), Some(86), "pass");
+    let mut skipped = differing.clone();
+    skipped["reads"][3]["batch_id"] = json!(88);
+    skipped["publications"] = json!([
+        {"batch_id": 87, "committed_unix_ms": 999, "evidence": "retained commit of intervening batch"},
+        {"batch_id": 88, "committed_unix_ms": 1001, "evidence": "retained later commit"}]);
+    check(skipped, None, "incomplete");
     // Equality at S is insufficient for the strictly-after exception, as is created_at alone.
     differing["publications"][0]["committed_unix_ms"] = json!(1000);
     check(differing.clone(), None, "incomplete");
@@ -10411,11 +10417,22 @@ async fn ac_b_membership_reference_checks() {
         .unwrap()
         .payload;
     let mut bad_payload: Value = serde_json::from_slice(&config_payload).unwrap();
-    bad_payload["published_entries"][0]["leader_score_bps"] = json!(true);
-    let bad_type = h
+    bad_payload
+        .as_object_mut()
+        .unwrap()
+        .remove("published_entries");
+    let missing_field = h
         .append(
             "pe-service.watchlist-capacity-config",
             &serde_json::to_vec(&bad_payload).unwrap(),
+        )
+        .await;
+    let mut extended: Value = serde_json::from_slice(&config_payload).unwrap();
+    extended["published_entries"][0]["future_field"] = json!("Rust accepts unknown entry fields");
+    let unknown_field = h
+        .append(
+            "pe-service.watchlist-capacity-config",
+            &serde_json::to_vec(&extended).unwrap(),
         )
         .await;
     let wrong_source = h
@@ -10543,8 +10560,19 @@ async fn ac_b_membership_reference_checks() {
         "receipt hash differs"
     );
 
+    ac_b_rewrite_paper(&capture, exclusion_sequence, |r| {
+        r["evidence"]["config_receipt"] = serde_json::to_value(unknown_field).unwrap();
+    });
+    let rows = ac_b_reference_rows(&ac_b_inspect(&h, &capture));
+    assert_eq!(
+        rows.iter()
+            .find(|r| r["seq"] == exclusion_sequence)
+            .unwrap()["verdict"],
+        "pass"
+    );
+
     for (receipt, error) in [
-        (bad_type, "artifact integer"),
+        (missing_field, "artifact required fields"),
         (wrong_source, "artifact envelope"),
         (wrong_parser, "artifact envelope"),
     ] {
@@ -10657,7 +10685,9 @@ async fn ac_c_receipt_census_query() {
             .await;
         let raw = h.deliver_frame(&frame, |_| {}).await;
         h.poll(&frame).await;
-        let echo = h.deliver_frame(&frame, |_| {}).await;
+        let echo = h
+            .deliver_frame(&frame, |r| r["outcomeIndex"] = json!("0"))
+            .await;
         h.stop().await;
         let snapshot = census_snapshot(&h, &logs);
         for excluded in [zero, sell, combo] {
@@ -10691,6 +10721,13 @@ async fn ac_c_receipt_census_query() {
                 .contains(&json!(frame.id.0))
         );
         assert_eq!(exported["received_at_ns"], EPOCH * 1_000_000_000);
+        let string_outcome = snapshot.population["receipts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["seq"] == echo.sequence.0)
+            .unwrap();
+        assert_eq!(string_outcome["outcome"], 0);
         assert_eq!(snapshot.ignored[0]["reason"], "identity_seen");
         // A contradictory snapshot which names the echo as the admitted receipt must count
         // both its decision and its real router line. Identity equality alone must not pass it.

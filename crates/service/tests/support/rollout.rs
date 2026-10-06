@@ -305,6 +305,15 @@ impl Child {
             stderr: Some(tokio::task::spawn_blocking(move || drain(stderr))),
         }
     }
+    pub fn signal_checkpoint(&self, signal: &str) {
+        assert!(
+            std::process::Command::new("kill")
+                .args([signal, &self.process.id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
     pub async fn finish_checkpoint(mut self, signal: Option<&str>) -> std::process::Output {
         if let Some(signal) = signal {
             assert!(
@@ -1242,9 +1251,13 @@ impl CheckpointFixture {
         );
     }
     pub fn logs(&self) -> String {
-        std::fs::read_dir(self.dir.path())
+        let mut entries = std::fs::read_dir(self.dir.path())
             .unwrap()
             .flatten()
+            .collect::<Vec<_>>();
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        entries
+            .into_iter()
             .filter_map(|entry| {
                 let name = entry.file_name();
                 let name = name.to_string_lossy();
@@ -1256,6 +1269,7 @@ impl CheckpointFixture {
             .collect::<Vec<_>>()
             .join("\n")
     }
+
     pub async fn wait_log(&self, message: &str) {
         until(|| self.logs().contains(message)).await;
     }

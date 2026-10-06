@@ -2004,7 +2004,7 @@ async fn main() -> Result<()> {
             })
     });
     // A quarantine failure always preserves the operator-recovery status, including join timeouts.
-    if invalidation_failed {
+    if invalidation_failed || checkpoint_slot.quarantine_failed() {
         std::process::exit(78);
     }
     if !owners_joined || !checkpoint_joined {

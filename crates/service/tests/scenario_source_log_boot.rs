@@ -3553,6 +3553,89 @@ async fn checkpoint_invalidation_failure_preserves_status_78_at_shutdown_bounds(
             );
         }
     }
+    checkpoint_unusable_lock_preserves_status_78().await;
+}
+
+async fn checkpoint_unusable_lock_preserves_status_78() {
+    let fixture = checkpoint_rollout::CheckpointFixture::new().await;
+    SourceLogBoot::prepare_checkpoint(&fixture.cfg.paper_state_db_path).unwrap();
+    let pause = fixture.dir.path().join("prefix-pause");
+    let child = checkpoint_rollout::Child::start_checkpoint(
+        &fixture.config_path,
+        Path::new(env!("CARGO_BIN_EXE_pe-service")),
+        &[("PE_SCENARIO_CHECKPOINT_PAUSE_BEFORE_HASH", pause.as_path())],
+    );
+    checkpoint_until(|| pause.with_extension("ready").exists()).await;
+    let lock = checkpoint_sidecar(&fixture.cfg.source_event_log_path, ".lock");
+    std::fs::remove_file(&lock).unwrap();
+    std::fs::create_dir(&lock).unwrap();
+    corrupt_checkpoint_prefix(&fixture.cfg.source_event_log_path);
+    std::fs::write(pause.with_extension("resume"), b"resume").unwrap();
+    let output = child.finish_checkpoint(None).await;
+    assert_eq!(output.status.code(), Some(78), "{output:?}");
+    let status = std::fs::read_to_string(&fixture.cfg.status_path).unwrap();
+    assert!(
+        status.contains("checkpoint_invalidation_failed"),
+        "{status}"
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_quarantine_failure_after_owner_shutdown_preserves_status_78() {
+    let fixture = checkpoint_rollout::CheckpointFixture::new().await;
+    SourceLogBoot::prepare_checkpoint(&fixture.cfg.paper_state_db_path).unwrap();
+    let pause = fixture.dir.path().join("prefix-pause");
+    let child = checkpoint_rollout::Child::start_checkpoint(
+        &fixture.config_path,
+        Path::new(env!("CARGO_BIN_EXE_pe-service")),
+        &[
+            ("PE_SCENARIO_CHECKPOINT_PAUSE_BEFORE_HASH", pause.as_path()),
+            (
+                "PE_SCENARIO_CHECKPOINT_FAIL_QUARANTINE_RENAME",
+                Path::new("1"),
+            ),
+        ],
+    );
+    checkpoint_until(|| pause.with_extension("ready").exists()).await;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(checkpoint_sidecar(
+            &fixture.cfg.source_event_log_path,
+            ".lock",
+        ))
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&lock).unwrap();
+    corrupt_checkpoint_prefix(&fixture.cfg.source_event_log_path);
+    std::fs::write(pause.with_extension("resume"), b"resume").unwrap();
+    fixture
+        .wait_log("source checkpoint prefix invalid; invalidating")
+        .await;
+    child.signal_checkpoint("-INT");
+    // TaskRunState::Stopped is written only after the supervisor joins the owner. The blocking
+    // child remains held on our lock until this status snapshot proves CleanShutdown won.
+    checkpoint_until(|| {
+        std::fs::read(&fixture.cfg.status_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|status| {
+                status["tasks"].as_array().is_some_and(|tasks| {
+                    tasks.iter().any(|task| {
+                        task["name"] == "source_checkpoint" && task["state"] == "stopped"
+                    })
+                })
+            })
+    })
+    .await;
+    fs2::FileExt::unlock(&lock).unwrap();
+    let output = child.finish_checkpoint(None).await;
+    assert_eq!(output.status.code(), Some(78), "{output:?}");
+}
+
+fn checkpoint_sidecar(source: &Path, suffix: &str) -> PathBuf {
+    let mut path = pe_service::source_checkpoint::checkpoint_path(source).into_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
 }
 
 #[tokio::test]
@@ -3719,11 +3802,58 @@ async fn previous_binary_rollback_matrix() {
         assert_eq!(std::fs::read(&record).ok(), record_before);
         std::fs::write(source, &source_before).unwrap();
         fixture.clear_logs();
+        std::fs::remove_file(&fixture.cfg.status_path).unwrap();
+        let retry_start = file_len(source);
+        // copy() serves transaction 1001; this is the same already-covered row, unchanged.
+        let covered_hash = format!("0x{:064x}", 1001);
         let child =
             checkpoint_rollout::Child::start_checkpoint(&fixture.config_path, &previous, &[]);
         fixture.wait_log("pe-service listening").await;
-        // The exact already-covered activity remains at the local endpoint during the old boot
-        // and next admission. No new decision/fence/financial mutation is permitted.
+        let logs = fixture.logs();
+        let admitted = logs
+            .lines()
+            .position(|line| {
+                let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+                    return false;
+                };
+                let fields = event.get("fields").unwrap_or(&event);
+                fields["message"] == "wallet bracket completed"
+                    && fields["wallet"] == fixture.wallet().to_string()
+                    && fields["outcome"] == "accepted"
+            })
+            .expect("previous binary must admit the stale-anchor fixture wallet");
+        let listening = logs
+            .lines()
+            .position(|line| line.contains("pe-service listening"))
+            .unwrap();
+        assert!(
+            admitted < listening,
+            "{row}: previous-binary boot admission must precede listening"
+        );
+        // Each reconciliation page is recorded by the previous poller. Two pages containing
+        // this exact retry, appended after this run began, prove its first round completed.
+        checkpoint_until(|| {
+            let Ok(frames) = pe_event_log::Reader::replay_with_offsets(source) else {
+                return false;
+            };
+            frames
+                .filter_map(Result::ok)
+                .filter(|(offset, _, frame)| {
+                    *offset >= retry_start
+                        && frame.source_id.0 == "polymarket-public.activity-reconciliation"
+                        && serde_json::from_slice::<serde_json::Value>(&frame.payload)
+                            .ok()
+                            .is_some_and(|rows| {
+                                rows.as_array().is_some_and(|rows| {
+                                    rows.iter()
+                                        .any(|row| row["transactionHash"] == covered_hash)
+                                })
+                            })
+                })
+                .count()
+                >= 2
+        })
+        .await;
         checkpoint_until(|| {
             std::fs::read(&fixture.cfg.status_path)
                 .ok()

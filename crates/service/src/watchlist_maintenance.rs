@@ -2274,6 +2274,28 @@ async fn maintenance_tick_inner(
         }
     }
 
+    // Give additions the shared preparation budget first on their alternating ticks. Returning
+    // from the knockout pass cannot skip the independently required live re-entry call.
+    if !sync.reentries_first {
+        knockout_tick(
+            live,
+            paper_state,
+            client,
+            base_url,
+            anon_key,
+            secret_key,
+            writer_lock,
+            applied_capacity,
+            preparer,
+            cfg,
+            capacity_epoch,
+            evicted,
+            sync,
+            now_unix,
+            deadline,
+        )
+        .await;
+    }
     // Every applied batch gives structurally present, live-absent wallets one admission turn,
     // including ticks that will return on edge-stat failure or full structural capacity.
     let report = if shared_batch_fetch_failed {
@@ -2301,6 +2323,47 @@ async fn maintenance_tick_inner(
     };
     record_live_reentry(preparer, sync, cfg.membership_mode, report).await;
 
+    if sync.reentries_first {
+        knockout_tick(
+            live,
+            paper_state,
+            client,
+            base_url,
+            anon_key,
+            secret_key,
+            writer_lock,
+            applied_capacity,
+            preparer,
+            cfg,
+            capacity_epoch,
+            evicted,
+            sync,
+            now_unix,
+            deadline,
+        )
+        .await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn knockout_tick(
+    live: &LiveWatchlist,
+    paper_state: &Arc<PaperStateDb>,
+    client: &reqwest::Client,
+    base_url: &str,
+    anon_key: &str,
+    secret_key: &str,
+    writer_lock: &Mutex<()>,
+    applied_capacity: &AppliedWatchlistCapacity,
+    preparer: &AdmissionPreparer,
+    cfg: &MaintenanceConfig,
+    capacity_epoch: WatchlistCapacityEpoch,
+    evicted: &mut HashSet<WalletAddress>,
+    sync: &mut BatchSync,
+    now_unix: i64,
+    deadline: tokio::time::Instant,
+) {
+    let cap = capacity_epoch.target;
     // 2. Per-wallet edge stats from the authoritative local paper-state (knockout pass only —
     // the batch step above never depends on this succeeding).
     let Some(stats) = load_edge_stats(paper_state, cfg, now_unix) else {
@@ -5447,9 +5510,20 @@ mod tests {
             sync: &mut BatchSync,
             interval_secs: u64,
         ) {
+            admission_tick_in_mode(h, preparer, sync, MembershipMode::FullRerank, interval_secs)
+                .await;
+        }
+
+        async fn admission_tick_in_mode(
+            h: &Harness,
+            preparer: &AdmissionPreparer,
+            sync: &mut BatchSync,
+            membership_mode: MembershipMode,
+            interval_secs: u64,
+        ) {
             let cfg = MaintenanceConfig {
                 interval_secs,
-                membership_mode: MembershipMode::FullRerank,
+                membership_mode,
                 ..cfg()
             };
             maintenance_tick(
@@ -5675,36 +5749,115 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn admission_paths_alternate_first_claim() {
             let _io = paused_io();
-            let retained = wallet(1);
-            let additions = (2..=9).map(wallet).collect::<Vec<_>>();
-            let mut fake = Fake::new(Some(2));
-            fake.ranking_entries.push(row(1, 1, retained));
-            for batch in 2..=3 {
-                fake.ranking_entries.push(row(batch, 1, retained));
-                let start = usize::try_from(batch - 2).unwrap() * 4;
-                for (i, w) in additions[start..start + 4].iter().enumerate() {
-                    fake.ranking_entries
-                        .push(row(batch, i64::try_from(i + 2).unwrap(), *w));
+            for mode in [MembershipMode::FullRerank, MembershipMode::Knockout] {
+                let retained = wallet(1);
+                let additions = (2..=9).map(wallet).collect::<Vec<_>>();
+                let mut fake = Fake::new(Some(2));
+                fake.ranking_entries.push(row(1, 1, retained));
+                for batch in 2..=3 {
+                    fake.ranking_entries.push(row(batch, 1, retained));
+                    let start = usize::try_from(batch - 2).unwrap() * 4;
+                    for (i, w) in additions[start..start + 4].iter().enumerate() {
+                        fake.ranking_entries
+                            .push(row(batch, i64::try_from(i + 2).unwrap(), *w));
+                    }
+                }
+                let latest = fake.latest_batch.clone();
+                let mut h = harness(fake, &[retained]).await;
+                h.applied = AppliedWatchlistCapacity::new(5);
+                h.live.remove_fenced(&set(&[retained]));
+                let preparer =
+                    admission_preparer(&h, Arc::new(StdMutex::new(set(&additions))), true);
+                let mut sync = admission_sync(1);
+                admission_tick_in_mode(&h, &preparer, &mut sync, mode, 10).await;
+                assert!(!sync.reentries_first);
+                assert!(!members(&h.live).contains(&retained));
+                assert_eq!(sync.started, 4);
+                latest.store(3, Ordering::SeqCst);
+                admission_tick_in_mode(&h, &preparer, &mut sync, mode, 10).await;
+                assert!(sync.reentries_first);
+                assert!(
+                    members(&h.live).contains(&retained),
+                    "retained re-entry claims the second tick's budget"
+                );
+                assert_eq!(sync.started, 1);
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn knockout_backfill_alternates_first_claim() {
+            let _io = paused_io();
+            let (retained, bench) = (wallet(1), wallet(2));
+            let mut fake = Fake::new(Some(1));
+            fake.latest_ranking = vec![row(1, 1, retained), row(1, 2, bench)];
+            let mut h = harness(fake, &[retained]).await;
+            h.applied = AppliedWatchlistCapacity::new(2);
+            h.live.remove_fenced(&set(&[retained]));
+            let preparer = admission_preparer(&h, Arc::new(StdMutex::new(set(&[retained]))), true);
+            let bytes = Arc::new(StdMutex::new(Vec::new()));
+            let _logs = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .json()
+                    .with_writer(CapturedLogs(bytes.clone()))
+                    .finish(),
+            );
+            let mut sync = admission_sync(1);
+            sync.reentries_first = false;
+            let mut evicted = HashSet::new();
+            let config = MaintenanceConfig {
+                interval_secs: 10,
+                membership_mode: MembershipMode::Knockout,
+                ..cfg()
+            };
+            for tick in 0..2 {
+                maintenance_tick(
+                    &h.live,
+                    &h.paper_state,
+                    &h.client,
+                    &h.base_url,
+                    "anon",
+                    "",
+                    &h.writer_lock,
+                    &h.applied,
+                    &preparer,
+                    &config,
+                    h.applied.load(),
+                    &mut evicted,
+                    &mut sync,
+                    NOW,
+                )
+                .await;
+                assert_eq!(sync.marker, Some(1), "unchanged batch");
+                if tick == 0 {
+                    assert!(!members(&h.live).contains(&bench));
+                    assert_eq!(sync.started, 1);
+                    tokio::time::advance(Duration::from_secs(300)).await;
                 }
             }
-            let latest = fake.latest_batch.clone();
-            let mut h = harness(fake, &[retained]).await;
-            h.applied = AppliedWatchlistCapacity::new(5);
-            h.live.remove_fenced(&set(&[retained]));
-            let preparer = admission_preparer(&h, Arc::new(StdMutex::new(set(&additions))), true);
-            let mut sync = admission_sync(1);
-            admission_tick(&h, &preparer, &mut sync).await;
-            assert!(!sync.reentries_first);
-            assert!(!members(&h.live).contains(&retained));
-            assert_eq!(sync.started, 4);
-            latest.store(3, Ordering::SeqCst);
-            admission_tick(&h, &preparer, &mut sync).await;
-            assert!(sync.reentries_first);
             assert!(
-                members(&h.live).contains(&retained),
-                "retained re-entry claims the second tick's budget"
+                members(&h.live).contains(&bench),
+                "backfill claims its second tick"
             );
-            assert_eq!(sync.started, 1);
+            assert!(!members(&h.live).contains(&retained));
+            let logs = log_fields(&bytes, "admission launch order");
+            assert_eq!(
+                logs.iter()
+                    .map(|l| (l["path"].as_str().unwrap(), l["first"].as_bool().unwrap()))
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("reentry", true),
+                    ("addition", false),
+                    ("addition", false),
+                    ("addition", true),
+                    ("reentry", false)
+                ]
+            );
+            let started = logs
+                .iter()
+                .filter(|l| l["started"] != 0)
+                .collect::<Vec<_>>();
+            assert_eq!(launched(started[0])[0].0, retained.to_string());
+            assert_eq!(launched(started[1])[0].0, bench.to_string());
         }
 
         #[tokio::test(start_paused = true)]
@@ -5829,76 +5982,78 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn admission_launch_order_both_paths() {
             let _io = paused_io();
-            let (reentry, addition, newer) = (wallet(1), wallet(2), wallet(3));
-            let mut fake = Fake::new(Some(2));
-            fake.ranking_entries = vec![
-                row(1, 1, reentry),
-                row(2, 1, reentry),
-                row(2, 2, addition),
-                row(3, 1, reentry),
-                row(3, 2, addition),
-                row(3, 3, newer),
-            ];
-            let latest = fake.latest_batch.clone();
-            let h = harness(fake, &[reentry]).await;
-            h.live.remove_fenced(&set(&[reentry]));
-            let bytes = Arc::new(StdMutex::new(Vec::new()));
-            let _logs = tracing::subscriber::set_default(
-                tracing_subscriber::fmt()
-                    .json()
-                    .with_writer(CapturedLogs(bytes.clone()))
-                    .finish(),
-            );
-            let mut sync = admission_sync(1);
-            admission_tick(&h, &h.preparer, &mut sync).await;
-            h.live.remove_fenced(&set(&[reentry]));
-            latest.store(3, Ordering::SeqCst);
-            admission_tick(&h, &h.preparer, &mut sync).await;
-            let logs = log_fields(&bytes, "admission launch order");
-            let started = logs
-                .iter()
-                .filter(|l| l["started"] != 0)
-                .collect::<Vec<_>>();
-            assert_eq!(
-                started
+            for mode in [MembershipMode::FullRerank, MembershipMode::Knockout] {
+                let (reentry, addition, newer) = (wallet(1), wallet(2), wallet(3));
+                let mut fake = Fake::new(Some(2));
+                fake.ranking_entries = vec![
+                    row(1, 1, reentry),
+                    row(2, 1, reentry),
+                    row(2, 2, addition),
+                    row(3, 1, reentry),
+                    row(3, 2, addition),
+                    row(3, 3, newer),
+                ];
+                let latest = fake.latest_batch.clone();
+                let h = harness(fake, &[reentry]).await;
+                h.live.remove_fenced(&set(&[reentry]));
+                let bytes = Arc::new(StdMutex::new(Vec::new()));
+                let _logs = tracing::subscriber::set_default(
+                    tracing_subscriber::fmt()
+                        .json()
+                        .with_writer(CapturedLogs(bytes.clone()))
+                        .finish(),
+                );
+                let mut sync = admission_sync(1);
+                admission_tick_in_mode(&h, &h.preparer, &mut sync, mode, 10).await;
+                h.live.remove_fenced(&set(&[reentry]));
+                latest.store(3, Ordering::SeqCst);
+                admission_tick_in_mode(&h, &h.preparer, &mut sync, mode, 10).await;
+                let logs = log_fields(&bytes, "admission launch order");
+                let started = logs
                     .iter()
-                    .map(|l| (l["path"].as_str().unwrap(), l["first"].as_bool().unwrap()))
-                    .collect::<Vec<_>>(),
-                vec![
-                    ("addition", true),
-                    ("reentry", false),
-                    ("reentry", true),
-                    ("addition", false)
-                ]
-            );
-            for (log, wallet) in started.iter().zip([addition, reentry, reentry, newer]) {
-                assert_eq!(eligible(log), vec![wallet.to_string()]);
-                assert_eq!(launched(log)[0].0, wallet.to_string());
-                assert_eq!(log["started"], 1);
+                    .filter(|l| l["started"] != 0)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    started
+                        .iter()
+                        .map(|l| (l["path"].as_str().unwrap(), l["first"].as_bool().unwrap()))
+                        .collect::<Vec<_>>(),
+                    vec![
+                        ("addition", true),
+                        ("reentry", false),
+                        ("reentry", true),
+                        ("addition", false)
+                    ]
+                );
+                for (log, wallet) in started.iter().zip([addition, reentry, reentry, newer]) {
+                    assert_eq!(eligible(log), vec![wallet.to_string()]);
+                    assert_eq!(launched(log)[0].0, wallet.to_string());
+                    assert_eq!(log["started"], 1);
+                }
+                assert_eq!(
+                    h.controls()
+                        .iter()
+                        .map(|(wallets, _)| *wallets.iter().next().unwrap())
+                        .collect::<Vec<_>>(),
+                    vec![addition, reentry, reentry, newer]
+                );
+                // Capacity and direct callers use the same queue, with no tick-first field.
+                h.preparer
+                    .prepare_ranked_until(
+                        &[newer],
+                        &HashMap::new(),
+                        None,
+                        crate::watchlist_admission::AdmissionContext::Capacity,
+                    )
+                    .await
+                    .unwrap();
+                h.preparer.prepare(&[addition]).await.unwrap();
+                let logs = log_fields(&bytes, "admission launch order");
+                assert_eq!(logs[logs.len() - 2]["path"], "capacity");
+                assert_eq!(logs[logs.len() - 1]["path"], "other");
+                assert!(logs[logs.len() - 2].get("first").is_none());
+                assert!(logs[logs.len() - 1].get("first").is_none());
             }
-            assert_eq!(
-                h.controls()
-                    .iter()
-                    .map(|(wallets, _)| *wallets.iter().next().unwrap())
-                    .collect::<Vec<_>>(),
-                vec![addition, reentry, reentry, newer]
-            );
-            // Capacity and direct callers use the same queue, with no tick-first field.
-            h.preparer
-                .prepare_ranked_until(
-                    &[newer],
-                    &HashMap::new(),
-                    None,
-                    crate::watchlist_admission::AdmissionContext::Capacity,
-                )
-                .await
-                .unwrap();
-            h.preparer.prepare(&[addition]).await.unwrap();
-            let logs = log_fields(&bytes, "admission launch order");
-            assert_eq!(logs[logs.len() - 2]["path"], "capacity");
-            assert_eq!(logs[logs.len() - 1]["path"], "other");
-            assert!(logs[logs.len() - 2].get("first").is_none());
-            assert!(logs[logs.len() - 1].get("first").is_none());
         }
 
         #[tokio::test(start_paused = true)]

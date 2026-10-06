@@ -63,9 +63,15 @@ type Job = JoinHandle<Result<JobOutput, TaskFailure>>;
 pub struct CheckpointJobSlot {
     job: Arc<Mutex<Option<Job>>>,
     cancelled: Arc<AtomicBool>,
+    quarantine_failed: Arc<AtomicBool>,
 }
 
 impl CheckpointJobSlot {
+    #[must_use]
+    pub fn quarantine_failed(&self) -> bool {
+        self.quarantine_failed.load(Ordering::Acquire)
+    }
+
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
     }
@@ -124,6 +130,9 @@ pub struct CheckpointOwnerHooks {
     pub before_walk: Option<Arc<dyn Fn() -> std::io::Result<()> + Send + Sync>>,
     pub checkpoint_write: Option<Arc<dyn Fn() -> std::io::Result<()> + Send + Sync>>,
     pub after_publication: Option<PublicationObserver>,
+    pub after_publication_applied: Option<Arc<dyn Fn(Option<u64>) + Send + Sync>>,
+    pub clock: Option<Arc<dyn Fn() -> std::io::Result<u64> + Send + Sync>>,
+    pub before_invalidation: Option<Arc<dyn Fn() + Send + Sync>>,
     pub invalidation: super::InvalidationHooks,
 }
 
@@ -188,9 +197,17 @@ impl SourceCheckpointOwner {
             .receipts
             .current_tail_binding()
             .map_err(TaskFailure::typed)?;
-        let capture = super::unix_ms().map_err(TaskFailure::typed)?;
+        let capture = self.unix_ms().map_err(TaskFailure::typed)?;
         self.capture(Some((tail, capture))).await?;
         self.attempt_publication().await
+    }
+
+    fn unix_ms(&self) -> std::io::Result<u64> {
+        #[cfg(feature = "scenario")]
+        if let Some(clock) = &self.hooks.clock {
+            return clock();
+        }
+        super::unix_ms()
     }
 
     pub async fn run(mut self, shutdown: ShutdownReceiver) -> TaskResult {
@@ -224,7 +241,7 @@ impl SourceCheckpointOwner {
                 biased;
                 _ = hourly.tick() => {
                     let tail = self.receipts.current_tail_binding().map_err(TaskFailure::typed)?;
-                    let capture = super::unix_ms().map_err(TaskFailure::typed)?;
+                    let capture = self.unix_ms().map_err(TaskFailure::typed)?;
                     self.capture(Some((tail, capture))).await?;
                     self.attempt_publication().await?;
                 }
@@ -240,6 +257,7 @@ impl SourceCheckpointOwner {
             .take()
             .ok_or_else(|| TaskFailure::typed(OwnerError::Cancelled))?;
         let receipts = self.receipts.clone();
+        let quarantine_failed = self.slot.quarantine_failed.clone();
         #[cfg(feature = "scenario")]
         let hooks = self.hooks.clone();
         let result = self.slot.execute(move |cancel| {
@@ -256,13 +274,22 @@ impl SourceCheckpointOwner {
                         if cancel.load(Ordering::Acquire) || matches!(error, OwnerError::Scan(LogError::Cancelled)) {
                             return Err(TaskFailure::typed(OwnerError::Cancelled));
                         }
+                        error!(%error, "source checkpoint prefix invalid; invalidating");
+                        #[cfg(feature = "scenario")]
+                        if let Some(hook) = &hooks.before_invalidation {
+                            hook();
+                        }
                         #[cfg(feature = "scenario")]
                         let invalidation = super::invalidate_with_hooks(&frozen.tail.path, &hooks.invalidation);
                         #[cfg(not(feature = "scenario"))]
                         let invalidation = super::invalidate(&frozen.tail.path);
                         if let Err(invalidation) = invalidation {
+                            let failed = matches!(invalidation, super::InvalidationError::QuarantineFailed(_));
+                            if failed {
+                                quarantine_failed.store(true, Ordering::Release);
+                            }
                             return Err(TaskFailure {
-                                kind: if matches!(invalidation, super::InvalidationError::QuarantineFailed(_)) {
+                                kind: if failed {
                                     TaskFailureKind::CheckpointInvalidationFailed
                                 } else { TaskFailureKind::TypedError },
                                 message: format!("{error}; {invalidation}"),
@@ -309,7 +336,7 @@ impl SourceCheckpointOwner {
         #[cfg(feature = "scenario")]
         let hooks = self.hooks.clone();
         let capture = candidate.capture_unix_ms;
-        let now = super::unix_ms().map_err(TaskFailure::typed)?;
+        let now = self.unix_ms().map_err(TaskFailure::typed)?;
         info!(
             attempt,
             capture_unix_ms = capture,
@@ -345,7 +372,12 @@ impl SourceCheckpointOwner {
                         &candidate,
                         attempt,
                         &mut HookWriter(hooks.clone()),
-                        super::unix_ms,
+                        || {
+                            hooks
+                                .clock
+                                .as_ref()
+                                .map_or_else(super::unix_ms, |clock| clock())
+                        },
                     )
                 };
                 #[cfg(not(feature = "scenario"))]
@@ -375,6 +407,10 @@ impl SourceCheckpointOwner {
                     last_published_age_ms = self.last_published_capture.map(|time| now.saturating_sub(time)),
                     "source checkpoint publication retry"),
             }
+        }
+        #[cfg(feature = "scenario")]
+        if let Some(hook) = &self.hooks.after_publication_applied {
+            hook(self.last_published_capture);
         }
         Ok(())
     }
@@ -718,10 +754,34 @@ mod tests {
             }
         }
     }
-    async fn tick() {
-        for _ in 0..20 {
-            tokio::task::yield_now().await;
+    #[derive(Clone)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
         }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+        fn make_writer(&'a self) -> Self {
+            self.clone()
+        }
+    }
+    fn retry_logs(bytes: &Arc<std::sync::Mutex<Vec<u8>>>) -> Vec<serde_json::Value> {
+        String::from_utf8(bytes.lock().unwrap().clone())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()["fields"].clone())
+            .filter(|line| line["message"] == "source checkpoint publication retry")
+            .collect()
+    }
+    async fn advance_clock(clock: &std::sync::atomic::AtomicU64, seconds: u64) {
+        clock.fetch_add(seconds * 1000, Ordering::AcqRel);
+        tokio::time::advance(Duration::from_secs(seconds)).await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -730,7 +790,10 @@ mod tests {
         fixture.append();
         let failures = Arc::new(AtomicBool::new(false));
         let flag = failures.clone();
+        let clock = Arc::new(std::sync::atomic::AtomicU64::new(123));
+        let hook_clock = clock.clone();
         let (tx, mut rx) = mpsc::unbounded_channel();
+        let (applied_tx, mut applied_rx) = mpsc::unbounded_channel();
         let hooks = Arc::new(CheckpointOwnerHooks {
             checkpoint_write: Some(Arc::new(move || {
                 if flag.load(Ordering::Acquire) {
@@ -739,11 +802,22 @@ mod tests {
                     Ok(())
                 }
             })),
+            clock: Some(Arc::new(move || Ok(hook_clock.load(Ordering::Acquire)))),
             after_publication: Some(Arc::new(move |bytes, capture, success| {
                 tx.send((bytes.to_vec(), capture, success)).unwrap();
             })),
+            after_publication_applied: Some(Arc::new(move |last| {
+                applied_tx.send(last).unwrap();
+            })),
             ..Default::default()
         });
+        let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let _logs = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .json()
+                .with_writer(CapturedLogs(bytes.clone()))
+                .finish(),
+        );
         let slot = CheckpointJobSlot::default();
         let mut owner = fixture.owner(slot.clone(), false, 0);
         owner.set_scenario_hooks(hooks);
@@ -751,37 +825,52 @@ mod tests {
         let task = tokio::spawn(owner.run(shutdown.subscribe()));
         let initial = receive(&mut rx).await;
         assert!(initial.2);
+        assert_eq!(receive(&mut applied_rx).await, Some(initial.1));
         let first_tail = fixture.append();
         failures.store(true, Ordering::Release);
-        tick().await;
-        tokio::time::advance(Duration::from_secs(CHECKPOINT_PUBLISH_SECS)).await;
+        advance_clock(&clock, CHECKPOINT_PUBLISH_SECS).await;
         let failed = receive(&mut rx).await;
         assert!(!failed.2);
+        assert_eq!(receive(&mut applied_rx).await, Some(initial.1));
         let decoded: serde_json::Value = serde_json::from_slice(&failed.0[65..]).unwrap();
         assert_eq!(decoded["tail"]["physical_tail"], first_tail.physical_tail);
+        let mut retry_times = vec![clock.load(Ordering::Acquire)];
         for _ in 0..2 {
-            tick().await;
-            tokio::time::advance(Duration::from_secs(CHECKPOINT_RETRY_SECS)).await;
+            advance_clock(&clock, CHECKPOINT_RETRY_SECS).await;
             assert_eq!(receive(&mut rx).await, failed);
+            assert_eq!(receive(&mut applied_rx).await, Some(initial.1));
+            retry_times.push(clock.load(Ordering::Acquire));
+        }
+        let logs = retry_logs(&bytes);
+        assert_eq!(logs.len(), retry_times.len());
+        for (log, now) in logs.iter().zip(retry_times) {
+            assert_eq!(log["capture_unix_ms"], failed.1);
+            assert_eq!(log["last_published_capture_unix_ms"], initial.1);
+            assert_eq!(log["last_published_age_ms"], now - initial.1);
         }
         // New frames never alter a retained retry. The next hourly capture replaces it.
         let later = fixture.append();
-        tick().await;
-        tokio::time::advance(Duration::from_secs(
-            CHECKPOINT_PUBLISH_SECS - 2 * CHECKPOINT_RETRY_SECS,
-        ))
-        .await;
+        advance_clock(&clock, CHECKPOINT_PUBLISH_SECS - 2 * CHECKPOINT_RETRY_SECS).await;
         let replacement = receive(&mut rx).await;
         assert!(!replacement.2);
+        assert_eq!(receive(&mut applied_rx).await, Some(initial.1));
         assert_ne!(replacement.0, failed.0);
         let body: serde_json::Value = serde_json::from_slice(&replacement.0[65..]).unwrap();
         assert_eq!(body["tail"]["physical_tail"], later.physical_tail);
+        let logs = retry_logs(&bytes);
+        assert_eq!(logs.len(), 4);
+        assert_eq!(logs[3]["capture_unix_ms"], replacement.1);
+        assert_eq!(logs[3]["last_published_capture_unix_ms"], initial.1);
+        assert_eq!(
+            logs[3]["last_published_age_ms"],
+            clock.load(Ordering::Acquire) - initial.1
+        );
         failures.store(false, Ordering::Release);
-        tick().await;
-        tokio::time::advance(Duration::from_secs(CHECKPOINT_RETRY_SECS)).await;
+        advance_clock(&clock, CHECKPOINT_RETRY_SECS).await;
         let success = receive(&mut rx).await;
         assert_eq!((&success.0, success.1), (&replacement.0, replacement.1));
         assert!(success.2);
+        assert_eq!(receive(&mut applied_rx).await, Some(replacement.1));
         assert_eq!(
             std::fs::read(super::super::checkpoint_path(&later.path)).unwrap(),
             replacement.0
@@ -803,11 +892,17 @@ mod tests {
                 )
                 .unwrap();
             }
+            let generation = if active { 4 } else { 0 };
             let slot = CheckpointJobSlot::default();
-            let mut owner = fixture.owner(slot.clone(), false, if active { 4 } else { 0 });
+            let mut owner = fixture.owner(slot.clone(), false, generation);
             let fail = Arc::new(AtomicBool::new(true));
             let write_fail = fail.clone();
+            let clock = Arc::new(std::sync::atomic::AtomicU64::new(123));
+            let hook_clock = clock.clone();
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let (applied_tx, mut applied_rx) = mpsc::unbounded_channel();
             owner.set_scenario_hooks(Arc::new(CheckpointOwnerHooks {
+                clock: Some(Arc::new(move || Ok(hook_clock.load(Ordering::Acquire)))),
                 checkpoint_write: Some(Arc::new(move || {
                     if write_fail.load(Ordering::Acquire) {
                         Err(std::io::Error::other("storage outage"))
@@ -815,25 +910,92 @@ mod tests {
                         Ok(())
                     }
                 })),
+                after_publication: Some(Arc::new(move |bytes, capture, success| {
+                    tx.send((bytes.to_vec(), capture, success)).unwrap();
+                })),
+                after_publication_applied: Some(Arc::new(move |last| {
+                    applied_tx.send(last).unwrap();
+                })),
                 ..Default::default()
             }));
-            owner.initialize_for_scenario().await.unwrap();
-            let first = owner.pending.clone().unwrap();
-            assert_eq!(first.capture_unix_ms, 123);
-            assert!(owner.last_published_capture.is_none());
-            tokio::time::advance(Duration::from_secs(CHECKPOINT_PUBLISH_SECS + 1)).await;
-            owner.attempt_publication().await.unwrap();
-            assert!(Arc::ptr_eq(&first, owner.pending.as_ref().unwrap()));
+            let (shutdown, _) = crate::supervisor::ShutdownController::new();
+            let task = tokio::spawn(owner.run(shutdown.subscribe()));
+            let first = receive(&mut rx).await;
+            assert_eq!(first.1, 123);
+            assert!(!first.2);
+            assert_eq!(receive(&mut applied_rx).await, None);
             let tail = fixture.append();
-            owner.capture(Some((tail.clone(), 789))).await.unwrap();
-            assert!(!Arc::ptr_eq(&first, owner.pending.as_ref().unwrap()));
-            owner.attempt_publication().await.unwrap();
+            // Drive the real hourly/retry select loop. Until the hourly boundary every retry
+            // uses the initial serialized candidate even though the source tail has extended.
+            for _ in 1..(CHECKPOINT_PUBLISH_SECS / CHECKPOINT_RETRY_SECS) {
+                advance_clock(&clock, CHECKPOINT_RETRY_SECS).await;
+                assert_eq!(receive(&mut rx).await, first);
+                assert_eq!(receive(&mut applied_rx).await, None);
+            }
+            advance_clock(&clock, CHECKPOINT_RETRY_SECS).await;
+            let replacement = receive(&mut rx).await;
+            assert_eq!(receive(&mut applied_rx).await, None);
+            assert!(!replacement.2);
+            assert_ne!(replacement.0, first.0);
+            assert_eq!(replacement.1, 123 + CHECKPOINT_PUBLISH_SECS * 1000);
+            let body: serde_json::Value = serde_json::from_slice(&replacement.0[65..]).unwrap();
+            assert_eq!(body["tail"]["physical_tail"], tail.physical_tail);
+            advance_clock(&clock, CHECKPOINT_RETRY_SECS).await;
+            assert_eq!(receive(&mut rx).await, replacement);
+            assert_eq!(receive(&mut applied_rx).await, None);
+            if active {
+                assert_eq!(
+                    super::super::read_authority(&tail.path).unwrap(),
+                    super::super::Authority::Readable(super::super::InvalidationRecord {
+                        generation,
+                        active: true
+                    })
+                );
+            }
             fail.store(false, Ordering::Release);
-            tokio::time::advance(Duration::from_secs(CHECKPOINT_RETRY_SECS)).await;
-            owner.attempt_publication().await.unwrap();
-            assert_eq!(owner.last_published_capture, Some(789));
-            let authority = super::super::read_authority(&tail.path).unwrap();
-            assert!(authority.permits_checkpoint());
+            advance_clock(&clock, CHECKPOINT_RETRY_SECS).await;
+            let success = receive(&mut rx).await;
+            assert_eq!((&success.0, success.1), (&replacement.0, replacement.1));
+            assert!(success.2);
+            assert_eq!(receive(&mut applied_rx).await, Some(replacement.1));
+            shutdown.advance(ShutdownPhase::StopProducers);
+            assert_eq!(task.await.unwrap().unwrap(), TaskExit::CleanShutdown);
+            slot.join().await.unwrap();
+            assert!(
+                super::super::read_authority(&tail.path)
+                    .unwrap()
+                    .permits_checkpoint()
+            );
+            let loaded = super::super::load_checkpoint(&tail.path, &fixture.activation, false)
+                .unwrap()
+                .data;
+            assert_eq!(loaded.tail, tail);
+            let receipts =
+                SourceReceiptIndex::restore_staging(&tail.path, loaded.receipts, &loaded.tail)
+                    .unwrap()
+                    .complete(&loaded.tail)
+                    .unwrap();
+            let mut reducers = Reducers::new(loaded.financial_era);
+            reducers.activity = loaded.activity;
+            reducers.daily_boundary = loaded.daily_boundary;
+            let restarted_slot = CheckpointJobSlot::default();
+            let mut restarted = SourceCheckpointOwner::new(
+                FrozenCheckpoint {
+                    authority_generation: Some(generation),
+                    capture_unix_ms: clock.load(Ordering::Acquire),
+                    financial_era: loaded.financial_era,
+                    activation: loaded.activation,
+                    tail: loaded.tail.clone(),
+                    prefix: FrozenPrefix::Deferred {
+                        tail: loaded.tail,
+                        prefix_blake3: loaded.prefix_blake3,
+                    },
+                    reducers,
+                },
+                receipts,
+                restarted_slot.clone(),
+            );
+            restarted.initialize_for_scenario().await.unwrap();
             assert_eq!(
                 super::super::load_checkpoint(&tail.path, &fixture.activation, false)
                     .unwrap()
@@ -841,8 +1003,43 @@ mod tests {
                     .tail,
                 tail
             );
-            slot.join().await.unwrap();
+            restarted_slot.join().await.unwrap();
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quarantine_failure_survives_owner_cancellation() {
+        let mut fixture = Fixture::new();
+        fixture.append();
+        let slot = CheckpointJobSlot::default();
+        let mut owner = fixture.owner(slot.clone(), true, 0);
+        let mut bytes = std::fs::read(&fixture.activation.path).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        std::fs::write(&fixture.activation.path, bytes).unwrap();
+        let (started, mut starts) = mpsc::unbounded_channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let wait = std::sync::Mutex::new(wait);
+        let hooks = CheckpointOwnerHooks {
+            before_invalidation: Some(Arc::new(move || {
+                started.send(()).unwrap();
+                wait.lock().unwrap().recv().unwrap();
+            })),
+            ..Default::default()
+        };
+        hooks
+            .invalidation
+            .fail_quarantine_rename
+            .store(true, Ordering::Release);
+        owner.set_scenario_hooks(Arc::new(hooks));
+        let (shutdown, _) = crate::supervisor::ShutdownController::new();
+        let task = tokio::spawn(owner.run(shutdown.subscribe()));
+        receive(&mut starts).await;
+        shutdown.advance(ShutdownPhase::StopProducers);
+        assert_eq!(task.await.unwrap().unwrap(), TaskExit::CleanShutdown);
+        assert!(!slot.quarantine_failed());
+        release.send(()).unwrap();
+        slot.join().await.unwrap();
+        assert!(slot.quarantine_failed());
     }
 
     #[tokio::test(start_paused = true)]
@@ -910,6 +1107,7 @@ mod tests {
                 fixture.append();
                 let slot = CheckpointJobSlot::default();
                 let mut owner = fixture.owner(slot.clone(), stage == "prefix", 0);
+                let (applied_tx, mut applied_rx) = mpsc::unbounded_channel();
                 let (started, mut starts) = mpsc::unbounded_channel();
                 let (release, wait) = std::sync::mpsc::channel();
                 let wait = std::sync::Mutex::new(wait);
@@ -921,6 +1119,9 @@ mod tests {
                 let writes = Arc::new(AtomicUsize::new(0));
                 let seen_writes = writes.clone();
                 let mut hooks = CheckpointOwnerHooks {
+                    after_publication_applied: Some(Arc::new(move |last| {
+                        applied_tx.send(last).unwrap();
+                    })),
                     after_publication: Some(Arc::new(move |_, _, _| {
                         seen_writes.fetch_add(1, Ordering::Release);
                     })),
@@ -936,11 +1137,8 @@ mod tests {
                 let (shutdown, _) = crate::supervisor::ShutdownController::new();
                 let task = tokio::spawn(owner.run(shutdown.subscribe()));
                 if stage == "hourly" {
-                    while writes.load(Ordering::Acquire) == 0 {
-                        tokio::task::yield_now().await;
-                    }
+                    assert!(receive(&mut applied_rx).await.is_some());
                     fixture.append();
-                    tick().await;
                     tokio::time::advance(Duration::from_secs(CHECKPOINT_PUBLISH_SECS)).await;
                 }
                 receive(&mut starts).await;

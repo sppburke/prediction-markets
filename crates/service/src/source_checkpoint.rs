@@ -449,7 +449,7 @@ fn record_bytes(record: InvalidationRecord) -> io::Result<Vec<u8>> {
 /// Establish a durable quarantine before changing the authority generation. A quarantine failure
 /// is typed separately so the runtime owner can suppress automatic restart.
 pub fn invalidate(source_log: &Path) -> Result<u64, InvalidationError> {
-    let _lock = CheckpointLock::acquire(source_log)?;
+    let _lock = CheckpointLock::acquire(source_log).map_err(InvalidationError::QuarantineFailed)?;
     invalidate_locked(source_log, &mut DurableFinalization)
 }
 
@@ -457,7 +457,7 @@ fn invalidate_locked(
     path: &Path,
     finalization: &mut impl Finalization,
 ) -> Result<u64, InvalidationError> {
-    let authority = read_authority(path)?;
+    let authority = read_authority(path).map_err(InvalidationError::QuarantineFailed)?;
     let checkpoint = checkpoint_path(path);
     let record = record_path(path);
     let renamed = match finalization.quarantine_rename(&checkpoint, &record) {
@@ -656,7 +656,7 @@ pub fn invalidate_with_hooks(
             crate::qualification::write_report(target, bytes)
         }
     }
-    let _lock = CheckpointLock::acquire(path)?;
+    let _lock = CheckpointLock::acquire(path).map_err(InvalidationError::QuarantineFailed)?;
     invalidate_locked(path, &mut ScenarioFinalization(hooks))
 }
 
@@ -1160,6 +1160,32 @@ mod tests {
     }
 
     #[test]
+    fn invalidation_lock_failure_cannot_establish_quarantine() {
+        let fixture = Fixture::new();
+        let candidate = fixture.candidate(1, 2, 0);
+        fixture.stage(&candidate);
+        std::fs::create_dir(suffixed(&checkpoint_path(&fixture.path), ".lock")).unwrap();
+        assert!(matches!(
+            invalidate(&fixture.path),
+            Err(InvalidationError::QuarantineFailed(_))
+        ));
+        #[cfg(feature = "scenario")]
+        assert!(matches!(
+            invalidate_with_hooks(&fixture.path, &InvalidationHooks::default()),
+            Err(InvalidationError::QuarantineFailed(_))
+        ));
+        assert_eq!(
+            std::fs::read(checkpoint_path(&fixture.path)).unwrap(),
+            candidate.bytes
+        );
+        // The preparation CLI still reports its own precondition failures as ordinary I/O.
+        assert!(matches!(
+            invalidate_if_current(&fixture.path, 0, candidate.bytes[..64].try_into().unwrap()),
+            Err(InvalidationError::Io(_))
+        ));
+    }
+
+    #[test]
     fn orphan_temporary_file_does_not_block_publication() {
         let fixture = Fixture::new();
         fixture.record(4, true);
@@ -1302,6 +1328,15 @@ mod tests {
         ));
         assert!(matches!(
             invalidate(&fixture.path),
+            Err(InvalidationError::QuarantineFailed(_))
+        ));
+        #[cfg(feature = "scenario")]
+        assert!(matches!(
+            invalidate_with_hooks(&fixture.path, &InvalidationHooks::default()),
+            Err(InvalidationError::QuarantineFailed(_))
+        ));
+        assert!(matches!(
+            invalidate_if_current(&fixture.path, 0, candidate.bytes[..64].try_into().unwrap()),
             Err(InvalidationError::Io(_))
         ));
         assert_eq!(

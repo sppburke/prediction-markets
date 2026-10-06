@@ -931,10 +931,12 @@ The critical `source_checkpoint` owner starts after HTTP listening. Its single c
 job slot verifies the loaded prefix, continues the same hasher to the frozen boot tail, then
 serializes and publishes the frozen initial receipt prefix and pre-consumption reducers. A mismatch,
 read error or binding inequality quarantines checkpoint use and triggers coordinated restart. A
-quarantine rename or directory-sync failure carries `CheckpointInvalidationFailed` and exits 78;
-with no checkpoint present, a failed invalidation-record write is itself that quarantine failure.
+failure before the quarantine is durable (checkpoint lock, invalidation-record read, quarantine
+rename or its directory sync) carries `CheckpointInvalidationFailed` and exits 78; with no
+checkpoint present, a failed invalidation-record write is itself that quarantine failure.
 The checkpoint-invalidation systemd drop-in prevents automatic restart for this status. Main
-retains and bounds the blocking-child join independently of async supervision; status 78 takes
+retains and bounds the blocking-child join independently of async supervision; the job slot
+carries a quarantine failure to main even after shutdown stopped the owner, and status 78 takes
 precedence over join/shutdown timeouts. Cancellation discards late computation results and starts
 no further publication; an already-started publication finishes.
 
