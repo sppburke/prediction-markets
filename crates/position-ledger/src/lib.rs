@@ -4,7 +4,7 @@
 //! deterministic output given the same ordered input stream.
 
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 #[cfg(test)]
 use std::sync::Arc;
 #[cfg(test)]
@@ -1149,6 +1149,446 @@ pub enum SameSecondEntryPolicy {
     HomogeneousPieces,
 }
 
+/// The scope of a wallet's cumulative drop, ordered by its wire name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScopeKind {
+    Event,
+    Market,
+}
+
+/// A neg-risk group or market, identified by canonical lowercase `0x` hex.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct Scope {
+    pub kind: ScopeKind,
+    pub id: String,
+}
+
+/// Problem causes, ordered by their wire names for same-second ties.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DropCause {
+    Conversion,
+    OrderDependent,
+    Overflow,
+    Underflow,
+    UnknownCondition,
+    UnknownType,
+    Unmapped,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeProblem {
+    pub scope: Scope,
+    pub cause: DropCause,
+    pub trigger: SourceTradeId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MarketLookup {
+    Unknown,
+    Ungrouped,
+    Grouped(String),
+}
+
+/// Bound market and token evidence supplied by the caller.
+pub trait ScopeLookups {
+    fn market(&self, condition_id: &str) -> MarketLookup;
+    fn token_market(&self, token_id: &str) -> Option<String>;
+    fn is_group(&self, id: &str) -> bool;
+}
+
+pub struct SecondRecord<'a> {
+    pub aggregate: &'a ActivityAggregate,
+    /// `LedgerMutation::from_activity` plus the caller's token rebinding, or its failure.
+    pub mutation: Result<LedgerMutation, LedgerError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopedSecond {
+    /// No entry from this second is scored, including when a certified trigger is absent.
+    pub problem_second: bool,
+    /// New drops, sorted by scope, with the smallest `(trigger.0, cause)` per scope.
+    pub problems: Vec<ScopeProblem>,
+    /// Unresolvable problems and token-less TRADEs, counted by activity type.
+    pub ignored: Vec<(SourceTradeId, ActivityType)>,
+    /// Valid mutations outside all drops, in canonical source-trade order.
+    pub apply: Vec<LedgerMutation>,
+    pub decisions: Vec<TradeDecision>,
+    /// Effective BUY markets, including those in dropped scopes, deduplicated.
+    pub consumed: Vec<MarketId>,
+}
+
+/// Classify a complete wallet-second with inclusive, cumulative scoped drops.
+#[allow(clippy::too_many_arguments)]
+pub fn classify_scoped_second(
+    entry_policy: SameSecondEntryPolicy,
+    ledger: &PositionLedger,
+    wallet: WalletAddress,
+    records: &[SecondRecord<'_>],
+    dropped: &BTreeSet<Scope>,
+    certified_problem_second: bool,
+    reconstruction_quality: ReconstructionQuality,
+    signal_config: &SignalConfig,
+    history_complete: bool,
+    has_market: &dyn Fn(&MarketId) -> bool,
+    lookups: &dyn ScopeLookups,
+) -> Result<ScopedSecond, LedgerError> {
+    let mut ordered = records.iter().collect::<Vec<_>>();
+    ordered.sort_by(|left, right| {
+        left.aggregate
+            .group_id
+            .key()
+            .0
+            .cmp(&right.aggregate.group_id.key().0)
+    });
+    let mut problems = BTreeMap::<Scope, ScopeProblem>::new();
+    let mut ignored = Vec::new();
+    let mut mutations = Vec::new();
+    let mut consumed = BTreeMap::new();
+    let mut effective_records = HashMap::new();
+    for record in ordered {
+        let aggregate = record.aggregate;
+        let components = aggregate.group_id.components();
+        if components.activity_type == ActivityType::Trade
+            && aggregate.share_sum != ShareAmount::ZERO
+            && components.asset.is_none()
+        {
+            ignored.push((aggregate.group_id.key().clone(), ActivityType::Trade));
+            continue;
+        }
+        let cause = match &record.mutation {
+            Err(LedgerError::InvalidMapping { .. }) => Some(DropCause::Unmapped),
+            Err(error) => return Err(error.clone()),
+            Ok(mutation) => match mutation.effect.effective() {
+                LedgerEffect::RawOnly => {
+                    mutations.push(mutation.clone());
+                    continue;
+                }
+                LedgerEffect::Conversion => Some(DropCause::Conversion),
+                LedgerEffect::UnknownEffect => Some(DropCause::UnknownType),
+                LedgerEffect::RequiresAnchor => {
+                    let known = components.condition_id.as_ref().is_some_and(|condition| {
+                        ledger.position(&wallet).is_some_and(|snapshot| {
+                            snapshot
+                                .positions
+                                .keys()
+                                .any(|key| key.market().0.0 == condition.0)
+                        })
+                    });
+                    (!known).then_some(DropCause::UnknownCondition)
+                }
+                effect => {
+                    let canonical = components
+                        .condition_id
+                        .as_ref()
+                        .is_some_and(|condition| canonical_scope_id(&condition.0));
+                    (effect_market(effect).is_some() && !canonical).then_some(DropCause::Unmapped)
+                }
+            },
+        };
+        if let Some(cause) = cause {
+            let Some(scope) = resolve_problem_scope(aggregate, cause, lookups) else {
+                ignored.push((
+                    aggregate.group_id.key().clone(),
+                    components.activity_type.clone(),
+                ));
+                continue;
+            };
+            if let Ok(mutation) = &record.mutation
+                && matches!(
+                    mutation.effect.effective(),
+                    LedgerEffect::Trade {
+                        side: Side::Buy,
+                        ..
+                    }
+                )
+            {
+                consumed.insert(
+                    aggregate.group_id.key().0.clone(),
+                    MarketId(VenueMarketId(scope.id.clone())),
+                );
+            }
+            if !scope_is_dropped(&scope, dropped, lookups) {
+                record_scope_problem(&mut problems, scope, cause, aggregate.group_id.key());
+            }
+            continue;
+        }
+        if let Ok(mutation) = &record.mutation {
+            if let LedgerEffect::Trade {
+                market_id,
+                side: Side::Buy,
+                ..
+            } = mutation.effect.effective()
+            {
+                consumed.insert(mutation.source_trade_id.0.clone(), market_id.clone());
+            }
+            if record_market(mutation, aggregate)
+                .is_some_and(|market| market_is_dropped(market, dropped, lookups))
+            {
+                continue;
+            }
+            effective_records.insert(mutation.source_trade_id.0.clone(), aggregate);
+            mutations.push(mutation.clone());
+        }
+    }
+
+    let mut failed = HashSet::new();
+    for component in mutation_components(&mutations) {
+        let Some(first) = component.first() else {
+            continue;
+        };
+        let cause =
+            match component_order_independent(ledger, wallet, &component, SecondProof::Repaired) {
+                Ok(true) => continue,
+                Ok(false) => DropCause::OrderDependent,
+                Err(LedgerError::Underflow { .. }) if component.len() == 1 => DropCause::Underflow,
+                Err(LedgerError::Overflow { .. }) if component.len() == 1 => DropCause::Overflow,
+                Err(error) => return Err(error),
+            };
+        let aggregate = effective_records
+            .get(&first.source_trade_id.0)
+            .ok_or_else(|| LedgerError::InvalidMapping {
+                source_trade_id: first.source_trade_id.clone(),
+            })?;
+        if let Some(scope) = resolve_problem_scope(aggregate, cause, lookups) {
+            if !dropped.contains(&scope) {
+                record_scope_problem(&mut problems, scope, cause, &first.source_trade_id);
+            }
+        } else {
+            for mutation in &component {
+                if let Some(aggregate) = effective_records.get(&mutation.source_trade_id.0) {
+                    ignored.push((
+                        mutation.source_trade_id.clone(),
+                        aggregate.group_id.components().activity_type.clone(),
+                    ));
+                }
+                consumed.remove(&mutation.source_trade_id.0);
+            }
+        }
+        failed.extend(
+            component
+                .iter()
+                .map(|mutation| mutation.source_trade_id.0.clone()),
+        );
+    }
+    let new_drops = problems.keys().cloned().collect::<BTreeSet<_>>();
+    let apply = mutations
+        .into_iter()
+        .filter(|mutation| {
+            !failed.contains(&mutation.source_trade_id.0)
+                && effective_records
+                    .get(&mutation.source_trade_id.0)
+                    .and_then(|aggregate| record_market(mutation, aggregate))
+                    .is_none_or(|market| !market_is_dropped(market, &new_drops, lookups))
+        })
+        .collect::<Vec<_>>();
+    let problem_second = certified_problem_second || !problems.is_empty();
+    let mut decisions = match classify_complete_second(
+        entry_policy,
+        ledger,
+        wallet,
+        &apply,
+        reconstruction_quality,
+        signal_config,
+        history_complete,
+        has_market,
+    )? {
+        SecondVerdict::OrderIndependent { decisions, .. } => decisions,
+        SecondVerdict::OrderDependent { trigger } => {
+            return Err(LedgerError::InvalidMapping {
+                source_trade_id: trigger,
+            });
+        }
+    };
+    if problem_second {
+        for decision in &mut decisions {
+            if decision.entry == EntryClassification::Admitted {
+                decision.entry = EntryClassification::NotAnEntry;
+            }
+        }
+    }
+    ignored.sort_by(|left, right| left.0.0.cmp(&right.0.0));
+    Ok(ScopedSecond {
+        problem_second,
+        problems: problems.into_values().collect(),
+        ignored,
+        apply,
+        decisions,
+        consumed: consumed
+            .into_values()
+            .map(|market| (market.to_string(), market))
+            .collect::<BTreeMap<_, _>>()
+            .into_values()
+            .collect(),
+    })
+}
+
+/// Historical scoped classification with canonical signal defaults and complete history.
+#[allow(clippy::too_many_arguments)]
+pub fn classify_scoped_historical_second(
+    ledger: &PositionLedger,
+    wallet: WalletAddress,
+    records: &[SecondRecord<'_>],
+    dropped: &BTreeSet<Scope>,
+    certified_problem_second: bool,
+    reconstruction_quality: ReconstructionQuality,
+    has_market: &dyn Fn(&MarketId) -> bool,
+    lookups: &dyn ScopeLookups,
+) -> Result<ScopedSecond, LedgerError> {
+    classify_scoped_second(
+        SameSecondEntryPolicy::HomogeneousPieces,
+        ledger,
+        wallet,
+        records,
+        dropped,
+        certified_problem_second,
+        reconstruction_quality,
+        &SignalConfig::default(),
+        true,
+        has_market,
+        lookups,
+    )
+}
+
+fn canonical_scope_id(id: &str) -> bool {
+    id.strip_prefix("0x").is_some_and(|hex| {
+        !hex.is_empty()
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
+}
+
+fn resolve_problem_scope(
+    aggregate: &ActivityAggregate,
+    cause: DropCause,
+    lookups: &dyn ScopeLookups,
+) -> Option<Scope> {
+    let components = aggregate.group_id.components();
+    let event_cause = matches!(cause, DropCause::Conversion | DropCause::UnknownType);
+    let condition = components
+        .condition_id
+        .as_ref()
+        .map(|condition| {
+            let lowercase = condition.0.to_ascii_lowercase();
+            lowercase
+                .strip_prefix("\\x")
+                .map_or_else(|| lowercase.clone(), |hex| format!("0x{hex}"))
+        })
+        .filter(|id| canonical_scope_id(id));
+    if let Some(id) = &condition {
+        if event_cause && lookups.is_group(id) {
+            return Some(Scope {
+                kind: ScopeKind::Event,
+                id: id.clone(),
+            });
+        }
+        match lookups.market(id) {
+            MarketLookup::Grouped(group) if event_cause => {
+                return Some(Scope {
+                    kind: ScopeKind::Event,
+                    id: group,
+                });
+            }
+            MarketLookup::Ungrouped | MarketLookup::Grouped(_) => {
+                return Some(Scope {
+                    kind: ScopeKind::Market,
+                    id: id.clone(),
+                });
+            }
+            MarketLookup::Unknown => {}
+        }
+    }
+    let market = components
+        .asset
+        .as_ref()
+        .and_then(|token| lookups.token_market(&token.0))?;
+    let scope = match lookups.market(&market) {
+        MarketLookup::Grouped(group) if event_cause => Scope {
+            kind: ScopeKind::Event,
+            id: group,
+        },
+        _ => Scope {
+            kind: ScopeKind::Market,
+            id: market,
+        },
+    };
+    Some(scope)
+}
+
+fn effect_market(effect: &LedgerEffect) -> Option<&MarketId> {
+    match effect.effective() {
+        LedgerEffect::Trade { market_id, .. }
+        | LedgerEffect::Split { market_id, .. }
+        | LedgerEffect::Merge { market_id, .. }
+        | LedgerEffect::Redeem { market_id, .. } => Some(market_id),
+        _ => None,
+    }
+}
+
+fn record_market<'a>(
+    mutation: &'a LedgerMutation,
+    aggregate: &'a ActivityAggregate,
+) -> Option<&'a str> {
+    effect_market(&mutation.effect)
+        .map(|market| market.0.0.as_str())
+        .or_else(|| {
+            if matches!(mutation.effect.effective(), LedgerEffect::RequiresAnchor) {
+                aggregate
+                    .group_id
+                    .components()
+                    .condition_id
+                    .as_ref()
+                    .map(|condition| condition.0.as_str())
+            } else {
+                None
+            }
+        })
+}
+
+fn market_is_dropped(market: &str, dropped: &BTreeSet<Scope>, lookups: &dyn ScopeLookups) -> bool {
+    if dropped.contains(&Scope {
+        kind: ScopeKind::Market,
+        id: market.to_owned(),
+    }) {
+        return true;
+    }
+    match lookups.market(market) {
+        MarketLookup::Grouped(group) => dropped.contains(&Scope {
+            kind: ScopeKind::Event,
+            id: group,
+        }),
+        MarketLookup::Unknown | MarketLookup::Ungrouped => false,
+    }
+}
+
+fn scope_is_dropped(scope: &Scope, dropped: &BTreeSet<Scope>, lookups: &dyn ScopeLookups) -> bool {
+    match scope.kind {
+        ScopeKind::Event => dropped.contains(scope),
+        ScopeKind::Market => market_is_dropped(&scope.id, dropped, lookups),
+    }
+}
+
+fn record_scope_problem(
+    problems: &mut BTreeMap<Scope, ScopeProblem>,
+    scope: Scope,
+    cause: DropCause,
+    trigger: &SourceTradeId,
+) {
+    let problem = problems
+        .entry(scope.clone())
+        .or_insert_with(|| ScopeProblem {
+            scope,
+            cause,
+            trigger: trigger.clone(),
+        });
+    if (&trigger.0, cause) < (&problem.trigger.0, problem.cause) {
+        problem.cause = cause;
+        problem.trigger = trigger.clone();
+    }
+}
+
 /// Prove mutation-order independence, apply the bucket to a disposable ledger clone,
 /// classify ordinary trades from the immutable pre-bucket snapshot, and classify first entries.
 #[allow(clippy::too_many_arguments)]
@@ -1404,21 +1844,29 @@ fn order_independent_validity(
         let Some(first) = component.first() else {
             continue;
         };
-        let valid = match proof {
-            SecondProof::Repaired => same_side_component_validity(ledger, wallet, &component),
-            SecondProof::Legacy => None,
-        };
-        let valid = match valid {
-            Some(Ok(())) => true,
-            Some(Err(error)) if component.len() == 1 => return Err(error),
-            Some(Err(_)) => false,
-            None => component.len() <= 4 && all_component_orders_match(ledger, wallet, &component)?,
-        };
-        if !valid {
+        if !component_order_independent(ledger, wallet, &component, proof)? {
             return Ok(Some(first.source_trade_id.clone()));
         }
     }
     Ok(None)
+}
+
+fn component_order_independent(
+    ledger: &PositionLedger,
+    wallet: WalletAddress,
+    component: &[&LedgerMutation],
+    proof: SecondProof,
+) -> Result<bool, LedgerError> {
+    let valid = match proof {
+        SecondProof::Repaired => same_side_component_validity(ledger, wallet, component),
+        SecondProof::Legacy => None,
+    };
+    match valid {
+        Some(Ok(())) => Ok(true),
+        Some(Err(error)) if component.len() == 1 => Err(error),
+        Some(Err(_)) => Ok(false),
+        None => Ok(component.len() <= 4 && all_component_orders_match(ledger, wallet, component)?),
+    }
 }
 
 // Ordinary same-side trades only decrease opposing inventory and increase same-side
@@ -1564,6 +2012,26 @@ mod tests {
 
     fn wallet(hex: &str) -> WalletAddress {
         serde_json::from_str(&format!("\"{hex}\"")).unwrap()
+    }
+
+    #[test]
+    fn scope_problem_cause_breaks_equal_trigger_ties_in_wire_order() {
+        let scope = Scope {
+            kind: ScopeKind::Market,
+            id: "0xaaa".to_owned(),
+        };
+        let trigger = SourceTradeId("g2:trigger".to_owned());
+        for causes in [
+            [DropCause::Unmapped, DropCause::Underflow],
+            [DropCause::Underflow, DropCause::Unmapped],
+        ] {
+            let mut problems = BTreeMap::new();
+            for cause in causes {
+                record_scope_problem(&mut problems, scope.clone(), cause, &trigger);
+            }
+            assert_eq!(problems[&scope].cause, DropCause::Underflow);
+            assert_eq!(problems[&scope].trigger, trigger);
+        }
     }
 
     fn market() -> pe_core_types::MarketId {
