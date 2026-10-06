@@ -9982,6 +9982,7 @@ fn census_python(code: &str, args: &[String], bin: &std::path::Path) -> std::pro
         .arg("-")
         .args(args)
         .env("PATH", path)
+        .env("PE_SERVICE_BIN", env!("CARGO_BIN_EXE_pe-service"))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -10576,10 +10577,23 @@ async fn ac_b_membership_reference_checks() {
             .unwrap()["verdict"],
         "pass"
     );
+    // AppendReceipt ignores unknown fields and parses hex in either case, so neither may fail.
+    ac_b_rewrite_paper(&capture, exclusion_sequence, |r| {
+        let receipt = &mut r["evidence"]["config_receipt"];
+        receipt["audit_note"] = json!("x");
+        receipt["this_hash"] = json!(receipt["this_hash"].as_str().unwrap().to_uppercase());
+    });
+    let rows = ac_b_reference_rows(&ac_b_inspect(&h, &capture));
+    assert_eq!(
+        rows.iter()
+            .find(|r| r["seq"] == exclusion_sequence)
+            .unwrap()["verdict"],
+        "pass"
+    );
 
     for (receipt, error) in [
-        (bad_type, "artifact integer"),
-        (null_entries, "artifact array"),
+        (bad_type, "artifact decode: "),
+        (null_entries, "artifact decode: "),
         (wrong_source, "artifact envelope"),
         (wrong_parser, "artifact envelope"),
     ] {
@@ -10593,7 +10607,13 @@ async fn ac_b_membership_reference_checks() {
             .unwrap();
         assert_eq!(failed["verdict"], "incomplete");
         assert_eq!(failed["failing_references"][0]["status"], "mismatched");
-        assert_eq!(failed["failing_references"][0]["error"], error);
+        assert!(
+            failed["failing_references"][0]["error"]
+                .as_str()
+                .unwrap()
+                .starts_with(error),
+            "{failed}"
+        );
     }
 
     // A contextual mismatch must still export all referenced receipts, even after the first.

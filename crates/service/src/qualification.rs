@@ -3214,10 +3214,79 @@ fn membership_artifact<T: serde::de::DeserializeOwned>(
     {
         return insufficient("MembershipChanged artifact receipt has the wrong envelope identity");
     }
-    serde_json::from_slice(&observation.payload).map_err(|error| {
+    decode_membership_artifact(&observation.payload)
+}
+
+fn decode_membership_artifact<T: serde::de::DeserializeOwned>(
+    payload: &[u8],
+) -> Result<T, QualificationError> {
+    serde_json::from_slice(payload).map_err(|error| {
         QualificationError::InsufficientEvidence(format!(
             "MembershipChanged artifact payload is invalid: {error}"
         ))
+    })
+}
+
+/// Offline audit decoding (docs/29 AC-B): decode one membership payload exactly as this verifier
+/// does and return its canonical JSON. `kind` is `membership_changed` for a paper record, whose
+/// sealed evidence is decoded too, or a membership artifact source ID; an admission artifact's
+/// proof manifest is verified for its wallet. Receipt presence and identity, and the checks that
+/// need replayed membership, stay with the caller.
+pub fn canonical_membership_json(
+    kind: &str,
+    payload: &[u8],
+) -> Result<serde_json::Value, QualificationError> {
+    Ok(match kind {
+        "membership_changed" => {
+            let PaperLogRecord::MembershipChanged {
+                reason,
+                removed,
+                added,
+                capacity,
+                ranking_batch_id,
+                evidence,
+            } = serde_json::from_slice(payload).map_err(|error| {
+                QualificationError::InsufficientEvidence(format!(
+                    "MembershipChanged record is invalid: {error}"
+                ))
+            })?
+            else {
+                return insufficient("paper record is not MembershipChanged");
+            };
+            let evidence: SealedMembershipEvidence =
+                serde_json::from_value(evidence).map_err(|error| {
+                    QualificationError::InsufficientEvidence(format!(
+                        "MembershipChanged evidence schema is invalid: {error}"
+                    ))
+                })?;
+            serde_json::to_value(PaperLogRecord::MembershipChanged {
+                reason,
+                removed,
+                added,
+                capacity,
+                ranking_batch_id,
+                evidence: serde_json::to_value(evidence)?,
+            })?
+        }
+        RANKING_MEMBERSHIP_SOURCE_ID => serde_json::to_value(decode_membership_artifact::<
+            RankingMembershipArtifact,
+        >(payload)?)?,
+        CAPACITY_CONFIG_SOURCE_ID => serde_json::to_value(decode_membership_artifact::<
+            CapacityMembershipArtifact,
+        >(payload)?)?,
+        MEMBERSHIP_ADMISSION_SOURCE_ID => {
+            let artifact: MembershipAdmissionArtifact = decode_membership_artifact(payload)?;
+            artifact.proof.verify(&[artifact.wallet]).map_err(|error| {
+                QualificationError::InsufficientEvidence(format!(
+                    "MembershipChanged admission proof is invalid: {error}"
+                ))
+            })?;
+            serde_json::to_value(artifact)?
+        }
+        KNOCKOUT_CAUSAL_SOURCE_ID => serde_json::to_value(decode_membership_artifact::<
+            KnockoutCausalArtifact,
+        >(payload)?)?,
+        other => return insufficient(format!("unknown membership payload kind {other}")),
     })
 }
 
@@ -15443,5 +15512,63 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), b"new");
         write_report(&path, b"complete retry").unwrap();
         assert_eq!(fs::read(&path).unwrap(), b"complete retry");
+    }
+
+    /// PASS: audit decoding is the verifier's own serde decoding, so representations serde accepts
+    /// (receipt and entry extra fields, uppercase hex, a unit variant written as an object,
+    /// duplicate keys inside an ignored field) decode to canonical JSON, while schema violations fail.
+    #[test]
+    fn canonical_membership_json_decodes_like_the_verifier() {
+        let record = serde_json::json!({
+            "record": "membership_changed", "reason": "capacity_change", "removed": [],
+            "added": [], "capacity": 5, "ranking_batch_id": null,
+            "evidence": {"kind": "capacity_change", "generation": 2,
+                "config_receipt": {"sequence": 3, "this_hash": "AB".repeat(32), "audit_note": "x"},
+                "admission_receipts": []}
+        });
+        let canonical = super::canonical_membership_json(
+            "membership_changed",
+            &serde_json::to_vec(&record).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            canonical["evidence"]["config_receipt"],
+            serde_json::json!({"sequence": 3, "this_hash": "ab".repeat(32)})
+        );
+        let mut extended = record;
+        extended["evidence"]["note"] = serde_json::json!(1);
+        assert!(
+            super::canonical_membership_json(
+                "membership_changed",
+                &serde_json::to_vec(&extended).unwrap()
+            )
+            .is_err()
+        );
+        let ranking = br#"{"batch_id":7,"entries":[{"wallet":"0x00000000000000000000000000000000000000AA","tier":{"Active":null},"leader_score_bps":1,"lcb_5pct_bps":1,"win_rate_bps":1,"closed_trades_in_window":1,"reconstruction_quality":100,"future_field":{"x":1,"x":2}}]}"#;
+        let canonical =
+            super::canonical_membership_json("pe-service.watchlist-ranking", ranking).unwrap();
+        assert_eq!(
+            canonical["entries"][0]["wallet"],
+            "0x00000000000000000000000000000000000000aa"
+        );
+        assert_eq!(canonical["entries"][0]["tier"], "Active");
+        assert!(canonical["entries"][0].get("future_field").is_none());
+        for (kind, payload) in [
+            (
+                "pe-service.watchlist-capacity-config",
+                &br#"{"generation":1,"target":2,"published_entries":null}"#[..],
+            ),
+            (
+                "pe-service.watchlist-ranking",
+                br#"{"batch_id":7,"entries":[],"extra":1}"#,
+            ),
+            ("pe-service.watchlist-unknown", br#"{}"#),
+            ("membership_changed", br#"{"record":"risk_halt_changed"}"#),
+        ] {
+            assert!(
+                super::canonical_membership_json(kind, payload).is_err(),
+                "{kind}"
+            );
+        }
     }
 }

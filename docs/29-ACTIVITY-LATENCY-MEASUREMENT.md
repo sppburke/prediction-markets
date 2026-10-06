@@ -329,13 +329,15 @@ later-captured logs may lack decisions in the database copy and appear as misses
 The decoder requires system `libzstd`; it checks framing/CRC, joins ordinary TRADE rows by the
 canonical `g2:` component encoding (using `b3sum`), and preserves envelope receipts. It does not
 replace the Rust log verifier or authority-specific semantic verification. Do not run normal service boot, `--report`, recovery or checkpoint
-preparation as part of this read-only audit.
+preparation as part of this read-only audit. Set `PE_SERVICE_BIN` to the absolute path of the deployed
+`pe-service` binary: the inspection decodes membership records and artifacts only through its
+read-only `--canonical-membership-json` command, and stops without it.
 
 ```bash
 sha256sum paper_state.db source_filtered.log paper.log
 stat -c '%s %n' paper_state.db source_filtered.log paper.log
 python3 - paper_state.db source_filtered.log paper.log <boundary-sequence> <AC16-cohort-size> <window-start-CT> <window-end-CT> <audit-directory> <<'PY'
-import calendar, ctypes, ctypes.util, hashlib, json, re, sqlite3, statistics, struct, subprocess, sys, time, zlib
+import calendar, ctypes, ctypes.util, hashlib, json, os, re, sqlite3, statistics, struct, subprocess, sys, time, zlib
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
@@ -395,100 +397,36 @@ def ns(value):
     d = datetime.fromisoformat(base + ("+00:00" if zone == "Z" else zone))
     return calendar.timegm(d.utctimetuple()) * 10**9 + int((fraction or "").ljust(9, "0"))
 
-# Membership artifact decoding mirrors paper_recovery's structs and qualification's
-# membership_artifact envelope checks. Optional Rust fields may be absent; denied unknown
-# fields, nested types and integer bounds are checked, rather than accepting any JSON object.
-# Open marks a struct without deny_unknown_fields (WatchlistEntry), whose extra keys serde ignores.
-class Open(dict): pass
-
-def shape(value, spec):
-    if isinstance(spec, dict):
-        assert isinstance(value, dict) and (isinstance(spec, Open) or not set(value) - set(spec)), "artifact fields"
-        for key, field in spec.items(): shape(value.get(key), field)
-    elif isinstance(spec, list):
-        assert isinstance(value, list), "artifact array"
-        for item in value: shape(item, spec[0])
-    elif isinstance(spec, tuple):
-        if spec[0] == "optional":
-            if value is not None: shape(value, spec[1])
-        else: assert value in spec, "artifact enum"
-    elif spec in ("u8", "u16", "u32", "u64", "i32", "i64"):
-        bits = int(spec[1:]); signed = spec[0] == "i"
-        assert type(value) is int and -(2**(bits-1) if signed else 0) <= value < 2**(bits-int(signed)), "artifact integer"
-    elif spec == "wallet":
-        assert isinstance(value, str) and re.fullmatch(r"0x[0-9a-fA-F]{40}", value), "artifact wallet"
-    elif spec == "decimal":
-        assert type(value) in (str, int, Decimal) and re.fullmatch(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?", str(value)), "artifact decimal"
-        d = Decimal(value); assert d.is_finite(), "artifact decimal"
-        # Published Decimal preimages must fit the owner's exact 96-bit mantissa and scale.
-        _, digits, exponent = d.as_tuple()
-        assert -28 <= exponent <= 28 and len(digits) <= 29, "artifact decimal range"
-        coefficient = int("".join(map(str, digits))) * 10**max(exponent, 0)
-        assert coefficient <= 79228162514264337593543950335, "artifact decimal range"
-    else: assert type(value) is spec, "artifact scalar"
-
-entry_shape = Open({"wallet": "wallet", "tier": ("Active", "Incubator"),
-    "leader_score_bps": "i32", "lcb_5pct_bps": "i32", "win_rate_bps": "i32",
-    "closed_trades_in_window": "u32", "reconstruction_quality": "u8"})
-history_shape = {"complete": bool, "proof_json": str, "updated_at_unix": "i64"}
-coverage_shape = {"activity_cutoff_unix": "i64", "coverage_generation": "i64",
-    "reanchor_required": bool, "anchor_seq": "i64", "anchored_at_unix": "i64"}
-anchor_shape = {"anchor_seq": "i64", "anchored_at_unix": "i64", "activity_cutoff_unix": "i64",
-    "balances_json": str, "ledger_hash_after": str, "proof_json": str}
-validation_shape = {"ledger_hash": str, "positions_proof_hash": str, "activity_bounds_json": str,
-    "source_log_generation": str, "proof_json": str, "recorded_at_unix": "i64"}
-proof_shape = {"membership": ["wallet"], "proofs": [{"wallet": "wallet",
-    "history": history_shape, "coverage": coverage_shape, "anchor": anchor_shape, "validation": validation_shape}]}
-fill_shape = {"idempotency_key": str, "market_id": str, "outcome_id": "u16", "side": ("Buy", "Sell"),
-    "quantity": "u64", "fill_price": "decimal", "principal": "u64", "fee": "u64",
-    "event_seq": "u64", "prepared_seq": "u64", "source_receipt_seq": ("optional", "u64")}
-settlement_shape = {"market_id": str, "outcome_prices": ["decimal"], "credit_applied": "decimal",
-    "settled_at_unix": "i64"}
-artifact_shapes = {
-    "pe-service.watchlist-ranking": {"batch_id": ("optional", "i64"), "entries": [entry_shape]},
-    "pe-service.watchlist-capacity-config": {"generation": "u64", "target": "u64", "published_entries": [entry_shape]},
-    "pe-service.watchlist-admission": {"wallet": "wallet", "proof": proof_shape},
-    "pe-service.watchlist-knockout": {"wallet": "wallet", "evaluated_at_unix": "i64",
-        "last_trade_unix": ("optional", "i64"), "inactivity_threshold_secs": "u64",
-        "inactivity_hard_cap_secs": "u64", "demotion_min_trades": "u64", "demotion_cb_alpha": "decimal",
-        "demotion_pnl_window_secs": "u64", "fills": [fill_shape], "settlements": [settlement_shape]}}
+# Rust owns membership decoding. The deployed binary named by PE_SERVICE_BIN decodes each paper
+# membership record and referenced artifact exactly as the qualification verifier does (typed
+# serde, the sealed-evidence schema and the admission proof manifest) and prints canonical JSON;
+# every comparison below reads that output.
+def canonical(kind, raw):
+    binary = os.environ.get("PE_SERVICE_BIN")
+    if not binary: raise RuntimeError("PE_SERVICE_BIN must name the deployed pe-service binary")
+    out = subprocess.run([binary, "--canonical-membership-json", kind], input=raw, capture_output=True)
+    if out.returncode != 0:
+        lines = [line.strip() for line in out.stderr.decode(errors="replace").splitlines() if line.strip()]
+        raise ValueError(lines[-1] if lines else f"exit {out.returncode}")
+    return json.loads(out.stdout)
 
 def membership_artifact(e, expected):
     assert (e["source_id"], e["schema_version"], e["parser_version"], e["content_type"]) == (expected, 1, 1, "json"), "artifact envelope"
-    def unique_fields(pairs):
-        result = {}
-        for key, value in pairs:
-            assert key not in result, "duplicate artifact field"
-            result[key] = value
-        return result
-    a = json.loads(bytes(e["payload"]), parse_float=Decimal, object_pairs_hook=unique_fields)
-    shape(a, artifact_shapes[expected])
-    if expected == "pe-service.watchlist-admission":
-        # MembershipProofManifest::verify authenticates its immutable preimages internally.
-        p = a["proof"]; assert p["membership"] == [a["wallet"]] and len(p["proofs"]) == 1, "admission manifest"
-        for proof in p["proofs"]:
-            assert proof["wallet"] == a["wallet"] and proof["history"]["complete"], "admission history"
-            assert not proof["coverage"]["reanchor_required"], "admission coverage"
-            for key in ("anchor_seq", "anchored_at_unix", "activity_cutoff_unix"):
-                assert proof["coverage"][key] == proof["anchor"][key], "admission anchor"
-            assert proof["validation"]["ledger_hash"] == proof["anchor"]["ledger_hash_after"], "admission validation"
-            assert proof["validation"]["proof_json"] == proof["anchor"]["proof_json"], "admission validation proof"
-            for owner, key in (("history", "proof_json"), ("anchor", "balances_json"), ("anchor", "proof_json"),
-                               ("validation", "activity_bounds_json"), ("validation", "proof_json")):
-                json.loads(proof[owner][key])
-    return a
+    try: return canonical(expected, bytes(e["payload"]))
+    except ValueError as error: raise AssertionError("artifact decode: " + str(error))
 
 def membership_record(e):
-    c = payload(e); evidence = c["evidence"]; references = []; errors = []
-    if not isinstance(evidence, dict):
-        errors.append("sealed evidence is not an object"); evidence = {}
+    references = []; errors = []
+    try: c = canonical("membership_changed", bytes(e["payload"]))
+    except ValueError as error:
+        c = payload(e); errors.append("record decode: " + str(error))
+        c["evidence"] = {}
+    evidence = c["evidence"]
     def reference(name, r, expected, wallet=None):
         row = {"reference": name, "seq": None, "hash": None, "expected_source_id": expected,
                "status": "mismatched", "error": None}
         references.append(row)
         try:
-            shape(r, {"sequence": "u64", "this_hash": str})
-            assert re.fullmatch(r"[0-9a-f]{64}", r["this_hash"]), "receipt hash"
             row.update(seq=r["sequence"], hash=r["this_hash"])
             if r["sequence"] not in source:
                 row.update(status="missing", error="receipt absent from captured source prefix"); return None
@@ -521,33 +459,22 @@ def membership_record(e):
         reasons = {"full_rerank": ["full_rerank"], "capacity_change": ["capacity_change"],
                    "knockout_backfill": ["knockout_inactivity", "knockout_inactivity_hard_cap", "knockout_underperformance"]}
         assert c["reason"] in reasons[kind], "evidence kind differs from reason"
-        required = {"kind", "admission_receipts"} | {
-            "full_rerank": {"ranking_receipt"}, "capacity_change": {"generation", "config_receipt"},
-            "knockout_backfill": {"evictions", "ranking_receipt"}}[kind]
-        optional = {"ranking_receipt"} if kind == "knockout_backfill" else set()
-        assert set(evidence) <= required and required - optional <= set(evidence), "sealed evidence fields"
         if ranking is not None:
             assert ranking.get("batch_id") == c["ranking_batch_id"], "ranking batch differs"
             if kind == "full_rerank": assert c["ranking_batch_id"] is not None, "ranking batch missing"
         if kind == "capacity_change":
-            shape(evidence["generation"], "u64")
             assert c["ranking_batch_id"] is None, "capacity unexpectedly names a batch"
             if config is not None:
                 assert config["generation"] == evidence["generation"] > 0 and config["target"] == c["capacity"], "capacity identity differs"
-        admissions = evidence["admission_receipts"]
-        shape(admissions, [{"wallet": "wallet", "receipt": {"sequence": "u64", "this_hash": str}}])
-        wallets = [a["wallet"] for a in admissions]
+        wallets = [a["wallet"] for a in evidence["admission_receipts"]]
         assert len(set(wallets)) == len(wallets) and set(wallets) == set(c["added"]), "admission wallets differ"
         if kind == "knockout_backfill":
-            evictions = evidence["evictions"]
-            shape(evictions, [{"wallet": "wallet", "reason": tuple(reasons[kind]),
-                "causal_receipt": {"sequence": "u64", "this_hash": str}}])
-            wallets = [a["wallet"] for a in evictions]
+            wallets = [a["wallet"] for a in evidence["evictions"]]
             assert len(set(wallets)) == len(wallets) and set(wallets) == set(c["removed"]), "eviction wallets differ"
     except (AssertionError, KeyError, ValueError, TypeError) as error:
         errors.append(str(error))
     return {"seq": e["seq"], "hash": e["this_hash"], "received_at_ns": ns(e["received_at"]),
-            **{k: c[k] for k in ("reason", "removed", "added", "capacity", "ranking_batch_id")},
+            **{k: c.get(k) for k in ("reason", "removed", "added", "capacity", "ranking_batch_id")},
             "kind": evidence.get("kind"), "references": references, "evidence_errors": errors}
 
 audit_unix_ns = time.time_ns(); print("audit clock", audit_unix_ns)
@@ -852,8 +779,13 @@ for e in source.values():
     if e["source_id"] != "pe-service.watchlist-deferral": continue
     assert (e["schema_version"], e["parser_version"], e["content_type"]) == (1, 1, "json")
     a = payload(e); assert a["version"] == 1
-    shape(a["deferrals"], [{"wallet": "wallet", "stage": str,
-        "class": ("wallet_transient", "wallet_persistent", "shared"), "kind": str, "message": str}])
+    # Deferrals are audit-only (no Rust decoder); check the writer's serialized shape.
+    assert isinstance(a["deferrals"], list), "deferrals array"
+    for d in a["deferrals"]:
+        assert isinstance(d, dict) and set(d) == {"wallet", "stage", "class", "kind", "message"}, "deferral fields"
+        assert isinstance(d["wallet"], str) and re.fullmatch(r"0x[0-9a-fA-F]{40}", d["wallet"]), "deferral wallet"
+        assert all(isinstance(d[k], str) for k in ("stage", "kind", "message")), "deferral text"
+        assert d["class"] in ("wallet_transient", "wallet_persistent", "shared"), "deferral class"
     deferrals.append({"seq": e["seq"], "hash": e["this_hash"], "received_at_ns": ns(e["received_at"]),
                       "deferrals": a["deferrals"]})
 frame_rows = [f for f in frame_rows if f["id"] in audited_ids]
@@ -875,17 +807,18 @@ PY
 receive nanoseconds, reason, deltas, capacity, ranking batch and sealed evidence kind. Each
 reference names its expected source ID and is `verified`, `missing` or `mismatched` against
 the captured source prefix. Verification requires the same sequence and hash, the owner's
-source ID, schema 1 / parser 1 / JSON envelope, and decoding as the owner's typed artifact
-(including nested admission proof preimages; ranking entries, like `WatchlistEntry`, accept
-unknown fields, while every other artifact struct denies them). The artifact structs contain no
-further `AppendReceipt` references: admission proof documents are retained JSON preimages and knockout
+source ID, schema 1 / parser 1 / JSON envelope, and decoding as the owner's typed artifact by
+`pe-service --canonical-membership-json`, which decodes the record, its sealed evidence and each
+artifact exactly as the qualification verifier does, including the admission proof manifest;
+every identity comparison reads its canonical output. The artifact structs contain no further
+`AppendReceipt` references: admission proof documents are retained JSON preimages and knockout
 fill sequence fields are provenance, not sequence/hash receipts. `deferrals` exports every
 captured deferral artifact with its sequence, hash and receive nanoseconds, and its full
 `deferrals` array, including wallet, class, kind and message. Neither export uses AC16's filters.
 
 Run this extracted reference check in the audit directory. It emits one row per membership
-record, with `pass` only when every referenced receipt is verified and the sealed evidence
-shape and wallet/batch/generation identities agree; otherwise it emits `incomplete` and the
+record, with `pass` only when the record decodes, every referenced receipt is verified and the
+wallet/batch/generation identities agree; otherwise it emits `incomplete` and the
 failing references and evidence errors. Use only records at or before S for AC-B judgments,
 including any earlier exclusion record selected by `<membership-from-paper-seq>`. This check
 establishes receipt completeness; the Rust verifier remains the authority for policy semantics.

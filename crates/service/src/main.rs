@@ -245,6 +245,21 @@ async fn main() -> Result<()> {
     }
     if let Some(position) = args
         .iter()
+        .position(|argument| argument == "--canonical-membership-json")
+    {
+        let kind = args.get(position + 1).context(
+            "--canonical-membership-json requires membership_changed or a membership artifact source ID",
+        )?;
+        let mut payload = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut payload)
+            .context("read the membership payload from stdin")?;
+        let canonical = pe_service::qualification::canonical_membership_json(kind, &payload)
+            .context("decode the membership payload")?;
+        println!("{canonical}");
+        return Ok(());
+    }
+    if let Some(position) = args
+        .iter()
         .position(|argument| argument == "--verify-staged-revision")
     {
         let expected = args
