@@ -1,4 +1,4 @@
-//! Process-lifetime Polymarket token identity authority (#555).
+//! Polymarket token identity authority with generation-bound durable caching (#555).
 //!
 //! Fresh Gamma pages become usable only after the service's single source-log
 //! owner acknowledges their durable append. Verified identities retain that
@@ -7,19 +7,33 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use pe_core_types::{PolymarketTokenId, SourceTimestamp};
-use pe_event_log::{ContentType, EnvelopeIn};
+use pe_core_types::{EventSeq, OutcomeId, PolymarketTokenId, SourceTimestamp};
+use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn};
+use pe_paper_state::{
+    ASSET_IDENTITY_INSERT_LIMIT, AssetIdentityRow, MigrationPhase, MigrationRecord, PaperStateDb,
+    PaperStateError,
+};
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::gamma_markets::verify_token_identities;
 use pe_source_polymarket_public::{
+    GAMMA_MARKETS_PARSER_VERSION, GAMMA_MARKETS_SCHEMA_VERSION, GAMMA_MARKETS_SOURCE_ID,
     GammaMarketsClient, GammaMarketsError, MarketFilter, MetadataPageEvidence,
-    ReconciliationFetcher, ReconciliationPageFetcher, VerifiedTokenIdentity,
+    ReconciliationFetcher, ReconciliationPageFetcher, VerifiedTokenIdentity, canonical_page_hash,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 
 use crate::activity_ingest::{SourceLogHandle, SourceLogHandleError};
+use crate::risk_inputs::SourceReceiptIndex;
 use crate::source_event_sink::SourceEventSink;
+
+type IdentityPage = (MetadataPageEvidence, Vec<u8>);
+
+struct AuthenticatedIdentityRows {
+    identities: Vec<(AssetIdentityRow, CachedIdentity)>,
+    pages: Vec<IdentityPage>,
+    invalid: Vec<PolymarketTokenId>,
+}
 
 /// Boot-time source-log owner shared with the recording position validator.
 pub type BootSourceLog = Arc<Mutex<SourceEventSink>>;
@@ -35,6 +49,58 @@ pub struct IdentityProvenance {
 struct CachedIdentity {
     identity: VerifiedTokenIdentity,
     provenance: IdentityProvenance,
+}
+
+#[derive(Default)]
+struct IdentityCache {
+    identities: HashMap<PolymarketTokenId, CachedIdentity>,
+    rejected: BTreeSet<String>,
+    // Boot's shared receipt index is extended only after its reducer walk. These pages
+    // already have a synchronized append receipt and are dropped when that index is installed.
+    boot_pages: BTreeMap<u64, (AppendReceipt, IdentityPage)>,
+}
+
+#[derive(Clone)]
+struct IdentityStore {
+    paper_state: Arc<PaperStateDb>,
+    generation: String,
+    source_receipts: SourceReceiptIndex,
+}
+
+/// Bind cache rows to the installed activation tails, never to a growing current log tail.
+pub fn installed_identity_generation(
+    record: &MigrationRecord,
+) -> Result<Option<String>, SourceError> {
+    if record.phase != MigrationPhase::Installed {
+        return Ok(None);
+    }
+    let activation = record
+        .activation_tails
+        .as_ref()
+        .ok_or_else(|| SourceError::Fatal {
+            message: "installed migration metadata omitted activation tails".to_owned(),
+        })?;
+    let tails = [
+        ("source", &activation.source),
+        ("paper", &activation.paper),
+        ("live_journal", &activation.live_journal),
+    ]
+    .map(|(name, tail)| {
+        (
+            name,
+            serde_json::json!({
+                "path": tail.path,
+                "physical_tail": tail.physical_tail,
+                "last_sequence": tail.last_sequence.map(|sequence| sequence.0),
+                "last_hash": tail.last_hash.to_hex().to_string(),
+            }),
+        )
+    })
+    .into_iter()
+    .collect::<BTreeMap<_, _>>();
+    serde_json::to_string(&tails)
+        .map(Some)
+        .map_err(identity_store_error)
 }
 
 #[derive(Clone)]
@@ -54,8 +120,10 @@ pub struct ResolvedIdentities {
 pub struct AssetIdentityResolver {
     client: GammaMarketsClient<ReconciliationPageFetcher>,
     gamma_batch_size: usize,
-    cache: RwLock<HashMap<PolymarketTokenId, CachedIdentity>>,
+    cache: RwLock<IdentityCache>,
+    misses: Mutex<()>,
     recorder: RwLock<IdentityRecorder>,
+    store: RwLock<Option<IdentityStore>>,
 }
 
 impl AssetIdentityResolver {
@@ -100,9 +168,43 @@ impl AssetIdentityResolver {
             client: GammaMarketsClient::new(gamma_base_url, ReconciliationPageFetcher(fetcher))
                 .with_batch_size(gamma_batch_size),
             gamma_batch_size,
-            cache: RwLock::new(HashMap::new()),
+            cache: RwLock::new(IdentityCache::default()),
+            misses: Mutex::new(()),
             recorder: RwLock::new(recorder),
+            store: RwLock::new(None),
         }
+    }
+
+    #[must_use]
+    pub fn with_paper_state(
+        self,
+        paper_state: Arc<PaperStateDb>,
+        generation: String,
+        source_receipts: SourceReceiptIndex,
+    ) -> Self {
+        Self {
+            store: RwLock::new(Some(IdentityStore {
+                paper_state,
+                generation,
+                source_receipts,
+            })),
+            ..self
+        }
+    }
+
+    /// Attach the installed main after first-migration boot releases its side-main handle.
+    pub async fn install_paper_state(
+        &self,
+        paper_state: Arc<PaperStateDb>,
+        generation: String,
+        source_receipts: SourceReceiptIndex,
+    ) {
+        *self.store.write().await = Some(IdentityStore {
+            paper_state,
+            generation,
+            source_receipts,
+        });
+        self.release_indexed_boot_pages().await;
     }
 
     /// Switch from the boot writer to the runtime coordinator before the
@@ -132,10 +234,40 @@ impl AssetIdentityResolver {
         retry_chunks: bool,
     ) -> Result<ResolvedIdentities, SourceError> {
         let requested = tokens.into_iter().collect::<BTreeSet<_>>();
-        let mut resolved = self.cached(&requested).await;
+        {
+            let cache = self.cache.read().await;
+            if requested.iter().all(|token| {
+                cache
+                    .identities
+                    .get(token)
+                    .is_some_and(|cached| !cache.rejected.contains(&cached.identity.condition_id.0))
+            }) {
+                let identities = requested
+                    .iter()
+                    .filter_map(|token| cache.identities.get(token));
+                return Ok(ResolvedIdentities {
+                    verified: identities
+                        .clone()
+                        .map(|cached| (cached.provenance.asset.clone(), cached.identity.clone()))
+                        .collect(),
+                    provenance: identities
+                        .map(|cached| (cached.provenance.asset.clone(), cached.provenance.clone()))
+                        .collect(),
+                    unverified: BTreeMap::new(),
+                });
+            }
+        }
+        let _misses = self.misses.lock().await;
+        let store = self.store.read().await.clone();
+        let mut read_pages = BTreeMap::new();
+        let mut resolved = self
+            .cached(&requested, store.as_ref(), &mut read_pages)
+            .await?;
         let misses = requested
             .iter()
-            .filter(|token| !resolved.verified.contains_key(*token))
+            .filter(|token| {
+                !resolved.verified.contains_key(*token) && !resolved.unverified.contains_key(*token)
+            })
             .cloned()
             .collect::<Vec<_>>();
         if misses.is_empty() {
@@ -145,15 +277,16 @@ impl AssetIdentityResolver {
         let mut pages = Vec::new();
         let mut sequences = HashMap::new();
         let mut newly_verified = BTreeMap::new();
-        self.fetch_and_record_chunks(
-            &misses,
-            MarketFilter::OpenOnly,
-            "gamma token lookup rejected",
-            &mut pages,
-            &mut sequences,
-            retry_chunks,
-        )
-        .await?;
+        let mut fetched = self
+            .fetch_and_record_chunks(
+                &misses,
+                MarketFilter::OpenOnly,
+                "gamma token lookup rejected",
+                &mut pages,
+                &mut sequences,
+                retry_chunks,
+            )
+            .await;
         let open_identities = verify_token_identities(&misses, &pages);
         let leftovers = misses
             .iter()
@@ -161,20 +294,26 @@ impl AssetIdentityResolver {
             .cloned()
             .collect::<Vec<_>>();
 
-        if !leftovers.is_empty() {
-            self.fetch_and_record_chunks(
-                &leftovers,
-                MarketFilter::ClosedOnly,
-                "gamma closed-token lookup rejected",
-                &mut pages,
-                &mut sequences,
-                retry_chunks,
-            )
-            .await?;
+        if fetched.is_ok() && !leftovers.is_empty() {
+            fetched = self
+                .fetch_and_record_chunks(
+                    &leftovers,
+                    MarketFilter::ClosedOnly,
+                    "gamma closed-token lookup rejected",
+                    &mut pages,
+                    &mut sequences,
+                    retry_chunks,
+                )
+                .await;
         }
 
+        let candidates = if store.is_some() {
+            page_tokens(&pages)
+        } else {
+            misses.clone()
+        };
         collect_verified(
-            verify_token_identities(&misses, &pages),
+            verify_token_identities(&candidates, &pages),
             &sequences,
             &mut newly_verified,
             &mut resolved.unverified,
@@ -188,19 +327,238 @@ impl AssetIdentityResolver {
                 );
             }
         }
-        {
-            let mut cache = self.cache.write().await;
-            for (token, cached) in &newly_verified {
-                cache.insert(token.clone(), cached.clone());
+        let saved = self
+            .save_verified(
+                store.as_ref(),
+                &pages,
+                &sequences,
+                &mut read_pages,
+                &mut newly_verified,
+                &mut resolved,
+            )
+            .await;
+        if let Err(error) = fetched {
+            if let Err(save_error) = saved {
+                tracing::error!(%save_error, "failed to save partial Gamma identity progress");
             }
+            return Err(error);
         }
+        saved?;
         for (token, cached) in newly_verified {
+            if !requested.contains(&token) {
+                continue;
+            }
+            resolved.unverified.remove(&token);
             resolved
                 .verified
                 .insert(token.clone(), cached.identity.clone());
             resolved.provenance.insert(token, cached.provenance);
         }
         Ok(resolved)
+    }
+
+    /// Release synchronized temporary pages once the boot extension has indexed their receipts.
+    pub async fn release_indexed_boot_pages(&self) {
+        if let Some(store) = self.store.read().await.clone() {
+            self.cache
+                .write()
+                .await
+                .boot_pages
+                .retain(|_, (receipt, _)| {
+                    !matches!(store.source_receipts.receipt_at(receipt.sequence),
+                    Ok(Some((indexed, _))) if indexed == *receipt)
+                });
+        }
+    }
+
+    async fn save_verified(
+        &self,
+        store: Option<&IdentityStore>,
+        pages: &[IdentityPage],
+        sequences: &HashMap<String, u64>,
+        read_pages: &mut BTreeMap<u64, IdentityPage>,
+        newly_verified: &mut BTreeMap<PolymarketTokenId, CachedIdentity>,
+        resolved: &mut ResolvedIdentities,
+    ) -> Result<(), SourceError> {
+        let mut cache = self.cache.write().await;
+        if let Some(store) = store {
+            let tokens = page_tokens(pages);
+            let token_set = tokens.iter().cloned().collect::<BTreeSet<_>>();
+            let mut witnesses = Vec::new();
+            for page in pages {
+                let mut identities = BTreeMap::new();
+                collect_verified(
+                    verify_token_identities(
+                        &page_tokens(std::slice::from_ref(page)),
+                        std::slice::from_ref(page),
+                    ),
+                    sequences,
+                    &mut identities,
+                    &mut BTreeMap::new(),
+                );
+                witnesses.extend(identities.into_values());
+            }
+            let conditions = page_token_conditions(pages)
+                .into_values()
+                .flatten()
+                .collect::<BTreeSet<_>>();
+            let mut rows = store
+                .paper_state
+                .asset_identities_by_condition(&store.generation, &conditions)
+                .map_err(identity_store_error)?
+                .into_iter()
+                .map(|row| (row.token.clone(), row))
+                .collect::<BTreeMap<_, _>>();
+            rows.extend(
+                store
+                    .paper_state
+                    .asset_identities(&store.generation, &tokens)
+                    .map_err(identity_store_error)?
+                    .into_iter()
+                    .map(|row| (row.token.clone(), row)),
+            );
+            let authenticated = authenticate_identity_rows(
+                store,
+                rows.values().cloned().collect(),
+                &cache.boot_pages,
+                read_pages,
+            );
+            delete_invalid_identity_rows(store, &authenticated.invalid).await?;
+            let new_rows = witnesses
+                .iter()
+                .map(|cached| identity_row(&cached.provenance.asset, cached))
+                .collect::<Result<Vec<_>, _>>()?;
+            let saved = authenticated.identities;
+            let mut combined_pages = pages.to_vec();
+            combined_pages.extend(authenticated.pages);
+            witnesses.extend(saved.iter().map(|(_, cached)| cached.clone()));
+            let combined_tokens = page_tokens(&combined_pages);
+            let verified = verify_token_identities(&combined_tokens, &combined_pages);
+            let mut rejections = BTreeMap::new();
+            for cached in &witnesses {
+                check_condition_rejection(store, &mut cache, &cached.identity.condition_id.0)?;
+                if verified
+                    .get(&cached.provenance.asset)
+                    .is_some_and(Result::is_err)
+                {
+                    let sequence = witnesses
+                        .iter()
+                        .filter(|fresh| {
+                            sequences.contains_key(&fresh.provenance.canonical_page_hash)
+                                && (fresh.provenance.asset == cached.provenance.asset
+                                    || fresh.identity.condition_id == cached.identity.condition_id)
+                        })
+                        .map(|fresh| fresh.provenance.source_log_sequence)
+                        .max()
+                        .or_else(|| sequences.values().copied().max())
+                        .ok_or_else(|| {
+                            identity_store_error("conflict has no recorded fresh page")
+                        })?;
+                    rejections.insert(
+                        cached.identity.condition_id.0.clone(),
+                        i64::try_from(sequence).map_err(identity_store_error)?,
+                    );
+                }
+            }
+            // A single page can contain conflicting markets with no individually usable
+            // token row. Their conditions still need independent rejection markers.
+            let token_conditions = page_token_conditions(&combined_pages);
+            for (token, identity) in &verified {
+                if !matches!(identity, Err(
+                    pe_source_polymarket_public::MetadataIdentityError::MarketCardinality { .. }
+                    | pe_source_polymarket_public::MetadataIdentityError::DuplicateIdentity { .. }
+                )) {
+                    continue;
+                }
+                if let Some(conditions) = token_conditions.get(token) {
+                    for condition in conditions {
+                        if rejections.contains_key(condition) {
+                            continue;
+                        }
+                        let sequence = pages
+                            .iter()
+                            .filter(|page| {
+                                page_token_conditions(std::slice::from_ref(page))
+                                    .contains_key(token)
+                            })
+                            .filter_map(|page| sequences.get(&page.0.canonical_page_hash))
+                            .max()
+                            .ok_or_else(|| {
+                                identity_store_error("conflict has no recorded fresh page")
+                            })?;
+                        rejections.insert(
+                            condition.clone(),
+                            i64::try_from(*sequence).map_err(identity_store_error)?,
+                        );
+                    }
+                }
+            }
+            // Rejections accompany the first bounded row insert, even if all fresh tokens
+            // already belong to another condition. Later row inserts cannot clear a marker.
+            if new_rows.is_empty() && !rejections.is_empty() {
+                identity_mutation(|| {
+                    store
+                        .paper_state
+                        .save_asset_identities(&store.generation, &[], &rejections)
+                })
+                .await?;
+            } else {
+                for (index, chunk) in new_rows.chunks(ASSET_IDENTITY_INSERT_LIMIT).enumerate() {
+                    let markers = if index == 0 {
+                        &rejections
+                    } else {
+                        &BTreeMap::new()
+                    };
+                    identity_mutation(|| {
+                        store
+                            .paper_state
+                            .save_asset_identities(&store.generation, chunk, markers)
+                    })
+                    .await?;
+                    if index == 0 {
+                        cache.rejected.extend(rejections.keys().cloned());
+                        evict_rejected(&mut cache, resolved);
+                    }
+                }
+            }
+            cache.rejected.extend(rejections.into_keys());
+            // Preserve saved provenance when a fresh page repeats a known identity.
+            for (row, cached) in saved {
+                if !cache.rejected.contains(&row.condition_id.0) {
+                    cache.identities.entry(row.token).or_insert(cached);
+                }
+            }
+            let mut fresh = BTreeMap::new();
+            collect_verified(verified, sequences, &mut fresh, &mut BTreeMap::new());
+            fresh.retain(|token, _| token_set.contains(token));
+            *newly_verified = fresh;
+            for cached in witnesses {
+                if cache.rejected.contains(&cached.identity.condition_id.0) {
+                    let token = cached.provenance.asset.clone();
+                    newly_verified.remove(&token);
+                    resolved.verified.remove(&token);
+                    resolved.provenance.remove(&token);
+                    resolved
+                        .unverified
+                        .insert(token, rejected_identity_reason());
+                }
+            }
+            let rejected = cache.rejected.clone();
+            newly_verified.retain(|_, cached| !rejected.contains(&cached.identity.condition_id.0));
+            for (token, fresh) in newly_verified.iter_mut() {
+                if let Some(cached) = cache.identities.get(token) {
+                    *fresh = cached.clone();
+                }
+            }
+            evict_rejected(&mut cache, resolved);
+        }
+        for (token, fresh) in newly_verified.iter_mut() {
+            if let Some(cached) = cache.identities.get(token) {
+                *fresh = cached.clone();
+            }
+            cache.identities.insert(token.clone(), fresh.clone());
+        }
+        Ok(())
     }
 
     async fn fetch_and_record_chunks(
@@ -262,21 +620,61 @@ impl AssetIdentityResolver {
         Ok(())
     }
 
-    async fn cached(&self, requested: &BTreeSet<PolymarketTokenId>) -> ResolvedIdentities {
-        let cache = self.cache.read().await;
-        let mut verified = BTreeMap::new();
-        let mut provenance = BTreeMap::new();
-        for token in requested {
-            if let Some(cached) = cache.get(token) {
-                verified.insert(token.clone(), cached.identity.clone());
-                provenance.insert(token.clone(), cached.provenance.clone());
+    async fn cached(
+        &self,
+        requested: &BTreeSet<PolymarketTokenId>,
+        store: Option<&IdentityStore>,
+        read_pages: &mut BTreeMap<u64, IdentityPage>,
+    ) -> Result<ResolvedIdentities, SourceError> {
+        let mut cache = self.cache.write().await;
+        let mut unverified = BTreeMap::new();
+        if let Some(store) = store {
+            let misses = requested
+                .iter()
+                .filter(|token| !cache.identities.contains_key(*token))
+                .cloned()
+                .collect::<Vec<_>>();
+            let rows = store
+                .paper_state
+                .asset_identities(&store.generation, &misses)
+                .map_err(identity_store_error)?;
+            let mut usable = Vec::new();
+            for row in rows {
+                check_condition_rejection(store, &mut cache, &row.condition_id.0)?;
+                if cache.rejected.contains(&row.condition_id.0) {
+                    unverified.insert(row.token, rejected_identity_reason());
+                } else {
+                    usable.push(row);
+                }
+            }
+            let authenticated =
+                authenticate_identity_rows(store, usable, &cache.boot_pages, read_pages);
+            delete_invalid_identity_rows(store, &authenticated.invalid).await?;
+            for (row, cached) in authenticated.identities {
+                if cache.rejected.contains(&row.condition_id.0) {
+                    unverified.insert(row.token, rejected_identity_reason());
+                } else {
+                    cache.identities.insert(row.token, cached);
+                }
             }
         }
-        ResolvedIdentities {
-            verified,
-            unverified: BTreeMap::new(),
-            provenance,
+        let mut resolved = ResolvedIdentities {
+            verified: BTreeMap::new(),
+            unverified,
+            provenance: BTreeMap::new(),
+        };
+        evict_rejected(&mut cache, &mut resolved);
+        for token in requested {
+            if let Some(cached) = cache.identities.get(token) {
+                resolved
+                    .verified
+                    .insert(token.clone(), cached.identity.clone());
+                resolved
+                    .provenance
+                    .insert(token.clone(), cached.provenance.clone());
+            }
         }
+        Ok(resolved)
     }
 
     async fn record_page(
@@ -310,7 +708,253 @@ impl AssetIdentityResolver {
                         message: "source-log coordinator closed".to_owned(),
                     })?,
             };
+        if matches!(recorder, IdentityRecorder::Boot(_)) {
+            self.cache
+                .write()
+                .await
+                .boot_pages
+                .insert(sequence.sequence.0, (sequence, page.clone()));
+        }
         Ok(sequence.sequence.0)
+    }
+}
+
+fn identity_row(
+    token: &PolymarketTokenId,
+    cached: &CachedIdentity,
+) -> Result<AssetIdentityRow, SourceError> {
+    Ok(AssetIdentityRow {
+        token: token.clone(),
+        condition_id: cached.identity.condition_id.clone(),
+        outcome: i64::from(cached.identity.outcome.0),
+        source_log_sequence: i64::try_from(cached.provenance.source_log_sequence)
+            .map_err(identity_store_error)?,
+        canonical_page_hash: cached.provenance.canonical_page_hash.clone(),
+    })
+}
+
+fn rejected_identity_reason() -> String {
+    "condition has conflicting Gamma identities in the installed generation".to_owned()
+}
+
+fn evict_rejected(cache: &mut IdentityCache, resolved: &mut ResolvedIdentities) {
+    let rejected_tokens = cache
+        .identities
+        .iter()
+        .filter(|(_, cached)| cache.rejected.contains(&cached.identity.condition_id.0))
+        .map(|(token, _)| token.clone())
+        .chain(
+            resolved
+                .verified
+                .iter()
+                .filter(|(_, identity)| cache.rejected.contains(&identity.condition_id.0))
+                .map(|(token, _)| token.clone()),
+        )
+        .collect::<BTreeSet<_>>();
+    for token in rejected_tokens {
+        cache.identities.remove(&token);
+        resolved.verified.remove(&token);
+        resolved.provenance.remove(&token);
+        resolved
+            .unverified
+            .insert(token, rejected_identity_reason());
+    }
+}
+
+fn check_condition_rejection(
+    store: &IdentityStore,
+    cache: &mut IdentityCache,
+    condition: &str,
+) -> Result<(), SourceError> {
+    if !cache.rejected.contains(condition)
+        && store
+            .paper_state
+            .asset_identity_condition_rejection(&store.generation, condition)
+            .map_err(identity_store_error)?
+            .is_some()
+    {
+        cache.rejected.insert(condition.to_owned());
+    }
+    Ok(())
+}
+
+async fn delete_invalid_identity_rows(
+    store: &IdentityStore,
+    invalid: &[PolymarketTokenId],
+) -> Result<(), SourceError> {
+    for chunk in invalid.chunks(ASSET_IDENTITY_INSERT_LIMIT) {
+        identity_mutation(|| {
+            store
+                .paper_state
+                .delete_asset_identities(&store.generation, chunk)
+        })
+        .await?;
+    }
+    Ok(())
+}
+
+// Paper-state owns the mutex and transaction; only waiting for its caller-owned batch is async.
+async fn identity_mutation(
+    mutation: impl Fn() -> Result<(), PaperStateError>,
+) -> Result<(), SourceError> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match mutation() {
+            Ok(()) => return Ok(()),
+            Err(PaperStateError::IdentityBatchOpen) => {
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(identity_store_error(
+                        "identity mutation waited 30 s for an open batch",
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            Err(error) => return Err(identity_store_error(error)),
+        }
+    }
+}
+
+fn authenticate_identity_rows(
+    store: &IdentityStore,
+    rows: Vec<AssetIdentityRow>,
+    boot_pages: &BTreeMap<u64, (AppendReceipt, IdentityPage)>,
+    read_pages: &mut BTreeMap<u64, IdentityPage>,
+) -> AuthenticatedIdentityRows {
+    let mut grouped = BTreeMap::<u64, Vec<AssetIdentityRow>>::new();
+    let mut invalid = Vec::new();
+    for row in rows {
+        if let Ok(sequence) = u64::try_from(row.source_log_sequence) {
+            grouped.entry(sequence).or_default().push(row);
+        } else {
+            invalid.push(row.token);
+        }
+    }
+    let mut authenticated = Vec::new();
+    let mut pages = Vec::new();
+    for (sequence, rows) in grouped {
+        let page = read_pages.get(&sequence).cloned().or_else(|| {
+            let receipt = store.source_receipts.receipt_at(EventSeq(sequence)).ok()?;
+            let page = if let Some((receipt, _)) = receipt {
+                let page = store.source_receipts.source_envelope(receipt).ok()?;
+                if page.content_type != ContentType::Json {
+                    return None;
+                }
+                let page_hash = canonical_page_hash(&page.payload).ok()?;
+                (
+                    MetadataPageEvidence {
+                        request_url: String::new(),
+                        canonical_page_hash: page_hash,
+                        raw_page_hash: blake3::hash(&page.payload).to_hex().to_string(),
+                        received_at: page.received_at,
+                        source_id: page.source_id,
+                        schema_version: page.schema_version,
+                        parser_version: page.parser_version,
+                    },
+                    page.payload,
+                )
+            } else {
+                let (receipt, page) = boot_pages.get(&sequence)?;
+                if receipt.sequence.0 != sequence {
+                    return None;
+                }
+                page.clone()
+            };
+            let evidence = &page.0;
+            if evidence.source_id.0 != GAMMA_MARKETS_SOURCE_ID
+                || evidence.schema_version != GAMMA_MARKETS_SCHEMA_VERSION
+                || evidence.parser_version != GAMMA_MARKETS_PARSER_VERSION
+                || blake3::hash(&page.1).to_hex().as_str() != evidence.raw_page_hash
+                || canonical_page_hash(&page.1).ok().as_ref() != Some(&evidence.canonical_page_hash)
+            {
+                return None;
+            }
+            read_pages.insert(sequence, page.clone());
+            Some(page)
+        });
+        let Some(page) = page else {
+            invalid.extend(rows.into_iter().map(|row| row.token));
+            continue;
+        };
+        let tokens = rows.iter().map(|row| row.token.clone()).collect::<Vec<_>>();
+        let mut verified = verify_token_identities(&tokens, std::slice::from_ref(&page));
+        let start = authenticated.len();
+        for row in rows {
+            let identity = u16::try_from(row.outcome)
+                .ok()
+                .map(|outcome| VerifiedTokenIdentity {
+                    condition_id: row.condition_id.clone(),
+                    outcome: OutcomeId(outcome),
+                    evidence_hash: row.canonical_page_hash.clone(),
+                });
+            if let Some(identity) = identity
+                && row.canonical_page_hash == page.0.canonical_page_hash
+                && verified.remove(&row.token).and_then(Result::ok).as_ref() == Some(&identity)
+            {
+                let provenance = IdentityProvenance {
+                    asset: row.token.clone(),
+                    source_log_sequence: sequence,
+                    canonical_page_hash: row.canonical_page_hash.clone(),
+                };
+                authenticated.push((
+                    row,
+                    CachedIdentity {
+                        identity,
+                        provenance,
+                    },
+                ));
+            } else {
+                invalid.push(row.token);
+            }
+        }
+        if authenticated.len() > start {
+            pages.push(page);
+        }
+    }
+    AuthenticatedIdentityRows {
+        identities: authenticated,
+        pages,
+        invalid,
+    }
+}
+
+// Enumerate candidates only; the source crate's verifier owns all identity validation.
+fn page_tokens(pages: &[IdentityPage]) -> Vec<PolymarketTokenId> {
+    page_token_conditions(pages).into_keys().collect()
+}
+
+fn page_token_conditions(pages: &[IdentityPage]) -> BTreeMap<PolymarketTokenId, BTreeSet<String>> {
+    let mut tokens = BTreeMap::<_, BTreeSet<_>>::new();
+    for (_, raw) in pages {
+        let Ok(markets) = serde_json::from_slice::<Vec<serde_json::Value>>(raw) else {
+            continue;
+        };
+        for market in markets {
+            let Some(ids) = market.get("clobTokenIds") else {
+                continue;
+            };
+            let ids = match ids.as_str() {
+                Some(encoded) => serde_json::from_str::<Vec<String>>(encoded),
+                None => serde_json::from_value::<Vec<String>>(ids.clone()),
+            };
+            if let Ok(ids) = ids {
+                for token in ids {
+                    let conditions = tokens.entry(PolymarketTokenId(token)).or_default();
+                    if let Some(condition) = market
+                        .get("conditionId")
+                        .and_then(serde_json::Value::as_str)
+                    {
+                        conditions.insert(condition.to_owned());
+                    }
+                }
+            }
+        }
+    }
+    tokens
+}
+
+fn identity_store_error(error: impl std::fmt::Display) -> SourceError {
+    SourceError::Fatal {
+        message: format!("asset identity cache failed: {error}"),
     }
 }
 
@@ -561,13 +1205,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             [0, 0, 2, 6, 14, 30]
         );
-        assert!(resolver.cache.read().await.is_empty());
+        assert_eq!(resolver.cache.read().await.identities.len(), 1);
         assert_eq!(Reader::replay(&path).unwrap().count(), 1);
         resolver
             .resolve_for_bracket([PolymarketTokenId("token-a".to_owned())])
             .await
             .unwrap();
-        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 7);
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 6);
     }
 
     #[tokio::test(start_paused = true)]
@@ -585,7 +1229,7 @@ mod tests {
         ));
         assert_eq!(fetcher.attempts.lock().unwrap().len(), 1);
         assert_eq!(tokio::time::Instant::now(), start);
-        assert!(resolver.cache.read().await.is_empty());
+        assert!(resolver.cache.read().await.identities.is_empty());
     }
 
     async fn http_resolver(
@@ -666,7 +1310,7 @@ mod tests {
                 matches!(resolve_http(&resolver).await, Err(SourceError::Transient { message }) if message.contains("HTTP 500"))
             );
             assert_eq!(hits.load(Ordering::SeqCst), expected);
-            assert!(resolver.cache.read().await.is_empty());
+            assert!(resolver.cache.read().await.identities.is_empty());
             server.abort();
         }
     }
@@ -717,7 +1361,7 @@ mod tests {
                 if case == "rate_limit" { 11 } else { 1 },
                 "{case}"
             );
-            assert!(resolver.cache.read().await.is_empty(), "{case}");
+            assert!(resolver.cache.read().await.identities.is_empty(), "{case}");
             assert_eq!(
                 Reader::replay(path).unwrap().count(),
                 usize::from(case == "parse"),
@@ -740,6 +1384,1160 @@ mod tests {
         let sink = Arc::new(Mutex::new(SourceEventSink::open(&path).unwrap()));
         let resolver = AssetIdentityResolver::new(fetcher, BASE.to_owned(), 50, Arc::clone(&sink));
         (dir, path, sink, resolver)
+    }
+
+    fn durable_resolver(
+        path: &std::path::Path,
+        paper_state: Arc<PaperStateDb>,
+        generation: &str,
+        fetcher: Arc<dyn ReconciliationFetcher>,
+        batch_size: usize,
+    ) -> AssetIdentityResolver {
+        let sink = Arc::new(Mutex::new(SourceEventSink::open(path).unwrap()));
+        let receipts = SourceReceiptIndex::replay(path).unwrap();
+        AssetIdentityResolver::new(fetcher, BASE.to_owned(), batch_size, sink).with_paper_state(
+            paper_state,
+            generation.to_owned(),
+            receipts,
+        )
+    }
+
+    #[tokio::test]
+    async fn durable_verified_page_saves_unrequested_siblings_for_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let fetcher = Arc::new(GammaFixture::new(
+            br#"[{"conditionId":"condition","clobTokenIds":"[\"token-a\",\"token-x\"]"}]"#,
+            b"[]",
+        ));
+        let token = PolymarketTokenId("token-a".into());
+        let sibling = PolymarketTokenId("token-x".into());
+        let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher, 50);
+        let original = resolver.resolve([token.clone()]).await.unwrap();
+        assert_eq!(original.verified.len(), 1);
+        let rows = paper
+            .asset_identities("installed", &[token.clone(), sibling.clone()])
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        drop(resolver);
+        let fetcher = Arc::new(GammaFixture::new(b"[]", b"[]"));
+        let resolver = durable_resolver(&path, paper, "installed", fetcher.clone(), 50);
+        let restored = resolver.resolve([sibling.clone()]).await.unwrap();
+        assert_eq!(restored.verified[&sibling].outcome, OutcomeId(1));
+        assert_eq!(
+            restored.provenance[&sibling].source_log_sequence,
+            original.provenance[&token].source_log_sequence
+        );
+        assert_eq!(
+            restored.provenance[&sibling].canonical_page_hash,
+            original.provenance[&token].canonical_page_hash
+        );
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn runtime_verified_identities_are_written_before_resolve_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let mut sink = SourceEventSink::open(&path).unwrap();
+        let receipts = SourceReceiptIndex::replay(&path).unwrap();
+        let writer_receipts = receipts.clone();
+        let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let (source_log, mut receiver) = SourceLogHandle::channel(1);
+        let writer = tokio::spawn(async move {
+            while let Some((envelope, acknowledgement)) = receiver.recv_for_test().await {
+                let receipt = sink.append_durable(envelope).unwrap();
+                writer_receipts.catch_up_verified_tail().unwrap();
+                acknowledgement.send(receipt).unwrap();
+            }
+        });
+        let fetcher = Arc::new(GammaFixture::new(
+            br#"[{"conditionId":"condition","clobTokenIds":["token-a","token-x"]}]"#,
+            b"[]",
+        ));
+        let resolver =
+            AssetIdentityResolver::new_runtime(fetcher.clone(), BASE.into(), 50, source_log)
+                .with_paper_state(paper.clone(), "installed".into(), receipts);
+        let token = PolymarketTokenId("token-a".into());
+        let resolved = resolver.resolve([token.clone()]).await.unwrap();
+        let saved = paper
+            .asset_identities("installed", std::slice::from_ref(&token))
+            .unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            saved[0].canonical_page_hash,
+            resolved.provenance[&token].canonical_page_hash
+        );
+        assert!(resolver.cache.read().await.boot_pages.is_empty());
+        drop(resolver);
+        writer.await.unwrap();
+        let fetcher = Arc::new(GammaFixture::new(b"[]", b"[]"));
+        let resolver = durable_resolver(&path, paper, "installed", fetcher.clone(), 50);
+        assert_eq!(
+            resolver.resolve([token]).await.unwrap().provenance,
+            resolved.provenance
+        );
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
+    }
+
+    struct OverlapFixture {
+        calls: AtomicUsize,
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl ReconciliationFetcher for OverlapFixture {
+        fn fetch<'a>(
+            &'a self,
+            _url: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
+            Box::pin(async move {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.started.notify_one();
+                    self.release.notified().await;
+                }
+                Ok(
+                    br#"[{"conditionId":"condition","clobTokenIds":["token-a","token-x"]}]"#
+                        .to_vec(),
+                )
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn overlapping_identity_requests_make_one_gamma_lookup() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let fetcher = Arc::new(OverlapFixture {
+            calls: AtomicUsize::new(0),
+            started: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let resolver = Arc::new(durable_resolver(
+            &path,
+            paper,
+            "installed",
+            fetcher.clone(),
+            50,
+        ));
+        let token = PolymarketTokenId("token-a".into());
+        let first_resolver = resolver.clone();
+        let first_token = token.clone();
+        let first =
+            tokio::spawn(async move { first_resolver.resolve([first_token]).await.unwrap() });
+        fetcher.started.notified().await;
+        let second_resolver = resolver.clone();
+        let second_token = token.clone();
+        let second = tokio::spawn(async move {
+            second_resolver
+                .resolve([second_token, PolymarketTokenId("token-x".into())])
+                .await
+                .unwrap()
+        });
+        tokio::task::yield_now().await;
+        fetcher.release.notify_one();
+        let first = first.await.unwrap();
+        let second = second.await.unwrap();
+        assert_eq!(first.provenance[&token], second.provenance[&token]);
+        assert_eq!(second.verified.len(), 2);
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+    }
+
+    struct CrossConditionFixture;
+
+    impl ReconciliationFetcher for CrossConditionFixture {
+        fn fetch<'a>(
+            &'a self,
+            url: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
+            Box::pin(async move {
+                if url.contains("clob_token_ids=token-a") {
+                    Ok(
+                        br#"[{"conditionId":"condition-c","clobTokenIds":["token-a","token-x"]}]"#
+                            .to_vec(),
+                    )
+                } else {
+                    Ok(
+                        br#"[{"conditionId":"condition-d","clobTokenIds":["token-a","token-b"]}]"#
+                            .to_vec(),
+                    )
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_cross_condition_overlap_rejects_both_conditions_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let db_path = dir.path().join("paper.db");
+        let paper = Arc::new(PaperStateDb::open(&db_path).unwrap());
+        let tokens = [
+            PolymarketTokenId("token-a".into()),
+            PolymarketTokenId("token-b".into()),
+            PolymarketTokenId("token-x".into()),
+        ];
+        let resolver = durable_resolver(
+            &path,
+            paper.clone(),
+            "installed",
+            Arc::new(CrossConditionFixture),
+            50,
+        );
+        let original = resolver.resolve([tokens[0].clone()]).await.unwrap();
+        drop(resolver);
+        let resolver = durable_resolver(
+            &path,
+            paper.clone(),
+            "installed",
+            Arc::new(CrossConditionFixture),
+            50,
+        );
+        let conflicting = resolver.resolve([tokens[1].clone()]).await.unwrap();
+        assert!(conflicting.verified.is_empty());
+        assert!(
+            tokens[..2]
+                .iter()
+                .all(|token| conflicting.unverified.contains_key(token))
+        );
+        let rows = paper.asset_identities("installed", &tokens).unwrap();
+        assert_eq!(rows.len(), 3);
+        for condition in rows.iter().map(|row| &row.condition_id.0) {
+            assert!(
+                paper
+                    .asset_identity_condition_rejection("installed", condition)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert_eq!(rows[0].condition_id.0, "condition-c");
+        assert_eq!(
+            rows[0].canonical_page_hash,
+            original.provenance[&tokens[0]].canonical_page_hash
+        );
+        drop(resolver);
+        drop(paper);
+        let paper = Arc::new(PaperStateDb::open(&db_path).unwrap());
+        let fetcher = Arc::new(GammaFixture::new(b"[]", b"[]"));
+        let resolver = durable_resolver(&path, paper, "installed", fetcher.clone(), 50);
+        for token in tokens {
+            let result = resolver.resolve([token.clone()]).await.unwrap();
+            assert!(result.verified.is_empty());
+            assert!(result.unverified.contains_key(&token));
+        }
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn durable_rejection_without_a_token_row_blocks_condition_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let db_path = dir.path().join("paper.db");
+        let paper = Arc::new(PaperStateDb::open(&db_path).unwrap());
+        let token = PolymarketTokenId("token-a".into());
+        let resolver = durable_resolver(
+            &path,
+            paper.clone(),
+            "installed",
+            Arc::new(GammaFixture::new(
+                br#"[{"conditionId":"condition-c","clobTokenIds":["token-a"]}]"#,
+                b"[]",
+            )),
+            50,
+        );
+        resolver.resolve([token.clone()]).await.unwrap();
+        drop(resolver);
+        let resolver = durable_resolver(
+            &path,
+            paper.clone(),
+            "installed",
+            Arc::new(GammaFixture::new(
+                br#"[{"conditionId":"condition-d","clobTokenIds":["token-a"]}]"#,
+                b"[]",
+            )),
+            50,
+        );
+        // A different requested miss exposes D:[A], whose entire token set already belongs to C.
+        let result = resolver
+            .resolve([PolymarketTokenId("probe".into())])
+            .await
+            .unwrap();
+        assert!(result.verified.is_empty());
+        for condition in ["condition-c", "condition-d"] {
+            assert_eq!(
+                paper
+                    .asset_identity_condition_rejection("installed", condition)
+                    .unwrap(),
+                Some(1)
+            );
+        }
+        assert!(
+            paper
+                .asset_identities_by_condition("installed", &BTreeSet::from(["condition-d".into()]))
+                .unwrap()
+                .is_empty()
+        );
+        drop(resolver);
+        drop(paper);
+        let paper = Arc::new(PaperStateDb::open(&db_path).unwrap());
+        let fetcher = Arc::new(GammaFixture::new(
+            br#"[{"conditionId":"condition-d","clobTokenIds":["token-b"]}]"#,
+            b"[]",
+        ));
+        let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher.clone(), 50);
+        let saved = resolver.resolve([token.clone()]).await.unwrap();
+        assert!(saved.verified.is_empty());
+        assert!(saved.unverified.contains_key(&token));
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
+        let token = PolymarketTokenId("token-b".into());
+        let later = resolver.resolve([token.clone()]).await.unwrap();
+        assert!(later.verified.is_empty());
+        assert!(later.unverified.contains_key(&token));
+        assert!(later.provenance.is_empty());
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            paper
+                .asset_identity_condition_rejection("installed", "condition-d")
+                .unwrap(),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn conflicting_markets_in_one_page_persist_rejections_without_token_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let db_path = dir.path().join("paper.db");
+        let paper = Arc::new(PaperStateDb::open(&db_path).unwrap());
+        let resolver = durable_resolver(&path, paper.clone(), "installed", Arc::new(GammaFixture::new(
+            br#"[{"conditionId":"condition-c","clobTokenIds":["token-a"]},{"conditionId":"condition-d","clobTokenIds":["token-a"]}]"#, b"[]",
+        )), 50);
+        let token = PolymarketTokenId("token-a".into());
+        let result = resolver.resolve([token.clone()]).await.unwrap();
+        assert!(result.verified.is_empty());
+        assert!(result.unverified.contains_key(&token));
+        assert!(
+            paper
+                .asset_identities("installed", &[token])
+                .unwrap()
+                .is_empty()
+        );
+        for condition in ["condition-c", "condition-d"] {
+            assert_eq!(
+                paper
+                    .asset_identity_condition_rejection("installed", condition)
+                    .unwrap(),
+                Some(0)
+            );
+        }
+        drop(resolver);
+        drop(paper);
+        let paper = Arc::new(PaperStateDb::open(&db_path).unwrap());
+        let resolver = durable_resolver(
+            &path,
+            paper,
+            "installed",
+            Arc::new(GammaFixture::new(
+                br#"[{"conditionId":"condition-d","clobTokenIds":["token-b"]}]"#,
+                b"[]",
+            )),
+            50,
+        );
+        let later = resolver
+            .resolve([PolymarketTokenId("token-b".into())])
+            .await
+            .unwrap();
+        assert!(later.verified.is_empty());
+        assert_eq!(later.unverified.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cross_condition_conflict_immediately_evicts_cached_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let fetcher = Arc::new(SequenceFixture {
+            pages: StdMutex::new(std::collections::VecDeque::from([
+                br#"[{"conditionId":"condition-c","clobTokenIds":["token-a","token-b"]}]"#.to_vec(),
+                br#"[{"conditionId":"condition-d","clobTokenIds":["token-a"]}]"#.to_vec(),
+                b"[]".to_vec(),
+            ])),
+        });
+        let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher, 50);
+        let sibling = PolymarketTokenId("token-b".into());
+        let first = resolver
+            .resolve([PolymarketTokenId("token-a".into())])
+            .await
+            .unwrap();
+        assert_eq!(first.verified.len(), 1);
+        assert!(
+            resolver
+                .cache
+                .read()
+                .await
+                .identities
+                .contains_key(&sibling)
+        );
+        let conflicting = resolver
+            .resolve([sibling.clone(), PolymarketTokenId("probe".into())])
+            .await
+            .unwrap();
+        assert!(conflicting.verified.is_empty());
+        assert!(conflicting.unverified.contains_key(&sibling));
+        assert!(resolver.cache.read().await.identities.is_empty());
+        let cached = resolver.resolve([sibling.clone()]).await.unwrap();
+        assert!(cached.verified.is_empty());
+        assert!(cached.unverified.contains_key(&sibling));
+        for condition in ["condition-c", "condition-d"] {
+            assert_eq!(
+                paper
+                    .asset_identity_condition_rejection("installed", condition)
+                    .unwrap(),
+                Some(1)
+            );
+        }
+    }
+
+    struct SequenceFixture {
+        pages: StdMutex<std::collections::VecDeque<Vec<u8>>>,
+    }
+
+    impl ReconciliationFetcher for SequenceFixture {
+        fn fetch<'a>(
+            &'a self,
+            _url: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
+            Box::pin(async move { Ok(self.pages.lock().unwrap().pop_front().unwrap()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn same_boot_conflicts_use_unindexed_pages_and_persist_after_restart() {
+        for cross_condition in [false, true] {
+            for extend_before_drop in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("source.log");
+                let db_path = dir.path().join("paper.db");
+                let paper = Arc::new(PaperStateDb::open(&db_path).unwrap());
+                let fetcher: Arc<dyn ReconciliationFetcher> = if cross_condition {
+                    Arc::new(CrossConditionFixture)
+                } else {
+                    Arc::new(SiblingConflictFixture)
+                };
+                let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher, 1);
+                let receipts = resolver
+                    .store
+                    .read()
+                    .await
+                    .as_ref()
+                    .unwrap()
+                    .source_receipts
+                    .clone();
+                let tokens = [
+                    PolymarketTokenId("token-a".into()),
+                    PolymarketTokenId("token-b".into()),
+                ];
+                let first = resolver
+                    .resolve_for_bracket([tokens[0].clone()])
+                    .await
+                    .unwrap();
+                assert!(first.verified.contains_key(&tokens[0]));
+                assert_eq!(
+                    paper.asset_identities("installed", &tokens).unwrap().len(),
+                    1
+                );
+                assert!(receipts.receipt_at(EventSeq(0)).unwrap().is_none());
+                paper.begin_batch().unwrap();
+                paper.rollback_batch().unwrap();
+                let conflicting = resolver
+                    .resolve_for_bracket([tokens[1].clone()])
+                    .await
+                    .unwrap();
+                assert!(conflicting.verified.is_empty());
+                assert!(
+                    tokens
+                        .iter()
+                        .all(|token| conflicting.unverified.contains_key(token))
+                );
+                let conditions = if cross_condition {
+                    vec!["condition-c", "condition-d"]
+                } else {
+                    vec!["condition"]
+                };
+                for condition in conditions {
+                    assert_eq!(
+                        paper
+                            .asset_identity_condition_rejection("installed", condition)
+                            .unwrap(),
+                        Some(1)
+                    );
+                }
+                assert_eq!(resolver.cache.read().await.boot_pages.len(), 2);
+                assert!(receipts.receipt_at(EventSeq(1)).unwrap().is_none());
+                if extend_before_drop {
+                    receipts.catch_up_verified_tail().unwrap();
+                    resolver.release_indexed_boot_pages().await;
+                    assert!(resolver.cache.read().await.boot_pages.is_empty());
+                }
+                // Also drop the entire process state before brackets finish or boot.extend runs.
+                drop(resolver);
+                drop(paper);
+                let paper = Arc::new(PaperStateDb::open(&db_path).unwrap());
+                let fetcher = Arc::new(GammaFixture::new(b"[]", b"[]"));
+                let resolver = durable_resolver(&path, paper, "installed", fetcher.clone(), 50);
+                for token in tokens {
+                    let result = resolver.resolve([token.clone()]).await.unwrap();
+                    assert!(result.verified.is_empty());
+                    assert!(result.unverified.contains_key(&token));
+                }
+                assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_restart_hit_retains_original_provenance_without_gamma_requests() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let db_path = dir.path().join("paper.db");
+        let paper = Arc::new(PaperStateDb::open(&db_path).unwrap());
+        let fetcher = Arc::new(GammaFixture::new(
+            br#"[{"conditionId":"condition-a","clobTokenIds":["token-a","token-b"]}]"#,
+            b"[]",
+        ));
+        let tokens = [
+            PolymarketTokenId("token-a".into()),
+            PolymarketTokenId("token-b".into()),
+        ];
+        let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher.clone(), 50);
+        let original = resolver.resolve(tokens.clone()).await.unwrap();
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            paper.asset_identities("installed", &tokens).unwrap().len(),
+            2
+        );
+        drop(resolver);
+        drop(paper);
+
+        let paper = Arc::new(PaperStateDb::open(&db_path).unwrap());
+        let fetcher = Arc::new(GammaFixture::new(b"[]", b"[]"));
+        let resolver = durable_resolver(&path, paper, "installed", fetcher.clone(), 50);
+        let restored = resolver.resolve_for_bracket(tokens.clone()).await.unwrap();
+        assert_eq!(restored.verified, original.verified);
+        assert_eq!(restored.provenance, original.provenance);
+        assert_eq!(resolver.cache.read().await.identities.len(), 2);
+        assert_eq!(
+            resolver.resolve(tokens).await.unwrap().provenance,
+            original.provenance
+        );
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn identity_write_waits_for_batch_end_and_survives_rollback() {
+        for rollback in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("source.log");
+            let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+            let fetcher = Arc::new(GammaFixture::new(
+                br#"[{"conditionId":"condition-a","clobTokenIds":["token-a"]}]"#,
+                b"[]",
+            ));
+            let token = PolymarketTokenId("token-a".into());
+            let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher.clone(), 50);
+            paper.begin_batch().unwrap();
+            let mut resolving = Box::pin(resolver.resolve_for_bracket([token.clone()]));
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(25), resolving.as_mut())
+                    .await
+                    .is_err()
+            );
+            assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+            assert!(
+                paper
+                    .asset_identities("installed", std::slice::from_ref(&token))
+                    .unwrap()
+                    .is_empty()
+            );
+            if rollback {
+                paper.rollback_batch().unwrap();
+            } else {
+                paper.commit_batch().unwrap();
+            }
+            let original = resolving.await.unwrap();
+            assert!(original.verified.contains_key(&token));
+            let saved = paper
+                .asset_identities("installed", std::slice::from_ref(&token))
+                .unwrap();
+            assert_eq!(saved.len(), 1);
+            assert_eq!(
+                saved[0].source_log_sequence,
+                i64::try_from(original.provenance[&token].source_log_sequence).unwrap()
+            );
+            paper.begin_batch().unwrap();
+            paper.rollback_batch().unwrap();
+            drop(resolver);
+            let fetcher = Arc::new(GammaFixture::new(b"[]", b"[]"));
+            let restarted = durable_resolver(&path, paper, "installed", fetcher.clone(), 50);
+            assert_eq!(
+                restarted.resolve([token]).await.unwrap().provenance,
+                original.provenance
+            );
+            assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn identity_write_times_out_without_acknowledging_or_caching() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let fetcher = Arc::new(GammaFixture::new(
+            br#"[{"conditionId":"condition-a","clobTokenIds":["token-a"]}]"#,
+            b"[]",
+        ));
+        let token = PolymarketTokenId("token-a".into());
+        let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher, 50);
+        paper.begin_batch().unwrap();
+        let start = tokio::time::Instant::now();
+        assert!(matches!(resolver.resolve([token.clone()]).await,
+            Err(SourceError::Fatal { message }) if message.contains("waited 30 s")));
+        assert_eq!(
+            tokio::time::Instant::now().duration_since(start).as_secs(),
+            30
+        );
+        assert!(resolver.cache.read().await.identities.is_empty());
+        assert!(
+            paper
+                .asset_identities("installed", &[token])
+                .unwrap()
+                .is_empty()
+        );
+        paper.rollback_batch().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn durable_invalid_row_cleanup_waits_for_batch_end_before_refetch() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let token = PolymarketTokenId("token-a".into());
+        let invalid = AssetIdentityRow {
+            token: token.clone(),
+            condition_id: pe_core_types::PolymarketConditionId("condition-a".into()),
+            outcome: 0,
+            source_log_sequence: 999,
+            canonical_page_hash: "0".repeat(64),
+        };
+        paper
+            .insert_asset_identities("installed", std::slice::from_ref(&invalid))
+            .unwrap();
+        let fetcher = Arc::new(GammaFixture::new(
+            br#"[{"conditionId":"condition-a","clobTokenIds":["token-a"]}]"#,
+            b"[]",
+        ));
+        let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher.clone(), 50);
+        paper.begin_batch().unwrap();
+        let mut resolving = Box::pin(resolver.resolve_for_bracket([token.clone()]));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), resolving.as_mut())
+                .await
+                .is_err()
+        );
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            paper
+                .asset_identities("installed", std::slice::from_ref(&token))
+                .unwrap(),
+            [invalid]
+        );
+        paper.rollback_batch().unwrap();
+        let resolved = resolving.await.unwrap();
+        assert!(resolved.verified.contains_key(&token));
+        let saved = paper
+            .asset_identities("installed", std::slice::from_ref(&token))
+            .unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(
+            saved[0].canonical_page_hash,
+            resolved.provenance[&token].canonical_page_hash
+        );
+        assert_eq!(saved[0].source_log_sequence, 0);
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+        drop(resolver);
+        let fetcher = Arc::new(GammaFixture::new(b"[]", b"[]"));
+        let resolver = durable_resolver(&path, paper, "installed", fetcher.clone(), 50);
+        assert_eq!(
+            resolver.resolve([token]).await.unwrap().provenance,
+            resolved.provenance
+        );
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
+    }
+
+    struct SiblingConflictFixture;
+
+    impl ReconciliationFetcher for SiblingConflictFixture {
+        fn fetch<'a>(
+            &'a self,
+            url: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
+            Box::pin(async move {
+                if url.contains("clob_token_ids=token-a") {
+                    Ok(
+                        br#"[{"conditionId":"condition","clobTokenIds":["token-a","token-x"]}]"#
+                            .to_vec(),
+                    )
+                } else {
+                    Ok(br#"[{"conditionId":"condition","clobTokenIds":["token-z","token-b"]},{"conditionId":"independent","clobTokenIds":["token-independent"]}]"#.to_vec())
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_unsaved_sibling_ambiguity_rejects_condition_and_keeps_independent_progress() {
+        for restart in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("source.log");
+            let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+            let tokens = [
+                PolymarketTokenId("token-a".into()),
+                PolymarketTokenId("token-b".into()),
+            ];
+            let mut resolver = durable_resolver(
+                &path,
+                paper.clone(),
+                "installed",
+                Arc::new(SiblingConflictFixture),
+                50,
+            );
+            resolver.resolve([tokens[0].clone()]).await.unwrap();
+            if restart {
+                drop(resolver);
+                resolver = durable_resolver(
+                    &path,
+                    paper.clone(),
+                    "installed",
+                    Arc::new(SiblingConflictFixture),
+                    50,
+                );
+            }
+            let independent = PolymarketTokenId("token-independent".into());
+            let resolved = resolver
+                .resolve([tokens[0].clone(), tokens[1].clone(), independent.clone()])
+                .await
+                .unwrap();
+            assert_eq!(resolved.verified.keys().collect::<Vec<_>>(), [&independent]);
+            assert!(
+                tokens
+                    .iter()
+                    .all(|token| resolved.unverified.contains_key(token))
+            );
+            assert_eq!(resolver.cache.read().await.identities.len(), 1);
+            let rows = paper.asset_identities("installed", &tokens).unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].outcome, 0);
+            assert_eq!(rows[1].outcome, 1);
+            assert_eq!(
+                paper
+                    .asset_identity_condition_rejection("installed", "condition")
+                    .unwrap(),
+                Some(1)
+            );
+            assert_eq!(
+                paper
+                    .asset_identity_condition_rejection("installed", "independent")
+                    .unwrap(),
+                None
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_condition_rejection_survives_restart_and_cannot_be_unrejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let db_path = dir.path().join("paper.db");
+        let paper = Arc::new(PaperStateDb::open(&db_path).unwrap());
+        let tokens = [
+            PolymarketTokenId("token-a".into()),
+            PolymarketTokenId("token-b".into()),
+        ];
+        let resolver = durable_resolver(
+            &path,
+            paper.clone(),
+            "installed",
+            Arc::new(SiblingConflictFixture),
+            50,
+        );
+        let original = resolver.resolve([tokens[0].clone()]).await.unwrap();
+        resolver.resolve([tokens[1].clone()]).await.unwrap();
+        drop(resolver);
+        drop(paper);
+        let paper = Arc::new(PaperStateDb::open(&db_path).unwrap());
+        let fetcher = Arc::new(GammaFixture::new(
+            br#"[{"conditionId":"condition","clobTokenIds":["token-a","token-b","token-new"]}]"#,
+            b"[]",
+        ));
+        let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher.clone(), 50);
+        let restored = resolver.resolve(tokens.clone()).await.unwrap();
+        assert!(restored.verified.is_empty());
+        assert!(restored.provenance.is_empty());
+        assert_eq!(restored.unverified.len(), 2);
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
+        let token = PolymarketTokenId("token-new".into());
+        let fresh = resolver.resolve([token.clone()]).await.unwrap();
+        assert!(fresh.verified.is_empty());
+        assert!(fresh.unverified.contains_key(&token));
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+        assert!(resolver.cache.read().await.identities.is_empty());
+        let rows = paper
+            .asset_identities("installed", &[tokens[0].clone(), tokens[1].clone(), token])
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        for condition in rows.iter().map(|row| &row.condition_id.0) {
+            assert!(
+                paper
+                    .asset_identity_condition_rejection("installed", condition)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        assert_eq!(
+            rows[0].source_log_sequence,
+            i64::try_from(original.provenance[&tokens[0]].source_log_sequence).unwrap()
+        );
+    }
+
+    struct PartialFailureFixture {
+        urls: StdMutex<Vec<String>>,
+        fail_second: std::sync::atomic::AtomicBool,
+        closed: bool,
+    }
+
+    impl ReconciliationFetcher for PartialFailureFixture {
+        fn fetch<'a>(
+            &'a self,
+            url: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
+            Box::pin(async move {
+                self.urls.lock().unwrap().push(url.to_owned());
+                if self.closed && !url.contains("closed=true") {
+                    return Ok(b"[]".to_vec());
+                }
+                let second = url.contains("clob_token_ids=token-b");
+                if second && self.fail_second.load(Ordering::SeqCst) {
+                    return Err(SourceError::Transient {
+                        message: "failed second chunk".into(),
+                    });
+                }
+                let suffix = if second { "b" } else { "a" };
+                Ok(format!(
+                    r#"[{{"conditionId":"condition-{suffix}","clobTokenIds":["token-{suffix}"]}}]"#
+                )
+                .into_bytes())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_partial_failure_saves_first_chunk_and_restart_fetches_only_failed_chunk() {
+        for closed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("source.log");
+            let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+            let fetcher = Arc::new(PartialFailureFixture {
+                urls: StdMutex::new(Vec::new()),
+                fail_second: std::sync::atomic::AtomicBool::new(true),
+                closed,
+            });
+            let tokens = [
+                PolymarketTokenId("token-a".into()),
+                PolymarketTokenId("token-b".into()),
+            ];
+            let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher.clone(), 1);
+            assert!(matches!(resolver.resolve(tokens.clone()).await,
+                Err(SourceError::Transient { message }) if message.contains("failed second chunk")));
+            let saved = paper.asset_identities("installed", &tokens).unwrap();
+            assert_eq!(saved.len(), 1);
+            assert_eq!(saved[0].token, tokens[0]);
+            let provenance = IdentityProvenance {
+                asset: saved[0].token.clone(),
+                source_log_sequence: u64::try_from(saved[0].source_log_sequence).unwrap(),
+                canonical_page_hash: saved[0].canonical_page_hash.clone(),
+            };
+            drop(resolver);
+            fetcher.fail_second.store(false, Ordering::SeqCst);
+            fetcher.urls.lock().unwrap().clear();
+            let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher.clone(), 1);
+            let retried = resolver.resolve(tokens.clone()).await.unwrap();
+            assert_eq!(retried.verified.len(), 2);
+            assert_eq!(retried.provenance[&tokens[0]], provenance);
+            let urls = fetcher.urls.lock().unwrap();
+            assert_eq!(urls.len(), if closed { 2 } else { 1 });
+            assert!(
+                urls.iter()
+                    .all(|url| url.contains("clob_token_ids=token-b"))
+            );
+            assert_eq!(
+                paper.asset_identities("installed", &tokens).unwrap().len(),
+                2
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_foreign_generation_is_ignored_and_current_identity_is_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let token = PolymarketTokenId("token-a".into());
+        let old_fetcher = Arc::new(GammaFixture::new(
+            br#"[{"conditionId":"old-condition","clobTokenIds":["token-a"]}]"#,
+            b"[]",
+        ));
+        let old = durable_resolver(&path, paper.clone(), "old", old_fetcher, 50);
+        old.resolve([token.clone()]).await.unwrap();
+        drop(old);
+        let current_fetcher = Arc::new(GammaFixture::new(
+            br#"[{"conditionId":"current-condition","clobTokenIds":["token-a"]}]"#,
+            b"[]",
+        ));
+        let current =
+            durable_resolver(&path, paper.clone(), "current", current_fetcher.clone(), 50);
+        let resolved = current.resolve([token.clone()]).await.unwrap();
+        assert_eq!(
+            resolved.verified[&token].condition_id.0,
+            "current-condition"
+        );
+        assert_eq!(current_fetcher.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            paper
+                .asset_identities("old", std::slice::from_ref(&token))
+                .unwrap()[0]
+                .condition_id
+                .0,
+            "old-condition"
+        );
+        assert_eq!(
+            paper.asset_identities("current", &[token]).unwrap()[0]
+                .condition_id
+                .0,
+            "current-condition"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_cross_run_ambiguity_marks_condition_rejected_and_rejects_both_tokens() {
+        for request_saved in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("source.log");
+            let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+            let tokens = [
+                PolymarketTokenId("token-a".into()),
+                PolymarketTokenId("token-b".into()),
+            ];
+            let old_fetcher = Arc::new(GammaFixture::new(
+                br#"[{"conditionId":"condition","clobTokenIds":["token-a"]}]"#,
+                b"[]",
+            ));
+            let old = durable_resolver(&path, paper.clone(), "installed", old_fetcher, 50);
+            old.resolve([tokens[0].clone()]).await.unwrap();
+            drop(old);
+            let fetcher = Arc::new(GammaFixture::new(
+                br#"[{"conditionId":"condition","clobTokenIds":["token-b"]}]"#,
+                b"[]",
+            ));
+            let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher, 50);
+            let requested = if request_saved {
+                tokens.to_vec()
+            } else {
+                vec![tokens[1].clone()]
+            };
+            let resolved = resolver.resolve(requested).await.unwrap();
+            assert!(resolved.verified.is_empty());
+            assert!(resolved.provenance.is_empty());
+            assert_eq!(
+                resolved.unverified.keys().cloned().collect::<Vec<_>>(),
+                tokens
+            );
+            assert!(resolver.cache.read().await.identities.is_empty());
+            let rows = paper.asset_identities("installed", &tokens).unwrap();
+            assert_eq!(rows.len(), 2);
+            for condition in rows.iter().map(|row| &row.condition_id.0) {
+                assert!(
+                    paper
+                        .asset_identity_condition_rejection("installed", condition)
+                        .unwrap()
+                        .is_some()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_restore_rejects_invalid_rows_and_source_contracts_before_refetch() {
+        use pe_core_types::{PolymarketConditionId, ReceivedAt, SourceId};
+        for altered in [
+            "source",
+            "schema",
+            "parser",
+            "content_type",
+            "condition",
+            "outcome",
+            "overflow_outcome",
+            "page_hash",
+            "sequence",
+            "negative_sequence",
+            "ambiguous",
+            "absent",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("source.log");
+            let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+            let token = PolymarketTokenId("token-a".into());
+            let valid = br#"[{"conditionId":"condition-a","clobTokenIds":["token-a"]}]"#;
+            let payload = match altered {
+                "ambiguous" => br#"[{"conditionId":"condition-a","clobTokenIds":["token-a"]},{"conditionId":"condition-a","clobTokenIds":["other"]}]"#.as_slice(),
+                "absent" => b"[]".as_slice(),
+                _ => valid.as_slice(),
+            };
+            let at = time::OffsetDateTime::from_unix_timestamp(100).unwrap();
+            let sink = Arc::new(Mutex::new(SourceEventSink::open(&path).unwrap()));
+            sink.lock()
+                .await
+                .append_durable(EnvelopeIn {
+                    source_id: SourceId(
+                        if altered == "source" {
+                            "different-source"
+                        } else {
+                            GAMMA_MARKETS_SOURCE_ID
+                        }
+                        .into(),
+                    ),
+                    schema_version: GAMMA_MARKETS_SCHEMA_VERSION + u32::from(altered == "schema"),
+                    parser_version: GAMMA_MARKETS_PARSER_VERSION + u32::from(altered == "parser"),
+                    observed_at: SourceTimestamp(at),
+                    received_at: ReceivedAt(at),
+                    content_type: if altered == "content_type" {
+                        ContentType::Raw
+                    } else {
+                        ContentType::Json
+                    },
+                    payload: payload.to_vec(),
+                })
+                .unwrap();
+            let original_hash = canonical_page_hash(payload).unwrap();
+            let provenance = IdentityProvenance {
+                asset: token.clone(),
+                source_log_sequence: u64::from(altered == "sequence"),
+                canonical_page_hash: if altered == "page_hash" {
+                    "0".repeat(64)
+                } else {
+                    original_hash
+                },
+            };
+            paper
+                .insert_asset_identities(
+                    "installed",
+                    &[AssetIdentityRow {
+                        token: token.clone(),
+                        condition_id: PolymarketConditionId(
+                            if altered == "condition" {
+                                "different-condition"
+                            } else {
+                                "condition-a"
+                            }
+                            .into(),
+                        ),
+                        outcome: match altered {
+                            "outcome" => 1,
+                            "overflow_outcome" => 65_536,
+                            _ => 0,
+                        },
+                        source_log_sequence: if altered == "negative_sequence" {
+                            -1
+                        } else {
+                            i64::try_from(provenance.source_log_sequence).unwrap()
+                        },
+                        canonical_page_hash: provenance.canonical_page_hash,
+                    }],
+                )
+                .unwrap();
+            let fetcher = Arc::new(GammaFixture::new(valid, b"[]"));
+            let resolver = AssetIdentityResolver::new(fetcher.clone(), BASE.into(), 50, sink)
+                .with_paper_state(
+                    paper.clone(),
+                    "installed".into(),
+                    SourceReceiptIndex::replay(&path).unwrap(),
+                );
+            let restored = resolver.resolve([token.clone()]).await.unwrap();
+            assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1, "{altered}");
+            assert_eq!(
+                restored.verified[&token].condition_id.0, "condition-a",
+                "{altered}"
+            );
+            assert_eq!(restored.verified[&token].outcome, OutcomeId(0), "{altered}");
+            assert_eq!(
+                restored.provenance[&token].source_log_sequence, 1,
+                "{altered}"
+            );
+            let rows = paper.asset_identities("installed", &[token]).unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].canonical_page_hash,
+                restored.provenance[&rows[0].token].canonical_page_hash,
+                "{altered}"
+            );
+        }
+    }
+
+    #[test]
+    fn installed_identity_generation_uses_only_installed_activation_tails() {
+        use pe_event_log::LogTailBinding;
+        use pe_paper_state::DurableLogBindings;
+        assert_eq!(
+            ASSET_IDENTITY_INSERT_LIMIT,
+            pe_source_polymarket_public::GAMMA_BATCH_SIZE
+        );
+        let tail = LogTailBinding {
+            path: "/fixture/source.log".into(),
+            physical_tail: 100,
+            last_sequence: Some(EventSeq(7)),
+            last_hash: blake3::hash(b"activation"),
+        };
+        let activation = DurableLogBindings {
+            source: tail.clone(),
+            paper: tail.clone(),
+            live_journal: tail,
+        };
+        let mut record = MigrationRecord {
+            version_one_boundary: activation.clone(),
+            activation_tails: Some(activation),
+            phase: MigrationPhase::BoundaryRecorded,
+            side_main_path: "/fixture/side.db".into(),
+            input_hashes: BTreeMap::new(),
+        };
+        assert_eq!(installed_identity_generation(&record).unwrap(), None);
+        record.phase = MigrationPhase::Installed;
+        let generation = installed_identity_generation(&record).unwrap();
+        record.version_one_boundary.source.physical_tail += 1;
+        record.side_main_path = "/fixture/moved.db".into();
+        assert_eq!(installed_identity_generation(&record).unwrap(), generation);
+        record
+            .activation_tails
+            .as_mut()
+            .unwrap()
+            .source
+            .physical_tail += 1;
+        assert_ne!(installed_identity_generation(&record).unwrap(), generation);
+        record.activation_tails = None;
+        assert!(matches!(
+            installed_identity_generation(&record),
+            Err(SourceError::Fatal { .. })
+        ));
     }
 
     #[tokio::test]
@@ -825,7 +2623,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_chunk_is_recorded_before_later_transient_and_no_identity_is_cached() {
+    async fn successful_chunk_is_recorded_and_cached_before_later_transient() {
         let fetcher = Arc::new(MixedChunkFixture {
             calls: AtomicUsize::new(0),
             attempts: StdMutex::new(Vec::new()),
@@ -853,8 +2651,8 @@ mod tests {
         assert_eq!(resolved.verified[&token_a].condition_id.0, "condition-a");
         assert_eq!(
             fetcher.calls.load(Ordering::SeqCst),
-            3,
-            "the failed multi-chunk lookup must not cache its successful sibling"
+            2,
+            "the failed multi-chunk lookup keeps its verified sibling"
         );
     }
 
@@ -901,7 +2699,7 @@ mod tests {
                 Err(SourceError::Fatal { message })
                     if message.starts_with("gamma metadata parse failed:")
             ));
-            assert!(resolver.cache.read().await.is_empty());
+            assert!(resolver.cache.read().await.identities.is_empty());
 
             drop(resolver);
             drop(sink);
