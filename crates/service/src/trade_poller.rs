@@ -387,9 +387,8 @@ impl ActivityCandidates {
             retired_frame_ids: admitted_ids,
             ..ReconciliationObligations::default()
         };
-        let mut authenticated = HashMap::new();
-        #[cfg(feature = "scenario")]
-        let mut counted = HashSet::new();
+        let mut needed = HashMap::<_, HashSet<_>>::new();
+        let mut pending = Vec::new();
         for (wallet, epochs) in self.by_wallet {
             let fenced = paper_state.is_wallet_fenced(&wallet)?;
             for (epoch, groups) in epochs {
@@ -409,57 +408,62 @@ impl ActivityCandidates {
                             obligation.receipt.this_hash,
                         ))
                         .unwrap_or_default();
-                    obligation.bindings.clear();
-                    #[cfg(feature = "scenario")]
-                    let mut used_receipts = Vec::new();
                     for receipt in &receipts {
-                        let read = match authenticated.entry((receipt.sequence, receipt.this_hash))
-                        {
-                            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-                            std::collections::hash_map::Entry::Vacant(entry) => {
-                                let read = crate::bucket_commit::verified_commitment_bindings(
-                                    *receipt,
-                                    source_receipts,
-                                )
-                                .map_err(|error| {
-                                    ObligationRebuildError::Binding(error.to_string())
-                                })?;
-                                entry.insert(read)
-                            }
-                        };
-                        #[cfg(feature = "scenario")]
-                        used_receipts.push(*receipt);
-                        obligation.bindings.extend(
-                            read.bindings
-                                .iter()
-                                .filter(|binding| {
-                                    binding.stream_receipt == obligation.receipt
-                                        && binding.stream_group_id == obligation.group_id
-                                })
-                                .cloned(),
-                        );
-                        if obligation_disposed(paper_state, fenced, &obligation)? {
-                            break;
-                        }
+                        needed
+                            .entry((receipt.sequence, receipt.this_hash))
+                            .or_default()
+                            .insert((obligation.receipt.sequence, obligation.receipt.this_hash));
                     }
-                    let disposed = !((obligation.bindings.is_empty() && fenced)
-                        || !obligation_disposed(paper_state, fenced, &obligation)?);
-                    #[cfg(feature = "scenario")]
-                    for receipt in used_receipts {
-                        let category = if disposed { 0 } else { 1 };
-                        if counted.insert((receipt.sequence, receipt.this_hash, category)) {
-                            source_receipts.record_binding_verification_category(receipt, category);
-                        }
-                    }
-                    if !disposed {
-                        insert_coalesced_obligation(
-                            &mut obligations.by_wallet,
-                            wallet,
-                            epoch,
-                            obligation,
-                        );
-                    }
+                    obligation.bindings.clear();
+                    pending.push((wallet, epoch, fenced, obligation, receipts));
                 }
+            }
+        }
+        let mut authenticated = HashMap::new();
+        #[cfg(feature = "scenario")]
+        let mut counted = HashSet::new();
+        for (wallet, epoch, fenced, mut obligation, receipts) in pending {
+            #[cfg(feature = "scenario")]
+            let mut used_receipts = Vec::new();
+            for receipt in &receipts {
+                let read = match authenticated.entry((receipt.sequence, receipt.this_hash)) {
+                    std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        let read = crate::bucket_commit::verified_commitment_bindings(
+                            *receipt,
+                            source_receipts,
+                            &needed[&(receipt.sequence, receipt.this_hash)],
+                        )
+                        .map_err(|error| ObligationRebuildError::Binding(error.to_string()))?;
+                        entry.insert(read)
+                    }
+                };
+                #[cfg(feature = "scenario")]
+                used_receipts.push(*receipt);
+                obligation.bindings.extend(
+                    read.bindings
+                        .iter()
+                        .filter(|binding| {
+                            binding.stream_receipt == obligation.receipt
+                                && binding.stream_group_id == obligation.group_id
+                        })
+                        .cloned(),
+                );
+                if obligation_disposed(paper_state, fenced, &obligation)? {
+                    break;
+                }
+            }
+            let disposed = !((obligation.bindings.is_empty() && fenced)
+                || !obligation_disposed(paper_state, fenced, &obligation)?);
+            #[cfg(feature = "scenario")]
+            for receipt in used_receipts {
+                let category = if disposed { 0 } else { 1 };
+                if counted.insert((receipt.sequence, receipt.this_hash, category)) {
+                    source_receipts.record_binding_verification_category(receipt, category);
+                }
+            }
+            if !disposed {
+                insert_coalesced_obligation(&mut obligations.by_wallet, wallet, epoch, obligation);
             }
         }
         Ok(obligations)

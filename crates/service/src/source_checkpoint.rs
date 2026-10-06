@@ -332,7 +332,7 @@ fn load_with_finalization(
     };
     let mut checksum = bytes[..64].try_into().map_err(io::Error::other)?;
     let staging = if data.format_version == 1 {
-        // Conversion is optional: a failed sidecar or manifest install retains the v1 loader.
+        // Conversion is optional; after-rename failures keep the visible v2 receipt prefix.
         let frames = std::mem::take(&mut data.receipts);
         data.format_version = 2;
         data.generation = read_authority(path)?.generation().unwrap_or(0);
@@ -341,13 +341,20 @@ fn load_with_finalization(
         let conversion = write_receipts(path, 0, &frames, true, finalization)
             .and_then(|()| finalization.checkpoint_write(&checkpoint_path(path), &converted));
         if let Err(error) = conversion {
-            // A directory-sync error can occur after rename. Restore the original manifest too.
-            if std::fs::read(checkpoint_path(path))? != bytes {
-                crate::qualification::write_report(&checkpoint_path(path), &bytes)?;
-            }
             tracing::warn!(%error, "source checkpoint v1 conversion deferred");
-            data.format_version = 1;
-            data.receipt_count = None;
+            if !read_authority(path)?.permits_checkpoint() {
+                return Ok(None);
+            }
+            let installed = std::fs::read(checkpoint_path(path))?;
+            if installed == bytes {
+                data.format_version = 1;
+                data.receipt_count = None;
+            } else if installed == converted {
+                // The next equal-candidate publication completes installation durability.
+                checksum = converted[..64].try_into().map_err(io::Error::other)?;
+            } else {
+                return Ok(None);
+            }
         } else {
             checksum = converted[..64].try_into().map_err(io::Error::other)?;
         }
@@ -1326,11 +1333,7 @@ mod tests {
 
     #[test]
     fn checkpoint_conversion_failure_keeps_v1_and_boot_index() {
-        for fault in [
-            Fault::ReceiptsSync,
-            Fault::CheckpointBeforeWrite,
-            Fault::CheckpointAfterRename,
-        ] {
+        for fault in [Fault::ReceiptsSync, Fault::CheckpointBeforeWrite] {
             let fixture = Fixture::new();
             let original = stage_v1(&fixture);
             let expected = SourceReceiptIndex::replay(&fixture.path).unwrap();
@@ -1358,6 +1361,74 @@ mod tests {
             );
             assert!(read_authority(&fixture.path).unwrap().permits_checkpoint());
         }
+    }
+
+    #[test]
+    fn checkpoint_conversion_after_rename_preserves_v2_and_equal_retry() {
+        let fixture = Fixture::new();
+        fixture.record(4, false);
+        let original = stage_v1(&fixture);
+        let expected = SourceReceiptIndex::replay(&fixture.path).unwrap();
+        let mut seam = Failure::new(Fault::CheckpointAfterRename);
+        let loaded = load_with_finalization(&fixture.path, &fixture.activation, false, &mut seam)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.data.format_version, 2);
+        assert_eq!(loaded.data.generation, 4);
+        let manifest = std::fs::read(checkpoint_path(&fixture.path)).unwrap();
+        assert_ne!(manifest, original);
+        assert_eq!(loaded.checksum.as_slice(), &manifest[..64]);
+        assert_eq!(seam.checkpoint_writes, 1);
+        let records = std::fs::read(receipts_path(&fixture.path)).unwrap();
+        assert_eq!(records.len(), 3 * 80);
+        assert_eq!(
+            loaded
+                .staging
+                .complete(&loaded.data.tail)
+                .unwrap()
+                .snapshot(),
+            expected.snapshot()
+        );
+
+        // Reread the visible manifest and current authority under the lock, then use the
+        // publisher's equal-candidate retry to complete the failed directory synchronization.
+        let loaded = load_checkpoint(&fixture.path, &fixture.activation, false)
+            .unwrap()
+            .unwrap();
+        let candidate = serialize(loaded.data, 4, CAPTURE).unwrap();
+        assert!(candidate.receipts.is_empty());
+        fixture.record(5, false);
+        assert!(matches!(
+            attempt(&candidate, &mut seam).unwrap(),
+            PublishOutcome::GenerationChanged {
+                candidate: 4,
+                current: 5
+            }
+        ));
+        assert_eq!(seam.checkpoint_writes, 1);
+        assert_eq!(
+            std::fs::read(receipts_path(&fixture.path)).unwrap(),
+            records
+        );
+        let loaded = load_checkpoint(&fixture.path, &fixture.activation, false)
+            .unwrap()
+            .unwrap();
+        let current_candidate = serialize(loaded.data, 5, CAPTURE).unwrap();
+        receipt(attempt(&current_candidate, &mut seam).unwrap());
+        assert_eq!(seam.checkpoint_writes, 2);
+        assert_eq!(
+            std::fs::read(receipts_path(&fixture.path)).unwrap(),
+            records
+        );
+        let boot = load_checkpoint(&fixture.path, &fixture.activation, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(boot.data.format_version, 2);
+        assert_eq!(boot.data.generation, 5);
+        assert_eq!(
+            boot.staging.complete(&boot.data.tail).unwrap().snapshot(),
+            expected.snapshot()
+        );
     }
 
     #[test]

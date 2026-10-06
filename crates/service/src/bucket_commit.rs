@@ -1072,7 +1072,7 @@ where
 struct ActivityReadVerification<'a> {
     version: u16,
     counterpart_depth: u8,
-    binding_filter: Option<AppendReceipt>,
+    binding_filter: Option<&'a HashSet<(pe_core_types::EventSeq, blake3::Hash)>>,
     wallet: WalletAddress,
     decision_inputs: &'a Value,
     page_occurrences: &'a [PageOccurrence],
@@ -1338,8 +1338,12 @@ impl ActivityReadVerification<'_> {
             .ok_or_else(|| complete_activity_read_error("binding read pages are absent"))?;
         let joined = joined_read_pages(self.page_occurrences, &pages)?;
         for binding in bindings.iter().filter(|binding| {
-            self.binding_filter
-                .is_none_or(|receipt| receipt == binding.stream_receipt)
+            self.binding_filter.is_none_or(|receipts| {
+                receipts.contains(&(
+                    binding.stream_receipt.sequence,
+                    binding.stream_receipt.this_hash,
+                ))
+            })
         }) {
             if binding.stream_receipt.sequence >= commitment_receipt.sequence
                 || binding
@@ -1461,7 +1465,10 @@ impl ActivityReadVerification<'_> {
                                     })
                                 },
                                 self.counterpart_depth + 1,
-                                Some(binding.stream_receipt),
+                                Some(&HashSet::from([(
+                                    binding.stream_receipt.sequence,
+                                    binding.stream_receipt.this_hash,
+                                )])),
                             )?;
                             if previous.wallet != self.wallet {
                                 return Err(complete_activity_read_error(
@@ -2377,19 +2384,26 @@ fn encode_activity_read_commitment(
     .map_err(|error| complete_activity_read_error(format!("commitment payload failed: {error}")))
 }
 
-/// Authenticate bindings collected by the existing boot scan, with exact indexed reads only.
+/// Authenticate only selected obligation receipts, retaining the complete read's proof checks.
 /// A verified commitment is evidence of correlation, never evidence of durable disposition.
 pub(crate) fn verified_commitment_bindings(
     receipt: AppendReceipt,
     source_receipts: &SourceReceiptIndex,
+    binding_filter: &HashSet<(pe_core_types::EventSeq, blake3::Hash)>,
 ) -> Result<VerifiedCommitment, CompleteActivityReadError> {
     #[cfg(feature = "scenario")]
     source_receipts.record_read_verification(receipt);
-    let read = verified_commitment_bindings_with_lookup(receipt, &mut |receipt| {
-        source_receipts
-            .source_envelope(receipt)
-            .map(CompleteActivityPage::from)
-    })?;
+    let read = verified_commitment_bindings_at_depth(
+        receipt,
+        &mut |receipt| {
+            source_receipts
+                .source_envelope(receipt)
+                .map(CompleteActivityPage::from)
+                .map_err(|error| complete_activity_read_error(error.to_string()))
+        },
+        0,
+        Some(binding_filter),
+    )?;
     Ok(read)
 }
 
@@ -2522,7 +2536,7 @@ fn verified_commitment_bindings_at_depth(
         AppendReceipt,
     ) -> Result<CompleteActivityPage, CompleteActivityReadError>,
     counterpart_depth: u8,
-    binding_filter: Option<AppendReceipt>,
+    binding_filter: Option<&HashSet<(pe_core_types::EventSeq, blake3::Hash)>>,
 ) -> Result<VerifiedCommitment, CompleteActivityReadError> {
     if counterpart_depth > 2 {
         return Err(complete_activity_read_error(
@@ -2579,7 +2593,14 @@ fn verified_commitment_bindings_at_depth(
     let read = verifier.reconstruct_verified_activity_read(&mut lookup)?;
     let selected_bindings = bindings
         .iter()
-        .filter(|binding| binding_filter.is_none_or(|receipt| receipt == binding.stream_receipt))
+        .filter(|binding| {
+            binding_filter.is_none_or(|receipts| {
+                receipts.contains(&(
+                    binding.stream_receipt.sequence,
+                    binding.stream_receipt.this_hash,
+                ))
+            })
+        })
         .cloned()
         .collect::<Vec<_>>();
     Ok(VerifiedCommitment {
@@ -7831,6 +7852,211 @@ pub(crate) mod continuation_v3_tests {
         assert!(rebuilt.is_empty());
         #[cfg(feature = "scenario")]
         assert_eq!(fresh.read_verification_count(commitment), 0);
+    }
+
+    #[test]
+    fn boot_mixed_commitment_authenticates_only_ordinary_obligation_receipts() {
+        let fixture = binding_fixture("shared_read");
+        let path = fixture.dir.path().join("binding.log");
+        let initial = fixture.continuation.read_commitment.unwrap();
+        let source = fixture.index.source_envelope(initial).unwrap();
+        let read: ActivityReadCommitment = serde_json::from_slice(&source.payload).unwrap();
+        let ordinary = read.bindings.as_ref().unwrap()[0].clone();
+        let proof = read.read_proof.as_ref().unwrap();
+        let mut writer = Writer::open(&path).unwrap();
+        let append = |writer: &mut Writer, source: &str, schema, parser, payload: Vec<u8>| {
+            let at = time::OffsetDateTime::from_unix_timestamp(100).unwrap();
+            writer
+                .append_synced(EnvelopeIn {
+                    source_id: SourceId(source.to_owned()),
+                    schema_version: schema,
+                    parser_version: parser,
+                    observed_at: SourceTimestamp(at),
+                    received_at: ReceivedAt(at),
+                    content_type: ContentType::Json,
+                    payload,
+                })
+                .unwrap()
+        };
+        let stream_payload = fixture
+            .index
+            .source_envelope(ordinary.stream_receipt)
+            .unwrap()
+            .payload;
+        let mut feed: Value = serde_json::from_slice(&stream_payload).unwrap();
+        feed["conditionId"] = json!("feed");
+        let feed = serde_json::to_vec(&feed).unwrap();
+        let feed_receipt = append(
+            &mut writer,
+            crate::activity_ingest::ACTIVITY_WS_SOURCE_ID,
+            2,
+            2,
+            feed.clone(),
+        );
+        let admission = append(
+            &mut writer,
+            crate::frame_admission::FRAME_ADMISSION_SOURCE_ID,
+            1,
+            1,
+            serde_json::to_vec(&crate::frame_admission::FrameAdmissionArtifact {
+                version: 1,
+                frame_receipt: feed_receipt,
+                capture_digest: "a".repeat(64),
+                identity: None,
+            })
+            .unwrap(),
+        );
+        let mut feed_binding = ordinary.clone();
+        feed_binding.stream_receipt = feed_receipt;
+        feed_binding.stream_group_id = parse_activity_trade_observation(&feed)
+            .unwrap()
+            .group_id
+            .key()
+            .clone();
+        feed_binding.frame_admission_receipt = Some(admission);
+        let encode = |bindings: &[ObservationBinding]| {
+            activity_read_commitment_payload_v2(
+                read.wallet,
+                read.fixed_end,
+                &proof.page_occurrences,
+                &proof.pages,
+                bindings,
+            )
+            .unwrap()
+        };
+        let basis = append(
+            &mut writer,
+            ACTIVITY_READ_COMMITMENT_SOURCE_ID,
+            2,
+            1,
+            encode(&[feed_binding.clone()]),
+        );
+        feed_binding.counterpart_basis_receipt = Some(basis);
+        let mut second: Value = serde_json::from_slice(&stream_payload).unwrap();
+        second["conditionId"] = json!("other");
+        second["asset"] = json!("456");
+        second["outcomeIndex"] = json!(0);
+        second["timestamp"] = json!(100);
+        let second = serde_json::to_vec(&second).unwrap();
+        let second_receipt = append(
+            &mut writer,
+            crate::activity_ingest::ACTIVITY_WS_SOURCE_ID,
+            2,
+            2,
+            second.clone(),
+        );
+        let mut second_binding = ordinary.clone();
+        second_binding.stream_group_id = parse_activity_trade_observation(&second)
+            .unwrap()
+            .group_id
+            .key()
+            .clone();
+        let second_target = fixture
+            .continuation
+            .reconstruct_complete_activity_read(&mut |receipt| {
+                fixture
+                    .index
+                    .source_envelope(receipt)
+                    .map(CompleteActivityPage::from)
+            })
+            .unwrap()
+            .into_iter()
+            .find(|aggregate| aggregate.group_id.key() == &second_binding.stream_group_id)
+            .unwrap();
+        second_binding.stream_receipt = second_receipt;
+        second_binding.history_group_id = second_target.group_id.key().clone();
+        second_binding.semantic_revision = second_target.semantic_revision.as_str().to_owned();
+        second_binding.identity_provenance = None;
+        second_binding.identity_receipt = None;
+        let mixed = append(
+            &mut writer,
+            ACTIVITY_READ_COMMITMENT_SOURCE_ID,
+            2,
+            1,
+            encode(&[ordinary.clone(), second_binding.clone(), feed_binding]),
+        );
+        drop(writer);
+        let index = SourceReceiptIndex::replay(&path).unwrap();
+        let filter = HashSet::from([
+            (
+                ordinary.stream_receipt.sequence,
+                ordinary.stream_receipt.this_hash,
+            ),
+            (second_receipt.sequence, second_receipt.this_hash),
+        ]);
+        let mut lookups = Vec::new();
+        let selected = verified_commitment_bindings_at_depth(
+            mixed,
+            &mut |receipt| {
+                lookups.push(receipt);
+                index
+                    .source_envelope(receipt)
+                    .map(CompleteActivityPage::from)
+                    .map_err(|error| complete_activity_read_error(error.to_string()))
+            },
+            0,
+            Some(&filter),
+        )
+        .unwrap();
+        assert_eq!(selected.bindings.len(), 2);
+        for excluded in [feed_receipt, admission, basis] {
+            assert!(
+                !lookups.contains(&excluded),
+                "unexpected lookup: {excluded:?}"
+            );
+        }
+        lookups.clear();
+        let full = verified_commitment_bindings_with_lookup(mixed, &mut |receipt| {
+            lookups.push(receipt);
+            index
+                .source_envelope(receipt)
+                .map(CompleteActivityPage::from)
+        })
+        .unwrap();
+        assert_eq!(full.bindings.len(), 3);
+        assert!(lookups.contains(&basis));
+
+        let error = verified_commitment_bindings_at_depth(
+            mixed,
+            &mut |receipt| {
+                let mut page = index
+                    .source_envelope(receipt)
+                    .map(CompleteActivityPage::from)
+                    .map_err(|error| complete_activity_read_error(error.to_string()))?;
+                if receipt == mixed {
+                    let mut payload: Value = serde_json::from_slice(&page.payload).unwrap();
+                    payload["digest"] = json!("changed");
+                    page.payload = serde_json::to_vec(&payload).unwrap();
+                }
+                Ok(page)
+            },
+            0,
+            Some(&filter),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("commitment differs from its frozen proof")
+        );
+
+        let state = PaperStateDb::open(&fixture.dir.path().join("paper.db")).unwrap();
+        state
+            .retire_activity_observation(feed_receipt, false)
+            .unwrap();
+        let rebuilt = crate::trade_poller::rebuild_reconciliation_obligations_with_index(
+            &path, &state, &index,
+        )
+        .unwrap();
+        assert_eq!(rebuilt.len(), 2);
+        #[cfg(feature = "scenario")]
+        {
+            assert_eq!(index.read_verification_count(initial), 1);
+            assert_eq!(index.read_verification_count(mixed), 1);
+            assert_eq!(index.read_verification_count(basis), 0);
+            assert_eq!(index.binding_verification_counts(mixed), [0, 1, 0]);
+            assert_eq!(index.frame_verification_count(feed_receipt), 0);
+        }
     }
 
     /// PASS: boot shares one authenticated v5 read across a stream decision and a poll decision.

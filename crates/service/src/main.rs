@@ -103,28 +103,35 @@ fn select_boot_anchor_wallets(
     };
     for wallet in wallets {
         let coverage = paper_state.wallet_coverage(wallet)?;
-        let reusable = !paper_state.is_wallet_fenced(wallet)?
-            && paper_state.wallet_history_complete(wallet)?
-            && paper_state.cursor(wallet)?.is_some()
-            && coverage.activity_cutoff_unix.is_some()
-            && coverage.anchor_seq.is_some()
-            && !coverage.reanchor_required;
-        let full_history = if reusable {
-            match coverage.anchor_seq {
-                Some(sequence) => paper_state
-                    .position_anchor_proof(wallet, sequence)?
-                    .is_some_and(|proof| {
-                        pe_service::position_seeder::anchor_proves_full_history(&proof)
-                    }),
-                None => false,
+        let reason = if paper_state.is_wallet_fenced(wallet)? {
+            Some("fenced")
+        } else if !paper_state.wallet_history_complete(wallet)? {
+            Some("history_incomplete")
+        } else if paper_state.cursor(wallet)?.is_none() {
+            Some("no_cursor")
+        } else if coverage.activity_cutoff_unix.is_none() {
+            Some("no_activity_cutoff")
+        } else if let Some(sequence) = coverage.anchor_seq {
+            if coverage.reanchor_required {
+                Some("reanchor_required")
+            } else if !paper_state
+                .position_anchor_proof(wallet, sequence)?
+                .is_some_and(|proof| {
+                    pe_service::position_seeder::anchor_proves_full_history(&proof)
+                })
+            {
+                Some("no_full_history_proof")
+            } else {
+                None
             }
         } else {
-            false
+            Some("no_anchor")
         };
-        if full_history {
-            selection.reused.push(*wallet);
-        } else {
+        if let Some(reason) = reason {
+            tracing::info!(wallet = %wallet, reason, "boot anchor requires history walk");
             selection.walked.push(*wallet);
+        } else {
+            selection.reused.push(*wallet);
         }
     }
     Ok(selection)
@@ -2709,6 +2716,8 @@ mod tests {
         let history_incomplete = wallet(6);
         let without_cursor = wallet(7);
         let without_cutoff = wallet(8);
+        let without_anchor = wallet(9);
+        let without_full_history = wallet(10);
         let refresh_secs = i64::try_from(pe_service::trade_poller::ANCHOR_REFRESH_SECS).unwrap();
         install_reusable_facts(&paper_state, with_validation, NOW - refresh_secs);
         for candidate in [
@@ -2717,6 +2726,8 @@ mod tests {
             fenced,
             history_incomplete,
             without_cutoff,
+            without_anchor,
+            without_full_history,
         ] {
             install_reusable_facts(&paper_state, candidate, NOW);
         }
@@ -2763,6 +2774,33 @@ mod tests {
                 params![without_cutoff.to_string()],
             )
             .unwrap();
+        connection
+            .execute(
+                "DELETE FROM position_anchors WHERE wallet_hex = ?1",
+                params![without_anchor.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE poll_cursors SET reanchor_required = 1 WHERE wallet_hex = ?1",
+                params![without_anchor.to_string()],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE position_anchors SET proof_json = '{}' WHERE wallet_hex = ?1",
+                params![without_full_history.to_string()],
+            )
+            .unwrap();
+        // Earlier failures must win even when later prerequisites also fail.
+        for candidate in [fenced, history_incomplete] {
+            connection
+                .execute(
+                    "DELETE FROM poll_cursors WHERE wallet_hex = ?1",
+                    params![candidate.to_string()],
+                )
+                .unwrap();
+        }
 
         drop(connection);
         drop(paper_state);
@@ -2776,8 +2814,18 @@ mod tests {
             history_incomplete,
             without_cursor,
             without_cutoff,
+            without_anchor,
+            without_full_history,
         ];
-        let selection = select_boot_anchor_wallets(&paper_state, &wallets, false).unwrap();
+        let log_path = dir.path().join("selector.jsonl");
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(Arc::new(std::fs::File::create(&log_path).unwrap()))
+            .finish();
+        let selection = tracing::subscriber::with_default(subscriber, || {
+            select_boot_anchor_wallets(&paper_state, &wallets, false).unwrap()
+        });
         assert_eq!(
             selection.reused,
             vec![with_validation, without_validation, aged]
@@ -2790,7 +2838,38 @@ mod tests {
                 history_incomplete,
                 without_cursor,
                 without_cutoff,
+                without_anchor,
+                without_full_history,
             ]
+        );
+        let logs = std::fs::read_to_string(log_path).unwrap();
+        let exclusions = logs
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .map(|line| {
+                assert_eq!(line["level"], "INFO");
+                assert_eq!(
+                    line["fields"]["message"],
+                    "boot anchor requires history walk"
+                );
+                (
+                    line["fields"]["wallet"].as_str().unwrap().to_owned(),
+                    line["fields"]["reason"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            exclusions,
+            [
+                (reanchor_required, "reanchor_required"),
+                (fenced, "fenced"),
+                (history_incomplete, "history_incomplete"),
+                (without_cursor, "no_cursor"),
+                (without_cutoff, "no_activity_cutoff"),
+                (without_anchor, "no_anchor"),
+                (without_full_history, "no_full_history_proof"),
+            ]
+            .map(|(wallet, reason)| (wallet.to_string(), reason.to_owned()))
         );
 
         let migration = select_boot_anchor_wallets(&paper_state, &[with_validation], true).unwrap();
