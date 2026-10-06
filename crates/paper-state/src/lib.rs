@@ -2774,6 +2774,14 @@ impl PaperStateDb {
                 {
                     receipts.push(serde_json::from_value(earlier["receipt"].clone())?);
                 }
+                // Version-2 admissions freeze the frame's original Gamma identity receipt; the
+                // service's authority receipts include it, so seal selection does too.
+                if let Some(identity) = scope.decision_inputs["inputs"]
+                    .get("identity")
+                    .filter(|identity| !identity.is_null())
+                {
+                    receipts.push(serde_json::from_value(identity["receipt"].clone())?);
+                }
             }
             let in_scope = matches!(scope.version, 3..=7)
                 && !receipts.is_empty()
@@ -9216,6 +9224,60 @@ mod tests {
                 Err(PaperStateError::SealEvidenceSelectionMismatch { .. })
             ));
         }
+    }
+
+    #[test]
+    fn source_prefix_seal_scopes_frame_admissions_by_their_identity_receipt() {
+        let (_dir, db) = db();
+        insert_seal_fixture(&db, "rev-1");
+        let keys = vec![(SourceTradeId("g2:seal".to_owned()), "rev-1".to_owned())];
+        let frozen = |identity: Option<AppendReceipt>| {
+            let mut inputs = serde_json::json!({
+                "frontier": {
+                    "commitment": append_receipt(1, 1),
+                    "page_occurrences": [{"receipt": append_receipt(1, 1)}],
+                },
+                "earlier_frames": [],
+            });
+            if let Some(receipt) = identity {
+                inputs["identity"] = serde_json::json!({"receipt": receipt});
+            }
+            serde_json::json!({
+                "version": 7,
+                "source_authority": "activity_frame",
+                "observed_source_receipt": append_receipt(2, 2),
+                "decision_inputs": {"admission_receipt": append_receipt(3, 3), "inputs": inputs},
+            })
+        };
+        let set = |value: serde_json::Value| {
+            db.lock()
+                .execute(
+                    "UPDATE decision_pending SET frozen_inputs_json = ?1",
+                    [value.to_string()],
+                )
+                .unwrap();
+        };
+
+        // A version-1 admission (no identity) and a version-2 admission whose identity receipt
+        // precedes the seal are both in scope.
+        for identity in [None, Some(append_receipt(2, 9))] {
+            set(frozen(identity));
+            assert!(
+                db.seal_decision_evidence_for_source_prefix(&keys, &keys, Some(EventSeq(3)))
+                    .is_ok()
+            );
+        }
+        // An identity receipt past the seal puts the decision out of scope, as the service's
+        // authority receipts do.
+        set(frozen(Some(append_receipt(4, 9))));
+        assert!(matches!(
+            db.seal_decision_evidence_for_source_prefix(&keys, &keys, Some(EventSeq(3))),
+            Err(PaperStateError::SealEvidenceSelectionMismatch { .. })
+        ));
+        assert!(
+            db.seal_decision_evidence_for_source_prefix(&[], &[], Some(EventSeq(3)))
+                .is_ok()
+        );
     }
 
     fn append_receipt(sequence: u64, byte: u8) -> AppendReceipt {
