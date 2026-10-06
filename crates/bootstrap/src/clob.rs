@@ -638,6 +638,54 @@ mod tests {
         assert_eq!(url, "https://clob.example/markets?closed=true&limit=1000");
     }
 
+    #[tokio::test]
+    async fn payout_walk_installs_group_ids_and_marks_group_coverage() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("cache.db");
+        let mut cache = crate::cache::WalletCache::open(&path).unwrap();
+        let group = format!("0x{}", "ab".repeat(32));
+        let initial_group = format!("0x{}", "cd".repeat(32));
+        let mut responses = HashMap::new();
+        responses.insert(build_page_url("https://clob.example", None), serde_json::to_vec(&serde_json::json!({
+            "data": [
+                {"condition_id": "0xgrouped", "closed": false, "neg_risk": true, "neg_risk_market_id": initial_group},
+                {"condition_id": "0xordinary", "closed": false, "neg_risk": false, "neg_risk_market_id": ""},
+                {"condition_id": "0xmissinggroup", "closed": false, "neg_risk": true}
+            ], "next_cursor": "PAGE2"
+        })).unwrap());
+        responses.insert(build_page_url("https://clob.example", Some("PAGE2")), serde_json::to_vec(&serde_json::json!({
+            "data": [{"condition_id": "0xgrouped", "closed": false, "neg_risk": true, "neg_risk_market_id": group}],
+            "next_cursor": "LTE="
+        })).unwrap());
+        let fetcher = ClobFetcher::new(
+            "https://clob.example".to_owned(),
+            pe_source_polymarket_public::FixtureFetcher::new(responses),
+        );
+        let report = fetcher.fetch_closed_markets(&mut cache).await.unwrap();
+        let manifest = report.coverage_manifest.unwrap();
+        assert_eq!(manifest.counts.pages, 2);
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        let (version, count): (Option<i64>, Option<i64>) = conn.query_row(
+            "SELECT group_version, evidence_count FROM clob_payout_coverage_manifests_v2 WHERE generation = ?1",
+            [i64::try_from(manifest.generation).unwrap()], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(version, Some(1));
+        assert_eq!(count, Some(3));
+        for (market, expected, ordinal) in [
+            ("0xgrouped", Some(group.clone()), 1),
+            ("0xordinary", None, 0),
+            ("0xmissinggroup", None, 0),
+        ] {
+            let (stored, page_ordinal): (Option<String>, i64) = conn.query_row(
+                "SELECT neg_risk_market_id, page_ordinal FROM clob_payout_evidence_v2 WHERE market_id = ?1",
+                [market], |row| Ok((row.get(0)?, row.get(1)?)),
+            ).unwrap();
+            assert_eq!(stored, expected);
+            assert_eq!(page_ordinal, ordinal);
+            assert!(cache.clob_payout_evidence_v2(market).unwrap().is_some());
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn legacy_terminator_cursor_triggers_full_walk() {
         let dir = tempfile::TempDir::new().unwrap();

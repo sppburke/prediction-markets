@@ -1491,6 +1491,7 @@ async fn collect_activity_v2(
                 wallet,
                 start_exclusive,
                 fixed_end_unix,
+                pe_source_polymarket_public::activity::ActivityRowAcceptance::Strict,
             );
             let outcome = match deadline {
                 Some(deadline) => tokio::time::timeout_at(deadline, read).await,

@@ -252,6 +252,8 @@ pub struct ClobMarket {
     pub minimum_tick_size: Option<serde_json::Value>,
     #[serde(default)]
     pub neg_risk: Option<bool>,
+    #[serde(default, deserialize_with = "deserialize_neg_risk_market_id")]
+    pub neg_risk_market_id: Option<String>,
     #[serde(default)]
     pub seconds_delay: Option<u64>,
     /// Legacy long-row maker fee field retained only by the raw source envelope.
@@ -273,11 +275,18 @@ impl ClobMarket {
             end_date_iso: self.end_date_iso.clone(),
             closed: self.closed,
             active: self.active,
+            neg_risk_market_id: self.neg_risk_market_id.clone(),
             is_50_50_outcome: self.is_50_50_outcome,
             tokens: self.tokens.clone(),
             payout: derive_payout(self),
         }
     }
+}
+
+fn deserialize_neg_risk_market_id<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    Ok(Option::<String>::deserialize(deserializer)?.filter(|value| !value.is_empty()))
 }
 
 /// Shared CLOB paginated response.
@@ -296,6 +305,7 @@ pub struct ClobResolutionEvidence {
     pub end_date_iso: Option<String>,
     pub closed: Option<bool>,
     pub active: Option<bool>,
+    pub neg_risk_market_id: Option<String>,
     pub is_50_50_outcome: Option<bool>,
     pub tokens: Vec<ClobToken>,
     pub payout: ClobPayoutResolution,
@@ -692,6 +702,30 @@ mod tests {
         parse_clob_market(body.as_bytes())
             .unwrap()
             .resolution_evidence()
+    }
+
+    #[test]
+    fn neg_risk_group_is_retained_and_empty_is_absent() {
+        for (field, expected) in [
+            (r#", "neg_risk_market_id":"0xgroup""#, Some("0xgroup")),
+            (r#", "neg_risk_market_id":"""#, None),
+            (r#", "neg_risk_market_id":null"#, None),
+            ("", None),
+        ] {
+            let raw = format!(r#"{{"condition_id":"market"{field}}}"#);
+            let parsed = parse_clob_market(raw.as_bytes()).unwrap();
+            assert_eq!(parsed.neg_risk_market_id.as_deref(), expected);
+            assert_eq!(
+                parsed.resolution_evidence().neg_risk_market_id.as_deref(),
+                expected
+            );
+            let page = format!(r#"{{"data":[{raw}],"next_cursor":"LTE="}}"#);
+            assert_eq!(
+                parse_clob_markets_page(page.as_bytes()).unwrap().data,
+                vec![parsed]
+            );
+        }
+        assert!(parse_clob_market(br#"{"neg_risk_market_id":42}"#).is_err());
     }
 
     #[test]

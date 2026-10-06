@@ -20,8 +20,8 @@ use serde_json::value::RawValue;
 
 use crate::activity::{
     ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ActivityAggregate, ActivityParseContext,
-    ActivityParseError, ActivityTransport, NormalizedActivity, aggregate_activity_rows,
-    parse_activity_response,
+    ActivityParseError, ActivityRowAcceptance, ActivityTransport, NormalizedActivity,
+    aggregate_activity_rows, parse_activity_response_with_acceptance,
 };
 use crate::endpoint::{PolymarketEndpoint, PositionPartition};
 use crate::fetcher::PageFetcher;
@@ -167,21 +167,42 @@ pub async fn fetch_complete_activity(
     start: Option<i64>,
     fixed_end: i64,
 ) -> Result<CompleteActivityRead, ActivityReadError> {
-    fetch_complete_activity_with(fetcher, base_url, requested_wallet, start, fixed_end, true).await
+    fetch_complete_activity_with(
+        fetcher,
+        base_url,
+        requested_wallet,
+        start,
+        fixed_end,
+        true,
+        ActivityRowAcceptance::Strict,
+    )
+    .await
 }
 
 /// [`fetch_complete_activity`] for a caller that uses only semantic row fields.
 /// Each row's raw JSON, raw hash and source ID are released as its page parses,
 /// so a multi-million-row history fits in memory (#588); page evidence, row
 /// order and every semantic field are unchanged.
+/// Row acceptance is explicit so acquisition 3 can retain missing mappings
+/// without changing public reconciliation's strict contract.
 pub async fn fetch_complete_activity_semantic(
     fetcher: &dyn ReconciliationFetcher,
     base_url: &str,
     requested_wallet: WalletAddress,
     start: Option<i64>,
     fixed_end: i64,
+    row_acceptance: ActivityRowAcceptance,
 ) -> Result<CompleteActivityRead, ActivityReadError> {
-    fetch_complete_activity_with(fetcher, base_url, requested_wallet, start, fixed_end, false).await
+    fetch_complete_activity_with(
+        fetcher,
+        base_url,
+        requested_wallet,
+        start,
+        fixed_end,
+        false,
+        row_acceptance,
+    )
+    .await
 }
 
 async fn fetch_complete_activity_with(
@@ -191,6 +212,7 @@ async fn fetch_complete_activity_with(
     start: Option<i64>,
     fixed_end: i64,
     retain_provenance: bool,
+    row_acceptance: ActivityRowAcceptance,
 ) -> Result<CompleteActivityRead, ActivityReadError> {
     let mut pending = vec![ActivityRequestBounds {
         start,
@@ -205,6 +227,7 @@ async fn fetch_complete_activity_with(
             requested_wallet,
             bounds,
             retain_provenance,
+            row_acceptance,
         )
         .await?
         {
@@ -318,6 +341,7 @@ async fn fetch_activity_segment(
     requested_wallet: WalletAddress,
     bounds: ActivityRequestBounds,
     retain_provenance: bool,
+    row_acceptance: ActivityRowAcceptance,
 ) -> Result<SegmentResult, ActivityReadError> {
     let mut rows = Vec::new();
     let mut pages = Vec::new();
@@ -353,7 +377,12 @@ async fn fetch_activity_segment(
             received_at: received_at.clone(),
             transport: ActivityTransport::Rest,
         };
-        let page = parse_activity_response(&raw, requested_wallet, &context)?;
+        let page = parse_activity_response_with_acceptance(
+            &raw,
+            requested_wallet,
+            &context,
+            row_acceptance,
+        )?;
         for row in &page.rows {
             let timestamp = row.source_time.0.unix_timestamp();
             if timestamp > bounds.end || bounds.start.is_some_and(|start| timestamp <= start) {
