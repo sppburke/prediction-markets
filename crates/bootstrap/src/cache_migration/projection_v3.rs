@@ -75,19 +75,25 @@ pub(super) struct BoundPayouts {
     pub(super) markets: BTreeMap<String, PayoutMarket>,
     token_markets: HashMap<String, String>,
     groups: HashSet<String>,
+    neg_risk_markets_without_group_id: u64,
 }
 
 impl BoundPayouts {
     pub(super) fn read(connection: &Connection) -> Result<Self, BootstrapError> {
         let mut bound = Self {
-            tokens: load_payout_tokens(connection)?,
+            tokens: BTreeMap::new(),
             markets: BTreeMap::new(),
             token_markets: HashMap::new(),
             groups: HashSet::new(),
+            neg_risk_markets_without_group_id: 0,
         };
         let mut statement = connection.prepare(
             "SELECT market_id, tokens_json, raw_page_sha256, neg_risk_market_id,
-                    end_date_unix, payout_vector_json, payout_status
+                    end_date_unix, payout_vector_json,
+                    CASE WHEN end_date_unix IS NOT NULL
+                      AND payout_status = 'resolved'
+                      AND payout_vector_json IN ('[\"1\",\"0\"]','[\"0\",\"1\"]','[\"0.5\",\"0.5\"]')
+                    THEN 1 ELSE 0 END, neg_risk
              FROM clob_payout_evidence_v2 ORDER BY market_id",
         )?;
         let mut rows = statement.query([])?;
@@ -105,6 +111,13 @@ impl BoundPayouts {
             if let Some(group) = &group {
                 bound.groups.insert(group.clone());
             }
+            if group.is_none() && row.get::<_, Option<bool>>(7)? == Some(true) {
+                bound.neg_risk_markets_without_group_id =
+                    checked_activity_count(bound.neg_risk_markets_without_group_id, 1)?;
+            }
+            bound
+                .tokens
+                .insert(market.clone(), (tokens, row.get(2)?, row.get(6)?));
             let end: Option<i64> = row.get(4)?;
             let payout: Option<String> = row.get(5)?;
             bound.markets.insert(market, (group, end, payout));
@@ -353,6 +366,7 @@ pub(super) fn rebuild_ranker_projection(
     transaction: &rusqlite::Transaction<'_>,
     cache_path: &Path,
     identity: &FreshCollectionIdentity,
+    proof: &incremental::HistoryProof,
 ) -> Result<(u64, String, SpoolCommitment, ClassificationReport), BootstrapError> {
     let path = spool_path(cache_path);
     remove_uncommitted_spools(&path)?;
@@ -363,10 +377,10 @@ pub(super) fn rebuild_ranker_projection(
         .open(&temp)?;
     let mut writer = std::io::BufWriter::new(file);
     let payout = BoundPayouts::read(transaction)?;
-    let proof = incremental::HistoryProof::load(transaction, identity)?;
-    let mut report = ClassificationReport { neg_risk_markets_without_group_id: to_u64(transaction.query_row(
-        "SELECT COUNT(*) FROM clob_payout_evidence_v2 WHERE neg_risk = 1 AND neg_risk_market_id IS NULL", [], |row| row.get(0),
-    )?, "neg-risk markets without group")?, ..Default::default() };
+    let mut report = ClassificationReport {
+        neg_risk_markets_without_group_id: payout.neg_risk_markets_without_group_id,
+        ..Default::default()
+    };
     let mut digest = JsonArrayDigest::new();
     let mut hash = Sha256::new();
     let mut count = 0;
@@ -423,7 +437,7 @@ pub(super) fn rebuild_ranker_projection(
                 let chain = incremental::HistoryChain::load(
                     transaction,
                     wallet,
-                    &proof,
+                    proof,
                     identity.generation,
                 )?;
                 let mut check = chain.check();
@@ -637,14 +651,16 @@ pub(super) fn finalize(
     let transaction =
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let authorization = authorize_history_writes(&transaction)?;
-    verify_history_certificates(&transaction)?;
     let identity = fresh_collection_record(&transaction)?.ok_or(BootstrapError::Internal)?;
+    let proof = CollectionProof::load(&transaction, identity.generation)?
+        .ok_or(BootstrapError::Internal)?;
     let manifest = completed_activity_manifest(
         &transaction,
         identity.generation,
         &identity.digest,
         identity.fixed_end_unix,
         &identity.wallets,
+        Some(&proof),
     )?
     .ok_or_else(|| BootstrapError::Invalid {
         message: "format-three finalize requires sealed activity coverage".to_owned(),
@@ -683,11 +699,14 @@ pub(super) fn finalize(
                 .ok_or(BootstrapError::Internal)?,
             count,
         )?;
-        incremental::verify_record_chain(&transaction, &identity)?;
         (count, digest, None)
     } else {
-        let (count, digest, spool, report) =
-            rebuild_ranker_projection(&transaction, cache_path, &identity)?;
+        let (count, digest, spool, report) = rebuild_ranker_projection(
+            &transaction,
+            cache_path,
+            &identity,
+            proof.history.as_deref().ok_or(BootstrapError::Internal)?,
+        )?;
         inputs.projection_spool = Some(spool);
         inputs.certificate_digest = Some(digests::certificate_digest(&transaction)?);
         transaction.execute("UPDATE cache_v2_migration_state SET phase = 'finalized', ranker_projection_count = ?1,

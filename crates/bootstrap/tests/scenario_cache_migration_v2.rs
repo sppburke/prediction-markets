@@ -2573,20 +2573,8 @@ async fn refinalization_refuses_changed_or_missing_projection_proof() {
              WHERE market_id = '0xlater-a'",
             "input binding changed",
         ),
-        (
-            // Classifier six reads each market's token order and its venue page.
-            "payout_tokens",
-            "UPDATE clob_payout_evidence_v2 SET tokens_json = json_array(
-                 json_extract(tokens_json, '$[1]'), json_extract(tokens_json, '$[0]'))
-             WHERE market_id = '0xlater-a'",
-            "input binding changed",
-        ),
-        (
-            "payout_page",
-            "UPDATE clob_payout_evidence_v2 SET raw_page_sha256 = printf('%064d', 0)
-             WHERE market_id = '0xlater-a'",
-            "input binding changed",
-        ),
+        // Decision 9 / B3.1: historical format two binds only four payout fields;
+        // token order and raw-page commitments are format-three refusal cases below.
         (
             "projection_row",
             "UPDATE ranker_entries_v2 SET source_trade_id = 'g2:' || printf('%064d', 0)
@@ -7949,11 +7937,23 @@ fn seed_historical_format_two(path: &std::path::Path, classifier: u32, now: i64)
                 .unwrap();
         }
     }
-    let payout_rows = connection.prepare("SELECT market_id, end_date_unix, payout_status,
-        payout_vector_json, tokens_json, raw_page_sha256 FROM clob_payout_evidence_v2 ORDER BY market_id")
-        .unwrap().query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?,
-            row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, String>(4)?,
-            row.get::<_, String>(5)?))).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
+    let payout_rows = connection
+        .prepare(
+            "SELECT market_id, end_date_unix, payout_status,
+        payout_vector_json FROM clob_payout_evidence_v2 ORDER BY market_id",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
     let (payout_generation, payout_manifest): (u64, String) = connection.query_row(
         "SELECT generation, manifest_json FROM clob_payout_coverage_manifests_v2 ORDER BY generation DESC LIMIT 1",
         [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
@@ -10961,8 +10961,8 @@ async fn incremental_proof_loading_refuses_external_commit_before_wallet_writes(
     let connection = trace_collection_interleaving(
         &side,
         "SELECT MAX(generation) FROM activity_coverage_manifests_v2 WHERE generation < 7",
-        // Skip receipt-only startup's proof load; target the collector's proof.
-        1,
+        // Decision 6: receipt-only startup and the collector share one stable proof.
+        0,
         // This changes the manifest commitment after it was read, while leaving
         // historical receipt validation valid against the cached manifest.
         "UPDATE activity_coverage_manifests_v2 SET completed_at_unix = completed_at_unix + 1 WHERE generation = 1",
@@ -14017,16 +14017,47 @@ async fn quiet_wallet_deferral_preserves_exact_publication_entries() {
         String::from_utf8_lossy(&bridge.stderr)
     );
 }
-// PASS: two real zero-argument wrapper cycles activate, publish and clear both pointers;
-// the successor defers a quiet wallet without a request, export row or batch entry.
-// FAIL: either cycle fails, bypasses the real scripts, or admits deferred history.
+// PASS: real transition and bulk-root publications carry the AC8 mapping, raw-only and scoped-drop cases;
+// the successor defers quiet history and a token_conditions edit changes no published scope.
+// FAIL: a wallet is excluded for the accepted defects, a dropped market scores, or raw-only BUYs consume.
 #[tokio::test]
 async fn real_wrapper_two_cycles_publish_and_defer_quiet_wallet() {
-    real_wrapper_publications(false).await;
-    real_wrapper_publications(true).await;
+    real_wrapper_publications(PublicationScenario::Transition).await;
+    real_wrapper_publications(PublicationScenario::BulkRoot).await;
 }
 
-async fn real_wrapper_publications(bulk_root: bool) {
+// PASS: the frozen identity-two root resumes and seals, then the real cycle admits identity four
+// before classifier-six finalization and publishes only that successor through the v2 RPC.
+// FAIL: format two is finalized, acquisitions are relaxed before transition, or publication is bypassed.
+#[tokio::test]
+async fn real_wrapper_unfinished_format_two_root_publishes_only_its_successor() {
+    real_wrapper_publications(PublicationScenario::LegacyRoot).await;
+}
+
+// PASS: installed history damage after retirement fails the pass; explicit repair publishes.
+// Post-pass certificate/receipt damage refuses re-finalize; abandonment/restaging publishes the successor.
+// Deleting a drop trigger after retirement keeps its original scope and second through publication.
+// FAIL: damage is hidden, recovery relies on the retired backup/spool, or a scope reopens.
+#[tokio::test]
+async fn real_wrapper_repair_and_record_recovery_publish_after_backup_retirement() {
+    real_wrapper_publications(PublicationScenario::Recovery).await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PublicationScenario {
+    Transition,
+    BulkRoot,
+    LegacyRoot,
+    Recovery,
+}
+
+async fn real_wrapper_publications(scenario: PublicationScenario) {
+    let bulk_root = matches!(
+        scenario,
+        PublicationScenario::BulkRoot | PublicationScenario::LegacyRoot
+    );
+    let legacy_root = scenario == PublicationScenario::LegacyRoot;
+    let recovery = scenario == PublicationScenario::Recovery;
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
     use std::sync::atomic::AtomicBool;
@@ -14036,7 +14067,7 @@ async fn real_wrapper_publications(bulk_root: bool) {
         "22".repeat(14),
         (-(now + 3 * 86_400)).rem_euclid(604_800)
     );
-    let (mut rows, mut markets, points) = publication_dataset(now, &quiet);
+    let (mut rows, mut markets, mut points) = publication_dataset(now, &quiet);
     let mut conversion = dataset_row(WALLET, "0xe", "wrapper-conversion", "BUY", now - 220);
     conversion["type"] = Value::from("CONVERSION");
     conversion["asset"] = Value::from("8000");
@@ -14099,7 +14130,74 @@ async fn real_wrapper_publications(bulk_root: bool) {
         assert!(finalize_cache_v2_unbound(&fixed, None, now - 237).is_ok());
         assert_eq!(classifier_projection_rows(&fixed).len(), 40);
     }
-    if bulk_root {
+    // AC8 / Decision 1: these defects are acquired only under acquisition three, beside valid BUYs.
+    let scoped_row = |market: &str, token: &str, id: &str, epoch: i64| {
+        let mut row = dataset_row(WALLET, market, id, "BUY", epoch);
+        row["asset"] = Value::from(token);
+        row
+    };
+    for (kind, market, token, epoch) in [
+        ("SPLIT", "0xfc", "8200", now - 218),
+        ("MERGE", "0xfd", "8300", now - 216),
+    ] {
+        let mut mapped = scoped_row(market, token, &format!("mapped-{kind}"), epoch);
+        mapped["type"] = Value::from(kind);
+        mapped.as_object_mut().unwrap().remove("conditionId");
+        let mut ignored = mapped.clone();
+        ignored["transactionHash"] = Value::from(format!("ignored-{kind}"));
+        ignored.as_object_mut().unwrap().remove("asset");
+        ignored["timestamp"] = Value::from(epoch + 1);
+        rows.extend([
+            mapped,
+            scoped_row("0xfe", "8400", &format!("beside-mapped-{kind}"), epoch),
+            ignored,
+            scoped_row(
+                if kind == "SPLIT" { "0xf1" } else { "0xf2" },
+                if kind == "SPLIT" { "8500" } else { "8600" },
+                &format!("beside-ignored-{kind}"),
+                epoch + 1,
+            ),
+        ]);
+    }
+    rows.extend([
+        scoped_row("\\xfb", "8100", "hex-trade", now - 210),
+        scoped_row("0xfb", "8100", "canonical-after-hex", now - 209),
+    ]);
+    for (market, token, second, same_second) in [
+        ("0xf3", "8700", now - 204, false),
+        ("0xf4", "8800", now - 202, true),
+    ] {
+        let mut tokenless = scoped_row(
+            market,
+            token,
+            &format!("tokenless-{market}"),
+            second - i64::from(!same_second),
+        );
+        tokenless.as_object_mut().unwrap().remove("asset");
+        tokenless["outcomeIndex"] = Value::from("1");
+        rows.extend([
+            tokenless,
+            scoped_row(market, token, &format!("bound-{market}"), second),
+        ]);
+    }
+    for (market, token, epoch) in [
+        ("0xfb", 8100, now - 210),
+        ("0xfc", 8200, now - 218),
+        ("0xfd", 8300, now - 216),
+        ("0xfe", 8400, now - 218),
+        ("0xf1", 8500, now - 217),
+        ("0xf2", 8600, now - 215),
+        ("0xf3", 8700, now - 204),
+        ("0xf4", 8800, now - 202),
+    ] {
+        markets.push(serde_json::json!({"condition_id":market,"closed":true,"neg_risk":false,"is_50_50_outcome":false,
+            "end_date_iso":time::OffsetDateTime::from_unix_timestamp(epoch + 7200).unwrap()
+                .format(&time::format_description::well_known::Rfc3339).unwrap(),
+            "tokens":[{"token_id":token.to_string(),"outcome":"Yes","price":"1","winner":true},
+                {"token_id":(token + 1).to_string(),"outcome":"No","price":"0","winner":false}]}));
+        points.push((token.to_string(), epoch + 2, "0.55".to_owned()));
+    }
+    if bulk_root && !legacy_root {
         // AC5: a raw-only market-less SPLIT beside a valid BUY reaches the new root's pass.
         let buy = rows
             .iter()
@@ -14114,6 +14212,9 @@ async fn real_wrapper_publications(bulk_root: bool) {
         ignored.as_object_mut().unwrap().remove("conditionId");
         rows.push(ignored);
     }
+    let fixture_markets = markets.clone();
+    let activity_rows = Arc::new(Mutex::new(rows));
+    let server_rows = Arc::clone(&activity_rows);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
@@ -14174,7 +14275,9 @@ async fn real_wrapper_publications(bulk_root: bool) {
                     let start = query["start"].parse::<i64>().unwrap();
                     let end = query["end"].parse::<i64>().unwrap();
                     let offset = query["offset"].parse::<usize>().unwrap();
-                    let mut selected = rows
+                    let mut selected = server_rows
+                        .lock()
+                        .unwrap()
                         .iter()
                         .filter(|row| {
                             row["proxyWallet"] == query["user"]
@@ -14284,12 +14387,256 @@ async fn real_wrapper_publications(bulk_root: bool) {
         .unwrap();
     assert!(python.status.success());
     let python = String::from_utf8(python.stdout).unwrap();
+    let run_wrapper = || {
+        Command::new("bash").args(["-c", "exec 9<>data/eval-results/.rank_and_push_loop.lock; flock -n 9; printf '%s\\n' \"$$\" > data/eval-results/.rank_and_push_loop.lock; exec bash scripts/rank_and_push.sh"])
+            .current_dir(dir.path()).env("PE_PYTHON", python.trim()).env("RUST_LOG", "info").env_remove("PYTHONPATH").output().unwrap()
+    };
+    let prepare_cycle = |cycle: i64| {
+        let stamp = time::OffsetDateTime::from_unix_timestamp(now + cycle)
+            .unwrap()
+            .format(
+                &time::format_description::parse("[year][month][day]T[hour][minute][second]Z")
+                    .unwrap(),
+            )
+            .unwrap();
+        let name = format!("cron-{stamp}");
+        let out = data.join("eval-results").join(&name);
+        std::fs::create_dir_all(&out).unwrap();
+        for (file, value) in [
+            (
+                "cycle_configuration.json",
+                serde_json::json!({"cache_lane":"fresh_v2"}),
+            ),
+            (
+                "cycle_manifest.json",
+                serde_json::json!({"version":1,"configuration":{"cache_lane":"fresh_v2"}}),
+            ),
+        ] {
+            std::fs::write(out.join(file), serde_json::to_vec(&value).unwrap()).unwrap();
+        }
+        let side = data.join(format!("wallet_cache.{name}.side.db"));
+        let prior = data.join(format!("wallet_cache.{name}.prior.db"));
+        let build = out.join("cache_build_manifest.json");
+        let report = pe_bootstrap::cache_migration::stage_cache_cycle_v2(
+            &fixed,
+            &prior,
+            &side,
+            Some(&build),
+            None,
+        )
+        .unwrap();
+        std::fs::write(
+            out.join("cache_stage.json"),
+            serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            data.join("eval-results/rank_and_push.cycle"),
+            format!("data/eval-results/{name}\n"),
+        )
+        .unwrap();
+        (out, side, prior, build)
+    };
+    let abandon_candidate = |out: &std::path::Path, side: &std::path::Path, error: &str| {
+        // The fixture process has exited and releases the same lock used by restaging.
+        let _lock = pe_bootstrap::lock::CacheMutationLock::acquire(&fixed).unwrap();
+        assert!(!data.join("eval-results/rank_and_push.pending").exists());
+        assert!(!out.join("ranking_publish_request.json").exists());
+        std::fs::write(out.join("failure-evidence.txt"), error).unwrap();
+        std::fs::remove_file(data.join("eval-results/rank_and_push.cycle")).unwrap();
+        for path in [
+            side.to_owned(),
+            pe_bootstrap::cache_migration::cache_stage_evidence_path(side),
+            std::path::PathBuf::from(format!("{}.projection-v3.jsonl", side.display())),
+        ] {
+            if path.exists() {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        let prefix = format!(
+            ".{}.projection-v3.jsonl.",
+            side.file_name().unwrap().to_str().unwrap()
+        );
+        for entry in std::fs::read_dir(&data).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            let name = name.to_str().unwrap();
+            if name.starts_with(&prefix) && name.ends_with(".tmp") {
+                std::fs::remove_file(entry.path()).unwrap();
+            }
+        }
+        assert!(!side.exists());
+    };
+    if legacy_root {
+        let (out, side, _, build) = prepare_cycle(0);
+        migrate_cache_v2(&side, &build).unwrap();
+        history_v3_freeze_legacy_root_at(&side, &[WALLET, &quiet], 1, now - 240);
+        Connection::open(&side)
+            .unwrap()
+            .execute_batch(
+                "DROP INDEX idx_activity_groups_v2_source_trade_id; PRAGMA user_version = -2",
+            )
+            .unwrap();
+        pe_bootstrap::cache_migration::populate_activity_bulk_root_v2_with_clock(
+            &collection_config(&side),
+            &fixed,
+            None,
+            &HistoryV3StopFetcher,
+            "https://data.example",
+            || Ok(now - 240),
+            now - 239,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(fresh_record(&side)["version"], 2);
+        assert_eq!(count(&side, "PRAGMA user_version"), -2);
+        assert!(out.join("cache_stage.json").exists());
+    }
     let mut cycles = Vec::new();
-    let total_cycles = if bulk_root { 1 } else { 2 };
+    let total_cycles = if recovery {
+        6
+    } else if bulk_root {
+        1
+    } else {
+        2
+    };
     for cycle in 0..total_cycles {
+        if recovery && cycle > 0 {
+            let cycle_end = time::OffsetDateTime::now_utc().unix_timestamp() - 120;
+            // Previous successful publication already retired its displaced backup and spool.
+            assert!(!data.read_dir().unwrap().any(|entry| {
+                let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+                name.ends_with(".displaced.db") || name.ends_with(".projection-v3.jsonl")
+            }));
+            if cycle == 2 {
+                history_v3_damage_connection(&fixed).execute(
+                    "UPDATE activity_groups_v2 SET share_amount_str = '10.000001' WHERE transaction_hash = ?1",
+                    [format!("{WALLET}-entry-0")],
+                ).unwrap();
+                let failed = run_wrapper();
+                assert!(!failed.status.success());
+                let error = String::from_utf8(failed.stderr).unwrap();
+                assert!(error.contains("activity history chain mismatch"), "{error}");
+                assert!(error.contains(WALLET), "{error}");
+                assert_eq!(batches.lock().unwrap().len(), 2);
+                let relative =
+                    std::fs::read_to_string(data.join("eval-results/rank_and_push.cycle")).unwrap();
+                let out = dir.path().join(relative.trim());
+                let side = data.join(format!(
+                    "wallet_cache.{}.side.db",
+                    out.file_name().unwrap().to_str().unwrap()
+                ));
+                abandon_candidate(&out, &side, &error);
+            }
+            let (out, side, _, _) = prepare_cycle(i64::from(cycle) + 30);
+            let source = DatasetFetcher {
+                rows: activity_rows.lock().unwrap().clone(),
+                ..Default::default()
+            };
+            if cycle == 1 || cycle == 3 || cycle == 4 {
+                history_v3_collect(
+                    &side,
+                    &source,
+                    u64::try_from(cycle + 2).unwrap(),
+                    cycle_end,
+                    &[],
+                )
+                .await
+                .unwrap();
+                publication_payouts(&side, &fixture_markets, now);
+                if cycle != 1 {
+                    finalize_cache_v2_unbound(&side, None, now).unwrap();
+                }
+                let connection = history_v3_damage_connection(&side);
+                if cycle == 1 {
+                    connection.execute("UPDATE activity_groups_v2 SET share_amount_str = '10.000001' WHERE transaction_hash = ?1", [format!("{WALLET}-entry-0")]).unwrap();
+                } else if cycle == 3 {
+                    connection.execute("UPDATE activity_wallet_history_v3 SET newest_source_unix = newest_source_unix - 1, newest_trade_unix = newest_trade_unix - 1 WHERE wallet_hex = ?1", [WALLET]).unwrap();
+                } else {
+                    connection.execute("UPDATE activity_wallet_coverage_staging_v2 SET ordered_aggregate_digest = ?1 WHERE generation = ?2 AND wallet_hex = ?3", params!["0".repeat(64), cycle + 2, WALLET]).unwrap();
+                }
+                drop(connection);
+                let error = finalize_cache_v2_unbound(&side, None, now + 1)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains(if cycle == 1 {
+                        "activity history chain mismatch"
+                    } else if cycle == 3 {
+                        "activity_wallet_history_v3 certificate digest mismatch"
+                    } else {
+                        "historical receipt-set commitment mismatch"
+                    }),
+                    "{error}"
+                );
+                assert_eq!(
+                    batches.lock().unwrap().len(),
+                    usize::try_from(cycle).unwrap()
+                );
+                abandon_candidate(&out, &side, &error);
+                let prior = data.join(format!(
+                    "wallet_cache.{}.prior.db",
+                    out.file_name().unwrap().to_str().unwrap()
+                ));
+                let report = pe_bootstrap::cache_migration::stage_cache_cycle_v2(
+                    &fixed, &prior, &side, None, None,
+                )
+                .unwrap();
+                std::fs::write(
+                    out.join("cache_stage.json"),
+                    serde_json::to_vec(&report).unwrap(),
+                )
+                .unwrap();
+                std::fs::write(
+                    data.join("eval-results/rank_and_push.cycle"),
+                    format!(
+                        "data/eval-results/{}\n",
+                        out.file_name().unwrap().to_str().unwrap()
+                    ),
+                )
+                .unwrap();
+            }
+            if cycle == 1 || cycle == 2 || cycle == 5 {
+                if cycle == 5 {
+                    activity_rows.lock().unwrap().retain(|row| {
+                        !matches!(
+                            row["transactionHash"].as_str(),
+                            Some(
+                                "wrapper-conversion"
+                                    | "hex-trade"
+                                    | "mapped-SPLIT"
+                                    | "mapped-MERGE"
+                            )
+                        )
+                    });
+                }
+                let source = DatasetFetcher {
+                    rows: activity_rows.lock().unwrap().clone(),
+                    ..Default::default()
+                };
+                history_v3_collect(
+                    &side,
+                    &source,
+                    u64::try_from(cycle + 2).unwrap(),
+                    cycle_end,
+                    &[WALLET.to_owned()],
+                )
+                .await
+                .unwrap();
+                if cycle == 5 {
+                    assert_eq!(
+                        count(
+                            &side,
+                            "SELECT COUNT(*) FROM activity_groups_v2 WHERE transaction_hash IN ('wrapper-conversion','hex-trade','mapped-SPLIT','mapped-MERGE')"
+                        ),
+                        0
+                    );
+                }
+            }
+        }
         let before = requests.lock().unwrap().len();
-        let output = Command::new("bash").args(["-c", "exec 9<>data/eval-results/.rank_and_push_loop.lock; flock -n 9; printf '%s\\n' \"$$\" > data/eval-results/.rank_and_push_loop.lock; exec bash scripts/rank_and_push.sh"])
-            .current_dir(dir.path()).env("PE_PYTHON", python.trim()).env("RUST_LOG", "info").env_remove("PYTHONPATH").output().unwrap();
+        let output = run_wrapper();
         assert!(
             output.status.success(),
             "real wrapper cycle {cycle}:\nstdout={}\nstderr={}",
@@ -14314,8 +14661,12 @@ async fn real_wrapper_publications(bulk_root: bool) {
         assert_eq!(reports.len(), 1);
         assert_eq!(
             reports[0]["ignored_by_activity_type"]["SPLIT"],
-            if bulk_root { 2 } else { 1 }
+            if bulk_root && !legacy_root { 3 } else { 2 }
         );
+        // Decision 1: unmapped SPLIT/MERGE and the noncanonical TRADE drop their resolved markets.
+        assert_eq!(reports[0]["ignored_by_activity_type"]["MERGE"], 1);
+        assert_eq!(reports[0]["ignored_by_activity_type"]["TRADE"], 2);
+        assert_eq!(reports[0]["drops_by_cause"]["unmapped"], 3);
         assert_eq!(reports[0]["drops_by_cause"]["conversion"], 1);
         assert_eq!(reports[0]["neg_risk_markets_without_group_id"], 0);
         let run = stdout
@@ -14331,8 +14682,31 @@ async fn real_wrapper_publications(bulk_root: bool) {
         let identity = fresh_record(&fixed);
         assert_eq!(
             identity["generation"],
-            cycle + if bulk_root { 1 } else { 2 }
+            cycle + if bulk_root && !legacy_root { 1 } else { 2 }
         );
+        if legacy_root {
+            assert!(stdout.contains("activity-top-up"), "{stdout}");
+            let receipts = stored_receipt_proofs(&Connection::open(&fixed).unwrap(), 1);
+            assert!(
+                receipts
+                    .iter()
+                    .all(|receipt| receipt["acquisition"]["version"] == 2)
+            );
+            assert_eq!(
+                count(
+                    &fixed,
+                    "SELECT COUNT(*) FROM activity_coverage_manifests_v2"
+                ),
+                2
+            );
+            assert_eq!(
+                count(
+                    &fixed,
+                    "SELECT ranker_classifier_version FROM cache_v2_migration_state"
+                ),
+                6
+            );
+        }
         // Decision 9: each new cycle freezes collection identity 4.
         assert_eq!(identity["version"], 4);
         let new_requests = requests.lock().unwrap()[before..].to_vec();
@@ -14344,7 +14718,8 @@ async fn real_wrapper_publications(bulk_root: bool) {
         } else {
             assert!(!quiet_requested, "{new_requests:?}");
             assert_eq!(identity["deferred_wallets"], serde_json::json!([quiet]));
-            let proofs = stored_receipt_proofs(&Connection::open(&fixed).unwrap(), 3);
+            let proofs =
+                stored_receipt_proofs(&Connection::open(&fixed).unwrap(), i64::from(cycle + 2));
             let deferred = proofs
                 .iter()
                 .find(|proof| proof["wallet_hex"] == quiet)
@@ -14359,7 +14734,8 @@ async fn real_wrapper_publications(bulk_root: bool) {
                 count(
                     &fixed,
                     &format!(
-                        "SELECT COUNT(*) FROM activity_wallet_history_v3 WHERE wallet_hex = '{quiet}' AND generation = 3"
+                        "SELECT COUNT(*) FROM activity_wallet_history_v3 WHERE wallet_hex = '{quiet}' AND generation = {}",
+                        cycle + 2
                     )
                 ),
                 0
@@ -14385,22 +14761,116 @@ async fn real_wrapper_publications(bulk_root: bool) {
             batch["p_entries"][0]["history_through_unix"],
             identity["fixed_end_unix"]
         );
-        assert_eq!(
-            saved["entries"][0]["scope_drops"],
-            serde_json::json!([
-            {"scope_kind":"event","scope_id":"0xe","dropped_at_unix":now - 220,"cause":"conversion"}])
+        let expected_drops = serde_json::json!([
+            {"scope_kind":"event","scope_id":"0xe","dropped_at_unix":now - 220,"cause":"conversion"},
+            {"scope_kind":"market","scope_id":"0xfb","dropped_at_unix":now - 210,"cause":"unmapped"},
+            {"scope_kind":"market","scope_id":"0xfc","dropped_at_unix":now - 218,"cause":"unmapped"},
+            {"scope_kind":"market","scope_id":"0xfd","dropped_at_unix":now - 216,"cause":"unmapped"}
+        ]);
+        assert_eq!(saved["entries"][0]["scope_drops"], expected_drops);
+        let flattened: Vec<Value> = expected_drops
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|drop| {
+                let mut drop = drop.clone();
+                drop["wallet_hex"] = Value::from(WALLET);
+                drop
+            })
+            .collect();
+        assert_eq!(batch["p_scope_drops"], Value::from(flattened));
+        if cycle > 0 {
+            // AC8: changing the mutable token_conditions map changes no published scope.
+            assert_eq!(
+                batch["p_scope_drops"],
+                batches.lock().unwrap()[0]["p_scope_drops"]
+            );
+        }
+        let projection = Command::new("python3").args(["-c", "import duckdb,json,sys; c=duckdb.connect(); r=c.execute('SELECT condition_id, source_time_unix, outcome_id FROM read_parquet(?)', [sys.argv[1]]); print(json.dumps([dict(zip([d[0] for d in r.description], row)) for row in r.fetchall()]))"])
+            .arg(data.join("parquet/projection.parquet")).output().unwrap();
+        assert!(
+            projection.status.success(),
+            "{}",
+            String::from_utf8_lossy(&projection.stderr)
         );
-        assert_eq!(
-            batch["p_scope_drops"],
-            serde_json::json!([
-            {"wallet_hex":WALLET,"scope_kind":"event","scope_id":"0xe","dropped_at_unix":now - 220,"cause":"conversion"}])
-        );
+        let projected: Vec<Value> = serde_json::from_slice(&projection.stdout).unwrap();
+        for market in ["0xfb", "0xfc", "0xfd", "0xfe"] {
+            assert!(
+                !projected.iter().any(|row| row["condition_id"] == market),
+                "{market}"
+            );
+        }
+        for (market, epoch) in [
+            ("0xf1", now - 217),
+            ("0xf2", now - 215),
+            ("0xf3", now - 204),
+            ("0xf4", now - 202),
+        ] {
+            let entries: Vec<_> = projected
+                .iter()
+                .filter(|row| row["condition_id"] == market)
+                .collect();
+            // Decision 1: an ignored row cannot consume, create a balance, or alter homogeneity.
+            assert_eq!(entries.len(), 1, "{market}: {entries:?}");
+            assert_eq!(entries[0]["source_time_unix"], epoch);
+            assert_eq!(entries[0]["outcome_id"], 0);
+        }
         // Decisions 4 and 5: the second cycle has no fetched rows for this available
         // wallet, but its whole checked history still supplies freshness and entries.
-        if cycle == 1 {
+        if cycle == 1 && !recovery {
             assert_eq!(receipt(&fixed, 3, WALLET), Some((0, 0, 0)));
         }
-        assert_eq!(batch["p_entries"][0]["last_trade_unix"], now - 3600);
+        // Acquisition three records recency from the acquired TRADEs, including the raw-only rows.
+        assert_eq!(batch["p_entries"][0]["last_trade_unix"], now - 202);
+        assert!(
+            !std::path::Path::new(
+                saved["cache_activation"]["prior_cache_backup_path"]
+                    .as_str()
+                    .unwrap()
+            )
+            .exists()
+        );
+        let side_path = saved["cache_activation"]["side_path"].as_str().unwrap();
+        assert!(!std::path::Path::new(&format!("{side_path}.projection-v3.jsonl")).exists());
+        if recovery && cycle == 0 {
+            let retired = std::path::Path::new(
+                saved["cache_activation"]["prior_cache_backup_path"]
+                    .as_str()
+                    .unwrap(),
+            );
+            let side = std::path::Path::new(side_path);
+            let (request, pending) =
+                write_pending_publication(&dir, "retired", side, &fixed, &fixed, retired);
+            let installed_hash = sha256_file(&fixed).unwrap();
+            let error = restore_prior_cache(
+                &fixed,
+                retired,
+                side,
+                &PriorCacheBinding {
+                    sha256: "0".repeat(64),
+                    schema_version: 2,
+                },
+                &request,
+                &pending,
+                &FixedPublicationProbe(true),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains(
+                    "restore is retired after the bound ranking publication was consumed"
+                ),
+                "{error}"
+            );
+            assert_eq!(sha256_file(&fixed).unwrap(), installed_hash);
+            std::fs::remove_file(pending).unwrap();
+        }
+        if cycle == 0 && !bulk_root {
+            let changed = Connection::open(&fixed).unwrap().execute(
+                "UPDATE token_conditions SET condition_id = '0xfa', outcome_index = 1 WHERE token_id IN ('8100','8200','8300')", []
+            ).unwrap();
+            assert_eq!(changed, 3);
+        }
         assert!(!cycles.contains(&out));
         cycles.push(out);
     }
@@ -15813,6 +16283,8 @@ async fn projection_v3_refinalize_refuses_certificate_receipt_spool_and_export_d
         "missing",
         "export",
         "group_version",
+        "payout_tokens",
+        "payout_page",
     ] {
         let dir = TempDir::new().unwrap();
         let side = dataset_candidate(&dir, "damage.db", &[]);
@@ -15854,6 +16326,17 @@ async fn projection_v3_refinalize_refuses_certificate_receipt_spool_and_export_d
                 )
                 .unwrap();
             }
+            // C5: format three retains the seven-field payout commitment.
+            "payout_tokens" => {
+                Connection::open(&side).unwrap().execute(
+                    "UPDATE clob_payout_evidence_v2 SET tokens_json = json_array(json_extract(tokens_json, '$[1]'), json_extract(tokens_json, '$[0]')) WHERE market_id = '0xa'", [],
+                ).unwrap();
+            }
+            "payout_page" => {
+                Connection::open(&side).unwrap().execute(
+                    "UPDATE clob_payout_evidence_v2 SET raw_page_sha256 = ?1 WHERE market_id = '0xa'", ["0".repeat(64)],
+                ).unwrap();
+            }
             "group_version" => {
                 Connection::open(&side)
                     .unwrap()
@@ -15880,6 +16363,12 @@ async fn projection_v3_refinalize_refuses_certificate_receipt_spool_and_export_d
             !dir.path().join("again.final.json").exists(),
             "{damage}: {error}"
         );
+        if matches!(damage, "payout_tokens" | "payout_page") {
+            assert!(
+                error.to_string().contains("input binding changed"),
+                "{error}"
+            );
+        }
         if damage == "certificate" {
             assert!(
                 error
@@ -16472,4 +16961,163 @@ async fn projection_v3_sample_refuses_an_untraceable_certified_drop() {
         "{error}"
     );
     assert_eq!(sha256_file(&side).unwrap(), before);
+}
+
+// PASS: an authentic classifier-3 format-two commitment with payout evidence is reused unchanged.
+// FAIL: reuse changes the digest or treats the historical four-field payout binding as damage.
+#[tokio::test]
+async fn historical_classifier_three_reuses_four_field_payout_commitment() {
+    let dir = TempDir::new().unwrap();
+    let (side, _) = history_v3_legacy_seed(
+        &dir,
+        vec![projection_v3_row("0xa", "historical", FRESH_END)],
+    )
+    .await;
+    projection_v3_payouts(&side);
+    seed_historical_format_two(&side, 3, FRESH_END + 1);
+    let before = query_values(
+        &side,
+        "SELECT ranker_projection_count, ranker_projection_digest, ranker_projection_inputs_json FROM cache_v2_migration_state",
+    );
+    assert!(count(&side, "SELECT COUNT(*) FROM clob_payout_evidence_v2") > 0);
+    assert_eq!(before[0][0], rusqlite::types::Value::Integer(1));
+    let stage = finalize_cache_v2_unbound(
+        &side,
+        Some(&dir.path().join("historical.final.json")),
+        FRESH_END + 2,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(stage.ranker_classifier_version, 3);
+    assert_eq!(
+        before,
+        query_values(
+            &side,
+            "SELECT ranker_projection_count, ranker_projection_digest, ranker_projection_inputs_json FROM cache_v2_migration_state"
+        )
+    );
+    assert_eq!(
+        before[0][1],
+        rusqlite::types::Value::Text(stage.ranker_projection_digest)
+    );
+}
+
+// PASS: each collection invocation reports its own commit modes, row I/O and separate fetch/drain times,
+// including a sealed resume and a failed verification after the writer drains accepted work.
+// FAIL: counters include earlier runs, unchanged full reads touch history, or an error suppresses the event.
+#[tokio::test]
+async fn history_v3_collection_reports_run_timing_and_writer_counts() {
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "timing.db", &[]);
+    let mut source = DatasetFetcher {
+        rows: vec![projection_v3_row("0xa", "a", FRESH_END)],
+        ..Default::default()
+    };
+    history_v3_collect(&side, &source, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    projection_v3_payouts(&side);
+    finalize_cache_v2_unbound(&side, None, FRESH_END + 1).unwrap();
+    admit_dataset_wallet(&side, WALLET_B);
+    source.rows.extend([
+        projection_v3_row("0xb", "b", FRESH_END + 1),
+        dataset_row(WALLET_B, "0xa", "new", "BUY", FRESH_END + 1),
+    ]);
+    let log = CheckLog::default();
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    let take = |generation, incremental, full, unchanged, excluded, inserted, deleted, verified| {
+        let events = log.take_named("activity collection run completed");
+        assert_eq!(events.len(), 1, "{events:?}");
+        let fields = &events[0]["fields"];
+        assert_eq!(fields["generation"], generation);
+        assert!(fields["run_started_at_unix"].as_i64().is_some());
+        for name in [
+            "fetch_completed_ms",
+            "writer_completed_ms",
+            "producer_blocked_ms",
+            "final_drain_ms",
+        ] {
+            assert!(fields[name].as_u64().is_some(), "{fields}");
+        }
+        let difference = fields["writer_completed_ms"]
+            .as_u64()
+            .unwrap()
+            .saturating_sub(fields["fetch_completed_ms"].as_u64().unwrap());
+        assert!(difference.saturating_sub(fields["final_drain_ms"].as_u64().unwrap()) <= 1);
+        assert_eq!(fields["incremental_wallets"], incremental);
+        assert_eq!(fields["differing_full_wallets"], full);
+        assert_eq!(fields["unchanged_full_wallets"], unchanged);
+        assert_eq!(fields["excluded_wallets"], excluded);
+        assert_eq!(fields["deferred_wallets"], 0);
+        assert_eq!(fields["rows_inserted"], inserted);
+        assert_eq!(fields["rows_deleted"], deleted);
+        assert_eq!(fields["rows_verified"], verified);
+    };
+    take(2, 1, 1, 0, 0, 2, 0, 0);
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    take(2, 0, 0, 0, 0, 0, 0, 0);
+    source.rows.push(history_v3_bad_row(FRESH_END + 2));
+    history_v3_collect(&side, &source, 3, FRESH_END + 2, &[])
+        .await
+        .unwrap();
+    take(3, 1, 0, 0, 1, 0, 0, 2);
+    source
+        .rows
+        .retain(|row| row["transactionHash"] != "bad-price");
+    history_v3_collect(&side, &source, 4, FRESH_END + 3, &[])
+        .await
+        .unwrap();
+    take(4, 1, 0, 1, 0, 0, 0, 0);
+    history_v3_collect(&side, &source, 5, FRESH_END + 4, &[WALLET.to_owned()])
+        .await
+        .unwrap();
+    take(5, 1, 1, 0, 0, 2, 2, 2);
+    source.rows.push(history_v3_bad_row(FRESH_END + 5));
+    history_v3_damage_connection(&side)
+        .execute(
+            "UPDATE activity_groups_v2 SET share_amount_str = '2.250001' WHERE wallet_hex = ?1",
+            [WALLET],
+        )
+        .unwrap();
+    let error = history_v3_collect(&side, &source, 6, FRESH_END + 5, &[])
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("activity history chain mismatch"),
+        "{error}"
+    );
+    let events = log.take_named("activity collection run completed");
+    assert_eq!(events.len(), 1, "{events:?}");
+    let fields = &events[0]["fields"];
+    assert_eq!(fields["generation"], 6);
+    assert_eq!(fields["rows_verified"], 2);
+    assert_eq!(fields["excluded_wallets"], 0);
+    assert_eq!(fields["rows_deleted"], 0);
+    let already_committed = count(
+        &side,
+        "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2 WHERE generation = 6",
+    );
+    history_v3_damage_connection(&side)
+        .execute(
+            "UPDATE activity_groups_v2 SET share_amount_str = '1.250001' WHERE wallet_hex = ?1",
+            [WALLET],
+        )
+        .unwrap();
+    history_v3_collect(&side, &source, 6, FRESH_END + 5, &[])
+        .await
+        .unwrap();
+    take(6, 1 - already_committed, 0, 0, 1, 0, 0, 2);
 }

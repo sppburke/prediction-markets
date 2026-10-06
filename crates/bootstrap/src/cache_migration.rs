@@ -399,21 +399,6 @@ impl RankerProjectionInputs {
         // projection digest, including markets that are not currently eligible.
         // Like the rebuild, read the whole payout table without a generation
         // filter. No activity rows are needed for this commitment.
-        let mut statement = connection.prepare(
-            "SELECT market_id, end_date_unix, payout_status, payout_vector_json, tokens_json,
-                    raw_page_sha256
-             FROM clob_payout_evidence_v2 ORDER BY market_id",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<i64>>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, Option<String>>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-            ))
-        })?;
         let format_three =
             fresh_collection_record(connection)?.is_some_and(|identity| identity.version == 4);
         let mut payout_evidence_digest = JsonArrayDigest::new();
@@ -446,6 +431,18 @@ impl RankerProjectionInputs {
                 ))?;
             }
         } else {
+            let mut statement = connection.prepare(
+                "SELECT market_id, end_date_unix, payout_status, payout_vector_json
+                 FROM clob_payout_evidence_v2 ORDER BY market_id",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?;
             for row in rows {
                 payout_evidence_digest.push(&row?)?;
             }
@@ -1357,8 +1354,18 @@ fn begin_or_resume_fresh_collection(
         connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let _authorization = authorize_history_writes(&transaction)?;
     let recorded = fresh_collection_record(&transaction)?;
-    verify_history_certificates(&transaction)?;
     let format_three = recorded.as_ref().is_some_and(|record| record.version == 4);
+    let collection_proof = if format_three {
+        CollectionProof::load(
+            &transaction,
+            recorded
+                .as_ref()
+                .ok_or(BootstrapError::Internal)?
+                .generation,
+        )?
+    } else {
+        None
+    };
     if bulk_root {
         let version: i64 =
             transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -1490,10 +1497,9 @@ fn begin_or_resume_fresh_collection(
     let mut due = BTreeSet::new();
     let mut prior_exclusions = BTreeSet::new();
     let mut transition = Vec::new();
-    let history_proof = recorded
+    let history_proof = collection_proof
         .as_ref()
-        .map(|record| incremental::HistoryProof::load(&transaction, record))
-        .transpose()?;
+        .and_then(|proof| proof.history.as_deref());
     if let Some(manifest) = &prior {
         let identity = activity_identity(&transaction)?;
         let prior_generation = to_i64(manifest.generation, "activity generation")?;
@@ -1505,6 +1511,7 @@ fn begin_or_resume_fresh_collection(
                 identity.fixed_end_unix,
                 &identity.wallets,
                 generation_rows,
+                collection_proof.as_ref(),
                 |validation, receipt| {
                     let newest = if format_three {
                         validation.record_fetched(receipt)?;
@@ -1798,6 +1805,70 @@ fn transition_excluded_wallet(
     Ok(None)
 }
 
+#[derive(Default)]
+struct CollectionWriteCounts {
+    incremental_wallets: u64,
+    differing_full_wallets: u64,
+    unchanged_full_wallets: u64,
+    excluded_wallets: u64,
+    deferred_wallets: u64,
+    rows_inserted: u64,
+    rows_deleted: u64,
+    rows_verified: u64,
+}
+
+impl CollectionWriteCounts {
+    fn add(&mut self, other: Self) -> Result<(), BootstrapError> {
+        self.incremental_wallets =
+            checked_activity_count(self.incremental_wallets, other.incremental_wallets)?;
+        self.differing_full_wallets =
+            checked_activity_count(self.differing_full_wallets, other.differing_full_wallets)?;
+        self.unchanged_full_wallets =
+            checked_activity_count(self.unchanged_full_wallets, other.unchanged_full_wallets)?;
+        self.excluded_wallets =
+            checked_activity_count(self.excluded_wallets, other.excluded_wallets)?;
+        self.deferred_wallets =
+            checked_activity_count(self.deferred_wallets, other.deferred_wallets)?;
+        self.rows_inserted = checked_activity_count(self.rows_inserted, other.rows_inserted)?;
+        self.rows_deleted = checked_activity_count(self.rows_deleted, other.rows_deleted)?;
+        self.rows_verified = checked_activity_count(self.rows_verified, other.rows_verified)?;
+        Ok(())
+    }
+}
+
+fn log_collection_run(
+    generation: u64,
+    run_started_at_unix: i64,
+    fetch_completed: Duration,
+    writer_completed: Duration,
+    producer_blocked: Duration,
+    counts: &CollectionWriteCounts,
+) -> Result<(), BootstrapError> {
+    tracing::info!(
+        generation,
+        run_started_at_unix,
+        fetch_completed_ms =
+            u64::try_from(fetch_completed.as_millis()).map_err(|_| BootstrapError::Internal)?,
+        writer_completed_ms =
+            u64::try_from(writer_completed.as_millis()).map_err(|_| BootstrapError::Internal)?,
+        producer_blocked_ms =
+            u64::try_from(producer_blocked.as_millis()).map_err(|_| BootstrapError::Internal)?,
+        final_drain_ms =
+            u64::try_from(writer_completed.saturating_sub(fetch_completed).as_millis())
+                .map_err(|_| BootstrapError::Internal)?,
+        incremental_wallets = counts.incremental_wallets,
+        differing_full_wallets = counts.differing_full_wallets,
+        unchanged_full_wallets = counts.unchanged_full_wallets,
+        excluded_wallets = counts.excluded_wallets,
+        deferred_wallets = counts.deferred_wallets,
+        rows_inserted = counts.rows_inserted,
+        rows_deleted = counts.rows_deleted,
+        rows_verified = counts.rows_verified,
+        "activity collection run completed"
+    );
+    Ok(())
+}
+
 async fn collect_activity_v2(
     mut connection: Connection,
     fetcher: &dyn ReconciliationFetcher,
@@ -1814,13 +1885,30 @@ async fn collect_activity_v2(
         wallets,
     } = identity;
     let (generation, fixed_end_unix) = (*generation, *fixed_end_unix);
+    let began = Instant::now();
+    let run_started_at_unix = OffsetDateTime::now_utc().unix_timestamp();
+    let proof = CollectionProof::load(&connection, generation)?;
     if let Some(manifest) = completed_activity_manifest(
         &connection,
         generation,
         reference_sha256,
         fixed_end_unix,
         wallets,
+        proof.as_ref(),
     )? {
+        if proof
+            .as_ref()
+            .is_some_and(|proof| proof.identity.version == 4)
+        {
+            log_collection_run(
+                generation,
+                run_started_at_unix,
+                began.elapsed(),
+                began.elapsed(),
+                Duration::ZERO,
+                &CollectionWriteCounts::default(),
+            )?;
+        }
         return Ok(manifest);
     }
     // Wallet writes are atomic. An intact receipt now skips its wallet even if
@@ -1831,6 +1919,7 @@ async fn collect_activity_v2(
         reference_sha256,
         fixed_end_unix,
         wallets,
+        proof.as_ref(),
     )?;
     let missing = wallets
         .iter()
@@ -1838,7 +1927,6 @@ async fn collect_activity_v2(
         .cloned()
         .collect::<Vec<_>>();
 
-    let proof = CollectionProof::load(&connection, generation)?;
     if proof.as_ref().is_some_and(|proof| proof.bulk_root) {
         // The final sort is far larger than Forge's memory. SQLITE_TMPDIR is an
         // operator-selected disk directory; never force this workload into RAM.
@@ -1998,11 +2086,12 @@ async fn collect_activity_v2(
     let writer = std::thread::Builder::new()
         .name("activity-cache-writer".to_owned())
         .spawn(move || {
+            let mut counts = CollectionWriteCounts::default();
             // One decode pool serves every carried wallet of this collection. A
             // commit failure is recorded where it happens, before the pool stops.
             let pool = aggregate_scan::scoped(|scan| {
                 while let Some(completion) = receiver.blocking_recv() {
-                    let committed = match writer_proof.as_ref() {
+                    let (written, committed) = match writer_proof.as_ref() {
                         Some(proof) => commit_incremental_wallet(
                             scan,
                             &mut connection,
@@ -2010,16 +2099,19 @@ async fn collect_activity_v2(
                             completed_at_unix,
                             &completion,
                         ),
-                        None => commit_activity_wallet_v2(
-                            &mut connection,
-                            generation,
-                            &writer_reference,
-                            fixed_end_unix,
-                            completed_at_unix,
-                            &completion,
+                        None => (
+                            CollectionWriteCounts::default(),
+                            commit_activity_wallet_v2(
+                                &mut connection,
+                                generation,
+                                &writer_reference,
+                                fixed_end_unix,
+                                completed_at_unix,
+                                &completion,
+                            ),
                         ),
                     };
-                    if let Err(error) = committed {
+                    if let Err(error) = committed.and(counts.add(written)) {
                         let _ = writer_error.set(error);
                         break;
                     }
@@ -2032,16 +2124,24 @@ async fn collect_activity_v2(
             // Free any queued completions before signalling, so the collector's
             // synchronous join never waits on their destruction.
             drop(receiver);
+            let writer_completed = began.elapsed();
             let _ = finished_sender.send(());
-            connection
+            (connection, counts, writer_completed)
         })?;
+    let mut producer_blocked = Duration::ZERO;
+    let mut producer_wait_started = None;
     let writer_finished = {
         let produce = async {
             futures::pin_mut!(reads);
             while let Some(completion) = reads.next().await {
                 match completion {
                     Ok(completion) => {
-                        if sender.send(completion).await.is_err() {
+                        let waiting = Instant::now();
+                        producer_wait_started = Some(waiting);
+                        let sent = sender.send(completion).await;
+                        producer_blocked += waiting.elapsed();
+                        producer_wait_started = None;
+                        if sent.is_err() {
                             break;
                         }
                     }
@@ -2058,6 +2158,10 @@ async fn collect_activity_v2(
             () = produce => false,
         }
     };
+    if let Some(waiting) = producer_wait_started {
+        producer_blocked += waiting.elapsed();
+    }
+    let fetch_completed = began.elapsed();
     // Stop reads, close the queue and drain accepted wallets after a read error.
     // Await termination before joining so SQLite cannot block the async runtime.
     // No return path after spawn may bypass this join: the caller holds the lock.
@@ -2065,16 +2169,29 @@ async fn collect_activity_v2(
     if !writer_finished {
         let _ = finished_receiver.await;
     }
-    let joined = writer.join();
+    let joined = writer.join().map_err(|_| BootstrapError::Cache {
+        message: "activity cache writer thread panicked".to_owned(),
+    })?;
+    let (mut connection, counts, writer_completed) = joined;
+    if proof
+        .as_ref()
+        .is_some_and(|proof| proof.identity.version == 4)
+    {
+        log_collection_run(
+            generation,
+            run_started_at_unix,
+            fetch_completed,
+            writer_completed,
+            producer_blocked,
+            &counts,
+        )?;
+    }
     if let Some(error) = Arc::try_unwrap(first_error)
         .map_err(|_| BootstrapError::Internal)?
         .into_inner()
     {
         return Err(error);
     }
-    let mut connection = joined.map_err(|_| BootstrapError::Cache {
-        message: "activity cache writer thread panicked".to_owned(),
-    })?;
 
     // Validate and install against one snapshot. If an external WAL writer
     // commits after validation, SQLite refuses to promote this stale snapshot
@@ -2104,6 +2221,7 @@ async fn collect_activity_v2(
         reference_sha256,
         fixed_end_unix,
         wallets,
+        proof.as_ref(),
     )?;
     let deferred = proof
         .as_ref()
@@ -2188,7 +2306,7 @@ pub fn commit_activity_batch_for_test(
         exclusion_reason: None,
     };
     aggregate_scan::scoped(|scan| {
-        commit_incremental_wallet(scan, connection, &proof, 0, &completion)
+        commit_incremental_wallet(scan, connection, &proof, 0, &completion).1
     })
 }
 
@@ -2984,6 +3102,7 @@ fn validate_activity_receipts(
     reference_sha256: &str,
     fixed_end_unix: i64,
     wallets: &[String],
+    proof: Option<&CollectionProof>,
 ) -> Result<BTreeSet<String>, BootstrapError> {
     let mut completed = BTreeSet::new();
     visit_activity_receipts(
@@ -2992,6 +3111,7 @@ fn validate_activity_receipts(
         reference_sha256,
         fixed_end_unix,
         wallets,
+        proof,
         |receipt| {
             completed.insert(receipt.wallet_hex);
             Ok(())
@@ -3023,10 +3143,13 @@ fn visit_activity_receipts(
     reference_sha256: &str,
     fixed_end_unix: i64,
     expected: &[String],
+    proof: Option<&CollectionProof>,
     mut visit: impl FnMut(ActivityWalletReceiptProof) -> Result<(), BootstrapError>,
 ) -> Result<(), BootstrapError> {
     let generation_i64 = to_i64(generation, "activity generation")?;
-    let proof = CollectionProof::load(connection, generation)?;
+    if let Some(proof) = proof {
+        proof.verify_unchanged(connection)?;
+    }
     let acquisition = if incremental::has_column(
         connection,
         "activity_wallet_coverage_staging_v2",
@@ -3071,6 +3194,7 @@ fn validate_activity_staging(
     reference_sha256: &str,
     fixed_end_unix: i64,
     wallets: &[String],
+    proof: Option<&CollectionProof>,
 ) -> Result<ValidatedActivityStaging, BootstrapError> {
     let generation_i64 = to_i64(generation, "activity generation")?;
     aggregate_scan::scoped(|scan| {
@@ -3080,6 +3204,7 @@ fn validate_activity_staging(
             reference_sha256,
             fixed_end_unix,
             wallets,
+            proof,
             None,
             |validation, receipt| {
                 validation.visit(scan, connection, generation_i64, receipt, |_| {})
@@ -3088,12 +3213,14 @@ fn validate_activity_staging(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn validate_activity_staging_with(
     connection: &Connection,
     generation: u64,
     reference_sha256: &str,
     fixed_end_unix: i64,
     wallets: &[String],
+    proof: Option<&CollectionProof>,
     generation_rows: Option<u64>,
     mut visit: impl FnMut(
         &mut ActivityValidation,
@@ -3108,6 +3235,7 @@ fn validate_activity_staging_with(
         reference_sha256,
         fixed_end_unix,
         wallets,
+        proof,
         |receipt| visit(&mut validation, &receipt),
     )?;
     // The table's primary key makes wallets unique, and the visitor rejects
@@ -3117,9 +3245,7 @@ fn validate_activity_staging_with(
     {
         return invalid("activity coverage is missing frozen wallets".to_owned());
     }
-    if generation_identity(connection, generation)?.is_some_and(|identity| identity.version == 4) {
-        verify_history_write_guards(connection)?;
-    } else {
+    if proof.is_none_or(|proof| proof.identity.version != 4) {
         check_generation_rows(
             connection,
             generation_i64,
@@ -3241,17 +3367,26 @@ fn completed_activity_manifest(
     reference_sha256: &str,
     fixed_end_unix: i64,
     wallets: &[String],
+    proof: Option<&CollectionProof>,
 ) -> Result<Option<ActivityCoverageManifestV2>, BootstrapError> {
     let Some(manifest) = stored_activity_manifest(connection, generation)? else {
         return Ok(None);
     };
-    verify_activity_manifest(
-        connection,
-        &manifest,
-        reference_sha256,
-        fixed_end_unix,
-        wallets,
-    )?;
+    let generation_i64 = to_i64(generation, "activity generation")?;
+    aggregate_scan::scoped(|scan| {
+        verify_activity_manifest_with(
+            connection,
+            &manifest,
+            reference_sha256,
+            fixed_end_unix,
+            wallets,
+            None,
+            proof,
+            |validation, receipt| {
+                validation.visit(scan, connection, generation_i64, receipt, |_| {})
+            },
+        )
+    })?;
     Ok(Some(manifest))
 }
 
@@ -3309,27 +3444,7 @@ fn stored_activity_manifest(
     Ok(Some(manifest))
 }
 
-fn verify_activity_manifest(
-    connection: &Connection,
-    manifest: &ActivityCoverageManifestV2,
-    reference_sha256: &str,
-    fixed_end_unix: i64,
-    wallets: &[String],
-) -> Result<(), BootstrapError> {
-    let generation = to_i64(manifest.generation, "activity generation")?;
-    aggregate_scan::scoped(|scan| {
-        verify_activity_manifest_with(
-            connection,
-            manifest,
-            reference_sha256,
-            fixed_end_unix,
-            wallets,
-            None,
-            |validation, receipt| validation.visit(scan, connection, generation, receipt, |_| {}),
-        )
-    })
-}
-
+#[allow(clippy::too_many_arguments)]
 fn verify_activity_manifest_with(
     connection: &Connection,
     manifest: &ActivityCoverageManifestV2,
@@ -3337,6 +3452,7 @@ fn verify_activity_manifest_with(
     fixed_end_unix: i64,
     wallets: &[String],
     generation_rows: Option<u64>,
+    proof: Option<&CollectionProof>,
     mut visit: impl FnMut(
         &mut ActivityValidation,
         &ActivityWalletReceiptProof,
@@ -3386,12 +3502,20 @@ fn verify_activity_manifest_with(
         if !manifest.page_hashes.is_empty() {
             return invalid("retained activity manifest has embedded page hashes".to_owned());
         }
+        let loaded;
+        let proof = if let Some(proof) = proof {
+            Some(proof)
+        } else {
+            loaded = CollectionProof::load(connection, manifest.generation)?;
+            loaded.as_ref()
+        };
         validate_activity_staging_with(
             connection,
             manifest.generation,
             reference_sha256,
             fixed_end_unix,
             wallets,
+            proof,
             generation_rows,
             &mut visit,
         )?
@@ -3626,36 +3750,6 @@ fn activity_identity(connection: &Connection) -> Result<ActivityIdentity, Bootst
 // Every payout market's token ids in payout-vector order, the venue page that
 // lists them, and eligibility for admission. Identity rebinding uses all markets.
 type PayoutTokens = BTreeMap<String, (Vec<String>, String, bool)>;
-
-fn load_payout_tokens(connection: &Connection) -> Result<PayoutTokens, BootstrapError> {
-    let payout_markets = connection
-        .prepare(
-            "SELECT market_id, tokens_json, raw_page_sha256,
-            CASE WHEN end_date_unix IS NOT NULL
-              AND payout_status = 'resolved'
-              AND payout_vector_json IN ('[\"1\",\"0\"]','[\"0\",\"1\"]','[\"0.5\",\"0.5\"]')
-            THEN 1 ELSE 0 END
-         FROM clob_payout_evidence_v2 ORDER BY market_id",
-        )?
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, bool>(3)?,
-            ))
-        })?
-        .map(|row| {
-            let (market, tokens, page, eligible) = row?;
-            let tokens = serde_json::from_str::<Vec<ClobToken>>(&tokens)?
-                .into_iter()
-                .map(|token| token.token_id.unwrap_or_default())
-                .collect();
-            Ok((market, (tokens, page, eligible)))
-        })
-        .collect::<Result<PayoutTokens, BootstrapError>>()?;
-    Ok(payout_markets)
-}
 
 // Aggregates retain the loader's (source_time_unix, source_trade_id) order.
 // Borrow contiguous seconds so classification uses the validated vector itself.
@@ -5819,6 +5913,7 @@ fn verify_finalized_v2_manifests(
             &reference_sha256,
             fixed_end_unix,
             &wallets,
+            None,
         )?
     }
     .ok_or_else(|| BootstrapError::Invalid {

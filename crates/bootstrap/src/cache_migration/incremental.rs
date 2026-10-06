@@ -229,10 +229,12 @@ impl HistoryChain {
         &self,
         scan: &mut aggregate_scan::Scan,
         connection: &Connection,
+        rows_verified: &mut u64,
     ) -> Result<HistoryCertificate, BootstrapError> {
         let mut check = self.check();
         let held = scan
             .for_each_history(connection, &self.wallet, |aggregate, json| {
+                *rows_verified = checked_activity_count(*rows_verified, 1)?;
                 if let Some(json) = json {
                     check.push(&aggregate, json)?;
                 }
@@ -561,7 +563,9 @@ impl CollectionProof {
                     "incremental predecessor is not the preceding completed head".to_owned(),
                 );
             }
-            verify_historical_receipts(connection, &manifest, &record)?;
+            if history.is_none() {
+                verify_historical_receipts(connection, &manifest, &record)?;
+            }
             Some((manifest, record))
         } else {
             None
@@ -582,6 +586,14 @@ impl CollectionProof {
             history,
             data_version,
         }))
+    }
+
+    pub(super) fn verify_unchanged(&self, connection: &Connection) -> Result<(), BootstrapError> {
+        let current: i64 = connection.pragma_query_value(None, "data_version", |row| row.get(0))?;
+        if current != self.data_version {
+            return invalid("collection changed externally while loading proof".to_owned());
+        }
+        Ok(())
     }
 
     pub(super) fn mode(&self, wallet: &str) -> ActivityReadMode {
@@ -1582,18 +1594,35 @@ pub(super) fn commit_incremental_wallet(
     proof: &CollectionProof,
     completed_at: i64,
     completion: &WalletActivityCompletion,
-) -> Result<(), BootstrapError> {
+) -> (CollectionWriteCounts, Result<(), BootstrapError>) {
     if proof.bulk_root {
         let mut ids = BTreeSet::new();
         for aggregate in &completion.aggregates {
             if !ids.insert(&aggregate.group_id.key().0) {
-                return invalid("duplicate source_trade_id in bulk-root wallet batch".to_owned());
+                return (
+                    CollectionWriteCounts::default(),
+                    invalid("duplicate source_trade_id in bulk-root wallet batch".to_owned()),
+                );
             }
         }
     }
     if proof.identity.version == 4 {
-        return commit_history_wallet(scan, connection, proof, completed_at, completion);
+        commit_history_wallet(scan, connection, proof, completed_at, completion)
+    } else {
+        (
+            CollectionWriteCounts::default(),
+            commit_incremental_wallet_v2(scan, connection, proof, completed_at, completion),
+        )
     }
+}
+
+fn commit_incremental_wallet_v2(
+    scan: &mut aggregate_scan::Scan,
+    connection: &mut Connection,
+    proof: &CollectionProof,
+    completed_at: i64,
+    completion: &WalletActivityCompletion,
+) -> Result<(), BootstrapError> {
     let began = std::time::Instant::now();
     let wallet = &completion.wallet_hex;
     let identity = &proof.identity;
@@ -1772,173 +1801,181 @@ fn commit_history_wallet(
     proof: &CollectionProof,
     completed_at: i64,
     completion: &WalletActivityCompletion,
-) -> Result<(), BootstrapError> {
-    let wallet = &completion.wallet_hex;
-    let identity = &proof.identity;
-    let generation = to_i64(identity.generation, "activity generation")?;
-    let transaction =
-        connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let _authorization = authorize_history_writes(&transaction)?;
-    let data_version: i64 =
-        transaction.pragma_query_value(None, "data_version", |row| row.get(0))?;
-    if data_version != proof.data_version {
-        return invalid("collection changed externally before wallet commit".to_owned());
-    }
-    let unexpected: bool = transaction.query_row(
+) -> (CollectionWriteCounts, Result<(), BootstrapError>) {
+    let mut counts = CollectionWriteCounts::default();
+    let result = (|| {
+        let wallet = &completion.wallet_hex;
+        let identity = &proof.identity;
+        let generation = to_i64(identity.generation, "activity generation")?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let _authorization = authorize_history_writes(&transaction)?;
+        let data_version: i64 =
+            transaction.pragma_query_value(None, "data_version", |row| row.get(0))?;
+        if data_version != proof.data_version {
+            return invalid("collection changed externally before wallet commit".to_owned());
+        }
+        let unexpected: bool = transaction.query_row(
         "SELECT EXISTS(SELECT 1 FROM activity_wallet_coverage_staging_v2 WHERE wallet_hex = ?1 AND generation = ?2)",
         params![wallet, generation], |row| row.get(0),
     )?;
-    if unexpected {
-        return invalid("unexpected receipt before wallet commit".to_owned());
-    }
-    let mode = proof.mode(wallet);
-    let repair = identity
-        .repair_wallets
-        .as_ref()
-        .is_some_and(|repairs| repairs.binary_search(wallet).is_ok());
-    let collision = check_collisions(&transaction, proof, completion)?;
-    let incomplete = completion.aggregation_status != AggregationStatus::Complete;
-    let excluded = incomplete || collision;
-    let chain = HistoryChain::load(
-        &transaction,
-        wallet,
-        proof.history.as_ref().ok_or(BootstrapError::Internal)?,
-        identity.base_generation.unwrap_or(0),
-    )?;
-    let predecessor = proof.predecessor(
-        &transaction,
-        wallet,
-        !excluded && mode == ActivityReadMode::Incremental,
-    )?;
-    let mut acquisition = ActivityAcquisition {
-        version: 3,
-        mode: mode.clone(),
-        start_exclusive: proof.start(wallet),
-        fixed_end_unix: identity.fixed_end_unix,
-        aggregation_status: completion.aggregation_status.clone(),
-        fetched_aggregate_digest: if incomplete {
-            None
-        } else {
-            Some(aggregate_digest(&completion.aggregates)?)
-        },
-        fetched_aggregate_count: if incomplete {
-            None
-        } else {
-            Some(u64::try_from(completion.aggregates.len()).map_err(|_| BootstrapError::Internal)?)
-        },
-        fetched_source_row_count: completion.fetched_source_row_count,
-        read_sha256: String::new(),
-        predecessor,
-        disposition: if excluded {
-            ActivityDisposition::Excluded
-        } else {
-            ActivityDisposition::Complete
-        },
-        exclusion_reason: if completion.aggregation_status == AggregationStatus::NotAttempted {
-            Some(if proof.deferred(wallet) {
-                ActivityExclusionReason::DormantDeferred
+        if unexpected {
+            return invalid("unexpected receipt before wallet commit".to_owned());
+        }
+        let mode = proof.mode(wallet);
+        let repair = identity
+            .repair_wallets
+            .as_ref()
+            .is_some_and(|repairs| repairs.binary_search(wallet).is_ok());
+        let collision = check_collisions(&transaction, proof, completion)?;
+        let incomplete = completion.aggregation_status != AggregationStatus::Complete;
+        let excluded = incomplete || collision;
+        let chain = HistoryChain::load(
+            &transaction,
+            wallet,
+            proof.history.as_ref().ok_or(BootstrapError::Internal)?,
+            identity.base_generation.unwrap_or(0),
+        )?;
+        let predecessor = proof.predecessor(
+            &transaction,
+            wallet,
+            !excluded && mode == ActivityReadMode::Incremental,
+        )?;
+        let mut acquisition = ActivityAcquisition {
+            version: 3,
+            mode: mode.clone(),
+            start_exclusive: proof.start(wallet),
+            fixed_end_unix: identity.fixed_end_unix,
+            aggregation_status: completion.aggregation_status.clone(),
+            fetched_aggregate_digest: if incomplete {
+                None
             } else {
-                ActivityExclusionReason::AcquisitionFailure
-            })
-        } else if incomplete {
-            Some(ActivityExclusionReason::AggregationFailure)
-        } else if collision {
-            Some(ActivityExclusionReason::CrossBoundaryCollision)
-        } else {
-            None
-        },
-    };
-    let unchanged_full = !excluded
-        && !repair
-        && mode == ActivityReadMode::Full
-        && chain.has_history_proof()
-        && chain.matches_fetched(&completion.aggregates)?;
-    for aggregate in &completion.aggregates {
-        let time = aggregate.source_time.0.unix_timestamp();
-        if time <= acquisition.start_exclusive || time > acquisition.fixed_end_unix {
-            return invalid("fetched aggregate outside acquisition window".to_owned());
-        }
-    }
-    if repair {
-        let certificate = HistoryCertificate::load(&transaction, wallet)?;
-        let mut digest = JsonArrayDigest::new();
-        let observed = scan.for_each_history(&transaction, wallet, |_, json| {
-            if let Some(json) = json {
-                digest.push_json(json);
-            }
-            Ok(())
-        });
-        match observed {
-            Ok(None) => {
-                tracing::warn!(wallet, stored_digest = digest.finish(), certified_digest = ?certificate.as_ref().map(|certificate| &certificate.ordered_digest), "replacing explicitly repaired wallet history")
-            }
-            Ok(Some(error))
-            | Err(
-                error @ (BootstrapError::Invalid { .. }
-                | BootstrapError::Json(_)
-                | BootstrapError::Parse { .. }
-                | BootstrapError::Sqlite(
-                    rusqlite::Error::InvalidColumnType(..)
-                    | rusqlite::Error::FromSqlConversionFailure(..),
-                )),
-            ) => {
-                tracing::warn!(wallet, stored_digest_error = %error, certified_digest = ?certificate.as_ref().map(|certificate| &certificate.ordered_digest), "replacing unreadable explicitly repaired wallet history");
-            }
-            Err(error) => return Err(error),
-        }
-        transaction.execute(
-            "DELETE FROM activity_groups_v2 WHERE wallet_hex = ?1",
-            [wallet],
-        )?;
-    } else if excluded {
-        if !proof.deferred(wallet) && chain.has_history_proof() {
-            chain.verify_stored(scan, &transaction)?;
-        }
-    } else if mode == ActivityReadMode::Full && !unchanged_full {
-        if chain.has_history_proof() {
-            chain.verify_stored(scan, &transaction)?;
-        }
-        transaction.execute(
-            "DELETE FROM activity_groups_v2 WHERE wallet_hex = ?1",
-            [wallet],
-        )?;
-    }
-    if !excluded && !unchanged_full {
+                Some(aggregate_digest(&completion.aggregates)?)
+            },
+            fetched_aggregate_count: if incomplete {
+                None
+            } else {
+                Some(
+                    u64::try_from(completion.aggregates.len())
+                        .map_err(|_| BootstrapError::Internal)?,
+                )
+            },
+            fetched_source_row_count: completion.fetched_source_row_count,
+            read_sha256: String::new(),
+            predecessor,
+            disposition: if excluded {
+                ActivityDisposition::Excluded
+            } else {
+                ActivityDisposition::Complete
+            },
+            exclusion_reason: if completion.aggregation_status == AggregationStatus::NotAttempted {
+                Some(if proof.deferred(wallet) {
+                    ActivityExclusionReason::DormantDeferred
+                } else {
+                    ActivityExclusionReason::AcquisitionFailure
+                })
+            } else if incomplete {
+                Some(ActivityExclusionReason::AggregationFailure)
+            } else if collision {
+                Some(ActivityExclusionReason::CrossBoundaryCollision)
+            } else {
+                None
+            },
+        };
+        let unchanged_full = !excluded
+            && !repair
+            && mode == ActivityReadMode::Full
+            && chain.has_history_proof()
+            && chain.matches_fetched(&completion.aggregates)?;
         for aggregate in &completion.aggregates {
-            insert_activity_aggregate_strict(&transaction, generation, wallet, aggregate)?;
+            let time = aggregate.source_time.0.unix_timestamp();
+            if time <= acquisition.start_exclusive || time > acquisition.fixed_end_unix {
+                return invalid("fetched aggregate outside acquisition window".to_owned());
+            }
         }
-    }
-    acquisition.read_sha256 = read_digest(wallet, &completion.pages, &acquisition)?;
-    let receipt = ActivityWalletReceiptProof {
-        wallet_hex: wallet.clone(),
-        pages: completion.pages.clone(),
-        ordered_aggregate_digest: if excluded {
-            aggregate_digest(&[])?
-        } else {
-            acquisition
-                .fetched_aggregate_digest
-                .clone()
-                .ok_or(BootstrapError::Internal)?
-        },
-        source_row_count: if excluded {
-            0
-        } else {
-            completion.fetched_source_row_count
-        },
-        aggregate_count: if excluded {
-            0
-        } else {
-            acquisition
-                .fetched_aggregate_count
-                .ok_or(BootstrapError::Internal)?
-        },
-        schema_version: ACTIVITY_SCHEMA_VERSION,
-        parser_version: ACTIVITY_PARSER_VERSION,
-        acquisition: Some(acquisition),
-        exclusion_reason: completion.exclusion_reason.clone(),
-    };
-    proof.validate_receipt(&transaction, &receipt)?;
-    transaction.execute(
+        if repair {
+            let certificate = HistoryCertificate::load(&transaction, wallet)?;
+            let mut digest = JsonArrayDigest::new();
+            let observed = scan.for_each_history(&transaction, wallet, |_, json| {
+                counts.rows_verified = checked_activity_count(counts.rows_verified, 1)?;
+                if let Some(json) = json {
+                    digest.push_json(json);
+                }
+                Ok(())
+            });
+            match observed {
+                Ok(None) => {
+                    tracing::warn!(wallet, stored_digest = digest.finish(), certified_digest = ?certificate.as_ref().map(|certificate| &certificate.ordered_digest), "replacing explicitly repaired wallet history")
+                }
+                Ok(Some(error))
+                | Err(
+                    error @ (BootstrapError::Invalid { .. }
+                    | BootstrapError::Json(_)
+                    | BootstrapError::Parse { .. }
+                    | BootstrapError::Sqlite(
+                        rusqlite::Error::InvalidColumnType(..)
+                        | rusqlite::Error::FromSqlConversionFailure(..),
+                    )),
+                ) => {
+                    tracing::warn!(wallet, stored_digest_error = %error, certified_digest = ?certificate.as_ref().map(|certificate| &certificate.ordered_digest), "replacing unreadable explicitly repaired wallet history");
+                }
+                Err(error) => return Err(error),
+            }
+            counts.rows_deleted = u64::try_from(transaction.execute(
+                "DELETE FROM activity_groups_v2 WHERE wallet_hex = ?1",
+                [wallet],
+            )?)
+            .map_err(|_| BootstrapError::Internal)?;
+        } else if excluded {
+            if !proof.deferred(wallet) && chain.has_history_proof() {
+                chain.verify_stored(scan, &transaction, &mut counts.rows_verified)?;
+            }
+        } else if mode == ActivityReadMode::Full && !unchanged_full {
+            if chain.has_history_proof() {
+                chain.verify_stored(scan, &transaction, &mut counts.rows_verified)?;
+            }
+            counts.rows_deleted = u64::try_from(transaction.execute(
+                "DELETE FROM activity_groups_v2 WHERE wallet_hex = ?1",
+                [wallet],
+            )?)
+            .map_err(|_| BootstrapError::Internal)?;
+        }
+        if !excluded && !unchanged_full {
+            for aggregate in &completion.aggregates {
+                insert_activity_aggregate_strict(&transaction, generation, wallet, aggregate)?;
+            }
+        }
+        acquisition.read_sha256 = read_digest(wallet, &completion.pages, &acquisition)?;
+        let receipt = ActivityWalletReceiptProof {
+            wallet_hex: wallet.clone(),
+            pages: completion.pages.clone(),
+            ordered_aggregate_digest: if excluded {
+                aggregate_digest(&[])?
+            } else {
+                acquisition
+                    .fetched_aggregate_digest
+                    .clone()
+                    .ok_or(BootstrapError::Internal)?
+            },
+            source_row_count: if excluded {
+                0
+            } else {
+                completion.fetched_source_row_count
+            },
+            aggregate_count: if excluded {
+                0
+            } else {
+                acquisition
+                    .fetched_aggregate_count
+                    .ok_or(BootstrapError::Internal)?
+            },
+            schema_version: ACTIVITY_SCHEMA_VERSION,
+            parser_version: ACTIVITY_PARSER_VERSION,
+            acquisition: Some(acquisition),
+            exclusion_reason: completion.exclusion_reason.clone(),
+        };
+        proof.validate_receipt(&transaction, &receipt)?;
+        transaction.execute(
         "INSERT INTO activity_wallet_coverage_staging_v2
          (generation, wallet_hex, reference_sha256, fixed_end_unix, page_evidence_json,
           ordered_aggregate_digest, source_row_count, aggregate_count, schema_version, parser_version,
@@ -1949,12 +1986,33 @@ fn commit_history_wallet(
             to_i64(receipt.aggregate_count, "receipt aggregate count")?, i64::from(ACTIVITY_SCHEMA_VERSION),
             i64::from(ACTIVITY_PARSER_VERSION), completed_at, canonical_json(&receipt.acquisition)?, receipt.exclusion_reason],
     )?;
-    drop(_authorization);
-    transaction.commit()?;
-    if excluded && !proof.deferred(wallet) {
-        tracing::warn!(wallet, generation, reason = ?receipt.acquisition.as_ref().and_then(|acquisition| acquisition.exclusion_reason.as_ref()), "activity wallet excluded from generation");
+        drop(_authorization);
+        transaction.commit()?;
+        counts.rows_inserted = if !excluded && !unchanged_full {
+            receipt.aggregate_count
+        } else {
+            0
+        };
+        if proof.deferred(wallet) {
+            counts.deferred_wallets = 1;
+        } else if excluded {
+            counts.excluded_wallets = 1;
+        } else if mode == ActivityReadMode::Incremental {
+            counts.incremental_wallets = 1;
+        } else if unchanged_full {
+            counts.unchanged_full_wallets = 1;
+        } else {
+            counts.differing_full_wallets = 1;
+        }
+        if excluded && !proof.deferred(wallet) {
+            tracing::warn!(wallet, generation, reason = ?receipt.acquisition.as_ref().and_then(|acquisition| acquisition.exclusion_reason.as_ref()), "activity wallet excluded from generation");
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        counts.rows_deleted = 0;
     }
-    Ok(())
+    (counts, result)
 }
 
 pub(super) fn log_writer_settings(connection: &Connection) -> Result<(), BootstrapError> {
