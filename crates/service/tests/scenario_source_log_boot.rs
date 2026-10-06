@@ -3830,13 +3830,15 @@ async fn previous_binary_rollback_matrix() {
             admitted < listening,
             "{row}: previous-binary boot admission must precede listening"
         );
-        // Each reconciliation page is recorded by the previous poller. Two pages containing
-        // this exact retry, appended after this run began, prove its first round completed.
+        // The previous poller records each reconciliation page before processing it, and
+        // persists the wallet's feed-history frontier only after that read's buckets and
+        // retirements are acknowledged. A frontier citing a page with this exact retry,
+        // appended after this run began, proves the retry was processed successfully.
         checkpoint_until(|| {
             let Ok(frames) = pe_event_log::Reader::replay_with_offsets(source) else {
                 return false;
             };
-            frames
+            let covered = frames
                 .filter_map(Result::ok)
                 .filter(|(offset, _, frame)| {
                     *offset >= retry_start
@@ -3850,8 +3852,28 @@ async fn previous_binary_rollback_matrix() {
                                 })
                             })
                 })
-                .count()
-                >= 2
+                .map(|(_, sequence, frame)| (sequence.0, frame.this_hash.to_hex().to_string()))
+                .collect::<std::collections::HashSet<_>>();
+            let Ok(collection) = fixture.paper.feed_history_frontiers() else {
+                return false;
+            };
+            collection["frontiers"].as_array().is_some_and(|frontiers| {
+                frontiers.iter().any(|frontier| {
+                    frontier["wallet"] == fixture.wallet().to_string()
+                        && frontier["page_occurrences"]
+                            .as_array()
+                            .is_some_and(|pages| {
+                                pages.iter().any(|page| {
+                                    let receipt = &page["receipt"];
+                                    receipt["sequence"].as_u64().is_some_and(|sequence| {
+                                        receipt["this_hash"].as_str().is_some_and(|hash| {
+                                            covered.contains(&(sequence, hash.to_owned()))
+                                        })
+                                    })
+                                })
+                            })
+                })
+            })
         })
         .await;
         checkpoint_until(|| {

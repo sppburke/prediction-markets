@@ -316,13 +316,7 @@ impl Child {
     }
     pub async fn finish_checkpoint(mut self, signal: Option<&str>) -> std::process::Output {
         if let Some(signal) = signal {
-            assert!(
-                std::process::Command::new("kill")
-                    .args([signal, &self.process.id().to_string()])
-                    .status()
-                    .unwrap()
-                    .success()
-            );
+            self.signal_checkpoint(signal);
         }
         let status = tokio::time::timeout(Duration::from_secs(40), async {
             loop {

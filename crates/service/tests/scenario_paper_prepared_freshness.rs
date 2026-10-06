@@ -10417,14 +10417,20 @@ async fn ac_b_membership_reference_checks() {
         .unwrap()
         .payload;
     let mut bad_payload: Value = serde_json::from_slice(&config_payload).unwrap();
-    bad_payload
-        .as_object_mut()
-        .unwrap()
-        .remove("published_entries");
-    let missing_field = h
+    bad_payload["published_entries"][0]["leader_score_bps"] = json!(true);
+    let bad_type = h
         .append(
             "pe-service.watchlist-capacity-config",
             &serde_json::to_vec(&bad_payload).unwrap(),
+        )
+        .await;
+    // Rust requires Vec<WatchlistEntry>; a present key holding null must not pass.
+    let mut null_entries: Value = serde_json::from_slice(&config_payload).unwrap();
+    null_entries["published_entries"] = Value::Null;
+    let null_entries = h
+        .append(
+            "pe-service.watchlist-capacity-config",
+            &serde_json::to_vec(&null_entries).unwrap(),
         )
         .await;
     let mut extended: Value = serde_json::from_slice(&config_payload).unwrap();
@@ -10572,7 +10578,8 @@ async fn ac_b_membership_reference_checks() {
     );
 
     for (receipt, error) in [
-        (missing_field, "artifact required fields"),
+        (bad_type, "artifact integer"),
+        (null_entries, "artifact array"),
         (wrong_source, "artifact envelope"),
         (wrong_parser, "artifact envelope"),
     ] {
