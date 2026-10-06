@@ -781,7 +781,10 @@ recomputes the candidate's digest (#682).
 Before the bound corrected batch becomes current, restore that exact prior cache by its recorded
 hash and schema. For a new cycle set `CACHE_PRIOR_BACKUP` to its `.displaced.db` (`D`) and
 `DISPLACED_CACHE_BACKUP` to its now-vacant `.side.db` (`C`). For a legacy cycle retain the original
-prior and displaced arguments. Preserve the rejected cache for audit:
+prior and displaced arguments. A history-format-3 publication also needs its cycle's final-stage
+record, `FINAL_STAGE_RECORD=<cycle out dir>/cache_stage_record.json` (written by the export-bound
+re-finalize); restore refuses format 3 without it, including an interrupted restore, and does not
+use it for a format-2 publication. Preserve the rejected cache for audit:
 
 ```bash
 pe-bootstrap cache-restore-prior \
@@ -791,7 +794,8 @@ pe-bootstrap cache-restore-prior \
   --prior-sha256 "$PRIOR_CACHE_SHA256" \
   --prior-schema "$PRIOR_CACHE_SCHEMA" \
   --publication-request "$PUBLISH_REQUEST_FILE" \
-  --pending-pointer data/eval-results/rank_and_push.pending
+  --pending-pointer data/eval-results/rank_and_push.pending \
+  --final-stage-record "$FINAL_STAGE_RECORD"
 ```
 
 Run this only with `SUPABASE_URL` and `SUPABASE_SECRET_KEY` in the environment after stopping the
