@@ -9973,16 +9973,27 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CensusLogs {
 }
 
 fn census_python(code: &str, args: &[String], bin: &std::path::Path) -> std::process::Output {
+    census_python_with(code, args, bin, Some(env!("CARGO_BIN_EXE_pe-service")))
+}
+
+fn census_python_with(
+    code: &str,
+    args: &[String],
+    bin: &std::path::Path,
+    pe_service: Option<&str>,
+) -> std::process::Output {
     use std::io::Write;
     let path = std::env::join_paths(std::iter::once(bin.to_path_buf()).chain(
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
     ))
     .unwrap();
-    let mut child = std::process::Command::new("python3")
-        .arg("-")
-        .args(args)
-        .env("PATH", path)
-        .env("PE_SERVICE_BIN", env!("CARGO_BIN_EXE_pe-service"))
+    let mut command = std::process::Command::new("python3");
+    command.arg("-").args(args).env("PATH", path);
+    match pe_service {
+        Some(binary) => command.env("PE_SERVICE_BIN", binary),
+        None => command.env_remove("PE_SERVICE_BIN"),
+    };
+    let mut child = command
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -10263,7 +10274,22 @@ fn ac_b_capture(
 }
 
 fn ac_b_inspect(h: &Harness, capture: &std::path::Path) -> Value {
-    let output = census_python(
+    let output = ac_b_inspection(h, capture, Some(env!("CARGO_BIN_EXE_pe-service")));
+    assert!(
+        output.status.success(),
+        "inspection: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    serde_json::from_slice(&std::fs::read(capture.join("ac16-population.json")).unwrap()).unwrap()
+}
+
+fn ac_b_inspection(
+    h: &Harness,
+    capture: &std::path::Path,
+    pe_service: Option<&str>,
+) -> std::process::Output {
+    census_python_with(
         &recipe_extract("import calendar, ctypes", "\nPY\n"),
         &[
             capture.join("paper_state.db").to_str().unwrap().to_owned(),
@@ -10283,14 +10309,8 @@ fn ac_b_inspect(h: &Harness, capture: &std::path::Path) -> Value {
             capture.to_str().unwrap().to_owned(),
         ],
         &h.dir.path().join("bin"),
-    );
-    assert!(
-        output.status.success(),
-        "inspection: {}\n{}",
-        String::from_utf8_lossy(&output.stderr),
-        String::from_utf8_lossy(&output.stdout)
-    );
-    serde_json::from_slice(&std::fs::read(capture.join("ac16-population.json")).unwrap()).unwrap()
+        pe_service,
+    )
 }
 
 /// Reframe a deliberately invalid receipt reference, retaining all other captured paper records.
@@ -10573,6 +10593,30 @@ async fn ac_b_membership_reference_checks() {
     let rows = ac_b_reference_rows(&ac_b_inspect(&h, &capture));
     assert_eq!(
         rows.iter()
+            .find(|r| r["seq"] == exclusion_sequence)
+            .unwrap()["verdict"],
+        "pass"
+    );
+    // The inspection refuses to run without the deployed decoder.
+    let refused = ac_b_inspection(&h, &capture, None);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("PE_SERVICE_BIN must name"));
+    // The replay and both exports read canonical wallets: an uppercase removal decodes as itself.
+    ac_b_rewrite_paper(&capture, exclusion_sequence, |r| {
+        let upper = r["removed"][0].as_str().unwrap()[2..].to_uppercase();
+        r["removed"][0] = json!(format!("0x{upper}"));
+    });
+    let population = ac_b_inspect(&h, &capture);
+    let change = population["membership_changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["seq"] == exclusion_sequence)
+        .unwrap();
+    assert_eq!(change["removed"], json!([newcomer]));
+    assert_eq!(
+        ac_b_reference_rows(&population)
+            .iter()
             .find(|r| r["seq"] == exclusion_sequence)
             .unwrap()["verdict"],
         "pass"

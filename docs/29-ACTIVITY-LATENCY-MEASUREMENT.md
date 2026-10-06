@@ -331,7 +331,8 @@ canonical `g2:` component encoding (using `b3sum`), and preserves envelope recei
 replace the Rust log verifier or authority-specific semantic verification. Do not run normal service boot, `--report`, recovery or checkpoint
 preparation as part of this read-only audit. Set `PE_SERVICE_BIN` to the absolute path of the deployed
 `pe-service` binary: the inspection decodes membership records and artifacts only through its
-read-only `--canonical-membership-json` command, and stops without it.
+read-only `--canonical-membership-json` command, and stops without it. It also stops, naming the
+record, at a membership record that command cannot decode; AC-B, AC-C and AC16 are then incomplete.
 
 ```bash
 sha256sum paper_state.db source_filtered.log paper.log
@@ -401,10 +402,8 @@ def ns(value):
 # membership record and referenced artifact exactly as the qualification verifier does (typed
 # serde, the sealed-evidence schema and the admission proof manifest) and prints canonical JSON;
 # every comparison below reads that output.
-def canonical(kind, raw):
-    binary = os.environ.get("PE_SERVICE_BIN")
-    if not binary: raise RuntimeError("PE_SERVICE_BIN must name the deployed pe-service binary")
-    out = subprocess.run([binary, "--canonical-membership-json", kind], input=raw, capture_output=True)
+def rust_membership_json(kind, raw):
+    out = subprocess.run([PE_SERVICE, "--canonical-membership-json", kind], input=raw, capture_output=True)
     if out.returncode != 0:
         lines = [line.strip() for line in out.stderr.decode(errors="replace").splitlines() if line.strip()]
         raise ValueError(lines[-1] if lines else f"exit {out.returncode}")
@@ -412,16 +411,11 @@ def canonical(kind, raw):
 
 def membership_artifact(e, expected):
     assert (e["source_id"], e["schema_version"], e["parser_version"], e["content_type"]) == (expected, 1, 1, "json"), "artifact envelope"
-    try: return canonical(expected, bytes(e["payload"]))
+    try: return rust_membership_json(expected, bytes(e["payload"]))
     except ValueError as error: raise AssertionError("artifact decode: " + str(error))
 
-def membership_record(e):
-    references = []; errors = []
-    try: c = canonical("membership_changed", bytes(e["payload"]))
-    except ValueError as error:
-        c = payload(e); errors.append("record decode: " + str(error))
-        c["evidence"] = {}
-    evidence = c["evidence"]
+def membership_record(e, c):
+    evidence = c["evidence"]; references = []; errors = []
     def reference(name, r, expected, wallet=None):
         row = {"reference": name, "seq": None, "hash": None, "expected_source_id": expected,
                "status": "mismatched", "error": None}
@@ -474,11 +468,22 @@ def membership_record(e):
     except (AssertionError, KeyError, ValueError, TypeError) as error:
         errors.append(str(error))
     return {"seq": e["seq"], "hash": e["this_hash"], "received_at_ns": ns(e["received_at"]),
-            **{k: c.get(k) for k in ("reason", "removed", "added", "capacity", "ranking_batch_id")},
+            **{k: c[k] for k in ("reason", "removed", "added", "capacity", "ranking_batch_id")},
             "kind": evidence.get("kind"), "references": references, "evidence_errors": errors}
 
+PE_SERVICE = os.environ.get("PE_SERVICE_BIN")
+if not PE_SERVICE or not os.access(PE_SERVICE, os.X_OK):
+    sys.exit("PE_SERVICE_BIN must name the deployed pe-service binary")
 audit_unix_ns = time.time_ns(); print("audit clock", audit_unix_ns)
 source = read_prefix(sys.argv[2]); paper = read_prefix(sys.argv[3])
+# Decode every membership record once; the replay and both exports read only this canonical form.
+# The shared replay cannot continue past a record the verifier cannot decode, so it stops here.
+membership = {}
+for e in paper.values():
+    if payload(e).get("record") != "membership_changed": continue
+    try: membership[e["seq"]] = rust_membership_json("membership_changed", bytes(e["payload"]))
+    except ValueError as error:
+        sys.exit(f"membership record {e['seq']} {e['this_hash']} does not decode; AC-B, AC-C and AC16 are incomplete: {error}")
 window_start = ns(sys.argv[6]) // 10**9; window_end = ns(sys.argv[7]) // 10**9
 assert window_start < window_end
 audit_dir = Path(sys.argv[8]).resolve(); assert audit_dir.is_dir()
@@ -705,12 +710,16 @@ for e in source.values():
         if b["history_group_id"] not in twins: twins.append(b["history_group_id"])
 print("bindings to observations before the capture", outside)
 # Replay recorded membership, retaining removed wallets and all prices.
-start = payload(paper[start_seq]); members = set(start["membership"])
-changes = sorted((e for e in paper.values() if e["seq"] > start_seq
-                  and payload(e).get("record") == "membership_changed"), key=lambda e: e["seq"])
+def canonical_wallet(w):
+    # WalletAddress::from_hex: "0x" then 40 hex digits in either case; canonical form is lowercase.
+    assert isinstance(w, str) and re.fullmatch(r"0x[0-9a-fA-F]{40}", w), "Start membership wallet"
+    return w.lower()
+start = payload(paper[start_seq]); members = {canonical_wallet(w) for w in start["membership"]}
+changes = sorted((e for e in paper.values() if e["seq"] > start_seq and e["seq"] in membership),
+                 key=lambda e: e["seq"])
 intervals = []; opened = {w: ns(paper[start_seq]["received_at"]) for w in members}
 for e in changes:
-    at = ns(e["received_at"]); c = payload(e)
+    at = ns(e["received_at"]); c = membership[e["seq"]]
     for w in c["removed"]: intervals.append((w, opened.pop(w), at)); members.remove(w)
     for w in c["added"]: assert w not in members; members.add(w); opened[w] = at
 intervals.extend((w, at, window_end * 10**9) for w, at in opened.items())
@@ -771,9 +780,10 @@ raw_window_receipt_count = len({(e["seq"], e["this_hash"]) for e in source.value
 assert raw_window_receipt_count == sum(ns(sys.argv[6]) <= r["received_at_ns"] < ns(sys.argv[7]) for r in receipts.values())
 print("unique in-window feed receipts", raw_window_receipt_count)
 membership_changes = [{"seq": e["seq"], "hash": e["this_hash"], "at_ns": ns(e["received_at"]),
-                       "removed": payload(e)["removed"], "added": payload(e)["added"]} for e in changes]
-membership_records = [membership_record(e) for e in sorted(paper.values(), key=lambda e: e["seq"])
-                      if payload(e).get("record") == "membership_changed"]
+                       "removed": membership[e["seq"]]["removed"], "added": membership[e["seq"]]["added"]}
+                      for e in changes]
+membership_records = [membership_record(e, membership[e["seq"]])
+                      for e in sorted(paper.values(), key=lambda e: e["seq"]) if e["seq"] in membership]
 deferrals = []
 for e in source.values():
     if e["source_id"] != "pe-service.watchlist-deferral": continue
@@ -817,8 +827,8 @@ captured deferral artifact with its sequence, hash and receive nanoseconds, and 
 `deferrals` array, including wallet, class, kind and message. Neither export uses AC16's filters.
 
 Run this extracted reference check in the audit directory. It emits one row per membership
-record, with `pass` only when the record decodes, every referenced receipt is verified and the
-wallet/batch/generation identities agree; otherwise it emits `incomplete` and the
+record, with `pass` only when every referenced receipt is verified and the wallet/batch/generation
+identities agree; otherwise it emits `incomplete` and the
 failing references and evidence errors. Use only records at or before S for AC-B judgments,
 including any earlier exclusion record selected by `<membership-from-paper-seq>`. This check
 establishes receipt completeness; the Rust verifier remains the authority for policy semantics.
