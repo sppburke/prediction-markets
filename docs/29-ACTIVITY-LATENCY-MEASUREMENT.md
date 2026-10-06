@@ -185,6 +185,7 @@ clocks; cohort size and stage bounds come from [#730 AC16](https://github.com/sp
 Apply the deployment sequence cutoff to `decision_inputs.admission_receipt.sequence`, including a
 pre-deployment frame recovered and admitted after deployment. Keep that frame's original synchronized
 receipt as the latency origin. Do not replace a cohort member with a later fill when evidence is missing or a span is invalid.
+A re-measurement the owner orders uses a recorded boundary sequence in place of the deployment sequence, with the same bounds.
 Keep each row's continuation, source authority, applied configuration hash, Start identity and
 source/paper prefix identities. Preserve the Part 1 population and causal audit above, with the
 [continuation-7 authority rules](_GLOSSARY.md#continuation-and-commitment-compatibility-588):
@@ -193,55 +194,199 @@ entry. Replaced thin-book/VWAP refusals and a cross-leader paper hold cannot exc
 Frame admission requires the financial Start; before Start a synchronized frame only triggers
 Part 1 reconciliation and creates no admission, decision or incident.
 
-Use captured, verified finite log prefixes and a consistent `paper_state.db` snapshot containing
-its committed WAL state. The deployment capture must identify the first source sequence after
-activation; do not infer it from trade epochs. Retain verification receipts and physical prefix
-bounds with the capture. Record identities and run this inspection, substituting the deployment
-source sequence and cohort size (one fill for AC15; the AC16 size for latency acceptance).
+Capture only after the cohort closes, never while a latency cohort is collecting: heavy reads and
+large writes on the host delay pe-service's durable appends (on 10/5 two AC16 tail samples coincided
+with such jobs). The read-only capture below copies `paper_state.db` with the SQLite backup API in one
+step (one read transaction; the page copy keeps rowids and committed WAL state; the CLI `.backup`
+steps 100 pages at a time and restarts on every production write), then the source frames from the
+capture start through the last complete frame, filtered to the source IDs the recipe reads, then
+the whole paper log. The capture start is separate from the cohort boundary. It is the deployment's
+first source sequence, or an earlier receipt when a frame received before the deployment was recovered
+and decided after it: the inspection authenticates the original receipt of every continuation-7 frame
+decision and the frame receipt of every admission or fallback artifact. The capture checks both and
+stops, naming the earliest missing sequence, when one precedes its start; capture again from a known
+receipt at or before that sequence. Find a start's byte offset by walking frame lengths forward from a
+known receipt (the deploy boot's checkpoint tail, an earlier capture's recorded start, or the log
+header at offset 5, sequence 0); do not infer it from trade epochs. A re-measurement uses the same
+capture start and passes its own cohort boundary to the inspection below. Retain verification
+receipts and physical prefix bounds with the capture.
+
+For #737 AC-B, optionally append `<membership-from-paper-seq>`: the first paper record used
+for judgments in `[restart, S]`, moved earlier when an older record substantiates a closing
+exclusion. Only membership records at or after that paper sequence extend the reference check;
+omitting it retains the frame-only check. A missing earlier receipt stops the capture and names
+the earliest required source sequence. The `KEEP` set also retains the five membership sources:
+ranking, admission, knockout, capacity-config and deferral. AC16 still selects its original sources.
+
+```bash
+python3 - <live-paper_state.db> <live-source_events.log> <live-paper.log> <capture-dir> <capture-start-offset> <capture-start-sequence> [<membership-from-paper-seq>] <<'PY'
+import ctypes, ctypes.util, json, os, re, sqlite3, struct, sys, time, zlib
+from pathlib import Path
+
+live_db, live_source, live_paper, out, start_offset, start_seq = sys.argv[1:7]
+start_offset, start_seq = int(start_offset), int(start_seq)
+membership_from = int(sys.argv[7]) if len(sys.argv) == 8 else None
+assert len(sys.argv) in (7, 8) and (membership_from is None or membership_from >= 0)
+out = Path(out); out.mkdir(mode=0o700, exist_ok=True)
+z = ctypes.CDLL(ctypes.util.find_library("zstd"))
+for name, args in (("ZSTD_decompressBound", [ctypes.c_void_p, ctypes.c_size_t]),
+                   ("ZSTD_decompress", [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t]),
+                   ("ZSTD_isError", [ctypes.c_size_t])):
+    fn = getattr(z, name); fn.argtypes = args; fn.restype = ctypes.c_size_t
+KEEP = {b"pe-service.activity-frame-admission", b"pe-service.activity-frame-fallback",
+        b"pe-service.activity-read-commitment", b"polymarket-activity-ws",
+        b"polymarket-public.activity-reconciliation", b"pe-service.watchlist-ranking",
+        b"pe-service.watchlist-admission", b"pe-service.watchlist-knockout",
+        b"pe-service.watchlist-capacity-config", b"pe-service.watchlist-deferral"}
+
+# 1. One backup-API step: a single read transaction and a page copy (rowids kept). The CLI
+#    `.backup` steps 100 pages at a time and restarts on every production write.
+started = time.time()
+src = sqlite3.connect(Path(live_db).resolve().as_uri() + "?mode=ro", uri=True)
+dst = sqlite3.connect(out / "paper_state.db"); src.backup(dst, pages=-1); dst.close(); src.close()
+print("database copy seconds", round(time.time() - started, 1),
+      "snapshot started", time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(started)))
+# The capture must hold the original receipt of every continuation-7 frame decision in the copy.
+copy = sqlite3.connect((out / "paper_state.db").resolve().as_uri() + "?mode=ro", uri=True)
+(earliest,) = copy.execute(
+    "SELECT min(json_extract(frozen_inputs_json,'$.observed_source_receipt.sequence')) FROM decision_pending "
+    "WHERE json_extract(frozen_inputs_json,'$.version')=7 "
+    "AND json_extract(frozen_inputs_json,'$.source_authority')='activity_frame'").fetchone()
+copy.close()
+missing = [] if earliest is None or earliest >= start_seq else [earliest]
+
+def frames(f, offset):
+    f.seek(offset)
+    while True:
+        head = f.read(4)
+        if len(head) < 4: return
+        (size,) = struct.unpack("<I", head); block = f.read(size); crc = f.read(4)
+        if len(block) < size or len(crc) < 4: return  # incomplete final frame: stop before it
+        assert zlib.crc32(block) == struct.unpack("<I", crc)[0], offset
+        yield offset, head + block + crc, block
+        offset += 4 + size + 4
+
+def envelope(block):
+    capacity = z.ZSTD_decompressBound(block, len(block)); buf = ctypes.create_string_buffer(capacity)
+    length = z.ZSTD_decompress(buf, capacity, block, len(block)); assert not z.ZSTD_isError(length)
+    match = re.match(rb'\{"seq":(\d+),"source_id":"([^"]+)"', buf.raw[:length])
+    return int(match.group(1)), match.group(2), buf.raw[:length]
+
+# 2. Source frames from the capture start to the last complete frame, filtered to the recipe's IDs.
+#    Captured after the copy; admission and fallback artifacts must reference frames inside it.
+REFERENCING = {b"pe-service.activity-frame-admission", b"pe-service.activity-frame-fallback"}
+with open(live_source, "rb") as f, open(out / "source_filtered.log", "wb") as w:
+    w.write(b"EDGE\x01"); expected = start_seq; kept = 0; end = start_offset
+    for end, raw, block in frames(f, start_offset):
+        seq, sid, text = envelope(block); assert seq == expected, (seq, expected); expected += 1
+        if sid in REFERENCING:
+            r = json.loads(bytes(json.loads(text)["payload"]))["frame_receipt"]
+            if r["sequence"] < start_seq: missing.append(r["sequence"])
+        if sid in KEEP: w.write(raw); kept += 1
+        end += len(raw)
+print("source sequences", start_seq, expected - 1, "end offset", end, "kept", kept)
+
+# 3. The whole paper log through its last complete frame.
+with open(live_paper, "rb") as f, open(out / "paper.log", "wb") as w:
+    header = f.read(5); assert header[:4] == b"EDGE"; w.write(header)
+    for _, raw, block in frames(f, 5):
+        w.write(raw)
+        if membership_from is None: continue
+        seq, _, text = envelope(block)
+        if seq < membership_from: continue
+        record = json.loads(bytes(json.loads(text)["payload"]))
+        if record.get("record") != "membership_changed": continue
+        evidence = record["evidence"]
+        references = [evidence.get("ranking_receipt"), evidence.get("config_receipt")]
+        references.extend(a["receipt"] for a in evidence["admission_receipts"])
+        references.extend(a["causal_receipt"] for a in evidence.get("evictions", []))
+        missing.extend(r["sequence"] for r in references if r is not None and r["sequence"] < start_seq)
+# Paper references can only be checked after both finite prefixes have been captured.
+assert not missing, ("capture again from a receipt at or before", min(missing))
+PY
+```
+
+Record identities and run this inspection on the capture, substituting the cohort boundary
+sequence (the deployment sequence, or a recorded re-measurement boundary) and cohort size (one fill
+for AC15; the AC16 size for latency acceptance). The inspection keeps REST pages compressed and
+decodes them on access. It counts bindings to observations before the capture and fails if one binds
+an admitted frame decision or an audited identity. For each market whose earliest captured BUY is not
+before the window, it reads recorded BUYs at or before that stamp from `activity_groups` effects
+before applying the window: an identity seen in the capture keeps its earliest stamp, as the
+whole-prefix reader does, and any other identity, including a captured one whose recorded effect
+corrects it to this market, is an earlier or same-second entry in that market. When such an entry is
+the market's first entry inside the window, the capture holds no source evidence for it in that
+market: the inspection reports it as unknown and acceptance stays unproven. It also reports raw-only
+groups it cannot attribute to a market. `ac16-population.json` keeps the cohort boundary under its
+historical key `deploy_source_seq`.
 It opens SQLite with `mode=ro` and `query_only`, uses autocommit reads on the captured
 snapshot (no long transaction), and reads finite log prefixes. It prints evidence and writes
 only `ac16-population.json` in the separate audit directory for the scoped queries below.
 Supply explicit Central window bounds with offsets, for example `2026-10-05T08:00:00-05:00`
-and `2026-10-05T09:00:00-05:00`; use `-06:00` when Central standard time applies.
+and `2026-10-05T09:00:00-05:00`; use `-06:00` when Central standard time applies. The window end
+must not follow the database snapshot start the capture prints (a conservative cutoff): trades in the
+later-captured logs may lack decisions in the database copy and appear as misses.
 The decoder requires system `libzstd`; it checks framing/CRC, joins ordinary TRADE rows by the
 canonical `g2:` component encoding (using `b3sum`), and preserves envelope receipts. It does not
 replace the Rust log verifier or authority-specific semantic verification. Do not run normal service boot, `--report`, recovery or checkpoint
-preparation as part of this read-only audit.
+preparation as part of this read-only audit. Set `PE_SERVICE_BIN` to the absolute path of the deployed
+`pe-service` binary: the inspection decodes membership records and artifacts only through its
+read-only `--canonical-membership-json` command, and stops without it. It also stops, naming the
+record, at a membership record that command cannot decode; AC-B, AC-C and AC16 are then incomplete.
 
 ```bash
-sha256sum paper_state.db source_events.log paper.log
-stat -c '%s %n' paper_state.db source_events.log paper.log
-python3 - paper_state.db source_events.log paper.log <deploy-source-sequence> <AC16-cohort-size> <window-start-CT> <window-end-CT> <audit-directory> <<'PY'
-import calendar, ctypes, ctypes.util, hashlib, json, re, sqlite3, statistics, struct, subprocess, sys, time, zlib
+sha256sum paper_state.db source_filtered.log paper.log
+stat -c '%s %n' paper_state.db source_filtered.log paper.log
+python3 - paper_state.db source_filtered.log paper.log <boundary-sequence> <AC16-cohort-size> <window-start-CT> <window-end-CT> <audit-directory> <<'PY'
+import calendar, ctypes, ctypes.util, hashlib, json, os, re, sqlite3, statistics, struct, subprocess, sys, time, zlib
 from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
+PE_SERVICE = os.environ.get("PE_SERVICE_BIN")
+if not PE_SERVICE or not os.path.isfile(PE_SERVICE) or not os.access(PE_SERVICE, os.X_OK):
+    sys.exit("PE_SERVICE_BIN must name the deployed pe-service binary")
 z = ctypes.CDLL(ctypes.util.find_library("zstd"))
 for name, args in (("ZSTD_decompressBound", [ctypes.c_void_p, ctypes.c_size_t]),
                    ("ZSTD_decompress", [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t]),
                    ("ZSTD_isError", [ctypes.c_size_t])):
     fn = getattr(z, name); fn.argtypes = args; fn.restype = ctypes.c_size_t
 
+def decode(block, where):
+    capacity = z.ZSTD_decompressBound(block, len(block))
+    assert not z.ZSTD_isError(capacity), where
+    out = ctypes.create_string_buffer(capacity)
+    length = z.ZSTD_decompress(out, capacity, block, len(block))
+    assert not z.ZSTD_isError(length), where
+    return json.loads(out.raw[:length])
+
+class Prefix(dict):
+    """Envelopes by sequence. REST history pages stay compressed and decode on each access."""
+    def __getitem__(self, seq):
+        e = dict.__getitem__(self, seq)
+        return decode(e, seq) if isinstance(e, bytes) else e
+    def values(self):
+        return (self[seq] for seq in self)
+
 def read_prefix(path):
-    raw = Path(path).read_bytes(); assert raw[:5] == b"EDGE\x01", (path, "header")
-    offset = 5; envelopes = {}
-    while offset < len(raw):
-        assert offset + 4 <= len(raw), (path, "incomplete header", offset)
-        size = struct.unpack_from("<I", raw, offset)[0]; end = offset + 4 + size
-        assert end + 4 <= len(raw), (path, "incomplete frame", offset)
-        block = raw[offset + 4:end]
-        assert zlib.crc32(block) == struct.unpack_from("<I", raw, end)[0], (path, offset)
-        capacity = z.ZSTD_decompressBound(block, len(block))
-        assert not z.ZSTD_isError(capacity), (path, offset)
-        out = ctypes.create_string_buffer(capacity)
-        length = z.ZSTD_decompress(out, capacity, block, len(block))
-        assert not z.ZSTD_isError(length), (path, offset)
-        e = json.loads(out.raw[:length]); assert e["seq"] not in envelopes
-        envelopes[e["seq"]] = e; offset = end + 4
-    tail = envelopes[max(envelopes)] if envelopes else None
-    print(path, len(raw), hashlib.sha256(raw).hexdigest(),
-          None if tail is None else (tail["seq"], tail["this_hash"]))
+    envelopes = Prefix(); digest = hashlib.sha256(); size_total = 0; tail = None
+    with open(path, "rb") as f:
+        header = f.read(5); assert header == b"EDGE\x01", (path, "header"); digest.update(header)
+        offset = 5
+        while True:
+            head = f.read(4)
+            if not head: break
+            assert len(head) == 4, (path, "incomplete header", offset)
+            size = struct.unpack("<I", head)[0]; block = f.read(size); crc = f.read(4)
+            assert len(block) == size and len(crc) == 4, (path, "incomplete frame", offset)
+            assert zlib.crc32(block) == struct.unpack("<I", crc)[0], (path, offset)
+            digest.update(head); digest.update(block); digest.update(crc)
+            e = decode(block, (path, offset)); assert e["seq"] not in envelopes
+            tail = (e["seq"], e["this_hash"])
+            dict.__setitem__(envelopes, e["seq"],
+                             block if e["source_id"] == "polymarket-public.activity-reconciliation" else e)
+            offset += 4 + size + 4
+    print(path, offset, digest.hexdigest(), tail)
     return envelopes
 
 def payload(e):
@@ -256,8 +401,84 @@ def ns(value):
     d = datetime.fromisoformat(base + ("+00:00" if zone == "Z" else zone))
     return calendar.timegm(d.utctimetuple()) * 10**9 + int((fraction or "").ljust(9, "0"))
 
+# Rust owns membership decoding. The deployed binary named by PE_SERVICE_BIN decodes each paper
+# membership record and referenced artifact exactly as the qualification verifier does (typed
+# serde, the sealed-evidence schema and the admission proof manifest) and prints canonical JSON;
+# every comparison below reads that output.
+def rust_membership_json(kind, raw):
+    out = subprocess.run([PE_SERVICE, "--canonical-membership-json", kind], input=raw, capture_output=True)
+    if out.returncode != 0:
+        lines = [line.strip() for line in out.stderr.decode(errors="replace").splitlines() if line.strip()]
+        raise ValueError(lines[-1] if lines else f"exit {out.returncode}")
+    return json.loads(out.stdout)
+
+def membership_artifact(e, expected):
+    assert (e["source_id"], e["schema_version"], e["parser_version"], e["content_type"]) == (expected, 1, 1, "json"), "artifact envelope"
+    try: return rust_membership_json(expected, bytes(e["payload"]))
+    except ValueError as error: raise AssertionError("artifact decode: " + str(error))
+
+def membership_record(e, c):
+    evidence = c["evidence"]; references = []; errors = []
+    def reference(name, r, expected, wallet=None):
+        row = {"reference": name, "seq": None, "hash": None, "expected_source_id": expected,
+               "status": "mismatched", "error": None}
+        references.append(row)
+        try:
+            row.update(seq=r["sequence"], hash=r["this_hash"])
+            if r["sequence"] not in source:
+                row.update(status="missing", error="receipt absent from captured source prefix"); return None
+            envelope = source[r["sequence"]]
+            assert envelope["this_hash"] == r["this_hash"], "receipt hash differs"
+            artifact = membership_artifact(envelope, expected)
+            if wallet is not None: assert artifact["wallet"] == wallet, "artifact wallet differs"
+            row["status"] = "verified"
+            return artifact
+        except (AssertionError, KeyError, ValueError, TypeError, ArithmeticError) as error:
+            row["error"] = str(error); return None
+    # Enumerate references before contextual checks: one bad batch identity must not hide
+    # an admission or eviction receipt from the export.
+    kind = evidence.get("kind")
+    ranking = config = None
+    if kind == "full_rerank" or evidence.get("ranking_receipt") is not None:
+        ranking = reference("ranking_receipt", evidence.get("ranking_receipt"), "pe-service.watchlist-ranking")
+    if kind == "capacity_change" or "config_receipt" in evidence:
+        config = reference("config_receipt", evidence.get("config_receipt"), "pe-service.watchlist-capacity-config")
+    for field, key, expected in (("admission_receipts", "receipt", "pe-service.watchlist-admission"),
+                                 ("evictions", "causal_receipt", "pe-service.watchlist-knockout")):
+        for i, item in enumerate(evidence.get(field, [])):
+            reference(f"{field}[{i}].{key}", item[key], expected, item["wallet"])
+    try:
+        reasons = {"full_rerank": ["full_rerank"], "capacity_change": ["capacity_change"],
+                   "knockout_backfill": ["knockout_inactivity", "knockout_inactivity_hard_cap", "knockout_underperformance"]}
+        assert c["reason"] in reasons[kind], "evidence kind differs from reason"
+        if ranking is not None:
+            assert ranking.get("batch_id") == c["ranking_batch_id"], "ranking batch differs"
+            if kind == "full_rerank": assert c["ranking_batch_id"] is not None, "ranking batch missing"
+        if kind == "capacity_change":
+            assert c["ranking_batch_id"] is None, "capacity unexpectedly names a batch"
+            if config is not None:
+                assert config["generation"] == evidence["generation"] > 0 and config["target"] == c["capacity"], "capacity identity differs"
+        wallets = [a["wallet"] for a in evidence["admission_receipts"]]
+        assert len(set(wallets)) == len(wallets) and set(wallets) == set(c["added"]), "admission wallets differ"
+        if kind == "knockout_backfill":
+            wallets = [a["wallet"] for a in evidence["evictions"]]
+            assert len(set(wallets)) == len(wallets) and set(wallets) == set(c["removed"]), "eviction wallets differ"
+    except (AssertionError, KeyError, ValueError, TypeError) as error:
+        errors.append(str(error))
+    return {"seq": e["seq"], "hash": e["this_hash"], "received_at_ns": ns(e["received_at"]),
+            **{k: c[k] for k in ("reason", "removed", "added", "capacity", "ranking_batch_id")},
+            "kind": evidence.get("kind"), "references": references, "evidence_errors": errors}
+
 audit_unix_ns = time.time_ns(); print("audit clock", audit_unix_ns)
 source = read_prefix(sys.argv[2]); paper = read_prefix(sys.argv[3])
+# Decode every membership record once; the replay and both exports read only this canonical form.
+# The shared replay cannot continue past a record the verifier cannot decode, so it stops here.
+membership = {}
+for e in paper.values():
+    if payload(e).get("record") != "membership_changed": continue
+    try: membership[e["seq"]] = rust_membership_json("membership_changed", bytes(e["payload"]))
+    except ValueError as error:
+        sys.exit(f"membership record {e['seq']} {e['this_hash']} does not decode; AC-B, AC-C and AC16 are incomplete: {error}")
 window_start = ns(sys.argv[6]) // 10**9; window_end = ns(sys.argv[7]) // 10**9
 assert window_start < window_end
 audit_dir = Path(sys.argv[8]).resolve(); assert audit_dir.is_dir()
@@ -373,14 +594,19 @@ for purpose, values in (("book receipt", book_receipt_spans), ("trade time / fee
     values.sort(); n = len(values)
     print(purpose, "n", n, "missing/invalid", len(cohort) - n, "median/p95/max ms",
           None if not n else (statistics.median(values), values[(95*n+99)//100-1], values[-1]))
-fallbacks = {}; fallback_rows = []
-for e in sorted(source.values(), key=lambda e: e["seq"]):
+fallbacks = {}; fallback_rows = []; window_fallbacks = []
+for e in (source[seq] for seq in sorted(source)):
     if e["source_id"] == "pe-service.activity-frame-fallback":
         a = payload(e); r = a["frame_receipt"]; frame = receipt(source, r)
         assert e["schema_version"] == 1 and e["parser_version"] == 1 and a["version"] == 1
         assert frame["source_id"] == "polymarket-activity-ws"
         assert a["reason"] in ("latched", "history_behind", "earlier_unresolved_buy", "wallet_not_ready")
         key = (r["sequence"], r["this_hash"])
+        window_fallbacks.append({"seq": e["seq"], "hash": e["this_hash"],
+                                 "recorded_at_ns": ns(e["received_at"]),
+                                 "frame_seq": r["sequence"], "frame_hash": r["this_hash"],
+                                 "reason": a["reason"], "routing_clock": a["routing_clock"],
+                                 "frontier": a["frontier"], "latest_incident_basis": a["latest_incident_basis"]})
         if key not in fallbacks:
             fallbacks[key] = a
             fallback_rows.append({"frame_seq": r["sequence"], "frame_hash": r["this_hash"],
@@ -395,13 +621,14 @@ for e in paper.values():
 groups = {r["source_trade_id"]: dict(r) for r in db.execute(
     "SELECT * FROM activity_groups WHERE source_epoch >= ? AND source_epoch < ?",
     (window_start, window_end))}
-keys = {}; matched = set(); legs = {}; buys = {}; frame_rows = []
+keys = {}; matched = set(); legs = {}; buys = {}; frame_rows = []; receipts = {}
 admitted = set()
 for row in db.execute("SELECT frozen_inputs_json FROM decision_pending "
                       "WHERE json_extract(frozen_inputs_json,'$.version')=7 "
                       "AND json_extract(frozen_inputs_json,'$.source_authority')='activity_frame'"):
     c = json.loads(row[0]); r = c["observed_source_receipt"]
-    receipt(source, r)  # authenticate the admitted receipt against the captured prefix
+    frame = receipt(source, r)  # authenticate the admitted receipt against the captured prefix
+    assert frame["source_id"] == "polymarket-activity-ws"
     admitted.add((r["sequence"], r["this_hash"]))
 def frame_row(identity, e):
     r = payload(e)
@@ -439,10 +666,17 @@ for e in source.values():
             and not r.get("isCombo", r.get("is_combo", False))):
             epoch = int(r["timestamp"]); epoch = epoch // 1000 if epoch > 9_999_999_999 else epoch  # production normalization
             entry = {"id": key, "wallet": wallet, "market": parts[4].decode(), "epoch": epoch,
-                     "page_seq": e["seq"], "page_hash": e["this_hash"]}
+                     "tx": tx, "page_seq": e["seq"], "page_hash": e["this_hash"]}
             if key not in buys or epoch < buys[key]["epoch"]: buys[key] = entry
         if is_frame:
             frame_rows.append(frame_row(key, e))
+            epoch = int(r["timestamp"]); epoch = epoch // 1000 if epoch > 9_999_999_999 else epoch
+            receipts[e["seq"]] = {"seq": e["seq"], "hash": e["this_hash"],
+                "received_at_ns": ns(e["received_at"]), "received_at": e["received_at"],
+                "wallet": wallet, "market": None if parts[4] is None else parts[4].decode(),
+                "outcome": None if parts[6] is None else int.from_bytes(parts[6], "big"), "side": None if parts[7] is None else parts[7].decode(),
+                "id": key, "history_group_ids": [], "epoch": epoch,
+                "qualifying": frame_rows[-1]["qualifying"]}
             continue
         if key not in groups: continue
         g = groups[key]; assert g["wallet_hex"] == wallet and g["transaction_hash"] == tx
@@ -456,25 +690,67 @@ for e in source.values():
 print("unmatched group identities; resolve from authenticated corrections or report unknown", sorted(set(groups) - matched))
 print("multi-leg controls", [(w, tx, sorted(ids)) for (w, tx), ids in legs.items() if len(ids) > 1])
 # Bind corrected/aliased frame identities using authenticated commitment receipts.
+first_captured = min(source); outside = 0; outside_ids = set()
 for e in source.values():
     if e["source_id"] != "pe-service.activity-read-commitment": continue
     for b in payload(e).get("bindings") or []:
-        f = receipt(source, b["stream_receipt"])
+        r = b["stream_receipt"]
+        if r["sequence"] < first_captured:
+            assert (r["sequence"], r["this_hash"]) not in admitted, ("audited frame outside the capture", r)
+            outside += 1; outside_ids.add(b["history_group_id"]); continue
+        f = receipt(source, r)
         assert f["source_id"] == "polymarket-activity-ws"
         frame_rows.append(frame_row(b["history_group_id"], f))
+        twins = receipts[f["seq"]]["history_group_ids"]
+        if b["history_group_id"] not in twins: twins.append(b["history_group_id"])
+print("bindings to observations before the capture", outside)
 # Replay recorded membership, retaining removed wallets and all prices.
-start = payload(paper[start_seq]); members = set(start["membership"])
-changes = sorted((e for e in paper.values() if e["seq"] > start_seq
-                  and payload(e).get("record") == "membership_changed"), key=lambda e: e["seq"])
+def canonical_wallet(w):
+    # WalletAddress::from_hex: "0x" then 40 hex digits in either case; canonical form is lowercase.
+    assert isinstance(w, str) and re.fullmatch(r"0x[0-9a-fA-F]{40}", w), "Start membership wallet"
+    return w.lower()
+start = payload(paper[start_seq]); members = {canonical_wallet(w) for w in start["membership"]}
+changes = sorted((e for e in paper.values() if e["seq"] > start_seq and e["seq"] in membership),
+                 key=lambda e: e["seq"])
 intervals = []; opened = {w: ns(paper[start_seq]["received_at"]) for w in members}
 for e in changes:
-    at = ns(e["received_at"]); c = payload(e)
+    at = ns(e["received_at"]); c = membership[e["seq"]]
     for w in c["removed"]: intervals.append((w, opened.pop(w), at)); members.remove(w)
     for w in c["added"]: assert w not in members; members.add(w); opened[w] = at
 intervals.extend((w, at, window_end * 10**9) for w, at in opened.items())
 first = {}
 for b in buys.values():
     k = (b["wallet"], b["market"]); first[k] = min(first.get(k, b["epoch"]), b["epoch"])
+unattributable = {}; restamped = []; unknown = []
+def captured(sid, wallet, market):
+    # Captured evidence for this pair: a recorded market correction is not the captured identity.
+    b = buys.get(sid); return b is not None and (b["wallet"], b["market"]) == (wallet, market)
+for (wallet, market), epoch in list(first.items()):
+    if epoch < window_start: continue  # stamps only move earlier: this first entry precedes the window
+    # Recorded BUYs at or before the captured first stamp: an identity seen in the capture keeps its
+    # earliest stamp, as the whole-prefix reader does; any other identity is an earlier or
+    # same-second entry in this market.
+    earlier = list(db.execute(
+            "SELECT source_trade_id, source_epoch FROM activity_groups WHERE wallet_hex=? AND activity_type='TRADE' "
+            "AND json_extract(proof_json,'$.effect.kind')='trade' AND json_extract(proof_json,'$.effect.side')='Buy' "
+            "AND json_extract(proof_json,'$.effect.market')=? AND CAST(json_extract(proof_json,'$.effect.amount') AS INTEGER) > 0 "
+            "AND source_epoch <= ?", (wallet, market, epoch)))
+    for sid, recorded in earlier:
+        if captured(sid, wallet, market) and recorded < buys[sid]["epoch"]:
+            restamped.append((sid, buys[sid]["epoch"], recorded)); buys[sid]["epoch"] = recorded
+        first[wallet, market] = min(first[wallet, market], recorded)
+    entry = first[wallet, market]
+    if not window_start <= entry < window_end: continue
+    # An in-window first entry recorded only outside the capture has no source evidence here.
+    unknown += [(wallet, market, sid, recorded) for sid, recorded in earlier
+                if recorded == entry and not captured(sid, wallet, market)]
+    (raw,) = db.execute("SELECT count(*) FROM activity_groups WHERE wallet_hex=? AND activity_type='TRADE' "
+                        "AND json_extract(proof_json,'$.effect.kind')='raw_only' AND source_epoch < ?",
+                        (wallet, entry)).fetchone()
+    if raw: unattributable[wallet] = max(unattributable.get(wallet, 0), raw)
+print("captured BUY identities with an earlier recorded stamp (identity, captured, recorded)", restamped)
+print("in-window first entries without captured source evidence (unknown; acceptance unproven)", unknown)
+print("earlier raw-only TRADE groups that cannot be attributed to a market, by wallet", unattributable)
 population = []
 for b in buys.values():
     if not window_start <= b["epoch"] < window_end or b["epoch"] != first[b["wallet"], b["market"]]: continue
@@ -487,15 +763,351 @@ audited_ids = {r[0] for r in db.execute(
     "SELECT source_trade_id FROM decision_pending WHERE source_epoch >= ? AND source_epoch < ? "
     "AND json_extract(frozen_inputs_json,'$.version')=7", (window_start, window_end))}
 audited_ids.update(b["id"] for b in population)
+assert not outside_ids & audited_ids, ("capture starts after bindings audited identities need", sorted(outside_ids & audited_ids)[:5])
+# AC-C's receipt census is independent of source-time first-entry population membership.
+# Count directly from the captured prefix, never from frame_rows or the JSON being exported.
+raw_receipt_count = len({(e["seq"], e["this_hash"]) for e in source.values()
+                         if e["source_id"] == "polymarket-activity-ws"})
+print("unique captured feed receipts", raw_receipt_count, "exported receipts", len(receipts))
+assert raw_receipt_count == len(receipts), "receipt export dropped captured feed inputs"
+raw_window_receipt_count = len({(e["seq"], e["this_hash"]) for e in source.values()
+    if e["source_id"] == "polymarket-activity-ws" and ns(sys.argv[6]) <= ns(e["received_at"]) < ns(sys.argv[7])})
+assert raw_window_receipt_count == sum(ns(sys.argv[6]) <= r["received_at_ns"] < ns(sys.argv[7]) for r in receipts.values())
+print("unique in-window feed receipts", raw_window_receipt_count)
+membership_changes = [{"seq": e["seq"], "hash": e["this_hash"], "at_ns": ns(e["received_at"]),
+                       "removed": membership[e["seq"]]["removed"], "added": membership[e["seq"]]["added"]}
+                      for e in changes]
+membership_records = [membership_record(e, membership[e["seq"]])
+                      for e in sorted(paper.values(), key=lambda e: e["seq"]) if e["seq"] in membership]
+deferrals = []
+for e in source.values():
+    if e["source_id"] != "pe-service.watchlist-deferral": continue
+    assert (e["schema_version"], e["parser_version"], e["content_type"]) == (1, 1, "json")
+    a = payload(e); assert a["version"] == 1
+    # Deferrals are audit-only (no Rust decoder); check the writer's serialized shape.
+    assert isinstance(a["deferrals"], list), "deferrals array"
+    for d in a["deferrals"]:
+        assert isinstance(d, dict) and set(d) == {"wallet", "stage", "class", "kind", "message"}, "deferral fields"
+        assert isinstance(d["wallet"], str) and re.fullmatch(r"0x[0-9a-fA-F]{40}", d["wallet"]), "deferral wallet"
+        assert all(isinstance(d[k], str) for k in ("stage", "kind", "message")), "deferral text"
+        assert d["class"] in ("wallet_transient", "wallet_persistent", "shared"), "deferral class"
+    deferrals.append({"seq": e["seq"], "hash": e["this_hash"], "received_at_ns": ns(e["received_at"]),
+                      "deferrals": a["deferrals"]})
 frame_rows = [f for f in frame_rows if f["id"] in audited_ids]
 frame_keys = {(f["frame_seq"], f["frame_hash"]) for f in frame_rows}
 fallback_rows = [f for f in fallback_rows if (f["frame_seq"], f["frame_hash"]) in frame_keys]
 (audit_dir / "ac16-population.json").write_text(json.dumps({
     "deploy_source_seq": int(sys.argv[4]), "window_start": window_start, "window_end": window_end,
+    "receipts": list(receipts.values()), "window_fallbacks": window_fallbacks,
+    "raw_receipt_count": raw_receipt_count, "raw_window_receipt_count": raw_window_receipt_count,
+    "membership_changes": membership_changes,
+    "membership_records": membership_records, "deferrals": deferrals,
     "frames": frame_rows, "fallbacks": fallback_rows, "buys": population}, sort_keys=True))
 db.close()
 PY
 ```
+
+**#737 AC-B membership evidence (release 1).** The same `ac16-population.json` now exports
+`membership_records`: every captured paper `membership_changed` record's sequence, hash,
+receive nanoseconds, reason, deltas, capacity, ranking batch and sealed evidence kind. Each
+reference names its expected source ID and is `verified`, `missing` or `mismatched` against
+the captured source prefix. Verification requires the same sequence and hash, the owner's
+source ID, schema 1 / parser 1 / JSON envelope, and decoding as the owner's typed artifact by
+`pe-service --canonical-membership-json`, which decodes the record, its sealed evidence and each
+artifact exactly as the qualification verifier does, including the admission proof manifest;
+every identity comparison reads its canonical output. The artifact structs contain no further
+`AppendReceipt` references: admission proof documents are retained JSON preimages and knockout
+fill sequence fields are provenance, not sequence/hash receipts. `deferrals` exports every
+captured deferral artifact with its sequence, hash and receive nanoseconds, and its full
+`deferrals` array, including wallet, class, kind and message. Neither export uses AC16's filters.
+
+Run this extracted reference check in the audit directory. It emits one row per membership
+record, with `pass` only when every referenced receipt is verified and the wallet/batch/generation
+identities agree; otherwise it emits `incomplete` and the
+failing references and evidence errors. Use only records at or before S for AC-B judgments,
+including any earlier exclusion record selected by `<membership-from-paper-seq>`. This check
+establishes receipt completeness; the Rust verifier remains the authority for policy semantics.
+AC-B's live-wallet accounting and operator status/journal commands are in docs/35.
+
+```bash
+sqlite3 -readonly -header -json paper_state.db <<'SQL'
+WITH membership_inputs AS (
+  SELECT value AS j FROM json_each(readfile('ac16-population.json'),'$.membership_records')
+)
+SELECT j->>'$.seq' AS seq, j->>'$.hash' AS hash, j->>'$.received_at_ns' AS received_at_ns,
+       j->>'$.reason' AS reason, j->>'$.kind' AS kind,
+       CASE WHEN json_array_length(j,'$.evidence_errors')=0
+             AND NOT EXISTS (SELECT 1 FROM json_each(j,'$.references')
+                             WHERE value->>'$.status' IS NOT 'verified')
+            THEN 'pass' ELSE 'incomplete' END AS verdict,
+       (SELECT json_group_array(json(value)) FROM json_each(j,'$.references')
+        WHERE value->>'$.status' IS NOT 'verified') AS failing_references,
+       j->'$.evidence_errors' AS evidence_errors
+FROM membership_inputs ORDER BY j->>'$.seq';
+SQL
+```
+
+The extracted closing-batch check consumes `ac-b-closing-batch.json`, with this shape (all
+times are integer epoch milliseconds; each read records `SELECT max(batch_id) FROM ranking_batches`):
+
+```json
+{"s_unix_ms": 1800000060000,
+ "reads": [{"started_unix_ms": 1800000050000, "completed_unix_ms": 1800000050100, "batch_id": 86},
+           {"started_unix_ms": 1800000060100, "completed_unix_ms": 1800000060200, "batch_id": 87}],
+ "publications": [{"batch_id": 87, "committed_unix_ms": 1800000060050,
+                   "evidence": "retained publication-commit evidence path and checksum"}]}
+```
+
+`publications` is optional and contains retained evidence of actual transaction commitment;
+a batch row's `created_at` alone is insufficient. The last read completed at or before S and
+the first read started at or after S must agree. When they differ, the earlier batch is selected
+only when the later batch ID is exactly the earlier ID plus one and retained evidence shows that
+later batch committed strictly after S. Otherwise AC-B remains incomplete: a skipped ID may have
+committed before S. Missing brackets, empty maxima, malformed read bounds and conflicting tied
+reads also remain incomplete. Reads that straddle S provide no bracket. Retain the input and result.
+
+```bash
+sqlite3 -readonly -header -json paper_state.db <<'SQL'
+WITH closing_batch_inputs AS (
+  SELECT readfile('ac-b-closing-batch.json') AS j
+), reads AS (
+  SELECT value AS r, value->>'$.started_unix_ms' AS started,
+         value->>'$.completed_unix_ms' AS completed, value->>'$.batch_id' AS batch
+  FROM closing_batch_inputs, json_each(j,'$.reads')
+), before_s AS (
+  SELECT * FROM reads, closing_batch_inputs WHERE completed <= j->>'$.s_unix_ms'
+    AND completed=(SELECT max(completed) FROM reads WHERE completed <= j->>'$.s_unix_ms')
+), after_s AS (
+  SELECT * FROM reads, closing_batch_inputs WHERE started >= j->>'$.s_unix_ms'
+    AND started=(SELECT min(started) FROM reads WHERE started >= j->>'$.s_unix_ms')
+), brackets AS (
+  SELECT (SELECT min(batch) FROM before_s) AS earlier_batch,
+         (SELECT min(batch) FROM after_s) AS later_batch,
+         json_type(j,'$.s_unix_ms')='integer' AND json_type(j,'$.reads')='array'
+         AND NOT EXISTS (SELECT 1 FROM reads WHERE json_type(r,'$.started_unix_ms') IS NOT 'integer'
+           OR json_type(r,'$.completed_unix_ms') IS NOT 'integer' OR started > completed
+           OR json_type(r,'$.batch_id') IS NOT 'integer')
+         AND (SELECT count(DISTINCT batch) FROM before_s)=1
+         AND (SELECT count(DISTINCT batch) FROM after_s)=1 AS valid,
+         j FROM closing_batch_inputs
+), result AS (
+  SELECT *, valid AND (earlier_batch=later_batch OR (later_batch = earlier_batch + 1
+    AND EXISTS (SELECT 1 FROM json_each(j,'$.publications')
+      WHERE value->>'$.batch_id'=later_batch AND json_type(value,'$.committed_unix_ms')='integer'
+        AND value->>'$.committed_unix_ms' > j->>'$.s_unix_ms'
+        AND json_type(value,'$.evidence')='text' AND length(trim(value->>'$.evidence')) > 0))) AS proved
+  FROM brackets
+)
+SELECT CASE WHEN proved THEN earlier_batch END AS closing_batch_id,
+       CASE WHEN proved THEN 'pass' ELSE 'incomplete' END AS verdict,
+       earlier_batch, later_batch FROM result;
+SQL
+```
+
+**#737 AC-C receipt census (release 1).** Pin this recipe by the deployed revision and
+its `sha256sum` before the swap. Record the deployment boundary source sequence, invocation ID,
+`pe-service listening` UTC time, and `window_end` (listening + 7,200 s). After the window
+closes, run the capture above once; its printed database snapshot start is the capture cutoff
+and must be later than `window_end`. Retain the activation sequence and verified source/paper
+prefix identities, plus the exact capture, inspection, journal and census command lines.
+Run the inspection with that deployment sequence, **AC16 cohort size 0**, listening as its
+window start and `window_end` as its end: its cohort assertion requires an empty latency cohort.
+The existing source-time first-entry checks and scoped SQL below still run unchanged.
+
+The export's `receipts` preserves every unique captured feed receipt before the population
+filter, with the original authenticated receive text and nanoseconds, normalized identity and
+trade epoch, content qualification, and authenticated binding targets in `history_group_ids`.
+`window_fallbacks` preserves every captured fallback before the frame-key filter, including
+frontier and latch evidence. Despite its name this array is unfiltered; the census applies the
+receive window. The inspection independently counts feed receipts straight from the captured
+prefix, asserts agreement with the export, and repeats that check for the receive window.
+
+Receipt selection is `[listening, window_end)`, whatever its trade-time delay or membership at
+trade time. Routing evidence continues through the capture cutoff: a queued receipt may route
+after `window_end`. Capture the journal for this invocation through that cutoff, retaining the
+journal timestamp and decoding `MESSAGE` as the service's **flattened** JSON event:
+
+```bash
+journalctl -u pe-service _SYSTEMD_INVOCATION_ID=<id> --since '<listening UTC>' --until '<capture-cutoff UTC>' -o json > journal.json
+python3 - journal.json ignored.json <<'PY'
+import json, re, sys
+from decimal import Decimal
+from pathlib import Path
+
+ignored = []
+def require(line, fields):
+    assert all(k in line and line[k] is not None for k in fields), ("missing ignored field", fields, line)
+for entry in Path(sys.argv[1]).read_text().splitlines():
+    entry = json.loads(entry)
+    try:
+        line = json.loads(entry.get("MESSAGE", ""))
+    except (ValueError, TypeError):
+        continue
+    if not isinstance(line, dict) or line.get("message") != "frame admission ignored": continue
+    require(entry, ["__REALTIME_TIMESTAMP"])
+    assert re.fullmatch(r"\d+", entry["__REALTIME_TIMESTAMP"]), entry
+    require(line, ["receipt_sequence", "receipt_hash", "wallet", "market", "outcome", "source_trade_id", "reason"])
+    assert type(line["receipt_sequence"]) is int and line["receipt_sequence"] >= 0, line
+    assert re.fullmatch(r"[0-9a-f]{64}", line["receipt_hash"]), line
+    assert type(line["outcome"]) is int, line
+    reason = line["reason"]
+    assert reason in ("identity_seen", "rest_owned", "market_consumed", "not_entry", "not_copy_eligible"), line
+    if reason == "identity_seen":
+        pairs = (["earlier_receipt_sequence", "earlier_receipt_hash"],
+                 ["continuation_source_trade_id", "continuation_semantic_revision"])
+        assert any(any(k in line for k in pair) for pair in pairs), line
+        for pair in pairs:
+            if any(k in line for k in pair): require(line, pair)
+    elif reason == "rest_owned":
+        require(line, ["semantic_revision", "disposition"])
+    else:
+        require(line, ["action", "balance", "short_balance"])
+        for field in ("balance", "short_balance"):
+            assert isinstance(line[field], str) and Decimal(line[field]).is_finite(), line
+        line["balance_positive"] = Decimal(line["balance"]) > 0
+        if reason == "market_consumed": require(line, ["consuming_source_trade_id", "first_epoch"])
+    line["__REALTIME_TIMESTAMP"] = entry["__REALTIME_TIMESTAMP"]
+    ignored.append(line)
+Path(sys.argv[2]).write_text(json.dumps(ignored, sort_keys=True))
+PY
+```
+
+Run this extracted SQL in the audit directory on the captured database. Set `listening_ns`,
+`window_end_ns` and `capture_cutoff_ns` to exact epoch nanoseconds for the recorded UTC bounds
+(the inspection's `ns` conversion preserves fractional seconds). The SQL joins JSON inputs
+directly. A decision counts only for its authenticated admitted receipt; a second reader's echo
+needs its own ignored line. Binding targets extend a receipt's identity, never its receipt key.
+Each qualifying receipt needs exactly one disposition: (a) frame decision; (b) confirmed ignored
+reason; or (c) `earlier_unresolved_buy` with a separately authenticated smaller-sequence BUY
+and the fallback receipt's **own** history group/gate, plus its decision if that gate admits.
+The blocker is reported with whether both receipts traded in the same second; receive-time ties
+never override durable sequence order. Other fallbacks, missing evidence and duplicate dispositions
+fail. An unexplained `not_copy_eligible` is incomplete: only a captured structural removal with
+no subsequent addition before routing, or a still-active fence recorded after receipt and before
+routing, confirms loss of live eligibility. A structural addition after either loss invalidates
+that explanation. Structural removals preclude live re-entry until structural addition; an
+active fence in this snapshot precludes live re-entry while it remains active. Same-second fence
+ordering that the persisted second clock cannot establish remains incomplete.
+
+```bash
+sqlite3 -readonly -header -json paper_state.db \
+  -cmd '.parameter init' \
+  -cmd '.parameter set :listening_ns <listening-epoch-ns>' \
+  -cmd '.parameter set :window_end_ns <window-end-epoch-ns>' \
+  -cmd '.parameter set :capture_cutoff_ns <capture-cutoff-epoch-ns>' <<'SQL'
+WITH census_inputs AS (
+  SELECT readfile('ac16-population.json') AS population, readfile('ignored.json') AS ignored
+), receipts AS (
+  SELECT j->>'$.seq' AS seq, j->>'$.hash' AS hash, j->>'$.id' AS id,
+         j->>'$.wallet' AS wallet, j->>'$.market' AS market, j->>'$.outcome' AS outcome,
+         j->>'$.epoch' AS epoch, j->>'$.received_at_ns' AS received_at_ns,
+         j->>'$.qualifying' AS qualifying, j
+  FROM (SELECT value AS j FROM census_inputs, json_each(population,'$.receipts'))
+), selected AS (
+  SELECT * FROM receipts WHERE qualifying=1 AND received_at_ns >= :listening_ns
+    AND received_at_ns < :window_end_ns
+), identities AS (
+  SELECT seq, hash, id FROM receipts
+  UNION SELECT r.seq, r.hash, b.value FROM receipts r, json_each(r.j,'$.history_group_ids') b
+), ignored AS (
+  SELECT value AS j, value->>'$.receipt_sequence' AS seq, value->>'$.receipt_hash' AS hash,
+         CAST(value->>'$.__REALTIME_TIMESTAMP' AS INTEGER)*1000 AS routed_at_ns
+  FROM census_inputs, json_each(ignored)
+), membership AS (
+  SELECT value AS j, value->>'$.at_ns' AS at_ns FROM census_inputs,
+       json_each(population,'$.membership_changes')
+), losses AS (
+  SELECT r.seq, r.hash, i.routed_at_ns, m.at_ns AS lost_at_ns
+  FROM selected r JOIN ignored i USING(seq,hash) JOIN membership m
+    ON m.at_ns > r.received_at_ns AND m.at_ns <= i.routed_at_ns
+  WHERE EXISTS (SELECT 1 FROM json_each(m.j,'$.removed') WHERE value=r.wallet)
+  UNION ALL
+  SELECT r.seq, r.hash, i.routed_at_ns, f.fenced_at_unix*1000000000
+  FROM selected r JOIN ignored i USING(seq,hash) JOIN wallet_fences f ON f.wallet_hex=r.wallet
+  WHERE f.fenced_at_unix*1000000000 > r.received_at_ns
+    AND f.fenced_at_unix*1000000000+999999999 <= i.routed_at_ns
+), confirmed_losses AS (
+  SELECT l.* FROM losses l JOIN selected r USING(seq,hash)
+  WHERE NOT EXISTS (SELECT 1 FROM membership m, json_each(m.j,'$.added') a
+    WHERE a.value=r.wallet AND m.at_ns >= l.lost_at_ns AND m.at_ns <= l.routed_at_ns)
+), dispositions AS (
+  SELECT r.seq, r.hash, 'a' AS class, 1 AS confirmed, 'frame decision' AS reason,
+         NULL AS blocking_seq, NULL AS same_trade_second
+  FROM selected r JOIN decision_pending d
+    ON json_extract(d.frozen_inputs_json,'$.version')=7
+   AND json_extract(d.frozen_inputs_json,'$.source_authority')='activity_frame'
+   AND json_extract(d.frozen_inputs_json,'$.observed_source_receipt.sequence')=r.seq
+   AND json_extract(d.frozen_inputs_json,'$.observed_source_receipt.this_hash')=r.hash
+   AND d.wallet_hex=r.wallet
+   AND EXISTS (SELECT 1 FROM identities x WHERE x.seq=r.seq AND x.hash=r.hash AND x.id=d.source_trade_id)
+  UNION ALL
+  SELECT r.seq, r.hash, 'b',
+    CASE WHEN i.j->>'$.wallet'!=r.wallet OR i.j->>'$.market'!=r.market
+           OR i.j->>'$.outcome'!=r.outcome OR i.j->>'$.source_trade_id'!=r.id
+           OR i.routed_at_ns+999 < r.received_at_ns THEN 0
+      WHEN i.j->>'$.reason'='identity_seen' THEN
+        EXISTS (SELECT 1 FROM receipts earlier JOIN identities x ON x.seq=earlier.seq AND x.hash=earlier.hash
+          JOIN identities own ON own.seq=r.seq AND own.hash=r.hash AND own.id=x.id
+          WHERE earlier.seq=i.j->>'$.earlier_receipt_sequence' AND earlier.hash=i.j->>'$.earlier_receipt_hash'
+            AND earlier.seq<r.seq AND earlier.wallet=r.wallet)
+        OR EXISTS (SELECT 1 FROM decision_pending d JOIN identities x ON x.id=d.source_trade_id
+          WHERE x.seq=r.seq AND x.hash=r.hash AND d.wallet_hex=r.wallet
+            AND d.source_trade_id=i.j->>'$.continuation_source_trade_id'
+            AND d.semantic_revision=i.j->>'$.continuation_semantic_revision')
+      WHEN i.j->>'$.reason'='rest_owned' THEN EXISTS (
+        SELECT 1 FROM activity_groups g WHERE g.source_trade_id=r.id AND g.wallet_hex=r.wallet
+          AND g.semantic_revision=i.j->>'$.semantic_revision' AND g.disposition=i.j->>'$.disposition')
+      WHEN i.j->>'$.reason'='market_consumed' THEN EXISTS (
+        SELECT 1 FROM wallet_market_history_v2 h WHERE h.wallet_hex=r.wallet AND h.market_id=r.market
+          AND h.source_trade_id=i.j->>'$.consuming_source_trade_id' AND h.first_epoch=i.j->>'$.first_epoch')
+      WHEN i.j->>'$.reason'='not_entry' THEN i.j->>'$.action'!='Entry'
+        AND (i.j->>'$.action'!='Add' OR i.j->>'$.balance_positive'=1)
+      WHEN i.j->>'$.reason'='not_copy_eligible' THEN CASE WHEN EXISTS (
+        SELECT 1 FROM confirmed_losses l WHERE l.seq=r.seq AND l.hash=r.hash AND l.routed_at_ns=i.routed_at_ns)
+        THEN 1 ELSE -1 END
+      ELSE 0 END,
+    i.j->>'$.reason', NULL, NULL
+  FROM selected r JOIN ignored i USING(seq,hash) WHERE i.routed_at_ns <= :capture_cutoff_ns
+  UNION ALL
+  SELECT r.seq, r.hash, 'c',
+    f.value->>'$.reason'='earlier_unresolved_buy'
+    AND EXISTS (SELECT 1 FROM receipts e WHERE e.wallet=r.wallet AND e.market=r.market
+      AND e.qualifying=1 AND e.seq<r.seq)
+    AND EXISTS (SELECT 1 FROM identities x JOIN activity_groups g ON g.source_trade_id=x.id
+      JOIN entry_gate_results gate ON gate.source_trade_id=g.source_trade_id
+      WHERE x.seq=r.seq AND x.hash=r.hash AND g.wallet_hex=r.wallet AND gate.wallet_hex=r.wallet
+        AND gate.market_id=r.market AND (gate.result!='admitted' OR EXISTS (
+          SELECT 1 FROM decision_pending d WHERE d.source_trade_id=g.source_trade_id AND d.wallet_hex=r.wallet))),
+    f.value->>'$.reason',
+    (SELECT min(e.seq) FROM receipts e WHERE e.wallet=r.wallet AND e.market=r.market AND e.qualifying=1 AND e.seq<r.seq),
+    (SELECT e.epoch=r.epoch FROM receipts e WHERE e.wallet=r.wallet AND e.market=r.market
+      AND e.qualifying=1 AND e.seq<r.seq ORDER BY e.seq LIMIT 1)
+  FROM selected r JOIN census_inputs p JOIN json_each(p.population,'$.window_fallbacks') f
+    ON f.value->>'$.frame_seq'=r.seq AND f.value->>'$.frame_hash'=r.hash
+  WHERE f.value->>'$.recorded_at_ns' <= :capture_cutoff_ns
+), counts AS (
+  SELECT r.seq, r.hash, r.wallet, r.market, r.outcome, r.id, r.epoch,
+         count(d.class) AS disposition_count, group_concat(d.class) AS disposition_class,
+         min(d.confirmed) AS confirmed, group_concat(d.reason) AS reasons,
+         max(d.blocking_seq) AS blocking_seq, max(d.same_trade_second) AS same_trade_second
+  FROM selected r LEFT JOIN dispositions d USING(seq,hash) GROUP BY r.seq,r.hash
+)
+SELECT seq, hash, wallet, market, outcome, id, epoch, disposition_count,
+       coalesce(disposition_class,'missing') AS disposition_class,
+       CASE WHEN disposition_count!=1 THEN 'fail' WHEN confirmed=-1 THEN 'incomplete'
+            WHEN confirmed=1 THEN 'pass' ELSE 'fail' END AS verdict,
+       CASE WHEN disposition_count=0 THEN 'no disposition at capture cutoff'
+            WHEN disposition_count>1 THEN 'multiple dispositions: ' || reasons
+            WHEN confirmed=-1 THEN 'not_copy_eligible: live-set loss unproven'
+            WHEN confirmed!=1 THEN 'unconfirmed or unconverged: ' || reasons ELSE reasons END AS reason,
+       blocking_seq, same_trade_second
+FROM counts ORDER BY seq;
+SQL
+```
+
+Retain every output row. Any fail reopens AC-C; any incomplete leaves it unproven.
+**Fewer than 10 receipts meeting (a) is insufficient evidence, not a pass**, even if every
+census row passes. This receipt census does not replace the source-time first-entry audit below.
 
 The `FROZEN COHORT` line is the identity list to retain for all later calculations. Report every
 stage's available count, median, nearest-rank p95 (rank `ceil(0.95 × n)`) and maximum, missing
@@ -560,8 +1172,9 @@ control from the same captured snapshot. The following commands run in the audit
 containing `ac16-population.json`; point `paper_state.db` at that captured snapshot.
 Each command is an autocommit read scoped to the frozen window or decision receipts.
 
-List **every** continuation-7 complete-read first-entry decision after the deployment source
-boundary in the window. Match frames by full identity and authenticated binding targets from
+List **every** continuation-7 complete-read first-entry decision in the window whose read commitment
+is at or after the cohort boundary (`deploy_source_seq`: the deployment sequence, or a recorded
+re-measurement boundary). Match frames by full identity and authenticated binding targets from
 the prefix export. Keep every receipt for feed-presence accounting; for routing choose the
 admitted receipt, otherwise the earliest qualifying positive-share, non-combo BUY, otherwise
 the earliest receipt, then that receipt's earliest fallback. An excluded zero-share observation

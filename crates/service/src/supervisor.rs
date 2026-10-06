@@ -42,6 +42,7 @@ pub enum TaskName {
     RuntimeConfigPoller,
     StatusWriter,
     HttpServer,
+    SourceCheckpoint,
     SupabaseAnalyticsSink,
     LiquiditySnapshotWorker,
     JsonTracingFullAppender,
@@ -50,7 +51,7 @@ pub enum TaskName {
 
 impl TaskName {
     /// Complete ordinary-service owner inventory used by scenario coverage.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::ActivityIngest,
         Self::PublicActivityPoll,
         Self::Orchestrator,
@@ -63,6 +64,7 @@ impl TaskName {
         Self::RuntimeConfigPoller,
         Self::StatusWriter,
         Self::HttpServer,
+        Self::SourceCheckpoint,
         Self::SupabaseAnalyticsSink,
         Self::LiquiditySnapshotWorker,
         Self::JsonTracingFullAppender,
@@ -91,7 +93,8 @@ impl TaskName {
             | Self::WatchlistRefresh
             | Self::WatchlistMaintenance
             | Self::CapacityWorker
-            | Self::RuntimeConfigPoller => ShutdownPhase::StopProducers,
+            | Self::RuntimeConfigPoller
+            | Self::SourceCheckpoint => ShutdownPhase::StopProducers,
             Self::Orchestrator => ShutdownPhase::DrainOrchestrator,
             Self::ActivityIngest
             | Self::LiveFanout
@@ -121,6 +124,7 @@ impl fmt::Display for TaskName {
             Self::RuntimeConfigPoller => "runtime_config_poller",
             Self::StatusWriter => "status_writer",
             Self::HttpServer => "http_server",
+            Self::SourceCheckpoint => "source_checkpoint",
             Self::SupabaseAnalyticsSink => "supabase_analytics_sink",
             Self::LiquiditySnapshotWorker => "liquidity_snapshot_worker",
             Self::JsonTracingFullAppender => "json_tracing_full_appender",
@@ -156,6 +160,7 @@ pub enum ShutdownPhase {
 #[serde(rename_all = "snake_case")]
 pub enum TaskFailureKind {
     TypedError,
+    CheckpointInvalidationFailed,
     EarlyReturn,
     ChannelClosed,
     JoinFailed,
@@ -635,6 +640,14 @@ mod tests {
             .into_iter()
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(unique.len(), TaskName::ALL.len());
+        assert_eq!(TaskName::ALL.len(), 17);
+        assert!(unique.contains(&TaskName::SourceCheckpoint));
+        assert_eq!(TaskName::SourceCheckpoint.class(), TaskClass::Critical);
+        assert_eq!(
+            TaskName::SourceCheckpoint.stop_phase(),
+            ShutdownPhase::StopProducers
+        );
+        assert_eq!(TaskName::SourceCheckpoint.to_string(), "source_checkpoint");
         for name in TaskName::ALL {
             assert!(name.stop_phase() > ShutdownPhase::Running);
         }

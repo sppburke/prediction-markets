@@ -3,7 +3,12 @@
 //! final frame, refusal of a truncation into the recorded prefix, a typed boot failure on poison
 //! followed by restart recovery, the handoff drift check, and the not-installed fallbacks.
 #![cfg(feature = "scenario")]
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::duplicate_mod
+)]
 
 mod support;
 
@@ -2137,6 +2142,10 @@ enum PreStartBootCase {
 }
 
 async fn boot_binary(config_path: &Path, exit_after_anchors: bool) -> std::process::Output {
+    support::bounded_command_output(boot_binary_command(config_path, exit_after_anchors)).await
+}
+
+fn boot_binary_command(config_path: &Path, exit_after_anchors: bool) -> std::process::Command {
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pe-service"));
     command
         .env_clear()
@@ -2145,7 +2154,7 @@ async fn boot_binary(config_path: &Path, exit_after_anchors: bool) -> std::proce
     if exit_after_anchors {
         command.arg("--exit-after-anchors");
     }
-    support::bounded_command_output(command).await
+    command
 }
 
 #[tokio::test]
@@ -2185,7 +2194,7 @@ fn paper_service_rollout_checkpoint_freezes_prefix_and_replays_suffix_exactly() 
     boot.extend(&mut sink).unwrap();
     let paper = PaperStateDb::open(&paths.fixed_main).unwrap();
     let expected = boot.obligations(&paper, &paths.paper_log).unwrap();
-    boot.publish_checkpoint().unwrap();
+    publish_owner_initial(boot).unwrap();
     let artifact = std::fs::read(paths.source_log.with_extension("log.boot-checkpoint")).unwrap();
     let projection: serde_json::Value = serde_json::from_slice(&artifact[65..]).unwrap();
     assert_eq!(
@@ -2269,12 +2278,27 @@ fn paper_service_rollout_checkpoint_damage_incompatibility_and_prefix_drift_fall
         let before = pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap();
         let opened = SourceLogBoot::open(&paths, false);
         if fault == "corruption" {
-            assert!(format!("{:#}", opened.err().unwrap()).contains("CRC"));
+            let opened = opened.unwrap().unwrap();
+            let failure = publish_owner_initial(opened.boot).unwrap_err();
+            assert!(failure.message.contains("prefix mismatch"));
+            assert!(
+                pe_service::source_checkpoint::read_authority(&paths.source_log)
+                    .unwrap()
+                    .generation()
+                    .unwrap()
+                    > 0
+            );
+            drop(opened.sink);
+            assert!(
+                format!("{:#}", SourceLogBoot::open(&paths, false).err().unwrap()).contains("CRC")
+            );
         } else {
             let opened = opened.unwrap().unwrap();
             assert_eq!(opened.binding, Scanner::verify(&paths.source_log).unwrap());
         }
-        assert!(pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap() > before);
+        if fault != "corruption" {
+            assert!(pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap() > before);
+        }
     }
 }
 
@@ -2300,6 +2324,33 @@ async fn paper_service_rollout_checkpoint_preparation_is_early_read_only_and_ign
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(stdout.lines().count(), 1);
+    assert!(stdout.starts_with("source checkpoint published offset="));
+    let fields: std::collections::HashMap<_, _> = stdout
+        .split_whitespace()
+        .filter_map(|part| part.split_once('='))
+        .collect();
+    assert_eq!(fields["offset"].parse::<u64>().unwrap(), complete_size);
+    let tail = writer.verified_tail().unwrap();
+    assert_eq!(
+        fields["sequence"],
+        tail.last_sequence.unwrap().0.to_string()
+    );
+    assert_eq!(fields["hash"], tail.last_hash.to_hex().as_str());
+    assert_eq!(
+        fields["prefix_blake3"],
+        Scanner::hash_prefix(&paths.source_log, complete_size)
+            .unwrap()
+            .finalize()
+            .to_hex()
+            .as_str()
+    );
+    assert_eq!(fields["validated"], "0");
+    assert!(
+        fields["published_unix_ms"].parse::<u64>().unwrap()
+            >= fields["capture_unix_ms"].parse::<u64>().unwrap()
+    );
     assert_eq!(std::fs::read(&paths.fixed_main).unwrap(), before_db);
     assert_eq!(file_len(&paths.source_log), complete_size);
     writer
@@ -2315,7 +2366,7 @@ async fn paper_service_rollout_checkpoint_preparation_is_early_read_only_and_ign
         .unwrap();
     let torn_size = file_len(&paths.source_log);
     let prepared = SourceLogBoot::prepare_checkpoint(&paths.fixed_main).unwrap();
-    assert_eq!(prepared.0, complete_tail);
+    assert_eq!(prepared.0.tail, complete_tail);
     assert_eq!(prepared.1, 0);
     assert_eq!(file_len(&paths.source_log), torn_size);
     assert_eq!(std::fs::read(&paths.fixed_main).unwrap(), before_db);
@@ -2723,4 +2774,1603 @@ fn mixed_continuation_market_evidence(
         books.insert(token, book);
     }
     (hooks, prices, books)
+}
+
+fn rewrite_boot_checkpoint(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
+    let bytes = std::fs::read(path).unwrap();
+    let mut body: serde_json::Value = serde_json::from_slice(&bytes[65..]).unwrap();
+    edit(&mut body);
+    let encoded = serde_json::to_vec(&body).unwrap();
+    let mut artifact = blake3::hash(&encoded).to_hex().as_bytes().to_vec();
+    artifact.push(b'\n');
+    artifact.extend_from_slice(&encoded);
+    std::fs::write(path, &artifact).unwrap();
+}
+
+fn checkpoint_record_path(source_log: &Path) -> PathBuf {
+    let mut name = pe_service::source_checkpoint::checkpoint_path(source_log).into_os_string();
+    name.push(".invalidation");
+    name.into()
+}
+
+fn write_checkpoint_record(source_log: &Path, generation: u64, active: bool) {
+    std::fs::write(
+        checkpoint_record_path(source_log),
+        serde_json::to_vec(&pe_service::source_checkpoint::InvalidationRecord {
+            generation,
+            active,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+fn assert_checkpoint_assisted_boot(
+    paths: &PaperMigrationPaths,
+    receipt: &pe_service::source_checkpoint::PublicationReceipt,
+) {
+    let before = pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap();
+    let opened = SourceLogBoot::open(paths, false).unwrap().unwrap();
+    assert_eq!(opened.binding, receipt.tail);
+    assert_eq!(
+        pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap(),
+        before
+    );
+    let artifact = std::fs::read(pe_service::source_checkpoint::checkpoint_path(
+        &paths.source_log,
+    ))
+    .unwrap();
+    assert_eq!(
+        &artifact[..64],
+        blake3::hash(&artifact[65..]).to_hex().as_bytes()
+    );
+    let body: serde_json::Value = serde_json::from_slice(&artifact[65..]).unwrap();
+    assert_eq!(body["prefix_blake3"], receipt.prefix_blake3);
+}
+
+/// PASS: wrong raw-prefix digests at unchanged tails are repaired under fresh authority; active
+/// records force full verification. Changed artifacts or generations restart preparation instead
+/// of invalidating the newly installed checkpoint. A post-checkpoint/pre-clearance image rebuilds.
+#[test]
+fn wrong_prefix_checkpoint_repaired_by_preparation() {
+    use pe_service::source_checkpoint::{
+        Authority, InvalidationRecord, PreparationHooks, read_authority,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    for case in [
+        "inactive",
+        "active",
+        "interrupted_clearance",
+        "artifact_changed",
+        "generation_changed",
+        "hash_io_error",
+    ] {
+        let (_dir, paths) = installed_fixture();
+        append(
+            &paths.source_log,
+            activity_envelope("0xrepair-prefix", NOW_UNIX + 1),
+        );
+        let (original, _) = SourceLogBoot::prepare_checkpoint(&paths.fixed_main).unwrap();
+        let sidecar = pe_service::source_checkpoint::checkpoint_path(&paths.source_log);
+        let good_bytes = std::fs::read(&sidecar).unwrap();
+        rewrite_boot_checkpoint(&sidecar, |body| {
+            body["prefix_blake3"] = serde_json::json!("ff".repeat(32))
+        });
+        write_checkpoint_record(
+            &paths.source_log,
+            4,
+            matches!(case, "active" | "interrupted_clearance"),
+        );
+        if case == "interrupted_clearance" {
+            // The durable image after checkpoint installation and before active-record clearance.
+            std::fs::write(&sidecar, &good_bytes).unwrap();
+        }
+        let checked = Arc::new(AtomicBool::new(false));
+        let changed = checked.clone();
+        let scenario_paths = paths.clone();
+        let bound_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let captures = bound_calls.clone();
+        let hash_paths = paths.clone();
+        let original_offset = original.tail.physical_tail;
+        let hooks = PreparationHooks {
+            before_cached_hash: Some(Arc::new(move || {
+                if case == "hash_io_error" {
+                    // The loaded cache passed the length check. Shorten the file only after
+                    // load so hashing reports UnexpectedEof; the remaining activation is valid.
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&hash_paths.source_log)?
+                        .set_len(recorded_source_tail(&hash_paths))?;
+                }
+                Ok(())
+            })),
+            after_bound: Some(Arc::new(move || {
+                captures.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })),
+            after_cached_hash: Some(Arc::new(move || {
+                if !changed.swap(true, Ordering::SeqCst) {
+                    if case == "artifact_changed" {
+                        // A verified later-tail publisher can legitimately replace the wrong
+                        // digest without changing authority; the paused preparation must restart.
+                        append(
+                            &scenario_paths.source_log,
+                            activity_envelope("0xnew-artifact", NOW_UNIX + 2),
+                        );
+                        rewrite_boot_checkpoint(
+                            &pe_service::source_checkpoint::checkpoint_path(
+                                &scenario_paths.source_log,
+                            ),
+                            |body| {
+                                body["prefix_blake3"] = serde_json::json!(
+                                    Scanner::hash_prefix(
+                                        &scenario_paths.source_log,
+                                        original_offset
+                                    )
+                                    .unwrap()
+                                    .finalize()
+                                    .to_hex()
+                                    .to_string()
+                                );
+                            },
+                        );
+                        SourceLogBoot::prepare_checkpoint(&scenario_paths.fixed_main).unwrap();
+                    } else if case == "generation_changed" {
+                        assert_eq!(
+                            pe_service::source_checkpoint::invalidate(&scenario_paths.source_log)
+                                .unwrap(),
+                            5
+                        );
+                        SourceLogBoot::prepare_checkpoint(&scenario_paths.fixed_main).unwrap();
+                    }
+                }
+                Ok(())
+            })),
+            ..PreparationHooks::default()
+        };
+        let (repaired, validated) =
+            SourceLogBoot::prepare_checkpoint_with_hooks(&paths.fixed_main, &hooks).unwrap();
+        assert_eq!(validated, 0);
+        if matches!(case, "artifact_changed" | "hash_io_error") {
+            if case == "artifact_changed" {
+                assert!(repaired.tail.physical_tail > original.tail.physical_tail);
+            } else {
+                assert!(repaired.tail.physical_tail < original.tail.physical_tail);
+            }
+            assert_eq!(repaired.tail, Scanner::verify(&paths.source_log).unwrap());
+            assert_eq!(
+                repaired.prefix_blake3,
+                Scanner::hash_prefix(&paths.source_log, repaired.tail.physical_tail)
+                    .unwrap()
+                    .finalize()
+                    .to_hex()
+                    .to_string()
+            );
+        } else {
+            assert_eq!(repaired.tail, original.tail);
+            assert_eq!(repaired.prefix_blake3, original.prefix_blake3);
+        }
+        assert_eq!(
+            bound_calls.load(Ordering::SeqCst),
+            if matches!(case, "artifact_changed" | "generation_changed") {
+                2
+            } else {
+                1
+            }
+        );
+        let expected_generation = if matches!(case, "inactive" | "generation_changed") {
+            5
+        } else {
+            4
+        };
+        assert_eq!(
+            read_authority(&paths.source_log).unwrap(),
+            Authority::Readable(InvalidationRecord {
+                generation: expected_generation,
+                active: false
+            }),
+            "{case}"
+        );
+        assert_checkpoint_assisted_boot(&paths, &repaired);
+    }
+}
+
+/// PASS: the same loader checks governing boot also allow publication to replace an unusable
+/// artifact, including a checksum-valid tail beyond physical EOF; the next boot uses the repair.
+#[test]
+fn unusable_checkpoint_replaced_by_verified_candidate() {
+    for fault in [
+        "absent",
+        "checksum",
+        "decode",
+        "mode",
+        "format",
+        "scanner",
+        "reducer",
+        "receipt",
+        "long_tail",
+    ] {
+        let (_dir, paths) = installed_fixture();
+        append(
+            &paths.source_log,
+            activity_envelope("0xreplace-unusable", NOW_UNIX + 1),
+        );
+        let (receipt, _) = SourceLogBoot::prepare_checkpoint(&paths.fixed_main).unwrap();
+        let sidecar = pe_service::source_checkpoint::checkpoint_path(&paths.source_log);
+        match fault {
+            "absent" => std::fs::remove_file(&sidecar).unwrap(),
+            "checksum" => {
+                let mut bytes = std::fs::read(&sidecar).unwrap();
+                bytes[0] ^= 1;
+                std::fs::write(&sidecar, bytes).unwrap();
+            }
+            "decode" => std::fs::write(&sidecar, b"damaged").unwrap(),
+            _ => rewrite_boot_checkpoint(&sidecar, |data| match fault {
+                "mode" => data["financial_era"] = serde_json::json!(true),
+                "format" => data["format_version"] = serde_json::json!(99),
+                "scanner" => data["scanner_version"] = serde_json::json!(99),
+                "reducer" => data["reducer_version"] = serde_json::json!(1),
+                "receipt" => data["receipts"][0]["byte_offset"] = serde_json::json!(999999),
+                "long_tail" => {
+                    data["tail"]["physical_tail"] =
+                        serde_json::json!(file_len(&paths.source_log) + 1)
+                }
+                _ => unreachable!(),
+            }),
+        }
+        let before = pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap();
+        let opened = SourceLogBoot::open(&paths, false).unwrap().unwrap();
+        assert_eq!(opened.binding, receipt.tail);
+        assert!(
+            pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap() > before,
+            "{fault}"
+        );
+        publish_owner_initial(opened.boot).unwrap();
+        drop(opened.sink);
+        assert_checkpoint_assisted_boot(&paths, &receipt);
+    }
+}
+
+/// PASS: a real preparation command paused after verification cannot publish over an interrupted
+/// invalidation. Its refusal preserves the undecodable quarantine, and the next boot full-walks.
+#[tokio::test]
+async fn checkpoint_cli_publisher_refused_after_interrupted_invalidation() {
+    use pe_service::source_checkpoint::{Authority, InvalidationError, InvalidationHooks};
+    use std::sync::atomic::Ordering;
+    for inactive_record in [false, true] {
+        let (dir, paths) = installed_fixture();
+        append(
+            &paths.source_log,
+            activity_envelope("0xcli-race", NOW_UNIX + 1),
+        );
+        SourceLogBoot::prepare_checkpoint(&paths.fixed_main).unwrap();
+        if inactive_record {
+            write_checkpoint_record(&paths.source_log, 0, false);
+        }
+        let pause = dir.path().join("preparation-pause");
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pe-service"));
+        command
+            .env_clear()
+            .env("PE_SCENARIO_CHECKPOINT_PAUSE_AFTER_WALK", &pause)
+            .arg("--prepare-source-checkpoint")
+            .arg("--paper-state")
+            .arg(&paths.fixed_main);
+        let publisher = tokio::spawn(support::bounded_command_output(command));
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while !pause.with_extension("ready").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let hooks = InvalidationHooks::default();
+        hooks.fail_record_write.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            pe_service::source_checkpoint::invalidate_with_hooks(&paths.source_log, &hooks),
+            Err(InvalidationError::Io(_))
+        ));
+        std::fs::write(pause.with_extension("resume"), b"resume").unwrap();
+        let output = publisher.await.unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("UnreadableRecord"));
+        assert!(!pe_service::source_checkpoint::checkpoint_path(&paths.source_log).exists());
+        assert_eq!(
+            pe_service::source_checkpoint::read_authority(&paths.source_log).unwrap(),
+            Authority::Unreadable
+        );
+        let before = pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap();
+        let opened = SourceLogBoot::open(&paths, false).unwrap().unwrap();
+        assert!(pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap() > before);
+        publish_owner_initial(opened.boot).unwrap();
+        assert_eq!(
+            pe_service::source_checkpoint::read_authority(&paths.source_log).unwrap(),
+            Authority::Unreadable
+        );
+    }
+}
+
+/// PASS: quiesced recovery removes the checkpoint before resetting the record even in the durable
+/// image preceding a failed quarantine sync; full verification and publication restore later boots.
+#[tokio::test]
+async fn checkpoint_failed_quarantine_sync_durable_image_recovers_with_full_walk() {
+    use pe_service::source_checkpoint::{
+        Authority, InvalidationError, InvalidationHooks, InvalidationRecord,
+    };
+    use std::sync::atomic::Ordering;
+    let (_dir, paths) = installed_fixture();
+    append(
+        &paths.source_log,
+        activity_envelope("0xquarantine-sync", NOW_UNIX + 1),
+    );
+    let (receipt, _) = SourceLogBoot::prepare_checkpoint(&paths.fixed_main).unwrap();
+    let sidecar = pe_service::source_checkpoint::checkpoint_path(&paths.source_log);
+    let durable_checkpoint = std::fs::read(&sidecar).unwrap();
+    write_checkpoint_record(&paths.source_log, 3, false);
+    let durable_record = std::fs::read(checkpoint_record_path(&paths.source_log)).unwrap();
+    let hooks = InvalidationHooks::default();
+    hooks.fail_quarantine_sync.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        pe_service::source_checkpoint::invalidate_with_hooks(&paths.source_log, &hooks),
+        Err(InvalidationError::QuarantineFailed(_))
+    ));
+    // Model loss of the unsynced rename: both original names and their preceding contents survive.
+    std::fs::write(&sidecar, &durable_checkpoint).unwrap();
+    std::fs::write(checkpoint_record_path(&paths.source_log), &durable_record).unwrap();
+    let before_db = std::fs::read(&paths.fixed_main).unwrap();
+    let before_log = std::fs::read(&paths.source_log).unwrap();
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pe-service"));
+    command
+        .env_clear()
+        .env("PE_BIND", "invalid")
+        .arg("--recover-source-checkpoint")
+        .arg("--paper-state")
+        .arg(&paths.fixed_main);
+    let output = support::bounded_command_output(command).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.starts_with("source checkpoint recovery checkpoint="));
+    assert_eq!(stdout.matches("removed=true").count(), 2);
+    assert!(!sidecar.exists());
+    assert!(!checkpoint_record_path(&paths.source_log).exists());
+    assert_eq!(std::fs::read(&paths.fixed_main).unwrap(), before_db);
+    assert_eq!(std::fs::read(&paths.source_log).unwrap(), before_log);
+    assert_eq!(
+        pe_service::source_checkpoint::read_authority(&paths.source_log).unwrap(),
+        Authority::Readable(InvalidationRecord::default())
+    );
+    let before = pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap();
+    let opened = SourceLogBoot::open(&paths, false).unwrap().unwrap();
+    assert!(pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap() > before);
+    publish_owner_initial(opened.boot).unwrap();
+    drop(opened.sink);
+    assert_checkpoint_assisted_boot(&paths, &receipt);
+}
+
+/// PASS: frontiers committed after preparation's finite bound are excluded from its census, then
+/// authenticated by boot against its own current index. Captured malformed collections still fail.
+#[test]
+fn checkpoint_preparation_uses_captured_frontiers() {
+    use pe_service::frame_admission::{FeedHistoryFrontier, FrontierCollection};
+    use pe_service::source_checkpoint::PreparationHooks;
+    let (_dir, paths) = installed_fixture();
+    let bound = Scanner::verify(&paths.source_log).unwrap();
+    let hook_paths = paths.clone();
+    let hooks = PreparationHooks {
+        after_bound: Some(Arc::new(move || {
+            let wallet = WalletAddress::from_hex(WALLET).unwrap();
+            let mut writer = Writer::open(&hook_paths.source_log).unwrap();
+            let (read, commitment) = support::append_committed_read_v2(
+                &mut writer,
+                wallet,
+                b"[]",
+                NOW_UNIX + 10,
+                NOW_UNIX + 11,
+            );
+            drop(writer);
+            let data: serde_json::Value = serde_json::from_str(&read.decision_inputs_json).unwrap();
+            let collection = FrontierCollection {
+                version: 1,
+                frontiers: vec![FeedHistoryFrontier {
+                    version: 1,
+                    wallet,
+                    fixed_end: NOW_UNIX + 10,
+                    commitment,
+                    page_occurrences: vec![read.page],
+                    pages: serde_json::from_value(data["pages"].clone()).unwrap(),
+                }],
+            };
+            PaperStateDb::open(&hook_paths.fixed_main)
+                .unwrap()
+                .publish_feed_history_frontiers(&serde_json::to_value(collection).unwrap())
+                .unwrap();
+            Ok(())
+        })),
+        ..PreparationHooks::default()
+    };
+    let (receipt, count) =
+        SourceLogBoot::prepare_checkpoint_with_hooks(&paths.fixed_main, &hooks).unwrap();
+    assert_eq!(receipt.tail, bound);
+    assert_eq!(count, 0);
+    let opened = SourceLogBoot::open(&paths, false).unwrap().unwrap();
+    assert!(opened.binding.physical_tail > bound.physical_tail);
+    let paper = PaperStateDb::open(&paths.fixed_main).unwrap();
+    assert_eq!(
+        pe_service::bucket_commit::validate_open_continuations(
+            &paper,
+            &opened.boot.receipt_index()
+        )
+        .unwrap(),
+        0
+    );
+    paper
+        .publish_feed_history_frontiers(&serde_json::json!({"version": 999, "frontiers": []}))
+        .unwrap();
+    let before = std::fs::read(pe_service::source_checkpoint::checkpoint_path(
+        &paths.source_log,
+    ))
+    .unwrap();
+    assert!(SourceLogBoot::prepare_checkpoint(&paths.fixed_main).is_err());
+    assert_eq!(
+        std::fs::read(pe_service::source_checkpoint::checkpoint_path(
+            &paths.source_log
+        ))
+        .unwrap(),
+        before
+    );
+}
+
+#[test]
+fn checkpoint_record_read_error_forces_full_walk_without_publication() {
+    let (_dir, paths) = installed_fixture();
+    append(
+        &paths.source_log,
+        activity_envelope("0xrecord-read-error", NOW_UNIX + 1),
+    );
+    SourceLogBoot::prepare_checkpoint(&paths.fixed_main).unwrap();
+    let sidecar = pe_service::source_checkpoint::checkpoint_path(&paths.source_log);
+    let artifact = std::fs::read(&sidecar).unwrap();
+    std::fs::create_dir(checkpoint_record_path(&paths.source_log)).unwrap();
+    let before = pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap();
+    let opened = SourceLogBoot::open(&paths, false).unwrap().unwrap();
+    assert!(pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap() > before);
+    publish_owner_initial(opened.boot).unwrap();
+    assert_eq!(std::fs::read(&sidecar).unwrap(), artifact);
+}
+
+fn publish_owner_initial(boot: SourceLogBoot) -> Result<(), pe_service::supervisor::TaskFailure> {
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let slot = pe_service::source_checkpoint::CheckpointJobSlot::default();
+            let mut owner = boot.into_checkpoint_owner(slot.clone());
+            let result = owner.initialize_for_scenario().await;
+            drop(owner);
+            slot.join().await.unwrap();
+            result
+        })
+    })
+    .join()
+    .unwrap()
+}
+
+#[path = "support/rollout.rs"]
+mod checkpoint_rollout;
+#[path = "support/golden.rs"]
+mod golden;
+
+fn checkpoint_json(path: &Path) -> serde_json::Value {
+    let bytes = std::fs::read(pe_service::source_checkpoint::checkpoint_path(path)).unwrap();
+    assert_eq!(&bytes[..64], blake3::hash(&bytes[65..]).to_hex().as_bytes());
+    serde_json::from_slice(&bytes[65..]).unwrap()
+}
+
+fn checkpoint_events(logs: &str, message: &str) -> Vec<serde_json::Value> {
+    logs.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|line| line["message"] == message)
+        .collect()
+}
+
+async fn checkpoint_until(mut predicate: impl FnMut() -> bool) {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while !predicate() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// PASS: while deferred hashing is paused, a real decision commits; verification and publication
+/// follow listening, and the published digest is that of the exact frozen bound.
+#[tokio::test]
+async fn checkpoint_prefix_verified_after_listening() {
+    let fixture = checkpoint_rollout::CheckpointFixture::new().await;
+    let (prepared, _) =
+        SourceLogBoot::prepare_checkpoint(&fixture.cfg.paper_state_db_path).unwrap();
+    let pause = fixture.dir.path().join("prefix-pause");
+    let child = checkpoint_rollout::Child::start_checkpoint(
+        &fixture.config_path,
+        Path::new(env!("CARGO_BIN_EXE_pe-service")),
+        &[("PE_SCENARIO_CHECKPOINT_PAUSE_BEFORE_HASH", &pause)],
+    );
+    checkpoint_until(|| pause.with_extension("ready").exists()).await;
+    fixture.wait_log("pe-service listening").await;
+    fixture.copy();
+    fixture.wait_copy().await;
+    assert!(!fixture.logs().contains("source checkpoint prefix verified"));
+    assert_eq!(
+        checkpoint_events(&fixture.logs(), "source checkpoint verification completed")[0]["prefix_verification"],
+        "deferred"
+    );
+    std::fs::write(pause.with_extension("resume"), b"resume").unwrap();
+    fixture.wait_log("source checkpoint published").await;
+    let output = child.finish_checkpoint(Some("-INT")).await;
+    assert!(output.status.success(), "{output:?}");
+    let logs = fixture.logs();
+    assert!(
+        logs.find("pe-service listening").unwrap()
+            < logs.find("source checkpoint prefix verified").unwrap()
+    );
+    assert!(
+        logs.find("source checkpoint prefix verified").unwrap()
+            < logs.find("source checkpoint published").unwrap()
+    );
+    assert!(!logs.contains("source checkpoint raw prefix verified"));
+    let data = checkpoint_json(&fixture.cfg.source_event_log_path);
+    assert_eq!(data["tail"]["physical_tail"], prepared.tail.physical_tail);
+    assert_eq!(
+        data["prefix_blake3"],
+        Scanner::hash_prefix(
+            &fixture.cfg.source_event_log_path,
+            prepared.tail.physical_tail
+        )
+        .unwrap()
+        .finalize()
+        .to_hex()
+        .as_str()
+    );
+    assert_eq!(fixture.paper.list_fills().unwrap().len(), 1);
+}
+
+/// PASS: mismatch after load invalidates and fails critically; corrupt frames are refused on later
+/// full walks. Restoring the source allows a new-generation full walk to publish and clear active.
+#[tokio::test]
+async fn checkpoint_prefix_mismatch_invalidates_and_full_walks() {
+    let fixture = checkpoint_rollout::CheckpointFixture::new().await;
+    SourceLogBoot::prepare_checkpoint(&fixture.cfg.paper_state_db_path).unwrap();
+    let original = std::fs::read(&fixture.cfg.source_event_log_path).unwrap();
+    let pause = fixture.dir.path().join("prefix-pause");
+    let child = checkpoint_rollout::Child::start_checkpoint(
+        &fixture.config_path,
+        Path::new(env!("CARGO_BIN_EXE_pe-service")),
+        &[("PE_SCENARIO_CHECKPOINT_PAUSE_BEFORE_HASH", &pause)],
+    );
+    checkpoint_until(|| pause.with_extension("ready").exists()).await;
+    corrupt_checkpoint_prefix(&fixture.cfg.source_event_log_path);
+    std::fs::write(pause.with_extension("resume"), b"resume").unwrap();
+    let output = child.finish_checkpoint(None).await;
+    assert!(!output.status.success());
+    assert_ne!(output.status.code(), Some(78));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("prefix mismatch"));
+    assert!(
+        !pe_service::source_checkpoint::checkpoint_path(&fixture.cfg.source_event_log_path)
+            .exists()
+    );
+    let authority =
+        pe_service::source_checkpoint::read_authority(&fixture.cfg.source_event_log_path).unwrap();
+    assert!(!authority.permits_checkpoint());
+    let generation = authority.generation().unwrap();
+    fixture.clear_logs();
+    let output = boot_binary(&fixture.config_path, false).await;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("CRC"));
+    assert!(!fixture.logs().contains("pe-service listening"));
+    {
+        use std::io::{Seek, SeekFrom};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fixture.cfg.source_event_log_path)
+            .unwrap();
+        file.seek(SeekFrom::Start(u64::try_from(original.len() - 1).unwrap()))
+            .unwrap();
+        file.write_all(&original[original.len() - 1..]).unwrap();
+        file.sync_all().unwrap();
+    }
+    fixture.clear_logs();
+    let child = checkpoint_rollout::Child::start_checkpoint(
+        &fixture.config_path,
+        Path::new(env!("CARGO_BIN_EXE_pe-service")),
+        &[],
+    );
+    fixture.wait_log("source checkpoint published").await;
+    assert_eq!(
+        checkpoint_events(&fixture.logs(), "source checkpoint verification completed")[0]["prefix_verification"],
+        "full_walk"
+    );
+    let output = child.finish_checkpoint(Some("-INT")).await;
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        pe_service::source_checkpoint::read_authority(&fixture.cfg.source_event_log_path).unwrap(),
+        pe_service::source_checkpoint::Authority::Readable(
+            pe_service::source_checkpoint::InvalidationRecord {
+                generation,
+                active: false
+            }
+        )
+    );
+}
+
+#[tokio::test]
+async fn prepared_checkpoint_receipt_matches_boot() {
+    let fixture = checkpoint_rollout::CheckpointFixture::new().await;
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pe-service"));
+    command
+        .env_clear()
+        .arg("--prepare-source-checkpoint")
+        .arg("--paper-state")
+        .arg(&fixture.cfg.paper_state_db_path);
+    let prepared = support::bounded_command_output(command).await;
+    assert!(prepared.status.success(), "{prepared:?}");
+    let stdout = String::from_utf8(prepared.stdout).unwrap();
+    let fields = stdout
+        .split_whitespace()
+        .filter_map(|part| part.split_once('='))
+        .collect::<std::collections::HashMap<_, _>>();
+    let child = checkpoint_rollout::Child::start_checkpoint(
+        &fixture.config_path,
+        Path::new(env!("CARGO_BIN_EXE_pe-service")),
+        &[],
+    );
+    fixture.wait_log("source checkpoint published").await;
+    let output = child.finish_checkpoint(Some("-INT")).await;
+    assert!(output.status.success(), "{output:?}");
+    let events = checkpoint_events(&fixture.logs(), "source checkpoint verification completed");
+    let boot = &events[0];
+    assert_eq!(boot["checkpoint_used"], true);
+    assert_eq!(
+        boot["checkpoint_offset"].as_u64().unwrap().to_string(),
+        fields["offset"]
+    );
+    assert_eq!(
+        boot["checkpoint_sequence"].as_u64().unwrap().to_string(),
+        fields["sequence"]
+    );
+    assert_eq!(boot["checkpoint_hash"], fields["hash"]);
+    assert_eq!(boot["prefix_blake3"], fields["prefix_blake3"]);
+    assert!(
+        fields["published_unix_ms"].parse::<u64>().unwrap()
+            >= fields["capture_unix_ms"].parse::<u64>().unwrap()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn hourly_checkpoint_matches_staged_preparation() {
+    for financial in [false, true] {
+        let (_dir, paths) = installed_fixture();
+        append(
+            &paths.source_log,
+            activity_envelope("0xhourly-first", NOW_UNIX + 1),
+        );
+        // Financial mode must agree with the database used by the staged preparer.
+        if financial {
+            let paper = PaperStateDb::open(&paths.fixed_main).unwrap();
+            let start = append_paper_record(&paths.paper_log, &start_record());
+            paper
+                .reset_financial_era(
+                    start,
+                    CollateralAmount::from_decimal_exact(dec!(10)).unwrap(),
+                )
+                .unwrap();
+        }
+        let mut opened = SourceLogBoot::open(&paths, financial).unwrap().unwrap();
+        let slot = pe_service::source_checkpoint::CheckpointJobSlot::default();
+        let mut owner = opened.boot.into_checkpoint_owner(slot.clone());
+        owner.initialize_for_scenario().await.unwrap();
+        let input = activity_envelope("0xhourly-second", NOW_UNIX + 2);
+        let receipt = opened
+            .sink
+            .append_durable(activity_envelope("0xhourly-second", NOW_UNIX + 2))
+            .unwrap();
+        owner
+            .record_synced_append_for_scenario(receipt, &input)
+            .unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(
+            pe_service::source_checkpoint::CHECKPOINT_PUBLISH_SECS,
+        ))
+        .await;
+        owner.publish_hourly_for_scenario().await.unwrap();
+        let hourly = checkpoint_json(&paths.source_log);
+        drop(owner);
+        drop(opened.sink);
+        SourceLogBoot::prepare_checkpoint(&paths.fixed_main).unwrap();
+        let prepared = checkpoint_json(&paths.source_log);
+        for field in [
+            "format_version",
+            "scanner_version",
+            "reducer_version",
+            "financial_era",
+            "activation",
+            "tail",
+            "receipts",
+            "prefix_blake3",
+        ] {
+            assert_eq!(hourly[field], prepared[field], "{field}");
+        }
+        assert_eq!(hourly["activity"], prepared["activity"]);
+        assert_eq!(hourly["daily_boundary"], prepared["daily_boundary"]);
+    }
+}
+
+/// PASS: the typed quarantine failure exits 78 with either durable-quarantine fault and keeps
+/// precedence over both shutdown-bound outcomes. Every row is fixed before running the binary.
+#[tokio::test]
+async fn checkpoint_invalidation_failure_preserves_status_78_at_shutdown_bounds() {
+    for fault in [
+        "PE_SCENARIO_CHECKPOINT_FAIL_QUARANTINE_RENAME",
+        "PE_SCENARIO_CHECKPOINT_FAIL_QUARANTINE_SYNC",
+    ] {
+        for timeout in [
+            None,
+            Some("PE_SCENARIO_CHECKPOINT_SHUTDOWN_TIMEOUT"),
+            Some("PE_SCENARIO_CHECKPOINT_JOB_JOIN_TIMEOUT"),
+        ] {
+            let fixture = checkpoint_rollout::CheckpointFixture::new().await;
+            SourceLogBoot::prepare_checkpoint(&fixture.cfg.paper_state_db_path).unwrap();
+            let pause = fixture.dir.path().join("prefix-pause");
+            let mut env = vec![
+                ("PE_SCENARIO_CHECKPOINT_PAUSE_BEFORE_HASH", pause.as_path()),
+                (fault, Path::new("1")),
+            ];
+            if let Some(timeout) = timeout {
+                env.push((timeout, Path::new("1")));
+            }
+            let child = checkpoint_rollout::Child::start_checkpoint(
+                &fixture.config_path,
+                Path::new(env!("CARGO_BIN_EXE_pe-service")),
+                &env,
+            );
+            checkpoint_until(|| pause.with_extension("ready").exists()).await;
+            corrupt_checkpoint_prefix(&fixture.cfg.source_event_log_path);
+            std::fs::write(pause.with_extension("resume"), b"resume").unwrap();
+            let output = child.finish_checkpoint(None).await;
+            assert_eq!(
+                output.status.code(),
+                Some(78),
+                "{fault} {timeout:?}: {output:?}"
+            );
+            let status: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&fixture.cfg.status_path).unwrap()).unwrap();
+            assert!(
+                status
+                    .to_string()
+                    .contains("checkpoint_invalidation_failed"),
+                "{status}"
+            );
+        }
+    }
+    checkpoint_unusable_lock_preserves_status_78().await;
+}
+
+async fn checkpoint_unusable_lock_preserves_status_78() {
+    let fixture = checkpoint_rollout::CheckpointFixture::new().await;
+    SourceLogBoot::prepare_checkpoint(&fixture.cfg.paper_state_db_path).unwrap();
+    let pause = fixture.dir.path().join("prefix-pause");
+    let child = checkpoint_rollout::Child::start_checkpoint(
+        &fixture.config_path,
+        Path::new(env!("CARGO_BIN_EXE_pe-service")),
+        &[("PE_SCENARIO_CHECKPOINT_PAUSE_BEFORE_HASH", pause.as_path())],
+    );
+    checkpoint_until(|| pause.with_extension("ready").exists()).await;
+    let lock = checkpoint_sidecar(&fixture.cfg.source_event_log_path, ".lock");
+    std::fs::remove_file(&lock).unwrap();
+    std::fs::create_dir(&lock).unwrap();
+    corrupt_checkpoint_prefix(&fixture.cfg.source_event_log_path);
+    std::fs::write(pause.with_extension("resume"), b"resume").unwrap();
+    let output = child.finish_checkpoint(None).await;
+    assert_eq!(output.status.code(), Some(78), "{output:?}");
+    let status = std::fs::read_to_string(&fixture.cfg.status_path).unwrap();
+    assert!(
+        status.contains("checkpoint_invalidation_failed"),
+        "{status}"
+    );
+}
+
+#[tokio::test]
+async fn checkpoint_quarantine_failure_after_owner_shutdown_preserves_status_78() {
+    let fixture = checkpoint_rollout::CheckpointFixture::new().await;
+    SourceLogBoot::prepare_checkpoint(&fixture.cfg.paper_state_db_path).unwrap();
+    let pause = fixture.dir.path().join("prefix-pause");
+    let child = checkpoint_rollout::Child::start_checkpoint(
+        &fixture.config_path,
+        Path::new(env!("CARGO_BIN_EXE_pe-service")),
+        &[
+            ("PE_SCENARIO_CHECKPOINT_PAUSE_BEFORE_HASH", pause.as_path()),
+            (
+                "PE_SCENARIO_CHECKPOINT_FAIL_QUARANTINE_RENAME",
+                Path::new("1"),
+            ),
+        ],
+    );
+    checkpoint_until(|| pause.with_extension("ready").exists()).await;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(checkpoint_sidecar(
+            &fixture.cfg.source_event_log_path,
+            ".lock",
+        ))
+        .unwrap();
+    fs2::FileExt::lock_exclusive(&lock).unwrap();
+    corrupt_checkpoint_prefix(&fixture.cfg.source_event_log_path);
+    std::fs::write(pause.with_extension("resume"), b"resume").unwrap();
+    fixture
+        .wait_log("source checkpoint prefix invalid; invalidating")
+        .await;
+    child.signal_checkpoint("-INT");
+    // TaskRunState::Stopped is written only after the supervisor joins the owner. The blocking
+    // child remains held on our lock until this status snapshot proves CleanShutdown won.
+    checkpoint_until(|| {
+        std::fs::read(&fixture.cfg.status_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .is_some_and(|status| {
+                status["tasks"].as_array().is_some_and(|tasks| {
+                    tasks.iter().any(|task| {
+                        task["name"] == "source_checkpoint" && task["state"] == "stopped"
+                    })
+                })
+            })
+    })
+    .await;
+    fs2::FileExt::unlock(&lock).unwrap();
+    let output = child.finish_checkpoint(None).await;
+    assert_eq!(output.status.code(), Some(78), "{output:?}");
+}
+
+fn checkpoint_sidecar(source: &Path, suffix: &str) -> PathBuf {
+    let mut path = pe_service::source_checkpoint::checkpoint_path(source).into_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
+#[tokio::test]
+async fn crash_restart_from_hourly_checkpoint() {
+    let fixture = checkpoint_rollout::CheckpointFixture::new().await;
+    SourceLogBoot::prepare_checkpoint(&fixture.cfg.paper_state_db_path).unwrap();
+    let child = checkpoint_rollout::Child::start_checkpoint(
+        &fixture.config_path,
+        Path::new(env!("CARGO_BIN_EXE_pe-service")),
+        &[(
+            "PE_SCENARIO_CHECKPOINT_PUBLISH_INTERVAL_MS",
+            Path::new("500"),
+        )],
+    );
+    checkpoint_until(|| {
+        checkpoint_events(&fixture.logs(), "source checkpoint published").len() >= 2
+    })
+    .await;
+    let output = child.finish_checkpoint(Some("-KILL")).await;
+    assert!(!output.status.success());
+    let events = checkpoint_events(&fixture.logs(), "source checkpoint published");
+    let last = events.last().unwrap();
+    let data = checkpoint_json(&fixture.cfg.source_event_log_path);
+    let tail: pe_event_log::LogTailBinding = serde_json::from_value(data["tail"].clone()).unwrap();
+    let lag =
+        last["published_unix_ms"].as_u64().unwrap() - last["capture_unix_ms"].as_u64().unwrap();
+    assert!(lag < 10_000);
+    assert_eq!(
+        data["prefix_blake3"],
+        Scanner::hash_prefix(&tail.path, tail.physical_tail)
+            .unwrap()
+            .finalize()
+            .to_hex()
+            .as_str()
+    );
+    let complete = Scanner::verify(&tail.path).unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&tail.path)
+        .unwrap()
+        .write_all(&[1, 2])
+        .unwrap();
+    fixture.clear_logs();
+    let child = checkpoint_rollout::Child::start_checkpoint(
+        &fixture.config_path,
+        Path::new(env!("CARGO_BIN_EXE_pe-service")),
+        &[],
+    );
+    fixture.wait_log("source checkpoint prefix verified").await;
+    fixture.wait_log("source checkpoint published").await;
+    let output = child.finish_checkpoint(Some("-INT")).await;
+    assert!(output.status.success(), "{output:?}");
+    let boot = &checkpoint_events(&fixture.logs(), "source checkpoint verification completed")[0];
+    assert_eq!(boot["checkpoint_used"], true);
+    assert_eq!(boot["checkpoint_offset"], tail.physical_tail);
+    assert_eq!(
+        boot["suffix_bytes"],
+        complete.physical_tail - tail.physical_tail
+    );
+    assert!(file_len(&tail.path) >= complete.physical_tail);
+}
+
+/// Fixed declared outcomes: all four old-binary rows are allowed. Each must verify before serving,
+/// reject the corrupt suffix control, retry idempotently and preserve finance/history/membership.
+/// New-binary rows: absent/inactive use checkpoint; active full-walks and clears; unreadable always
+/// full-walks until quiesced recovery, whose next full walk publishes a usable checkpoint.
+#[tokio::test]
+async fn previous_binary_rollback_matrix() {
+    let Some(previous) = std::env::var_os("PE_ROLLBACK_SERVICE_BINARY") else {
+        eprintln!(
+            "SKIP previous_binary_rollback_matrix: PE_ROLLBACK_SERVICE_BINARY is unset; rollback compatibility is unproven"
+        );
+        return;
+    };
+    let previous = PathBuf::from(previous);
+    assert!(previous.is_absolute());
+    for binary in [
+        Path::new(env!("CARGO_BIN_EXE_pe-service")),
+        previous.as_path(),
+    ] {
+        let output = std::process::Command::new("sha256sum")
+            .arg(binary)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        eprintln!(
+            "rollback executable identity: {}",
+            String::from_utf8(output.stdout).unwrap().trim()
+        );
+        let version = std::process::Command::new(binary)
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(version.status.success());
+        eprintln!(
+            "rollback embedded identity: {}",
+            String::from_utf8(version.stdout).unwrap().trim()
+        );
+    }
+    for row in ["absent", "inactive", "active", "unreadable"] {
+        eprintln!("rollback row {row}: declared allowed; all preservation criteria required");
+        let fixture = checkpoint_rollout::CheckpointFixture::new().await;
+        // A genuine new-owner hourly artifact and persistent lock are the old reader's input.
+        let child = checkpoint_rollout::Child::start_checkpoint(
+            &fixture.config_path,
+            Path::new(env!("CARGO_BIN_EXE_pe-service")),
+            &[(
+                "PE_SCENARIO_CHECKPOINT_PUBLISH_INTERVAL_MS",
+                Path::new("500"),
+            )],
+        );
+        fixture.copy();
+        fixture.wait_copy().await;
+        checkpoint_until(|| {
+            checkpoint_events(&fixture.logs(), "source checkpoint published").len() >= 2
+        })
+        .await;
+        let output = child.finish_checkpoint(Some("-INT")).await;
+        assert!(output.status.success(), "{row}: {output:?}");
+        fixture.mirror_positions();
+        fixture.stale_anchors();
+        let source = &fixture.cfg.source_event_log_path;
+        let mut lock = pe_service::source_checkpoint::checkpoint_path(source).into_os_string();
+        lock.push(".lock");
+        assert!(PathBuf::from(lock).exists());
+        let mut record = pe_service::source_checkpoint::checkpoint_path(source).into_os_string();
+        record.push(".invalidation");
+        let record = PathBuf::from(record);
+        match row {
+            "absent" => {
+                if record.exists() {
+                    std::fs::remove_file(&record).unwrap();
+                }
+            }
+            "inactive" => std::fs::write(&record, br#"{"generation":4,"active":false}"#).unwrap(),
+            "active" => std::fs::write(&record, br#"{"generation":4,"active":true}"#).unwrap(),
+            "unreadable" => std::fs::write(&record, b"unreadable quarantine").unwrap(),
+            _ => unreachable!(),
+        }
+        let record_before = std::fs::read(&record).ok();
+        let finances = fixture.paper.financial_snapshot(NOW_UNIX).unwrap();
+        let history = fixture.paper.gate_history().unwrap();
+        let decisions = fixture.paper.decision_pending_history().unwrap();
+        let source_before = std::fs::read(source).unwrap();
+        // Control in every row: append a corrupt complete frame after the checkpoint.
+        append(
+            source,
+            envelope("rollback.control", 1, 1, b"control", NOW_UNIX),
+        );
+        let mut corrupt = std::fs::read(source).unwrap();
+        *corrupt.last_mut().unwrap() ^= 1;
+        std::fs::write(source, corrupt).unwrap();
+        fixture.clear_logs();
+        let output = boot_binary_at(&fixture.config_path, &previous).await;
+        assert!(
+            !output.status.success(),
+            "{row}: corrupt suffix unexpectedly allowed"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("CRC"),
+            "{row}: {output:?}"
+        );
+        assert!(!fixture.logs().contains("pe-service listening"));
+        assert_eq!(std::fs::read(&record).ok(), record_before);
+        std::fs::write(source, &source_before).unwrap();
+        fixture.clear_logs();
+        std::fs::remove_file(&fixture.cfg.status_path).unwrap();
+        let retry_start = file_len(source);
+        // copy() serves transaction 1001; this is the same already-covered row, unchanged.
+        let covered_hash = format!("0x{:064x}", 1001);
+        let child =
+            checkpoint_rollout::Child::start_checkpoint(&fixture.config_path, &previous, &[]);
+        fixture.wait_log("pe-service listening").await;
+        let logs = fixture.logs();
+        let admitted = logs
+            .lines()
+            .position(|line| {
+                let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+                    return false;
+                };
+                let fields = event.get("fields").unwrap_or(&event);
+                fields["message"] == "wallet bracket completed"
+                    && fields["wallet"] == fixture.wallet().to_string()
+                    && fields["outcome"] == "accepted"
+            })
+            .expect("previous binary must admit the stale-anchor fixture wallet");
+        let listening = logs
+            .lines()
+            .position(|line| line.contains("pe-service listening"))
+            .unwrap();
+        assert!(
+            admitted < listening,
+            "{row}: previous-binary boot admission must precede listening"
+        );
+        // The previous poller records each reconciliation page before processing it, and
+        // persists the wallet's feed-history frontier only after that read's buckets and
+        // retirements are acknowledged. A frontier citing a page with this exact retry,
+        // appended after this run began, proves the retry was processed successfully.
+        checkpoint_until(|| {
+            let Ok(frames) = pe_event_log::Reader::replay_with_offsets(source) else {
+                return false;
+            };
+            let covered = frames
+                .filter_map(Result::ok)
+                .filter(|(offset, _, frame)| {
+                    *offset >= retry_start
+                        && frame.source_id.0 == "polymarket-public.activity-reconciliation"
+                        && serde_json::from_slice::<serde_json::Value>(&frame.payload)
+                            .ok()
+                            .is_some_and(|rows| {
+                                rows.as_array().is_some_and(|rows| {
+                                    rows.iter()
+                                        .any(|row| row["transactionHash"] == covered_hash)
+                                })
+                            })
+                })
+                .map(|(_, sequence, frame)| (sequence.0, frame.this_hash.to_hex().to_string()))
+                .collect::<std::collections::HashSet<_>>();
+            let Ok(collection) = fixture.paper.feed_history_frontiers() else {
+                return false;
+            };
+            collection["frontiers"].as_array().is_some_and(|frontiers| {
+                frontiers.iter().any(|frontier| {
+                    frontier["wallet"] == fixture.wallet().to_string()
+                        && frontier["page_occurrences"]
+                            .as_array()
+                            .is_some_and(|pages| {
+                                pages.iter().any(|page| {
+                                    let receipt = &page["receipt"];
+                                    receipt["sequence"].as_u64().is_some_and(|sequence| {
+                                        receipt["this_hash"].as_str().is_some_and(|hash| {
+                                            covered.contains(&(sequence, hash.to_owned()))
+                                        })
+                                    })
+                                })
+                            })
+                })
+            })
+        })
+        .await;
+        checkpoint_until(|| {
+            std::fs::read(&fixture.cfg.status_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .is_some_and(|status| {
+                    status["uptime_secs"]
+                        .as_u64()
+                        .is_some_and(|seconds| seconds >= 2)
+                })
+        })
+        .await;
+        fixture.assert_live_membership();
+        let output = child.finish_checkpoint(Some("-INT")).await;
+        assert!(output.status.success(), "{row}: {output:?}");
+        let logs = fixture.logs();
+        assert!(
+            logs.find("source checkpoint raw prefix verified").unwrap()
+                < logs.find("pe-service listening").unwrap()
+        );
+        assert_eq!(
+            std::fs::read(&record).ok(),
+            record_before,
+            "old binary changed {row} record"
+        );
+        assert_eq!(
+            fixture.paper.financial_snapshot(NOW_UNIX).unwrap(),
+            finances
+        );
+        assert_eq!(fixture.paper.gate_history().unwrap(), history);
+        assert_eq!(fixture.paper.decision_pending_history().unwrap(), decisions);
+        assert!(!fixture.paper.is_wallet_fenced(&fixture.wallet()).unwrap());
+        assert!(
+            fixture
+                .paper
+                .wallet_history_complete(&fixture.wallet())
+                .unwrap()
+        );
+        fixture.clear_logs();
+        let child = checkpoint_rollout::Child::start_checkpoint(
+            &fixture.config_path,
+            Path::new(env!("CARGO_BIN_EXE_pe-service")),
+            &[],
+        );
+        fixture.wait_log("pe-service listening").await;
+        if row != "unreadable" {
+            fixture.wait_log("source checkpoint published").await;
+        }
+        let output = child.finish_checkpoint(Some("-INT")).await;
+        assert!(output.status.success(), "{row}: new reader {output:?}");
+        let boot =
+            &checkpoint_events(&fixture.logs(), "source checkpoint verification completed")[0];
+        assert_eq!(
+            boot["checkpoint_used"],
+            matches!(row, "absent" | "inactive"),
+            "{row}"
+        );
+        if row == "active" {
+            assert!(
+                pe_service::source_checkpoint::read_authority(source)
+                    .unwrap()
+                    .permits_checkpoint()
+            );
+        }
+        if row == "unreadable" {
+            assert_eq!(std::fs::read(&record).ok(), record_before);
+            fixture.clear_logs();
+            let child = checkpoint_rollout::Child::start_checkpoint(
+                &fixture.config_path,
+                Path::new(env!("CARGO_BIN_EXE_pe-service")),
+                &[],
+            );
+            fixture.wait_log("pe-service listening").await;
+            assert!(
+                !checkpoint_events(&fixture.logs(), "source checkpoint verification completed")[0]
+                    ["checkpoint_used"]
+                    .as_bool()
+                    .unwrap()
+            );
+            assert!(child.finish_checkpoint(Some("-INT")).await.status.success());
+            let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pe-service"));
+            command
+                .env_clear()
+                .arg("--recover-source-checkpoint")
+                .arg("--paper-state")
+                .arg(&fixture.cfg.paper_state_db_path);
+            assert!(
+                support::bounded_command_output(command)
+                    .await
+                    .status
+                    .success()
+            );
+            fixture.clear_logs();
+            let child = checkpoint_rollout::Child::start_checkpoint(
+                &fixture.config_path,
+                Path::new(env!("CARGO_BIN_EXE_pe-service")),
+                &[],
+            );
+            fixture.wait_log("source checkpoint published").await;
+            assert_eq!(
+                checkpoint_events(&fixture.logs(), "source checkpoint verification completed")[0]["prefix_verification"],
+                "full_walk"
+            );
+            assert!(child.finish_checkpoint(Some("-INT")).await.status.success());
+            fixture.clear_logs();
+            let child = checkpoint_rollout::Child::start_checkpoint(
+                &fixture.config_path,
+                Path::new(env!("CARGO_BIN_EXE_pe-service")),
+                &[],
+            );
+            fixture.wait_log("source checkpoint prefix verified").await;
+            assert!(child.finish_checkpoint(Some("-INT")).await.status.success());
+            assert_eq!(
+                checkpoint_events(&fixture.logs(), "source checkpoint verification completed")[0]["checkpoint_used"],
+                true
+            );
+        }
+        assert_eq!(
+            fixture.paper.financial_snapshot(NOW_UNIX).unwrap(),
+            finances
+        );
+        assert_eq!(fixture.paper.gate_history().unwrap(), history);
+        assert_eq!(fixture.paper.decision_pending_history().unwrap(), decisions);
+        eprintln!(
+            "rollback row {row}: allowed PASS; corrupt control refused; retry idempotent; drained; balances/history/decisions/fences preserved; new invalidation policy PASS"
+        );
+    }
+}
+
+async fn boot_binary_at(config: &Path, binary: &Path) -> std::process::Output {
+    let mut command = std::process::Command::new(binary);
+    command
+        .env_clear()
+        .current_dir(config.parent().unwrap())
+        .arg(config);
+    support::bounded_command_output(command).await
+}
+
+fn corrupt_checkpoint_prefix(source: &Path) {
+    use std::io::{Seek, SeekFrom};
+    let offset = checkpoint_json(source)["tail"]["physical_tail"]
+        .as_u64()
+        .unwrap()
+        - 1;
+    let bytes = std::fs::read(source).unwrap();
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(source)
+        .unwrap();
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    file.write_all(&[bytes[usize::try_from(offset).unwrap()] ^ 1])
+        .unwrap();
+    file.sync_all().unwrap();
+}
+
+/// The request barrier holds the actual bracket open, so listening with an empty live set
+/// proves boot did not wait for it. The Start-only control holds the same bracket before
+/// listening, then completes the original boot waves. No production endpoint is contacted.
+#[tokio::test]
+async fn progressive_boot_skips_waves_after_membership_record() {
+    use axum::{Json, Router, extract::State, http::Uri, routing::any};
+    use std::io::BufRead;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    #[derive(Clone)]
+    struct BootAdmissionSource {
+        start: AppendReceipt,
+        now: i64,
+        first_activity: Arc<AtomicBool>,
+        activity_requested: Arc<tokio::sync::Notify>,
+        release_activity: Arc<tokio::sync::Semaphore>,
+    }
+    async fn respond(
+        State(source): State<BootAdmissionSource>,
+        uri: Uri,
+        body: axum::body::Bytes,
+    ) -> Json<serde_json::Value> {
+        use serde_json::json;
+        Json(match uri.path() {
+            "/rest/v1/service_config" => {
+                let rows = [
+                    ("active_watchlist_size", "1", "integer"),
+                    ("mode", "paper", "text"),
+                    ("max_fill_price", "0.85", "decimal"),
+                    ("min_fill_price", "0.15", "decimal"),
+                    ("min_resolution_horizon_secs", "60", "integer"),
+                    ("max_resolution_horizon_secs", "172800", "integer"),
+                    ("price_impact_cap_bps", "100", "integer"),
+                    ("flip_human_approved", "false", "bool"),
+                    (
+                        "kelly_fraction_above_default_human_approved",
+                        "false",
+                        "bool",
+                    ),
+                    ("per_trade_cap", "unlimited", "text"),
+                    ("slippage_rate", "0.01", "decimal"),
+                    ("sizing_mode", "dollar", "text"),
+                    ("sizing_dollar_usd", "25", "decimal"),
+                    ("sizing_contracts", "1", "integer"),
+                ];
+                json!(rows.map(|(key, value, value_type)| json!({"key": key, "value": value, "value_type": value_type})))
+            }
+            "/rest/v1/ranking_batches" => json!([{"batch_id":572}]),
+            "/rest/v1/ranking_entries" | "/rest/v1/latest_ranking" => json!([
+                {"batch_id":572,"rank":1,"wallet_hex":WALLET,"ls_tstat":"3","hit_rate":"0.6","n_trades":20,"last_trade_unix":source.now-60,"survives":true}
+            ]),
+            "/rest/v1/paper_bankroll" => json!([{"bankroll_str":"10","last_prepared_seq":null}]),
+            "/rest/v1/paper_positions" | "/rest/v1/accounts" | "/rest/v1/account_credentials" => {
+                json!([])
+            }
+            "/rest/v1/rpc/seed_financial_start" => {
+                json!({"outcome":"existing", "start_seq":source.start.sequence.0, "start_hash":source.start.this_hash.to_hex().to_string()})
+            }
+            "/rest/v1/service_runtime" => {
+                json!([{"watchlist_size":0,"updated_at":"fixture-token"}])
+            }
+            "/rest/v1/rpc/service_watchlist_replace_v1" => {
+                let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                json!([{"new_token":"fixture-token","count":request["entries"].as_array().unwrap().len()}])
+            }
+            "/activity" => {
+                if !source.first_activity.swap(true, Ordering::SeqCst) {
+                    source.activity_requested.notify_one();
+                }
+                source.release_activity.acquire().await.unwrap().forget();
+                json!([])
+            }
+            "/positions" => json!([]),
+            _ => panic!("unexpected progressive-boot request {uri}"),
+        })
+    }
+
+    struct BootChild(std::process::Child);
+    impl Drop for BootChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    async fn status_at(path: &Path, expected: serde_json::Value) -> serde_json::Value {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let Ok(bytes) = std::fs::read(path)
+                    && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                    && value["live_wallets"] == expected
+                {
+                    break value;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    for post_start_record in [true, false] {
+        let (dir, mut paths) = version_one_fixture();
+        paths.binary_identity = pe_service::build_info::embedded()
+            .source_revision
+            .to_owned();
+        let paths = install_generation(paths);
+        let wallet = WalletAddress::from_hex(WALLET).unwrap();
+        let start = append_paper_record(&paths.paper_log, &start_record());
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let paper = PaperStateDb::open(&paths.fixed_main).unwrap();
+        paper
+            .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
+                wallet,
+                complete: true,
+                proof_json: "{}".to_owned(),
+                updated_at_unix: now,
+            })
+            .unwrap();
+        support::install_full_history_anchor(&paper, wallet, now - 3_601);
+        paper
+            .reset_financial_era(
+                start,
+                CollateralAmount::from_decimal_exact(dec!(10)).unwrap(),
+            )
+            .unwrap();
+        if post_start_record {
+            let config = append(&paths.source_log, envelope("pe-service.watchlist-capacity-config", 1, 1,
+                &serde_json::to_vec(&serde_json::json!({"generation":2,"target":1,"published_entries":start_batch().entries})).unwrap(), now));
+            append_paper_record(&paths.paper_log, &pe_service::paper_recovery::MembershipChange {
+                reason:pe_service::paper_recovery::MembershipReason::CapacityChange,
+                removed:Vec::new(), added:Vec::new(), capacity:1, ranking_batch_id:None,
+                evidence:serde_json::json!({"kind":"capacity_change","generation":2,"config_receipt":config,"admission_receipts":[]}),
+            }.into_record());
+        }
+        // Preserve an already sealed historical generation; this scenario isolates admission.
+        append_paper_record(
+            &paths.paper_log,
+            &PaperLogRecord::QualificationSealed(Box::new(
+                pe_service::paper_recovery::QualificationSealed {
+                    start_receipt: start,
+                    source_prefix: TailBinding::from(&Scanner::verify(&paths.source_log).unwrap()),
+                    financial_prefix: TailBinding::from(
+                        &Scanner::verify(&paths.paper_log).unwrap(),
+                    ),
+                    live_prefix: TailBinding::from(&Scanner::verify(&paths.live_journal).unwrap()),
+                    decision_evidence_digest: blake3::hash(b"[]").to_hex().to_string(),
+                    sealed_cutoff_unix: now,
+                    reason: pe_service::paper_recovery::SealReason::InsufficientEvidence(
+                        "admission fixture".to_owned(),
+                    ),
+                },
+            )),
+        );
+        drop(paper);
+        let source = BootAdmissionSource {
+            start,
+            now,
+            first_activity: Arc::new(AtomicBool::new(false)),
+            activity_requested: Arc::new(tokio::sync::Notify::new()),
+            release_activity: Arc::new(tokio::sync::Semaphore::new(0)),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let router = Router::new()
+            .fallback(any(respond))
+            .with_state(source.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap()
+        });
+        let cfg = pe_service::config::ServiceConfig {
+            bind: "127.0.0.1:0".to_owned(),
+            paper_state_db_path: paths.fixed_main.clone(),
+            source_event_log_path: paths.source_log.clone(),
+            event_log_path: paths.paper_log.clone(),
+            legacy_wallet_history_path: paths.legacy_history.clone(),
+            jsonl_log_path: dir.path().join("service.jsonl"),
+            status_path: dir.path().join("status.json"),
+            status_interval_secs: 1,
+            supabase_url: base.clone(),
+            supabase_secret_key: "fixture".to_owned(),
+            supabase_authoritative: true,
+            polymarket_base_url: base.clone(),
+            gamma_base_url: base.clone(),
+            polymarket_clob_base_url: base.clone(),
+            polygon_receipt_rpc_url: base,
+            bankroll_usd: "10".to_owned(),
+            maintenance_interval_secs: 600,
+            ..Default::default()
+        };
+        let config_path = dir.path().join("service.toml");
+        std::fs::write(&config_path, toml::to_string(&cfg).unwrap()).unwrap();
+        let mut command = boot_binary_command(&config_path, false);
+        command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = BootChild(command.spawn().unwrap());
+        let (lines, mut received) = tokio::sync::mpsc::channel(256);
+        let pipes: Vec<Box<dyn std::io::Read + Send>> = vec![
+            Box::new(child.0.stdout.take().unwrap()),
+            Box::new(child.0.stderr.take().unwrap()),
+        ];
+        let readers = pipes
+            .into_iter()
+            .map(|pipe| {
+                let lines = lines.clone();
+                tokio::task::spawn_blocking(move || {
+                    for line in std::io::BufReader::new(pipe).lines() {
+                        if lines.blocking_send(line.unwrap()).is_err() {
+                            break;
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        drop(lines);
+        let mut captured = Vec::new();
+        if !post_start_record {
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                source.activity_requested.notified(),
+            )
+            .await
+            .unwrap();
+            while let Ok(line) = received.try_recv() {
+                captured.push(line);
+            }
+            assert!(
+                captured
+                    .iter()
+                    .all(|line: &String| !line.contains("pe-service listening"))
+            );
+            assert!(
+                !cfg.status_path.exists(),
+                "Start without membership record waits for boot waves"
+            );
+            source.release_activity.add_permits(1_000);
+        }
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let line = received
+                    .recv()
+                    .await
+                    .expect("binary exited before listening");
+                let listening = line.contains("pe-service listening");
+                captured.push(line);
+                if listening {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("binary did not listen while the runtime bracket was held");
+        if post_start_record {
+            let zero = status_at(&cfg.status_path, serde_json::json!([])).await;
+            assert_eq!(zero["watchlist_size"], 0);
+            assert!(zero["live_wallets_at_unix_ms"].as_i64().is_some());
+            assert!(
+                captured
+                    .iter()
+                    .any(|line| line.contains("zero eligible live wallets"))
+            );
+            source.release_activity.add_permits(1_000);
+        }
+        let admitted = status_at(&cfg.status_path, serde_json::json!([wallet.to_string()])).await;
+        assert_eq!(admitted["watchlist_size"], 1);
+        // Listening/status can precede main's shutdown loop while it publishes the boot
+        // checkpoint. On Linux, wait for the actual SIGINT handler rather than a delay.
+        #[cfg(target_os = "linux")]
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let status =
+                    std::fs::read_to_string(format!("/proc/{}/status", child.0.id())).unwrap();
+                let caught = status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("SigCgt:"))
+                    .map(|mask| u64::from_str_radix(mask.trim(), 16).unwrap())
+                    .unwrap();
+                if caught & 2 != 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("binary did not install its shutdown handler");
+        assert!(
+            std::process::Command::new("kill")
+                .arg("-INT")
+                .arg(child.0.id().to_string())
+                .status()
+                .unwrap()
+                .success()
+        );
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(line) = received.recv().await {
+                captured.push(line);
+            }
+        })
+        .await
+        .unwrap();
+        let exit = child.0.wait().unwrap();
+        assert!(exit.success(), "{exit}: {}", captured.join("\n"));
+        for reader in readers {
+            reader.await.unwrap();
+        }
+        let logs = captured
+            .iter()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .collect::<Vec<_>>();
+        assert!(
+            logs.iter()
+                .any(|line| line["message"] == "boot anchor selection census"
+                    && line["reused"] == 0
+                    && line["walked"] == 1)
+        );
+        if post_start_record {
+            assert!(
+                logs.iter()
+                    .any(|line| line["message"] == "admission launch order"
+                        && line["path"] == "reentry"
+                        && line["started"] == 1)
+            );
+        } else {
+            let listening = captured
+                .iter()
+                .position(|line| line.contains("pe-service listening"))
+                .unwrap();
+            assert!(
+                captured[..listening]
+                    .iter()
+                    .any(|line| line.contains("wallet bracket completed"))
+            );
+        }
+        stop.send(()).unwrap();
+        server.await.unwrap();
+    }
 }

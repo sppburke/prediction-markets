@@ -43,6 +43,6 @@ pub use envelope::{ContentType, EnvelopeIn, EventEnvelope};
 pub use error::{LogError, PoisonReason};
 pub use reader::Reader;
 pub use scanner::{IncompleteTail, LogTailBinding, ScanOutcome, Scanner};
-pub use writer::{AppendReceipt, CheckpointVerification, Writer};
+pub use writer::{AppendReceipt, CheckpointPrefix, CheckpointVerification, Writer};
 #[cfg(feature = "scan-metrics")]
 pub mod scan_metrics;

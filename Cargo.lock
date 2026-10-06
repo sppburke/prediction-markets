@@ -3814,6 +3814,7 @@ dependencies = [
  "base64 0.22.1",
  "blake3",
  "figment",
+ "fs2",
  "futures",
  "hyper",
  "hyper-util",

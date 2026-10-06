@@ -13,6 +13,11 @@ path = "src/main.rs"
 name = "pe-service-live-canary"
 path = "src/bin/pe-service-live-canary.rs"
 
+[[bin]]
+name = "pe-scenario-b3sum"
+path = "src/bin/pe-scenario-b3sum.rs"
+required-features = ["scenario"]
+
 [lib]
 name = "pe_service"
 path = "src/lib.rs"
@@ -52,6 +57,7 @@ hyper           = { version = "1.9.0", features = ["http1", "server"] }
 hyper-util      = { version = "0.1.20", features = ["http1", "tokio", "service", "server-graceful"] }
 figment         = { workspace = true }
 futures         = { workspace = true }
+fs2             = { workspace = true }
 toml            = { workspace = true }
 reqwest         = { workspace = true }
 rust_decimal    = { workspace = true }

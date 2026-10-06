@@ -146,6 +146,17 @@ fn progressive_boot_enabled(
         && cfg.maintenance_interval_secs > 0
 }
 
+fn boot_transient_retry_at(
+    class: pe_service::position_seeder::FailureClass,
+    completed_at: Option<tokio::time::Instant>,
+) -> Option<tokio::time::Instant> {
+    completed_at
+        .filter(|_| class == pe_service::position_seeder::FailureClass::WalletTransient)
+        .map(|terminal| {
+            terminal + Duration::from_secs(pe_service::watchlist_admission::ADMISSION_RETRY_SECS)
+        })
+}
+
 fn boot_wave_has_eligible_wallet<'a>(
     paper: &PaperStateDb,
     accepted_or_reused: impl Iterator<Item = &'a WalletAddress>,
@@ -175,17 +186,76 @@ async fn main() -> Result<()> {
         let paper = args
             .get(position + 1)
             .context("--paper-state requires a path")?;
-        let (tail, validated) = pe_service::source_log_boot::SourceLogBoot::prepare_checkpoint(
+        #[cfg(feature = "scenario")]
+        let hooks = pe_service::source_checkpoint::cli_preparation_hooks()?;
+        #[cfg(feature = "scenario")]
+        let (receipt, validated) = if let Some(hooks) = hooks {
+            pe_service::source_log_boot::SourceLogBoot::prepare_checkpoint_with_hooks(
+                std::path::Path::new(paper),
+                &hooks,
+            )?
+        } else {
+            pe_service::source_log_boot::SourceLogBoot::prepare_checkpoint(std::path::Path::new(
+                paper,
+            ))?
+        };
+        #[cfg(not(feature = "scenario"))]
+        let (receipt, validated) = pe_service::source_log_boot::SourceLogBoot::prepare_checkpoint(
             std::path::Path::new(paper),
         )?;
         println!(
-            "prepared source checkpoint: {} bytes, sequence {:?}, validated {validated} open continuations",
-            tail.physical_tail, tail.last_sequence
+            "source checkpoint published offset={} sequence={} hash={} prefix_blake3={} capture_unix_ms={} published_unix_ms={} validated={validated}",
+            receipt.tail.physical_tail,
+            receipt
+                .tail
+                .last_sequence
+                .map_or_else(|| "none".to_owned(), |seq| seq.0.to_string()),
+            receipt.tail.last_hash.to_hex(),
+            receipt.prefix_blake3,
+            receipt.capture_unix_ms,
+            receipt.published_unix_ms
+        );
+        return Ok(());
+    }
+    if args
+        .iter()
+        .any(|argument| argument == "--recover-source-checkpoint")
+    {
+        let position = args
+            .iter()
+            .position(|argument| argument == "--paper-state")
+            .context("--recover-source-checkpoint requires --paper-state <installed-path>")?;
+        let paper = args
+            .get(position + 1)
+            .context("--paper-state requires a path")?;
+        let receipt =
+            pe_service::source_checkpoint::recover_installed(std::path::Path::new(paper))?;
+        println!(
+            "source checkpoint recovery checkpoint={} removed={} record={} removed={}",
+            receipt.checkpoint.display(),
+            receipt.checkpoint_removed,
+            receipt.record.display(),
+            receipt.record_removed
         );
         return Ok(());
     }
     if args.iter().any(|argument| argument == "--version") {
         println!("{}", pe_service::build_info::version_line());
+        return Ok(());
+    }
+    if let Some(position) = args
+        .iter()
+        .position(|argument| argument == "--canonical-membership-json")
+    {
+        let kind = args.get(position + 1).context(
+            "--canonical-membership-json requires membership_changed or a membership artifact source ID",
+        )?;
+        let mut payload = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut payload)
+            .context("read the membership payload from stdin")?;
+        let canonical = pe_service::qualification::canonical_membership_json(kind, &payload)
+            .context("decode the membership payload")?;
+        println!("{canonical}");
         return Ok(());
     }
     if let Some(position) = args
@@ -872,7 +942,7 @@ async fn main() -> Result<()> {
     let mut boot_cooldowns = std::collections::HashMap::new();
     let reused_eligible =
         boot_wave_has_eligible_wallet(&paper_state, boot_anchor_selection.reused.iter())?;
-    if !progressive_boot || !reused_eligible {
+    if !progressive_boot || (!post_start_record_replayed && !reused_eligible) {
         let wave_size = if progressive_boot {
             pe_service::position_seeder::BRACKET_CONCURRENCY
         } else {
@@ -897,14 +967,10 @@ async fn main() -> Result<()> {
                 {
                     boot_persistent_deferred.insert(*wallet);
                 }
-                if error.class() == pe_service::position_seeder::FailureClass::WalletTransient
-                    && let Some(terminal) = outcome.failure_completed_at(wallet)
+                if let Some(retry_at) =
+                    boot_transient_retry_at(error.class(), outcome.failure_completed_at(wallet))
                 {
-                    boot_cooldowns.insert(
-                        *wallet,
-                        terminal
-                            + Duration::from_secs(pe_service::trade_poller::ANCHOR_REFRESH_SECS),
-                    );
+                    boot_cooldowns.insert(*wallet, retry_at);
                 }
             }
             anchored.extend(outcome.accepted);
@@ -1773,11 +1839,15 @@ async fn main() -> Result<()> {
         (cfg.status_interval_secs > 0).then(|| Duration::from_secs(cfg.status_interval_secs));
     // Register the final two owners before the status writer's immediate first tick.
     task_status.register(TaskName::HttpServer);
+    if source_log_boot.is_some() {
+        task_status.register(TaskName::SourceCheckpoint);
+    }
     let status_writer = pe_service::status_writer::run_status_writer(
         cfg.status_path.clone(),
         status_interval,
         paper_state.clone(),
         live_watchlist.clone(),
+        watchlist_writer_lock.clone(),
         applied_watchlist_capacity.clone(),
         live_runtime_config.clone(),
         runtime_config_status.clone(),
@@ -1830,10 +1900,16 @@ async fn main() -> Result<()> {
         Ok(TaskExit::CleanShutdown)
     });
 
-    if let Some(boot) = &source_log_boot
-        && let Err(error) = boot.publish_checkpoint()
-    {
-        warn!(%error, "source checkpoint publication failed; next boot can perform a full walk");
+    let checkpoint_slot = pe_service::source_checkpoint::CheckpointJobSlot::default();
+    if let Some(boot) = source_log_boot.take() {
+        let owner = boot.into_checkpoint_owner(checkpoint_slot.clone());
+        #[cfg(feature = "scenario")]
+        let owner = {
+            let mut owner = owner;
+            owner.set_scenario_hooks(pe_service::source_checkpoint::cli_owner_hooks()?);
+            owner
+        };
+        supervisor.spawn(TaskName::SourceCheckpoint, owner.run(shutdown.subscribe()));
     }
 
     let initial_failure = loop {
@@ -1859,7 +1935,9 @@ async fn main() -> Result<()> {
     // stragglers and immediately joins those abort completions; no task is detached (#544).
     let deadline = tokio::time::Instant::now() + SHUTDOWN_DEADLINE;
     advance_shutdown(&shutdown, &task_status, ShutdownPhase::StopProducers);
+    checkpoint_slot.cancel();
     let producers = [
+        TaskName::SourceCheckpoint,
         TaskName::PublicActivityPoll,
         TaskName::ResolutionPoller,
         TaskName::LiveAccountsPoller,
@@ -1918,11 +1996,36 @@ async fn main() -> Result<()> {
     task_status.mark_stopped(TaskName::JsonTracingFullAppender);
     task_status.mark_stopped(TaskName::JsonTracingErrorAppender);
     shutdown.advance(ShutdownPhase::Complete);
-    if !supervisor.join_all_bounded().await {
-        // A pinned non-yielding task never observes abort, and dropping the
-        // runtime would wait on it forever: force the bounded exit the plan
-        // promises — durable state recovers on the next start (#544 review).
-        eprintln!("pe-service: final join bound expired with unjoined owners; forcing exit");
+    let owners_joined = supervisor.join_all_bounded().await;
+    #[cfg(feature = "scenario")]
+    let owners_joined =
+        owners_joined && std::env::var_os("PE_SCENARIO_CHECKPOINT_SHUTDOWN_TIMEOUT").is_none();
+    let checkpoint_joined = matches!(
+        tokio::time::timeout(
+            pe_service::supervisor::POST_ABORT_JOIN_BOUND,
+            checkpoint_slot.join()
+        )
+        .await,
+        Ok(Ok(()))
+    );
+    #[cfg(feature = "scenario")]
+    let checkpoint_joined =
+        checkpoint_joined && std::env::var_os("PE_SCENARIO_CHECKPOINT_JOB_JOIN_TIMEOUT").is_none();
+    let invalidation_failed = task_status.snapshot().iter().any(|task| {
+        task.name == TaskName::SourceCheckpoint
+            && task.failure.as_ref().is_some_and(|failure| {
+                failure.kind
+                    == pe_service::supervisor::TaskFailureKind::CheckpointInvalidationFailed
+            })
+    });
+    // A quarantine failure always preserves the operator-recovery status, including join timeouts.
+    if invalidation_failed || checkpoint_slot.quarantine_failed() {
+        std::process::exit(78);
+    }
+    if !owners_joined || !checkpoint_joined {
+        eprintln!(
+            "pe-service: final join bound expired with unjoined owners or checkpoint job; forcing exit"
+        );
         std::process::exit(70);
     }
 
@@ -2392,6 +2495,24 @@ mod tests {
     use rusqlite::params;
 
     const NOW: i64 = 10_000;
+
+    #[tokio::test(start_paused = true)]
+    async fn boot_transient_deferral_eligibility() {
+        use pe_service::position_seeder::FailureClass;
+        let completed = tokio::time::Instant::now();
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let retry_at =
+            boot_transient_retry_at(FailureClass::WalletTransient, Some(completed)).unwrap();
+        assert_eq!(retry_at, completed + Duration::from_secs(300));
+        tokio::time::advance(Duration::from_secs(269)).await;
+        assert!(tokio::time::Instant::now() < retry_at);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(tokio::time::Instant::now(), retry_at);
+        for class in [FailureClass::WalletPersistent, FailureClass::Shared] {
+            assert!(boot_transient_retry_at(class, Some(completed)).is_none());
+        }
+        assert!(boot_transient_retry_at(FailureClass::WalletTransient, None).is_none());
+    }
 
     #[test]
     fn paper_only_boot_uses_existing_journal_read_only_and_leaves_missing_file_absent() {

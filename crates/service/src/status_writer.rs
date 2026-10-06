@@ -154,6 +154,11 @@ pub struct StatusSnapshot {
     pub last_event_seq: u64,
     /// Live watchlist size (wallets currently copied).
     pub watchlist_size: usize,
+    /// Effective live membership sampled with durable fences under the structural writer lock.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_wallets: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub live_wallets_at_unix_ms: Option<i64>,
     /// Last successfully applied Supabase-configured cap. It can differ from `watchlist_size`
     /// when the ranking bench cannot fill every requested slot or maintenance is between fills.
     pub watchlist_target_size: usize,
@@ -290,6 +295,8 @@ pub fn build_snapshot(
             .map(|s| s.0)
             .unwrap_or(0),
         watchlist_size,
+        live_wallets: None,
+        live_wallets_at_unix_ms: None,
         watchlist_target_size,
         runtime_config: None,
         watchlist_projection: None,
@@ -344,6 +351,7 @@ pub async fn run_status_writer(
     interval: Option<Duration>,
     paper_state: Arc<PaperStateDb>,
     watchlist: LiveWatchlist,
+    watchlist_writer_lock: Arc<tokio::sync::Mutex<()>>,
     applied_capacity: AppliedWatchlistCapacity,
     runtime_config: LiveRuntimeConfig,
     runtime_config_status: RuntimeConfigStatus,
@@ -381,7 +389,27 @@ pub async fn run_status_writer(
         });
         let applied_config = runtime_config.snapshot();
         let now_unix = OffsetDateTime::now_utc().unix_timestamp();
-        let watchlist_snapshot = watchlist.snapshot();
+        let (watchlist_snapshot, effective_live) = {
+            let _writer = watchlist_writer_lock.lock().await;
+            let snapshot = watchlist.snapshot();
+            let effective =
+                crate::supabase_refresh::effective_projection_entries(&watchlist, &paper_state)
+                    .ok()
+                    .and_then(|entries| {
+                        let at = i64::try_from(
+                            OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000,
+                        )
+                        .ok()?;
+                        Some((
+                            entries
+                                .into_iter()
+                                .map(|entry| entry.wallet_hex)
+                                .collect::<Vec<_>>(),
+                            at,
+                        ))
+                    });
+            (snapshot, effective)
+        };
         let live_wallets = watchlist_snapshot
             .entries
             .iter()
@@ -410,6 +438,10 @@ pub async fn run_status_writer(
             live_accounts.as_ref().map(|l| l.snapshot()).as_deref(),
         );
         snap.source_health = source_health;
+        if let Some((wallets, at)) = effective_live {
+            snap.live_wallets = Some(wallets);
+            snap.live_wallets_at_unix_ms = Some(at);
+        }
         let runtime_status = runtime_config_status.snapshot();
         snap.applied_config_hash = runtime_status.applied_hash.clone();
         snap.runtime_config = Some(runtime_status.as_ref().clone());
@@ -447,6 +479,185 @@ mod tests {
 
     fn t0() -> OffsetDateTime {
         OffsetDateTime::from_unix_timestamp(1_000_000).unwrap()
+    }
+
+    fn status_watchlist(wallets: &[WalletAddress]) -> LiveWatchlist {
+        use pe_core_types::{BasisPoints, ReconstructionQuality};
+        use pe_trader_index::{WatchlistEntry, WatchlistTier};
+        LiveWatchlist::new(Watchlist {
+            entries: wallets
+                .iter()
+                .map(|wallet| WatchlistEntry {
+                    wallet: *wallet,
+                    tier: WatchlistTier::Active,
+                    leader_score_bps: BasisPoints(0),
+                    lcb_5pct_bps: BasisPoints(0),
+                    win_rate_bps: BasisPoints(0),
+                    closed_trades_in_window: 0,
+                    reconstruction_quality: ReconstructionQuality::new(100).unwrap(),
+                })
+                .collect(),
+            snapshot_at: SourceTimestamp(OffsetDateTime::UNIX_EPOCH),
+            active_count: wallets.len(),
+            incubator_count: 0,
+        })
+    }
+
+    async fn write_live_status(
+        path: &Path,
+        paper: Arc<PaperStateDb>,
+        live: LiveWatchlist,
+        lock: Arc<tokio::sync::Mutex<()>>,
+    ) -> serde_json::Value {
+        let config = RuntimeConfig::from_service_config(&ServiceConfig::default());
+        run_status_writer(
+            path.to_owned(),
+            None,
+            paper,
+            live,
+            lock,
+            AppliedWatchlistCapacity::new(config.active_watchlist_size),
+            LiveRuntimeConfig::new(config.clone()),
+            RuntimeConfigStatus::new(&config),
+            WatchlistProjectionStatus::default(),
+            false,
+            None,
+            None,
+            None,
+            TaskStatus::new(),
+            async {},
+        )
+        .await
+        .unwrap();
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    fn status_fence(path: &Path, wallet: WalletAddress) {
+        rusqlite::Connection::open(path).unwrap().execute(
+            "INSERT INTO wallet_fences (wallet_hex, source_trade_id, cause, proof_json, fenced_at_unix) VALUES (?1, 'status-test', 'invalid_mapping', '{}', 1)",
+            [wallet.to_string()],
+        ).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_wallets_equals_effective_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("paper.db");
+        let path = dir.path().join("status.json");
+        let paper = Arc::new(PaperStateDb::open(&db).unwrap());
+        let (ready, fenced, structural_only) = (
+            WalletAddress([1; 20]),
+            WalletAddress([2; 20]),
+            WalletAddress([3; 20]),
+        );
+        let live = status_watchlist(&[ready, fenced]);
+        live.commit_structural_change(&[], &[structural_only]);
+        status_fence(&db, fenced);
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let value = write_live_status(&path, paper.clone(), live.clone(), lock.clone()).await;
+        assert_eq!(
+            value["live_wallets"],
+            serde_json::json!([ready.to_string()])
+        );
+        assert!(value["live_wallets_at_unix_ms"].as_i64().is_some());
+        assert_eq!(value["watchlist_size"], 2);
+        let entries = status_watchlist(&[structural_only])
+            .snapshot()
+            .entries
+            .clone();
+        live.replace(&std::collections::HashSet::new(), &entries, 3);
+        let value = write_live_status(&path, paper.clone(), live.clone(), lock).await;
+        let expected = crate::supabase_refresh::effective_projection_entries(&live, &paper)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.wallet_hex)
+            .collect::<Vec<_>>();
+        assert_eq!(value["live_wallets"], serde_json::json!(expected));
+        assert_eq!(
+            expected,
+            vec![ready.to_string(), structural_only.to_string()]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_wallets_omitted_on_fence_read_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("paper.db");
+        let path = dir.path().join("status.json");
+        let paper = Arc::new(PaperStateDb::open(&db).unwrap());
+        let wallet = WalletAddress([1; 20]);
+        let live = status_watchlist(&[wallet]);
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("ALTER TABLE wallet_fences RENAME TO unavailable_fences")
+            .unwrap();
+        let failed = write_live_status(&path, paper.clone(), live.clone(), lock.clone()).await;
+        assert!(failed.get("live_wallets").is_none());
+        assert!(failed.get("live_wallets_at_unix_ms").is_none());
+        conn.execute_batch("ALTER TABLE unavailable_fences RENAME TO wallet_fences")
+            .unwrap();
+        let recovered = write_live_status(&path, paper, live, lock).await;
+        assert_eq!(
+            recovered["live_wallets"],
+            serde_json::json!([wallet.to_string()])
+        );
+        assert!(recovered["live_wallets_at_unix_ms"].as_i64().is_some());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_wallets_read_under_writer_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("paper.db");
+        let path = dir.path().join("status.json");
+        let paper = Arc::new(PaperStateDb::open(&db).unwrap());
+        let wallet = WalletAddress([1; 20]);
+        let live = status_watchlist(&[wallet]);
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let before = write_live_status(&path, paper.clone(), live.clone(), lock.clone()).await;
+        assert_eq!(
+            before["live_wallets"],
+            serde_json::json!([wallet.to_string()])
+        );
+        for fenced in [true, false] {
+            let held = lock.lock().await;
+            let write = write_live_status(&path, paper.clone(), live.clone(), lock.clone());
+            tokio::pin!(write);
+            assert!(futures::poll!(&mut write).is_pending());
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&std::fs::read(&path).unwrap())
+                    .unwrap()["live_wallets"],
+                if fenced {
+                    serde_json::json!([wallet.to_string()])
+                } else {
+                    serde_json::json!([])
+                }
+            );
+            if fenced {
+                status_fence(&db, wallet);
+                live.replace(&std::collections::HashSet::from([wallet]), &[], 1);
+            } else {
+                rusqlite::Connection::open(&db)
+                    .unwrap()
+                    .execute("DELETE FROM wallet_fences", [])
+                    .unwrap();
+                let entries = status_watchlist(&[wallet]).snapshot().entries.clone();
+                live.replace(&std::collections::HashSet::new(), &entries, 1);
+            }
+            let committed_at =
+                i64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000)
+                    .unwrap();
+            drop(held);
+            let value = write.await;
+            assert_eq!(
+                value["live_wallets"],
+                if fenced {
+                    serde_json::json!([])
+                } else {
+                    serde_json::json!([wallet.to_string()])
+                }
+            );
+            assert!(value["live_wallets_at_unix_ms"].as_i64().unwrap() >= committed_at);
+        }
     }
 
     #[test]
@@ -567,6 +778,7 @@ mod tests {
             None,
             paper_state,
             watchlist,
+            Arc::new(tokio::sync::Mutex::new(())),
             AppliedWatchlistCapacity::new(config.active_watchlist_size),
             runtime,
             runtime_status.clone(),
