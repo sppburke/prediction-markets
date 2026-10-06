@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import os
@@ -106,7 +107,12 @@ def _wallet_last_trade(con: sqlite3.Connection, wallets_lower: list[str]) -> dic
     """
     out: dict[str, int] = {}
     if _cache_schema(con) >= 2:
-        from rank_cycle_manifest import WALLET_NEWEST_TRADE_V2
+        from rank_cycle_manifest import WALLET_NEWEST_TRADE_V2, finalized_certificates
+
+        certificates = finalized_certificates(con)
+        if certificates is not None:
+            return {wallet: row["newest_trade_unix"] for wallet, row in certificates["wallets"].items()
+                    if wallet in wallets_lower and row["newest_trade_unix"] is not None}
 
         query = (
             "SELECT w.value, (" + WALLET_NEWEST_TRADE_V2.format(wallet="w.value") + ") "
@@ -138,7 +144,8 @@ def _cache_schema(con: sqlite3.Connection) -> int:
     return schema
 
 
-def filter_active_rows(rows, db_path, active_window_hours, max_staleness_hours, now):
+def filter_active_rows(rows, db_path, active_window_hours, max_staleness_hours, now,
+                       *, publication_history=None):
     """Drop ranked rows whose wallet has no cached trade within ``active_window_hours``.
 
     Aborts with :class:`CacheStaleError` unless the newest trade, newest resolution
@@ -162,9 +169,10 @@ def filter_active_rows(rows, db_path, active_window_hours, max_staleness_hours, 
         # block the writer.
         con.execute("BEGIN")
         partial = partial_backfill_wallets(con)
-        from rank_cycle_manifest import newest_trade_unix
+        from rank_cycle_manifest import decode_scope_drops, finalized_certificates, newest_trade_unix
 
-        newest = newest_trade_unix(con)
+        certificates = finalized_certificates(con) if _cache_schema(con) >= 2 else None
+        newest = certificates["newest_trade_unix"] if certificates is not None else newest_trade_unix(con)
         if newest is None or now - newest > max_staleness_hours * 3600:
             age = "unknown" if newest is None else f"{(now - newest) / 3600:.1f}"
             error_type = RankingUnavailableError if _cache_schema(con) < 2 else CacheStaleError
@@ -207,7 +215,27 @@ def filter_active_rows(rows, db_path, active_window_hours, max_staleness_hours, 
                 "(docs/26)"
             )
         wallets_lower = sorted({r["wallet"].lower() for r in rows})
-        last = _wallet_last_trade(con, wallets_lower)
+        if certificates is None:
+            last = _wallet_last_trade(con, wallets_lower)
+        else:
+            current = certificates["wallets"]
+            last = {wallet: current[wallet]["newest_trade_unix"] for wallet in wallets_lower
+                    if wallet in current and current[wallet]["newest_trade_unix"] is not None}
+            if publication_history is not None:
+                publication_history["classifier_version"] = certificates["classifier_version"]
+                publication_history["wallets"] = {}
+                for wallet in wallets_lower:
+                    if wallet not in last:
+                        continue
+                    receipt = con.execute(
+                        "SELECT fixed_end_unix, exclusion_reason FROM activity_wallet_coverage_staging_v2 "
+                        "WHERE generation = ? AND wallet_hex = ?", (certificates["generation"], wallet)).fetchone()
+                    if receipt is None or receipt[1] is not None or type(receipt[0]) is not int:
+                        raise ValueError("entry wallet omitted its complete finalized-head receipt")
+                    publication_history["wallets"][wallet] = {
+                        "history_through_unix": receipt[0],
+                        "scope_drops": decode_scope_drops(current[wallet]["scope_drops_json"]),
+                    }
     finally:
         con.close()
     cutoff = now - active_window_hours * 3600
@@ -391,6 +419,14 @@ def validate_publish_request(request: dict) -> None:
         raise ValueError("publish request entry ranks must be contiguous from 1")
     if any(not entry.get("wallet_hex") for entry in entries):
         raise ValueError("publish request entries require wallet_hex")
+    if "classifier_version" in batch:
+        if type(batch["classifier_version"]) is not int:
+            raise ValueError("publish request classifier_version must be an integer")
+        from rank_cycle_manifest import decode_scope_drops
+        for entry in entries:
+            if type(entry.get("history_through_unix")) is not int or not isinstance(entry.get("scope_drops"), list):
+                raise ValueError("publish request entry requires history_through_unix and scope_drops")
+            decode_scope_drops(json.dumps(entry["scope_drops"], sort_keys=True, separators=(",", ":"), ensure_ascii=False))
     if cache_activation is not None:
         required = {"side_path", "fixed_path", "prior_cache_backup_path", "expected_sha256"}
         if not isinstance(cache_activation, dict) or set(cache_activation) not in (
@@ -530,11 +566,6 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--cache-fixed-db", help="fixed cache path replaced after preparation")
     ap.add_argument("--prior-cache-backup", help="generic prior-main backup path")
     ap.add_argument("--top-n", type=int, default=200)
-    ap.add_argument("--band-lo", type=float, default=0.15)
-    ap.add_argument("--band-hi", type=float, default=0.85)
-    ap.add_argument("--ttr-floor-secs", type=int, default=30)
-    ap.add_argument("--ttr-max-secs", type=int, default=259200)
-    ap.add_argument("--latency-shift-secs", type=int, default=20)
     ap.add_argument("--manifest-file", default=None,
                     help="pass-2 oracle_manifest.json; its canonical sha256 is stored as "
                          "ranking_batches.config_hash (#536 replay binding)")
@@ -603,9 +634,11 @@ def prepare_publish_request(a: argparse.Namespace, process_now: int) -> dict:
     # before the top-N cut fills the uploaded bench with active wallets rather than padding
     # it with idle ones.
     last_trade_map: dict[str, int] = {}
+    publication_history = {}
     if a.db:
         rows, dropped, last_trade_map = filter_active_rows(
-            rows, a.db, a.active_window_hours, a.max_cache_staleness_hours, process_now
+            rows, a.db, a.active_window_hours, a.max_cache_staleness_hours, process_now,
+            publication_history=publication_history,
         )
         print(f"active-filter: dropped {dropped} wallet(s) idle > {a.active_window_hours}h "
               f"per {a.db}; {len(rows)} remain")
@@ -638,38 +671,41 @@ def prepare_publish_request(a: argparse.Namespace, process_now: int) -> dict:
         error_type = RankingUnavailableError if schema_version < 2 else ValueError
         raise error_type("no rows to push (empty CSV, or the active/completeness filter removed all)")
 
-    config_hash = None
-    manifest = None
-    if a.manifest_file is not None:
-        # "" is a caller bug, not "no manifest": open() fails loudly below (#536).
-        with open(a.manifest_file, encoding="utf-8") as mf:
-            manifest = json.load(mf)
-        # #536: config_hash must BIND the manifest to the ranking actually being
-        # published — a stale/mixed run directory must never publish ranking A under
-        # the replay identity of ranking B.
-        actual = hashlib.sha256(open(a.ranked_csv, "rb").read()).hexdigest()
-        declared = manifest.get("outputs", {}).get("latency_shift_ranked_sha256")
-        if declared != actual:
-            raise ValueError(
-                f"manifest binds ranking {str(declared)[:16]}… but --ranked-csv digests "
-                f"{actual[:16]}… — mixed or stale run directory; refusing to publish"
-            )
-        config_hash = hashlib.sha256(
-            json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
+    if a.manifest_file is None:
+        raise ValueError("publication preparation requires the bound oracle manifest")
+    # "" is a caller bug, not "no manifest": open() fails loudly below (#536).
+    with open(a.manifest_file, encoding="utf-8") as mf:
+        manifest = json.load(mf)
+    # #536: config_hash must BIND the manifest to the ranking actually being
+    # published — a stale/mixed run directory must never publish ranking A under
+    # the replay identity of ranking B.
+    actual = hashlib.sha256(open(a.ranked_csv, "rb").read()).hexdigest()
+    declared = manifest.get("outputs", {}).get("latency_shift_ranked_sha256")
+    if declared != actual:
+        raise ValueError(
+            f"manifest binds ranking {str(declared)[:16]}… but --ranked-csv digests "
+            f"{actual[:16]}… — mixed or stale run directory; refusing to publish"
+        )
+    config_hash = hashlib.sha256(
+        json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
 
     batch = {
         "git_sha": a.git_sha or None,
         "config_hash": config_hash,
-        "band_lo": a.band_lo,
-        "band_hi": a.band_hi,
-        "ttr_floor_secs": a.ttr_floor_secs,
-        "ttr_max_secs": a.ttr_max_secs,
-        "latency_shift_secs": a.latency_shift_secs,
+        "band_lo": manifest["price_band"]["minimum_inclusive"],
+        "band_hi": manifest["price_band"]["maximum_exclusive"],
+        "ttr_floor_secs": _postgres_integer(manifest["scheduled_horizon"]["minimum_secs"], "ttr_floor_secs"),
+        "ttr_max_secs": _postgres_integer(manifest["scheduled_horizon"]["maximum_secs_exclusive"], "ttr_max_secs"),
+        "latency_shift_secs": _postgres_integer(manifest["latency_shift_secs"], "latency_shift_secs"),
         "universe_size": a.universe_size or universe_count,
         "notes": a.notes or None,
     }
     entries = build_entries(top, last_trade_map)
+    if publication_history:
+        batch["classifier_version"] = publication_history["classifier_version"]
+        for entry in entries:
+            entry.update(publication_history["wallets"][entry["wallet_hex"].lower()])
     activation_args = (
         getattr(a, "cache_stage_record", None), getattr(a, "cache_side_db", None),
         getattr(a, "cache_fixed_db", None), getattr(a, "prior_cache_backup", None),
@@ -717,16 +753,37 @@ def _batch_id_from_rpc_response(response) -> int:
     raise ValueError(f"publish_ranking_batch returned invalid batch id: {response!r}")
 
 
+def _postgres_integer(value, field: str) -> int:
+    if type(value) not in (int, float):
+        raise ValueError(f"{field} must be a finite integral PostgreSQL integer")
+    try:
+        number = Decimal(str(value))
+    except InvalidOperation as error:
+        raise ValueError(f"invalid {field}") from error
+    if (not number.is_finite() or number != number.to_integral_value()
+            or not -(2**31) <= number <= 2**31 - 1):
+        raise ValueError(f"{field} must be a finite integral PostgreSQL integer")
+    return int(number)
+
+
 def publish_request_to_supabase(request: dict, url: str, key: str) -> int:
     validate_publish_request(request)
+    if type(request["batch"].get("classifier_version")) is not int:
+        raise ValueError("publication requires classifier_version; pre-release requests belong to the prior release")
+    drops = sorted(
+        ({"wallet_hex": entry["wallet_hex"], **drop} for entry in request["entries"]
+         for drop in entry["scope_drops"]),
+        key=lambda drop: (drop["wallet_hex"], drop["scope_kind"], drop["scope_id"]),
+    )
     _, response = _req(
         "POST",
-        f"{url}/rest/v1/rpc/publish_ranking_batch",
+        f"{url}/rest/v1/rpc/publish_ranking_batch_v2",
         key,
         body={
             "p_publish_key": request["publish_key"],
             "p_batch": request["batch"],
             "p_entries": request["entries"],
+            "p_scope_drops": drops,
         },
     )
     batch_id = _batch_id_from_rpc_response(response)

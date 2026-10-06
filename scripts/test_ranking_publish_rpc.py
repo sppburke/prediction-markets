@@ -9,6 +9,7 @@ authoritative paper-state RPC harness.
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import os
 import shutil
@@ -156,8 +157,77 @@ def main() -> int:
             check=False,
         )
 
+    test_v2(url, suffix, batch, entries)
+
     print("PASS: concurrent retries converge; publication is complete and rollback-atomic")
     return 0
+
+
+def test_v2(url, suffix, batch, entries):
+    current = {**batch, "classifier_version": 6, "ttr_floor_secs": 10, "latency_shift_secs": 2}
+    entries = [{**entry, "history_through_unix": 1700000010} for entry in entries]
+    drops = [{"wallet_hex": "0xaaa", "scope_kind": "event", "scope_id": "0xa",
+              "dropped_at_unix": 1700000000, "cause": "conversion"},
+             {"wallet_hex": "0xbbb", "scope_kind": "market", "scope_id": "0xb",
+              "dropped_at_unix": 1700000001, "cause": "underflow"}]
+    batch_id = -1
+    prefix = "ranking-v2-test-" + suffix
+    keys = [hashlib.sha256((prefix + str(i)).encode()).hexdigest() for i in range(8)]
+    def call(key, scope_drops, entry_rows=entries):
+        return ("select publish_ranking_batch_v2("
+                f"'{key}', '{sql_json(current)}'::jsonb, '{sql_json(entry_rows)}'::jsonb, "
+                f"'{sql_json(scope_drops)}'::jsonb);")
+    try:
+        legacy_key = keys[-1]
+        old_batch = int(psql(url, "select publish_ranking_batch("
+                             f"'{legacy_key}', '{sql_json(batch)}'::jsonb, '{sql_json(entries)}'::jsonb);").stdout.strip())
+        if psql(url, f"select classifier_version is null from ranking_batches where batch_id={old_batch};").stdout.strip() != "t":
+            raise AssertionError("old batch classifier_version changed")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(lambda _: psql(url, call(keys[0], drops)).stdout.strip(), range(2)))
+        if len(set(results)) != 1 or not results[0].isdigit():
+            raise AssertionError(f"v2 same-key retry did not converge: {results}")
+        batch_id = int(results[0])
+        stored = psql(url, f"select classifier_version, ttr_floor_secs, latency_shift_secs from ranking_batches where batch_id={batch_id};").stdout.strip()
+        if stored != "6|10|2":
+            raise AssertionError(f"v2 batch metadata mismatch: {stored}")
+        through = psql(url, f"select history_through_unix from ranking_entries where batch_id={batch_id} order by rank;").stdout.split()
+        if through != ["1700000010"] * len(entries):
+            raise AssertionError(f"v2 coverage ends mismatch: {through}")
+        anon = psql(url, f"set role anon; select count(*) from ranking_scope_drops where batch_id={batch_id};").stdout.splitlines()[-1]
+        if anon != "2":
+            raise AssertionError("anon cannot read scope drops")
+        privileges = psql(url, "select has_function_privilege('anon', 'publish_ranking_batch_v2(text,jsonb,jsonb,jsonb)', 'EXECUTE'), "
+                         "has_function_privilege('authenticated', 'publish_ranking_batch_v2(text,jsonb,jsonb,jsonb)', 'EXECUTE'), "
+                         "has_function_privilege('service_role', 'publish_ranking_batch_v2(text,jsonb,jsonb,jsonb)', 'EXECUTE');").stdout.strip()
+        if privileges != "f|f|t":
+            raise AssertionError(f"v2 execute privilege mismatch: {privileges}")
+        failures = (
+            [{**drops[0], "cause": "bad-cause"}],
+            [drops[0], drops[0]],
+            [{**drops[0], "wallet_hex": "0xforeign"}],
+            [{**drops[0], "scope_kind": "wallet"}],
+        )
+        for key, bad_drops in zip(keys[1:5], failures, strict=True):
+            failed = psql(url, call(key, bad_drops), check=False)
+            if failed.returncode == 0:
+                raise AssertionError(f"invalid v2 drops accepted: {bad_drops}")
+            count = psql(url, f"select count(*) from ranking_batches where publish_key='{key}';").stdout.strip()
+            if count != "0":
+                raise AssertionError("failing drop did not roll back batch and entries")
+        # Retry counts remain enforced for both inherited entries and the extension's drops.
+        for scope_drops, entry_rows in (([], entries), (drops, entries[:1])):
+            if psql(url, call(keys[0], scope_drops, entry_rows), check=False).returncode == 0:
+                raise AssertionError("v2 retry count mismatch accepted")
+        no_end = [{**entry, "history_through_unix": None} for entry in entries]
+        if psql(url, call(keys[5], drops, no_end), check=False).returncode == 0:
+            raise AssertionError("v2 missing coverage end accepted")
+        print("PASS: v2 drops atomic; retries converge; counts checked; old classifier NULL; anon reads drops")
+    finally:
+        rendered = ",".join("'" + key + "'" for key in keys)
+        psql(url, f"delete from ranking_batches where publish_key in ({rendered});", check=False)
+        if psql(url, f"select count(*) from ranking_scope_drops where batch_id={batch_id};").stdout.strip() != "0":
+            raise AssertionError("batch delete did not cascade to drops")
 
 
 if __name__ == "__main__":

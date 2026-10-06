@@ -234,6 +234,8 @@ def load_universe_from_trades(conn: sqlite3.Connection, limit: int) -> list[str]
 def load_universe_from_export(engine) -> list[str]:
     """Schema two: the certified projection's wallets, joined in the verified export
     (older exports carry full activity history, so the join, not the file, decides)."""
+    if engine.execute("SELECT COUNT(*) FROM duckdb_views() WHERE view_name = 'projection'").fetchone()[0]:
+        return _valid_wallets(engine.execute("SELECT DISTINCT wallet_hex FROM projection ORDER BY wallet_hex").fetchall())
     return _valid_wallets(engine.execute(
         "SELECT DISTINCT g.wallet_hex FROM ranker_entries_v2 r "
         "JOIN activity_groups_v2 g ON g.source_trade_id = r.source_trade_id "
@@ -410,7 +412,7 @@ def process_wallet_positions(w, positions, prm, writer, summaries, floor_pos):
         and (n > 1)
         and not math.isnan(tstat_net)
     )
-    if eligible and (tstat_net >= prm.floor_tstat) and (mean_net > 0):
+    if floor_pos is not None and eligible and (tstat_net >= prm.floor_tstat) and (mean_net > 0):
         floor_pos[w] = (net_arr, np.asarray(resolveds, dtype=np.int64))
     return n
 
@@ -540,7 +542,7 @@ def main() -> int:
                      "contracts", "payoff", "gross", "net", "resolved_at"])
 
     summaries: list[dict] = []
-    floor_pos: dict[str, tuple[np.ndarray, np.ndarray]] = {}  # wallet -> (net, resolved_at)
+    floor_pos = {} if schema_version < 2 else None  # wallet -> (net, resolved_at)
     diag = dict(wallets_seen=0, first_buys=0, no_ref=0, ttr_fail=0, unresolved=0,
                 bad_price=0, out_of_band=0, out_of_window=0, qualified=0)
     t0 = time.time()
@@ -641,6 +643,9 @@ def main() -> int:
         for wlt in elig["wallet"].tolist():
             f.write(wlt + "\n")
     log(f"wrote {ranked_txt}")
+
+    if schema_version >= 2:
+        return 0
 
     # Stage 4 — EDGE FLOOR then max group Sharpe (on net returns).
     floor = elig[(elig["tstat_net"] >= prm.floor_tstat) & (elig["mean_net"] > 0)].reset_index(drop=True)

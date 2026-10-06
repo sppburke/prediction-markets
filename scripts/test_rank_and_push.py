@@ -144,6 +144,10 @@ class RankAndPushScenario(unittest.TestCase):
             "#!/usr/bin/env python3\n"
             "import os, sys\n"
             'open("export.log", "a").write(" ".join(sys.argv[1:]) + "\\n")\n'
+            'import json\n'
+            'a = sys.argv[1:]; out = a[a.index("--out-dir") + 1]\n'
+            'os.makedirs(out, exist_ok=True)\n'
+            'json.dump({"version": int(os.environ.get("STUB_EXPORT_VERSION", "2"))}, open(os.path.join(out, "schema_v2_export_manifest.json"), "w"))\n'
             'raise SystemExit(int(os.environ.get("STUB_EXIT_export", "0")))\n',
         )
         _write_exec(
@@ -187,6 +191,9 @@ class RankAndPushScenario(unittest.TestCase):
             '        ranked = open(os.path.join(out, "latency_shift_ranked.csv"), "rb").read()\n'
             '        open(os.path.join(out, "oracle_manifest.json"), "w").write(json.dumps(\n'
             '            {"oracle": "clob-minute-reference",\n'
+            '             "price_band": {"minimum_inclusive": float(a[a.index("--price-min") + 1]), "maximum_exclusive": float(a[a.index("--price-max") + 1])},\n'
+            '             "scheduled_horizon": {"minimum_secs": int(a[a.index("--min-ttr-secs") + 1]), "maximum_secs_exclusive": int(a[a.index("--ttr-max-secs") + 1])},\n'
+            '             "latency_shift_secs": float(a[a.index("--latency-shift-secs") + 1]),\n'
             '             "outputs": {"latency_shift_ranked_sha256": hashlib.sha256(ranked).hexdigest()}}))\n'
             "    return 0\n"
             'if __name__ == "__main__":\n'
@@ -220,6 +227,9 @@ class RankAndPushScenario(unittest.TestCase):
             '    request = Path(a[a.index("--request-file") + 1])\n'
             '    request.parent.mkdir(parents=True, exist_ok=True)\n'
             '    payload = {"version": 1, "batch": {}, "entries": [{"rank": 1, "wallet_hex": "0xabc"}], "keep_batches": 1080}\n'
+            '    if "--manifest-file" in a:\n'
+            '        manifest = json.load(open(a[a.index("--manifest-file") + 1]))\n'
+            '        payload["batch"].update(ttr_floor_secs=manifest["scheduled_horizon"]["minimum_secs"])\n'
             '    if "--cache-side-db" in a:\n'
             '        stage = json.load(open(a[a.index("--cache-stage-record") + 1]))\n'
             '        payload["cache_activation"] = {\n'
@@ -782,12 +792,18 @@ class RankAndPushScenario(unittest.TestCase):
         print("PASS: transient push resume replays only the exact publication request")
 
     def test_new_publication_records_ranking_floor_and_resume_keeps_old_floor(self):
-        first = self._run(exit_env={"STUB_PUSH_EXIT": "75"})
+        with (self.root / ".env").open("a") as env_file:
+            env_file.write("MIN_TTR_SECS=99\n")
+        first = self._run(exit_env={"STUB_PUSH_EXIT": "75", "MIN_TTR_SECS": "88"})
         self.assertEqual(first.returncode, 75, first.stderr)
         pending = self.root / "data/eval-results/rank_and_push.pending"
         request = self.root / pending.read_text().strip()
         fresh_args = shlex.split((self._log("push.log") or "").splitlines()[0])
-        self.assertEqual(fresh_args[fresh_args.index("--ttr-floor-secs") + 1], "60")
+        for removed in ("--band-lo", "--band-hi", "--ttr-floor-secs", "--ttr-max-secs", "--latency-shift-secs"):
+            self.assertNotIn(removed, fresh_args)
+        calls = [shlex.split(line) for line in self._log("rerank.log").splitlines()]
+        self.assertEqual([call[call.index("--min-ttr-secs") + 1] for call in calls], ["10", "10"])
+        self.assertEqual(json.loads(request.read_text())["batch"]["ttr_floor_secs"], 10)
         # Emulate a request prepared by the prior checkout; its recorded floor is immutable.
         payload = json.loads(request.read_text())
         payload["batch"]["ttr_floor_secs"] = 30
@@ -1398,7 +1414,7 @@ class RankAndPushScenario(unittest.TestCase):
 
     def test_run28_shape_threaded_to_stages(self):
         """run28 cutover (#417): TTR 48h + MinTRL-20 (per-month gates zeroed) reach both
-        ranking passes, and the push receives the matching --ttr-max-secs provenance."""
+        ranking passes, and the push receives the manifest with matching limits."""
         r = self._run()
         self.assertEqual(r.returncode, 0, f"stderr={r.stderr}")
         for logname in ("rank.log", "rerank.log"):
@@ -1407,8 +1423,11 @@ class RankAndPushScenario(unittest.TestCase):
             self.assertIn("--min-avg-per-month 0", log, f"{logname} per-month gate not zeroed")
             self.assertIn("--min-active-months 0", log, f"{logname} per-month gate not zeroed")
         self.assertIn("--ttr-hours 48", self._log("rank.log"), "pass-1 missing TTR 48h")
-        self.assertIn("--ttr-max-secs 172800", self._log("push.log"),
-                      "push missing the 48h ttr_max_secs provenance")
+        self.assertIn("--ttr-max-secs 172800", self._log("rerank.log"))
+        manifest = next((self.root / "data/eval-results").glob("cron-*/oracle_manifest.json"))
+        self.assertEqual(json.loads(manifest.read_text())["scheduled_horizon"]["maximum_secs_exclusive"], 172800)
+        self.assertIn("--manifest-file", self._log("push.log"))
+        self.assertNotIn("--ttr-max-secs", self._log("push.log"))
         print("PASS: run28 shape (ttr48 + trl20, per-month zeroed) threaded to rank/rerank/push")
 
     def test_missing_bootstrap_binary_is_fatal(self):
@@ -1772,7 +1791,8 @@ class RankAndPushScenario(unittest.TestCase):
             "        if os.environ.get('STUB_PRIOR_SCHEMA') == '2':\n"
             "            with sqlite3.connect(prior) as c:\n"
             "                c.executescript('PRAGMA user_version = 2; DROP TABLE trades; DROP TABLE market_resolutions; DROP TABLE source_cursor;')\n"
-            "                recorded = {'version': 2, 'generation': 1, 'fixed_end_unix': now - int(os.environ.get('STUB_PRIOR_AGE', '100000')), 'wallets': ['0xabc'], 'base_generation': None, 'base_manifest_sha256': None, 'start_exclusive': 0, 'full_read_wallets': ['0xabc']}\n"
+            "                recorded = {'version': 4, 'generation': 1, 'fixed_end_unix': now - int(os.environ.get('STUB_PRIOR_AGE', '100000')), 'wallets': ['0x'+'a'*40], 'base_generation': None, 'base_manifest_sha256': None, 'start_exclusive': 0, 'full_read_wallets': ['0x'+'a'*40]}\n"
+            "                recorded.update(deferred_wallets=[], repair_wallets=[], quiet_after_secs=2592000, repoll_period_secs=604800, certified_digest=hashlib.sha256(b'[]').hexdigest())\n"
             "                recorded['digest'] = hashlib.sha256(json.dumps(recorded, sort_keys=True, separators=(',', ':')).encode()).hexdigest()\n"
             "                c.execute('INSERT INTO activity_groups_v2 (wallet_hex, source_time_unix, activity_type, coverage_generation) VALUES (?, ?, ?, ?)', ('0xabc', recorded['fixed_end_unix'], 'TRADE', 1))\n"
             "                c.execute('INSERT INTO activity_coverage_manifests_v2 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', (1, '{}', now, recorded['digest'], 1, 'bb', 'cc', 1, json.dumps(recorded), 1))\n"
@@ -1800,7 +1820,8 @@ class RankAndPushScenario(unittest.TestCase):
             "        if recorded is None or recorded['generation'] != generation:\n"
             "            base = recorded['generation'] if recorded else None\n"
             "            end = now - int(os.environ.get('STUB_ACTIVITY_AGE_' + str(generation), '120'))\n"
-            "            recorded = {'version': 2, 'generation': generation, 'fixed_end_unix': end, 'wallets': ['0xabc'], 'base_generation': base, 'base_manifest_sha256': 'a'*64 if base else None, 'start_exclusive': recorded['fixed_end_unix'] if base else 0, 'full_read_wallets': [] if base else ['0xabc']}\n"
+            "            recorded = {'version': 4, 'generation': generation, 'fixed_end_unix': end, 'wallets': ['0x'+'a'*40], 'base_generation': base, 'base_manifest_sha256': 'a'*64 if base else None, 'start_exclusive': recorded['fixed_end_unix'] if base else 0, 'full_read_wallets': [] if base else ['0x'+'a'*40]}\n"
+            "            recorded.update(deferred_wallets=[], repair_wallets=[], quiet_after_secs=2592000, repoll_period_secs=604800, certified_digest=hashlib.sha256(b'[]').hexdigest())\n"
             "            recorded['digest'] = hashlib.sha256(json.dumps(recorded, sort_keys=True, separators=(',', ':')).encode()).hexdigest()\n"
             "            c.execute('UPDATE cache_v2_migration_state SET fresh_collection_json = ?, ranker_projection_count = NULL, ranker_projection_digest = NULL, ranker_classifier_version = NULL', (json.dumps(recorded),))\n"
             "        if '--bulk-root' in a:\n"
@@ -1834,7 +1855,14 @@ class RankAndPushScenario(unittest.TestCase):
             "        rows = c.execute('SELECT COUNT(*) FROM activity_groups_v2 WHERE coverage_generation = ?', (generation,)).fetchone()[0]\n"
             "        if c.execute('INSERT OR IGNORE INTO activity_coverage_manifests_v2 (generation, cursors_json, completed_at_unix, reference_sha256, wallet_count, receipt_set_digest, aggregate_digest, source_row_count, group_count) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', (generation, '[]', now, f'fresh-{generation}', 1, 'bb', 'cc', 1, rows)).rowcount:\n"
             "            c.execute('INSERT INTO activity_wallet_coverage_staging_v2 VALUES (?, ?, ?)', (generation, '0xabc', rows))\n"
-            "        c.execute('UPDATE cache_v2_migration_state SET ranker_projection_count = 1, ranker_projection_digest = ?, ranker_classifier_version = 2', (f'digest-{generation}',))\n"
+            "        c.execute('CREATE TABLE IF NOT EXISTS activity_wallet_history_v3 (wallet_hex TEXT PRIMARY KEY, generation INTEGER, newest_source_unix INTEGER, newest_trade_unix INTEGER, aggregate_count INTEGER, source_row_count INTEGER, ordered_digest TEXT, scope_drops_json TEXT)')\n"
+            "        for wallet, count in c.execute('SELECT wallet_hex, aggregate_count FROM activity_wallet_coverage_staging_v2 WHERE generation=?', (generation,)).fetchall():\n"
+            "            newest = c.execute('SELECT MAX(source_time_unix) FROM activity_groups_v2 WHERE wallet_hex=? AND coverage_generation=?', (wallet,generation)).fetchone()[0]\n"
+            "            c.execute('INSERT OR REPLACE INTO activity_wallet_history_v3 VALUES (?,?,?,?,?,?,?,?)', (wallet,generation,newest,newest,count,count,'a'*64,'[]'))\n"
+            "        columns = ['wallet_hex','generation','newest_source_unix','newest_trade_unix','aggregate_count','source_row_count','ordered_digest','scope_drops_json']\n"
+            "        certs = [dict(zip(columns,row)) for row in c.execute('SELECT * FROM activity_wallet_history_v3 ORDER BY wallet_hex')]\n"
+            "        inputs = dict(activity_generation=generation, oracle_version=6, certificate_digest=hashlib.sha256(json.dumps(certs,sort_keys=True,separators=(',',':'),ensure_ascii=False).encode()).hexdigest())\n"
+            "        c.execute('UPDATE cache_v2_migration_state SET phase=?, ranker_projection_count = 1, ranker_projection_digest = ?, ranker_classifier_version = 6, ranker_projection_inputs_json=?', ('finalized',f'digest-{generation}',json.dumps(inputs)))\n"
             "    if opt('--stage-record'): json.dump({'cache_path': os.path.abspath(db), 'cache_sha256': sha(db)}, open(opt('--stage-record'), 'w'))\n"
             "elif sub == 'cache-activate':\n"
             "    fixed, backup = opt('--fixed-db'), opt('--backup')\n"
@@ -2027,6 +2055,16 @@ raise SystemExit(subprocess.run([sys.executable, 'scripts/_rank_cycle_manifest_r
             1,
         )
         _write_exec(bootstrap, body)
+
+    def test_format_three_refinalize_receives_nondefault_export_manifest(self):
+        self._prepare_incremental_fixture(two_file=True)
+        result = self._run(exit_env={"STUB_EXPORT_VERSION": "3", "PE_RANKER_PARQUET_DIR": "data/custom-parquet"})
+        self.assertEqual(result.returncode, 2, result.stderr + result.stdout)
+        calls = [shlex.split(line) for line in self._log("pe_bootstrap.log").splitlines()
+                 if line.startswith("cache-finalize-v2") and "--stage-record" in line]
+        self.assertEqual(len(calls), 1)
+        manifest = calls[0][calls[0].index("--export-manifest") + 1]
+        self.assertEqual(manifest, "data/custom-parquet/schema_v2_export_manifest.json")
 
     def test_candidate_capture_overlaps_export_and_targets_then_finishes_before_fetch(self):
         self._prepare_incremental_fixture(two_file=True)
@@ -2332,6 +2370,9 @@ finally:
                 path = physical / f"wallet_cache.cron-20000101T000000Z.{role}.db{suffix}"
                 copies[path] = f"old {role}{suffix}".encode()
                 path.write_bytes(copies[path])
+        spool = physical / "wallet_cache.cron-20000101T000000Z.side.db.projection-v3.jsonl"
+        copies[spool] = b"committed projection\n"
+        spool.write_bytes(copies[spool])
         return copies
 
     def _assert_cache_copies(self, copies):
@@ -2375,6 +2416,10 @@ finally:
                 if not path.exists():
                     path.write_bytes(b"current cycle")
                 older[path] = path.read_bytes()
+        spool = fixed.parent / f"wallet_cache.{out.name}.side.db.projection-v3.jsonl"
+        spool.write_bytes(b"retained request projection\n")
+        older[spool] = spool.read_bytes()
+        self.assertTrue(spool.exists())
         resumed = self._run("--resume-pending")
         self.assertEqual(resumed.returncode, 0, resumed.stderr + resumed.stdout)
         self.assertTrue(all(not path.exists() for path in older))
@@ -2949,7 +2994,7 @@ if "--ranked-csv" in args:
     path.write_text("wallet,survives,tstat_net_ls,hit_rate,n_filled\\n{WA},True,4,0.8,40\\n{WB},True,3,0.8,40\\n")
     if "--manifest-file" in args:
         manifest=Path(args[args.index("--manifest-file")+1])
-        manifest.write_text(json.dumps({{"outputs":{{"latency_shift_ranked_sha256":hashlib.sha256(path.read_bytes()).hexdigest()}}}}))
+        manifest.write_text(json.dumps({{"price_band":{{"minimum_inclusive":0.15,"maximum_exclusive":0.85}},"scheduled_horizon":{{"minimum_secs":10,"maximum_secs_exclusive":172800}},"latency_shift_secs":2.0,"outputs":{{"latency_shift_ranked_sha256":hashlib.sha256(path.read_bytes()).hexdigest()}}}}))
 entries=[]
 config_hash=None
 def transport(method,url,key,body=None,**kwargs):
@@ -2964,6 +3009,14 @@ def transport(method,url,key,body=None,**kwargs):
         return 200,[{{"config_hash":"wrong" if {case!r}=="integrity" else config_hash}}]
     return 200,[]
 pub._req=transport
+real_filter=pub.filter_active_rows
+def with_finalized_context(*a,**kw):
+    result=real_filter(*a,**kw)
+    history=kw.get("publication_history")
+    if history is not None:
+        history.update(classifier_version=6,wallets={{wallet:{{"history_through_unix":{self.NOW},"scope_drops":[]}} for wallet in result[2]}})
+    return result
+pub.filter_active_rows=with_finalized_context
 raise SystemExit(pub.main())
 ''')
         elif case == "pass2":
@@ -3040,6 +3093,7 @@ raise SystemExit(real_ranker.main())
         db=self.prepare("publish_partial",active=False)
         out=self.root/"data/eval-results/cron-retained";out.mkdir()
         (out/"latency_shift_ranked.csv").write_text("wallet\nplaceholder\n")
+        (out/"oracle_manifest.json").write_text("{}")
         # Pure re-push and its guard must import no analytics, including transitively.
         blocker=self.root/"blocked";blocker.mkdir()
         (blocker/"sitecustomize.py").write_text('import sys\nclass Block:\n def find_spec(self,name,*args):\n  if name.split(".")[0] in ("numpy","pandas"): raise ImportError("analytics forbidden")\nsys.meta_path.insert(0,Block())\n')
@@ -3052,7 +3106,7 @@ raise SystemExit(real_ranker.main())
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)
         request=out/"ranking_publish_request.json";before=request.read_bytes()
         self.assertEqual(json.loads(before)["entries"][0]["wallet_hex"],self.wb)
-        self.assertEqual(json.loads(before)["batch"]["ttr_floor_secs"], 60)
+        self.assertEqual(json.loads(before)["batch"]["ttr_floor_secs"], 10)
         with sqlite3.connect(db) as con: con.execute("UPDATE wallets SET backfill_partial=1")
         unavailable=self._run(*args,exit_env={"PYTHONPATH":str(blocker)})
         self.assertEqual(unavailable.returncode,75,unavailable.stdout+unavailable.stderr)

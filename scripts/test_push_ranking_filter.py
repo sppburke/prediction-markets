@@ -417,6 +417,7 @@ class PublishRequestTest(unittest.TestCase):
         where the key is absent from every entry — the durable-recovery case that must keep
         validating and replaying unchanged."""
         batch = {
+            "classifier_version": 6,
             "git_sha": "abc123",
             "band_lo": 0.15,
             "band_hi": 0.85,
@@ -450,6 +451,8 @@ class PublishRequestTest(unittest.TestCase):
                 "last_trade_unix": None,
             },
         ]
+        for entry in entries:
+            entry.update(history_through_unix=NOW, scope_drops=[])
         if verdicts is not None:
             for entry, verdict in zip(entries, verdicts):
                 entry["survives"] = verdict
@@ -628,6 +631,13 @@ class PublishRequestTest(unittest.TestCase):
                 "wallet,survives,tstat_net_ls\n0xaaa,true,2.5\n",
                 encoding="utf-8",
             )
+            manifest_path = csv_path.with_name("oracle_manifest.json")
+            manifest_path.write_text(json.dumps({
+                "price_band": {"minimum_inclusive": 0.15, "maximum_exclusive": 0.85},
+                "scheduled_horizon": {"minimum_secs": 10, "maximum_secs_exclusive": 172800},
+                "latency_shift_secs": 2.0,
+                "outputs": {"latency_shift_ranked_sha256": hashlib.sha256(csv_path.read_bytes()).hexdigest()},
+            }))
             request_path = csv_path.with_name("ranking_publish_request.json")
             pending_path = Path("data/eval-results/rank_and_push.pending")
             with (
@@ -642,6 +652,7 @@ class PublishRequestTest(unittest.TestCase):
                         str(request_path),
                         "--pending-file",
                         str(pending_path),
+                        "--manifest-file", str(manifest_path),
                         "--prepare-only",
                     ],
                 ),
@@ -663,12 +674,19 @@ class PublishRequestTest(unittest.TestCase):
             csv_path = Path("data/eval-results/cron-test/latency_shift_ranked.csv")
             csv_path.parent.mkdir(parents=True)
             csv_path.write_text("wallet,tstat_net_ls\n0xaaa,2.5\n", encoding="utf-8")
+            manifest_path = csv_path.with_name("oracle_manifest.json")
+            manifest_path.write_text(json.dumps({
+                "price_band": {"minimum_inclusive": 0.15, "maximum_exclusive": 0.85},
+                "scheduled_horizon": {"minimum_secs": 10, "maximum_secs_exclusive": 172800},
+                "latency_shift_secs": 2.0,
+                "outputs": {"latency_shift_ranked_sha256": hashlib.sha256(csv_path.read_bytes()).hexdigest()},
+            }))
             request_path = csv_path.with_name("ranking_publish_request.json")
             with (
                 mock.patch.object(
                     sys, "argv",
                     ["push", "--ranked-csv", str(csv_path), "--request-file", str(request_path),
-                     "--prepare-only"],
+                     "--manifest-file", str(manifest_path), "--prepare-only"],
                 ),
                 mock.patch.dict("os.environ", {}, clear=True),
                 mock.patch.object(pr, "_request_once") as network,
@@ -691,12 +709,19 @@ class PublishRequestTest(unittest.TestCase):
                 "wallet,survives,tstat_net_ls\n0xaaa,True,2.5\n0xbbb,False,1.0\n",
                 encoding="utf-8",
             )
+            manifest_path = csv_path.with_name("oracle_manifest.json")
+            manifest_path.write_text(json.dumps({
+                "price_band": {"minimum_inclusive": 0.15, "maximum_exclusive": 0.85},
+                "scheduled_horizon": {"minimum_secs": 10, "maximum_secs_exclusive": 172800},
+                "latency_shift_secs": 2.0,
+                "outputs": {"latency_shift_ranked_sha256": hashlib.sha256(csv_path.read_bytes()).hexdigest()},
+            }))
             request_path = csv_path.with_name("ranking_publish_request.json")
             with (
                 mock.patch.object(
                     sys, "argv",
                     ["push", "--ranked-csv", str(csv_path), "--request-file", str(request_path),
-                     "--prepare-only"],
+                     "--manifest-file", str(manifest_path), "--prepare-only"],
                 ),
                 mock.patch.dict("os.environ", {}, clear=True),
                 mock.patch.object(pr, "_request_once") as network,
@@ -727,7 +752,7 @@ class PublishRequestTest(unittest.TestCase):
         self.assertEqual(request_mock.call_count, 2)
         rpc = request_mock.call_args_list[0]
         self.assertEqual(rpc.args[0], "POST")
-        self.assertTrue(rpc.args[1].endswith("/rest/v1/rpc/publish_ranking_batch"))
+        self.assertTrue(rpc.args[1].endswith("/rest/v1/rpc/publish_ranking_batch_v2"))
         self.assertEqual(rpc.kwargs["body"]["p_publish_key"], request["publish_key"])
         self.assertNotIn("batch_id", rpc.kwargs["body"]["p_entries"][0])
         self.assertIs(rpc.kwargs["body"]["p_entries"][0]["survives"], True)
@@ -748,22 +773,18 @@ class PublishRequestTest(unittest.TestCase):
                 pr.publish_request_to_supabase(request, "https://x.supabase.co", "secret")
         self.assertIn("survives", str(caught.exception))
 
-    def test_legacy_request_without_verdict_still_validates_and_verifies(self):
-        # A durable request recorded before #518 carries no verdict key. It must still validate
-        # (no entry-key whitelist), replay, and pass verification: absent submitted value vs
-        # stored SQL NULL is a match, so the upgrade can never wedge publication recovery.
+    def test_pre_release_request_loads_but_refuses_publication_before_rpc(self):
         request = self._request(keep_batches=0, verdicts=None)
-        pr.validate_publish_request(request)
-        self.assertNotIn("survives", request["entries"][0])
-        latest = [
-            {"batch_id": 42, "rank": 1, "survives": None},
-            {"batch_id": 42, "rank": 2, "survives": None},
-        ]
-        with mock.patch.object(pr, "_req", side_effect=[(200, 42), (200, latest)]):
-            self.assertEqual(
-                pr.publish_request_to_supabase(request, "https://x.supabase.co", "secret"),
-                42,
-            )
+        del request["batch"]["classifier_version"]
+        request["publish_key"] = pr.publication_key(request["batch"], request["entries"])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "legacy.json"
+            pr.save_publish_request(str(path), request)
+            self.assertEqual(pr.load_publish_request(str(path)), request)
+        with mock.patch.object(pr, "_req") as rpc:
+            with self.assertRaisesRegex(ValueError, "pre-release requests"):
+                pr.publish_request_to_supabase(request, "https://x.supabase.co", "secret")
+        rpc.assert_not_called()
 
     def test_retry_transient_only_with_bounded_exponential_backoff(self):
         transient = pr.SupabaseRequestError("timeout", retryable=True)
@@ -935,6 +956,9 @@ class ManifestBindingTest(unittest.TestCase):
         digest = _hashlib.sha256(ranked.read_bytes()).hexdigest()
         manifest = root / "oracle_manifest.json"
         manifest.write_text(_json.dumps({
+            "price_band": {"minimum_inclusive": 0.15, "maximum_exclusive": 0.85},
+            "scheduled_horizon": {"minimum_secs": 10, "maximum_secs_exclusive": 172800},
+            "latency_shift_secs": 2.0,
             "oracle": "clob-minute-reference",
             "outputs": {"latency_shift_ranked_sha256": "0" * 64 if tamper else digest},
         }))
@@ -956,6 +980,102 @@ class ManifestBindingTest(unittest.TestCase):
             pr.prepare_publish_request(self._prep(tamper=True), 1_700_000_000)
         self.assertIn("refusing to publish", str(ctx.exception))
         print("PASS: manifest/ranking digest mismatch refuses publication")
+
+
+class FormatThreePublicationTest(unittest.TestCase):
+    def setUp(self):
+        from test_ranker_duck_parity import build_format_three_cache, W
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.db = self.root / "candidate.db"
+        _, self.entry, _ = build_format_three_cache(str(self.db))
+        self.a, self.b, self.excluded = W("a"), W("b"), W("f")
+        self.now = self.entry + 200
+        self.ranked = self.root / "latency_shift_ranked.csv"
+        self.ranked.write_text(f"wallet,survives,tstat_net_ls\n{self.a},True,3\n{self.excluded},True,4\n")
+        self.manifest = self.root / "oracle_manifest.json"
+        self.value = {"price_band": {"minimum_inclusive": 0.15, "maximum_exclusive": 0.85},
+                      "scheduled_horizon": {"minimum_secs": 10.0, "maximum_secs_exclusive": 172800.0},
+                      "latency_shift_secs": 2.0,
+                      "outputs": {"latency_shift_ranked_sha256": hashlib.sha256(self.ranked.read_bytes()).hexdigest()}}
+        self.manifest.write_text(json.dumps(self.value))
+        self.args = pr.build_parser().parse_args(["--ranked-csv", str(self.ranked), "--db", str(self.db),
+                                                 "--manifest-file", str(self.manifest), "--keep-batches", "0"])
+
+    def rebind_certificates(self, connection):
+        columns = rank_cycle_manifest.CERTIFICATE_COLUMNS
+        rows = [dict(zip(columns, row, strict=True)) for row in connection.execute(
+            f"SELECT {', '.join(columns)} FROM activity_wallet_history_v3 ORDER BY wallet_hex")]
+        inputs = json.loads(connection.execute("SELECT ranker_projection_inputs_json FROM cache_v2_migration_state").fetchone()[0])
+        inputs["certificate_digest"] = hashlib.sha256(json.dumps(rows, sort_keys=True, separators=(",", ":"),
+                                                                ensure_ascii=False).encode()).hexdigest()
+        connection.execute("UPDATE cache_v2_migration_state SET ranker_projection_inputs_json=?", (json.dumps(inputs),))
+
+    def test_zero_fetch_wallet_freshness_stamps_scopes_and_manifest_limits_reach_v2(self):
+        with sqlite3.connect(self.db) as con:
+            con.execute("UPDATE activity_wallet_coverage_staging_v2 SET aggregate_count=0 WHERE wallet_hex=?", (self.a,))
+            # Neither mirror nor the venue's mislabeled outcome can change certificate recency.
+            con.execute("UPDATE activity_groups_v2 SET activity_type='CONVERSION', coverage_generation=99, outcome_id=0")
+        request = pr.prepare_publish_request(self.args, self.now)
+        self.assertEqual(request["batch"]["classifier_version"], 6)
+        self.assertEqual([entry["wallet_hex"] for entry in request["entries"]], [self.a])
+        entry = request["entries"][0]
+        self.assertEqual(entry["last_trade_unix"], self.entry)
+        self.assertEqual(entry["history_through_unix"], self.entry + 10)
+        self.assertEqual([drop["scope_kind"] for drop in entry["scope_drops"]], ["event", "market"])
+        limits = request["batch"]
+        self.assertEqual((limits["band_lo"], limits["band_hi"], limits["ttr_floor_secs"],
+                          limits["ttr_max_secs"], limits["latency_shift_secs"]), (0.15, 0.85, 10, 172800, 2))
+        self.assertTrue(all(type(limits[key]) is int for key in ("ttr_floor_secs", "ttr_max_secs", "latency_shift_secs")))
+        latest = [{"batch_id": 42, "rank": 1, "survives": True}]
+        with mock.patch.object(pr, "_req", side_effect=[(200, 42), (200, latest),
+                                                       (200, [{"config_hash": limits["config_hash"]}])]) as rpc:
+            self.assertEqual(pr.publish_request_to_supabase(request, "https://example.test", "test"), 42)
+        body = rpc.call_args_list[0].kwargs["body"]
+        self.assertEqual(body["p_batch"]["latency_shift_secs"], 2)
+        self.assertEqual(body["p_scope_drops"], [{"wallet_hex": self.a, **drop} for drop in entry["scope_drops"]])
+        self.assertTrue(rpc.call_args_list[0].args[1].endswith("/publish_ranking_batch_v2"))
+        entry["scope_drops"][0]["scope_id"] = "0xc"
+        with self.assertRaisesRegex(ValueError, "content hash mismatch"):
+            pr.validate_publish_request(request)
+
+    def test_limits_refuse_fractional_nonfinite_and_postgres_overflow(self):
+        for location, key in (("scheduled_horizon", "minimum_secs"),
+                              ("scheduled_horizon", "maximum_secs_exclusive"), (None, "latency_shift_secs")):
+            for value in (2.5, float("inf"), float("nan"), 2**31, -(2**31) - 1, True, "2"):
+                with self.subTest(key=key, value=value):
+                    manifest = json.loads(json.dumps(self.value))
+                    target = manifest if location is None else manifest[location]
+                    target[key] = value
+                    self.manifest.write_text(json.dumps(manifest))
+                    with self.assertRaisesRegex(ValueError, "finite integral PostgreSQL integer"):
+                        pr.prepare_publish_request(self.args, self.now)
+
+    def test_older_certificate_supplies_no_freshness_eligibility_stamps_or_drops(self):
+        rows = [{"wallet": self.a}, {"wallet": self.excluded}]
+        metadata = {}
+        kept, count, last = pr.filter_active_rows(rows, str(self.db), 72, 24, self.now, publication_history=metadata)
+        self.assertEqual((kept, count, last), ([rows[0]], 1, {self.a: self.entry}))
+        self.assertEqual(set(metadata["wallets"]), {self.a})
+        with sqlite3.connect(self.db) as con:
+            self.assertEqual(rank_cycle_manifest.newest_trade_unix(con), self.entry)
+            con.execute("UPDATE activity_wallet_history_v3 SET newest_trade_unix=? WHERE generation=7", (self.now - 25 * HOUR,))
+            con.execute("UPDATE activity_wallet_history_v3 SET newest_trade_unix=? WHERE generation=6", (self.now,))
+            self.rebind_certificates(con)
+        with self.assertRaisesRegex(pr.CacheStaleError, "newest trade is 25.0h old"):
+            pr.filter_active_rows(rows, str(self.db), 72, 24, self.now)
+
+    def test_certificate_damage_fails_closed_before_freshness_or_request(self):
+        for column, value in (("newest_trade_unix", self.now), ("generation", 7), ("scope_drops_json", "[]")):
+            with self.subTest(column=column):
+                with sqlite3.connect(self.db) as con:
+                    old = con.execute(f"SELECT {column} FROM activity_wallet_history_v3 WHERE wallet_hex=?", (self.excluded,)).fetchone()[0]
+                    con.execute(f"UPDATE activity_wallet_history_v3 SET {column}=? WHERE wallet_hex=?", (value, self.excluded))
+                with self.assertRaisesRegex(ValueError, "activity_wallet_history_v3 certificate digest mismatch"):
+                    pr.prepare_publish_request(self.args, self.now)
+                with sqlite3.connect(self.db) as con:
+                    con.execute(f"UPDATE activity_wallet_history_v3 SET {column}=? WHERE wallet_hex=?", (old, self.excluded))
 
 
 if __name__ == "__main__":
