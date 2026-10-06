@@ -1909,8 +1909,19 @@ async fn main() -> Result<()> {
         .layer(axum::Extension(paper_api_state));
     {
         let _writer = watchlist_writer_lock.lock().await;
-        let live_wallet_list = effective_live_wallet_list(&live_watchlist, &paper_state)?;
-        info!(bind = %cfg.bind, live_wallets = live_wallet_list.len(), ?live_wallet_list, "pe-service listening");
+        match effective_live_wallet_list(&live_watchlist, &paper_state) {
+            Ok(live_wallet_list) => info!(
+                bind = %cfg.bind,
+                live_wallets = live_wallet_list.len(),
+                ?live_wallet_list,
+                "pe-service listening"
+            ),
+            // A census read failure is reported as such, never as an empty census.
+            Err(error) => {
+                warn!(error = %format!("{error:#}"), "listening census unavailable");
+                info!(bind = %cfg.bind, "pe-service listening");
+            }
+        }
     }
     let http_shutdown = shutdown.subscribe();
     supervisor.spawn(TaskName::HttpServer, async move {
