@@ -1196,13 +1196,18 @@ to the owner. Record each completed step and resume it, rather than starting ano
    → collection → payout → finalize → export → passes/reference fetch → export-bound re-finalize →
    prepare. Acceptance is `RANK_AND_PUSH_PREPARED_ONLY=<request>` and exit 2 with request/pending
    pointer retained and installed bytes unchanged; other exit-2 failures are not acceptance.
-   Right after finalize, while later stages write only prices, run #739 AC1's deterministic wallet
-   sample through an ordinary read-only connection. Compare selected IDs, all fourteen spool fields
-   and certificate drops, and explain each difference against the classifier-5 baseline by its
-   explicit rule. An unexplained difference stops the recorded PID before preparation and keeps
-   pre-prepare abandonment available. Reference pages warm through the ordinary resumable stage,
-   not a special pre-head fetch. Record the full candidate-through-prepare acceptance on the tested
-   tree; activation/publication/retention and cadence complete acceptance after merge.
+   Before launching, cross-build from the tested tree with the bootstrap release recipe:
+   `cargo build --release -p pe-bootstrap --features scenario --example classifier_v6_sample`,
+   keeping the same Forge target/toolchain arguments and environment. Record the example executable's
+   SHA-256 beside the tested tree. Right after finalize, while later stages write only prices, run
+   `<release-example>/classifier_v6_sample <finalized-candidate-side-cache>` for #739 AC1's
+   deterministic wallet sample through an ordinary read-only connection. It compares selected IDs,
+   all fourteen spool fields and certificate drops, and explains classifier-5 differences by their
+   explicit rules. Keep its stdout JSON and exit status in the cycle's record; on any nonzero exit,
+   stop the recorded wrapper process group before preparation. Pre-prepare abandonment stays available.
+   Reference pages warm through the ordinary resumable stage, not a special pre-head fetch.
+   Record the full candidate-through-prepare acceptance on the tested tree;
+   activation/publication/retention and cadence complete acceptance after merge.
 6. Merge only after green CI with an expected-head guard, coordinating the runtime-change window on
    [#588](https://github.com/sppburke/prediction-markets/issues/588) and
    [#694](https://github.com/sppburke/prediction-markets/issues/694). Acceptance transfers only across

@@ -1050,6 +1050,25 @@ class DuckParityTest(unittest.TestCase):
             print("PASS: pass one scores the traded token; an unmatched asset is invalid")
 
     @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
+    def test_historical_schema_two_without_fresh_collection_column_exports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db, pq = str(Path(tmp) / "historical.db"), str(Path(tmp) / "export")
+            rows, _, _ = build_certified_cache(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute("ALTER TABLE cache_v2_migration_state DROP COLUMN fresh_collection_json")
+            export(db, pq)
+            manifest = json.loads((Path(pq) / exp.V2_EXPORT_MANIFEST).read_text())
+            self.assertEqual(manifest["version"], 2)
+            self.assertEqual(set(manifest["tables"]), set(exp.V2_TABLES))
+            self.assertEqual(manifest["projection"]["count"], len(rows))
+            self.assertEqual(manifest["projection"]["digest"], whole_projection_digest(rows))
+            engine = ranker_duck.get_engine(force="duck", parquet_dir=pq, schema_version=2)
+            try:
+                self.assertEqual(rk.load_universe_from_export(engine), [W("a"), W("b")])
+            finally:
+                engine.close()
+
+    @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
     def test_format_three_compact_export_and_pass_one(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = str(Path(tmp) / "candidate.db")
@@ -1080,6 +1099,33 @@ class DuckParityTest(unittest.TestCase):
             self.assertFalse((Path(tmp) / "rank/250_72hr_buyandhold_variance.txt").exists())
             self.assertFalse((Path(pq) / "activity_groups_v2.parquet").exists())
             self.assertIn("tökén雪".encode(), Path(db + ".projection-v3.jsonl").read_bytes())
+
+    @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
+    def test_format_three_reader_requires_complete_typed_projection_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db, pq = str(Path(tmp) / "candidate.db"), str(Path(tmp) / "export")
+            build_format_three_cache(db)
+            export(db, pq)
+            path = Path(pq) / exp.V2_EXPORT_MANIFEST
+            original = json.loads(path.read_text())
+            self.assertEqual(ranker_duck._load_v2_export_manifest(pq), original)
+            cases = [(field, value)
+                     for field in ("count", "classifier_version", "oracle_version", "activity_generation")
+                     for value in (None, True, float(original["projection"][field]),
+                                   str(original["projection"][field]))]
+            cases += [(field, value)
+                      for field in ("digest", "spool_sha256")
+                      for value in (None, "a" * 63, "a" * 65, "A" * 64, "g" * 64, 64)]
+            for field, value in cases:
+                with self.subTest(field=field, value=value):
+                    changed = json.loads(json.dumps(original))
+                    if value is None:
+                        del changed["projection"][field]
+                    else:
+                        changed["projection"][field] = value
+                    path.write_text(json.dumps(changed))
+                    with self.assertRaisesRegex(ranker_duck.SchemaTwoEngineError, "projection summary"):
+                        ranker_duck.get_engine(force="duck", parquet_dir=pq, schema_version=2)
 
     @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
     def test_format_three_export_retry_uses_kept_spool_and_hashes_guard_reader(self):

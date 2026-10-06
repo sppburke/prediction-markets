@@ -43,11 +43,11 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import sqlite3
 import statistics
 import sys
 import time
-import tempfile
 from itertools import groupby
 
 import duckdb
@@ -559,10 +559,18 @@ def main() -> int:
         # An explicit anchor keeps decay independent of which wallets are evaluated.
         log("FATAL: schema two requires cycle-start ranking, cache manifests and --as-of")
         return 1
-    with tempfile.TemporaryDirectory(prefix="pass2-", dir=a.out_dir) as spill_dir:
+    spill_dir = os.path.join(a.out_dir, "pass2-spill")
+    if os.path.lexists(spill_dir):
+        if os.path.islink(spill_dir) or not os.path.isdir(spill_dir):
+            raise ValueError("pass-two spill path must be a directory, not a symlink")
+        shutil.rmtree(spill_dir)
+    os.mkdir(spill_dir)
+    try:
         with duckdb.connect() as con:
             limit_memory(con, spill_dir)
             return rerank(con, a, schema_version)
+    finally:
+        shutil.rmtree(spill_dir)
 
 
 def rerank(con, a, schema_version):

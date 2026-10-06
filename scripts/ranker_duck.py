@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import re
 import time
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -111,11 +112,15 @@ def _load_v2_export_manifest(parquet_dir: str) -> dict:
             raise SchemaTwoEngineError("schema-two certified activity scope/count mismatch")
     if value["version"] == 3:
         projection = value.get("projection", {})
+        if (not isinstance(projection, dict)
+                or any(type(projection.get(field)) is not int
+                       for field in ("count", "classifier_version", "oracle_version", "activity_generation"))
+                or any(not isinstance(projection.get(field), str)
+                       or re.fullmatch(r"[0-9a-f]{64}", projection[field]) is None
+                       for field in ("digest", "spool_sha256"))):
+            raise SchemaTwoEngineError("format-three projection summary is incomplete or invalid")
         if (value.get("activity_scope") != "projection_spool"
-                or type(projection.get("classifier_version")) is not int
-                or type(projection.get("oracle_version")) is not int
                 or projection.get("classifier_version") != 6 or projection.get("oracle_version") != 6
-                or type(projection.get("activity_generation")) is not int
                 or value["tables"]["projection"].get("count") != projection.get("count")):
             raise SchemaTwoEngineError("format-three projection scope/count/version mismatch")
     for name in required:

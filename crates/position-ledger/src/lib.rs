@@ -1250,21 +1250,21 @@ pub fn classify_scoped_second(
     for record in ordered {
         let aggregate = record.aggregate;
         let components = aggregate.group_id.components();
-        if components.activity_type == ActivityType::Trade
-            && aggregate.share_sum != ShareAmount::ZERO
-            && components.asset.is_none()
-        {
-            ignored.push((aggregate.group_id.key().clone(), ActivityType::Trade));
-            continue;
-        }
         let cause = match &record.mutation {
+            Ok(mutation) if matches!(mutation.effect.effective(), LedgerEffect::RawOnly) => {
+                mutations.push(mutation.clone());
+                continue;
+            }
+            _ if components.activity_type == ActivityType::Trade
+                && aggregate.share_sum != ShareAmount::ZERO
+                && components.asset.is_none() =>
+            {
+                ignored.push((aggregate.group_id.key().clone(), ActivityType::Trade));
+                continue;
+            }
             Err(LedgerError::InvalidMapping { .. }) => Some(DropCause::Unmapped),
             Err(error) => return Err(error.clone()),
             Ok(mutation) => match mutation.effect.effective() {
-                LedgerEffect::RawOnly => {
-                    mutations.push(mutation.clone());
-                    continue;
-                }
                 LedgerEffect::Conversion => Some(DropCause::Conversion),
                 LedgerEffect::UnknownEffect => Some(DropCause::UnknownType),
                 LedgerEffect::RequiresAnchor => components

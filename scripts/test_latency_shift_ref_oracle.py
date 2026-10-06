@@ -270,6 +270,48 @@ class RefOracleScenario(unittest.TestCase):
         self.assertEqual(lines[1:], expected)
         print("PASS: emit-targets writes merged, padded backward windows")
 
+    def test_retry_removes_stale_cycle_spill_and_cleans_up_on_exit(self):
+        out = self.root / "out"
+        spill = out / "pass2-spill"
+        other = out / "pass2-unrelated"
+        other.mkdir(parents=True)
+        (other / "keep").write_text("unrelated")
+        targets = self.root / "targets.csv"
+        for extra, expected in (((), 75), (("--emit-targets", str(targets)), 0)):
+            with self.subTest(expected=expected):
+                spill.mkdir()
+                (spill / "stale").write_bytes(b"stale spill")
+                result, _ = self.run_pass2(*extra)
+                self.assertEqual(result.returncode, expected, result.stderr + result.stdout)
+                self.assertFalse(spill.exists())
+                self.assertEqual(list(out.glob("pass2-*")), [other])
+                self.assertEqual((other / "keep").read_text(), "unrelated")
+
+    def test_spill_path_refuses_symlinks_and_non_directories(self):
+        out = self.root / "out"
+        out.mkdir()
+        spill = out / "pass2-spill"
+        target = self.root / "keep"
+        target.mkdir()
+        (target / "keep").write_text("untouched")
+        targets = self.root / "targets.csv"
+        for kind in ("directory_symlink", "broken_symlink", "file"):
+            with self.subTest(kind=kind):
+                if kind == "file":
+                    spill.write_text("untouched")
+                else:
+                    spill.symlink_to(target if kind == "directory_symlink" else self.root / "absent")
+                result, _ = self.run_pass2("--emit-targets", str(targets))
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("spill", result.stderr + result.stdout)
+                self.assertTrue(os.path.lexists(spill))
+                self.assertEqual((target / "keep").read_text(), "untouched")
+                if kind == "file":
+                    self.assertEqual(spill.read_text(), "untouched")
+                else:
+                    self.assertTrue(spill.is_symlink())
+                spill.unlink()
+
     def test_ref_oracle_at_or_before_staleness_and_lookahead(self):
         # Position 1: fresh sample 30s before entry+Δ → repriced at it (0.40).
         # Position 2: nearest earlier sample 121s stale → NOT repriced; a sample

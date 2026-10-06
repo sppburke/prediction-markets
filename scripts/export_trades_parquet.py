@@ -425,7 +425,9 @@ def main() -> int:
         format_three = False
         if schema >= 2:
             import json
-            raw = sqlite.execute("SELECT fresh_collection_json FROM cache_v2_migration_state WHERE singleton = 1").fetchone()[0]
+            columns = {row[1] for row in sqlite.execute("PRAGMA table_info(cache_v2_migration_state)")}
+            raw = (sqlite.execute("SELECT fresh_collection_json FROM cache_v2_migration_state WHERE singleton = 1").fetchone()[0]
+                   if "fresh_collection_json" in columns else None)
             identity_version = None if raw is None else json.loads(raw).get("version")
             if identity_version not in (None, 1, 2, 3, 4):
                 raise ValueError("unsupported candidate activity identity version")

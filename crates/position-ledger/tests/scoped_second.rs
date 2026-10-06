@@ -472,14 +472,55 @@ fn unknown_type_on_an_ungrouped_market_drops_only_that_market() {
 fn raw_only_precedence_preserves_zero_conversion_combo_and_rebound_trades() {
     let mut combo = buy("combo", "\\xaaa", 0, 10);
     combo.is_combo = true;
+    let tokenless = activity(
+        ActivityType::Trade,
+        "tokenless",
+        Some(A),
+        None,
+        Some(Side::Buy),
+        Some(0),
+        10,
+    );
+    let mut tokenless_combo = activity(
+        ActivityType::Trade,
+        "tokenless-combo",
+        Some(A),
+        None,
+        Some(Side::Buy),
+        Some(0),
+        10,
+    );
+    tokenless_combo.is_combo = true;
+    let tokenless_unmapped = activity(
+        ActivityType::Trade,
+        "tokenless-unmapped",
+        Some(A),
+        None,
+        Some(Side::Buy),
+        None,
+        10,
+    );
     let zero_conversion =
         position_activity(ActivityType::Conversion, "zero-conversion", "\\xeee", 0);
     let zero_trade = buy("zero-trade", "\\xaaa", 0, 0);
     let reward = position_activity(ActivityType::Reward, "reward", "\\xeee", 10);
     let rebound = buy("unbound-token", "\\xaaa", 1, 10);
-    let aggregates = [zero_conversion, zero_trade, combo, reward, rebound];
+    let aggregates = [
+        zero_conversion,
+        zero_trade,
+        combo,
+        reward,
+        rebound,
+        tokenless_combo,
+        tokenless,
+        tokenless_unmapped,
+    ];
     let mut records = records(&aggregates);
     records[4].mutation.as_mut().unwrap().effect = LedgerEffect::RawOnly;
+    assert!(matches!(
+        records[7].mutation,
+        Err(LedgerError::InvalidMapping { .. })
+    ));
     let result = classify_scoped_historical_second(
         &PositionLedger::new(),
         wallet(),
@@ -493,8 +534,13 @@ fn raw_only_precedence_preserves_zero_conversion_combo_and_rebound_trades() {
     .unwrap();
     assert!(!result.problem_second);
     assert!(result.problems.is_empty());
-    assert!(result.ignored.is_empty());
-    assert_eq!(result.apply.len(), 5);
+    let mut ignored = aggregates[6..]
+        .iter()
+        .map(|aggregate| (aggregate.group_id.key().clone(), ActivityType::Trade))
+        .collect::<Vec<_>>();
+    ignored.sort_by(|left, right| left.0.0.cmp(&right.0.0));
+    assert_eq!(result.ignored, ignored);
+    assert_eq!(result.apply.len(), 6);
     assert!(
         result
             .apply

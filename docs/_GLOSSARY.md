@@ -1378,7 +1378,7 @@ uses a direct group or the resolved market's group, otherwise that market. A pro
 neither group nor market is ignored, not applied or consuming, and counted by activity type.
 Raw-only mappings take precedence: zero-share, combo and non-position effects stay raw-only;
 a positive token-less TRADE is ignored/counted with no balance, consumption or homogeneity effect.
-Zero-share REDEEM retains `RequiresAnchor`: a known pre-second condition is a no-op, otherwise
+Zero-share REDEEM retains `RequiresAnchor`: a record carrying a condition id is a no-op, otherwise
 `unknown_condition`. Acquisition 3's bootstrap-only semantic reader keeps rows whose only defect
 is a missing condition id or token; public strict service readers and acquisition 2 retain their
 acceptance. Effective TRADE/REDEEM/SPLIT/MERGE ids outside canonical lowercase `0x` hex are `unmapped`.
