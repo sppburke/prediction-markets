@@ -358,9 +358,7 @@ impl AssetIdentityResolver {
         resolved: &mut ResolvedIdentities,
     ) -> Result<bool, SourceError> {
         let requested = &chunk.requested;
-        if purpose == LookupPurpose::Historical
-            && let Some(store) = store
-        {
+        if let Some(store) = store {
             let misses = requested
                 .iter()
                 .filter(|token| {
@@ -379,16 +377,18 @@ impl AssetIdentityResolver {
                     .unverified
                     .insert(token, rejected_identity_reason());
             }
-            for token in store
-                .paper_state
-                .absent_asset_tokens(&store.generation, &misses)
-                .map_err(identity_store_error)?
-                .into_keys()
-            {
-                resolved
-                    .unverified
-                    .entry(token)
-                    .or_insert_with(absent_identity_reason);
+            if purpose == LookupPurpose::Historical {
+                for token in store
+                    .paper_state
+                    .absent_asset_tokens(&store.generation, &misses)
+                    .map_err(identity_store_error)?
+                    .into_keys()
+                {
+                    resolved
+                        .unverified
+                        .entry(token)
+                        .or_insert_with(absent_identity_reason);
+                }
             }
         }
         let misses = requested
@@ -559,6 +559,31 @@ impl AssetIdentityResolver {
         if let Some(store) = store {
             let tokens = page_tokens(pages);
             let token_set = tokens.iter().cloned().collect::<BTreeSet<_>>();
+            cache.rejected_tokens.extend(
+                store
+                    .paper_state
+                    .rejected_asset_tokens(&store.generation, &tokens)
+                    .map_err(identity_store_error)?
+                    .into_keys(),
+            );
+            // A rejected token without a row extends its conflict to fresh conditions.
+            let mut rejections = BTreeMap::new();
+            for page in pages {
+                for (token, conditions) in page_token_conditions(std::slice::from_ref(page)) {
+                    if !cache.rejected_tokens.contains(&token) {
+                        continue;
+                    }
+                    let sequence = sequences.get(&page.0.canonical_page_hash).ok_or_else(|| {
+                        identity_store_error("conflict has no recorded fresh page")
+                    })?;
+                    for condition in conditions {
+                        rejections.insert(
+                            condition,
+                            i64::try_from(*sequence).map_err(identity_store_error)?,
+                        );
+                    }
+                }
+            }
             let mut witnesses = Vec::new();
             for page in pages {
                 let mut identities = BTreeMap::new();
@@ -604,6 +629,7 @@ impl AssetIdentityResolver {
             delete_invalid_identity_rows(store, &authenticated.invalid).await?;
             let new_rows = witnesses
                 .iter()
+                .filter(|cached| !rejections.contains_key(&cached.identity.condition_id.0))
                 .map(|cached| identity_row(&cached.provenance.asset, cached))
                 .collect::<Result<Vec<_>, _>>()?;
             let saved = authenticated.identities;
@@ -612,7 +638,6 @@ impl AssetIdentityResolver {
             witnesses.extend(saved.iter().map(|(_, cached)| cached.clone()));
             let combined_tokens = page_tokens(&combined_pages);
             let verified = verify_token_identities(&combined_tokens, &combined_pages);
-            let mut rejections = BTreeMap::new();
             for cached in &witnesses {
                 if !conditions.contains(&cached.identity.condition_id.0) {
                     check_condition_rejection(store, &mut cache, &cached.identity.condition_id.0)?;
@@ -2547,6 +2572,31 @@ mod tests {
         assert!(historical.verified.is_empty());
         assert!(historical.unverified.contains_key(&token));
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
+        drop(resolver);
+        let fetcher = Arc::new(GammaFixture::new(
+            br#"[{"conditionId":"condition-e","clobTokenIds":["token-a"]}]"#,
+            b"[]",
+        ));
+        let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher.clone(), 50);
+        for _ in 0..2 {
+            let live = resolver.resolve_live([token.clone()]).await.unwrap();
+            assert!(live.verified.is_empty());
+            assert_eq!(live.unverified[&token], rejected_identity_reason());
+            assert!(live.provenance.is_empty());
+        }
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
+        assert!(
+            paper
+                .asset_identities("installed", std::slice::from_ref(&token))
+                .unwrap()
+                .is_empty()
+        );
+        drop(resolver);
+        let fetcher = Arc::new(GammaFixture::new(
+            br#"[{"conditionId":"condition-d","clobTokenIds":["token-b"]}]"#,
+            b"[]",
+        ));
+        let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher.clone(), 50);
         let later = resolver
             .resolve_live([PolymarketTokenId("token-b".into())])
             .await
@@ -2582,6 +2632,99 @@ mod tests {
         assert!(historical.verified.is_empty());
         assert!(historical.unverified.contains_key(&token));
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn durable_rejected_token_in_fresh_sibling_page_rejects_condition_across_restarts() {
+        for purpose in [LookupPurpose::Live, LookupPurpose::Historical] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("source.log");
+            let db_path = dir.path().join("paper.db");
+            let paper = Arc::new(PaperStateDb::open(&db_path).unwrap());
+            let tokens = [
+                PolymarketTokenId("token-a".into()),
+                PolymarketTokenId("token-y".into()),
+            ];
+            let resolver = durable_resolver(&path, paper.clone(), "installed", Arc::new(GammaFixture::new(
+                br#"[{"conditionId":"condition-c","clobTokenIds":["token-a"]},{"conditionId":"condition-d","clobTokenIds":["token-a"]}]"#, b"[]",
+            )), 50);
+            let original = resolver.resolve_live([tokens[0].clone()]).await.unwrap();
+            assert!(original.verified.is_empty());
+            assert!(original.unverified.contains_key(&tokens[0]));
+            assert!(
+                paper
+                    .asset_identities("installed", &tokens)
+                    .unwrap()
+                    .is_empty()
+            );
+            drop(resolver);
+            drop(paper);
+
+            let paper = Arc::new(PaperStateDb::open(&db_path).unwrap());
+            let fetcher = Arc::new(GammaFixture::new(
+                br#"[{"conditionId":"condition-e","clobTokenIds":["token-a","token-y"]}]"#,
+                b"[]",
+            ));
+            let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher.clone(), 50);
+            let sibling = match purpose {
+                LookupPurpose::Live => resolver.resolve_live([tokens[1].clone()]).await,
+                LookupPurpose::Historical => {
+                    resolver
+                        .resolve_historical_for_bracket([tokens[1].clone()])
+                        .await
+                }
+            }
+            .unwrap();
+            assert!(sibling.verified.is_empty());
+            assert_eq!(sibling.unverified[&tokens[1]], rejected_identity_reason());
+            assert!(sibling.provenance.is_empty());
+            assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                paper
+                    .asset_identity_condition_rejection("installed", "condition-e")
+                    .unwrap(),
+                Some(1)
+            );
+            assert!(
+                paper
+                    .asset_identities("installed", &tokens)
+                    .unwrap()
+                    .is_empty()
+            );
+            for token in &tokens {
+                let live = resolver.resolve_live([token.clone()]).await.unwrap();
+                assert!(live.verified.is_empty());
+                assert_eq!(live.unverified[token], rejected_identity_reason());
+                assert!(live.provenance.is_empty());
+            }
+            assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+            drop(resolver);
+            drop(paper);
+
+            let paper = Arc::new(PaperStateDb::open(&db_path).unwrap());
+            let fetcher = Arc::new(GammaFixture::new(
+                br#"[{"conditionId":"condition-f","clobTokenIds":["token-y"]}]"#,
+                b"[]",
+            ));
+            let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher.clone(), 50);
+            let historical = resolver
+                .resolve_historical_for_bracket([tokens[1].clone()])
+                .await
+                .unwrap();
+            let live = resolver.resolve_live([tokens[1].clone()]).await.unwrap();
+            for result in [historical, live] {
+                assert!(result.verified.is_empty());
+                assert_eq!(result.unverified[&tokens[1]], rejected_identity_reason());
+                assert!(result.provenance.is_empty());
+            }
+            assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
+            assert!(
+                paper
+                    .asset_identities("installed", &tokens)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 
     #[tokio::test]
@@ -3312,7 +3455,10 @@ mod tests {
         let rows = paper
             .asset_identities("installed", &[tokens[0].clone(), tokens[1].clone(), token])
             .unwrap();
-        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows.iter().map(|row| &row.token).collect::<Vec<_>>(),
+            tokens.iter().collect::<Vec<_>>()
+        );
         for condition in rows.iter().map(|row| &row.condition_id.0) {
             assert!(
                 paper
