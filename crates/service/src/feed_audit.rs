@@ -1,4 +1,4 @@
-//! Shared authentication and semantic conclusions for admitted frame audits.
+//! Historical frame-audit verification for version-one admissions.
 use pe_core_types::{MarketId, MarketOutcomeId, ShareAmount, Side, SourceTradeId, VenueMarketId};
 use pe_event_log::AppendReceipt;
 use pe_source_polymarket_public::{ActivityAggregate, ActivityTradeObservation, ActivityType};
@@ -90,21 +90,6 @@ impl FrameAuditIdentity for DecisionContinuationV3 {
     }
 }
 
-impl FrameAuditIdentity for pe_paper_state::ActivityFrameDecisionIndex {
-    fn audit_facts(&self) -> FrameAuditFacts<'_> {
-        FrameAuditFacts {
-            wallet: self.wallet,
-            source_epoch: self.source_epoch,
-            transaction_hash: &self.transaction_hash,
-            market_id: &self.market_id,
-            outcome_id: self.outcome_id,
-            receipt: self.observed_source_receipt,
-            copy_budget: Some(self.copy_latency_budget_secs),
-            frame_authority: true,
-        }
-    }
-}
-
 pub(crate) fn disposition(
     frame: &impl FrameAuditIdentity,
     read: &VerifiedCommitment,
@@ -122,9 +107,9 @@ pub(crate) fn disposition(
         .and_then(|index| read.bindings.get(*index));
     if let Some(binding) = binding {
         let target = read
-            .aggregate_indices
-            .get(&binding.history_group_id)
-            .and_then(|index| read.aggregates.get(*index))
+            .aggregates
+            .iter()
+            .find(|aggregate| aggregate.group_id.key() == &binding.history_group_id)
             .ok_or(FeedAuditError::Semantic(
                 "counterpart absent from authenticated read",
             ))?;
@@ -205,33 +190,6 @@ pub(crate) fn verify_incident_conclusion(
             "incident cause/counterpart differs from authenticated conclusion",
         )),
     }
-}
-
-pub(crate) fn latest_incident(era: &PaperEra) -> Option<FeedIncident> {
-    era.frames
-        .iter()
-        .rev()
-        .find_map(|frame| match &frame.frame {
-            PaperLogFrame::Record(PaperLogRecord::FeedIncidentChanged {
-                incident,
-                state: HaltState::Engaged,
-            }) => Some(incident.clone()),
-            _ => None,
-        })
-}
-
-/// Engagements remain audit evidence after release. Release never revives an obligation.
-pub(crate) fn audited_receipts(era: &PaperEra) -> Vec<AppendReceipt> {
-    era.frames
-        .iter()
-        .filter_map(|frame| match &frame.frame {
-            PaperLogFrame::Record(PaperLogRecord::FeedIncidentChanged {
-                incident,
-                state: HaltState::Engaged,
-            }) => Some(incident.frame_receipt),
-            _ => None,
-        })
-        .collect()
 }
 
 /// A concluded frame audit retires once its fixed counterpart group is disposed.

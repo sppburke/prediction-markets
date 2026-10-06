@@ -60,8 +60,6 @@ impl ReaderHealth {
 /// Mutable health state updated by the orchestrator.
 #[derive(Debug)]
 pub struct HealthState {
-    pub feed_latch: crate::frame_admission::FeedLatchBasis,
-    pub feed_incident: Option<crate::paper_recovery::FeedIncident>,
     pub polygon_status: SourceStatus,
     pub polymarket_last_event_at: Option<OffsetDateTime>,
     pub polygon_last_event_at: Option<OffsetDateTime>,
@@ -176,8 +174,6 @@ pub fn new_shared_health_with_ws(
     poll_round_stale_secs: i64,
 ) -> SharedHealth {
     Arc::new(Mutex::new(HealthState {
-        feed_latch: Default::default(),
-        feed_incident: None,
         polygon_status: SourceStatus::Healthy,
         polymarket_last_event_at: None,
         polygon_last_event_at: None,
@@ -379,8 +375,6 @@ mod tests {
     /// reader/sink vectors decide the websocket issues.
     fn ws_base() -> HealthState {
         HealthState {
-            feed_latch: Default::default(),
-            feed_incident: None,
             polygon_status: SourceStatus::Healthy,
             polymarket_last_event_at: Some(t0()),
             polygon_last_event_at: None,

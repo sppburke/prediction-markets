@@ -512,7 +512,7 @@ async fn acknowledged_pre_cutoff_websocket_fill_survives_late_final_and_replay()
     drop(source_writer);
 
     let mut waiting = rebuild_reconciliation_obligations(&source_path, &state).unwrap();
-    recover_daily_boundary(&source_path, &paper_path, &mut waiting, &state).unwrap();
+    recover_daily_boundary(&source_path, &paper_path, &mut waiting).unwrap();
     assert_eq!(
         waiting.pending_boundary(),
         Some(PendingBoundary {
@@ -549,7 +549,7 @@ async fn acknowledged_pre_cutoff_websocket_fill_survives_late_final_and_replay()
         })
         .unwrap();
     let mut acknowledged = rebuild_reconciliation_obligations(&source_path, &state).unwrap();
-    recover_daily_boundary(&source_path, &paper_path, &mut acknowledged, &state).unwrap();
+    recover_daily_boundary(&source_path, &paper_path, &mut acknowledged).unwrap();
     assert_eq!(
         acknowledged.take_ready_boundary(),
         Some(PendingBoundary {

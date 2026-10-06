@@ -882,6 +882,28 @@ impl PaperStateDb {
         })
     }
 
+    /// Checkpoint dispositions before source work is removed from a runtime checkpoint.
+    pub fn sync_checkpoint_dispositions(&self) -> Result<(), PaperStateError> {
+        let conn = self.lock();
+        if !conn.is_autocommit() {
+            return Err(PaperStateError::Internal(
+                "checkpoint barrier during a paper-state batch".to_owned(),
+            ));
+        }
+        let (busy, log, checkpointed): (i64, i64, i64) =
+            conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+        if busy != 0 || log != checkpointed {
+            return Err(PaperStateError::MigrationCheckpointIncomplete {
+                busy,
+                log,
+                checkpointed,
+            });
+        }
+        Ok(())
+    }
+
     /// Open an existing database without DDL, migration, or write permission.
     ///
     /// Qualification verification uses this entry point so merely producing a report cannot
@@ -6747,6 +6769,49 @@ mod tests {
             db.insert_asset_identities("generation", &oversized),
             Err(PaperStateError::Internal(_))
         ));
+    }
+
+    #[test]
+    fn sync_checkpoint_dispositions_requires_complete_wal_checkpoint() {
+        let (dir, db) = db();
+        let reader = Connection::open(dir.path().join("paper_state.db")).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM meta;")
+            .unwrap();
+        let receipt = AppendReceipt {
+            sequence: EventSeq(4),
+            this_hash: blake3::hash(b"retired"),
+        };
+        db.retire_activity_observation(receipt, false).unwrap();
+        assert!(matches!(
+            db.sync_checkpoint_dispositions(),
+            Err(PaperStateError::MigrationCheckpointIncomplete { busy: 0, log, checkpointed })
+                if log > checkpointed
+        ));
+        reader.execute_batch("ROLLBACK").unwrap();
+        db.sync_checkpoint_dispositions().unwrap();
+        let (busy, log, checkpointed): (i64, i64, i64) = db
+            .lock()
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(busy, 0);
+        assert_eq!(log, checkpointed);
+        let readonly = PaperStateDb::open_read_only(&dir.path().join("paper_state.db")).unwrap();
+        assert!(readonly.activity_observation_retired(receipt).unwrap());
+    }
+
+    #[test]
+    fn sync_checkpoint_dispositions_refuses_an_open_batch() {
+        let (_dir, db) = db();
+        db.begin_batch().unwrap();
+        assert!(matches!(
+            db.sync_checkpoint_dispositions(),
+            Err(PaperStateError::Internal(_))
+        ));
+        db.rollback_batch().unwrap();
+        db.sync_checkpoint_dispositions().unwrap();
     }
 
     fn wallet() -> WalletAddress {

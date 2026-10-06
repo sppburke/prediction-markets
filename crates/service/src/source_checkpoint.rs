@@ -320,7 +320,9 @@ fn load_with_finalization(
         }
         _ => return Ok(None),
     };
-    if header.reducer_version != ACTIVITY_REDUCER_VERSION {
+    // Reducer 2 (deployed format-1 artifacts) is accepted once so its recorded commitment
+    // bindings can be hydrated into the current reducer representation.
+    if header.reducer_version != 2 && header.reducer_version != ACTIVITY_REDUCER_VERSION {
         return Ok(None);
     }
     drop(header);
@@ -392,7 +394,7 @@ pub(crate) fn capture_start(
 /// A verified candidate serialized once; publication borrows it and never consumes its bytes.
 /// Construct only from projections verified through `tail` under `authority_generation`.
 pub struct SerializedCandidate {
-    bytes: Vec<u8>,
+    pub(crate) bytes: Vec<u8>,
     activation: LogTailBinding,
     financial_era: bool,
     tail: LogTailBinding,

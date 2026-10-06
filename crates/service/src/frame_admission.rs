@@ -87,37 +87,6 @@ pub struct FrontierCollection {
     pub frontiers: Vec<FeedHistoryFrontier>,
 }
 
-pub(crate) fn restore_frontiers(
-    state: &PaperStateDb,
-    index: &crate::risk_inputs::SourceReceiptIndex,
-) -> Result<HashMap<WalletAddress, FeedHistoryFrontier>, FrameAdmissionError> {
-    restore_frontiers_from_collection(state.feed_history_frontiers()?, index)
-}
-
-/// Authenticate a collection captured before the source-log bound, rather than re-reading it.
-pub(crate) fn restore_frontiers_from_collection(
-    collection: serde_json::Value,
-    index: &crate::risk_inputs::SourceReceiptIndex,
-) -> Result<HashMap<WalletAddress, FeedHistoryFrontier>, FrameAdmissionError> {
-    let collection: FrontierCollection = serde_json::from_value(collection)?;
-    if collection.version != 1 {
-        return Err(FrameAdmissionError::UnsupportedVersion {
-            surface: "frontier collection",
-            version: collection.version,
-        });
-    }
-    let mut result = HashMap::new();
-    for frontier in collection.frontiers {
-        index.verify_frame_frontier(&frontier)?;
-        if result.insert(frontier.wallet, frontier).is_some() {
-            return Err(FrameAdmissionError::InvalidPrefix(
-                "duplicate wallet frontier",
-            ));
-        }
-    }
-    Ok(result)
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FrameFallbackReason {
@@ -125,6 +94,8 @@ pub enum FrameFallbackReason {
     HistoryBehind,
     EarlierUnresolvedBuy,
     WalletNotReady,
+    IdentityUnverified,
+    CopyExpired,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -196,6 +167,8 @@ pub struct FrameAdmissionInputs {
     pub poll_round_stale_secs: i64,
     pub latch: FeedLatchBasis,
     pub paper_prefix: Option<AppendReceipt>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<FrameIdentityProof>,
 }
 
 impl FrameAdmissionInputs {
@@ -402,6 +375,13 @@ pub(crate) fn unique_earlier(earlier: &[EarlierFrame], frame: AppendReceipt) -> 
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FrameIdentityProof {
+    pub provenance: crate::asset_identity::IdentityProvenance,
+    pub receipt: AppendReceipt,
+}
+
 /// Compact source-log authentication of the continuation-owned admission body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -409,14 +389,17 @@ pub struct FrameAdmissionArtifact {
     pub version: u16,
     pub frame_receipt: AppendReceipt,
     pub capture_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<FrameIdentityProof>,
 }
 
 impl FrameAdmissionArtifact {
     pub fn from_inputs(inputs: &FrameAdmissionInputs) -> Result<Self, serde_json::Error> {
         Ok(Self {
-            version: 1,
+            version: inputs.version,
             frame_receipt: inputs.frame_receipt,
             capture_digest: frame_revision(inputs)?,
+            identity: inputs.identity.clone(),
         })
     }
 }
@@ -430,7 +413,11 @@ pub struct FrameDecisionProof {
 
 pub(crate) fn frame_revision(inputs: &FrameAdmissionInputs) -> Result<String, serde_json::Error> {
     let mut hash = blake3::Hasher::new();
-    hash.update(b"prediction-edge/activity-frame-decision/v1\0");
+    hash.update(if inputs.version == 1 {
+        b"prediction-edge/activity-frame-decision/v1\0"
+    } else {
+        b"prediction-edge/activity-frame-decision/v2\0"
+    });
     hash.update(&crate::bucket_commit::canonical_json(inputs)?);
     Ok(hash.finalize().to_hex().to_string())
 }

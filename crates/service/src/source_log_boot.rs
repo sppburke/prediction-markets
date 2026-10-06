@@ -40,7 +40,7 @@ use crate::trade_poller::{
 
 // Version 1 retained only the first non-admitted observation and could discard a
 // later qualifying BUY. Rebuild those checkpoints from the authenticated source log.
-pub(crate) const ACTIVITY_REDUCER_VERSION: u32 = 2;
+pub(crate) const ACTIVITY_REDUCER_VERSION: u32 = 3;
 
 /// Scenario-only fault seams (absent from ordinary builds).
 #[cfg(feature = "scenario")]
@@ -239,6 +239,12 @@ impl SourceLogBoot {
         let receipt_index = staging
             .complete(&binding)
             .context("complete source receipt index at verified tail")?;
+        let hydration_started = Instant::now();
+        reducers.activity.hydrate_bindings(&receipt_index)?;
+        info!(
+            elapsed_ms = u64::try_from(hydration_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "source checkpoint activity bindings hydrated"
+        );
         let frozen = FrozenCheckpoint {
             authority_generation,
             capture_unix_ms: source_checkpoint::unix_ms()?,
@@ -361,9 +367,8 @@ impl SourceLogBoot {
             let mut generation = authority.generation();
             let paper = PaperStateDb::open_read_only_allowing_unmigrated(paper_path)?;
             let financial_era = paper.financial_start()?.is_some();
-            // Capture both collections before bounding: every referenced receipt is already synced.
+            // Capture open continuations before bounding: their receipts are already synchronized.
             let open = paper.open_decision_pending()?;
-            let frontiers = paper.feed_history_frontiers()?;
             let byte_bound = std::fs::metadata(path)?.len();
             let capture_unix_ms = source_checkpoint::unix_ms()?;
             #[cfg(feature = "scenario")]
@@ -444,9 +449,9 @@ impl SourceLogBoot {
             }
             reducers.take_error()?;
             let index = staging.complete(&tail)?;
-            let validated =
-                crate::bucket_commit::validate_continuation_rows(&paper, open, frontiers, &index)
-                    .context("validate open decision continuations before deployment")?;
+            reducers.activity.hydrate_bindings(&index)?;
+            let validated = crate::bucket_commit::validate_continuation_rows(&paper, open, &index)
+                .context("validate open decision continuations before deployment")?;
             #[cfg(feature = "scenario")]
             if let Some(pause) = hooks.and_then(|hooks| hooks.after_walk.as_ref()) {
                 pause()?;
@@ -478,6 +483,10 @@ impl SourceLogBoot {
                 )?,
                 capture_unix_ms,
             )?;
+            info!(
+                manifest_bytes = candidate.bytes.len(),
+                "source checkpoint manifest serialized"
+            );
             return match source_checkpoint::publish(&candidate, 1)? {
                 PublishOutcome::Published(receipt) => Ok((receipt, validated)),
                 outcome => anyhow::bail!("source checkpoint publication refused: {outcome:?}"),
@@ -565,8 +574,6 @@ impl SourceLogBoot {
         let era = crate::paper_recovery::paper_era(crate::paper_recovery::scan_paper_log(
             paper_log_path,
         )?);
-        crate::paper_recovery::feed_latch_basis(&era)?;
-        obligations.retire_feed_incidents(&era, paper_state)?;
         if let Some(candidates) = self.reducers.daily_boundary.take()
             && let Some(anchor) = recover_daily_boundary_anchor_from_era(&era, &mut obligations)
                 .context("recover causal daily boundary")?
