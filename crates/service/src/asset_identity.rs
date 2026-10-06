@@ -38,6 +38,11 @@ struct RecordedIdentityPages {
     absences: BTreeMap<PolymarketTokenId, i64>,
 }
 
+struct IdentityChunk {
+    requested: BTreeSet<PolymarketTokenId>,
+    filter: MarketFilter,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LookupPurpose {
     Historical,
@@ -285,26 +290,54 @@ impl AssetIdentityResolver {
             .collect::<Vec<_>>();
         let mut memory_pages = RecordedIdentityPages::default();
         for chunk in misses.chunks(self.gamma_batch_size.min(GAMMA_BATCH_SIZE)) {
-            let _misses = self.misses.lock().await;
-            let requested = chunk.iter().cloned().collect::<BTreeSet<_>>();
-            let cached = self
-                .cached(&requested, store.as_ref(), &mut read_pages)
-                .await?;
-            for token in &requested {
-                resolved.unverified.remove(token);
+            let mut chunk = IdentityChunk {
+                requested: chunk.iter().cloned().collect(),
+                filter: MarketFilter::OpenOnly,
+            };
+            let retry_delays: &[u64] = if purpose == LookupPurpose::Historical {
+                &[2, 4, 8, 16]
+            } else {
+                &[]
+            };
+            let mut delays = retry_delays.iter();
+            loop {
+                let attempt = {
+                    let _misses = self.misses.lock().await;
+                    let cached = self
+                        .cached(&chunk.requested, store.as_ref(), &mut read_pages)
+                        .await?;
+                    for token in &chunk.requested {
+                        resolved.verified.remove(token);
+                        resolved.unverified.remove(token);
+                        resolved.provenance.remove(token);
+                    }
+                    resolved.verified.extend(cached.verified);
+                    resolved.unverified.extend(cached.unverified);
+                    resolved.provenance.extend(cached.provenance);
+                    self.resolve_chunk(
+                        &mut chunk,
+                        purpose,
+                        store.as_ref(),
+                        &mut read_pages,
+                        &mut memory_pages,
+                        &mut resolved,
+                    )
+                    .await
+                };
+                match attempt {
+                    Ok(true) => break,
+                    Ok(false) => delays = retry_delays.iter(),
+                    Err(error) => {
+                        if matches!(error, SourceError::Transient { .. })
+                            && let Some(delay) = delays.next()
+                        {
+                            tokio::time::sleep(std::time::Duration::from_secs(*delay)).await;
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                }
             }
-            resolved.verified.extend(cached.verified);
-            resolved.unverified.extend(cached.unverified);
-            resolved.provenance.extend(cached.provenance);
-            self.resolve_chunk(
-                &requested,
-                purpose,
-                store.as_ref(),
-                &mut read_pages,
-                &mut memory_pages,
-                &mut resolved,
-            )
-            .await?;
         }
         // Another request can reject an earlier chunk's condition between chunks.
         evict_rejected(&mut *self.cache.write().await, &mut resolved);
@@ -313,13 +346,14 @@ impl AssetIdentityResolver {
 
     async fn resolve_chunk(
         &self,
-        requested: &BTreeSet<PolymarketTokenId>,
+        chunk: &mut IdentityChunk,
         purpose: LookupPurpose,
         store: Option<&IdentityStore>,
         read_pages: &mut BTreeMap<u64, IdentityPage>,
         memory_pages: &mut RecordedIdentityPages,
         resolved: &mut ResolvedIdentities,
-    ) -> Result<(), SourceError> {
+    ) -> Result<bool, SourceError> {
+        let requested = &chunk.requested;
         if purpose == LookupPurpose::Historical
             && let Some(store) = store
         {
@@ -361,43 +395,35 @@ impl AssetIdentityResolver {
             .cloned()
             .collect::<Vec<_>>();
         if misses.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
 
         let mut recorded = RecordedIdentityPages::default();
         let mut newly_verified = BTreeMap::new();
-        let mut fetched = self
+        let fetched = self
             .fetch_and_record_chunks(
                 &misses,
-                MarketFilter::OpenOnly,
-                "gamma token lookup rejected",
+                chunk.filter,
+                match chunk.filter {
+                    MarketFilter::OpenOnly => "gamma token lookup rejected",
+                    MarketFilter::ClosedOnly => "gamma closed-token lookup rejected",
+                },
                 &mut recorded,
-                purpose == LookupPurpose::Historical,
             )
             .await;
-        let open_identities = verify_token_identities(&misses, &recorded.pages);
+        let identities = verify_token_identities(&misses, &recorded.pages);
         let leftovers = misses
             .iter()
-            .filter(|token| !open_identities.contains_key(*token))
+            .filter(|token| !identities.contains_key(*token))
             .cloned()
             .collect::<Vec<_>>();
-
-        if fetched.is_ok() && !leftovers.is_empty() {
-            fetched = self
-                .fetch_and_record_chunks(
-                    &leftovers,
-                    MarketFilter::ClosedOnly,
-                    "gamma closed-token lookup rejected",
-                    &mut recorded,
-                    purpose == LookupPurpose::Historical,
-                )
-                .await;
-        }
+        let complete = chunk.filter == MarketFilter::ClosedOnly || leftovers.is_empty();
 
         let returned_tokens = page_tokens(&recorded.pages)
             .into_iter()
             .collect::<BTreeSet<_>>();
         if fetched.is_ok()
+            && complete
             && store.is_some()
             && let Some(sequence) = recorded.last_sequence
         {
@@ -496,7 +522,11 @@ impl AssetIdentityResolver {
                 .insert(token.clone(), cached.identity.clone());
             resolved.provenance.insert(token, cached.provenance);
         }
-        Ok(())
+        if !complete {
+            chunk.requested = leftovers.into_iter().collect();
+            chunk.filter = MarketFilter::ClosedOnly;
+        }
+        Ok(complete)
     }
 
     /// Release synchronized temporary pages once the boot extension has indexed their receipts.
@@ -752,37 +782,25 @@ impl AssetIdentityResolver {
         filter: MarketFilter,
         rejected_message: &str,
         recorded: &mut RecordedIdentityPages,
-        retry_chunks: bool,
     ) -> Result<(), SourceError> {
         for chunk in tokens.chunks(self.gamma_batch_size) {
-            let retry_delays: &[u64] = if retry_chunks { &[2, 4, 8, 16] } else { &[] };
-            let mut retry_delays = retry_delays.iter();
-            let fetched = loop {
-                match self
-                    .client
-                    .fetch_markets_by_token_ids(
-                        &chunk
-                            .iter()
-                            .map(|token| token.0.clone())
-                            .collect::<Vec<_>>(),
-                        filter,
-                    )
-                    .await
-                {
-                    Ok(fetched) => break fetched,
-                    Err(error) => {
-                        if let Some(page) = &error.page {
-                            self.record_page(page).await?;
-                        }
-                        let error = map_gamma_error(error.source);
-                        if matches!(error, SourceError::Transient { .. })
-                            && let Some(delay) = retry_delays.next()
-                        {
-                            tokio::time::sleep(std::time::Duration::from_secs(*delay)).await;
-                            continue;
-                        }
-                        return Err(error);
+            let fetched = match self
+                .client
+                .fetch_markets_by_token_ids(
+                    &chunk
+                        .iter()
+                        .map(|token| token.0.clone())
+                        .collect::<Vec<_>>(),
+                    filter,
+                )
+                .await
+            {
+                Ok(fetched) => fetched,
+                Err(error) => {
+                    if let Some(page) = &error.page {
+                        self.record_page(page).await?;
                     }
+                    return Err(map_gamma_error(error.source));
                 }
             };
             if let Some(page) = fetched.page {
@@ -1746,6 +1764,7 @@ mod tests {
         urls: StdMutex<Vec<String>>,
         release: tokio::sync::Notify,
         live_completed: std::sync::atomic::AtomicBool,
+        fail_first: bool,
     }
 
     impl ReconciliationFetcher for InterleavedChunkFixture {
@@ -1762,9 +1781,19 @@ mod tests {
                     .collect::<Vec<_>>();
                 assert!(tokens.len() <= GAMMA_BATCH_SIZE);
                 assert!(!url.query_pairs().any(|(key, _)| key == "closed"));
-                self.urls.lock().unwrap().push(url.to_string());
+                let attempt = {
+                    let mut urls = self.urls.lock().unwrap();
+                    let attempt = urls.len();
+                    urls.push(url.to_string());
+                    attempt
+                };
                 if tokens.iter().any(|token| token == "token-000") {
                     self.release.notified().await;
+                    if self.fail_first && attempt == 0 {
+                        return Err(SourceError::Transient {
+                            message: "injected first chunk failure".into(),
+                        });
+                    }
                 } else if tokens.iter().any(|token| token.ends_with("-050")) {
                     assert!(self.live_completed.load(Ordering::SeqCst));
                 }
@@ -1793,6 +1822,7 @@ mod tests {
                 urls: StdMutex::new(Vec::new()),
                 release: tokio::sync::Notify::new(),
                 live_completed: std::sync::atomic::AtomicBool::new(false),
+                fail_first: false,
             });
             let resolver = if durable {
                 durable_resolver(
@@ -1868,6 +1898,165 @@ mod tests {
             assert!(urls[queued_count + 1].contains("clob_token_ids=token-live"));
             assert!(urls[queued_count + 2].contains("clob_token_ids=token-050"));
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_identity_lookup_does_not_wait_for_queued_bracket_retry_backoff() {
+        for durable in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("source.log");
+            let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+            let fetcher = Arc::new(InterleavedChunkFixture {
+                urls: StdMutex::new(Vec::new()),
+                release: tokio::sync::Notify::new(),
+                live_completed: std::sync::atomic::AtomicBool::new(false),
+                fail_first: true,
+            });
+            let resolver = if durable {
+                durable_resolver(
+                    &path,
+                    paper.clone(),
+                    "installed",
+                    fetcher.clone(),
+                    GAMMA_BATCH_SIZE,
+                )
+            } else {
+                AssetIdentityResolver::new(
+                    fetcher.clone(),
+                    BASE.into(),
+                    GAMMA_BATCH_SIZE,
+                    Arc::new(Mutex::new(SourceEventSink::open(&path).unwrap())),
+                )
+            };
+            let start = tokio::time::Instant::now();
+            let tokens = (0..=GAMMA_BATCH_SIZE)
+                .map(|index| PolymarketTokenId(format!("token-{index:03}")))
+                .collect::<Vec<_>>();
+            let mut historical = Box::pin(resolver.resolve_historical_for_bracket(tokens.clone()));
+            std::future::poll_fn(|cx| {
+                assert!(historical.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            let mut queued = Vec::new();
+            for caller in 0..3 {
+                let tokens = (0..=GAMMA_BATCH_SIZE)
+                    .map(|index| PolymarketTokenId(format!("queued-{caller}-{index:03}")))
+                    .collect::<Vec<_>>();
+                let mut waiting = Box::pin(resolver.resolve_historical_for_bracket(tokens));
+                std::future::poll_fn(|cx| {
+                    assert!(waiting.as_mut().poll(cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                queued.push(waiting);
+            }
+            let live_token = PolymarketTokenId("token-live".into());
+            let mut live = Box::pin(async {
+                let resolved = resolver.resolve_live([live_token.clone()]).await.unwrap();
+                assert_eq!(tokio::time::Instant::now(), start);
+                assert_eq!(fetcher.urls.lock().unwrap().len(), 5);
+                fetcher.live_completed.store(true, Ordering::SeqCst);
+                fetcher.release.notify_one();
+                resolved
+            });
+            // All four bracket callers are ahead of live; the failed attempt must yield
+            // without holding the mutex through its first backoff.
+            std::future::poll_fn(|cx| {
+                assert!(live.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            fetcher.release.notify_one();
+            let (historical, queued, live) =
+                tokio::join!(historical, futures::future::join_all(queued), live);
+            let historical = historical.unwrap();
+            assert_eq!(historical.verified.len(), tokens.len());
+            for completed in queued {
+                assert_eq!(completed.unwrap().verified.len(), tokens.len());
+            }
+            assert_eq!(live.verified.len(), 1);
+            assert_eq!(
+                tokio::time::Instant::now() - start,
+                std::time::Duration::from_secs(2)
+            );
+            {
+                let urls = fetcher.urls.lock().unwrap();
+                assert_eq!(urls.len(), 10);
+                assert!(urls[0].contains("clob_token_ids=token-000"));
+                for caller in 0..3 {
+                    assert!(
+                        urls[caller + 1].contains(&format!("clob_token_ids=queued-{caller}-000"))
+                    );
+                }
+                assert!(urls[4].contains("clob_token_ids=token-live"));
+                assert_eq!(urls[0], urls[8]);
+            }
+            if durable {
+                let saved = PaperStateDb::open(&dir.path().join("paper.db")).unwrap();
+                let rows = saved.asset_identities("installed", &tokens).unwrap();
+                assert_eq!(rows.len(), tokens.len());
+                for row in rows {
+                    assert_eq!(
+                        u64::try_from(row.source_log_sequence).unwrap(),
+                        historical.provenance[&row.token].source_log_sequence
+                    );
+                    assert_eq!(
+                        row.canonical_page_hash,
+                        historical.provenance[&row.token].canonical_page_hash
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn bracket_retry_rechecks_table_for_identity_saved_during_backoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let fetcher = Arc::new(InterleavedChunkFixture {
+            urls: StdMutex::new(Vec::new()),
+            release: tokio::sync::Notify::new(),
+            live_completed: std::sync::atomic::AtomicBool::new(false),
+            fail_first: true,
+        });
+        let resolver =
+            durable_resolver(&path, paper, "installed", fetcher.clone(), GAMMA_BATCH_SIZE);
+        let token = PolymarketTokenId("token-000".into());
+        let start = tokio::time::Instant::now();
+        let mut first = Box::pin(resolver.resolve_historical_for_bracket([token.clone()]));
+        std::future::poll_fn(|cx| {
+            assert!(first.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let mut second = Box::pin(resolver.resolve_live([token.clone()]));
+        std::future::poll_fn(|cx| {
+            assert!(second.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        fetcher.release.notify_one();
+        std::future::poll_fn(|cx| {
+            assert!(first.as_mut().poll(cx).is_pending());
+            assert!(second.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(fetcher.urls.lock().unwrap().len(), 2);
+        fetcher.release.notify_one();
+        let saved = second.await.unwrap();
+        assert_eq!(tokio::time::Instant::now(), start);
+        resolver.cache.write().await.identities.clear();
+        let retried = first.await.unwrap();
+        assert_eq!(retried.provenance, saved.provenance);
+        assert_eq!(retried.verified[&token], saved.verified[&token]);
+        assert_eq!(fetcher.urls.lock().unwrap().len(), 2);
+        assert_eq!(
+            tokio::time::Instant::now() - start,
+            std::time::Duration::from_secs(2)
+        );
     }
 
     struct CrossConditionFixture;
