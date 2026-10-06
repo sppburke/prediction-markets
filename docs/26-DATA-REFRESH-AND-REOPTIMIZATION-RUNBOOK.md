@@ -80,18 +80,29 @@ pre-drain run intent and enablement, target checkout/binary identities, the prio
 binary/checkout pair, and cycle/pending/request identities. Preserve other operators' pause
 records and all user work. Resume an interrupted deployment from its recorded step.
 
+**Classifier-6 / format-3 release boundary (#739).** Install the first release only with the
+loop flag `stop`, the unit inactive, no cycle and no pending or durable unconsumed request.
+Record checkout/tree and binary identities. Pre-release classifier-3 requests belong to the prior
+release: finish them there before crossing the boundary. The shared authenticated version-1 loader
+still reads them for retention, but new publication refuses requests without `classifier_version`
+before RPC, and activation/restore refuse classifier-3 candidates. The
+[catch-up procedure](#classifier-6-catch-up-and-coordinated-release-739) keeps the restored pause
+intent stopped until its explicit owner-consent points.
+
 1. Prepare the combined release while work continues. Finish verification and building before
    pausing; keep the release executable separate from the installed executable.
 2. Record the operator's run intent and enablement before changing them, then atomically set
    `data/eval-results/rank_and_push.loop` to `stop` using the existing temporary-file/rename pattern.
 3. Let the current attempt finish or fail. Successful publication, exit 75 and a zero-price
-   failure are valid stopped-attempt boundaries. Recovery pointers need not be cleared.
+   failure are valid stopped-attempt boundaries for compatible releases. Recovery pointers need not
+   be cleared except at the first classifier-6 boundary above.
 4. Verify no loop, wrapper, bootstrap or ranking descendants remain, and that the loop, one-shot
    and relevant cache mutation locks are free, including the candidate's actual physical path.
    Keep lock inodes; old PID text does not prove ownership.
 5. Preserve fixed/prior/candidate files, committed WAL, cycle and pending pointers, configuration,
-   generations, receipts and artifacts. Replay any prepared publication request unchanged;
-   never rebuild it from the new clock, cache or code revision.
+   generations, receipts and artifacts. Replay a compatible prepared publication request unchanged;
+   never rebuild it from the new clock, cache or code revision. A pre-release request stays with
+   its prior release; the tested branch-to-main handoff retains its format-3 request.
 6. Run `bash scripts/deploy/forge_pause.sh status` first. Invoke `pause` and `restore` only when
    no pause record exists, or when the record belongs to this deployment's interrupted procedure:
    its `recorded_at` must match the deployment record. If another operator's record exists or
@@ -109,13 +120,19 @@ records and all user work. Resume an interrupted deployment from its recorded st
    request first, otherwise the retained cycle. A recorded stopped intent stays stopped.
 
 Verify installed checkout/binary identities, retained-cycle recovery, exact publication and
-successor creation. Observe the first three ordinary #704 publications and the existing
+successor creation. Observe the first three ordinary publications and the existing
 batch-application, bounded-membership and service-health checks while the loop runs. Record
 same-revision stage durations, source ages and publication cadence; no total saving is projected.
 
 Rollback reinstalls the recorded prior binary/checkout pair through these same seven steps,
 retaining cache state, recovery evidence and published batches. The target pair must support any
 unfinished bulk root and recorded parser/classifier contracts.
+For #739, rollback to the prior pair (`aaf185d`) is available only before the first format-3
+request is prepared: prove inactivity and no request, abandon the unprepared candidate through
+[recovery](#recovery-and-damage-boundaries), and keep the installed generation-8 format-2 cache and
+published batch 86. From the first format-3 preparation onward, keep a format-3-capable release and
+fix forward. Never downgrade a format-3 cache in place. Supabase's additive objects remain installed;
+`cache-restore-prior` is paused integrity recovery, not release rollback.
 
 ## Wallet-cache tuning measurement and rollback (#606)
 
@@ -501,7 +518,8 @@ latest reference sample at-or-before `entry+Δ` (adds `hit_rate`, writes the
 per-position `oracle_outcomes.csv` and the versioned `oracle_manifest.json` whose
 canonical hash the push stores as `ranking_batches.config_hash`); **Stage 3** record
 the exact publication request, atomically publish it through the idempotent
-`publish_ranking_batch` RPC, verify that exact batch is `latest_ranking`, and write the
+`publish_ranking_batch_v2` RPC (classifier 6; historical requests belong to their prior release),
+verify that exact batch is `latest_ranking`, and write the
 accepted cycle record. The legacy lane captures a full watermark for its unchanged-day check;
 the fresh lane writes its configuration without scanning the installed cache. Completed-cycle
 retention deletes eligible old cycle cache files; there is no SQLite reclamation, index rebuild,
@@ -598,6 +616,10 @@ inspect the evidence again. Missing index, changed path/device, insufficient spa
 failure stops before checkpoint or rename.
 
 ### Version-two cache generation and fixed-path activation (#544)
+
+The frozen-payload and marker-projection procedures in this section describe historical
+**format 2**. Current cycles use the [format-3 candidate contract](#fresh-private-candidate-cycles-and-the-scheduled-schema-two-lane-588-648)
+and its export-bound final-stage record. Cache schema two alone does not select the history format.
 
 Build and resume the side cache by its hash-bound manifest and explicit `--db` path. Version one
 is sealed into `*_v1_sealed` audit tables; version-two consumers read only complete normalized
@@ -788,14 +810,11 @@ requires the verified DuckDB snapshot and refuses SQLite.
 
 ### Fresh private-candidate cycles and the scheduled schema-two lane (#588, #648)
 
-The frozen-payload flow above seals one historical snapshot; it cannot collect a later
-generation because the frozen reference is bound to one generation and end, the wallet
-list is fixed to the sealed schema-one history, and activity insertion moves matching rows
-between generations inside one database. Recurring schema-two publication therefore
-builds each new cycle in a **private candidate** copied directly from the checkpointed fixed
-cache and certifies one complete current activity generation for the union of acquisition candidates,
-every retained history and every wallet the prior's newest generation excluded, without a
-frozen reference:
+Recurring schema-two publication builds each cycle in a **private candidate** copied from the
+checkpointed fixed cache. Current cycles use [history format 3](_GLOSSARY.md#history-format-3-and-classifier-6-739):
+collection identity 4, acquisition 3 and export manifest 3, without a cache `user_version` change.
+The union includes acquisition candidates, every retained history and the prior head's exclusions;
+no frozen reference narrows it. Classifier 6 never finalizes a format-2 head.
 
 ```bash
 # Under the cache lock: checkpoint, copy to pending while hashing the fixed main, then
@@ -815,62 +834,109 @@ pe-bootstrap cache-finalize-v2 --db "$SIDE"                # certify, checkpoint
 ```
 
 `--fresh-generation N` records the versioned acquisition identity specified in
-[`_GLOSSARY.md`](_GLOSSARY.md#complete-activity-generations-and-incremental-acquisition-648).
-The collector first validates its completed predecessor and derives the wallet union, then samples
-and freezes the settled end. New roots read full history; polled successors read only `(previous_end,new_end]`
-for wallets with usable predecessor history. New wallets and genuine previous exclusions read full history.
-Generation numbers may have gaps; carry always uses the recorded predecessor generation.
+[`_GLOSSARY.md`](_GLOSSARY.md#history-format-3-and-classifier-6-739).
+The collector validates predecessor records and certificates and derives the wallet union before
+sampling/freezing the settled end. New roots read full history; polled successors read
+`(previous_end,new_end]` for wallets with usable predecessor history. New wallets, genuine previous
+exclusions and explicit repairs read full history. Generation numbers may have gaps; the frozen
+identity binds the predecessor. Acquisition 3 keeps otherwise valid rows missing a condition id or
+token for scoped classification/ignored-record accounting; acquisition 2 and public service readers
+retain strict acceptance.
 
-Version-3 successors defer quiet wallets until their address-phased weekly instant falls in the
-predecessor interval, using the [canonical quiet/due/deferred rule and constants](_GLOSSARY.md#complete-activity-generations-and-incremental-acquisition-648).
+**Transition in admission.** The first format-3 admission performs the format-2 predecessor walk
+once, verifies its receipts and creates certificates, tables and write-authorization triggers in
+the same transaction as identity 4. Complete wallets, including empty histories, are certified;
+excluded wallets with an authenticated earlier complete receipt are certified with unknown recency;
+proofless excluded wallets must have no rows and stay uncertified. Both excluded classes next read
+in full. Retained rows without usable proof are fatal. Interruption before commit reruns the walk;
+after commit, resume returns the frozen identity. Later admissions check certificates/receipts
+without history visits. No separate transition command exists.
+
+Identity-4 successors defer quiet wallets using the unchanged
+[quiet/due/deferred schedule](_GLOSSARY.md#complete-activity-generations-and-incremental-acquisition-648).
+A deferred predecessor stays quiet; committed rows since certification make a wallet active;
+otherwise the quiet decision uses certified newest activity, not an activity-index probe.
 Due complete wallets read incrementally; due `dormant_deferred` wallets read full history. Roots,
 new wallets, genuine exclusions and repairs never defer. Top-ups use the same rule, resume keeps
-the frozen list, and admission/completion logs report deferrals separately from failures.
-A pause lengthens the next collection's interval, so the collection after it also reads in full
-every deferred wallet whose instant fell in that interval — all of them once it reaches a week.
+the frozen list, and admission/completion report deferrals separately from failures. A pause
+lengthens the predecessor interval; deferred wallets whose weekly instant fell inside it read in full.
 
-Admission preserves activity rows, receipts and historical manifests, clears the derived projection
-and its recorded `ranker_projection_inputs_json` binding and invalidates finalization. Each successful
-wallet atomically re-stamps its verified predecessor rows, strictly inserts delta rows and commits complete-history counts/digest plus acquisition proof.
-The carry verifies the predecessor rows through the shared decode pool (the certification read: same
-rows, order and bytes), then re-stamps them with one update whose change count must equal the receipt
-count, all in the wallet's transaction. A full read replaces every retained row for that wallet, including an empty
-replacement. Historical manifests in the mutated candidate are commitments, not physical snapshots.
-Keep staging evidence; activation preserves the old fixed bytes at `D` for eligible restoration.
-A resumed stage returns the original `H0`, leaves candidate progress intact, and never recaptures
-its baseline from a changed installed cache. Legacy cycles continue to use their immutable prior.
+Admission preserves activity rows, receipts, manifests and cumulative drops, clears the derived
+projection/binding and invalidates finalization. Incremental collection strictly inserts only fetched
+rows and their fetched-set receipt in one wallet transaction; no carry or re-stamping occurs.
+The receipt-chain verifier owns effective history. An unchanged automatic full read writes only its
+receipt, without a history read/write or per-aggregate identity probe. A differing full read checks
+stored history before replacing it; a foreign-wallet identity is fatal. Explicit repairs always
+replace after logging stored/certified digests, with empty history if acquisition fails. Other
+exclusions and deferrals keep retained rows and never reset the chain. Historical manifests are
+commitments, not queryable snapshots. Keep staging evidence and `H0`; resumed staging leaves progress
+intact and never recaptures a changed installed baseline. Activation preserves old fixed bytes at `D`.
 
-A retry resumes the exact recorded bounds and lists and fetches only wallets without a valid receipt.
-Receipt-only startup validates proof metadata without reading completed wallets' aggregates;
-completion and first finalization verify the content. A completed generation returns the same manifest
-without source calls or a new clock. Authentic version-1 and version-2 collections resume without rewriting their
-identity or receipt bytes; their identity is archived when a successor starts. Storage version,
-aggregate and projection digest encodings, and generation-equality consumers remain unchanged.
+A retry retains bounds/lists and skips valid receipts. Startup and collection completion authenticate
+receipt membership, acquisition and sealed commitments without reading history; finalize performs
+the verified pass over every available wallet. A completed generation returns the same manifest
+without source calls or a new clock. Authentic older identities resume without rewriting their bytes.
+Format-3 consumers use receipt availability and head certificates, never generation-equality probes
+of activity rows or the `activity_type` mirror.
 
-A wallet whose history cannot be parsed, identified, bounded or bucketed, or has a cross-boundary ID
-collision, is excluded from this generation.
-The warning names the wallet and stable reason, and completion reports the excluded count. Its
-receipt retains actual read evidence when available; a failed acquisition records an explicit reason
-and no complete page evidence. The receipt certifies empty resulting history; older rows stay untouched
-and produce no current projection entries. With `bootstrap_polymarket_wallet_timeout_secs` set, a wallet whose acquisition cannot complete within that budget — recoverable failures are retried in place under it — is excluded the same way with a recorded reason (#681). Resume skips the exclusion; the next generation includes
-that wallet for a full read. Equal-revision collisions also exclude. Missing predecessor proof,
-foreign-wallet collisions or unreceipted current rows are fatal cache errors.
+A wallet whose acquisition cannot be parsed, identified, bounded or bucketed, or has an incremental
+same-wallet identity collision, is excluded with its reason/evidence retained. Missing condition/token
+alone follows acquisition 3's acceptance above. Every non-deferral failed acquisition with retained
+history verifies it in the exclusion transaction, in either read mode, except an explicit repair's
+replacement. Excluded receipts have zero admitted counts and no current projection; older rows stay
+untouched except for a repair. With `bootstrap_polymarket_wallet_timeout_secs` set, recoverable failures
+retry in place under that budget and expiry records an exclusion (#681). Resume skips it; the next
+generation reads the wallet in full. Equal-revision incremental collisions also exclude. Missing
+proof, foreign-wallet collisions or unreceipted current rows fail the cache closed.
 
-Incremental acquisition does not discover revisions wholly before the lower bound. For reconciliation,
-select wallets **before starting a new generation**:
+Incremental reads do not discover revisions wholly before the lower bound. Select repair wallets
+**before starting a new generation**:
 
 ```bash
 pe-bootstrap cache-populate-activity-v2 --db "$SIDE" --fresh-generation "$N" \
   --full-read-wallets "$WALLET_A,$WALLET_B"
 ```
 
-Selection is a frozen subset of the union; it cannot change on resume. A full-read replacement
-reconciles old revisions and deletions. The venue freshness endpoint does not promise immutable
-historical buckets. Slower revision discovery remains outside the publication path. This change
-retains the shared paced fetcher, bounded reads/channel and single writer from #646 and exclusions
-from #645. Exhausted transient source retries still exit `rank_and_push_tempfail_exit`; permanent
-errors stop the cycle. Payout, finalization, activation, restore and exact-request validation retain
-their existing contracts.
+Selection is the frozen `repair_wallets` subset in identity 4; it cannot change on resume.
+Repairs reconcile revisions/deletions and logical history damage, preserve cumulative drops, and
+cannot repair structural SQLite damage or damaged certificates/receipts/manifests/state. Follow
+[the damage boundary](#recovery-and-damage-boundaries) before selecting a repair. The shared paced
+fetcher, bounded reads/channel and single writer remain; transient exhaustion exits
+`rank_and_push_tempfail_exit`, while permanent errors stop the cycle.
+
+**Verified pass, spool and export.** Finalize visits every available wallet once (complete,
+non-excluded head receipt, even with zero fetched rows), verifies its effective history, classifies
+with `classify_scoped_historical_second`, and writes its new certificate and cumulative drops.
+It reports ignored activity by type, drops by cause and neg-risk markets missing a group id.
+`ranker_entries_v2` stays empty. The [projection spool contract](_GLOSSARY.md#history-format-3-and-classifier-6-739)
+binds `<candidate>.projection-v3.jsonl` in `ranker_projection_inputs_json` with `oracle_version`,
+`projection_spool` and `certificate_digest`. The payout binding includes `neg_risk_market_id` and
+requires coverage `group_version=1`; older staged payout pages restart from page one.
+
+The streamed spool is synced/renamed beside the candidate before finalize commits. A rebuild deletes
+its uncommitted/temporary spool first; committed reuse leaves it intact. Readers verify its size
+and SHA-256 before reading. Missing/altered committed spools fail closed and require guarded
+pre-prepare abandonment/restaging. Export converts it to compact Parquet, keeps payout evidence,
+recomputes projection count/digest from Parquet and writes manifest 3 last. A retry after export or
+an interrupted reference fetch reruns export from the retained spool. Retirement deletes it;
+retained requests keep it. Format 3 has no marker inserts, join digests or copied activity export.
+
+After price writes, the wrapper re-finalizes with the actual cycle export manifest, including a
+non-default Parquet directory:
+
+```bash
+pe-bootstrap cache-finalize-v2 --db "$SIDE" --stage-record "$CACHE_STAGE_RECORD" \
+  --export-manifest "$EXPORT_MANIFEST"
+```
+
+Re-finalize validates input bindings and the state's count/digest/classifier/oracle against that
+manifest, re-checks certificates, spool and the cycle's sealed manifests/receipts inside its
+verification transaction, then checkpoints/hashes the candidate. It never regenerates predecessors
+from advanced certificates or re-reads history/projection. The final-stage record binds the export
+manifest's SHA-256 and summary. Until finalize, phase checks use identity 4's incoming
+`certified_digest`; afterwards they use the finalized `certificate_digest`, once per stable proof
+while data-version checks show no outside write. Publication reads freshness, stamps and scopes
+only from certificates at this finalized head.
 
 **Structural checks (#643 step 2).** Each uninterrupted recurring cycle runs at most two
 `PRAGMA quick_check` scans (previously eight): the checkpointed fixed main under the
@@ -897,15 +963,23 @@ Finalization certifies activity, payout and projection evidence, and with `--sta
 binds exact bytes, not every SQLite page. Damage outside those reads may now survive migration resume, the
 post-seal step and either finalization, wasting private collection/ranking work before
 activation refuses installation; fault localization is consequently later. Outgoing
-and retained backups keep hash and schema validation. Activation skips the outgoing
-activity-manifest verification only when an accepted activation installed exactly those H0 bytes;
-otherwise it runs in full. New-layout activation and restoration move existing files;
+and retained backups keep hash and schema validation. Format-2 outgoing validation retains its
+accepted-H0 shortcut and otherwise runs in full. Format-3 outgoing validation uses H0 and the state's
+recorded form: admission already checked records at those exact bytes; it never walks history,
+recomputes a retired projection or needs a retired backup. New-layout activation and restoration move existing files;
 legacy fallback/audit copies remain hash-verified. Backups may contain preexisting damage:
 the prior's restore-time check decides whether it is eligible for restoration, and
 post-rename hash equality carries that proof without another scan. All checkpoints,
 sidecar rejection, candidate receipt/content digests, locks and publication gates remain in place;
 hash equality proves byte identity, not health. `quick_check` itself does not check
 UNIQUE constraints or index-to-table agreement; no routine full `integrity_check` is added.
+
+Format-3 activation checks candidate hash equality with the export-bound final-stage record,
+`quick_check`, the state's export summary and payout coverage, then outgoing H0. It carries
+re-finalize's record checks to the installed bytes without a history re-read. Logical history damage
+after a wallet's check is caught at its next available-cycle check or quiet weekly due read, a week
+plus at most one cycle. These are the owner's accepted integrity gaps (#739 Decision 6), not proof
+that unchecked history stayed intact. Rankings and publication inputs use only this cycle's checked rows.
 
 With `RUST_LOG=info` (or `pe_bootstrap::cache_migration=info`) in the loop environment,
 each completed check emits one JSON event to stderr, inherited by the loop journal
@@ -928,7 +1002,9 @@ configuration and prepared request intact. A release that preserves parser/class
 may install with a cycle retained at a stopped-attempt boundary. A classifier-version change
 requires a clean publication boundary with `paused_complete`, no cycle pointer,
 `cache_stage_record.json`, `ranking_publish_request.json` or pending pointer: a resumed cycle freezes
-its pipeline versions. The next cycle's first finalization rebuilds the projection at the new version.
+its pipeline versions. For classifier 6, follow the [first format-3 boundary](#forge-release-deployment-and-rollback)
+and [catch-up handoff](#classifier-6-catch-up-and-coordinated-release-739); a retained format-3 request
+transfers from the tested branch tree to its runtime-identical main release unchanged.
 
 The zero-argument `rank_and_push.sh` production cycle enters this lane automatically when
 the installed cache is schema two, and for the one-time initial cutover when `.env` sets
@@ -938,8 +1014,8 @@ opt-in changes and an outstanding legacy cycle completes under its original cont
 the lane, Step 0 is the sequence above (legacy `backfill`, `events` and `resolutions` read
 retired `trades`/`source_cursor` and do not run), followed by the existing cutover path:
 candidate capture into `candidate_cycle_manifest.json` alongside Parquet export, pass one and
-target emission, then targeted `prices-history` and second finalization with `--stage-record`,
-which writes the record binding the price writes. Pass two binds that
+target emission, then targeted `prices-history` and second finalization with `--stage-record`
+and `--export-manifest`, which binds the price writes and manifest-3 export summary. Pass two binds that
 capture. An initial schema-one cutover keeps its full initial `cycle_manifest.json` capture and
 same-day gate; recurring cycles started on installed schema two write a two-field lane record
 (`version`, `configuration`) instead. The new-cycle `pipeline-versions` output remains available
@@ -951,10 +1027,13 @@ interrupted successor belonging to this cycle. `candidate-targets --include-bulk
 bulk eligibility as field four and `activity_complete` as field five; the default interface stays
 three fields. Inside its read transaction, completion requires schema two, the selected generation
 matching the validated head, and a completed manifest referencing that head's digest. Only that
-completed selected head skips the collection invocation. Incomplete and unsealed bulk roots still
-collect; standalone Rust collection still certifies content. The wrapper always calls
+completed selected format-3 head skips the collection invocation. Every format-2 head takes the
+ordinary successor path (`initial + 1`) before finalization, even when fresh; this runs the transition.
+Incomplete and unsealed bulk roots still collect under their frozen acquisition contract;
+standalone collection authenticates receipts, with content checks retained for format 2. The wrapper always calls
 `--after-collection`, including after a skip, so freshness equality and the single-top-up allowance
-are unchanged. Activation still rejects corrupt receipts and nonprojected content before publication.
+are unchanged. Format-3 re-finalize rejects record damage before preparation; activation binds those
+checks to installed bytes without another history read. Format 2 retains its content checks.
 If the completed initial head's age plus `candidate_top_up_reserve_hours` exceeds the
 publisher's unchanged `max_cache_staleness_hours`, the wrapper admits one linked top-up. Its persisted
 base link consumes that allowance across restarts; a stale top-up stops before ranking and never
@@ -989,7 +1068,7 @@ An existing candidate with neither evidence nor prior refuses. Installed drift a
 reported against recorded `H0`; that hash detects drift but cannot reconstruct the original bytes.
 
 After verified publication and both pointer clearings, retention deletes the completed cycle's
-`D` (or legacy `P` and `D`) as well as eligible older cycle artifacts. The existing durable
+`D` (or legacy `P` and `D`), its projection spool and eligible older cycle artifacts. The existing durable
 `accepted_cycle_manifest.json`, written after publication verification as a full legacy capture or
 fresh-lane lane record, and `ranking_publish_request.json`
 remain the discoverable cleanup obligation, together with the request-bound `.side.stage.json` for
@@ -1000,7 +1079,8 @@ again. The evidence stays as audit history; no new receipt format is introduced.
 retirement pass synchronizes the physical cache directory, even if an interrupted pass already unlinked
 the last backup. It accepts only regular files named
 `wallet_cache.cron-<YYYYMMDDTHHMMSSZ>.{prior,side,displaced}.db` and their `-wal`/`-shm` sidecars,
-from that cycle or earlier, in the request's physical cache directory. Pending pointer, cycle pointer
+and the candidate's `.projection-v3.jsonl` spool, from that cycle or earlier, in the request's
+physical cache directory. A retained request keeps its spool. Pending pointer, cycle pointer
 or `.forge_pause.json` presence, including malformed/symlink records, prevents deletion. A pause
 defers cleanup and new-cycle admission; removing it lets the next loop pass finish retirement.
 The installed file, its inode aliases, symlinks, directories, `..` paths and other names remain
@@ -1011,9 +1091,12 @@ At **830 GB per cache**, two full caches use **about 1.66 TB**, leaving **about 
 device. Staging, activation, rename-gap recovery and rollback retain at most those two full mains.
 Keeping the previous backup into the next copy would require 2.49 TB and is refused. The 240 GB
 remainder is shared by WAL, exports, sort scratch, growth, filesystem overhead and other usage;
-this arithmetic does not measure their peak usage.
+this arithmetic does not measure their peak usage. Format-3 capacity also includes the spool;
+recompute headroom and retention horizon from catch-up measurements before ordinary operation.
 
-**Initial cutover and acceptance.** Complete any outstanding schema-one cycle and its
+**Historical schema-one cutover and acceptance.** For classifier 6, use the
+[one-time catch-up](#classifier-6-catch-up-and-coordinated-release-739), including its temporary
+freshness policy. The following remains the initial schema-one procedure. Complete any outstanding schema-one cycle and its
 publication first. Create the two aliases, retire eligible previous backups, and check free space
 for one candidate plus the measured WAL/export/scratch budget on that filesystem, then set `PE_RANK_SCHEMA_TWO_CUTOVER=prepare` and run
 one zero-argument cycle, either under the supervisor or by hand while it is paused with
@@ -1036,28 +1119,128 @@ membership or relax freshness. Require the next real scheduled refresh and publi
 (installed schema two selects the lane automatically) before closing the schema-two
 handoff.
 
-**Recovery states.** Before a prepared request exists, abandon a cycle only after
+#### Recovery and damage boundaries
+
+Before a prepared request exists, abandon a cycle only after
 `scripts/deploy/forge_pause.sh pause` reports the loop inactive with no cycle descendant and
 no held lock; then confirm `rank_and_push.pending` is absent and the cycle directory holds no
 `ranking_publish_request.json`, remove `rank_and_push.cycle`, and delete only that cycle's
-candidate and its staging metadata. Preserve any legacy prior until its own recovery is resolved;
+candidate, its projection spool (including uncommitted/temporary spool) and staging metadata.
+Preserve the failure evidence before deletion. Preserve any legacy prior until its own recovery is resolved;
 an outstanding prior will block the next new-layout copy. Once a
 request is prepared, never delete it or start another cycle: the pending pointer resumes
 activation and publication. If the pointer is missing but this cycle has a durable
 `ranking_publish_request.json`, both recovery entries validate that request and reconstruct its pointer
 through the publisher before discovery or collection. Both remain held while cutover is `prepare`.
 After activation but before the publication is consumed,
-`cache-restore-prior` with backup `D` and rejected destination `C` restores the old bytes by rename
-for a new cycle, including its interrupted gap. A legacy cycle keeps its prior/displaced arguments
+`cache-restore-prior` with backup `D`, rejected destination `C` and `--final-stage-record` restores
+the old bytes by rename for a new cycle, including its interrupted gap. For format 3 the record must
+match the candidate path/hash; both interrupted-restore branches use its export summary, not a marker
+projection. Missing or mismatched evidence fails closed. A legacy cycle keeps its prior/displaced arguments
 and existing semantics. The supervisor must stay paused until the recovery is resolved. After consumption, roll
 forward. Confirm the host paths before cutover and keep the prior until publication is confirmed.
 
-For version-3 collection identities (#731), reinstall the prior binary/checkout pair only before
-a prepared version-3 request exists and while that pair can read the installed cache and retained
-recovery artifacts, before the first version-3 activation. From request preparation onward, or
-after any version-3 activation, keep a version-3-capable release and fix forward. A release that
-stops deferring full-reads every deferred wallet in its next generation through exclusion recovery.
-`cache-restore-prior` remains paused integrity recovery, not a return to the prior release.
+**Logical history damage.** A structurally readable database can be repaired for named wallets.
+A failed history check reports expected/observed digests and stops the cycle. Pause, preserve evidence,
+abandon the failed unprepared candidate under the guards above, stage from the installed cache and
+admit a new generation with `--full-read-wallets` for the named wallets. Repair logs stored/certified
+digests and replaces history, with nothing if download fails, so repeated failed downloads do not
+keep a damaged wallet blocking later cycles. The pass verifies replacement before preparation;
+cumulative drops survive. This applies to history damage at rest in an otherwise readable installed
+format-3 cache; outgoing validation needs neither history nor a retired backup.
+
+**Record damage.** Certificates, receipts, manifests and migration state cannot be re-downloaded.
+Re-finalize checks them before candidate hashing; damage there refuses preparation and is recovered
+by abandonment/restaging from the untouched installed cache. Certificate digest failure names the
+table, not wallets. Damage to those records at rest in the installed file stops admission and is
+detected, not repaired: restaging and `--full-read-wallets` cannot fix it. After publication,
+`cache-restore-prior` refuses and retention has deleted the displaced backup. Keep the loop paused,
+preserve evidence and obtain an independently verified restore or separately authorized reseed.
+
+**Structural damage.** `--full-read-wallets` never repairs SQLite structure. Abandon a structurally
+damaged candidate and restage from an intact installed cache. A structurally damaged installed file
+loses its accepted-hash shortcut when bytes change and staging's `quick_check` refuses it. Preserve
+the file/evidence while paused for an independently verified restore or separately authorized reseed.
+Neither manual SQL nor a new candidate bypasses this boundary. Missing/altered committed spools use
+pre-prepare abandonment/restaging, never regeneration.
+
+From the first format-3 preparation onward, keep a format-3-capable release and fix forward through
+the exact request. Never downgrade the cache in place; see [release rollback](#forge-release-deployment-and-rollback).
+
+### Classifier-6 catch-up and coordinated release (#739)
+
+Rollout step 1 is the reviewed/tested combined release: current main reconciled, full gate and CI
+green, cross-built Forge binaries and their dependency closure recorded with the tested git tree
+and binary hashes, kept beside the installed release. One Forge operator owns the resumable record.
+This docs procedure does not authorize Forge or Supabase mutation; the consent points below belong
+to the owner. Record each completed step and resume it, rather than starting another cycle.
+
+2. **Boundary.** Require flag `stop`, unit inactive, no cycle and no pending/unconsumed request.
+   Resolve pre-release requests with their prior release and record installed/target identities.
+3. Install the tested branch release through [release steps 1–7](#forge-release-deployment-and-rollback).
+   Restoring the pause record must keep the recorded stop/inactive intent.
+4. Record original `.env` values, then set this catch-up configuration before its cycle starts:
+
+   | `.env` key | Catch-up value |
+   |---|---|
+   | `MAX_CACHE_STALENESS_HOURS` | [Owner's interim freshness bound](_GLOSSARY.md#catch-up-freshness) |
+   | `PE_RANK_SCHEMA_TWO_CUTOVER` | `prepare` |
+   | `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS` | `0` |
+
+   Keep existing `PE_BOOTSTRAP_CLOB_CONCURRENCY` unless a two-minute read-only Forge probe of
+   reference pages/s shows request latency, rather than the shared rate gate, binding. If so, raise
+   that existing knob before starting, preserving the [canonical prices-history gate and documented
+   limit](_GLOSSARY.md#bootstrap-defaults-pe-bootstrap). Never change configuration during the cycle.
+5. **Owner consent to the catch-up**, then run one detached `bash scripts/rank_and_push.sh` while
+   the loop unit stays inactive; record its PID/process group and log. It runs staging → transition
+   → collection → payout → finalize → export → passes/reference fetch → export-bound re-finalize →
+   prepare. Acceptance is `RANK_AND_PUSH_PREPARED_ONLY=<request>` and exit 2 with request/pending
+   pointer retained and installed bytes unchanged; other exit-2 failures are not acceptance.
+   Right after finalize, while later stages write only prices, run #739 AC1's deterministic wallet
+   sample through an ordinary read-only connection. Compare selected IDs, all fourteen spool fields
+   and certificate drops, and explain each difference against the classifier-5 baseline by its
+   explicit rule. An unexplained difference stops the recorded PID before preparation and keeps
+   pre-prepare abandonment available. Reference pages warm through the ordinary resumable stage,
+   not a special pre-head fetch. Record the full candidate-through-prepare acceptance on the tested
+   tree; activation/publication/retention and cadence complete acceptance after merge.
+6. Merge only after green CI with an expected-head guard, coordinating the runtime-change window on
+   [#588](https://github.com/sppburke/prediction-markets/issues/588) and
+   [#694](https://github.com/sppburke/prediction-markets/issues/694). Acceptance transfers only across
+   identical Forge runtime inputs: bootstrap's dependency closure, `Cargo.lock`, toolchain, wrapper
+   scripts, `supabase_schema.sql` and configuration. If main moved, rerun the full gate on the merged
+   tree; a runtime-input change invalidates affected acceptance, which must rerun with the prepared
+   request unchanged. Documentation-only differences take their applicable checks. Install the
+   main release built from that merged tree, recording identities and retaining the exact request
+   through release step 5; verify main CI. Keep cutover at `prepare`.
+7. **Owner consent to Supabase**, then apply `scripts/supabase_schema.sql` idempotently. It adds
+   `ranking_batches.classifier_version`, `ranking_entries.history_through_unix`,
+   `ranking_scope_drops` and `publish_ranking_batch_v2`, with no removals. Verify objects read-only:
+   nullable historical fields, scope/cause constraints and primary key, cascading batch reference,
+   RLS/anon reads and service-role-only execution. The v2 function preserves the original RPC's
+   validation/idempotency/count checks and commits batch, entries and drops atomically; the original
+   three-argument RPC stays for older releases.
+8. Set `PE_RANK_SCHEMA_TWO_CUTOVER=1` and resume the pending-publication path. It activates and
+   publishes exactly the saved request through `publish_ranking_batch_v2`, without a new clock or
+   rebuilt request. Verify its classifier, scoring limits, entry coverage ends and scope rows as
+   well as exact latest-batch/application checks. pe-service release 2 starts on its coordinated
+   restart after this batch is applied; its code and deploy belong to #588, not this Forge release.
+9. Recompute both drives' capacity headroom, retention horizon and stage forecasts from measured
+   classifier-6 spool bytes, positions and reference demand at the [shared floor](_GLOSSARY.md#ranking-horizon-floor).
+   Set `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS` to the owner's ordinary-cycle choice. **Explicit owner
+   restart consent** is required before setting flag `run` and starting the loop unit. The first
+   ordinary cycle keeps the [interim freshness override](_GLOSSARY.md#catch-up-freshness): deferred
+   wallets due after the catch-up read in full and fetch their unwarmed reference pages. After it
+   prepares, remove that override by a `.env` edit between cycles, before the second ordinary cycle
+   starts. Observe three ordinary publications under the existing batch-application,
+   bounded-membership and service-health checks.
+
+For each cycle record stage durations, rows read/written and commitments, drops and ignored records,
+peak RSS, spool/export/spill/WAL bytes and both drives' free space. Collection timing separates fetch
+completion, writer completion, blocked-producer time and final drain. Report publication-to-publication
+cadence; report the first ordinary cycle separately. Forecasts are not measurements. A cycle exceeding
+the canonical freshness/cadence goal is reported to the owner the same day with options; closure needs
+measured ordinary cadence meeting the owner's goal. Rollback before preparation uses the guarded
+abandonment above; after preparation fix forward with a format-3-capable release.
 
 ### Fresh bulk root with deferred global uniqueness (#588)
 
@@ -1067,12 +1250,15 @@ for a legacy cycle. New roots read the immutable staging baseline without a prio
 for a newly staged and migrated private candidate. Fixed, candidate and any legacy prior must be
 distinct paths and inodes. The candidate must have no activity rows, receipts,
 completed activity manifest, frozen-reference verification or finalized projection. Admission freezes
-an ordinary version-2 root identity, with no predecessor and the full wallet union, and atomically
+identity 4 in format 3, with no predecessor, the full wallet union, empty `repair_wallets` and the
+empty certificate table's `certified_digest`. The same admission creates format-3 tables/triggers,
 removes the empty named identity index and sets `PRAGMA user_version=-2`. This negative version is
 reserved for the unfinished private layout; it is not an activity/parser/identity version or a
 configuration key. Existing collections are never converted. Historical version-1 identities,
 frozen-reference collections, ordinary collections without the flag, and every successor retain
-immediate indexed uniqueness and their existing acquisition semantics.
+immediate indexed uniqueness. New roots use acquisition-3 full reads without a predecessor and its
+bootstrap-only relaxed row acceptance. An unfinished identity-2 root keeps its frozen acquisition-2
+contract through resume/sealing; it is never reinterpreted as acquisition 3.
 
 New ordinary schemas use `idx_activity_groups_v2_source_trade_id`, a full single-column `BINARY`
 unique index, in place of the automatic primary-key index. Historical primary-key schemas remain
@@ -1084,10 +1270,14 @@ and exclusions still run.
 
 After the serial writer drains, `collect_activity_v2` builds the named unique index with **plain
 `CREATE UNIQUE INDEX`**, verifies its definition through `index_list`/`index_xinfo`, validates all
-activity content and receipts, records the completed manifest and archived identity, and restores
+receipt commitments (with the historical acquisition-2 content checks for an older root), records
+the completed manifest and archived identity, and restores
 `user_version=2` in one transaction. A successful checkpoint/truncate follows. The build therefore
 precedes successor admission and the successor's settled-end clock; no top-up freshness budget is
-spent building the root index. It does not prove that later top-up, payout, ranking and preparation
+spent building the root index. A new format-3 root finalizes through the ordinary verified pass,
+certifying each available wallet's recency and drops from its complete full receipt. A sealed
+identity-2 root must first admit an identity-4 successor, even when fresh, so classifier 6 never
+finalizes format 2. It does not prove that later top-up, payout, ranking and preparation
 fit the unchanged freshness limit.
 
 Global duplicates, an existing index of the same name (even one with the right definition), index
@@ -1149,11 +1339,12 @@ The zero-argument wrapper stages/migrates, discovers and activates, then asks
 root requires schema two, generation one, no existing collection identity, activity rows or receipts,
 the exact named unique index with no primary-key layout, and the unfinalized private state with no
 completed activity manifest, frozen verification or projection. A reserved-state root resumes only
-with its version-two generation-one identity, no predecessor, and that same private state; retained
+with its identity-2 or identity-4 generation-one root, no predecessor, and that same private state; retained
 wallet rows/receipts are allowed. Rust still owns admission and fails closed. Ordinary interrupted
-roots and unfinished successors use ordinary collection. Completed selected schema-two heads
+roots and unfinished successors use ordinary collection. Completed selected format-3 heads
 skip wrapper collection re-entry; the always-run `--after-collection` check still selects an allowed
-stale-head top-up or refuses a stale completed top-up. After a transient exit 75 the existing
+stale-head top-up or refuses a stale completed top-up. A completed format-2 head first selects its
+ordinary successor (`initial + 1`) regardless of freshness. After a transient exit 75 the existing
 supervisor re-enters the same cycle, skips staging/migration/discovery/activation for a fenced
 candidate, and resumes bulk collection from its receipts. After sealing, the one allowed top-up
 never receives `--bulk-root`. Payout, finalization and preparation keep their existing gates.
@@ -1174,6 +1365,10 @@ same command and receipts; never archive the cycle pointer, allocate a replaceme
 force a successor as part of deployment. A prepared request takes precedence over collection.
 
 ### Incremental top-up measurement and paused-cycle handoff (#648)
+
+The carry/re-stamping measurements below describe historical format 2. For format 3, measure fetched
+inserts, differing full replacements and failed-acquisition checks separately, plus the single
+verified pass, spool and export; use the [#739 catch-up acceptance](#classifier-6-catch-up-and-coordinated-release-739).
 
 The implementation fixtures prove acquisition/certification equivalence, crash atomicity and consumer
 selection. They do **not** establish production throughput, disk budget or freshness acceptance.
@@ -1227,6 +1422,15 @@ bytes while cutover is `prepare`; unrelated exit-2 failures are not acceptance. 
 prepared request through acceptance and resume rather than recreating it.
 
 ### Continuous Forge supervisor
+
+Classifier 6 / format 3 changes no loop unit, flag or lock lifecycle. Its
+[catch-up procedure](#classifier-6-catch-up-and-coordinated-release-739) owns the stopped installation,
+detached one-shot acceptance, exact pending-request handoff and explicit owner restart consent.
+The [interim `.env` freshness bound](_GLOSSARY.md#catch-up-freshness) covers catch-up and the first
+ordinary cycle only; remove it between cycles before the second ordinary cycle. Normal cycles use
+the canonical freshness checks, the owner's frozen activation batch and the one
+[`MIN_TTR_SECS` scoring value](_GLOSSARY.md#ranking-horizon-floor), with batch limits taken from the
+validated oracle manifest. Scope/coverage publication is atomic; the supervisor adds no special stage.
 
 Production repetition is file-governed and runs the complete one-shot command
 with exactly zero parameters each cycle. Before cutover, inventory and disable
@@ -1368,8 +1572,14 @@ Recovery additionally logs `LOOP_TEMPFAIL`, `LOOP_RESUME_START`, and
 `LOOP_RESUME_END`, with `kind=publication-resume` or `kind=cycle-resume`.
 The distinct supervisor lock prevents two loops from racing at a cycle boundary.
 
-Before first deployment, apply `scripts/supabase_schema.sql` before updating the
-Forge checkout. The additive `ranking_batches.publish_key` column and unique
+For classifier 6, apply `scripts/supabase_schema.sql` with owner consent at
+[catch-up step 7](#classifier-6-catch-up-and-coordinated-release-739), before resuming publication.
+It adds the nullable classifier/coverage fields, `ranking_scope_drops` and the service-role-only
+`publish_ranking_batch_v2`; verify the new objects read-only. All five batch limits, scope drops and
+coverage ends belong to the exact saved request and commit atomically with its entries. The original
+three-argument function stays for older releases; the additions remain on rollback.
+
+For the historical first publication-RPC deployment, the additive `ranking_batches.publish_key` column and unique
 index preserve historical batches whose key is null. The service-role-only
 `publish_ranking_batch` RPC creates/reuses the keyed batch and inserts all entries
 inside one PostgreSQL transaction, so a failed request exposes neither a partial

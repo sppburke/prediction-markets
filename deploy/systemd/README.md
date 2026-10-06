@@ -25,6 +25,16 @@ semantics, and verification live in
 [`docs/26-DATA-REFRESH-AND-REOPTIMIZATION-RUNBOOK.md`](../../docs/26-DATA-REFRESH-AND-REOPTIMIZATION-RUNBOOK.md)
 ("Continuous Forge supervisor").
 
+Classifier 6 / history format 3 (#739) changes nothing in this unit. Keep it inactive with flag
+`stop` for the [one-time catch-up and release handoff](../../docs/26-DATA-REFRESH-AND-REOPTIMIZATION-RUNBOOK.md#classifier-6-catch-up-and-coordinated-release-739).
+The wrapper exports its `.env`: set `MAX_CACHE_STALENESS_HOURS` to the
+[interim bound](../../docs/_GLOSSARY.md#catch-up-freshness), `PE_RANK_SCHEMA_TWO_CUTOVER=prepare`
+and `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` before that cycle. Keep existing CLOB concurrency
+unless the runbook's read-only probe justifies raising `PE_BOOTSTRAP_CLOB_CONCURRENCY`; never edit
+cycle configuration in flight. After exact-request activation/publication, the owner selects the
+ordinary batch and explicitly consents to restart. The first ordinary cycle keeps the interim
+bound; remove it between cycles after that preparation and before the second ordinary cycle.
+
 ## Install
 
 ```bash

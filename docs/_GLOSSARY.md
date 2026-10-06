@@ -455,7 +455,7 @@ Campaign financial limits and eligibility are canonical in
 | `gamma_base_url` | `https://gamma-api.polymarket.com` | Base URL for Polymarket Gamma market metadata and mark-price reads. Resolution payout evidence comes from the CLOB market endpoint. Shares the same 50 ms / 20 req/s rate limit as `bootstrap_gamma_min_interval_ms`. |
 | `gamma_resolution_poll_interval_secs` | 120 | Legacy-named cadence for the service's CLOB resolution poll. The poll is limited to conditions with open unsettled positions; Gamma is not a payout authority. |
 | `max_resolution_horizon_secs` | 172_800 (48 h) | `ServiceConfig` field. Drop entry signals whose market resolves further than this many seconds into the future. 0 disables the upper bound. Guards against locking capital in months-long markets (issue #290). **172_800 since the 2026-07-03 run28 cutover** — the copy-time twin of `ranker_ttr_hours` (48 h ≈ 72 h on paired weekly P&L, `docs/33` §5; was 259_200/72 h). Paired with `min_resolution_horizon_secs` — one resolution lookup serves both. NOTE: the live `service_config` row must be PATCHed at deploy (`on conflict do nothing` never updates an already-seeded row). |
-| `min_resolution_horizon_secs` | 60 | `ServiceConfig` field. Drop entry signals whose market resolves *sooner* than this many seconds from now — a copy cannot realistically fill and hold a market about to resolve. 0 disables the lower bound. `docs/29`: the 1-minute copy floor; sub-minute "breaks down" (issue #339). |
+| `min_resolution_horizon_secs` | [`MIN_TTR_SECS`](#ranking-horizon-floor) | Copy gate's lower horizon bound, aligned with the ranking floor on pe-service release 2 (#588). Drop entry signals whose market resolves sooner than this interval from now; 0 disables the copy bound. Historical decisions retain their recorded configuration. |
 
 ### Copy-entry gate (first-ever BUY entry; issues #290, #339)
 
@@ -795,6 +795,7 @@ both tokens and row count agree, retrying one token race before returning typed 
 | `ACTIVE_WINDOW_HOURS` | 72 | **Module const** (`i64`) in `crates/service/src/supabase_reader.rs` (#357). Candidate-freshness filter: `fetch_candidates` only returns bench wallets whose `last_trade_unix ≥ now − 72 h`, mirroring `upload_active_window_hours` on the push side so the maintenance-tick backfill never admits a wallet the upload would have dropped. |
 | `candidate_top_up_reserve_hours` | 7 | Module const `TOP_UP_RESERVE_HOURS` in `scripts/rank_cycle_manifest.py`. After collection, an unused top-up is taken once the head's age plus this reserve exceeds `upload_max_cache_staleness_hours`, so the cycle can still reach preparation within the bound; a used top-up is refused only above the bound. Provisional: payout through prepare start, measured by the preparation benchmark. |
 | `upload_max_cache_staleness_hours` | 24 | `--max-cache-staleness-hours` in `scripts/push_ranking_to_supabase.py` (issues #350/#519). The push aborts (non-zero exit, no Supabase write) unless the newest trade, newest resolution fetch, and present completed CLOB sweep marker (`value=''`) are all within this bound. Backfill before pushing (docs/26). Drift-guarded by `scripts/test_push_ranking_filter.py`. |
+| <a id="catch-up-freshness"></a>`MAX_CACHE_STALENESS_HOURS` interim (#739) | 48 | Owner-authorized `.env` override for preparation of the one-time catch-up and first ordinary cycle only. Remove between cycles after the first ordinary cycle prepares and before the second ordinary cycle starts; the canonical `upload_max_cache_staleness_hours` then applies. Saved requests retain their accepted clocks and limits. |
 | `ranking_publish_max_retries` | 5 | Maximum transient Supabase retries for each atomic ranking-publication request in `scripts/push_ranking_to_supabase.py`; the initial attempt is additional. Only transport/timeouts and HTTP 408/425/429/5xx retry. |
 | `ranking_publish_retry_base_secs` | 1 | Initial exponential-backoff delay for transient ranking-publication retries. Backoff doubles to `ranking_publish_retry_max_secs`; a numeric `Retry-After` overrides the exponential delay within the same bound. |
 | `ranking_publish_retry_max_secs` | 30 | Maximum per-request transient retry delay for ranking publication. |
@@ -806,7 +807,8 @@ both tokens and row count agree, retrying one token race before returning typed 
 | `ranker_window_days` | 180 | `DEFAULT_WINDOW_DAYS` in `scripts/ranker_decay.py` (issue #366). Relative entry-date window: when `--win-end`/`--win-start` are omitted, the ranker (`scripts/rank_72hr_buyandhold.py`) scores `win_end = today UTC-midnight`, `win_start = win_end − this`. Replaces the old fixed calendar window (`2025-12-01 → 2026-06-01`); the relative default **does** take effect on the next production `scripts/rank_and_push.sh` (which leaves `WIN_START`/`WIN_END` empty). Override via `--win-start`/`--win-end` (Python) or `WIN_START`/`WIN_END` (shell). Drift-guarded by `scripts/test_ranker_decay.py`. |
 | `ranker_half_life_days` | 30 | `DEFAULT_HALF_LIFE_DAYS` in `scripts/ranker_decay.py` (issue #366). Exponential recency-decay half-life (days) for the edge/t-stat score in BOTH ranking passes (`rank_72hr_buyandhold.py`, `latency_shift_rerank.py`): a trade one half-life old weighs 0.5. `0` disables decay (flat weights = legacy behaviour, bitwise-identical). Both the standalone Python scripts and the production wrapper `scripts/rank_and_push.sh` default to **30** (issue #370 adopted 30-day decay after the half-life sweep, flipping the #366 flat wrapper default). Override with `--half-life-days N`; for the first full-universe run, stage with `--half-life-days 0` so a cohort shift is attributable to the wider universe vs decay. Eligibility/activity gates and `hit_rate` stay raw. Drift-guarded by `scripts/test_ranker_decay.py`. |
 | `ranker_universe_source` | all-trade-wallets | Production ranking enumerates distinct trade wallets, then excludes every schema-one `backfill_partial=1` wallet (including inactive rows) before limiting. Unmarked wallets and wallets without a pile row remain eligible. Both `--universe-from-trades` and research `--universe <file>` use the same exclusion. Schema two is unchanged. |
-| `ranker_ttr_hours` | 48 | Production TTR ceiling for qualifying first-buys: `TTR_HOURS` in `scripts/rank_and_push.sh` → `--ttr-hours` in `scripts/rank_72hr_buyandhold.py` (whose own argparse default stays 72 — the "72hr" filename is historical). **48 since the 2026-07-03 run28 cutover** (48h ≈ 72h on paired weekly P&L — NW-t 0.11 — so the capital-velocity preference for 48h is free; 24h measurably worse, `docs/33` §5). The shell also derives `--ttr-max-secs` for the push from this value so `ranking_batches.ttr_max_secs` provenance matches the ranked shape. The live copy-time twin is `max_resolution_horizon_secs`. |
+| `ranker_ttr_hours` | 48 | Production TTR ceiling for qualifying first-buys: `TTR_HOURS` in `scripts/rank_and_push.sh` → `--ttr-hours` in `scripts/rank_72hr_buyandhold.py` (whose own argparse default stays 72 — the "72hr" filename is historical). **48 since the 2026-07-03 run28 cutover** (48h ≈ 72h on paired weekly P&L — NW-t 0.11 — so the capital-velocity preference for 48h is free; 24h measurably worse, `docs/33` §5). Publication takes `ranking_batches.ttr_max_secs`, along with the other four scoring limits, from the validated oracle manifest bound to the ranked CSV, without separate limit arguments. The live copy-time twin is `max_resolution_horizon_secs`. |
+| <a id="ranking-horizon-floor"></a>`MIN_TTR_SECS` | 10 | One wrapper-local value in `scripts/rank_and_push.sh` feeds both pass-two calls. No environment or configuration override in this release. The publisher reads the floor from the validated oracle manifest's `scheduled_horizon`, so the batch row records the scoring run's value. The copy gate aligns through `min_resolution_horizon_secs` in pe-service release 2 (#588). |
 | `ranker_prod_min_trl` | 20 | Production MinTRL eligibility: `MIN_TRL` in `scripts/rank_and_push.sh` → `--min-trl` in both ranking passes (pass-1 qualifying-position count `n`, pass-2 filled count `n_filled`; Python argparse defaults stay 0 = off). **The 2026-07-03 run28 cutover value** — MinTRL-20 was the single dominant fix across the run28 grid (`docs/33` §4). It REPLACES the per-month activity gates (run28's `trl20` axis has no per-month component): production passes `--min-avg-per-month 0 --min-active-months 0` alongside it (the Python defaults 20/3 apply only when the flags are omitted, i.e. research invocations). Distinct from `ranker_min_trl` (the bake-off grid's swept sentinel, below). Purge note: widening eligibility grows rule-B's protected set (fewer dead-weight deletions) and newly-eligible provable losers become rule-A tombstone candidates — both by design (`crates/bootstrap/src/purge.rs`). |
 | `ranker_fdr_q` | 0.05 | Family significance / false-coverage-rate target for the #421 bake-off harness honesty layer (`docs/31-RANKER-BAKEOFF-METHODOLOGY.md`). The canonical strategy-level significance level — the `select_winner_or_nogo` winner gate and `winner_uncertainty` FCR `top_q` now read the named constant `RANKER_FDR_Q` (issue #436 A6); the Romano-Wolf StepM, Hansen-SPA, and AKM/MRSW inference in `scripts/ranker/oos_validation.py` still take it as their own method-level `size`/`alpha` default `0.05`. Bootstrap reps/seeds and CSCV group counts are method-internal parameters, **not** glossary'd (see `oos_validation.py` header). |
 | `ranker_pbo_max` | 0.5 | Probability-of-Backtest-Overfitting ceiling in the #421 winner gate (`select_winner_or_nogo`, `scripts/ranker/bakeoff.py`): a config can only be declared WINNER when its CSCV `PBO < 0.5` (the IS-best config lands above the OOS median more often than not). Wired to the named constant `RANKER_PBO_MAX` (issue #436 A6 — it was glossary'd but the gate read a hardcoded `0.5`). A **degenerate** PBO (`NaN` from near-zero cross-config dispersion — #436 A7) fails the gate *safe* (`NaN < 0.5` is False → NO-GO). |
@@ -1220,16 +1222,16 @@ for admission, supervised resume, older-binary exclusion and manual recovery.
 | `ranker_price_fidelity_minutes` | 1 | Fidelity of the targeted ranker fill-oracle fetch (#536): `RANKER_PRICE_FIDELITY_MINUTES` in `pe_bootstrap::prices_history`. Part of the `ranker_price_pages` coverage identity — a fidelity change invalidates coverage; a code deploy (parser version, provenance-only) does not. |
 | `ranker_price_page_max_span_secs` | 80_000 | Maximum requested span per targeted `/prices-history` page (#536): safely under the measured ~1,437-point (~24 h at minute fidelity) END-anchored response cap, so silent truncation cannot occur (80,000 s → ≤ 1,334 points). Const `RANKER_PAGE_MAX_SPAN_SECS`. The endpoint also rejects spans somewhere above 14 days with HTTP 400 at any fidelity; the `interval` enum mode returns empty on resolved markets and is never used. |
 | `ranker_price_store` | `ranker_price_points` + `ranker_price_pages` | Isolated minute price-reference store for the pass-2 fill oracle (#536) — deliberately separate from `market_price_history`, whose every `source='clob'` row feeds true-CLV and the mark index. Points are write-once `(token_id, t)`; pages are an append-only validated ledger (`complete`/`empty`, full per-page provenance incl. `raw_sha256`) committed atomically with their points. Coverage = range algebra over terminal pages; a conflicting duplicate point rolls back its whole page. Written only by `pe-bootstrap prices-history --targets-csv` (cache-mutation-locked); read by `latency_shift_rerank.py` (the sole pass-2 oracle since the #536 cutover), whose binary publication gate exits 75 (supervised retry) while any needed window is un-terminal. Pass-2 also writes `oracle_outcomes.csv` (per-position provenance) and `oracle_manifest.json`, whose canonical sha256 the push stores as `ranking_batches.config_hash` with a round-trip check. |
-| `fresh_collection_json` | versions 2 and 3 | Frozen fresh acquisition identity owned by `cache_migration`: generation, preceding completed fresh generation and manifest commitment (both null for a version-2 root), exclusive start, fixed end, sorted wallet union, sorted `full_read_wallets` subset, and canonical identity digest. Version-3 successors add sorted `deferred_wallets`, `quiet_after_secs` and `repoll_period_secs`, all inside the digest. Existing version-1 and version-2 collections resume authentically. See the acquisition contract below. |
-| `activity_quiet_after_secs` | 2,592,000 | **Module const** `QUIET_AFTER_SECS` in `pe-bootstrap`'s `cache_migration.rs` (not a TOML/env key). A predecessor's newest verified aggregate must be strictly older than its fixed end minus this interval to make a completed wallet quiet. Recorded as `quiet_after_secs` in each version-3 identity. |
-| `activity_repoll_period_secs` | 604,800 | **Module const** `REPOLL_PERIOD_SECS` in `pe-bootstrap`'s `cache_migration.rs` (not a TOML/env key). Weekly polling period for quiet wallets, phased by the wallet address's low 48 bits modulo this period. Recorded as `repoll_period_secs` in each version-3 identity. |
-| `activity_coverage_manifests_v2` receipt storage | marker version 2 for new fresh collections | `cursors_json = {"receipt_storage":"activity_wallet_coverage_staging_v2","version":2}`, `page_hashes_json = []`; receipts and historical manifest commitments remain retained. Version-1 retained and authentic embedded proofs remain readable; unknown versions and downgrades fail closed. `collection_identity_json TEXT NULL` archives the completed fresh identity; `acquisition_json TEXT NULL` on wallet receipts holds version-2 read/carry proof. NULL selects authentic historical decoding only. |
+| `fresh_collection_json` | version 4 for format 3 | Frozen fresh acquisition identity owned by `cache_migration`. Identity 3's fields plus sorted unique `repair_wallets` and incoming `certified_digest`, all inside the identity digest. Identities 1–3 select historical format 2; an unfinished identity-2 root resumes its frozen contract and seals before admitting a format-3 successor. See [format 3](#history-format-3-and-classifier-6-739) and the historical acquisition contract below. |
+| `activity_quiet_after_secs` | 2,592,000 | **Module const** `QUIET_AFTER_SECS` in `pe-bootstrap`'s `cache_migration.rs` (not a TOML/env key). A predecessor's newest verified aggregate must be strictly older than its fixed end minus this interval to make a completed wallet quiet. Recorded as `quiet_after_secs` in identities 3 and 4; format 3 uses certified activity and committed receipts rather than an activity-index probe. |
+| `activity_repoll_period_secs` | 604,800 | **Module const** `REPOLL_PERIOD_SECS` in `pe-bootstrap`'s `cache_migration.rs` (not a TOML/env key). Weekly polling period for quiet wallets, phased by the wallet address's low 48 bits modulo this period. Recorded as `repoll_period_secs` in identities 3 and 4. The accepted quiet-wallet integrity gap is one week plus at most one cycle. |
+| `activity_coverage_manifests_v2` receipt storage | marker version 2 for new fresh collections | `cursors_json = {"receipt_storage":"activity_wallet_coverage_staging_v2","version":2}`, `page_hashes_json = []`; receipts and historical manifest commitments remain retained. Version-1 retained and authentic embedded proofs remain readable; unknown versions and downgrades fail closed. `collection_identity_json TEXT NULL` archives the completed fresh identity; `acquisition_json TEXT NULL` holds acquisition-3 fetched-set proof in format 3 and acquisition-2 read/carry proof in format 2. NULL selects authentic historical decoding only. |
 | `activity_scan_batch_rows` | 512 | Module const `BATCH_ROWS` in `cache_migration::aggregate_scan`. Stored rows packed into one batch for a decode worker. Batching is internal: commitments see every aggregate in stored order regardless of where batches fall (#670). |
 | `activity_scan_batch_text_bytes` | 4 MiB | Module const `BATCH_TEXT_BYTES` in `cache_migration::aggregate_scan`. A batch also ends once its packed text columns reach this size; a row wider than the bound forms its own batch. |
 | `activity_scan_outstanding_text_bytes` | 32 MiB | Module const `OUTSTANDING_TEXT_BYTES` in `cache_migration::aggregate_scan`. Packed text queued across all workers. One batch is always admitted, so unusually wide rows still make progress, alone; this is what bounds the scan's added memory. |
 | `activity_scan_workers` | `min(3, cores - 1)`, at least 1 | Module const `MAX_WORKERS` in `cache_migration::aggregate_scan`. Decode-and-serialize workers beside the reading/consuming thread, each holding at most two batches. Validation and the collection writer's carry each use one such pool. Three was the measured knee on four cores; a two-core host runs one (#670). |
 | `clob_payout_evidence_count` | recorded per walk | Column `evidence_count` on `clob_payout_coverage_manifests_v2`, written from the row count of the staging-to-evidence copy. The distinct markets a payout walk committed. A market the venue returns on more than one page is summed twice by `market_count` and stored once here, so coverage verifies against this count; `NULL` marks coverage written before the column and fails closed (#672). |
-| `ranker_classifier_version` | 3 | **Module const** `RANKER_CLASSIFIER_VERSION` in `bootstrap::cache_migration`. Generation of the derived `ranker_entries_v2` first-entry projection rebuilt from retained complete activity. Version 3: only a market's first entry consumes its history (not a sell, split, merge or redemption); an entry whose action depends on its second's order is not projected; and a wallet's projection stops at its first activity that requires a position anchor, where the live copy path waits for the anchor and continues (classifier 4, #690, closes that gap). Distinct from `CACHE_SCHEMA_VERSION_V2` (cache schema) and `FINAL_STAGE_RECORD_VERSION` (finalization receipt format), both unchanged. Newly finalized/installed candidates require the current classifier; hash-bound historical caches retain their authentic classifier generation (1 to 3 accepted), with projection rows required to match their certified state. |
+| `ranker_classifier_version` | 6 | **Module const** `RANKER_CLASSIFIER_VERSION` in `bootstrap::cache_migration`. Classifier 5's reviewed #690 rules plus #588's homogeneous pieces and cumulative scoped drops; classifier 5 never shipped. Every new finalization uses format 3 and oracle 6; `ranker_entries_v2` stays empty. Historical classifier acceptance is `1..=3 \| 6`, distinct from the unchanged cache schema and final-stage record versions. See [the classifier contract](#history-format-3-and-classifier-6-739). |
 | `bootstrap_pile_activation_min_trades` | 100 | Minimum trade count (DB `trade_count` OR Dune `dune_closed_markets`) for a non-infra wallet to be activated in the pile (issue #166). Curation-list membership (Polymarket leaderboard / 502-gap / datadash) bypasses this gate. Hardcoded as `pe_bootstrap::pile::PILE_ACTIVATION_MIN_TRADES`; changing it requires re-migrating the pile. |
 | `bootstrap_pipeline_activation_batch_wallets` | 20,000 | Maximum inactive, non-infra, non-tombstoned wallets activated by one zero-argument `rank_and_push.sh` cycle. Discovery and backfill defer the legacy global rule inside this wrapper; `activate-next` owns the single deterministic, transactionally audited batch. If fewer remain it activates all and warns; if none remain it warns and skips. Default of `BootstrapConfig::activation_batch_wallets` (`pe_bootstrap::pile::PIPELINE_ACTIVATION_BATCH_WALLETS`); `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS` overrides it, and `0` admits none (an info line, not a warning). A recorded batch reloads only under the requested count it was recorded with, so a resumed cycle keeps its value. |
 | `bootstrap_backfill_limit` | 0 (no limit) | Per-run cap on active, non-infrastructure wallets selected for `pe-bootstrap backfill`. Marked wallets are due regardless of stamp; others follow `bootstrap_backfill_staleness_secs`. Zero-argument loop cycles use 0; a positive value bounds an ad-hoc run. Set via `PE_BOOTSTRAP_BACKFILL_LIMIT`. |
@@ -1251,9 +1253,176 @@ for admission, supervised resume, older-binary exclusion and manual recovery.
 | `bootstrap_datadash_exclude_titles` | `["Polymarket Twitter/X Linked Traders"]` | datadash cohort titles excluded from ingest, matched **exactly** (issue #365). Default drops `Polymarket Twitter/X Linked Traders` while keeping the distinct `Polymarket Twitter/X Linked with PnL >$100k` cohort. Set via `PE_BOOTSTRAP_DATADASH_EXCLUDE_TITLES` (TOML array of titles). |
 | `bootstrap_datadash_max_cohort_wallets` | 10_000 | Magnitude cap: any datadash cohort whose advertised `numWallets` exceeds this is skipped with a `warn!` before its wallets are fetched (issue #365). Belt-and-braces safety net so a recreated/misnamed mega-cohort cannot flood the pile even if the id/title guards drift (largest legitimate cohort is currently 706). Set via `PE_BOOTSTRAP_DATADASH_MAX_COHORT_WALLETS`. |
 
+#### History format 3 and classifier 6 (#739)
+
+History format is independent of cache `user_version`: format 3 uses collection identity 4,
+acquisition 3 and export manifest 3, with cache schema two and activity schema/parser two unchanged.
+Identities 1–3 remain format 2. Old readers refuse the new identity, acquisition and export versions.
+New bulk roots start in format 3; an unfinished identity-2 root seals under acquisition 2 and then
+admits its ordinary successor before classifier-6 finalization, regardless of head freshness.
+The transition runs inside the first format-3 admission, not a separate migration command.
+
+Identity 4 extends identity 3 with `repair_wallets` (sorted unique explicit full-read selections)
+and `certified_digest` (the certificate table's incoming SHA-256). Its digest uses the existing
+canonical identity encoding. A root has null `base_generation` and `base_manifest_sha256`,
+`start_exclusive=0`, `deferred_wallets=[]`, the canonical quiet/repoll constants and every wallet
+full-read; a new root binds the empty certificate table's digest.
+
+**Certified history.** `activity_wallet_history_v3` has eight columns: `wallet_hex` (primary key),
+`generation`, nullable `newest_source_unix` and `newest_trade_unix`, `aggregate_count`,
+`source_row_count`, `ordered_digest` and `scope_drops_json`. The history digest is the existing
+typed-aggregate JSON-array digest over `(source_time_unix, source_trade_id)` order. Recency comes
+from verified decoded aggregates, never the `activity_type` or `coverage_generation` mirrors.
+The latter retains insertion provenance; incremental reads insert only fetched rows, with no carry
+or re-stamping. Certificates at the finalized head alone supply available-history counts, newest
+TRADE times, publisher freshness, eligibility, entry stamps and drops. Older deferred/excluded
+certificates retain audit evidence and cumulative drops but supply none of those publication inputs.
+
+`scope_drops_json` is compact JSON text: an array of objects with keys `cause`, `dropped_at_unix`,
+`scope_id`, `scope_kind`, sorted keys and elements in `(scope_kind, scope_id)` wire-string order;
+`[]` means no drops. The certificate digest is `JsonArrayDigest` over every eight-column row in
+`wallet_hex` order, as UTF-8 compact JSON with sorted keys, JSON-number integers, null for NULL and
+`scope_drops_json` as its stored text (a JSON string). Before finalize, phase checks compare with
+identity 4's incoming `certified_digest`; after finalize they compare with `certificate_digest`
+in `ranker_projection_inputs_json`. Each check runs once per stable proof and is reused only while
+data-version checks prove no outside write. Receipts and manifests authenticate through their sealed
+commitments; an advanced certificate never regenerates an acquisition's predecessor.
+
+The receipt-chain verifier owns effective history: the certificate (or latest committed complete
+full receipt when uncertified) plus later committed receipts. The latest complete full read or
+explicit repair supersedes earlier history; a failed repair supersedes it with empty history.
+Other failed, excluded and deferred receipts authenticate audit records without resetting the chain.
+Acquisition-3 receipt counts/digest describe the fetched set; `predecessor` is its immutable certified
+history snapshot. The manifest's `aggregate_digest` commits the ordered receipts' fetched digests;
+`receipt_set_digest` keeps its encoding. An unchanged automatic full read writes only a receipt;
+a differing full read verifies stored history before replacing it. Every non-deferral failed
+acquisition with retained history verifies that history inside its exclusion transaction, except
+an explicit repair, which logs stored/certified digests and replaces even on acquisition failure.
+
+Admission's atomic transition verifies the format-2 predecessor and certifies complete wallets,
+including empty histories. An excluded wallet with an authenticated earlier complete receipt is
+certified with unknown newest times; a proofless exclusion must have no retained rows and stays
+uncertified. Both next read in full. Later admissions read certificates and receipts, not history
+rows. A deferred predecessor stays quiet; committed rows since certification make a wallet active;
+otherwise the quiet decision uses certified newest activity and the canonical weekly rule below.
+Finalize verifies every available wallet's whole effective history once before classification and
+replaces its certificate in the finalize transaction. Availability means a complete, non-excluded
+head receipt, even with no fetched rows. Deferral postpones its check to the weekly due read.
+
+**Connection-local write authorization.** `BEFORE INSERT/UPDATE/DELETE` triggers guard
+`activity_groups_v2`, `activity_wallet_coverage_staging_v2`, `activity_coverage_manifests_v2`,
+`activity_wallet_history_v3` and `cache_v2_migration_state`. They require
+`pe_history_write_authorized()` to return true. The bootstrap registers a default-deny function
+whose connection-local flag opens only inside its owning admission, collector, certification or
+finalize transaction. Other SQL connections fail closed; a SQL-visible flag cannot authorize them.
+Schema verification checks trigger SQL. Deliberately registering the function or replacing the
+schema is outside this guard. Legacy frozen verification refuses identity 4 before its first write.
+
+**Projection spool.** `<candidate>.projection-v3.jsonl` is beside the candidate, one compact UTF-8
+JSON object per newline-terminated line, keys sorted, integers as numbers and NULL as null
+(Python `ensure_ascii=False`). Rows are ordered by `(wallet_hex, source_time_unix, source_trade_id)`
+and have exactly these fourteen keys: `activity_generation`, `asset`, `classifier_version`,
+`condition_id`, `end_date_unix`, `outcome_id`, `payout_vector_json`,
+`price_weighted_share_amount_str`, `share_amount_str`, `side`, `source_time_unix`,
+`source_trade_id`, `source_usdc_amount_str`, `wallet_hex`. Fields come from verified aggregates,
+with token-verified outcome and the certifying head as `activity_generation`. Projection count is
+the row count; its `JsonArrayDigest` is SHA-256 of `[` + comma-joined row JSON + `]`.
+
+Finalize publishes the streamed spool by temporary file, sync, rename and parent sync before its
+transaction commits. A rebuild deletes uncommitted/temporary spools first. Committed reuse leaves
+the spool intact; every reader checks size and SHA-256 before reading. Missing or altered committed
+spools fail closed and require pre-prepare abandonment/restaging, not regeneration. Retirement and
+guarded pre-prepare abandonment delete the spool; a retained request keeps it. No later stage needs
+a retired spool. Format 3 writes no marker projection and performs no marker/activity join digest.
+
+`ranker_projection_inputs_json` keeps its existing keys and adds `oracle_version=6`,
+`projection_spool={path_name,size_bytes,lines,sha256}` (`path_name` is a filename only) and finalized
+`certificate_digest`. The payout digest covers `market_id`, `end_date_unix`, `payout_status`,
+`payout_vector_json`, `tokens_json`, `raw_page_sha256`, `neg_risk_market_id`. The group column is
+`neg_risk_market_id TEXT NULL` on `clob_payout_evidence_staging_v2` and `clob_payout_evidence_v2`;
+coverage requires `group_version=1` for classifier 6 (NULL identifies older coverage). The bound payout map owns market/group lookup,
+token-to-market lookup from `tokens_json` and the distinct non-NULL group-id set; neither
+`market_events` nor mutable `token_conditions` supplies scopes.
+
+Export manifest 3 uses `activity_scope="projection_spool"`, `tables` with payout-table and
+`projection` count/sha256 records, and `projection={count,digest,classifier_version,oracle_version,
+activity_generation,spool_sha256}`. Export writes compact Parquet from the spool, recomputes count
+and digest from Parquet and writes the manifest last. Re-finalize takes `--export-manifest <path>`
+alongside `--stage-record`, checks the bound export summary, certificates, spool and sealed records,
+then hashes the checkpointed candidate without another history/projection scan. Its stage record
+binds the export manifest's SHA-256 and summary; activation and interrupted restore use that summary.
+
+**Classifier 6.** `position-ledger::classify_scoped_second` owns the scoped-second rule; bootstrap
+calls `classify_scoped_historical_second`, which owns default signal configuration and complete
+history and selects `SameSecondEntryPolicy::HomogeneousPieces`. pe-service release 2 coordinates
+on [#588](https://github.com/sppburke/prediction-markets/issues/588). The existing historical entry
+point retains its behavior. Same-wallet/market/second/outcome homogeneous BUY pieces count once
+(minimum `source_trade_id`), with every piece applied and consuming. Mixed outcomes remain ambiguous.
+
+`ScopeKind` wire strings are `event` and `market`; `Scope.id` is canonical lowercase `0x` hex.
+An event scope is a neg-risk group, not a Gamma event. `DropCause` has exactly seven wire strings:
+
+| Cause | Scope |
+|---|---|
+| `conversion` | Resolved neg-risk event group, otherwise market |
+| `order_dependent` | Resolved market |
+| `overflow` | Resolved market |
+| `underflow` | Resolved market |
+| `unknown_condition` | Resolved market for a redemption needing an unknown anchor |
+| `unknown_type` | Resolved neg-risk event group, otherwise market |
+| `unmapped` | Resolved market for an invalid mapping or non-canonical effective position id |
+
+Scope resolution normalizes `\x` to `0x` and lowercases for lookup only, trying group id, market
+condition id, then token's market. Market causes do not use a group-id match. Conversion/unknown-type
+uses a direct group or the resolved market's group, otherwise that market. A problem resolving to
+neither group nor market is ignored, not applied or consuming, and counted by activity type.
+Raw-only mappings take precedence: zero-share, combo and non-position effects stay raw-only;
+a positive token-less TRADE is ignored/counted with no balance, consumption or homogeneity effect.
+Zero-share REDEEM retains `RequiresAnchor`: a known pre-second condition is a no-op, otherwise
+`unknown_condition`. Acquisition 3's bootstrap-only semantic reader keeps rows whose only defect
+is a missing condition id or token; public strict service readers and acquisition 2 retain their
+acceptance. Effective TRADE/REDEEM/SPLIT/MERGE ids outside canonical lowercase `0x` hex are `unmapped`.
+
+The shared function sorts by source ID, partitions remaining mutations with `mutation_components`
+and reuses repaired-proof validity. A singleton underflow/overflow records that cause; other failing
+components record `order_dependent` using their first input mutation. A **problem second** has a
+certified drop starting then or a new resolvable problem: nothing in it is scored, all newly/already
+dropped scopes are excluded from application, other valid scopes still apply, and every effective
+BUY consumes its market, including BUYs in dropped scopes and markets with no payout evidence.
+The caller uses `apply_all_or_none` for returned mutations (failure is a bug and fails closed),
+extends BUY history from `consumed` and retains `dropped` across seconds. Earlier scored entries stay.
+Later activity in a dropped scope never applies or scores; effective BUYs still consume.
+An event drop covers every market with that group, including markets named after the drop.
+Problems resolving to an already dropped scope are ignored silently, without a new trigger/count.
+`classify_complete_second` decides over `apply` only, per market across the whole second, so separate
+arithmetic components never make opposite-outcome first BUYs homogeneous. The scoped function keeps
+the caller's consumed-market lookup, reconstruction quality, signal configuration and history
+completeness; output is independent of record order.
+
+Drops are cumulative per wallet and include their starting second. Certificates keep the earliest
+`dropped_at_unix` and cause per scope; a tie chooses the smallest `(trigger source_trade_id, cause)`
+in wire order, retaining an already certified cause on a tied second. Deferral, exclusion, replacement
+and repair never remove a drop, even if the source removes its trigger. A certified starting second
+remains a problem second without the trigger. Digest, decoding and chain failures remain cycle-fatal
+integrity failures, not scope drops. The consumed-market lookup remains necessary at zero balance:
+BUY → SELL → BUY cannot reopen first-entry eligibility.
+
+**Publication.** Version-1 request envelopes keep their shape: the batch adds `classifier_version`,
+entries add `history_through_unix` (head receipt's `fixed_end_unix`) and their certificate's
+`scope_drops`. Publication flattens drops to `p_scope_drops` rows with `wallet_hex`, `scope_kind`,
+`scope_id`, `dropped_at_unix`, `cause`, ordered by `(wallet_hex, scope_kind, scope_id)`, and calls
+`publish_ranking_batch_v2(p_publish_key,p_batch,p_entries,p_scope_drops)`. Batch, entries and drops
+commit in one count-checked idempotent transaction. Earlier batches retain NULL classifier/coverage
+fields. The five batch limits come from the validated oracle manifest; integer limits must be finite,
+integral and PostgreSQL-integer-sized (an integral `2.0` becomes JSON integer `2`, never rounded).
+The shared authenticated request loader still supports historical envelopes for retention; publication
+refuses requests missing `classifier_version` before RPC. The prior release owns pre-release requests.
+
 #### Complete activity generations and incremental acquisition (#648)
 
-New fresh collections keep cache storage, activity schema/parser and classifier versions unchanged.
+The following is the historical **format-2** acquisition contract. New collections use
+[format 3](#history-format-3-and-classifier-6-739); format-2 cache storage and activity schema/parser
+versions remain readable unchanged.
 A root retains the identity `{version:2,generation:N,base_generation:B,base_manifest_sha256:H,
 start_exclusive:E1,fixed_end_unix:E2,wallets:[…],full_read_wallets:[…],digest:D}`. New successors
 use version 3, adding `deferred_wallets:[…]`, `quiet_after_secs:Q` and `repoll_period_secs:R`
