@@ -4428,10 +4428,13 @@ impl BucketCommitEngine {
     ///
     /// Connection ownership makes this safe: the only production caller is the boot bracket's
     /// `commit_direct`, under the engine lock before producers start; `begin_batch` therefore has
-    /// that single production caller and batches never nest. The sole boot-path paper-state write
-    /// outside that lock, `mark_seeded_history_validated`, runs after every bracket completes. A
-    /// failed `ROLLBACK` surfaces as the bracket error, and the next `BEGIN IMMEDIATE` then fails,
-    /// so boot fails closed instead of committing partial state.
+    /// that single production caller and batches never nest. Identity-cache inserts, corrupt-row
+    /// deletions and condition rejection markers commit in separate transactions: their writer
+    /// checks autocommit under the connection mutex, releases it and asynchronously waits while
+    /// this batch is open. They cannot join a batch because bracket rollback must not erase an
+    /// acknowledged identity or rejection. `mark_seeded_history_validated` runs after every bracket
+    /// completes. A failed `ROLLBACK` surfaces as the bracket error, and the next `BEGIN IMMEDIATE`
+    /// then fails, so boot fails closed instead of committing partial state.
     pub fn commit_batch<T>(
         &mut self,
         f: impl FnOnce(&mut Self) -> Result<T, BucketCommitError>,

@@ -30,7 +30,7 @@
 mod migration;
 mod schema;
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::{Mutex, PoisonError};
@@ -42,8 +42,9 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use pe_core_types::{
-    CollateralAmount, EventSeq, MarketId, OutcomeId, Price, ShareAmount, Side, SourceTradeId,
-    SourceTradeIdentityVersion, VenueMarketId, WalletAddress,
+    CollateralAmount, EventSeq, MarketId, OutcomeId, PolymarketConditionId, PolymarketTokenId,
+    Price, ShareAmount, Side, SourceTradeId, SourceTradeIdentityVersion, VenueMarketId,
+    WalletAddress,
 };
 use pe_event_log::AppendReceipt;
 
@@ -84,6 +85,9 @@ pub enum PaperStateError {
     /// An internal invariant was violated (e.g. a poisoned lock or arithmetic overflow).
     #[error("internal invariant violated: {0}")]
     Internal(String),
+    /// Identity mutations must wait for the caller-owned activity batch to end.
+    #[error("identity mutation requires an autocommit connection")]
+    IdentityBatchOpen,
     /// Filesystem synchronization failed while persisting boot metadata.
     #[error("paper-state synchronization failed: {0}")]
     Synchronization(#[from] std::io::Error),
@@ -769,6 +773,25 @@ pub struct DispatchTargetRow {
     pub updated_at_unix: i64,
 }
 
+/// Maximum rows in one identity-cache insert, matching the Gamma token batch default.
+pub const ASSET_IDENTITY_INSERT_LIMIT: usize = 50;
+
+/// Cached identity columns and original provenance; the service authenticates them on restore.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AssetIdentityRow {
+    pub token: PolymarketTokenId,
+    pub condition_id: PolymarketConditionId,
+    pub outcome: i64,
+    pub source_log_sequence: i64,
+    pub canonical_page_hash: String,
+}
+
+const ASSET_IDENTITY_LOOKUP: &str = "SELECT token, condition_id, outcome, source_log_sequence, canonical_page_hash \
+     FROM asset_identities WHERE generation = ?1 AND token IN (SELECT value FROM json_each(?2))";
+
+const ASSET_IDENTITY_CONDITION_LOOKUP: &str = "SELECT token, condition_id, outcome, source_log_sequence, canonical_page_hash FROM asset_identities \
+     WHERE generation = ?1 AND condition_id IN (SELECT value FROM json_each(?2))";
+
 /// Crash-safe SQLite mirror. Cheap to share behind an `Arc`; all methods take `&self`.
 pub struct PaperStateDb {
     conn: Mutex<Connection>,
@@ -916,6 +939,143 @@ impl PaperStateDb {
     /// Roll back the caller-owned activity-bucket batch.
     pub fn rollback_batch(&self) -> Result<(), PaperStateError> {
         self.lock().execute_batch("ROLLBACK")?;
+        Ok(())
+    }
+
+    /// Fetch only the requested tokens through the generation/token primary-key index.
+    pub fn asset_identities(
+        &self,
+        generation: &str,
+        tokens: &[PolymarketTokenId],
+    ) -> Result<Vec<AssetIdentityRow>, PaperStateError> {
+        self.query_asset_identities(generation, ASSET_IDENTITY_LOOKUP, tokens)
+    }
+
+    /// Fetch saved evidence for only these conditions through the condition/outcome index.
+    pub fn asset_identities_by_condition(
+        &self,
+        generation: &str,
+        conditions: &BTreeSet<String>,
+    ) -> Result<Vec<AssetIdentityRow>, PaperStateError> {
+        self.query_asset_identities(generation, ASSET_IDENTITY_CONDITION_LOOKUP, conditions)
+    }
+
+    fn query_asset_identities(
+        &self,
+        generation: &str,
+        query: &str,
+        keys: &(impl Serialize + ?Sized),
+    ) -> Result<Vec<AssetIdentityRow>, PaperStateError> {
+        let keys = serde_json::to_string(keys)?;
+        let conn = self.lock();
+        let mut statement = conn.prepare(query)?;
+        statement
+            .query_map(params![generation, keys], |row| {
+                Ok(AssetIdentityRow {
+                    token: PolymarketTokenId(row.get(0)?),
+                    condition_id: PolymarketConditionId(row.get(1)?),
+                    outcome: row.get(2)?,
+                    source_log_sequence: row.get(3)?,
+                    canonical_page_hash: row.get(4)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(PaperStateError::from)
+    }
+
+    /// Point lookup of a condition's monotonic rejection, independent of its token rows.
+    pub fn asset_identity_condition_rejection(
+        &self,
+        generation: &str,
+        condition: &str,
+    ) -> Result<Option<i64>, PaperStateError> {
+        self.lock()
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                [format!("rejected_asset_condition:{generation}:{condition}")],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(PaperStateError::from)
+    }
+
+    /// Commit verified rows independently, retaining their original provenance.
+    pub fn insert_asset_identities(
+        &self,
+        generation: &str,
+        identities: &[AssetIdentityRow],
+    ) -> Result<(), PaperStateError> {
+        self.save_asset_identities(generation, identities, &BTreeMap::new())
+    }
+
+    /// Commit rows and their condition rejections together; never join an activity batch.
+    /// The async resolver retries `IdentityBatchOpen` after releasing this method's mutex.
+    pub fn save_asset_identities(
+        &self,
+        generation: &str,
+        identities: &[AssetIdentityRow],
+        rejections: &BTreeMap<String, i64>,
+    ) -> Result<(), PaperStateError> {
+        Self::check_identity_mutation_bound(identities.len())?;
+        let mut conn = self.lock();
+        Self::require_identity_autocommit(&conn)?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO asset_identities \
+             (generation, token, condition_id, outcome, source_log_sequence, canonical_page_hash) \
+             SELECT ?1, json_extract(value, '$.token'), json_extract(value, '$.condition_id'), \
+             json_extract(value, '$.outcome'), \
+             json_extract(value, '$.source_log_sequence'), json_extract(value, '$.canonical_page_hash') \
+             FROM json_each(?2) WHERE true \
+             ON CONFLICT(generation, token) DO NOTHING",
+            params![generation, serde_json::to_string(identities)?],
+        )?;
+        let rejections = rejections.iter().collect::<Vec<_>>();
+        for chunk in rejections.chunks(ASSET_IDENTITY_INSERT_LIMIT) {
+            tx.execute(
+                "INSERT INTO meta (key, value) \
+                 SELECT 'rejected_asset_condition:' || ?1 || ':' || json_extract(value, '$[0]'), \
+                 json_extract(value, '$[1]') FROM json_each(?2) WHERE true \
+                 ON CONFLICT(key) DO NOTHING",
+                params![generation, serde_json::to_string(chunk)?],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Remove unauthenticated rows independently; rejected conditions remain recorded.
+    pub fn delete_asset_identities(
+        &self,
+        generation: &str,
+        tokens: &[PolymarketTokenId],
+    ) -> Result<(), PaperStateError> {
+        Self::check_identity_mutation_bound(tokens.len())?;
+        let mut conn = self.lock();
+        Self::require_identity_autocommit(&conn)?;
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM asset_identities WHERE generation = ?1 \
+             AND token IN (SELECT value FROM json_each(?2))",
+            params![generation, serde_json::to_string(tokens)?],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn check_identity_mutation_bound(rows: usize) -> Result<(), PaperStateError> {
+        if rows > ASSET_IDENTITY_INSERT_LIMIT {
+            return Err(PaperStateError::Internal(format!(
+                "identity mutation exceeds {ASSET_IDENTITY_INSERT_LIMIT} rows"
+            )));
+        }
+        Ok(())
+    }
+
+    fn require_identity_autocommit(conn: &Connection) -> Result<(), PaperStateError> {
+        if !conn.is_autocommit() {
+            return Err(PaperStateError::IdentityBatchOpen);
+        }
         Ok(())
     }
 
@@ -6300,6 +6460,293 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db = PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap();
         (dir, db)
+    }
+
+    fn asset_identity_row(token: &str, condition: &str) -> AssetIdentityRow {
+        AssetIdentityRow {
+            token: PolymarketTokenId(token.to_owned()),
+            condition_id: PolymarketConditionId(condition.to_owned()),
+            outcome: 0,
+            source_log_sequence: 7,
+            canonical_page_hash: "a".repeat(64),
+        }
+    }
+
+    #[test]
+    fn asset_identities_lookup_is_indexed_and_requested_only() {
+        let (_dir, db) = db();
+        let rows = [
+            asset_identity_row("token-a", "a"),
+            asset_identity_row("token-b", "b"),
+        ];
+        db.insert_asset_identities("generation", &rows).unwrap();
+        let mut requested = (0..35_000)
+            .map(|index| PolymarketTokenId(format!("missing-{index}")))
+            .collect::<Vec<_>>();
+        requested.push(rows[0].token.clone());
+        assert_eq!(
+            db.asset_identities("generation", &requested).unwrap(),
+            [rows[0].clone()]
+        );
+        assert!(db.asset_identities("generation", &[]).unwrap().is_empty());
+        let query = format!("EXPLAIN QUERY PLAN {ASSET_IDENTITY_LOOKUP}");
+        let conn = db.lock();
+        let plan = conn
+            .prepare(&query)
+            .unwrap()
+            .query_map(
+                params!["generation", serde_json::to_string(&requested).unwrap()],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(
+                |detail| detail.contains("SEARCH asset_identities USING INDEX")
+                    && detail.contains("generation=? AND token=?")
+            ),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn asset_identities_condition_lookup_is_indexed_and_requested_only() {
+        let (_dir, db) = db();
+        let mut sibling = asset_identity_row("token-b", "condition");
+        sibling.outcome = 1;
+        let rows = [
+            asset_identity_row("token-a", "condition"),
+            sibling,
+            asset_identity_row("token-c", "other"),
+        ];
+        db.insert_asset_identities("generation", &rows).unwrap();
+        let conditions = BTreeSet::from(["condition".to_owned()]);
+        assert_eq!(
+            db.asset_identities_by_condition("generation", &conditions)
+                .unwrap(),
+            rows[..2]
+        );
+        assert!(
+            db.asset_identities_by_condition("foreign", &conditions)
+                .unwrap()
+                .is_empty()
+        );
+        let query = format!("EXPLAIN QUERY PLAN {ASSET_IDENTITY_CONDITION_LOOKUP}");
+        let conn = db.lock();
+        let plan = conn
+            .prepare(&query)
+            .unwrap()
+            .query_map(
+                params!["generation", serde_json::to_string(&conditions).unwrap()],
+                |row| row.get::<_, String>(3),
+            )
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|detail| detail.contains(
+                "SEARCH asset_identities USING INDEX idx_asset_identities_condition_outcome"
+            ) && detail.contains("generation=? AND condition_id=?")),
+            "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn asset_identities_foreign_generation_does_not_block_insert() {
+        let (_dir, db) = db();
+        let old = asset_identity_row("token-a", "old");
+        let current = asset_identity_row("token-a", "current");
+        db.insert_asset_identities("old", std::slice::from_ref(&old))
+            .unwrap();
+        assert!(
+            db.asset_identities("current", std::slice::from_ref(&old.token))
+                .unwrap()
+                .is_empty()
+        );
+        db.insert_asset_identities("current", std::slice::from_ref(&current))
+            .unwrap();
+        assert_eq!(
+            db.asset_identities("old", std::slice::from_ref(&old.token))
+                .unwrap(),
+            [old]
+        );
+        assert_eq!(
+            db.asset_identities("current", std::slice::from_ref(&current.token))
+                .unwrap(),
+            [current]
+        );
+    }
+
+    #[test]
+    fn asset_identities_rejection_markers_are_independent_and_preserve_other_generation() {
+        let (_dir, db) = db();
+        let old = asset_identity_row("token-a", "condition-c");
+        let mut incoming = old.clone();
+        incoming.condition_id.0 = "condition-d".into();
+        for generation in ["old", "current"] {
+            db.insert_asset_identities(generation, std::slice::from_ref(&old))
+                .unwrap();
+        }
+        let rejections =
+            BTreeMap::from([("condition-c".to_owned(), 8), ("condition-d".to_owned(), 8)]);
+        db.save_asset_identities("current", &[incoming], &rejections)
+            .unwrap();
+        for condition in rejections.keys() {
+            assert_eq!(
+                db.asset_identity_condition_rejection("current", condition)
+                    .unwrap(),
+                Some(8)
+            );
+            assert_eq!(
+                db.asset_identity_condition_rejection("old", condition)
+                    .unwrap(),
+                None
+            );
+        }
+        // The duplicate token retains its original row; D's marker exists without any D row.
+        assert_eq!(
+            db.asset_identities("current", std::slice::from_ref(&old.token))
+                .unwrap(),
+            std::slice::from_ref(&old)
+        );
+        db.save_asset_identities("current", &[], &BTreeMap::from([("condition-d".into(), 9)]))
+            .unwrap();
+        db.delete_asset_identities("current", &[old.token]).unwrap();
+        assert_eq!(
+            db.asset_identity_condition_rejection("current", "condition-d")
+                .unwrap(),
+            Some(8)
+        );
+        assert_eq!(
+            db.asset_identity_condition_rejection("current", "condition-c")
+                .unwrap(),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn asset_identities_rows_and_rejection_markers_commit_atomically() {
+        let (_dir, db) = db();
+        db.lock()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_identity_rejection BEFORE INSERT ON meta \
+             WHEN NEW.key LIKE 'rejected_asset_condition:%' \
+             BEGIN SELECT RAISE(ABORT, 'injected marker failure'); END;",
+            )
+            .unwrap();
+        let row = asset_identity_row("token-a", "condition");
+        let rejections = BTreeMap::from([("condition".to_owned(), 8)]);
+        assert!(
+            db.save_asset_identities("generation", std::slice::from_ref(&row), &rejections)
+                .is_err()
+        );
+        assert!(
+            db.asset_identities("generation", std::slice::from_ref(&row.token))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.asset_identity_condition_rejection("generation", "condition")
+                .unwrap(),
+            None
+        );
+        db.lock()
+            .execute_batch("DROP TRIGGER fail_identity_rejection")
+            .unwrap();
+        db.save_asset_identities("generation", std::slice::from_ref(&row), &rejections)
+            .unwrap();
+        assert_eq!(
+            db.asset_identities("generation", std::slice::from_ref(&row.token))
+                .unwrap(),
+            [row]
+        );
+        assert_eq!(
+            db.asset_identity_condition_rejection("generation", "condition")
+                .unwrap(),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn asset_identities_mutations_refuse_batches_and_preserve_original_provenance() {
+        let (dir, db) = db();
+        let observer = Connection::open(dir.path().join("paper_state.db")).unwrap();
+        let count = || {
+            observer
+                .query_row("SELECT COUNT(*) FROM asset_identities", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+        let rows = [
+            asset_identity_row("token-a", "a"),
+            asset_identity_row("token-b", "b"),
+        ];
+        let tokens = rows.iter().map(|row| row.token.clone()).collect::<Vec<_>>();
+        let rejections = BTreeMap::from([("a".to_owned(), 8)]);
+        db.begin_batch().unwrap();
+        assert!(matches!(
+            db.insert_asset_identities("generation", &rows),
+            Err(PaperStateError::IdentityBatchOpen)
+        ));
+        assert!(matches!(
+            db.delete_asset_identities("generation", &tokens),
+            Err(PaperStateError::IdentityBatchOpen)
+        ));
+        assert!(matches!(
+            db.save_asset_identities("generation", &rows, &rejections),
+            Err(PaperStateError::IdentityBatchOpen)
+        ));
+        assert_eq!(count(), 0);
+        assert_eq!(
+            db.asset_identity_condition_rejection("generation", "a")
+                .unwrap(),
+            None
+        );
+        db.rollback_batch().unwrap();
+        db.insert_asset_identities("generation", &rows).unwrap();
+        assert_eq!(count(), 2);
+        db.begin_batch().unwrap();
+        assert!(db.delete_asset_identities("generation", &tokens).is_err());
+        assert!(
+            db.save_asset_identities("generation", &[], &rejections)
+                .is_err()
+        );
+        db.rollback_batch().unwrap();
+        let mut replacement = rows[0].clone();
+        replacement.source_log_sequence = 999;
+        replacement.canonical_page_hash = "b".repeat(64);
+        db.insert_asset_identities("generation", &[replacement])
+            .unwrap();
+        assert_eq!(db.asset_identities("generation", &tokens).unwrap(), rows);
+        db.save_asset_identities("generation", &[], &rejections)
+            .unwrap();
+        assert_eq!(db.asset_identities("generation", &tokens).unwrap(), rows);
+        db.delete_asset_identities("generation", &tokens).unwrap();
+        assert_eq!(count(), 0);
+        assert_eq!(
+            db.asset_identity_condition_rejection("generation", "a")
+                .unwrap(),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn asset_identities_insert_is_bounded() {
+        let (_dir, db) = db();
+        let rows = (0..ASSET_IDENTITY_INSERT_LIMIT)
+            .map(|index| {
+                asset_identity_row(&format!("token-{index}"), &format!("condition-{index}"))
+            })
+            .collect::<Vec<_>>();
+        db.insert_asset_identities("generation", &rows).unwrap();
+        let mut oversized = rows;
+        oversized.push(asset_identity_row("overflow", "overflow"));
+        assert!(matches!(
+            db.insert_asset_identities("generation", &oversized),
+            Err(PaperStateError::Internal(_))
+        ));
     }
 
     fn wallet() -> WalletAddress {

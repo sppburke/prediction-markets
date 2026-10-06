@@ -15,7 +15,7 @@ use pe_core_types::{PolymarketConditionId, ReceivedAt, SourceId, SourceTimestamp
 use pe_event_log::{ContentType, EnvelopeIn, Scanner};
 use pe_execution_core::LiveJournal;
 use pe_paper_state::{MigrationMetadata, MigrationPhase, PaperStateDb};
-use pe_service::asset_identity::AssetIdentityResolver;
+use pe_service::asset_identity::{AssetIdentityResolver, installed_identity_generation};
 use pe_service::bucket_commit::BucketCommitEngine;
 use pe_service::config::{self as service_config, ServiceConfig};
 use pe_service::paper_migration::{
@@ -912,12 +912,28 @@ async fn main() -> Result<()> {
         None => pe_service::source_event_sink::SourceEventSink::open(&cfg.source_event_log_path)
             .context("open boot source-log recorder")?,
     }));
-    let asset_identity = Arc::new(AssetIdentityResolver::new(
+    let identity_generation = MigrationMetadata::read(&migration_boot.active_main)
+        .context("read migration metadata for the identity cache")?
+        .as_ref()
+        .map(installed_identity_generation)
+        .transpose()?
+        .flatten();
+    let mut asset_identity = AssetIdentityResolver::new(
         position_fetcher.clone(),
         cfg.gamma_base_url.clone(),
         GAMMA_BATCH_SIZE,
         Arc::clone(&boot_source_log),
-    ));
+    );
+    if let Some(generation) = identity_generation {
+        let receipts = match source_log_boot.as_ref() {
+            Some(boot) => boot.receipt_index(),
+            None => pe_service::risk_inputs::SourceReceiptIndex::replay(&cfg.source_event_log_path)
+                .context("build identity cache source receipt index")?,
+        };
+        asset_identity =
+            asset_identity.with_paper_state(Arc::clone(&paper_state), generation, receipts);
+    }
+    let asset_identity = Arc::new(asset_identity);
     let boot_position_validator = if migration_boot.session.is_some() {
         CausalPositionValidator::new_recording(
             position_fetcher.clone(),
@@ -1031,6 +1047,8 @@ async fn main() -> Result<()> {
         }
     };
 
+    asset_identity.release_indexed_boot_pages().await;
+
     let complete_history = paper_state
         .complete_history_wallets()
         .context("reload durable history completeness after boot brackets")?;
@@ -1103,10 +1121,8 @@ async fn main() -> Result<()> {
         "position validation requires installed migration metadata, found {}",
         installed_migration.phase
     );
-    let _activation = installed_migration
-        .activation_tails
-        .as_ref()
-        .context("installed migration metadata omitted activation tails")?;
+    let identity_generation = installed_identity_generation(&installed_migration)?
+        .context("installed migration metadata omitted identity generation")?;
     if exit_after_anchors {
         info!("boot anchors prepared; exiting before runtime writers and listeners");
         return Ok(());
@@ -1180,6 +1196,13 @@ async fn main() -> Result<()> {
         None => pe_service::risk_inputs::SourceReceiptIndex::replay(&cfg.source_event_log_path)
             .context("build verified source receipt index")?,
     };
+    asset_identity
+        .install_paper_state(
+            Arc::clone(&paper_state),
+            identity_generation,
+            source_receipts.clone(),
+        )
+        .await;
     if financial_start.is_none() {
         pe_service::bucket_commit::validate_frame_history(&paper_state, &source_receipts)
             .context("validate complete frame history before resume")?;
