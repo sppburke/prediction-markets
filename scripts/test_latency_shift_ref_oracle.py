@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import csv
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -20,6 +21,8 @@ from pathlib import Path
 from unittest import mock
 
 SCRIPT = Path(__file__).with_name("latency_shift_rerank.py")
+sys.path.insert(0, str(SCRIPT.parent))
+from latency_shift_rerank import ORACLE_VERSION  # noqa: E402
 
 SHIFT = 2
 WINDOW = 120
@@ -64,6 +67,118 @@ POSITIONS_HEADER = [
 W1 = "0x" + "1" * 40
 ENTRIES = [1_000_000, 1_050_000, 1_100_000]  # three first-buys, market 0xm outcome 0
 RESOLVED_AT = 1_200_000
+
+
+def schema_two_tokens(con, yes_tokens: dict[str, str]) -> None:
+    """Schema two maps outcomes through each market's payout evidence token list;
+    outcome 0 of every market here is its given token."""
+    con.execute("CREATE TABLE clob_payout_evidence_v2 (market_id TEXT PRIMARY KEY, tokens_json TEXT NOT NULL)")
+    for market, token in yes_tokens.items():
+        con.execute("INSERT INTO clob_payout_evidence_v2 VALUES (?, ?)",
+                    (market, json.dumps([{"token_id": token}, {"token_id": token + "-no"}])))
+
+
+class TokenAuthority(unittest.TestCase):
+    def test_oracle_six_identity(self):
+        self.assertEqual(ORACLE_VERSION, 6)
+
+    def test_schema_two_maps_through_payout_evidence(self):
+        """PASS: schema two takes a pair's token from the payout evidence even when
+        token_conditions holds a stale order; schema one keeps token_conditions (#690)."""
+        from latency_shift_rerank import map_pair_tokens
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "tokens.db")
+            con = sqlite3.connect(db)
+            con.executescript(FIXTURE_DDL)
+            con.execute("INSERT INTO token_conditions VALUES ('STALE', '0xm', 1, 0)")
+            schema_two_tokens(con, {"0xm": "TOK"})
+            pairs = [("0xm", "0"), ("0xm", "1")]
+            con.execute("PRAGMA user_version=1")
+            con.commit()
+            self.assertEqual(map_pair_tokens(db, pairs), {("0xm", "0"): "STALE"})
+            con.execute("PRAGMA user_version=2")
+            con.commit()
+            con.close()
+            self.assertEqual(map_pair_tokens(db, pairs), {("0xm", "0"): "TOK", ("0xm", "1"): "TOK-no"})
+
+
+class RangeAlgebra(unittest.TestCase):
+    def test_streamed_inclusive_difference(self):
+        from latency_shift_rerank import subtract_ranges
+
+        for needed, covered, expected in (
+            ([(1, 5), (6, 10)], [(0, 20)], []),
+            ([(1, 10)], [(0, 3), (3, 4), (6, 8)], [(5, 5), (9, 10)]),
+            ([(1, 3), (7, 11)], [(0, 5), (10, 15)], [(7, 9)]),
+            ([(-10, -2), (1, 4)], [], [(-10, -2), (1, 4)]),
+            ([], [(0, 5)], []),
+        ):
+            with self.subTest(needed=needed, covered=covered):
+                self.assertEqual(list(subtract_ranges(iter(needed), iter(covered))), expected)
+
+
+# Captured from 2690d92's in-memory path with only the 53f1bf7 oracle-6 port.
+EXPECTED_POPULATION = {
+    'latency_shift_ranked.csv': (
+        'wallet,n_total,n_filled,fill_rate,active_months,mean_net_ls,tstat_net_ls,n_eff,hit_rate,eligible,survives\r\n'
+        '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb,4,4,1.0,2,1.260483,3.8369,4.0,1.0,True,True\r\n'
+        '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,4,4,1.0,2,1.260483,3.8369,4.0,1.0,True,True\r\n'
+        '0xcccccccccccccccccccccccccccccccccccccccc,9,1,0.125,1,-1.0,,1.0,0.0,False,False\r\n'
+        '0x0000000000000000000000000000000000000000,0,,,,,,,,False,False\r\n'
+        '0xdddddddddddddddddddddddddddddddddddddddd,1,,,,,,,,False,False\r\n'
+    ),
+    'oracle_outcomes.csv': (
+        'wallet,market_id,outcome_id,token_id,entry_ts,payoff,resolved_at,sample_t,sample_price,outcome\r\n'
+        '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb,0xm1,0,T1,1000400,1.0,1004000,1000402,0.31,repriced\r\n'
+        '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,0xm1,0,T1,1000100,1.0,1003700,1000072,0.31,repriced\r\n'
+        '0xcccccccccccccccccccccccccccccccccccccccc,0xm10,0,T10,10000100,1.0,10003700,,,invalid_price\r\n'
+        '0xcccccccccccccccccccccccccccccccccccccccc,0xm11,0,T11,11000100,1.0,11003700,,,future_only\r\n'
+        '0xcccccccccccccccccccccccccccccccccccccccc,0xm12,0,T12,12000100,1.0,12003700,,,no_sample\r\n'
+        '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,0xm2,0,T2,2000100,1.0,2003700,2000102,0.41,repriced\r\n'
+        '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb,0xm2,0,T2,2000400,1.0,2004000,2000402,0.41,repriced\r\n'
+        '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,0xm3,0,T3,3000100,1.0,3003700,3000102,0.51,repriced\r\n'
+        '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb,0xm3,0,T3,3000400,1.0,3004000,3000402,0.51,repriced\r\n'
+        '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,0xm4,0,T4,4000100,1.0,4003700,4000102,0.61,repriced\r\n'
+        '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb,0xm4,0,T4,4000400,1.0,4004000,4000402,0.61,repriced\r\n'
+        '0xcccccccccccccccccccccccccccccccccccccccc,0xm5,0,T5,5000100,0.0,5003700,5000102,0.50,repriced\r\n'
+        '0xcccccccccccccccccccccccccccccccccccccccc,0xm5,0,T5,5000500,1.0,5000501,,,post_resolution\r\n'
+        '0xcccccccccccccccccccccccccccccccccccccccc,0xm5,1,T5-no,5000200,1.0,5003800,,,stale\r\n'
+        '0xcccccccccccccccccccccccccccccccccccccccc,0xm5,1,T5-no,5000300,1.0,5003900,,,stale\r\n'
+        '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,0xm6,0,T6,6000100,1.0,6000130,,,scheduled_horizon\r\n'
+        '0xcccccccccccccccccccccccccccccccccccccccc,0xm7,0,,7000100,1.0,7003700,,,unmapped\r\n'
+        '0xcccccccccccccccccccccccccccccccccccccccc,0xm8,0,T8,8000100,1.0,8003700,,,price_band\r\n'
+    ),
+    'oracle_targets.csv': (
+        'token_id,start_ts,end_ts\n'
+        'T1,999981,1000103\n'
+        'T1,1000281,1000403\n'
+        'T10,9999981,10000103\n'
+        'T11,10999981,11000103\n'
+        'T12,11999981,12000103\n'
+        'T2,1999981,2000103\n'
+        'T2,2000281,2000403\n'
+        'T3,2999981,3000103\n'
+        'T3,3000281,3000403\n'
+        'T4,3999981,4000103\n'
+        'T4,4000281,4000403\n'
+        'T5,4999981,5000103\n'
+        'T5,5000381,5000503\n'
+        'T5-no,5000081,5000303\n'
+        'T8,7999981,8000103\n'
+    ),
+    'oracle_manifest.json': (
+        '{"as_of":13000000,"fidelity_minutes":1,"floor_tstat":2.0,"git_sha":"unknown","half_life_days":0.0,"inputs":{"before_ranking_sha256":"4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945","cache_stage_record_sha256":"2d01818ed9d47605b5c8b85acf1e2b3c2d82ff703aff45dfe992f05e7d2f7eba","cycle_manifest_sha256":"0c06aa75f133913dd3a2b963013e92b008346070f97c28e8a8848d3eebb698df","oracle_targets_sha256":"ceed5f16ea3ab06e73532fb6e9e4eec74c6bd7d205ffe27c97b0df960f0678e9","positions_csv_sha256":"43cd6e82f06853333d155e561f2c20fd7399a314486537a49930a13785c01473","ranked_csv_sha256":"bcbbbc4d6ef3bec75fd513fac672f0e94fc0ab3b624d63b58bc70bef9950e824"},"latency_shift_secs":2.0,"lookup":"latest sample at-or-before entry+shift","min_active_months":0,"min_avg_per_month":0.0,"min_coverage":0.5,"min_trl":2,"oracle":"clob-minute-reference","oracle_version":6,"outputs":{"before_after_diff_sha256":"5edcf3dee79b541f396ee1c3a971b79d2a028121e8a08ed7e98c7336f1551edb","latency_shift_ranked_sha256":"64180d3275a0bd11f00d0b2e76cb711f756891fef61ed7c49429987c58015375","oracle_outcomes_sha256":"6f9265c8c255a686739237facc7add37ec5f2812140c11de5f924b56c5513bae"},"parser_version":1,"price_band":{"maximum_exclusive":0.85,"minimum_inclusive":0.15},"scheduled_horizon":{"maximum_secs_exclusive":259200,"minimum_secs":60},"schema_version":2,"slip_cents":1.0,"staleness_bound_secs":120.0,"versions":{"activity_parser":2,"activity_schema":2,"cache_schema":2,"clob_resolution_parser":2,"clob_resolution_schema":2,"configuration":1,"oracle_parser":1,"ranker":6,"source":"polymarket-public-activity"}}\n'
+    ),
+    'before_after_diff.json': (
+        '[{"after":{"eligibility":false,"membership":false,"rank":4,"score":null,"survival":false},"before":{"eligibility":false,"membership":false,"rank":null,"score":null,"survival":false},"wallet":"0x0000000000000000000000000000000000000000"},{"after":{"eligibility":true,"membership":true,"rank":2,"score":3.8369,"survival":true},"before":{"eligibility":false,"membership":false,"rank":null,"score":null,"survival":false},"wallet":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},{"after":{"eligibility":true,"membership":true,"rank":1,"score":3.8369,"survival":true},"before":{"eligibility":false,"membership":false,"rank":null,"score":null,"survival":false},"wallet":"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},{"after":{"eligibility":false,"membership":false,"rank":3,"score":null,"survival":false},"before":{"eligibility":false,"membership":false,"rank":null,"score":null,"survival":false},"wallet":"0xcccccccccccccccccccccccccccccccccccccccc"},{"after":{"eligibility":false,"membership":false,"rank":5,"score":null,"survival":false},"before":{"eligibility":false,"membership":false,"rank":null,"score":null,"survival":false},"wallet":"0xdddddddddddddddddddddddddddddddddddddddd"}]\n'
+    ),
+    'latency_shift_basket.txt': (
+        '# latency_shift_basket — Δ=2.0s slip=0.01 floor_t=2.0 half_life=0.0d min_coverage=0.5 candidates=5 survivors=2\n'
+        '0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n'
+        '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n'
+    ),
+}
 
 
 class RefOracleScenario(unittest.TestCase):
@@ -240,7 +355,7 @@ class RefOracleScenario(unittest.TestCase):
                 manifest = json.loads((out / "oracle_manifest.json").read_text())
                 self.assertEqual(manifest["as_of"], entries[-1])
                 self.assertEqual(manifest["half_life_days"], half_life)
-                self.assertEqual(manifest["oracle_version"], 5)
+                self.assertEqual(manifest["oracle_version"], ORACLE_VERSION)
         self.assertEqual(len(outcomes), 2)
         self.assertEqual(outcomes[0], outcomes[1])
         print("PASS: twenty covered/repriced constant returns have no score and never survive")
@@ -280,8 +395,8 @@ class RefOracleScenario(unittest.TestCase):
         self.assertEqual(man["versions"]["activity_schema"], 2)
         self.assertEqual(man["versions"]["clob_resolution_parser"], 2)
         self.assertEqual(man["versions"]["clob_resolution_schema"], 2)
-        self.assertEqual(man["versions"]["ranker"], 5)
-        self.assertEqual(man["oracle_version"], 5)
+        self.assertEqual(man["versions"]["ranker"], ORACLE_VERSION)
+        self.assertEqual(man["oracle_version"], ORACLE_VERSION)
         self.assertEqual(man["versions"]["configuration"], 1)
         print("PASS: outcomes artifact + manifest regenerate and bind the published aggregates")
 
@@ -290,6 +405,7 @@ class RefOracleScenario(unittest.TestCase):
         +1-cent repricing, and binds a deterministic before/after diff."""
         con = sqlite3.connect(self.db)
         con.execute("PRAGMA user_version=2")
+        schema_two_tokens(con, {"0xm": "TOK"})
         con.commit()
         con.close()
         cases = [
@@ -354,8 +470,8 @@ class RefOracleScenario(unittest.TestCase):
         self.assertEqual(first, (out / "before_after_diff.json").read_bytes())
         manifest = json.loads((out / "oracle_manifest.json").read_text())
         import hashlib
-        self.assertEqual(manifest["oracle_version"], 5)
-        self.assertEqual(manifest["versions"]["ranker"], 5)
+        self.assertEqual(manifest["oracle_version"], ORACLE_VERSION)
+        self.assertEqual(manifest["versions"]["ranker"], ORACLE_VERSION)
         for name, key in (("latency_shift_ranked.csv", "latency_shift_ranked_sha256"),
                           ("oracle_outcomes.csv", "oracle_outcomes_sha256")):
             self.assertEqual(manifest["outputs"][key],
@@ -392,8 +508,7 @@ class RefOracleScenario(unittest.TestCase):
                     venue.setdefault(f"T{pair}", []).append((entry + SHIFT, price))
         con = sqlite3.connect(self.db)
         con.execute("PRAGMA user_version=2")
-        for token in spans:
-            con.execute("INSERT INTO token_conditions VALUES (?, ?, 1, 0)", (token, "0xm" + token[1:]))
+        schema_two_tokens(con, {"0xm" + token[1:]: token for token in spans})
         con.commit()
         con.close()
 
@@ -418,9 +533,9 @@ class RefOracleScenario(unittest.TestCase):
         stage.write_text('{"cache_sha256":"aa"}\n')
         survivable = lsr.load_survivable_wallets
 
-        def everyone(path, a):
-            universe, _ = survivable(path, a)
-            return universe, set(universe)
+        def everyone(con, a):
+            survivable(con, a)
+            con.execute("UPDATE wallets SET candidate=true")
 
         def run(db, name, *extra, prune=True, anchor=("--as-of", "7000000")):
             out = self.root / name
@@ -513,9 +628,7 @@ class RefOracleScenario(unittest.TestCase):
             [nets[i] for i in order], [weights[i] for i in order])[0], 6))
         with sqlite3.connect(self.db) as con:
             con.execute("PRAGMA user_version=2")
-            for i in range(8):
-                con.execute("INSERT INTO token_conditions VALUES (?, ?, 1, 0)",
-                            (f"T{i}", f"0xm{i}"))
+            schema_two_tokens(con, {f"0xm{i}": f"T{i}" for i in range(8)})
         for i, entry in enumerate(entries):
             self.add_points([(entry + SHIFT, prices[i])], token_id=f"T{i}")
             self.add_full_coverage(entries=[entry, entry + 10], token_id=f"T{i}")
@@ -569,6 +682,102 @@ class RefOracleScenario(unittest.TestCase):
         self.assertEqual(len(outputs[0]), 2)
         self.assertEqual(outputs[0], outputs[1])
 
+    def population_fixture(self):
+        """Unsorted shared pairs, tied scores, every skip shape and false verdicts."""
+        a, b, c, d, quiet = ("0x" + digit * 40 for digit in "abcd0")
+        rows = [(quiet, "0xm0", "0", 900_000, 30, 1.0, None, None)]
+        for wallet, pair, offset, price, age in (
+            (a, 2, 100, "0.41", 0), (b, 1, 400, "0.31", 0),
+            (a, 1, 100, "0.31", 30), (b, 2, 400, "0.41", 0),
+            (a, 3, 100, "0.51", 0), (b, 3, 400, "0.51", 0),
+            (a, 4, 100, "0.61", 0), (b, 4, 400, "0.61", 0),
+        ):
+            rows.append((wallet, f"0xm{pair}", "0", pair * 1_000_000 + offset,
+                         3600, 1.0, price, age))
+        rows += [
+            (a, "0xm6", "0", 6_000_100, 30, 1.0, None, None),
+            (c, "0xm5", "0", 5_000_100, 3600, 0.0, "0.50", 0),
+            (c, "0xm5", "1", 5_000_200, 3600, 1.0, "0.50", 121),
+            (c, "0xm5", "1", 5_000_300, 3600, 1.0, None, None),
+            (c, "0xm7", "0", 7_000_100, 3600, 1.0, None, None),
+            (c, "0xm8", "0", 8_000_100, 3600, 1.0, "0.84", 0),
+            (d, "0xm9", "0", 9_000_100, 3600, 1.0, None, None),
+            (c, "0xm5", "0", 5_000_500, 3600, 1.0, "0.50", 0),
+            (c, "0xm10", "0", 10_000_100, 3600, 1.0, "invalid", 0),
+            (c, "0xm11", "0", 11_000_100, 3600, 1.0, "0.50", -1),
+            (c, "0xm12", "0", 12_000_100, 3600, 1.0, None, None),
+        ]
+        with open(self.positions, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(POSITIONS_HEADER)
+            for wallet, market, outcome, entry, ttr, payoff, _price, _age in rows:
+                writer.writerow([wallet, market, outcome, entry, ttr, 0.99, "1.250000",
+                                 payoff, 0, 0, entry + (1 if entry == 5_000_500 else ttr)])
+        with sqlite3.connect(self.db) as con:
+            con.execute("PRAGMA user_version=2")
+            schema_two_tokens(con, {f"0xm{i}": f"T{i}" for i in range(13) if i != 7})
+            for wallet, market, outcome, entry, ttr, payoff, price, age in rows:
+                if price is not None:
+                    token = "T" + market[3:] + ("-no" if outcome == "1" else "")
+                    con.execute("INSERT INTO ranker_price_points VALUES (?, ?, ?, 1)",
+                                (token, entry + SHIFT - age, price))
+            for i in range(13):
+                for suffix in ("", "-no"):
+                    con.execute("INSERT INTO ranker_price_pages VALUES (?, 0, 14000000, 1, "
+                                "'complete', 1, '00', 'test', 1, 1, 1, 1, 'url')",
+                                (f"T{i}{suffix}",))
+        before, cycle, stage = (self.root / name for name in ("before.json", "cycle.json", "stage.json"))
+        before.write_text("[]")
+        cycle.write_text('{"cache_schema":2}\n')
+        stage.write_text('{"cache_sha256":"aa"}\n')
+        return ("--as-of", "13000000", "--min-trl", "2",
+                "--before-ranking-json", str(before), "--cycle-manifest-file", str(cycle),
+                "--cache-stage-record", str(stage))
+
+    def test_bounded_population_matches_in_memory_bytes(self):
+        args = self.population_fixture()
+        targets = self.root / "out" / "oracle_targets.csv"
+        with mock.patch.dict(os.environ, {"PE_RANKER_DUCKDB_MEMORY_LIMIT": "64MB"}):
+            result, _ = self.run_pass2(*args, "--emit-targets", str(targets))
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            result, out = self.run_pass2(*args)
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        for name, expected in EXPECTED_POPULATION.items():
+            self.assertEqual((out / name).read_bytes(), expected.encode(), name)
+        self.assertIn("reference-sample staleness (s before entry+Δ): p50=0 p90=30 max=30", result.stdout)
+        self.assertFalse(list(out.glob("pass2-*")), "the private spill is retired")
+
+    def test_ten_second_floor_admits_short_scheduled_horizon(self):
+        with sqlite3.connect(self.db) as con:
+            con.execute("PRAGMA user_version=2")
+            schema_two_tokens(con, {"0xm": "TOK"})
+        entries = ENTRIES + [1_150_000, 1_175_000]
+        with open(self.positions, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(POSITIONS_HEADER)
+            for entry, ttr in zip(entries, (12, 32, 3600, 3600, 11)):
+                writer.writerow([W1, "0xm", 0, entry, ttr, .5, 10, 1, 0, 0, entry + ttr])
+        self.add_points([(entry + SHIFT, price) for entry, price in zip(entries, ("0.3", "0.4", "0.5", "0.6", "0.7"))])
+        self.add_full_coverage(entries=entries)
+        before, cycle, stage = (self.root / name for name in ("before.json", "cycle.json", "stage.json"))
+        for path in (before, cycle, stage):
+            path.write_text("[]" if path == before else "{}")
+        args = ("--as-of", str(ENTRIES[-1]), "--before-ranking-json", str(before),
+                "--cycle-manifest-file", str(cycle), "--cache-stage-record", str(stage))
+        for floor, total, filled in ((10, "4", "4"), (60, "2", "2")):
+            with self.subTest(floor=floor):
+                result, out = self.run_pass2(*args, "--min-ttr-secs", str(floor))
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+                row = self.read_row(out)
+                self.assertEqual((row["n_total"], row["n_filled"]), (total, filled))
+                manifest = json.loads((out / "oracle_manifest.json").read_text())
+                self.assertEqual(manifest["scheduled_horizon"]["minimum_secs"], floor)
+                with open(out / "oracle_outcomes.csv", newline="") as f:
+                    outcomes = list(csv.DictReader(f))
+                self.assertEqual([r["outcome"] for r in outcomes],
+                                 ["repriced"] * 4 + ["scheduled_horizon"] if floor == 10 else
+                                 ["scheduled_horizon"] * 2 + ["repriced"] * 2 + ["scheduled_horizon"])
+
     def test_nonpositive_fill_window_is_fatal(self):
         # #536 review M2: staleness bound 0 would admit every stale sample; reject
         # at argument parse, before any output is written.
@@ -576,6 +785,37 @@ class RefOracleScenario(unittest.TestCase):
         self.assertEqual(r.returncode, 1, r.stderr + r.stdout)
         self.assertFalse((out / "latency_shift_ranked.csv").exists())
         print("PASS: --fill-window-secs 0 rejected as fatal before any output")
+
+    def test_empty_population_keeps_schema_exit_codes(self):
+        self.ranked.write_text("wallet,eligible,tstat_net,mean_net\n")
+        result, _ = self.run_pass2("--positions-csv", str(self.root / "absent.csv"))
+        self.assertEqual(result.returncode, 76, result.stderr + result.stdout)
+        self.positions.write_text(",".join(POSITIONS_HEADER) + "\n")
+        with sqlite3.connect(self.db) as con:
+            con.execute("PRAGMA user_version=2")
+            schema_two_tokens(con, {})
+        before, cycle, stage = (self.root / name for name in ("before.json", "cycle.json", "stage.json"))
+        for path in (before, cycle, stage):
+            path.write_text("[]" if path == before else "{}")
+        result, _ = self.run_pass2("--as-of", "1100000", "--before-ranking-json", str(before),
+                                   "--cycle-manifest-file", str(cycle), "--cache-stage-record", str(stage))
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+
+    def test_schema_one_empty_overlap_writes_header_only(self):
+        self.positions.write_text(",".join(POSITIONS_HEADER) + "\n")
+        result, out = self.run_pass2()
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        with open(out / "latency_shift_ranked.csv", newline="") as f:
+            self.assertEqual(list(csv.DictReader(f)), [])
+        manifest = json.loads((out / "oracle_manifest.json").read_text())
+        self.assertEqual(manifest["as_of"], 0)
+
+    def test_missing_outcome_column_is_fatal(self):
+        self.positions.write_text("wallet,market_id\n")
+        result, out = self.run_pass2()
+        self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
+        self.assertIn("positions CSV lacks outcome_id", result.stdout)
+        self.assertFalse((out / "latency_shift_ranked.csv").exists())
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
