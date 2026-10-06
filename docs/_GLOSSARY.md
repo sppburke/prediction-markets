@@ -915,16 +915,46 @@ fatal. Append, flush, or synchronization uncertainty poisons the writer. The acc
 `live_journal.log` uses its native verified replay for the same binding fields. An ordinary
 installed boot holds that lock while binding the recorded activation prefix. A compatible
 `<source-log>.boot-checkpoint` restores receipt metadata and raw activity/boundary candidates after
-checksum, version, mode, path, activation and tail checks and BLAKE3 verification of its exact raw
-prefix. The existing scanner verifies every suffix frame. Missing, damaged or incompatible artifacts,
-shortened files and prefix mismatch select a full verified walk under the same lock; actual corruption
-still refuses. Incomplete-tail repair and activation-prefix authority remain unchanged, including
-the absence of every-durable-mark coupling. Projections publish only after verification and every
-reducer succeeds. The initial-open checkpoint snapshot freezes the existing receipt-index prefix
-and pre-consumption candidates, excluding later boot/runtime appends. Synchronous best-effort atomic
-publication occurs after the producer barrier with runtime tasks running. The walked binding is
-reused only while that writer remains sole appender and its synchronized tail equals its byte cursor,
-which detects external length drift but not equal-length rewrites of verified bytes (#572).
+checksum, version, mode, path, activation and tail checks. With readable inactive authority,
+boot defers the exact raw-prefix BLAKE3 check and scanner-verifies only the suffix; its completion
+line records `prefix_verification="deferred"`, the loaded binding and `prefix_blake3`. Missing,
+damaged or incompatible artifacts, shortened files, and active or unreadable authority select a
+full verified walk; actual frame corruption still refuses. Activation-prefix authority and
+incomplete-tail repair remain unchanged. Runtime indexed reads verify individual frames.
+
+The critical `source_checkpoint` owner starts after HTTP listening. Its single cancellable blocking
+job slot verifies the loaded prefix, continues the same hasher to the frozen boot tail, then
+serializes and publishes the frozen initial receipt prefix and pre-consumption reducers. A mismatch,
+read error or binding inequality quarantines checkpoint use and triggers coordinated restart; a
+quarantine rename or directory-sync failure carries `CheckpointInvalidationFailed` and exits 78,
+which the checkpoint-invalidation systemd drop-in prevents from automatically restarting. Main
+retains and bounds the blocking-child join independently of async supervision; status 78 takes
+precedence over join/shutdown timeouts. Cancellation discards late computation results and starts
+no further publication; an already-started publication finishes.
+
+All publishers share one persistent `<checkpoint>.lock` inode and the durable
+`<checkpoint>.invalidation` record (`generation`, `active`; absence means generation zero/inactive).
+Invalidation atomically quarantines the artifact before advancing active authority. Publication
+compares artifact applicability, reducer version, tail, binding and prefix under the lock and
+installs only an authorized candidate; a verified current-generation publication clears active
+only after durable installation. Unreadable authority requires quiesced recovery that removes and
+syncs the checkpoint before removing and syncing the record. Preparation captures open rows and
+feed frontiers before its finite source bound and prints a durable publication receipt.
+
+Hourly scanner-verified extensions reuse the frozen reducers and hasher and retain their originating
+generation. Successful walks advance that state even when publication is refused or fails. Walk,
+reducer, binding or changed-generation failures trigger coordinated restart. Publication I/O
+failures retain the exact serialized bytes and original capture time for retries; the next hourly
+candidate replaces a pending one. Other protocol refusals discard the candidate. Every attempt
+logs the age of the last binding this owner successfully published. The walked binding is reused
+only while that writer remains sole appender and its synchronized tail equals its byte cursor,
+which detects external length drift but not equal-length rewrites of verified bytes (#572, #737).
+
+| Compiled checkpoint default | Value | Owner |
+|---|---|---|
+| `CHECKPOINT_PUBLISH_SECS` | 3,600 s | `source_checkpoint`: hourly incremental capture/publication interval; no TOML/env setting. |
+| `CHECKPOINT_RETRY_SECS` | 60 s | `source_checkpoint`: retained serialized-candidate publication retry; no TOML/env setting. |
+
 The runtime qualification seal verifies the sealed prefix with one scanner walk bounded by the
 caller's candidate (the just-recorded mark tail at a completion boundary, the receipt-index tail on
 configuration drift), reads the frames its decision rows reference exactly through the receipt
@@ -939,9 +969,9 @@ side main; path, prefix, hash, identity, or phase drift fails closed. Pre-bounda
 audit/replay history and cannot create v2 state. Once v2 input has appended or active state has
 committed, rollback to v1 is refused; restart the v2-compatible binary to resume roll-forward.
 
-Ordinary production has one named supervisor over 16 retained owners. Activity ingest, public
+Ordinary production has one named supervisor over 17 retained owners. Activity ingest, public
 poll/reconciliation, orchestrator, resolution poller, configured live-account/fan-out owners,
-watchlist refresh/projection, maintenance, capacity/config workers, status writer, and HTTP server
+watchlist refresh/projection, maintenance, capacity/config workers, source checkpoint, status writer, and HTTP server
 are critical: an unexpected typed error, early return, channel close, or join failure sticks in
 readiness/status and initiates ordered shutdown. Supabase analytics, liquidity snapshots, and JSON
 tracing appenders are best-effort and degrade status without failing trading readiness. Shutdown

@@ -1817,6 +1817,9 @@ async fn main() -> Result<()> {
         (cfg.status_interval_secs > 0).then(|| Duration::from_secs(cfg.status_interval_secs));
     // Register the final two owners before the status writer's immediate first tick.
     task_status.register(TaskName::HttpServer);
+    if source_log_boot.is_some() {
+        task_status.register(TaskName::SourceCheckpoint);
+    }
     let status_writer = pe_service::status_writer::run_status_writer(
         cfg.status_path.clone(),
         status_interval,
@@ -1874,10 +1877,16 @@ async fn main() -> Result<()> {
         Ok(TaskExit::CleanShutdown)
     });
 
-    if let Some(boot) = &source_log_boot
-        && let Err(error) = boot.publish_checkpoint()
-    {
-        warn!(%error, "source checkpoint publication failed; next boot can perform a full walk");
+    let checkpoint_slot = pe_service::source_checkpoint::CheckpointJobSlot::default();
+    if let Some(boot) = source_log_boot.take() {
+        let owner = boot.into_checkpoint_owner(checkpoint_slot.clone());
+        #[cfg(feature = "scenario")]
+        let owner = {
+            let mut owner = owner;
+            owner.set_scenario_hooks(pe_service::source_checkpoint::cli_owner_hooks()?);
+            owner
+        };
+        supervisor.spawn(TaskName::SourceCheckpoint, owner.run(shutdown.subscribe()));
     }
 
     let initial_failure = loop {
@@ -1903,7 +1912,9 @@ async fn main() -> Result<()> {
     // stragglers and immediately joins those abort completions; no task is detached (#544).
     let deadline = tokio::time::Instant::now() + SHUTDOWN_DEADLINE;
     advance_shutdown(&shutdown, &task_status, ShutdownPhase::StopProducers);
+    checkpoint_slot.cancel();
     let producers = [
+        TaskName::SourceCheckpoint,
         TaskName::PublicActivityPoll,
         TaskName::ResolutionPoller,
         TaskName::LiveAccountsPoller,
@@ -1962,11 +1973,36 @@ async fn main() -> Result<()> {
     task_status.mark_stopped(TaskName::JsonTracingFullAppender);
     task_status.mark_stopped(TaskName::JsonTracingErrorAppender);
     shutdown.advance(ShutdownPhase::Complete);
-    if !supervisor.join_all_bounded().await {
-        // A pinned non-yielding task never observes abort, and dropping the
-        // runtime would wait on it forever: force the bounded exit the plan
-        // promises — durable state recovers on the next start (#544 review).
-        eprintln!("pe-service: final join bound expired with unjoined owners; forcing exit");
+    let owners_joined = supervisor.join_all_bounded().await;
+    #[cfg(feature = "scenario")]
+    let owners_joined =
+        owners_joined && std::env::var_os("PE_SCENARIO_CHECKPOINT_SHUTDOWN_TIMEOUT").is_none();
+    let checkpoint_joined = matches!(
+        tokio::time::timeout(
+            pe_service::supervisor::POST_ABORT_JOIN_BOUND,
+            checkpoint_slot.join()
+        )
+        .await,
+        Ok(Ok(()))
+    );
+    #[cfg(feature = "scenario")]
+    let checkpoint_joined =
+        checkpoint_joined && std::env::var_os("PE_SCENARIO_CHECKPOINT_JOB_JOIN_TIMEOUT").is_none();
+    let invalidation_failed = task_status.snapshot().iter().any(|task| {
+        task.name == TaskName::SourceCheckpoint
+            && task.failure.as_ref().is_some_and(|failure| {
+                failure.kind
+                    == pe_service::supervisor::TaskFailureKind::CheckpointInvalidationFailed
+            })
+    });
+    // A quarantine failure always preserves the operator-recovery status, including join timeouts.
+    if invalidation_failed {
+        std::process::exit(78);
+    }
+    if !owners_joined || !checkpoint_joined {
+        eprintln!(
+            "pe-service: final join bound expired with unjoined owners or checkpoint job; forcing exit"
+        );
         std::process::exit(70);
     }
 

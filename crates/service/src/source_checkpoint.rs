@@ -3,6 +3,13 @@
 //! Source-log verification and candidate serialization precede the persistent checkpoint lock. A
 //! serialized candidate keeps its authority and capture time through every publication retry.
 
+mod runtime;
+pub use runtime::{
+    CHECKPOINT_PUBLISH_SECS, CHECKPOINT_RETRY_SECS, CheckpointJobSlot, SourceCheckpointOwner,
+};
+#[cfg(feature = "scenario")]
+pub use runtime::{CheckpointOwnerHooks, cli_owner_hooks};
+
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};

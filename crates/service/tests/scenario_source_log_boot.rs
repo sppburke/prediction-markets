@@ -3,7 +3,12 @@
 //! final frame, refusal of a truncation into the recorded prefix, a typed boot failure on poison
 //! followed by restart recovery, the handoff drift check, and the not-installed fallbacks.
 #![cfg(feature = "scenario")]
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::duplicate_mod
+)]
 
 mod support;
 
@@ -2185,7 +2190,7 @@ fn paper_service_rollout_checkpoint_freezes_prefix_and_replays_suffix_exactly() 
     boot.extend(&mut sink).unwrap();
     let paper = PaperStateDb::open(&paths.fixed_main).unwrap();
     let expected = boot.obligations(&paper, &paths.paper_log).unwrap();
-    boot.publish_checkpoint().unwrap();
+    publish_owner_initial(boot).unwrap();
     let artifact = std::fs::read(paths.source_log.with_extension("log.boot-checkpoint")).unwrap();
     let projection: serde_json::Value = serde_json::from_slice(&artifact[65..]).unwrap();
     assert_eq!(
@@ -2269,12 +2274,27 @@ fn paper_service_rollout_checkpoint_damage_incompatibility_and_prefix_drift_fall
         let before = pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap();
         let opened = SourceLogBoot::open(&paths, false);
         if fault == "corruption" {
-            assert!(format!("{:#}", opened.err().unwrap()).contains("CRC"));
+            let opened = opened.unwrap().unwrap();
+            let failure = publish_owner_initial(opened.boot).unwrap_err();
+            assert!(failure.message.contains("prefix mismatch"));
+            assert!(
+                pe_service::source_checkpoint::read_authority(&paths.source_log)
+                    .unwrap()
+                    .generation()
+                    .unwrap()
+                    > 0
+            );
+            drop(opened.sink);
+            assert!(
+                format!("{:#}", SourceLogBoot::open(&paths, false).err().unwrap()).contains("CRC")
+            );
         } else {
             let opened = opened.unwrap().unwrap();
             assert_eq!(opened.binding, Scanner::verify(&paths.source_log).unwrap());
         }
-        assert!(pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap() > before);
+        if fault != "corruption" {
+            assert!(pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap() > before);
+        }
     }
 }
 
@@ -2847,6 +2867,7 @@ fn wrong_prefix_checkpoint_repaired_by_preparation() {
         let bound_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let captures = bound_calls.clone();
         let hash_paths = paths.clone();
+        let original_offset = original.tail.physical_tail;
         let hooks = PreparationHooks {
             before_cached_hash: Some(Arc::new(move || {
                 if case == "hash_io_error" {
@@ -2872,10 +2893,24 @@ fn wrong_prefix_checkpoint_repaired_by_preparation() {
                             &scenario_paths.source_log,
                             activity_envelope("0xnew-artifact", NOW_UNIX + 2),
                         );
-                        let opened = SourceLogBoot::open(&scenario_paths, false)
-                            .unwrap()
-                            .unwrap();
-                        opened.boot.publish_checkpoint().unwrap();
+                        rewrite_boot_checkpoint(
+                            &pe_service::source_checkpoint::checkpoint_path(
+                                &scenario_paths.source_log,
+                            ),
+                            |body| {
+                                body["prefix_blake3"] = serde_json::json!(
+                                    Scanner::hash_prefix(
+                                        &scenario_paths.source_log,
+                                        original_offset
+                                    )
+                                    .unwrap()
+                                    .finalize()
+                                    .to_hex()
+                                    .to_string()
+                                );
+                            },
+                        );
+                        SourceLogBoot::prepare_checkpoint(&scenario_paths.fixed_main).unwrap();
                     } else if case == "generation_changed" {
                         assert_eq!(
                             pe_service::source_checkpoint::invalidate(&scenario_paths.source_log)
@@ -2986,8 +3021,8 @@ fn unusable_checkpoint_replaced_by_verified_candidate() {
             pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap() > before,
             "{fault}"
         );
-        opened.boot.publish_checkpoint().unwrap();
-        drop(opened);
+        publish_owner_initial(opened.boot).unwrap();
+        drop(opened.sink);
         assert_checkpoint_assisted_boot(&paths, &receipt);
     }
 }
@@ -3042,7 +3077,7 @@ async fn checkpoint_cli_publisher_refused_after_interrupted_invalidation() {
         let before = pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap();
         let opened = SourceLogBoot::open(&paths, false).unwrap().unwrap();
         assert!(pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap() > before);
-        assert!(opened.boot.publish_checkpoint().is_err());
+        publish_owner_initial(opened.boot).unwrap();
         assert_eq!(
             pe_service::source_checkpoint::read_authority(&paths.source_log).unwrap(),
             Authority::Unreadable
@@ -3106,8 +3141,8 @@ async fn checkpoint_failed_quarantine_sync_durable_image_recovers_with_full_walk
     let before = pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap();
     let opened = SourceLogBoot::open(&paths, false).unwrap().unwrap();
     assert!(pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap() > before);
-    opened.boot.publish_checkpoint().unwrap();
-    drop(opened);
+    publish_owner_initial(opened.boot).unwrap();
+    drop(opened.sink);
     assert_checkpoint_assisted_boot(&paths, &receipt);
 }
 
@@ -3198,6 +3233,643 @@ fn checkpoint_record_read_error_forces_full_walk_without_publication() {
     let before = pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap();
     let opened = SourceLogBoot::open(&paths, false).unwrap().unwrap();
     assert!(pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap() > before);
-    assert!(opened.boot.publish_checkpoint().is_err());
+    publish_owner_initial(opened.boot).unwrap();
     assert_eq!(std::fs::read(&sidecar).unwrap(), artifact);
+}
+
+fn publish_owner_initial(boot: SourceLogBoot) -> Result<(), pe_service::supervisor::TaskFailure> {
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async move {
+            let slot = pe_service::source_checkpoint::CheckpointJobSlot::default();
+            let mut owner = boot.into_checkpoint_owner(slot.clone());
+            let result = owner.initialize_for_scenario().await;
+            drop(owner);
+            slot.join().await.unwrap();
+            result
+        })
+    })
+    .join()
+    .unwrap()
+}
+
+#[path = "support/rollout.rs"]
+mod checkpoint_rollout;
+#[path = "support/golden.rs"]
+mod golden;
+
+fn checkpoint_json(path: &Path) -> serde_json::Value {
+    let bytes = std::fs::read(pe_service::source_checkpoint::checkpoint_path(path)).unwrap();
+    assert_eq!(&bytes[..64], blake3::hash(&bytes[65..]).to_hex().as_bytes());
+    serde_json::from_slice(&bytes[65..]).unwrap()
+}
+
+fn checkpoint_events(logs: &str, message: &str) -> Vec<serde_json::Value> {
+    logs.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|line| line["message"] == message)
+        .collect()
+}
+
+async fn checkpoint_until(mut predicate: impl FnMut() -> bool) {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while !predicate() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// PASS: while deferred hashing is paused, a real decision commits; verification and publication
+/// follow listening, and the published digest is that of the exact frozen bound.
+#[tokio::test]
+async fn checkpoint_prefix_verified_after_listening() {
+    let fixture = checkpoint_rollout::CheckpointFixture::new().await;
+    let (prepared, _) =
+        SourceLogBoot::prepare_checkpoint(&fixture.cfg.paper_state_db_path).unwrap();
+    let pause = fixture.dir.path().join("prefix-pause");
+    let child = checkpoint_rollout::Child::start_checkpoint(
+        &fixture.config_path,
+        Path::new(env!("CARGO_BIN_EXE_pe-service")),
+        &[("PE_SCENARIO_CHECKPOINT_PAUSE_BEFORE_HASH", &pause)],
+    );
+    checkpoint_until(|| pause.with_extension("ready").exists()).await;
+    fixture.wait_log("pe-service listening").await;
+    fixture.copy();
+    fixture.wait_copy().await;
+    assert!(!fixture.logs().contains("source checkpoint prefix verified"));
+    assert_eq!(
+        checkpoint_events(&fixture.logs(), "source checkpoint verification completed")[0]["prefix_verification"],
+        "deferred"
+    );
+    std::fs::write(pause.with_extension("resume"), b"resume").unwrap();
+    fixture.wait_log("source checkpoint published").await;
+    let output = child.finish_checkpoint(Some("-INT")).await;
+    assert!(output.status.success(), "{output:?}");
+    let logs = fixture.logs();
+    assert!(
+        logs.find("pe-service listening").unwrap()
+            < logs.find("source checkpoint prefix verified").unwrap()
+    );
+    assert!(
+        logs.find("source checkpoint prefix verified").unwrap()
+            < logs.find("source checkpoint published").unwrap()
+    );
+    assert!(!logs.contains("source checkpoint raw prefix verified"));
+    let data = checkpoint_json(&fixture.cfg.source_event_log_path);
+    assert_eq!(data["tail"]["physical_tail"], prepared.tail.physical_tail);
+    assert_eq!(
+        data["prefix_blake3"],
+        Scanner::hash_prefix(
+            &fixture.cfg.source_event_log_path,
+            prepared.tail.physical_tail
+        )
+        .unwrap()
+        .finalize()
+        .to_hex()
+        .as_str()
+    );
+    assert_eq!(fixture.paper.list_fills().unwrap().len(), 1);
+}
+
+/// PASS: mismatch after load invalidates and fails critically; corrupt frames are refused on later
+/// full walks. Restoring the source allows a new-generation full walk to publish and clear active.
+#[tokio::test]
+async fn checkpoint_prefix_mismatch_invalidates_and_full_walks() {
+    let fixture = checkpoint_rollout::CheckpointFixture::new().await;
+    SourceLogBoot::prepare_checkpoint(&fixture.cfg.paper_state_db_path).unwrap();
+    let original = std::fs::read(&fixture.cfg.source_event_log_path).unwrap();
+    let pause = fixture.dir.path().join("prefix-pause");
+    let child = checkpoint_rollout::Child::start_checkpoint(
+        &fixture.config_path,
+        Path::new(env!("CARGO_BIN_EXE_pe-service")),
+        &[("PE_SCENARIO_CHECKPOINT_PAUSE_BEFORE_HASH", &pause)],
+    );
+    checkpoint_until(|| pause.with_extension("ready").exists()).await;
+    corrupt_checkpoint_prefix(&fixture.cfg.source_event_log_path);
+    std::fs::write(pause.with_extension("resume"), b"resume").unwrap();
+    let output = child.finish_checkpoint(None).await;
+    assert!(!output.status.success());
+    assert_ne!(output.status.code(), Some(78));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("prefix mismatch"));
+    assert!(
+        !pe_service::source_checkpoint::checkpoint_path(&fixture.cfg.source_event_log_path)
+            .exists()
+    );
+    let authority =
+        pe_service::source_checkpoint::read_authority(&fixture.cfg.source_event_log_path).unwrap();
+    assert!(!authority.permits_checkpoint());
+    let generation = authority.generation().unwrap();
+    fixture.clear_logs();
+    let output = boot_binary(&fixture.config_path, false).await;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("CRC"));
+    assert!(!fixture.logs().contains("pe-service listening"));
+    {
+        use std::io::{Seek, SeekFrom};
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&fixture.cfg.source_event_log_path)
+            .unwrap();
+        file.seek(SeekFrom::Start(u64::try_from(original.len() - 1).unwrap()))
+            .unwrap();
+        file.write_all(&original[original.len() - 1..]).unwrap();
+        file.sync_all().unwrap();
+    }
+    fixture.clear_logs();
+    let child = checkpoint_rollout::Child::start_checkpoint(
+        &fixture.config_path,
+        Path::new(env!("CARGO_BIN_EXE_pe-service")),
+        &[],
+    );
+    fixture.wait_log("source checkpoint published").await;
+    assert_eq!(
+        checkpoint_events(&fixture.logs(), "source checkpoint verification completed")[0]["prefix_verification"],
+        "full_walk"
+    );
+    let output = child.finish_checkpoint(Some("-INT")).await;
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        pe_service::source_checkpoint::read_authority(&fixture.cfg.source_event_log_path).unwrap(),
+        pe_service::source_checkpoint::Authority::Readable(
+            pe_service::source_checkpoint::InvalidationRecord {
+                generation,
+                active: false
+            }
+        )
+    );
+}
+
+#[tokio::test]
+async fn prepared_checkpoint_receipt_matches_boot() {
+    let fixture = checkpoint_rollout::CheckpointFixture::new().await;
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pe-service"));
+    command
+        .env_clear()
+        .arg("--prepare-source-checkpoint")
+        .arg("--paper-state")
+        .arg(&fixture.cfg.paper_state_db_path);
+    let prepared = support::bounded_command_output(command).await;
+    assert!(prepared.status.success(), "{prepared:?}");
+    let stdout = String::from_utf8(prepared.stdout).unwrap();
+    let fields = stdout
+        .split_whitespace()
+        .filter_map(|part| part.split_once('='))
+        .collect::<std::collections::HashMap<_, _>>();
+    let child = checkpoint_rollout::Child::start_checkpoint(
+        &fixture.config_path,
+        Path::new(env!("CARGO_BIN_EXE_pe-service")),
+        &[],
+    );
+    fixture.wait_log("source checkpoint published").await;
+    let output = child.finish_checkpoint(Some("-INT")).await;
+    assert!(output.status.success(), "{output:?}");
+    let events = checkpoint_events(&fixture.logs(), "source checkpoint verification completed");
+    let boot = &events[0];
+    assert_eq!(boot["checkpoint_used"], true);
+    assert_eq!(
+        boot["checkpoint_offset"].as_u64().unwrap().to_string(),
+        fields["offset"]
+    );
+    assert_eq!(
+        boot["checkpoint_sequence"].as_u64().unwrap().to_string(),
+        fields["sequence"]
+    );
+    assert_eq!(boot["checkpoint_hash"], fields["hash"]);
+    assert_eq!(boot["prefix_blake3"], fields["prefix_blake3"]);
+    assert!(
+        fields["published_unix_ms"].parse::<u64>().unwrap()
+            >= fields["capture_unix_ms"].parse::<u64>().unwrap()
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn hourly_checkpoint_matches_staged_preparation() {
+    for financial in [false, true] {
+        let (_dir, paths) = installed_fixture();
+        append(
+            &paths.source_log,
+            activity_envelope("0xhourly-first", NOW_UNIX + 1),
+        );
+        // Financial mode must agree with the database used by the staged preparer.
+        if financial {
+            let paper = PaperStateDb::open(&paths.fixed_main).unwrap();
+            let start = append_paper_record(&paths.paper_log, &start_record());
+            paper
+                .reset_financial_era(
+                    start,
+                    CollateralAmount::from_decimal_exact(dec!(10)).unwrap(),
+                )
+                .unwrap();
+        }
+        let mut opened = SourceLogBoot::open(&paths, financial).unwrap().unwrap();
+        let slot = pe_service::source_checkpoint::CheckpointJobSlot::default();
+        let mut owner = opened.boot.into_checkpoint_owner(slot.clone());
+        owner.initialize_for_scenario().await.unwrap();
+        let input = activity_envelope("0xhourly-second", NOW_UNIX + 2);
+        let receipt = opened
+            .sink
+            .append_durable(activity_envelope("0xhourly-second", NOW_UNIX + 2))
+            .unwrap();
+        owner
+            .record_synced_append_for_scenario(receipt, &input)
+            .unwrap();
+        tokio::time::advance(std::time::Duration::from_secs(
+            pe_service::source_checkpoint::CHECKPOINT_PUBLISH_SECS,
+        ))
+        .await;
+        owner.publish_hourly_for_scenario().await.unwrap();
+        let hourly = checkpoint_json(&paths.source_log);
+        drop(owner);
+        drop(opened.sink);
+        SourceLogBoot::prepare_checkpoint(&paths.fixed_main).unwrap();
+        let prepared = checkpoint_json(&paths.source_log);
+        for field in [
+            "format_version",
+            "scanner_version",
+            "reducer_version",
+            "financial_era",
+            "activation",
+            "tail",
+            "receipts",
+            "prefix_blake3",
+        ] {
+            assert_eq!(hourly[field], prepared[field], "{field}");
+        }
+        assert_eq!(hourly["activity"], prepared["activity"]);
+        assert_eq!(hourly["daily_boundary"], prepared["daily_boundary"]);
+    }
+}
+
+/// PASS: the typed quarantine failure exits 78 with either durable-quarantine fault and keeps
+/// precedence over both shutdown-bound outcomes. Every row is fixed before running the binary.
+#[tokio::test]
+async fn checkpoint_invalidation_failure_preserves_status_78_at_shutdown_bounds() {
+    for fault in [
+        "PE_SCENARIO_CHECKPOINT_FAIL_QUARANTINE_RENAME",
+        "PE_SCENARIO_CHECKPOINT_FAIL_QUARANTINE_SYNC",
+    ] {
+        for timeout in [
+            None,
+            Some("PE_SCENARIO_CHECKPOINT_SHUTDOWN_TIMEOUT"),
+            Some("PE_SCENARIO_CHECKPOINT_JOB_JOIN_TIMEOUT"),
+        ] {
+            let fixture = checkpoint_rollout::CheckpointFixture::new().await;
+            SourceLogBoot::prepare_checkpoint(&fixture.cfg.paper_state_db_path).unwrap();
+            let pause = fixture.dir.path().join("prefix-pause");
+            let mut env = vec![
+                ("PE_SCENARIO_CHECKPOINT_PAUSE_BEFORE_HASH", pause.as_path()),
+                (fault, Path::new("1")),
+            ];
+            if let Some(timeout) = timeout {
+                env.push((timeout, Path::new("1")));
+            }
+            let child = checkpoint_rollout::Child::start_checkpoint(
+                &fixture.config_path,
+                Path::new(env!("CARGO_BIN_EXE_pe-service")),
+                &env,
+            );
+            checkpoint_until(|| pause.with_extension("ready").exists()).await;
+            corrupt_checkpoint_prefix(&fixture.cfg.source_event_log_path);
+            std::fs::write(pause.with_extension("resume"), b"resume").unwrap();
+            let output = child.finish_checkpoint(None).await;
+            assert_eq!(
+                output.status.code(),
+                Some(78),
+                "{fault} {timeout:?}: {output:?}"
+            );
+            let status: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&fixture.cfg.status_path).unwrap()).unwrap();
+            assert!(
+                status
+                    .to_string()
+                    .contains("checkpoint_invalidation_failed"),
+                "{status}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn crash_restart_from_hourly_checkpoint() {
+    let fixture = checkpoint_rollout::CheckpointFixture::new().await;
+    SourceLogBoot::prepare_checkpoint(&fixture.cfg.paper_state_db_path).unwrap();
+    let child = checkpoint_rollout::Child::start_checkpoint(
+        &fixture.config_path,
+        Path::new(env!("CARGO_BIN_EXE_pe-service")),
+        &[(
+            "PE_SCENARIO_CHECKPOINT_PUBLISH_INTERVAL_MS",
+            Path::new("500"),
+        )],
+    );
+    checkpoint_until(|| {
+        checkpoint_events(&fixture.logs(), "source checkpoint published").len() >= 2
+    })
+    .await;
+    let output = child.finish_checkpoint(Some("-KILL")).await;
+    assert!(!output.status.success());
+    let events = checkpoint_events(&fixture.logs(), "source checkpoint published");
+    let last = events.last().unwrap();
+    let data = checkpoint_json(&fixture.cfg.source_event_log_path);
+    let tail: pe_event_log::LogTailBinding = serde_json::from_value(data["tail"].clone()).unwrap();
+    let lag =
+        last["published_unix_ms"].as_u64().unwrap() - last["capture_unix_ms"].as_u64().unwrap();
+    assert!(lag < 10_000);
+    assert_eq!(
+        data["prefix_blake3"],
+        Scanner::hash_prefix(&tail.path, tail.physical_tail)
+            .unwrap()
+            .finalize()
+            .to_hex()
+            .as_str()
+    );
+    let complete = Scanner::verify(&tail.path).unwrap();
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&tail.path)
+        .unwrap()
+        .write_all(&[1, 2])
+        .unwrap();
+    fixture.clear_logs();
+    let child = checkpoint_rollout::Child::start_checkpoint(
+        &fixture.config_path,
+        Path::new(env!("CARGO_BIN_EXE_pe-service")),
+        &[],
+    );
+    fixture.wait_log("source checkpoint prefix verified").await;
+    fixture.wait_log("source checkpoint published").await;
+    let output = child.finish_checkpoint(Some("-INT")).await;
+    assert!(output.status.success(), "{output:?}");
+    let boot = &checkpoint_events(&fixture.logs(), "source checkpoint verification completed")[0];
+    assert_eq!(boot["checkpoint_used"], true);
+    assert_eq!(boot["checkpoint_offset"], tail.physical_tail);
+    assert_eq!(
+        boot["suffix_bytes"],
+        complete.physical_tail - tail.physical_tail
+    );
+    assert!(file_len(&tail.path) >= complete.physical_tail);
+}
+
+/// Fixed declared outcomes: all four old-binary rows are allowed. Each must verify before serving,
+/// reject the corrupt suffix control, retry idempotently and preserve finance/history/membership.
+/// New-binary rows: absent/inactive use checkpoint; active full-walks and clears; unreadable always
+/// full-walks until quiesced recovery, whose next full walk publishes a usable checkpoint.
+#[tokio::test]
+async fn previous_binary_rollback_matrix() {
+    let Some(previous) = std::env::var_os("PE_ROLLBACK_SERVICE_BINARY") else {
+        eprintln!(
+            "SKIP previous_binary_rollback_matrix: PE_ROLLBACK_SERVICE_BINARY is unset; rollback compatibility is unproven"
+        );
+        return;
+    };
+    let previous = PathBuf::from(previous);
+    assert!(previous.is_absolute());
+    for binary in [
+        Path::new(env!("CARGO_BIN_EXE_pe-service")),
+        previous.as_path(),
+    ] {
+        let output = std::process::Command::new("sha256sum")
+            .arg(binary)
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        eprintln!(
+            "rollback executable identity: {}",
+            String::from_utf8(output.stdout).unwrap().trim()
+        );
+        let version = std::process::Command::new(binary)
+            .arg("--version")
+            .output()
+            .unwrap();
+        assert!(version.status.success());
+        eprintln!(
+            "rollback embedded identity: {}",
+            String::from_utf8(version.stdout).unwrap().trim()
+        );
+    }
+    for row in ["absent", "inactive", "active", "unreadable"] {
+        eprintln!("rollback row {row}: declared allowed; all preservation criteria required");
+        let fixture = checkpoint_rollout::CheckpointFixture::new().await;
+        // A genuine new-owner hourly artifact and persistent lock are the old reader's input.
+        let child = checkpoint_rollout::Child::start_checkpoint(
+            &fixture.config_path,
+            Path::new(env!("CARGO_BIN_EXE_pe-service")),
+            &[(
+                "PE_SCENARIO_CHECKPOINT_PUBLISH_INTERVAL_MS",
+                Path::new("500"),
+            )],
+        );
+        fixture.copy();
+        fixture.wait_copy().await;
+        checkpoint_until(|| {
+            checkpoint_events(&fixture.logs(), "source checkpoint published").len() >= 2
+        })
+        .await;
+        let output = child.finish_checkpoint(Some("-INT")).await;
+        assert!(output.status.success(), "{row}: {output:?}");
+        fixture.mirror_positions();
+        fixture.stale_anchors();
+        let source = &fixture.cfg.source_event_log_path;
+        let mut lock = pe_service::source_checkpoint::checkpoint_path(source).into_os_string();
+        lock.push(".lock");
+        assert!(PathBuf::from(lock).exists());
+        let mut record = pe_service::source_checkpoint::checkpoint_path(source).into_os_string();
+        record.push(".invalidation");
+        let record = PathBuf::from(record);
+        match row {
+            "absent" => {
+                if record.exists() {
+                    std::fs::remove_file(&record).unwrap();
+                }
+            }
+            "inactive" => std::fs::write(&record, br#"{"generation":4,"active":false}"#).unwrap(),
+            "active" => std::fs::write(&record, br#"{"generation":4,"active":true}"#).unwrap(),
+            "unreadable" => std::fs::write(&record, b"unreadable quarantine").unwrap(),
+            _ => unreachable!(),
+        }
+        let record_before = std::fs::read(&record).ok();
+        let finances = fixture.paper.financial_snapshot(NOW_UNIX).unwrap();
+        let history = fixture.paper.gate_history().unwrap();
+        let decisions = fixture.paper.decision_pending_history().unwrap();
+        let source_before = std::fs::read(source).unwrap();
+        // Control in every row: append a corrupt complete frame after the checkpoint.
+        append(
+            source,
+            envelope("rollback.control", 1, 1, b"control", NOW_UNIX),
+        );
+        let mut corrupt = std::fs::read(source).unwrap();
+        *corrupt.last_mut().unwrap() ^= 1;
+        std::fs::write(source, corrupt).unwrap();
+        fixture.clear_logs();
+        let output = boot_binary_at(&fixture.config_path, &previous).await;
+        assert!(
+            !output.status.success(),
+            "{row}: corrupt suffix unexpectedly allowed"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("CRC"),
+            "{row}: {output:?}"
+        );
+        assert!(!fixture.logs().contains("pe-service listening"));
+        assert_eq!(std::fs::read(&record).ok(), record_before);
+        std::fs::write(source, &source_before).unwrap();
+        fixture.clear_logs();
+        let child =
+            checkpoint_rollout::Child::start_checkpoint(&fixture.config_path, &previous, &[]);
+        fixture.wait_log("pe-service listening").await;
+        // The exact already-covered activity remains at the local endpoint during the old boot
+        // and next admission. No new decision/fence/financial mutation is permitted.
+        checkpoint_until(|| {
+            std::fs::read(&fixture.cfg.status_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+                .is_some_and(|status| {
+                    status["uptime_secs"]
+                        .as_u64()
+                        .is_some_and(|seconds| seconds >= 2)
+                })
+        })
+        .await;
+        fixture.assert_live_membership();
+        let output = child.finish_checkpoint(Some("-INT")).await;
+        assert!(output.status.success(), "{row}: {output:?}");
+        let logs = fixture.logs();
+        assert!(
+            logs.find("source checkpoint raw prefix verified").unwrap()
+                < logs.find("pe-service listening").unwrap()
+        );
+        assert_eq!(
+            std::fs::read(&record).ok(),
+            record_before,
+            "old binary changed {row} record"
+        );
+        assert_eq!(
+            fixture.paper.financial_snapshot(NOW_UNIX).unwrap(),
+            finances
+        );
+        assert_eq!(fixture.paper.gate_history().unwrap(), history);
+        assert_eq!(fixture.paper.decision_pending_history().unwrap(), decisions);
+        assert!(!fixture.paper.is_wallet_fenced(&fixture.wallet()).unwrap());
+        assert!(
+            fixture
+                .paper
+                .wallet_history_complete(&fixture.wallet())
+                .unwrap()
+        );
+        fixture.clear_logs();
+        let child = checkpoint_rollout::Child::start_checkpoint(
+            &fixture.config_path,
+            Path::new(env!("CARGO_BIN_EXE_pe-service")),
+            &[],
+        );
+        fixture.wait_log("pe-service listening").await;
+        if row != "unreadable" {
+            fixture.wait_log("source checkpoint published").await;
+        }
+        let output = child.finish_checkpoint(Some("-INT")).await;
+        assert!(output.status.success(), "{row}: new reader {output:?}");
+        let boot =
+            &checkpoint_events(&fixture.logs(), "source checkpoint verification completed")[0];
+        assert_eq!(
+            boot["checkpoint_used"],
+            matches!(row, "absent" | "inactive"),
+            "{row}"
+        );
+        if row == "active" {
+            assert!(
+                pe_service::source_checkpoint::read_authority(source)
+                    .unwrap()
+                    .permits_checkpoint()
+            );
+        }
+        if row == "unreadable" {
+            assert_eq!(std::fs::read(&record).ok(), record_before);
+            fixture.clear_logs();
+            let child = checkpoint_rollout::Child::start_checkpoint(
+                &fixture.config_path,
+                Path::new(env!("CARGO_BIN_EXE_pe-service")),
+                &[],
+            );
+            fixture.wait_log("pe-service listening").await;
+            assert!(
+                !checkpoint_events(&fixture.logs(), "source checkpoint verification completed")[0]
+                    ["checkpoint_used"]
+                    .as_bool()
+                    .unwrap()
+            );
+            assert!(child.finish_checkpoint(Some("-INT")).await.status.success());
+            let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pe-service"));
+            command
+                .env_clear()
+                .arg("--recover-source-checkpoint")
+                .arg("--paper-state")
+                .arg(&fixture.cfg.paper_state_db_path);
+            assert!(
+                support::bounded_command_output(command)
+                    .await
+                    .status
+                    .success()
+            );
+            fixture.clear_logs();
+            let child = checkpoint_rollout::Child::start_checkpoint(
+                &fixture.config_path,
+                Path::new(env!("CARGO_BIN_EXE_pe-service")),
+                &[],
+            );
+            fixture.wait_log("source checkpoint published").await;
+            assert_eq!(
+                checkpoint_events(&fixture.logs(), "source checkpoint verification completed")[0]["prefix_verification"],
+                "full_walk"
+            );
+            assert!(child.finish_checkpoint(Some("-INT")).await.status.success());
+            fixture.clear_logs();
+            let child = checkpoint_rollout::Child::start_checkpoint(
+                &fixture.config_path,
+                Path::new(env!("CARGO_BIN_EXE_pe-service")),
+                &[],
+            );
+            fixture.wait_log("source checkpoint prefix verified").await;
+            assert!(child.finish_checkpoint(Some("-INT")).await.status.success());
+            assert_eq!(
+                checkpoint_events(&fixture.logs(), "source checkpoint verification completed")[0]["checkpoint_used"],
+                true
+            );
+        }
+        assert_eq!(
+            fixture.paper.financial_snapshot(NOW_UNIX).unwrap(),
+            finances
+        );
+        assert_eq!(fixture.paper.gate_history().unwrap(), history);
+        assert_eq!(fixture.paper.decision_pending_history().unwrap(), decisions);
+        eprintln!(
+            "rollback row {row}: allowed PASS; corrupt control refused; retry idempotent; drained; balances/history/decisions/fences preserved; new invalidation policy PASS"
+        );
+    }
+}
+
+async fn boot_binary_at(config: &Path, binary: &Path) -> std::process::Output {
+    let mut command = std::process::Command::new(binary);
+    command
+        .env_clear()
+        .current_dir(config.parent().unwrap())
+        .arg(config);
+    support::bounded_command_output(command).await
+}
+
+fn corrupt_checkpoint_prefix(source: &Path) {
+    use std::io::{Seek, SeekFrom};
+    let offset = checkpoint_json(source)["tail"]["physical_tail"]
+        .as_u64()
+        .unwrap()
+        - 1;
+    let bytes = std::fs::read(source).unwrap();
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(source)
+        .unwrap();
+    file.seek(SeekFrom::Start(offset)).unwrap();
+    file.write_all(&[bytes[usize::try_from(offset).unwrap()] ^ 1])
+        .unwrap();
+    file.sync_all().unwrap();
 }

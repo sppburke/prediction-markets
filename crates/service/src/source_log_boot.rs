@@ -53,16 +53,16 @@ pub struct SourceLogBootHooks {
 /// The reducers fed by every verified frame. Each reducer latches its own first error, reported
 /// after the walk in owner order (activity, then daily boundary); a physical scanner error
 /// surfaces first because the walk itself returns it.
-struct Reducers {
-    activity: ActivityCandidates,
-    daily_boundary: Option<DailyBoundaryCandidates>,
+pub(crate) struct Reducers {
+    pub(crate) activity: ActivityCandidates,
+    pub(crate) daily_boundary: Option<DailyBoundaryCandidates>,
     activity_error: Option<ObligationRebuildError>,
     boundary_error: Option<ObligationRebuildError>,
     frames: u64,
 }
 
 impl Reducers {
-    fn new(financial_era: bool) -> Self {
+    pub(crate) fn new(financial_era: bool) -> Self {
         Self {
             activity: ActivityCandidates::default(),
             daily_boundary: financial_era.then(DailyBoundaryCandidates::default),
@@ -72,7 +72,7 @@ impl Reducers {
         }
     }
 
-    fn observe(&mut self, envelope: &EventEnvelope) {
+    pub(crate) fn observe(&mut self, envelope: &EventEnvelope) {
         self.frames = self.frames.saturating_add(1);
         if self.activity_error.is_none()
             && let Err(error) = self.activity.observe_activity(envelope)
@@ -87,7 +87,7 @@ impl Reducers {
         }
     }
 
-    fn take_error(&mut self) -> Result<()> {
+    pub(crate) fn take_error(&mut self) -> Result<()> {
         if let Some(error) = self.activity_error.take() {
             return Err(error).context("rebuild durable activity reconciliation obligations");
         }
@@ -116,25 +116,31 @@ pub struct OpenedSourceLog {
     pub binding: LogTailBinding,
 }
 
-struct FrozenCheckpoint {
-    authority_generation: Option<u64>,
-    capture_unix_ms: u64,
-    financial_era: bool,
-    activation: LogTailBinding,
-    tail: LogTailBinding,
-    prefix_blake3: String,
-    receipt_count: usize,
-    activity: ActivityCandidates,
-    daily_boundary: Option<DailyBoundaryCandidates>,
+pub(crate) enum FrozenPrefix {
+    Verified(Box<blake3::Hasher>),
+    Deferred {
+        tail: LogTailBinding,
+        prefix_blake3: String,
+    },
+}
+
+pub(crate) struct FrozenCheckpoint {
+    pub(crate) authority_generation: Option<u64>,
+    pub(crate) capture_unix_ms: u64,
+    pub(crate) financial_era: bool,
+    pub(crate) activation: LogTailBinding,
+    pub(crate) tail: LogTailBinding,
+    pub(crate) prefix: FrozenPrefix,
+    pub(crate) reducers: Reducers,
 }
 
 impl SourceLogBoot {
     /// Walk the source log once under the writer lock when the paper main holds an exact
     /// `Installed` record whose recorded source path is the configured one. Any other record
     /// (a migration boot or a mid-migration phase) yields `None` and the caller keeps its
-    /// existing flow. The walk fails closed on any frame error, prefix mismatch, lock
-    /// contention, or truncation into the recorded prefix; it repairs only a scanner-proven
-    /// incomplete final frame after that prefix.
+    /// existing flow. Suffix frame errors, lock contention, or truncation into the recorded
+    /// prefix fail closed; only a scanner-proven incomplete final frame is repaired. A loaded
+    /// checkpoint's raw prefix is deferred to the runtime checkpoint owner after listening.
     pub fn open(
         paths: &PaperMigrationPaths,
         financial_era: bool,
@@ -208,7 +214,7 @@ impl SourceLogBoot {
             checkpoint_binding
                 .as_ref()
                 .map(|(tail, hash)| (tail, hash.as_str())),
-            CheckpointPrefix::Verify,
+            CheckpointPrefix::Defer,
             &mut digest,
             &mut start,
             &mut observer,
@@ -220,10 +226,13 @@ impl SourceLogBoot {
             )
         })?;
         let checkpoint_used = verification.used;
-        info!(
-            elapsed_ms = u64::try_from(verification.prefix_elapsed.as_millis()).unwrap_or(u64::MAX),
-            "source checkpoint raw prefix verified"
-        );
+        if !verification.deferred {
+            info!(
+                elapsed_ms =
+                    u64::try_from(verification.prefix_elapsed.as_millis()).unwrap_or(u64::MAX),
+                "source checkpoint raw prefix verified"
+            );
+        }
         info!(
             elapsed_ms = u64::try_from(verification.suffix_elapsed.as_millis()).unwrap_or(u64::MAX),
             "source checkpoint suffix processed"
@@ -242,18 +251,46 @@ impl SourceLogBoot {
             financial_era,
             activation: prefix.binding().clone(),
             tail: binding.clone(),
-            prefix_blake3: digest.finalize().to_hex().to_string(),
-            receipt_count: binding.last_sequence.map_or(Ok(0), |seq| {
-                usize::try_from(seq.0)
-                    .ok()
-                    .and_then(|n| n.checked_add(1))
-                    .context("checkpoint receipt count overflow")
-            })?,
-            activity: reducers.activity.clone(),
-            daily_boundary: reducers.daily_boundary.clone(),
+            prefix: if verification.deferred {
+                let (tail, prefix_blake3) = checkpoint_binding
+                    .as_ref()
+                    .context("deferred checkpoint missing loaded binding")?;
+                FrozenPrefix::Deferred {
+                    tail: tail.clone(),
+                    prefix_blake3: prefix_blake3.clone(),
+                }
+            } else {
+                FrozenPrefix::Verified(Box::new(digest))
+            },
+            reducers: Reducers {
+                activity: reducers.activity.clone(),
+                daily_boundary: reducers.daily_boundary.clone(),
+                ..Reducers::new(financial_era)
+            },
         };
         info!(
             checkpoint_used,
+            prefix_verification = if verification.deferred {
+                "deferred"
+            } else {
+                "full_walk"
+            },
+            checkpoint_offset = checkpoint_binding
+                .as_ref()
+                .filter(|_| checkpoint_used)
+                .map(|(tail, _)| tail.physical_tail),
+            checkpoint_sequence = checkpoint_binding
+                .as_ref()
+                .filter(|_| checkpoint_used)
+                .and_then(|(tail, _)| tail.last_sequence.map(|seq| seq.0)),
+            checkpoint_hash = checkpoint_binding
+                .as_ref()
+                .filter(|_| checkpoint_used)
+                .map(|(tail, _)| tail.last_hash.to_hex().to_string()),
+            prefix_blake3 = checkpoint_binding
+                .as_ref()
+                .filter(|_| checkpoint_used)
+                .map(|(_, hash)| hash.as_str()),
             prefix_bytes = checkpoint_binding
                 .as_ref()
                 .filter(|_| checkpoint_used)
@@ -290,34 +327,12 @@ impl SourceLogBoot {
         }))
     }
 
-    /// Publish the frozen initial boot prefix, after the producer barrier. Later appends are
-    /// intentionally excluded and become the next restart's suffix.
-    pub fn publish_checkpoint(&self) -> Result<()> {
-        let frozen = &self.checkpoint;
-        let candidate = source_checkpoint::serialize(
-            CheckpointData {
-                format_version: 1,
-                scanner_version: 1,
-                reducer_version: ACTIVITY_REDUCER_VERSION,
-                financial_era: frozen.financial_era,
-                activation: frozen.activation.clone(),
-                tail: frozen.tail.clone(),
-                prefix_blake3: frozen.prefix_blake3.clone(),
-                receipts: self
-                    .receipt_index
-                    .checkpoint_prefix(frozen.receipt_count, &frozen.tail)?,
-                activity: frozen.activity.clone(),
-                daily_boundary: frozen.daily_boundary.clone(),
-            },
-            frozen
-                .authority_generation
-                .context("checkpoint capture had no readable authority")?,
-            frozen.capture_unix_ms,
-        )?;
-        match source_checkpoint::publish(&candidate, 1)? {
-            PublishOutcome::Published(_) => Ok(()),
-            outcome => anyhow::bail!("source checkpoint publication refused: {outcome:?}"),
-        }
+    /// Move the frozen boot prefix to its sole runtime owner after HTTP starts.
+    pub fn into_checkpoint_owner(
+        self,
+        slot: source_checkpoint::CheckpointJobSlot,
+    ) -> source_checkpoint::SourceCheckpointOwner {
+        source_checkpoint::SourceCheckpointOwner::new(self.checkpoint, self.receipt_index, slot)
     }
 
     /// Prepare while an installed service appends: read-only database/log access, finite size

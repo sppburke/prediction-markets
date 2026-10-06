@@ -696,7 +696,7 @@ publishes no checkpoint and blocks replacement, without repairing rows or the lo
 census, perform only the required restart; skip it if the exact desired binary already runs.
 
 Record stdout, stderr, and the exit status. Success prints
-`prepared source checkpoint: <bytes> bytes, sequence <sequence>, validated N open continuations` and
+`source checkpoint published offset=<offset> sequence=<sequence> hash=<hash> prefix_blake3=<digest> capture_unix_ms=<capture> published_unix_ms=<publication> validated=<count>` and
 exits zero.
 A continuation validation failure exits nonzero with `open decision continuation <source_trade_id>: <cause>`;
 it blocks the swap for diagnosis without repairing rows or fabricating dispositions. Normal boot
@@ -1014,7 +1014,7 @@ comparisons decide what remains; never guess from memory.
    temporary files. Publication failure before rename preserves the previous artifact; after rename a
    complete new artifact may remain despite a directory-sync error.
 
-   Record checkpoint-loading, BLAKE3 raw-prefix verification and verified suffix durations separately
+   Record checkpoint-loading, deferred BLAKE3 prefix verification and verified suffix durations separately
    from first-copy time, plus checkpoint use and prefix/suffix sizes. Admission logs report wallet
    bracket elapsed/outcome and tick budget, starts, acceptances, deferrals and unstarted candidates.
    Compare these stages with the captured restart baseline; BLAKE2 throughput is not a BLAKE3 restart
@@ -1047,7 +1047,9 @@ comparisons decide what remains; never guess from memory.
    first-entry refusal, unsafe-wallet quarantine, later progressive admissions and Supabase
    projection convergence. Full/checkpoint restart must preserve history, ledger and financial
    state. Before committed clearance, prior-reader rollback follows existing era boundaries and
-   ignores the sidecar. After clearance, recover forward with a compatible implementation. Stop
+   ignores the sidecar. The #737 matrix below is required for the release-1 checkpoint authority
+   states; an allowed matrix row does not override the existing financial-era boundaries.
+   After financial clearance, recover forward with a compatible implementation. Stop
    and drain before assessing this boundary: queued controls can commit during shutdown. Never
    restore stale state or delete fences manually.
 
@@ -1325,3 +1327,97 @@ targets, retained paper decisions, and live-journal recovery work. Recheck after
 | SQL only | The locked mode RPC accepts only a proposal matching the current owner request. The old site's non-null `enabled` settings save and retired review actions fail visibly without changing mode or events. **Request mode** remains available. |
 | SQL and site | The new site labels stored `enabled` as history, leaves **Request mode** visible, and identifies an unmarked legacy readiness response as the old service. Check an unavailable readiness response separately. |
 | SQL, site, and service | The marked readiness body identifies the owner-requested contract on 200 and 503. Compare requested and effective modes, control availability, and retained dispatch/journal work against the inventory; an existing `live_tiny` request may reconcile immediately. |
+
+
+## #737 release 1 checkpoint restart and rollback
+
+Install `deploy/systemd/pe-service.service.d-checkpoint-invalidation.conf` as
+`/etc/systemd/system/pe-service.service.d/checkpoint-invalidation.conf`, then run
+`sudo systemctl daemon-reload` and verify
+`systemctl show pe-service -p RestartPreventExitStatus` includes 78 before the binary swap.
+A service exit with 78 means durable checkpoint quarantine failed. Stop and drain the service;
+run `pe-service --recover-source-checkpoint --paper-state <installed-path>` while quiesced before
+starting it. The command removes and syncs both installed logs' checkpoint artifacts before their
+invalidation records. Preserve the database and event logs. Manual starts and host reboots before
+recovery can reopen the old checkpoint and repeat the deferred verification window.
+
+Retain the successful `--prepare-source-checkpoint` stdout before deployment: offset, sequence,
+hash, `prefix_blake3`, `capture_unix_ms`, `published_unix_ms` and validated continuation count.
+The restart's `source checkpoint verification completed` event must report `checkpoint_used=true`
+and match that binding and digest to establish the initial AC-A age. Deferred boot serves before
+the `source checkpoint prefix verified` event, then publishes. A prefix mismatch invalidates and
+stops; later boots full-walk and refuse corrupt frames. Active authority clears only after a
+current-generation verified publication. Unreadable authority forces full walks and cannot publish
+until the quiesced recovery above; after recovery the next boot full-walks and publishes, and the
+following boot can use its checkpoint.
+
+The runtime owner extends only the newly captured suffix at the compiled intervals in
+[`_GLOSSARY.md`](_GLOSSARY.md). Each successful publication rewrites the whole artifact under its
+persistent lock. I/O failures log ERROR `source checkpoint publication retry`, retain identical
+bytes and capture time, and retry without another reducer walk. The next hourly candidate replaces
+that pending candidate. A generation change or an incremental integrity failure triggers restart.
+Audit the invocation's flattened JSON journal lines for `source checkpoint published`,
+`source checkpoint publication retry`, and `source checkpoint candidate refused`. Successful
+receipt lag is `published_unix_ms - capture_unix_ms`; last-published age and pending-candidate age
+are separate. Missing receipt/binding evidence or a failed publication leaves AC-A incomplete.
+
+Before deployment run the fixed rollback matrix against the recorded previous executable:
+
+```bash
+PE_ROLLBACK_SERVICE_BINARY=/mnt/data/pm-e224e32/target/debug/pe-service cargo nextest run -p pe-service --all-features --test scenario_source_log_boot previous_binary_rollback_matrix --nocapture
+```
+
+The scenario prints both executable SHA-256 identities and each row result. An unset-variable skip
+proves no rollback compatibility. The declared old-reader outcomes are fixed before execution:
+
+| Invalidation record | Previous `e224e32` outcome | Following new-reader outcome |
+|---|---|---|
+| Absent | Allowed: raw-prefix verifies before serving; ignores lock/record | Checkpoint-assisted |
+| Inactive | Allowed: raw-prefix verifies before serving; preserves record | Checkpoint-assisted |
+| Active with checkpoint present | Allowed: raw-prefix verifies before serving; preserves record | Full verified walk, publication, active clearance |
+| Unreadable | Allowed: raw-prefix verifies before serving; preserves record | Repeated full verified walks; quiesced recovery, full walk/publication, then checkpoint-assisted |
+
+Recorded local A-2 run, 2026-10-06, worktree HEAD `3c3881f658fefa2fb750ece17c41bc453e338031`
+with uncommitted lane A-2 edits: the exact command above passed once (1 test passed, 40 filtered).
+The current executable was `/mnt/data/pm-fast-restart/target/debug/pe-service`, embedded revision
+`dev-dirty`, SHA-256 `0b7706ba903b83a2f6bee6e8d9d3207ded6148a093169ecedddc788bf49b014b`.
+The previous executable was `/mnt/data/pm-e224e32/target/debug/pe-service`, embedded revision
+`e224e3204d0163e88daf707991ad10497ca481d4`, SHA-256
+`9c82ea00c2fb5e970d58b235652b9ed0f68bd5a47c09148fc8746a4de5d70092`.
+Observed outcomes: absent **allowed PASS**, inactive **allowed PASS**, active **allowed PASS**,
+unreadable **allowed PASS**. Every row refused its corrupt suffix control, retried idempotently,
+drained gracefully, preserved balances/history/decisions/fences and effective live membership,
+and passed the subsequent new-reader invalidation policy. No row was reclassified.
+
+Every row requires refusal of a corrupt frame after the checkpoint, idempotent exact covered retry,
+graceful drain, unchanged balances/history/decisions, no re-fence, and effective live membership
+after stale-anchor admission. An unexpected observation fails its row and removes authorization to
+roll back that state. Record the exact run's printed identities and results in deployment artifacts.
+Stop and drain before reversal, preserve all state, never undo clearance or restore stale state.
+The unit drop-in is harmless to the previous binary, which never selects checkpoint status 78.
+
+
+For AC-A, set `invocation`, `restart_utc`, and `window_end_utc` from the retained invocation and
+explicit UTC window; write the scoped journal before extracting it:
+
+```bash
+journalctl -u pe-service "_SYSTEMD_INVOCATION_ID=$invocation" --since "$restart_utc" --until "$window_end_utc" -o json > checkpoint-journal.jsonl
+jq -ce '
+  . as $journal | (.MESSAGE | fromjson) as $line |
+  select($line.message == "source checkpoint published" or
+         $line.message == "source checkpoint publication retry" or
+         $line.message == "source checkpoint candidate refused") |
+  (if $line.message == "source checkpoint published" then
+     ["offset","sequence","hash","prefix_blake3","capture_unix_ms","published_unix_ms","write_ms","bytes","attempt"]
+   elif $line.message == "source checkpoint publication retry" then
+     ["error","capture_unix_ms"]
+   else ["reason","capture_unix_ms"] end) as $required |
+  if all($required[]; . as $key | $line | has($key)) then
+    {journal_unix_us:$journal.__REALTIME_TIMESTAMP, event:$line}
+  else error("checkpoint event missing required receipt fields") end
+' checkpoint-journal.jsonl > checkpoint-events.jsonl
+```
+
+An owner that has not yet completed a publication has no `last_published_capture_unix_ms`; use the
+matched staged receipt for that initial interval. Keep its capture time separate from the pending
+candidate's timestamp. Do not treat a missing publication or an extraction failure as a pass.

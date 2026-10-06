@@ -1,5 +1,5 @@
 //! The real service process, local HTTP authority, and unchanged production admission gates.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#![allow(dead_code, clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 use axum::{
     Json, Router,
     body::Bytes,
@@ -261,7 +261,7 @@ async fn serve(
     };
     (StatusCode::OK, Json(answer))
 }
-struct Child {
+pub struct Child {
     process: std::process::Child,
     root: std::path::PathBuf,
     stdout: Option<tokio::task::JoinHandle<Vec<u8>>>,
@@ -269,8 +269,12 @@ struct Child {
 }
 impl Child {
     fn start(config: &Path) -> Self {
-        let mut process = std::process::Command::new(env!("CARGO_BIN_EXE_pe-service"))
+        Self::start_checkpoint(config, Path::new(env!("CARGO_BIN_EXE_pe-service")), &[])
+    }
+    pub fn start_checkpoint(config: &Path, binary: &Path, env: &[(&str, &Path)]) -> Self {
+        let mut process = std::process::Command::new(binary)
             .env_clear()
+            .envs(env.iter().map(|(key, value)| (key, value)))
             .current_dir(config.parent().unwrap())
             .arg(config)
             .stdout(std::process::Stdio::piped())
@@ -289,6 +293,32 @@ impl Child {
             root: config.parent().unwrap().to_path_buf(),
             stdout: Some(tokio::task::spawn_blocking(move || drain(stdout))),
             stderr: Some(tokio::task::spawn_blocking(move || drain(stderr))),
+        }
+    }
+    pub async fn finish_checkpoint(mut self, signal: Option<&str>) -> std::process::Output {
+        if let Some(signal) = signal {
+            assert!(
+                std::process::Command::new("kill")
+                    .args([signal, &self.process.id().to_string()])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let status = tokio::time::timeout(Duration::from_secs(40), async {
+            loop {
+                if let Some(status) = self.process.try_wait().unwrap() {
+                    break status;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        std::process::Output {
+            status,
+            stdout: self.stdout.take().unwrap().await.unwrap(),
+            stderr: self.stderr.take().unwrap().await.unwrap(),
         }
     }
     async fn stop(mut self) -> String {
@@ -1011,4 +1041,238 @@ async fn run_case(boot_waves: bool) {
             .is_some()
     );
     server.abort();
+}
+
+/// Minimal real-process checkpoint fixture reusing the rollout's local financial authority.
+pub struct CheckpointFixture {
+    pub dir: tempfile::TempDir,
+    pub cfg: ServiceConfig,
+    pub config_path: std::path::PathBuf,
+    pub paper: Arc<PaperStateDb>,
+    state: Arc<HttpState>,
+    server: tokio::task::JoinHandle<Result<(), std::io::Error>>,
+}
+impl Drop for CheckpointFixture {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+impl CheckpointFixture {
+    pub async fn new() -> Self {
+        use std::sync::atomic::AtomicBool;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let cfg = ServiceConfig {
+            bind: "127.0.0.1:0".to_owned(),
+            event_log_path: root.join("paper.log"),
+            source_event_log_path: root.join("source.log"),
+            paper_state_db_path: root.join("paper.db"),
+            legacy_wallet_history_path: root.join("legacy.json"),
+            jsonl_log_path: root.join("service.jsonl"),
+            status_path: root.join("status.json"),
+            polymarket_base_url: base.clone(),
+            gamma_base_url: base.clone(),
+            polymarket_clob_base_url: base.clone(),
+            polygon_receipt_rpc_url: base.clone(),
+            supabase_url: base,
+            supabase_secret_key: "fixture".to_owned(),
+            supabase_authoritative: true,
+            bankroll_usd: "10000".to_owned(),
+            maintenance_interval_secs: 3600,
+            trade_poll_interval_secs: 1,
+            gamma_resolution_poll_interval_secs: 3600,
+            supabase_refresh_interval_secs: 3600,
+            status_interval_secs: 1,
+            ..ServiceConfig::default()
+        };
+        let mut runtime = RuntimeConfig::from_service_config(&cfg);
+        runtime.sizing_mode = pe_strategy_winner_follow::SizingMode::Dollar { usd: dec!(5) };
+        runtime.sizing_dollar_usd = dec!(5);
+        let state = Arc::new(HttpState {
+            rows: crate::golden::golden_config_rows(&runtime),
+            now,
+            ranked_wallets: 1,
+            full_history_requests: Mutex::new(Vec::new()),
+            start: Mutex::new(None),
+            authority: Mutex::new(Authority {
+                cash: dec!(10000),
+                ..Default::default()
+            }),
+            activity: Mutex::new(HashMap::new()),
+            positions: Mutex::new(Vec::new()),
+            slow_started: Notify::new(),
+            slow: Semaphore::new(0),
+            release_slow: AtomicBool::new(true),
+            gamma_fails: AtomicBool::new(false),
+            stale_ranked_wallet_2: AtomicBool::new(false),
+            gamma_failures: std::sync::atomic::AtomicUsize::new(0),
+            resolved: AtomicBool::new(false),
+        });
+        let server = tokio::spawn(
+            axum::serve(
+                listener,
+                Router::new().fallback(serve).with_state(state.clone()),
+            )
+            .into_future(),
+        );
+        rusqlite::Connection::open(&cfg.paper_state_db_path)
+            .unwrap()
+            .execute_batch(include_str!(
+                "../../../paper-state/tests/fixtures/paper_state_v1.sql"
+            ))
+            .unwrap();
+        drop(Writer::open(&cfg.event_log_path).unwrap());
+        drop(Writer::open(&cfg.source_event_log_path).unwrap());
+        drop(pe_execution_core::LiveJournal::open(root.join("live_journal.log")).unwrap());
+        std::fs::write(&cfg.legacy_wallet_history_path, br#"{"wallets":[]}"#).unwrap();
+        let paths = PaperMigrationPaths {
+            fixed_main: cfg.paper_state_db_path.clone(),
+            source_log: cfg.source_event_log_path.clone(),
+            paper_log: cfg.event_log_path.clone(),
+            live_journal: root.join("live_journal.log"),
+            legacy_history: cfg.legacy_wallet_history_path.clone(),
+            binary_identity: pe_service::build_info::embedded()
+                .source_revision
+                .to_owned(),
+        };
+        let boot = PaperMigrationBoot::prepare(paths.clone(), now).unwrap();
+        let side = PaperStateDb::open(&boot.active_main).unwrap();
+        side.record_migration_activation_facts(
+            &json!({"fixture":"complete"}),
+            &paths.binary_identity,
+        )
+        .unwrap();
+        drop(side);
+        boot.session.unwrap().finish().unwrap();
+        let paper = Arc::new(PaperStateDb::open(&cfg.paper_state_db_path).unwrap());
+        crate::support::install_full_history_anchor(&paper, wallet(1), now - 10);
+        paper
+            .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
+                wallet: wallet(1),
+                complete: true,
+                proof_json: "{}".to_owned(),
+                updated_at_unix: now - 10,
+            })
+            .unwrap();
+        let members = vec![wallet(1)];
+        let start = QualificationStarted {
+            starting_bankroll: CollateralAmount::from_decimal_exact(dec!(10000)).unwrap(),
+            paper_prefix: TailBinding::from(&Scanner::verify(&cfg.event_log_path).unwrap()),
+            source_prefix: TailBinding::from(&Scanner::verify(&cfg.source_event_log_path).unwrap()),
+            live_prefix: TailBinding::from(&Scanner::verify(&paths.live_journal).unwrap()),
+            artifact_blake3: "a".repeat(64),
+            static_config_hash: "b".repeat(64),
+            hot_config_hash: runtime.canonical_hash(),
+            generation: "checkpoint".to_owned(),
+            activation_id: "checkpoint".to_owned(),
+            ranking_batch_id: 1,
+            membership: members.clone(),
+            membership_proofs_hash: pe_service::qualification::scenario_membership_proofs_hash(
+                &paper, &members,
+            )
+            .unwrap(),
+            schema_version: 2,
+            parser_version: 1,
+            financial_semantic_version: pe_service::paper_recovery::FINANCIAL_SEMANTIC_VERSION,
+        };
+        let receipt = Writer::open(&cfg.event_log_path)
+            .unwrap()
+            .append_synced(envelope(
+                serde_json::to_vec(&PaperLogRecord::QualificationStarted(Arc::new(start))).unwrap(),
+                "pe-service.paper",
+                now - 5,
+                2,
+                1,
+            ))
+            .unwrap();
+        paper
+            .reset_financial_era(
+                receipt,
+                CollateralAmount::from_decimal_exact(dec!(10000)).unwrap(),
+            )
+            .unwrap();
+        *state.start.lock().unwrap() = Some(receipt);
+        let config_path = root.join("service.toml");
+        std::fs::write(&config_path, toml::to_string(&cfg).unwrap()).unwrap();
+        Self {
+            dir,
+            cfg,
+            config_path,
+            paper,
+            state,
+            server,
+        }
+    }
+    pub fn copy(&self) {
+        self.state.activity.lock().unwrap().insert(
+            wallet(1).to_string(),
+            vec![row(
+                wallet(1),
+                1,
+                OffsetDateTime::now_utc().unix_timestamp(),
+                1001,
+            )],
+        );
+    }
+    pub fn logs(&self) -> String {
+        std::fs::read_dir(self.dir.path())
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                (name.starts_with("service.")
+                    && name.ends_with(".jsonl")
+                    && !name.contains("error"))
+                .then(|| std::fs::read_to_string(entry.path()).unwrap_or_default())
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+    pub async fn wait_log(&self, message: &str) {
+        until(|| self.logs().contains(message)).await;
+    }
+    pub async fn wait_copy(&self) {
+        until(|| self.paper.list_fills().unwrap().len() == 1).await;
+    }
+    pub fn clear_logs(&self) {
+        for entry in std::fs::read_dir(self.dir.path()).unwrap().flatten() {
+            if entry.file_name().to_string_lossy().ends_with(".jsonl") {
+                std::fs::remove_file(entry.path()).unwrap();
+            }
+        }
+    }
+    pub fn stale_anchors(&self) {
+        rusqlite::Connection::open(&self.cfg.paper_state_db_path)
+            .unwrap()
+            .execute(
+                "UPDATE position_anchors SET anchored_at_unix=?1",
+                [self.state.now - 4000],
+            )
+            .unwrap();
+    }
+    pub fn mirror_positions(&self) {
+        *self.state.positions.lock().unwrap() = self.paper.leader_positions().unwrap().into_iter().map(|position| json!({"proxyWallet": position.wallet, "conditionId": position.market_id.0.0, "asset":"103", "outcomeIndex":position.outcome_id.0, "size":position.long_contracts.to_decimal().to_string(), "negativeRisk":false, "redeemable":false})).collect();
+    }
+    pub fn wallet(&self) -> WalletAddress {
+        wallet(1)
+    }
+    pub fn assert_live_membership(&self) {
+        let status: Value =
+            serde_json::from_slice(&std::fs::read(&self.cfg.status_path).unwrap()).unwrap();
+        assert_eq!(status["watchlist_size"], 1, "{status}");
+        assert!(
+            self.state
+                .authority
+                .lock()
+                .unwrap()
+                .projection
+                .iter()
+                .any(|row| row["wallet_hex"] == wallet(1).to_string())
+        );
+        assert!(!self.paper.is_wallet_fenced(&wallet(1)).unwrap());
+    }
 }

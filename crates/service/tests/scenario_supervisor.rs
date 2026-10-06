@@ -227,3 +227,15 @@ async fn ingest_exit_before_sink_phase_is_unexpected() {
         TaskFailureKind::EarlyReturn
     );
 }
+
+#[tokio::test]
+async fn checkpoint_invalidation_failure_is_typed_and_sticky() {
+    let failure = TaskFailure {
+        kind: TaskFailureKind::CheckpointInvalidationFailed,
+        message: "durable quarantine failed".to_owned(),
+    };
+    let (class, kind, readiness_failed) = observe(TaskName::SourceCheckpoint, Err(failure)).await;
+    assert_eq!(class, TaskClass::Critical);
+    assert_eq!(kind, TaskFailureKind::CheckpointInvalidationFailed);
+    assert!(readiness_failed);
+}
