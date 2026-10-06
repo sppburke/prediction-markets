@@ -391,6 +391,9 @@ else
     echo "FATAL: uncheckpointed rehearsal copy exists: $copy_dir" >&2
     exit 1
   fi
+  # Capture the companions under the service's publication/invalidation lock.
+  exec 8<>"$active_generation/source_events.log.boot-checkpoint.lock"
+  flock -x 8
   for name in source_events.log.boot-checkpoint{,.receipts,.invalidation}; do
     if [[ -e "$active_generation/$name" || -L "$active_generation/$name" ]]; then
       [[ -f "$active_generation/$name" && ! -L "$active_generation/$name" ]] || {
@@ -400,6 +403,8 @@ else
       cp -p "$active_generation/$name" "$copy_dir/$name"
     fi
   done
+  flock -u 8
+  exec 8>&-
   sqlite3 -readonly "$active_generation/paper_state.db" ".backup '$copy_dir/paper_state.db'"
   for name in paper.log source_events.log live_journal.log wallet_market_history.json; do
     cp -p "$active_generation/$name" "$copy_dir/$name"
