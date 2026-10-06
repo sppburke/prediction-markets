@@ -1014,7 +1014,17 @@ pub(crate) async fn plan_membership(
             continue;
         }
         match preparer
-            .prepare_ranked_until(&new, &selected_last_trade, deadline)
+            .prepare_ranked_until(
+                &new,
+                &selected_last_trade,
+                deadline,
+                sync.as_ref().map_or(
+                    crate::watchlist_admission::AdmissionContext::Capacity,
+                    |sync| crate::watchlist_admission::AdmissionContext::Addition {
+                        first: !sync.reentries_first,
+                    },
+                ),
+            )
             .await
         {
             Ok(outcome) => {
@@ -1274,6 +1284,8 @@ pub async fn apply_full_rerank_swap(
 /// when the marker already names it (#542). The marker itself is never erased — it still decides
 /// whether a tick is a genuine batch transition, which is what clears the eviction memory.
 pub(crate) struct BatchSync {
+    reentries_first: bool,
+    attempted_batch_id: Option<i64>,
     cooldowns: HashMap<WalletAddress, tokio::time::Instant>,
     parking_batch: Option<i64>,
     started: usize,
@@ -1297,7 +1309,7 @@ fn park_persistent(
                 .unwrap_or_else(tokio::time::Instant::now);
             sync.cooldowns.insert(
                 deferral.wallet,
-                terminal + Duration::from_secs(crate::trade_poller::ANCHOR_REFRESH_SECS),
+                terminal + Duration::from_secs(crate::watchlist_admission::ADMISSION_RETRY_SECS),
             );
         }
     }
@@ -1503,7 +1515,14 @@ async fn live_reentry_tick(
     }
     park_persistent(sync, paper_state, &deferred);
     let prepared = match preparer
-        .prepare_ranked_until(&candidates, last_trade, deadline)
+        .prepare_ranked_until(
+            &candidates,
+            last_trade,
+            deadline,
+            crate::watchlist_admission::AdmissionContext::Reentry {
+                first: sync.reentries_first,
+            },
+        )
         .await
     {
         Ok(prepared) => prepared,
@@ -1603,6 +1622,8 @@ impl ScenarioMaintenanceState {
                 marker,
                 capacity_generation,
                 parking_batch: marker,
+                reentries_first: true,
+                attempted_batch_id: None,
                 knockout_deferred: HashSet::new(),
                 cooldowns: HashMap::new(),
                 started: 0,
@@ -1649,7 +1670,7 @@ impl ScenarioMaintenanceState {
 
 /// Run the maintenance tick loop until the process exits.
 ///
-/// `cfg.interval_secs == 0` disables the loop. The first tick fires one interval after startup.
+/// `cfg.interval_secs == 0` disables the loop. The first tick fires at startup.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_maintenance_loop(
     live: LiveWatchlist,
@@ -1690,6 +1711,8 @@ pub async fn run_maintenance_loop(
         capacity_generation: applied_capacity.load().generation,
         knockout_deferred: boot_persistent_deferred,
         parking_batch: initial_batch_marker,
+        reentries_first: true,
+        attempted_batch_id: None,
         cooldowns: boot_cooldowns,
         started: 0,
         accepted: 0,
@@ -1697,7 +1720,6 @@ pub async fn run_maintenance_loop(
         unstarted: 0,
     };
     loop {
-        tokio::time::sleep(interval).await;
         let capacity_epoch = applied_capacity.load();
         maintenance_tick(
             &live,
@@ -1716,6 +1738,7 @@ pub async fn run_maintenance_loop(
             OffsetDateTime::now_utc().unix_timestamp(),
         )
         .await;
+        tokio::time::sleep(interval).await;
     }
 }
 
@@ -1786,6 +1809,7 @@ async fn maintenance_tick(
     sync.accepted = 0;
     sync.deferred = 0;
     sync.unstarted = 0;
+    sync.attempted_batch_id = None;
     maintenance_tick_inner(
         live,
         paper_state,
@@ -1811,6 +1835,9 @@ async fn maintenance_tick(
         accepted = sync.accepted,
         deferred = sync.deferred,
         unstarted = sync.unstarted,
+        attempted_batch_id = sync.attempted_batch_id,
+        applied_batch_id = sync.marker,
+        capacity_generation = capacity_epoch.generation,
         "maintenance admission budget completed"
     );
 }
@@ -1836,13 +1863,35 @@ async fn maintenance_tick_inner(
     let cap = capacity_epoch.target;
     let mut held_batch: Option<(i64, Watchlist, HashMap<WalletAddress, i64>)> = None;
     let mut attempted_reentries = HashSet::new();
+    sync.reentries_first = !sync.reentries_first;
+    if sync.reentries_first {
+        let report = live_reentry_tick(
+            live,
+            paper_state,
+            cfg,
+            client,
+            base_url,
+            anon_key,
+            secret_key,
+            writer_lock,
+            applied_capacity,
+            capacity_epoch,
+            preparer,
+            sync,
+            None,
+            &mut attempted_reentries,
+            now_unix,
+            Some(deadline),
+        )
+        .await;
+        record_live_reentry(preparer, sync, cfg.membership_mode, report).await;
+    }
     let mut shared_batch_fetch_failed = false;
     // A capacity transition since the last sync means membership may reflect an older
     // `latest_ranking` read than the batch this loop last applied (#542).
     let capacity_changed = capacity_epoch.generation != sync.capacity_generation;
 
-    // 1. Ranking-batch step — UNCONDITIONAL, never coupled to local DB read health (the
-    // legacy tick ran it first; a review finding on the first draft caught the reorder).
+    // Ranking-batch step remains unconditional, independent of re-entry/read health.
     // Knockout mode: a fresh batch clears the evicted-set and can restore prepared,
     // structural wallets that are absent from live. FullRerank mode: a batch TRANSITION
     // hands membership to the ranker —
@@ -1860,6 +1909,7 @@ async fn maintenance_tick_inner(
                     if let Some(batch_id) = latest
                         && latest != sync.marker
                     {
+                        sync.attempted_batch_id = Some(batch_id);
                         match supabase_reader::fetch_batch(
                             client,
                             base_url,
@@ -1918,6 +1968,7 @@ async fn maintenance_tick_inner(
                     if let Some(batch_id) = latest
                         && (latest != sync.marker || capacity_changed)
                     {
+                        sync.attempted_batch_id = Some(batch_id);
                         match supabase_reader::fetch_batch(
                             client,
                             base_url,
@@ -3304,6 +3355,7 @@ mod tests {
         /// the prepared wallet was not yet published.
         struct Harness {
             live: LiveWatchlist,
+            projection_rx: tokio::sync::watch::Receiver<u64>,
             paper_state: Arc<PaperStateDb>,
             preparer: crate::watchlist_admission::AdmissionPreparer,
             control_tx: mpsc::Sender<OrchestratorControl>,
@@ -3361,7 +3413,11 @@ mod tests {
                     })
                     .unwrap();
             }
-            let live = live(initial);
+            let (dirty, projection_rx) = crate::live_watchlist::projection_dirty_channel();
+            let live = LiveWatchlist::new_with_projection(
+                live(initial).snapshot().as_ref().clone(),
+                dirty,
+            );
             let (control_tx, mut control_rx) = mpsc::channel(2);
             let controls: Arc<StdMutex<ControlLog>> = Arc::new(StdMutex::new(Vec::new()));
             let (control_live, control_log) = (live.clone(), Arc::clone(&controls));
@@ -3556,7 +3612,9 @@ mod tests {
                                 continue;
                             }
 
-                            if failure == Some("structural")
+                            if (failure == Some("structural")
+                                || (failure == Some("structural_after_first")
+                                    && publication_attempt > 0))
                                 && change.reason == MembershipReason::FullRerank
                             {
                                 acknowledged
@@ -3619,6 +3677,7 @@ mod tests {
             .with_source_log(source_handle.clone());
             Harness {
                 live,
+                projection_rx,
                 paper_state,
                 preparer,
                 control_tx,
@@ -3646,6 +3705,8 @@ mod tests {
             ) {
                 let mut sync = BatchSync {
                     parking_batch: None,
+                    reentries_first: true,
+                    attempted_batch_id: None,
                     cooldowns: HashMap::new(),
                     started: 0,
                     accepted: 0,
@@ -3698,6 +3759,8 @@ mod tests {
             ) {
                 let mut sync = BatchSync {
                     parking_batch: None,
+                    reentries_first: true,
+                    attempted_batch_id: None,
                     cooldowns: HashMap::new(),
                     started: 0,
                     accepted: 0,
@@ -4035,6 +4098,8 @@ mod tests {
             let mut evicted = HashSet::new();
             let mut sync = BatchSync {
                 parking_batch: None,
+                reentries_first: true,
+                attempted_batch_id: None,
                 cooldowns: HashMap::new(),
                 started: 0,
                 accepted: 0,
@@ -4072,6 +4137,8 @@ mod tests {
             let mut evicted = HashSet::new();
             let mut sync = BatchSync {
                 parking_batch: None,
+                reentries_first: true,
+                attempted_batch_id: None,
                 cooldowns: HashMap::new(),
                 started: 0,
                 accepted: 0,
@@ -4507,6 +4574,8 @@ mod tests {
             h.live.remove_fenced(&set(&[deferred]));
             let mut sync = BatchSync {
                 parking_batch: None,
+                reentries_first: true,
+                attempted_batch_id: None,
                 cooldowns: HashMap::new(),
                 started: 0,
                 accepted: 0,
@@ -4571,6 +4640,8 @@ mod tests {
                 }
                 let mut sync = BatchSync {
                     parking_batch: None,
+                    reentries_first: true,
+                    attempted_batch_id: None,
                     cooldowns: HashMap::new(),
                     started: 0,
                     accepted: 0,
@@ -4644,6 +4715,8 @@ mod tests {
             let mut attempted = HashSet::new();
             let mut sync = BatchSync {
                 parking_batch: None,
+                reentries_first: true,
+                attempted_batch_id: None,
                 cooldowns: HashMap::new(),
                 started: 0,
                 accepted: 0,
@@ -4716,6 +4789,8 @@ mod tests {
             h.live.remove_fenced(&set(&[deferred]));
             let mut sync = BatchSync {
                 parking_batch: None,
+                reentries_first: true,
+                attempted_batch_id: None,
                 cooldowns: HashMap::new(),
                 started: 0,
                 accepted: 0,
@@ -4854,6 +4929,8 @@ mod tests {
             let mut evicted = set(&[knocked_out]);
             let mut sync = BatchSync {
                 parking_batch: None,
+                reentries_first: true,
+                attempted_batch_id: None,
                 cooldowns: HashMap::new(),
                 started: 0,
                 accepted: 0,
@@ -4906,6 +4983,8 @@ mod tests {
             let mut evicted = set(&[knocked_out]);
             let mut sync = BatchSync {
                 parking_batch: None,
+                reentries_first: true,
+                attempted_batch_id: None,
                 cooldowns: HashMap::new(),
                 started: 0,
                 accepted: 0,
@@ -5254,6 +5333,697 @@ mod tests {
                 assert!(h.paper_state.cursor(&fenced).unwrap().is_none());
             }
         }
+        fn admission_sync(marker: i64) -> BatchSync {
+            BatchSync {
+                cooldowns: HashMap::new(),
+                parking_batch: Some(marker),
+                reentries_first: true,
+                attempted_batch_id: None,
+                started: 0,
+                accepted: 0,
+                deferred: 0,
+                unstarted: 0,
+                marker: Some(marker),
+                capacity_generation: 0,
+                knockout_deferred: HashSet::new(),
+            }
+        }
+
+        // Keep Tokio from auto-advancing through local HTTP deadlines. Tests explicitly
+        // advance the paused clock at the simulated read/completion boundaries.
+        struct PausedIo(tokio::task::JoinHandle<()>);
+        impl Drop for PausedIo {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        fn paused_io() -> PausedIo {
+            PausedIo(tokio::spawn(async {
+                loop {
+                    tokio::task::yield_now().await;
+                }
+            }))
+        }
+
+        struct AdmissionFetcher {
+            paper: Arc<PaperStateDb>,
+            busy: Arc<StdMutex<HashSet<WalletAddress>>>,
+            activity_reads: StdMutex<HashMap<WalletAddress, usize>>,
+            spend_budget: bool,
+        }
+        impl PageFetcher for AdmissionFetcher {
+            async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+                let wallet = url
+                    .split("user=")
+                    .nth(1)
+                    .unwrap()
+                    .split('&')
+                    .next()
+                    .unwrap();
+                let wallet = WalletAddress::from_hex(wallet).unwrap();
+                if url.contains("/activity?") {
+                    let first = {
+                        let mut reads = self.activity_reads.lock().unwrap();
+                        let count = reads.entry(wallet).or_default();
+                        let first = (*count).is_multiple_of(3);
+                        *count += 1;
+                        first
+                    };
+                    if first && self.spend_budget {
+                        tokio::time::advance(Duration::from_secs(11)).await;
+                    }
+                } else if url.contains("redeemable=false")
+                    && self.busy.lock().unwrap().contains(&wallet)
+                {
+                    // Simulate ordinary reconciliation changing the delivery cursor between
+                    // captures. The real validator classifies this as intervening activity.
+                    let at = self.paper.cursor(&wallet).unwrap().unwrap_or(NOW - 60);
+                    self.paper.set_cursor(&wallet, at + 1).unwrap();
+                }
+                Ok(b"[]".to_vec())
+            }
+        }
+
+        fn admission_preparer(
+            h: &Harness,
+            busy: Arc<StdMutex<HashSet<WalletAddress>>>,
+            spend_budget: bool,
+        ) -> AdmissionPreparer {
+            let fetcher: Arc<dyn ReconciliationFetcher> = Arc::new(AdmissionFetcher {
+                paper: h.paper_state.clone(),
+                busy,
+                activity_reads: StdMutex::new(HashMap::new()),
+                spend_budget,
+            });
+            let identity = Arc::new(AssetIdentityResolver::new(
+                fetcher.clone(),
+                "https://fixture.invalid".to_owned(),
+                GAMMA_BATCH_SIZE,
+                Arc::new(tokio::sync::Mutex::new(
+                    SourceEventSink::open(h._temp.path().join("admission-identity.log")).unwrap(),
+                )),
+            ));
+            AdmissionPreparer::with_validator(
+                h.control_tx.clone(),
+                h.paper_state.clone(),
+                CausalPositionValidator::new(
+                    fetcher,
+                    "https://fixture.invalid",
+                    "admission-test",
+                    identity,
+                )
+                .with_clock(Arc::new(|| NOW)),
+            )
+            .with_source_log(h.source_handle.clone())
+        }
+
+        async fn admission_tick(h: &Harness, preparer: &AdmissionPreparer, sync: &mut BatchSync) {
+            admission_tick_with_interval(h, preparer, sync, 10).await;
+        }
+
+        async fn admission_tick_with_interval(
+            h: &Harness,
+            preparer: &AdmissionPreparer,
+            sync: &mut BatchSync,
+            interval_secs: u64,
+        ) {
+            let cfg = MaintenanceConfig {
+                interval_secs,
+                membership_mode: MembershipMode::FullRerank,
+                ..cfg()
+            };
+            maintenance_tick(
+                &h.live,
+                &h.paper_state,
+                &h.client,
+                &h.base_url,
+                "anon",
+                "",
+                &h.writer_lock,
+                &h.applied,
+                preparer,
+                &cfg,
+                h.applied.load(),
+                &mut HashSet::new(),
+                sync,
+                NOW,
+            )
+            .await;
+        }
+
+        fn log_fields(bytes: &Arc<StdMutex<Vec<u8>>>, message: &str) -> Vec<serde_json::Value> {
+            String::from_utf8(bytes.lock().unwrap().clone())
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|line| line["fields"]["message"] == message)
+                .map(|line| line["fields"].clone())
+                .collect()
+        }
+        fn launched(log: &serde_json::Value) -> Vec<(String, u64)> {
+            serde_json::from_str(log["started_previous_keys"].as_str().unwrap()).unwrap()
+        }
+        fn eligible(log: &serde_json::Value) -> Vec<String> {
+            serde_json::from_str(log["eligible"].as_str().unwrap()).unwrap()
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn admission_retry_eligibility_boundary() {
+            let dir = tempfile::tempdir().unwrap();
+            let paper = PaperStateDb::open(&dir.path().join("paper.db")).unwrap();
+            let wallet = wallet(1);
+            let mut sync = admission_sync(1);
+            let completion = tokio::time::Instant::now();
+            tokio::time::advance(Duration::from_secs(30)).await;
+            sync.completed(
+                &paper,
+                &[wallet],
+                &[],
+                &[crate::watchlist_admission::Deferral {
+                    completed_at: Some(completion),
+                    wallet,
+                    stage: "validation",
+                    class: crate::position_seeder::FailureClass::WalletTransient,
+                    kind: "validation.intervening_activity",
+                    message: "busy".to_owned(),
+                }],
+                &[],
+            );
+            assert_eq!(
+                sync.cooldowns[&wallet],
+                completion + Duration::from_secs(300)
+            );
+            tokio::time::advance(Duration::from_secs(269)).await;
+            assert!(sync.cooling(&wallet));
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert!(!sync.cooling(&wallet));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn maintenance_first_tick_at_startup() {
+            let _io = paused_io();
+            let wallet = wallet(1);
+            let mut fake = Fake::new(Some(1));
+            fake.ranking_entries = vec![row(1, 1, wallet)];
+            // The production loop samples UTC; only its interval clock is paused.
+            fake.ranking_entries[0]["last_trade_unix"] =
+                serde_json::json!(OffsetDateTime::now_utc().unix_timestamp() - 60);
+            let mut h = harness(fake, &[wallet]).await;
+            h.live.remove_fenced(&set(&[wallet]));
+            h.projection_rx.borrow_and_update();
+            let start = tokio::time::Instant::now();
+            let task = tokio::spawn(run_maintenance_loop(
+                h.live.clone(),
+                h.paper_state.clone(),
+                h.client.clone(),
+                h.base_url.clone(),
+                "anon".to_owned(),
+                "".to_owned(),
+                Arc::new(Mutex::new(())),
+                cfg(),
+                h.applied.clone(),
+                h.preparer.clone(),
+                Some(1),
+                HashSet::new(),
+                HashMap::new(),
+            ));
+            while !members(&h.live).contains(&wallet) {
+                h.projection_rx.changed().await.unwrap();
+            }
+            assert_eq!(members(&h.live), set(&[wallet]));
+            assert_eq!(h.controls().len(), 1);
+            assert_eq!(tokio::time::Instant::now(), start);
+            task.abort();
+            let _ = task.await;
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn admission_queue_keys_bound_failing_wallets() {
+            let _io = paused_io();
+            let wallets = (1..=5).map(wallet).collect::<Vec<_>>();
+            let mut fake = Fake::new(Some(1));
+            for batch in 1..=5 {
+                let shift = usize::try_from(batch).unwrap() % wallets.len();
+                for (rank, wallet) in wallets.iter().cycle().skip(shift).take(5).enumerate() {
+                    fake.ranking_entries.push(row(
+                        batch,
+                        i64::try_from(rank + 1).unwrap(),
+                        *wallet,
+                    ));
+                }
+            }
+            let latest = fake.latest_batch.clone();
+            let mut h = harness(fake, &wallets).await;
+            h.applied = AppliedWatchlistCapacity::new(5);
+            h.live.remove_fenced(&set(&wallets));
+            let busy = Arc::new(StdMutex::new(set(&wallets)));
+            let preparer = admission_preparer(&h, busy.clone(), true);
+            let initial = preparer.prepare(&wallets).await.unwrap();
+            assert_eq!(initial.started, wallets);
+            assert_eq!(initial.deferred.len(), 5);
+            assert!(
+                initial
+                    .deferred
+                    .iter()
+                    .all(|d| d.kind == "validation.intervening_activity")
+            );
+            busy.lock().unwrap().remove(&wallets[4]);
+            let bytes = Arc::new(StdMutex::new(Vec::new()));
+            let _logs = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .json()
+                    .with_writer(CapturedLogs(bytes.clone()))
+                    .finish(),
+            );
+            let mut sync = admission_sync(1);
+            let mut first_turns = 0;
+            for batch in 2..=5 {
+                latest.store(batch, Ordering::SeqCst);
+                // Apply the reordered batch with no launch budget before each measured pass.
+                // These zero-start calls must retain all existing queue keys.
+                admission_tick_with_interval(&h, &preparer, &mut sync, 0).await;
+                assert_eq!(sync.marker, Some(batch));
+                assert_eq!(sync.started, 0);
+                tokio::time::advance(Duration::from_secs(300)).await;
+                admission_tick(&h, &preparer, &mut sync).await;
+                assert!(sync.reentries_first);
+                if sync.started > 0 {
+                    first_turns += 1;
+                }
+                if members(&h.live).contains(&wallets[4]) {
+                    break;
+                }
+            }
+            assert!(members(&h.live).contains(&wallets[4]));
+            assert_eq!(first_turns, 2, "ceil(5/4) first-claim ticks");
+            let logs = log_fields(&bytes, "admission launch order");
+            assert!(logs.iter().any(|l| {
+                launched(l)
+                    .iter()
+                    .any(|(w, _)| *w == wallets[4].to_string())
+            }));
+            assert!(
+                logs.iter()
+                    .filter(|l| l["path"] == "reentry" && l["started"] != 0)
+                    .all(|l| l["started"].as_u64().unwrap() <= 4)
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn admission_newcomers_queue_behind_waiting_wallet() {
+            let _io = paused_io();
+            let old = wallet(1);
+            let newcomers = [wallet(2), wallet(3), wallet(4)];
+            let mut fake = Fake::new(Some(1));
+            fake.ranking_entries = std::iter::once(old)
+                .chain(newcomers)
+                .enumerate()
+                .map(|(i, w)| row(1, i64::try_from(i + 1).unwrap(), w))
+                .collect();
+            let h = harness(fake, &[]).await;
+            let preparer = admission_preparer(&h, Arc::new(StdMutex::new(set(&[old]))), true);
+            let seeds = std::iter::once(old)
+                .chain(newcomers)
+                .map(|w| (w, NOW - 60))
+                .collect();
+            let offered = preparer
+                .prepare_ranked_until(
+                    &[old],
+                    &seeds,
+                    Some(tokio::time::Instant::now()),
+                    crate::watchlist_admission::AdmissionContext::Addition { first: true },
+                )
+                .await
+                .unwrap();
+            assert_eq!(offered.unstarted, vec![old]);
+            for new in newcomers {
+                let outcome = preparer
+                    .prepare_ranked_until(
+                        &[new, old],
+                        &seeds,
+                        Some(tokio::time::Instant::now() + Duration::from_secs(10)),
+                        crate::watchlist_admission::AdmissionContext::Addition { first: true },
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(outcome.started.first(), Some(&old));
+                assert_eq!(outcome.deferred[0].wallet, old);
+                assert_eq!(outcome.deferred[0].kind, "validation.intervening_activity");
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn admission_paths_alternate_first_claim() {
+            let _io = paused_io();
+            let retained = wallet(1);
+            let additions = (2..=9).map(wallet).collect::<Vec<_>>();
+            let mut fake = Fake::new(Some(2));
+            fake.ranking_entries.push(row(1, 1, retained));
+            for batch in 2..=3 {
+                fake.ranking_entries.push(row(batch, 1, retained));
+                let start = usize::try_from(batch - 2).unwrap() * 4;
+                for (i, w) in additions[start..start + 4].iter().enumerate() {
+                    fake.ranking_entries
+                        .push(row(batch, i64::try_from(i + 2).unwrap(), *w));
+                }
+            }
+            let latest = fake.latest_batch.clone();
+            let mut h = harness(fake, &[retained]).await;
+            h.applied = AppliedWatchlistCapacity::new(5);
+            h.live.remove_fenced(&set(&[retained]));
+            let preparer = admission_preparer(&h, Arc::new(StdMutex::new(set(&additions))), true);
+            let mut sync = admission_sync(1);
+            admission_tick(&h, &preparer, &mut sync).await;
+            assert!(!sync.reentries_first);
+            assert!(!members(&h.live).contains(&retained));
+            assert_eq!(sync.started, 4);
+            latest.store(3, Ordering::SeqCst);
+            admission_tick(&h, &preparer, &mut sync).await;
+            assert!(sync.reentries_first);
+            assert!(
+                members(&h.live).contains(&retained),
+                "retained re-entry claims the second tick's budget"
+            );
+            assert_eq!(sync.started, 1);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn admission_batch_ids_attempted_and_applied() {
+            let _io = paused_io();
+            let mut fake = Fake::new(Some(2));
+            fake.ranking_entries = vec![row(2, 1, wallet(2))];
+            fake.failure = Some("structural");
+            let latest = fake.latest_batch.clone();
+            let h = harness(fake, &[wallet(1)]).await;
+            let bytes = Arc::new(StdMutex::new(Vec::new()));
+            let _logs = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .json()
+                    .with_writer(CapturedLogs(bytes.clone()))
+                    .finish(),
+            );
+            let mut sync = admission_sync(1);
+            admission_tick(&h, &h.preparer, &mut sync).await;
+            assert_eq!(sync.attempted_batch_id, Some(2));
+            assert_eq!(sync.marker, Some(1));
+            latest.store(1, Ordering::SeqCst);
+            admission_tick(&h, &h.preparer, &mut sync).await;
+            assert!(sync.attempted_batch_id.is_none());
+            let logs = log_fields(&bytes, "maintenance admission budget completed");
+            assert_eq!(logs.len(), 2);
+            assert_eq!(logs[0]["attempted_batch_id"], 2);
+            assert_eq!(logs[0]["applied_batch_id"], 1);
+            assert_eq!(logs[0]["capacity_generation"], 0);
+            assert!(logs[1].get("attempted_batch_id").is_none());
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn admission_queue_keys_survive_resync() {
+            let _io = paused_io();
+            let (waiting, first, second, third) = (wallet(1), wallet(2), wallet(3), wallet(4));
+            let mut fake = Fake::new(Some(2));
+            fake.failure = Some("structural_after_first");
+            fake.ranking_entries = vec![
+                row(1, 1, waiting),
+                row(2, 1, waiting),
+                row(2, 2, first),
+                row(3, 1, waiting),
+                row(3, 2, second),
+                row(4, 1, waiting),
+                row(4, 2, third),
+            ];
+            let latest = fake.latest_batch.clone();
+            let h = harness(fake, &[waiting]).await;
+            h.live.remove_fenced(&set(&[waiting]));
+            // A zero-start offer gives this wallet a key; synchronization must never discard it.
+            let seeds = HashMap::from([(waiting, NOW - 60)]);
+            h.preparer
+                .prepare_ranked_until(
+                    &[waiting],
+                    &seeds,
+                    Some(tokio::time::Instant::now()),
+                    crate::watchlist_admission::AdmissionContext::Other,
+                )
+                .await
+                .unwrap();
+            let bytes = Arc::new(StdMutex::new(Vec::new()));
+            let _logs = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .json()
+                    .with_writer(CapturedLogs(bytes.clone()))
+                    .finish(),
+            );
+            let mut sync = admission_sync(1);
+            admission_tick(&h, &h.preparer, &mut sync).await;
+            assert_eq!(sync.marker, Some(2));
+            latest.store(3, Ordering::SeqCst);
+            admission_tick(&h, &h.preparer, &mut sync).await;
+            assert_eq!(
+                sync.marker,
+                Some(2),
+                "failed publication keeps applied batch"
+            );
+            latest.store(2, Ordering::SeqCst);
+            h.applied.store(WatchlistCapacityEpoch {
+                generation: 1,
+                target: CAP,
+            });
+            admission_tick(&h, &h.preparer, &mut sync).await;
+            assert_eq!(sync.capacity_generation, 1);
+            let outcome = h
+                .preparer
+                .prepare(&[third, second, waiting, first])
+                .await
+                .unwrap();
+            assert_eq!(outcome.started, vec![first, waiting, second, third]);
+            let logs = log_fields(&bytes, "admission launch order");
+            let waiting_keys = logs
+                .iter()
+                .flat_map(launched)
+                .filter(|(w, _)| *w == waiting.to_string())
+                .map(|(_, key)| key)
+                .collect::<Vec<_>>();
+            assert_eq!(waiting_keys.len(), 2);
+            assert_eq!(
+                waiting_keys[0], 0,
+                "first-offer key retained through successful apply"
+            );
+            assert!(
+                waiting_keys[1] > waiting_keys[0],
+                "started key survives failed apply and capacity resync"
+            );
+            for (wallet, expected) in [(first, vec![1, 2]), (second, vec![4, 5])] {
+                let keys = logs
+                    .iter()
+                    .flat_map(launched)
+                    .filter(|(w, _)| *w == wallet.to_string())
+                    .map(|(_, key)| key)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    keys, expected,
+                    "successful and failed applications retain started wallets' keys"
+                );
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn admission_launch_order_both_paths() {
+            let _io = paused_io();
+            let (reentry, addition, newer) = (wallet(1), wallet(2), wallet(3));
+            let mut fake = Fake::new(Some(2));
+            fake.ranking_entries = vec![
+                row(1, 1, reentry),
+                row(2, 1, reentry),
+                row(2, 2, addition),
+                row(3, 1, reentry),
+                row(3, 2, addition),
+                row(3, 3, newer),
+            ];
+            let latest = fake.latest_batch.clone();
+            let h = harness(fake, &[reentry]).await;
+            h.live.remove_fenced(&set(&[reentry]));
+            let bytes = Arc::new(StdMutex::new(Vec::new()));
+            let _logs = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .json()
+                    .with_writer(CapturedLogs(bytes.clone()))
+                    .finish(),
+            );
+            let mut sync = admission_sync(1);
+            admission_tick(&h, &h.preparer, &mut sync).await;
+            h.live.remove_fenced(&set(&[reentry]));
+            latest.store(3, Ordering::SeqCst);
+            admission_tick(&h, &h.preparer, &mut sync).await;
+            let logs = log_fields(&bytes, "admission launch order");
+            let started = logs
+                .iter()
+                .filter(|l| l["started"] != 0)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                started
+                    .iter()
+                    .map(|l| (l["path"].as_str().unwrap(), l["first"].as_bool().unwrap()))
+                    .collect::<Vec<_>>(),
+                vec![
+                    ("addition", true),
+                    ("reentry", false),
+                    ("reentry", true),
+                    ("addition", false)
+                ]
+            );
+            for (log, wallet) in started.iter().zip([addition, reentry, reentry, newer]) {
+                assert_eq!(eligible(log), vec![wallet.to_string()]);
+                assert_eq!(launched(log)[0].0, wallet.to_string());
+                assert_eq!(log["started"], 1);
+            }
+            assert_eq!(
+                h.controls()
+                    .iter()
+                    .map(|(wallets, _)| *wallets.iter().next().unwrap())
+                    .collect::<Vec<_>>(),
+                vec![addition, reentry, reentry, newer]
+            );
+            // Capacity and direct callers use the same queue, with no tick-first field.
+            h.preparer
+                .prepare_ranked_until(
+                    &[newer],
+                    &HashMap::new(),
+                    None,
+                    crate::watchlist_admission::AdmissionContext::Capacity,
+                )
+                .await
+                .unwrap();
+            h.preparer.prepare(&[addition]).await.unwrap();
+            let logs = log_fields(&bytes, "admission launch order");
+            assert_eq!(logs[logs.len() - 2]["path"], "capacity");
+            assert_eq!(logs[logs.len() - 1]["path"], "other");
+            assert!(logs[logs.len() - 2].get("first").is_none());
+            assert!(logs[logs.len() - 1].get("first").is_none());
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn admission_timeout_and_zero_start_calls() {
+            let _io = paused_io();
+            let (holder, a, b) = (wallet(1), wallet(2), wallet(3));
+            let mut fake = Fake::new(Some(1));
+            fake.ranking_entries = vec![row(1, 1, holder), row(1, 2, a), row(1, 3, b)];
+            let h = harness(fake, &[]).await;
+            let (tx, mut rx) = mpsc::channel(1);
+            let preparer = AdmissionPreparer::new(tx, h.paper_state.clone());
+            let held_preparer = preparer.clone();
+            let holder_task =
+                tokio::spawn(async move { held_preparer.prepare(&[holder]).await.unwrap() });
+            let OrchestratorControl::PrepareAdmissions { acknowledged, .. } =
+                rx.recv().await.unwrap()
+            else {
+                panic!("expected holder preparation")
+            };
+            let seeds = HashMap::from([(a, NOW - 60), (b, NOW - 60)]);
+            let timed = preparer
+                .prepare_ranked_until(
+                    &[a, b],
+                    &seeds,
+                    Some(tokio::time::Instant::now()),
+                    crate::watchlist_admission::AdmissionContext::Other,
+                )
+                .await
+                .unwrap();
+            assert_eq!(timed.unstarted, vec![a, b]);
+            assert!(timed.started.is_empty() && timed.deferred.is_empty());
+            assert!(h.paper_state.cursor(&a).unwrap().is_none());
+            assert!(h.paper_state.cursor(&b).unwrap().is_none());
+            acknowledged.send(()).unwrap();
+            holder_task.await.unwrap();
+            let bytes = Arc::new(StdMutex::new(Vec::new()));
+            let _logs = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .json()
+                    .with_writer(CapturedLogs(bytes.clone()))
+                    .finish(),
+            );
+            let zero = preparer
+                .prepare_ranked_until(
+                    &[b, a],
+                    &seeds,
+                    Some(tokio::time::Instant::now()),
+                    crate::watchlist_admission::AdmissionContext::Other,
+                )
+                .await
+                .unwrap();
+            assert_eq!(zero.unstarted, vec![b, a]);
+            assert!(zero.started.is_empty() && zero.deferred.is_empty());
+            assert_eq!(h.paper_state.cursor(&a).unwrap(), Some(NOW - 60));
+            assert_eq!(h.paper_state.cursor(&b).unwrap(), Some(NOW - 60));
+            let reseed = HashMap::from([(a, NOW), (b, NOW)]);
+            let again = preparer
+                .prepare_ranked_until(
+                    &[a, b],
+                    &reseed,
+                    Some(tokio::time::Instant::now()),
+                    crate::watchlist_admission::AdmissionContext::Other,
+                )
+                .await
+                .unwrap();
+            assert_eq!(again.unstarted, vec![b, a]);
+            assert!(again.started.is_empty() && again.deferred.is_empty());
+            assert_eq!(h.paper_state.cursor(&a).unwrap(), Some(NOW - 60));
+            assert_eq!(h.paper_state.cursor(&b).unwrap(), Some(NOW - 60));
+            let zero_logs = log_fields(&bytes, "admission launch order");
+            assert_eq!(zero_logs.len(), 2);
+            assert!(zero_logs.iter().all(|l| l["started"] == 0
+                && launched(l).is_empty()
+                && eligible(l) == vec![b.to_string(), a.to_string()]));
+            let mut sync = admission_sync(1);
+            sync.completed(
+                &h.paper_state,
+                &zero.started,
+                &zero.admitted,
+                &zero.deferred,
+                &zero.unstarted,
+            );
+            assert_eq!(sync.started, 0);
+            assert_eq!(sync.deferred, 0);
+            assert!(sync.cooldowns.is_empty());
+            let actor = tokio::spawn(async move {
+                while let Some(OrchestratorControl::PrepareAdmissions { acknowledged, .. }) =
+                    rx.recv().await
+                {
+                    acknowledged.send(()).unwrap();
+                }
+            });
+            let outcome = preparer.prepare(&[a, b]).await.unwrap();
+            assert_eq!(
+                outcome.started,
+                vec![b, a],
+                "zero-start offers register rank-ordered keys; timeout registered none"
+            );
+            drop(preparer);
+            actor.await.unwrap();
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn busy_then_quiet_wallet_admitted() {
+            let _io = paused_io();
+            let wallet = wallet(1);
+            let mut fake = Fake::new(Some(1));
+            fake.ranking_entries = vec![row(1, 1, wallet)];
+            let h = harness(fake, &[wallet]).await;
+            h.live.remove_fenced(&set(&[wallet]));
+            let busy = Arc::new(StdMutex::new(set(&[wallet])));
+            let preparer = admission_preparer(&h, busy.clone(), true);
+            let mut sync = admission_sync(1);
+            admission_tick(&h, &preparer, &mut sync).await;
+            assert_eq!(sync.started, 1);
+            assert_eq!(sync.deferred, 1);
+            assert!(members(&h.live).is_empty());
+            busy.lock().unwrap().clear();
+            tokio::time::advance(Duration::from_secs(300)).await;
+            admission_tick(&h, &preparer, &mut sync).await;
+            assert_eq!(sync.started, 1);
+            assert_eq!(sync.accepted, 1);
+            assert_eq!(members(&h.live), set(&[wallet]));
+            assert!(!sync.cooldowns.contains_key(&wallet));
+        }
     }
     #[tokio::test(start_paused = true)]
     async fn paper_service_rollout_cooldown_uses_terminal_time_and_survives_batch_changes() {
@@ -5263,6 +6033,8 @@ mod tests {
         let mut sync = BatchSync {
             marker: Some(1),
             parking_batch: Some(1),
+            reentries_first: true,
+            attempted_batch_id: None,
             capacity_generation: 0,
             knockout_deferred: HashSet::new(),
             cooldowns: HashMap::new(),
@@ -5284,13 +6056,13 @@ mod tests {
         sync.completed(&paper, &[wallet], &[], &[failure], &[]);
         assert_eq!(
             sync.cooldowns[&wallet],
-            terminal + Duration::from_secs(crate::trade_poller::ANCHOR_REFRESH_SECS)
+            terminal + Duration::from_secs(crate::watchlist_admission::ADMISSION_RETRY_SECS)
         );
         sync.marker = Some(2);
         sync.knockout_deferred.clear();
         assert!(sync.cooling(&wallet));
         tokio::time::advance(Duration::from_secs(
-            crate::trade_poller::ANCHOR_REFRESH_SECS - 30,
+            crate::watchlist_admission::ADMISSION_RETRY_SECS - 30,
         ))
         .await;
         assert!(!sync.cooling(&wallet));

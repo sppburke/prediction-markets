@@ -2142,6 +2142,10 @@ enum PreStartBootCase {
 }
 
 async fn boot_binary(config_path: &Path, exit_after_anchors: bool) -> std::process::Output {
+    support::bounded_command_output(boot_binary_command(config_path, exit_after_anchors)).await
+}
+
+fn boot_binary_command(config_path: &Path, exit_after_anchors: bool) -> std::process::Command {
     let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pe-service"));
     command
         .env_clear()
@@ -2150,7 +2154,7 @@ async fn boot_binary(config_path: &Path, exit_after_anchors: bool) -> std::proce
     if exit_after_anchors {
         command.arg("--exit-after-anchors");
     }
-    support::bounded_command_output(command).await
+    command
 }
 
 #[tokio::test]
@@ -3872,4 +3876,349 @@ fn corrupt_checkpoint_prefix(source: &Path) {
     file.write_all(&[bytes[usize::try_from(offset).unwrap()] ^ 1])
         .unwrap();
     file.sync_all().unwrap();
+}
+
+/// The request barrier holds the actual bracket open, so listening with an empty live set
+/// proves boot did not wait for it. The Start-only control holds the same bracket before
+/// listening, then completes the original boot waves. No production endpoint is contacted.
+#[tokio::test]
+async fn progressive_boot_skips_waves_after_membership_record() {
+    use axum::{Json, Router, extract::State, http::Uri, routing::any};
+    use std::io::BufRead;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    #[derive(Clone)]
+    struct BootAdmissionSource {
+        start: AppendReceipt,
+        now: i64,
+        first_activity: Arc<AtomicBool>,
+        activity_requested: Arc<tokio::sync::Notify>,
+        release_activity: Arc<tokio::sync::Semaphore>,
+    }
+    async fn respond(
+        State(source): State<BootAdmissionSource>,
+        uri: Uri,
+        body: axum::body::Bytes,
+    ) -> Json<serde_json::Value> {
+        use serde_json::json;
+        Json(match uri.path() {
+            "/rest/v1/service_config" => {
+                let rows = [
+                    ("active_watchlist_size", "1", "integer"),
+                    ("mode", "paper", "text"),
+                    ("max_fill_price", "0.85", "decimal"),
+                    ("min_fill_price", "0.15", "decimal"),
+                    ("min_resolution_horizon_secs", "60", "integer"),
+                    ("max_resolution_horizon_secs", "172800", "integer"),
+                    ("price_impact_cap_bps", "100", "integer"),
+                    ("flip_human_approved", "false", "bool"),
+                    (
+                        "kelly_fraction_above_default_human_approved",
+                        "false",
+                        "bool",
+                    ),
+                    ("per_trade_cap", "unlimited", "text"),
+                    ("slippage_rate", "0.01", "decimal"),
+                    ("sizing_mode", "dollar", "text"),
+                    ("sizing_dollar_usd", "25", "decimal"),
+                    ("sizing_contracts", "1", "integer"),
+                ];
+                json!(rows.map(|(key, value, value_type)| json!({"key": key, "value": value, "value_type": value_type})))
+            }
+            "/rest/v1/ranking_batches" => json!([{"batch_id":572}]),
+            "/rest/v1/ranking_entries" | "/rest/v1/latest_ranking" => json!([
+                {"batch_id":572,"rank":1,"wallet_hex":WALLET,"ls_tstat":"3","hit_rate":"0.6","n_trades":20,"last_trade_unix":source.now-60,"survives":true}
+            ]),
+            "/rest/v1/paper_bankroll" => json!([{"bankroll_str":"10","last_prepared_seq":null}]),
+            "/rest/v1/paper_positions" | "/rest/v1/accounts" | "/rest/v1/account_credentials" => {
+                json!([])
+            }
+            "/rest/v1/rpc/seed_financial_start" => {
+                json!({"outcome":"existing", "start_seq":source.start.sequence.0, "start_hash":source.start.this_hash.to_hex().to_string()})
+            }
+            "/rest/v1/service_runtime" => {
+                json!([{"watchlist_size":0,"updated_at":"fixture-token"}])
+            }
+            "/rest/v1/rpc/service_watchlist_replace_v1" => {
+                let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                json!([{"new_token":"fixture-token","count":request["entries"].as_array().unwrap().len()}])
+            }
+            "/activity" => {
+                if !source.first_activity.swap(true, Ordering::SeqCst) {
+                    source.activity_requested.notify_one();
+                }
+                source.release_activity.acquire().await.unwrap().forget();
+                json!([])
+            }
+            "/positions" => json!([]),
+            _ => panic!("unexpected progressive-boot request {uri}"),
+        })
+    }
+
+    struct BootChild(std::process::Child);
+    impl Drop for BootChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    async fn status_at(path: &Path, expected: serde_json::Value) -> serde_json::Value {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if let Ok(bytes) = std::fs::read(path)
+                    && let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+                    && value["live_wallets"] == expected
+                {
+                    break value;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    for post_start_record in [true, false] {
+        let (dir, mut paths) = version_one_fixture();
+        paths.binary_identity = pe_service::build_info::embedded()
+            .source_revision
+            .to_owned();
+        let paths = install_generation(paths);
+        let wallet = WalletAddress::from_hex(WALLET).unwrap();
+        let start = append_paper_record(&paths.paper_log, &start_record());
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let paper = PaperStateDb::open(&paths.fixed_main).unwrap();
+        paper
+            .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
+                wallet,
+                complete: true,
+                proof_json: "{}".to_owned(),
+                updated_at_unix: now,
+            })
+            .unwrap();
+        support::install_full_history_anchor(&paper, wallet, now - 3_601);
+        paper
+            .reset_financial_era(
+                start,
+                CollateralAmount::from_decimal_exact(dec!(10)).unwrap(),
+            )
+            .unwrap();
+        if post_start_record {
+            let config = append(&paths.source_log, envelope("pe-service.watchlist-capacity-config", 1, 1,
+                &serde_json::to_vec(&serde_json::json!({"generation":2,"target":1,"published_entries":start_batch().entries})).unwrap(), now));
+            append_paper_record(&paths.paper_log, &pe_service::paper_recovery::MembershipChange {
+                reason:pe_service::paper_recovery::MembershipReason::CapacityChange,
+                removed:Vec::new(), added:Vec::new(), capacity:1, ranking_batch_id:None,
+                evidence:serde_json::json!({"kind":"capacity_change","generation":2,"config_receipt":config,"admission_receipts":[]}),
+            }.into_record());
+        }
+        // Preserve an already sealed historical generation; this scenario isolates admission.
+        append_paper_record(
+            &paths.paper_log,
+            &PaperLogRecord::QualificationSealed(Box::new(
+                pe_service::paper_recovery::QualificationSealed {
+                    start_receipt: start,
+                    source_prefix: TailBinding::from(&Scanner::verify(&paths.source_log).unwrap()),
+                    financial_prefix: TailBinding::from(
+                        &Scanner::verify(&paths.paper_log).unwrap(),
+                    ),
+                    live_prefix: TailBinding::from(&Scanner::verify(&paths.live_journal).unwrap()),
+                    decision_evidence_digest: blake3::hash(b"[]").to_hex().to_string(),
+                    sealed_cutoff_unix: now,
+                    reason: pe_service::paper_recovery::SealReason::InsufficientEvidence(
+                        "admission fixture".to_owned(),
+                    ),
+                },
+            )),
+        );
+        drop(paper);
+        let source = BootAdmissionSource {
+            start,
+            now,
+            first_activity: Arc::new(AtomicBool::new(false)),
+            activity_requested: Arc::new(tokio::sync::Notify::new()),
+            release_activity: Arc::new(tokio::sync::Semaphore::new(0)),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let router = Router::new()
+            .fallback(any(respond))
+            .with_state(source.clone());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap()
+        });
+        let cfg = pe_service::config::ServiceConfig {
+            bind: "127.0.0.1:0".to_owned(),
+            paper_state_db_path: paths.fixed_main.clone(),
+            source_event_log_path: paths.source_log.clone(),
+            event_log_path: paths.paper_log.clone(),
+            legacy_wallet_history_path: paths.legacy_history.clone(),
+            jsonl_log_path: dir.path().join("service.jsonl"),
+            status_path: dir.path().join("status.json"),
+            status_interval_secs: 1,
+            supabase_url: base.clone(),
+            supabase_secret_key: "fixture".to_owned(),
+            supabase_authoritative: true,
+            polymarket_base_url: base.clone(),
+            gamma_base_url: base.clone(),
+            polymarket_clob_base_url: base.clone(),
+            polygon_receipt_rpc_url: base,
+            bankroll_usd: "10".to_owned(),
+            maintenance_interval_secs: 600,
+            ..Default::default()
+        };
+        let config_path = dir.path().join("service.toml");
+        std::fs::write(&config_path, toml::to_string(&cfg).unwrap()).unwrap();
+        let mut command = boot_binary_command(&config_path, false);
+        command
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        let mut child = BootChild(command.spawn().unwrap());
+        let (lines, mut received) = tokio::sync::mpsc::channel(256);
+        let pipes: Vec<Box<dyn std::io::Read + Send>> = vec![
+            Box::new(child.0.stdout.take().unwrap()),
+            Box::new(child.0.stderr.take().unwrap()),
+        ];
+        let readers = pipes
+            .into_iter()
+            .map(|pipe| {
+                let lines = lines.clone();
+                tokio::task::spawn_blocking(move || {
+                    for line in std::io::BufReader::new(pipe).lines() {
+                        if lines.blocking_send(line.unwrap()).is_err() {
+                            break;
+                        }
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        drop(lines);
+        let mut captured = Vec::new();
+        if !post_start_record {
+            tokio::time::timeout(
+                Duration::from_secs(20),
+                source.activity_requested.notified(),
+            )
+            .await
+            .unwrap();
+            while let Ok(line) = received.try_recv() {
+                captured.push(line);
+            }
+            assert!(
+                captured
+                    .iter()
+                    .all(|line: &String| !line.contains("pe-service listening"))
+            );
+            assert!(
+                !cfg.status_path.exists(),
+                "Start without membership record waits for boot waves"
+            );
+            source.release_activity.add_permits(1_000);
+        }
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let line = received
+                    .recv()
+                    .await
+                    .expect("binary exited before listening");
+                let listening = line.contains("pe-service listening");
+                captured.push(line);
+                if listening {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("binary did not listen while the runtime bracket was held");
+        if post_start_record {
+            let zero = status_at(&cfg.status_path, serde_json::json!([])).await;
+            assert_eq!(zero["watchlist_size"], 0);
+            assert!(zero["live_wallets_at_unix_ms"].as_i64().is_some());
+            assert!(
+                captured
+                    .iter()
+                    .any(|line| line.contains("zero eligible live wallets"))
+            );
+            source.release_activity.add_permits(1_000);
+        }
+        let admitted = status_at(&cfg.status_path, serde_json::json!([wallet.to_string()])).await;
+        assert_eq!(admitted["watchlist_size"], 1);
+        // Listening/status can precede main's shutdown loop while it publishes the boot
+        // checkpoint. On Linux, wait for the actual SIGINT handler rather than a delay.
+        #[cfg(target_os = "linux")]
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let status =
+                    std::fs::read_to_string(format!("/proc/{}/status", child.0.id())).unwrap();
+                let caught = status
+                    .lines()
+                    .find_map(|line| line.strip_prefix("SigCgt:"))
+                    .map(|mask| u64::from_str_radix(mask.trim(), 16).unwrap())
+                    .unwrap();
+                if caught & 2 != 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("binary did not install its shutdown handler");
+        assert!(
+            std::process::Command::new("kill")
+                .arg("-INT")
+                .arg(child.0.id().to_string())
+                .status()
+                .unwrap()
+                .success()
+        );
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while let Some(line) = received.recv().await {
+                captured.push(line);
+            }
+        })
+        .await
+        .unwrap();
+        let exit = child.0.wait().unwrap();
+        assert!(exit.success(), "{exit}: {}", captured.join("\n"));
+        for reader in readers {
+            reader.await.unwrap();
+        }
+        let logs = captured
+            .iter()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .collect::<Vec<_>>();
+        assert!(
+            logs.iter()
+                .any(|line| line["message"] == "boot anchor selection census"
+                    && line["reused"] == 0
+                    && line["walked"] == 1)
+        );
+        if post_start_record {
+            assert!(
+                logs.iter()
+                    .any(|line| line["message"] == "admission launch order"
+                        && line["path"] == "reentry"
+                        && line["started"] == 1)
+            );
+        } else {
+            let listening = captured
+                .iter()
+                .position(|line| line.contains("pe-service listening"))
+                .unwrap();
+            assert!(
+                captured[..listening]
+                    .iter()
+                    .any(|line| line.contains("wallet bracket completed"))
+            );
+        }
+        stop.send(()).unwrap();
+        server.await.unwrap();
+    }
 }

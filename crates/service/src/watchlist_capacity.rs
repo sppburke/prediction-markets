@@ -147,7 +147,14 @@ impl SupabaseWatchlistCapacity {
             }
             deferrals.extend(plan.deferrals);
             let reentry_candidates = planned_live_reentries(&self.live, &plan.entries);
-            let reentry_outcome = match self.preparer.prepare(&reentry_candidates).await {
+            let reentry_outcome = match self
+                .preparer
+                .prepare_in(
+                    &reentry_candidates,
+                    crate::watchlist_admission::AdmissionContext::Capacity,
+                )
+                .await
+            {
                 Ok(reentries) => reentries,
                 Err(abort) => {
                     deferrals.extend(abort.deferred);
@@ -802,7 +809,9 @@ mod tests {
         assert_eq!(applied.load().target, 2, "applied target must be unchanged");
 
         // The retry plans against the current set. In the validator-free path, each new
-        // addition is sent as its own preparation command within that fresh attempt.
+        // addition is sent as its own preparation command within that fresh attempt. The
+        // already offered newcomer keeps its queue key ahead of the newly offered departing
+        // wallet even though the ranking places departing first.
         assert_eq!(applier.apply(request).await.unwrap(), 3);
         assert_eq!(live.snapshot().entries.len(), 3);
         assert_eq!(live.structural_membership().len(), 3);
@@ -811,7 +820,7 @@ mod tests {
             *prepared_sets
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner),
-            vec![vec![newcomer], vec![departing], vec![newcomer]]
+            vec![vec![newcomer], vec![newcomer], vec![departing]]
         );
         control.abort();
         source_log.task.abort();
