@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr as _;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, sync_channel};
+use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -1516,7 +1516,7 @@ fn begin_or_resume_fresh_collection(
                             let new_rows = history_proof
                                 .as_ref()
                                 .ok_or(BootstrapError::Internal)?
-                                .has_new_rows(&receipt.wallet_hex, certificate.generation);
+                                .has_new_rows(&receipt.wallet_hex, &certificate);
                             if new_rows {
                                 Some(identity.fixed_end_unix)
                             } else {
@@ -3623,177 +3623,6 @@ fn activity_identity(connection: &Connection) -> Result<ActivityIdentity, Bootst
     })
 }
 
-fn prepare_activity_manifest(
-    transaction: &rusqlite::Transaction<'_>,
-    finalized_at_unix: i64,
-    mut consume: impl FnMut(&str, Vec<ActivityAggregate>),
-) -> Result<(ActivityCoverageManifestV2, bool), BootstrapError> {
-    let ActivityIdentity {
-        generation,
-        reference_sha256,
-        fixed_end_unix,
-        wallets,
-    } = activity_identity(transaction)?;
-    let generation_i64 = to_i64(generation, "activity generation")?;
-    aggregate_scan::scoped(|scan| {
-        let visit = |validation: &mut ActivityValidation, receipt: &ActivityWalletReceiptProof| {
-            let mut aggregates = Vec::new();
-            // Classification may stop at an unusable second; content validation must
-            // cover the entire wallet, including everything after that stopping point.
-            validation.visit(scan, transaction, generation_i64, receipt, |aggregate| {
-                aggregates.push(aggregate);
-            })?;
-            consume(&receipt.wallet_hex, aggregates);
-            Ok(())
-        };
-        if let Some(manifest) = stored_activity_manifest(transaction, generation)? {
-            verify_activity_manifest_with(
-                transaction,
-                &manifest,
-                &reference_sha256,
-                fixed_end_unix,
-                &wallets,
-                None,
-                visit,
-            )?;
-            return Ok((manifest, false));
-        }
-        let mut manifest = validate_activity_staging_with(
-            transaction,
-            generation,
-            &reference_sha256,
-            fixed_end_unix,
-            &wallets,
-            None,
-            visit,
-        )?
-        .into_manifest(
-            generation,
-            reference_sha256,
-            fixed_end_unix,
-            finalized_at_unix,
-        );
-        if CollectionProof::load(transaction, generation)?.is_some() {
-            manifest.cursors = incremental::receipt_marker_v2();
-        }
-        Ok((manifest, true))
-    })
-}
-
-fn rebuild_ranker_projection(
-    transaction: &rusqlite::Transaction<'_>,
-    activity_generation: u64,
-    finalized_at_unix: i64,
-) -> Result<(ActivityCoverageManifestV2, u64), BootstrapError> {
-    let generation = to_i64(activity_generation, "activity generation")?;
-    let projection = (|| -> Result<_, BootstrapError> {
-        let payout_markets = load_payout_tokens(transaction)?;
-        let quality = ReconstructionQuality::new(100).map_err(|error| BootstrapError::Invalid {
-            message: format!("bootstrap reconstruction quality is invalid: {error}"),
-        })?;
-        transaction.execute("DELETE FROM ranker_entries_v2", [])?;
-        let insert = transaction.prepare(
-            "INSERT INTO ranker_entries_v2
-             (source_trade_id, activity_generation, classifier_version)
-         VALUES (?1, ?2, ?3)
-         ON CONFLICT(source_trade_id) DO NOTHING",
-        )?;
-        Ok((payout_markets, quality, insert))
-    })();
-    let (mut projection, mut projection_error) = match projection {
-        Ok(projection) => (Some(projection), None),
-        Err(error) => (None, Some(error)),
-    };
-    let prepared = thread::scope(|scope| {
-        let Some((payout_markets, quality, insert)) = projection.as_mut() else {
-            return prepare_activity_manifest(transaction, finalized_at_unix, |_, _| {});
-        };
-        let (send_input, input) = sync_channel::<(String, Vec<ActivityAggregate>)>(1);
-        let (send_output, output) = sync_channel::<Result<Vec<String>, BootstrapError>>(1);
-        let payout_markets: &PayoutTokens = payout_markets;
-        let quality = *quality;
-        if let Err(error) = thread::Builder::new()
-            .name("projection-classify".to_owned())
-            .spawn_scoped(scope, move || {
-                while let Ok((wallet, aggregates)) = input.recv() {
-                    if send_output
-                        .send(classify_loaded_wallet(
-                            &wallet,
-                            &aggregates,
-                            payout_markets,
-                            quality,
-                        ))
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            })
-        {
-            projection_error = Some(error.into());
-        }
-        let mut pending = false;
-        // Validate wallet k+1 while the worker classifies k, then insert k's
-        // ids before handing off k+1 so projection order stays unchanged.
-        let prepared =
-            prepare_activity_manifest(transaction, finalized_at_unix, |wallet, aggregates| {
-                if projection_error.is_some() {
-                    return;
-                }
-                if pending {
-                    projection_error = insert_classified_wallet(&output, insert, generation).err();
-                    pending = false;
-                }
-                if projection_error.is_none() {
-                    if send_input.send((wallet.to_owned(), aggregates)).is_ok() {
-                        pending = true;
-                    } else {
-                        projection_error = Some(BootstrapError::Internal);
-                    }
-                }
-            });
-        drop(send_input);
-        if prepared.is_ok() && pending && projection_error.is_none() {
-            projection_error = insert_classified_wallet(&output, insert, generation).err();
-        }
-        for _ in output {}
-        prepared
-    });
-    let (manifest, needs_install) = prepared?;
-    // Content/receipt/manifest validation failures retain precedence over SQL
-    // errors. Return a deferred projection error before installing the manifest:
-    // SQLite may already have rolled back the transaction, so later writes could
-    // otherwise commit independently in autocommit mode.
-    if let Some(error) = projection_error {
-        return Err(error);
-    }
-    if needs_install {
-        record_completed_manifest(transaction, &manifest)?;
-    }
-    let count: i64 =
-        transaction.query_row("SELECT COUNT(*) FROM ranker_entries_v2", [], |row| {
-            row.get(0)
-        })?;
-    let count = to_u64(count, "ranker projection count")?;
-    Ok((manifest, count))
-}
-
-fn insert_classified_wallet(
-    output: &Receiver<Result<Vec<String>, BootstrapError>>,
-    insert: &mut rusqlite::Statement<'_>,
-    generation: i64,
-) -> Result<(), BootstrapError> {
-    let ids = output.recv().map_err(|_| BootstrapError::Internal)??;
-    for id in ids {
-        insert.execute(params![
-            id,
-            generation,
-            i64::from(RANKER_CLASSIFIER_VERSION)
-        ])?;
-    }
-    Ok(())
-}
-
 // Every payout market's token ids in payout-vector order, the venue page that
 // lists them, and eligibility for admission. Identity rebinding uses all markets.
 type PayoutTokens = BTreeMap<String, (Vec<String>, String, bool)>;
@@ -4089,9 +3918,9 @@ fn verify_reusable_ranker_projection(
 }
 
 /// Finalize a complete v2 side cache and optionally emit a hash-bound stage record.
-/// First finalization and classifier upgrades validate activity and rebuild the
-/// projection. Reuse verifies unchanged inputs and the projection count/digest;
-/// activation validates complete content and structural health before installation.
+/// Format three verifies available histories once and commits their projection spool.
+/// Format two reuses only finalized historical classifiers; classifier six requires
+/// an admitted format-three successor.
 pub fn finalize_cache_v2(
     cache_path: &Path,
     stage_record_path: Option<&Path>,
@@ -4108,9 +3937,6 @@ pub fn finalize_cache_v2_with_export_manifest(
     finalized_at_unix: i64,
 ) -> Result<Option<CacheFinalStageRecord>, BootstrapError> {
     let mut connection = open_existing_rw(cache_path)?;
-    // A rebuild inserts every projection row. With SQLite's default page cache
-    // the key index's pages are evicted and rewritten per insert; 1 GiB cut
-    // insert CPU 56% and finalization CPU 22% locally, same digest.
     connection.pragma_update(None, "cache_size", -1_048_576_i64)?;
     require_schema(&connection, CACHE_SCHEMA_VERSION_V2)?;
     ensure_lane_a_v2_schema(&connection)?;
@@ -4121,19 +3947,16 @@ pub fn finalize_cache_v2_with_export_manifest(
         "generation",
     )?;
     verify_payout_coverage(&connection, payout_generation)?;
-    if let Some(identity) = fresh_collection_record(&connection)? {
-        if identity.version == 4 {
-            return projection_v3::finalize(
-                connection,
-                cache_path,
-                stage_record_path,
-                export_manifest,
-                finalized_at_unix,
-                sealed_generation,
-                payout_generation,
-            );
-        }
-        return invalid("format-two head must admit its identity-four successor before classifier-6 finalization".to_owned());
+    if fresh_collection_record(&connection)?.is_some_and(|identity| identity.version == 4) {
+        return projection_v3::finalize(
+            connection,
+            cache_path,
+            stage_record_path,
+            export_manifest,
+            finalized_at_unix,
+            sealed_generation,
+            payout_generation,
+        );
     }
     // The write lock is held from the start: re-finalization verifies the
     // committed projection from other connections, which must see this state.
@@ -4153,67 +3976,27 @@ pub fn finalize_cache_v2_with_export_manifest(
         .ok_or_else(|| BootstrapError::Invalid {
             message: "cache omitted its migration state".to_owned(),
         })?;
+    // Change 2: format two may only reuse an already-finalized historical
+    // classifier. The current classifier requires an identity-four successor.
+    if state.0 == "finalized" && state.3.is_none() {
+        return invalid("finalized ranker projection classifier version is missing".to_owned());
+    }
+    let Some(classifier_version @ 1..=3) = state.3 else {
+        return invalid("format-two head must admit its identity-four successor before classifier-6 finalization".to_owned());
+    };
+    if state.0 != "finalized" {
+        return invalid("format-two head must admit its identity-four successor before classifier-6 finalization".to_owned());
+    }
     let (activity_generation, ranker_projection_count, ranker_projection_digest) =
-        if state.0 == "finalized" && state.3 == Some(i64::from(RANKER_CLASSIFIER_VERSION)) {
-            let reused = verify_reusable_ranker_projection(
-                &transaction,
-                cache_path,
-                payout_generation,
-                state.1,
-                state.2,
-            )?;
-            drop(_authorization);
-            transaction.commit()?;
-            reused
-        } else if state.0 == "finalized" && state.3.is_none() {
-            return invalid("finalized ranker projection classifier version is missing".to_owned());
-        } else {
-            let identity = activity_identity(&transaction)?;
-            let (activity_manifest, count) =
-                rebuild_ranker_projection(&transaction, identity.generation, finalized_at_unix)?;
-            // Commit the rebuilt projection unfinalized, so its digest can be read
-            // from other connections; a failure after this leaves only an
-            // unfinalized projection, which the next finalization rebuilds.
-            transaction.execute(
-                "UPDATE cache_v2_migration_state
-             SET phase = CASE WHEN phase = 'finalized' THEN 'schema_sealed' ELSE phase END,
-                 ranker_projection_count = NULL, ranker_projection_digest = NULL,
-                 ranker_classifier_version = NULL, ranker_projection_inputs_json = NULL,
-                 updated_at_unix = ?1 WHERE singleton = 1",
-                params![finalized_at_unix],
-            )?;
-            let baseline: i64 =
-                transaction.pragma_query_value(None, "data_version", |row| row.get(0))?;
-            drop(_authorization);
-            transaction.commit()?;
-            let transaction = relock_unchanged(&mut connection, baseline)?;
-            let _authorization = authorize_history_writes(&transaction)?;
-            let digest =
-                projection_digest::compute_committed(cache_path, activity_manifest.generation)?;
-            let inputs = RankerProjectionInputs::read(
-                &transaction,
-                &activity_manifest,
-                &identity,
-                payout_generation,
-            )?;
-            transaction.execute(
-                "UPDATE cache_v2_migration_state
-                 SET phase = 'finalized', ranker_projection_count = ?1,
-                     ranker_projection_digest = ?2, ranker_classifier_version = ?3,
-                     updated_at_unix = ?4, ranker_projection_inputs_json = ?5 WHERE singleton = 1",
-                params![
-                    to_i64(count, "ranker projection count")?,
-                    digest,
-                    i64::from(RANKER_CLASSIFIER_VERSION),
-                    finalized_at_unix,
-                    canonical_json(&inputs)?,
-                ],
-            )?;
-            verify_history_certificates(&transaction)?;
-            drop(_authorization);
-            transaction.commit()?;
-            (activity_manifest.generation, count, digest)
-        };
+        verify_reusable_ranker_projection(
+            &transaction,
+            cache_path,
+            payout_generation,
+            state.1,
+            state.2,
+        )?;
+    drop(_authorization);
+    transaction.commit()?;
     checkpoint_truncate(&connection)?;
     connection.close().map_err(|(_, error)| error)?;
     reject_nonempty_sidecars(cache_path)?;
@@ -4231,7 +4014,8 @@ pub fn finalize_cache_v2_with_export_manifest(
         payout_coverage_generation: to_u64(payout_generation, "payout generation")?,
         ranker_projection_count,
         ranker_projection_digest,
-        ranker_classifier_version: RANKER_CLASSIFIER_VERSION,
+        ranker_classifier_version: u32::try_from(classifier_version)
+            .map_err(|_| BootstrapError::Internal)?,
         export_manifest_sha256: None,
         export_projection: None,
         classification_report: None,
@@ -4243,6 +4027,7 @@ pub fn finalize_cache_v2_with_export_manifest(
 /// Takes the write lock again after this connection's commit, refusing if any
 /// other connection committed since `baseline`, which this connection read
 /// while it still held the lock (its own commits never change the value).
+#[cfg(test)]
 fn relock_unchanged(
     connection: &mut Connection,
     baseline: i64,
@@ -6097,8 +5882,8 @@ fn verify_finalized_v2_manifests(
         ClassifierGeneration::Current => {
             classifier_version == Some(i64::from(RANKER_CLASSIFIER_VERSION))
         }
-        // Classifiers four and five were never published; retain authentic historical generations.
-        ClassifierGeneration::Historical => matches!(classifier_version, Some(1..=3 | 6)),
+        // Classifiers four and five were never published; format-two caches retain classifiers one through three.
+        ClassifierGeneration::Historical => matches!(classifier_version, Some(1..=3)),
     };
     let mismatched_rows: bool = connection.query_row(
         "SELECT EXISTS(SELECT 1 FROM ranker_entries_v2 WHERE classifier_version IS NOT ?1)",

@@ -45,14 +45,14 @@ struct ExportManifest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct ScopeDrop {
-    cause: DropCause,
+    pub(super) cause: DropCause,
     pub(super) dropped_at_unix: i64,
     pub(super) scope_id: String,
-    scope_kind: ScopeKind,
+    pub(super) scope_kind: ScopeKind,
 }
 
 impl ScopeDrop {
-    fn scope(&self) -> Scope {
+    pub(super) fn scope(&self) -> Scope {
         Scope {
             kind: self.scope_kind,
             id: self.scope_id.clone(),

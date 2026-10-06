@@ -411,19 +411,34 @@ def _export_certified_cache(db: str, pq: str, expected_wallets: set[str] | None 
     try:
         con.execute("LOAD sqlite_scanner")
         con.execute(f"ATTACH '{exp._q(os.path.abspath(db))}' AS src (TYPE sqlite, READ_ONLY)")
-        counts = {table: exp._export_table(con, pq, table, 100) for table in exp.V2_TABLES}
-        projection = exp._verify_v2_projection(con, pq)
-        exp._write_v2_export_manifest(pq, counts, projection)
+        raw_identity = con.execute(
+            "SELECT fresh_collection_json FROM src.cache_v2_migration_state").fetchone()[0]
+        three = raw_identity is not None and json.loads(raw_identity)["version"] == 4
+        if three:
+            # Change 4: format 3 exports the committed spool, with no marker join.
+            projection = exp._export_v3_projection(con, db, pq, 100)
+            payout_count = exp._export_table(con, pq, "clob_payout_evidence_v2", 100)
+            exp._write_v3_export_manifest(pq, payout_count, projection)
+        else:
+            counts = {table: exp._export_table(con, pq, table, 100) for table in exp.V2_TABLES}
+            projection = exp._verify_v2_projection(con, pq)
+            exp._write_v2_export_manifest(pq, counts, projection)
         if expected_wallets is not None:
             # Retained excluded history remains audit data in activity_groups_v2;
             # neither the source nor exported ranker projection may admit it.
-            with sqlite3.connect(db) as source:
-                source_wallets = {wallet for (wallet,) in source.execute(
-                    "SELECT g.wallet_hex FROM ranker_entries_v2 r JOIN activity_groups_v2 g "
-                    "ON g.source_trade_id = r.source_trade_id "
-                    "AND g.coverage_generation = r.activity_generation "
-                    "JOIN clob_payout_evidence_v2 p ON p.market_id = g.condition_id")}
-            exported_wallets = {row["wallet_hex"] for row in exp._projection_rows(con)}
+            if three:
+                spool = Path(db).with_name(Path(db).name + ".projection-v3.jsonl")
+                source_wallets = {json.loads(line)["wallet_hex"] for line in spool.read_text().splitlines()}
+                exported_wallets = {row["wallet_hex"] for row in exp._compact_projection_rows(
+                    con, str(Path(pq) / "projection.parquet"))}
+            else:
+                with sqlite3.connect(db) as source:
+                    source_wallets = {wallet for (wallet,) in source.execute(
+                        "SELECT g.wallet_hex FROM ranker_entries_v2 r JOIN activity_groups_v2 g "
+                        "ON g.source_trade_id = r.source_trade_id "
+                        "AND g.coverage_generation = r.activity_generation "
+                        "JOIN clob_payout_evidence_v2 p ON p.market_id = g.condition_id")}
+                exported_wallets = {row["wallet_hex"] for row in exp._projection_rows(con)}
             for prefix, wallets in (("src", source_wallets), ("exported", exported_wallets)):
                 assert wallets == expected_wallets, (prefix, wallets, expected_wallets)
         return projection
@@ -466,12 +481,20 @@ def assert_certified_full_incremental_equivalence(full: str, incremental: str) -
                                   ignore_index=True)
             engine.close()
             watermark = cycle.snapshot(Path(db), "2027-01-15", {}, {})["source_watermark"]["activity"]
-            results.append((wallets, last, newest, positions, projection, watermark))
+            with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as sqlite:
+                # Change 2: manifests commit fetched sets; certificates commit effective history.
+                certificates = sqlite.execute(
+                    "SELECT wallet_hex, generation, newest_source_unix, newest_trade_unix, "
+                    "aggregate_count, source_row_count, ordered_digest, scope_drops_json "
+                    "FROM activity_wallet_history_v3 WHERE generation = ? ORDER BY wallet_hex",
+                    (watermark["generation"],)).fetchall()
+            results.append((wallets, last, newest, positions, projection, watermark, certificates))
         a, b = results
         assert a[:3] == b[:3], "wallet universe or publisher source times changed"
         pd.testing.assert_frame_equal(a[3], b[3], check_exact=True)
         assert a[4] == b[4], "exported projection certification changed"
-        for field in ("generation", "count", "newest_source_unix", "wallet_count", "aggregate_digest", "source_row_count"):
+        assert a[6] == b[6], ("effective certified history changed", a[6], b[6])
+        for field in ("generation", "count", "newest_source_unix", "wallet_count"):
             assert a[5][field] == b[5][field], field
         assert a[5]["reference_sha256"] != b[5]["reference_sha256"]
         assert a[5]["receipt_set_digest"] != b[5]["receipt_set_digest"]
@@ -546,6 +569,42 @@ def assert_certified_deferred_publication_equivalence(
         assert requests[0]["batch"]["config_hash"] != requests[1]["batch"]["config_hash"]
         assert requests[0]["cache_activation"] != requests[1]["cache_activation"]
         print("PASS: deferral preserves exact published entries with independently bound provenance")
+
+
+def assert_certified_excluded_newest_is_stale(db: str, excluded: str, process_now: int) -> None:
+    """AC5: an older excluded certificate cannot lend freshness to this head."""
+    import push_ranking_to_supabase as publisher
+    import rank_cycle_manifest as cycle
+
+    with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as con:
+        con.execute("BEGIN")
+        excluded_newest = con.execute(
+            "SELECT newest_trade_unix FROM activity_wallet_history_v3 WHERE wallet_hex = ?",
+            (excluded,)).fetchone()[0]
+        certificates = cycle.finalized_certificates(con)
+        assert excluded not in certificates["wallets"]
+        assert excluded_newest > certificates["newest_trade_unix"]
+        assert process_now - certificates["newest_trade_unix"] > 24 * 3600
+    with mock.patch.object(publisher, "_request_once") as network:
+        try:
+            publisher.filter_active_rows([], db, 720, 24, process_now)
+        except publisher.CacheStaleError as error:
+            assert "newest trade" in str(error), error
+        else:
+            raise AssertionError("excluded certificate supplied publisher freshness")
+    network.assert_not_called()
+
+
+def certified_publication_history(db: str, wallet: str, process_now: int) -> str:
+    """Read freshness, eligibility, stamps and scopes for Rust mirror-damage checks."""
+    import push_ranking_to_supabase as publisher
+
+    history = {}
+    result = publisher.filter_active_rows(
+        [{"wallet": wallet, "survives": True}], db, 720, 24, process_now,
+        publication_history=history)
+    assert result[0] and result[0][0]["wallet"] == wallet
+    return json.dumps({"result": result, "history": history}, sort_keys=True)
 
 
 class DuckParityTest(unittest.TestCase):

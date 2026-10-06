@@ -671,7 +671,9 @@ impl CollectionProof {
             ))
         } else {
             let mut snapshot = None;
-            for (&generation, (identity, _)) in history.records.range(..=base_generation).rev() {
+            for (&generation, (identity, manifest)) in
+                history.records.range(..=base_generation).rev()
+            {
                 if identity
                     .wallets
                     .binary_search_by(|w| w.as_str().cmp(wallet))
@@ -679,7 +681,10 @@ impl CollectionProof {
                 {
                     continue;
                 }
-                let receipt = receipt_for_identity(connection, identity, wallet)?;
+                let receipt = match manifest {
+                    Some(manifest) => predecessor_receipt(connection, manifest, identity, wallet)?,
+                    None => receipt_for_identity(connection, identity, wallet)?,
+                };
                 let repaired = identity.repair_wallets.as_ref().is_some_and(|repairs| {
                     repairs.binary_search_by(|w| w.as_str().cmp(wallet)).is_ok()
                 });
@@ -990,7 +995,7 @@ fn verify_historical_receipts_with(
 pub(super) struct HistoryProof {
     records: BTreeMap<u64, (FreshCollectionIdentity, Option<ActivityCoverageManifestV2>)>,
     links: BTreeMap<u64, String>,
-    last_fetched: BTreeMap<String, u64>,
+    last_fetched: BTreeMap<String, (u64, Option<String>)>,
 }
 
 impl HistoryProof {
@@ -1000,7 +1005,7 @@ impl HistoryProof {
     ) -> Result<Self, BootstrapError> {
         let mut records = BTreeMap::new();
         let mut links = BTreeMap::new();
-        let mut last_fetched = BTreeMap::<String, u64>::new();
+        let mut last_fetched = BTreeMap::<String, (u64, Option<String>)>::new();
         let mut identity = head.clone();
         loop {
             let manifest = stored_activity_manifest(connection, identity.generation)?;
@@ -1009,15 +1014,25 @@ impl HistoryProof {
                 verify_archived_identity(connection, identity.generation, &identity, true)?;
                 verify_historical_receipts_with(connection, manifest, &identity, |receipt| {
                     if !receipt.excluded()
-                        && receipt.acquisition.as_ref().is_some_and(|acquisition| {
-                            acquisition
+                        && let Some(acquisition) = receipt.acquisition.as_ref()
+                        && (acquisition.mode == ActivityReadMode::Full
+                            || acquisition
                                 .fetched_aggregate_count
-                                .is_some_and(|count| count > 0)
-                        })
+                                .is_some_and(|count| count > 0))
                     {
-                        let generation =
-                            last_fetched.entry(receipt.wallet_hex.clone()).or_default();
-                        *generation = (*generation).max(identity.generation);
+                        // Decision 4: an unchanged full read commits only its receipt.
+                        // Its fetched rows do not make a certified quiet history active.
+                        let change = (
+                            identity.generation,
+                            (acquisition.mode == ActivityReadMode::Full)
+                                .then(|| receipt.ordered_aggregate_digest.clone()),
+                        );
+                        let latest = last_fetched
+                            .entry(receipt.wallet_hex.clone())
+                            .or_insert_with(|| change.clone());
+                        if change.0 > latest.0 {
+                            *latest = change;
+                        }
                     }
                 })?;
             }
@@ -1048,10 +1063,15 @@ impl HistoryProof {
         })
     }
 
-    pub(super) fn has_new_rows(&self, wallet: &str, since: u64) -> bool {
+    pub(super) fn has_new_rows(&self, wallet: &str, certificate: &HistoryCertificate) -> bool {
         self.last_fetched
             .get(wallet)
-            .is_some_and(|generation| *generation > since)
+            .is_some_and(|(generation, full_digest)| {
+                *generation > certificate.generation
+                    && full_digest
+                        .as_ref()
+                        .is_none_or(|digest| digest != &certificate.ordered_digest)
+            })
     }
 
     fn identity(&self, generation: u64) -> Option<&FreshCollectionIdentity> {

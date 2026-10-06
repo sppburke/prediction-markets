@@ -13,6 +13,10 @@ path = "src/main.rs"
 name = "pe_bootstrap"
 path = "src/lib.rs"
 
+[[example]]
+name = "classifier_v6_sample"
+required-features = ["scenario"]
+
 [features]
 # Gates bootstrap's `tests/scenario_*.rs` integration tests so a plain
 # `cargo test` (without `--all-features`) skips them.
