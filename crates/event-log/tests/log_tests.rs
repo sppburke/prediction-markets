@@ -1876,6 +1876,7 @@ fn paper_service_rollout_checkpoint_fallback_preserves_corruption_and_torn_prefi
             &path,
             &activation,
             Some((&tail, &good_hash)),
+            pe_event_log::CheckpointPrefix::Verify,
             &mut hash,
             &mut |value| used = Some(value),
             &mut |_, _| {}
@@ -1893,6 +1894,7 @@ fn paper_service_rollout_checkpoint_fallback_preserves_corruption_and_torn_prefi
         &path,
         &activation,
         Some((&tail, &good_hash)),
+        pe_event_log::CheckpointPrefix::Verify,
         &mut hash,
         &mut |_| {},
         &mut |_, _| {},
@@ -1901,5 +1903,201 @@ fn paper_service_rollout_checkpoint_fallback_preserves_corruption_and_torn_prefi
     assert_eq!(
         std::fs::metadata(&path).unwrap().len(),
         activation.physical_tail - 1
+    );
+}
+
+#[test]
+fn checkpoint_scanner_cancellation_preserves_uncancelled_results() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = tmp_dir();
+    let path = dir.path().join("source.log");
+    let mut writer = Writer::open(&path).unwrap();
+    let activation = writer.verified_tail().unwrap();
+    for payload in [b"first".as_slice(), b"second"] {
+        writer
+            .append_synced(make_envelope(payload.to_vec()))
+            .unwrap();
+    }
+    let tail = writer.verified_tail().unwrap();
+    drop(writer);
+    let cancel = AtomicBool::new(true);
+    assert!(matches!(
+        Scanner::hash_prefix_cancellable(&path, tail.physical_tail, Some(&cancel)),
+        Err(LogError::Cancelled)
+    ));
+    assert!(matches!(
+        Scanner::walk_bounded_cancellable(
+            &path,
+            tail.physical_tail,
+            &activation,
+            None,
+            &mut blake3::Hasher::new(),
+            &mut |_, _| {},
+            Some(&cancel)
+        ),
+        Err(LogError::Cancelled)
+    ));
+    cancel.store(false, Ordering::Relaxed);
+    let hash = Scanner::hash_prefix_cancellable(&path, tail.physical_tail, Some(&cancel)).unwrap();
+    assert_eq!(
+        hash.finalize(),
+        Scanner::hash_prefix(&path, tail.physical_tail)
+            .unwrap()
+            .finalize()
+    );
+    let mut digest = blake3::Hasher::new();
+    let mut seen = Vec::new();
+    let result = Scanner::walk_bounded_cancellable(
+        &path,
+        tail.physical_tail,
+        &activation,
+        None,
+        &mut digest,
+        &mut |_, frame| {
+            seen.push(frame.seq);
+            cancel.store(true, Ordering::Relaxed);
+        },
+        Some(&cancel),
+    );
+    assert!(matches!(result, Err(LogError::Cancelled)));
+    assert_eq!(seen, vec![EventSeq(0)]);
+    cancel.store(false, Ordering::Relaxed);
+    let actual = Scanner::walk_bounded_cancellable(
+        &path,
+        tail.physical_tail,
+        &activation,
+        None,
+        &mut digest,
+        &mut |_, _| {},
+        Some(&cancel),
+    )
+    .unwrap();
+    assert_eq!(actual, tail);
+    assert_eq!(digest.finalize(), hash.finalize());
+}
+
+#[test]
+fn deferred_checkpoint_reads_only_suffix_and_verify_fails_corrupt_prefix() {
+    use pe_event_log::CheckpointPrefix;
+    let dir = tmp_dir();
+    let path = dir.path().join("source.log");
+    let mut writer = Writer::open(&path).unwrap();
+    writer
+        .append_synced(make_envelope(b"activation".to_vec()))
+        .unwrap();
+    let activation = writer.verified_tail().unwrap();
+    writer
+        .append_synced(make_envelope(b"checkpoint".to_vec()))
+        .unwrap();
+    let checkpoint = writer.verified_tail().unwrap();
+    let prefix_hash = Scanner::hash_prefix(&path, checkpoint.physical_tail)
+        .unwrap()
+        .finalize()
+        .to_hex()
+        .to_string();
+    writer
+        .append_synced(make_envelope(b"suffix".to_vec()))
+        .unwrap();
+    let tail = writer.verified_tail().unwrap();
+    drop(writer);
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[usize::try_from(activation.physical_tail - 1).unwrap()] ^= 1;
+    std::fs::write(&path, &bytes).unwrap();
+    let mut seen = Vec::new();
+    let mut digest = blake3::Hasher::new();
+    let (writer, actual, verification) = Writer::open_verified_checkpoint(
+        &path,
+        &activation,
+        Some((&checkpoint, &prefix_hash)),
+        CheckpointPrefix::Defer,
+        &mut digest,
+        &mut |used| assert!(used),
+        &mut |_, frame| seen.push(frame.seq),
+    )
+    .unwrap();
+    assert!(verification.used && verification.deferred);
+    assert_eq!(actual, tail);
+    assert_eq!(seen, vec![EventSeq(2)]);
+    assert_eq!(
+        digest.finalize(),
+        blake3::hash(&bytes[usize::try_from(checkpoint.physical_tail).unwrap()..])
+    );
+    drop(writer);
+    let result = Writer::open_verified_checkpoint(
+        &path,
+        &activation,
+        Some((&checkpoint, &prefix_hash)),
+        CheckpointPrefix::Verify,
+        &mut blake3::Hasher::new(),
+        &mut |used| assert!(!used),
+        &mut |_, _| {},
+    );
+    assert!(matches!(result, Err(LogError::CrcMismatch { .. })));
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn deferred_checkpoint_shorter_file_full_walks_and_suffix_error_fails_closed() {
+    use pe_event_log::CheckpointPrefix;
+    let dir = tmp_dir();
+    let path = dir.path().join("source.log");
+    let mut writer = Writer::open(&path).unwrap();
+    writer
+        .append_synced(make_envelope(b"activation".to_vec()))
+        .unwrap();
+    let activation = writer.verified_tail().unwrap();
+    writer
+        .append_synced(make_envelope(b"checkpoint".to_vec()))
+        .unwrap();
+    let checkpoint = writer.verified_tail().unwrap();
+    let hash = Scanner::hash_prefix(&path, checkpoint.physical_tail)
+        .unwrap()
+        .finalize()
+        .to_hex()
+        .to_string();
+    writer
+        .append_synced(make_envelope(b"suffix".to_vec()))
+        .unwrap();
+    drop(writer);
+    let original = std::fs::read(&path).unwrap();
+    let mut corrupt = original.clone();
+    let last = corrupt.len() - 1;
+    corrupt[last] ^= 1;
+    std::fs::write(&path, &corrupt).unwrap();
+    let mut observed = 0;
+    let result = Writer::open_verified_checkpoint(
+        &path,
+        &activation,
+        Some((&checkpoint, &hash)),
+        CheckpointPrefix::Defer,
+        &mut blake3::Hasher::new(),
+        &mut |used| assert!(used),
+        &mut |_, _| observed += 1,
+    );
+    assert!(matches!(result, Err(LogError::CrcMismatch { .. })));
+    assert_eq!(observed, 0); // no full-walk retry after deferred resume
+    std::fs::write(
+        &path,
+        &original[..usize::try_from(activation.physical_tail).unwrap()],
+    )
+    .unwrap();
+    let mut seen = Vec::new();
+    let mut digest = blake3::Hasher::new();
+    let (_writer, actual, verification) = Writer::open_verified_checkpoint(
+        &path,
+        &activation,
+        Some((&checkpoint, &hash)),
+        CheckpointPrefix::Defer,
+        &mut digest,
+        &mut |used| assert!(!used),
+        &mut |_, frame| seen.push(frame.seq),
+    )
+    .unwrap();
+    assert_eq!(actual, activation);
+    assert!(!verification.used && !verification.deferred);
+    assert_eq!(seen, vec![EventSeq(0)]);
+    assert_eq!(
+        digest.finalize(),
+        blake3::hash(&original[..usize::try_from(activation.physical_tail).unwrap()])
     );
 }

@@ -3021,21 +3021,29 @@ pub fn validate_open_continuations(
                 source_trade_id: None,
                 cause: error.to_string(),
             })?;
-    validate_continuation_rows(paper_state, rows, source_receipts)
+    let frontiers =
+        paper_state
+            .feed_history_frontiers()
+            .map_err(|error| ContinuationValidationError {
+                source_trade_id: None,
+                cause: error.to_string(),
+            })?;
+    validate_continuation_rows(paper_state, rows, frontiers, source_receipts)
 }
 
 /// Validate open rows read earlier (for example before a log bound) against `source_receipts`.
 pub(crate) fn validate_continuation_rows(
     paper_state: &PaperStateDb,
     rows: Vec<DecisionPendingRow>,
+    frontiers: serde_json::Value,
     source_receipts: &SourceReceiptIndex,
 ) -> Result<usize, ContinuationValidationError> {
-    crate::frame_admission::restore_frontiers(paper_state, source_receipts).map_err(|cause| {
-        ContinuationValidationError {
+    crate::frame_admission::restore_frontiers_from_collection(frontiers, source_receipts).map_err(
+        |cause| ContinuationValidationError {
             source_trade_id: None,
             cause: cause.to_string(),
-        }
-    })?;
+        },
+    )?;
     let validated = rows.len();
     let mut reads = Vec::<(DecisionContinuationV3, Vec<DecisionContinuationV3>)>::new();
     let mut page_reads = HashMap::<pe_core_types::EventSeq, usize>::new();

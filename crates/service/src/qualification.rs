@@ -383,7 +383,7 @@ pub(crate) fn write_report(path: &Path, bytes: &[u8]) -> Result<(), std::io::Err
     )
 }
 
-fn write_report_with_finalization(
+pub(crate) fn write_report_with_finalization(
     path: &Path,
     bytes: &[u8],
     rename: impl FnOnce(&Path, &Path) -> std::io::Result<()>,

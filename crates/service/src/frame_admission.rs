@@ -91,7 +91,15 @@ pub(crate) fn restore_frontiers(
     state: &PaperStateDb,
     index: &crate::risk_inputs::SourceReceiptIndex,
 ) -> Result<HashMap<WalletAddress, FeedHistoryFrontier>, FrameAdmissionError> {
-    let collection: FrontierCollection = serde_json::from_value(state.feed_history_frontiers()?)?;
+    restore_frontiers_from_collection(state.feed_history_frontiers()?, index)
+}
+
+/// Authenticate a collection captured before the source-log bound, rather than re-reading it.
+pub(crate) fn restore_frontiers_from_collection(
+    collection: serde_json::Value,
+    index: &crate::risk_inputs::SourceReceiptIndex,
+) -> Result<HashMap<WalletAddress, FeedHistoryFrontier>, FrameAdmissionError> {
+    let collection: FrontierCollection = serde_json::from_value(collection)?;
     if collection.version != 1 {
         return Err(FrameAdmissionError::UnsupportedVersion {
             surface: "frontier collection",

@@ -2300,6 +2300,33 @@ async fn paper_service_rollout_checkpoint_preparation_is_early_read_only_and_ign
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(stdout.lines().count(), 1);
+    assert!(stdout.starts_with("source checkpoint published offset="));
+    let fields: std::collections::HashMap<_, _> = stdout
+        .split_whitespace()
+        .filter_map(|part| part.split_once('='))
+        .collect();
+    assert_eq!(fields["offset"].parse::<u64>().unwrap(), complete_size);
+    let tail = writer.verified_tail().unwrap();
+    assert_eq!(
+        fields["sequence"],
+        tail.last_sequence.unwrap().0.to_string()
+    );
+    assert_eq!(fields["hash"], tail.last_hash.to_hex().as_str());
+    assert_eq!(
+        fields["prefix_blake3"],
+        Scanner::hash_prefix(&paths.source_log, complete_size)
+            .unwrap()
+            .finalize()
+            .to_hex()
+            .as_str()
+    );
+    assert_eq!(fields["validated"], "0");
+    assert!(
+        fields["published_unix_ms"].parse::<u64>().unwrap()
+            >= fields["capture_unix_ms"].parse::<u64>().unwrap()
+    );
     assert_eq!(std::fs::read(&paths.fixed_main).unwrap(), before_db);
     assert_eq!(file_len(&paths.source_log), complete_size);
     writer
@@ -2315,7 +2342,7 @@ async fn paper_service_rollout_checkpoint_preparation_is_early_read_only_and_ign
         .unwrap();
     let torn_size = file_len(&paths.source_log);
     let prepared = SourceLogBoot::prepare_checkpoint(&paths.fixed_main).unwrap();
-    assert_eq!(prepared.0, complete_tail);
+    assert_eq!(prepared.0.tail, complete_tail);
     assert_eq!(prepared.1, 0);
     assert_eq!(file_len(&paths.source_log), torn_size);
     assert_eq!(std::fs::read(&paths.fixed_main).unwrap(), before_db);
@@ -2723,4 +2750,454 @@ fn mixed_continuation_market_evidence(
         books.insert(token, book);
     }
     (hooks, prices, books)
+}
+
+fn rewrite_boot_checkpoint(path: &Path, edit: impl FnOnce(&mut serde_json::Value)) {
+    let bytes = std::fs::read(path).unwrap();
+    let mut body: serde_json::Value = serde_json::from_slice(&bytes[65..]).unwrap();
+    edit(&mut body);
+    let encoded = serde_json::to_vec(&body).unwrap();
+    let mut artifact = blake3::hash(&encoded).to_hex().as_bytes().to_vec();
+    artifact.push(b'\n');
+    artifact.extend_from_slice(&encoded);
+    std::fs::write(path, &artifact).unwrap();
+}
+
+fn checkpoint_record_path(source_log: &Path) -> PathBuf {
+    let mut name = pe_service::source_checkpoint::checkpoint_path(source_log).into_os_string();
+    name.push(".invalidation");
+    name.into()
+}
+
+fn write_checkpoint_record(source_log: &Path, generation: u64, active: bool) {
+    std::fs::write(
+        checkpoint_record_path(source_log),
+        serde_json::to_vec(&pe_service::source_checkpoint::InvalidationRecord {
+            generation,
+            active,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+}
+
+fn assert_checkpoint_assisted_boot(
+    paths: &PaperMigrationPaths,
+    receipt: &pe_service::source_checkpoint::PublicationReceipt,
+) {
+    let before = pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap();
+    let opened = SourceLogBoot::open(paths, false).unwrap().unwrap();
+    assert_eq!(opened.binding, receipt.tail);
+    assert_eq!(
+        pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap(),
+        before
+    );
+    let artifact = std::fs::read(pe_service::source_checkpoint::checkpoint_path(
+        &paths.source_log,
+    ))
+    .unwrap();
+    assert_eq!(
+        &artifact[..64],
+        blake3::hash(&artifact[65..]).to_hex().as_bytes()
+    );
+    let body: serde_json::Value = serde_json::from_slice(&artifact[65..]).unwrap();
+    assert_eq!(body["prefix_blake3"], receipt.prefix_blake3);
+}
+
+/// PASS: wrong raw-prefix digests at unchanged tails are repaired under fresh authority; active
+/// records force full verification. Changed artifacts or generations restart preparation instead
+/// of invalidating the newly installed checkpoint. A post-checkpoint/pre-clearance image rebuilds.
+#[test]
+fn wrong_prefix_checkpoint_repaired_by_preparation() {
+    use pe_service::source_checkpoint::{
+        Authority, InvalidationRecord, PreparationHooks, read_authority,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+    for case in [
+        "inactive",
+        "active",
+        "interrupted_clearance",
+        "artifact_changed",
+        "generation_changed",
+        "hash_io_error",
+    ] {
+        let (_dir, paths) = installed_fixture();
+        append(
+            &paths.source_log,
+            activity_envelope("0xrepair-prefix", NOW_UNIX + 1),
+        );
+        let (original, _) = SourceLogBoot::prepare_checkpoint(&paths.fixed_main).unwrap();
+        let sidecar = pe_service::source_checkpoint::checkpoint_path(&paths.source_log);
+        let good_bytes = std::fs::read(&sidecar).unwrap();
+        rewrite_boot_checkpoint(&sidecar, |body| {
+            body["prefix_blake3"] = serde_json::json!("ff".repeat(32))
+        });
+        write_checkpoint_record(
+            &paths.source_log,
+            4,
+            matches!(case, "active" | "interrupted_clearance"),
+        );
+        if case == "interrupted_clearance" {
+            // The durable image after checkpoint installation and before active-record clearance.
+            std::fs::write(&sidecar, &good_bytes).unwrap();
+        }
+        let checked = Arc::new(AtomicBool::new(false));
+        let changed = checked.clone();
+        let scenario_paths = paths.clone();
+        let bound_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let captures = bound_calls.clone();
+        let hash_paths = paths.clone();
+        let hooks = PreparationHooks {
+            before_cached_hash: Some(Arc::new(move || {
+                if case == "hash_io_error" {
+                    // The loaded cache passed the length check. Shorten the file only after
+                    // load so hashing reports UnexpectedEof; the remaining activation is valid.
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&hash_paths.source_log)?
+                        .set_len(recorded_source_tail(&hash_paths))?;
+                }
+                Ok(())
+            })),
+            after_bound: Some(Arc::new(move || {
+                captures.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })),
+            after_cached_hash: Some(Arc::new(move || {
+                if !changed.swap(true, Ordering::SeqCst) {
+                    if case == "artifact_changed" {
+                        // A verified later-tail publisher can legitimately replace the wrong
+                        // digest without changing authority; the paused preparation must restart.
+                        append(
+                            &scenario_paths.source_log,
+                            activity_envelope("0xnew-artifact", NOW_UNIX + 2),
+                        );
+                        let opened = SourceLogBoot::open(&scenario_paths, false)
+                            .unwrap()
+                            .unwrap();
+                        opened.boot.publish_checkpoint().unwrap();
+                    } else if case == "generation_changed" {
+                        assert_eq!(
+                            pe_service::source_checkpoint::invalidate(&scenario_paths.source_log)
+                                .unwrap(),
+                            5
+                        );
+                        SourceLogBoot::prepare_checkpoint(&scenario_paths.fixed_main).unwrap();
+                    }
+                }
+                Ok(())
+            })),
+            ..PreparationHooks::default()
+        };
+        let (repaired, validated) =
+            SourceLogBoot::prepare_checkpoint_with_hooks(&paths.fixed_main, &hooks).unwrap();
+        assert_eq!(validated, 0);
+        if matches!(case, "artifact_changed" | "hash_io_error") {
+            if case == "artifact_changed" {
+                assert!(repaired.tail.physical_tail > original.tail.physical_tail);
+            } else {
+                assert!(repaired.tail.physical_tail < original.tail.physical_tail);
+            }
+            assert_eq!(repaired.tail, Scanner::verify(&paths.source_log).unwrap());
+            assert_eq!(
+                repaired.prefix_blake3,
+                Scanner::hash_prefix(&paths.source_log, repaired.tail.physical_tail)
+                    .unwrap()
+                    .finalize()
+                    .to_hex()
+                    .to_string()
+            );
+        } else {
+            assert_eq!(repaired.tail, original.tail);
+            assert_eq!(repaired.prefix_blake3, original.prefix_blake3);
+        }
+        assert_eq!(
+            bound_calls.load(Ordering::SeqCst),
+            if matches!(case, "artifact_changed" | "generation_changed") {
+                2
+            } else {
+                1
+            }
+        );
+        let expected_generation = if matches!(case, "inactive" | "generation_changed") {
+            5
+        } else {
+            4
+        };
+        assert_eq!(
+            read_authority(&paths.source_log).unwrap(),
+            Authority::Readable(InvalidationRecord {
+                generation: expected_generation,
+                active: false
+            }),
+            "{case}"
+        );
+        assert_checkpoint_assisted_boot(&paths, &repaired);
+    }
+}
+
+/// PASS: the same loader checks governing boot also allow publication to replace an unusable
+/// artifact, including a checksum-valid tail beyond physical EOF; the next boot uses the repair.
+#[test]
+fn unusable_checkpoint_replaced_by_verified_candidate() {
+    for fault in [
+        "absent",
+        "checksum",
+        "decode",
+        "mode",
+        "format",
+        "scanner",
+        "reducer",
+        "receipt",
+        "long_tail",
+    ] {
+        let (_dir, paths) = installed_fixture();
+        append(
+            &paths.source_log,
+            activity_envelope("0xreplace-unusable", NOW_UNIX + 1),
+        );
+        let (receipt, _) = SourceLogBoot::prepare_checkpoint(&paths.fixed_main).unwrap();
+        let sidecar = pe_service::source_checkpoint::checkpoint_path(&paths.source_log);
+        match fault {
+            "absent" => std::fs::remove_file(&sidecar).unwrap(),
+            "checksum" => {
+                let mut bytes = std::fs::read(&sidecar).unwrap();
+                bytes[0] ^= 1;
+                std::fs::write(&sidecar, bytes).unwrap();
+            }
+            "decode" => std::fs::write(&sidecar, b"damaged").unwrap(),
+            _ => rewrite_boot_checkpoint(&sidecar, |data| match fault {
+                "mode" => data["financial_era"] = serde_json::json!(true),
+                "format" => data["format_version"] = serde_json::json!(99),
+                "scanner" => data["scanner_version"] = serde_json::json!(99),
+                "reducer" => data["reducer_version"] = serde_json::json!(1),
+                "receipt" => data["receipts"][0]["byte_offset"] = serde_json::json!(999999),
+                "long_tail" => {
+                    data["tail"]["physical_tail"] =
+                        serde_json::json!(file_len(&paths.source_log) + 1)
+                }
+                _ => unreachable!(),
+            }),
+        }
+        let before = pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap();
+        let opened = SourceLogBoot::open(&paths, false).unwrap().unwrap();
+        assert_eq!(opened.binding, receipt.tail);
+        assert!(
+            pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap() > before,
+            "{fault}"
+        );
+        opened.boot.publish_checkpoint().unwrap();
+        drop(opened);
+        assert_checkpoint_assisted_boot(&paths, &receipt);
+    }
+}
+
+/// PASS: a real preparation command paused after verification cannot publish over an interrupted
+/// invalidation. Its refusal preserves the undecodable quarantine, and the next boot full-walks.
+#[tokio::test]
+async fn checkpoint_cli_publisher_refused_after_interrupted_invalidation() {
+    use pe_service::source_checkpoint::{Authority, InvalidationError, InvalidationHooks};
+    use std::sync::atomic::Ordering;
+    for inactive_record in [false, true] {
+        let (dir, paths) = installed_fixture();
+        append(
+            &paths.source_log,
+            activity_envelope("0xcli-race", NOW_UNIX + 1),
+        );
+        SourceLogBoot::prepare_checkpoint(&paths.fixed_main).unwrap();
+        if inactive_record {
+            write_checkpoint_record(&paths.source_log, 0, false);
+        }
+        let pause = dir.path().join("preparation-pause");
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pe-service"));
+        command
+            .env_clear()
+            .env("PE_SCENARIO_CHECKPOINT_PAUSE_AFTER_WALK", &pause)
+            .arg("--prepare-source-checkpoint")
+            .arg("--paper-state")
+            .arg(&paths.fixed_main);
+        let publisher = tokio::spawn(support::bounded_command_output(command));
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            while !pause.with_extension("ready").exists() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let hooks = InvalidationHooks::default();
+        hooks.fail_record_write.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            pe_service::source_checkpoint::invalidate_with_hooks(&paths.source_log, &hooks),
+            Err(InvalidationError::Io(_))
+        ));
+        std::fs::write(pause.with_extension("resume"), b"resume").unwrap();
+        let output = publisher.await.unwrap();
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("UnreadableRecord"));
+        assert!(!pe_service::source_checkpoint::checkpoint_path(&paths.source_log).exists());
+        assert_eq!(
+            pe_service::source_checkpoint::read_authority(&paths.source_log).unwrap(),
+            Authority::Unreadable
+        );
+        let before = pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap();
+        let opened = SourceLogBoot::open(&paths, false).unwrap().unwrap();
+        assert!(pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap() > before);
+        assert!(opened.boot.publish_checkpoint().is_err());
+        assert_eq!(
+            pe_service::source_checkpoint::read_authority(&paths.source_log).unwrap(),
+            Authority::Unreadable
+        );
+    }
+}
+
+/// PASS: quiesced recovery removes the checkpoint before resetting the record even in the durable
+/// image preceding a failed quarantine sync; full verification and publication restore later boots.
+#[tokio::test]
+async fn checkpoint_failed_quarantine_sync_durable_image_recovers_with_full_walk() {
+    use pe_service::source_checkpoint::{
+        Authority, InvalidationError, InvalidationHooks, InvalidationRecord,
+    };
+    use std::sync::atomic::Ordering;
+    let (_dir, paths) = installed_fixture();
+    append(
+        &paths.source_log,
+        activity_envelope("0xquarantine-sync", NOW_UNIX + 1),
+    );
+    let (receipt, _) = SourceLogBoot::prepare_checkpoint(&paths.fixed_main).unwrap();
+    let sidecar = pe_service::source_checkpoint::checkpoint_path(&paths.source_log);
+    let durable_checkpoint = std::fs::read(&sidecar).unwrap();
+    write_checkpoint_record(&paths.source_log, 3, false);
+    let durable_record = std::fs::read(checkpoint_record_path(&paths.source_log)).unwrap();
+    let hooks = InvalidationHooks::default();
+    hooks.fail_quarantine_sync.store(true, Ordering::SeqCst);
+    assert!(matches!(
+        pe_service::source_checkpoint::invalidate_with_hooks(&paths.source_log, &hooks),
+        Err(InvalidationError::QuarantineFailed(_))
+    ));
+    // Model loss of the unsynced rename: both original names and their preceding contents survive.
+    std::fs::write(&sidecar, &durable_checkpoint).unwrap();
+    std::fs::write(checkpoint_record_path(&paths.source_log), &durable_record).unwrap();
+    let before_db = std::fs::read(&paths.fixed_main).unwrap();
+    let before_log = std::fs::read(&paths.source_log).unwrap();
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pe-service"));
+    command
+        .env_clear()
+        .env("PE_BIND", "invalid")
+        .arg("--recover-source-checkpoint")
+        .arg("--paper-state")
+        .arg(&paths.fixed_main);
+    let output = support::bounded_command_output(command).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.starts_with("source checkpoint recovery checkpoint="));
+    assert_eq!(stdout.matches("removed=true").count(), 2);
+    assert!(!sidecar.exists());
+    assert!(!checkpoint_record_path(&paths.source_log).exists());
+    assert_eq!(std::fs::read(&paths.fixed_main).unwrap(), before_db);
+    assert_eq!(std::fs::read(&paths.source_log).unwrap(), before_log);
+    assert_eq!(
+        pe_service::source_checkpoint::read_authority(&paths.source_log).unwrap(),
+        Authority::Readable(InvalidationRecord::default())
+    );
+    let before = pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap();
+    let opened = SourceLogBoot::open(&paths, false).unwrap().unwrap();
+    assert!(pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap() > before);
+    opened.boot.publish_checkpoint().unwrap();
+    drop(opened);
+    assert_checkpoint_assisted_boot(&paths, &receipt);
+}
+
+/// PASS: frontiers committed after preparation's finite bound are excluded from its census, then
+/// authenticated by boot against its own current index. Captured malformed collections still fail.
+#[test]
+fn checkpoint_preparation_uses_captured_frontiers() {
+    use pe_service::frame_admission::{FeedHistoryFrontier, FrontierCollection};
+    use pe_service::source_checkpoint::PreparationHooks;
+    let (_dir, paths) = installed_fixture();
+    let bound = Scanner::verify(&paths.source_log).unwrap();
+    let hook_paths = paths.clone();
+    let hooks = PreparationHooks {
+        after_bound: Some(Arc::new(move || {
+            let wallet = WalletAddress::from_hex(WALLET).unwrap();
+            let mut writer = Writer::open(&hook_paths.source_log).unwrap();
+            let (read, commitment) = support::append_committed_read_v2(
+                &mut writer,
+                wallet,
+                b"[]",
+                NOW_UNIX + 10,
+                NOW_UNIX + 11,
+            );
+            drop(writer);
+            let data: serde_json::Value = serde_json::from_str(&read.decision_inputs_json).unwrap();
+            let collection = FrontierCollection {
+                version: 1,
+                frontiers: vec![FeedHistoryFrontier {
+                    version: 1,
+                    wallet,
+                    fixed_end: NOW_UNIX + 10,
+                    commitment,
+                    page_occurrences: vec![read.page],
+                    pages: serde_json::from_value(data["pages"].clone()).unwrap(),
+                }],
+            };
+            PaperStateDb::open(&hook_paths.fixed_main)
+                .unwrap()
+                .publish_feed_history_frontiers(&serde_json::to_value(collection).unwrap())
+                .unwrap();
+            Ok(())
+        })),
+        ..PreparationHooks::default()
+    };
+    let (receipt, count) =
+        SourceLogBoot::prepare_checkpoint_with_hooks(&paths.fixed_main, &hooks).unwrap();
+    assert_eq!(receipt.tail, bound);
+    assert_eq!(count, 0);
+    let opened = SourceLogBoot::open(&paths, false).unwrap().unwrap();
+    assert!(opened.binding.physical_tail > bound.physical_tail);
+    let paper = PaperStateDb::open(&paths.fixed_main).unwrap();
+    assert_eq!(
+        pe_service::bucket_commit::validate_open_continuations(
+            &paper,
+            &opened.boot.receipt_index()
+        )
+        .unwrap(),
+        0
+    );
+    paper
+        .publish_feed_history_frontiers(&serde_json::json!({"version": 999, "frontiers": []}))
+        .unwrap();
+    let before = std::fs::read(pe_service::source_checkpoint::checkpoint_path(
+        &paths.source_log,
+    ))
+    .unwrap();
+    assert!(SourceLogBoot::prepare_checkpoint(&paths.fixed_main).is_err());
+    assert_eq!(
+        std::fs::read(pe_service::source_checkpoint::checkpoint_path(
+            &paths.source_log
+        ))
+        .unwrap(),
+        before
+    );
+}
+
+#[test]
+fn checkpoint_record_read_error_forces_full_walk_without_publication() {
+    let (_dir, paths) = installed_fixture();
+    append(
+        &paths.source_log,
+        activity_envelope("0xrecord-read-error", NOW_UNIX + 1),
+    );
+    SourceLogBoot::prepare_checkpoint(&paths.fixed_main).unwrap();
+    let sidecar = pe_service::source_checkpoint::checkpoint_path(&paths.source_log);
+    let artifact = std::fs::read(&sidecar).unwrap();
+    std::fs::create_dir(checkpoint_record_path(&paths.source_log)).unwrap();
+    let before = pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap();
+    let opened = SourceLogBoot::open(&paths, false).unwrap().unwrap();
+    assert!(pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap() > before);
+    assert!(opened.boot.publish_checkpoint().is_err());
+    assert_eq!(std::fs::read(&sidecar).unwrap(), artifact);
 }

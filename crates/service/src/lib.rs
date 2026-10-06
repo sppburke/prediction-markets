@@ -40,6 +40,7 @@ pub mod qualification;
 pub mod risk_inputs;
 pub mod runtime_config;
 pub mod snapshot_worker;
+pub mod source_checkpoint;
 pub mod source_event_sink;
 pub mod source_log_boot;
 pub mod status_writer;

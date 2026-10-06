@@ -175,12 +175,56 @@ async fn main() -> Result<()> {
         let paper = args
             .get(position + 1)
             .context("--paper-state requires a path")?;
-        let (tail, validated) = pe_service::source_log_boot::SourceLogBoot::prepare_checkpoint(
+        #[cfg(feature = "scenario")]
+        let hooks = pe_service::source_checkpoint::cli_preparation_hooks()?;
+        #[cfg(feature = "scenario")]
+        let (receipt, validated) = if let Some(hooks) = hooks {
+            pe_service::source_log_boot::SourceLogBoot::prepare_checkpoint_with_hooks(
+                std::path::Path::new(paper),
+                &hooks,
+            )?
+        } else {
+            pe_service::source_log_boot::SourceLogBoot::prepare_checkpoint(std::path::Path::new(
+                paper,
+            ))?
+        };
+        #[cfg(not(feature = "scenario"))]
+        let (receipt, validated) = pe_service::source_log_boot::SourceLogBoot::prepare_checkpoint(
             std::path::Path::new(paper),
         )?;
         println!(
-            "prepared source checkpoint: {} bytes, sequence {:?}, validated {validated} open continuations",
-            tail.physical_tail, tail.last_sequence
+            "source checkpoint published offset={} sequence={} hash={} prefix_blake3={} capture_unix_ms={} published_unix_ms={} validated={validated}",
+            receipt.tail.physical_tail,
+            receipt
+                .tail
+                .last_sequence
+                .map_or_else(|| "none".to_owned(), |seq| seq.0.to_string()),
+            receipt.tail.last_hash.to_hex(),
+            receipt.prefix_blake3,
+            receipt.capture_unix_ms,
+            receipt.published_unix_ms
+        );
+        return Ok(());
+    }
+    if args
+        .iter()
+        .any(|argument| argument == "--recover-source-checkpoint")
+    {
+        let position = args
+            .iter()
+            .position(|argument| argument == "--paper-state")
+            .context("--recover-source-checkpoint requires --paper-state <installed-path>")?;
+        let paper = args
+            .get(position + 1)
+            .context("--paper-state requires a path")?;
+        let receipt =
+            pe_service::source_checkpoint::recover_installed(std::path::Path::new(paper))?;
+        println!(
+            "source checkpoint recovery checkpoint={} removed={} record={} removed={}",
+            receipt.checkpoint.display(),
+            receipt.checkpoint_removed,
+            receipt.record.display(),
+            receipt.record_removed
         );
         return Ok(());
     }
