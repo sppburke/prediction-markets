@@ -202,9 +202,10 @@ steps 100 pages at a time and restarts on every production write), then the sour
 capture start through the last complete frame, filtered to the source IDs the recipe reads, then
 the whole paper log. The capture start is separate from the cohort boundary. It is the deployment's
 first source sequence, or an earlier receipt when a frame received before the deployment was recovered
-and decided after it: the inspection authenticates the original receipt of every continuation-7 frame
-decision and the frame receipt of every admission or fallback artifact. The capture checks both and
-stops, naming the earliest missing sequence, when one precedes its start; capture again from a known
+and decided after it: the inspection authenticates the original frame and frozen Gamma identity receipts
+of every continuation-7 frame decision and the receipts referenced by every admission or fallback
+artifact. The capture checks these and stops, naming the earliest missing sequence, when one
+precedes its start; capture again from a known
 receipt at or before that sequence. Find a start's byte offset by walking frame lengths forward from a
 known receipt (the deploy boot's checkpoint tail, an earlier capture's recorded start, or the log
 header at offset 5, sequence 0); do not infer it from trade epochs. A re-measurement uses the same
@@ -237,7 +238,8 @@ KEEP = {b"pe-service.activity-frame-admission", b"pe-service.activity-frame-fall
         b"pe-service.activity-read-commitment", b"polymarket-activity-ws",
         b"polymarket-public.activity-reconciliation", b"pe-service.watchlist-ranking",
         b"pe-service.watchlist-admission", b"pe-service.watchlist-knockout",
-        b"pe-service.watchlist-capacity-config", b"pe-service.watchlist-deferral"}
+        b"pe-service.watchlist-capacity-config", b"pe-service.watchlist-deferral",
+        b"polymarket.gamma.markets"}
 
 # 1. One backup-API step: a single read transaction and a page copy (rowids kept). The CLI
 #    `.backup` steps 100 pages at a time and restarts on every production write.
@@ -246,14 +248,18 @@ src = sqlite3.connect(Path(live_db).resolve().as_uri() + "?mode=ro", uri=True)
 dst = sqlite3.connect(out / "paper_state.db"); src.backup(dst, pages=-1); dst.close(); src.close()
 print("database copy seconds", round(time.time() - started, 1),
       "snapshot started", time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(started)))
-# The capture must hold the original receipt of every continuation-7 frame decision in the copy.
+# The capture must hold the original frame and identity receipts of every continuation-7 frame decision.
 copy = sqlite3.connect((out / "paper_state.db").resolve().as_uri() + "?mode=ro", uri=True)
 (earliest,) = copy.execute(
     "SELECT min(json_extract(frozen_inputs_json,'$.observed_source_receipt.sequence')) FROM decision_pending "
     "WHERE json_extract(frozen_inputs_json,'$.version')=7 "
     "AND json_extract(frozen_inputs_json,'$.source_authority')='activity_frame'").fetchone()
+(identity_earliest,) = copy.execute(
+    "SELECT min(json_extract(frozen_inputs_json,'$.decision_inputs.inputs.identity.receipt.sequence')) FROM decision_pending "
+    "WHERE json_extract(frozen_inputs_json,'$.version')=7 "
+    "AND json_extract(frozen_inputs_json,'$.source_authority')='activity_frame'").fetchone()
 copy.close()
-missing = [] if earliest is None or earliest >= start_seq else [earliest]
+missing = [r for r in (earliest, identity_earliest) if r is not None and r < start_seq]
 
 def frames(f, offset):
     f.seek(offset)
@@ -280,8 +286,10 @@ with open(live_source, "rb") as f, open(out / "source_filtered.log", "wb") as w:
     for end, raw, block in frames(f, start_offset):
         seq, sid, text = envelope(block); assert seq == expected, (seq, expected); expected += 1
         if sid in REFERENCING:
-            r = json.loads(bytes(json.loads(text)["payload"]))["frame_receipt"]
-            if r["sequence"] < start_seq: missing.append(r["sequence"])
+            a = json.loads(bytes(json.loads(text)["payload"]))
+            references = [a["frame_receipt"]]
+            if a.get("identity") is not None: references.append(a["identity"]["receipt"])
+            missing.extend(r["sequence"] for r in references if r["sequence"] < start_seq)
         if sid in KEEP: w.write(raw); kept += 1
         end += len(raw)
 print("source sequences", start_seq, expected - 1, "end offset", end, "kept", kept)
@@ -331,7 +339,9 @@ canonical `g2:` component encoding (using `b3sum`), and preserves envelope recei
 replace the Rust log verifier or authority-specific semantic verification. Do not run normal service boot, `--report`, recovery or checkpoint
 preparation as part of this read-only audit. Set `PE_SERVICE_BIN` to the absolute path of the deployed
 `pe-service` binary: the inspection decodes membership records and artifacts only through its
-read-only `--canonical-membership-json` command, and stops without it. It also stops, naming the
+read-only `--canonical-membership-json` command, and authenticates frozen Gamma identities through
+its read-only `--verify-frame-identity-json` command. This preserves the service's JSON number
+parsing and canonical page hashes. The inspection stops without these commands. It also stops, naming the
 record, at a membership record that command cannot decode; AC-B, AC-C and AC16 are then incomplete.
 
 ```bash
@@ -361,7 +371,7 @@ def decode(block, where):
     return json.loads(out.raw[:length])
 
 class Prefix(dict):
-    """Envelopes by sequence. REST history pages stay compressed and decode on each access."""
+    """Envelopes by sequence. REST history and Gamma pages stay compressed and decode on access."""
     def __getitem__(self, seq):
         e = dict.__getitem__(self, seq)
         return decode(e, seq) if isinstance(e, bytes) else e
@@ -384,7 +394,7 @@ def read_prefix(path):
             e = decode(block, (path, offset)); assert e["seq"] not in envelopes
             tail = (e["seq"], e["this_hash"])
             dict.__setitem__(envelopes, e["seq"],
-                             block if e["source_id"] == "polymarket-public.activity-reconciliation" else e)
+                             block if e["source_id"] in ("polymarket-public.activity-reconciliation", "polymarket.gamma.markets") else e)
             offset += 4 + size + 4
     print(path, offset, digest.hexdigest(), tail)
     return envelopes
@@ -522,9 +532,26 @@ for row in cohort:
     proof = c["decision_inputs"]; admission = receipt(source, proof["admission_receipt"])
     assert admission["source_id"] == "pe-service.activity-frame-admission"
     artifact = payload(admission)
-    body = json.dumps(proof["inputs"], sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-    digest = subprocess.check_output(["b3sum"], input=b"prediction-edge/activity-frame-decision/v1\0" + body).decode().split()[0]
-    assert artifact == {"version": 1, "frame_receipt": proof["inputs"]["frame_receipt"], "capture_digest": digest}
+    inputs = proof["inputs"]; version = inputs["version"]; assert version in (1, 2)
+    assert admission["schema_version"] == version and admission["parser_version"] == 1 and admission["content_type"] == "json"
+    body = json.dumps(inputs, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    domain = f"prediction-edge/activity-frame-decision/v{version}\0".encode()
+    digest = subprocess.check_output(["b3sum"], input=domain + body).decode().split()[0]
+    expected = {"version": version, "frame_receipt": inputs["frame_receipt"], "capture_digest": digest}
+    if version == 2:
+        identity = inputs["identity"]; expected["identity"] = identity
+        provenance = identity["provenance"]; asset = provenance["asset"]
+        assert inputs["frame_receipt"] == c["observed_source_receipt"]
+        assert asset == payload(frame)["asset"].strip(), "frame identity asset differs"
+        assert provenance["source_log_sequence"] == identity["receipt"]["sequence"] < admission["seq"], "frame identity receipt sequence differs"
+        gamma = receipt(source, identity["receipt"])
+        verified = subprocess.run([PE_SERVICE, "--verify-frame-identity-json"],
+                                  input=json.dumps({"identity": identity, "source": gamma}).encode(), capture_output=True)
+        assert verified.returncode == 0, verified.stderr.decode()
+        token = json.loads(verified.stdout)
+        assert token["condition_id"] == c["market_id"] and token["outcome"] == c["outcome_id"], "frame asset differs from claimed market"
+        assert token["evidence_hash"] == provenance["canonical_page_hash"]
+    assert artifact == expected
     assert digest == c["semantic_revision"]
     print(row["source_trade_id"], c["source_authority"], c["applied_configuration_hash"],
           t.get("financial_semantic_version"), proof, row["result"], row["history_consumed"], row["first_epoch"])
@@ -600,7 +627,8 @@ for e in (source[seq] for seq in sorted(source)):
         a = payload(e); r = a["frame_receipt"]; frame = receipt(source, r)
         assert e["schema_version"] == 1 and e["parser_version"] == 1 and a["version"] == 1
         assert frame["source_id"] == "polymarket-activity-ws"
-        assert a["reason"] in ("latched", "history_behind", "earlier_unresolved_buy", "wallet_not_ready")
+        assert a["reason"] in ("latched", "history_behind", "earlier_unresolved_buy", "wallet_not_ready",
+                               "identity_unverified", "copy_expired")
         key = (r["sequence"], r["this_hash"])
         window_fallbacks.append({"seq": e["seq"], "hash": e["this_hash"],
                                  "recorded_at_ns": ns(e["received_at"]),

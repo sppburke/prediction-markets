@@ -887,7 +887,7 @@ async fn verify_qualification(
                             "empty frame paper prefix follows existing paper evidence",
                         );
                     }
-                    Vec::new()
+                    &frames[..0]
                 }
                 Some(receipt) => {
                     let position = frames[..=financial_prefix_index]
@@ -901,11 +901,11 @@ async fn verify_qualification(
                     if frames[position].envelope.received_at.0 > proof.inputs.admitted_at {
                         return insufficient("frame paper prefix follows admission clock");
                     }
-                    frames[..=position].to_vec()
+                    &frames[..=position]
                 }
             };
             if proof.inputs.version == 1 {
-                let basis = crate::paper_recovery::feed_latch_basis(&paper_era(prefix))
+                let basis = crate::paper_recovery::feed_latch_basis(&paper_era(prefix.to_vec()))
                     .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
                 if basis != proof.inputs.latch {
                     return insufficient("frame incident basis differs from sealed paper prefix");
@@ -3304,6 +3304,35 @@ pub fn canonical_membership_json(
         >(payload)?)?,
         other => return insufficient(format!("unknown membership payload kind {other}")),
     })
+}
+
+/// Offline inspection (docs/29): authenticate one frozen identity against its captured Gamma
+/// envelope through the shared verifier. Full source-log chain verification stays with the caller.
+pub fn verify_frame_identity_json(payload: &[u8]) -> Result<serde_json::Value, QualificationError> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct CapturedIdentity {
+        identity: crate::frame_admission::FrameIdentityProof,
+        source: EventEnvelope,
+    }
+    let captured: CapturedIdentity = serde_json::from_slice(payload)?;
+    let identity = captured.identity;
+    let source = captured.source;
+    if source.seq != identity.receipt.sequence
+        || source.this_hash != identity.receipt.this_hash
+        || source.seq.0 != identity.provenance.source_log_sequence
+        || blake3::hash(&source.payload) != source.raw_payload_hash
+    {
+        return insufficient("frame identity receipt or raw payload hash differs");
+    }
+    let verified =
+        crate::bucket_commit::verify_binding_identity(&source.into(), &identity.provenance)
+            .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+    Ok(serde_json::json!({
+        "condition_id": verified.condition_id,
+        "outcome": verified.outcome,
+        "evidence_hash": verified.evidence_hash,
+    }))
 }
 
 fn verify_ranked_change(

@@ -6926,6 +6926,7 @@ async fn recovered_pre_start_frame_admitted_after_fresh_read_qualifies() {
     let proof: pe_service::frame_admission::FrameDecisionProof =
         serde_json::from_value(replay.continuation.facts.decision_inputs.clone()).unwrap();
     assert_eq!(proof.inputs.frame_receipt.sequence, EventSeq(0));
+    assert_eq!(proof.inputs.version, 2);
     let cutoff = i64::try_from(proof.admission_receipt.sequence.0).unwrap();
     let report = h.qualify_one_fill().await;
     assert!(report.replay.exact, "{report:?}");
@@ -6951,6 +6952,9 @@ async fn recovered_pre_start_frame_admitted_after_fresh_read_qualifies() {
     };
     assert_eq!(selected(cutoff), vec![recorded.id.0]);
     assert!(selected(cutoff + 1).is_empty());
+    let snapshot = census_snapshot(&h, &CensusLogs::default());
+    assert_eq!(inspection_cohort_size(&h.dir.path().join("capture")), 1);
+    assert_eq!(snapshot.population["frames"].as_array().unwrap().len(), 1);
 }
 
 struct FrameBracketPages {
@@ -7941,7 +7945,18 @@ fn census_snapshot(h: &Harness, logs: &CensusLogs) -> CensusSnapshot {
     assert!(String::from_utf8_lossy(&output.stdout).contains(&format!(
         "unique captured feed receipts {raw} exported receipts {raw}"
     )));
-    assert!(String::from_utf8_lossy(&output.stdout).contains("FROZEN COHORT []"));
+    let cohort_size = inspection_cohort_size(&capture);
+    if cohort_size == 0 {
+        assert!(String::from_utf8_lossy(&output.stdout).contains("FROZEN COHORT []"));
+    } else {
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("FROZEN COHORT []"));
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout)
+                .matches("Prepared/Final equal")
+                .count(),
+            cohort_size
+        );
+    }
 
     // A journal entry contains the exact flattened subscriber line in MESSAGE. The synthetic
     // journal's fixed microsecond timestamp is after window_end, before the snapshot cutoff.
@@ -8085,6 +8100,22 @@ fn ac_b_inspect(h: &Harness, capture: &std::path::Path) -> Value {
     serde_json::from_slice(&std::fs::read(capture.join("ac16-population.json")).unwrap()).unwrap()
 }
 
+fn inspection_cohort_size(capture: &std::path::Path) -> usize {
+    let connection = rusqlite::Connection::open_with_flags(
+        capture.join("paper_state.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let sql = recipe_extract("SELECT f.*, d.source_trade_id", "\"\"\", (int(sys.argv[4])");
+    connection
+        .query_row(
+            &format!("SELECT count(*) FROM ({sql})"),
+            rusqlite::params![0, i64::MAX],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
 fn inspection_run(
     h: &Harness,
     capture: &std::path::Path,
@@ -8101,7 +8132,7 @@ fn inspection_run(
                 .to_owned(),
             capture.join("paper.log").to_str().unwrap().to_owned(),
             "0".to_owned(),
-            "0".to_owned(),
+            inspection_cohort_size(capture).to_string(),
             at().format(&time::format_description::well_known::Rfc3339)
                 .unwrap(),
             (at() + time::Duration::seconds(60))
@@ -8112,6 +8143,116 @@ fn inspection_run(
         &h.dir.path().join("bin"),
         pe_service,
     )
+}
+
+#[tokio::test(start_paused = true)]
+async fn measurement_recipe_authenticates_version_two_admission_and_new_fallbacks() {
+    let mut h = Harness::new().await;
+    let admitted = h.record(1).await;
+    let mismatched = h.record(2).await;
+    let expired = h.record(3).await;
+    h.prices
+        .markets
+        .lock()
+        .unwrap()
+        .get_mut(&admitted.admission.market.condition_id.0)
+        .unwrap()["numeric_hash_fixture"] =
+        serde_json::from_str("[1e-7,1e-5,0.12345678901234567]").unwrap();
+    h.attempt(&admitted, at());
+    h.start_frames();
+    h.empty_frontier(EPOCH - 1).await;
+    h.deliver_frame(&admitted, |_| {}).await;
+    let mismatch = h
+        .deliver_frame(&mismatched, |row| {
+            row["asset"] = json!(admitted.admission.market.ordered_outcome_token_ids[0].0);
+        })
+        .await;
+    let expiry = h
+        .deliver_frame(&expired, |row| {
+            row["timestamp"] = json!(EPOCH - 3);
+        })
+        .await;
+    let replay = replay_decision_pending(&h.terminal(&admitted)).unwrap();
+    assert_eq!(
+        replay.continuation.facts.decision_inputs["inputs"]["version"],
+        2
+    );
+    h.stop().await;
+    let snapshot = census_snapshot(&h, &CensusLogs::default());
+    assert_eq!(inspection_cohort_size(&h.dir.path().join("capture")), 1);
+    let fallbacks = snapshot.population["window_fallbacks"].as_array().unwrap();
+    for (receipt, reason) in [(mismatch, "identity_unverified"), (expiry, "copy_expired")] {
+        assert!(fallbacks.iter().any(|row| {
+            row["frame_seq"] == receipt.sequence.0
+                && row["frame_hash"] == receipt.this_hash.to_hex().to_string()
+                && row["reason"] == reason
+        }));
+    }
+    let row = h.paper.decision_pending_for(&admitted.id).unwrap().unwrap();
+    let wire: Value = serde_json::from_str(&row.frozen_inputs_json).unwrap();
+    for (field, value, refusal) in [
+        (
+            "asset",
+            json!("foreign-token"),
+            "frame identity asset differs",
+        ),
+        (
+            "source_log_sequence",
+            json!(u64::MAX),
+            "frame identity receipt sequence differs",
+        ),
+        (
+            "canonical_page_hash",
+            json!("00".repeat(32)),
+            "binding metadata has the wrong source contract or page hash",
+        ),
+    ] {
+        let mut changed = wire.clone();
+        changed["decision_inputs"]["inputs"]["identity"]["provenance"][field] = value;
+        snapshot
+            .connection
+            .execute(
+                "UPDATE decision_pending SET frozen_inputs_json=?1 WHERE source_trade_id=?2",
+                rusqlite::params![changed.to_string(), admitted.id.0],
+            )
+            .unwrap();
+        let output = inspection_run(
+            &h,
+            &h.dir.path().join("capture"),
+            Some(env!("CARGO_BIN_EXE_pe-service")),
+        );
+        assert!(!output.status.success(), "{field}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(refusal),
+            "{field}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn measurement_recipe_authenticates_historical_version_one_admission() {
+    let mut h = Harness::new().await;
+    let recorded = h.record(1).await;
+    h.attempt(&recorded, at());
+    h.start_frames();
+    h.empty_frontier(EPOCH - 1).await;
+    h.deliver_frame(&recorded, |_| {}).await;
+    let row = h.paper.decision_pending_for(&recorded.id).unwrap().unwrap();
+    let mut wire: Value = serde_json::from_str(&row.frozen_inputs_json).unwrap();
+    wire["decision_inputs"]["inputs"]["version"] = json!(1);
+    wire["decision_inputs"]["inputs"]
+        .as_object_mut()
+        .unwrap()
+        .remove("identity");
+    h.authenticate_frame_wire(&mut wire).await;
+    rusqlite::Connection::open(h.dir.path().join("paper.db")).unwrap().execute(
+        "UPDATE decision_pending SET semantic_revision=?1, frozen_inputs_json=?2 WHERE source_trade_id=?3",
+        rusqlite::params![wire["semantic_revision"].as_str().unwrap(), wire.to_string(), recorded.id.0],
+    ).unwrap();
+    h.stop().await;
+    census_snapshot(&h, &CensusLogs::default());
+    assert_eq!(inspection_cohort_size(&h.dir.path().join("capture")), 1);
 }
 
 /// Reframe a deliberately invalid receipt reference, retaining all other captured paper records.

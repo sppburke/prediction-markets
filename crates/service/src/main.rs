@@ -258,6 +258,18 @@ async fn main() -> Result<()> {
         println!("{}", pe_service::build_info::version_line());
         return Ok(());
     }
+    if args
+        .iter()
+        .any(|argument| argument == "--verify-frame-identity-json")
+    {
+        let mut payload = Vec::new();
+        std::io::Read::read_to_end(&mut std::io::stdin().lock(), &mut payload)
+            .context("read the captured frame identity from stdin")?;
+        let identity = pe_service::qualification::verify_frame_identity_json(&payload)
+            .context("verify the captured frame identity")?;
+        println!("{identity}");
+        return Ok(());
+    }
     if let Some(position) = args
         .iter()
         .position(|argument| argument == "--canonical-membership-json")
