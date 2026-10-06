@@ -37,8 +37,6 @@ use time::format_description::well_known::Rfc3339;
 #[derive(Debug, Clone, Serialize)]
 pub struct SourceHealthStatus {
     pub activity_ws_enabled: bool,
-    pub feed_latch: crate::frame_admission::FeedLatchBasis,
-    pub feed_incident: Option<crate::paper_recovery::FeedIncident>,
     pub ws_connected: bool,
     pub ws_last_frame_age_secs: Option<i64>,
     pub ws_last_valid_frame_age_secs: Option<i64>,
@@ -81,8 +79,6 @@ impl SourceHealthStatus {
         let readers = h.ws_readers.iter();
         Self {
             activity_ws_enabled: h.activity_ws_enabled,
-            feed_latch: h.feed_latch.clone(),
-            feed_incident: h.feed_incident.clone(),
             ws_connected: readers.clone().any(|r| r.connected),
             ws_last_frame_age_secs: age_mono(
                 readers.clone().filter_map(|r| r.last_wire_frame_at).max(),

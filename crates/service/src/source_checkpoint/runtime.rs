@@ -8,7 +8,7 @@ use pe_event_log::{LogError, LogTailBinding, Scanner};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use super::{CheckpointData, PublishError, PublishOutcome, SerializedCandidate};
 use crate::risk_inputs::SourceReceiptIndex;
@@ -141,6 +141,7 @@ pub struct SourceCheckpointOwner {
     receipts: SourceReceiptIndex,
     slot: CheckpointJobSlot,
     pending: Option<Arc<SerializedCandidate>>,
+    paper_state: Option<Arc<pe_paper_state::PaperStateDb>>,
     attempt: u32,
     last_published_capture: Option<u64>,
     #[cfg(feature = "scenario")]
@@ -164,11 +165,18 @@ impl SourceCheckpointOwner {
             receipts,
             slot,
             pending: None,
+            paper_state: None,
             attempt: 0,
             last_published_capture: None,
             #[cfg(feature = "scenario")]
             hooks: Arc::new(CheckpointOwnerHooks::default()),
         }
+    }
+
+    #[must_use]
+    pub fn with_paper_state(mut self, paper_state: Arc<pe_paper_state::PaperStateDb>) -> Self {
+        self.paper_state = Some(paper_state);
+        self
     }
 
     #[cfg(feature = "scenario")]
@@ -260,6 +268,7 @@ impl SourceCheckpointOwner {
         let quarantine_failed = self.slot.quarantine_failed.clone();
         #[cfg(feature = "scenario")]
         let hooks = self.hooks.clone();
+        let paper_state = self.paper_state.clone();
         let result = self.slot.execute(move |cancel| {
             let mut frozen = frozen;
             if matches!(frozen.prefix, FrozenPrefix::Deferred { .. }) {
@@ -316,7 +325,19 @@ impl SourceCheckpointOwner {
                     &hooks,
                 ).map_err(TaskFailure::typed)?;
             }
+            if let Some(paper_state) = &paper_state {
+                let mut activity = frozen.reducers.activity.clone();
+                activity.prune(paper_state, &receipts).map_err(TaskFailure::typed)?;
+                if let Err(error) = paper_state.sync_checkpoint_dispositions() {
+                    warn!(%error, "source checkpoint disposition barrier failed; publication skipped");
+                    return Ok(JobOutput::Candidate(Box::new(frozen), None));
+                }
+                frozen.reducers.activity = activity;
+            }
             let candidate = candidate(&frozen, &receipts).map_err(TaskFailure::typed)?;
+            if let Some(candidate) = &candidate {
+                info!(manifest_bytes = candidate.bytes.len(), "source checkpoint manifest serialized");
+            }
             Ok(JobOutput::Candidate(Box::new(frozen), candidate.map(Arc::new)))
         }).await?;
         if let JobOutput::Candidate(frozen, candidate) = result {

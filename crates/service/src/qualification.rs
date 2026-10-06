@@ -812,48 +812,62 @@ async fn verify_qualification(
         .map_err(|error| {
             QualificationError::InsufficientEvidence(format!("decision replay mismatch: {error}"))
         })?;
-    let audit_era = paper_era(frames[..=financial_prefix_index].to_vec());
-    crate::paper_recovery::feed_latch_basis(&audit_era)
-        .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
-    let audit_commitments = source_observations
-        .values()
-        .filter(|observation| {
-            observation.source_id == crate::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID
-        })
-        .filter_map(|observation| {
-            serde_json::from_slice::<crate::bucket_commit::ActivityReadCommitment>(
-                &observation.payload,
+    let historical_frames = replayed_decisions
+        .iter()
+        .filter(|decision| decision.continuation.is_activity_frame())
+        .map(|decision| {
+            serde_json::from_value::<crate::frame_admission::FrameDecisionProof>(
+                decision.continuation.facts.decision_inputs.clone(),
             )
-            .ok()
-            .filter(|commitment| commitment.version == 2 && commitment.read_proof.is_some())
-            .map(|_| observation.receipt)
+            .map(|proof| (proof.inputs.version, &decision.continuation))
         })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+    let historical_frames = historical_frames
+        .into_iter()
+        .filter(|(version, _)| *version == 1)
+        .map(|(_, continuation)| continuation)
         .collect::<Vec<_>>();
-    let unresolved = crate::feed_audit::verify_recorded_audits(
-        &state,
-        &replayed_decisions
-            .iter()
-            .filter(|decision| decision.continuation.is_activity_frame())
-            .map(|decision| &decision.continuation)
-            .collect::<Vec<_>>(),
-        &audit_era,
-        &audit_commitments,
-        &mut |receipt| {
-            let source = decision_source_receipt(&source_observations, receipt)?;
-            Ok::<_, QualificationError>(CompleteActivityPage {
-                payload: source.payload.clone(),
-                observed_at: source.observed_at.clone(),
-                received_at: source.received_at.clone(),
-                source_id: source.source_id.clone(),
-                schema_version: source.schema_version,
-                parser_version: source.parser_version,
-                content_type: source.content_type.clone(),
+    if !historical_frames.is_empty() {
+        let audit_era = paper_era(frames[..=financial_prefix_index].to_vec());
+        crate::paper_recovery::feed_latch_basis(&audit_era)
+            .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+        let audit_commitments = source_observations
+            .values()
+            .filter(|observation| {
+                observation.source_id == crate::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID
             })
-        },
-    )
-    .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
-    if !unresolved.is_empty() {
-        return insufficient(format!("unresolved frame audits: {unresolved:?}"));
+            .filter_map(|observation| {
+                serde_json::from_slice::<crate::bucket_commit::ActivityReadCommitment>(
+                    &observation.payload,
+                )
+                .ok()
+                .filter(|commitment| commitment.version == 2 && commitment.read_proof.is_some())
+                .map(|_| observation.receipt)
+            })
+            .collect::<Vec<_>>();
+        let unresolved = crate::feed_audit::verify_recorded_audits(
+            &state,
+            &historical_frames,
+            &audit_era,
+            &audit_commitments,
+            &mut |receipt| {
+                let source = decision_source_receipt(&source_observations, receipt)?;
+                Ok::<_, QualificationError>(CompleteActivityPage {
+                    payload: source.payload.clone(),
+                    observed_at: source.observed_at.clone(),
+                    received_at: source.received_at.clone(),
+                    source_id: source.source_id.clone(),
+                    schema_version: source.schema_version,
+                    parser_version: source.parser_version,
+                    content_type: source.content_type.clone(),
+                })
+            },
+        )
+        .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+        if !unresolved.is_empty() {
+            return insufficient(format!("unresolved frame audits: {unresolved:?}"));
+        }
     }
     verify_decision_configurations(&replayed_decisions, &start)?;
     let mut decision_observations = HashMap::new();

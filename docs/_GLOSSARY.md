@@ -172,8 +172,8 @@ pub enum Side { Buy, Sell }                   // venue adapters map Yes/No → S
 `SourceTradeId` is generation-aware (#544). Historical version-one frames retain their
 transaction-hash identity. A version-two normalized activity group is keyed by
 `g2:<lowercase BLAKE3>` over the canonical length-prefixed group components; its
-`transaction_hash` remains separate audit evidence and never participates in deduplication or
-causal ordering. Only the exact 67-byte lowercase `g2:` encoding is version two. `ShareAmount`
+`transaction_hash` remains separate evidence and does not define group identity or causal
+ordering; frame/REST copy ownership uses the tuple defined below. Only the exact 67-byte lowercase `g2:` encoding is version two. `ShareAmount`
 and `CollateralAmount` preserve venue decimals exactly to six places as checked `u64` atomics;
 lossy fractional input, negative input, and overflow are rejected rather than rounded.
 
@@ -557,34 +557,41 @@ The paper wire-2 core hash remains separately bound in both cases.
 **Frame authority (#730 Part 2).** After source synchronization, the first qualifying frame in
 receipt order is classified against the admission-time confirmed ledger, consumed history and
 earlier frames. Only positive-share, non-combo BUY Entries from copy-eligible, history-complete,
-unfenced wallets without a re-anchor requirement can enter, with a current frontier and clear
-feed latch, after the financial Start. Before Start, synchronized frames only trigger
+unfenced wallets without a re-anchor requirement can enter with a current frontier after the
+financial Start. Before Start, synchronized frames only trigger
 reconciliation, as in Part 1; they create no admission, decision or incident.
 An earlier unresolved BUY blocks later frames of that wallet/market only; REST
 winning first consumes history before frame admission. The frame transaction writes gate,
 wallet-market history and pending decision together. Later declines never undo consumption.
 Frames create no activity-group/revision rows, leader-balance effects or delivery-cursor progress.
-REST applies and binds each authenticated counterpart once, including aliases, without another
-decision or any change to the frame's pending row, terminal or Prepared inputs. This suppression
-survives negative audits, release and restart; equal identifiers retain the frame-owned gate and
-single terminal. A later-discovered earlier BUY with a different verified identity is audit-only:
-it neither latches nor changes the decision; genuine late arrivals retain causal re-anchoring.
+REST applies each matching counterpart once, including aliases, without another decision or
+any change to the frame's pending row, terminal or Prepared inputs. Copy ownership survives
+restart; equal identifiers retain the frame-owned gate and single terminal. Genuine late
+arrivals retain causal re-anchoring.
 
 The admission capture retains the frame receipt, source/receive/admission clocks, compact
 `AdmissionLedgerCapture`, append-only activity row boundary, frame-market anchor balances and
 post-anchor groups, a single market-consumption fact, and only
 the admitting wallet's preceding unresolved BUYs or obligations. Eligibility, history/fence/coverage,
-frontier/staleness and paper-prefix incident/release basis remain frozen. Durable anchor/group
+frontier/staleness and paper prefix remain frozen. Historical incident/release fields remain
+decodable and frozen proofs remain verifiable. Durable anchor/group
 owners authenticate the scoped rebuild through the recovery reducer; the frame transaction's
 `wallet_market_history_v2` row proves first consumption. Configuration, sizing basis and quality
 live in continuation facts; frame payload/hash and parser/schema contracts resolve from its
 receipt. The continuation stores the scoped body once; the compact source-log admission artifact stores
-only its version, frame receipt and `capture_digest` (the domain-separated frame revision).
+its version, frame receipt and `capture_digest` (the domain-separated frame revision).
+Version-two admissions additionally freeze the shared resolver’s verified asset provenance and
+original Gamma receipt, authenticate the condition and outcome before consuming history, and
+record admission without a feed check. Version-one admissions retain their original digest and
+verification rules. Unavailable or mismatched identity routes to REST without consuming history. Eligibility and
+copy freshness are checked again after identity resolution, before history is consumed.
 Classification uses the position rebuilt from these inputs. Resolved
-barriers retire through the owner's acknowledged match/disposition or incident path at runtime;
-boot rebuilds the same coalesced unresolved receipts. The poller and owner share one same-identity
-rule: retain the admitted receipt, otherwise the earliest positive-share, non-combo BUY, then the earliest synchronized
-receipt, including across source epochs. Admission supersedes an earlier excluded zero-share receipt of that identity.
+barriers for fallback observations retire through the owner's acknowledged disposition at runtime;
+boot rebuilds the same coalesced unresolved receipts. An admitted frame leaves the unresolved
+set immediately and creates no reconciliation obligation. Its durable decision rejects repeated
+feed messages as `identity_seen`. For remaining observations, retain the earliest positive-share,
+non-combo BUY, then the earliest synchronized receipt, including across source epochs. Admission
+supersedes an earlier excluded zero-share receipt of that identity.
 Unrelated wallets/positions/history cannot grow the body.
 
 First-entry history is per wallet and market. Continuation 7 copies each wallet's first entry
@@ -597,102 +604,63 @@ fee reserve, affordability, caps and the admission minimum. Below-minimum signed
 shares. Historical paper, ordinary live and backtest retain `Dollar`; Kelly and Contract remain
 exact-or-decline. Economic wire 2 alone never selects partial sizing.
 
-**Feed history frontier and audit.** Versioned `FeedHistoryFrontier` values under the
-`feed_history_frontiers` key in `meta` authenticate the latest contiguous complete read's fixed end H,
-commitment, pages and occurrences. Publish only after every bucket and observation-retirement
-acknowledgement. The serialized owner's current ordering barrier is the authority: H cannot cross
-any unresolved wallet observation whose authenticated source time is at or before H, including a
-qualifying frame routed to history without admission. Launches, failed acknowledgements and incomplete reads never
-advance H. Empty reads first persist a proofless payload-2 commitment. Authenticate restored
-frontiers and freeze their bounds in admission inputs. For frame receipt r and admission a,
+**Frame/REST copy ownership.** A durable frame decision owns one TRADE counterpart key:
+wallet, transaction hash, verified asset and side. Every matching REST group is disposed without
+another copy, regardless of candidate count, quantity, price or timestamp; partial fills aggregate
+within their group. Read-proven restamp pairs retain their existing collapse and ledger semantics.
+A different asset or side in the same transaction is an independent leg and keeps ordinary routing,
+including when it arrives alone after restart. The frame's asset and side come from its recorded
+feed message. REST winning first retains exact-ID and consumed-market refusal. A feed/REST asset
+disagreement is a different trade under this key; runtime no longer checks for feed contradictions
+or absence and produces no feed incidents. Economics and financial semantic versions are unchanged.
+
+**Feed history frontier.** Versioned `FeedHistoryFrontier` values under the
+`feed_history_frontiers` key in `meta` record the latest contiguous complete read's fixed end H,
+commitment, pages and occurrences. Publish a freshly authenticated frontier only after every bucket
+and ordinary observation-retirement acknowledgement. H cannot cross an unresolved wallet
+observation whose authenticated source time is at or before H, including a qualifying fallback.
+Admitted frames create no barrier. Launches, failed acknowledgements and incomplete reads never
+advance H. Empty reads first persist a proofless payload-2 commitment.
+
+Boot starts with an empty verified-frontier map. Persisted `fixed_end` is only a read-start hint:
+`start = min(start, fixed_end − 1)`, without frontier verification. Feed copies resume after the
+first fresh REST read publishes a frontier; until then frames use REST fallback. Open frame
+continuations still authenticate their own frozen frontier. For frame receipt r and admission a,
 history is required if H is absent, H > r, a − H exceeds `poll_round_stale_secs`, or an earlier
-wallet obligation has waited longer than that bound. `poll_round_stale_secs` is boot-resolved as
-3 × `trade_poll_interval_secs` and frozen in `FrameAdmissionInputs`; equality passes. It is not a
-new configuration key.
+fallback obligation has waited longer than that bound. `poll_round_stale_secs` is boot-resolved as
+3 × `trade_poll_interval_secs` and frozen in `FrameAdmissionInputs`; equality passes.
 
-An admitted frame remains an audit obligation, even after fencing, until its matched, contradicted
-or absent conclusion is recorded (a negative conclusion acknowledged by the orchestrator) and
-its fixed counterpart group has a durable disposition under any revision. Absence has no
-counterpart and retires on acknowledgement. Its frozen receipt cannot be replaced by another
-observation of the same identity.
-For a still-unbound frame, discover counterparts by authenticated wallet/transaction and asset
-disambiguation before side comparison, preserving verified bindings, restamp equivalence and ambiguity.
-Once authenticated, its counterpart identity stays fixed through commitment-before-bucket crashes,
-audit retirement, release and restart; another transaction leg receives its own decision. A different
-identifier is equivalent only through an authenticated restamp pair. Retained authenticated
-counterparts, matched or contradicted, win over later absence and commit their recorded read
-through the bucket owner. An earlier match suppresses only later absence. Any authenticated read binding an admitted
-frame to a contradicting counterpart journals one incident for that frame, before or after
-audit retirement, including a changed revision. Changed revisions follow REST's existing
-revision routing and fence. Production, boot and qualification
-retire the audit once the conclusion is recorded (a negative conclusion acknowledged) and the
-fixed counterpart group has a durable disposition under any revision. A match confirms
-an ordinary positive-share TRADE with the same effective side, condition and outcome; combo,
-zero-share or disagreeing counterparts contradict. Positive quantity, price and time differences
-are audit facts. Absence matures at frozen frame source time + `copy_latency_budget_secs`:
-search retained authenticated counterparts first, then require a successful complete `(0, fixed_end]`
-read ending at or after maturity. Cursor-bounded, immature or failed reads prove no absence;
-negative audits retain the deciding commitment's proof, including empty bindings. Qualification
-retains only authenticated bindings/restamp pairs for selection and releases reconstructed aggregates,
-effective identities and read indexes after each authentication.
-Boot keeps a frame's obligation while any retained commitment concludes negatively without a
-journaled incident for that frame, even if catch-up already disposed a group matched by an
-earlier commitment. The first retained-read attempt journals the pending negative before retirement.
-Replaying an older retained read keeps the ordering barrier unless the counterpart is matched
-in that read or its group is already disposed; a counterpart learned from a later read alone
-cannot release it. Qualification verifies every recorded incident against its deciding read
-and exposes unresolved audits. Incident completeness is proven by production scenarios and
-audited on deployed data using [AC16's recipe](29-ACTIVITY-LATENCY-MEASUREMENT.md#730-acceptance-measurement).
-A match or contradiction fixes the frame's counterpart, so a later read cannot rebind it to
-another transaction leg. After an absence incident, counterpart discovery still disambiguates
-multiple same-transaction groups by the frame's asset and leaves multiple remaining candidates
-unresolved. The first uniquely resolved later authenticated group becomes the frame's late
-counterpart: it applies to the leader ledger once and creates no second decision.
-Its first binding fixes that counterpart durably; later reads cannot replace it with another leg.
-Only authenticated restamp equivalence can change its identifier.
-A frame whose transaction REST already decided for that wallet under another identifier is
-admitted like any frame. Its audit matches an independent leg to that leg's own group through
-the equal-ID branch, with no second decision; a market/asset misreport contradicts and latches.
-Admission performs no source-log counterpart search.
-Once a read commitment is enqueued, reconciliation drains its acknowledgement, authenticates it
-and retains its binding/proof before honoring preemption.
-Later frame bindings carry `counterpart_basis_receipt`, referencing the first binding commitment
-or the full-history absence proof for a late counterpart. Synchronization, boot and sealed replay
-authenticate that basis with the same counterpart rule; initial and historical bindings omit it.
+**Ordinary observation retirement and recovery.** Binding commitments continue to bind fallback
+observations to their authenticated REST targets, including corrections with a different group ID.
+During the hash-chained source-log walk, `ActivityCandidates` records each commitment’s bindings
+and obligation receipts. Boot first drops admitted-frame candidates, exact durable observation
+retirements and observations whose own group is disposed. Parsed bindings locate commitments;
+they never prove retirement by themselves. Only commitments needed to prove an ordinary
+obligation’s retirement, support a surviving ordinary obligation or verify an open continuation
+are authenticated. Scenario counters distinguish these three uses. Deployed checkpoint format 1,
+activity reducer 2 stores only commitment receipts; hydration reads each payload once through the
+receipt index, without re-authenticating the complete read, and advances to reducer 3. Reducer 1
+still requires a full walk. Runtime publication prunes current work through the shared paper-state
+handle, then requires a successful `wal_checkpoint(TRUNCATE)` durability barrier before installing
+the pruned manifest. A failed barrier skips publication until the next hourly attempt. Read-only
+preparation and compatibility conversion keep unpruned candidates. Manifest bytes are logged.
+New commitments produce no frame bindings or counterpart-basis receipts. Historical commitment
+fields and basis-bearing proofs remain decodable and verifiable when selected by an open
+continuation or qualification. Qualification retains feed-audit verification for version-one frame
+admissions and skips it for version two; economic and financial versions are unchanged.
 
-**Feed incidents and history fallback.** `PaperLogRecord::FeedIncidentChanged { incident, state }`
-journals contradiction or absence before the audit ordering barrier retires. A contradiction
-engages the latch as soon as the audit concludes, before any routing of that read (including
-retained-read recovery), but retains reconciliation and ordering work across acknowledgement
-and restart until its fixed counterpart group has a durable disposition under any revision,
-including late-group re-anchor handling. Qualification applies the same group-disposition rule;
-an acknowledged absence retires immediately because it has no counterpart. Repeated engagement
-requests acknowledge the existing incident once. The synchronized
-paper era rebuilds one process-wide latch before boot admissions: `Engaged` sets the latest
-incident, and `Released` must reference that latest engagement. While latched, frames wait for
-history; admitted work completes. `status.json` reports `source_health.feed_latch` and `source_health.feed_incident`, the
-structured error `feed audit incident engaged; frames wait for history` carries the same
-incident, and qualification checks each frame's frozen latch basis against its paper prefix.
-Release uses
-only the existing `risk_halt_release_hash` row and the latest unreleased engagement's `this_hash`.
-The owner rechecks that identity immediately before durable release; a newer incident makes a
-queued older release a no-op. Independent risk halts retain their own release path; malformed,
-stale or repeated values and restart cannot clear the latch.
-
-A qualifying frame routed to history appends one versioned audit-only artifact under
+A qualifying frame routed to history appends one versioned artifact under
 `pe-service.activity-frame-fallback`, with `frame_receipt`, `routing_clock`, typed `reason`,
-evaluated `frontier` and `latest_incident_basis`. `FrameFallbackReason` encodes `latched`,
-`history_behind`, `earlier_unresolved_buy` or `wallet_not_ready`. Wallet and market are derived
-from the authenticated frame. This artifact consumes no entry and is not a decision input;
-measure routing from the earliest authenticated artifact per frame, never current status.
-`pe-service.activity-frame-admission` authenticates the digest of the frozen frame admission
-inputs in the pending continuation; it does not duplicate the inputs. Ordinary non-admitted
-obligations retire through the owner acknowledgement, retaining their exact receipt and whether
-retirement was unbound under
-`retired_activity_observation:<sequence>` in `meta` so fence clearance and restart cannot
-restore an obsolete ordering barrier. Bound observations still require their authenticated
-disposed target during obligation rebuild. Admitted audits retire only through an authenticated
-disposed match or an acknowledged incident.
+evaluated `frontier` and the compatible `latest_incident_basis` field. Current reasons are
+`history_behind`, `earlier_unresolved_buy`, `wallet_not_ready`, `identity_unverified` and
+`copy_expired`; historical `latched` and paper-log
+incident records remain decodable. Wallet and market derive from the authenticated frame. This
+artifact consumes no entry and is not a decision input; measure routing from the earliest artifact
+per frame. `pe-service.activity-frame-admission` authenticates the frozen admission digest.
+Ordinary obligations retire through the owner acknowledgement, retaining their exact receipt and
+whether retirement was unbound under `retired_activity_observation:<sequence>` in `meta` so fence
+clearance and restart cannot restore an obsolete ordering barrier. Bound observations retain their
+disposed-target retirement semantics. Independent risk halts keep their existing release path.
 
 **History-only bracket disposition.** `history_only_bracket` (`HISTORY_ONLY_BRACKET`) records an
 admitted first entry whose copying a causal bracket suppresses. It is an applied activity
@@ -733,9 +701,8 @@ their typed error are status evidence, not a second revision.
 After `QualificationStarted`, optional text row `risk_halt_release_hash` is incident control, not
 economic configuration. The boot and poll paths partition it before exact-key parsing and exclude
 it from the applied economic hash. A value must be exactly 64 lowercase hexadecimal characters
-and name the append hash of the latest unreleased feed engagement or a currently active
-`RiskHaltChanged` engagement. A feed release clears only the process-wide feed latch; a risk
-release may release only that same absolute-loss cause, or a latency cause held by a missing
+and name the append hash of a currently active `RiskHaltChanged` engagement. A risk release
+may release only that same absolute-loss cause, or a historical latency cause held by a missing
 sample; the synchronized release consumes it. Missing, empty, malformed, stale, already-consumed, or cause-mismatched
 values only warn and change neither economics nor halt state.
 
@@ -949,7 +916,7 @@ only after durable installation. Clearance is automatic on a verified current-ge
 publication, whether by the next boot's full walk or `--prepare-source-checkpoint`; there is no
 separate clearance command. Unreadable authority makes boots full-walk and refuses publication
 until quiesced recovery removes and syncs the checkpoint before removing and syncing the record.
-Preparation reads authority first, captures open rows and feed frontiers before its finite source
+Preparation reads authority first, captures open rows before its finite source
 bound, and full-walks when the record is active or undecodable. A proven wrong prefix digest
 invalidates only the still-current artifact and generation; if either changed, preparation starts
 again. Its durable publication receipt is documented in the

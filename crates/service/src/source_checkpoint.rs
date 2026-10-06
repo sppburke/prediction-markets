@@ -203,7 +203,7 @@ pub(crate) fn load_checkpoint(
     let ArtifactCheck::Valid(header) = check else {
         return None;
     };
-    if header.reducer_version != ACTIVITY_REDUCER_VERSION {
+    if !matches!(header.reducer_version, 2) && header.reducer_version != ACTIVITY_REDUCER_VERSION {
         return None;
     }
     drop(header);
@@ -215,7 +215,7 @@ pub(crate) fn load_checkpoint(
 /// A verified candidate serialized once; publication borrows it and never consumes its bytes.
 /// Construct only from projections verified through `tail` under `authority_generation`.
 pub struct SerializedCandidate {
-    bytes: Vec<u8>,
+    pub(crate) bytes: Vec<u8>,
     activation: LogTailBinding,
     financial_era: bool,
     tail: LogTailBinding,

@@ -579,7 +579,6 @@ fn financial_boot_replays_start_membership_through_the_index_and_recovers_the_bo
         &paths.source_log,
         &paths.paper_log,
         &mut rebuilt,
-        &paper_state,
     )
     .unwrap();
     assert_eq!(published, rebuilt);
@@ -2546,6 +2545,7 @@ fn install_mixed_current_open_continuations(
         poll_round_stale_secs: 90,
         latch: FeedLatchBasis::default(),
         paper_prefix: Some(paper_prefix),
+        identity: None,
     };
     let revision = pe_service::frame_admission::FrameAdmissionArtifact::from_inputs(&inputs)
         .unwrap()
@@ -3150,10 +3150,10 @@ async fn checkpoint_failed_quarantine_sync_durable_image_recovers_with_full_walk
     assert_checkpoint_assisted_boot(&paths, &receipt);
 }
 
-/// PASS: frontiers committed after preparation's finite bound are excluded from its census, then
-/// authenticated by boot against its own current index. Captured malformed collections still fail.
+/// PASS: preparation and open-continuation validation ignore the stored frontier collection.
+/// Runtime admission waits for a freshly authenticated read.
 #[test]
-fn checkpoint_preparation_uses_captured_frontiers() {
+fn checkpoint_preparation_does_not_restore_stored_frontiers() {
     use pe_service::frame_admission::{FeedHistoryFrontier, FrontierCollection};
     use pe_service::source_checkpoint::PreparationHooks;
     let (_dir, paths) = installed_fixture();
@@ -3209,17 +3209,15 @@ fn checkpoint_preparation_uses_captured_frontiers() {
     paper
         .publish_feed_history_frontiers(&serde_json::json!({"version": 999, "frontiers": []}))
         .unwrap();
-    let before = std::fs::read(pe_service::source_checkpoint::checkpoint_path(
-        &paths.source_log,
-    ))
-    .unwrap();
-    assert!(SourceLogBoot::prepare_checkpoint(&paths.fixed_main).is_err());
+    let (_, count) = SourceLogBoot::prepare_checkpoint(&paths.fixed_main).unwrap();
+    assert_eq!(count, 0);
     assert_eq!(
-        std::fs::read(pe_service::source_checkpoint::checkpoint_path(
-            &paths.source_log
-        ))
+        pe_service::bucket_commit::validate_open_continuations(
+            &paper,
+            &opened.boot.receipt_index()
+        )
         .unwrap(),
-        before
+        0,
     );
 }
 
@@ -4372,5 +4370,188 @@ async fn progressive_boot_skips_waves_after_membership_record() {
         }
         stop.send(()).unwrap();
         server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn runtime_checkpoint_prunes_only_after_successful_disposition_barrier() {
+    for blocked in [false, true] {
+        let (_dir, paths) = installed_fixture();
+        let retired = append(
+            &paths.source_log,
+            activity_envelope("0xretired", NOW_UNIX + 1),
+        );
+        let disposed = append(
+            &paths.source_log,
+            activity_envelope("0xdisposed", NOW_UNIX + 2),
+        );
+        let surviving = append(
+            &paths.source_log,
+            activity_envelope("0xsurviving", NOW_UNIX + 3),
+        );
+        let retired_id = pe_source_polymarket_public::parse_activity_trade_observation(
+            &activity_payload("0xretired", NOW_UNIX + 1),
+        )
+        .unwrap()
+        .group_id
+        .key()
+        .clone();
+        // An appended but unauthenticated commitment cannot override exact durable retirement.
+        let binding = pe_service::bucket_commit::ObservationBinding {
+            stream_group_id: retired_id.clone(),
+            stream_receipt: retired,
+            history_group_id: retired_id,
+            semantic_revision: "recorded".to_owned(),
+            page_raw_hash: "recorded".to_owned(),
+            page_occurrence_index: 0,
+            identity_provenance: None,
+            identity_receipt: None,
+            counterpart_basis_receipt: None,
+            frame_admission_receipt: None,
+        };
+        let commitment = append(
+            &paths.source_log,
+            envelope(
+                pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID,
+                2,
+                1,
+                &serde_json::to_vec(&pe_service::bucket_commit::ActivityReadCommitment {
+                    version: 2,
+                    wallet: WalletAddress::from_hex(WALLET).unwrap(),
+                    fixed_end: NOW_UNIX + 4,
+                    digest: "unauthenticated".to_owned(),
+                    bindings: Some(vec![binding]),
+                    read_proof: None,
+                })
+                .unwrap(),
+                NOW_UNIX + 4,
+            ),
+        );
+        let paper = Arc::new(PaperStateDb::open(&paths.fixed_main).unwrap());
+        let reader = Connection::open(&paths.fixed_main).unwrap();
+        if blocked {
+            reader
+                .execute_batch("BEGIN; SELECT count(*) FROM meta;")
+                .unwrap();
+        }
+        paper.retire_activity_observation(retired, false).unwrap();
+        let observation = pe_source_polymarket_public::parse_activity_trade_observation(
+            &activity_payload("0xdisposed", NOW_UNIX + 2),
+        )
+        .unwrap();
+        paper
+            .commit_activity_bucket(&pe_paper_state::ActivityBucketCommit {
+                wallet: observation.wallet,
+                source_epoch: NOW_UNIX + 2,
+                dispositions: vec![pe_paper_state::ActivityDispositionRecord {
+                    source_trade_id: observation.group_id.key().clone(),
+                    transaction_hash: observation.group_id.components().transaction_hash.clone(),
+                    wallet: observation.wallet,
+                    source_epoch: NOW_UNIX + 2,
+                    semantic_revision: "disposed".to_owned(),
+                    activity_type: "TRADE".to_owned(),
+                    disposition: "raw_only".to_owned(),
+                    proof_json: "{}".to_owned(),
+                    no_copy: None,
+                }],
+                leader_positions: Vec::new(),
+                gate_results: Vec::new(),
+                history_effects: Vec::new(),
+                history_status: None,
+                pending: Vec::new(),
+                fence: None,
+                reanchor: None,
+                advance_cursor: false,
+            })
+            .unwrap();
+        // Preparation is read-only and retains both disposed candidates and their commitment.
+        SourceLogBoot::prepare_checkpoint(&paths.fixed_main).unwrap();
+        let unpruned = checkpoint_json(&paths.source_log);
+        assert_eq!(
+            unpruned["activity"]["binding_commitments"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let candidates = |data: &serde_json::Value| {
+            data["activity"]["by_wallet"]
+                .as_object()
+                .unwrap()
+                .values()
+                .flat_map(|epochs| epochs.as_object().unwrap().values())
+                .flat_map(|groups| groups.as_object().unwrap().values())
+                .map(|obligation| {
+                    serde_json::from_value::<AppendReceipt>(obligation["receipt"].clone()).unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(candidates(&unpruned), vec![retired, disposed, surviving]);
+        rewrite_boot_checkpoint(
+            &pe_service::source_checkpoint::checkpoint_path(&paths.source_log),
+            |data| {
+                data["reducer_version"] = serde_json::json!(2);
+                data["activity"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("recorded_bindings");
+            },
+        );
+        let converted = SourceLogBoot::open(&paths, false).unwrap().unwrap();
+        assert_eq!(
+            converted
+                .boot
+                .receipt_index()
+                .read_verification_count(commitment),
+            0
+        );
+        drop(converted);
+        SourceLogBoot::prepare_checkpoint(&paths.fixed_main).unwrap();
+        let converted = checkpoint_json(&paths.source_log);
+        assert_eq!(converted["reducer_version"], 3);
+        assert_eq!(candidates(&converted), vec![retired, disposed, surviving]);
+        assert_eq!(
+            converted["activity"]["recorded_bindings"][0]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+        let previous = std::fs::read(pe_service::source_checkpoint::checkpoint_path(
+            &paths.source_log,
+        ))
+        .unwrap();
+        let opened = SourceLogBoot::open(&paths, false).unwrap().unwrap();
+        let index = opened.boot.receipt_index();
+        let slot = pe_service::source_checkpoint::CheckpointJobSlot::default();
+        let mut owner = opened
+            .boot
+            .into_checkpoint_owner(slot.clone())
+            .with_paper_state(paper.clone());
+        owner.initialize_for_scenario().await.unwrap();
+        if blocked {
+            assert_eq!(
+                std::fs::read(pe_service::source_checkpoint::checkpoint_path(
+                    &paths.source_log
+                ))
+                .unwrap(),
+                previous
+            );
+            reader.execute_batch("ROLLBACK").unwrap();
+            owner.publish_hourly_for_scenario().await.unwrap();
+        }
+        let pruned = checkpoint_json(&paths.source_log);
+        assert_eq!(candidates(&pruned), vec![surviving]);
+        assert!(
+            pruned["activity"]["binding_commitments"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(index.read_verification_count(commitment), 0);
+        let wal = PathBuf::from(format!("{}-wal", paths.fixed_main.display()));
+        assert_eq!(std::fs::metadata(wal).unwrap().len(), 0);
+        drop(owner);
+        slot.join().await.unwrap();
     }
 }

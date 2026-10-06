@@ -122,12 +122,6 @@ struct Obligation {
     received_at: OffsetDateTime,
     receipt: pe_event_log::AppendReceipt,
     bindings: Vec<ObservationBinding>,
-    #[serde(default)]
-    frame_admission_receipt: Option<AppendReceipt>,
-    #[serde(default)]
-    retained_commitments: Vec<AppendReceipt>,
-    #[serde(default)]
-    retained_negative_pending: bool,
 }
 
 type WalletObligations = BTreeMap<i64, BTreeMap<String, Obligation>>;
@@ -148,10 +142,10 @@ fn insert_coalesced_obligation(
     if let Some((previous_epoch, existing)) = existing {
         if !crate::frame_admission::prefer_observation(
             existing.receipt,
-            existing.frame_admission_receipt.is_some(),
+            false,
             existing.qualifying_buy,
             obligation.receipt,
-            obligation.frame_admission_receipt.is_some(),
+            false,
             obligation.qualifying_buy,
         ) {
             return;
@@ -178,9 +172,6 @@ fn insert_reconciliation_trigger(
         epoch,
         Obligation {
             qualifying_buy: trigger.qualifying_buy,
-            frame_admission_receipt: None,
-            retained_commitments: Vec::new(),
-            retained_negative_pending: false,
             group_id: trigger.source_trade_id,
             received_at: trigger.received_at,
             receipt: trigger.receipt,
@@ -213,6 +204,8 @@ pub struct ReconciliationObligations {
 pub(crate) struct ActivityCandidates {
     by_wallet: CoalescedObligations,
     binding_commitments: Vec<AppendReceipt>,
+    #[serde(default)]
+    recorded_bindings: Vec<Option<Vec<ObservationBinding>>>,
     #[serde(default)]
     routed_frames: HashSet<pe_core_types::EventSeq>,
     #[serde(default)]
@@ -265,6 +258,10 @@ impl ActivityCandidates {
                 .is_some_and(|bindings| !bindings.is_empty())
                 || commitment.read_proof.is_some()
             {
+                self.recorded_bindings
+                    .resize(self.binding_commitments.len(), None);
+                self.recorded_bindings
+                    .push(Some(commitment.bindings.unwrap_or_default()));
                 self.binding_commitments.push(AppendReceipt {
                     sequence: envelope.seq,
                     this_hash: envelope.this_hash,
@@ -321,59 +318,46 @@ impl ActivityCandidates {
             .sum()
     }
 
-    /// Filter the coalesced log candidates against durable paper state (#572). The result is a
-    /// keyed map, so the visiting order does not affect it.
+    /// Hydrate deployed reducer-two checkpoints without authenticating complete reads.
+    pub(crate) fn hydrate_bindings(
+        &mut self,
+        source_receipts: &SourceReceiptIndex,
+    ) -> Result<(), ObligationRebuildError> {
+        self.recorded_bindings
+            .resize(self.binding_commitments.len(), None);
+        for (receipt, bindings) in self
+            .binding_commitments
+            .iter()
+            .zip(&mut self.recorded_bindings)
+        {
+            if bindings.is_none() {
+                let envelope = source_receipts
+                    .source_envelope(*receipt)
+                    .map_err(|error| ObligationRebuildError::Binding(error.to_string()))?;
+                let commitment: crate::bucket_commit::ActivityReadCommitment =
+                    serde_json::from_slice(&envelope.payload)
+                        .map_err(|error| ObligationRebuildError::Binding(error.to_string()))?;
+                *bindings = Some(commitment.bindings.unwrap_or_default());
+            }
+        }
+        Ok(())
+    }
+
+    /// Filter durable authorities first; parsed bindings only locate proofs to authenticate.
     pub(crate) fn into_obligations(
-        self,
+        mut self,
         paper_state: &PaperStateDb,
         source_receipts: &SourceReceiptIndex,
     ) -> Result<ReconciliationObligations, ObligationRebuildError> {
-        let mut by_wallet = self.by_wallet;
-        let frames = paper_state.activity_frame_decision_index(None)?;
-        for frame in &frames {
-            let (wallet, epoch, obligation) = admitted_frame_obligation(frame)?;
-            let epochs = by_wallet.entry(wallet).or_default();
-            replace_admitted_obligation(epochs, epoch, obligation, true);
-        }
-        let mut bindings = HashMap::<_, Vec<ObservationBinding>>::new();
-        let mut retained = HashMap::<WalletAddress, Vec<AppendReceipt>>::new();
-        let frames_by_receipt = frames
-            .iter()
-            .filter_map(|frame| {
-                frame
-                    .observed_source_receipt
-                    .map(|receipt| ((receipt.sequence, receipt.this_hash), frame))
-            })
-            .collect::<HashMap<_, _>>();
-        let mut matched_frames = HashSet::new();
-        let mut negative_frames = HashSet::new();
-        for receipt in self.binding_commitments {
-            let read = crate::bucket_commit::verified_commitment_bindings(receipt, source_receipts)
-                .map_err(|error| ObligationRebuildError::Binding(error.to_string()))?;
-            retained.entry(read.wallet).or_default().push(receipt);
-            for binding in &read.bindings {
-                // Boot catch-up may already have disposed a matched group. A retained
-                // contradiction (always bound in its deciding read) still needs its incident
-                // before that match can retire the frame; the paper-era filter below retires
-                // journaled incidents. An unjournaled absence has no match, so it stays anyway.
-                let key = (
-                    binding.stream_receipt.sequence,
-                    binding.stream_receipt.this_hash,
-                );
-                if let Some(frame) = frames_by_receipt.get(&key) {
-                    match crate::feed_audit::disposition(*frame, &read)
-                        .map_err(|error| ObligationRebuildError::Binding(error.to_string()))?
-                    {
-                        crate::feed_audit::AuditDisposition::Matched(_) => {
-                            matched_frames.insert(key);
-                        }
-                        crate::feed_audit::AuditDisposition::Contradicted(_) => {
-                            negative_frames.insert(key);
-                        }
-                        crate::feed_audit::AuditDisposition::Absent
-                        | crate::feed_audit::AuditDisposition::Unresolved => {}
-                    }
-                }
+        self.hydrate_bindings(source_receipts)?;
+        let admitted_ids = paper_state
+            .activity_frame_decision_index(None)?
+            .into_iter()
+            .map(|frame| frame.source_trade_id)
+            .collect::<HashSet<_>>();
+        let mut bindings = HashMap::<_, Vec<AppendReceipt>>::new();
+        for (receipt, recorded) in self.binding_commitments.iter().zip(&self.recorded_bindings) {
+            for binding in recorded.iter().flatten() {
                 bindings
                     .entry((
                         binding.stream_group_id.clone(),
@@ -381,59 +365,140 @@ impl ActivityCandidates {
                         binding.stream_receipt.this_hash,
                     ))
                     .or_default()
-                    .push(binding.clone());
+                    .push(*receipt);
             }
         }
         let mut obligations = ReconciliationObligations {
             routed_frames: self.routed_frames,
-            frame_candidates: self.frame_candidates,
+            frame_candidates: self
+                .frame_candidates
+                .into_iter()
+                .filter(|(id, _)| !admitted_ids.contains(id))
+                .collect(),
+            retired_frame_ids: admitted_ids,
             ..ReconciliationObligations::default()
         };
-        for (wallet, epochs) in by_wallet {
+        let mut authenticated = HashMap::new();
+        #[cfg(feature = "scenario")]
+        let mut counted = HashSet::new();
+        for (wallet, epochs) in self.by_wallet {
             let fenced = paper_state.is_wallet_fenced(&wallet)?;
             for (epoch, groups) in epochs {
                 for mut obligation in groups.into_values() {
-                    let frame_key = (obligation.receipt.sequence, obligation.receipt.this_hash);
-                    let matched = matched_frames.contains(&frame_key);
-                    obligation.bindings = bindings
+                    if obligations.retired_frame_ids.contains(&obligation.group_id)
+                        || paper_state.activity_observation_retired(obligation.receipt)?
+                        || paper_state
+                            .activity_group_state(&obligation.group_id)?
+                            .is_some()
+                    {
+                        continue;
+                    }
+                    let receipts = bindings
                         .remove(&(
                             obligation.group_id.clone(),
                             obligation.receipt.sequence,
                             obligation.receipt.this_hash,
                         ))
                         .unwrap_or_default();
-                    if obligation.frame_admission_receipt.is_some() {
-                        obligation.retained_commitments =
-                            retained.get(&wallet).cloned().unwrap_or_default();
-                        obligation.retained_negative_pending = negative_frames.contains(&frame_key);
+                    obligation.bindings.clear();
+                    #[cfg(feature = "scenario")]
+                    let mut used_receipts = Vec::new();
+                    for receipt in &receipts {
+                        let read = match authenticated.entry((receipt.sequence, receipt.this_hash))
+                        {
+                            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                let read = crate::bucket_commit::verified_commitment_bindings(
+                                    *receipt,
+                                    source_receipts,
+                                )
+                                .map_err(|error| {
+                                    ObligationRebuildError::Binding(error.to_string())
+                                })?;
+                                entry.insert(read)
+                            }
+                        };
+                        #[cfg(feature = "scenario")]
+                        used_receipts.push(*receipt);
+                        obligation.bindings.extend(
+                            read.bindings
+                                .iter()
+                                .filter(|binding| {
+                                    binding.stream_receipt == obligation.receipt
+                                        && binding.stream_group_id == obligation.group_id
+                                })
+                                .cloned(),
+                        );
+                        if obligation_disposed(paper_state, fenced, &obligation)? {
+                            break;
+                        }
                     }
-                    // A fence alone is not an acknowledgement. Keep ordinary fenced work
-                    // until the serialized owner persists retirement and removes its barrier.
-                    if (obligation.frame_admission_receipt.is_none()
-                        && obligation.bindings.is_empty()
-                        && fenced
-                        && paper_state
-                            .activity_group_state(&obligation.group_id)?
-                            .is_none()
-                        && !paper_state.activity_observation_unbound_retired(obligation.receipt)?)
-                        || (obligation.frame_admission_receipt.is_some()
-                            && (!matched || negative_frames.contains(&frame_key)))
-                        || !obligation_disposed(paper_state, fenced, &obligation, matched)?
-                    {
+                    let disposed = !((obligation.bindings.is_empty() && fenced)
+                        || !obligation_disposed(paper_state, fenced, &obligation)?);
+                    #[cfg(feature = "scenario")]
+                    for receipt in used_receipts {
+                        let category = if disposed { 0 } else { 1 };
+                        if counted.insert((receipt.sequence, receipt.this_hash, category)) {
+                            source_receipts.record_binding_verification_category(receipt, category);
+                        }
+                    }
+                    if !disposed {
                         insert_coalesced_obligation(
                             &mut obligations.by_wallet,
                             wallet,
                             epoch,
                             obligation,
                         );
-                    } else if obligation.frame_admission_receipt.is_some() {
-                        obligations.retired_frame_receipts.push(obligation.receipt);
-                        obligations.retired_frame_ids.insert(obligation.group_id);
                     }
                 }
             }
         }
         Ok(obligations)
+    }
+
+    /// Keep only current work, using the same authenticated authorities as boot.
+    pub(crate) fn prune(
+        &mut self,
+        paper_state: &PaperStateDb,
+        source_receipts: &SourceReceiptIndex,
+    ) -> Result<(), ObligationRebuildError> {
+        self.hydrate_bindings(source_receipts)?;
+        let obligations = self
+            .clone()
+            .into_obligations(paper_state, source_receipts)?;
+        let remaining = obligations
+            .by_wallet
+            .values()
+            .flat_map(BTreeMap::values)
+            .flat_map(BTreeMap::values)
+            .map(|obligation| (obligation.receipt.sequence, obligation.receipt.this_hash))
+            .collect::<HashSet<_>>();
+        let mut commitments = Vec::new();
+        let mut recorded = Vec::new();
+        for (receipt, bindings) in self
+            .binding_commitments
+            .drain(..)
+            .zip(self.recorded_bindings.drain(..))
+        {
+            if bindings.as_ref().is_some_and(|bindings| {
+                bindings.iter().any(|binding| {
+                    remaining.contains(&(
+                        binding.stream_receipt.sequence,
+                        binding.stream_receipt.this_hash,
+                    ))
+                })
+            }) {
+                commitments.push(receipt);
+                recorded.push(bindings);
+            }
+        }
+        self.binding_commitments = commitments;
+        self.recorded_bindings = recorded;
+        self.by_wallet = obligations.by_wallet;
+        self.frame_candidates = obligations.frame_candidates;
+        self.routed_frames
+            .retain(|seq| remaining.iter().any(|(sequence, _)| sequence == seq));
+        Ok(())
     }
 }
 
@@ -482,48 +547,25 @@ impl ReconciliationObligations {
         (all, undelivered)
     }
 
-    /// Retire synchronized incident receipts from the coalesced unresolved work.
-    pub fn retire_feed_incidents(
+    fn retire_admitted_frames(
         &mut self,
-        era: &crate::paper_recovery::PaperEra,
         paper_state: &PaperStateDb,
     ) -> Result<(), pe_paper_state::PaperStateError> {
-        let mut retired = crate::feed_audit::audited_receipts(era);
-        for frame in &era.frames {
-            if let crate::paper_recovery::PaperLogFrame::Record(
-                crate::paper_recovery::PaperLogRecord::FeedIncidentChanged {
-                    incident,
-                    state: crate::paper_recovery::HaltState::Engaged,
-                },
-            ) = &frame.frame
-                && !crate::feed_audit::counterpart_disposed(
-                    paper_state,
-                    incident.counterpart_identity.as_ref(),
-                )?
-            {
-                retired.retain(|receipt| *receipt != incident.frame_receipt);
-            }
-        }
-        for receipt in &retired {
-            if !self.retired_frame_receipts.contains(receipt) {
-                self.retired_frame_receipts.push(*receipt);
-            }
-        }
-        self.retired_frame_ids.extend(
-            self.frame_candidates
-                .iter()
-                .filter(|(_, receipt)| retired.contains(receipt))
-                .map(|(id, _)| id.clone()),
-        );
         for epochs in self.by_wallet.values_mut() {
             for groups in epochs.values_mut() {
-                self.retired_frame_ids.extend(
-                    groups
-                        .values()
-                        .filter(|obligation| retired.contains(&obligation.receipt))
-                        .map(|obligation| obligation.group_id.clone()),
-                );
-                groups.retain(|_, obligation| !retired.contains(&obligation.receipt));
+                let mut admitted = Vec::new();
+                for obligation in groups.values() {
+                    if paper_state
+                        .activity_frame_decision(&obligation.group_id)?
+                        .is_some()
+                    {
+                        self.retired_frame_ids.insert(obligation.group_id.clone());
+                        admitted.push(obligation.group_id.0.clone());
+                    }
+                }
+                for id in admitted {
+                    groups.remove(&id);
+                }
             }
             epochs.retain(|_, groups| !groups.is_empty());
         }
@@ -666,18 +708,7 @@ impl ReconciliationObligations {
     }
 
     fn remove_selected(&mut self, wallet: WalletAddress, epoch: i64, selected: &Obligation) {
-        if selected.frame_admission_receipt.is_some() {
-            self.retired_frame_ids.insert(selected.group_id.clone());
-            if let Some(epochs) = self.by_wallet.get_mut(&wallet) {
-                for groups in epochs.values_mut() {
-                    groups.remove(&selected.group_id.0);
-                }
-                epochs.retain(|_, groups| !groups.is_empty());
-                if epochs.is_empty() {
-                    self.by_wallet.remove(&wallet);
-                }
-            }
-        } else if self
+        if self
             .observation(&wallet, epoch, &selected.group_id)
             .is_some_and(|(receipt, _)| receipt == selected.receipt)
         {
@@ -761,12 +792,10 @@ impl DailyBoundaryCandidates {
 pub(crate) fn recover_daily_boundary_anchor(
     paper_log_path: &Path,
     obligations: &mut ReconciliationObligations,
-    paper_state: &PaperStateDb,
 ) -> Result<Option<i64>, ObligationRebuildError> {
     let frames = crate::paper_recovery::scan_paper_log(paper_log_path)
         .map_err(|error| ObligationRebuildError::PaperLog(error.to_string()))?;
     let era = crate::paper_recovery::paper_era(frames);
-    obligations.retire_feed_incidents(&era, paper_state)?;
     recover_daily_boundary_anchor_from_era(&era, obligations)
 }
 
@@ -825,10 +854,8 @@ pub fn recover_daily_boundary(
     source_log_path: &Path,
     paper_log_path: &Path,
     obligations: &mut ReconciliationObligations,
-    paper_state: &PaperStateDb,
 ) -> Result<(), ObligationRebuildError> {
-    let Some(anchor) = recover_daily_boundary_anchor(paper_log_path, obligations, paper_state)?
-    else {
+    let Some(anchor) = recover_daily_boundary_anchor(paper_log_path, obligations)? else {
         return Ok(());
     };
     let mut candidates = DailyBoundaryCandidates::default();
@@ -1051,7 +1078,7 @@ enum Completion {
         wallet: WalletAddress,
         urgent: bool,
         selected: WalletObligations,
-        acknowledged_audits: Vec<(i64, Obligation)>,
+        acknowledged_retirements: Vec<(i64, Obligation)>,
         result: Result<Vec<(i64, Obligation)>, ReconciliationError>,
     },
     Refreshed(
@@ -1244,7 +1271,16 @@ impl TradePoller {
                 }
             }
             if !stopping {
-                self.drain_triggers();
+                if let Err(error) = self.drain_triggers() {
+                    failure = Some(error);
+                    stopping = true;
+                    continue;
+                }
+                if let Err(error) = self.obligations.retire_admitted_frames(&self.paper_state) {
+                    failure = Some(TradePollerOwnerError::Reconciliation(error.to_string()));
+                    stopping = true;
+                    continue;
+                }
                 let now = (self.now)();
                 if let Some((wallet, handoff, handle)) = &refresh_visit
                     && self.obligations.by_wallet.contains_key(wallet)
@@ -1520,7 +1556,7 @@ impl TradePoller {
                 }
                 completed = tasks.join_next(), if !tasks.is_empty() => {
                     match completed {
-                        Some(Ok(Completion::Reconciled { wallet, urgent, selected, acknowledged_audits, result })) => {
+                        Some(Ok(Completion::Reconciled { wallet, urgent, selected, acknowledged_retirements, result })) => {
                             busy_wallets.remove(&wallet);
                             if urgent { urgent_busy = false; urgent_visit = None; }
                             else { backstop_busy = false; backstop_visit = None; }
@@ -1534,9 +1570,6 @@ impl TradePoller {
                             // when application leaves targets outstanding for a later read.
                             for (epoch, groups) in &selected {
                                 for obligation in groups.values() {
-                                    if obligation.frame_admission_receipt.is_some() {
-                                        insert_coalesced_obligation(&mut self.obligations.by_wallet, wallet, *epoch, obligation.clone());
-                                    }
                                     if let Some(current) = self.obligations.by_wallet
                                         .get_mut(&wallet)
                                         .and_then(|epochs| epochs.get_mut(epoch))
@@ -1544,7 +1577,6 @@ impl TradePoller {
                                         && current.receipt == obligation.receipt
                                     {
                                         current.bindings.clone_from(&obligation.bindings);
-                                        current.retained_commitments.clone_from(&obligation.retained_commitments);
                                     }
                                 }
                             }
@@ -1552,8 +1584,8 @@ impl TradePoller {
                                 attempt.selected.clone_from(&selected);
                             }
                             // A later fetch, cancellation, or bucket failure cannot undo an
-                            // acknowledged incident or a retained disposed match.
-                            for (epoch, obligation) in acknowledged_audits {
+                            // acknowledged observation retirement.
+                            for (epoch, obligation) in acknowledged_retirements {
                                 if !self.obligations.retired_frame_receipts.contains(&obligation.receipt) {
                                     self.obligations.retired_frame_receipts.push(obligation.receipt);
                                 }
@@ -1571,9 +1603,6 @@ impl TradePoller {
                                 Ok(resolved) => {
                                     if counts_round { round.successes += 1; }
                                     for (epoch, obligation) in resolved {
-                                        if obligation.frame_admission_receipt.is_some() && !self.obligations.retired_frame_receipts.contains(&obligation.receipt) {
-                                            self.obligations.retired_frame_receipts.push(obligation.receipt);
-                                        }
                                         self.obligations.remove_selected(wallet, epoch, &obligation);
                                         if let Some(attempt) = attempts.get_mut(&wallet) {
                                             remove_wallet_obligation(&mut attempt.selected, epoch, &obligation.group_id);
@@ -1656,7 +1685,11 @@ impl TradePoller {
                     }
                 }
                 trigger = self.trigger_rx.recv(), if !stopping => match trigger {
-                    Some(trigger) => self.obligations.insert(trigger),
+                    Some(trigger) => {
+                        if let Err(error) = self.insert_trigger(trigger) {
+                            failure = Some(error);
+                        }
+                    },
                     None => failure = Some(TradePollerOwnerError::TriggerChannelClosed),
                 },
                 () = async { if let Some(wake) = wake { tokio::time::sleep_until(wake).await; } else { std::future::pending::<()>().await; } }, if !stopping => {}
@@ -1666,13 +1699,33 @@ impl TradePoller {
         failure.map_or(Ok(()), Err)
     }
 
-    fn drain_triggers(&mut self) {
+    fn insert_trigger(
+        &mut self,
+        trigger: ReconciliationTrigger,
+    ) -> Result<(), TradePollerOwnerError> {
+        if self
+            .paper_state
+            .activity_frame_decision(&trigger.source_trade_id)
+            .map_err(|error| TradePollerOwnerError::Reconciliation(error.to_string()))?
+            .is_some()
+        {
+            self.obligations
+                .retired_frame_ids
+                .insert(trigger.source_trade_id);
+        } else {
+            self.obligations.insert(trigger);
+        }
+        Ok(())
+    }
+
+    fn drain_triggers(&mut self) -> Result<(), TradePollerOwnerError> {
         for _ in 0..self.trigger_rx.max_capacity() {
             let Ok(trigger) = self.trigger_rx.try_recv() else {
                 break;
             };
-            self.obligations.insert(trigger);
+            self.insert_trigger(trigger)?;
         }
+        Ok(())
     }
 
     fn has_new_obligation(
@@ -1783,7 +1836,7 @@ impl TradePoller {
             frontier: frontier.clone(),
         });
         tasks.spawn(async move {
-            let mut acknowledged_audits = Vec::new();
+            let mut acknowledged_retirements = Vec::new();
             let result = operation
                 .reconcile_wallet(
                     wallet,
@@ -1791,14 +1844,14 @@ impl TradePoller {
                     &mut selected,
                     fixed_end,
                     &mut cancel,
-                    &mut acknowledged_audits,
+                    &mut acknowledged_retirements,
                 )
                 .await;
             Completion::Reconciled {
                 wallet,
                 urgent,
                 selected,
-                acknowledged_audits,
+                acknowledged_retirements,
                 result,
             }
         });
@@ -2017,179 +2070,9 @@ impl WalletOperation {
         selected: &mut WalletObligations,
         fixed_end: i64,
         cancel: &mut Option<watch::Receiver<bool>>,
-        acknowledged_audits: &mut Vec<(i64, Obligation)>,
+        acknowledged_retirements: &mut Vec<(i64, Obligation)>,
     ) -> Result<Vec<(i64, Obligation)>, ReconciliationError> {
-        let initial_frames = admitted_frame_obligations(&self.paper_state, Some(wallet))?;
-        for (frame_wallet, epoch, obligation) in &initial_frames {
-            if *frame_wallet == wallet {
-                replace_admitted_obligation(selected, *epoch, obligation.clone(), false);
-            }
-        }
-        let mut negative_resolved: Vec<(i64, Obligation)> = Vec::new();
-        let mut retained_matched: Vec<(i64, Obligation)> = Vec::new();
-        let mut counterparts = HashSet::new();
-        let mut journaled_negatives = HashSet::new();
-        if let Some(index) = &self.source_receipts {
-            let frames = self
-                .paper_state
-                .activity_frame_decision_index(Some(&wallet))?
-                .into_iter()
-                .map(|frame| (frame.source_trade_id.clone(), frame))
-                .collect::<HashMap<_, _>>();
-            let obligations = selected
-                .iter()
-                .flat_map(|(epoch, groups)| {
-                    groups
-                        .values()
-                        .filter(|obligation| obligation.frame_admission_receipt.is_some())
-                        .map(move |obligation| (*epoch, obligation.clone()))
-                })
-                .collect::<Vec<_>>();
-            let mut receipts = obligations
-                .iter()
-                .flat_map(|(_, obligation)| obligation.retained_commitments.iter().copied())
-                .collect::<Vec<_>>();
-            receipts.sort_by_key(|receipt| receipt.sequence);
-            receipts.dedup();
-            // Authenticate each retained read once, then release its reconstructed history.
-            // A fixed counterpart wins over later absence, but its later contradiction
-            // still engages the latch before routing, including unrelated metadata resolution.
-            for receipt in receipts {
-                let read = Arc::new(
-                    crate::bucket_commit::verified_commitment_bindings(receipt, index)
-                        .map_err(|error| ReconciliationError::Binding(error.to_string()))?,
-                );
-                self.audit_unselected_frame_bindings(&read, selected)
-                    .await?;
-                let mut matches = Vec::new();
-                let mut negatives = Vec::new();
-                for (epoch, obligation) in &obligations {
-                    // A disposed match must not hide a later retained contradiction whose
-                    // commitment synchronized before the crash but whose incident did not.
-                    if negative_resolved
-                        .iter()
-                        .any(|(_, resolved)| resolved.receipt == obligation.receipt)
-                    {
-                        continue;
-                    }
-                    let frame = frames.get(&obligation.group_id).ok_or_else(|| {
-                        ReconciliationError::Binding("admitted frame disappeared".to_owned())
-                    })?;
-                    let conclusion = crate::feed_audit::disposition(frame, &read)
-                        .map_err(|error| ReconciliationError::Binding(error.to_string()))?;
-                    match conclusion {
-                        crate::feed_audit::AuditDisposition::Matched(id) => {
-                            counterparts.insert(obligation.receipt.sequence);
-                            matches.push((*epoch, obligation.clone(), id))
-                        }
-                        crate::feed_audit::AuditDisposition::Absent
-                            if counterparts.contains(&obligation.receipt.sequence) => {}
-                        crate::feed_audit::AuditDisposition::Absent
-                        | crate::feed_audit::AuditDisposition::Contradicted(_) => {
-                            if matches!(
-                                conclusion,
-                                crate::feed_audit::AuditDisposition::Contradicted(_)
-                            ) {
-                                counterparts.insert(obligation.receipt.sequence);
-                            }
-                            if self
-                                .request_negative_audit(
-                                    obligation.receipt,
-                                    receipt,
-                                    &conclusion,
-                                    Some(read.clone()),
-                                )
-                                .await?
-                            {
-                                journaled_negatives.insert(obligation.receipt.sequence);
-                                if self.negative_target_disposed(&conclusion)? {
-                                    acknowledged_audits.push((*epoch, obligation.clone()));
-                                    negative_resolved.push((*epoch, obligation.clone()));
-                                } else {
-                                    negatives.push((*epoch, obligation.clone(), conclusion));
-                                }
-                            }
-                        }
-                        crate::feed_audit::AuditDisposition::Unresolved => {}
-                    }
-                }
-                let mut needs_commit = false;
-                for (_, obligation) in &obligations {
-                    for binding in read
-                        .bindings
-                        .iter()
-                        .filter(|binding| binding.stream_receipt == obligation.receipt)
-                    {
-                        needs_commit |= !binding_target_disposed(&self.paper_state, binding)?;
-                    }
-                }
-                if needs_commit {
-                    self.commit_retained_read(read.clone(), selected, entry, cancel)
-                        .await?;
-                }
-                // Retained routing also dispositions ordinary observations, including a
-                // first-seen ambiguity fence. A later failed fetch cannot leave their barriers.
-                self.promote_selected_admissions(wallet, selected)?;
-                let ordinary = self.disposed_obligations(wallet, selected, &read)?;
-                for (epoch, obligation) in ordinary
-                    .into_iter()
-                    .filter(|(_, obligation)| obligation.frame_admission_receipt.is_none())
-                {
-                    if self
-                        .acknowledge_retirement(&obligation, Some(read.clone()))
-                        .await?
-                    {
-                        acknowledged_audits.push((epoch, obligation.clone()));
-                        remove_wallet_obligation(selected, epoch, &obligation.group_id);
-                    }
-                }
-                self.promote_selected_admissions(wallet, selected)?;
-                for (epoch, obligation, id) in matches {
-                    if obligation.retained_negative_pending
-                        && !journaled_negatives.contains(&obligation.receipt.sequence)
-                    {
-                        continue; // the retained negative must journal before match retirement
-                    }
-                    if !crate::feed_audit::counterpart_disposed(&self.paper_state, Some(&id))? {
-                        continue; // ordinary routing stopped at an unresolved observation or fence
-                    }
-                    if !self
-                        .acknowledge_retirement(&obligation, Some(read.clone()))
-                        .await?
-                    {
-                        self.promote_selected_admissions(wallet, selected)?;
-                        continue;
-                    }
-                    acknowledged_audits.push((epoch, obligation.clone()));
-                    retained_matched.push((epoch, obligation));
-                }
-                for (epoch, obligation, conclusion) in negatives {
-                    if self.negative_target_disposed(&conclusion)?
-                        && self
-                            .request_negative_audit(
-                                obligation.receipt,
-                                receipt,
-                                &conclusion,
-                                Some(read.clone()),
-                            )
-                            .await?
-                    {
-                        acknowledged_audits.push((epoch, obligation.clone()));
-                        negative_resolved.push((epoch, obligation));
-                    }
-                }
-            }
-        }
-        let mut has_frame_audit = selected
-            .values()
-            .flat_map(BTreeMap::values)
-            .any(|obligation| {
-                obligation.frame_admission_receipt.is_some()
-                    && !negative_resolved
-                        .iter()
-                        .chain(&retained_matched)
-                        .any(|(_, resolved)| resolved.receipt == obligation.receipt)
-            });
+        self.remove_selected_admissions(selected, acknowledged_retirements)?;
         let cursor_start = self
             .paper_state
             .cursor(&wallet)?
@@ -2197,36 +2080,25 @@ impl WalletOperation {
         let obligation_start = selected
             .first_key_value()
             .map(|(epoch, _)| epoch.saturating_sub(1));
-        let mut start = if has_frame_audit {
-            Some(0)
-        } else {
-            match (cursor_start, obligation_start) {
-                (Some(left), Some(right)) => Some(left.min(right)),
-                (left, None) => left,
-                (None, Some(_)) => None,
-            }
+        let mut start = match (cursor_start, obligation_start) {
+            (Some(left), Some(right)) => Some(left.min(right)),
+            (left, None) => left,
+            (None, Some(_)) => None,
         };
-        // A delivery cursor can be ahead of the contiguous feed frontier after an audit.
-        // Keep the next ordinary read contiguous instead of turning successful work into
-        // a publication failure, while unresolved frame absence still uses (0, fixed_end].
-        if !has_frame_audit && let Some(index) = &self.source_receipts {
-            let collection: crate::frame_admission::FrontierCollection =
-                serde_json::from_value(self.paper_state.feed_history_frontiers()?)?;
-            if collection.version != 1 {
-                return Err(ReconciliationError::Binding(
-                    "unsupported frontier collection".to_owned(),
-                ));
-            }
-            if let Some(frontier) = collection
-                .frontiers
-                .iter()
-                .find(|frontier| frontier.wallet == wallet)
-            {
-                index
-                    .verify_frame_frontier(frontier)
-                    .map_err(|error| ReconciliationError::Binding(error.to_string()))?;
-                start = start.map(|start| start.min(frontier.fixed_end.saturating_sub(1)));
-            }
+        // Persisted frontiers are read-start hints only. Admission waits for a fresh read.
+        let collection: crate::frame_admission::FrontierCollection =
+            serde_json::from_value(self.paper_state.feed_history_frontiers()?)?;
+        if collection.version != 1 {
+            return Err(ReconciliationError::Binding(
+                "unsupported frontier collection".to_owned(),
+            ));
+        }
+        if let Some(frontier) = collection
+            .frontiers
+            .iter()
+            .find(|frontier| frontier.wallet == wallet)
+        {
+            start = start.map(|start| start.min(frontier.fixed_end.saturating_sub(1)));
         }
         let append_closed = Arc::new(AtomicBool::new(false));
         let recording = RecordingFetcher {
@@ -2256,36 +2128,11 @@ impl WalletOperation {
         for bucket in &buckets {
             identities.push(Self::cancellable(self.resolve_bucket(bucket), cancel).await??);
         }
-        // Admission can commit during either network acquisition. Refresh the durable
-        // authority before correlating this read, including triggers selected before commit.
-        let frames = admitted_frame_obligations(&self.paper_state, Some(wallet))?;
-        for (frame_wallet, epoch, obligation) in &frames {
-            if *frame_wallet == wallet {
-                let newly_admitted = !initial_frames
-                    .iter()
-                    .any(|(_, _, initial)| initial.receipt == obligation.receipt);
-                replace_admitted_obligation(selected, *epoch, obligation.clone(), newly_admitted);
-            }
-        }
-        has_frame_audit |= selected
-            .values()
-            .flat_map(BTreeMap::values)
-            .any(|obligation| {
-                obligation.frame_admission_receipt.is_some()
-                    && !negative_resolved
-                        .iter()
-                        .chain(&retained_matched)
-                        .any(|(_, resolved)| resolved.receipt == obligation.receipt)
-            });
-        let mut correlation_candidates = selected.clone();
-        for (frame_wallet, epoch, obligation) in frames {
-            if frame_wallet == wallet {
-                replace_admitted_obligation(&mut correlation_candidates, epoch, obligation, true);
-            }
-        }
-        let mut correlation = self.correlate(
+        // Admission can commit during network acquisition. It owns copying immediately.
+        self.remove_selected_admissions(selected, acknowledged_retirements)?;
+        let correlation = self.correlate(
             wallet,
-            &correlation_candidates,
+            selected,
             &activity.rows,
             &restamp_twins,
             &buckets.iter().flatten().collect::<Vec<_>>(),
@@ -2298,43 +2145,6 @@ impl WalletOperation {
             .iter()
             .map(|matched| matched.binding.clone())
             .collect::<Vec<_>>();
-        // Bindings retain their proof through the shared encoder. An empty binding set
-        // needs a proof only when this complete full-history read can decide absence;
-        // immature or ambiguous reads remain ordinary proofless frontier commitments.
-        let mut retain_proof = false;
-        for obligation in selected
-            .values()
-            .flat_map(BTreeMap::values)
-            .filter(|obligation| obligation.frame_admission_receipt.is_some())
-        {
-            if negative_resolved
-                .iter()
-                .chain(&retained_matched)
-                .any(|(_, resolved)| resolved.receipt == obligation.receipt)
-            {
-                continue;
-            }
-            let frame = self
-                .paper_state
-                .activity_frame_decision(&obligation.group_id)?
-                .ok_or_else(|| {
-                    ReconciliationError::Binding("admitted frame disappeared".to_owned())
-                })?;
-            let maturity = i64::try_from(frame.copy_latency_budget_secs)
-                .ok()
-                .and_then(|budget| frame.source_epoch.checked_add(budget))
-                .ok_or_else(|| {
-                    ReconciliationError::Binding("audit maturity overflow".to_owned())
-                })?;
-            retain_proof |= start == Some(0)
-                && fixed_end >= maturity
-                && !buckets.iter().flatten().any(|aggregate| {
-                    let components = aggregate.group_id.components();
-                    components.wallet == wallet
-                        && components.transaction_hash == frame.transaction_hash
-                        && components.activity_type == ActivityType::Trade
-                });
-        }
         // Once queued, the coordinator owns the append. Drain and authenticate its
         // acknowledgement before yielding, just as for a sent bucket commit.
         let read_commitment = self
@@ -2344,7 +2154,6 @@ impl WalletOperation {
                 &page_occurrences,
                 &activity.pages,
                 &bindings,
-                retain_proof,
             )
             .await?;
         #[cfg(feature = "scenario")]
@@ -2370,81 +2179,8 @@ impl WalletOperation {
                 && !obligation.bindings.contains(&matched.binding)
             {
                 obligation.bindings.push(matched.binding.clone());
-                obligation.retained_commitments.push(read_commitment);
             }
         }
-        // Resolved audits still present in this attempt are suppression evidence only.
-        // Include them in the contradiction check without restoring an ordering barrier.
-        let mut active_audits = selected.clone();
-        for (epoch, obligation) in negative_resolved.iter().chain(&retained_matched) {
-            remove_wallet_obligation(&mut active_audits, *epoch, &obligation.group_id);
-        }
-        self.audit_unselected_frame_bindings(&verified, &active_audits)
-            .await?;
-        if has_frame_audit {
-            if retain_proof || !bindings.is_empty() {
-                for obligation in selected
-                    .values_mut()
-                    .flat_map(BTreeMap::values_mut)
-                    .filter(|obligation| obligation.frame_admission_receipt.is_some())
-                {
-                    obligation.retained_commitments.push(read_commitment);
-                }
-            }
-            if cancel.as_ref().is_some_and(|cancel| *cancel.borrow()) {
-                return Err(ReconciliationError::Preempted);
-            }
-            for (epoch, groups) in selected.iter() {
-                for obligation in groups
-                    .values()
-                    .filter(|obligation| obligation.frame_admission_receipt.is_some())
-                {
-                    if negative_resolved
-                        .iter()
-                        .chain(&retained_matched)
-                        .any(|(_, resolved)| resolved.receipt == obligation.receipt)
-                    {
-                        continue;
-                    }
-                    let frame = self
-                        .paper_state
-                        .activity_frame_decision(&obligation.group_id)?
-                        .ok_or_else(|| {
-                            ReconciliationError::Binding("admitted frame disappeared".to_owned())
-                        })?;
-                    let conclusion = crate::feed_audit::disposition(&frame, &verified)
-                        .map_err(|error| ReconciliationError::Binding(error.to_string()))?;
-                    if conclusion == crate::feed_audit::AuditDisposition::Absent
-                        && counterparts.contains(&obligation.receipt.sequence)
-                    {
-                        continue;
-                    }
-                    if !self
-                        .request_negative_audit(
-                            obligation.receipt,
-                            read_commitment,
-                            &conclusion,
-                            Some(verified.clone()),
-                        )
-                        .await?
-                    {
-                        continue;
-                    }
-                    if self.negative_target_disposed(&conclusion)? {
-                        acknowledged_audits.push((*epoch, obligation.clone()));
-                        negative_resolved.push((*epoch, obligation.clone()));
-                    }
-                }
-            }
-        }
-        correlation.unmatched.retain(|(_, id)| {
-            selected.values().any(|groups| groups.contains_key(&id.0))
-                && !negative_resolved
-                    .iter()
-                    .chain(&retained_matched)
-                    .any(|(_, obligation)| &obligation.group_id == id)
-        });
-        correlation.unmatched_epoch = correlation.unmatched.iter().map(|(epoch, _)| *epoch).min();
         if let Some(latest) = buckets
             .iter()
             .flatten()
@@ -2474,60 +2210,19 @@ impl WalletOperation {
         if cancel.as_ref().is_some_and(|cancel| *cancel.borrow()) {
             return Err(ReconciliationError::Preempted);
         }
-        // Admission can synchronize during commitment append or any bucket await. Promote
-        // before considering disposal, then let the serialized owner reject a stale receipt.
-        self.promote_selected_admissions(wallet, selected)?;
-        if has_frame_audit {
-            for (epoch, groups) in selected.iter() {
-                for obligation in groups.values() {
-                    if obligation.frame_admission_receipt.is_none()
-                        || negative_resolved
-                            .iter()
-                            .any(|(_, resolved)| resolved.receipt == obligation.receipt)
-                    {
-                        continue;
-                    }
-                    let frame = self
-                        .paper_state
-                        .activity_frame_decision(&obligation.group_id)?
-                        .ok_or_else(|| {
-                            ReconciliationError::Binding("admitted frame disappeared".to_owned())
-                        })?;
-                    let conclusion = crate::feed_audit::disposition(&frame, &verified)
-                        .map_err(|error| ReconciliationError::Binding(error.to_string()))?;
-                    if conclusion == crate::feed_audit::AuditDisposition::Absent
-                        && counterparts.contains(&obligation.receipt.sequence)
-                    {
-                        continue;
-                    }
-                    if self.negative_target_disposed(&conclusion)?
-                        && self
-                            .request_negative_audit(
-                                obligation.receipt,
-                                verified.receipt,
-                                &conclusion,
-                                Some(verified.clone()),
-                            )
-                            .await?
-                    {
-                        acknowledged_audits.push((*epoch, obligation.clone()));
-                        negative_resolved.push((*epoch, obligation.clone()));
-                    }
-                }
-            }
-        }
-        let disposed = self.disposed_obligations(wallet, selected, &verified)?;
+        self.remove_selected_admissions(selected, acknowledged_retirements)?;
+        let disposed = self.disposed_obligations(wallet, selected)?;
         let mut resolved = Vec::new();
         for (epoch, obligation) in disposed {
             if self
                 .acknowledge_retirement(&obligation, Some(verified.clone()))
                 .await?
             {
-                acknowledged_audits.push((epoch, obligation.clone()));
+                acknowledged_retirements.push((epoch, obligation.clone()));
                 resolved.push((epoch, obligation));
             }
         }
-        self.promote_selected_admissions(wallet, selected)?;
+        self.remove_selected_admissions(selected, acknowledged_retirements)?;
         // Publication reads the owner's barrier after all acknowledged retirements.
         if all_acknowledged
             && correlation.unmatched_epoch.is_none()
@@ -2538,8 +2233,6 @@ impl WalletOperation {
                 .all(|obligation| {
                     resolved
                         .iter()
-                        .chain(&negative_resolved)
-                        .chain(&retained_matched)
                         .any(|(_, retired)| retired.receipt == obligation.receipt)
                 })
         {
@@ -2553,8 +2246,6 @@ impl WalletOperation {
             )
             .await?;
         }
-        resolved.extend(negative_resolved);
-        resolved.extend(retained_matched);
         Ok(resolved)
     }
 
@@ -2631,136 +2322,6 @@ impl WalletOperation {
         Ok(all_acknowledged)
     }
 
-    async fn commit_retained_read(
-        &self,
-        read: Arc<crate::bucket_commit::VerifiedCommitment>,
-        selected: &WalletObligations,
-        entry: Option<&pe_trader_index::WatchlistEntry>,
-        cancel: &mut Option<watch::Receiver<bool>>,
-    ) -> Result<(), ReconciliationError> {
-        let frontier = read.frontier.as_ref().ok_or_else(|| {
-            ReconciliationError::Binding("retained match lacks read proof".to_owned())
-        })?;
-        let index = self.source_receipts.as_ref().ok_or_else(|| {
-            ReconciliationError::Binding("source receipt index missing".to_owned())
-        })?;
-        let quality = match entry {
-            Some(entry) => entry.reconstruction_quality,
-            None => ReconstructionQuality::new(0)
-                .map_err(|_| ReconciliationError::ReconstructionQuality)?,
-        };
-        let bound = read
-            .bindings
-            .iter()
-            .map(|binding| (&binding.history_group_id, binding))
-            .collect::<HashMap<_, _>>();
-        let rows = crate::bucket_commit::retained_read_rows(&read, index)
-            .map_err(|error| ReconciliationError::Binding(error.to_string()))?;
-        let restamp_twins = restamp_twins(&self.paper_state, &rows)?;
-        let mut bucket_identities = Vec::new();
-        // Sort references, retaining only the current bucket's owned routing input.
-        let mut ordered = read.aggregates.iter().collect::<Vec<_>>();
-        ordered.sort_by_key(|aggregate| aggregate.source_time.0);
-        for group in ordered.chunk_by(|left, right| left.source_time == right.source_time) {
-            let bucket = group
-                .iter()
-                .map(|aggregate| (*aggregate).clone())
-                .collect::<Vec<_>>();
-            let unbound = bucket
-                .iter()
-                .filter(|aggregate| !bound.contains_key(aggregate.group_id.key()))
-                .cloned()
-                .collect::<Vec<_>>();
-            let mut identities = if unbound.is_empty() {
-                BucketIdentities::default()
-            } else {
-                Self::cancellable(self.resolve_bucket(&unbound), cancel).await??
-            };
-            // Reuse authenticated effective identities for bound targets. A later metadata
-            // response cannot change the recorded match between sync and bucket commit.
-            for aggregate in &bucket {
-                let id = aggregate.group_id.key();
-                if let Some(verified) = read.identities.get(id) {
-                    let components = aggregate.group_id.components();
-                    let raw = components
-                        .condition_id
-                        .as_ref()
-                        .zip(components.outcome)
-                        .map(|(condition, outcome)| {
-                            MarketOutcomeId::new(
-                                MarketId(VenueMarketId(condition.0.clone())),
-                                outcome,
-                            )
-                        });
-                    if raw.as_ref() != Some(verified) {
-                        let evidence_hash = bound
-                            .get(id)
-                            .and_then(|binding| binding.identity_provenance.as_ref())
-                            .map(|provenance| provenance.canonical_page_hash.clone())
-                            .ok_or_else(|| {
-                                ReconciliationError::Binding(
-                                    "retained effective identity lacks authenticated provenance"
-                                        .to_owned(),
-                                )
-                            })?;
-                        identities.overrides.insert(
-                            id.clone(),
-                            IdentityOverride {
-                                verified: verified.clone(),
-                                evidence_hash,
-                            },
-                        );
-                    }
-                }
-            }
-            bucket_identities.push(identities);
-        }
-        let mut candidates = selected.clone();
-        for (_, epoch, obligation) in
-            admitted_frame_obligations(&self.paper_state, Some(read.wallet))?
-        {
-            replace_admitted_obligation(&mut candidates, epoch, obligation, true);
-        }
-        let mut correlation = self.correlate(
-            read.wallet,
-            &candidates,
-            &rows,
-            &restamp_twins,
-            &ordered,
-            &bucket_identities,
-            &frontier.page_occurrences,
-            &frontier.pages,
-        )?;
-        // The durable commitment is the authority for already bound observations. Current
-        // discovery supplies barriers/fences but never rewrites their original proof.
-        for matched in &mut correlation.matched {
-            if let Some(binding) = read
-                .binding_indices
-                .get(&(
-                    matched.binding.stream_receipt.sequence,
-                    matched.binding.stream_receipt.this_hash,
-                ))
-                .and_then(|position| read.bindings.get(*position))
-            {
-                matched.binding.clone_from(binding);
-            }
-        }
-        self.route_authenticated_read(
-            ordered
-                .chunk_by(|left, right| left.source_time == right.source_time)
-                .map(|group| group.iter().map(|aggregate| (*aggregate).clone()).collect()),
-            bucket_identities,
-            &restamp_twins,
-            &correlation,
-            read.clone(),
-            quality,
-            entry.is_some_and(|entry| entry.tier == WatchlistTier::Active),
-            cancel,
-        )
-        .await?;
-        Ok(())
-    }
-
     async fn acknowledge_retirement(
         &self,
         obligation: &Obligation,
@@ -2768,8 +2329,8 @@ impl WalletOperation {
     ) -> Result<bool, ReconciliationError> {
         let (acknowledged, response) = oneshot::channel();
         self.control_tx
-            .send(OrchestratorControl::FeedAuditUpdate {
-                update: crate::orchestrator_control::FeedAuditUpdate::RetireObservation {
+            .send(OrchestratorControl::ReconciliationUpdate {
+                update: crate::orchestrator_control::ReconciliationUpdate::RetireObservation {
                     receipt: obligation.receipt,
                     source_trade_id: obligation.group_id.clone(),
                     unbound: obligation.bindings.is_empty(),
@@ -2785,125 +2346,34 @@ impl WalletOperation {
             .map(|ack| {
                 matches!(
                     ack,
-                    crate::orchestrator_control::FeedAuditAcknowledgement::Applied
+                    crate::orchestrator_control::ReconciliationAcknowledgement::Applied
                 )
             })
             .map_err(ReconciliationError::BucketCommit)
     }
 
-    fn negative_target_disposed(
+    fn remove_selected_admissions(
         &self,
-        conclusion: &crate::feed_audit::AuditDisposition,
-    ) -> Result<bool, ReconciliationError> {
-        let counterpart = match conclusion {
-            crate::feed_audit::AuditDisposition::Absent => None,
-            crate::feed_audit::AuditDisposition::Contradicted(id) => Some(id),
-            _ => return Ok(false),
-        };
-        crate::feed_audit::counterpart_disposed(&self.paper_state, counterpart).map_err(Into::into)
-    }
-
-    async fn request_negative_audit(
-        &self,
-        frame_receipt: AppendReceipt,
-        deciding_commitment_receipt: AppendReceipt,
-        conclusion: &crate::feed_audit::AuditDisposition,
-        verified_read: Option<std::sync::Arc<crate::bucket_commit::VerifiedCommitment>>,
-    ) -> Result<bool, ReconciliationError> {
-        let (cause, counterpart_identity) = match conclusion {
-            crate::feed_audit::AuditDisposition::Contradicted(id) => (
-                crate::paper_recovery::FeedIncidentCause::Contradiction,
-                Some(id.clone()),
-            ),
-            crate::feed_audit::AuditDisposition::Absent => {
-                (crate::paper_recovery::FeedIncidentCause::Absence, None)
-            }
-            _ => return Ok(false),
-        };
-        let (acknowledged, response) = oneshot::channel();
-        self.control_tx
-            .send(OrchestratorControl::FeedAuditUpdate {
-                update: crate::orchestrator_control::FeedAuditUpdate::Incident(
-                    crate::paper_recovery::FeedIncident {
-                        cause,
-                        frame_receipt,
-                        deciding_commitment_receipt,
-                        counterpart_identity,
-                        engagement_receipt: None,
-                    },
-                    verified_read,
-                ),
-                acknowledged,
-            })
-            .await
-            .map_err(|_| ReconciliationError::ControlClosed)?;
-        response
-            .await
-            .map_err(|_| ReconciliationError::ControlClosed)?
-            .map_err(ReconciliationError::BucketCommit)?;
-        Ok(true)
-    }
-
-    /// A retired frame remains authenticated suppression evidence. Every later bound
-    /// contradiction must engage its incident before routing, without reviving its audit.
-    async fn audit_unselected_frame_bindings(
-        &self,
-        read: &Arc<crate::bucket_commit::VerifiedCommitment>,
-        selected: &WalletObligations,
-    ) -> Result<(), ReconciliationError> {
-        let frames = self
-            .paper_state
-            .activity_frame_decision_index(Some(&read.wallet))?
-            .into_iter()
-            .filter_map(|frame| {
-                frame
-                    .observed_source_receipt
-                    .map(|receipt| ((receipt.sequence, receipt.this_hash), frame))
-            })
-            .collect::<HashMap<_, _>>();
-        for binding in &read.bindings {
-            if selected
-                .values()
-                .flat_map(BTreeMap::values)
-                .any(|obligation| {
-                    obligation.frame_admission_receipt.is_some()
-                        && obligation.receipt == binding.stream_receipt
-                })
-            {
-                continue;
-            }
-            let Some(frame) = frames.get(&(
-                binding.stream_receipt.sequence,
-                binding.stream_receipt.this_hash,
-            )) else {
-                continue; // ordinary, non-admitted observations have no frame audit
-            };
-            let conclusion = crate::feed_audit::disposition(frame, read)
-                .map_err(|error| ReconciliationError::Binding(error.to_string()))?;
-            if matches!(
-                conclusion,
-                crate::feed_audit::AuditDisposition::Contradicted(_)
-            ) {
-                self.request_negative_audit(
-                    binding.stream_receipt,
-                    read.receipt,
-                    &conclusion,
-                    Some(read.clone()),
-                )
-                .await?;
-            }
-        }
-        Ok(())
-    }
-
-    fn promote_selected_admissions(
-        &self,
-        wallet: WalletAddress,
         selected: &mut WalletObligations,
+        acknowledged: &mut Vec<(i64, Obligation)>,
     ) -> Result<(), ReconciliationError> {
-        for (_, epoch, obligation) in admitted_frame_obligations(&self.paper_state, Some(wallet))? {
-            replace_admitted_obligation(selected, epoch, obligation, false);
+        for (epoch, groups) in selected.iter_mut() {
+            let mut admitted = Vec::new();
+            for obligation in groups.values() {
+                if self
+                    .paper_state
+                    .activity_frame_decision(&obligation.group_id)?
+                    .is_some()
+                {
+                    acknowledged.push((*epoch, obligation.clone()));
+                    admitted.push(obligation.group_id.0.clone());
+                }
+            }
+            for id in admitted {
+                groups.remove(&id);
+            }
         }
+        selected.retain(|_, groups| !groups.is_empty());
         Ok(())
     }
 
@@ -2911,27 +2381,12 @@ impl WalletOperation {
         &self,
         wallet: WalletAddress,
         selected: &WalletObligations,
-        read: &crate::bucket_commit::VerifiedCommitment,
     ) -> Result<Vec<(i64, Obligation)>, ReconciliationError> {
         let fenced = self.paper_state.is_wallet_fenced(&wallet)?;
         let mut resolved = Vec::new();
         for (epoch, groups) in selected {
             for obligation in groups.values() {
-                if let Some(frame) = self
-                    .paper_state
-                    .activity_frame_decision(&obligation.group_id)?
-                    && frame.observed_source_receipt == Some(obligation.receipt)
-                {
-                    if let crate::feed_audit::AuditDisposition::Matched(id) =
-                        crate::feed_audit::disposition(&frame, read)
-                            .map_err(|error| ReconciliationError::Binding(error.to_string()))?
-                        && crate::feed_audit::counterpart_disposed(&self.paper_state, Some(&id))?
-                    {
-                        resolved.push((*epoch, obligation.clone()));
-                    }
-                    continue;
-                }
-                if obligation_disposed(&self.paper_state, fenced, obligation, false)? {
+                if obligation_disposed(&self.paper_state, fenced, obligation)? {
                     resolved.push((*epoch, obligation.clone()));
                 }
             }
@@ -3042,18 +2497,7 @@ impl WalletOperation {
                     ));
                 }
                 let original = stream.group_id.components();
-                let frame_audit = obligation.frame_admission_receipt.is_some();
-                let fixed_basis = frame_audit
-                    .then(|| index.frame_counterpart_basis(obligation.receipt))
-                    .flatten();
-                let mut candidates = if frame_audit {
-                    crate::feed_audit::resolve_frame_counterpart(
-                        &stream,
-                        fixed_basis.as_ref().map(|(target, _)| target.as_ref()),
-                        aggregates.iter().copied(),
-                        &pairs,
-                    )
-                } else if let Some(exact) = by_group.get(&obligation.group_id) {
+                let mut candidates = if let Some(exact) = by_group.get(&obligation.group_id) {
                     vec![*exact]
                 } else {
                     aggregates
@@ -3069,30 +2513,21 @@ impl WalletOperation {
                         })
                         .collect::<Vec<_>>()
                 };
-                if !frame_audit {
-                    crate::bucket_commit::collapse_restamp_pairs(&mut candidates, &restamp_pairs);
-                }
-                let provenance = if !frame_audit && by_group.contains_key(&obligation.group_id) {
+                crate::bucket_commit::collapse_restamp_pairs(&mut candidates, &restamp_pairs);
+                let provenance = if by_group.contains_key(&obligation.group_id) {
                     None
                 } else {
-                    (if frame_audit {
-                        candidates
-                            .first()
-                            .and_then(|target| target.group_id.components().asset.as_ref())
-                    } else {
-                        original.asset.as_ref()
-                    })
-                    .and_then(|asset| {
-                        identities
-                            .iter()
-                            .find_map(|identities| identities.provenance.get(asset))
-                    })
-                    .cloned()
+                    original
+                        .asset
+                        .as_ref()
+                        .and_then(|asset| {
+                            identities
+                                .iter()
+                                .find_map(|identities| identities.provenance.get(asset))
+                        })
+                        .cloned()
                 };
-                if !frame_audit
-                    && !by_group.contains_key(&obligation.group_id)
-                    && provenance.is_none()
-                {
+                if !by_group.contains_key(&obligation.group_id) && provenance.is_none() {
                     candidates.clear();
                 }
                 if candidates.len() > 1
@@ -3107,15 +2542,6 @@ impl WalletOperation {
                 }
                 let target = candidates.first().copied();
                 let Some(target) = target else {
-                    if frame_audit
-                        && let Some(counterpart) = index.frame_counterpart(obligation.receipt)
-                        && crate::feed_audit::counterpart_disposed(
-                            &self.paper_state,
-                            counterpart.as_ref(),
-                        )?
-                    {
-                        continue;
-                    }
                     result.unmatched.push((*epoch, obligation.group_id.clone()));
                     result.unmatched_epoch = Some(
                         result
@@ -3148,8 +2574,8 @@ impl WalletOperation {
                     epoch: *epoch,
                     source_time: stream.source_time.0,
                     binding: ObservationBinding {
-                        counterpart_basis_receipt: fixed_basis.map(|(_, receipt)| receipt),
-                        frame_admission_receipt: obligation.frame_admission_receipt,
+                        counterpart_basis_receipt: None,
+                        frame_admission_receipt: None,
                         stream_group_id: obligation.group_id.clone(),
                         stream_receipt: obligation.receipt,
                         history_group_id: target.group_id.key().clone(),
@@ -3191,10 +2617,10 @@ impl WalletOperation {
                 .reduce(|existing, incoming| {
                     if crate::frame_admission::prefer_observation(
                         existing.binding.stream_receipt,
-                        existing.binding.frame_admission_receipt.is_some(),
+                        false,
                         existing.qualifying_buy,
                         incoming.binding.stream_receipt,
-                        incoming.binding.frame_admission_receipt.is_some(),
+                        false,
                         incoming.qualifying_buy,
                     ) {
                         incoming
@@ -3278,7 +2704,6 @@ impl WalletOperation {
         page_occurrences: &[PageOccurrence],
         pages: &[pe_source_polymarket_public::ReconciliationPageEvidence],
         bindings: &[ObservationBinding],
-        retain_proof: bool,
     ) -> Result<AppendReceipt, ReconciliationError> {
         let payload = activity_read_commitment_payload_v2(
             wallet,
@@ -3288,17 +2713,6 @@ impl WalletOperation {
             bindings,
         )
         .map_err(|_| ReconciliationError::PageReceiptMismatch)?;
-        let payload = if retain_proof {
-            let mut commitment: crate::bucket_commit::ActivityReadCommitment =
-                serde_json::from_slice(&payload)?;
-            commitment.read_proof = Some(crate::bucket_commit::CommittedReadProof {
-                page_occurrences: page_occurrences.to_vec(),
-                pages: pages.to_vec(),
-            });
-            serde_json::to_vec(&commitment)?
-        } else {
-            payload
-        };
         let recorded_at = (self.now)();
         self.source_log
             .append(EnvelopeIn {
@@ -3374,8 +2788,8 @@ impl WalletOperation {
     ) -> Result<(), ReconciliationError> {
         let (acknowledged, received) = oneshot::channel();
         self.control_tx
-            .send(OrchestratorControl::FeedAuditUpdate {
-                update: crate::orchestrator_control::FeedAuditUpdate::Frontier(
+            .send(OrchestratorControl::ReconciliationUpdate {
+                update: crate::orchestrator_control::ReconciliationUpdate::Frontier(
                     crate::frame_admission::FeedHistoryFrontier {
                         version: 1,
                         wallet,
@@ -3494,125 +2908,19 @@ struct MatchedObservation {
     binding: ObservationBinding,
 }
 
-fn admitted_frame_obligations(
-    state: &PaperStateDb,
-    wallet: Option<WalletAddress>,
-) -> Result<Vec<(WalletAddress, i64, Obligation)>, pe_paper_state::PaperStateError> {
-    state
-        .activity_frame_decision_index(wallet.as_ref())?
-        .iter()
-        .map(admitted_frame_obligation)
-        .collect()
-}
-
-fn admitted_frame_obligation(
-    frame: &pe_paper_state::ActivityFrameDecisionIndex,
-) -> Result<(WalletAddress, i64, Obligation), pe_paper_state::PaperStateError> {
-    let receipt = frame.observed_source_receipt.ok_or_else(|| {
-        pe_paper_state::PaperStateError::Internal("frame receipt missing".to_owned())
-    })?;
-    Ok((
-        frame.wallet,
-        frame.source_epoch,
-        Obligation {
-            qualifying_buy: true,
-            group_id: frame.source_trade_id.clone(),
-            receipt,
-            received_at: frame.received_at,
-            bindings: Vec::new(),
-            frame_admission_receipt: Some(frame.admission_receipt),
-            retained_commitments: Vec::new(),
-            retained_negative_pending: false,
-        },
-    ))
-}
-
-fn replace_admitted_obligation(
-    selected: &mut WalletObligations,
-    epoch: i64,
-    obligation: Obligation,
-    insert_missing: bool,
-) {
-    let present = selected
-        .values()
-        .any(|groups| groups.contains_key(&obligation.group_id.0));
-    if !present && !insert_missing {
-        return;
-    }
-    if let Some(existing) = selected
-        .values()
-        .find_map(|groups| groups.get(&obligation.group_id.0))
-        && existing.receipt != obligation.receipt
-        && !crate::frame_admission::prefer_observation(
-            existing.receipt,
-            existing.frame_admission_receipt.is_some(),
-            existing.qualifying_buy,
-            obligation.receipt,
-            obligation.frame_admission_receipt.is_some(),
-            obligation.qualifying_buy,
-        )
-    {
-        return;
-    }
-    let mut bindings = Vec::new();
-    let mut retained_commitments = Vec::new();
-    let mut retained_negative_pending = obligation.retained_negative_pending;
-    for groups in selected.values_mut() {
-        if let Some(existing) = groups.remove(&obligation.group_id.0) {
-            retained_negative_pending |= existing.retained_negative_pending;
-            retained_commitments.extend(existing.retained_commitments);
-            bindings.extend(
-                existing
-                    .bindings
-                    .into_iter()
-                    .filter(|binding| binding.stream_receipt == obligation.receipt),
-            );
-        }
-    }
-    selected.retain(|_, groups| !groups.is_empty());
-    selected.entry(epoch).or_default().insert(
-        obligation.group_id.0.clone(),
-        Obligation {
-            bindings,
-            retained_commitments,
-            retained_negative_pending,
-            ..obligation
-        },
-    );
-}
-
 fn obligation_disposed(
     paper_state: &PaperStateDb,
     fenced: bool,
     obligation: &Obligation,
-    authenticated_frame_match: bool,
 ) -> Result<bool, pe_paper_state::PaperStateError> {
-    if let Some(frame) = paper_state.activity_frame_decision(&obligation.group_id)?
-        && frame.observed_source_receipt == Some(obligation.receipt)
-    {
-        if !authenticated_frame_match {
-            return Ok(false);
-        }
-        for binding in &obligation.bindings {
-            if binding.stream_receipt == obligation.receipt
-                && crate::feed_audit::counterpart_disposed(
-                    paper_state,
-                    Some(&binding.history_group_id),
-                )?
-            {
-                return Ok(true);
-            }
-        }
-        return Ok(false);
+    if paper_state.activity_observation_retired(obligation.receipt)? {
+        return Ok(true);
     }
     if obligation.bindings.is_empty() {
-        return Ok(
-            paper_state.activity_observation_unbound_retired(obligation.receipt)?
-                || fenced
-                || paper_state
-                    .activity_group_state(&obligation.group_id)?
-                    .is_some(),
-        );
+        return Ok(fenced
+            || paper_state
+                .activity_group_state(&obligation.group_id)?
+                .is_some());
     }
     for binding in &obligation.bindings {
         if binding_target_disposed(paper_state, binding)? {
@@ -4579,6 +3887,102 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_recorded_corrected_targets_require_authentication() {
+        for legacy in [false, true] {
+            let dir = tempdir().unwrap();
+            let source_path = dir.path().join("source.log");
+            let paper = PaperStateDb::open(&dir.path().join("paper.db")).unwrap();
+            let mut writer = Writer::open(&source_path).unwrap();
+            let mut candidates = ActivityCandidates::default();
+            let mut commitments = Vec::new();
+            for suffix in ['a', 'b'] {
+                let payload = activity_payload(suffix, 100);
+                let stream = parse_activity_trade_observation(&payload).unwrap();
+                let stream_receipt = append_source_frame(
+                    &mut writer,
+                    ACTIVITY_WS_SOURCE_ID,
+                    &payload,
+                    100,
+                    ACTIVITY_SCHEMA_VERSION,
+                    ACTIVITY_PARSER_VERSION,
+                );
+                let mut target: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                target["side"] = serde_json::json!("SELL");
+                let target = serde_json::to_vec(&target).unwrap();
+                let history = parse_activity_trade_observation(&target).unwrap();
+                resolve_activity_group(&paper, &target);
+                assert!(
+                    paper
+                        .activity_group_state(stream.group_id.key())
+                        .unwrap()
+                        .is_none()
+                );
+                let binding = ObservationBinding {
+                    stream_group_id: stream.group_id.key().clone(),
+                    stream_receipt,
+                    history_group_id: history.group_id.key().clone(),
+                    semantic_revision: "candidate-split-test-v1".to_owned(),
+                    page_raw_hash: "recorded".to_owned(),
+                    page_occurrence_index: 0,
+                    identity_provenance: None,
+                    identity_receipt: None,
+                    counterpart_basis_receipt: None,
+                    frame_admission_receipt: None,
+                };
+                // A recorded target cannot retire an observation without authenticating the read.
+                let commitment = crate::bucket_commit::ActivityReadCommitment {
+                    version: 2,
+                    wallet: stream.wallet,
+                    fixed_end: 100,
+                    digest: "recorded".to_owned(),
+                    bindings: Some(vec![binding]),
+                    read_proof: None,
+                };
+                commitments.push(append_source_frame(
+                    &mut writer,
+                    ACTIVITY_READ_COMMITMENT_SOURCE_ID,
+                    &serde_json::to_vec(&commitment).unwrap(),
+                    100,
+                    2,
+                    1,
+                ));
+                let envelopes = Reader::replay(&source_path)
+                    .unwrap()
+                    .map(|item| item.unwrap().1)
+                    .collect::<Vec<_>>();
+                for envelope in &envelopes[envelopes.len() - 2..] {
+                    candidates.observe_activity(envelope).unwrap();
+                }
+                if suffix == 'a' && legacy {
+                    let mut checkpoint = serde_json::to_value(&candidates).unwrap();
+                    checkpoint
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("recorded_bindings");
+                    candidates = serde_json::from_value(checkpoint).unwrap();
+                }
+            }
+            drop(writer);
+            let index = SourceReceiptIndex::replay(&source_path).unwrap();
+            let error = candidates.into_obligations(&paper, &index).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("binding commitment read proof is absent"),
+                "{error}"
+            );
+            #[cfg(feature = "scenario")]
+            assert_eq!(
+                commitments
+                    .iter()
+                    .map(|receipt| index.read_verification_count(*receipt))
+                    .sum::<usize>(),
+                1
+            );
+        }
+    }
+
+    #[test]
     fn malformed_activity_candidate_matches_rebuild_error() {
         let dir = tempdir().unwrap();
         let source_path = dir.path().join("source.log");
@@ -4669,23 +4073,13 @@ mod tests {
             candidates.observe_daily_boundary(&item.unwrap().1).unwrap();
         }
         let mut split = ReconciliationObligations::default();
-        let anchor = recover_daily_boundary_anchor(
-            &paper_path,
-            &mut split,
-            &PaperStateDb::open(&dir.path().join("paper.sqlite")).unwrap(),
-        )
-        .unwrap()
-        .unwrap();
+        let anchor = recover_daily_boundary_anchor(&paper_path, &mut split)
+            .unwrap()
+            .unwrap();
         recover_daily_boundary_from_candidates(candidates, anchor, &mut split);
 
         let mut recovered = ReconciliationObligations::default();
-        recover_daily_boundary(
-            &source_path,
-            &paper_path,
-            &mut recovered,
-            &PaperStateDb::open(&dir.path().join("paper.sqlite")).unwrap(),
-        )
-        .unwrap();
+        recover_daily_boundary(&source_path, &paper_path, &mut recovered).unwrap();
         assert_eq!(split, recovered);
         assert_eq!(split.boundary_anchor(), Some(200));
         assert_eq!(
@@ -4736,13 +4130,7 @@ mod tests {
         drop(Writer::open(&paper_path).unwrap());
 
         let mut obligations = ReconciliationObligations::default();
-        recover_daily_boundary(
-            &missing_source_path,
-            &paper_path,
-            &mut obligations,
-            &PaperStateDb::open(&dir.path().join("paper.sqlite")).unwrap(),
-        )
-        .unwrap();
+        recover_daily_boundary(&missing_source_path, &paper_path, &mut obligations).unwrap();
 
         assert!(obligations.boundary_anchor().is_none());
         assert!(obligations.pending_boundary().is_none());

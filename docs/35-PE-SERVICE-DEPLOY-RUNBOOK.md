@@ -895,21 +895,12 @@ and restamp-pair commitments. Stop and drain before inspecting any boundary: que
 work can cross it. After a boundary, preserve all state and fix forward. These conditions also
 govern reversal after a reader failure.
 
-**Feed-incident release (no restart).** Inspect the latest unreleased `FeedIncidentChanged`
-engagement in the verified paper era and authenticate its frame, deciding commitment and any
-counterpart identity. Inspect `status.json` `source_health.feed_incident` and `source_health.feed_latch` and the
-`feed audit incident engaged; frames wait for history` error line. When websocket ingestion
-is disabled, `source_health` is omitted; use the authenticated `FeedIncidentChanged`
-engagement and release records in the verified paper era as latch evidence. Resolve the cause
-and outstanding audits before releasing. Set the existing optional `service_config` text row
-`risk_halt_release_hash` to that engagement's `this_hash`, using the existing configuration
-editor. A successful economically valid poll with a successful seal check routes the release
-through `RiskHaltReleaseHandle::apply`; the owner rechecks the expected engagement immediately
-before synchronizing `FeedIncidentChanged` with `Released`. Verify its `engagement_receipt`
-names the inspected latest engagement and the durable latch is clear, then delete the release
-row. Do not restart. If a newer incident intervenes, the queued older release changes nothing;
-inspect and resolve the new incident before setting its hash. Malformed, stale or repeated
-values cannot release, and independent risk halts require their own matching release.
+Runtime no longer checks admitted frames against later REST history or produces feed incidents.
+Historical incident records remain decodable; `risk_halt_release_hash` continues to release
+independent risk halts through their existing owner. After any restart, feed admission waits for a
+fresh REST read to publish a frontier. Verify fallback during that interval, the first fresh frontier,
+and subsequent feed copying. Economics and financial semantic versions are unchanged, so this
+policy change alone does not seal qualification.
 
 Every step is bound to the embedded full Git revision plus exact binary bytes (#544). The binary
 reports `revision=<40-hex> config_identity=runtime-applied`; `--verify-staged-identity` checks that
@@ -1008,8 +999,8 @@ comparisons decide what remains; never guess from memory.
    [open-continuation census](#565-open-continuation-census-before-deployment); a nonzero exit stops
    the deploy. The command derives the canonical source path
    from installed activation metadata and reads Start without upgrading or writing the database. It
-   reads checkpoint invalidation authority first and captures the open continuation rows and feed
-   frontiers before bounding the source log. It verifies that finite prefix through its last complete
+   reads checkpoint invalidation authority first and captures the open continuation rows
+   before bounding the source log. Stored frontiers are not restored. It verifies that finite prefix through its last complete
    frame, excludes incomplete bytes without repair, and performs no HTTP requests. An active or
    undecodable invalidation record selects a full walk; unreadable authority refuses publication
    until quiesced recovery. A record-read I/O error stops preparation. Compatible artifacts raw-verify
@@ -1504,7 +1495,11 @@ deployment actions described above; this procedure makes no trading or policy ch
 
 4. **Prepare and census.** Run the staged `--prepare-source-checkpoint` command in the main
    [Procedure](#procedure), step 3, while the old service serves, retaining stdout, stderr and exit
-   status. Its open rows and feed frontiers are captured before the log bound. A nonzero exit stops
+   status. Its open rows are captured before the log bound; stored frontier collections are ignored.
+   Preparation retains unpruned reducer candidates. Runtime publication prunes them through the
+   shared paper-state handle only after a complete `wal_checkpoint(TRUNCATE)` barrier; a failed
+   barrier leaves the previous manifest installed and retries at the next hourly publication.
+   A nonzero exit stops
    deployment. Keep the printed publication
    receipt for AC-A's initial age and binding match.
 

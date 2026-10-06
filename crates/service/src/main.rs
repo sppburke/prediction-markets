@@ -800,8 +800,6 @@ async fn main() -> Result<()> {
             None => pe_service::risk_inputs::SourceReceiptIndex::replay(&cfg.source_event_log_path)
                 .context("build verified boot source receipt index")?,
         };
-        pe_service::bucket_commit::validate_frame_history(&paper_state, &boot_receipts)
-            .context("validate complete frame history before financial recovery")?;
         let recovered = reconcile_active_financial_frames(
             authority,
             &paper_state,
@@ -1157,10 +1155,6 @@ async fn main() -> Result<()> {
         None => pe_service::risk_inputs::SourceReceiptIndex::replay(&cfg.source_event_log_path)
             .context("build verified source receipt index")?,
     };
-    if financial_start.is_none() {
-        pe_service::bucket_commit::validate_frame_history(&paper_state, &source_receipts)
-            .context("validate complete frame history before resume")?;
-    }
     let open_rows =
         pe_service::bucket_commit::validate_open_continuations(&paper_state, &source_receipts)
             .context("validate open decision continuations before resume")?;
@@ -1205,7 +1199,6 @@ async fn main() -> Result<()> {
                     &cfg.source_event_log_path,
                     &cfg.event_log_path,
                     &mut obligations,
-                    &paper_state,
                 )
                 .context("recover causal daily boundary")?;
             }
@@ -1631,7 +1624,11 @@ async fn main() -> Result<()> {
         supervisor.spawn(TaskName::LiveFanout, task);
     }
     if financial_start.is_some() {
-        orch = orch.with_activity_frames(orchestrator_source_log.clone(), poll_round_stale_secs);
+        orch = orch.with_activity_frames(
+            orchestrator_source_log.clone(),
+            poll_round_stale_secs,
+            Arc::clone(&asset_identity),
+        );
         orch.configure_financial_log_paths(
             cfg.event_log_path.clone(),
             cfg.source_event_log_path.clone(),
@@ -1902,7 +1899,9 @@ async fn main() -> Result<()> {
 
     let checkpoint_slot = pe_service::source_checkpoint::CheckpointJobSlot::default();
     if let Some(boot) = source_log_boot.take() {
-        let owner = boot.into_checkpoint_owner(checkpoint_slot.clone());
+        let owner = boot
+            .into_checkpoint_owner(checkpoint_slot.clone())
+            .with_paper_state(Arc::clone(&paper_state));
         #[cfg(feature = "scenario")]
         let owner = {
             let mut owner = owner;
