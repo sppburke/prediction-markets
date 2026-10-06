@@ -13,6 +13,11 @@ path = "src/main.rs"
 name = "pe-service-live-canary"
 path = "src/bin/pe-service-live-canary.rs"
 
+[[bin]]
+name = "pe-scenario-b3sum"
+path = "src/bin/pe-scenario-b3sum.rs"
+required-features = ["scenario"]
+
 [lib]
 name = "pe_service"
 path = "src/lib.rs"

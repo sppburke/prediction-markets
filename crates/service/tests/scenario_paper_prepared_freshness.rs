@@ -9844,11 +9844,15 @@ async fn retired_frame_changed_combo_revision_journals_once_without_barrier_acro
     }
 }
 
-fn ac16_sql(start: &str) -> String {
+fn recipe_extract(start: &str, terminator: &str) -> String {
     let recipe = include_str!("../../../docs/29-ACTIVITY-LATENCY-MEASUREMENT.md");
     let begin = recipe.find(start).unwrap();
-    let end = begin + recipe[begin..].find("\nSQL\n").unwrap();
-    recipe[begin..end].replace("readfile('ac16-population.json')", "?1")
+    let end = begin + recipe[begin..].find(terminator).unwrap();
+    recipe[begin..end].to_owned()
+}
+
+fn ac16_sql(start: &str) -> String {
+    recipe_extract(start, "\nSQL\n").replace("readfile('ac16-population.json')", "?1")
 }
 
 /// Export the authenticated fixture receipts in the documented population shape.
@@ -9947,4 +9951,584 @@ async fn ac16_unexplained_buy_query_joins_successful_frame_fill_with_null_termin
         .count();
     assert_eq!(count, 1);
     h.stop().await;
+}
+
+#[derive(Clone, Default)]
+struct CensusLogs(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for CensusLogs {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CensusLogs {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+fn census_python(code: &str, args: &[String], bin: &std::path::Path) -> std::process::Output {
+    use std::io::Write;
+    let path = std::env::join_paths(std::iter::once(bin.to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
+    let mut child = std::process::Command::new("python3")
+        .arg("-")
+        .args(args)
+        .env("PATH", path)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Operational clock output is fixed too; none of the extracted logic is replaced.
+    writeln!(
+        child.stdin.as_mut().unwrap(),
+        "import time\ntime.time = lambda: {}\ntime.time_ns = lambda: {}\n{code}",
+        EPOCH + 120,
+        (EPOCH + 120) * 1_000_000_000
+    )
+    .unwrap();
+    drop(child.stdin.take());
+    child.wait_with_output().unwrap()
+}
+
+struct CensusSnapshot {
+    population: Value,
+    ignored: Value,
+    connection: rusqlite::Connection,
+}
+impl CensusSnapshot {
+    fn rows(&self) -> Vec<Value> {
+        let sql = ac16_sql("WITH census_inputs AS").replace("readfile('ignored.json')", "?2");
+        let mut statement = self.connection.prepare(&sql).unwrap();
+        let columns = statement
+            .column_names()
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        statement
+            .query_map(
+                rusqlite::named_params! {
+                    "?1": self.population.to_string(), "?2": self.ignored.to_string(),
+                    ":listening_ns": EPOCH * 1_000_000_000,
+                    ":window_end_ns": (EPOCH + 60) * 1_000_000_000,
+                    ":capture_cutoff_ns": (EPOCH + 120) * 1_000_000_000,
+                },
+                |row| {
+                    let mut object = serde_json::Map::new();
+                    for (index, column) in columns.iter().enumerate() {
+                        let value = match row.get_ref(index)? {
+                            rusqlite::types::ValueRef::Null => Value::Null,
+                            rusqlite::types::ValueRef::Integer(value) => json!(value),
+                            rusqlite::types::ValueRef::Text(value) => {
+                                json!(std::str::from_utf8(value).unwrap())
+                            }
+                            other => panic!("unexpected census value {other:?}"),
+                        };
+                        object.insert(column.clone(), value);
+                    }
+                    Ok(Value::Object(object))
+                },
+            )
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+    fn assert_row(&self, receipt: AppendReceipt, class: &str, verdict: &str) -> Value {
+        let rows = self.rows();
+        let row = rows
+            .iter()
+            .find(|row| row["seq"] == receipt.sequence.0)
+            .unwrap_or_else(|| panic!("missing census receipt {}: {rows:?}", receipt.sequence.0));
+        assert_eq!(row["hash"], receipt.this_hash.to_hex().to_string());
+        assert_eq!(row["disposition_class"], class, "{row}");
+        assert_eq!(row["verdict"], verdict, "{row}");
+        row.clone()
+    }
+}
+
+fn census_snapshot(h: &Harness, logs: &CensusLogs) -> CensusSnapshot {
+    let path = h.dir.path();
+    let bin = path.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_pe-scenario-b3sum"), bin.join("b3sum")).unwrap();
+    let capture = path.join("capture");
+    let args = [
+        path.join("paper.db"),
+        path.join("source.log"),
+        path.join("paper.log"),
+        capture.clone(),
+    ]
+    .map(|path| path.to_str().unwrap().to_owned());
+    let output = census_python(
+        &recipe_extract(
+            "import ctypes, ctypes.util, json, os, re, sqlite3",
+            "\nPY\n",
+        ),
+        &[
+            args[0].clone(),
+            args[1].clone(),
+            args[2].clone(),
+            args[3].clone(),
+            "5".to_owned(),
+            "0".to_owned(),
+        ],
+        &bin,
+    );
+    assert!(
+        output.status.success(),
+        "capture: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("snapshot started"));
+    let output = census_python(
+        &recipe_extract("import calendar, ctypes", "\nPY\n"),
+        &[
+            capture.join("paper_state.db").to_str().unwrap().to_owned(),
+            capture
+                .join("source_filtered.log")
+                .to_str()
+                .unwrap()
+                .to_owned(),
+            capture.join("paper.log").to_str().unwrap().to_owned(),
+            "0".to_owned(),
+            "0".to_owned(),
+            at().format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+            (at() + time::Duration::seconds(60))
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+            capture.to_str().unwrap().to_owned(),
+        ],
+        &bin,
+    );
+    assert!(
+        output.status.success(),
+        "inspection: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let population: Value =
+        serde_json::from_slice(&std::fs::read(capture.join("ac16-population.json")).unwrap())
+            .unwrap();
+    let raw = Reader::replay(path.join("source.log"))
+        .unwrap()
+        .map(|frame| frame.unwrap().1)
+        .filter(|frame| frame.source_id.0 == pe_service::activity_ingest::ACTIVITY_WS_SOURCE_ID)
+        .count();
+    assert_eq!(population["raw_receipt_count"], raw);
+    assert_eq!(population["receipts"].as_array().unwrap().len(), raw);
+    assert!(String::from_utf8_lossy(&output.stdout).contains(&format!(
+        "unique captured feed receipts {raw} exported receipts {raw}"
+    )));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("FROZEN COHORT []"));
+
+    // A journal entry contains the exact flattened subscriber line in MESSAGE. The synthetic
+    // journal's fixed microsecond timestamp is after window_end, before the snapshot cutoff.
+    let journal = String::from_utf8(std::mem::take(&mut *logs.0.lock().unwrap())).unwrap().lines()
+        .map(|line| json!({"MESSAGE": line, "__REALTIME_TIMESTAMP": ((EPOCH + 90) * 1_000_000).to_string()}).to_string())
+        .chain([json!({"MESSAGE": "non-JSON systemd line"}).to_string(),
+            json!({"MESSAGE": json!({"fields": {"message": "frame admission ignored"}}).to_string()}).to_string()])
+        .collect::<Vec<_>>().join("\n");
+    let journal_path = capture.join("journal.json");
+    let ignored_path = capture.join("ignored.json");
+    std::fs::write(&journal_path, journal).unwrap();
+    let output = census_python(
+        &recipe_extract("import json, re, sys\nfrom decimal", "\nPY\n"),
+        &[
+            journal_path.to_str().unwrap().to_owned(),
+            ignored_path.to_str().unwrap().to_owned(),
+        ],
+        &bin,
+    );
+    assert!(
+        output.status.success(),
+        "journal: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let ignored = serde_json::from_slice(&std::fs::read(&ignored_path).unwrap()).unwrap();
+    CensusSnapshot {
+        population,
+        ignored,
+        connection: rusqlite::Connection::open(capture.join("paper_state.db")).unwrap(),
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn ac_c_receipt_census_query() {
+    let logs = CensusLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .flatten_event(true)
+        .without_time()
+        .with_ansi(false)
+        .with_writer(logs.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    // Same identity: excluded zero, SELL, combo; one admitted positive receipt, one reader echo.
+    {
+        let mut h = Harness::new().await;
+        h.copy_budget_secs = 120;
+        let frame = h.record(1).await;
+        h.attempt(&frame, at());
+        h.start_frames();
+        h.empty_frontier(EPOCH - 1).await;
+        let zero = h
+            .deliver_frame(&frame, |r| {
+                r["size"] = json!("0");
+                r["usdcSize"] = json!("0");
+            })
+            .await;
+        let sell = h.deliver_frame(&frame, |r| r["side"] = json!("SELL")).await;
+        let combo = h
+            .deliver_frame(&frame, |r| r["isCombo"] = json!(true))
+            .await;
+        let raw = h.deliver_frame(&frame, |_| {}).await;
+        h.poll(&frame).await;
+        let echo = h.deliver_frame(&frame, |_| {}).await;
+        h.stop().await;
+        let snapshot = census_snapshot(&h, &logs);
+        for excluded in [zero, sell, combo] {
+            assert!(
+                !snapshot
+                    .rows()
+                    .iter()
+                    .any(|r| r["seq"] == excluded.sequence.0)
+            );
+        }
+        snapshot.assert_row(raw, "a", "pass");
+        snapshot.assert_row(echo, "b", "pass");
+        assert_eq!(
+            snapshot
+                .rows()
+                .iter()
+                .filter(|r| r["disposition_class"] == "a")
+                .count(),
+            1
+        );
+        let exported = snapshot.population["receipts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["seq"] == raw.sequence.0)
+            .unwrap();
+        assert!(
+            exported["history_group_ids"]
+                .as_array()
+                .unwrap()
+                .contains(&json!(frame.id.0))
+        );
+        assert_eq!(exported["received_at_ns"], EPOCH * 1_000_000_000);
+        assert_eq!(snapshot.ignored[0]["reason"], "identity_seen");
+        // A contradictory snapshot which names the echo as the admitted receipt must count
+        // both its decision and its real router line. Identity equality alone must not pass it.
+        snapshot.connection.execute("UPDATE decision_pending SET frozen_inputs_json=json_set(frozen_inputs_json,'$.observed_source_receipt.sequence',?1,'$.observed_source_receipt.this_hash',?2) WHERE source_trade_id=?3",
+            rusqlite::params![echo.sequence.0, echo.this_hash.to_hex().to_string(), frame.id.0]).unwrap();
+        let double = snapshot.assert_row(echo, "a,b", "fail");
+        assert_eq!(double["disposition_count"], 2);
+        snapshot
+            .connection
+            .execute("DELETE FROM decision_pending", [])
+            .unwrap();
+        snapshot.assert_row(raw, "missing", "fail");
+        snapshot.assert_row(echo, "b", "pass"); // Its named earlier receipt still exists.
+        // Fail extraction of a kept event with a missing reason-specific field.
+        let mut malformed = snapshot.ignored[0].clone();
+        malformed
+            .as_object_mut()
+            .unwrap()
+            .remove("earlier_receipt_hash");
+        let path = h.dir.path().join("capture/journal.json");
+        std::fs::write(&path, json!({"MESSAGE": malformed.to_string(), "__REALTIME_TIMESTAMP": ((EPOCH+90)*1_000_000).to_string()}).to_string()).unwrap();
+        let output = census_python(
+            &recipe_extract("import json, re, sys\nfrom decimal", "\nPY\n"),
+            &[
+                path.to_str().unwrap().to_owned(),
+                h.dir
+                    .path()
+                    .join("capture/ignored.json")
+                    .to_str()
+                    .unwrap()
+                    .to_owned(),
+            ],
+            &h.dir.path().join("bin"),
+        );
+        assert!(!output.status.success());
+    }
+
+    // Trade-time precedes listening and initial live membership by 30 seconds. Receipt time
+    // controls AC-C, including when this wallet only became live between trade and receipt.
+    {
+        let mut h = Harness::new().await;
+        h.copy_budget_secs = 120;
+        let frame = h.record(1).await;
+        let frame = h.rest_counterpart(&frame, |r| r["timestamp"] = json!(EPOCH - 30));
+        h.attempt(&frame, at());
+        h.start_frames();
+        h.empty_frontier(EPOCH - 1).await;
+        h.hooks
+            .financial_clock_unix
+            .store(EPOCH + 1, Ordering::SeqCst);
+        let receipt = h.deliver_frame(&frame, |_| {}).await;
+        h.stop().await;
+        let snapshot = census_snapshot(&h, &logs);
+        snapshot.assert_row(receipt, "a", "pass");
+        assert!(snapshot.population["buys"].as_array().unwrap().is_empty());
+        assert_eq!(snapshot.population["receipts"][0]["epoch"], EPOCH - 30);
+        assert_eq!(
+            snapshot.population["receipts"][0]["received_at_ns"],
+            (EPOCH + 1) * 1_000_000_000
+        );
+        // Half-open receive boundaries, independent of the trade epoch.
+        let mut outside = snapshot;
+        outside.population["receipts"][0]["received_at_ns"] = json!((EPOCH - 1) * 1_000_000_000);
+        assert!(outside.rows().is_empty());
+        outside.population["receipts"][0]["received_at_ns"] = json!((EPOCH + 60) * 1_000_000_000);
+        assert!(outside.rows().is_empty());
+    }
+
+    // Converted inventory has no BUY history. An Add remains an unresolved BUY barrier for
+    // a later Entry, including the opposite outcome and trades before listening.
+    for opposite in [false, true] {
+        let mut h = Harness::new().await;
+        h.copy_budget_secs = 120;
+        let frame = h.record(1).await;
+        let add = h.rest_counterpart(&frame, |r| r["timestamp"] = json!(EPOCH - 30));
+        let entry = h.rest_counterpart(&add, |r| {
+            r["transactionHash"] = json!("later-entry");
+            if opposite {
+                r["outcomeIndex"] = json!(1);
+                r["outcome"] = json!("No");
+                r["asset"] = json!(frame.admission.market.ordered_outcome_token_ids[1].0);
+            }
+        });
+        h.start_frames();
+        h.empty_frontier(EPOCH - 1).await;
+        let market = pe_core_types::MarketId(pe_core_types::VenueMarketId(
+            frame.admission.market.condition_id.0.clone(),
+        ));
+        h.install_runtime_anchor(
+            EPOCH - 31,
+            vec![(
+                market,
+                pe_core_types::OutcomeId(0),
+                pe_core_types::ShareAmount::from_whole(3).unwrap(),
+            )],
+        )
+        .await;
+        let earlier = h.deliver_frame(&add, |_| {}).await;
+        if !opposite {
+            h.install_runtime_anchor(EPOCH - 31, Vec::new()).await;
+        }
+        let fallback = h.deliver_frame(&entry, |_| {}).await;
+        // REST convergence is produced by the complete-read router for both identities.
+        let mut complete = add.clone();
+        let mut rows: Value = serde_json::from_slice(&add.activity).unwrap();
+        let entry_rows: Value = serde_json::from_slice(&entry.activity).unwrap();
+        rows.as_array_mut().unwrap().push(entry_rows[0].clone());
+        complete.activity = serde_json::to_vec(&rows).unwrap();
+        h.poll(&complete).await;
+        h.stop().await;
+        let mut snapshot = census_snapshot(&h, &logs);
+        snapshot.assert_row(earlier, "b", "pass");
+        let add_line = snapshot
+            .ignored
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|line| line["receipt_sequence"] == earlier.sequence.0)
+            .unwrap();
+        assert_eq!(add_line["reason"], "not_entry");
+        assert_eq!(add_line["action"], "Add");
+        assert_eq!(add_line["balance"], "3");
+        let row = snapshot.assert_row(fallback, "c", "pass");
+        assert_eq!(row["blocking_seq"], earlier.sequence.0);
+        assert_eq!(row["same_trade_second"], 1);
+        let receipts = snapshot.population["receipts"].as_array().unwrap();
+        assert_eq!(receipts[0]["received_at_ns"], receipts[1]["received_at_ns"]);
+        assert!(earlier.sequence < fallback.sequence);
+        assert!(
+            snapshot.population["frames"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["frame_seq"] != fallback.sequence.0)
+        );
+        assert!(
+            snapshot.population["window_fallbacks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["frame_seq"] == fallback.sequence.0)
+        );
+        // A larger durable sequence cannot block even with a converged Entry and identical
+        // receive timestamps. Restore it before testing independently missing history rows.
+        let earlier_index = snapshot.population["receipts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|r| r["seq"] == earlier.sequence.0)
+            .unwrap();
+        snapshot.population["receipts"][earlier_index]["seq"] = json!(fallback.sequence.0 + 100);
+        let row = snapshot.assert_row(fallback, "c", "fail");
+        assert!(row["blocking_seq"].is_null());
+        snapshot.population["receipts"][earlier_index]["seq"] = json!(earlier.sequence.0);
+        snapshot.assert_row(fallback, "c", "pass");
+        let gate: String = snapshot
+            .connection
+            .query_row(
+                "SELECT result FROM entry_gate_results WHERE source_trade_id=?1",
+                [&entry.id.0],
+                |row| row.get(0),
+            )
+            .unwrap();
+        snapshot
+            .connection
+            .execute(
+                "UPDATE entry_gate_results SET result='admitted' WHERE source_trade_id=?1",
+                [&entry.id.0],
+            )
+            .unwrap();
+        snapshot
+            .connection
+            .execute(
+                "DELETE FROM decision_pending WHERE source_trade_id=?1",
+                [&entry.id.0],
+            )
+            .unwrap();
+        snapshot.assert_row(fallback, "c", "fail");
+        snapshot
+            .connection
+            .execute(
+                "UPDATE entry_gate_results SET result=?1 WHERE source_trade_id=?2",
+                rusqlite::params![gate, entry.id.0],
+            )
+            .unwrap();
+        // Only the earlier Add converged: its rows cannot satisfy the Entry's obligation.
+        snapshot
+            .connection
+            .execute(
+                "DELETE FROM entry_gate_results WHERE source_trade_id=?1",
+                [&entry.id.0],
+            )
+            .unwrap();
+        snapshot
+            .connection
+            .execute(
+                "DELETE FROM activity_groups WHERE source_trade_id=?1",
+                [&entry.id.0],
+            )
+            .unwrap();
+        snapshot.assert_row(fallback, "c", "fail");
+    }
+
+    // HistoryBehind fails even when the receipt is outside the old source-time frame keys.
+    {
+        let mut h = Harness::new().await;
+        let frame = h.record(1).await;
+        let frame = h.rest_counterpart(&frame, |r| r["timestamp"] = json!(EPOCH - 30));
+        h.start_frames();
+        let receipt = h.deliver_frame(&frame, |_| {}).await;
+        h.stop().await;
+        let snapshot = census_snapshot(&h, &logs);
+        let row = snapshot.assert_row(receipt, "c", "fail");
+        assert!(row["reason"].as_str().unwrap().contains("history_behind"));
+        assert!(
+            snapshot.population["fallbacks"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            snapshot.population["window_fallbacks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    // A pre-end receipt routes after the window. The named market history must exist.
+    {
+        let mut h = Harness::new().await;
+        let first = h.record(1).await;
+        let next = h.rest_counterpart(&first, |r| {
+            r["transactionHash"] = json!("consumed-market-echo")
+        });
+        h.attempt(&first, at());
+        h.start_frames();
+        h.empty_frontier(EPOCH - 1).await;
+        h.deliver_frame(&first, |_| {}).await;
+        h.hooks
+            .financial_clock_unix
+            .store(EPOCH + 59, Ordering::SeqCst);
+        let receipt = h.append_frame(&next, |_| {}).await;
+        h.hooks
+            .financial_clock_unix
+            .store(EPOCH + 90, Ordering::SeqCst);
+        h.control
+            .as_ref()
+            .unwrap()
+            .send(OrchestratorControl::ActivityFrameDecision { receipt })
+            .await
+            .unwrap();
+        h.boot_barrier_readonly().await;
+        h.stop().await;
+        let mut snapshot = census_snapshot(&h, &logs);
+        snapshot.assert_row(receipt, "b", "pass");
+        let lines = snapshot.ignored.clone();
+        snapshot.ignored = json!([]);
+        snapshot.assert_row(receipt, "missing", "fail");
+        snapshot.ignored = lines;
+        snapshot
+            .connection
+            .execute("DELETE FROM wallet_market_history_v2", [])
+            .unwrap();
+        snapshot.assert_row(receipt, "b", "fail");
+    }
+
+    // Selection was live; the wallet was fenced out while its receipt waited in the queue.
+    {
+        let mut h = Harness::new().await;
+        let frame = h.record(1).await;
+        h.start_frames();
+        // An empty confirmed snapshot keeps Entry classification even after quality falls to
+        // zero on removal; a missing snapshot would correctly classify Unknown first.
+        h.install_runtime_anchor(EPOCH - 1, Vec::new()).await;
+        let receipt = h.append_frame(&frame, |_| {}).await;
+        assert_eq!(h.watchlist.snapshot().entries.len(), 1);
+        h.watchlist
+            .remove_fenced(&std::collections::HashSet::from([wallet()]));
+        // Durable removal evidence is recorded before the queued receipt routes.
+        rusqlite::Connection::open(h.dir.path().join("paper.db")).unwrap().execute(
+            "INSERT INTO wallet_fences(wallet_hex,source_trade_id,cause,proof_json,fenced_at_unix) VALUES (?1,?2,'conversion','{}',?3)",
+            rusqlite::params![wallet().to_string(), frame.id.0, EPOCH + 1]).unwrap();
+        h.hooks
+            .financial_clock_unix
+            .store(EPOCH + 90, Ordering::SeqCst);
+        h.control
+            .as_ref()
+            .unwrap()
+            .send(OrchestratorControl::ActivityFrameDecision { receipt })
+            .await
+            .unwrap();
+        h.boot_barrier_readonly().await;
+        h.stop().await;
+        // The captured fence clock is strictly between selection and routing.
+        let snapshot = census_snapshot(&h, &logs);
+        snapshot.assert_row(receipt, "b", "pass");
+        snapshot
+            .connection
+            .execute("DELETE FROM wallet_fences", [])
+            .unwrap();
+        snapshot.assert_row(receipt, "b", "incomplete");
+    }
 }
