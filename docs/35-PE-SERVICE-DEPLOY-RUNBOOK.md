@@ -1008,18 +1008,30 @@ comparisons decide what remains; never guess from memory.
    [open-continuation census](#565-open-continuation-census-before-deployment); a nonzero exit stops
    the deploy. The command derives the canonical source path
    from installed activation metadata and reads Start without upgrading or writing the database. It
-   verifies a finite captured source prefix through its last complete frame, excludes incomplete bytes
-   without repair, and performs no HTTP requests. Interrupted initial preparation can restart while the
-   old process serves; compatible completed artifacts raw-verify and extend incrementally. Ignore
-   temporary files. Publication failure before rename preserves the previous artifact; after rename a
-   complete new artifact may remain despite a directory-sync error.
+   reads checkpoint invalidation authority first and captures the open continuation rows and feed
+   frontiers before bounding the source log. It verifies that finite prefix through its last complete
+   frame, excludes incomplete bytes without repair, and performs no HTTP requests. An active or
+   undecodable invalidation record selects a full walk; unreadable authority refuses publication
+   until quiesced recovery. A record-read I/O error stops preparation. Compatible artifacts raw-verify
+   and extend incrementally. A proven wrong prefix digest invalidates the artifact only if that exact
+   artifact and authority generation are still current; otherwise preparation starts again.
+   Interrupted preparation can restart while the old process serves. Publication failure before
+   rename preserves the previous artifact; after rename a complete new artifact may remain despite
+   a directory-sync error. Retain the successful receipt line documented
+   [below](#737-release-1-checkpoint-restart-and-rollback).
 
-   Record checkpoint-loading, deferred BLAKE3 prefix verification and verified suffix durations separately
+   Record checkpoint loading, deferred verification and boot suffix processing durations separately
    from first-copy time, plus checkpoint use and prefix/suffix sizes. Admission logs report wallet
    bracket elapsed/outcome and tick budget, starts, acceptances, deferrals and unstarted candidates.
+   A deferred boot emits no `source checkpoint raw prefix verified` event at boot: the owner's
+   `source checkpoint prefix verified` line carries `elapsed_ms` after listening, covering the raw
+   prefix hash and verified continuation through the frozen boot tail.
    Compare these stages with the captured restart baseline; BLAKE2 throughput is not a BLAKE3 restart
-   measurement. The launch deadline and cooldown use the existing
-   [`maintenance_interval_secs` and `ANCHOR_REFRESH_SECS`](./_GLOSSARY.md); started work may overrun it.
+   measurement. The launch deadline uses [`maintenance_interval_secs`](./_GLOSSARY.md#configuration-defaults--concrete-values);
+   the admission cooldown is `ADMISSION_RETRY_SECS`, defined by
+   [`admission_retry_secs`](./_GLOSSARY.md#admission_retry_secs). Re-anchor cadence and the refresh-only
+   cooldown remain [`anchor_refresh_secs`](./_GLOSSARY.md#anchor_refresh_secs); started work may overrun
+   the launch deadline.
 
 4. **Baseline and atomic swap** (the old process keeps running on its open inode).
    Run this guarded sequence in the same shell holding the deployment lock, with `$art` from step 3:
@@ -1331,44 +1343,77 @@ targets, retained paper decisions, and live-journal recovery work. Recheck after
 
 ## #737 release 1 checkpoint restart and rollback
 
-Install `deploy/systemd/pe-service.service.d-checkpoint-invalidation.conf` as
-`/etc/systemd/system/pe-service.service.d/checkpoint-invalidation.conf`, then run
-`sudo systemctl daemon-reload` and verify
-`systemctl show pe-service -p RestartPreventExitStatus` includes 78 before the binary swap.
+Install the checkpoint-invalidation drop-in with root and verify it before the binary swap:
+
+```bash
+sudo install -d -m 0755 /etc/systemd/system/pe-service.service.d
+sudo install -o root -g root -m 0644 deploy/systemd/pe-service.service.d-checkpoint-invalidation.conf \
+  /etc/systemd/system/pe-service.service.d/checkpoint-invalidation.conf
+sudo systemctl daemon-reload
+systemctl show pe-service -p RestartPreventExitStatus
+```
+
+The effective `RestartPreventExitStatus` must include 78.
 A service exit with 78 means durable checkpoint quarantine failed. Stop and drain the service;
-run `pe-service --recover-source-checkpoint --paper-state <installed-path>` while quiesced before
-starting it. The command removes and syncs both installed logs' checkpoint artifacts before their
-invalidation records. Preserve the database and event logs. Manual starts and host reboots before
-recovery can reopen the old checkpoint and repeat the deferred verification window.
+finish or terminate every preparation before running recovery while quiesced:
+
+```bash
+pe-service --recover-source-checkpoint --paper-state <installed-path>
+```
+
+The command removes the installed source log's checkpoint and syncs its directory, then removes
+its invalidation record and syncs that directory. The persistent checkpoint lock remains. Its stdout
+line is `source checkpoint recovery checkpoint={} removed={} record={} removed={}`, with paths and
+removal booleans substituted. Preserve the database and event logs. A manual start or host reboot
+before recovery can boot with the checkpoint once more; its deferred check then re-detects the
+mismatch. With no checkpoint present, failure to write the invalidation record is also a quarantine
+failure selecting status 78.
 
 Retain the successful `--prepare-source-checkpoint` stdout before deployment: offset, sequence,
-hash, `prefix_blake3`, `capture_unix_ms`, `published_unix_ms` and validated continuation count.
+hash, `prefix_blake3`, `capture_unix_ms`, `published_unix_ms` and validated continuation count. The
+actual printed form is:
+
+```text
+source checkpoint published offset={} sequence={} hash={} prefix_blake3={} capture_unix_ms={} published_unix_ms={} validated={validated}
+```
+
 The restart's `source checkpoint verification completed` event must report `checkpoint_used=true`
 and match that binding and digest to establish the initial AC-A age. Deferred boot serves before
 the `source checkpoint prefix verified` event, then publishes. A prefix mismatch invalidates and
-stops; later boots full-walk and refuse corrupt frames. Active authority clears only after a
-current-generation verified publication. Unreadable authority forces full walks and cannot publish
+stops; later boots full-walk and refuse corrupt frames. Clearance happens automatically when a
+verified publication of the current generation is durably installed, by the next boot's full walk
+or `--prepare-source-checkpoint`. There is no separate clearance command. Unreadable authority forces
+full walks and cannot publish
 until the quiesced recovery above; after recovery the next boot full-walks and publishes, and the
 following boot can use its checkpoint.
 
 The runtime owner extends only the newly captured suffix at the compiled intervals in
-[`_GLOSSARY.md`](_GLOSSARY.md). Each successful publication rewrites the whole artifact under its
-persistent lock. I/O failures log ERROR `source checkpoint publication retry`, retain identical
+[`_GLOSSARY.md`](_GLOSSARY.md#durable-log-migration-and-supervisor-boundaries-544). Each attempt logs
+`source checkpoint publication attempt`; successful installation logs `source checkpoint published`
+and rewrites the whole artifact under its persistent lock. I/O failures log ERROR
+`source checkpoint publication retry`, retain identical
 bytes and capture time, and retry without another reducer walk. The next hourly candidate replaces
-that pending candidate. A generation change or an incremental integrity failure triggers restart.
+that pending candidate. Protocol refusals log `source checkpoint candidate refused`. A generation
+change or an incremental integrity failure triggers restart. Maintenance's first tick runs at
+startup, so stale-anchor wallets can start runtime admission brackets right after listening; each
+tick sleeps only after it completes. Admission retry timing and fair launch order are defined in
+[`admission_retry_secs`](_GLOSSARY.md#admission_retry_secs) and
+[`maintenance_interval_secs`](_GLOSSARY.md#configuration-defaults--concrete-values).
 Audit the invocation's flattened JSON journal lines for `source checkpoint published`,
 `source checkpoint publication retry`, and `source checkpoint candidate refused`. Successful
 receipt lag is `published_unix_ms - capture_unix_ms`; last-published age and pending-candidate age
 are separate. Missing receipt/binding evidence or a failed publication leaves AC-A incomplete.
 
-Before deployment run the fixed rollback matrix against the recorded previous executable:
+Before deployment, run the fixed rollback matrix on the exact release head against the previous
+production binary built from `e224e32`:
 
 ```bash
-PE_ROLLBACK_SERVICE_BINARY=/mnt/data/pm-e224e32/target/debug/pe-service cargo nextest run -p pe-service --all-features --test scenario_source_log_boot previous_binary_rollback_matrix --nocapture
+PE_ROLLBACK_SERVICE_BINARY='<absolute path to the previous production binary built from e224e32>' cargo nextest run -p pe-service --all-features --test scenario_source_log_boot previous_binary_rollback_matrix --nocapture
 ```
 
-The scenario prints both executable SHA-256 identities and each row result. An unset-variable skip
-proves no rollback compatibility. The declared old-reader outcomes are fixed before execution:
+Record the scenario's printed executable identities and every row's result in the deployment
+artifacts. An unset-variable skip proves nothing. The declared old-reader outcomes are fixed before
+execution:
 
 | Invalidation record | Previous `e224e32` outcome | Following new-reader outcome |
 |---|---|---|
@@ -1376,18 +1421,6 @@ proves no rollback compatibility. The declared old-reader outcomes are fixed bef
 | Inactive | Allowed: raw-prefix verifies before serving; preserves record | Checkpoint-assisted |
 | Active with checkpoint present | Allowed: raw-prefix verifies before serving; preserves record | Full verified walk, publication, active clearance |
 | Unreadable | Allowed: raw-prefix verifies before serving; preserves record | Repeated full verified walks; quiesced recovery, full walk/publication, then checkpoint-assisted |
-
-Recorded local A-2 run, 2026-10-06, worktree HEAD `3c3881f658fefa2fb750ece17c41bc453e338031`
-with uncommitted lane A-2 edits: the exact command above passed once (1 test passed, 40 filtered).
-The current executable was `/mnt/data/pm-fast-restart/target/debug/pe-service`, embedded revision
-`dev-dirty`, SHA-256 `0b7706ba903b83a2f6bee6e8d9d3207ded6148a093169ecedddc788bf49b014b`.
-The previous executable was `/mnt/data/pm-e224e32/target/debug/pe-service`, embedded revision
-`e224e3204d0163e88daf707991ad10497ca481d4`, SHA-256
-`9c82ea00c2fb5e970d58b235652b9ed0f68bd5a47c09148fc8746a4de5d70092`.
-Observed outcomes: absent **allowed PASS**, inactive **allowed PASS**, active **allowed PASS**,
-unreadable **allowed PASS**. Every row refused its corrupt suffix control, retried idempotently,
-drained gracefully, preserved balances/history/decisions/fences and effective live membership,
-and passed the subsequent new-reader invalidation policy. No row was reclassified.
 
 Every row requires refusal of a corrupt frame after the checkpoint, idempotent exact covered retry,
 graceful drain, unchanged balances/history/decisions, no re-fence, and effective live membership
@@ -1421,3 +1454,245 @@ jq -ce '
 An owner that has not yet completed a publication has no `last_published_capture_unix_ms`; use the
 matched staged receipt for that initial interval. Keep its capture time separate from the pending
 candidate's timestamp. Do not treat a missing publication or an extraction failure as a pass.
+
+### Release-1 deployment procedure
+
+Use this order for #737 in one deployment shell. Set `$art` to the retained deployment artifact
+directory before starting. Keep database queries and evidence collection read-only throughout;
+retain artifacts outside the service's state paths. Run heavy database/log captures only after the
+observation window closes. The preparation, drop-in installation and guarded activation are the
+deployment actions described above; this procedure makes no trading or policy change.
+
+1. **Pin the recipe and prove rollback.** Record the merged release revision and the checksum of
+   [`docs/29`](29-ACTIVITY-LATENCY-MEASUREMENT.md#730-acceptance-measurement), including its AC-B
+   checks and AC-C census. Run the previous-binary matrix above on the exact release head before
+   deployment and retain stdout and stderr, executable identities and every row result. A skip is no proof.
+
+   ```bash
+   set -euo pipefail
+   umask 077
+   install -d -m 0700 "$art"
+   git rev-parse HEAD > "$art/release-revision.txt"
+   sha256sum docs/29-ACTIVITY-LATENCY-MEASUREMENT.md > "$art/docs29.sha256"
+   ```
+
+   Use the merged revision's recipe for the later shared capture and audit; verify its checksum
+   again before running it.
+
+2. **Install restart prevention.** Run the root drop-in installation above and retain
+   `systemctl show pe-service -p RestartPreventExitStatus`; it must include 78.
+
+3. **Freeze the baseline.** Set `$status_path` to the installed status file and `$SUPABASE_DB_URL`
+   to the authorized database connection. The helper enforces read-only transactions and ignores
+   local psql startup files. Retain the baseline maximum batch, its survivors, status and journal cursor before
+   preparation and restart:
+
+   ```bash
+   ranking_read() {
+     PGOPTIONS='-c default_transaction_read_only=on' \
+       psql "$SUPABASE_DB_URL" -X -v ON_ERROR_STOP=1 "$@"
+   }
+   baseline_batch=$(ranking_read -Atc 'SELECT max(batch_id) FROM ranking_batches')
+   [[ "$baseline_batch" =~ ^[0-9]+$ ]]
+   printf '%s\n' "$baseline_batch" > "$art/baseline-batch.txt"
+   ranking_read --csv -c "SELECT batch_id, rank, wallet_hex, last_trade_unix FROM ranking_entries WHERE batch_id = $baseline_batch AND survives IS TRUE ORDER BY rank" \
+     > "$art/baseline-survivors.csv"
+   cp -- "$status_path" "$art/status.baseline.json"
+   journalctl -u pe-service -n 1 --show-cursor -o json > "$art/journal.before.jsonl"
+   systemctl show pe-service -p InvocationID -p ExecMainStartTimestamp > "$art/invocation.before"
+   ```
+
+4. **Prepare and census.** Run the staged `--prepare-source-checkpoint` command in the main
+   [Procedure](#procedure), step 3, while the old service serves, retaining stdout, stderr and exit
+   status. Its open rows and feed frontiers are captured before the log bound. A nonzero exit stops
+   deployment. Keep the printed publication
+   receipt for AC-A's initial age and binding match.
+
+5. **Swap with guards.** Use the deployment lock, identity checks and guarded atomic swap in
+   the main [Procedure](#procedure), steps 1–4. Preserve the previous binary and all durable state.
+
+6. **Restart once with the owner's explicit consent.** Use the main [Procedure](#procedure), step 5,
+   only after that consent.
+   Recheck installed/running identities first so an already activated release gets no extra restart.
+   Capture the new invocation:
+
+   ```bash
+   systemctl show pe-service -p InvocationID -p ExecMainStartTimestamp > "$art/invocation.after"
+   invocation=$(sed -n 's/^InvocationID=//p' "$art/invocation.after")
+   restart_timestamp=$(sed -n 's/^ExecMainStartTimestamp=//p' "$art/invocation.after")
+   restart_utc=$(date -u -d "$restart_timestamp" +'%Y-%m-%dT%H:%M:%S.%NZ')
+   ```
+
+7. **Verify AC-A.** Use that invocation's start timestamp and `pe-service listening` line to prove
+   start-to-listening at most 60 s. The owner must log `source checkpoint prefix verified` within
+   four minutes and publish. Match the staged receipt's offset, sequence, hash and `prefix_blake3`
+   to `checkpoint_offset`, `checkpoint_sequence`, `checkpoint_hash` and `prefix_blake3` in the
+   boot's `source checkpoint verification completed` event with `checkpoint_used=true`.
+   Record the release acceptance window ending 7,200 s after listening. AC-A and AC-B begin at
+   restart; AC-C selects receipts from listening. All windows end at `window_end`. Retain bounded
+   startup evidence and derive the bounds from the listening line's journal epoch, preserving its
+   full precision for docs/29's nanosecond inputs:
+
+   ```bash
+   startup_until_utc=$(date -u +'%Y-%m-%dT%H:%M:%S.%NZ')
+   journalctl -u pe-service "_SYSTEMD_INVOCATION_ID=$invocation" --since "$restart_utc" --until "$startup_until_utc" -o json > "$art/startup-journal.jsonl"
+   listening_unix_us=$(jq -ser '
+     [.[] | . as $journal | (.MESSAGE | fromjson) as $line |
+      select($line.message == "pe-service listening") | ($journal.__REALTIME_TIMESTAMP | tonumber)] |
+     if length == 1 then .[0] else error("expected one listening event for this invocation") end
+   ' "$art/startup-journal.jsonl")
+   window_end_unix_us=$((listening_unix_us + 7200000000))
+   window_end_unix_ms=$((window_end_unix_us / 1000))
+   listening_ns=$((listening_unix_us * 1000))
+   window_end_ns=$((window_end_unix_us * 1000))
+   window_end_utc=$(date -u -d "@$((window_end_unix_us / 1000000)).$(printf '%06d' "$((window_end_unix_us % 1000000))")" +'%Y-%m-%dT%H:%M:%S.%NZ')
+   jq -n --arg invocation "$invocation" --arg restart "$restart_utc" --arg end "$window_end_utc" \
+     --argjson listening_ns "$listening_ns" --argjson window_end_ns "$window_end_ns" \
+     '{invocation:$invocation, restart_utc:$restart, window_end_utc:$end,
+       listening_ns:$listening_ns, window_end_ns:$window_end_ns}' > "$art/window.json"
+   ```
+
+   After the window closes, run this section's `checkpoint-journal.jsonl` extraction above for the
+   full AC-A window. Each hourly publication must succeed on its first attempt.
+   At every instant, age of the latest successfully published binding capture must stay within
+   `CHECKPOINT_PUBLISH_SECS` plus the largest logged publication lag in the window; use the
+   [compiled interval](./_GLOSSARY.md#durable-log-migration-and-supervisor-boundaries-544).
+   Lag is `published_unix_ms - capture_unix_ms`. Report pending candidate capture times separately.
+   Missing observations, an unmatched initial receipt or any failed publication leave AC-A incomplete.
+
+8. **Capture closing status and batch visibility.** From `window_end` minus 120 s, copy status every
+   10 s. Each iteration also records a read-only maximum-batch query with its start and completion
+   times. Continue through the first copy sampled after `window_end`. Set `release_revision` to the
+   deployed embedded revision. Run with step 7's bounds in the same shell as the `ranking_read` helper:
+
+   ```bash
+   install -d -m 0700 "$art/status-copies"
+   next_copy_unix_ms=$((window_end_unix_ms - 120000))
+   : > "$art/max-batch-reads.jsonl"
+   while :; do
+     now_unix_ms=$(date -u +%s%3N)
+     if (( now_unix_ms < next_copy_unix_ms )); then
+       delay_ms=$((next_copy_unix_ms - now_unix_ms))
+       sleep "$(printf '%d.%03d' "$((delay_ms / 1000))" "$((delay_ms % 1000))")"
+     fi
+     copy_started_unix_ms=$(date -u +%s%3N)
+     sample="$art/status-copies/$copy_started_unix_ms.status.json"
+     cp -- "$status_path" "$sample"
+     read_started_unix_ms=$(date -u +%s%3N)
+     read_exit=0
+     max_batch=$(ranking_read -Atc 'SELECT max(batch_id) FROM ranking_batches' \
+       2> "$sample.max-batch.stderr") || read_exit=$?
+     read_completed_unix_ms=$(date -u +%s%3N)
+     jq -cn --arg sample "$sample" --arg batch "$max_batch" \
+       --argjson started "$read_started_unix_ms" --argjson completed "$read_completed_unix_ms" \
+       --argjson exit_status "$read_exit" \
+       '{sample:$sample, started_unix_ms:$started, completed_unix_ms:$completed,
+         batch_id:(if ($batch | test("^[0-9]+$")) then ($batch | tonumber) else null end),
+         exit_status:$exit_status}' >> "$art/max-batch-reads.jsonl"
+     (( read_exit == 0 ))
+     [[ "$max_batch" =~ ^[0-9]+$ ]]
+     jq -e --arg revision "$release_revision" '
+       .revision == $revision and (.live_wallets | type == "array") and
+       all(.live_wallets[]; type == "string" and test("^0x[0-9a-f]{40}$")) and
+       ((.live_wallets | unique | length) == (.live_wallets | length)) and
+       (.live_wallets_at_unix_ms | type == "number" and floor == .)
+     ' "$sample" > /dev/null
+     if jq -e --argjson end "$window_end_unix_ms" \
+       '.live_wallets_at_unix_ms > $end' "$sample" > /dev/null; then
+       break
+     fi
+     next_copy_unix_ms=$((next_copy_unix_ms + 10000))
+   done
+   ```
+
+   Choose the last copy from the deployed revision whose `live_wallets_at_unix_ms` is at or before
+   `window_end`; that field's value is S.
+   Retain that copy, the following copy and all timed reads. Missing or malformed live fields mean
+   incomplete evidence, never an empty set. The closing latest batch is the shared result of the
+   last read completed at or before S and the first read started at or after S. Differing results
+   need retained commit-order evidence or AC-B stays incomplete; `created_at` alone cannot resolve
+   them. Build `ac-b-closing-batch.json` from these reads and S, and run docs/29's closing-batch check.
+
+9. **Take one shared capture after the window.** Run the pinned docs/29 committed-WAL/source/paper
+   capture once with `<membership-from-paper-seq>`, retaining its stdout and prefix bounds. Choose
+   that paper sequence to include every record used in `[restart, S]` and any earlier record needed
+   to substantiate a closing exclusion. The printed database snapshot start must be at or after
+   `window_end`; it is AC-C's separately recorded routing cutoff. A missing reference requires an
+   earlier capture start, never an omitted reference. Use the same capture for both audits and
+   docs/29's inspection/export; its membership sources and deferrals are already in the `KEEP` set.
+
+10. **Audit AC-B and AC-C on retained evidence.** Extract the admission journal through `window_end`,
+    decoding each entry's `MESSAGE` as a flattened service JSON event and retaining its timestamp:
+
+    ```bash
+    journalctl -u pe-service "_SYSTEMD_INVOCATION_ID=$invocation" --since "$restart_utc" --until "$window_end_utc" -o json > "$art/admission-journal.jsonl"
+    jq -ce '
+      . as $journal | (.MESSAGE | fromjson) as $line |
+      select($line.message == "maintenance admission budget completed" or
+             $line.message == "admission launch order" or
+             $line.message == "wallet bracket completed" or
+             $line.message == "membership admission deferred") |
+      (if $line.message == "maintenance admission budget completed" then
+         ["elapsed_ms","deadline_expired","started","accepted","deferred","unstarted","capacity_generation"]
+       elif $line.message == "admission launch order" then
+         ["path","eligible","started","started_previous_keys"] +
+         (if $line.path == "addition" or $line.path == "reentry" then ["first"] else [] end)
+       elif $line.message == "wallet bracket completed" then ["wallet","elapsed_ms","outcome"]
+       else ["wallet","stage","kind","deferral.class","context"] end) as $required |
+      if all($required[]; . as $key | $line | has($key)) then
+        {journal_unix_us:$journal.__REALTIME_TIMESTAMP, event:$line}
+      else error("admission event missing required fields") end
+    ' "$art/admission-journal.jsonl" > "$art/admission-events.jsonl"
+    ```
+
+    `attempted_batch_id` is absent when no batch was attempted; retain it and `applied_batch_id`
+    wherever present. The journal's class field is `deferral.class`; the artifact uses `class`.
+    Decode `eligible` and `started_previous_keys` as JSON-encoded strings for
+    launch-order analysis. From docs/29's proven closing-batch result, set `closing_batch` to its
+    integer ID. Capture survivors for the baseline, every attempted and applied batch, the closing
+    batch and every published batch in between:
+
+    ```bash
+    baseline_batch=$(cat "$art/baseline-batch.txt")
+    [[ "$baseline_batch" =~ ^[0-9]+$ && "$closing_batch" =~ ^[0-9]+$ ]]
+    ranking_read -Atc "SELECT batch_id FROM ranking_batches WHERE batch_id > $baseline_batch AND batch_id <= $closing_batch ORDER BY batch_id" \
+      > "$art/intermediate-batches.txt"
+    {
+      printf '%s\n' "$baseline_batch" "$closing_batch"
+      jq -r 'select(.event.message == "maintenance admission budget completed") |
+        .event | .attempted_batch_id, .applied_batch_id | select(type == "number")' \
+        "$art/admission-events.jsonl"
+      cat "$art/intermediate-batches.txt"
+    } | sort -n -u > "$art/audit-batch-ids.txt"
+    while IFS= read -r batch_id; do
+      [[ "$batch_id" =~ ^[0-9]+$ ]]
+      ranking_read --csv -c "SELECT batch_id, rank, wallet_hex, last_trade_unix FROM ranking_entries WHERE batch_id = $batch_id AND survives IS TRUE ORDER BY rank" \
+        > "$art/survivors.$batch_id.csv"
+    done < "$art/audit-batch-ids.txt"
+    ```
+
+    Classify each published batch not attempted in the tick summaries as superseded or unobserved.
+    Account for the closing batch's survivors even if applying it failed. Use only evidence at or
+    before S for transitions, attempts, deferrals, exclusions and fairness; later lines establish
+    coverage only. A survivor is live only if present in the closing copy's `live_wallets`.
+    Structural membership and Supabase projection do not establish that. Policy exclusions require
+    evidence from the wallet's own inactivity history, knockout or capacity. Rank 25 and other
+    conversion-fenced survivors are reported as awaiting release 2; ranks 3 and 27 must be live or
+    excluded by an existing owner policy.
+
+    For each continuously eligible wallet, count ticks where its path ran first and started at least
+    one bracket. N is the distinct eligible-wallet count across those path calls; k is their smallest
+    positive started count. The wallet must start within ⌈N ÷ k⌉ such ticks. Report zero-start calls
+    separately. A remaining absence justified by fairness requires failures all
+    `validation.intervening_activity`; missing launches, too few measured ticks or missing evidence
+    leave fairness unproven. Unaccounted survivors or an unobserved final transition leave AC-B
+    incomplete and require a consolidated scope revision with the diagnostics.
+
+    Use [docs/29's AC-B reference and closing-batch checks](29-ACTIVITY-LATENCY-MEASUREMENT.md#730-acceptance-measurement)
+    on the shared export, including the full `pe-service.watchlist-deferral` arrays; the journal omits
+    their detailed messages. Missing or mismatched ranking, admission, knockout or capacity receipt
+    references leave the corresponding judgment incomplete. Then run
+    [docs/29's AC-C receipt census](29-ACTIVITY-LATENCY-MEASUREMENT.md#730-acceptance-measurement),
+    including its ignored-line journal extraction from listening through the recorded capture cutoff.
+    Retain every census row and its raw-versus-export receipt count. Apply its failure and insufficient
+    evidence rules without substituting AC16's source-time population for the receipt census.
