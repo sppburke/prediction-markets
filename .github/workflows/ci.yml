@@ -259,6 +259,12 @@ jobs:
       - name: Install Python analytics deps
         run: python3 -m pip install -r scripts/requirements.txt
 
+      # The financial-era suite executes this exact command, so it stays a literal step here.
+      - name: Rehearsal dry run
+        run: |
+          bash scripts/deploy/rehearsal545.sh --dry-run \
+            0000000000000000000000000000000000000000 >/dev/null
+
       - name: Python drift-guard tests
         run: python3 scripts/run_ci_suites.py drift
 

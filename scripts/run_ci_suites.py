@@ -150,8 +150,6 @@ def main():
         else:
             suites = [(name, [sys.executable, str(ROOT / "scripts" / name)], {}, None)
                       for name in DRIFT_SUITES]
-            suites.append(("rehearsal545 dry-run", ["bash", str(ROOT / "scripts/deploy/rehearsal545.sh"),
-                                                   "--dry-run", "0" * 40], {}, None))
         return run_suites(suites)
 
 
