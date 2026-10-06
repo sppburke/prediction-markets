@@ -81,8 +81,8 @@ jobs:
             bash -n "$script" || exit 1
           done
 
-  rust:
-    name: rustc 1.95.0 acceptance gate
+  rust-lint:
+    name: rustc 1.95.0 lint gate
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -115,14 +115,13 @@ jobs:
       - name: Install cargo tools
         uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest,cargo-deny,cargo-audit
+          tool: cargo-deny,cargo-audit
 
-      # One shared cache for both Rust-building jobs. `rust` is the sole writer so the two
-      # jobs cannot race to save; `postgres` restores it read-only and therefore does not
-      # cold-build pe-service on every run the way a per-job cache key would.
+      # The first nextest shard is the sole writer of the shared Rust cache.
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: gate
+          save-if: "false"
 
       - name: rustc version contains 1.95.0
         run: rustc --version | grep -F '1.95.0'
@@ -131,9 +130,68 @@ jobs:
 
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-      - run: cargo test --doc --workspace --all-features
+      - run: cargo deny check
+
+      - run: cargo audit
+
+      - run: cargo metadata --locked --format-version 1 > /dev/null
+
+  rust-test:
+    name: rustc 1.95.0 tests (${{ matrix.suite }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - suite: nextest 1/3
+            shard: 1
+          - suite: nextest 2/3
+            shard: 2
+          - suite: nextest 3/3
+            shard: 3
+          - suite: doc
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python
+        if: matrix.suite != 'doc'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/share/powershell || true
+          df -h /
+
+      - name: Install pinned toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.95.0"
+
+      - name: Install cargo tools
+        if: matrix.suite != 'doc'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.shard == 1
+        with:
+          shared-key: gate
+
+      - uses: Swatinem/rust-cache@v2
+        if: matrix.shard != 1
+        with:
+          shared-key: gate
+          save-if: "false"
 
       - name: Install Python analytics deps (needed by in-test cross-reader parity, #544)
+        if: matrix.suite != 'doc'
         run: |
           python3 -m pip install -r scripts/requirements.txt
           # #648 compares real certified caches through the Parquet exporter.
@@ -141,15 +199,15 @@ jobs:
           # automatic extension downloads so the test itself stays offline.
           python3 -c "import duckdb; c = duckdb.connect(); c.execute('INSTALL sqlite_scanner'); c.close()"
 
-      # The two slowest tests (about 5 and 3.5 minutes of single-threaded work, #664) run in
-      # the `rust-slow` job in parallel with this one; every other test runs here.
-      - run: cargo nextest run --workspace --all-features -E 'not (binary_id(pe-service::scenario_golden_stream_v1) | binary_id(pe-service::scenario_deployed_flow))'
+      - name: Nextest partition
+        if: matrix.suite != 'doc'
+        env:
+          SHARD: ${{ matrix.shard }}
+        run: cargo nextest run --workspace --all-features --partition "hash:${SHARD}/3" -E 'not (binary_id(pe-service::scenario_golden_stream_v1) | binary_id(pe-service::scenario_deployed_flow))'
 
-      - run: cargo deny check
-
-      - run: cargo audit
-
-      - run: cargo metadata --locked --format-version 1 > /dev/null
+      - name: Doc tests
+        if: matrix.suite == 'doc'
+        run: cargo test --doc --workspace --all-features
 
   rust-slow:
     name: slow service scenarios
@@ -202,34 +260,7 @@ jobs:
         run: python3 -m pip install -r scripts/requirements.txt
 
       - name: Python drift-guard tests
-        run: |
-          bash scripts/deploy/rehearsal545.sh --dry-run \
-            0000000000000000000000000000000000000000 >/dev/null
-          python3 scripts/check_sql_unfiltered_dml.py
-          python3 scripts/test_push_ranking_filter.py
-          python3 scripts/test_ranker_decay.py
-          python3 scripts/test_rank_72hr_consolidated.py
-          python3 scripts/test_audit_wallet_history.py
-          python3 scripts/test_clob_reconciliation.py
-          python3 scripts/test_rank_and_push.py
-          python3 scripts/test_rank_cycle_manifest.py
-          python3 scripts/test_rank_and_push_loop.py
-          python3 scripts/test_ranker_duck_parity.py
-          python3 scripts/test_latency_shift_ref_oracle.py
-          python3 scripts/test_probe_gamma_ua.py
-          python3 scripts/test_ranker_interfaces.py
-          python3 scripts/test_ranker_suff_stats.py
-          python3 scripts/test_ranker_estimators.py
-          python3 scripts/test_ranker_deflation.py
-          python3 scripts/test_ranker_oos_validation.py
-          python3 scripts/test_ranker_selectors.py
-          python3 scripts/test_ranker_demotion.py
-          python3 scripts/test_ranker_policies.py
-          python3 scripts/test_ranker_bakeoff.py
-          python3 scripts/test_ranker_confirmatory.py
-          python3 scripts/test_ranker_bench_composition.py
-          python3 scripts/test_ranker_clv_source_comparison.py
-          python3 scripts/verify_bakeoff_components.py
+        run: python3 scripts/run_ci_suites.py drift
 
   activation-generation:
     name: generation activation scenarios
@@ -328,21 +359,22 @@ jobs:
           shared-key: gate
           save-if: "false"
 
-      - name: Legacy-to-financial PostgreSQL archive/restore scenario (issue #545)
-        env:
-          PG_ADMIN_URL: postgres://postgres:postgres@localhost:5432/postgres
-          PG_LEGACY_URL: postgres://postgres:postgres@localhost:5432/pe_legacy_545
-        run: bash scripts/deploy/test_legacy_to_financial_pg.sh
-
       # ── Authoritative-RPC parity + concurrency (issue #397) ──────────────────────────
       # Load both Supabase schema files into the Postgres service (creating the Supabase
       # roles the grants reference), then run the pg_parity test against the real PL/pgSQL.
       # This is the only check of the live SQL execution + the B-E self-referencing-UPDATE
-      # lost-update safety; the workspace nextest in the `rust` job self-skips it (no PE_TEST_PG_URL).
+      # lost-update safety; workspace nextest shards self-skip it (no PE_TEST_PG_URL).
       - name: Load Supabase schema into Postgres
         env:
-          PGURL: postgres://postgres:postgres@localhost:5432/postgres
+          PG_ADMIN_URL: postgres://postgres:postgres@localhost:5432/postgres
+          PGURL: postgres://postgres:postgres@localhost:5432/pe_ci_template
         run: |
+          psql "$PG_ADMIN_URL" -v ON_ERROR_STOP=1 <<'SQL'
+          create role anon nologin nobypassrls;
+          create role authenticated nologin nobypassrls;
+          create role service_role nologin bypassrls;
+          create database pe_ci_template;
+          SQL
           psql "$PGURL" -v ON_ERROR_STOP=1 -f scripts/supabase_schema.sql
           psql "$PGURL" -v ON_ERROR_STOP=1 -f scripts/supabase_paper_state_schema.sql
           # Matview SQL must load on vanilla Postgres too (its pg_cron block self-skips when the
@@ -352,17 +384,8 @@ jobs:
           psql "$PGURL" -v ON_ERROR_STOP=1 -f scripts/supabase_multi_account_live_schema.sql
           psql "$PGURL" -v ON_ERROR_STOP=1 -f scripts/supabase_multi_account_live_schema.sql
 
-      - name: Multi-account schema acceptance suite (issue #508)
+      - name: Postgres suites in isolated databases
         env:
-          PG_URL: postgres://postgres:postgres@localhost:5432/postgres
-        run: bash scripts/test_multi_account_schema.sh "$PG_URL"
-
-      - name: Postgres RPC parity + concurrency test (issue #397)
-        env:
-          PE_TEST_PG_URL: postgres://postgres:postgres@localhost:5432/postgres
-        run: cargo nextest run -p pe-service --features scenario --test pg_parity
-
-      - name: Ranking publication RPC idempotency + rollback test
-        env:
-          PE_TEST_PG_URL: postgres://postgres:postgres@localhost:5432/postgres
-        run: python3 scripts/test_ranking_publish_rpc.py
+          PG_ADMIN_URL: postgres://postgres:postgres@localhost:5432/postgres
+          PE_TEST_PG_URL: postgres://postgres:postgres@localhost:5432/pe_ci_template
+        run: python3 scripts/run_ci_suites.py postgres
