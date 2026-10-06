@@ -4030,9 +4030,9 @@ fn corrupt_checkpoint_prefix(source: &Path) {
     file.sync_all().unwrap();
 }
 
-/// The request barrier holds the actual bracket open, so listening with an empty live set
-/// proves boot did not wait for it. The Start-only control holds the same bracket before
-/// listening, then completes the original boot waves. No production endpoint is contacted.
+/// Required reanchors retain progressive and Start-only boot wave behavior under a held bracket.
+/// A stale reusable anchor stays live at listening with either membership shape, including with
+/// status ticks disabled. No production endpoint is contacted.
 #[tokio::test]
 async fn progressive_boot_skips_waves_after_membership_record() {
     use axum::{Json, Router, extract::State, http::Uri, routing::any};
@@ -4131,7 +4131,9 @@ async fn progressive_boot_skips_waves_after_membership_record() {
         .unwrap()
     }
 
-    for post_start_record in [true, false] {
+    for (post_start_record, reanchor_required) in
+        [(true, true), (false, true), (true, false), (false, false)]
+    {
         let (dir, mut paths) = version_one_fixture();
         paths.binary_identity = pe_service::build_info::embedded()
             .source_revision
@@ -4150,6 +4152,15 @@ async fn progressive_boot_skips_waves_after_membership_record() {
             })
             .unwrap();
         support::install_full_history_anchor(&paper, wallet, now - 3_601);
+        if reanchor_required {
+            rusqlite::Connection::open(&paths.fixed_main)
+                .unwrap()
+                .execute(
+                    "UPDATE poll_cursors SET reanchor_required = 1 WHERE wallet_hex = ?1",
+                    rusqlite::params![wallet.to_string()],
+                )
+                .unwrap();
+        }
         paper
             .reset_financial_era(
                 start,
@@ -4214,7 +4225,7 @@ async fn progressive_boot_skips_waves_after_membership_record() {
             legacy_wallet_history_path: paths.legacy_history.clone(),
             jsonl_log_path: dir.path().join("service.jsonl"),
             status_path: dir.path().join("status.json"),
-            status_interval_secs: 1,
+            status_interval_secs: u64::from(reanchor_required),
             supabase_url: base.clone(),
             supabase_secret_key: "fixture".to_owned(),
             supabase_authoritative: true,
@@ -4253,7 +4264,7 @@ async fn progressive_boot_skips_waves_after_membership_record() {
             .collect::<Vec<_>>();
         drop(lines);
         let mut captured = Vec::new();
-        if !post_start_record {
+        if !post_start_record && reanchor_required {
             tokio::time::timeout(
                 Duration::from_secs(20),
                 source.activity_requested.notified(),
@@ -4289,7 +4300,7 @@ async fn progressive_boot_skips_waves_after_membership_record() {
         })
         .await
         .expect("binary did not listen while the runtime bracket was held");
-        if post_start_record {
+        if post_start_record && reanchor_required {
             let zero = status_at(&cfg.status_path, serde_json::json!([])).await;
             assert_eq!(zero["watchlist_size"], 0);
             assert!(zero["live_wallets_at_unix_ms"].as_i64().is_some());
@@ -4300,8 +4311,26 @@ async fn progressive_boot_skips_waves_after_membership_record() {
             );
             source.release_activity.add_permits(1_000);
         }
-        let admitted = status_at(&cfg.status_path, serde_json::json!([wallet.to_string()])).await;
-        assert_eq!(admitted["watchlist_size"], 1);
+        let listening = captured
+            .iter()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|line| line["message"] == "pe-service listening")
+            .unwrap();
+        let expected = if post_start_record && reanchor_required {
+            Vec::new()
+        } else {
+            vec![wallet.to_string()]
+        };
+        assert_eq!(listening["live_wallets"], expected.len());
+        let wallets: Vec<String> =
+            serde_json::from_str(listening["live_wallet_list"].as_str().unwrap()).unwrap();
+        assert_eq!(wallets, expected);
+        source.release_activity.add_permits(1_000);
+        if reanchor_required {
+            let admitted =
+                status_at(&cfg.status_path, serde_json::json!([wallet.to_string()])).await;
+            assert_eq!(admitted["watchlist_size"], 1);
+        }
         // Listening/status can precede main's shutdown loop while it publishes the boot
         // checkpoint. On Linux, wait for the actual SIGINT handler rather than a delay.
         #[cfg(target_os = "linux")]
@@ -4349,10 +4378,24 @@ async fn progressive_boot_skips_waves_after_membership_record() {
         assert!(
             logs.iter()
                 .any(|line| line["message"] == "boot anchor selection census"
-                    && line["reused"] == 0
-                    && line["walked"] == 1)
+                    && line["reused"] == usize::from(!reanchor_required)
+                    && line["walked"] == usize::from(reanchor_required))
         );
-        if post_start_record {
+        if !reanchor_required {
+            assert!(
+                logs.iter()
+                    .any(|line| line["message"] == "disk space monitoring started")
+            );
+            let status: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&cfg.status_path).unwrap()).unwrap();
+            assert!(
+                status["tasks"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|task| task["name"] == "disk_monitor" && task["state"] == "stopped")
+            );
+        } else if post_start_record {
             assert!(
                 logs.iter()
                     .any(|line| line["message"] == "admission launch order"

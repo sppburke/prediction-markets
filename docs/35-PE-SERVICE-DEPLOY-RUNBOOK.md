@@ -1394,9 +1394,12 @@ and rewrites the whole artifact under its persistent lock. I/O failures log ERRO
 `source checkpoint publication retry`, retain identical
 bytes and capture time, and retry without another reducer walk. The next hourly candidate replaces
 that pending candidate. Protocol refusals log `source checkpoint candidate refused`. A generation
-change or an incremental integrity failure triggers restart. Maintenance's first tick runs at
-startup, so stale-anchor wallets can start runtime admission brackets right after listening; each
-tick sleeps only after it completes. Admission retry timing and fair launch order are defined in
+change or an incremental integrity failure triggers restart. Installed anchors that pass the
+[boot reuse conditions](_GLOSSARY.md#causal-re-anchor-and-rehearsal-rules-557) stay live at listening
+regardless of age; runtime refresh rechecks stale anchors in the background. The listening event
+reports `live_wallets` and the sorted `live_wallet_list` from the locked effective projection.
+Maintenance's first tick runs at startup, so wallets requiring admission can start runtime brackets
+right after listening; each tick sleeps only after it completes. Admission retry timing and fair launch order are defined in
 [`admission_retry_secs`](_GLOSSARY.md#admission_retry_secs) and
 [`maintenance_interval_secs`](_GLOSSARY.md#configuration-defaults--concrete-values).
 Audit the invocation's flattened JSON journal lines for `source checkpoint published`,

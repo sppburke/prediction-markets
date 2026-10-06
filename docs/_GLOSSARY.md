@@ -374,7 +374,7 @@ the next-whole-second wake; periodic work retains its cadence. A held urgent slo
 
 **Installed-boot anchor reuse.** An ordinary installed boot reuses a wallet's `leader_positions`
 mirror only when the wallet is unfenced and history-complete, has a delivery cursor and non-null
-activity cutoff, has an installed anchor no older than `ANCHOR_REFRESH_SECS`, and has
+activity cutoff, has an installed anchor regardless of age, and has
 `reanchor_required = false`. Any failed condition selects the wallet for `validate_direct`.
 The durable `position_anchors` proof selected by coverage must also retain all three full-history
 activity walks: each walk includes its original page-zero request with exclusive start zero and
@@ -385,8 +385,10 @@ temporary projection without deleting the durable anchor. Only reused wallets an
 by direct validation can enter the boot universe; a deferred walk cannot reuse an old complete flag.
 When Supabase is configured and `maintenance_interval_secs` is positive, an ordinary progressive
 boot skips validation waves if a post-Start membership record has replayed, even when all anchors
-are stale. Stale-anchor structural members await runtime admission, whose first maintenance tick
-runs at startup. Without that record, an eligible reused wallet still skips fresh boot validation;
+are stale. Reusable stale anchors stay live while the unchanged runtime refresh rechecks them in
+the background. Structural members that fail the reuse conditions await runtime admission, whose
+first maintenance tick runs at startup. Without that record, an eligible reused wallet still skips
+fresh boot validation;
 otherwise boot validates `BRACKET_CONCURRENCY`-sized waves until a wallet passes the final fence,
 durable-history and acceptance filters. A successful bracket without seeded history does not stop
 the waves. Migration, `--exit-after-anchors` and disabled maintenance retain complete validation.
@@ -395,7 +397,7 @@ When a required `validate_direct` walk fails, boot defers every wallet-scoped fa
 the legacy deferral predicate (including the invalid-price row observed in #594, transient and
 rate-limited source reads). Only accepted wallets install anchors atomically, and only their seeded
 history promotes to complete. Deferred wallets stay unvalidated for runtime admission; a wallet
-reused on a fresh anchor is not re-read at boot. Shared infrastructure and consistency failures
+reused on an installed anchor is not re-read at boot. Shared infrastructure and consistency failures
 outside the legacy predicate retain their boot failure policy. Runtime-refresh error conversion is
 unchanged: a deferred refresh keeps the current anchor usable under existing eligibility rules and
 starts the refresh-only cooldown (#597). A deferred routine refresh still gets its immediate
@@ -891,6 +893,14 @@ call count.
 | Key | Default | Meaning |
 |---|---:|---|
 | `source_freshness_window_seconds` | 60 | Seconds without an event before a source is considered stale in `/health/ready` |
+| `DISK_FREE_WARN_BYTES` | 15,000,000,000 bytes (15 GB) | Compiled `disk_monitor` constant, no TOML/env key. Below this on any durable filesystem, readiness reports `disk_low` and one ERROR logs the transition; recovery to at least this clears the issue and logs INFO. |
+| `DISK_FREE_FLOOR_BYTES` | 5,000,000,000 bytes (5 GB) | Compiled `disk_monitor` constant, no TOML/env key. Startup refuses before writable initialization below this; a runtime sample below it fails the critical owner and requests coordinated shutdown. |
+| `DISK_SAMPLE_SECS` | 60 s | Compiled `disk_monitor` constant, no TOML/env key. The named critical owner samples immediately, then at this cadence regardless of `status_interval_secs`; sampling errors WARN and retry at the next tick without initiating shutdown. |
+
+Disk checks cover the parent directories of `source_event_log_path`, `paper_state_db_path`,
+`event_log_path`, `status_path`, and `jsonl_log_path`, once per device. Before a parent exists,
+its nearest existing directory supplies the filesystem sample; startup creates no directory for
+this check.
 
 ### Agent-friendly log layout
 
@@ -983,9 +993,10 @@ side main; path, prefix, hash, identity, or phase drift fails closed. Pre-bounda
 audit/replay history and cannot create v2 state. Once v2 input has appended or active state has
 committed, rollback to v1 is refused; restart the v2-compatible binary to resume roll-forward.
 
-Ordinary production has one named supervisor over 17 retained owners. Activity ingest, public
+Ordinary production has one named supervisor over 18 retained owners. Activity ingest, public
 poll/reconciliation, orchestrator, resolution poller, configured live-account/fan-out owners,
-watchlist refresh/projection, maintenance, capacity/config workers, source checkpoint, status writer, and HTTP server
+watchlist refresh/projection, maintenance, capacity/config workers, source checkpoint, disk monitor,
+status writer, and HTTP server
 are critical: an unexpected typed error, early return, channel close, or join failure sticks in
 readiness/status and initiates ordered shutdown. Supabase analytics, liquidity snapshots, and JSON
 tracing appenders are best-effort and degrade status without failing trading readiness. Shutdown

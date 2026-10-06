@@ -14,6 +14,7 @@ pub mod config;
 pub mod config_poller;
 pub mod decision_replay;
 pub mod demotion_stat;
+pub mod disk_monitor;
 pub mod dispatch_recovery;
 pub mod entry_gate;
 pub mod health;
