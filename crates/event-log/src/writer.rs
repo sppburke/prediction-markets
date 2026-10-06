@@ -40,8 +40,17 @@ pub struct AppendReceipt {
 #[derive(Debug)]
 pub struct CheckpointVerification {
     pub used: bool,
+    /// True only when a checkpoint was used without hashing its raw prefix.
+    pub deferred: bool,
     pub prefix_elapsed: std::time::Duration,
     pub suffix_elapsed: std::time::Duration,
+}
+
+/// Whether a compatible checkpoint's raw prefix must be verified before opening.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CheckpointPrefix {
+    Verify,
+    Defer,
 }
 
 /// Single-writer handle for an append-only event log file.
@@ -237,10 +246,15 @@ impl Writer {
 
     /// Checkpoint-assisted verification holds the same exclusive lock for raw-prefix checking,
     /// full-walk fallback, suffix verification, and torn-tail repair.
+    ///
+    /// With `prefix_mode = Defer`, a used checkpoint skips all prefix reads. The caller's
+    /// `digest` then contains only suffix bytes and is **not** a valid prefix digest. The
+    /// caller must verify the skipped prefix independently before publishing a checkpoint.
     pub fn open_verified_checkpoint(
         path: &Path,
         expected: &LogTailBinding,
         checkpoint: Option<(&LogTailBinding, &str)>,
+        prefix_mode: CheckpointPrefix,
         digest: &mut blake3::Hasher,
         start: &mut dyn FnMut(bool),
         observer: &mut dyn FnMut(u64, &EventEnvelope),
@@ -256,13 +270,21 @@ impl Writer {
             }
         })?;
         let prefix_started = std::time::Instant::now();
+        let file_len = if prefix_mode == CheckpointPrefix::Defer {
+            Some(file.metadata()?.len())
+        } else {
+            None
+        };
         let resume = checkpoint.and_then(|(tail, expected_hash)| {
             if tail.path != std::fs::canonicalize(path).ok()?
                 || tail.physical_tail < expected.physical_tail
             {
                 return None;
             }
-            let hash = crate::scanner::hash_open_prefix(&file, tail.physical_tail).ok()?;
+            if let Some(file_len) = file_len {
+                return (file_len >= tail.physical_tail).then_some(tail);
+            }
+            let hash = crate::scanner::hash_open_prefix(&file, tail.physical_tail, None).ok()?;
             if hash.finalize().to_hex().as_str() != expected_hash {
                 return None;
             }
@@ -270,9 +292,16 @@ impl Writer {
             Some(tail)
         });
         let used = resume.is_some();
+        let deferred = used && prefix_mode == CheckpointPrefix::Defer;
         let prefix_elapsed = prefix_started.elapsed();
         start(used);
         let suffix_started = std::time::Instant::now();
+        if used && !deferred {
+            // Preserve Verify's header check. A deferred resume reads no prefix bytes.
+            let mut reader = std::io::BufReader::new(&file);
+            reader.seek(SeekFrom::Start(0))?;
+            crate::frame::verify_file_header(path, &mut reader)?;
+        }
         let (scan, verdict) = crate::scanner::walk_hashed(
             path,
             &file,
@@ -281,6 +310,7 @@ impl Writer {
             None,
             digest,
             observer,
+            None,
         )?;
         let (writer, binding) = Self::finish_verified_open(path, file, scan, verdict, true)?;
         Ok((
@@ -288,6 +318,7 @@ impl Writer {
             binding,
             CheckpointVerification {
                 used,
+                deferred,
                 prefix_elapsed,
                 suffix_elapsed: suffix_started.elapsed(),
             },

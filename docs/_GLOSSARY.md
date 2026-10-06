@@ -335,7 +335,9 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `reconciliation_page_limit` | 500 | **Module const** in `source-polymarket-public` (not a TOML/env key). Fixed page size for the #544 activity and current-position proof readers. |
 | `activity_max_offset` | 5,000 | **Module const** in `source-polymarket-public` (not a TOML/env key). A full terminal `/activity` page at this offset is split at an integer-second boundary; a still-full one-second terminal window is typed-incomplete and blocks reconciliation (#544). |
 | `positions_max_offset` | 10,000 | **Module const** in `source-polymarket-public` (not a TOML/env key). Each explicit `redeemable=false` and `redeemable=true` current-position partition is walked independently through this offset. A full terminal page is typed-incomplete (#544). |
-| `anchor_refresh_secs` | 3,600 | **Module const** `ANCHOR_REFRESH_SECS` in `service` (not a TOML/env key). Seconds between best-effort per-wallet position re-anchors; also the in-memory transient admission cooldown and the refresh-only cooldown for every terminal `Deferred`. Refresh deadlines use monotonic time captured immediately after terminal completion, before coordinator handling, and gate normal selection, retry selection and queued launch. Successful anchoring clears the refresh deadline; cancelled, skipped and unstarted work create none. Cooldowns survive membership/ranking-batch changes and reset on restart; successful admission clears its admission cooldown. An owner-selected operational default, not a calibrated value. |
+| <a id="anchor_refresh_secs"></a>`anchor_refresh_secs` | 3,600 | **Module const** `ANCHOR_REFRESH_SECS` in `service::trade_poller` (not a TOML/env key). Seconds between best-effort per-wallet position re-anchors and the refresh-only cooldown for every terminal `Deferred`. Refresh deadlines use monotonic time captured immediately after terminal completion, before coordinator handling, and gate normal selection, retry selection and queued launch. Successful anchoring clears the refresh deadline; cancelled, skipped and unstarted work create none. Cooldowns survive membership/ranking-batch changes and reset on restart. Admission uses [`admission_retry_secs`](#admission_retry_secs). An owner-selected operational default, not a calibrated value. |
+| <a id="admission_retry_secs"></a>`admission_retry_secs` | 300 | **Module const** `ADMISSION_RETRY_SECS` in `service::watchlist_admission` (not a TOML/env key). In-memory cooldown from a `WalletTransient` bracket failure's monotonic completion time until the wallet becomes eligible again: boot's `boot_transient_retry_at` in `main.rs` and runtime maintenance's `park_persistent` use the same constant. Cooldowns survive ranking-batch changes and reset on restart; successful admission clears the wallet's cooldown. |
+| `bracket_identity_chunk_retry` | 4 additional retries; waits of 2, 4, 8 and 16 s | Compiled retry schedule in `service::asset_identity` (`resolve_for_bracket` / `fetch_and_record_chunks`), not a TOML/env key. An admission bracket retries a chunk whose fetch exhausted the fetcher's transient retries; each retry passes through the shared rate gate. Rate-limited, fatal, parse and recording failures receive no additional chunk retry. The poller's `resolve` retains one attempt per chunk, including the fetcher's own retry policy. |
 | `bracket_concurrency` | 4 | **Module const** `BRACKET_CONCURRENCY` in `service` (not a TOML/env key). Maximum wallet brackets in flight at once during the boot bracket and runtime admission batches (#555 addendum D9). Chosen from the measured per-wallet peak of ~304 MB resident on the largest wallet against the 2 GB production host; every bracket still reads the wallet's full history three times. |
 | `redeem_residual_limit_atomic` | 100 | **Exclusive module const** `REDEEM_RESIDUAL_LIMIT_ATOMIC` in `position-ledger` (#557). A REDEEM underflow residual of 1..=99 atomic units clamps the position closed and is recorded in the version-3 effect document; 100 or more fences. `ShareAmount` has six decimal places, so 100 atomic units equal one ten-thousandth of a position: the limit is one four-decimal `/positions` reporting quantum and accepts venue-display quantization residue without hiding a full reported quantum. SELL and MERGE remain strict, and the tolerance cannot stack within a bucket. |
 | `rehearsal_quiescence` | production unit policy at run time | The #545 rehearsal reads the production `pe-service` unit's `TimeoutStopSec` as its exact quiescence bound and requires `KillSignal` to be SIGINT, the signal handled by the service. The harness owns no separate numeric shutdown bound (#586). |
@@ -381,11 +383,14 @@ including omitted-start walks, require validation even when an old completion fl
 `position_validation_current` is not a reuse prerequisite: ordinary activity can delete that
 temporary projection without deleting the durable anchor. Only reused wallets and wallets accepted
 by direct validation can enter the boot universe; a deferred walk cannot reuse an old complete flag.
-When Supabase is configured and `maintenance_interval_secs` is positive, an eligible reused wallet
-skips fresh boot validation. Otherwise boot validates `BRACKET_CONCURRENCY`-sized waves until a
-wallet passes the final fence, durable-history and acceptance filters; a successful bracket without
-seeded history does not stop the waves. Migration, `--exit-after-anchors` and disabled maintenance
-retain complete validation. Remaining structural members await runtime admission.
+When Supabase is configured and `maintenance_interval_secs` is positive, an ordinary progressive
+boot skips validation waves if a post-Start membership record has replayed, even when all anchors
+are stale. Stale-anchor structural members await runtime admission, whose first maintenance tick
+runs at startup. Without that record, an eligible reused wallet still skips fresh boot validation;
+otherwise boot validates `BRACKET_CONCURRENCY`-sized waves until a wallet passes the final fence,
+durable-history and acceptance filters. A successful bracket without seeded history does not stop
+the waves. Migration, `--exit-after-anchors` and disabled maintenance retain complete validation.
+Remaining structural members await runtime admission.
 When a required `validate_direct` walk fails, boot defers every wallet-scoped failure class plus
 the legacy deferral predicate (including the invalid-price row observed in #594, transient and
 rate-limited source reads). Only accepted wallets install anchors atomically, and only their seeded
@@ -824,7 +829,7 @@ both tokens and row count agree, retrying one token race before returning typed 
 | `clv_compare_trades_dominates_pp` | 20 | CLV source-comparison gate (#429 PR2, const `TRADES_DOMINATES_PP`): trades-bucket coverage must exceed CLOB coverage by ≥ this many percentage points (AND be a sound proxy per `clv_compare_mid_bias_max`) to select `trades_only`. |
 | `clv_compare_trades_fill_min_pp` | 5 | CLV source-comparison gate (#429 PR2, const `TRADES_FILL_MIN_PP`): min coverage (percentage points) the trades series must add beyond CLOB (AND be a sound proxy) to select `clob_primary_with_trades_fill`; below it the trades pass is dropped (`clob_only`). |
 | `true_clv_coverage_warn_pct` | 30 | Warn floor (percent) for the `true_clv` estimator's *position-level* CLOB coverage, checked in `suff_stats.materialize` when the optional `market_price_history` + `token_conditions` views ARE registered (issue #429 PR4): the share of materialized positions carrying a non-NaN `true_clv_close`. `true_clv` is best-effort (PR2's ~63.6% market-level ceiling, less at position level), so 30 catches the degenerate/mis-wired case (≈0% — empty backfill or a broken join) without false-warning on the expected partial coverage. Distinct from the bootstrap-side `prices_history_coverage_warn_pct` (market-level, Rust). Const `TRUE_CLV_COVERAGE_WARN_PCT` in `scripts/ranker/suff_stats.py`. |
-| `maintenance_interval_secs` | 600 | `ServiceConfig` field (issue #350 WS1 PR-D). Seconds between maintenance ticks (inactivity + underperformance knockout + atomic backfill). `0` disables the tick entirely (skipped, not a zero-duration loop). The task is spawned only when `supabase_url` is non-empty and this is `> 0`. `PE_MAINTENANCE_INTERVAL_SECS`. One monotonic launch deadline covers mutex waiting, full rerank, replanning, live reentry and knockout/backfill. Expiry prevents new brackets and optional retries; started work drains and completed acceptances use existing publication checks. Unstarted wallets remain retryable without failure, cooldown or attempted status. |
+| `maintenance_interval_secs` | 600 | `ServiceConfig` field (issue #350 WS1 PR-D). The first maintenance tick runs at startup; this interval's sleep follows each completed tick (inactivity + underperformance knockout + atomic backfill). `0` disables the tick entirely (skipped, not a zero-duration loop). The task is spawned only when `supabase_url` is non-empty and this is `> 0`. `PE_MAINTENANCE_INTERVAL_SECS`. One monotonic launch deadline covers mutex waiting, full rerank, replanning, live reentry and knockout/backfill. Expiry prevents new brackets and optional retries; started work drains and completed acceptances use existing publication checks. Unstarted wallets remain retryable without failure, cooldown or attempted status. Launch order uses per-wallet queue keys in the shared admission preparer: first offers take keys in rank order, each started wallet moves behind every waiting wallet, and keys survive ranking-batch and capacity resynchronization. Additions and live re-entries alternate which path prepares first each tick. `admission launch order` reports `path`, `first`, `eligible`, `started` and `started_previous_keys`; `maintenance admission budget completed` reports `attempted_batch_id`, `applied_batch_id` and `capacity_generation` alongside its timing and outcome counts. |
 | `inactivity_threshold_secs` | 259_200 | `ServiceConfig` field (#350 WS1 PR-D). A live wallet idle (no observed trade) ≥ this many seconds is evicted, unless it is a proven winner (then spared up to `inactivity_hard_cap_secs`). 72 h. Inactivity uses the Activity clock (#511), falling back to the delivery cursor; ranking timestamps seed that clock without an admission grace period. `PE_INACTIVITY_THRESHOLD_SECS`. |
 | `inactivity_hard_cap_secs` | 604_800 | `ServiceConfig` field (#350 WS1 PR-D). Hard ceiling on sparing a proven winner from inactivity eviction: past this idle span the wallet is evicted unconditionally (a winner silent for a week is more likely abandoned than patient). 7 d. `PE_INACTIVITY_HARD_CAP_SECS`. |
 | `bench_overfetch` | 10 | `ServiceConfig` field (#350 WS1 PR-D). Accepted for configuration compatibility only; since #588 it has no runtime effect because membership maintenance reads the latest ranking batch bounded by `MAX_ACTIVE_WATCHLIST_SIZE` (fence-before-cap selection). `PE_BENCH_OVERFETCH`. |
@@ -894,7 +899,7 @@ a focused file for problems, and a bounded stream for detail — never an unboun
 
 | Artifact | Shape | Use |
 |---|---|---|
-| `status.json` (`status_path`) | single file, atomically rewritten every `status_interval_secs` | **current health snapshot** — includes the embedded source `revision`, top-level `applied_config_hash`, sticky named `tasks` with class/state/typed failure, `status_error`, the prior financial/source/live fields, optional `runtime_config` (applied hash plus separately typed rejected raw proposal), and optional `watchlist_projection` (`pending`/`applied` token, count, time plus `last_error`). `watchlist_size` is actual membership; `watchlist_target_size` is the last safely applied runtime cap. Read this first; no grep. |
+| `status.json` (`status_path`) | single file, atomically rewritten every `status_interval_secs` | **current health snapshot** — includes the embedded source `revision`, top-level `applied_config_hash`, sticky named `tasks` with class/state/typed failure, `status_error`, the prior financial/source/live fields, optional `runtime_config` (applied hash plus separately typed rejected raw proposal), and optional `watchlist_projection` (`pending`/`applied` token, count, time plus `last_error`). Optional `live_wallets` and `live_wallets_at_unix_ms` sample the live snapshot minus durable fences (`effective_projection_entries`) together with its time under the structural writer lock. A fence-read failure omits both fields; it never substitutes an empty list. `watchlist_size` is the live snapshot's membership count before that fence subtraction; `watchlist_target_size` is the last safely applied runtime cap. Read this first; no grep. |
 | `<stem>.<date>.jsonl` (from `jsonl_log_path`) | full stream, rotated **daily**, keeps `log_retention_days` | full detail; grep one day's file |
 | `errors.<date>.jsonl` (same dir) | **WARN+ERROR only**, rotated daily | the clean "what broke" tape (no INFO chatter) |
 
@@ -915,16 +920,55 @@ fatal. Append, flush, or synchronization uncertainty poisons the writer. The acc
 `live_journal.log` uses its native verified replay for the same binding fields. An ordinary
 installed boot holds that lock while binding the recorded activation prefix. A compatible
 `<source-log>.boot-checkpoint` restores receipt metadata and raw activity/boundary candidates after
-checksum, version, mode, path, activation and tail checks and BLAKE3 verification of its exact raw
-prefix. The existing scanner verifies every suffix frame. Missing, damaged or incompatible artifacts,
-shortened files and prefix mismatch select a full verified walk under the same lock; actual corruption
-still refuses. Incomplete-tail repair and activation-prefix authority remain unchanged, including
-the absence of every-durable-mark coupling. Projections publish only after verification and every
-reducer succeeds. The initial-open checkpoint snapshot freezes the existing receipt-index prefix
-and pre-consumption candidates, excluding later boot/runtime appends. Synchronous best-effort atomic
-publication occurs after the producer barrier with runtime tasks running. The walked binding is
-reused only while that writer remains sole appender and its synchronized tail equals its byte cursor,
-which detects external length drift but not equal-length rewrites of verified bytes (#572).
+checksum, version, mode, path, activation and tail checks. With readable inactive authority,
+boot defers the exact raw-prefix BLAKE3 check and scanner-verifies only the suffix; its completion
+line records `prefix_verification="deferred"`, the loaded binding and `prefix_blake3`. Missing,
+damaged or incompatible artifacts, shortened files, and active or unreadable authority select a
+full verified walk; actual frame corruption still refuses. Activation-prefix authority and
+incomplete-tail repair remain unchanged. Runtime indexed reads verify individual frames.
+
+The critical `source_checkpoint` owner starts after HTTP listening. Its single cancellable blocking
+job slot verifies the loaded prefix, continues the same hasher to the frozen boot tail, then
+serializes and publishes the frozen initial receipt prefix and pre-consumption reducers. A mismatch,
+read error or binding inequality quarantines checkpoint use and triggers coordinated restart. A
+failure before the quarantine is durable (checkpoint lock, invalidation-record read, quarantine
+rename or its directory sync) carries `CheckpointInvalidationFailed` and exits 78; with no
+checkpoint present, a failed invalidation-record write is itself that quarantine failure.
+The checkpoint-invalidation systemd drop-in prevents automatic restart for this status. Main
+retains and bounds the blocking-child join independently of async supervision; the job slot
+carries a quarantine failure to main even after shutdown stopped the owner, and status 78 takes
+precedence over join/shutdown timeouts. Cancellation discards late computation results and starts
+no further publication; an already-started publication finishes.
+
+All publishers share one persistent `<checkpoint>.lock` inode and the durable
+`<checkpoint>.invalidation` record (`generation`, `active`; absence means generation zero/inactive).
+Invalidation atomically quarantines the artifact before advancing active authority. Publication
+compares artifact applicability, reducer version, tail, binding and prefix under the lock and
+installs only an authorized candidate; a verified current-generation publication clears active
+only after durable installation. Clearance is automatic on a verified current-generation
+publication, whether by the next boot's full walk or `--prepare-source-checkpoint`; there is no
+separate clearance command. Unreadable authority makes boots full-walk and refuses publication
+until quiesced recovery removes and syncs the checkpoint before removing and syncing the record.
+Preparation reads authority first, captures open rows and feed frontiers before its finite source
+bound, and full-walks when the record is active or undecodable. A proven wrong prefix digest
+invalidates only the still-current artifact and generation; if either changed, preparation starts
+again. Its durable publication receipt is documented in the
+[deploy runbook](35-PE-SERVICE-DEPLOY-RUNBOOK.md#737-release-1-checkpoint-restart-and-rollback).
+
+Hourly scanner-verified extensions reuse the frozen reducers and hasher and retain their originating
+generation. Successful walks advance that state even when publication is refused or fails. Walk,
+reducer, binding or changed-generation failures trigger coordinated restart. Publication I/O
+failures retain the exact serialized bytes and original capture time for retries; the next hourly
+candidate replaces a pending one. Other protocol refusals discard the candidate. Every attempt
+logs the age of the last binding this owner successfully published. The walked binding is reused
+only while that writer remains sole appender and its synchronized tail equals its byte cursor,
+which detects external length drift but not equal-length rewrites of verified bytes (#572, #737).
+
+| Compiled checkpoint default | Value | Owner |
+|---|---|---|
+| `CHECKPOINT_PUBLISH_SECS` | 3,600 s | `source_checkpoint`: hourly incremental capture/publication interval; no TOML/env setting. |
+| `CHECKPOINT_RETRY_SECS` | 60 s | `source_checkpoint`: retained serialized-candidate publication retry; no TOML/env setting. |
+
 The runtime qualification seal verifies the sealed prefix with one scanner walk bounded by the
 caller's candidate (the just-recorded mark tail at a completion boundary, the receipt-index tail on
 configuration drift), reads the frames its decision rows reference exactly through the receipt
@@ -939,9 +983,9 @@ side main; path, prefix, hash, identity, or phase drift fails closed. Pre-bounda
 audit/replay history and cannot create v2 state. Once v2 input has appended or active state has
 committed, rollback to v1 is refused; restart the v2-compatible binary to resume roll-forward.
 
-Ordinary production has one named supervisor over 16 retained owners. Activity ingest, public
+Ordinary production has one named supervisor over 17 retained owners. Activity ingest, public
 poll/reconciliation, orchestrator, resolution poller, configured live-account/fan-out owners,
-watchlist refresh/projection, maintenance, capacity/config workers, status writer, and HTTP server
+watchlist refresh/projection, maintenance, capacity/config workers, source checkpoint, status writer, and HTTP server
 are critical: an unexpected typed error, early return, channel close, or join failure sticks in
 readiness/status and initiates ordered shutdown. Supabase analytics, liquidity snapshots, and JSON
 tracing appenders are best-effort and degrade status without failing trading readiness. Shutdown
@@ -974,10 +1018,10 @@ Written to the rolling full-stream files derived from `jsonl_log_path` (default 
 
 ### Logging conventions (issue #184)
 
-Every log line in the workspace is JSONL, emitted via the `tracing` crate. Subscribers
+Runtime log lines in the workspace are JSONL, emitted via the `tracing` crate. Subscribers
 are configured to `.json()` in `pe-bootstrap`, `pe-backtest`, and `pe-service` (both
 stderr and file layers for service). Operators wanting human-readable console output
-pipe through `jq`. No production code path uses `eprintln!`/`println!` for logging.
+pipe through `jq`. Command-mode stdout also carries operator receipts and executable identities.
 
 **Canonical field shapes:**
 

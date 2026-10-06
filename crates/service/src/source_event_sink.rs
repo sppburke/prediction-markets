@@ -51,12 +51,20 @@ impl SourceEventSink {
         path: &Path,
         expected: &LogTailBinding,
         checkpoint: Option<(&LogTailBinding, &str)>,
+        prefix_mode: pe_event_log::CheckpointPrefix,
         digest: &mut blake3::Hasher,
         start: &mut dyn FnMut(bool),
         observer: &mut dyn FnMut(u64, &EventEnvelope),
     ) -> Result<(Self, LogTailBinding, pe_event_log::CheckpointVerification), LogError> {
-        let (writer, binding, used) =
-            Writer::open_verified_checkpoint(path, expected, checkpoint, digest, start, observer)?;
+        let (writer, binding, used) = Writer::open_verified_checkpoint(
+            path,
+            expected,
+            checkpoint,
+            prefix_mode,
+            digest,
+            start,
+            observer,
+        )?;
         Ok((Self::from_writer(path.to_owned(), writer), binding, used))
     }
 

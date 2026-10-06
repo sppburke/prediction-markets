@@ -3,6 +3,7 @@
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use blake3::Hash;
 use pe_core_types::EventSeq;
@@ -116,7 +117,28 @@ impl Scanner {
         digest: &mut blake3::Hasher,
         observer: &mut dyn FnMut(u64, &EventEnvelope),
     ) -> Result<LogTailBinding, LogError> {
+        Self::walk_bounded_cancellable(path, byte_bound, expected, resume, digest, observer, None)
+    }
+
+    /// As [`Self::walk_bounded`], stopping between verified frames when cancellation is set.
+    pub fn walk_bounded_cancellable(
+        path: &Path,
+        byte_bound: u64,
+        expected: &LogTailBinding,
+        resume: Option<&LogTailBinding>,
+        digest: &mut blake3::Hasher,
+        observer: &mut dyn FnMut(u64, &EventEnvelope),
+        cancel: Option<&AtomicBool>,
+    ) -> Result<LogTailBinding, LogError> {
+        check_cancelled(cancel)?;
         let file = File::open(path)?;
+        if resume.is_some() {
+            // Bounded callers retain the original header check; only the writer's explicit
+            // Defer mode skips the trusted prefix entirely.
+            let mut reader = BufReader::new(&file);
+            reader.seek(SeekFrom::Start(0))?;
+            verify_file_header(path, &mut reader)?;
+        }
         let (outcome, verdict) = walk_hashed(
             path,
             &file,
@@ -125,6 +147,7 @@ impl Scanner {
             Some(byte_bound),
             digest,
             observer,
+            cancel,
         )?;
         verdict.require_match()?;
         Ok(outcome.verified_tail)
@@ -132,7 +155,17 @@ impl Scanner {
 
     /// Hash exactly a claimed physical prefix. No frames are decoded by this check.
     pub fn hash_prefix(path: &Path, physical_tail: u64) -> Result<blake3::Hasher, LogError> {
-        hash_open_prefix(&File::open(path)?, physical_tail)
+        Self::hash_prefix_cancellable(path, physical_tail, None)
+    }
+
+    /// As [`Self::hash_prefix`], stopping between 64 KiB reads when cancellation is set.
+    pub fn hash_prefix_cancellable(
+        path: &Path,
+        physical_tail: u64,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<blake3::Hasher, LogError> {
+        check_cancelled(cancel)?;
+        hash_open_prefix(&File::open(path)?, physical_tail, cancel)
     }
 }
 
@@ -479,13 +512,31 @@ impl<R: Seek> Seek for BoundedReader<R> {
 pub(crate) fn hash_open_prefix(
     file: &File,
     physical_tail: u64,
+    cancel: Option<&AtomicBool>,
 ) -> Result<blake3::Hasher, LogError> {
     let mut reader = BufReader::new(file);
     reader.seek(SeekFrom::Start(0))?;
+    hash_reader_prefix(&mut reader, physical_tail, cancel)
+}
+
+fn check_cancelled(cancel: Option<&AtomicBool>) -> Result<(), LogError> {
+    if cancel.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        return Err(LogError::Cancelled);
+    }
+    Ok(())
+}
+
+fn hash_reader_prefix(
+    reader: &mut impl Read,
+    physical_tail: u64,
+    cancel: Option<&AtomicBool>,
+) -> Result<blake3::Hasher, LogError> {
+    check_cancelled(cancel)?;
     let mut hash = blake3::Hasher::new();
     let mut remaining = physical_tail;
     let mut buffer = [0u8; 64 * 1024];
     while remaining > 0 {
+        check_cancelled(cancel)?;
         let size = usize::try_from(remaining)
             .unwrap_or(usize::MAX)
             .min(buffer.len());
@@ -499,10 +550,12 @@ pub(crate) fn hash_open_prefix(
         hash.update(&buffer[..count]);
         remaining -= u64::try_from(count).map_err(std::io::Error::other)?;
     }
+    check_cancelled(cancel)?;
     Ok(hash)
 }
 
 /// Digest advances only after the exact consumed frame bytes pass every verifier.
+#[allow(clippy::too_many_arguments)] // One shared walker with explicit verification and cancellation inputs.
 pub(crate) fn walk_hashed(
     path: &Path,
     file: &File,
@@ -511,7 +564,9 @@ pub(crate) fn walk_hashed(
     bound: Option<u64>,
     digest: &mut blake3::Hasher,
     observer: &mut dyn FnMut(u64, &EventEnvelope),
+    cancel: Option<&AtomicBool>,
 ) -> Result<(ScanOutcome, PrefixVerdict), LogError> {
+    check_cancelled(cancel)?;
     let resolved_path = std::fs::canonicalize(path)?;
     #[cfg(feature = "scan-metrics")]
     crate::scan_metrics::record(&resolved_path);
@@ -520,8 +575,6 @@ pub(crate) fn walk_hashed(
         cursor: 0,
         bound: bound.unwrap_or(u64::MAX),
     };
-    reader.seek(SeekFrom::Start(0))?;
-    verify_file_header(path, &mut reader)?;
     let mut state = if let Some(resume) = resume {
         if resume.physical_tail > reader.bound {
             return Err(LogError::Io(std::io::Error::other(
@@ -542,6 +595,8 @@ pub(crate) fn walk_hashed(
             resume.physical_tail,
         )
     } else {
+        reader.seek(SeekFrom::Start(0))?;
+        verify_file_header(path, &mut reader)?;
         *digest = blake3::Hasher::new();
         // These are the bytes just read and checked by verify_file_header.
         digest.update(crate::frame::MAGIC);
@@ -554,6 +609,7 @@ pub(crate) fn walk_hashed(
     } // Caller authenticated the checkpoint's activation binding.
     prefix.observe(&state);
     loop {
+        check_cancelled(cancel)?;
         let start = state.physical_tail();
         let mut candidate = digest.clone();
         match read_verified_frame_observed(&mut reader, &mut state, &mut |bytes| {
@@ -594,5 +650,42 @@ fn tail_binding(path: PathBuf, state: &ScanState) -> LogTailBinding {
         physical_tail: state.physical_tail,
         last_sequence: state.next_sequence.checked_sub(1).map(EventSeq),
         last_hash: state.previous_hash,
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    #[test]
+    fn checkpoint_prefix_hash_cancelled_between_64_kib_reads() {
+        struct CancelAfterRead<'a> {
+            flag: &'a AtomicBool,
+            reads: usize,
+        }
+        impl Read for CancelAfterRead<'_> {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                assert_eq!(bytes.len(), 64 * 1024);
+                bytes.fill(17);
+                self.reads += 1;
+                self.flag.store(true, Ordering::Relaxed);
+                Ok(bytes.len())
+            }
+        }
+        let flag = AtomicBool::new(false);
+        let mut reader = CancelAfterRead {
+            flag: &flag,
+            reads: 0,
+        };
+        assert!(matches!(
+            hash_reader_prefix(&mut reader, 128 * 1024, Some(&flag)),
+            Err(LogError::Cancelled)
+        ));
+        assert_eq!(reader.reads, 1);
+        let mut bytes = std::io::Cursor::new(vec![17; 128 * 1024]);
+        flag.store(false, Ordering::Relaxed);
+        let hash = hash_reader_prefix(&mut bytes, 128 * 1024, Some(&flag)).unwrap();
+        assert_eq!(hash.finalize(), blake3::hash(bytes.get_ref()));
     }
 }

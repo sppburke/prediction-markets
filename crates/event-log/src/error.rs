@@ -23,6 +23,9 @@ impl std::fmt::Display for PoisonReason {
 
 #[derive(Debug, Error)]
 pub enum LogError {
+    #[error("event-log scan cancelled")]
+    Cancelled,
+
     #[error("bad file header at {path}: expected EDGE\\x01")]
     BadHeader { path: PathBuf },
 
