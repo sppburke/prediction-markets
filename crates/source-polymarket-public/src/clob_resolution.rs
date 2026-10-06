@@ -275,6 +275,7 @@ impl ClobMarket {
             end_date_iso: self.end_date_iso.clone(),
             closed: self.closed,
             active: self.active,
+            neg_risk: self.neg_risk,
             neg_risk_market_id: self.neg_risk_market_id.clone(),
             is_50_50_outcome: self.is_50_50_outcome,
             tokens: self.tokens.clone(),
@@ -301,6 +302,7 @@ pub struct ClobMarketsPage {
 /// Fully retained payout evidence for one parsed market.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClobResolutionEvidence {
+    pub neg_risk: Option<bool>,
     pub condition_id: Option<String>,
     pub end_date_iso: Option<String>,
     pub closed: Option<bool>,

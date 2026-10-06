@@ -682,6 +682,14 @@ mod tests {
             ).unwrap();
             assert_eq!(stored, expected);
             assert_eq!(page_ordinal, ordinal);
+            let flag: Option<i64> = conn
+                .query_row(
+                    "SELECT neg_risk FROM clob_payout_evidence_v2 WHERE market_id = ?1",
+                    [market],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(flag, Some(i64::from(market != "0xordinary")));
             assert!(cache.clob_payout_evidence_v2(market).unwrap().is_some());
         }
     }

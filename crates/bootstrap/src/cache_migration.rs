@@ -48,7 +48,11 @@ use tokio::sync::{mpsc, oneshot};
 mod aggregate_scan;
 mod digests;
 mod incremental;
+#[cfg(feature = "scenario")]
+mod measurement;
 mod projection_digest;
+mod projection_v3;
+pub use projection_v3::{ClassificationReport, ExportProjectionSummary};
 #[cfg(target_os = "linux")]
 mod walk_prefetch;
 use digests::{JsonArrayDigest, ReceiptSetDigest};
@@ -371,6 +375,12 @@ struct RankerProjectionInputs {
     payout_generation: u64,
     payout_manifest_sha256: String,
     payout_evidence_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    oracle_version: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    projection_spool: Option<projection_v3::SpoolCommitment>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    certificate_digest: Option<String>,
 }
 
 impl RankerProjectionInputs {
@@ -404,9 +414,41 @@ impl RankerProjectionInputs {
                 row.get::<_, String>(5)?,
             ))
         })?;
+        let format_three =
+            fresh_collection_record(connection)?.is_some_and(|identity| identity.version == 4);
         let mut payout_evidence_digest = JsonArrayDigest::new();
-        for row in rows {
-            payout_evidence_digest.push(&row?)?;
+        if format_three {
+            let group_version: Option<i64> = connection.query_row(
+                "SELECT group_version FROM clob_payout_coverage_manifests_v2 WHERE generation = ?1",
+                [payout_generation],
+                |row| row.get(0),
+            )?;
+            if group_version != Some(1) {
+                return invalid(
+                    "classifier 6 requires payout coverage group_version = 1".to_owned(),
+                );
+            }
+            let mut statement = connection.prepare(
+                "SELECT market_id, end_date_unix, payout_status,
+                payout_vector_json, tokens_json, raw_page_sha256, neg_risk_market_id
+                FROM clob_payout_evidence_v2 ORDER BY market_id",
+            )?;
+            let mut rows = statement.query([])?;
+            while let Some(row) = rows.next()? {
+                payout_evidence_digest.push(&(
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                ))?;
+            }
+        } else {
+            for row in rows {
+                payout_evidence_digest.push(&row?)?;
+            }
         }
         Ok(Self {
             activity_generation: manifest.generation,
@@ -425,6 +467,9 @@ impl RankerProjectionInputs {
             payout_generation: to_u64(payout_generation, "payout generation")?,
             payout_manifest_sha256: sha256_bytes(payout_manifest.as_bytes()),
             payout_evidence_digest: payout_evidence_digest.finish(),
+            oracle_version: format_three.then_some(6),
+            projection_spool: None,
+            certificate_digest: None,
         })
     }
 }
@@ -837,6 +882,12 @@ pub struct CacheFinalStageRecord {
     pub ranker_projection_count: u64,
     pub ranker_projection_digest: String,
     pub ranker_classifier_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export_manifest_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub export_projection: Option<ExportProjectionSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification_report: Option<ClassificationReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1492,7 +1543,7 @@ fn begin_or_resume_fresh_collection(
                                 }
                             },
                         )?;
-                        if !receipt.excluded() {
+                        if recorded.is_some() && !receipt.excluded() {
                             transition.push(incremental::HistoryCertificate {
                                 wallet_hex: receipt.wallet_hex.clone(),
                                 generation: manifest.generation,
@@ -1503,12 +1554,14 @@ fn begin_or_resume_fresh_collection(
                                 ordered_digest: receipt.ordered_aggregate_digest.clone(),
                                 scope_drops_json: "[]".to_owned(),
                             });
-                        } else if let Some(certificate) = transition_excluded_wallet(
-                            scan,
-                            &transaction,
-                            manifest.generation,
-                            receipt,
-                        )? {
+                        } else if recorded.is_some()
+                            && let Some(certificate) = transition_excluded_wallet(
+                                scan,
+                                &transaction,
+                                manifest.generation,
+                                receipt,
+                            )?
+                        {
                             transition.push(certificate);
                         }
                         newest
@@ -1552,7 +1605,7 @@ fn begin_or_resume_fresh_collection(
     } else {
         distinct_wallets(
             &transaction,
-            if prior.is_some() {
+            if prior.is_some() || head.is_some() {
                 "activity_groups_v2"
             } else {
                 "trades_v1_sealed"
@@ -1601,7 +1654,7 @@ fn begin_or_resume_fresh_collection(
         let certified_rows = transition.iter().try_fold(0, |total, certificate| {
             checked_activity_count(total, certificate.aggregate_count)
         })?;
-        if retained_row_count.is_some_and(|total| total != certified_rows) {
+        if recorded.is_some() && retained_row_count.is_some_and(|total| total != certified_rows) {
             return invalid("retained rows have no usable predecessor proof".to_owned());
         }
         create_history_v3(&transaction)?;
@@ -1821,7 +1874,11 @@ async fn collect_activity_v2(
                 wallet,
                 start_exclusive,
                 fixed_end_unix,
-                pe_source_polymarket_public::activity::ActivityRowAcceptance::Strict,
+                if proof_ref.is_some_and(|proof| proof.identity.version == 4) {
+                    pe_source_polymarket_public::activity::ActivityRowAcceptance::Acquisition3
+                } else {
+                    pe_source_polymarket_public::activity::ActivityRowAcceptance::Strict
+                },
             );
             let outcome = match deadline {
                 Some(deadline) => tokio::time::timeout_at(deadline, read).await,
@@ -3630,32 +3687,7 @@ fn rebuild_ranker_projection(
 ) -> Result<(ActivityCoverageManifestV2, u64), BootstrapError> {
     let generation = to_i64(activity_generation, "activity generation")?;
     let projection = (|| -> Result<_, BootstrapError> {
-        let payout_markets = transaction
-            .prepare(
-                "SELECT market_id, tokens_json, raw_page_sha256,
-                        CASE WHEN end_date_unix IS NOT NULL
-                          AND payout_status = 'resolved'
-                          AND payout_vector_json IN ('[\"1\",\"0\"]','[\"0\",\"1\"]','[\"0.5\",\"0.5\"]')
-                        THEN 1 ELSE 0 END
-                 FROM clob_payout_evidence_v2 ORDER BY market_id",
-            )?
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, bool>(3)?,
-                ))
-            })?
-            .map(|row| {
-                let (market, tokens, page, eligible) = row?;
-                let tokens = serde_json::from_str::<Vec<ClobToken>>(&tokens)?
-                    .into_iter()
-                    .map(|token| token.token_id.unwrap_or_default())
-                    .collect();
-                Ok((market, (tokens, page, eligible)))
-            })
-            .collect::<Result<PayoutTokens, BootstrapError>>()?;
+        let payout_markets = load_payout_tokens(transaction)?;
         let quality = ReconstructionQuality::new(100).map_err(|error| BootstrapError::Invalid {
             message: format!("bootstrap reconstruction quality is invalid: {error}"),
         })?;
@@ -3765,6 +3797,36 @@ fn insert_classified_wallet(
 // Every payout market's token ids in payout-vector order, the venue page that
 // lists them, and eligibility for admission. Identity rebinding uses all markets.
 type PayoutTokens = BTreeMap<String, (Vec<String>, String, bool)>;
+
+fn load_payout_tokens(connection: &Connection) -> Result<PayoutTokens, BootstrapError> {
+    let payout_markets = connection
+        .prepare(
+            "SELECT market_id, tokens_json, raw_page_sha256,
+            CASE WHEN end_date_unix IS NOT NULL
+              AND payout_status = 'resolved'
+              AND payout_vector_json IN ('[\"1\",\"0\"]','[\"0\",\"1\"]','[\"0.5\",\"0.5\"]')
+            THEN 1 ELSE 0 END
+         FROM clob_payout_evidence_v2 ORDER BY market_id",
+        )?
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, bool>(3)?,
+            ))
+        })?
+        .map(|row| {
+            let (market, tokens, page, eligible) = row?;
+            let tokens = serde_json::from_str::<Vec<ClobToken>>(&tokens)?
+                .into_iter()
+                .map(|token| token.token_id.unwrap_or_default())
+                .collect();
+            Ok((market, (tokens, page, eligible)))
+        })
+        .collect::<Result<PayoutTokens, BootstrapError>>()?;
+    Ok(payout_markets)
+}
 
 // Aggregates retain the loader's (source_time_unix, source_trade_id) order.
 // Borrow contiguous seconds so classification uses the validated vector itself.
@@ -4035,6 +4097,16 @@ pub fn finalize_cache_v2(
     stage_record_path: Option<&Path>,
     finalized_at_unix: i64,
 ) -> Result<Option<CacheFinalStageRecord>, BootstrapError> {
+    finalize_cache_v2_with_export_manifest(cache_path, stage_record_path, None, finalized_at_unix)
+}
+
+/// Bind a format-three re-finalization to its validated exported projection.
+pub fn finalize_cache_v2_with_export_manifest(
+    cache_path: &Path,
+    stage_record_path: Option<&Path>,
+    export_manifest: Option<&Path>,
+    finalized_at_unix: i64,
+) -> Result<Option<CacheFinalStageRecord>, BootstrapError> {
     let mut connection = open_existing_rw(cache_path)?;
     // A rebuild inserts every projection row. With SQLite's default page cache
     // the key index's pages are evicted and rewritten per insert; 1 GiB cut
@@ -4049,6 +4121,20 @@ pub fn finalize_cache_v2(
         "generation",
     )?;
     verify_payout_coverage(&connection, payout_generation)?;
+    if let Some(identity) = fresh_collection_record(&connection)? {
+        if identity.version == 4 {
+            return projection_v3::finalize(
+                connection,
+                cache_path,
+                stage_record_path,
+                export_manifest,
+                finalized_at_unix,
+                sealed_generation,
+                payout_generation,
+            );
+        }
+        return invalid("format-two head must admit its identity-four successor before classifier-6 finalization".to_owned());
+    }
     // The write lock is held from the start: re-finalization verifies the
     // committed projection from other connections, which must see this state.
     let transaction =
@@ -4146,6 +4232,9 @@ pub fn finalize_cache_v2(
         ranker_projection_count,
         ranker_projection_digest,
         ranker_classifier_version: RANKER_CLASSIFIER_VERSION,
+        export_manifest_sha256: None,
+        export_projection: None,
+        classification_report: None,
     };
     atomic_write_json(stage_record_path, &record)?;
     Ok(Some(record))
@@ -5917,6 +6006,17 @@ fn verify_finalized_v2_manifests(
     if required_max(connection, "sealed_generation_manifests", "generation")? != 1 {
         return invalid("installed cache has an invalid sealed generation".to_owned());
     }
+    if fresh_collection_record(connection)?.is_some_and(|identity| identity.version == 4) {
+        // Candidate bytes are export-bound; outgoing bytes are H0-bound by the caller.
+        // Neither path needs the retired spool, backup, or history rows.
+        let payout = required_max(
+            connection,
+            "clob_payout_coverage_manifests_v2",
+            "generation",
+        )?;
+        verify_payout_coverage(connection, payout)?;
+        return projection_v3::verify_recorded_state(connection, generation, projection);
+    }
     // A legacy identity exists only through a frozen-payload verification row
     // carrying its activity binding; a fresh collection identity needs none.
     let ActivityIdentity {
@@ -7200,4 +7300,10 @@ mod quiet_identity_tests {
         adopt_pending(&pending, &target, Some(&digest)).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), bytes);
     }
+}
+
+/// AC1's deterministic 1/256 sample through an ordinary read-only connection.
+#[cfg(feature = "scenario")]
+pub fn measure_classifier_v6_sample(cache_path: &Path) -> Result<Value, BootstrapError> {
+    measurement::run(cache_path)
 }

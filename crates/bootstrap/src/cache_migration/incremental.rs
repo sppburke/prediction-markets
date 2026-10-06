@@ -113,7 +113,7 @@ impl HistoryChain {
                 source_rows: certificate.source_row_count,
             });
         }
-        for (_, (identity, _)) in proof.records.range((
+        for (_, (identity, manifest)) in proof.records.range((
             std::ops::Bound::Excluded(certified_generation),
             std::ops::Bound::Included(through_generation),
         )) {
@@ -124,7 +124,10 @@ impl HistoryChain {
             {
                 continue;
             }
-            let receipt = receipt_for_identity(connection, identity, wallet)?;
+            let receipt = match manifest {
+                Some(manifest) => predecessor_receipt(connection, manifest, identity, wallet)?,
+                None => receipt_for_identity(connection, identity, wallet)?,
+            };
             let repair = identity.repair_wallets.as_ref().is_some_and(|repairs| {
                 repairs.binary_search_by(|w| w.as_str().cmp(wallet)).is_ok()
             });
@@ -350,7 +353,7 @@ impl HistoryCheck<'_> {
     }
 }
 
-fn receipt_for_identity(
+pub(super) fn receipt_for_identity(
     connection: &Connection,
     identity: &FreshCollectionIdentity,
     wallet: &str,
