@@ -74,6 +74,7 @@ struct Authority {
     projection_generation: u64,
 }
 struct HttpState {
+    boot_waves: bool,
     rows: Vec<ConfigRow>,
     now: i64,
     ranked_wallets: usize,
@@ -102,7 +103,16 @@ async fn serve(
     if path == "/activity" {
         let w = q.get("user").unwrap();
         if q.get("start").is_some_and(|start| start == "1") {
-            state.full_history_requests.lock().unwrap().push(w.clone());
+            let reads = {
+                let mut requests = state.full_history_requests.lock().unwrap();
+                requests.push(w.clone());
+                requests.iter().filter(|requested| *requested == w).count()
+            };
+            // Startup maintenance now runs immediately. Hold its first read for each
+            // boot-incomplete wallet so the boot-wave assertions observe boot state.
+            if state.boot_waves && w != &wallet(5).to_string() && reads == 4 {
+                state.slow.acquire().await.unwrap().forget();
+            }
         }
         if w == &wallet(2).to_string() && !state.release_slow.load(Ordering::SeqCst) {
             state.slow_started.notify_one();
@@ -423,6 +433,7 @@ async fn run_case(boot_waves: bool) {
     assert!(runtime.max_resolution_horizon_secs > runtime.min_resolution_horizon_secs);
     assert_eq!(runtime.price_impact_cap_bps, 100);
     let state = Arc::new(HttpState {
+        boot_waves,
         rows: crate::golden::golden_config_rows(&runtime),
         now,
         ranked_wallets: if boot_waves { 5 } else { 4 },
@@ -577,6 +588,17 @@ async fn run_case(boot_waves: bool) {
         })
         .await
         .expect("boot waves must reach successful readiness");
+        until(|| {
+            let requests = state.full_history_requests.lock().unwrap();
+            wallets[..4].iter().all(|w| {
+                requests
+                    .iter()
+                    .filter(|requested| *requested == &w.to_string())
+                    .count()
+                    == 4
+            })
+        })
+        .await;
         let requests = state.full_history_requests.lock().unwrap().clone();
         for w in &wallets {
             assert_eq!(
@@ -584,7 +606,7 @@ async fn run_case(boot_waves: bool) {
                     .iter()
                     .filter(|requested| *requested == &w.to_string())
                     .count(),
-                3,
+                if w == &wallet(5) { 3 } else { 4 },
                 "{requests:?}"
             );
             assert_eq!(
@@ -609,6 +631,7 @@ async fn run_case(boot_waves: bool) {
                 })
         })
         .await;
+        state.slow.add_permits(4);
         child.stop().await;
         server.abort();
         return;

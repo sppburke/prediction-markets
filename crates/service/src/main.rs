@@ -146,6 +146,17 @@ fn progressive_boot_enabled(
         && cfg.maintenance_interval_secs > 0
 }
 
+fn boot_transient_retry_at(
+    class: pe_service::position_seeder::FailureClass,
+    completed_at: Option<tokio::time::Instant>,
+) -> Option<tokio::time::Instant> {
+    completed_at
+        .filter(|_| class == pe_service::position_seeder::FailureClass::WalletTransient)
+        .map(|terminal| {
+            terminal + Duration::from_secs(pe_service::watchlist_admission::ADMISSION_RETRY_SECS)
+        })
+}
+
 fn boot_wave_has_eligible_wallet<'a>(
     paper: &PaperStateDb,
     accepted_or_reused: impl Iterator<Item = &'a WalletAddress>,
@@ -872,7 +883,7 @@ async fn main() -> Result<()> {
     let mut boot_cooldowns = std::collections::HashMap::new();
     let reused_eligible =
         boot_wave_has_eligible_wallet(&paper_state, boot_anchor_selection.reused.iter())?;
-    if !progressive_boot || !reused_eligible {
+    if !progressive_boot || (!post_start_record_replayed && !reused_eligible) {
         let wave_size = if progressive_boot {
             pe_service::position_seeder::BRACKET_CONCURRENCY
         } else {
@@ -897,14 +908,10 @@ async fn main() -> Result<()> {
                 {
                     boot_persistent_deferred.insert(*wallet);
                 }
-                if error.class() == pe_service::position_seeder::FailureClass::WalletTransient
-                    && let Some(terminal) = outcome.failure_completed_at(wallet)
+                if let Some(retry_at) =
+                    boot_transient_retry_at(error.class(), outcome.failure_completed_at(wallet))
                 {
-                    boot_cooldowns.insert(
-                        *wallet,
-                        terminal
-                            + Duration::from_secs(pe_service::trade_poller::ANCHOR_REFRESH_SECS),
-                    );
+                    boot_cooldowns.insert(*wallet, retry_at);
                 }
             }
             anchored.extend(outcome.accepted);
@@ -1778,6 +1785,7 @@ async fn main() -> Result<()> {
         status_interval,
         paper_state.clone(),
         live_watchlist.clone(),
+        watchlist_writer_lock.clone(),
         applied_watchlist_capacity.clone(),
         live_runtime_config.clone(),
         runtime_config_status.clone(),
@@ -2392,6 +2400,24 @@ mod tests {
     use rusqlite::params;
 
     const NOW: i64 = 10_000;
+
+    #[tokio::test(start_paused = true)]
+    async fn boot_transient_deferral_eligibility() {
+        use pe_service::position_seeder::FailureClass;
+        let completed = tokio::time::Instant::now();
+        tokio::time::advance(Duration::from_secs(30)).await;
+        let retry_at =
+            boot_transient_retry_at(FailureClass::WalletTransient, Some(completed)).unwrap();
+        assert_eq!(retry_at, completed + Duration::from_secs(300));
+        tokio::time::advance(Duration::from_secs(269)).await;
+        assert!(tokio::time::Instant::now() < retry_at);
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert_eq!(tokio::time::Instant::now(), retry_at);
+        for class in [FailureClass::WalletPersistent, FailureClass::Shared] {
+            assert!(boot_transient_retry_at(class, Some(completed)).is_none());
+        }
+        assert!(boot_transient_retry_at(FailureClass::WalletTransient, None).is_none());
+    }
 
     #[test]
     fn paper_only_boot_uses_existing_journal_read_only_and_leaves_missing_file_absent() {

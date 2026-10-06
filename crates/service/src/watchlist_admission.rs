@@ -15,7 +15,7 @@ use pe_trader_index::WatchlistEntry;
 use serde::Serialize;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::Instant;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::activity_ingest::{SourceLogHandle, SourceLogHandleError};
 use crate::bucket_commit::AnchorInstallError;
@@ -32,6 +32,7 @@ use crate::position_seeder::{
 use crate::watchlist_maintenance::MembershipCommit;
 
 const ADMISSION_PREPARE_ACK_TIMEOUT_SECS: u64 = 30;
+pub const ADMISSION_RETRY_SECS: u64 = 300;
 pub(crate) const CAPACITY_CONFIG_SOURCE_ID: &str = "pe-service.watchlist-capacity-config";
 pub(crate) const RANKING_MEMBERSHIP_SOURCE_ID: &str = "pe-service.watchlist-ranking";
 pub(crate) const MEMBERSHIP_ADMISSION_SOURCE_ID: &str = "pe-service.watchlist-admission";
@@ -74,6 +75,8 @@ pub enum AdmissionError {
     MembershipSourceLog(#[from] SourceLogHandleError),
     #[error("capture immutable membership proof: {0}")]
     MembershipProof(#[from] MembershipProofError),
+    #[error("admission queue key counter exhausted")]
+    QueueKeyExhausted,
 }
 
 #[cfg(test)]
@@ -217,7 +220,12 @@ mod admission_tests {
         let held = preparer.inner.attempt.lock().await;
         let deadline = Instant::now() + Duration::from_secs(10);
         let outcome = preparer
-            .prepare_with_cursors(&[wallet(1), wallet(2)], None, Some(deadline))
+            .prepare_with_cursors(
+                &[wallet(1), wallet(2)],
+                None,
+                Some(deadline),
+                AdmissionContext::Other,
+            )
             .await
             .unwrap();
         assert_eq!(Instant::now(), deadline);
@@ -248,6 +256,7 @@ impl AdmissionError {
             | Self::MembershipArtifactEncoding(_)
             | Self::CapacityTargetOverflow { .. }
             | Self::MembershipSourceLog(_) => FailureClass::Shared,
+            Self::QueueKeyExhausted => FailureClass::Shared,
         }
     }
 
@@ -269,6 +278,7 @@ impl AdmissionError {
             Self::MembershipArtifactEncoding(_) => "artifact.encoding",
             Self::CapacityTargetOverflow { .. } => "capacity.overflow",
             Self::MembershipSourceLog(_) => "source_log.append",
+            Self::QueueKeyExhausted => "queue.exhausted",
         }
     }
 }
@@ -428,8 +438,75 @@ pub struct AdmissionPreparer {
 struct Preparer {
     control_tx: mpsc::Sender<OrchestratorControl>,
     paper_state: Arc<PaperStateDb>,
-    attempt: Mutex<()>,
+    attempt: Mutex<AdmissionQueue>,
     validator: Option<CausalPositionValidator>,
+}
+
+#[derive(Default)]
+struct AdmissionQueue {
+    next: u64,
+    keys: HashMap<WalletAddress, u64>,
+}
+
+impl AdmissionQueue {
+    fn offer(&mut self, wallet: WalletAddress) -> Result<(), AdmissionError> {
+        if !self.keys.contains_key(&wallet) {
+            self.move_back(wallet)?;
+        }
+        Ok(())
+    }
+
+    fn move_back(&mut self, wallet: WalletAddress) -> Result<(), AdmissionError> {
+        let next = self
+            .next
+            .checked_add(1)
+            .ok_or(AdmissionError::QueueKeyExhausted)?;
+        self.keys.insert(wallet, self.next);
+        self.next = next;
+        Ok(())
+    }
+}
+
+/// One preparation context; capacity work does not participate in tick alternation.
+#[derive(Clone, Copy)]
+pub(crate) enum AdmissionContext {
+    Addition { first: bool },
+    Reentry { first: bool },
+    Capacity,
+    Other,
+}
+
+/// Emit exactly once on every return, including lock timeout and shared failure.
+struct AdmissionLaunchLog {
+    context: AdmissionContext,
+    eligible: Vec<String>,
+    started_previous_keys: Vec<(String, u64)>,
+}
+
+impl AdmissionLaunchLog {
+    fn started(
+        &mut self,
+        queue: &mut AdmissionQueue,
+        wallet: WalletAddress,
+    ) -> Result<(), AdmissionError> {
+        if let Some(key) = queue.keys.get(&wallet) {
+            self.started_previous_keys.push((wallet.to_string(), *key));
+        }
+        queue.move_back(wallet)
+    }
+}
+
+impl Drop for AdmissionLaunchLog {
+    fn drop(&mut self) {
+        let (path, first) = match self.context {
+            AdmissionContext::Addition { first } => ("addition", Some(first)),
+            AdmissionContext::Reentry { first } => ("reentry", Some(first)),
+            AdmissionContext::Capacity => ("capacity", None),
+            AdmissionContext::Other => ("other", None),
+        };
+        info!(path, first, eligible = %serde_json::json!(self.eligible), started = self.started_previous_keys.len(),
+            started_previous_keys = %serde_json::json!(self.started_previous_keys), "admission launch order");
+    }
 }
 
 impl AdmissionPreparer {
@@ -441,7 +518,7 @@ impl AdmissionPreparer {
             inner: Arc::new(Preparer {
                 control_tx,
                 paper_state,
-                attempt: Mutex::new(()),
+                attempt: Mutex::new(AdmissionQueue::default()),
                 validator: None,
             }),
             source_log: None,
@@ -462,7 +539,7 @@ impl AdmissionPreparer {
             inner: Arc::new(Preparer {
                 control_tx,
                 paper_state,
-                attempt: Mutex::new(()),
+                attempt: Mutex::new(AdmissionQueue::default()),
                 validator: Some(validator),
             }),
             source_log: None,
@@ -500,8 +577,9 @@ impl AdmissionPreparer {
         additions: &[WalletAddress],
         ranked_last_trade: &HashMap<WalletAddress, i64>,
         deadline: Option<Instant>,
+        context: AdmissionContext,
     ) -> Result<AdmissionOutcome, AdmissionAbort> {
-        self.prepare_with_cursors(additions, Some(ranked_last_trade), deadline)
+        self.prepare_with_cursors(additions, Some(ranked_last_trade), deadline, context)
             .await
     }
 
@@ -511,7 +589,7 @@ impl AdmissionPreparer {
         additions: &[WalletAddress],
         deadline: tokio::time::Instant,
     ) -> Result<AdmissionOutcome, AdmissionAbort> {
-        self.prepare_with_cursors(additions, None, Some(deadline))
+        self.prepare_with_cursors(additions, None, Some(deadline), AdmissionContext::Other)
             .await
     }
 
@@ -522,7 +600,17 @@ impl AdmissionPreparer {
         &self,
         additions: &[WalletAddress],
     ) -> Result<AdmissionOutcome, AdmissionAbort> {
-        self.prepare_with_cursors(additions, None, None).await
+        self.prepare_in(additions, AdmissionContext::Other).await
+    }
+
+    /// As [`Self::prepare`], logging the caller's launch-order path.
+    pub(crate) async fn prepare_in(
+        &self,
+        additions: &[WalletAddress],
+        context: AdmissionContext,
+    ) -> Result<AdmissionOutcome, AdmissionAbort> {
+        self.prepare_with_cursors(additions, None, None, context)
+            .await
     }
 
     async fn prepare_with_cursors(
@@ -530,11 +618,17 @@ impl AdmissionPreparer {
         additions: &[WalletAddress],
         ranked_last_trade: Option<&HashMap<WalletAddress, i64>>,
         deadline: Option<Instant>,
+        context: AdmissionContext,
     ) -> Result<AdmissionOutcome, AdmissionAbort> {
         let preparer = &self.inner;
         let mut started = Vec::new();
         let mut unstarted = Vec::new();
-        let _attempt = if let Some(end) = deadline {
+        let mut launch = AdmissionLaunchLog {
+            context,
+            eligible: Vec::new(),
+            started_previous_keys: Vec::new(),
+        };
+        let mut attempt = if let Some(end) = deadline {
             match tokio::time::timeout_at(end, preparer.attempt.lock()).await {
                 Ok(guard) => guard,
                 Err(_) => {
@@ -569,6 +663,20 @@ impl AdmissionPreparer {
                 }
             }
         }
+        for wallet in &eligible {
+            if let Err(cause) = attempt.offer(*wallet) {
+                return Err(AdmissionAbort {
+                    started,
+                    unstarted,
+                    admitted,
+                    cause,
+                    deferred,
+                });
+            }
+        }
+        // Stable sorting preserves caller rank order for equal keys.
+        eligible.sort_by_key(|wallet| attempt.keys.get(wallet).copied());
+        launch.eligible = eligible.iter().map(ToString::to_string).collect();
         if let Some(validator) = &preparer.validator {
             if let Err(cause) = self.seed_ranked_cursors(&eligible, ranked_last_trade) {
                 return Err(AdmissionAbort {
@@ -590,6 +698,17 @@ impl AdmissionPreparer {
                 .await;
             started.extend_from_slice(&eligible[..outcomes.started_prefix]);
             unstarted.extend_from_slice(&eligible[outcomes.started_prefix..]);
+            for wallet in &started {
+                if let Err(cause) = launch.started(&mut attempt, *wallet) {
+                    return Err(AdmissionAbort {
+                        started,
+                        unstarted,
+                        admitted,
+                        cause,
+                        deferred,
+                    });
+                }
+            }
             for (wallet, error) in outcomes.deferred {
                 let error = AdmissionError::PositionValidation(error);
                 let mut deferral = Deferral::from_error(wallet, "validation", &error);
@@ -645,10 +764,29 @@ impl AdmissionPreparer {
         } else {
             for wallet in eligible {
                 if deadline.is_some_and(|end| Instant::now() >= end) {
+                    // A zero-start call still idempotently seeds ranked cursors.
+                    if let Err(cause) = self.seed_ranked_cursors(&[wallet], ranked_last_trade) {
+                        return Err(AdmissionAbort {
+                            started,
+                            unstarted,
+                            admitted,
+                            cause,
+                            deferred,
+                        });
+                    }
                     unstarted.push(wallet);
                     continue;
                 }
                 started.push(wallet);
+                if let Err(cause) = launch.started(&mut attempt, wallet) {
+                    return Err(AdmissionAbort {
+                        started,
+                        unstarted,
+                        admitted,
+                        cause,
+                        deferred,
+                    });
+                }
                 match self.check_prerequisites(&[wallet]) {
                     Ok(()) => {}
                     Err(error) if error.class() != FailureClass::Shared => {
