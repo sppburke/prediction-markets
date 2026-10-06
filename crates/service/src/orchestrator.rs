@@ -1593,7 +1593,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         let identity = if let (Some(resolver), Some(asset)) =
             (&self.frame_identity_resolver, &parts.asset)
         {
-            match resolver.resolve([asset.clone()]).await {
+            match resolver.resolve_live([asset.clone()]).await {
                 Ok(resolved) => resolved.verified.get(asset).and_then(|verified| {
                     if Some(&verified.condition_id) != parts.condition_id.as_ref()
                         || Some(verified.outcome) != parts.outcome

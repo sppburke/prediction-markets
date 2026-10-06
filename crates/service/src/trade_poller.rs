@@ -2763,7 +2763,7 @@ impl WalletOperation {
             .collect::<HashSet<PolymarketTokenId>>();
         let resolved = self
             .asset_identity
-            .resolve(tokens)
+            .resolve_live(tokens)
             .await
             .map_err(ReconciliationError::Identity)?;
         let mut identities = BucketIdentities {

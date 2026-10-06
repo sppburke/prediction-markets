@@ -1021,22 +1021,68 @@ impl PaperStateDb {
             .map_err(PaperStateError::from)
     }
 
+    /// Fetch completed lookup absences for only the requested tokens in this generation.
+    pub fn absent_asset_tokens(
+        &self,
+        generation: &str,
+        tokens: &[PolymarketTokenId],
+    ) -> Result<BTreeMap<PolymarketTokenId, i64>, PaperStateError> {
+        self.asset_identity_token_markers(generation, tokens, "absent_asset_token:")
+    }
+
+    /// Rejected tokens can lack identity rows when one page contains conflicting markets.
+    pub fn rejected_asset_tokens(
+        &self,
+        generation: &str,
+        tokens: &[PolymarketTokenId],
+    ) -> Result<BTreeMap<PolymarketTokenId, i64>, PaperStateError> {
+        self.asset_identity_token_markers(generation, tokens, "rejected_asset_token:")
+    }
+
+    fn asset_identity_token_markers(
+        &self,
+        generation: &str,
+        tokens: &[PolymarketTokenId],
+        prefix: &str,
+    ) -> Result<BTreeMap<PolymarketTokenId, i64>, PaperStateError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT requested.value, meta.value FROM json_each(?2) AS requested \
+             JOIN meta ON meta.key = ?3 || ?1 || ':' || requested.value",
+        )?;
+        statement
+            .query_map(
+                params![generation, serde_json::to_string(tokens)?, prefix],
+                |row| Ok((PolymarketTokenId(row.get(0)?), row.get(1)?)),
+            )?
+            .collect::<Result<_, _>>()
+            .map_err(PaperStateError::from)
+    }
+
     /// Commit verified rows independently, retaining their original provenance.
     pub fn insert_asset_identities(
         &self,
         generation: &str,
         identities: &[AssetIdentityRow],
     ) -> Result<(), PaperStateError> {
-        self.save_asset_identities(generation, identities, &BTreeMap::new())
+        self.save_asset_identities(
+            generation,
+            identities,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
     }
 
-    /// Commit rows and their condition rejections together; never join an activity batch.
+    /// Commit rows, condition rejections and completed absences; never join an activity batch.
     /// The async resolver retries `IdentityBatchOpen` after releasing this method's mutex.
     pub fn save_asset_identities(
         &self,
         generation: &str,
         identities: &[AssetIdentityRow],
         rejections: &BTreeMap<String, i64>,
+        absences: &BTreeMap<PolymarketTokenId, i64>,
+        rejected_tokens: &BTreeMap<PolymarketTokenId, i64>,
     ) -> Result<(), PaperStateError> {
         Self::check_identity_mutation_bound(identities.len())?;
         let mut conn = self.lock();
@@ -1057,6 +1103,26 @@ impl PaperStateDb {
             tx.execute(
                 "INSERT INTO meta (key, value) \
                  SELECT 'rejected_asset_condition:' || ?1 || ':' || json_extract(value, '$[0]'), \
+                 json_extract(value, '$[1]') FROM json_each(?2) WHERE true \
+                 ON CONFLICT(key) DO NOTHING",
+                params![generation, serde_json::to_string(chunk)?],
+            )?;
+        }
+        let absences = absences.iter().collect::<Vec<_>>();
+        for chunk in absences.chunks(ASSET_IDENTITY_INSERT_LIMIT) {
+            tx.execute(
+                "INSERT INTO meta (key, value) \
+                 SELECT 'absent_asset_token:' || ?1 || ':' || json_extract(value, '$[0]'), \
+                 json_extract(value, '$[1]') FROM json_each(?2) WHERE true \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                params![generation, serde_json::to_string(chunk)?],
+            )?;
+        }
+        let rejected_tokens = rejected_tokens.iter().collect::<Vec<_>>();
+        for chunk in rejected_tokens.chunks(ASSET_IDENTITY_INSERT_LIMIT) {
+            tx.execute(
+                "INSERT INTO meta (key, value) \
+                 SELECT 'rejected_asset_token:' || ?1 || ':' || json_extract(value, '$[0]'), \
                  json_extract(value, '$[1]') FROM json_each(?2) WHERE true \
                  ON CONFLICT(key) DO NOTHING",
                 params![generation, serde_json::to_string(chunk)?],
@@ -6612,8 +6678,14 @@ mod tests {
         }
         let rejections =
             BTreeMap::from([("condition-c".to_owned(), 8), ("condition-d".to_owned(), 8)]);
-        db.save_asset_identities("current", &[incoming], &rejections)
-            .unwrap();
+        db.save_asset_identities(
+            "current",
+            &[incoming],
+            &rejections,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
         for condition in rejections.keys() {
             assert_eq!(
                 db.asset_identity_condition_rejection("current", condition)
@@ -6632,8 +6704,14 @@ mod tests {
                 .unwrap(),
             std::slice::from_ref(&old)
         );
-        db.save_asset_identities("current", &[], &BTreeMap::from([("condition-d".into(), 9)]))
-            .unwrap();
+        db.save_asset_identities(
+            "current",
+            &[],
+            &BTreeMap::from([("condition-d".into(), 9)]),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
         db.delete_asset_identities("current", &[old.token]).unwrap();
         assert_eq!(
             db.asset_identity_condition_rejection("current", "condition-d")
@@ -6660,8 +6738,14 @@ mod tests {
         let row = asset_identity_row("token-a", "condition");
         let rejections = BTreeMap::from([("condition".to_owned(), 8)]);
         assert!(
-            db.save_asset_identities("generation", std::slice::from_ref(&row), &rejections)
-                .is_err()
+            db.save_asset_identities(
+                "generation",
+                std::slice::from_ref(&row),
+                &rejections,
+                &BTreeMap::new(),
+                &BTreeMap::new()
+            )
+            .is_err()
         );
         assert!(
             db.asset_identities("generation", std::slice::from_ref(&row.token))
@@ -6676,8 +6760,14 @@ mod tests {
         db.lock()
             .execute_batch("DROP TRIGGER fail_identity_rejection")
             .unwrap();
-        db.save_asset_identities("generation", std::slice::from_ref(&row), &rejections)
-            .unwrap();
+        db.save_asset_identities(
+            "generation",
+            std::slice::from_ref(&row),
+            &rejections,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
         assert_eq!(
             db.asset_identities("generation", std::slice::from_ref(&row.token))
                 .unwrap(),
@@ -6717,7 +6807,13 @@ mod tests {
             Err(PaperStateError::IdentityBatchOpen)
         ));
         assert!(matches!(
-            db.save_asset_identities("generation", &rows, &rejections),
+            db.save_asset_identities(
+                "generation",
+                &rows,
+                &rejections,
+                &BTreeMap::new(),
+                &BTreeMap::new()
+            ),
             Err(PaperStateError::IdentityBatchOpen)
         ));
         assert_eq!(count(), 0);
@@ -6732,8 +6828,14 @@ mod tests {
         db.begin_batch().unwrap();
         assert!(db.delete_asset_identities("generation", &tokens).is_err());
         assert!(
-            db.save_asset_identities("generation", &[], &rejections)
-                .is_err()
+            db.save_asset_identities(
+                "generation",
+                &[],
+                &rejections,
+                &BTreeMap::new(),
+                &BTreeMap::new()
+            )
+            .is_err()
         );
         db.rollback_batch().unwrap();
         let mut replacement = rows[0].clone();
@@ -6742,8 +6844,14 @@ mod tests {
         db.insert_asset_identities("generation", &[replacement])
             .unwrap();
         assert_eq!(db.asset_identities("generation", &tokens).unwrap(), rows);
-        db.save_asset_identities("generation", &[], &rejections)
-            .unwrap();
+        db.save_asset_identities(
+            "generation",
+            &[],
+            &rejections,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
         assert_eq!(db.asset_identities("generation", &tokens).unwrap(), rows);
         db.delete_asset_identities("generation", &tokens).unwrap();
         assert_eq!(count(), 0);
@@ -6751,6 +6859,144 @@ mod tests {
             db.asset_identity_condition_rejection("generation", "a")
                 .unwrap(),
             Some(8)
+        );
+    }
+
+    #[test]
+    fn asset_identities_absence_lookup_is_requested_and_generation_scoped() {
+        let (dir, db) = db();
+        let absences = (0..121)
+            .map(|index| (PolymarketTokenId(format!("token-{index}")), 7))
+            .collect::<BTreeMap<_, _>>();
+        db.save_asset_identities(
+            "current",
+            &[],
+            &BTreeMap::new(),
+            &absences,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let token = PolymarketTokenId("token-120".into());
+        let requested = [token.clone(), PolymarketTokenId("missing".into())];
+        assert_eq!(
+            db.absent_asset_tokens("current", &requested).unwrap(),
+            BTreeMap::from([(token.clone(), 7)])
+        );
+        assert!(
+            db.absent_asset_tokens("foreign", &requested)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(db.absent_asset_tokens("current", &[]).unwrap().is_empty());
+        let update = BTreeMap::from([(token.clone(), 9)]);
+        db.save_asset_identities("current", &[], &BTreeMap::new(), &update, &BTreeMap::new())
+            .unwrap();
+        drop(db);
+        let db = PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap();
+        assert_eq!(
+            db.absent_asset_tokens("current", &requested).unwrap(),
+            update
+        );
+    }
+
+    #[test]
+    fn asset_identities_absences_commit_with_rows_and_rejections() {
+        let (_dir, db) = db();
+        db.lock()
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_identity_absence BEFORE INSERT ON meta \
+                 WHEN NEW.key LIKE 'absent_asset_token:%' \
+                 BEGIN SELECT RAISE(ABORT, 'injected absence failure'); END;",
+            )
+            .unwrap();
+        let row = asset_identity_row("token-a", "condition");
+        let tokens = [row.token.clone(), PolymarketTokenId("absent".into())];
+        let rejections = BTreeMap::from([("condition".to_owned(), 8)]);
+        let absences = BTreeMap::from([(tokens[1].clone(), 9)]);
+        let rejected_tokens = BTreeMap::from([(tokens[0].clone(), 8)]);
+        assert!(
+            db.save_asset_identities(
+                "generation",
+                std::slice::from_ref(&row),
+                &rejections,
+                &absences,
+                &rejected_tokens
+            )
+            .is_err()
+        );
+        assert!(
+            db.asset_identities("generation", &tokens)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.absent_asset_tokens("generation", &tokens)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.asset_identity_condition_rejection("generation", "condition")
+                .unwrap(),
+            None
+        );
+        assert!(
+            db.rejected_asset_tokens("generation", &tokens)
+                .unwrap()
+                .is_empty()
+        );
+        db.lock()
+            .execute_batch("DROP TRIGGER fail_identity_absence")
+            .unwrap();
+        db.save_asset_identities(
+            "generation",
+            std::slice::from_ref(&row),
+            &rejections,
+            &absences,
+            &rejected_tokens,
+        )
+        .unwrap();
+        assert_eq!(db.asset_identities("generation", &tokens).unwrap(), [row]);
+        assert_eq!(
+            db.rejected_asset_tokens("generation", &tokens).unwrap(),
+            rejected_tokens
+        );
+        assert!(
+            db.rejected_asset_tokens("foreign", &tokens)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            db.absent_asset_tokens("generation", &tokens).unwrap(),
+            absences
+        );
+        assert_eq!(
+            db.asset_identity_condition_rejection("generation", "condition")
+                .unwrap(),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn asset_identities_absence_write_refuses_open_batches() {
+        let (_dir, db) = db();
+        let token = PolymarketTokenId("absent".into());
+        let absences = BTreeMap::from([(token.clone(), 9)]);
+        db.begin_batch().unwrap();
+        assert!(matches!(
+            db.save_asset_identities(
+                "generation",
+                &[],
+                &BTreeMap::new(),
+                &absences,
+                &BTreeMap::new()
+            ),
+            Err(PaperStateError::IdentityBatchOpen)
+        ));
+        db.rollback_batch().unwrap();
+        assert!(
+            db.absent_asset_tokens("generation", &[token])
+                .unwrap()
+                .is_empty()
         );
     }
 

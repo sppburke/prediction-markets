@@ -1080,7 +1080,7 @@ mod tests {
             let resolver = Arc::clone(&resolver);
             async move {
                 resolver
-                    .resolve([PolymarketTokenId("token-runtime".to_owned())])
+                    .resolve_live([PolymarketTokenId("token-runtime".to_owned())])
                     .await
             }
         });
