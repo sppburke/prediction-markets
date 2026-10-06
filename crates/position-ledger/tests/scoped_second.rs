@@ -281,8 +281,8 @@ fn record_problem_causes_resolve_to_their_market_or_event() {
         (
             ActivityType::Redeem,
             0,
-            Some(A),
             None,
+            Some("token-a"),
             ScopeKind::Market,
             A,
             DropCause::UnknownCondition,
@@ -506,56 +506,85 @@ fn raw_only_precedence_preserves_zero_conversion_combo_and_rebound_trades() {
 }
 
 #[test]
-fn requires_anchor_uses_only_the_pre_second_ledger_even_at_zero_balance() {
-    let redeem = position_activity(ActivityType::Redeem, "zero-redeem", A, 0);
-    let mut ledger = PositionLedger::new();
-    let same_second = fresh(&[redeem.clone(), buy("same-second-buy", A, 0, 10)]);
-    assert_problem(
-        &same_second,
-        ScopeKind::Market,
-        A,
-        DropCause::UnknownCondition,
+fn unknown_condition_redeem_with_an_unresolvable_token_is_ignored() {
+    let redeem = activity(
+        ActivityType::Redeem,
+        "zero-redeem",
+        None,
+        Some("missing"),
+        None,
+        Some(0),
+        0,
     );
-    assert!(same_second.apply.is_empty());
-    assert_eq!(same_second.consumed, vec![market(A)]);
-    assert_problem(
-        &fresh(std::slice::from_ref(&redeem)),
-        ScopeKind::Market,
-        A,
-        DropCause::UnknownCondition,
-    );
-    ledger.replace_wallet_snapshot(
-        wallet(),
-        HashMap::from([(
-            MarketOutcomeId::new(market(A), OutcomeId(1)),
-            PositionState::default(),
-        )]),
-    );
-    let result = classify(
-        &ledger,
-        std::slice::from_ref(&redeem),
-        &BTreeSet::new(),
-        false,
-        &HashSet::new(),
-        &lookups(),
-    );
+    let result = fresh(std::slice::from_ref(&redeem));
     assert!(!result.problem_second);
-    assert_eq!(result.apply[0].effect, LedgerEffect::RequiresAnchor);
-    let before = ledger.snapshots().clone();
-    ledger.apply_all_or_none(&result.apply).unwrap();
-    assert_eq!(ledger.snapshots(), &before);
-    let dropped = BTreeSet::from([scope(ScopeKind::Event, GROUP)]);
-    let dropped_result = classify(
-        &ledger,
-        &[redeem],
-        &dropped,
-        false,
-        &HashSet::new(),
-        &lookups(),
+    assert!(result.problems.is_empty());
+    assert!(result.apply.is_empty());
+    assert!(result.decisions.is_empty());
+    assert!(result.consumed.is_empty());
+    assert_eq!(
+        result.ignored,
+        vec![(redeem.group_id.key().clone(), ActivityType::Redeem)]
     );
-    assert!(dropped_result.apply.is_empty());
-    assert!(dropped_result.problems.is_empty());
-    assert!(dropped_result.ignored.is_empty());
+}
+
+#[test]
+fn known_condition_requires_anchor_is_a_no_op_regardless_of_pre_second_ledger() {
+    let redeem = position_activity(ActivityType::Redeem, "zero-redeem", A, 0);
+    let same_second = fresh(&[redeem.clone(), buy("same-second-buy", A, 0, 10)]);
+    assert!(!same_second.problem_second);
+    assert!(same_second.problems.is_empty());
+    assert_eq!(same_second.apply.len(), 2);
+    assert_eq!(
+        same_second.decisions[0].entry,
+        EntryClassification::Admitted
+    );
+    assert_eq!(same_second.consumed, vec![market(A)]);
+    for amount in [None, Some(0), Some(10)] {
+        let mut ledger = PositionLedger::new();
+        if let Some(amount) = amount {
+            ledger.replace_wallet_snapshot(
+                wallet(),
+                HashMap::from([(
+                    MarketOutcomeId::new(market(A), OutcomeId(1)),
+                    PositionState {
+                        long_contracts: ShareAmount::from_atomic(amount),
+                        short_contracts: ShareAmount::ZERO,
+                    },
+                )]),
+            );
+        }
+        let result = classify(
+            &ledger,
+            std::slice::from_ref(&redeem),
+            &BTreeSet::new(),
+            false,
+            &HashSet::new(),
+            &lookups(),
+        );
+        assert!(!result.problem_second);
+        assert!(result.problems.is_empty());
+        assert!(result.ignored.is_empty());
+        assert!(result.decisions.is_empty());
+        assert!(result.consumed.is_empty());
+        assert_eq!(result.apply.len(), 1);
+        assert_eq!(result.apply[0].effect, LedgerEffect::RequiresAnchor);
+        let before = ledger.snapshots().clone();
+        ledger.apply_all_or_none(&result.apply).unwrap();
+        assert_eq!(ledger.snapshots(), &before);
+        let dropped = BTreeSet::from([scope(ScopeKind::Event, GROUP)]);
+        let dropped_result = classify(
+            &ledger,
+            std::slice::from_ref(&redeem),
+            &dropped,
+            false,
+            &HashSet::new(),
+            &lookups(),
+        );
+        assert!(dropped_result.apply.is_empty());
+        assert!(dropped_result.problems.is_empty());
+        assert!(dropped_result.ignored.is_empty());
+    }
 }
 
 #[test]

@@ -1267,17 +1267,10 @@ pub fn classify_scoped_second(
                 }
                 LedgerEffect::Conversion => Some(DropCause::Conversion),
                 LedgerEffect::UnknownEffect => Some(DropCause::UnknownType),
-                LedgerEffect::RequiresAnchor => {
-                    let known = components.condition_id.as_ref().is_some_and(|condition| {
-                        ledger.position(&wallet).is_some_and(|snapshot| {
-                            snapshot
-                                .positions
-                                .keys()
-                                .any(|key| key.market().0.0 == condition.0)
-                        })
-                    });
-                    (!known).then_some(DropCause::UnknownCondition)
-                }
+                LedgerEffect::RequiresAnchor => components
+                    .condition_id
+                    .is_none()
+                    .then_some(DropCause::UnknownCondition),
                 effect => {
                     let canonical = components
                         .condition_id
