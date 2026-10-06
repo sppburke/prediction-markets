@@ -16,9 +16,10 @@ use pe_paper_state::{
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::gamma_markets::verify_token_identities;
 use pe_source_polymarket_public::{
-    GAMMA_MARKETS_PARSER_VERSION, GAMMA_MARKETS_SCHEMA_VERSION, GAMMA_MARKETS_SOURCE_ID,
-    GammaMarketsClient, GammaMarketsError, MarketFilter, MetadataPageEvidence,
-    ReconciliationFetcher, ReconciliationPageFetcher, VerifiedTokenIdentity, canonical_page_hash,
+    GAMMA_BATCH_SIZE, GAMMA_MARKETS_PARSER_VERSION, GAMMA_MARKETS_SCHEMA_VERSION,
+    GAMMA_MARKETS_SOURCE_ID, GammaMarketsClient, GammaMarketsError, MarketFilter,
+    MetadataPageEvidence, ReconciliationFetcher, ReconciliationPageFetcher, VerifiedTokenIdentity,
+    canonical_page_hash,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
@@ -272,14 +273,55 @@ impl AssetIdentityResolver {
                 });
             }
         }
-        let _misses = self.misses.lock().await;
         let store = self.store.read().await.clone();
         let mut read_pages = BTreeMap::new();
-        let mut resolved = self
-            .cached(&requested, store.as_ref(), &mut read_pages)
+        let mut resolved = self.cached(&requested, None, &mut read_pages).await?;
+        let misses = requested
+            .iter()
+            .filter(|token| {
+                !resolved.verified.contains_key(*token) && !resolved.unverified.contains_key(*token)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut memory_pages = RecordedIdentityPages::default();
+        for chunk in misses.chunks(self.gamma_batch_size.min(GAMMA_BATCH_SIZE)) {
+            let _misses = self.misses.lock().await;
+            let requested = chunk.iter().cloned().collect::<BTreeSet<_>>();
+            let cached = self
+                .cached(&requested, store.as_ref(), &mut read_pages)
+                .await?;
+            for token in &requested {
+                resolved.unverified.remove(token);
+            }
+            resolved.verified.extend(cached.verified);
+            resolved.unverified.extend(cached.unverified);
+            resolved.provenance.extend(cached.provenance);
+            self.resolve_chunk(
+                &requested,
+                purpose,
+                store.as_ref(),
+                &mut read_pages,
+                &mut memory_pages,
+                &mut resolved,
+            )
             .await?;
+        }
+        // Another request can reject an earlier chunk's condition between chunks.
+        evict_rejected(&mut *self.cache.write().await, &mut resolved);
+        Ok(resolved)
+    }
+
+    async fn resolve_chunk(
+        &self,
+        requested: &BTreeSet<PolymarketTokenId>,
+        purpose: LookupPurpose,
+        store: Option<&IdentityStore>,
+        read_pages: &mut BTreeMap<u64, IdentityPage>,
+        memory_pages: &mut RecordedIdentityPages,
+        resolved: &mut ResolvedIdentities,
+    ) -> Result<(), SourceError> {
         if purpose == LookupPurpose::Historical
-            && let Some(store) = &store
+            && let Some(store) = store
         {
             let misses = requested
                 .iter()
@@ -319,7 +361,7 @@ impl AssetIdentityResolver {
             .cloned()
             .collect::<Vec<_>>();
         if misses.is_empty() {
-            return Ok(resolved);
+            return Ok(());
         }
 
         let mut recorded = RecordedIdentityPages::default();
@@ -366,10 +408,51 @@ impl AssetIdentityResolver {
                 .map(|token| (token.clone(), sequence))
                 .collect();
         }
-        let candidates = if store.is_some() {
+        if store.is_none() {
+            // First-migration boot has no saved rows; compare intersecting pages from earlier chunks.
+            let fresh = page_token_conditions(&recorded.pages);
+            let conditions = fresh.values().flatten().collect::<BTreeSet<_>>();
+            let previous = memory_pages
+                .pages
+                .iter()
+                .filter(|page| {
+                    page_token_conditions(std::slice::from_ref(page))
+                        .iter()
+                        .any(|(token, prior)| {
+                            fresh.contains_key(token)
+                                || prior.iter().any(|condition| conditions.contains(condition))
+                        })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            memory_pages.pages.extend(recorded.pages.clone());
+            for (hash, sequence) in &recorded.sequences {
+                memory_pages
+                    .sequences
+                    .entry(hash.clone())
+                    .or_insert(*sequence);
+            }
+            recorded.pages.extend(previous);
+            for (page, _) in &recorded.pages {
+                if let Some(sequence) = memory_pages.sequences.get(&page.canonical_page_hash) {
+                    recorded
+                        .sequences
+                        .insert(page.canonical_page_hash.clone(), *sequence);
+                }
+            }
+        }
+        let candidates: Vec<_> = if store.is_some() {
             returned_tokens.into_iter().collect()
         } else {
-            misses.clone()
+            resolved
+                .verified
+                .keys()
+                .chain(resolved.unverified.keys())
+                .chain(misses.iter())
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
         };
         collect_verified(
             verify_token_identities(&candidates, &recorded.pages),
@@ -377,6 +460,16 @@ impl AssetIdentityResolver {
             &mut newly_verified,
             &mut resolved.unverified,
         );
+        if store.is_none() {
+            let mut cache = self.cache.write().await;
+            for token in &candidates {
+                if resolved.unverified.contains_key(token) && !newly_verified.contains_key(token) {
+                    cache.identities.remove(token);
+                    resolved.verified.remove(token);
+                    resolved.provenance.remove(token);
+                }
+            }
+        }
 
         for token in misses {
             if !newly_verified.contains_key(&token) && !resolved.unverified.contains_key(&token) {
@@ -384,13 +477,7 @@ impl AssetIdentityResolver {
             }
         }
         let saved = self
-            .save_verified(
-                store.as_ref(),
-                &recorded,
-                &mut read_pages,
-                &mut newly_verified,
-                &mut resolved,
-            )
+            .save_verified(store, &recorded, read_pages, &mut newly_verified, resolved)
             .await;
         if let Err(error) = fetched {
             if let Err(save_error) = saved {
@@ -409,7 +496,7 @@ impl AssetIdentityResolver {
                 .insert(token.clone(), cached.identity.clone());
             resolved.provenance.insert(token, cached.provenance);
         }
-        Ok(resolved)
+        Ok(())
     }
 
     /// Release synchronized temporary pages once the boot extension has indexed their receipts.
@@ -1655,6 +1742,134 @@ mod tests {
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
     }
 
+    struct InterleavedChunkFixture {
+        urls: StdMutex<Vec<String>>,
+        release: tokio::sync::Notify,
+        live_completed: std::sync::atomic::AtomicBool,
+    }
+
+    impl ReconciliationFetcher for InterleavedChunkFixture {
+        fn fetch<'a>(
+            &'a self,
+            url: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
+            Box::pin(async move {
+                let url = reqwest::Url::parse(url).unwrap();
+                let tokens = url
+                    .query_pairs()
+                    .filter(|(key, _)| key == "clob_token_ids")
+                    .map(|(_, token)| token.into_owned())
+                    .collect::<Vec<_>>();
+                assert!(tokens.len() <= GAMMA_BATCH_SIZE);
+                assert!(!url.query_pairs().any(|(key, _)| key == "closed"));
+                self.urls.lock().unwrap().push(url.to_string());
+                if tokens.iter().any(|token| token == "token-000") {
+                    self.release.notified().await;
+                } else if tokens.iter().any(|token| token.ends_with("-050")) {
+                    assert!(self.live_completed.load(Ordering::SeqCst));
+                }
+                serde_json::to_vec(
+                    &tokens
+                        .iter()
+                        .map(|token| {
+                            serde_json::json!({
+                                "conditionId": format!("condition-{token}"),
+                                "clobTokenIds": [token],
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .map_err(identity_store_error)
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn live_identity_lookup_completes_between_historical_chunks() {
+        for (durable, queued_count) in [(false, 0), (true, 0), (true, 3)] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("source.log");
+            let fetcher = Arc::new(InterleavedChunkFixture {
+                urls: StdMutex::new(Vec::new()),
+                release: tokio::sync::Notify::new(),
+                live_completed: std::sync::atomic::AtomicBool::new(false),
+            });
+            let resolver = if durable {
+                durable_resolver(
+                    &path,
+                    Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap()),
+                    "installed",
+                    fetcher.clone(),
+                    GAMMA_BATCH_SIZE,
+                )
+            } else {
+                AssetIdentityResolver::new(
+                    fetcher.clone(),
+                    BASE.into(),
+                    GAMMA_BATCH_SIZE,
+                    Arc::new(Mutex::new(SourceEventSink::open(&path).unwrap())),
+                )
+            };
+            let tokens = (0..=GAMMA_BATCH_SIZE)
+                .map(|index| PolymarketTokenId(format!("token-{index:03}")))
+                .collect::<Vec<_>>();
+            let mut historical = Box::pin(resolver.resolve_historical_for_bracket(tokens.clone()));
+            std::future::poll_fn(|cx| {
+                assert!(historical.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            let mut queued = Vec::new();
+            for caller in 0..queued_count {
+                let tokens = (0..=GAMMA_BATCH_SIZE)
+                    .map(|index| PolymarketTokenId(format!("queued-{caller}-{index:03}")))
+                    .collect::<Vec<_>>();
+                let mut waiting = Box::pin(resolver.resolve_historical_for_bracket(tokens));
+                std::future::poll_fn(|cx| {
+                    assert!(waiting.as_mut().poll(cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                queued.push(waiting);
+            }
+            let live_token = PolymarketTokenId("token-live".into());
+            let mut live = Box::pin(async {
+                let resolved = resolver.resolve_live([live_token.clone()]).await.unwrap();
+                fetcher.live_completed.store(true, Ordering::SeqCst);
+                resolved
+            });
+            // Polling queues this waiter while the first chunk still holds the mutex.
+            std::future::poll_fn(|cx| {
+                assert!(live.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert_eq!(fetcher.urls.lock().unwrap().len(), 1);
+            fetcher.release.notify_one();
+            let (historical, queued, live) =
+                tokio::join!(historical, futures::future::join_all(queued), live);
+            let historical = historical.unwrap();
+            for completed in queued {
+                assert_eq!(completed.unwrap().verified.len(), tokens.len());
+            }
+            assert_eq!(historical.verified.len(), tokens.len());
+            assert_eq!(live.verified.len(), 1);
+            assert_eq!(
+                live.provenance[&live_token].source_log_sequence,
+                u64::try_from(queued_count + 1).unwrap()
+            );
+            assert_eq!(historical.provenance[&tokens[0]].source_log_sequence, 0);
+            assert_eq!(
+                historical.provenance[&tokens[GAMMA_BATCH_SIZE]].source_log_sequence,
+                u64::try_from(queued_count + 2).unwrap()
+            );
+            let urls = fetcher.urls.lock().unwrap();
+            assert_eq!(urls.len(), 3 + 2 * queued_count);
+            assert!(urls[queued_count + 1].contains("clob_token_ids=token-live"));
+            assert!(urls[queued_count + 2].contains("clob_token_ids=token-050"));
+        }
+    }
+
     struct CrossConditionFixture;
 
     impl ReconciliationFetcher for CrossConditionFixture {
@@ -1952,6 +2167,37 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
             Box::pin(async move { Ok(self.pages.lock().unwrap().pop_front().unwrap()) })
         }
+    }
+
+    #[tokio::test]
+    async fn memory_only_cross_chunk_ambiguity_evicts_earlier_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let fetcher = Arc::new(SequenceFixture {
+            pages: StdMutex::new(std::collections::VecDeque::from([
+                br#"[{"conditionId":"condition","clobTokenIds":["token-a","token-x"]}]"#.to_vec(),
+                br#"[{"conditionId":"condition","clobTokenIds":["token-z","token-b"]}]"#.to_vec(),
+            ])),
+        });
+        let resolver = AssetIdentityResolver::new(
+            fetcher,
+            BASE.into(),
+            1,
+            Arc::new(Mutex::new(SourceEventSink::open(&path).unwrap())),
+        );
+        let tokens = [
+            PolymarketTokenId("token-a".into()),
+            PolymarketTokenId("token-b".into()),
+        ];
+        let resolved = resolver.resolve_live(tokens.clone()).await.unwrap();
+        assert!(resolved.verified.is_empty());
+        assert!(resolved.provenance.is_empty());
+        assert!(
+            tokens
+                .iter()
+                .all(|token| resolved.unverified.contains_key(token))
+        );
+        assert!(resolver.cache.read().await.identities.is_empty());
     }
 
     #[tokio::test]
