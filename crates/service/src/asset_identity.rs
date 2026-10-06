@@ -29,6 +29,20 @@ use crate::source_event_sink::SourceEventSink;
 
 type IdentityPage = (MetadataPageEvidence, Vec<u8>);
 
+#[derive(Default)]
+struct RecordedIdentityPages {
+    pages: Vec<IdentityPage>,
+    sequences: HashMap<String, u64>,
+    last_sequence: Option<u64>,
+    absences: BTreeMap<PolymarketTokenId, i64>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LookupPurpose {
+    Historical,
+    Live,
+}
+
 struct AuthenticatedIdentityRows {
     identities: Vec<(AssetIdentityRow, CachedIdentity)>,
     pages: Vec<IdentityPage>,
@@ -213,25 +227,26 @@ impl AssetIdentityResolver {
         *self.recorder.write().await = IdentityRecorder::Runtime(source_log);
     }
 
-    pub async fn resolve(
+    /// Live decisions ignore completed absences so newly listed tokens can be discovered.
+    pub async fn resolve_live(
         &self,
         tokens: impl IntoIterator<Item = PolymarketTokenId>,
     ) -> Result<ResolvedIdentities, SourceError> {
-        self.resolve_inner(tokens, false).await
+        self.resolve_inner(tokens, LookupPurpose::Live).await
     }
 
-    /// Keep a bracket's completed history reads while retrying exhausted transient chunks.
-    pub async fn resolve_for_bracket(
+    /// Historical brackets reuse completed absences and retry exhausted transient chunks.
+    pub async fn resolve_historical_for_bracket(
         &self,
         tokens: impl IntoIterator<Item = PolymarketTokenId>,
     ) -> Result<ResolvedIdentities, SourceError> {
-        self.resolve_inner(tokens, true).await
+        self.resolve_inner(tokens, LookupPurpose::Historical).await
     }
 
     async fn resolve_inner(
         &self,
         tokens: impl IntoIterator<Item = PolymarketTokenId>,
-        retry_chunks: bool,
+        purpose: LookupPurpose,
     ) -> Result<ResolvedIdentities, SourceError> {
         let requested = tokens.into_iter().collect::<BTreeSet<_>>();
         {
@@ -263,6 +278,39 @@ impl AssetIdentityResolver {
         let mut resolved = self
             .cached(&requested, store.as_ref(), &mut read_pages)
             .await?;
+        if purpose == LookupPurpose::Historical
+            && let Some(store) = &store
+        {
+            let misses = requested
+                .iter()
+                .filter(|token| {
+                    !resolved.verified.contains_key(*token)
+                        && !resolved.unverified.contains_key(*token)
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            for token in store
+                .paper_state
+                .rejected_asset_tokens(&store.generation, &misses)
+                .map_err(identity_store_error)?
+                .into_keys()
+            {
+                resolved
+                    .unverified
+                    .insert(token, rejected_identity_reason());
+            }
+            for token in store
+                .paper_state
+                .absent_asset_tokens(&store.generation, &misses)
+                .map_err(identity_store_error)?
+                .into_keys()
+            {
+                resolved
+                    .unverified
+                    .entry(token)
+                    .or_insert_with(absent_identity_reason);
+            }
+        }
         let misses = requested
             .iter()
             .filter(|token| {
@@ -274,20 +322,18 @@ impl AssetIdentityResolver {
             return Ok(resolved);
         }
 
-        let mut pages = Vec::new();
-        let mut sequences = HashMap::new();
+        let mut recorded = RecordedIdentityPages::default();
         let mut newly_verified = BTreeMap::new();
         let mut fetched = self
             .fetch_and_record_chunks(
                 &misses,
                 MarketFilter::OpenOnly,
                 "gamma token lookup rejected",
-                &mut pages,
-                &mut sequences,
-                retry_chunks,
+                &mut recorded,
+                purpose == LookupPurpose::Historical,
             )
             .await;
-        let open_identities = verify_token_identities(&misses, &pages);
+        let open_identities = verify_token_identities(&misses, &recorded.pages);
         let leftovers = misses
             .iter()
             .filter(|token| !open_identities.contains_key(*token))
@@ -300,38 +346,47 @@ impl AssetIdentityResolver {
                     &leftovers,
                     MarketFilter::ClosedOnly,
                     "gamma closed-token lookup rejected",
-                    &mut pages,
-                    &mut sequences,
-                    retry_chunks,
+                    &mut recorded,
+                    purpose == LookupPurpose::Historical,
                 )
                 .await;
         }
 
+        let returned_tokens = page_tokens(&recorded.pages)
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        if fetched.is_ok()
+            && store.is_some()
+            && let Some(sequence) = recorded.last_sequence
+        {
+            let sequence = i64::try_from(sequence).map_err(identity_store_error)?;
+            recorded.absences = misses
+                .iter()
+                .filter(|token| !returned_tokens.contains(token))
+                .map(|token| (token.clone(), sequence))
+                .collect();
+        }
         let candidates = if store.is_some() {
-            page_tokens(&pages)
+            returned_tokens.into_iter().collect()
         } else {
             misses.clone()
         };
         collect_verified(
-            verify_token_identities(&candidates, &pages),
-            &sequences,
+            verify_token_identities(&candidates, &recorded.pages),
+            &recorded.sequences,
             &mut newly_verified,
             &mut resolved.unverified,
         );
 
         for token in misses {
             if !newly_verified.contains_key(&token) && !resolved.unverified.contains_key(&token) {
-                resolved.unverified.insert(
-                    token,
-                    "token absent from open and closed Gamma metadata".to_owned(),
-                );
+                resolved.unverified.insert(token, absent_identity_reason());
             }
         }
         let saved = self
             .save_verified(
                 store.as_ref(),
-                &pages,
-                &sequences,
+                &recorded,
                 &mut read_pages,
                 &mut newly_verified,
                 &mut resolved,
@@ -374,12 +429,13 @@ impl AssetIdentityResolver {
     async fn save_verified(
         &self,
         store: Option<&IdentityStore>,
-        pages: &[IdentityPage],
-        sequences: &HashMap<String, u64>,
+        recorded: &RecordedIdentityPages,
         read_pages: &mut BTreeMap<u64, IdentityPage>,
         newly_verified: &mut BTreeMap<PolymarketTokenId, CachedIdentity>,
         resolved: &mut ResolvedIdentities,
     ) -> Result<(), SourceError> {
+        let pages = &recorded.pages;
+        let sequences = &recorded.sequences;
         let mut cache = self.cache.write().await;
         if let Some(store) = store {
             let tokens = page_tokens(pages);
@@ -402,6 +458,9 @@ impl AssetIdentityResolver {
                 .into_values()
                 .flatten()
                 .collect::<BTreeSet<_>>();
+            for condition in &conditions {
+                check_condition_rejection(store, &mut cache, condition)?;
+            }
             let mut rows = store
                 .paper_state
                 .asset_identities_by_condition(&store.generation, &conditions)
@@ -436,7 +495,9 @@ impl AssetIdentityResolver {
             let verified = verify_token_identities(&combined_tokens, &combined_pages);
             let mut rejections = BTreeMap::new();
             for cached in &witnesses {
-                check_condition_rejection(store, &mut cache, &cached.identity.condition_id.0)?;
+                if !conditions.contains(&cached.identity.condition_id.0) {
+                    check_condition_rejection(store, &mut cache, &cached.identity.condition_id.0)?;
+                }
                 if verified
                     .get(&cached.provenance.asset)
                     .is_some_and(Result::is_err)
@@ -493,13 +554,36 @@ impl AssetIdentityResolver {
                     }
                 }
             }
+            let rejected_tokens = token_conditions
+                .iter()
+                .filter(|(_, conditions)| {
+                    conditions.iter().any(|condition| {
+                        rejections.contains_key(condition) || cache.rejected.contains(condition)
+                    })
+                })
+                .map(|(token, _)| {
+                    recorded
+                        .last_sequence
+                        .ok_or_else(|| identity_store_error("rejected token has no recorded page"))
+                        .and_then(|sequence| i64::try_from(sequence).map_err(identity_store_error))
+                        .map(|sequence| (token.clone(), sequence))
+                })
+                .collect::<Result<BTreeMap<_, _>, _>>()?;
             // Rejections accompany the first bounded row insert, even if all fresh tokens
             // already belong to another condition. Later row inserts cannot clear a marker.
-            if new_rows.is_empty() && !rejections.is_empty() {
+            if new_rows.is_empty()
+                && (!rejections.is_empty()
+                    || !recorded.absences.is_empty()
+                    || !rejected_tokens.is_empty())
+            {
                 identity_mutation(|| {
-                    store
-                        .paper_state
-                        .save_asset_identities(&store.generation, &[], &rejections)
+                    store.paper_state.save_asset_identities(
+                        &store.generation,
+                        &[],
+                        &rejections,
+                        &recorded.absences,
+                        &rejected_tokens,
+                    )
                 })
                 .await?;
             } else {
@@ -509,10 +593,24 @@ impl AssetIdentityResolver {
                     } else {
                         &BTreeMap::new()
                     };
+                    let absences = if index == 0 {
+                        &recorded.absences
+                    } else {
+                        &BTreeMap::new()
+                    };
+                    let rejected_tokens = if index == 0 {
+                        &rejected_tokens
+                    } else {
+                        &BTreeMap::new()
+                    };
                     identity_mutation(|| {
-                        store
-                            .paper_state
-                            .save_asset_identities(&store.generation, chunk, markers)
+                        store.paper_state.save_asset_identities(
+                            &store.generation,
+                            chunk,
+                            markers,
+                            absences,
+                            rejected_tokens,
+                        )
                     })
                     .await?;
                     if index == 0 {
@@ -566,8 +664,7 @@ impl AssetIdentityResolver {
         tokens: &[PolymarketTokenId],
         filter: MarketFilter,
         rejected_message: &str,
-        pages: &mut Vec<(MetadataPageEvidence, Vec<u8>)>,
-        sequences: &mut HashMap<String, u64>,
+        recorded: &mut RecordedIdentityPages,
         retry_chunks: bool,
     ) -> Result<(), SourceError> {
         for chunk in tokens.chunks(self.gamma_batch_size) {
@@ -603,10 +700,12 @@ impl AssetIdentityResolver {
             };
             if let Some(page) = fetched.page {
                 let sequence = self.record_page(&page).await?;
-                sequences
+                recorded.last_sequence = Some(sequence);
+                recorded
+                    .sequences
                     .entry(page.0.canonical_page_hash.clone())
                     .or_insert(sequence);
-                pages.push(page);
+                recorded.pages.push(page);
             }
             if !fetched.markets.unfetched.is_empty() {
                 return Err(SourceError::Fatal {
@@ -735,6 +834,10 @@ fn identity_row(
 
 fn rejected_identity_reason() -> String {
     "condition has conflicting Gamma identities in the installed generation".to_owned()
+}
+
+fn absent_identity_reason() -> String {
+    "token absent from open and closed Gamma metadata".to_owned()
 }
 
 fn evict_rejected(cache: &mut IdentityCache, resolved: &mut ResolvedIdentities) {
@@ -1144,7 +1247,10 @@ mod tests {
         let (_dir, path, _sink, resolver) = boot_resolver(fetcher.clone());
         let start = tokio::time::Instant::now();
         let token = PolymarketTokenId("token-a".to_owned());
-        let resolved = resolver.resolve_for_bracket([token.clone()]).await.unwrap();
+        let resolved = resolver
+            .resolve_historical_for_bracket([token.clone()])
+            .await
+            .unwrap();
         assert_eq!(resolved.verified[&token].condition_id.0, "condition-closed");
         assert_eq!(resolved.provenance[&token].source_log_sequence, 1);
         assert_eq!(
@@ -1165,7 +1271,10 @@ mod tests {
             ]
         );
         assert_eq!(Reader::replay(path).unwrap().count(), 2);
-        let cached = resolver.resolve_for_bracket([token]).await.unwrap();
+        let cached = resolver
+            .resolve_historical_for_bracket([token])
+            .await
+            .unwrap();
         assert_eq!(cached.provenance, resolved.provenance);
         assert_eq!(fetcher.attempts.lock().unwrap().len(), 6);
     }
@@ -1183,7 +1292,7 @@ mod tests {
         let start = tokio::time::Instant::now();
         assert!(matches!(
             resolver
-                .resolve_for_bracket([
+                .resolve_historical_for_bracket([
                     PolymarketTokenId("token-a".to_owned()),
                     PolymarketTokenId("token-b".to_owned())
                 ])
@@ -1208,7 +1317,7 @@ mod tests {
         assert_eq!(resolver.cache.read().await.identities.len(), 1);
         assert_eq!(Reader::replay(&path).unwrap().count(), 1);
         resolver
-            .resolve_for_bracket([PolymarketTokenId("token-a".to_owned())])
+            .resolve_historical_for_bracket([PolymarketTokenId("token-a".to_owned())])
             .await
             .unwrap();
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 6);
@@ -1223,7 +1332,7 @@ mod tests {
         let start = tokio::time::Instant::now();
         assert!(matches!(
             resolver
-                .resolve([PolymarketTokenId("token-a".to_owned())])
+                .resolve_live([PolymarketTokenId("token-a".to_owned())])
                 .await,
             Err(SourceError::Transient { .. })
         ));
@@ -1276,7 +1385,8 @@ mod tests {
     async fn resolve_http(
         resolver: &AssetIdentityResolver,
     ) -> Result<ResolvedIdentities, SourceError> {
-        let resolve = resolver.resolve_for_bracket([PolymarketTokenId("token-a".to_owned())]);
+        let resolve =
+            resolver.resolve_historical_for_bracket([PolymarketTokenId("token-a".to_owned())]);
         tokio::pin!(resolve);
         loop {
             tokio::select! {
@@ -1414,7 +1524,7 @@ mod tests {
         let token = PolymarketTokenId("token-a".into());
         let sibling = PolymarketTokenId("token-x".into());
         let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher, 50);
-        let original = resolver.resolve([token.clone()]).await.unwrap();
+        let original = resolver.resolve_live([token.clone()]).await.unwrap();
         assert_eq!(original.verified.len(), 1);
         let rows = paper
             .asset_identities("installed", &[token.clone(), sibling.clone()])
@@ -1423,7 +1533,7 @@ mod tests {
         drop(resolver);
         let fetcher = Arc::new(GammaFixture::new(b"[]", b"[]"));
         let resolver = durable_resolver(&path, paper, "installed", fetcher.clone(), 50);
-        let restored = resolver.resolve([sibling.clone()]).await.unwrap();
+        let restored = resolver.resolve_live([sibling.clone()]).await.unwrap();
         assert_eq!(restored.verified[&sibling].outcome, OutcomeId(1));
         assert_eq!(
             restored.provenance[&sibling].source_log_sequence,
@@ -1460,7 +1570,7 @@ mod tests {
             AssetIdentityResolver::new_runtime(fetcher.clone(), BASE.into(), 50, source_log)
                 .with_paper_state(paper.clone(), "installed".into(), receipts);
         let token = PolymarketTokenId("token-a".into());
-        let resolved = resolver.resolve([token.clone()]).await.unwrap();
+        let resolved = resolver.resolve_live([token.clone()]).await.unwrap();
         let saved = paper
             .asset_identities("installed", std::slice::from_ref(&token))
             .unwrap();
@@ -1475,7 +1585,7 @@ mod tests {
         let fetcher = Arc::new(GammaFixture::new(b"[]", b"[]"));
         let resolver = durable_resolver(&path, paper, "installed", fetcher.clone(), 50);
         assert_eq!(
-            resolver.resolve([token]).await.unwrap().provenance,
+            resolver.resolve_live([token]).await.unwrap().provenance,
             resolved.provenance
         );
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
@@ -1526,13 +1636,13 @@ mod tests {
         let first_resolver = resolver.clone();
         let first_token = token.clone();
         let first =
-            tokio::spawn(async move { first_resolver.resolve([first_token]).await.unwrap() });
+            tokio::spawn(async move { first_resolver.resolve_live([first_token]).await.unwrap() });
         fetcher.started.notified().await;
         let second_resolver = resolver.clone();
         let second_token = token.clone();
         let second = tokio::spawn(async move {
             second_resolver
-                .resolve([second_token, PolymarketTokenId("token-x".into())])
+                .resolve_live([second_token, PolymarketTokenId("token-x".into())])
                 .await
                 .unwrap()
         });
@@ -1586,7 +1696,7 @@ mod tests {
             Arc::new(CrossConditionFixture),
             50,
         );
-        let original = resolver.resolve([tokens[0].clone()]).await.unwrap();
+        let original = resolver.resolve_live([tokens[0].clone()]).await.unwrap();
         drop(resolver);
         let resolver = durable_resolver(
             &path,
@@ -1595,7 +1705,7 @@ mod tests {
             Arc::new(CrossConditionFixture),
             50,
         );
-        let conflicting = resolver.resolve([tokens[1].clone()]).await.unwrap();
+        let conflicting = resolver.resolve_live([tokens[1].clone()]).await.unwrap();
         assert!(conflicting.verified.is_empty());
         assert!(
             tokens[..2]
@@ -1623,7 +1733,7 @@ mod tests {
         let fetcher = Arc::new(GammaFixture::new(b"[]", b"[]"));
         let resolver = durable_resolver(&path, paper, "installed", fetcher.clone(), 50);
         for token in tokens {
-            let result = resolver.resolve([token.clone()]).await.unwrap();
+            let result = resolver.resolve_live([token.clone()]).await.unwrap();
             assert!(result.verified.is_empty());
             assert!(result.unverified.contains_key(&token));
         }
@@ -1647,7 +1757,7 @@ mod tests {
             )),
             50,
         );
-        resolver.resolve([token.clone()]).await.unwrap();
+        resolver.resolve_live([token.clone()]).await.unwrap();
         drop(resolver);
         let resolver = durable_resolver(
             &path,
@@ -1661,7 +1771,7 @@ mod tests {
         );
         // A different requested miss exposes D:[A], whose entire token set already belongs to C.
         let result = resolver
-            .resolve([PolymarketTokenId("probe".into())])
+            .resolve_live([PolymarketTokenId("probe".into())])
             .await
             .unwrap();
         assert!(result.verified.is_empty());
@@ -1687,12 +1797,12 @@ mod tests {
             b"[]",
         ));
         let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher.clone(), 50);
-        let saved = resolver.resolve([token.clone()]).await.unwrap();
+        let saved = resolver.resolve_live([token.clone()]).await.unwrap();
         assert!(saved.verified.is_empty());
         assert!(saved.unverified.contains_key(&token));
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
         let token = PolymarketTokenId("token-b".into());
-        let later = resolver.resolve([token.clone()]).await.unwrap();
+        let later = resolver.resolve_live([token.clone()]).await.unwrap();
         assert!(later.verified.is_empty());
         assert!(later.unverified.contains_key(&token));
         assert!(later.provenance.is_empty());
@@ -1715,12 +1825,12 @@ mod tests {
             br#"[{"conditionId":"condition-c","clobTokenIds":["token-a"]},{"conditionId":"condition-d","clobTokenIds":["token-a"]}]"#, b"[]",
         )), 50);
         let token = PolymarketTokenId("token-a".into());
-        let result = resolver.resolve([token.clone()]).await.unwrap();
+        let result = resolver.resolve_live([token.clone()]).await.unwrap();
         assert!(result.verified.is_empty());
         assert!(result.unverified.contains_key(&token));
         assert!(
             paper
-                .asset_identities("installed", &[token])
+                .asset_identities("installed", std::slice::from_ref(&token))
                 .unwrap()
                 .is_empty()
         );
@@ -1735,22 +1845,53 @@ mod tests {
         drop(resolver);
         drop(paper);
         let paper = Arc::new(PaperStateDb::open(&db_path).unwrap());
-        let resolver = durable_resolver(
-            &path,
-            paper,
-            "installed",
-            Arc::new(GammaFixture::new(
-                br#"[{"conditionId":"condition-d","clobTokenIds":["token-b"]}]"#,
-                b"[]",
-            )),
-            50,
-        );
+        let fetcher = Arc::new(GammaFixture::new(
+            br#"[{"conditionId":"condition-d","clobTokenIds":["token-b"]}]"#,
+            b"[]",
+        ));
+        let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher.clone(), 50);
+        let historical = resolver
+            .resolve_historical_for_bracket([token.clone()])
+            .await
+            .unwrap();
+        assert!(historical.verified.is_empty());
+        assert!(historical.unverified.contains_key(&token));
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
         let later = resolver
-            .resolve([PolymarketTokenId("token-b".into())])
+            .resolve_live([PolymarketTokenId("token-b".into())])
             .await
             .unwrap();
         assert!(later.verified.is_empty());
         assert_eq!(later.unverified.len(), 1);
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+        drop(resolver);
+        // An unusable new token in a previously rejected condition also has no row.
+        let token = PolymarketTokenId("token-c".into());
+        let fetcher = Arc::new(GammaFixture::new(
+            br#"[{"conditionId":"condition-d","clobTokenIds":["token-c","token-c"]}]"#,
+            b"[]",
+        ));
+        let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher.clone(), 50);
+        let malformed = resolver.resolve_live([token.clone()]).await.unwrap();
+        assert!(malformed.verified.is_empty());
+        assert!(malformed.unverified.contains_key(&token));
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            paper
+                .asset_identities("installed", std::slice::from_ref(&token))
+                .unwrap()
+                .is_empty()
+        );
+        drop(resolver);
+        let fetcher = Arc::new(GammaFixture::new(b"[]", b"[]"));
+        let resolver = durable_resolver(&path, paper, "installed", fetcher.clone(), 50);
+        let historical = resolver
+            .resolve_historical_for_bracket([token.clone()])
+            .await
+            .unwrap();
+        assert!(historical.verified.is_empty());
+        assert!(historical.unverified.contains_key(&token));
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1768,7 +1909,7 @@ mod tests {
         let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher, 50);
         let sibling = PolymarketTokenId("token-b".into());
         let first = resolver
-            .resolve([PolymarketTokenId("token-a".into())])
+            .resolve_live([PolymarketTokenId("token-a".into())])
             .await
             .unwrap();
         assert_eq!(first.verified.len(), 1);
@@ -1781,13 +1922,13 @@ mod tests {
                 .contains_key(&sibling)
         );
         let conflicting = resolver
-            .resolve([sibling.clone(), PolymarketTokenId("probe".into())])
+            .resolve_live([sibling.clone(), PolymarketTokenId("probe".into())])
             .await
             .unwrap();
         assert!(conflicting.verified.is_empty());
         assert!(conflicting.unverified.contains_key(&sibling));
         assert!(resolver.cache.read().await.identities.is_empty());
-        let cached = resolver.resolve([sibling.clone()]).await.unwrap();
+        let cached = resolver.resolve_live([sibling.clone()]).await.unwrap();
         assert!(cached.verified.is_empty());
         assert!(cached.unverified.contains_key(&sibling));
         for condition in ["condition-c", "condition-d"] {
@@ -1840,7 +1981,7 @@ mod tests {
                     PolymarketTokenId("token-b".into()),
                 ];
                 let first = resolver
-                    .resolve_for_bracket([tokens[0].clone()])
+                    .resolve_historical_for_bracket([tokens[0].clone()])
                     .await
                     .unwrap();
                 assert!(first.verified.contains_key(&tokens[0]));
@@ -1852,7 +1993,7 @@ mod tests {
                 paper.begin_batch().unwrap();
                 paper.rollback_batch().unwrap();
                 let conflicting = resolver
-                    .resolve_for_bracket([tokens[1].clone()])
+                    .resolve_historical_for_bracket([tokens[1].clone()])
                     .await
                     .unwrap();
                 assert!(conflicting.verified.is_empty());
@@ -1888,13 +2029,222 @@ mod tests {
                 let fetcher = Arc::new(GammaFixture::new(b"[]", b"[]"));
                 let resolver = durable_resolver(&path, paper, "installed", fetcher.clone(), 50);
                 for token in tokens {
-                    let result = resolver.resolve([token.clone()]).await.unwrap();
+                    let result = resolver.resolve_live([token.clone()]).await.unwrap();
                     assert!(result.verified.is_empty());
                     assert!(result.unverified.contains_key(&token));
                 }
                 assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn durable_absence_restart_blocks_historical_but_live_discovers_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let db_path = dir.path().join("paper.db");
+        let paper = Arc::new(PaperStateDb::open(&db_path).unwrap());
+        let token = PolymarketTokenId("token-a".into());
+        let fetcher = Arc::new(GammaFixture::new(b"[]", b"[]"));
+        let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher.clone(), 50);
+        let result = resolver
+            .resolve_historical_for_bracket([token.clone()])
+            .await
+            .unwrap();
+        assert!(result.verified.is_empty());
+        assert!(result.unverified.contains_key(&token));
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
+        // Both pages have the same canonical hash; the marker still names the final receipt.
+        assert_eq!(
+            paper
+                .absent_asset_tokens("installed", std::slice::from_ref(&token))
+                .unwrap(),
+            BTreeMap::from([(token.clone(), 1)])
+        );
+        drop(resolver);
+        drop(paper);
+
+        let paper = Arc::new(PaperStateDb::open(&db_path).unwrap());
+        let fetcher = Arc::new(GammaFixture::new(
+            br#"[{"conditionId":"condition-a","clobTokenIds":["token-a"]}]"#,
+            b"[]",
+        ));
+        let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher.clone(), 50);
+        let historical = resolver
+            .resolve_historical_for_bracket([token.clone()])
+            .await
+            .unwrap();
+        assert!(historical.verified.is_empty());
+        assert!(historical.unverified.contains_key(&token));
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
+        let live = resolver.resolve_live([token.clone()]).await.unwrap();
+        assert_eq!(live.verified[&token].condition_id.0, "condition-a");
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            paper
+                .asset_identities("installed", std::slice::from_ref(&token))
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(resolver);
+
+        let fetcher = Arc::new(GammaFixture::new(b"[]", b"[]"));
+        let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher.clone(), 50);
+        let historical = resolver
+            .resolve_historical_for_bracket([token.clone()])
+            .await
+            .unwrap();
+        assert_eq!(historical.verified, live.verified);
+        assert_eq!(historical.provenance, live.provenance);
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            paper
+                .absent_asset_tokens("installed", &[token])
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_absence_foreign_generation_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let token = PolymarketTokenId("token-a".into());
+        let old = durable_resolver(
+            &path,
+            paper.clone(),
+            "old",
+            Arc::new(GammaFixture::new(b"[]", b"[]")),
+            50,
+        );
+        old.resolve_historical_for_bracket([token.clone()])
+            .await
+            .unwrap();
+        drop(old);
+        let fetcher = Arc::new(GammaFixture::new(
+            br#"[{"conditionId":"condition-a","clobTokenIds":["token-a"]}]"#,
+            b"[]",
+        ));
+        let resolver = durable_resolver(&path, paper.clone(), "current", fetcher.clone(), 50);
+        let result = resolver
+            .resolve_historical_for_bracket([token.clone()])
+            .await
+            .unwrap();
+        assert!(result.verified.contains_key(&token));
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+        assert!(
+            paper
+                .absent_asset_tokens("current", std::slice::from_ref(&token))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(paper.absent_asset_tokens("old", &[token]).unwrap().len(), 1);
+    }
+
+    struct FailedAbsenceFixture {
+        fail_closed: bool,
+    }
+
+    impl ReconciliationFetcher for FailedAbsenceFixture {
+        fn fetch<'a>(
+            &'a self,
+            url: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
+            Box::pin(async move {
+                if url.contains("closed=true") == self.fail_closed {
+                    Err(SourceError::Transient {
+                        message: "injected lookup failure".into(),
+                    })
+                } else {
+                    Ok(b"[]".to_vec())
+                }
+            })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_identity_lookup_saves_no_absence_markers() {
+        for fail_closed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("source.log");
+            let db_path = dir.path().join("paper.db");
+            let paper = Arc::new(PaperStateDb::open(&db_path).unwrap());
+            let token = PolymarketTokenId("token-a".into());
+            let resolver = durable_resolver(
+                &path,
+                paper.clone(),
+                "installed",
+                Arc::new(FailedAbsenceFixture { fail_closed }),
+                50,
+            );
+            assert!(matches!(
+                resolver
+                    .resolve_historical_for_bracket([token.clone()])
+                    .await,
+                Err(SourceError::Transient { .. })
+            ));
+            assert!(
+                paper
+                    .absent_asset_tokens("installed", std::slice::from_ref(&token))
+                    .unwrap()
+                    .is_empty()
+            );
+            drop(resolver);
+            drop(paper);
+            let paper = Arc::new(PaperStateDb::open(&db_path).unwrap());
+            let fetcher = Arc::new(GammaFixture::new(b"[]", b"[]"));
+            let resolver = durable_resolver(&path, paper, "installed", fetcher.clone(), 50);
+            resolver
+                .resolve_historical_for_bracket([token])
+                .await
+                .unwrap();
+            assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn durable_absence_write_waits_for_batch_and_survives_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let token = PolymarketTokenId("token-a".into());
+        let fetcher = Arc::new(GammaFixture::new(b"[]", b"[]"));
+        let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher.clone(), 50);
+        paper.begin_batch().unwrap();
+        let mut resolving = Box::pin(resolver.resolve_historical_for_bracket([token.clone()]));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), resolving.as_mut())
+                .await
+                .is_err()
+        );
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
+        assert!(
+            paper
+                .absent_asset_tokens("installed", std::slice::from_ref(&token))
+                .unwrap()
+                .is_empty()
+        );
+        paper.rollback_batch().unwrap();
+        let result = resolving.await.unwrap();
+        assert!(result.verified.is_empty());
+        assert!(result.unverified.contains_key(&token));
+        assert_eq!(
+            paper
+                .absent_asset_tokens("installed", std::slice::from_ref(&token))
+                .unwrap(),
+            BTreeMap::from([(token.clone(), 1)])
+        );
+        drop(resolver);
+        let fetcher = Arc::new(GammaFixture::new(b"[]", b"[]"));
+        let resolver = durable_resolver(&path, paper, "installed", fetcher.clone(), 50);
+        resolver
+            .resolve_historical_for_bracket([token])
+            .await
+            .unwrap();
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1912,7 +2262,7 @@ mod tests {
             PolymarketTokenId("token-b".into()),
         ];
         let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher.clone(), 50);
-        let original = resolver.resolve(tokens.clone()).await.unwrap();
+        let original = resolver.resolve_live(tokens.clone()).await.unwrap();
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
         assert_eq!(
             paper.asset_identities("installed", &tokens).unwrap().len(),
@@ -1924,12 +2274,15 @@ mod tests {
         let paper = Arc::new(PaperStateDb::open(&db_path).unwrap());
         let fetcher = Arc::new(GammaFixture::new(b"[]", b"[]"));
         let resolver = durable_resolver(&path, paper, "installed", fetcher.clone(), 50);
-        let restored = resolver.resolve_for_bracket(tokens.clone()).await.unwrap();
+        let restored = resolver
+            .resolve_historical_for_bracket(tokens.clone())
+            .await
+            .unwrap();
         assert_eq!(restored.verified, original.verified);
         assert_eq!(restored.provenance, original.provenance);
         assert_eq!(resolver.cache.read().await.identities.len(), 2);
         assert_eq!(
-            resolver.resolve(tokens).await.unwrap().provenance,
+            resolver.resolve_live(tokens).await.unwrap().provenance,
             original.provenance
         );
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
@@ -1948,7 +2301,7 @@ mod tests {
             let token = PolymarketTokenId("token-a".into());
             let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher.clone(), 50);
             paper.begin_batch().unwrap();
-            let mut resolving = Box::pin(resolver.resolve_for_bracket([token.clone()]));
+            let mut resolving = Box::pin(resolver.resolve_historical_for_bracket([token.clone()]));
             assert!(
                 tokio::time::timeout(std::time::Duration::from_millis(25), resolving.as_mut())
                     .await
@@ -1982,7 +2335,7 @@ mod tests {
             let fetcher = Arc::new(GammaFixture::new(b"[]", b"[]"));
             let restarted = durable_resolver(&path, paper, "installed", fetcher.clone(), 50);
             assert_eq!(
-                restarted.resolve([token]).await.unwrap().provenance,
+                restarted.resolve_live([token]).await.unwrap().provenance,
                 original.provenance
             );
             assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
@@ -2002,7 +2355,7 @@ mod tests {
         let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher, 50);
         paper.begin_batch().unwrap();
         let start = tokio::time::Instant::now();
-        assert!(matches!(resolver.resolve([token.clone()]).await,
+        assert!(matches!(resolver.resolve_live([token.clone()]).await,
             Err(SourceError::Fatal { message }) if message.contains("waited 30 s")));
         assert_eq!(
             tokio::time::Instant::now().duration_since(start).as_secs(),
@@ -2040,7 +2393,7 @@ mod tests {
         ));
         let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher.clone(), 50);
         paper.begin_batch().unwrap();
-        let mut resolving = Box::pin(resolver.resolve_for_bracket([token.clone()]));
+        let mut resolving = Box::pin(resolver.resolve_historical_for_bracket([token.clone()]));
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(25), resolving.as_mut())
                 .await
@@ -2070,7 +2423,7 @@ mod tests {
         let fetcher = Arc::new(GammaFixture::new(b"[]", b"[]"));
         let resolver = durable_resolver(&path, paper, "installed", fetcher.clone(), 50);
         assert_eq!(
-            resolver.resolve([token]).await.unwrap().provenance,
+            resolver.resolve_live([token]).await.unwrap().provenance,
             resolved.provenance
         );
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
@@ -2113,7 +2466,7 @@ mod tests {
                 Arc::new(SiblingConflictFixture),
                 50,
             );
-            resolver.resolve([tokens[0].clone()]).await.unwrap();
+            resolver.resolve_live([tokens[0].clone()]).await.unwrap();
             if restart {
                 drop(resolver);
                 resolver = durable_resolver(
@@ -2126,7 +2479,7 @@ mod tests {
             }
             let independent = PolymarketTokenId("token-independent".into());
             let resolved = resolver
-                .resolve([tokens[0].clone(), tokens[1].clone(), independent.clone()])
+                .resolve_live([tokens[0].clone(), tokens[1].clone(), independent.clone()])
                 .await
                 .unwrap();
             assert_eq!(resolved.verified.keys().collect::<Vec<_>>(), [&independent]);
@@ -2172,8 +2525,8 @@ mod tests {
             Arc::new(SiblingConflictFixture),
             50,
         );
-        let original = resolver.resolve([tokens[0].clone()]).await.unwrap();
-        resolver.resolve([tokens[1].clone()]).await.unwrap();
+        let original = resolver.resolve_live([tokens[0].clone()]).await.unwrap();
+        resolver.resolve_live([tokens[1].clone()]).await.unwrap();
         drop(resolver);
         drop(paper);
         let paper = Arc::new(PaperStateDb::open(&db_path).unwrap());
@@ -2182,13 +2535,13 @@ mod tests {
             b"[]",
         ));
         let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher.clone(), 50);
-        let restored = resolver.resolve(tokens.clone()).await.unwrap();
+        let restored = resolver.resolve_live(tokens.clone()).await.unwrap();
         assert!(restored.verified.is_empty());
         assert!(restored.provenance.is_empty());
         assert_eq!(restored.unverified.len(), 2);
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
         let token = PolymarketTokenId("token-new".into());
-        let fresh = resolver.resolve([token.clone()]).await.unwrap();
+        let fresh = resolver.resolve_live([token.clone()]).await.unwrap();
         assert!(fresh.verified.is_empty());
         assert!(fresh.unverified.contains_key(&token));
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
@@ -2258,7 +2611,7 @@ mod tests {
                 PolymarketTokenId("token-b".into()),
             ];
             let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher.clone(), 1);
-            assert!(matches!(resolver.resolve(tokens.clone()).await,
+            assert!(matches!(resolver.resolve_live(tokens.clone()).await,
                 Err(SourceError::Transient { message }) if message.contains("failed second chunk")));
             let saved = paper.asset_identities("installed", &tokens).unwrap();
             assert_eq!(saved.len(), 1);
@@ -2272,7 +2625,7 @@ mod tests {
             fetcher.fail_second.store(false, Ordering::SeqCst);
             fetcher.urls.lock().unwrap().clear();
             let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher.clone(), 1);
-            let retried = resolver.resolve(tokens.clone()).await.unwrap();
+            let retried = resolver.resolve_live(tokens.clone()).await.unwrap();
             assert_eq!(retried.verified.len(), 2);
             assert_eq!(retried.provenance[&tokens[0]], provenance);
             let urls = fetcher.urls.lock().unwrap();
@@ -2299,7 +2652,7 @@ mod tests {
             b"[]",
         ));
         let old = durable_resolver(&path, paper.clone(), "old", old_fetcher, 50);
-        old.resolve([token.clone()]).await.unwrap();
+        old.resolve_live([token.clone()]).await.unwrap();
         drop(old);
         let current_fetcher = Arc::new(GammaFixture::new(
             br#"[{"conditionId":"current-condition","clobTokenIds":["token-a"]}]"#,
@@ -2307,7 +2660,7 @@ mod tests {
         ));
         let current =
             durable_resolver(&path, paper.clone(), "current", current_fetcher.clone(), 50);
-        let resolved = current.resolve([token.clone()]).await.unwrap();
+        let resolved = current.resolve_live([token.clone()]).await.unwrap();
         assert_eq!(
             resolved.verified[&token].condition_id.0,
             "current-condition"
@@ -2344,7 +2697,7 @@ mod tests {
                 b"[]",
             ));
             let old = durable_resolver(&path, paper.clone(), "installed", old_fetcher, 50);
-            old.resolve([tokens[0].clone()]).await.unwrap();
+            old.resolve_live([tokens[0].clone()]).await.unwrap();
             drop(old);
             let fetcher = Arc::new(GammaFixture::new(
                 br#"[{"conditionId":"condition","clobTokenIds":["token-b"]}]"#,
@@ -2356,7 +2709,7 @@ mod tests {
             } else {
                 vec![tokens[1].clone()]
             };
-            let resolved = resolver.resolve(requested).await.unwrap();
+            let resolved = resolver.resolve_live(requested).await.unwrap();
             assert!(resolved.verified.is_empty());
             assert!(resolved.provenance.is_empty());
             assert_eq!(
@@ -2473,7 +2826,7 @@ mod tests {
                     "installed".into(),
                     SourceReceiptIndex::replay(&path).unwrap(),
                 );
-            let restored = resolver.resolve([token.clone()]).await.unwrap();
+            let restored = resolver.resolve_live([token.clone()]).await.unwrap();
             assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1, "{altered}");
             assert_eq!(
                 restored.verified[&token].condition_id.0, "condition-a",
@@ -2549,7 +2902,7 @@ mod tests {
         let (_dir, path, sink, resolver) = boot_resolver(fetcher.clone());
         let token = PolymarketTokenId("token-b".to_owned());
 
-        let first = resolver.resolve([token.clone()]).await.unwrap();
+        let first = resolver.resolve_live([token.clone()]).await.unwrap();
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
         assert_eq!(first.verified[&token].condition_id.0, "condition-a");
         assert_eq!(first.verified[&token].outcome.0, 1);
@@ -2559,7 +2912,7 @@ mod tests {
             first.verified[&token].evidence_hash
         );
 
-        let second = resolver.resolve([token.clone()]).await.unwrap();
+        let second = resolver.resolve_live([token.clone()]).await.unwrap();
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
         assert_eq!(second.provenance, first.provenance);
 
@@ -2586,7 +2939,7 @@ mod tests {
         let (_dir, _path, _sink, resolver) = boot_resolver(fetcher.clone());
         let token = PolymarketTokenId("token-a".to_owned());
 
-        let resolved = resolver.resolve([token.clone()]).await.unwrap();
+        let resolved = resolver.resolve_live([token.clone()]).await.unwrap();
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
         assert_eq!(resolved.provenance[&token].source_log_sequence, 1);
         let urls = fetcher.urls.lock().unwrap();
@@ -2609,7 +2962,7 @@ mod tests {
         let token_b = PolymarketTokenId("token-b".to_owned());
 
         let resolved = resolver
-            .resolve([token_a.clone(), token_b.clone()])
+            .resolve_live([token_a.clone(), token_b.clone()])
             .await
             .unwrap();
 
@@ -2637,7 +2990,7 @@ mod tests {
         let token_b = PolymarketTokenId("token-b".to_owned());
 
         assert!(matches!(
-            resolver.resolve([token_a.clone(), token_b]).await,
+            resolver.resolve_live([token_a.clone(), token_b]).await,
             Err(SourceError::Transient { message })
                 if message.contains("injected second chunk failure")
         ));
@@ -2647,7 +3000,7 @@ mod tests {
             .unwrap();
         assert_eq!(entries_after_failure.len(), 1);
 
-        let resolved = resolver.resolve([token_a.clone()]).await.unwrap();
+        let resolved = resolver.resolve_live([token_a.clone()]).await.unwrap();
         assert_eq!(resolved.verified[&token_a].condition_id.0, "condition-a");
         assert_eq!(
             fetcher.calls.load(Ordering::SeqCst),
@@ -2681,7 +3034,7 @@ mod tests {
             let (_dir, _path, _sink, resolver) = boot_resolver(fetcher);
             let token = PolymarketTokenId("token-a".to_owned());
 
-            let resolved = resolver.resolve([token.clone()]).await.unwrap();
+            let resolved = resolver.resolve_live([token.clone()]).await.unwrap();
             assert!(!resolved.verified.contains_key(&token));
             assert!(resolved.unverified.contains_key(&token));
         }
@@ -2695,7 +3048,7 @@ mod tests {
             let token = PolymarketTokenId("token-a".to_owned());
 
             assert!(matches!(
-                resolver.resolve([token]).await,
+                resolver.resolve_live([token]).await,
                 Err(SourceError::Fatal { message })
                     if message.starts_with("gamma metadata parse failed:")
             ));
@@ -2726,7 +3079,7 @@ mod tests {
 
         assert!(matches!(
             resolver
-                .resolve([PolymarketTokenId("token-a".to_owned())])
+                .resolve_live([PolymarketTokenId("token-a".to_owned())])
                 .await,
             Err(SourceError::Fatal { message }) if message.contains("source-log append failed")
         ));
@@ -2744,7 +3097,7 @@ mod tests {
 
         assert!(matches!(
             resolver
-                .resolve([PolymarketTokenId("token-a".to_owned())])
+                .resolve_live([PolymarketTokenId("token-a".to_owned())])
                 .await,
             Err(SourceError::Fatal { message }) if message == "source-log coordinator closed"
         ));

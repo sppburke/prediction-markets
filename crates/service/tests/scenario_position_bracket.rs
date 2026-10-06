@@ -1240,6 +1240,150 @@ fn durable_bracket_validator(
 }
 
 #[tokio::test]
+async fn durable_bracket_restart_skips_gamma_for_absent_and_rejected_tokens() {
+    for rejection_case in 0..3 {
+        let wallet = wallet(0x74);
+        let (dir, paper, engine) = fresh(&[wallet]);
+        let db_path = dir.path().join("paper.db");
+        let path = dir.path().join("source.log");
+        let token = pe_core_types::PolymarketTokenId(asset(1));
+        let generation = "installed-identity-generation";
+        let sink = Arc::new(tokio::sync::Mutex::new(
+            SourceEventSink::open(&path).unwrap(),
+        ));
+        let receipts = pe_service::risk_inputs::SourceReceiptIndex::replay(&path).unwrap();
+        let rejected = rejection_case != 0;
+        let gamma = if rejection_case == 2 {
+            serde_json::to_vec(&json!([
+                {"conditionId": condition(9), "clobTokenIds": [asset(1)]},
+                {"conditionId": condition(10), "clobTokenIds": [asset(1)]}
+            ]))
+            .unwrap()
+        } else if rejected {
+            serde_json::to_vec(&json!([{
+                "conditionId": condition(9), "clobTokenIds": [asset(1), "sibling"]
+            }]))
+            .unwrap()
+        } else {
+            b"[]".to_vec()
+        };
+        let seed = Arc::new(QueueFetcher::with_gamma(HashMap::new(), Some(gamma)));
+        let resolver =
+            AssetIdentityResolver::new(seed.clone(), BASE.into(), GAMMA_BATCH_SIZE, sink)
+                .with_paper_state(paper.clone(), generation.into(), receipts);
+        let initial = resolver
+            .resolve_historical_for_bracket([token.clone()])
+            .await
+            .unwrap();
+        assert_eq!(initial.verified.contains_key(&token), rejection_case == 1);
+        drop(resolver);
+        if rejection_case == 1 {
+            let sink = Arc::new(tokio::sync::Mutex::new(
+                SourceEventSink::open(&path).unwrap(),
+            ));
+            let receipts = pe_service::risk_inputs::SourceReceiptIndex::replay(&path).unwrap();
+            let gamma = serde_json::to_vec(&json!([{
+                "conditionId": condition(9), "clobTokenIds": ["different-token", asset(2)]
+            }]))
+            .unwrap();
+            let seed = Arc::new(QueueFetcher::with_gamma(HashMap::new(), Some(gamma)));
+            let resolver = AssetIdentityResolver::new(seed, BASE.into(), GAMMA_BATCH_SIZE, sink)
+                .with_paper_state(paper.clone(), generation.into(), receipts);
+            let conflicting = resolver
+                .resolve_live([pe_core_types::PolymarketTokenId(asset(2))])
+                .await
+                .unwrap();
+            assert!(conflicting.verified.is_empty());
+            assert!(
+                paper
+                    .asset_identity_condition_rejection(generation, &condition(9))
+                    .unwrap()
+                    .is_some()
+            );
+        } else if rejection_case == 0 {
+            assert_eq!(
+                paper
+                    .absent_asset_tokens(generation, std::slice::from_ref(&token))
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        if rejected {
+            assert!(
+                paper
+                    .rejected_asset_tokens(generation, std::slice::from_ref(&token))
+                    .unwrap()
+                    .contains_key(&token)
+            );
+        }
+        drop(engine);
+        drop(paper);
+
+        let paper = Arc::new(PaperStateDb::open(&db_path).unwrap());
+        let mut engine =
+            BucketCommitEngine::load(paper.clone(), build_leader_ledger(&paper).unwrap()).unwrap();
+        let activity =
+            serde_json::to_vec(&vec![activity(wallet, 1, "1.000000", "0xunverified", 10)]).unwrap();
+        let fetcher = Arc::new(QueueFetcher::with_gamma(
+            HashMap::from([
+                (activity_url(wallet), vec![activity; 3]),
+                (
+                    position_url(wallet, PositionPartition::NotRedeemable),
+                    vec![b"[]".to_vec(); 2],
+                ),
+                (
+                    position_url(wallet, PositionPartition::Redeemable),
+                    vec![b"[]".to_vec(); 2],
+                ),
+            ]),
+            Some(b"[]".to_vec()),
+        ));
+        let validator = durable_bracket_validator(fetcher.clone(), paper.clone(), &path);
+        let accepted = validator
+            .validate_direct(&[wallet], &mut engine, &paper)
+            .await
+            .unwrap();
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(
+            fetcher
+                .urls()
+                .iter()
+                .filter(|url| url.contains("/markets?"))
+                .count(),
+            0
+        );
+        let groups = paper.activity_groups_after(&wallet, -1).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].disposition, "raw_only");
+        assert_eq!(
+            paper
+                .no_copy_disposition(&groups[0].source_trade_id)
+                .unwrap()
+                .unwrap()
+                .2,
+            "identity_unresolved"
+        );
+        assert!(
+            paper
+                .gate_history()
+                .unwrap()
+                .get(&wallet)
+                .is_none_or(HashSet::is_empty)
+        );
+        assert!(paper.decision_pending_history().unwrap().is_empty());
+        if rejected {
+            assert!(
+                paper
+                    .asset_identity_condition_rejection(generation, &condition(9))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn durable_bracket_identity_restart_authenticates_cache_and_refetches_altered_rows() {
     for altered in ["outcome", "page_hash"] {
         let wallet = wallet(0x12);
