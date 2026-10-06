@@ -868,7 +868,7 @@ impl PaperStateDb {
             ));
         }
         let (busy, log, checkpointed): (i64, i64, i64) =
-            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            conn.query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?;
         if busy != 0 || log != checkpointed {
@@ -6327,7 +6327,6 @@ mod tests {
     #[test]
     fn sync_checkpoint_dispositions_requires_complete_wal_checkpoint() {
         let (dir, db) = db();
-        db.lock().busy_timeout(std::time::Duration::ZERO).unwrap();
         let reader = Connection::open(dir.path().join("paper_state.db")).unwrap();
         reader
             .execute_batch("BEGIN; SELECT count(*) FROM meta;")
@@ -6339,16 +6338,19 @@ mod tests {
         db.retire_activity_observation(receipt, false).unwrap();
         assert!(matches!(
             db.sync_checkpoint_dispositions(),
-            Err(PaperStateError::MigrationCheckpointIncomplete { busy: 1, .. })
+            Err(PaperStateError::MigrationCheckpointIncomplete { busy: 0, log, checkpointed })
+                if log > checkpointed
         ));
         reader.execute_batch("ROLLBACK").unwrap();
         db.sync_checkpoint_dispositions().unwrap();
-        assert_eq!(
-            std::fs::metadata(dir.path().join("paper_state.db-wal"))
-                .unwrap()
-                .len(),
-            0
-        );
+        let (busy, log, checkpointed): (i64, i64, i64) = db
+            .lock()
+            .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(busy, 0);
+        assert_eq!(log, checkpointed);
         let readonly = PaperStateDb::open_read_only(&dir.path().join("paper_state.db")).unwrap();
         assert!(readonly.activity_observation_retired(receipt).unwrap());
     }

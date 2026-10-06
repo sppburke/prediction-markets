@@ -336,7 +336,12 @@ impl SourceCheckpointOwner {
             }
             let candidate = candidate(&frozen, &receipts).map_err(TaskFailure::typed)?;
             if let Some(candidate) = &candidate {
-                info!(manifest_bytes = candidate.bytes.len(), "source checkpoint manifest serialized");
+                let (activity_triggers, activity_candidates, activity_commitments, routed_frame_receipts) =
+                    frozen.reducers.activity.checkpoint_counts();
+                let daily_boundary_entries = frozen.reducers.daily_boundary.as_ref().map_or(0, |entries| entries.len());
+                info!(manifest_bytes = candidate.bytes.len(), activity_triggers, activity_candidates,
+                    activity_commitments, daily_boundary_entries, routed_frame_receipts,
+                    "source checkpoint manifest serialized");
             }
             Ok(JobOutput::Candidate(Box::new(frozen), candidate.map(Arc::new)))
         }).await?;

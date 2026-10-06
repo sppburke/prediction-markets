@@ -3525,6 +3525,7 @@ pub struct BucketCommitEngine {
     admitted_frame_receipts:
         HashMap<(pe_core_types::EventSeq, blake3::Hash), (WalletAddress, usize)>,
     verified_frontiers: HashMap<WalletAddress, crate::frame_admission::FeedHistoryFrontier>,
+    frontier_hints: HashMap<WalletAddress, crate::frame_admission::FeedHistoryFrontier>,
     routed_frame_receipts: HashSet<pe_core_types::EventSeq>,
     frame_source_index: Option<SourceReceiptIndex>,
 }
@@ -3542,6 +3543,14 @@ impl BucketCommitEngine {
             .into_iter()
             .map(|fence| fence.wallet)
             .collect();
+        let frontier_hints: crate::frame_admission::FrontierCollection =
+            serde_json::from_value(paper_state.feed_history_frontiers()?)
+                .map_err(|error| BucketCommitError::Invariant(error.to_string()))?;
+        if frontier_hints.version != 1 {
+            return Err(BucketCommitError::Invariant(
+                "unsupported frontier collection".to_owned(),
+            ));
+        }
         let mut frame_decisions =
             HashMap::<WalletAddress, Vec<pe_paper_state::ActivityFrameDecisionIndex>>::new();
         for frame in paper_state.activity_frame_decision_index(None)? {
@@ -3572,6 +3581,11 @@ impl BucketCommitEngine {
             frame_transactions,
             admitted_frame_receipts,
             verified_frontiers: HashMap::new(),
+            frontier_hints: frontier_hints
+                .frontiers
+                .into_iter()
+                .map(|frontier| (frontier.wallet, frontier))
+                .collect(),
             routed_frame_receipts: HashSet::new(),
             frame_source_index: None,
         })
@@ -3858,7 +3872,9 @@ impl BucketCommitEngine {
         }
         index.remember_verified_frontier(&frontier);
         frontiers.insert(frontier.wallet, frontier);
-        crate::frame_admission::persist_frontiers(&self.paper_state, &frontiers)
+        let mut hints = self.frontier_hints.clone();
+        hints.extend(frontiers.clone());
+        crate::frame_admission::persist_frontiers(&self.paper_state, &hints)
             .map_err(|error| error.to_string())?;
         self.verified_frontiers = frontiers;
         Ok(())
@@ -3874,6 +3890,11 @@ impl BucketCommitEngine {
         self.frame_source_index = Some(index.clone());
         use crate::frame_admission::*;
         if self.routed_frame_receipts.contains(&receipt.sequence) {
+            return Ok(FrameRoute::Ignored);
+        }
+        if self.paper_state.activity_observation_retired(receipt)? {
+            self.retire_observation_barrier(receipt);
+            self.routed_frame_receipts.insert(receipt.sequence);
             return Ok(FrameRoute::Ignored);
         }
         let source = index

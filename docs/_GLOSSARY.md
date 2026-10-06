@@ -611,7 +611,8 @@ wallet, transaction hash, verified asset and side. Every matching REST group is 
 another copy, regardless of candidate count, quantity, price or timestamp; partial fills aggregate
 within their group. Read-proven restamp pairs retain their existing collapse and ledger semantics.
 A different asset or side in the same transaction is an independent leg and keeps ordinary routing,
-including when it arrives alone after restart. The frame's asset and side come from its recorded
+including when it arrives alone after restart. An eligible BUY in a different, unconsumed market
+can copy; SELLs and same-market legs retain the entry gates. The frame's asset and side come from its recorded
 feed message. REST winning first retains exact-ID and consumed-market refusal. A feed/REST asset
 disagreement is a different trade under this key; runtime no longer checks for feed contradictions
 or absence and produces no feed incidents. Economics and financial semantic versions are unchanged.
@@ -625,7 +626,9 @@ Admitted frames create no barrier. Launches, failed acknowledgements and incompl
 advance H. Empty reads first persist a proofless payload-2 commitment.
 
 Boot starts with an empty verified-frontier map. Persisted `fixed_end` is only a read-start hint:
-`start = min(start, fixed_end − 1)`, without frontier verification. Feed copies resume after the
+`start = min(start, fixed_end − 1)`, without frontier verification. The stored collection is loaded
+once as unverified hints; publication overlays this invocation's authenticated entries so a wallet's
+fresh read preserves every other wallet's hint. Hints never authorize admission. Feed copies resume after the
 first fresh REST read publishes a frontier; until then frames use REST fallback. Open frame
 continuations still authenticate their own frozen frontier. For frame receipt r and admission a,
 history is required if H is absent, H > r, a − H exceeds `poll_round_stale_secs`, or an earlier
@@ -643,13 +646,16 @@ are authenticated. Scenario counters distinguish these three uses. Deployed chec
 activity reducer 2 stores only commitment receipts; hydration reads each payload once through the
 receipt index, without re-authenticating the complete read, and advances to reducer 3. Reducer 1
 still requires a full walk. Runtime publication prunes current work through the shared paper-state
-handle, then requires a successful `wal_checkpoint(TRUNCATE)` durability barrier before installing
-the pruned manifest. A failed barrier skips publication until the next hourly attempt. Read-only
-preparation and compatibility conversion keep unpruned candidates. Manifest bytes are logged.
+handle, then requires a complete `wal_checkpoint(PASSIVE)` durability barrier before installing
+the pruned manifest: busy is zero and every WAL frame is checkpointed. The barrier never waits on
+readers under the connection mutex and retains `synchronous=NORMAL`. An incomplete or failed
+barrier skips publication until the next hourly attempt. Read-only preparation and compatibility
+conversion keep unpruned candidates. Manifest bytes and retained collection counts are logged.
 New commitments produce no frame bindings or counterpart-basis receipts. Historical commitment
 fields and basis-bearing proofs remain decodable and verifiable when selected by an open
-continuation or qualification. Qualification retains feed-audit verification for version-one frame
-admissions and skips it for version two; economic and financial versions are unchanged.
+continuation or qualification. Qualification retains feed-audit verification and the frozen
+paper-prefix latch comparison for version-one frame admissions and skips both for version two;
+economic and financial versions are unchanged.
 
 A qualifying frame routed to history appends one versioned artifact under
 `pe-service.activity-frame-fallback`, with `frame_receipt`, `routing_clock`, typed `reason`,

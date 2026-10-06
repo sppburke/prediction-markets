@@ -318,6 +318,15 @@ impl ActivityCandidates {
             .sum()
     }
 
+    pub(crate) fn checkpoint_counts(&self) -> (usize, usize, usize, usize) {
+        (
+            self.len(),
+            self.frame_candidates.len(),
+            self.binding_commitments.len(),
+            self.routed_frames.len(),
+        )
+    }
+
     /// Hydrate deployed reducer-two checkpoints without authenticating complete reads.
     pub(crate) fn hydrate_bindings(
         &mut self,
@@ -496,8 +505,8 @@ impl ActivityCandidates {
         self.recorded_bindings = recorded;
         self.by_wallet = obligations.by_wallet;
         self.frame_candidates = obligations.frame_candidates;
-        self.routed_frames
-            .retain(|seq| remaining.iter().any(|(sequence, _)| sequence == seq));
+        self.frame_candidates
+            .retain(|_, receipt| remaining.contains(&(receipt.sequence, receipt.this_hash)));
         Ok(())
     }
 }
@@ -756,6 +765,10 @@ pub(crate) struct DailyBoundaryCandidates {
 }
 
 impl DailyBoundaryCandidates {
+    pub(crate) fn len(&self) -> usize {
+        self.boundaries.len()
+    }
+
     /// Observe and validate one matching source frame without reading the paper log (#572).
     pub(crate) fn observe_daily_boundary(
         &mut self,
@@ -1703,6 +1716,13 @@ impl TradePoller {
         &mut self,
         trigger: ReconciliationTrigger,
     ) -> Result<(), TradePollerOwnerError> {
+        if self
+            .paper_state
+            .activity_observation_retired(trigger.receipt)
+            .map_err(|error| TradePollerOwnerError::Reconciliation(error.to_string()))?
+        {
+            return Ok(());
+        }
         if self
             .paper_state
             .activity_frame_decision(&trigger.source_trade_id)

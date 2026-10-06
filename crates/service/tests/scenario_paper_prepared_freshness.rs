@@ -5958,6 +5958,7 @@ impl Harness {
             source,
             self.control.as_ref().unwrap().clone(),
             false,
+            self.watchlist.clone(),
         )
     }
 
@@ -5968,6 +5969,7 @@ impl Harness {
         source: SourceLogHandle,
         control: mpsc::Sender<OrchestratorControl>,
         activity_ws_enabled: bool,
+        watchlist: LiveWatchlist,
     ) -> HeldPoll {
         let (requests, pages) = mpsc::channel(4);
         let (progress, completion) = mpsc::channel(8);
@@ -6006,7 +6008,7 @@ impl Harness {
                 activity_ws_enabled,
                 copy_latency_budget_secs: self.copy_budget_secs,
             },
-            self.watchlist.clone(),
+            watchlist,
             Arc::new(support::GatedFetcher { requests }),
             Arc::new(AssetIdentityResolver::new_runtime(
                 Arc::new(Page(recorded.gamma.clone())),
@@ -7227,6 +7229,87 @@ async fn restart_requires_a_fresh_read_before_frame_admission() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn frontier_publication_preserves_other_wallet_read_hints_across_restarts() {
+    let other = WalletAddress::from_hex("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+    let mut h = Harness::new_with_leaders(
+        pe_service::paper_recovery::FINANCIAL_SEMANTIC_VERSION,
+        runtime(),
+        vec![wallet(), other],
+    )
+    .await;
+    let recorded = h.record(1).await;
+    h.start_frames();
+    h.empty_frontier_for(wallet(), EPOCH - 1).await;
+    h.empty_frontier_for(other, EPOCH - 30).await;
+    let stored: pe_service::frame_admission::FrontierCollection =
+        serde_json::from_value(h.paper.feed_history_frontiers().unwrap()).unwrap();
+    let other_hint = stored
+        .frontiers
+        .into_iter()
+        .find(|frontier| frontier.wallet == other)
+        .unwrap();
+    // Frame delivery can leave the cursor well ahead of this wallet's last completed read.
+    h.paper.set_cursor(&other, EPOCH + 10).unwrap();
+    h.restart_frames().await;
+    h.empty_frontier_for(wallet(), EPOCH).await;
+    let stored: pe_service::frame_admission::FrontierCollection =
+        serde_json::from_value(h.paper.feed_history_frontiers().unwrap()).unwrap();
+    assert_eq!(
+        stored
+            .frontiers
+            .iter()
+            .find(|frontier| frontier.wallet == other),
+        Some(&other_hint)
+    );
+
+    for restart in [false, true] {
+        if restart {
+            h.restart_frames().await;
+            h.empty_frontier_for(wallet(), EPOCH + 1).await;
+        }
+        let mut membership = (*h.watchlist.snapshot()).clone();
+        membership.entries.retain(|entry| entry.wallet == other);
+        membership.active_count = membership.entries.len();
+        let mut held = h.held_poll_with_source_and_control(
+            &recorded,
+            None,
+            h.source.clone(),
+            h.control.as_ref().unwrap().clone(),
+            false,
+            LiveWatchlist::new(membership),
+        );
+        held.clock.store(EPOCH + 11, Ordering::SeqCst);
+        let response = held.pages.recv().await.unwrap();
+        let url = reqwest::Url::parse(&response.url).unwrap();
+        assert!(
+            url.query_pairs()
+                .any(|(key, value)| key == "user" && value == other.to_string())
+        );
+        // The REST query uses an inclusive start; the read window starts exclusively at H - 1.
+        assert!(
+            url.query_pairs()
+                .any(|(key, value)| key == "start" && value == other_hint.fixed_end.to_string()),
+            "{}",
+            response.url
+        );
+        // Stop before B's first fresh read completes; its hint must also survive another restart.
+        held.stop.send(()).unwrap();
+        drop(response);
+        held.task.await.unwrap().unwrap();
+        let stored: pe_service::frame_admission::FrontierCollection =
+            serde_json::from_value(h.paper.feed_history_frontiers().unwrap()).unwrap();
+        assert_eq!(
+            stored
+                .frontiers
+                .iter()
+                .find(|frontier| frontier.wallet == other),
+            Some(&other_hint)
+        );
+    }
+    h.stop().await;
+}
+
+#[tokio::test(start_paused = true)]
 async fn boot_authenticates_only_surviving_obligation_commitments() {
     let mut h = Harness::new().await;
     let disposed = h.record(1).await;
@@ -7351,13 +7434,35 @@ async fn rest_first_condition_stamp_mismatch_copies_once_across_restart() {
             h.restart_frames().await;
         }
         h.empty_frontier(EPOCH - 1).await;
-        h.deliver_frame(&frame, |_| {}).await;
+        let retired_frame = h.deliver_frame(&frame, |_| {}).await;
         assert!(h.paper.decision_pending_for(&frame.id).unwrap().is_none());
         assert_eq!(h.paper.decision_pending_history().unwrap().len(), 1);
         assert_eq!(h.prepared_count(), 1);
         assert!(h.feed_edges().is_empty());
         h.poll(&counterpart).await;
+        assert!(h.paper.activity_observation_retired(retired_frame).unwrap());
         h.restart_frames().await;
+        h.control
+            .as_ref()
+            .unwrap()
+            .send(OrchestratorControl::ActivityFrameDecision {
+                receipt: retired_frame,
+            })
+            .await
+            .unwrap();
+        h.assert_frame_barrier(Some(&[])).await;
+        *h.pending_poller_trigger.lock().unwrap() =
+            Some(pe_service::activity_ingest::ReconciliationTrigger {
+                qualifying_buy: true,
+                wallet: wallet(),
+                source_time: at(),
+                source_trade_id: frame.id.clone(),
+                provenance: pe_copy_signal_engine::TradeProvenance::ActivityWs,
+                received_at: at(),
+                receipt: retired_frame,
+            });
+        h.poll(&counterpart).await;
+        h.assert_frame_barrier(Some(&[])).await;
         let repeat = h.append_frame(&frame, |_| {}).await;
         h.control
             .as_ref()
@@ -7368,6 +7473,19 @@ async fn rest_first_condition_stamp_mismatch_copies_once_across_restart() {
         h.boot_barrier_readonly().await;
         assert_eq!(h.prepared_count(), 1);
         assert_eq!(h.paper.decision_pending_history().unwrap().len(), 1);
+        // A newly appended receipt is not covered by the earlier receipt's exact retirement.
+        assert_eq!(
+            h.hooks.frame_barriers.lock().unwrap().get(&wallet()),
+            Some(&vec![repeat])
+        );
+        assert!(
+            pe_service::trade_poller::rebuild_reconciliation_obligations(
+                &h.dir.path().join("source.log"),
+                &h.paper,
+            )
+            .unwrap()
+            .is_empty()
+        );
         // This harness starts one poller per read; deliver the live trigger for this exact receipt.
         *h.pending_poller_trigger.lock().unwrap() =
             Some(pe_service::activity_ingest::ReconciliationTrigger {
@@ -8881,6 +8999,69 @@ async fn qualification_requires_audits_only_for_version_one_admissions() {
             assert_eq!(report.replay.fills, 1);
         }
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn qualification_new_admission_ignores_released_historical_incident_basis() {
+    let mut h = Harness::new().await;
+    let recorded = h.record(1).await;
+    let mut writer = Writer::open(h.dir.path().join("paper.log")).unwrap();
+    let mut incident = pe_service::paper_recovery::FeedIncident {
+        cause: pe_service::paper_recovery::FeedIncidentCause::Contradiction,
+        frame_receipt: support::scenario_receipt(0),
+        deciding_commitment_receipt: support::scenario_receipt(1),
+        counterpart_identity: Some(recorded.id.clone()),
+        engagement_receipt: None,
+    };
+    let append_incident = |writer: &mut Writer, incident, state| {
+        writer
+            .append_synced(EnvelopeIn {
+                source_id: SourceId("pe-service.paper".to_owned()),
+                schema_version: 2,
+                parser_version: 1,
+                observed_at: SourceTimestamp(at()),
+                received_at: ReceivedAt(at()),
+                content_type: ContentType::Json,
+                payload: serde_json::to_vec(&PaperLogRecord::FeedIncidentChanged {
+                    incident,
+                    state,
+                })
+                .unwrap(),
+            })
+            .unwrap()
+    };
+    let engaged = append_incident(
+        &mut writer,
+        incident.clone(),
+        pe_service::paper_recovery::HaltState::Engaged,
+    );
+    incident.engagement_receipt = Some(engaged);
+    let released = append_incident(
+        &mut writer,
+        incident,
+        pe_service::paper_recovery::HaltState::Released,
+    );
+    drop(writer);
+    let basis = pe_service::paper_recovery::feed_latch_basis(&h.feed_era()).unwrap();
+    assert_eq!(basis.latest_incident, Some(engaged));
+    assert_eq!(basis.release, Some(released));
+    assert!(!basis.engaged());
+    h.attempt(&recorded, at());
+    h.start_frames();
+    h.empty_frontier(EPOCH - 1).await;
+    h.deliver_frame(&recorded, |_| {}).await;
+    let replay = replay_decision_pending(&h.terminal(&recorded)).unwrap();
+    let proof: pe_service::frame_admission::FrameDecisionProof =
+        serde_json::from_value(replay.continuation.facts.decision_inputs).unwrap();
+    assert_eq!(proof.inputs.version, 2);
+    assert_eq!(proof.inputs.paper_prefix, Some(released));
+    assert_eq!(
+        proof.inputs.latch,
+        pe_service::frame_admission::FeedLatchBasis::default()
+    );
+    let report = h.qualify_one_fill().await;
+    assert!(report.replay.exact, "{report:?}");
+    assert_eq!(report.replay.fills, 1);
 }
 
 #[tokio::test(start_paused = true)]

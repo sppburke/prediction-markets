@@ -4741,6 +4741,19 @@ async fn runtime_checkpoint_prunes_only_after_successful_disposition_barrier() {
         rewrite_boot_checkpoint(
             &pe_service::source_checkpoint::checkpoint_path(&paths.source_log),
             |data| {
+                let receipts: Vec<_> = pe_event_log::Reader::replay_with_offsets(&paths.source_log).unwrap()
+                    .map(|item| {
+                        let (offset, sequence, envelope) = item.unwrap();
+                        serde_json::json!({
+                            "receipt": AppendReceipt { sequence, this_hash: envelope.this_hash },
+                            "received_millis": i64::try_from(envelope.received_at.0.unix_timestamp_nanos() / 1_000_000).unwrap(),
+                            "byte_offset": offset,
+                        })
+                    }).collect();
+                data["format_version"] = serde_json::json!(1);
+                data["receipts"] = serde_json::json!(receipts);
+                data.as_object_mut().unwrap().remove("receipt_count");
+                data.as_object_mut().unwrap().remove("generation");
                 data["reducer_version"] = serde_json::json!(2);
                 data["activity"]
                     .as_object_mut()
@@ -4748,13 +4761,24 @@ async fn runtime_checkpoint_prunes_only_after_successful_disposition_barrier() {
                     .remove("recorded_bindings");
             },
         );
-        let converted = SourceLogBoot::open(&paths, false).unwrap().unwrap();
+        std::fs::remove_file(checkpoint_sidecar(&paths.source_log, ".receipts")).unwrap();
+        let mut converted = SourceLogBoot::open(&paths, false).unwrap().unwrap();
         assert_eq!(
             converted
                 .boot
                 .receipt_index()
                 .read_verification_count(commitment),
             0
+        );
+        assert_eq!(checkpoint_json(&paths.source_log)["format_version"], 2);
+        converted.boot.extend(&mut converted.sink).unwrap();
+        assert_eq!(
+            converted
+                .boot
+                .obligations(&paper, &paths.paper_log)
+                .unwrap()
+                .unresolved_receipts(WalletAddress::from_hex(WALLET).unwrap()),
+            vec![surviving]
         );
         drop(converted);
         SourceLogBoot::prepare_checkpoint(&paths.fixed_main).unwrap();
@@ -4793,6 +4817,13 @@ async fn runtime_checkpoint_prunes_only_after_successful_disposition_barrier() {
         }
         let pruned = checkpoint_json(&paths.source_log);
         assert_eq!(candidates(&pruned), vec![surviving]);
+        assert_eq!(
+            pruned["activity"]["frame_candidates"]
+                .as_object()
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(
             pruned["activity"]["binding_commitments"]
                 .as_array()
@@ -4800,9 +4831,19 @@ async fn runtime_checkpoint_prunes_only_after_successful_disposition_barrier() {
                 .is_empty()
         );
         assert_eq!(index.read_verification_count(commitment), 0);
-        let wal = PathBuf::from(format!("{}-wal", paths.fixed_main.display()));
-        assert_eq!(std::fs::metadata(wal).unwrap().len(), 0);
+        paper.sync_checkpoint_dispositions().unwrap();
         drop(owner);
         slot.join().await.unwrap();
+        drop(opened.sink);
+        let mut reboot = SourceLogBoot::open(&paths, false).unwrap().unwrap();
+        reboot.boot.extend(&mut reboot.sink).unwrap();
+        assert_eq!(
+            reboot
+                .boot
+                .obligations(&paper, &paths.paper_log)
+                .unwrap()
+                .unresolved_receipts(WalletAddress::from_hex(WALLET).unwrap()),
+            vec![surviving]
+        );
     }
 }

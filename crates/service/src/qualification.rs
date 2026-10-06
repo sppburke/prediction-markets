@@ -904,10 +904,12 @@ async fn verify_qualification(
                     frames[..=position].to_vec()
                 }
             };
-            let basis = crate::paper_recovery::feed_latch_basis(&paper_era(prefix))
-                .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
-            if basis != proof.inputs.latch {
-                return insufficient("frame incident basis differs from sealed paper prefix");
+            if proof.inputs.version == 1 {
+                let basis = crate::paper_recovery::feed_latch_basis(&paper_era(prefix))
+                    .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+                if basis != proof.inputs.latch {
+                    return insufficient("frame incident basis differs from sealed paper prefix");
+                }
             }
         }
 

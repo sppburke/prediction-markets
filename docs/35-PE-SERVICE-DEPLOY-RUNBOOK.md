@@ -1519,8 +1519,10 @@ deployment actions described above; this procedure makes no trading or policy ch
    [Procedure](#procedure), step 3, while the old service serves, retaining stdout, stderr and exit
    status. Its open rows are captured before the log bound; stored frontier collections are ignored.
    Preparation retains unpruned reducer candidates. Runtime publication prunes them through the
-   shared paper-state handle only after a complete `wal_checkpoint(TRUNCATE)` barrier; a failed
-   barrier leaves the previous manifest installed and retries at the next hourly publication.
+   shared paper-state handle only after a complete `wal_checkpoint(PASSIVE)` barrier (busy zero,
+   every WAL frame checkpointed). An incomplete or failed barrier leaves the previous manifest
+   installed and retries at the next hourly publication. Record the logged manifest bytes and
+   retained activity trigger/candidate/commitment, daily-boundary and routed-frame counts.
    A nonzero exit stops
    deployment. Keep the printed publication
    receipt for AC-A's initial age and binding match.
