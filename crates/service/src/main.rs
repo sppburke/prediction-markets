@@ -1219,7 +1219,8 @@ async fn main() -> Result<()> {
             identity_generation,
             source_receipts.clone(),
         )
-        .await;
+        .await
+        .context("install durable asset identity cache after position validation")?;
     let open_rows =
         pe_service::bucket_commit::validate_open_continuations(&paper_state, &source_receipts)
             .context("validate open decision continuations before resume")?;
