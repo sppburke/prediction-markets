@@ -343,6 +343,9 @@ from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
+PE_SERVICE = os.environ.get("PE_SERVICE_BIN")
+if not PE_SERVICE or not os.path.isfile(PE_SERVICE) or not os.access(PE_SERVICE, os.X_OK):
+    sys.exit("PE_SERVICE_BIN must name the deployed pe-service binary")
 z = ctypes.CDLL(ctypes.util.find_library("zstd"))
 for name, args in (("ZSTD_decompressBound", [ctypes.c_void_p, ctypes.c_size_t]),
                    ("ZSTD_decompress", [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t]),
@@ -442,13 +445,8 @@ def membership_record(e, c):
         config = reference("config_receipt", evidence.get("config_receipt"), "pe-service.watchlist-capacity-config")
     for field, key, expected in (("admission_receipts", "receipt", "pe-service.watchlist-admission"),
                                  ("evictions", "causal_receipt", "pe-service.watchlist-knockout")):
-        items = evidence.get(field, [])
-        if not isinstance(items, list):
-            errors.append(field + " is not an array"); continue
-        for i, item in enumerate(items):
-            if not isinstance(item, dict):
-                errors.append(field + " contains a non-object"); continue
-            reference(f"{field}[{i}].{key}", item.get(key), expected, item.get("wallet"))
+        for i, item in enumerate(evidence.get(field, [])):
+            reference(f"{field}[{i}].{key}", item[key], expected, item["wallet"])
     try:
         reasons = {"full_rerank": ["full_rerank"], "capacity_change": ["capacity_change"],
                    "knockout_backfill": ["knockout_inactivity", "knockout_inactivity_hard_cap", "knockout_underperformance"]}
@@ -471,9 +469,6 @@ def membership_record(e, c):
             **{k: c[k] for k in ("reason", "removed", "added", "capacity", "ranking_batch_id")},
             "kind": evidence.get("kind"), "references": references, "evidence_errors": errors}
 
-PE_SERVICE = os.environ.get("PE_SERVICE_BIN")
-if not PE_SERVICE or not os.access(PE_SERVICE, os.X_OK):
-    sys.exit("PE_SERVICE_BIN must name the deployed pe-service binary")
 audit_unix_ns = time.time_ns(); print("audit clock", audit_unix_ns)
 source = read_prefix(sys.argv[2]); paper = read_prefix(sys.argv[3])
 # Decode every membership record once; the replay and both exports read only this canonical form.

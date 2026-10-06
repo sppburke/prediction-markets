@@ -10100,27 +10100,7 @@ fn census_snapshot(h: &Harness, logs: &CensusLogs) -> CensusSnapshot {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("snapshot started"));
-    let output = census_python(
-        &recipe_extract("import calendar, ctypes", "\nPY\n"),
-        &[
-            capture.join("paper_state.db").to_str().unwrap().to_owned(),
-            capture
-                .join("source_filtered.log")
-                .to_str()
-                .unwrap()
-                .to_owned(),
-            capture.join("paper.log").to_str().unwrap().to_owned(),
-            "0".to_owned(),
-            "0".to_owned(),
-            at().format(&time::format_description::well_known::Rfc3339)
-                .unwrap(),
-            (at() + time::Duration::seconds(60))
-                .format(&time::format_description::well_known::Rfc3339)
-                .unwrap(),
-            capture.to_str().unwrap().to_owned(),
-        ],
-        &bin,
-    );
+    let output = inspection_run(h, &capture, Some(env!("CARGO_BIN_EXE_pe-service")));
     assert!(
         output.status.success(),
         "inspection: {}\n{}",
@@ -10274,7 +10254,7 @@ fn ac_b_capture(
 }
 
 fn ac_b_inspect(h: &Harness, capture: &std::path::Path) -> Value {
-    let output = ac_b_inspection(h, capture, Some(env!("CARGO_BIN_EXE_pe-service")));
+    let output = inspection_run(h, capture, Some(env!("CARGO_BIN_EXE_pe-service")));
     assert!(
         output.status.success(),
         "inspection: {}\n{}",
@@ -10284,7 +10264,7 @@ fn ac_b_inspect(h: &Harness, capture: &std::path::Path) -> Value {
     serde_json::from_slice(&std::fs::read(capture.join("ac16-population.json")).unwrap()).unwrap()
 }
 
-fn ac_b_inspection(
+fn inspection_run(
     h: &Harness,
     capture: &std::path::Path,
     pe_service: Option<&str>,
@@ -10597,10 +10577,12 @@ async fn ac_b_membership_reference_checks() {
             .unwrap()["verdict"],
         "pass"
     );
-    // The inspection refuses to run without the deployed decoder.
-    let refused = ac_b_inspection(&h, &capture, None);
-    assert!(!refused.status.success());
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("PE_SERVICE_BIN must name"));
+    // The inspection refuses to run without the deployed decoder, including a directory value.
+    for pe_service in [None, Some(capture.to_str().unwrap())] {
+        let refused = inspection_run(&h, &capture, pe_service);
+        assert!(!refused.status.success());
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("PE_SERVICE_BIN must name"));
+    }
     // The replay and both exports read canonical wallets: an uppercase removal decodes as itself.
     ac_b_rewrite_paper(&capture, exclusion_sequence, |r| {
         let upper = r["removed"][0].as_str().unwrap()[2..].to_uppercase();
@@ -10722,6 +10704,19 @@ async fn ac_b_membership_reference_checks() {
     );
     let output = ac_b_capture(&h, "omitted", *offset, seq.0, None);
     assert!(output.status.success(), "{output:?}");
+
+    // A record the verifier cannot decode stops the inspection and names it.
+    ac_b_rewrite_paper(&capture, exclusion_sequence, |r| {
+        r["evidence"]["kind"] = json!("not_a_membership_kind");
+    });
+    let stopped = inspection_run(&h, &capture, Some(env!("CARGO_BIN_EXE_pe-service")));
+    assert!(!stopped.status.success());
+    let stderr = String::from_utf8_lossy(&stopped.stderr);
+    assert!(
+        stderr.contains(&format!("membership record {exclusion_sequence} "))
+            && stderr.contains("does not decode"),
+        "{stderr}"
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -10761,6 +10756,12 @@ async fn ac_c_receipt_census_query() {
             .await;
         h.stop().await;
         let snapshot = census_snapshot(&h, &logs);
+        // This capture holds no membership record, yet the inspection still refuses to run
+        // without the deployed decoder.
+        assert_eq!(snapshot.population["membership_records"], json!([]));
+        let refused = inspection_run(&h, &h.dir.path().join("capture"), None);
+        assert!(!refused.status.success());
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("PE_SERVICE_BIN must name"));
         for excluded in [zero, sell, combo] {
             assert!(
                 !snapshot
