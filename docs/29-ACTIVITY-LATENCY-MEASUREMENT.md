@@ -199,7 +199,7 @@ large writes on the host delay pe-service's durable appends (on 10/5 two AC16 ta
 with such jobs). The read-only capture below copies `paper_state.db` with the SQLite backup API in one
 step (one read transaction; the page copy keeps rowids and committed WAL state; the CLI `.backup`
 steps 100 pages at a time and restarts on every production write), then the source frames from the
-capture start through the last complete frame, filtered to the five source IDs the recipe reads, then
+capture start through the last complete frame, filtered to the source IDs the recipe reads, then
 the whole paper log. The capture start is separate from the cohort boundary. It is the deployment's
 first source sequence, or an earlier receipt when a frame received before the deployment was recovered
 and decided after it: the inspection authenticates the original receipt of every continuation-7 frame
@@ -211,13 +211,22 @@ header at offset 5, sequence 0); do not infer it from trade epochs. A re-measure
 capture start and passes its own cohort boundary to the inspection below. Retain verification
 receipts and physical prefix bounds with the capture.
 
+For #737 AC-B, optionally append `<membership-from-paper-seq>`: the first paper record used
+for judgments in `[restart, S]`, moved earlier when an older record substantiates a closing
+exclusion. Only membership records at or after that paper sequence extend the reference check;
+omitting it retains the frame-only check. A missing earlier receipt stops the capture and names
+the earliest required source sequence. The `KEEP` set also retains the five membership sources:
+ranking, admission, knockout, capacity-config and deferral. AC16 still selects its original sources.
+
 ```bash
-python3 - <live-paper_state.db> <live-source_events.log> <live-paper.log> <capture-dir> <capture-start-offset> <capture-start-sequence> <<'PY'
+python3 - <live-paper_state.db> <live-source_events.log> <live-paper.log> <capture-dir> <capture-start-offset> <capture-start-sequence> [<membership-from-paper-seq>] <<'PY'
 import ctypes, ctypes.util, json, os, re, sqlite3, struct, sys, time, zlib
 from pathlib import Path
 
 live_db, live_source, live_paper, out, start_offset, start_seq = sys.argv[1:7]
 start_offset, start_seq = int(start_offset), int(start_seq)
+membership_from = int(sys.argv[7]) if len(sys.argv) == 8 else None
+assert len(sys.argv) in (7, 8) and (membership_from is None or membership_from >= 0)
 out = Path(out); out.mkdir(mode=0o700, exist_ok=True)
 z = ctypes.CDLL(ctypes.util.find_library("zstd"))
 for name, args in (("ZSTD_decompressBound", [ctypes.c_void_p, ctypes.c_size_t]),
@@ -226,7 +235,9 @@ for name, args in (("ZSTD_decompressBound", [ctypes.c_void_p, ctypes.c_size_t]),
     fn = getattr(z, name); fn.argtypes = args; fn.restype = ctypes.c_size_t
 KEEP = {b"pe-service.activity-frame-admission", b"pe-service.activity-frame-fallback",
         b"pe-service.activity-read-commitment", b"polymarket-activity-ws",
-        b"polymarket-public.activity-reconciliation"}
+        b"polymarket-public.activity-reconciliation", b"pe-service.watchlist-ranking",
+        b"pe-service.watchlist-admission", b"pe-service.watchlist-knockout",
+        b"pe-service.watchlist-capacity-config", b"pe-service.watchlist-deferral"}
 
 # 1. One backup-API step: a single read transaction and a page copy (rowids kept). The CLI
 #    `.backup` steps 100 pages at a time and restarts on every production write.
@@ -274,12 +285,24 @@ with open(live_source, "rb") as f, open(out / "source_filtered.log", "wb") as w:
         if sid in KEEP: w.write(raw); kept += 1
         end += len(raw)
 print("source sequences", start_seq, expected - 1, "end offset", end, "kept", kept)
-assert not missing, ("capture again from a receipt at or before", min(missing))
 
 # 3. The whole paper log through its last complete frame.
 with open(live_paper, "rb") as f, open(out / "paper.log", "wb") as w:
     header = f.read(5); assert header[:4] == b"EDGE"; w.write(header)
-    for _, raw, _ in frames(f, 5): w.write(raw)
+    for _, raw, block in frames(f, 5):
+        w.write(raw)
+        if membership_from is None: continue
+        seq, _, text = envelope(block)
+        if seq < membership_from: continue
+        record = json.loads(bytes(json.loads(text)["payload"]))
+        if record.get("record") != "membership_changed": continue
+        evidence = record["evidence"]
+        references = [evidence.get("ranking_receipt"), evidence.get("config_receipt")]
+        references.extend(a["receipt"] for a in evidence["admission_receipts"])
+        references.extend(a["causal_receipt"] for a in evidence.get("evictions", []))
+        missing.extend(r["sequence"] for r in references if r is not None and r["sequence"] < start_seq)
+# Paper references can only be checked after both finite prefixes have been captured.
+assert not missing, ("capture again from a receipt at or before", min(missing))
 PY
 ```
 
@@ -371,6 +394,158 @@ def ns(value):
     base, fraction, zone = re.fullmatch(r"(.{19})(?:\.(\d+))?(Z|[+-]\d\d:\d\d)", value).groups()
     d = datetime.fromisoformat(base + ("+00:00" if zone == "Z" else zone))
     return calendar.timegm(d.utctimetuple()) * 10**9 + int((fraction or "").ljust(9, "0"))
+
+# Membership artifact decoding mirrors paper_recovery's structs and qualification's
+# membership_artifact envelope checks. Optional Rust fields may be absent; denied unknown
+# fields, nested types and integer bounds are checked, rather than accepting any JSON object.
+def shape(value, spec):
+    if isinstance(spec, dict):
+        assert isinstance(value, dict) and not set(value) - set(spec), "artifact fields"
+        for key, field in spec.items(): shape(value.get(key), field)
+    elif isinstance(spec, list):
+        assert isinstance(value, list), "artifact array"
+        for item in value: shape(item, spec[0])
+    elif isinstance(spec, tuple):
+        if spec[0] == "optional":
+            if value is not None: shape(value, spec[1])
+        else: assert value in spec, "artifact enum"
+    elif spec in ("u8", "u16", "u32", "u64", "i32", "i64"):
+        bits = int(spec[1:]); signed = spec[0] == "i"
+        assert type(value) is int and -(2**(bits-1) if signed else 0) <= value < 2**(bits-int(signed)), "artifact integer"
+    elif spec == "wallet":
+        assert isinstance(value, str) and re.fullmatch(r"0x[0-9a-fA-F]{40}", value), "artifact wallet"
+    elif spec == "decimal":
+        assert type(value) in (str, int, Decimal) and re.fullmatch(r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?", str(value)), "artifact decimal"
+        d = Decimal(value); assert d.is_finite(), "artifact decimal"
+        # Published Decimal preimages must fit the owner's exact 96-bit mantissa and scale.
+        _, digits, exponent = d.as_tuple()
+        assert -28 <= exponent <= 28 and len(digits) <= 29, "artifact decimal range"
+        coefficient = int("".join(map(str, digits))) * 10**max(exponent, 0)
+        assert coefficient <= 79228162514264337593543950335, "artifact decimal range"
+    else: assert type(value) is spec, "artifact scalar"
+
+entry_shape = {"wallet": "wallet", "tier": ("Active", "Incubator"),
+    "leader_score_bps": "i32", "lcb_5pct_bps": "i32", "win_rate_bps": "i32",
+    "closed_trades_in_window": "u32", "reconstruction_quality": "u8"}
+history_shape = {"complete": bool, "proof_json": str, "updated_at_unix": "i64"}
+coverage_shape = {"activity_cutoff_unix": "i64", "coverage_generation": "i64",
+    "reanchor_required": bool, "anchor_seq": "i64", "anchored_at_unix": "i64"}
+anchor_shape = {"anchor_seq": "i64", "anchored_at_unix": "i64", "activity_cutoff_unix": "i64",
+    "balances_json": str, "ledger_hash_after": str, "proof_json": str}
+validation_shape = {"ledger_hash": str, "positions_proof_hash": str, "activity_bounds_json": str,
+    "source_log_generation": str, "proof_json": str, "recorded_at_unix": "i64"}
+proof_shape = {"membership": ["wallet"], "proofs": [{"wallet": "wallet",
+    "history": history_shape, "coverage": coverage_shape, "anchor": anchor_shape, "validation": validation_shape}]}
+fill_shape = {"idempotency_key": str, "market_id": str, "outcome_id": "u16", "side": ("Buy", "Sell"),
+    "quantity": "u64", "fill_price": "decimal", "principal": "u64", "fee": "u64",
+    "event_seq": "u64", "prepared_seq": "u64", "source_receipt_seq": ("optional", "u64")}
+settlement_shape = {"market_id": str, "outcome_prices": ["decimal"], "credit_applied": "decimal",
+    "settled_at_unix": "i64"}
+artifact_shapes = {
+    "pe-service.watchlist-ranking": {"batch_id": ("optional", "i64"), "entries": [entry_shape]},
+    "pe-service.watchlist-capacity-config": {"generation": "u64", "target": "u64", "published_entries": [entry_shape]},
+    "pe-service.watchlist-admission": {"wallet": "wallet", "proof": proof_shape},
+    "pe-service.watchlist-knockout": {"wallet": "wallet", "evaluated_at_unix": "i64",
+        "last_trade_unix": ("optional", "i64"), "inactivity_threshold_secs": "u64",
+        "inactivity_hard_cap_secs": "u64", "demotion_min_trades": "u64", "demotion_cb_alpha": "decimal",
+        "demotion_pnl_window_secs": "u64", "fills": [fill_shape], "settlements": [settlement_shape]}}
+
+def membership_artifact(e, expected):
+    assert (e["source_id"], e["schema_version"], e["parser_version"], e["content_type"]) == (expected, 1, 1, "json"), "artifact envelope"
+    def unique_fields(pairs):
+        result = {}
+        for key, value in pairs:
+            assert key not in result, "duplicate artifact field"
+            result[key] = value
+        return result
+    a = json.loads(bytes(e["payload"]), parse_float=Decimal, object_pairs_hook=unique_fields)
+    shape(a, artifact_shapes[expected])
+    if expected == "pe-service.watchlist-admission":
+        # MembershipProofManifest::verify authenticates its immutable preimages internally.
+        p = a["proof"]; assert p["membership"] == [a["wallet"]] and len(p["proofs"]) == 1, "admission manifest"
+        for proof in p["proofs"]:
+            assert proof["wallet"] == a["wallet"] and proof["history"]["complete"], "admission history"
+            assert not proof["coverage"]["reanchor_required"], "admission coverage"
+            for key in ("anchor_seq", "anchored_at_unix", "activity_cutoff_unix"):
+                assert proof["coverage"][key] == proof["anchor"][key], "admission anchor"
+            assert proof["validation"]["ledger_hash"] == proof["anchor"]["ledger_hash_after"], "admission validation"
+            assert proof["validation"]["proof_json"] == proof["anchor"]["proof_json"], "admission validation proof"
+            for owner, key in (("history", "proof_json"), ("anchor", "balances_json"), ("anchor", "proof_json"),
+                               ("validation", "activity_bounds_json"), ("validation", "proof_json")):
+                json.loads(proof[owner][key])
+    return a
+
+def membership_record(e):
+    c = payload(e); evidence = c["evidence"]; references = []; errors = []
+    if not isinstance(evidence, dict):
+        errors.append("sealed evidence is not an object"); evidence = {}
+    def reference(name, r, expected, wallet=None):
+        row = {"reference": name, "seq": None, "hash": None, "expected_source_id": expected,
+               "status": "mismatched", "error": None}
+        references.append(row)
+        try:
+            shape(r, {"sequence": "u64", "this_hash": str})
+            assert re.fullmatch(r"[0-9a-f]{64}", r["this_hash"]), "receipt hash"
+            row.update(seq=r["sequence"], hash=r["this_hash"])
+            if r["sequence"] not in source:
+                row.update(status="missing", error="receipt absent from captured source prefix"); return None
+            envelope = source[r["sequence"]]
+            assert envelope["this_hash"] == r["this_hash"], "receipt hash differs"
+            artifact = membership_artifact(envelope, expected)
+            if wallet is not None: assert artifact["wallet"] == wallet, "artifact wallet differs"
+            row["status"] = "verified"
+            return artifact
+        except (AssertionError, KeyError, ValueError, TypeError, ArithmeticError) as error:
+            row["error"] = str(error); return None
+    # Enumerate references before contextual checks: one bad batch identity must not hide
+    # an admission or eviction receipt from the export.
+    kind = evidence.get("kind")
+    ranking = config = None
+    if kind == "full_rerank" or evidence.get("ranking_receipt") is not None:
+        ranking = reference("ranking_receipt", evidence.get("ranking_receipt"), "pe-service.watchlist-ranking")
+    if kind == "capacity_change" or "config_receipt" in evidence:
+        config = reference("config_receipt", evidence.get("config_receipt"), "pe-service.watchlist-capacity-config")
+    for field, key, expected in (("admission_receipts", "receipt", "pe-service.watchlist-admission"),
+                                 ("evictions", "causal_receipt", "pe-service.watchlist-knockout")):
+        items = evidence.get(field, [])
+        if not isinstance(items, list):
+            errors.append(field + " is not an array"); continue
+        for i, item in enumerate(items):
+            if not isinstance(item, dict):
+                errors.append(field + " contains a non-object"); continue
+            reference(f"{field}[{i}].{key}", item.get(key), expected, item.get("wallet"))
+    try:
+        reasons = {"full_rerank": ["full_rerank"], "capacity_change": ["capacity_change"],
+                   "knockout_backfill": ["knockout_inactivity", "knockout_inactivity_hard_cap", "knockout_underperformance"]}
+        assert c["reason"] in reasons[kind], "evidence kind differs from reason"
+        required = {"kind", "admission_receipts"} | {
+            "full_rerank": {"ranking_receipt"}, "capacity_change": {"generation", "config_receipt"},
+            "knockout_backfill": {"evictions", "ranking_receipt"}}[kind]
+        optional = {"ranking_receipt"} if kind == "knockout_backfill" else set()
+        assert set(evidence) <= required and required - optional <= set(evidence), "sealed evidence fields"
+        if ranking is not None:
+            assert ranking.get("batch_id") == c["ranking_batch_id"], "ranking batch differs"
+            if kind == "full_rerank": assert c["ranking_batch_id"] is not None, "ranking batch missing"
+        if kind == "capacity_change":
+            shape(evidence["generation"], "u64")
+            assert c["ranking_batch_id"] is None, "capacity unexpectedly names a batch"
+            if config is not None:
+                assert config["generation"] == evidence["generation"] > 0 and config["target"] == c["capacity"], "capacity identity differs"
+        admissions = evidence["admission_receipts"]
+        shape(admissions, [{"wallet": "wallet", "receipt": {"sequence": "u64", "this_hash": str}}])
+        wallets = [a["wallet"] for a in admissions]
+        assert len(set(wallets)) == len(wallets) and set(wallets) == set(c["added"]), "admission wallets differ"
+        if kind == "knockout_backfill":
+            evictions = evidence["evictions"]
+            shape(evictions, [{"wallet": "wallet", "reason": tuple(reasons[kind]),
+                "causal_receipt": {"sequence": "u64", "this_hash": str}}])
+            wallets = [a["wallet"] for a in evictions]
+            assert len(set(wallets)) == len(wallets) and set(wallets) == set(c["removed"]), "eviction wallets differ"
+    except (AssertionError, KeyError, ValueError, TypeError) as error:
+        errors.append(str(error))
+    return {"seq": e["seq"], "hash": e["this_hash"], "received_at_ns": ns(e["received_at"]),
+            **{k: c[k] for k in ("reason", "removed", "added", "capacity", "ranking_batch_id")},
+            "kind": evidence.get("kind"), "references": references, "evidence_errors": errors}
 
 audit_unix_ns = time.time_ns(); print("audit clock", audit_unix_ns)
 source = read_prefix(sys.argv[2]); paper = read_prefix(sys.argv[3])
@@ -667,6 +842,17 @@ assert raw_window_receipt_count == sum(ns(sys.argv[6]) <= r["received_at_ns"] < 
 print("unique in-window feed receipts", raw_window_receipt_count)
 membership_changes = [{"seq": e["seq"], "hash": e["this_hash"], "at_ns": ns(e["received_at"]),
                        "removed": payload(e)["removed"], "added": payload(e)["added"]} for e in changes]
+membership_records = [membership_record(e) for e in sorted(paper.values(), key=lambda e: e["seq"])
+                      if payload(e).get("record") == "membership_changed"]
+deferrals = []
+for e in source.values():
+    if e["source_id"] != "pe-service.watchlist-deferral": continue
+    assert (e["schema_version"], e["parser_version"], e["content_type"]) == (1, 1, "json")
+    a = payload(e); assert a["version"] == 1
+    shape(a["deferrals"], [{"wallet": "wallet", "stage": str,
+        "class": ("wallet_transient", "wallet_persistent", "shared"), "kind": str, "message": str}])
+    deferrals.append({"seq": e["seq"], "hash": e["this_hash"], "received_at_ns": ns(e["received_at"]),
+                      "deferrals": a["deferrals"]})
 frame_rows = [f for f in frame_rows if f["id"] in audited_ids]
 frame_keys = {(f["frame_seq"], f["frame_hash"]) for f in frame_rows}
 fallback_rows = [f for f in fallback_rows if (f["frame_seq"], f["frame_hash"]) in frame_keys]
@@ -675,9 +861,104 @@ fallback_rows = [f for f in fallback_rows if (f["frame_seq"], f["frame_hash"]) i
     "receipts": list(receipts.values()), "window_fallbacks": window_fallbacks,
     "raw_receipt_count": raw_receipt_count, "raw_window_receipt_count": raw_window_receipt_count,
     "membership_changes": membership_changes,
+    "membership_records": membership_records, "deferrals": deferrals,
     "frames": frame_rows, "fallbacks": fallback_rows, "buys": population}, sort_keys=True))
 db.close()
 PY
+```
+
+**#737 AC-B membership evidence (release 1).** The same `ac16-population.json` now exports
+`membership_records`: every captured paper `membership_changed` record's sequence, hash,
+receive nanoseconds, reason, deltas, capacity, ranking batch and sealed evidence kind. Each
+reference names its expected source ID and is `verified`, `missing` or `mismatched` against
+the captured source prefix. Verification requires the same sequence and hash, the owner's
+source ID, schema 1 / parser 1 / JSON envelope, and decoding as the owner's typed artifact
+(including nested admission proof preimages). The artifact structs contain no further
+`AppendReceipt` references: admission proof documents are retained JSON preimages and knockout
+fill sequence fields are provenance, not sequence/hash receipts. `deferrals` exports every
+captured deferral artifact with its sequence, hash and receive nanoseconds, and its full
+`deferrals` array, including wallet, class, kind and message. Neither export uses AC16's filters.
+
+Run this extracted reference check in the audit directory. It emits one row per membership
+record, with `pass` only when every referenced receipt is verified and the sealed evidence
+shape and wallet/batch/generation identities agree; otherwise it emits `incomplete` and the
+failing references and evidence errors. Use only records at or before S for AC-B judgments,
+including any earlier exclusion record selected by `<membership-from-paper-seq>`. This check
+establishes receipt completeness; the Rust verifier remains the authority for policy semantics.
+AC-B's live-wallet accounting and operator status/journal commands are in docs/35.
+
+```bash
+sqlite3 -readonly -header -json paper_state.db <<'SQL'
+WITH membership_inputs AS (
+  SELECT value AS j FROM json_each(readfile('ac16-population.json'),'$.membership_records')
+)
+SELECT j->>'$.seq' AS seq, j->>'$.hash' AS hash, j->>'$.received_at_ns' AS received_at_ns,
+       j->>'$.reason' AS reason, j->>'$.kind' AS kind,
+       CASE WHEN json_array_length(j,'$.evidence_errors')=0
+             AND NOT EXISTS (SELECT 1 FROM json_each(j,'$.references')
+                             WHERE value->>'$.status' IS NOT 'verified')
+            THEN 'pass' ELSE 'incomplete' END AS verdict,
+       (SELECT json_group_array(json(value)) FROM json_each(j,'$.references')
+        WHERE value->>'$.status' IS NOT 'verified') AS failing_references,
+       j->'$.evidence_errors' AS evidence_errors
+FROM membership_inputs ORDER BY j->>'$.seq';
+SQL
+```
+
+The extracted closing-batch check consumes `ac-b-closing-batch.json`, with this shape (all
+times are integer epoch milliseconds; each read records `SELECT max(batch_id) FROM ranking_batches`):
+
+```json
+{"s_unix_ms": 1800000060000,
+ "reads": [{"started_unix_ms": 1800000050000, "completed_unix_ms": 1800000050100, "batch_id": 86},
+           {"started_unix_ms": 1800000060100, "completed_unix_ms": 1800000060200, "batch_id": 87}],
+ "publications": [{"batch_id": 87, "committed_unix_ms": 1800000060050,
+                   "evidence": "retained publication-commit evidence path and checksum"}]}
+```
+
+`publications` is optional and contains retained evidence of actual transaction commitment;
+a batch row's `created_at` alone is insufficient. The last read completed at or before S and
+the first read started at or after S must agree. When they differ, retained evidence that the
+later batch committed strictly after S selects the earlier batch; without it, AC-B remains
+incomplete. Missing brackets, empty maxima, malformed read bounds and conflicting tied reads
+also remain incomplete. Reads that straddle S provide no bracket. Retain the input and result.
+
+```bash
+sqlite3 -readonly -header -json paper_state.db <<'SQL'
+WITH closing_batch_inputs AS (
+  SELECT readfile('ac-b-closing-batch.json') AS j
+), reads AS (
+  SELECT value AS r, value->>'$.started_unix_ms' AS started,
+         value->>'$.completed_unix_ms' AS completed, value->>'$.batch_id' AS batch
+  FROM closing_batch_inputs, json_each(j,'$.reads')
+), before_s AS (
+  SELECT * FROM reads, closing_batch_inputs WHERE completed <= j->>'$.s_unix_ms'
+    AND completed=(SELECT max(completed) FROM reads WHERE completed <= j->>'$.s_unix_ms')
+), after_s AS (
+  SELECT * FROM reads, closing_batch_inputs WHERE started >= j->>'$.s_unix_ms'
+    AND started=(SELECT min(started) FROM reads WHERE started >= j->>'$.s_unix_ms')
+), brackets AS (
+  SELECT (SELECT min(batch) FROM before_s) AS earlier_batch,
+         (SELECT min(batch) FROM after_s) AS later_batch,
+         json_type(j,'$.s_unix_ms')='integer' AND json_type(j,'$.reads')='array'
+         AND NOT EXISTS (SELECT 1 FROM reads WHERE json_type(r,'$.started_unix_ms') IS NOT 'integer'
+           OR json_type(r,'$.completed_unix_ms') IS NOT 'integer' OR started > completed
+           OR json_type(r,'$.batch_id') IS NOT 'integer')
+         AND (SELECT count(DISTINCT batch) FROM before_s)=1
+         AND (SELECT count(DISTINCT batch) FROM after_s)=1 AS valid,
+         j FROM closing_batch_inputs
+), result AS (
+  SELECT *, valid AND (earlier_batch=later_batch OR (later_batch > earlier_batch
+    AND EXISTS (SELECT 1 FROM json_each(j,'$.publications')
+      WHERE value->>'$.batch_id'=later_batch AND json_type(value,'$.committed_unix_ms')='integer'
+        AND value->>'$.committed_unix_ms' > j->>'$.s_unix_ms'
+        AND json_type(value,'$.evidence')='text' AND length(trim(value->>'$.evidence')) > 0))) AS proved
+  FROM brackets
+)
+SELECT CASE WHEN proved THEN earlier_batch END AS closing_batch_id,
+       CASE WHEN proved THEN 'pass' ELSE 'incomplete' END AS verdict,
+       earlier_batch, later_batch FROM result;
+SQL
 ```
 
 **#737 AC-C receipt census (release 1).** Pin this recipe by the deployed revision and

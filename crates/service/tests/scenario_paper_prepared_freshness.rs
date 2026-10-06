@@ -10161,6 +10161,470 @@ fn census_snapshot(h: &Harness, logs: &CensusLogs) -> CensusSnapshot {
     }
 }
 
+#[test]
+fn ac_b_closing_batch_query() {
+    let sql = recipe_extract("WITH closing_batch_inputs AS", "\nSQL\n")
+        .replace("readfile('ac-b-closing-batch.json')", "?1");
+    let connection = rusqlite::Connection::open_in_memory().unwrap();
+    let check = |input: Value, expected_batch: Option<i64>, verdict: &str| {
+        let result: (Option<i64>, String) = connection
+            .query_row(&sql, [input.to_string()], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(result, (expected_batch, verdict.to_owned()), "{input}");
+    };
+    // A straddling read and more distant reads must not replace the closest brackets.
+    let input = json!({"s_unix_ms": 1000, "reads": [
+        {"started_unix_ms": 700, "completed_unix_ms": 800, "batch_id": 85},
+        {"started_unix_ms": 900, "completed_unix_ms": 1000, "batch_id": 86},
+        {"started_unix_ms": 999, "completed_unix_ms": 1001, "batch_id": 99},
+        {"started_unix_ms": 1000, "completed_unix_ms": 1100, "batch_id": 86},
+        {"started_unix_ms": 1200, "completed_unix_ms": 1300, "batch_id": 88}]});
+    check(input.clone(), Some(86), "pass");
+    let mut differing = input.clone();
+    differing["reads"][3]["batch_id"] = json!(87);
+    check(differing.clone(), None, "incomplete");
+    differing["publications"] = json!([{"batch_id": 87, "committed_unix_ms": 1001,
+        "evidence": "retained transaction commit acknowledgement and checksum"}]);
+    check(differing.clone(), Some(86), "pass");
+    // Equality at S is insufficient for the strictly-after exception, as is created_at alone.
+    differing["publications"][0]["committed_unix_ms"] = json!(1000);
+    check(differing.clone(), None, "incomplete");
+    differing["publications"] = json!([{"batch_id": 87, "created_at": 1001}]);
+    check(differing, None, "incomplete");
+    let mut unbracketed = input.clone();
+    unbracketed["reads"] = json!([input["reads"][1]]);
+    check(unbracketed, None, "incomplete");
+    let mut malformed = input.clone();
+    malformed["reads"][0]["completed_unix_ms"] = json!(600);
+    check(malformed, None, "incomplete");
+    let mut tied = input.clone();
+    tied["reads"].as_array_mut().unwrap().push(json!({
+        "started_unix_ms": 901, "completed_unix_ms": 1000, "batch_id": 87}));
+    check(tied, None, "incomplete");
+    let mut empty_maximum = input;
+    empty_maximum["reads"][1]["batch_id"] = Value::Null;
+    check(empty_maximum, None, "incomplete");
+}
+
+fn ac_b_reference_rows(population: &Value) -> Vec<Value> {
+    let connection = rusqlite::Connection::open_in_memory().unwrap();
+    let mut statement = connection
+        .prepare(&ac16_sql("WITH membership_inputs AS"))
+        .unwrap();
+    statement
+        .query_map([population.to_string()], |row| {
+            Ok(
+                json!({"seq": row.get::<_, u64>(0)?, "hash": row.get::<_, String>(1)?,
+            "received_at_ns": row.get::<_, i64>(2)?, "reason": row.get::<_, String>(3)?,
+            "kind": row.get::<_, String>(4)?, "verdict": row.get::<_, String>(5)?,
+            "failing_references": serde_json::from_str::<Value>(&row.get::<_, String>(6)?).unwrap(),
+            "evidence_errors": serde_json::from_str::<Value>(&row.get::<_, String>(7)?).unwrap()}),
+            )
+        })
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+fn ac_b_capture(
+    h: &Harness,
+    name: &str,
+    offset: u64,
+    sequence: u64,
+    membership_from: Option<u64>,
+) -> std::process::Output {
+    let mut args = [
+        h.dir.path().join("paper.db"),
+        h.dir.path().join("source.log"),
+        h.dir.path().join("paper.log"),
+        h.dir.path().join(name),
+    ]
+    .map(|path| path.to_str().unwrap().to_owned())
+    .to_vec();
+    args.extend([offset.to_string(), sequence.to_string()]);
+    args.extend(membership_from.map(|value| value.to_string()));
+    census_python(
+        &recipe_extract(
+            "import ctypes, ctypes.util, json, os, re, sqlite3",
+            "\nPY\n",
+        ),
+        &args,
+        &h.dir.path().join("bin"),
+    )
+}
+
+fn ac_b_inspect(h: &Harness, capture: &std::path::Path) -> Value {
+    let output = census_python(
+        &recipe_extract("import calendar, ctypes", "\nPY\n"),
+        &[
+            capture.join("paper_state.db").to_str().unwrap().to_owned(),
+            capture
+                .join("source_filtered.log")
+                .to_str()
+                .unwrap()
+                .to_owned(),
+            capture.join("paper.log").to_str().unwrap().to_owned(),
+            "0".to_owned(),
+            "0".to_owned(),
+            at().format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+            (at() + time::Duration::seconds(60))
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap(),
+            capture.to_str().unwrap().to_owned(),
+        ],
+        &h.dir.path().join("bin"),
+    );
+    assert!(
+        output.status.success(),
+        "inspection: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    serde_json::from_slice(&std::fs::read(capture.join("ac16-population.json")).unwrap()).unwrap()
+}
+
+/// Reframe a deliberately invalid receipt reference, retaining all other captured paper records.
+fn ac_b_rewrite_paper(capture: &std::path::Path, sequence: u64, edit: impl Fn(&mut Value)) {
+    let path = capture.join("paper.log");
+    let records = Reader::replay(&path)
+        .unwrap()
+        .map(|row| row.unwrap().1)
+        .collect::<Vec<_>>();
+    let temporary = capture.join("edited-paper.log");
+    let mut writer = Writer::open(&temporary).unwrap();
+    for mut record in records {
+        if record.seq.0 == sequence {
+            let mut payload: Value = serde_json::from_slice(&record.payload).unwrap();
+            edit(&mut payload);
+            record.payload = serde_json::to_vec(&payload).unwrap();
+        }
+        writer
+            .append_synced(EnvelopeIn {
+                source_id: record.source_id,
+                schema_version: record.schema_version,
+                parser_version: record.parser_version,
+                observed_at: record.observed_at,
+                received_at: record.received_at,
+                content_type: record.content_type,
+                payload: record.payload,
+            })
+            .unwrap();
+    }
+    drop(writer);
+    std::fs::rename(temporary, path).unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn ac_b_membership_reference_checks() {
+    use pe_service::config_poller::{WatchlistCapacityApplier, capacity_request_channel};
+    use pe_service::runtime_config::AppliedWatchlistCapacity;
+    use pe_service::watchlist_admission::AdmissionPreparer;
+    use pe_service::watchlist_capacity::SupabaseWatchlistCapacity;
+
+    let mut h = Harness::new().await;
+    let newcomer = WalletAddress([0xbb; 20]);
+    let missing_history = WalletAddress([0xcc; 20]);
+    h.paper
+        .record_reconciled_history_status(&WalletHistoryStatusRecord {
+            wallet: newcomer,
+            complete: true,
+            proof_json: "{}".to_owned(),
+            updated_at_unix: EPOCH,
+        })
+        .unwrap();
+    support::install_verified_empty_anchor(&h.paper, newcomer, 0);
+    h.start_frames();
+    let writer_lock = Arc::new(tokio::sync::Mutex::new(()));
+    let preparer = AdmissionPreparer::new(h.control.as_ref().unwrap().clone(), h.paper.clone())
+        .with_source_log(h.source.clone());
+    let prepared = preparer.prepare(&[newcomer]).await.unwrap();
+    assert_eq!(prepared.admitted, vec![newcomer]);
+    let original = h.watchlist.snapshot().entries[0].clone();
+    preparer
+        .scenario_publish_ranking(
+            &h.watchlist,
+            &writer_lock,
+            vec![
+                original.clone(),
+                WatchlistEntry {
+                    wallet: newcomer,
+                    ..original
+                },
+            ],
+            &HashMap::from([(newcomer, EPOCH - 1)]),
+            2,
+        )
+        .await
+        .unwrap();
+
+    // The real capacity worker uses a loopback fixture for its read-only ranking input.
+    // Its preparer records both typed capacity artifacts and full wallet-scoped deferrals.
+    let ranking_row = |rank, wallet: WalletAddress| {
+        json!({"batch_id": 546, "rank": rank,
+        "wallet_hex": wallet.to_string(), "hit_rate_text": "0.7", "ls_tstat_text": "2.0",
+        "n_trades": 90, "last_trade_unix": EPOCH - 1, "survives": true})
+    };
+    let rows = Arc::new(Mutex::new(json!([
+        ranking_row(1, wallet()),
+        ranking_row(2, newcomer)
+    ])));
+    let server_rows = rows.clone();
+    let router = axum::Router::new().route(
+        "/rest/v1/latest_ranking",
+        axum::routing::get(move || {
+            let rows = server_rows.clone();
+            async move { axum::Json(rows.lock().unwrap().clone()) }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let applied = AppliedWatchlistCapacity::new(2);
+    let (requests, desired) = capacity_request_channel(2, writer_lock.clone());
+    let capacity = SupabaseWatchlistCapacity::new(
+        h.watchlist.clone(),
+        h.paper.clone(),
+        writer_lock,
+        applied,
+        desired,
+        preparer,
+        reqwest::Client::new(),
+        format!("http://{address}"),
+        "fixture".to_owned(),
+        "fixture".to_owned(),
+    );
+    assert_eq!(capacity.apply(requests.request(1).await).await.unwrap(), 1);
+    assert_eq!(
+        h.watchlist.structural_membership(),
+        std::collections::HashSet::from([wallet()])
+    );
+    *rows.lock().unwrap() = json!([ranking_row(1, wallet()), ranking_row(2, missing_history)]);
+    assert_eq!(capacity.apply(requests.request(2).await).await.unwrap(), 1);
+    server.abort();
+    let config_payload = Reader::replay(h.dir.path().join("source.log"))
+        .unwrap()
+        .map(|row| row.unwrap().1)
+        .find(|e| e.source_id.0 == "pe-service.watchlist-capacity-config")
+        .unwrap()
+        .payload;
+    let mut bad_payload: Value = serde_json::from_slice(&config_payload).unwrap();
+    bad_payload["published_entries"][0]["leader_score_bps"] = json!(true);
+    let bad_type = h
+        .append(
+            "pe-service.watchlist-capacity-config",
+            &serde_json::to_vec(&bad_payload).unwrap(),
+        )
+        .await;
+    let wrong_source = h
+        .append("pe-service.watchlist-ranking", &config_payload)
+        .await;
+    let wrong_parser = h
+        .source
+        .append(EnvelopeIn {
+            source_id: SourceId("pe-service.watchlist-capacity-config".to_owned()),
+            schema_version: 1,
+            parser_version: 2,
+            observed_at: SourceTimestamp(at()),
+            received_at: ReceivedAt(at()),
+            content_type: ContentType::Json,
+            payload: config_payload,
+        })
+        .await
+        .unwrap();
+    h.stop().await;
+
+    let snapshot = census_snapshot(&h, &CensusLogs::default());
+    let capture = h.dir.path().join("capture");
+    let baseline = snapshot.population;
+    let records = baseline["membership_records"].as_array().unwrap();
+    let ranking = records.iter().find(|r| r["kind"] == "full_rerank").unwrap();
+    let exclusion = records
+        .iter()
+        .find(|r| r["kind"] == "capacity_change" && r["removed"] == json!([newcomer]))
+        .unwrap();
+    let ranking_sequence = ranking["seq"].as_u64().unwrap();
+    let exclusion_sequence = exclusion["seq"].as_u64().unwrap();
+    for record in [ranking, exclusion] {
+        assert_eq!(record["received_at_ns"], EPOCH * 1_000_000_000);
+        assert!(
+            record["references"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| r["status"] == "verified"),
+            "{record}"
+        );
+    }
+    let judged = ac_b_reference_rows(&baseline);
+    assert_eq!(judged.len(), records.len());
+    assert!(judged.iter().all(|r| r["verdict"] == "pass"), "{judged:?}");
+    let deferrals = baseline["deferrals"].as_array().unwrap();
+    assert_eq!(deferrals.len(), 1);
+    let deferral = &deferrals[0]["deferrals"][0];
+    assert_eq!(deferral["wallet"], missing_history.to_string());
+    assert_eq!(deferral["class"], "wallet_persistent");
+    assert_eq!(deferral["kind"], "history.missing");
+    assert!(
+        deferral["message"]
+            .as_str()
+            .unwrap()
+            .contains(&missing_history.to_string())
+    );
+    let sources = Reader::replay_with_offsets(h.dir.path().join("source.log"))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect::<Vec<_>>();
+    let (_, _, artifact) = sources
+        .iter()
+        .find(|(_, seq, _)| seq.0 == deferrals[0]["seq"])
+        .unwrap();
+    assert_eq!(
+        deferrals[0]["hash"],
+        artifact.this_hash.to_hex().to_string()
+    );
+    assert_eq!(
+        deferrals[0]["received_at_ns"],
+        i64::try_from(artifact.received_at.0.unix_timestamp_nanos()).unwrap()
+    );
+
+    // Remove one authentic captured frame without altering any other receipt's identity.
+    let config_ref = &exclusion["references"][0];
+    assert_eq!(
+        config_ref["expected_source_id"],
+        "pe-service.watchlist-capacity-config"
+    );
+    let source_path = capture.join("source_filtered.log");
+    let source_bytes = std::fs::read(&source_path).unwrap();
+    assert_eq!(
+        source_bytes,
+        std::fs::read(h.dir.path().join("source.log")).unwrap()
+    );
+    let (offset, _, _) = sources
+        .iter()
+        .find(|(_, seq, _)| seq.0 == config_ref["seq"])
+        .unwrap();
+    let offset = usize::try_from(*offset).unwrap();
+    let size = usize::try_from(u32::from_le_bytes(
+        source_bytes[offset..offset + 4].try_into().unwrap(),
+    ))
+    .unwrap();
+    let mut missing = source_bytes.clone();
+    missing.drain(offset..offset + 4 + size + 4);
+    std::fs::write(&source_path, missing).unwrap();
+    let rows = ac_b_reference_rows(&ac_b_inspect(&h, &capture));
+    let failed = rows
+        .iter()
+        .find(|r| r["seq"] == exclusion_sequence)
+        .unwrap();
+    assert_eq!(failed["verdict"], "incomplete");
+    assert_eq!(failed["failing_references"][0]["status"], "missing");
+    assert_eq!(failed["failing_references"][0]["seq"], config_ref["seq"]);
+    assert_eq!(
+        rows.iter().find(|r| r["seq"] == ranking_sequence).unwrap()["verdict"],
+        "pass"
+    );
+    std::fs::write(&source_path, source_bytes).unwrap();
+
+    ac_b_rewrite_paper(&capture, exclusion_sequence, |r| {
+        r["evidence"]["config_receipt"]["this_hash"] = json!("00".repeat(32));
+    });
+    let rows = ac_b_reference_rows(&ac_b_inspect(&h, &capture));
+    let failed = rows
+        .iter()
+        .find(|r| r["seq"] == exclusion_sequence)
+        .unwrap();
+    assert_eq!(failed["verdict"], "incomplete");
+    assert_eq!(failed["failing_references"][0]["status"], "mismatched");
+    assert_eq!(
+        failed["failing_references"][0]["error"],
+        "receipt hash differs"
+    );
+
+    for (receipt, error) in [
+        (bad_type, "artifact integer"),
+        (wrong_source, "artifact envelope"),
+        (wrong_parser, "artifact envelope"),
+    ] {
+        ac_b_rewrite_paper(&capture, exclusion_sequence, |r| {
+            r["evidence"]["config_receipt"] = serde_json::to_value(receipt).unwrap();
+        });
+        let rows = ac_b_reference_rows(&ac_b_inspect(&h, &capture));
+        let failed = rows
+            .iter()
+            .find(|r| r["seq"] == exclusion_sequence)
+            .unwrap();
+        assert_eq!(failed["verdict"], "incomplete");
+        assert_eq!(failed["failing_references"][0]["status"], "mismatched");
+        assert_eq!(failed["failing_references"][0]["error"], error);
+    }
+
+    // A contextual mismatch must still export all referenced receipts, even after the first.
+    ac_b_rewrite_paper(&capture, ranking_sequence, |r| {
+        r["ranking_batch_id"] = json!(999)
+    });
+    let population = ac_b_inspect(&h, &capture);
+    let changed = population["membership_records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["seq"] == ranking_sequence)
+        .unwrap();
+    assert_eq!(
+        changed["references"].as_array().unwrap().len(),
+        ranking["references"].as_array().unwrap().len()
+    );
+    assert_eq!(
+        ac_b_reference_rows(&population)
+            .iter()
+            .find(|r| r["seq"] == ranking_sequence)
+            .unwrap()["verdict"],
+        "incomplete"
+    );
+    ac_b_rewrite_paper(&capture, ranking_sequence, |r| {
+        r["ranking_batch_id"] = json!(546)
+    });
+
+    // All refs being verified is insufficient when evidence omits an added wallet's proof.
+    ac_b_rewrite_paper(&capture, ranking_sequence, |r| {
+        r["evidence"]["admission_receipts"] = json!([])
+    });
+    let rows = ac_b_reference_rows(&ac_b_inspect(&h, &capture));
+    assert_eq!(
+        rows.iter().find(|r| r["seq"] == ranking_sequence).unwrap()["verdict"],
+        "incomplete"
+    );
+
+    // The ranking record cites source seq 0. Starting at its admission receipt omits that
+    // ranking; an inclusive paper boundary fails and names 0. An older record is ignored.
+    let (offset, seq, _) = &sources[1];
+    let output = ac_b_capture(&h, "covered", *offset, seq.0, Some(ranking_sequence));
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("('capture again from a receipt at or before', 0)"),
+        "{output:?}"
+    );
+    let output = ac_b_capture(&h, "older", *offset, seq.0, Some(ranking_sequence + 1));
+    assert!(output.status.success(), "{output:?}");
+    let older = ac_b_reference_rows(&ac_b_inspect(&h, &h.dir.path().join("older")));
+    assert_eq!(
+        older.iter().find(|r| r["seq"] == ranking_sequence).unwrap()["verdict"],
+        "incomplete"
+    );
+    assert_eq!(
+        older
+            .iter()
+            .find(|r| r["seq"] == exclusion_sequence)
+            .unwrap()["verdict"],
+        "pass"
+    );
+    let output = ac_b_capture(&h, "omitted", *offset, seq.0, None);
+    assert!(output.status.success(), "{output:?}");
+}
+
 #[tokio::test(start_paused = true)]
 async fn ac_c_receipt_census_query() {
     let logs = CensusLogs::default();
