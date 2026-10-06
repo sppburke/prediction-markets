@@ -5,7 +5,7 @@
 //! immutable provenance across cache hits.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use pe_core_types::{EventSeq, OutcomeId, PolymarketTokenId, SourceTimestamp};
 use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn};
@@ -75,6 +75,10 @@ struct CachedIdentity {
 struct IdentityCache {
     identities: HashMap<PolymarketTokenId, CachedIdentity>,
     rejected: BTreeSet<String>,
+    rejected_tokens: BTreeSet<PolymarketTokenId>,
+    memory_pages: RecordedIdentityPages,
+    // An expired caller cannot make a later live lookup skip the open query.
+    completed_open: HashMap<PolymarketTokenId, Weak<()>>,
     // Boot's shared receipt index is extended only after its reducer walk. These pages
     // already have a synchronized append receipt and are dropped when that index is installed.
     boot_pages: BTreeMap<u64, (AppendReceipt, IdentityPage)>,
@@ -258,10 +262,10 @@ impl AssetIdentityResolver {
         {
             let cache = self.cache.read().await;
             if requested.iter().all(|token| {
-                cache
-                    .identities
-                    .get(token)
-                    .is_some_and(|cached| !cache.rejected.contains(&cached.identity.condition_id.0))
+                cache.identities.get(token).is_some_and(|cached| {
+                    !cache.rejected_tokens.contains(token)
+                        && !cache.rejected.contains(&cached.identity.condition_id.0)
+                })
             }) {
                 let identities = requested
                     .iter()
@@ -288,7 +292,7 @@ impl AssetIdentityResolver {
             })
             .cloned()
             .collect::<Vec<_>>();
-        let mut memory_pages = RecordedIdentityPages::default();
+        let open_phase = Arc::new(());
         for chunk in misses.chunks(self.gamma_batch_size.min(GAMMA_BATCH_SIZE)) {
             let mut chunk = IdentityChunk {
                 requested: chunk.iter().cloned().collect(),
@@ -319,7 +323,7 @@ impl AssetIdentityResolver {
                         purpose,
                         store.as_ref(),
                         &mut read_pages,
-                        &mut memory_pages,
+                        &open_phase,
                         &mut resolved,
                     )
                     .await
@@ -350,7 +354,7 @@ impl AssetIdentityResolver {
         purpose: LookupPurpose,
         store: Option<&IdentityStore>,
         read_pages: &mut BTreeMap<u64, IdentityPage>,
-        memory_pages: &mut RecordedIdentityPages,
+        open_phase: &Arc<()>,
         resolved: &mut ResolvedIdentities,
     ) -> Result<bool, SourceError> {
         let requested = &chunk.requested;
@@ -398,11 +402,32 @@ impl AssetIdentityResolver {
             return Ok(true);
         }
 
+        let mut fetch_tokens = misses.clone();
+        if chunk.filter == MarketFilter::OpenOnly {
+            let cache = self.cache.read().await;
+            fetch_tokens.retain(|token| {
+                cache
+                    .completed_open
+                    .get(token)
+                    .is_none_or(|phase| phase.strong_count() == 0)
+            });
+            if fetch_tokens.is_empty() {
+                chunk.filter = MarketFilter::ClosedOnly;
+                fetch_tokens = misses.clone();
+            }
+        }
+        if chunk.filter == MarketFilter::ClosedOnly {
+            let mut cache = self.cache.write().await;
+            for token in &fetch_tokens {
+                cache.completed_open.remove(token);
+            }
+        }
+
         let mut recorded = RecordedIdentityPages::default();
         let mut newly_verified = BTreeMap::new();
         let fetched = self
             .fetch_and_record_chunks(
-                &misses,
+                &fetch_tokens,
                 chunk.filter,
                 match chunk.filter {
                     MarketFilter::OpenOnly => "gamma token lookup rejected",
@@ -433,39 +458,6 @@ impl AssetIdentityResolver {
                 .filter(|token| !returned_tokens.contains(token))
                 .map(|token| (token.clone(), sequence))
                 .collect();
-        }
-        if store.is_none() {
-            // First-migration boot has no saved rows; compare intersecting pages from earlier chunks.
-            let fresh = page_token_conditions(&recorded.pages);
-            let conditions = fresh.values().flatten().collect::<BTreeSet<_>>();
-            let previous = memory_pages
-                .pages
-                .iter()
-                .filter(|page| {
-                    page_token_conditions(std::slice::from_ref(page))
-                        .iter()
-                        .any(|(token, prior)| {
-                            fresh.contains_key(token)
-                                || prior.iter().any(|condition| conditions.contains(condition))
-                        })
-                })
-                .cloned()
-                .collect::<Vec<_>>();
-            memory_pages.pages.extend(recorded.pages.clone());
-            for (hash, sequence) in &recorded.sequences {
-                memory_pages
-                    .sequences
-                    .entry(hash.clone())
-                    .or_insert(*sequence);
-            }
-            recorded.pages.extend(previous);
-            for (page, _) in &recorded.pages {
-                if let Some(sequence) = memory_pages.sequences.get(&page.canonical_page_hash) {
-                    recorded
-                        .sequences
-                        .insert(page.canonical_page_hash.clone(), *sequence);
-                }
-            }
         }
         let candidates: Vec<_> = if store.is_some() {
             returned_tokens.into_iter().collect()
@@ -512,6 +504,16 @@ impl AssetIdentityResolver {
             return Err(error);
         }
         saved?;
+        if chunk.filter == MarketFilter::OpenOnly {
+            let mut cache = self.cache.write().await;
+            for token in &leftovers {
+                if fetch_tokens.contains(token) {
+                    cache
+                        .completed_open
+                        .insert(token.clone(), Arc::downgrade(open_phase));
+                }
+            }
+        }
         for (token, cached) in newly_verified {
             if !requested.contains(&token) {
                 continue;
@@ -737,6 +739,7 @@ impl AssetIdentityResolver {
                 }
             }
             cache.rejected.extend(rejections.into_keys());
+            cache.rejected_tokens.extend(rejected_tokens.into_keys());
             // Preserve saved provenance when a fresh page repeats a known identity.
             for (row, cached) in saved {
                 if !cache.rejected.contains(&row.condition_id.0) {
@@ -765,6 +768,89 @@ impl AssetIdentityResolver {
                     *fresh = cached.clone();
                 }
             }
+            evict_rejected(&mut cache, resolved);
+        } else {
+            let fresh_conditions = page_token_conditions(pages);
+            let conditions = fresh_conditions.values().flatten().collect::<BTreeSet<_>>();
+            let mut combined_pages = pages.to_vec();
+            combined_pages.extend(
+                cache
+                    .memory_pages
+                    .pages
+                    .iter()
+                    .filter(|page| {
+                        page_token_conditions(std::slice::from_ref(page))
+                            .iter()
+                            .any(|(token, prior)| {
+                                fresh_conditions.contains_key(token)
+                                    || prior.iter().any(|condition| conditions.contains(condition))
+                            })
+                    })
+                    .cloned(),
+            );
+            cache.memory_pages.pages.extend(pages.to_vec());
+            for (hash, sequence) in sequences {
+                cache
+                    .memory_pages
+                    .sequences
+                    .entry(hash.clone())
+                    .or_insert(*sequence);
+            }
+            let token_conditions = page_token_conditions(&combined_pages);
+            let mut candidates = newly_verified
+                .keys()
+                .chain(resolved.verified.keys())
+                .chain(resolved.unverified.keys())
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            // First tokens witness differing outcome vectors; shared tokens witness cross-condition conflicts.
+            for (_, tokens) in page_markets(&combined_pages) {
+                if let Some(token) = tokens.into_iter().next() {
+                    candidates.insert(PolymarketTokenId(token));
+                }
+            }
+            candidates.extend(
+                token_conditions.iter().filter_map(|(token, conditions)| {
+                    (conditions.len() > 1).then_some(token.clone())
+                }),
+            );
+            let verified = verify_token_identities(
+                &candidates.into_iter().collect::<Vec<_>>(),
+                &combined_pages,
+            );
+            for (token, identity) in &verified {
+                if matches!(identity, Err(
+                    pe_source_polymarket_public::MetadataIdentityError::MarketCardinality { .. }
+                    | pe_source_polymarket_public::MetadataIdentityError::DuplicateIdentity { .. }
+                )) && let Some(conditions) = token_conditions.get(token)
+                {
+                    cache.rejected.extend(conditions.iter().cloned());
+                }
+            }
+            for (token, conditions) in token_conditions {
+                if conditions
+                    .iter()
+                    .any(|condition| cache.rejected.contains(condition))
+                {
+                    resolved
+                        .unverified
+                        .insert(token.clone(), rejected_identity_reason());
+                    cache.rejected_tokens.insert(token);
+                }
+            }
+            let mut fresh = BTreeMap::new();
+            collect_verified(
+                verified,
+                &cache.memory_pages.sequences,
+                &mut fresh,
+                &mut BTreeMap::new(),
+            );
+            fresh.retain(|token, cached| {
+                newly_verified.contains_key(token)
+                    && !cache.rejected_tokens.contains(token)
+                    && !cache.rejected.contains(&cached.identity.condition_id.0)
+            });
+            *newly_verified = fresh;
             evict_rejected(&mut cache, resolved);
         }
         for (token, fresh) in newly_verified.iter_mut() {
@@ -831,11 +917,18 @@ impl AssetIdentityResolver {
         read_pages: &mut BTreeMap<u64, IdentityPage>,
     ) -> Result<ResolvedIdentities, SourceError> {
         let mut cache = self.cache.write().await;
-        let mut unverified = BTreeMap::new();
+        let mut unverified = requested
+            .iter()
+            .filter(|token| cache.rejected_tokens.contains(*token))
+            .map(|token| (token.clone(), rejected_identity_reason()))
+            .collect::<BTreeMap<_, _>>();
         if let Some(store) = store {
             let misses = requested
                 .iter()
-                .filter(|token| !cache.identities.contains_key(*token))
+                .filter(|token| {
+                    !cache.identities.contains_key(*token)
+                        && !cache.rejected_tokens.contains(*token)
+                })
                 .cloned()
                 .collect::<Vec<_>>();
             let rows = store
@@ -949,17 +1042,24 @@ fn evict_rejected(cache: &mut IdentityCache, resolved: &mut ResolvedIdentities) 
     let rejected_tokens = cache
         .identities
         .iter()
-        .filter(|(_, cached)| cache.rejected.contains(&cached.identity.condition_id.0))
+        .filter(|(token, cached)| {
+            cache.rejected_tokens.contains(*token)
+                || cache.rejected.contains(&cached.identity.condition_id.0)
+        })
         .map(|(token, _)| token.clone())
         .chain(
             resolved
                 .verified
                 .iter()
-                .filter(|(_, identity)| cache.rejected.contains(&identity.condition_id.0))
+                .filter(|(token, identity)| {
+                    cache.rejected_tokens.contains(*token)
+                        || cache.rejected.contains(&identity.condition_id.0)
+                })
                 .map(|(token, _)| token.clone()),
         )
         .collect::<BTreeSet<_>>();
     for token in rejected_tokens {
+        cache.rejected_tokens.insert(token.clone());
         cache.identities.remove(&token);
         resolved.verified.remove(&token);
         resolved.provenance.remove(&token);
@@ -1132,6 +1232,19 @@ fn page_tokens(pages: &[IdentityPage]) -> Vec<PolymarketTokenId> {
 
 fn page_token_conditions(pages: &[IdentityPage]) -> BTreeMap<PolymarketTokenId, BTreeSet<String>> {
     let mut tokens = BTreeMap::<_, BTreeSet<_>>::new();
+    for (condition, ids) in page_markets(pages) {
+        for token in ids {
+            let conditions = tokens.entry(PolymarketTokenId(token)).or_default();
+            if let Some(condition) = &condition {
+                conditions.insert(condition.clone());
+            }
+        }
+    }
+    tokens
+}
+
+fn page_markets(pages: &[IdentityPage]) -> Vec<(Option<String>, Vec<String>)> {
+    let mut candidates = Vec::new();
     for (_, raw) in pages {
         let Ok(markets) = serde_json::from_slice::<Vec<serde_json::Value>>(raw) else {
             continue;
@@ -1145,19 +1258,17 @@ fn page_token_conditions(pages: &[IdentityPage]) -> BTreeMap<PolymarketTokenId, 
                 None => serde_json::from_value::<Vec<String>>(ids.clone()),
             };
             if let Ok(ids) = ids {
-                for token in ids {
-                    let conditions = tokens.entry(PolymarketTokenId(token)).or_default();
-                    if let Some(condition) = market
+                candidates.push((
+                    market
                         .get("conditionId")
                         .and_then(serde_json::Value::as_str)
-                    {
-                        conditions.insert(condition.to_owned());
-                    }
-                }
+                        .map(str::to_owned),
+                    ids,
+                ));
             }
         }
     }
-    tokens
+    candidates
 }
 
 fn identity_store_error(error: impl std::fmt::Display) -> SourceError {
@@ -1758,6 +1869,181 @@ mod tests {
         assert_eq!(first.provenance[&token], second.provenance[&token]);
         assert_eq!(second.verified.len(), 2);
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+    }
+
+    struct InterleavedIdentityFixture {
+        urls: StdMutex<Vec<String>>,
+        release: tokio::sync::Notify,
+        closed_only: bool,
+    }
+
+    impl ReconciliationFetcher for InterleavedIdentityFixture {
+        fn fetch<'a>(
+            &'a self,
+            url: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
+            Box::pin(async move {
+                let first = {
+                    let mut urls = self.urls.lock().unwrap();
+                    urls.push(url.to_owned());
+                    urls.len() == 1
+                };
+                if first {
+                    self.release.notified().await;
+                }
+                if self.closed_only {
+                    if url.contains("closed=true") {
+                        Ok(br#"[{"conditionId":"condition","clobTokenIds":["token-b"]}]"#.to_vec())
+                    } else {
+                        Ok(b"[]".to_vec())
+                    }
+                } else if url.contains("clob_token_ids=token-a") {
+                    Ok(
+                        br#"[{"conditionId":"condition","clobTokenIds":["token-a","token-x"]}]"#
+                            .to_vec(),
+                    )
+                } else {
+                    Ok(
+                        br#"[{"conditionId":"condition","clobTokenIds":["token-z","token-b"]}]"#
+                            .to_vec(),
+                    )
+                }
+            })
+        }
+    }
+
+    async fn assert_interleaved_identity_conflict_is_rejected(durable: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let fetcher = Arc::new(InterleavedIdentityFixture {
+            urls: StdMutex::new(Vec::new()),
+            release: tokio::sync::Notify::new(),
+            closed_only: false,
+        });
+        let resolver = if durable {
+            durable_resolver(
+                &path,
+                Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap()),
+                "installed",
+                fetcher.clone(),
+                1,
+            )
+        } else {
+            AssetIdentityResolver::new(
+                fetcher.clone(),
+                BASE.into(),
+                1,
+                Arc::new(Mutex::new(SourceEventSink::open(&path).unwrap())),
+            )
+        };
+        let token_a = PolymarketTokenId("token-a".into());
+        let token_b = PolymarketTokenId("token-b".into());
+        let mut first = Box::pin(resolver.resolve_live([token_a.clone(), token_b.clone()]));
+        std::future::poll_fn(|cx| {
+            assert!(first.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        let mut second = Box::pin(resolver.resolve_live([token_b.clone()]));
+        std::future::poll_fn(|cx| {
+            assert!(second.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert_eq!(fetcher.urls.lock().unwrap().len(), 1);
+        fetcher.release.notify_one();
+        let (first, second) = tokio::join!(first, second);
+        let first = first.unwrap();
+        let second = second.unwrap();
+        assert!(first.verified.is_empty());
+        assert!(first.provenance.is_empty());
+        assert!(first.unverified.contains_key(&token_a));
+        assert!(first.unverified.contains_key(&token_b));
+        assert!(second.verified.is_empty());
+        assert!(second.provenance.is_empty());
+        assert!(second.unverified.contains_key(&token_b));
+        assert!(resolver.cache.read().await.identities.is_empty());
+        for token in [
+            token_a,
+            token_b,
+            PolymarketTokenId("token-x".into()),
+            PolymarketTokenId("token-z".into()),
+        ] {
+            let rejected = resolver.resolve_live([token.clone()]).await.unwrap();
+            assert!(rejected.verified.is_empty());
+            assert!(rejected.provenance.is_empty());
+            assert!(rejected.unverified.contains_key(&token));
+        }
+        let urls = fetcher.urls.lock().unwrap();
+        assert_eq!(urls.len(), 2);
+        assert!(urls[0].contains("clob_token_ids=token-a"));
+        assert!(urls[1].contains("clob_token_ids=token-b"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn memory_only_interleaved_requests_reject_conflicting_condition_and_cached_siblings() {
+        assert_interleaved_identity_conflict_is_rejected(false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn durable_interleaved_requests_reject_conflicting_condition_and_cached_siblings() {
+        assert_interleaved_identity_conflict_is_rejected(true).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overlapping_closed_token_requests_share_completed_open_query() {
+        for durable in [false, true] {
+            for purpose in [LookupPurpose::Live, LookupPurpose::Historical] {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("source.log");
+                let fetcher = Arc::new(InterleavedIdentityFixture {
+                    urls: StdMutex::new(Vec::new()),
+                    release: tokio::sync::Notify::new(),
+                    closed_only: true,
+                });
+                let resolver = if durable {
+                    durable_resolver(
+                        &path,
+                        Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap()),
+                        "installed",
+                        fetcher.clone(),
+                        1,
+                    )
+                } else {
+                    AssetIdentityResolver::new(
+                        fetcher.clone(),
+                        BASE.into(),
+                        1,
+                        Arc::new(Mutex::new(SourceEventSink::open(&path).unwrap())),
+                    )
+                };
+                let token = PolymarketTokenId("token-b".into());
+                let mut first = Box::pin(resolver.resolve_inner([token.clone()], purpose));
+                std::future::poll_fn(|cx| {
+                    assert!(first.as_mut().poll(cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                let mut second = Box::pin(resolver.resolve_inner([token.clone()], purpose));
+                std::future::poll_fn(|cx| {
+                    assert!(second.as_mut().poll(cx).is_pending());
+                    std::task::Poll::Ready(())
+                })
+                .await;
+                assert_eq!(fetcher.urls.lock().unwrap().len(), 1);
+                fetcher.release.notify_one();
+                let (first, second) = tokio::join!(first, second);
+                let first = first.unwrap();
+                let second = second.unwrap();
+                assert_eq!(first.verified.len(), 1);
+                assert_eq!(second.verified, first.verified);
+                assert_eq!(second.provenance, first.provenance);
+                let urls = fetcher.urls.lock().unwrap();
+                assert_eq!(urls.len(), 2);
+                assert!(!urls[0].contains("closed=true"));
+                assert!(urls[1].contains("closed=true"));
+            }
+        }
     }
 
     struct InterleavedChunkFixture {
@@ -2387,6 +2673,48 @@ mod tests {
                 .all(|token| resolved.unverified.contains_key(token))
         );
         assert!(resolver.cache.read().await.identities.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn memory_only_unrequested_conflict_rejects_conditions_and_evicts_cached_sibling() {
+        let fetcher = Arc::new(SequenceFixture {
+            pages: StdMutex::new(std::collections::VecDeque::from([
+                br#"[{"conditionId":"condition-c","clobTokenIds":["token-a","token-x"]}]"#.to_vec(),
+                br#"[{"conditionId":"condition-d","clobTokenIds":["token-z","token-a"]}]"#.to_vec(),
+                b"[]".to_vec(),
+                br#"[{"conditionId":"condition-d","clobTokenIds":["token-b"]}]"#.to_vec(),
+            ])),
+        });
+        let (_dir, _path, _sink, resolver) = boot_resolver(fetcher.clone());
+        let sibling = PolymarketTokenId("token-x".into());
+        assert_eq!(
+            resolver
+                .resolve_live([sibling.clone()])
+                .await
+                .unwrap()
+                .verified
+                .len(),
+            1
+        );
+        let conflicting = resolver
+            .resolve_live([sibling.clone(), PolymarketTokenId("probe".into())])
+            .await
+            .unwrap();
+        assert!(conflicting.verified.is_empty());
+        assert!(conflicting.unverified.contains_key(&sibling));
+        assert!(resolver.cache.read().await.identities.is_empty());
+        for token in [
+            sibling,
+            PolymarketTokenId("token-a".into()),
+            PolymarketTokenId("token-z".into()),
+            PolymarketTokenId("token-b".into()),
+        ] {
+            let rejected = resolver.resolve_live([token.clone()]).await.unwrap();
+            assert!(rejected.verified.is_empty());
+            assert!(rejected.provenance.is_empty());
+            assert!(rejected.unverified.contains_key(&token));
+        }
+        assert!(fetcher.pages.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
