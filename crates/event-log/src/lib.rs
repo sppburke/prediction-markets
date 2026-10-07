@@ -33,15 +33,24 @@
 
 pub mod envelope;
 pub mod error;
+pub mod feed;
 mod frame;
 pub use frame::HEADER_LEN;
 pub mod reader;
+pub mod receipt;
+pub mod retention;
 pub mod scanner;
 pub mod writer;
 
 pub use envelope::{ContentType, EnvelopeIn, EventEnvelope};
 pub use error::{LogError, PoisonReason};
+pub use feed::{FeedArchiveIter, FeedArchiveWriter, feed_directory, feed_path};
 pub use reader::Reader;
+pub use receipt::{RECEIPT_RECORD_LEN, ReceiptRecord};
+pub use retention::{
+    FeedEntry, RetentionAuthority, RetentionBoundary, RetentionError, RetentionPin,
+    RetentionWriteError, TailBinding, retention_path,
+};
 pub use scanner::{IncompleteTail, LogTailBinding, ScanOutcome, Scanner};
 pub use writer::{AppendReceipt, CheckpointPrefix, CheckpointVerification, Writer};
 #[cfg(feature = "scan-metrics")]

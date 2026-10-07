@@ -8,8 +8,10 @@ use pe_core_types::EventSeq;
 use blake3::Hash;
 
 use crate::frame::verify_file_header;
-use crate::scanner::{LogTailBinding, ScanState, ScanStep, Scanner, read_verified_frame};
-use crate::{EventEnvelope, LogError};
+use crate::scanner::{
+    LogTailBinding, PrefixTracker, ScanState, ScanStep, Scanner, fresh_state, read_verified_frame,
+};
+use crate::{EventEnvelope, LogError, RetentionAuthority};
 
 /// How long tail mode retries a partial frame before giving up.
 const TRUNCATION_TIMEOUT: Duration = Duration::from_secs(30);
@@ -91,6 +93,8 @@ struct ReplayIter {
     poll_interval: Option<Duration>,
     poisoned: bool,
     truncation_deadline: Option<Instant>,
+    retained_tail: Option<LogTailBinding>,
+    reached_retained_tail: bool,
 }
 
 impl ReplayIter {
@@ -102,9 +106,18 @@ impl ReplayIter {
         if poll_interval.is_none() {
             crate::scan_metrics::record(&std::fs::canonicalize(path)?);
         }
+        let authority = RetentionAuthority::load(path)?;
+        let state = fresh_state(authority.as_ref());
+        reader.seek(SeekFrom::Start(state.physical_tail()))?;
+        let retained_tail = authority
+            .as_ref()
+            .map(|authority| authority.retained_tail.resolve(path))
+            .transpose()?;
         Ok(Self {
             reader,
-            state: ScanState::after_header(),
+            state,
+            retained_tail,
+            reached_retained_tail: authority.is_none(),
             poll_interval,
             poisoned: false,
             truncation_deadline: None,
@@ -125,13 +138,36 @@ impl Iterator for ReplayIter {
             match read_verified_frame(&mut self.reader, &mut self.state) {
                 Ok(ScanStep::Frame(envelope)) => {
                     self.truncation_deadline = None;
+                    if let Some(tail) = &self.retained_tail {
+                        let mut tracker = PrefixTracker::new(Some(tail), &tail.path);
+                        tracker.observe(&self.state);
+                        if tracker.verdict(&self.state) == crate::scanner::PrefixVerdict::Matched {
+                            self.reached_retained_tail = true;
+                        }
+                    }
                     return Some(Ok((frame_start, envelope.seq, envelope)));
                 }
-                Ok(ScanStep::Eof) => match self.poll_interval {
-                    None => return None,
-                    Some(interval) => std::thread::sleep(interval),
-                },
+                Ok(ScanStep::Eof) => {
+                    if !self.reached_retained_tail {
+                        self.poisoned = true;
+                        return Some(Err(crate::retention::RetentionError::Invalid(
+                            "log did not reach retained tail".into(),
+                        )
+                        .into()));
+                    }
+                    match self.poll_interval {
+                        None => return None,
+                        Some(interval) => std::thread::sleep(interval),
+                    }
+                }
                 Ok(ScanStep::Incomplete(incomplete)) => {
+                    if !self.reached_retained_tail {
+                        self.poisoned = true;
+                        return Some(Err(crate::retention::RetentionError::Invalid(
+                            "log did not reach retained tail".into(),
+                        )
+                        .into()));
+                    }
                     if let Some(interval) = self.poll_interval {
                         let deadline = self
                             .truncation_deadline

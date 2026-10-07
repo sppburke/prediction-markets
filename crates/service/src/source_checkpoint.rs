@@ -15,7 +15,7 @@ use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use pe_event_log::LogTailBinding;
+use pe_event_log::{LogTailBinding, RECEIPT_RECORD_LEN, ReceiptRecord};
 use serde::{Deserialize, Serialize, de::IgnoredAny};
 use thiserror::Error;
 use tracing::info;
@@ -25,7 +25,6 @@ use crate::source_log_boot::ACTIVITY_REDUCER_VERSION;
 use crate::trade_poller::{ActivityCandidates, DailyBoundaryCandidates};
 
 pub(crate) const CHECKPOINT_HEADER_LEN: usize = 65;
-const RECEIPT_RECORD_LEN: u64 = 80;
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct CheckpointData {
@@ -101,31 +100,23 @@ fn receipt_position(count: usize) -> io::Result<u64> {
 }
 
 fn encode_record(frame: &SourceFrameMetadata) -> [u8; 80] {
-    let mut bytes = [0; 80];
-    bytes[..32].copy_from_slice(frame.receipt.this_hash.as_bytes());
-    bytes[32..40].copy_from_slice(&frame.received_millis.to_le_bytes());
-    bytes[40..48].copy_from_slice(&frame.byte_offset.unwrap_or(u64::MAX).to_le_bytes());
-    let checksum = blake3::hash(&bytes[..48]);
-    bytes[48..].copy_from_slice(checksum.as_bytes());
-    bytes
+    ReceiptRecord {
+        receipt: frame.receipt,
+        received_millis: frame.received_millis,
+        byte_offset: frame.byte_offset,
+    }
+    .encode()
 }
 
 fn read_record(reader: &mut impl Read, sequence: usize) -> io::Result<SourceFrameMetadata> {
-    let mut bytes = [0; 80];
-    reader.read_exact(&mut bytes)?;
-    if bytes[48..] != *blake3::hash(&bytes[..48]).as_bytes() {
-        return Err(io::Error::other("checkpoint receipt checksum mismatch"));
-    }
-    let hash = bytes[..32].try_into().map_err(io::Error::other)?;
-    let received = bytes[32..40].try_into().map_err(io::Error::other)?;
-    let offset = u64::from_le_bytes(bytes[40..48].try_into().map_err(io::Error::other)?);
+    let record = ReceiptRecord::read(
+        reader,
+        pe_core_types::EventSeq(u64::try_from(sequence).map_err(io::Error::other)?),
+    )?;
     Ok(SourceFrameMetadata {
-        receipt: pe_event_log::AppendReceipt {
-            sequence: pe_core_types::EventSeq(u64::try_from(sequence).map_err(io::Error::other)?),
-            this_hash: blake3::Hash::from_bytes(hash),
-        },
-        received_millis: i64::from_le_bytes(received),
-        byte_offset: (offset != u64::MAX).then_some(offset),
+        receipt: record.receipt,
+        received_millis: record.received_millis,
+        byte_offset: record.byte_offset,
     })
 }
 
