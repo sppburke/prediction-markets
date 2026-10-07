@@ -649,10 +649,17 @@ copy_pre_t0_files() {
     atomic_adopt "$source" "$archive/$name" 0600 "archive-$name"
   done
   source=$(manifest_get old_paths.source_log)
-  for name in boot-checkpoint boot-checkpoint.receipts boot-checkpoint.invalidation; do
+  for name in boot-checkpoint boot-checkpoint.receipts boot-checkpoint.invalidation retention; do
     [[ ! -f "$source.$name" ]] ||
       atomic_adopt "$source.$name" "$archive/source_log.$name" 0600 "archive-$name"
   done
+  if [[ -d "$source.feed" ]]; then
+    [[ ! -L "$source.feed" ]] || die "source feed archive must not be a symlink"
+    while IFS= read -r -d '' name; do
+      [[ -f "$name" && ! -L "$name" ]] || die "source feed archive contains a non-regular file"
+      atomic_adopt "$name" "$archive/source_log.feed/${name#"$source.feed/"}" 0600 archive-feed
+    done < <(find "$source.feed" \( -type f -o -type l \) -print0 | sort -z)
+  fi
   [[ -f "$SERVICE_CONFIG" && -f "$SERVICE_ENV" && -f "$SERVICE_BINARY" ]] ||
     die "one or more installed service artifacts are absent"
   atomic_adopt "$SERVICE_CONFIG" "$archive/service.toml" 0600 archive-config
@@ -662,11 +669,15 @@ copy_pre_t0_files() {
   [[ ! -f "$source" ]] || atomic_adopt "$source" "$archive/status.json" 0600 archive-status
   python3 -c 'import hashlib,json,os,sys
 root=sys.argv[1]; result={}
-for name in sorted(os.listdir(root)):
- path=os.path.join(root,name)
- if os.path.isfile(path):
-  key=name.replace(".","_").replace("-","_")
-  with open(path,"rb") as handle: result[key]={"path":path,"sha256":hashlib.sha256(handle.read()).hexdigest()}
+for directory, subdirectories, files in os.walk(root):
+ for name in sorted(files):
+  path=os.path.join(directory,name)
+  relative=os.path.relpath(path,root)
+  key=relative.replace(".","_").replace("-","_")
+  digest=hashlib.sha256()
+  with open(path,"rb") as handle:
+   for chunk in iter(lambda: handle.read(1024 * 1024), b""): digest.update(chunk)
+  result[key]={"path":path,"sha256":digest.hexdigest()}
 print(json.dumps({"archive_artifacts":result},sort_keys=True))' "$archive"
 }
 

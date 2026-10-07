@@ -181,9 +181,43 @@ fn effective_live_wallet_list(live: &LiveWatchlist, paper: &PaperStateDb) -> Res
     Ok(wallets)
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build service runtime")?;
+    let result = runtime.block_on(run());
+    runtime.shutdown_timeout(pe_service::supervisor::POST_ABORT_JOIN_BOUND);
+    result
+}
+
+async fn run() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
+    #[cfg(feature = "scenario")]
+    if args
+        .first()
+        .is_some_and(|arg| arg == "--scenario-runtime-exit-cap")
+    {
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let stuck = move || {
+            let _ = started.send(());
+            loop {
+                std::thread::park();
+            }
+        };
+        match args.get(1).map(String::as_str) {
+            Some("blocking") => {
+                tokio::task::spawn_blocking(stuck);
+            }
+            Some("async") => {
+                tokio::spawn(async move { stuck() });
+            }
+            _ => anyhow::bail!("exit-cap scenario requires blocking or async"),
+        }
+        ready.await.context("wait for synchronous scenario work")?;
+        println!("scenario main finished");
+        return Ok(());
+    }
     let exit_after_anchors = args
         .iter()
         .any(|argument| argument == "--exit-after-anchors");
@@ -2491,7 +2525,7 @@ async fn tick_financial_resolution(
         )
         .await
         {
-            warn!(condition = %condition.0, error = %error, "financial resolution condition failed; continuing");
+            warn!(condition = %condition.0, error = %format!("{error:#}"), "financial resolution condition failed; continuing");
         }
     }
     Ok(())

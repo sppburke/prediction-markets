@@ -132,6 +132,20 @@ set -e
   fail "digest-bound adoption replaced the destination with unreviewed bytes"
 grep -q 'source hash changed before adoption' "$TEST_TMP/adopt.err" ||
   fail "digest-bound adoption refusal was not explicit"
+
+# Sparse adoption preserves holes and hashes a file larger than the chunk size correctly.
+python3 - "$adopt_source" <<'PY'
+import sys
+with open(sys.argv[1], "wb") as source:
+    source.write(b"head")
+    source.seek(16 * 1024 * 1024)
+    source.write(b"tail")
+PY
+PE_ACTIVATION_TESTING=1 PE_ACTIVATION_TEST_ROOT="$TEST_TMP" bash -c \
+  'source "$1"; atomic_adopt "$2" "$3" 0600 sparse-adopt' \
+  bash "$SCRIPT_DIR/generation_common.sh" "$adopt_source" "$adopt_destination"
+cmp "$adopt_source" "$adopt_destination" || fail "sparse adoption changed bytes"
+[[ $(stat -c '%b' "$adopt_destination") -lt 1024 ]] || fail "sparse adoption allocated the holes"
 fi
 
 write_shims() {
@@ -601,6 +615,10 @@ EOF
   for name in boot-checkpoint boot-checkpoint.receipts boot-checkpoint.invalidation; do
     printf '%s\n' "old-$name" > "$service/old/source_events.log.$name"
   done
+  printf '%s\n' '{"authority":{"epoch":1,"feed":[{"epoch":1}]},"checksum":"0"}' > "$service/old/source_events.log.retention"
+  mkdir -p "$service/old/source_events.log.feed/nested"
+  printf 'EDGE\001retained-feed\n' > "$service/old/source_events.log.feed/1.frames"
+  printf '%s\n' nested-feed > "$service/old/source_events.log.feed/nested/evidence.frames"
   printf '%s\n' old-live > "$service/old/live_journal.log"
   printf '%s\n' old-db > "$service/old/paper_state.db"
   printf '%s\n' old-history > "$service/old/wallet_market_history.json"
@@ -691,6 +709,21 @@ assert_verified() {
       "$root/prediction-markets/gen/557/pre-t0/source_log.$name" ||
       fail "archive omitted or changed checkpoint companion $name"
   done
+  for name in retention feed/1.frames feed/nested/evidence.frames; do
+    cmp "$root/prediction-markets/old/source_events.log.$name" \
+      "$root/prediction-markets/gen/557/pre-t0/source_log.$name" ||
+      fail "archive omitted or changed retained evidence $name"
+  done
+  python3 - "$root/pe-activation.json" <<'PY' || fail "retention archive inventory hashes mismatched"
+import hashlib, json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))["archive_artifacts"]
+for name in ("source_log_retention", "source_log_feed/1_frames", "source_log_feed/nested/evidence_frames"):
+    row = value[name]
+    digest = hashlib.sha256()
+    with open(row["path"], "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""): digest.update(chunk)
+    assert row["sha256"] == digest.hexdigest()
+PY
   python3 -c 'import json,sys
 value=json.load(open(sys.argv[1], encoding="utf-8"))
 assert value["ranking_batch_id"] == 7
@@ -783,6 +816,7 @@ artifact_boundaries=(
   stage-binary rendered-config rendered-rehearsal-config rendered-env rendered-rehearsal-env
   archive-paper-state archive-paper_log archive-source_log archive-live_journal
   archive-boot-checkpoint archive-boot-checkpoint.receipts archive-boot-checkpoint.invalidation
+  archive-retention archive-feed
   archive-legacy_history archive-config archive-env archive-binary archive-status
   adopted-config adopted-env adopted-binary db-commit service-started
 )

@@ -69,7 +69,7 @@ require_text "$REHEARSAL" 'account_census_before_sha256='
 require_text "$REHEARSAL" 'account_census_after_count='
 require_text "$REHEARSAL" 'account_census_after_sha256='
 require_text "$REHEARSAL" 'account_census_before_after_identical='
-require_text "$REHEARSAL" 'atomic_adopt "$copy_manifest_stage" "$copy_manifest"'
+require_text "$REHEARSAL" 'atomic_adopt "$copy_manifest_stage" "$copy_stage/copied.sha256"'
 require_text "$REHEARSAL" 'atomic_adopt "$manifest_stage" "$manifest"'
 require_text "$REHEARSAL" 'atomic_adopt "$evidence_stage" "$evidence_hash_file"'
 
@@ -221,6 +221,20 @@ PY
     shift 2
     exec /usr/bin/python3 -c "$script" "$@"
   fi
+fi
+# Inject space only into the capture preflight; no production override is introduced.
+if [[ "${1-}" == - && "${!#}" == */crates/service/src/disk_monitor.rs &&
+      -f "$state/capture-free-bytes" ]]; then
+  available=$(<"$state/capture-free-bytes")
+  shift
+  exec /usr/bin/python3 -c 'import os,sys
+available=int(sys.argv[1]); sys.argv=["-",*sys.argv[2:]]
+original=os.statvfs
+def space(path):
+    value=list(original(path)); value[4]=available//value[1]
+    return os.statvfs_result(value)
+os.statvfs=space
+exec(compile(sys.stdin.read(),"capture-space-fixture","exec"))' "$available" "$@"
 fi
 exec /usr/bin/python3 "$@"
 SH
@@ -1431,6 +1445,136 @@ rows = [line.rstrip("\n").split("  ", 1) for line in open(os.path.join(copy, "co
 assert len(rows) == len(expected) and {entry[1] for entry in rows} == expected
 assert dict((path, digest) for digest, path in rows)[name] == hashlib.sha256(open(os.path.join(copy, name), "rb").read()).hexdigest()
 PY
+
+# Capture preflight includes a dense standalone SQLite backup plus sparse staging and the floor.
+root=$TEST_TMP/rehearsal-capture-space
+setup_rehearsal_fixture "$root" true none
+printf '%s\n' 5000004096 > "$root/test-state/capture-free-bytes"
+set +e
+output=$(run_rehearsal_fixture "$root" 2>&1)
+status=$?
+set -e
+[[ $status -ne 0 && "$output" == *reason=insufficient_free_space* ]] ||
+  fail "capture did not refuse insufficient peak space: $output"
+[[ ! -e "$root/rehearsal/copy" && ! -e "$root/rehearsal/copy.staging-1111111111111111111111111111111111111111" ]] ||
+  fail "space refusal happened after copying mutable inputs"
+
+# A completed staged capture is adopted without recopying, even when fresh capture space is absent.
+root=$TEST_TMP/rehearsal-completed-staging
+setup_rehearsal_fixture "$root" true none
+capture_stage="$root/rehearsal/copy.staging-1111111111111111111111111111111111111111"
+set +e
+output=$(SIMULATE_CRASH_AFTER=rehearsal-staging-complete run_rehearsal_fixture "$root" 2>&1)
+status=$?
+set -e
+[[ $status -eq 86 && -f "$capture_stage/copied.sha256" && ! -e "$root/rehearsal/copy" ]] ||
+  fail "completed staging crash did not retain the capture: $output"
+printf '%s\n' changed-after-capture >> "$root/prediction-markets/gen/g557/source_events.log"
+printf '%s\n' 0 > "$root/test-state/capture-free-bytes"
+output=$(run_rehearsal_fixture "$root" 2>&1)
+[[ "$output" == *REHEARSAL545_PASS* && ! -e "$capture_stage" ]] ||
+  fail "completed staging was not adopted: $output"
+! grep -q changed-after-capture "$root/rehearsal/copy/source_events.log" ||
+  fail "completed staging was recopied from mutable inputs"
+
+# Only this task's incomplete stage is discarded; a neighbouring capture remains untouched.
+root=$TEST_TMP/rehearsal-incomplete-staging
+setup_rehearsal_fixture "$root" true none
+capture_stage="$root/rehearsal/copy.staging-1111111111111111111111111111111111111111"
+other_stage="$root/rehearsal/copy.staging-2222222222222222222222222222222222222222"
+mkdir -p "$other_stage"
+printf '%s\n' unrelated > "$other_stage/keep"
+set +e
+output=$(SIMULATE_CRASH_AFTER=rehearsal-inputs-copied run_rehearsal_fixture "$root" 2>&1)
+status=$?
+set -e
+[[ $status -eq 86 && -f "$capture_stage/source.identity" && ! -f "$capture_stage/copied.sha256" ]] ||
+  fail "incomplete staging crash was not reached: $output"
+printf '%s\n' disposable > "$capture_stage/incomplete-only"
+output=$(run_rehearsal_fixture "$root" 2>&1)
+[[ "$output" == *REHEARSAL545_PASS* && ! -e "$root/rehearsal/copy/incomplete-only" &&
+   $(<"$other_stage/keep") == unrelated ]] || fail "incomplete-stage cleanup escaped its task: $output"
+
+# Retained inputs stay sparse, committed feed files are inventoried and copying holds the lock.
+root=$TEST_TMP/rehearsal-retained-capture
+setup_rehearsal_fixture "$root" true none
+generation="$root/prediction-markets/gen/g557"
+printf '%s\n' '{"authority":{"epoch":1,"feed":[{"epoch":1}]},"checksum":"0"}' > "$generation/source_events.log.retention"
+mkdir -p "$generation/source_events.log.feed"
+printf 'EDGE\001feed-one\n' > "$generation/source_events.log.feed/1.frames"
+printf 'EDGE\001uncommitted\n' > "$generation/source_events.log.feed/2.frames"
+python3 - "$generation/source_events.log" <<'PY'
+import sys
+with open(sys.argv[1], "r+b") as source:
+    source.seek(16 * 1024 * 1024)
+    source.write(b"tail")
+PY
+cat > "$root/bin/cp" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+generation="$PE_ACTIVATION_TEST_ROOT/prediction-markets/gen/g557"
+for argument in "$@"; do
+  if [[ $argument == "$generation/"* ]]; then
+    if /usr/bin/flock -n "$generation/source_events.log.boot-checkpoint.lock" true; then
+      echo 'mutable input copied without checkpoint lock' >&2
+      exit 99
+    fi
+    printf '%s\n' "$argument" >> "$PE_ACTIVATION_TEST_ROOT/test-state/capture-lock-checked"
+  fi
+done
+exec /usr/bin/cp "$@"
+SH
+chmod +x "$root/bin/cp"
+cat > "$root/bin/sqlite3" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+generation="$PE_ACTIVATION_TEST_ROOT/prediction-markets/gen/g557"
+if [[ "$*" == *"$generation/paper_state.db"* && "$*" == *'.backup '* ]]; then
+  if /usr/bin/flock -n "$generation/source_events.log.boot-checkpoint.lock" true; then
+    echo 'SQLite backup ran without checkpoint lock' >&2
+    exit 99
+  fi
+  : > "$PE_ACTIVATION_TEST_ROOT/test-state/capture-backup-lock-checked"
+fi
+exec /usr/bin/sqlite3 "$@"
+SH
+cat > "$root/bin/sha256sum" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+for argument in "$@"; do
+  if [[ $argument == paper_state.db || $argument == source_events.log* ]]; then
+    /usr/bin/flock -n "$PE_ACTIVATION_TEST_ROOT/prediction-markets/gen/g557/source_events.log.boot-checkpoint.lock" true || {
+      echo 'capture hashing kept the checkpoint lock' >&2
+      exit 99
+    }
+    : > "$PE_ACTIVATION_TEST_ROOT/test-state/capture-hash-lock-released"
+  fi
+done
+exec /usr/bin/sha256sum "$@"
+SH
+chmod +x "$root/bin/sqlite3" "$root/bin/sha256sum"
+# Ample for the dense backup and sparse staging, insufficient for a dense copy of the hole.
+printf '%s\n' 5001048576 > "$root/test-state/capture-free-bytes"
+output=$(run_rehearsal_fixture "$root" 2>&1)
+[[ "$output" == *REHEARSAL545_PASS* ]] || fail "retained capture did not pass: $output"
+for name in retention feed/1.frames; do
+  cmp "$generation/source_events.log.$name" "$root/rehearsal/copy/source_events.log.$name" ||
+    fail "retained capture changed $name"
+  grep -Fq "  source_events.log.$name" "$root/rehearsal/copy/copied.sha256" ||
+    fail "retained capture manifest omitted $name"
+done
+[[ ! -e "$root/rehearsal/copy/source_events.log.feed/2.frames" ]] || fail "uncommitted feed was captured"
+[[ $(stat -c '%b' "$root/rehearsal/copy/source_events.log") -lt 1024 ]] || fail "capture expanded sparse holes"
+grep -Fq "$generation/source_events.log" "$root/test-state/capture-lock-checked" || fail "source copy lock was not checked"
+[[ -f "$root/test-state/capture-backup-lock-checked" && -f "$root/test-state/capture-hash-lock-released" ]] ||
+  fail "capture did not bound the checkpoint lock to mutable copying"
+# Inventory omission fails even when all remaining manifest hashes are valid.
+sed -i '\|  source_events.log.feed/1.frames$|d' "$root/rehearsal/copy/copied.sha256"
+set +e
+output=$(run_rehearsal_fixture "$root" 2>&1)
+status=$?
+set -e
+[[ $status -ne 0 && "$output" == *'wrong file inventory'* ]] || fail "incomplete retained inventory was accepted: $output"
 
 # Scenario REHEARSAL-BINDINGS-01
 # Preconditions: authoritative reviewed config/environment and a clean copied generation.

@@ -711,7 +711,7 @@ fan-out, the HTTP server, and the status writer have not started yet); the row s
 unit's `Restart=on-failure` policy repeats the failed start until the row is diagnosed. A `paper durability became uncertain` exit (for example after a failed risk-halt append)
 repeats the same way until storage works; preserve the era and the pending rows and diagnose
 storage. The ordinary [rollback](#rollback) to a pre-#565 binary is available only
-before the first synchronized schema-3 reconciliation page. After that boundary, preserve all state
+before the first synchronized schema-3 reconciliation page. After that boundary, preserve all retained evidence and financial state
 and use a binary retaining schema-3 page and V4 continuation compatibility plus any later durable
 contracts below; never delete records or rewrite rows to make an older reader accept them.
 
@@ -742,7 +742,7 @@ at least seven source requests (three activity walks and two position reads over
 before pagination. Full reads can take longer; retain the existing request/retry bounds without
 a new timeout or fallback.
 
-For recovery, preserve all state and use a compatible binary containing both the history repair
+For recovery, preserve all retained evidence and financial state and use a compatible binary containing both the history repair
 and boot-proof check. An older binary can decode the unchanged formats but resumes the defective
 admission rules, so it is not an accepted recovery target. Do not reset state, clear fences,
 recopy historical trades or perform another first financial activation. Existing completion
@@ -895,7 +895,7 @@ incompatible paper-log record, including `FeedIncidentChanged`. A frontier-only 
 or proofless empty-read commitment creates no new reader boundary. Older targets additionally
 require every existing boundary, including Part 1 closure receipts, ordinary-live admissions
 and restamp-pair commitments. Stop and drain before inspecting any boundary: queued shutdown
-work can cross it. After a boundary, preserve all state and fix forward. These conditions also
+work can cross it. After a boundary, preserve all retained evidence and financial state and fix forward. These conditions also
 govern reversal after a reader failure.
 
 Runtime no longer checks admitted frames against later REST history or produces feed incidents.
@@ -918,9 +918,11 @@ whole run: `exec 9</home/sean/.pe-deploy.lock && flock -n 9 || { echo 'another d
 The lock serializes concurrent deploy agents on the VPS; backfill/reset (dev-box `psql` paths) are
 excluded instead by their own runbook precondition that the service is STOPPED while they run (docs/34).
 
-Since #546 the binary is replaced **while the old process keeps running** — Linux keeps the old inode
-open under it — and activated by **one** `systemctl restart`. Every step is resumable: the hash
-comparisons decide what remains; never guess from memory.
+Release 2 uses one stop/start: prepare while the old service runs, census all pe-service
+processes, then disable and stop the unit and clear a fresh census before swapping the binary.
+The unit stays disabled and stopped across any interruption until clearance and the swap are
+complete. Every resume reruns the census; earlier clearance records are audit receipts only.
+Hash comparisons decide what remains, but never substitute for process clearance.
 
 1. **Build from a clean checkout at the exact reviewed SHA** and record both identities:
 
@@ -974,10 +976,12 @@ comparisons decide what remains; never guess from memory.
    Expected contract: `enabled`, `active`, `UnitFileState=enabled`, `WantedBy=multi-user.target`,
    `Restart=on-failure`, `RestartUSec=10s`, `KillSignal=2`, staged = desired, installed = running.
    The staged `--version` revision and verified BLAKE3 must match step 1 in addition to the sha256
-   equality. If installed = running = desired already, the deploy is complete (a resumed run): go to step 6.
-   If installed = desired but running is prior, go to step 5. Any unit-policy or ownership drift
-   stops the deploy for a reviewed correction; only enablement drift may be repaired in place with
-   `sudo systemctl enable pe-service` (no `--now`, no restart).
+   equality. These active/enabled states describe a fresh deploy. A resumed guarded deploy must
+   remain disabled and stopped until step 5; do not repair enablement early. If installed and running
+   already equal desired, rerun and clear the census of other processes and prove installed-unit
+   ownership before accepting the healthy service in step 6. If installed is desired but running
+   is prior, complete step 4's disable/stop and clearance before step 5. Other unit-policy or
+   ownership drift stops the deploy for a reviewed correction.
 
    Before activation, while the old service still runs, prepare the disposable source checkpoint
    with the staged binary against the exact installed paper-state path:
@@ -1027,8 +1031,16 @@ comparisons decide what remains; never guess from memory.
    cooldown remain [`anchor_refresh_secs`](./_GLOSSARY.md#anchor_refresh_secs); started work may overrun
    the launch deadline.
 
-4. **Baseline and atomic swap** (the old process keeps running on its open inode).
-   Run this guarded sequence in the same shell holding the deployment lock, with `$art` from step 3:
+4. **Census, stop and atomic swap.** While the old unit still serves and its executable is still
+   installed, run O2's recorded census command. Match every process whose executable is any
+   pe-service binary (installed, `.bak-*` or staged), or whose argv names this generation's config,
+   whether or not it holds state files open. Record PID, `/proc` start time, executable hash (read
+   `/proc/<pid>/exe` even for a deleted/replaced executable), and the config argument. Account for
+   the proved unit MainPID; report every other match. Before stopping a verified stray, repeat the
+   census and check its PID/start-time/hash/config identity, then record its exit.
+
+   Tell the owner before the pre-approved stop/start. In the same shell holding the deploy lock,
+   with `$art` from step 3, record the baseline and stop the unit before touching its executable:
 
    ```bash
    set -euo pipefail
@@ -1036,23 +1048,46 @@ comparisons decide what remains; never guess from memory.
    systemctl show pe-service -p InvocationID -p MainPID -p ExecStart -p WorkingDirectory > "$art/unit.before"
    [ -f target/release/pe-service.bak-<prior-sha12> ] || cp -p target/release/pe-service target/release/pe-service.bak-<prior-sha12>
    sha256sum target/release/pe-service.bak-<prior-sha12>       # = prior (= installed = running)
+   sudo systemctl disable pe-service
+   sudo systemctl stop pe-service
+   systemctl show pe-service -p ActiveState -p SubState -p UnitFileState -p MainPID > "$art/unit.stopped"
+   [ "$(systemctl is-enabled pe-service || true)" = disabled ]
+   [ "$(systemctl is-active pe-service || true)" = inactive ]
+   [ "$(systemctl show pe-service -p MainPID --value)" = 0 ]
+   [ ! -e "/proc/$pid" ]
+   ```
+
+   Repeat the census now; it must be readable and clear of **every** match, including an old boot
+   paused after checkpoint load and any preparation. Save the clearance alongside both unit-state
+   receipts. If any match remains or cannot be inspected, leave the unit disabled and stopped,
+   tell the owner, and do not swap/start. Every interrupted deploy repeats this census on resume;
+   a previous receipt grants no clearance. Only after this fresh clearance:
+
+   ```bash
    chmod 0755 /tmp/pe-service.new.<desired-sha12>
    mv -T --no-copy /tmp/pe-service.new.<desired-sha12> target/release/pe-service && sync -f target/release/pe-service
-   sha256sum target/release/pe-service "/proc/$pid/exe"        # installed = desired; running still = prior
+   sha256sum target/release/pe-service                         # installed = desired, unit still stopped
    ```
 
 5. **Config deltas for this deploy** (see each PR's "Deployment impact": `.env` / TOML boot knobs,
    PATCH/INSERT of the live `service_config` rows the new binary reads — seed `on conflict do nothing`
-   never updates an existing row), then **one activation**:
-   `sudo systemctl restart pe-service` (passwordless after the grant script; otherwise `ssh -t …`). Immediately before it, re-read the installed and
-   running hashes and `InvocationID`: if the running hash is already desired (the unit re-activated on
-   its own after a crash), do not restart again.
+   never updates an existing row), then **one activation**. Confirm the installed desired hash and
+   a fresh clear census before `sudo systemctl enable pe-service` followed by
+   `sudo systemctl start pe-service`. On resume, repeat disable/stop and clearance before starting;
+   never enable while an old process remains. If the new unit already runs healthy, rerun the census
+   of other processes and the ownership proof before accepting it. The disable/stop guard prevents
+   an old-unit crash from launching the new binary before clearance.
 6. **Verify**:
 
    Verify an eligible paper copy and one exact settlement, the recovered wallet's old-market
    first-entry refusal, unsafe-wallet quarantine, later progressive admissions and Supabase
-   projection convergence. Full/checkpoint restart must preserve history, ledger and financial
-   state. Format-2 checkpoints require fix-forward recovery as documented in the #737 section
+   projection convergence. Run `verify_installed_unit_owner` from
+   `scripts/deploy/generation_common.sh` to prove the stable unit PID runs the installed binary with
+   its exact argv, environment and cwd. Check the invalidation fence is present before the first
+   retention tick. Record the prepare output, every census, disabled/stopped states, ownership proof
+   and restart timings. Full/checkpoint restart preserves retained history, ledger and financial
+   state. Retention checkpoints require fix-forward recovery as documented in the release-2 section;
+   format-2 checkpoints also require fix-forward recovery as documented in the #737 section
    below. Its historical format-1 rollback matrix does not authorize reversal of this release
    or override existing financial-era boundaries.
    After financial clearance, recover forward with a compatible implementation. Stop
@@ -1273,6 +1308,12 @@ do not change the owner's requested mode.
 
 ## Rollback
 
+**Release-2 retention prerequisite:** fix forward. Once the fence is installed, 6e09b86 cannot
+use/publish a checkpoint; after the first punch it refuses the source log. Never reverse to that
+binary or restore stale state. Preserve all retained evidence, durable receipt commitments, compact
+feed archives, entry history, fences and financial state. Intentional paper-retention disposal is
+owned only by the retention job; live evidence is never erased.
+
 **#730 Part 2 compatibility prerequisite:** stop and drain before inspection. A compatible
 Phase 1 target is available only before the first continuation-7 pending row or incompatible
 paper-log record, including a feed incident. Frontier-only metadata and proofless empty-read
@@ -1297,7 +1338,7 @@ with an L13-compatible binary while preserving modes and all durable dispatch an
 **Compatibility prerequisite (#565):** reverse to a pre-#565 executable only while no synchronized
 schema-3 reconciliation page has become durable in the source log (the first successor poll page
 crosses that boundary, before any commitment or version-4 continuation exists). After it, preserve
-all state and roll forward with an executable that retains schema-3 page and version-4 continuation
+all retained evidence and financial state and roll forward with an executable that retains schema-3 page and version-4 continuation
 compatibility plus any later durable contracts below; see the
 [open-continuation census](#565-open-continuation-census-before-deployment). Never delete records or
 rewrite rows to make an older reader accept them.
@@ -1314,8 +1355,8 @@ first durable continuation-5 write and the first `history_only_bracket` disposit
 financial/schema reader prerequisites above still apply. After the earliest of those writes, use a
 reader retaining the new versions and disposition and roll forward; an older reader lacking any of
 the three contracts is no longer a rollback target.
-Preserve all old source records, recorded effects, fences, financial records, and publication
-artifacts. Continuation 5 and terminal-evidence version 5 are distinct contracts; use the
+Preserve retained source records and effects, receipt commitments, feed archives, fences,
+financial records, and publication artifacts. Continuation 5 and terminal-evidence version 5 are distinct contracts; use the
 [glossary compatibility table](_GLOSSARY.md#continuation-and-commitment-compatibility-588).
 
 For this live-control cutover, deploy SQL, then site, then service. An old service can still be
@@ -1355,15 +1396,16 @@ finish or terminate every preparation before running recovery while quiesced:
 pe-service --recover-source-checkpoint --paper-state <installed-path>
 ```
 
-The command removes the installed source log's manifest and receipts sidecar and syncs their
-directory, then removes its invalidation record and syncs that directory. The persistent checkpoint
-lock remains. The next full-walk publication creates a fresh receipts file from record zero before
-installing its manifest through the normal durable path. Its stdout
-line is `source checkpoint recovery checkpoint={} removed={} receipts={} removed={} record={} removed={}`, with paths and
-removal booleans substituted. Preserve the database and event logs. A manual start or host reboot
-before recovery can boot with the checkpoint once more; its deferred check then re-detects the
-mismatch. With no checkpoint present, failure to write the invalidation record is also a quarantine
-failure selecting status 78.
+Once the old-binary fence exists, recovery first installs and syncs a fenced, active
+next-generation invalidation record. Only then does it remove checkpoint state and truncate the
+receipts sidecar to the durable records below the retention boundary, syncing each change and the
+directory. It preserves the fence, retention authority, receipts prefix and feed archives at every
+intermediate step. A record rename followed by failed directory sync is visible but not yet durable;
+recovery completes that sync before proceeding. Without retention, receipts may be removed and
+rebuilt from zero. The persistent lock remains. Never delete the receipts file by hand. Preserve
+the database, paper/live logs and retained source evidence. With no checkpoint present, failure to
+write/sync the invalidation record still selects quarantine status 78. See release-2 recovery below
+before attempting any manual start or host reboot.
 
 Retain the successful `--prepare-source-checkpoint` stdout before deployment: offset, sequence,
 hash, `prefix_blake3`, `capture_unix_ms`, `published_unix_ms`, validated continuation count and
@@ -1387,16 +1429,18 @@ The runtime owner extends only the newly captured suffix at the compiled interva
 [`_GLOSSARY.md`](_GLOSSARY.md#durable-log-migration-and-supervisor-boundaries-544). Each attempt logs
 `source checkpoint publication attempt`; successful installation logs `source checkpoint published`
 and appends only new 80-byte receipt records to `<source-log>.boot-checkpoint.receipts` under
-its persistent lock. After fsyncing those records it atomically replaces the smaller format-2
-manifest at the existing `<source-log>.boot-checkpoint` path; the manifest contains `receipt_count`
-and reducer projections, with no receipt list. Preserve both files together in rehearsal snapshots.
+its persistent lock. After fsyncing those records it atomically replaces the smaller manifest
+(format 2 at epoch zero, format 3 after retention) at `<source-log>.boot-checkpoint`; it contains
+`receipt_count` and reducer projections, with no receipt list. Preserve the manifest, receipts,
+invalidation fence, retention authority and committed feed files together in coherent captures.
 A crash before manifest installation leaves its previous named receipt prefix valid; uncommitted
 sidecar bytes are ignored. Boot converts a format-1 manifest once, sidecar first; a failed conversion
-keeps format 1 usable. Bad record checksums, torn named records or a tail mismatch quarantine the
-manifest and discard the receipts file together under the existing invalidation lock, then force
-a full walk. The next publication creates a fresh receipts file from the rebuilt index; the next
-boot validates that file through the normal checkpoint loader. Deploy snapshot and archive
-inventories preserve the manifest, `.receipts` companion and any `.invalidation` record together.
+keeps format 1 usable. Bad record checksums, torn named records or a tail mismatch invalidate
+checkpoint use under the existing lock, preserving the durable receipts prefix and fence. Rebuild
+verifies pins and the retained suffix; missing/invalid prefix metadata beside a punched log requires
+a coherent capture restored. Only without retention may publication recreate receipts from zero.
+Deploy snapshot and archive inventories include `.retention` and nested `.feed/` files alongside
+the manifest, `.receipts` and `.invalidation` companions.
 The exact format is canonical in
 [`_GLOSSARY.md`](_GLOSSARY.md#durable-log-migration-and-supervisor-boundaries-544).
 This release uses fix-forward recovery: `d998fbf` cannot read the format-2 checkpoint. I/O failures
@@ -1439,7 +1483,7 @@ Every row requires refusal of a corrupt frame after the checkpoint, idempotent e
 graceful drain, unchanged balances/history/decisions, no re-fence, and effective live membership
 after stale-anchor admission. An unexpected observation fails its row and removes authorization to
 roll back that state. Record the exact run's printed identities and results in deployment artifacts.
-Stop and drain before reversal, preserve all state, never undo clearance or restore stale state.
+Stop and drain before reversal, preserve retained evidence and all financial state, never undo clearance or restore stale state.
 The unit drop-in is harmless to the previous binary, which never selects checkpoint status 78.
 
 
@@ -1528,7 +1572,7 @@ deployment actions described above; this procedure makes no trading or policy ch
    receipt for AC-A's initial age and binding match.
 
 5. **Swap with guards.** Use the deployment lock, identity checks and guarded atomic swap in
-   the main [Procedure](#procedure), steps 1–4. Preserve the previous binary and all durable state.
+   the main [Procedure](#procedure), steps 1–4. Preserve the previous binary for forensics and all retained evidence and financial state.
 
 6. **Restart once with the owner's explicit consent.** Use the main [Procedure](#procedure), step 5,
    only after that consent.
@@ -1715,3 +1759,100 @@ deployment actions described above; this procedure makes no trading or policy ch
     including its ignored-line journal extraction from listening through the recorded capture cutoff.
     Retain every census row and its raw-versus-export receipt count. Apply its failure and insufficient
     evidence rules without substituting AC16's source-time population for the receipt census.
+
+
+## Release 2: retention rehearsal, deployment and recovery
+
+Canonical retention values and invariants are in
+[`_GLOSSARY.md`](_GLOSSARY.md#paper-source-retention-release-2). This release changes neither
+financial tables nor sizing and adds no configuration setting. AC8's binary scenario bounds runtime
+shutdown after the async entry point returns; it does not replace the existing application drain
+policy. Rollout and failures use fix-forward recovery.
+
+### O1 — isolated rehearsal
+
+Record two commands, fresh and resume, bound to one reviewed binary and isolated directory
+`/mnt/data/pm-snap/runs/<sha>-retention/`. Both use identical path overrides, loopback bind, memory
+limit and local authority. Fresh capture sparsely copies `/mnt/data/pm-snap/g557` and rebinds paths
+with the existing migration-path tool. Load `/mnt/data/pm-snap/authority` into local Postgres 16 and
+PostgREST behind nginx on `127.0.0.1:56432/56321`, with freshly minted local keys and no production
+key in the child environment. Confirm 338 `paper_fills`, matching the snapshot, before launch; stop
+on mismatch. A plain SQLite copy is allowed only for this stopped, checkpointed snapshot; mutable
+inputs use SQLite's online `.backup`.
+
+Before launching, record the binary hash, authority endpoint/key-file path, every override, bind
+and exact commands. Confirm the memory cap (8.3 GB) and four-CPU pin on the service process itself, rather
+than only its launcher. Resume relaunches the same progressed directory and financial state without
+copying, reseeding or validating its original-copy hashes. `rehearsal545.sh` reusable-capture hash
+validation is for an unchanged capture; O1's progressed resume uses its separately recorded command.
+
+Capture epoch, boundary, pins, allocated bytes before/after, net freed space including feed copies,
+lock times for every database transaction (largest eligible wallet included), copy latency and memory.
+During advance, blanking and retirements, readiness must stay true with no stale-copy refusal; any
+failure is fixed and re-measured before deployment. If the largest wallet is ineligible, also measure
+the large-wallet retirement fixture. Apply the glossary's retention rehearsal space and timing gates.
+
+The kill command waits for `source retention committed`, verifies the authority's new epoch and
+SIGKILLs only the recorded service PID before punching. **After the process dies**, record both
+authority and checkpoint epochs. The intended crash window passes only when the authority holds
+the new epoch and the checkpoint is still the previous epoch's. Otherwise record the actual window,
+keep the progressed run for resume, and repeat the intended case in a fresh isolated subrun. Resume
+finishes the committed epoch and verifies the feed inventory. No checkpoint matches the authority's
+epoch in that window, so the resumed boot rebuilds from the boundary: record its listening and
+readiness times. The glossary's listening/readiness gates apply to the next boot after the epoch
+is finished.
+Use the recorded evidence decoder (`source_mix.py`) to compare every below-boundary snapshot feed
+frame byte-for-byte with the epoch-1 file and compare both counts with the authority entry. Then soak
+for 60 minutes.
+
+Measure normal swap-out in another fresh subrun with its own sparse state, checkpoint kept, and a
+fresh local authority holding the matching fills, after stopping the earlier subrun. Record paths,
+PID, lock times and copy latency through its first advance and retirements. For the census test,
+launch 6e09b86 against a separate copy, SIGSTOP immediately after `source checkpoint loaded`, and
+prove O2's census reports it and clearance refuses to start the new binary. Kill that recorded PID.
+Repeat with an old boot started after a prior clearance and before a resumed census. Stop on a
+serving-path `Erased`/`Retired` or failed boot; retain scripts and receipts with the issue evidence.
+
+### O2 — deployment
+
+Follow the guarded [Procedure](#procedure): staged preparation while the old unit serves must keep
+epoch zero/format 2, install no fence and erase nothing. The first census runs while the old unit
+serves with its executable still installed. Repeat and verify each stray's identity before stopping
+it. Then disable and stop the unit, confirm both states and its process exit, and clear another
+readable census before swapping the binary. Keep the unit disabled/stopped over every interruption.
+Every resume reruns and clears the census before starting, or before accepting an already healthy
+new unit; old receipts only document history. A blocked/unreadable census stops deployment and is
+reported to the owner. After the swap/hash check, enable and start, run `verify_installed_unit_owner`
+and prove the fence exists before the first retention job. Record all preparation/census/unit-state
+receipts and restart timings. The stop/start is pre-approved; tell the owner before doing it.
+
+### O3 / O4 — observe the first and next advances
+
+At the first hourly tick, retain `source retention committed` before rehash and the run's
+`source retention` summary: epoch/boundary, pins, punched bytes/feed frames, proofs blanked,
+wallets swapped out/waiting with reasons, skip reason, elapsed time and transaction lock times.
+Verify the authority matches the published format-3 epoch, inventory the committed feed files,
+measure allocated/net free-space change and copy latency, and inspect readiness/task health and
+journal for serving-path `Erased`/`Retired`. Compare pre-advance Prepared/Final records and Supabase
+`paper_fills` with post-advance state; all must remain, with later activity accounted for separately.
+Report skips and fix failures forward. After the canonical advance interval, verify the second
+advance and disk/database trend, post evidence and close the issue. #602 and #619 close on merge;
+confirm the exit cap at the next restart.
+
+### Recovery of a retained log
+
+Loss/rejection of `.boot-checkpoint` alone is recoverable from the coherent authority, durable
+receipts prefix, every verified pin and suffix through `retained_tail`; feed files are not rebuild
+inputs. A missing/invalid `.retention`, missing/invalid receipts prefix, corrupt pin or suffix, or
+suffix ending before `retained_tail` refuses boot. Restore one coherent capture, never individual
+stale companions, and never delete receipts by hand. Rebind moved captures with the existing
+migration-path rebinder; do not rewrite logs or offsets. Only an incomplete final append beyond
+`retained_tail` may be repaired automatically.
+
+For quarantine status 78, disable/stop, confirm process exit, finish/terminate preparations and
+clear the census before the quiesced recovery command above. Recovery preserves the fence and
+receipts prefix, and syncs visible record state before removing checkpoint state. Preserve the
+retention authority and committed feed files. An authority committed before checkpoint publication
+is finished first under the same pauses: complete its directory sync, publish its matching format-3
+checkpoint, repeat idempotent punches and fsync. Startup never advances the boundary. Fix forward
+with a compatible binary; never return to 6e09b86 after the fence or restore stale financial state.

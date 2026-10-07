@@ -45,6 +45,9 @@ Quality bar:
 ## Skill: Event sourcing and deterministic replay
 
 - Every source, model, strategy, risk, order, fill, and settlement event is replayable.
+  Paper source retention is the scoped exception: replay uses retained windows and pins, while
+  full-prefix tools return `Retired` after history retires; receipt commitments and compact feed
+  archives remain. Live evidence is never erased (see `_GLOSSARY.md` "Paper source retention").
 - Replay uses the same crates as production.
 - Replay output includes deterministic decision hashes.
 - CI runs a replay smoke test.

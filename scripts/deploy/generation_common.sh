@@ -402,14 +402,16 @@ atomic_adopt() {
     fi
   fi
   mkdir -p "$(dirname "$destination")"
-  python3 -c 'import hashlib,os,shutil,sys
+  python3 -c 'import hashlib,os,subprocess,sys
 source,destination,mode,expected,enforce_expected=sys.argv[1:]
 parent=os.path.dirname(destination) or "."
 tmp=os.path.join(parent, ".pe-adopt.tmp.%d" % os.getpid())
 try:
-    shutil.copyfile(source, tmp)
+    subprocess.run(["cp", "--sparse=always", "--", source, tmp], check=True)
     with open(tmp, "rb") as handle:
-        actual=hashlib.sha256(handle.read()).hexdigest()
+        digest=hashlib.sha256()
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""): digest.update(chunk)
+        actual=digest.hexdigest()
         if enforce_expected == "true" and actual != expected:
             raise SystemExit(f"source hash changed before adoption of {destination}")
         os.fsync(handle.fileno())
