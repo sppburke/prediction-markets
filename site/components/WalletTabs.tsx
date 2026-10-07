@@ -39,7 +39,12 @@ export function WalletTabs({
     const keys = [...new Set(openFills.map((f) => `${f.market_id}:${f.outcome_id}`))];
     if (keys.length === 0) return;
     let cancelled = false;
-    fetch(`/api/marks?keys=${encodeURIComponent(keys.join(","))}`)
+    // POST body, not a query string: one key per open fill outgrows the 8 KB request line (lib/marks.ts).
+    fetch("/api/marks", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ keys }),
+    })
       .then((r) => (r.ok ? r.json() : {}))
       .then((marks: Record<string, number>) => {
         if (cancelled) return;
