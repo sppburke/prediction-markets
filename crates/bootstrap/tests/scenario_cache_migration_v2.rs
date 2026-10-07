@@ -17443,3 +17443,316 @@ async fn history_v3_collection_reports_run_timing_and_writer_counts() {
     );
     assert_eq!(fields["final_drain_ms"], drain);
 }
+
+// #747 chunked finalize (AC7)
+
+async fn chunked_finalize_candidate(dir: &TempDir) -> std::path::PathBuf {
+    let side = dataset_candidate(dir, "unfinalized.db", &[WALLET_B]);
+    let mut conversion = projection_v3_row("0xe", "retained-conversion", FRESH_END - 5);
+    conversion["type"] = "CONVERSION".into();
+    let source = DatasetFetcher {
+        rows: vec![conversion],
+        ..Default::default()
+    };
+    history_v3_collect(&side, &source, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    projection_v3_payouts(&side);
+    finalize_cache_v2_unbound(&side, None, FRESH_END + 1).unwrap();
+    let mut rows = vec![
+        projection_v3_row("0xa", "before-retained-drop", FRESH_END - 6),
+        projection_v3_row("0xf", "certified-problem-second", FRESH_END - 5),
+    ];
+    for index in 0..513 {
+        rows.push(projection_v3_row(
+            "0xb",
+            &format!("large-second-{index}"),
+            FRESH_END - 4,
+        ));
+    }
+    let mut sell = projection_v3_row("0xb", "sell-every-piece", FRESH_END - 3);
+    sell["side"] = "SELL".into();
+    sell["size"] = "641.250513".into();
+    sell["usdcSize"] = "320".into();
+    rows.extend([
+        sell,
+        projection_v3_row("0xd", "entry-after-large-second", FRESH_END - 3),
+        projection_v3_row("0xb", "consumed-after-zero-balance", FRESH_END - 2),
+        projection_v3_row("0xf", "consumed-at-certified-problem", FRESH_END - 2),
+        projection_v3_row("0x10", "later-entry", FRESH_END - 1),
+    ]);
+    let mut ignored = projection_v3_row("0xdead", "ignored-conversion", FRESH_END - 2);
+    ignored["type"] = "CONVERSION".into();
+    ignored["asset"] = "".into();
+    rows.push(ignored);
+    let mut underflow = projection_v3_row("0x13", "new-drop", FRESH_END);
+    underflow["type"] = "MERGE".into();
+    rows.extend([
+        underflow,
+        projection_v3_row("0x14", "buy-in-problem-second", FRESH_END),
+        projection_v3_row("0x14", "consumed-problem-buy", FRESH_END + 1),
+        projection_v3_row("0x12", "final-second-entry", FRESH_END + 1),
+    ]);
+    let mut other_wallet = projection_v3_row("0xd", "other-wallet", FRESH_END + 1);
+    other_wallet["proxyWallet"] = WALLET_B.into();
+    rows.push(other_wallet);
+    let markets = ["0xa", "0xb", "0xd", "0xf", "0x10", "0x12", "0x13", "0x14"]
+        .into_iter()
+        .map(|market| serde_json::json!({
+            "condition_id":market,"closed":true,"neg_risk":market == "0xa",
+            "neg_risk_market_id":if market == "0xa" { Some("0xe") } else { None },
+            "is_50_50_outcome":false,"end_date_iso":"2027-01-16T00:00:00Z",
+            "tokens":[{"token_id":if market == "0xb" { "200" } else { "100" },"outcome":"Yes","price":"1","winner":true},
+                      {"token_id":if market == "0xb" { "201" } else { "101" },"outcome":"No","price":"0","winner":false}]
+        }))
+        .collect::<Vec<_>>();
+    let source = DatasetFetcher {
+        rows,
+        ..Default::default()
+    };
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[WALLET.to_owned()])
+        .await
+        .unwrap();
+    publication_payouts(&side, &markets, FRESH_END + 2);
+    Connection::open(&side)
+        .unwrap()
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    side
+}
+
+#[tokio::test]
+async fn chunked_finalize_targets_one_and_three_match_one_chunk_and_scoped_oracle() {
+    use pe_bootstrap::cache_migration::finalize_cache_v2_with_projection_chunk_for_test;
+    let dir = TempDir::new().unwrap();
+    let candidate = chunked_finalize_candidate(&dir).await;
+    let expected = reference_scoped_rows(&candidate);
+    assert_eq!(expected.len(), 6);
+    assert!(
+        expected
+            .iter()
+            .any(|row| row["source_time_unix"] == FRESH_END + 1)
+    );
+    assert_eq!(
+        count(
+            &candidate,
+            &format!(
+                "SELECT COUNT(*) FROM activity_groups_v2 WHERE wallet_hex = '{WALLET}' AND source_time_unix = {}",
+                FRESH_END - 4
+            )
+        ),
+        513
+    );
+    let certificate_sql = "SELECT * FROM activity_wallet_history_v3 ORDER BY wallet_hex";
+    let mut baseline = None;
+    for chunk in [usize::MAX, 1, 3] {
+        let copy_dir = dir.path().join(format!("chunk-{chunk}"));
+        std::fs::create_dir(&copy_dir).unwrap();
+        let path = copy_dir.join("candidate.db");
+        std::fs::copy(&candidate, &path).unwrap();
+        let report = finalize_cache_v2_with_projection_chunk_for_test(&path, FRESH_END + 3, chunk)
+            .unwrap()
+            .unwrap();
+        let report_bytes = serde_json::to_vec(&report).unwrap();
+        assert_eq!(report.drops_by_cause.get("conversion"), Some(&1));
+        assert_eq!(report.drops_by_cause.get("underflow"), Some(&1));
+        assert_eq!(report.ignored_by_activity_type.get("CONVERSION"), Some(&1));
+        let rows = projection_v3_rows(&path);
+        assert_eq!(rows, expected, "target {chunk}");
+        let state = query_values(
+            &path,
+            "SELECT ranker_projection_count, ranker_projection_digest, ranker_projection_inputs_json FROM cache_v2_migration_state",
+        );
+        assert_eq!(
+            state[0][1],
+            rusqlite::types::Value::Text(whole_json_digest(&expected))
+        );
+        let observed = (
+            std::fs::read(format!("{}.projection-v3.jsonl", path.display())).unwrap(),
+            state,
+            query_values(&path, certificate_sql),
+            digests::certificate_digest(&Connection::open(&path).unwrap()).unwrap(),
+            report_bytes,
+        );
+        if let Some(baseline) = &baseline {
+            assert_eq!(&observed, baseline, "target {chunk}");
+        } else {
+            baseline = Some(observed);
+        }
+    }
+}
+
+#[tokio::test]
+async fn chunked_finalize_scan_failure_after_rows_rolls_back_and_drains() {
+    use pe_bootstrap::cache_migration::finalize_cache_v2_with_projection_chunk_for_test;
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "scan-failure.db", &[]);
+    let source = DatasetFetcher {
+        rows: (0..1_100)
+            .map(|index| {
+                projection_v3_row("0xa", &format!("row-{index}"), FRESH_END - 1_100 + index)
+            })
+            .collect(),
+        ..Default::default()
+    };
+    history_v3_collect(&side, &source, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    projection_v3_payouts(&side);
+    let expected = reference_scoped_rows(&side);
+    let original = query_values(
+        &side,
+        "SELECT * FROM activity_wallet_history_v3 ORDER BY wallet_hex",
+    );
+    let connection = history_v3_damage_connection(&side);
+    let (id, components): (String, String) = connection.query_row(
+        "SELECT source_trade_id, components_json FROM activity_groups_v2 ORDER BY source_time_unix, source_trade_id LIMIT 1 OFFSET 700", [],
+        |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+    connection
+        .execute(
+            "UPDATE activity_groups_v2 SET components_json = '{}' WHERE source_trade_id = ?1",
+            [&id],
+        )
+        .unwrap();
+    drop(connection);
+    let error =
+        finalize_cache_v2_with_projection_chunk_for_test(&side, FRESH_END + 1, 3).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("activity history decoding failed"),
+        "{error}"
+    );
+    assert_chunked_finalize_rolled_back_after_rows(&side, &original);
+    history_v3_damage_connection(&side)
+        .execute(
+            "UPDATE activity_groups_v2 SET components_json = ?2 WHERE source_trade_id = ?1",
+            params![id, components],
+        )
+        .unwrap();
+    finalize_cache_v2_with_projection_chunk_for_test(&side, FRESH_END + 1, 3).unwrap();
+    assert_eq!(projection_v3_rows(&side), expected);
+}
+
+#[tokio::test]
+async fn chunked_finalize_serialization_failure_after_rows_rolls_back_and_drains() {
+    use pe_bootstrap::cache_migration::finalize_cache_v2_with_projection_chunk_for_test;
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "serialization-failure.db", &[]);
+    let source = DatasetFetcher {
+        rows: (0..600)
+            .map(|index| projection_v3_row("0xa", &format!("row-{index}"), FRESH_END - 600 + index))
+            .collect(),
+        ..Default::default()
+    };
+    history_v3_collect(&side, &source, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    projection_v3_payouts(&side);
+    let expected = reference_scoped_rows(&side);
+    let original = query_values(
+        &side,
+        "SELECT * FROM activity_wallet_history_v3 ORDER BY wallet_hex",
+    );
+    let connection = history_v3_damage_connection(&side);
+    let (id, second): (String, i64) = connection.query_row(
+        "SELECT source_trade_id, source_time_unix FROM activity_groups_v2 ORDER BY source_time_unix, source_trade_id LIMIT 1 OFFSET 100", [],
+        |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+    connection.execute("UPDATE activity_groups_v2 SET source_time_unix = -62167219201 WHERE source_trade_id = ?1", [&id]).unwrap();
+    drop(connection);
+    let error =
+        finalize_cache_v2_with_projection_chunk_for_test(&side, FRESH_END + 1, 3).unwrap_err();
+    assert!(error.to_string().contains("year"), "{error}");
+    assert_chunked_finalize_rolled_back_after_rows(&side, &original);
+    history_v3_damage_connection(&side)
+        .execute(
+            "UPDATE activity_groups_v2 SET source_time_unix = ?2 WHERE source_trade_id = ?1",
+            params![id, second],
+        )
+        .unwrap();
+    finalize_cache_v2_with_projection_chunk_for_test(&side, FRESH_END + 1, 3).unwrap();
+    assert_eq!(projection_v3_rows(&side), expected);
+}
+
+fn assert_chunked_finalize_rolled_back_after_rows(
+    path: &std::path::Path,
+    certificates: &[Vec<rusqlite::types::Value>],
+) {
+    let spool = std::path::PathBuf::from(format!("{}.projection-v3.jsonl", path.display()));
+    assert!(!spool.exists());
+    assert_eq!(
+        query_values(
+            path,
+            "SELECT * FROM activity_wallet_history_v3 ORDER BY wallet_hex"
+        ),
+        certificates
+    );
+    assert_eq!(
+        count(
+            path,
+            "SELECT COUNT(*) FROM cache_v2_migration_state WHERE phase = 'finalized' OR ranker_projection_inputs_json IS NOT NULL"
+        ),
+        0
+    );
+    let prefix = format!(".{}.", spool.file_name().unwrap().to_str().unwrap());
+    let temporary = std::fs::read_dir(path.parent().unwrap())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|entry| {
+            entry
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with(&prefix)
+        })
+        .unwrap();
+    // A return from the scoped pipeline joins both worker pools; these bytes
+    // prove rollback followed a delivered and written projection chunk.
+    assert!(!std::fs::read(temporary).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn chunked_finalize_history_check_failure_after_rows_rolls_back_and_drains() {
+    use pe_bootstrap::cache_migration::finalize_cache_v2_with_projection_chunk_for_test;
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "history-check-failure.db", &[]);
+    let source = DatasetFetcher {
+        rows: (0..600)
+            .map(|index| projection_v3_row("0xa", &format!("row-{index}"), FRESH_END - 600 + index))
+            .collect(),
+        ..Default::default()
+    };
+    history_v3_collect(&side, &source, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    projection_v3_payouts(&side);
+    let expected = reference_scoped_rows(&side);
+    let original = query_values(
+        &side,
+        "SELECT * FROM activity_wallet_history_v3 ORDER BY wallet_hex",
+    );
+    let connection = history_v3_damage_connection(&side);
+    let (id, amount): (String, String) = connection.query_row(
+        "SELECT source_trade_id, share_amount_str FROM activity_groups_v2 ORDER BY source_time_unix, source_trade_id LIMIT 1 OFFSET 550", [],
+        |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+    connection.execute("UPDATE activity_groups_v2 SET share_amount_str = '2.250001' WHERE source_trade_id = ?1", [&id]).unwrap();
+    drop(connection);
+    let error =
+        finalize_cache_v2_with_projection_chunk_for_test(&side, FRESH_END + 1, 3).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("activity history chain mismatch"),
+        "{error}"
+    );
+    assert_chunked_finalize_rolled_back_after_rows(&side, &original);
+    history_v3_damage_connection(&side)
+        .execute(
+            "UPDATE activity_groups_v2 SET share_amount_str = ?2 WHERE source_trade_id = ?1",
+            params![id, amount],
+        )
+        .unwrap();
+    finalize_cache_v2_with_projection_chunk_for_test(&side, FRESH_END + 1, 3).unwrap();
+    assert_eq!(projection_v3_rows(&side), expected);
+}

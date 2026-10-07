@@ -4030,6 +4030,9 @@ fn verify_reusable_ranker_projection(
     ))
 }
 
+#[cfg(feature = "scenario")]
+pub use projection_v3::finalize_cache_v2_with_projection_chunk_for_test;
+
 /// Finalize a complete v2 side cache and optionally emit a hash-bound stage record.
 /// Format three verifies available histories once and commits their projection spool.
 /// Format two reuses only finalized historical classifiers; classifier six requires
@@ -4049,17 +4052,8 @@ pub fn finalize_cache_v2_with_export_manifest(
     export_manifest: Option<&Path>,
     finalized_at_unix: i64,
 ) -> Result<Option<CacheFinalStageRecord>, BootstrapError> {
-    let mut connection = open_existing_rw(cache_path)?;
-    connection.pragma_update(None, "cache_size", -1_048_576_i64)?;
-    require_schema(&connection, CACHE_SCHEMA_VERSION_V2)?;
-    ensure_lane_a_v2_schema(&connection)?;
-    let sealed_generation = required_max(&connection, "sealed_generation_manifests", "generation")?;
-    let payout_generation = required_max(
-        &connection,
-        "clob_payout_coverage_manifests_v2",
-        "generation",
-    )?;
-    verify_payout_coverage(&connection, payout_generation)?;
+    let (mut connection, sealed_generation, payout_generation) =
+        projection_v3::open_finalize(cache_path)?;
     if fresh_collection_record(&connection)?.is_some_and(|identity| identity.version == 4) {
         return projection_v3::finalize(
             connection,
