@@ -156,7 +156,7 @@ pub struct SourceCheckpointOwner {
     pending: Option<Arc<SerializedCandidate>>,
     paper_state: Option<Arc<pe_paper_state::PaperStateDb>>,
     database_retention: Option<crate::database_retention::DatabaseRetention>,
-    obligation_wallets: Option<tokio::sync::watch::Receiver<HashSet<pe_core_types::WalletAddress>>>,
+    held_obligations: Option<tokio::sync::watch::Receiver<crate::trade_poller::HeldObligations>>,
     attempt: u32,
     last_published_capture: Option<u64>,
     retention: Option<RetentionContext>,
@@ -192,7 +192,7 @@ impl SourceCheckpointOwner {
             pending: None,
             paper_state: None,
             database_retention: None,
-            obligation_wallets: None,
+            held_obligations: None,
             attempt: 0,
             last_published_capture: None,
             retention: None,
@@ -218,10 +218,18 @@ impl SourceCheckpointOwner {
     pub fn with_database_retention(
         mut self,
         retention: crate::database_retention::DatabaseRetention,
-        obligation_wallets: tokio::sync::watch::Receiver<HashSet<pe_core_types::WalletAddress>>,
     ) -> Self {
         self.database_retention = Some(retention);
-        self.obligation_wallets = Some(obligation_wallets);
+        self
+    }
+
+    /// What the running poller still holds; the daily job keeps those frames readable.
+    #[must_use]
+    pub fn with_held_obligations(
+        mut self,
+        held: tokio::sync::watch::Receiver<crate::trade_poller::HeldObligations>,
+    ) -> Self {
+        self.held_obligations = Some(held);
         self
     }
 
@@ -675,11 +683,16 @@ impl SourceCheckpointOwner {
             let frozen = self.frozen.take().ok_or(OwnerError::Cancelled)?;
             let job_context = context.clone();
             let now = i64::try_from(self.unix_ms()? / 1000)?;
+            let held = self
+                .held_obligations
+                .as_ref()
+                .map(|held| held.borrow().receipts.clone())
+                .unwrap_or_default();
             let output = self
                 .slot
                 .execute(move |cancel| {
                     let prepared =
-                        retention::prepare(&frozen, &job_context, &receipts, now, &cancel);
+                        retention::prepare(&frozen, &job_context, &receipts, &held, now, &cancel);
                     // Restore the owner's frozen state even when preparation fails.
                     let prepared = match prepared {
                         Ok(prepared) => prepared,
@@ -957,9 +970,9 @@ impl SourceCheckpointOwner {
                 .collect()
         });
         let obligation_wallets = self
-            .obligation_wallets
+            .held_obligations
             .as_ref()
-            .map(|wallets| wallets.borrow().clone())
+            .map(|held| held.borrow().wallets.clone())
             .unwrap_or_default();
         Ok(crate::database_retention::run_database_retention(
             database,

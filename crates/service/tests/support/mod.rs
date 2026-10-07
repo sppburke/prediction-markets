@@ -1188,6 +1188,21 @@ pub fn retention_controls(
     mpsc::Sender<OrchestratorControl>,
     tokio::task::JoinHandle<()>,
 ) {
+    retention_controls_at(paper, state, index, None, None)
+}
+
+pub fn retention_controls_at(
+    paper: pe_service::paper_recovery::PaperLog,
+    state: Arc<pe_paper_state::PaperStateDb>,
+    index: pe_service::risk_inputs::SourceReceiptIndex,
+    terminal_at: Option<time::OffsetDateTime>,
+    hooks: Option<Arc<pe_service::orchestrator::ScenarioHooks>>,
+) -> (
+    pe_service::live_watchlist::LiveWatchlist,
+    pe_service::watchlist_admission::AdmissionPreparer,
+    mpsc::Sender<OrchestratorControl>,
+    tokio::task::JoinHandle<()>,
+) {
     let (tx, rx) = mpsc::channel(4);
     let live = pe_service::live_watchlist::LiveWatchlist::new(pe_trader_index::Watchlist {
         entries: Vec::new(),
@@ -1197,7 +1212,7 @@ pub fn retention_controls(
     });
     let preparer =
         pe_service::watchlist_admission::AdmissionPreparer::new(tx.clone(), state.clone());
-    let orchestrator = pe_service::orchestrator::Orchestrator::new(
+    let mut orchestrator = pe_service::orchestrator::Orchestrator::new(
         live.clone(),
         pe_service::orchestrator::OrchestratorConfig {
             bankroll: rust_decimal::Decimal::ZERO,
@@ -1235,6 +1250,63 @@ pub fn retention_controls(
     )
     .unwrap()
     .with_source_receipt_index(index.clone());
-    let control = tokio::spawn(orchestrator.run(std::future::pending::<()>()));
+    if let Some(hooks) = hooks {
+        orchestrator.set_scenario_hooks(hooks);
+    }
+    let control = tokio::spawn(async move {
+        let run = orchestrator.run(std::future::pending::<()>());
+        if let Some(at) = terminal_at {
+            pe_service::orchestrator::SCENARIO_TERMINAL_CLOCK
+                .scope(at, run)
+                .await;
+        } else {
+            run.await;
+        }
+    });
     (live, preparer, tx, control)
+}
+
+#[derive(Clone, Default)]
+pub struct RetentionLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for RetentionLogs {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RetentionLogs {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl RetentionLogs {
+    pub fn text(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+
+    pub fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + 'static {
+        tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .without_time()
+            .with_writer(self.clone())
+            .finish()
+    }
+
+    pub fn last_run(&self) -> serde_json::Value {
+        self.text()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .rfind(|event| event["message"] == "source retention")
+            .unwrap()
+    }
 }

@@ -747,6 +747,43 @@ async fn retention_commit_defers_after_an_invalidation_since_the_capture() {
 }
 
 #[tokio::test]
+async fn retention_keeps_every_frame_the_running_poller_still_holds() {
+    // The old feed observation is retired, so the reducer holds nothing for it; while the running
+    // poller still holds it (its retirement is in flight) the advance keeps it readable.
+    for held in [false, true] {
+        let fixture = Fixture::new(Some(true));
+        install_retention_fence(&fixture.path).unwrap();
+        let (_tx, rx) = tokio::sync::watch::channel(pe_service::trade_poller::HeldObligations {
+            wallets: std::collections::HashSet::from([WalletAddress::from_hex(WALLET).unwrap()]),
+            receipts: if held { vec![fixture.feed] } else { Vec::new() },
+        });
+        let mut owner = fixture
+            .owner(CheckpointOwnerHooks::default())
+            .with_held_obligations(rx);
+        owner.initialize_for_scenario().await.unwrap();
+        owner.retention_for_scenario().await.unwrap();
+        let authority = RetentionAuthority::load(&fixture.path).unwrap().unwrap();
+        assert_eq!(authority.epoch, 1);
+        assert_eq!(manifest(&fixture.path)["format_version"], 3, "{held}");
+        match authority.pin(fixture.feed.sequence) {
+            Some(pin) => {
+                assert!(held);
+                assert!(!pin.reducer);
+                assert_eq!(
+                    authority
+                        .verify_pin(&fixture.path, pin)
+                        .unwrap()
+                        .0
+                        .this_hash,
+                    fixture.feed.this_hash
+                );
+            }
+            None => assert!(!held),
+        }
+    }
+}
+
+#[tokio::test]
 async fn retention_deferred_check_rejects_a_corrupt_non_reducer_pin() {
     let fixture = Fixture::new(Some(true));
     install_retention_fence(&fixture.path).unwrap();

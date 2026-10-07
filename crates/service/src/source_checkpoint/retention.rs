@@ -460,6 +460,7 @@ pub(crate) fn prepare(
     frozen: &FrozenCheckpoint,
     context: &RetentionContext,
     index: &SourceReceiptIndex,
+    held: &[AppendReceipt],
     now: i64,
     cancel: &AtomicBool,
 ) -> anyhow::Result<PreparedRetention> {
@@ -534,6 +535,12 @@ pub(crate) fn prepare(
         false,
     )?;
     let routed = reducer_pins(frozen, context, index, boundary, &mut pins)?;
+    // The running poller may still read what it holds (correlation, retirement, a verified read's
+    // bindings) after its group is disposed and the reducer prunes it; keep those frames readable.
+    for receipt in held {
+        cancelled(cancel)?;
+        add_pin(&mut pins, index, boundary, *receipt, false)?;
+    }
     let mut payload_receipts: HashMap<String, Vec<AppendReceipt>> = HashMap::new();
     if let Some(authority) = &authority {
         for pin in &authority.pins {

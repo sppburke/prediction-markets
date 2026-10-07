@@ -3778,16 +3778,9 @@ impl BucketCommitEngine {
             .activity_group_state(source_trade_id)
             .map_err(|error| error.to_string())?
             .is_some();
-        let source = match index.source_envelope(receipt) {
-            Ok(source) => source,
-            // An advance erases an observation once its exact group is durably disposed; that
-            // disposition already retires it.
-            Err(crate::risk_inputs::RiskInputsUnavailable::Erased) if group_disposed => {
-                self.retire_observation_barrier(receipt);
-                return Ok(ReconciliationAcknowledgement::Applied);
-            }
-            Err(error) => return Err(error.to_string()),
-        };
+        let source = index
+            .source_envelope(receipt)
+            .map_err(|error| error.to_string())?;
         // The read only supplies a bound disposition when the exact group has none. One verified
         // before an advance is authenticated again under the current boundary (the orchestrator
         // serializes both); an erased dependency still refuses.
@@ -4681,27 +4674,26 @@ impl BucketCommitEngine {
         paper_freshness_policy: Option<PaperFreshnessPolicy>,
     ) -> Result<BucketCommitResult, BucketCommitError> {
         let mut context = context.clone();
-        if let Some(read) = context.verified_read.as_ref() {
-            let index = self.frame_source_index.as_ref().ok_or_else(|| {
-                BucketCommitError::Invariant("authenticated read source index absent".to_owned())
-            })?;
-            if read.retention_epoch != Some(index.retention_epoch()) {
-                let epoch = index.retention_epoch();
-                let mut fresh =
-                    verified_commitment_bindings_with_lookup(read.receipt, &mut |receipt| {
-                        index
-                            .source_envelope(receipt)
-                            .map(CompleteActivityPage::from)
-                    })
-                    .map_err(|error| BucketCommitError::Invariant(error.to_string()))?;
-                if index.retention_epoch() != epoch {
-                    return Err(BucketCommitError::Invariant(
-                        "retention epoch changed during decision verification".to_owned(),
-                    ));
-                }
-                fresh.retention_epoch = Some(epoch);
-                context.verified_read = Some(std::sync::Arc::new(fresh));
+        // Without a source index there is no retention boundary to compare against.
+        if let Some(read) = context.verified_read.as_ref()
+            && let Some(index) = self.frame_source_index.as_ref()
+            && read.retention_epoch != Some(index.retention_epoch())
+        {
+            let epoch = index.retention_epoch();
+            let mut fresh =
+                verified_commitment_bindings_with_lookup(read.receipt, &mut |receipt| {
+                    index
+                        .source_envelope(receipt)
+                        .map(CompleteActivityPage::from)
+                })
+                .map_err(|error| BucketCommitError::Invariant(error.to_string()))?;
+            if index.retention_epoch() != epoch {
+                return Err(BucketCommitError::Invariant(
+                    "retention epoch changed during decision verification".to_owned(),
+                ));
             }
+            fresh.retention_epoch = Some(epoch);
+            context.verified_read = Some(std::sync::Arc::new(fresh));
         }
         if let Some(read) = context.verified_read.as_ref()
             && (context.read_commitment
@@ -7720,13 +7712,14 @@ pub(crate) mod continuation_v3_tests {
             authority.write(&path).unwrap();
             fixture.index.install_retention(authority).unwrap();
             let result = engine.retire_observation(observed, &group, false, Some(&read));
-            if case == "erased_page" {
-                assert!(result.unwrap_err().contains("erased"), "{case}");
-            } else {
+            // Erased evidence is never acknowledged: the job keeps every frame the poller holds.
+            if case == "retained" {
                 assert!(matches!(
                     result.unwrap(),
                     crate::orchestrator_control::ReconciliationAcknowledgement::Applied
                 ));
+            } else {
+                assert!(result.unwrap_err().contains("erased"), "{case}");
             }
         }
     }

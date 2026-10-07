@@ -129,6 +129,39 @@ struct Obligation {
 type WalletObligations = BTreeMap<i64, BTreeMap<String, Obligation>>;
 type CoalescedObligations = HashMap<WalletAddress, WalletObligations>;
 
+/// What the running poller still holds: its wallets (database retention waits on them) and every
+/// source receipt it may still read for them (the daily source retention keeps those readable).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeldObligations {
+    pub wallets: HashSet<WalletAddress>,
+    pub receipts: Vec<pe_event_log::AppendReceipt>,
+}
+
+impl From<&ReconciliationObligations> for HeldObligations {
+    fn from(obligations: &ReconciliationObligations) -> Self {
+        // The same frames recovery would route again, plus the evidence their bindings name.
+        let (mut receipts, _) = obligations.frame_recovery_receipts();
+        for binding in obligations
+            .by_wallet
+            .values()
+            .flat_map(BTreeMap::values)
+            .flat_map(BTreeMap::values)
+            .flat_map(|obligation| &obligation.bindings)
+        {
+            receipts.push(binding.stream_receipt);
+            receipts.extend(binding.identity_receipt);
+            receipts.extend(binding.counterpart_basis_receipt);
+            receipts.extend(binding.frame_admission_receipt);
+        }
+        receipts.sort_by_key(|receipt| receipt.sequence);
+        receipts.dedup();
+        Self {
+            wallets: obligations.wallets().collect(),
+            receipts,
+        }
+    }
+}
+
 fn insert_coalesced_obligation(
     by_wallet: &mut CoalescedObligations,
     wallet: WalletAddress,
@@ -995,7 +1028,7 @@ pub struct TradePoller {
     refresh_cooldown: HashMap<WalletAddress, tokio::time::Instant>,
     now: Arc<dyn Fn() -> OffsetDateTime + Send + Sync>,
     source_receipts: Option<SourceReceiptIndex>,
-    obligation_wallets: Option<watch::Sender<HashSet<WalletAddress>>>,
+    held_obligations: Option<watch::Sender<HeldObligations>>,
     #[cfg(feature = "scenario")]
     crash_boundary: Option<Arc<Mutex<Option<ReconciliationCrashBoundary>>>>,
     #[cfg(feature = "scenario")]
@@ -1166,7 +1199,7 @@ impl TradePoller {
             refresh_cooldown: HashMap::new(),
             now: Arc::new(OffsetDateTime::now_utc),
             source_receipts: None,
-            obligation_wallets: None,
+            held_obligations: None,
             #[cfg(feature = "scenario")]
             crash_boundary: None,
             #[cfg(feature = "scenario")]
@@ -1207,12 +1240,9 @@ impl TradePoller {
     }
 
     #[must_use]
-    pub fn with_obligation_wallets(
-        mut self,
-        wallets: watch::Sender<HashSet<WalletAddress>>,
-    ) -> Self {
-        wallets.send_replace(self.obligations.wallets().collect());
-        self.obligation_wallets = Some(wallets);
+    pub fn with_held_obligations(mut self, held: watch::Sender<HeldObligations>) -> Self {
+        held.send_replace(HeldObligations::from(&self.obligations));
+        self.held_obligations = Some(held);
         self
     }
 
@@ -1518,8 +1548,8 @@ impl TradePoller {
                     }
                 }
             }
-            if let Some(wallets) = &self.obligation_wallets {
-                wallets.send_replace(self.obligations.wallets().collect());
+            if let Some(held) = &self.held_obligations {
+                held.send_replace(HeldObligations::from(&self.obligations));
             }
             if stopping && tasks.is_empty() {
                 break;

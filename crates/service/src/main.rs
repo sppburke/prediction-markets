@@ -1335,8 +1335,9 @@ async fn run() -> Result<()> {
     let boot_obligation_wallets = obligations
         .wallets()
         .collect::<std::collections::HashSet<_>>();
-    let (obligation_wallets_tx, obligation_wallets_rx) =
-        watch::channel(boot_obligation_wallets.clone());
+    let (held_obligations_tx, held_obligations_rx) = watch::channel(
+        pe_service::trade_poller::HeldObligations::from(&obligations),
+    );
     let database_retention = pe_service::database_retention::DatabaseRetention::new(
         Arc::clone(&paper_state),
         paper_writer.clone(),
@@ -1464,7 +1465,7 @@ async fn run() -> Result<()> {
             Some(poller_admission_preparer),
         )
         .with_source_receipt_index(poller_source_receipts)
-        .with_obligation_wallets(obligation_wallets_tx)
+        .with_held_obligations(held_obligations_tx)
         .run_until(public_poll_shutdown.wait_for(ShutdownPhase::StopProducers))
         .await
         .map(|()| TaskExit::CleanShutdown)
@@ -2069,7 +2070,8 @@ async fn run() -> Result<()> {
         let owner = boot
             .into_checkpoint_owner(checkpoint_slot.clone())
             .with_paper_state(Arc::clone(&paper_state))
-            .with_database_retention(database_retention, obligation_wallets_rx)
+            .with_database_retention(database_retention)
+            .with_held_obligations(held_obligations_rx)
             .with_retention(retention_context)
             .context("attach daily source and database retention")?;
         #[cfg(feature = "scenario")]

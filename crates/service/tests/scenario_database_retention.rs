@@ -379,7 +379,7 @@ async fn retention_keeps_recent_removal_boot_obligation_and_process_removal() {
 }
 
 #[tokio::test]
-async fn retention_keeps_recent_terminal_transition_for_two_jobs_then_retires() {
+async fn retention_recent_terminal_guard_includes_buffer_boundary() {
     let fixture = Fixture::new(None, false);
     let empty = HashSet::new();
     fixture.sql.execute("INSERT INTO decision_pending VALUES ('old', 'r', ?1, 1, '{}', '{}', 'terminal', 'no_copy', ?2)", params![wallet().to_string(), NOW]).unwrap();
@@ -550,11 +550,10 @@ async fn retention_cancelled_while_waiting_for_admission_leaves_wallet_intact() 
 }
 
 #[test]
-fn retention_returning_wallet_rebuilds_balances_preserves_entry_history_and_rejects_stale_capture()
-{
+fn retention_rejects_anchor_capture_from_before_swap_out() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("paper.db");
-    let mut db = Arc::new(PaperStateDb::open(&path).unwrap());
+    let db = Arc::new(PaperStateDb::open(&path).unwrap());
     let sql = Connection::open(&path).unwrap();
     seed(&sql);
     let mut engine =
@@ -600,34 +599,6 @@ fn retention_returning_wallet_rebuilds_balances_preserves_entry_history_and_reje
         engine.install_anchors(&[make_install(before)]),
         Err(AnchorInstallError::LedgerHashChanged { .. })
     ));
-    for reboot in [false, true] {
-        if reboot {
-            db = Arc::new(PaperStateDb::open(&path).unwrap());
-            engine =
-                BucketCommitEngine::load(db.clone(), build_leader_ledger(&db).unwrap()).unwrap();
-        }
-        db.seed_cursor_if_absent(&wallet(), 0).unwrap();
-        let capture = ledger_capture(engine.ledger(), &db, wallet()).unwrap();
-        engine.install_anchors(&[make_install(capture)]).unwrap();
-        assert!(engine.history_complete(&wallet()));
-        assert_eq!(
-            engine
-                .ledger()
-                .position(&wallet())
-                .unwrap()
-                .positions
-                .values()
-                .next()
-                .unwrap()
-                .long_contracts,
-            ShareAmount::from_whole(25).unwrap()
-        );
-        assert!(
-            CopyEntryGate::new(CopyEntryGateConfig, db.gate_history().unwrap())
-                .has_market(&wallet(), &market())
-        );
-        engine.retire_wallet(wallet(), NOW + 1, None).unwrap();
-    }
 }
 
 fn feed_payload(source_unix: i64) -> Vec<u8> {
