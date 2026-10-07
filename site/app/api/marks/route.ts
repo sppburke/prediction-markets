@@ -1,7 +1,9 @@
 // Current-mark proxy for watched-paper unrealized PnL (#398 WS3, #508 terminology). Gamma fetch with an
-// in-process 30s TTL cache (no Supabase writes) keyed "market:outcome". Returns { key: mark } for
-// the requested keys; a key whose market can't be fetched is simply omitted (the cell shows "—").
+// in-process 30s TTL cache (no Supabase writes) keyed "market:outcome". POST `{ keys }` returns
+// { key: mark } for the requested keys; a key whose market can't be fetched is simply omitted (the
+// cell shows "—").
 import { NextResponse } from "next/server";
+import { parseMarkKeys } from "@/lib/marks";
 
 const GAMMA_BASE = process.env.GAMMA_BASE_URL ?? "https://gamma-api.polymarket.com";
 const TTL_MS = 30_000;
@@ -45,11 +47,11 @@ async function refreshMarkets(markets: string[], now: number): Promise<void> {
   }
 }
 
-export async function GET(req: Request) {
-  const keys = (new URL(req.url).searchParams.get("keys") ?? "")
-    .split(",")
-    .map((k) => k.trim())
-    .filter(Boolean);
+export async function POST(req: Request) {
+  const keys = parseMarkKeys(await req.json().catch(() => null));
+  if (keys === null) {
+    return NextResponse.json({ error: "expected { keys: string[] }" }, { status: 400 });
+  }
 
   const now = Date.now();
   const stale = keys.filter((k) => {
