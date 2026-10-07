@@ -1234,6 +1234,17 @@ async fn run() -> Result<()> {
         disk_monitor.run(health.clone(), shutdown.subscribe()),
     );
     pe_service::source_checkpoint::install_retention_fence(&cfg.source_event_log_path)
+        .map_err(|error| {
+            // Like a boot quarantine failure: status 78 stops systemd restarts for quiesced recovery.
+            if matches!(
+                error,
+                pe_service::source_checkpoint::InvalidationError::QuarantineFailed(_)
+            ) {
+                eprintln!("pe-service: install source retention fence before listening: {error}");
+                std::process::exit(78);
+            }
+            error
+        })
         .context("install source retention fence before listening")?;
     let listener = tokio::net::TcpListener::bind(&cfg.bind)
         .await

@@ -251,7 +251,8 @@ async fn retention_orchestrator_clears_running_ledger_cursor_and_persisted_front
     assert_eq!(report.anchors_blanked, 1);
     assert_eq!(report.wallets_swapped_out, 1);
     assert!(report.wallets_waiting.is_empty());
-    assert_eq!(report.transaction_lock_times.len(), 2);
+    // One blanking batch, two candidate pages (the second empty) and one retirement.
+    assert_eq!(report.transaction_lock_times.len(), 4);
     let (captured, capture) = oneshot::channel();
     fixture
         .tx

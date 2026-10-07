@@ -95,6 +95,7 @@ pub struct RetentionCommitRequest {
     receipts: SourceReceiptIndex,
     authority: RetentionAuthority,
     expected_epoch: u64,
+    expected_generation: Option<u64>,
     cutoff: i64,
     payload_receipts: HashMap<String, Vec<AppendReceipt>>,
 }
@@ -661,6 +662,7 @@ pub(crate) fn prepare(
             context: context.clone(),
             receipts: index.clone(),
             expected_epoch: epoch,
+            expected_generation: frozen.authority_generation,
             cutoff,
             payload_receipts,
             authority: RetentionAuthority {
@@ -728,10 +730,15 @@ pub(crate) fn commit(
     if let Some(reason) = pause_reason(&request.context)? {
         return Ok(RetentionCommitOutcome::Deferred(reason));
     }
+    let checkpoint = super::read_authority(&path)?;
     ensure!(
-        matches!(super::read_authority(&path)?, Authority::Readable(record) if record.retention_fence),
+        matches!(checkpoint, Authority::Readable(record) if record.retention_fence),
         "retention fence missing"
     );
+    // An invalidation since the owner's capture may have trimmed the receipts this boundary needs.
+    if !checkpoint.permits_checkpoint() || checkpoint.generation() != request.expected_generation {
+        return Ok(RetentionCommitOutcome::Deferred("checkpoint_invalidated"));
+    }
     let mut pins = request
         .authority
         .pins

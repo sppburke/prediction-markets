@@ -3848,6 +3848,25 @@ async fn checkpoint_quarantine_failure_after_owner_shutdown_preserves_status_78(
     assert_eq!(output.status.code(), Some(78), "{output:?}");
 }
 
+/// PASS: an unreadable invalidation record stops the fence installation with status 78 (quiesced
+/// recovery) before listening, never an ordinary failure that systemd restarts.
+#[tokio::test]
+async fn retention_fence_on_an_unreadable_invalidation_record_exits_78() {
+    let fixture = checkpoint_rollout::CheckpointFixture::new().await;
+    std::fs::write(
+        checkpoint_sidecar(&fixture.cfg.source_event_log_path, ".invalidation"),
+        b"{not json",
+    )
+    .unwrap();
+    let output = boot_binary(&fixture.config_path, false).await;
+    assert_eq!(output.status.code(), Some(78), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("install source retention fence"),
+        "{output:?}"
+    );
+    assert!(!fixture.logs().contains("pe-service listening"));
+}
+
 fn checkpoint_sidecar(source: &Path, suffix: &str) -> PathBuf {
     let mut path = pe_service::source_checkpoint::checkpoint_path(source).into_os_string();
     path.push(suffix);

@@ -226,9 +226,18 @@ pub async fn run_database_retention(
             report.cancelled = true;
             break;
         }
+        // The candidate page holds the shared database connection like a transaction (AC1).
+        let started = std::time::Instant::now();
         let wallets = state
             .paper_state
             .retention_wallets(after, DATABASE_BATCH_LIMIT)?;
+        let lock_time = started.elapsed();
+        report.transaction_lock_times.push(lock_time);
+        tracing::info!(
+            wallets = wallets.len(),
+            lock_time_micros = lock_time.as_micros(),
+            "source retention database scan"
+        );
         if wallets.is_empty() {
             break;
         }

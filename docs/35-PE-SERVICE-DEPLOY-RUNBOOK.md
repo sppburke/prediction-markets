@@ -957,8 +957,11 @@ Hash comparisons decide what remains, but never substitute for process clearance
    publication. Restore only this task's recorded Forge flag, enablement, and activity independently.
    The wrapper's later cutover finalization binds its targeted writes and does not replace this
    pre-capture finalization.
-2. **Ship** hash-qualified:
+2. **Ship** hash-qualified, with the reviewed census script (the VPS checkout does not carry
+   `scripts/`; record `sha256sum scripts/deploy/pe_service_census.sh` from the release checkout as
+   `<census-sha256>`):
    `scp -i ~/.ssh/id_personal target/release/pe-service sean@82.22.32.225:/tmp/pe-service.new.<desired-sha12>`
+   `scp -i ~/.ssh/id_personal scripts/deploy/pe_service_census.sh sean@82.22.32.225:/home/sean/pe-service-census.<desired-sha12>.sh`
 3. **Preflight and checkpoint preparation on the VPS** (lock first; the service keeps running):
 
    ```bash
@@ -968,6 +971,8 @@ Hash comparisons decide what remains, but never substitute for process clearance
    systemctl show pe-service -p MainPID -p InvocationID -p ExecMainStartTimestamp -p NRestarts -p ExecStart -p WorkingDirectory -p FragmentPath -p DropInPaths -p UnitFileState -p WantedBy -p Restart -p RestartUSec -p KillSignal
    pid=$(systemctl show pe-service -p MainPID --value)
    sha256sum target/release/pe-service "/proc/$pid/exe" /tmp/pe-service.new.<desired-sha12> .env smoke-test/service.toml
+   echo '<census-sha256>  /home/sean/pe-service-census.<desired-sha12>.sh' | sha256sum -c -
+   chmod 0755 /home/sean/pe-service-census.<desired-sha12>.sh
    chmod 0755 /tmp/pe-service.new.<desired-sha12>
    /tmp/pe-service.new.<desired-sha12> --version
    /tmp/pe-service.new.<desired-sha12> --verify-staged-identity '<reviewed-40-hex>' '<staged-blake3>'
@@ -1043,7 +1048,8 @@ Hash comparisons decide what remains, but never substitute for process clearance
    the launch deadline.
 
 4. **Census, stop and atomic swap.** While the old unit still serves and its executable is still
-   installed, run the census (`scripts/deploy/pe_service_census.sh`, read-only). It matches every
+   installed, run the census (the staged, hash-checked copy of `scripts/deploy/pe_service_census.sh`
+   from step 2; read-only; on resume check its sha256 again first). It matches every
    process whose executable is any pe-service binary (installed, `.bak-*` or staged, by name or by
    size and sha256), or whose argv names this generation's config resolved against the process cwd,
    whether or not it holds state files open. It records PID, `/proc` start time, executable path and
@@ -1053,15 +1059,17 @@ Hash comparisons decide what remains, but never substitute for process clearance
 
    ```bash
    pid=$(systemctl show pe-service -p MainPID --value)
-   census() { scripts/deploy/pe_service_census.sh --config smoke-test/service.toml \
+   census() { /home/sean/pe-service-census.<desired-sha12>.sh --config smoke-test/service.toml \
      --cwd-root /home/sean/prediction-markets --binary target/release/pe-service \
      --binary-glob 'target/release/pe-service*' --binary-glob '/tmp/pe-service.new.*' "$@"; }
-   census --allow "$pid" > "$art/census.serving.jsonl" || true   # the unit's MainPID is listed, not counted
+   census --allow "$pid" > "$art/census.serving.jsonl"; echo "serving census exit=$?"   # MainPID listed, not counted
    tail -1 "$art/census.serving.jsonl"
    ```
 
-   Report every other match. Before stopping a verified stray, repeat the census, check its
-   PID/start-time/hash/config identity against the first record, then record its exit.
+   Go on to the stop only after a serving census that exits 0 (a missing or failing script stops
+   the deploy here, while the old unit still serves). Report every other match. Before stopping a
+   verified stray, repeat the census, check its PID/start-time/hash/config identity against the
+   first record, then record its exit; rerun until it exits 0.
 
    Tell the owner before the pre-approved stop/start. In the same shell holding the deploy lock,
    with `$art` from step 3, record the baseline and stop the unit before touching its executable:
@@ -1843,7 +1851,7 @@ serving-path `Erased`/`Retired` or failed boot; retain scripts and receipts with
 
 Follow the guarded [Procedure](#procedure): staged preparation while the old unit serves must keep
 epoch zero/format 2, install no fence and erase nothing. The first census runs while the old unit
-serves with its executable still installed (`scripts/deploy/pe_service_census.sh`, step 4). Repeat
+serves with its executable still installed (the staged census script, step 4). Repeat
 and verify each stray's identity before stopping it. Then disable and stop the unit, confirm both states and its process exit, and clear another
 readable census before swapping the binary. Keep the unit disabled/stopped over every interruption.
 Every resume reruns and clears the census before starting, or before accepting an already healthy

@@ -164,6 +164,8 @@ pub struct SourceCheckpointOwner {
     finishing_retention: bool,
     retention_walk_complete: bool,
     retention_tail: Option<LogTailBinding>,
+    /// A publication failure inside the job ends the owner, as it does in the hourly loop.
+    publication_failure: Option<TaskFailure>,
     window_wallets: HashSet<pe_core_types::WalletAddress>,
     published_observation_wallets: HashSet<pe_core_types::WalletAddress>,
     #[cfg(feature = "scenario")]
@@ -198,6 +200,7 @@ impl SourceCheckpointOwner {
             finishing_retention: false,
             retention_walk_complete: false,
             retention_tail: None,
+            publication_failure: None,
             window_wallets: HashSet::new(),
             published_observation_wallets: HashSet::new(),
             #[cfg(feature = "scenario")]
@@ -645,6 +648,9 @@ impl SourceCheckpointOwner {
             elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "source retention"
         );
+        if let Some(failure) = self.publication_failure.take() {
+            return Err(failure);
+        }
         // Storage failures before a commit defer. A committed authority remains unfinished and is
         // retried before the next daily gate, retaining its immutable archive and exact candidate.
         if let Err(error) = result {
@@ -866,9 +872,12 @@ impl SourceCheckpointOwner {
             .as_ref()
             .map(|candidate| candidate.capture_unix_ms);
         let verified_epoch = self.retention_epoch;
-        self.attempt_publication()
-            .await
-            .map_err(|error| anyhow::anyhow!("{}", error.message))?;
+        // A changed generation needs an owner restart; retrying would keep an inadmissible candidate.
+        if let Err(failure) = self.attempt_publication().await {
+            let message = failure.message.clone();
+            self.publication_failure = Some(failure);
+            anyhow::bail!("source checkpoint publication failed: {message}");
+        }
         if self.retention_epoch != verified_epoch {
             *skip = Some("epoch_changed");
             return Ok(());

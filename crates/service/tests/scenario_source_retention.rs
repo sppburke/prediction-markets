@@ -427,6 +427,45 @@ async fn retention_publication_retry_keeps_archive_and_finishes_before_punch() {
 }
 
 #[tokio::test]
+async fn retention_publication_after_a_generation_change_ends_the_owner() {
+    // Another process invalidated the checkpoint after the commit: the owner's candidate can never
+    // publish, so the job fails the owner (restart) instead of retrying it forever.
+    let fixture = Fixture::new(Some(true));
+    install_retention_fence(&fixture.path).unwrap();
+    let fail = Arc::new(AtomicBool::new(false));
+    let flag = fail.clone();
+    let mut owner = fixture.owner(CheckpointOwnerHooks {
+        checkpoint_write: Some(Arc::new(move || {
+            if flag.load(Ordering::Acquire) {
+                Err(std::io::Error::other("publication unavailable"))
+            } else {
+                Ok(())
+            }
+        })),
+        ..Default::default()
+    });
+    owner.initialize_for_scenario().await.unwrap();
+    fail.store(true, Ordering::Release);
+    owner.retention_for_scenario().await.unwrap();
+    assert_eq!(
+        RetentionAuthority::load(&fixture.path)
+            .unwrap()
+            .unwrap()
+            .epoch,
+        1
+    );
+    let original = fs::read(&fixture.path).unwrap();
+    pe_service::source_checkpoint::invalidate(&fixture.path).unwrap();
+    fail.store(false, Ordering::Release);
+    let failure = owner.retention_for_scenario().await.unwrap_err();
+    assert!(
+        failure.message.contains("generation changed"),
+        "{failure:?}"
+    );
+    assert_eq!(fs::read(&fixture.path).unwrap(), original);
+}
+
+#[tokio::test]
 async fn retention_visible_authority_switches_index_while_sync_retries_fail() {
     let mut fixture = Fixture::new(Some(true));
     install_retention_fence(&fixture.path).unwrap();
@@ -678,6 +717,33 @@ async fn retention_fault_before_index_switch_still_installs_visible_boundary() {
         1
     );
     assert_eq!(manifest(&fixture.path)["format_version"], 3);
+}
+
+#[tokio::test]
+async fn retention_commit_defers_after_an_invalidation_since_the_capture() {
+    // A concurrent preparation's invalidation can trim the receipts a prepared boundary needs.
+    let mut fixture = Fixture::new(Some(true));
+    install_retention_fence(&fixture.path).unwrap();
+    let (proxy, mut requests) = tokio::sync::mpsc::channel(4);
+    let orchestrator = fixture.context.control.clone();
+    let path = fixture.path.clone();
+    let forward = tokio::spawn(async move {
+        while let Some(message) = requests.recv().await {
+            let path = path.clone();
+            tokio::task::spawn_blocking(move || pe_service::source_checkpoint::invalidate(&path))
+                .await
+                .unwrap()
+                .unwrap();
+            orchestrator.send(message).await.unwrap();
+        }
+    });
+    fixture.context.control = proxy;
+    let mut owner = fixture.owner(CheckpointOwnerHooks::default());
+    owner.initialize_for_scenario().await.unwrap();
+    owner.retention_for_scenario().await.unwrap();
+    assert!(RetentionAuthority::load(&fixture.path).unwrap().is_none());
+    assert_eq!(fixture.index.retention_epoch(), 0);
+    forward.abort();
 }
 
 #[tokio::test]

@@ -3773,9 +3773,24 @@ impl BucketCommitEngine {
             .frame_source_index
             .as_ref()
             .ok_or_else(|| "frame source index absent".to_owned())?;
-        if read.is_some_and(|read| read.retention_epoch != Some(index.retention_epoch())) {
-            return Err("retention epoch changed before observation retirement".to_owned());
-        }
+        // A read verified before an advance is authenticated again under the current boundary
+        // (the orchestrator serializes both); an erased dependency still refuses.
+        let reauthenticated;
+        let read = match read {
+            Some(stale) if stale.retention_epoch != Some(index.retention_epoch()) => {
+                let mut fresh =
+                    verified_commitment_bindings_with_lookup(stale.receipt, &mut |receipt| {
+                        index
+                            .source_envelope(receipt)
+                            .map(CompleteActivityPage::from)
+                    })
+                    .map_err(|error| error.to_string())?;
+                fresh.retention_epoch = Some(index.retention_epoch());
+                reauthenticated = fresh;
+                Some(&reauthenticated)
+            }
+            read => read,
+        };
         let source = index
             .source_envelope(receipt)
             .map_err(|error| error.to_string())?;
@@ -7569,6 +7584,100 @@ pub(crate) mod continuation_v3_tests {
                 .contains("erased")
         );
         assert_eq!(state.decision_pending_history().unwrap(), before);
+    }
+
+    /// PASS: an advance between a read's verification and its observation retirement authenticates
+    /// the read again under the new boundary; an erased read dependency still refuses.
+    #[test]
+    fn retention_epoch_reauthenticates_observation_retirement() {
+        for erase_page in [false, true] {
+            let mut fixture = binding_fixture("valid");
+            let path = fixture.dir.path().join("binding.log");
+            let mut writer = Writer::open(&path).unwrap();
+            let at = time::OffsetDateTime::from_unix_timestamp(101).unwrap();
+            writer
+                .append_synced(EnvelopeIn {
+                    source_id: SourceId("suffix".to_owned()),
+                    schema_version: 1,
+                    parser_version: 1,
+                    observed_at: SourceTimestamp(at),
+                    received_at: ReceivedAt(at),
+                    content_type: ContentType::Json,
+                    payload: b"{}".to_vec(),
+                })
+                .unwrap();
+            drop(writer);
+            fixture.index = SourceReceiptIndex::replay(&path).unwrap();
+            let continuation = &fixture.continuation;
+            let pages: Vec<ReconciliationPageEvidence> =
+                serde_json::from_value(continuation.facts.decision_inputs["pages"].clone())
+                    .unwrap();
+            let read = verified_read_for_routing(
+                continuation.read_commitment.unwrap(),
+                continuation.facts.wallet,
+                100,
+                &continuation.page_occurrences,
+                &pages,
+                &fixture.index,
+            )
+            .unwrap();
+            let state = binding_state(&fixture);
+            let mut engine = BucketCommitEngine::load(state, PositionLedger::new())
+                .unwrap()
+                .with_source_receipt_index(fixture.index.clone());
+            let observed = continuation.observed_source_receipt.unwrap();
+            let group = parse_activity_trade_observation(
+                &fixture.index.source_envelope(observed).unwrap().payload,
+            )
+            .unwrap()
+            .group_id
+            .key()
+            .clone();
+            let erased = continuation.page_occurrences[0].receipt;
+            let frames = Reader::replay_with_offsets(&path)
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>();
+            let suffix = frames.last().unwrap();
+            let tail = fixture.index.current_tail_binding().unwrap();
+            let authority = pe_event_log::RetentionAuthority {
+                format_version: 1,
+                epoch: 1,
+                advanced_at: 101,
+                boundary: pe_event_log::RetentionBoundary {
+                    sequence: suffix.1,
+                    offset: suffix.0,
+                },
+                chain_head: suffix.2.prev_hash,
+                pins: frames
+                    .iter()
+                    .filter(|(_, sequence, _)| {
+                        *sequence < suffix.1 && !(erase_page && *sequence == erased.sequence)
+                    })
+                    .map(|(offset, sequence, frame)| pe_event_log::RetentionPin {
+                        sequence: *sequence,
+                        offset: *offset,
+                        hash: frame.this_hash,
+                        predecessor_hash: frame.prev_hash,
+                        reducer: false,
+                        wallet: None,
+                    })
+                    .collect(),
+                retained_tail: (&tail).into(),
+                feed: Vec::new(),
+            };
+            authority.write(&path).unwrap();
+            fixture.index.install_retention(authority).unwrap();
+            let result = engine.retire_observation(observed, &group, false, Some(&read));
+            if erase_page {
+                assert!(result.unwrap_err().contains("erased"), "{erase_page}");
+            } else {
+                assert!(matches!(
+                    result.unwrap(),
+                    crate::orchestrator_control::ReconciliationAcknowledgement::Applied
+                ));
+            }
+        }
     }
 
     /// PASS: raw stream/history/metadata evidence authenticates a correction and its oldest clock;
