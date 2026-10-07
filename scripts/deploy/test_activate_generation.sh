@@ -598,6 +598,9 @@ EOF
   mkdir -p "$service/old"
   printf '%s\n' old-paper > "$service/old/paper.log"
   printf '%s\n' old-source > "$service/old/source_events.log"
+  for name in boot-checkpoint boot-checkpoint.receipts boot-checkpoint.invalidation; do
+    printf '%s\n' "old-$name" > "$service/old/source_events.log.$name"
+  done
   printf '%s\n' old-live > "$service/old/live_journal.log"
   printf '%s\n' old-db > "$service/old/paper_state.db"
   printf '%s\n' old-history > "$service/old/wallet_market_history.json"
@@ -683,6 +686,11 @@ assert_verified() {
   [[ "$(stat -c '%a' "$root/.pe-deploy.lock")" == 444 ]] || fail "deploy lock mode changed"
   [[ "$(<"$root/.pe-deploy.lock")" == provisioned-deploy-lock ]] || fail "deploy lock content changed"
   assert_deploy_lock_unchanged "$root"
+  for name in boot-checkpoint boot-checkpoint.receipts boot-checkpoint.invalidation; do
+    cmp "$root/prediction-markets/old/source_events.log.$name" \
+      "$root/prediction-markets/gen/557/pre-t0/source_log.$name" ||
+      fail "archive omitted or changed checkpoint companion $name"
+  done
   python3 -c 'import json,sys
 value=json.load(open(sys.argv[1], encoding="utf-8"))
 assert value["ranking_batch_id"] == 7
@@ -774,6 +782,7 @@ artifact_boundaries=(
   seed-main seed-paper-log seed-live-journal seed-source-log seed-history seed-history-hashes
   stage-binary rendered-config rendered-rehearsal-config rendered-env rendered-rehearsal-env
   archive-paper-state archive-paper_log archive-source_log archive-live_journal
+  archive-boot-checkpoint archive-boot-checkpoint.receipts archive-boot-checkpoint.invalidation
   archive-legacy_history archive-config archive-env archive-binary archive-status
   adopted-config adopted-env adopted-binary db-commit service-started
 )

@@ -737,8 +737,8 @@ async fn run_case(boot_waves: bool) {
         .unwrap();
     }
     c.execute(
-        "UPDATE position_anchors SET anchored_at_unix=?2 WHERE wallet_hex=?1",
-        rusqlite::params![wallet(4).to_string(), now - 4000],
+        "UPDATE poll_cursors SET reanchor_required=1 WHERE wallet_hex=?1",
+        rusqlite::params![wallet(4).to_string()],
     )
     .unwrap();
     // Wallet 2's pinned ranking timestamp turns stale: only its recorded activity re-admits it.
@@ -895,11 +895,11 @@ async fn run_case(boot_waves: bool) {
     rusqlite::Connection::open(&cfg.paper_state_db_path)
         .unwrap()
         .execute(
-            "UPDATE position_anchors SET anchored_at_unix=?3 WHERE wallet_hex IN (?1, ?2)",
-            rusqlite::params![wallet(1).to_string(), wallet(2).to_string(), now - 4000],
+            "UPDATE poll_cursors SET reanchor_required=1 WHERE wallet_hex IN (?1, ?2)",
+            rusqlite::params![wallet(1).to_string(), wallet(2).to_string()],
         )
         .unwrap();
-    // No eligible anchor is reused, so boot validates both wallets. The healthy venue mirror
+    // Both wallets require reanchoring, so boot validates both wallets. The healthy venue mirror
     // matches its recorded balance; only the negative-size wallet is left unvalidated.
     *state.positions.lock().unwrap() = paper
         .leader_positions()

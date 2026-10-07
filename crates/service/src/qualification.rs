@@ -812,48 +812,62 @@ async fn verify_qualification(
         .map_err(|error| {
             QualificationError::InsufficientEvidence(format!("decision replay mismatch: {error}"))
         })?;
-    let audit_era = paper_era(frames[..=financial_prefix_index].to_vec());
-    crate::paper_recovery::feed_latch_basis(&audit_era)
-        .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
-    let audit_commitments = source_observations
-        .values()
-        .filter(|observation| {
-            observation.source_id == crate::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID
-        })
-        .filter_map(|observation| {
-            serde_json::from_slice::<crate::bucket_commit::ActivityReadCommitment>(
-                &observation.payload,
+    let historical_frames = replayed_decisions
+        .iter()
+        .filter(|decision| decision.continuation.is_activity_frame())
+        .map(|decision| {
+            serde_json::from_value::<crate::frame_admission::FrameDecisionProof>(
+                decision.continuation.facts.decision_inputs.clone(),
             )
-            .ok()
-            .filter(|commitment| commitment.version == 2 && commitment.read_proof.is_some())
-            .map(|_| observation.receipt)
+            .map(|proof| (proof.inputs.version, &decision.continuation))
         })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+    let historical_frames = historical_frames
+        .into_iter()
+        .filter(|(version, _)| *version == 1)
+        .map(|(_, continuation)| continuation)
         .collect::<Vec<_>>();
-    let unresolved = crate::feed_audit::verify_recorded_audits(
-        &state,
-        &replayed_decisions
-            .iter()
-            .filter(|decision| decision.continuation.is_activity_frame())
-            .map(|decision| &decision.continuation)
-            .collect::<Vec<_>>(),
-        &audit_era,
-        &audit_commitments,
-        &mut |receipt| {
-            let source = decision_source_receipt(&source_observations, receipt)?;
-            Ok::<_, QualificationError>(CompleteActivityPage {
-                payload: source.payload.clone(),
-                observed_at: source.observed_at.clone(),
-                received_at: source.received_at.clone(),
-                source_id: source.source_id.clone(),
-                schema_version: source.schema_version,
-                parser_version: source.parser_version,
-                content_type: source.content_type.clone(),
+    if !historical_frames.is_empty() {
+        let audit_era = paper_era(frames[..=financial_prefix_index].to_vec());
+        crate::paper_recovery::feed_latch_basis(&audit_era)
+            .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+        let audit_commitments = source_observations
+            .values()
+            .filter(|observation| {
+                observation.source_id == crate::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID
             })
-        },
-    )
-    .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
-    if !unresolved.is_empty() {
-        return insufficient(format!("unresolved frame audits: {unresolved:?}"));
+            .filter_map(|observation| {
+                serde_json::from_slice::<crate::bucket_commit::ActivityReadCommitment>(
+                    &observation.payload,
+                )
+                .ok()
+                .filter(|commitment| commitment.version == 2 && commitment.read_proof.is_some())
+                .map(|_| observation.receipt)
+            })
+            .collect::<Vec<_>>();
+        let unresolved = crate::feed_audit::verify_recorded_audits(
+            &state,
+            &historical_frames,
+            &audit_era,
+            &audit_commitments,
+            &mut |receipt| {
+                let source = decision_source_receipt(&source_observations, receipt)?;
+                Ok::<_, QualificationError>(CompleteActivityPage {
+                    payload: source.payload.clone(),
+                    observed_at: source.observed_at.clone(),
+                    received_at: source.received_at.clone(),
+                    source_id: source.source_id.clone(),
+                    schema_version: source.schema_version,
+                    parser_version: source.parser_version,
+                    content_type: source.content_type.clone(),
+                })
+            },
+        )
+        .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+        if !unresolved.is_empty() {
+            return insufficient(format!("unresolved frame audits: {unresolved:?}"));
+        }
     }
     verify_decision_configurations(&replayed_decisions, &start)?;
     let mut decision_observations = HashMap::new();
@@ -873,7 +887,7 @@ async fn verify_qualification(
                             "empty frame paper prefix follows existing paper evidence",
                         );
                     }
-                    Vec::new()
+                    &frames[..0]
                 }
                 Some(receipt) => {
                     let position = frames[..=financial_prefix_index]
@@ -887,13 +901,15 @@ async fn verify_qualification(
                     if frames[position].envelope.received_at.0 > proof.inputs.admitted_at {
                         return insufficient("frame paper prefix follows admission clock");
                     }
-                    frames[..=position].to_vec()
+                    &frames[..=position]
                 }
             };
-            let basis = crate::paper_recovery::feed_latch_basis(&paper_era(prefix))
-                .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
-            if basis != proof.inputs.latch {
-                return insufficient("frame incident basis differs from sealed paper prefix");
+            if proof.inputs.version == 1 {
+                let basis = crate::paper_recovery::feed_latch_basis(&paper_era(prefix.to_vec()))
+                    .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+                if basis != proof.inputs.latch {
+                    return insufficient("frame incident basis differs from sealed paper prefix");
+                }
             }
         }
 
@@ -3288,6 +3304,35 @@ pub fn canonical_membership_json(
         >(payload)?)?,
         other => return insufficient(format!("unknown membership payload kind {other}")),
     })
+}
+
+/// Offline inspection (docs/29): authenticate one frozen identity against its captured Gamma
+/// envelope through the shared verifier. Full source-log chain verification stays with the caller.
+pub fn verify_frame_identity_json(payload: &[u8]) -> Result<serde_json::Value, QualificationError> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct CapturedIdentity {
+        identity: crate::frame_admission::FrameIdentityProof,
+        source: EventEnvelope,
+    }
+    let captured: CapturedIdentity = serde_json::from_slice(payload)?;
+    let identity = captured.identity;
+    let source = captured.source;
+    if source.seq != identity.receipt.sequence
+        || source.this_hash != identity.receipt.this_hash
+        || source.seq.0 != identity.provenance.source_log_sequence
+        || blake3::hash(&source.payload) != source.raw_payload_hash
+    {
+        return insufficient("frame identity receipt or raw payload hash differs");
+    }
+    let verified =
+        crate::bucket_commit::verify_binding_identity(&source.into(), &identity.provenance)
+            .map_err(|error| QualificationError::InsufficientEvidence(error.to_string()))?;
+    Ok(serde_json::json!({
+        "condition_id": verified.condition_id,
+        "outcome": verified.outcome,
+        "evidence_hash": verified.evidence_hash,
+    }))
 }
 
 fn verify_ranked_change(

@@ -330,12 +330,19 @@ source_identity="$copy_dir/source.identity"
 }
 validate_copy_manifest() {
   python3 - "$copy_manifest" <<'PY'
-import re, sys
+import os, re, sys
 
 expected = {
     "paper_state.db", "paper.log", "source_events.log", "live_journal.log",
     "wallet_market_history.json", "source.identity",
 }
+for suffix in ("", ".receipts", ".invalidation"):
+    name = "source_events.log.boot-checkpoint" + suffix
+    path = os.path.join(os.path.dirname(sys.argv[1]), name)
+    if os.path.lexists(path):
+        if not os.path.isfile(path) or os.path.islink(path):
+            raise SystemExit("rehearsal checkpoint companion is not a regular file")
+        expected.add(name)
 seen = set()
 with open(sys.argv[1], encoding="utf-8") as source:
     for line in source:
@@ -384,6 +391,20 @@ else
     echo "FATAL: uncheckpointed rehearsal copy exists: $copy_dir" >&2
     exit 1
   fi
+  # Capture the companions under the service's publication/invalidation lock.
+  exec 8<>"$active_generation/source_events.log.boot-checkpoint.lock"
+  flock -x 8
+  for name in source_events.log.boot-checkpoint{,.receipts,.invalidation}; do
+    if [[ -e "$active_generation/$name" || -L "$active_generation/$name" ]]; then
+      [[ -f "$active_generation/$name" && ! -L "$active_generation/$name" ]] || {
+        echo "FATAL: active checkpoint companion is not regular $name" >&2
+        exit 1
+      }
+      cp -p "$active_generation/$name" "$copy_dir/$name"
+    fi
+  done
+  flock -u 8
+  exec 8>&-
   sqlite3 -readonly "$active_generation/paper_state.db" ".backup '$copy_dir/paper_state.db'"
   for name in paper.log source_events.log live_journal.log wallet_market_history.json; do
     cp -p "$active_generation/$name" "$copy_dir/$name"
@@ -398,6 +419,9 @@ else
     cd "$copy_dir"
     sha256sum paper_state.db paper.log source_events.log live_journal.log \
       wallet_market_history.json source.identity > "$copy_manifest_stage"
+    for name in source_events.log.boot-checkpoint{,.receipts,.invalidation}; do
+      [[ ! -f "$name" ]] || sha256sum "$name" >> "$copy_manifest_stage"
+    done
   )
   atomic_adopt "$copy_manifest_stage" "$copy_manifest" 0600 rehearsal-copy-manifest
   rm -f "$copy_manifest_stage"

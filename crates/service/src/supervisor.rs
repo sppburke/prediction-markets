@@ -43,6 +43,7 @@ pub enum TaskName {
     StatusWriter,
     HttpServer,
     SourceCheckpoint,
+    DiskMonitor,
     SupabaseAnalyticsSink,
     LiquiditySnapshotWorker,
     JsonTracingFullAppender,
@@ -51,7 +52,7 @@ pub enum TaskName {
 
 impl TaskName {
     /// Complete ordinary-service owner inventory used by scenario coverage.
-    pub const ALL: [Self; 17] = [
+    pub const ALL: [Self; 18] = [
         Self::ActivityIngest,
         Self::PublicActivityPoll,
         Self::Orchestrator,
@@ -65,6 +66,7 @@ impl TaskName {
         Self::StatusWriter,
         Self::HttpServer,
         Self::SourceCheckpoint,
+        Self::DiskMonitor,
         Self::SupabaseAnalyticsSink,
         Self::LiquiditySnapshotWorker,
         Self::JsonTracingFullAppender,
@@ -94,7 +96,8 @@ impl TaskName {
             | Self::WatchlistMaintenance
             | Self::CapacityWorker
             | Self::RuntimeConfigPoller
-            | Self::SourceCheckpoint => ShutdownPhase::StopProducers,
+            | Self::SourceCheckpoint
+            | Self::DiskMonitor => ShutdownPhase::StopProducers,
             Self::Orchestrator => ShutdownPhase::DrainOrchestrator,
             Self::ActivityIngest
             | Self::LiveFanout
@@ -125,6 +128,7 @@ impl fmt::Display for TaskName {
             Self::StatusWriter => "status_writer",
             Self::HttpServer => "http_server",
             Self::SourceCheckpoint => "source_checkpoint",
+            Self::DiskMonitor => "disk_monitor",
             Self::SupabaseAnalyticsSink => "supabase_analytics_sink",
             Self::LiquiditySnapshotWorker => "liquidity_snapshot_worker",
             Self::JsonTracingFullAppender => "json_tracing_full_appender",
@@ -640,7 +644,7 @@ mod tests {
             .into_iter()
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(unique.len(), TaskName::ALL.len());
-        assert_eq!(TaskName::ALL.len(), 17);
+        assert_eq!(TaskName::ALL.len(), 18);
         assert!(unique.contains(&TaskName::SourceCheckpoint));
         assert_eq!(TaskName::SourceCheckpoint.class(), TaskClass::Critical);
         assert_eq!(
@@ -648,6 +652,13 @@ mod tests {
             ShutdownPhase::StopProducers
         );
         assert_eq!(TaskName::SourceCheckpoint.to_string(), "source_checkpoint");
+        assert!(unique.contains(&TaskName::DiskMonitor));
+        assert_eq!(TaskName::DiskMonitor.class(), TaskClass::Critical);
+        assert_eq!(
+            TaskName::DiskMonitor.stop_phase(),
+            ShutdownPhase::StopProducers
+        );
+        assert_eq!(TaskName::DiskMonitor.to_string(), "disk_monitor");
         for name in TaskName::ALL {
             assert!(name.stop_phase() > ShutdownPhase::Running);
         }

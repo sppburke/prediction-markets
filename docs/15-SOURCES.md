@@ -89,10 +89,11 @@
 > published completeness, uptime, ordering, continuity, or resume guarantees**: re-check the
 > endpoint, subscription shape, and payload keys before each deploy that relies on it
 > (`scripts/probe_activity_ws.py`). Continuation-7 paper entries are decided from synchronized
-> activity frames without waiting for REST; complete history still audits each admitted frame and
-> supplies missed entries and leader balances. A process-wide incident latch routes frames back
-> to history after contradiction or mature absence; a stale wallet frontier falls back per wallet
-> (see the [frontier and incident contract](_GLOSSARY.md#continuation-and-commitment-compatibility-588)).
+> activity frames without waiting for REST; complete history supplies missed entries and leader
+> balances. Admitted frames create no after-the-fact feed audit or incident latch. Durable copy
+> ownership prevents matching REST groups from copying again; after restart, one fresh REST read
+> must publish a frontier before feed admission resumes
+> (see the [frontier and copy-ownership contract](_GLOSSARY.md#continuation-and-commitment-compatibility-588)).
 > Re-run the probe and record source verification before the Part 2 deploy; update `Last checked`
 > only after that re-verification. Owner: `source-polymarket-public::activity_ws`
 > (transport/envelope/constants) and `pe-service::activity_ingest` (readers, liveness,

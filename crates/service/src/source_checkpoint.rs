@@ -11,7 +11,7 @@ pub use runtime::{
 pub use runtime::{CheckpointOwnerHooks, cli_owner_hooks};
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -20,11 +20,12 @@ use serde::{Deserialize, Serialize, de::IgnoredAny};
 use thiserror::Error;
 use tracing::info;
 
-use crate::risk_inputs::{SourceFrameMetadata, SourceReceiptIndex};
+use crate::risk_inputs::{SourceFrameMetadata, SourceReceiptIndex, SourceReceiptIndexStaging};
 use crate::source_log_boot::ACTIVITY_REDUCER_VERSION;
 use crate::trade_poller::{ActivityCandidates, DailyBoundaryCandidates};
 
 pub(crate) const CHECKPOINT_HEADER_LEN: usize = 65;
+const RECEIPT_RECORD_LEN: u64 = 80;
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct CheckpointData {
@@ -35,6 +36,11 @@ pub(crate) struct CheckpointData {
     pub(crate) activation: LogTailBinding,
     pub(crate) tail: LogTailBinding,
     pub(crate) prefix_blake3: String,
+    #[serde(default)]
+    pub(crate) generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) receipt_count: Option<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) receipts: Vec<SourceFrameMetadata>,
     pub(crate) activity: ActivityCandidates,
     pub(crate) daily_boundary: Option<DailyBoundaryCandidates>,
@@ -45,6 +51,7 @@ pub(crate) struct CheckpointData {
 pub(crate) struct LoadedCheckpoint {
     pub(crate) data: CheckpointData,
     pub(crate) checksum: [u8; 64],
+    pub(crate) staging: SourceReceiptIndexStaging,
 }
 
 #[derive(Deserialize)]
@@ -56,7 +63,10 @@ struct HeaderView {
     activation: LogTailBinding,
     tail: LogTailBinding,
     prefix_blake3: String,
-    receipts: Vec<SourceFrameMetadata>,
+    #[serde(default, rename = "generation")]
+    _generation: u64,
+    receipt_count: Option<usize>,
+    receipts: Option<Vec<SourceFrameMetadata>>,
     // Publication must not allocate the reducer projections.
     #[serde(rename = "activity")]
     _activity: IgnoredAny,
@@ -67,6 +77,7 @@ enum ArtifactCheck {
     Absent,
     Invalid,
     Inapplicable,
+    InvalidReceipts,
     Valid(Box<HeaderView>),
 }
 
@@ -74,6 +85,70 @@ enum ArtifactCheck {
 #[must_use]
 pub fn checkpoint_path(source_log: &Path) -> PathBuf {
     suffixed(source_log, ".boot-checkpoint")
+}
+
+/// The receipt sidecar companion of the source-log checkpoint manifest.
+#[must_use]
+pub fn receipts_path(source_log: &Path) -> PathBuf {
+    suffixed(&checkpoint_path(source_log), ".receipts")
+}
+
+fn receipt_position(count: usize) -> io::Result<u64> {
+    u64::try_from(count)
+        .ok()
+        .and_then(|count| count.checked_mul(RECEIPT_RECORD_LEN))
+        .ok_or_else(|| io::Error::other("checkpoint receipt position overflow"))
+}
+
+fn encode_record(frame: &SourceFrameMetadata) -> [u8; 80] {
+    let mut bytes = [0; 80];
+    bytes[..32].copy_from_slice(frame.receipt.this_hash.as_bytes());
+    bytes[32..40].copy_from_slice(&frame.received_millis.to_le_bytes());
+    bytes[40..48].copy_from_slice(&frame.byte_offset.unwrap_or(u64::MAX).to_le_bytes());
+    let checksum = blake3::hash(&bytes[..48]);
+    bytes[48..].copy_from_slice(checksum.as_bytes());
+    bytes
+}
+
+fn read_record(reader: &mut impl Read, sequence: usize) -> io::Result<SourceFrameMetadata> {
+    let mut bytes = [0; 80];
+    reader.read_exact(&mut bytes)?;
+    if bytes[48..] != *blake3::hash(&bytes[..48]).as_bytes() {
+        return Err(io::Error::other("checkpoint receipt checksum mismatch"));
+    }
+    let hash = bytes[..32].try_into().map_err(io::Error::other)?;
+    let received = bytes[32..40].try_into().map_err(io::Error::other)?;
+    let offset = u64::from_le_bytes(bytes[40..48].try_into().map_err(io::Error::other)?);
+    Ok(SourceFrameMetadata {
+        receipt: pe_event_log::AppendReceipt {
+            sequence: pe_core_types::EventSeq(u64::try_from(sequence).map_err(io::Error::other)?),
+            this_hash: blake3::Hash::from_bytes(hash),
+        },
+        received_millis: i64::from_le_bytes(received),
+        byte_offset: (offset != u64::MAX).then_some(offset),
+    })
+}
+
+fn restore_receipts(
+    path: &Path,
+    count: usize,
+    tail: &LogTailBinding,
+) -> io::Result<SourceReceiptIndexStaging> {
+    let file = File::open(receipts_path(path))?;
+    if file.metadata()?.len() < receipt_position(count)? {
+        return Err(io::Error::other("checkpoint receipt sidecar is truncated"));
+    }
+    let mut reader = BufReader::new(file);
+    let mut staging = SourceReceiptIndex::staging(path).map_err(io::Error::other)?;
+    for sequence in 0..count {
+        staging
+            .restore_record(read_record(&mut reader, sequence)?, tail)
+            .map_err(io::Error::other)?;
+    }
+    staging
+        .validate_checkpoint(tail)
+        .map_err(io::Error::other)?;
+    Ok(staging)
 }
 
 fn suffixed(path: &Path, suffix: &str) -> PathBuf {
@@ -174,8 +249,21 @@ fn check_artifact(
         Err(_) => return Ok((ArtifactCheck::Invalid, bytes)),
     };
     let file_len = std::fs::metadata(path)?.len();
-    if header.format_version != 1
-        || header.scanner_version != 1
+    let receipts_valid = match header.format_version {
+        1 => header.receipts.as_ref().is_some_and(|receipts| {
+            SourceReceiptIndex::checkpoint_metadata_valid(path, receipts, &header.tail).is_ok()
+        }),
+        2 => {
+            header.receipts.is_none()
+                && header.receipt_count == tail_receipt_count(&header.tail).ok()
+                && std::fs::canonicalize(path)? == header.tail.path
+                && (header.receipt_count != Some(0)
+                    || (header.tail.physical_tail == pe_event_log::HEADER_LEN
+                        && header.tail.last_hash == blake3::Hash::from_bytes([0; 32])))
+        }
+        _ => false,
+    };
+    if header.scanner_version != 1
         || header.financial_era != financial_era
         || header.activation != *activation
         || header.tail.path != activation.path
@@ -186,10 +274,18 @@ fn check_artifact(
             && header.tail.last_sequence == activation.last_sequence)
         || header.daily_boundary.is_some() != financial_era
         || (header.tail.physical_tail == activation.physical_tail && header.tail != *activation)
-        || SourceReceiptIndex::checkpoint_metadata_valid(path, &header.receipts, &header.tail)
-            .is_err()
     {
         return Ok((ArtifactCheck::Inapplicable, bytes));
+    }
+    if !receipts_valid {
+        return Ok((
+            if header.format_version == 2 {
+                ArtifactCheck::InvalidReceipts
+            } else {
+                ArtifactCheck::Inapplicable
+            },
+            bytes,
+        ));
     }
     Ok((ArtifactCheck::Valid(Box::new(header)), bytes))
 }
@@ -198,24 +294,114 @@ pub(crate) fn load_checkpoint(
     path: &Path,
     activation: &LogTailBinding,
     financial_era: bool,
-) -> Option<LoadedCheckpoint> {
-    let (check, bytes) = check_artifact(path, activation, financial_era).ok()?;
-    let ArtifactCheck::Valid(header) = check else {
-        return None;
+) -> Result<Option<LoadedCheckpoint>, InvalidationError> {
+    load_with_finalization(path, activation, financial_era, &mut DurableFinalization)
+}
+
+fn load_with_finalization(
+    path: &Path,
+    activation: &LogTailBinding,
+    financial_era: bool,
+    finalization: &mut impl Finalization,
+) -> Result<Option<LoadedCheckpoint>, InvalidationError> {
+    let _lock = CheckpointLock::acquire(path)?;
+    if !read_authority(path)?.permits_checkpoint() {
+        return Ok(None);
+    }
+    let (check, bytes) = match check_artifact(path, activation, financial_era) {
+        Ok(checked) => checked,
+        Err(_) => return Ok(None),
     };
-    if header.reducer_version != ACTIVITY_REDUCER_VERSION {
-        return None;
+    let header = match check {
+        ArtifactCheck::Valid(header) => header,
+        ArtifactCheck::InvalidReceipts => {
+            invalidate_locked(path, finalization)?;
+            return Ok(None);
+        }
+        _ => return Ok(None),
+    };
+    // Reducer 2 (deployed format-1 artifacts) is accepted once so its recorded commitment
+    // bindings can be hydrated into the current reducer representation.
+    if header.reducer_version != 2 && header.reducer_version != ACTIVITY_REDUCER_VERSION {
+        return Ok(None);
     }
     drop(header);
-    let data = serde_json::from_slice(bytes.get(CHECKPOINT_HEADER_LEN..)?).ok()?;
-    let checksum = bytes.get(..64)?.try_into().ok()?;
-    Some(LoadedCheckpoint { data, checksum })
+    let mut data: CheckpointData = match serde_json::from_slice(&bytes[CHECKPOINT_HEADER_LEN..]) {
+        Ok(data) => data,
+        Err(_) => return Ok(None),
+    };
+    let mut checksum = bytes[..64].try_into().map_err(io::Error::other)?;
+    let staging = if data.format_version == 1 {
+        // Conversion is optional; after-rename failures keep the visible v2 receipt prefix.
+        let frames = std::mem::take(&mut data.receipts);
+        data.format_version = 2;
+        data.generation = read_authority(path)?.generation().unwrap_or(0);
+        data.receipt_count = Some(frames.len());
+        let converted = serialize_manifest(&data).map_err(io::Error::other)?;
+        let conversion = write_receipts(path, 0, &frames, true, finalization)
+            .and_then(|()| finalization.checkpoint_write(&checkpoint_path(path), &converted));
+        if let Err(error) = conversion {
+            tracing::warn!(%error, "source checkpoint v1 conversion deferred");
+            if !read_authority(path)?.permits_checkpoint() {
+                return Ok(None);
+            }
+            let installed = std::fs::read(checkpoint_path(path))?;
+            if installed == bytes {
+                data.format_version = 1;
+                data.receipt_count = None;
+            } else if installed == converted {
+                // The next equal-candidate publication completes installation durability.
+                checksum = converted[..64].try_into().map_err(io::Error::other)?;
+            } else {
+                return Ok(None);
+            }
+        } else {
+            checksum = converted[..64].try_into().map_err(io::Error::other)?;
+        }
+        SourceReceiptIndex::restore_staging(path, frames, &data.tail).map_err(io::Error::other)?
+    } else {
+        match restore_receipts(path, data.receipt_count.unwrap_or(0), &data.tail) {
+            Ok(staging) => staging,
+            Err(error) => {
+                tracing::warn!(%error, "source checkpoint receipts invalid; invalidating");
+                invalidate_locked(path, finalization)?;
+                return Ok(None);
+            }
+        }
+    };
+    Ok(Some(LoadedCheckpoint {
+        data,
+        checksum,
+        staging,
+    }))
+}
+
+fn tail_receipt_count(tail: &LogTailBinding) -> io::Result<usize> {
+    tail.last_sequence.map_or(Ok(0), |seq| {
+        usize::try_from(seq.0)
+            .ok()
+            .and_then(|n| n.checked_add(1))
+            .ok_or_else(|| io::Error::other("checkpoint receipt count overflow"))
+    })
+}
+
+pub(crate) fn capture_start(
+    activation: &LogTailBinding,
+    financial_era: bool,
+    count: usize,
+) -> usize {
+    match check_artifact(&activation.path, activation, financial_era) {
+        Ok((ArtifactCheck::Valid(current), _)) if current.format_version == 2 => {
+            current.receipt_count.unwrap_or(0).min(count)
+        }
+        _ => 0,
+    }
 }
 
 /// A verified candidate serialized once; publication borrows it and never consumes its bytes.
 /// Construct only from projections verified through `tail` under `authority_generation`.
 pub struct SerializedCandidate {
-    bytes: Vec<u8>,
+    pub(crate) bytes: Vec<u8>,
     activation: LogTailBinding,
     financial_era: bool,
     tail: LogTailBinding,
@@ -223,18 +409,21 @@ pub struct SerializedCandidate {
     reducer_version: u32,
     authority_generation: u64,
     capture_unix_ms: u64,
+    receipt_start: usize,
+    receipt_count: usize,
+    receipts: Vec<SourceFrameMetadata>,
 }
 
 pub(crate) fn serialize(
-    data: CheckpointData,
+    mut data: CheckpointData,
     authority_generation: u64,
     capture_unix_ms: u64,
 ) -> Result<SerializedCandidate, serde_json::Error> {
-    let mut encoded = vec![b'0'; CHECKPOINT_HEADER_LEN];
-    encoded[64] = b'\n';
-    serde_json::to_writer(&mut encoded, &data)?;
-    let checksum = blake3::hash(&encoded[CHECKPOINT_HEADER_LEN..]).to_hex();
-    encoded[..64].copy_from_slice(checksum.as_bytes());
+    data.generation = authority_generation;
+    let receipt_count = data.receipt_count.unwrap_or(data.receipts.len());
+    let receipt_start = receipt_count.saturating_sub(data.receipts.len());
+    let receipts = std::mem::take(&mut data.receipts);
+    let encoded = serialize_manifest(&data)?;
     Ok(SerializedCandidate {
         bytes: encoded,
         activation: data.activation,
@@ -244,7 +433,19 @@ pub(crate) fn serialize(
         reducer_version: data.reducer_version,
         authority_generation,
         capture_unix_ms,
+        receipt_start,
+        receipt_count,
+        receipts,
     })
+}
+
+fn serialize_manifest(data: &CheckpointData) -> Result<Vec<u8>, serde_json::Error> {
+    let mut encoded = vec![b'0'; CHECKPOINT_HEADER_LEN];
+    encoded[64] = b'\n';
+    serde_json::to_writer(&mut encoded, &data)?;
+    let checksum = blake3::hash(&encoded[CHECKPOINT_HEADER_LEN..]).to_hex();
+    encoded[..64].copy_from_slice(checksum.as_bytes());
+    Ok(encoded)
 }
 
 /// Receipt of a durably installed checkpoint, including successful active-record clearance.
@@ -305,6 +506,12 @@ pub(crate) fn unix_ms() -> io::Result<u64> {
 // Private finalization seam: ordinary builds always use the canonical writer; unit tests inject
 // failures at protocol boundaries without adding a public testing API or another atomic writer.
 trait Finalization {
+    fn receipts_sync(&mut self, file: &File) -> io::Result<()> {
+        file.sync_all()
+    }
+    fn receipts_remove(&mut self, path: &Path) -> io::Result<bool> {
+        remove_if_present(path)
+    }
     fn quarantine_rename(&mut self, from: &Path, to: &Path) -> io::Result<()> {
         std::fs::rename(from, to)
     }
@@ -320,6 +527,62 @@ trait Finalization {
 }
 struct DurableFinalization;
 impl Finalization for DurableFinalization {}
+
+fn write_receipts(
+    path: &Path,
+    start: usize,
+    frames: &[SourceFrameMetadata],
+    fresh: bool,
+    finalization: &mut impl Finalization,
+) -> io::Result<()> {
+    let receipts = receipts_path(path);
+    if fresh {
+        remove_if_present(&receipts)?;
+    }
+    let mut file = OpenOptions::new()
+        .write(true)
+        .read(true)
+        .create_new(fresh)
+        .truncate(false)
+        .open(receipts)?;
+    let position = receipt_position(start)?;
+    if file.metadata()?.len() < position {
+        return Err(io::Error::other(
+            "committed checkpoint receipts are missing",
+        ));
+    }
+    file.seek(SeekFrom::Start(position))?;
+    let mut writer = BufWriter::new(file);
+    for (index, frame) in frames.iter().enumerate() {
+        let sequence = start
+            .checked_add(index)
+            .ok_or_else(|| io::Error::other("checkpoint receipt sequence overflow"))?;
+        if frame.receipt.sequence.0 != u64::try_from(sequence).map_err(io::Error::other)? {
+            return Err(io::Error::other("checkpoint receipts are not dense"));
+        }
+        writer.write_all(&encode_record(frame))?;
+    }
+    writer.flush()?;
+    finalization.receipts_sync(writer.get_ref())
+}
+
+fn installed_receipts_valid(path: &Path, current: &HeaderView) -> io::Result<bool> {
+    let count = current.receipt_count.unwrap_or(0);
+    let mut file = File::open(receipts_path(path))?;
+    if file.metadata()?.len() < receipt_position(count)? {
+        return Ok(false);
+    }
+    if count == 0 {
+        return Ok(true);
+    }
+    file.seek(SeekFrom::Start(receipt_position(count - 1)?))?;
+    let frame = read_record(&mut file, count - 1)?;
+    Ok(Some(frame.receipt.sequence) == current.tail.last_sequence
+        && frame.receipt.this_hash == current.tail.last_hash
+        && frame.byte_offset.is_some_and(|offset| {
+            offset >= pe_event_log::HEADER_LEN && offset < current.tail.physical_tail
+        }))
+}
 
 fn sync_directory(target: &Path) -> io::Result<()> {
     let parent = target
@@ -376,9 +639,11 @@ fn publish_with_finalization(
         }
         let (check, bytes) = check_artifact(path, &candidate.activation, candidate.financial_era)?;
         drop(bytes);
+        let mut installed_count = 0;
         match check {
             ArtifactCheck::Absent => decision = "replace_absent",
             ArtifactCheck::Invalid => decision = "replace_invalid",
+            ArtifactCheck::InvalidReceipts => decision = "replace_invalid_receipts",
             ArtifactCheck::Inapplicable => decision = "replace_inapplicable",
             ArtifactCheck::Valid(current) => {
                 if current.reducer_version > candidate.reducer_version {
@@ -403,9 +668,31 @@ fn publish_with_finalization(
                 } else {
                     decision = "replace_earlier_tail";
                 }
+                if current.format_version == 2 {
+                    if !installed_receipts_valid(path, &current)? {
+                        return Err(
+                            io::Error::other("installed checkpoint receipts invalid").into()
+                        );
+                    }
+                    installed_count = current.receipt_count.unwrap_or(0);
+                } else {
+                    let frames = current.receipts.as_deref().unwrap_or(&[]);
+                    write_receipts(path, 0, frames, true, finalization)?;
+                    installed_count = frames.len();
+                }
             }
         }
         let write_started = Instant::now();
+        let start = installed_count.min(candidate.receipt_count);
+        let frames = candidate
+            .receipts
+            .get(
+                start.checked_sub(candidate.receipt_start).ok_or_else(|| {
+                    io::Error::other("checkpoint capture omitted required receipts")
+                })?..,
+            )
+            .ok_or_else(|| io::Error::other("checkpoint receipt capture is out of bounds"))?;
+        write_receipts(path, start, frames, installed_count == 0, finalization)?;
         finalization.checkpoint_write(&checkpoint_path(path), &candidate.bytes)?;
         if record.active {
             let cleared = InvalidationRecord {
@@ -446,8 +733,8 @@ fn record_bytes(record: InvalidationRecord) -> io::Result<Vec<u8>> {
     serde_json::to_vec(&record).map_err(io::Error::other)
 }
 
-/// Establish a durable quarantine before changing the authority generation. A quarantine failure
-/// is typed separately so the runtime owner can suppress automatic restart.
+/// Establish a durable quarantine of both files before changing the authority generation.
+/// A quarantine failure is typed separately so the runtime owner can suppress automatic restart.
 pub fn invalidate(source_log: &Path) -> Result<u64, InvalidationError> {
     let _lock = CheckpointLock::acquire(source_log).map_err(InvalidationError::QuarantineFailed)?;
     invalidate_locked(source_log, &mut DurableFinalization)
@@ -461,15 +748,18 @@ fn invalidate_locked(
     let checkpoint = checkpoint_path(path);
     let record = record_path(path);
     let renamed = match finalization.quarantine_rename(&checkpoint, &record) {
-        Ok(()) => {
-            finalization
-                .sync_directory(&record)
-                .map_err(InvalidationError::QuarantineFailed)?;
-            true
-        }
+        Ok(()) => true,
         Err(error) if error.kind() == io::ErrorKind::NotFound => false,
         Err(error) => return Err(InvalidationError::QuarantineFailed(error)),
     };
+    let receipts_removed = finalization
+        .receipts_remove(&receipts_path(path))
+        .map_err(InvalidationError::QuarantineFailed)?;
+    if renamed || receipts_removed {
+        finalization
+            .sync_directory(&record)
+            .map_err(InvalidationError::QuarantineFailed)?;
+    }
     let Authority::Readable(current) = authority else {
         return Err(InvalidationError::UnreadableRecord);
     };
@@ -533,12 +823,14 @@ pub(crate) fn invalidate_if_current(
 pub struct RecoveryReceipt {
     pub checkpoint: PathBuf,
     pub checkpoint_removed: bool,
+    pub receipts: PathBuf,
+    pub receipts_removed: bool,
     pub record: PathBuf,
     pub record_removed: bool,
 }
 
 /// The operator must stop and drain the service and finish or terminate every preparation first.
-/// Remove and sync the checkpoint before resetting its authority; the persistent lock stays.
+/// Remove and sync both checkpoint files before resetting authority; the persistent lock stays.
 pub fn recover_quiesced(source_log: &Path) -> io::Result<RecoveryReceipt> {
     recover_with_finalization(source_log, &mut DurableFinalization)
 }
@@ -549,14 +841,18 @@ fn recover_with_finalization(
 ) -> io::Result<RecoveryReceipt> {
     let _lock = CheckpointLock::acquire(path)?;
     let checkpoint = checkpoint_path(path);
+    let receipts = receipts_path(path);
     let record = record_path(path);
     let checkpoint_removed = remove_if_present(&checkpoint)?;
+    let receipts_removed = finalization.receipts_remove(&receipts)?;
     finalization.sync_directory(&checkpoint)?;
     let record_removed = remove_if_present(&record)?;
     finalization.sync_directory(&record)?;
     Ok(RecoveryReceipt {
         checkpoint,
         checkpoint_removed,
+        receipts,
+        receipts_removed,
         record,
         record_removed,
     })
@@ -715,7 +1011,9 @@ mod tests {
             let tail = self.tails[tail].clone();
             let index = SourceReceiptIndex::replay(&self.path).unwrap();
             CheckpointData {
-                format_version: 1,
+                format_version: 2,
+                generation: 0,
+                receipt_count: Some(usize::try_from(tail.last_sequence.unwrap().0 + 1).unwrap()),
                 scanner_version: 1,
                 reducer_version,
                 financial_era: false,
@@ -726,7 +1024,8 @@ mod tests {
                     .to_hex()
                     .to_string(),
                 receipts: index
-                    .checkpoint_prefix(
+                    .checkpoint_suffix(
+                        0,
                         usize::try_from(tail.last_sequence.unwrap().0 + 1).unwrap(),
                         &tail,
                     )
@@ -742,6 +1041,14 @@ mod tests {
         }
 
         fn stage(&self, candidate: &SerializedCandidate) {
+            write_receipts(
+                &self.path,
+                candidate.receipt_start,
+                &candidate.receipts,
+                candidate.receipt_start == 0,
+                &mut DurableFinalization,
+            )
+            .unwrap();
             crate::qualification::write_report(&checkpoint_path(&self.path), &candidate.bytes)
                 .unwrap();
         }
@@ -771,6 +1078,8 @@ mod tests {
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Fault {
+        ReceiptsSync,
+        ReceiptsRemove,
         QuarantineRename,
         QuarantineSync,
         RecordBeforeWrite,
@@ -812,6 +1121,18 @@ mod tests {
     }
 
     impl Finalization for Failure {
+        fn receipts_remove(&mut self, path: &Path) -> io::Result<bool> {
+            if self.fails(Fault::ReceiptsRemove) {
+                return Err(io::Error::other("injected receipts removal"));
+            }
+            remove_if_present(path)
+        }
+        fn receipts_sync(&mut self, file: &File) -> io::Result<()> {
+            if self.fails(Fault::ReceiptsSync) {
+                return Err(io::Error::other("injected receipts sync"));
+            }
+            file.sync_all()
+        }
         fn quarantine_rename(&mut self, from: &Path, to: &Path) -> io::Result<()> {
             if self.fails(Fault::QuarantineRename) {
                 return Err(io::Error::other("injected quarantine rename"));
@@ -844,6 +1165,331 @@ mod tests {
             }
             crate::qualification::write_report(target, bytes)
         }
+    }
+
+    #[test]
+    fn checkpoint_publication_appends_only_new_records() {
+        let fixture = Fixture::new();
+        let first = fixture.candidate(0, 2, 0);
+        receipt(attempt(&first, &mut DurableFinalization).unwrap());
+        let original = std::fs::read(receipts_path(&fixture.path)).unwrap();
+        assert_eq!(original.len(), 80);
+        let index = SourceReceiptIndex::replay(&fixture.path).unwrap();
+        let tail = &fixture.tails[2];
+        let count = tail_receipt_count(tail).unwrap();
+        let start = capture_start(&fixture.activation, false, count);
+        assert_eq!(start, 1);
+        let mut data = fixture.data(2, 2);
+        data.receipts = index.checkpoint_suffix(start, count, tail).unwrap();
+        let candidate = serialize(data, 0, CAPTURE).unwrap();
+        assert_eq!(candidate.receipts.len(), 2);
+        receipt(attempt(&candidate, &mut DurableFinalization).unwrap());
+        let appended = std::fs::read(receipts_path(&fixture.path)).unwrap();
+        assert_eq!(appended.len(), original.len() + 80 * 2);
+        assert_eq!(&appended[..original.len()], original);
+        let loaded = load_checkpoint(&fixture.path, &fixture.activation, false)
+            .unwrap()
+            .unwrap();
+        let restored = loaded.staging.complete(&loaded.data.tail).unwrap();
+        assert_eq!(restored.snapshot(), index.snapshot());
+        let manifest: serde_json::Value = serde_json::from_slice(&candidate.bytes[65..]).unwrap();
+        assert_eq!(manifest["format_version"], 2);
+        assert_eq!(manifest["receipt_count"], 3);
+        assert!(manifest.get("receipts").is_none());
+        let empty = candidate_from_installed(&fixture, 2);
+        assert!(empty.receipts.is_empty());
+        receipt(attempt(&empty, &mut DurableFinalization).unwrap());
+        assert_eq!(
+            std::fs::read(receipts_path(&fixture.path)).unwrap(),
+            appended
+        );
+    }
+
+    fn candidate_from_installed(fixture: &Fixture, tail: usize) -> SerializedCandidate {
+        let mut data = fixture.data(tail, 2);
+        let count = tail_receipt_count(&data.tail).unwrap();
+        let start = capture_start(&fixture.activation, false, count);
+        data.receipts = SourceReceiptIndex::replay(&fixture.path)
+            .unwrap()
+            .checkpoint_suffix(start, count, &data.tail)
+            .unwrap();
+        serialize(data, 0, CAPTURE).unwrap()
+    }
+
+    #[test]
+    fn checkpoint_sidecar_sync_before_manifest_keeps_previous_checkpoint() {
+        for fault in [Fault::ReceiptsSync, Fault::CheckpointBeforeWrite] {
+            let fixture = Fixture::new();
+            let first = fixture.candidate(0, 2, 0);
+            receipt(attempt(&first, &mut DurableFinalization).unwrap());
+            let candidate = candidate_from_installed(&fixture, 2);
+            let mut seam = Failure::new(fault);
+            assert!(attempt(&candidate, &mut seam).is_err());
+            assert_eq!(
+                std::fs::read(checkpoint_path(&fixture.path)).unwrap(),
+                first.bytes
+            );
+            assert_eq!(
+                std::fs::metadata(receipts_path(&fixture.path))
+                    .unwrap()
+                    .len(),
+                3 * 80
+            );
+            let loaded = load_checkpoint(&fixture.path, &fixture.activation, false)
+                .unwrap()
+                .unwrap();
+            assert_eq!(loaded.data.tail, first.tail);
+            assert_eq!(
+                loaded
+                    .staging
+                    .complete(&first.tail)
+                    .unwrap()
+                    .snapshot()
+                    .len(),
+                1
+            );
+            // Retry overwrites only uncommitted garbage, then names it atomically.
+            receipt(attempt(&candidate, &mut seam).unwrap());
+            assert_eq!(
+                load_checkpoint(&fixture.path, &fixture.activation, false)
+                    .unwrap()
+                    .unwrap()
+                    .data
+                    .tail,
+                candidate.tail
+            );
+        }
+    }
+
+    fn stage_v1(fixture: &Fixture) -> Vec<u8> {
+        let mut data = fixture.data(2, 2);
+        data.format_version = 1;
+        data.receipt_count = None;
+        let mut legacy = serde_json::to_value(data).unwrap();
+        legacy.as_object_mut().unwrap().remove("generation");
+        let body = serde_json::to_vec(&legacy).unwrap();
+        let mut bytes = blake3::hash(&body).to_hex().as_bytes().to_vec();
+        bytes.push(b'\n');
+        bytes.extend_from_slice(&body);
+        crate::qualification::write_report(&checkpoint_path(&fixture.path), &bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn checkpoint_v1_converts_once_and_v2_restores_same_index() {
+        let fixture = Fixture::new();
+        let original = stage_v1(&fixture);
+        let original_body: serde_json::Value = serde_json::from_slice(&original[65..]).unwrap();
+        let expected = SourceReceiptIndex::replay(&fixture.path).unwrap();
+        let loaded = load_checkpoint(&fixture.path, &fixture.activation, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.data.format_version, 2);
+        assert_eq!(
+            loaded
+                .staging
+                .complete(&loaded.data.tail)
+                .unwrap()
+                .snapshot(),
+            expected.snapshot()
+        );
+        let manifest = std::fs::read(checkpoint_path(&fixture.path)).unwrap();
+        let converted_body: serde_json::Value = serde_json::from_slice(&manifest[65..]).unwrap();
+        for field in ["activity", "daily_boundary", "reducer_version"] {
+            assert_eq!(converted_body[field], original_body[field], "{field}");
+        }
+        let records = std::fs::read(receipts_path(&fixture.path)).unwrap();
+        let mut seam = Failure::new(Fault::CheckpointBeforeWrite);
+        let restored = load_with_finalization(&fixture.path, &fixture.activation, false, &mut seam)
+            .unwrap()
+            .unwrap();
+        let restored_index = restored.staging.complete(&restored.data.tail).unwrap();
+        assert_eq!(restored_index.snapshot(), expected.snapshot());
+        let count = tail_receipt_count(&restored.data.tail).unwrap();
+        assert_eq!(
+            serde_json::to_value(
+                restored_index
+                    .checkpoint_suffix(0, count, &restored.data.tail)
+                    .unwrap()
+            )
+            .unwrap(),
+            serde_json::to_value(
+                expected
+                    .checkpoint_suffix(0, count, &restored.data.tail)
+                    .unwrap()
+            )
+            .unwrap()
+        );
+        assert_eq!(seam.checkpoint_writes, 0);
+        assert_eq!(
+            std::fs::read(checkpoint_path(&fixture.path)).unwrap(),
+            manifest
+        );
+        assert_eq!(
+            std::fs::read(receipts_path(&fixture.path)).unwrap(),
+            records
+        );
+    }
+
+    #[test]
+    fn checkpoint_conversion_failure_keeps_v1_and_boot_index() {
+        for fault in [Fault::ReceiptsSync, Fault::CheckpointBeforeWrite] {
+            let fixture = Fixture::new();
+            let original = stage_v1(&fixture);
+            let expected = SourceReceiptIndex::replay(&fixture.path).unwrap();
+            let loaded = load_with_finalization(
+                &fixture.path,
+                &fixture.activation,
+                false,
+                &mut Failure::new(fault),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(loaded.data.format_version, 1);
+            assert_eq!(loaded.checksum.as_slice(), &original[..64]);
+            assert_eq!(
+                std::fs::read(checkpoint_path(&fixture.path)).unwrap(),
+                original
+            );
+            assert_eq!(
+                loaded
+                    .staging
+                    .complete(&loaded.data.tail)
+                    .unwrap()
+                    .snapshot(),
+                expected.snapshot()
+            );
+            assert!(read_authority(&fixture.path).unwrap().permits_checkpoint());
+        }
+    }
+
+    #[test]
+    fn checkpoint_conversion_after_rename_preserves_v2_and_equal_retry() {
+        let fixture = Fixture::new();
+        fixture.record(4, false);
+        let original = stage_v1(&fixture);
+        let expected = SourceReceiptIndex::replay(&fixture.path).unwrap();
+        let mut seam = Failure::new(Fault::CheckpointAfterRename);
+        let loaded = load_with_finalization(&fixture.path, &fixture.activation, false, &mut seam)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.data.format_version, 2);
+        assert_eq!(loaded.data.generation, 4);
+        let manifest = std::fs::read(checkpoint_path(&fixture.path)).unwrap();
+        assert_ne!(manifest, original);
+        assert_eq!(loaded.checksum.as_slice(), &manifest[..64]);
+        assert_eq!(seam.checkpoint_writes, 1);
+        let records = std::fs::read(receipts_path(&fixture.path)).unwrap();
+        assert_eq!(records.len(), 3 * 80);
+        assert_eq!(
+            loaded
+                .staging
+                .complete(&loaded.data.tail)
+                .unwrap()
+                .snapshot(),
+            expected.snapshot()
+        );
+
+        // Reread the visible manifest and current authority under the lock, then use the
+        // publisher's equal-candidate retry to complete the failed directory synchronization.
+        let loaded = load_checkpoint(&fixture.path, &fixture.activation, false)
+            .unwrap()
+            .unwrap();
+        let candidate = serialize(loaded.data, 4, CAPTURE).unwrap();
+        assert!(candidate.receipts.is_empty());
+        fixture.record(5, false);
+        assert!(matches!(
+            attempt(&candidate, &mut seam).unwrap(),
+            PublishOutcome::GenerationChanged {
+                candidate: 4,
+                current: 5
+            }
+        ));
+        assert_eq!(seam.checkpoint_writes, 1);
+        assert_eq!(
+            std::fs::read(receipts_path(&fixture.path)).unwrap(),
+            records
+        );
+        let loaded = load_checkpoint(&fixture.path, &fixture.activation, false)
+            .unwrap()
+            .unwrap();
+        let current_candidate = serialize(loaded.data, 5, CAPTURE).unwrap();
+        receipt(attempt(&current_candidate, &mut seam).unwrap());
+        assert_eq!(seam.checkpoint_writes, 2);
+        assert_eq!(
+            std::fs::read(receipts_path(&fixture.path)).unwrap(),
+            records
+        );
+        let boot = load_checkpoint(&fixture.path, &fixture.activation, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(boot.data.format_version, 2);
+        assert_eq!(boot.data.generation, 5);
+        assert_eq!(
+            boot.staging.complete(&boot.data.tail).unwrap().snapshot(),
+            expected.snapshot()
+        );
+    }
+
+    #[test]
+    fn checkpoint_receipt_wire_preserves_dense_sequence_and_absent_offset() {
+        let frame = SourceFrameMetadata {
+            receipt: pe_event_log::AppendReceipt {
+                sequence: pe_core_types::EventSeq(7),
+                this_hash: blake3::hash(b"receipt wire"),
+            },
+            received_millis: -123,
+            byte_offset: None,
+        };
+        let bytes = encode_record(&frame);
+        assert_eq!(&bytes[..32], frame.receipt.this_hash.as_bytes());
+        assert_eq!(&bytes[32..40], &(-123_i64).to_le_bytes());
+        assert_eq!(&bytes[40..48], &u64::MAX.to_le_bytes());
+        assert_eq!(&bytes[48..], blake3::hash(&bytes[..48]).as_bytes());
+        let decoded = read_record(&mut bytes.as_slice(), 7).unwrap();
+        assert_eq!(decoded.receipt, frame.receipt);
+        assert_eq!(decoded.received_millis, frame.received_millis);
+        assert_eq!(decoded.byte_offset, None);
+    }
+
+    #[test]
+    fn checkpoint_empty_receipt_prefix_round_trips() {
+        let fixture = Fixture::new();
+        let mut data = fixture.data(0, 2);
+        data.tail = fixture.activation.clone();
+        data.receipt_count = Some(0);
+        data.receipts.clear();
+        OpenOptions::new()
+            .write(true)
+            .open(&fixture.path)
+            .unwrap()
+            .set_len(pe_event_log::HEADER_LEN)
+            .unwrap();
+        data.prefix_blake3 =
+            pe_event_log::Scanner::hash_prefix(&fixture.path, data.tail.physical_tail)
+                .unwrap()
+                .finalize()
+                .to_hex()
+                .to_string();
+        let candidate = serialize(data, 0, CAPTURE).unwrap();
+        receipt(attempt(&candidate, &mut DurableFinalization).unwrap());
+        assert_eq!(
+            std::fs::metadata(receipts_path(&fixture.path))
+                .unwrap()
+                .len(),
+            0
+        );
+        let loaded = load_checkpoint(&fixture.path, &fixture.activation, false)
+            .unwrap()
+            .unwrap();
+        assert!(
+            loaded
+                .staging
+                .complete(&loaded.data.tail)
+                .unwrap()
+                .snapshot()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -940,7 +1586,7 @@ mod tests {
                 "long_tail" => {
                     data.tail.physical_tail = std::fs::metadata(&fixture.path).unwrap().len() + 1
                 }
-                "receipt" => data.receipts.clear(),
+                "receipt" => data.receipt_count = Some(0),
                 "boundary" => data.daily_boundary = Some(DailyBoundaryCandidates::default()),
                 _ => {}
             }
@@ -964,7 +1610,11 @@ mod tests {
                 candidate.bytes,
                 "{fault}"
             );
-            assert!(load_checkpoint(&fixture.path, &fixture.activation, false).is_some());
+            assert!(
+                load_checkpoint(&fixture.path, &fixture.activation, false)
+                    .unwrap()
+                    .is_some()
+            );
         }
     }
 
@@ -1110,6 +1760,7 @@ mod tests {
             for present in [false, true] {
                 for fault in [
                     Fault::QuarantineRename,
+                    Fault::ReceiptsRemove,
                     Fault::QuarantineSync,
                     Fault::RecordBeforeWrite,
                     Fault::RecordAfterRename,
@@ -1126,7 +1777,7 @@ mod tests {
                     let _lock = CheckpointLock::acquire(&fixture.path).unwrap();
                     let result = invalidate_locked(&fixture.path, &mut seam);
                     drop(_lock);
-                    if fault == Fault::QuarantineRename
+                    if matches!(fault, Fault::QuarantineRename | Fault::ReceiptsRemove)
                         || present && fault == Fault::QuarantineSync
                         || !present
                             && matches!(fault, Fault::RecordBeforeWrite | Fault::RecordAfterRename)
@@ -1157,6 +1808,48 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn conditional_checkpoint_invalidation_handles_both_files() {
+        let fixture = Fixture::new();
+        let candidate = fixture.candidate(1, 2, 0);
+        fixture.stage(&candidate);
+        let checksum: &[u8; 64] = candidate.bytes[..64].try_into().unwrap();
+        let records = std::fs::read(receipts_path(&fixture.path)).unwrap();
+        let mut different = *checksum;
+        different[0] ^= 1;
+        for (generation, checksum) in [(1, checksum), (0, &different)] {
+            assert!(matches!(
+                invalidate_if_current(&fixture.path, generation, checksum).unwrap(),
+                ConditionalInvalidation::Changed
+            ));
+            assert_eq!(
+                std::fs::read(checkpoint_path(&fixture.path)).unwrap(),
+                candidate.bytes
+            );
+            assert_eq!(
+                std::fs::read(receipts_path(&fixture.path)).unwrap(),
+                records
+            );
+            assert_eq!(
+                read_authority(&fixture.path).unwrap(),
+                Authority::Readable(InvalidationRecord::default())
+            );
+        }
+        assert!(matches!(
+            invalidate_if_current(&fixture.path, 0, checksum).unwrap(),
+            ConditionalInvalidation::Invalidated(1)
+        ));
+        assert!(!checkpoint_path(&fixture.path).exists());
+        assert!(!receipts_path(&fixture.path).exists());
+        assert_eq!(
+            read_authority(&fixture.path).unwrap(),
+            Authority::Readable(InvalidationRecord {
+                generation: 1,
+                active: true
+            })
+        );
     }
 
     #[test]
@@ -1304,6 +1997,7 @@ mod tests {
                 Err(InvalidationError::UnreadableRecord)
             ));
             assert!(!checkpoint_path(&fixture.path).exists());
+            assert!(!receipts_path(&fixture.path).exists());
             assert_eq!(
                 read_authority(&fixture.path).unwrap(),
                 Authority::Unreadable
@@ -1354,6 +2048,7 @@ mod tests {
             std::fs::write(record_path(&fixture.path), b"quarantine").unwrap();
             struct OrderedRecovery {
                 checkpoint: PathBuf,
+                receipts: PathBuf,
                 record: PathBuf,
                 calls: usize,
                 fail_at: usize,
@@ -1362,6 +2057,7 @@ mod tests {
                 fn sync_directory(&mut self, target: &Path) -> io::Result<()> {
                     self.calls += 1;
                     assert!(!self.checkpoint.exists());
+                    assert!(!self.receipts.exists());
                     if self.calls == 1 {
                         assert_eq!(target, self.checkpoint);
                         assert!(self.record.exists());
@@ -1377,6 +2073,7 @@ mod tests {
             }
             let mut seam = OrderedRecovery {
                 checkpoint: checkpoint_path(&fixture.path),
+                receipts: receipts_path(&fixture.path),
                 record: record_path(&fixture.path),
                 calls: 0,
                 fail_at,
@@ -1406,8 +2103,10 @@ mod tests {
             }
             let receipt = recover_quiesced(&fixture.path).unwrap();
             assert_eq!(receipt.checkpoint_removed, fault.is_none());
+            assert_eq!(receipt.receipts_removed, fault.is_none());
             assert!(receipt.record_removed);
             assert!(!checkpoint_path(&fixture.path).exists());
+            assert!(!receipts_path(&fixture.path).exists());
             assert_eq!(
                 read_authority(&fixture.path).unwrap(),
                 Authority::Readable(InvalidationRecord::default())

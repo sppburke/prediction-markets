@@ -40,7 +40,7 @@ use crate::trade_poller::{
 
 // Version 1 retained only the first non-admitted observation and could discard a
 // later qualifying BUY. Rebuild those checkpoints from the authenticated source log.
-pub(crate) const ACTIVITY_REDUCER_VERSION: u32 = 2;
+pub(crate) const ACTIVITY_REDUCER_VERSION: u32 = 3;
 
 /// Scenario-only fault seams (absent from ordinary builds).
 #[cfg(feature = "scenario")]
@@ -153,26 +153,28 @@ impl SourceLogBoot {
         let started = Instant::now();
         let loading_started = std::time::Instant::now();
         let authority = source_checkpoint::read_authority(&paths.source_log);
-        let authority_generation = authority.as_ref().ok().and_then(|value| value.generation());
-        let mut checkpoint = authority
+        let mut checkpoint = if authority
             .as_ref()
-            .ok()
-            .filter(|value| value.permits_checkpoint())
-            .and_then(|_| {
-                source_checkpoint::load_checkpoint(
-                    &paths.source_log,
-                    prefix.binding(),
-                    financial_era,
-                )
-            })
-            .map(|loaded| loaded.data);
+            .is_ok_and(|value| value.permits_checkpoint())
+        {
+            source_checkpoint::load_checkpoint(&paths.source_log, prefix.binding(), financial_era)?
+        } else {
+            None
+        };
+        let authority_generation = if checkpoint.is_none() {
+            source_checkpoint::read_authority(&paths.source_log)
+                .ok()
+                .and_then(|value| value.generation())
+        } else {
+            authority.as_ref().ok().and_then(|value| value.generation())
+        };
         info!(
             elapsed_ms = u64::try_from(loading_started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "source checkpoint loaded"
         );
         let checkpoint_binding = checkpoint
             .as_ref()
-            .map(|data| (data.tail.clone(), data.prefix_blake3.clone()));
+            .map(|loaded| (loaded.data.tail.clone(), loaded.data.prefix_blake3.clone()));
         let staged = RefCell::new((
             SourceReceiptIndex::staging(&paths.source_log).context("stage source receipt index")?,
             Reducers::new(financial_era),
@@ -183,19 +185,11 @@ impl SourceLogBoot {
                 checkpoint = None;
                 return;
             }
-            if let Some(data) = checkpoint.take() {
+            if let Some(loaded) = checkpoint.take() {
                 let mut stage = staged.borrow_mut();
-                // Compatibility and receipt consistency were checked before the locked raw hash.
-                match SourceReceiptIndex::restore_staging(
-                    &paths.source_log,
-                    data.receipts,
-                    &data.tail,
-                ) {
-                    Ok(index) => stage.0 = index,
-                    Err(error) => stage.2 = Some(error),
-                }
-                stage.1.activity = data.activity;
-                stage.1.daily_boundary = data.daily_boundary;
+                stage.0 = loaded.staging;
+                stage.1.activity = loaded.data.activity;
+                stage.1.daily_boundary = loaded.data.daily_boundary;
             }
         };
         let mut observer = |offset: u64, envelope: &EventEnvelope| {
@@ -245,6 +239,12 @@ impl SourceLogBoot {
         let receipt_index = staging
             .complete(&binding)
             .context("complete source receipt index at verified tail")?;
+        let hydration_started = Instant::now();
+        reducers.activity.hydrate_bindings(&receipt_index)?;
+        info!(
+            elapsed_ms = u64::try_from(hydration_started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "source checkpoint activity bindings hydrated"
+        );
         let frozen = FrozenCheckpoint {
             authority_generation,
             capture_unix_ms: source_checkpoint::unix_ms()?,
@@ -367,19 +367,22 @@ impl SourceLogBoot {
             let mut generation = authority.generation();
             let paper = PaperStateDb::open_read_only_allowing_unmigrated(paper_path)?;
             let financial_era = paper.financial_start()?.is_some();
-            // Capture both collections before bounding: every referenced receipt is already synced.
+            // Capture open continuations before bounding: their receipts are already synchronized.
             let open = paper.open_decision_pending()?;
-            let frontiers = paper.feed_history_frontiers()?;
             let byte_bound = std::fs::metadata(path)?.len();
             let capture_unix_ms = source_checkpoint::unix_ms()?;
             #[cfg(feature = "scenario")]
             if let Some(pause) = hooks.and_then(|hooks| hooks.after_bound.as_ref()) {
                 pause()?;
             }
-            let cached = authority
-                .permits_checkpoint()
-                .then(|| source_checkpoint::load_checkpoint(path, &activation, financial_era))
-                .flatten();
+            let cached = if authority.permits_checkpoint() {
+                source_checkpoint::load_checkpoint(path, &activation, financial_era)?
+            } else {
+                None
+            };
+            if cached.is_none() {
+                generation = source_checkpoint::read_authority(path)?.generation();
+            }
             let mut verified = None;
             if let Some(loaded) =
                 cached.filter(|loaded| loaded.data.tail.physical_tail <= byte_bound)
@@ -395,7 +398,7 @@ impl SourceLogBoot {
                         pause()?;
                     }
                     if digest.finalize().to_hex().as_str() == loaded.data.prefix_blake3 {
-                        verified = Some((loaded.data, digest));
+                        verified = Some((loaded, digest));
                     } else {
                         match source_checkpoint::invalidate_if_current(
                             path,
@@ -410,22 +413,21 @@ impl SourceLogBoot {
                     }
                 }
             }
-            let (mut staging, mut reducers, resume, mut digest) = if let Some((data, digest)) =
-                verified
-            {
-                let staging = SourceReceiptIndex::restore_staging(path, data.receipts, &data.tail)?;
-                let mut reducers = Reducers::new(financial_era);
-                reducers.activity = data.activity;
-                reducers.daily_boundary = data.daily_boundary;
-                (staging, reducers, Some(data.tail), digest)
-            } else {
-                (
-                    SourceReceiptIndex::staging(path)?,
-                    Reducers::new(financial_era),
-                    None,
-                    blake3::Hasher::new(),
-                )
-            };
+            let (mut staging, mut reducers, resume, mut digest) =
+                if let Some((loaded, digest)) = verified {
+                    let data = loaded.data;
+                    let mut reducers = Reducers::new(financial_era);
+                    reducers.activity = data.activity;
+                    reducers.daily_boundary = data.daily_boundary;
+                    (loaded.staging, reducers, Some(data.tail), digest)
+                } else {
+                    (
+                        SourceReceiptIndex::staging(path)?,
+                        Reducers::new(financial_era),
+                        None,
+                        blake3::Hasher::new(),
+                    )
+                };
             let mut index_error = None;
             let tail = Scanner::walk_bounded(
                 path,
@@ -447,9 +449,9 @@ impl SourceLogBoot {
             }
             reducers.take_error()?;
             let index = staging.complete(&tail)?;
-            let validated =
-                crate::bucket_commit::validate_continuation_rows(&paper, open, frontiers, &index)
-                    .context("validate open decision continuations before deployment")?;
+            reducers.activity.hydrate_bindings(&index)?;
+            let validated = crate::bucket_commit::validate_continuation_rows(&paper, open, &index)
+                .context("validate open decision continuations before deployment")?;
             #[cfg(feature = "scenario")]
             if let Some(pause) = hooks.and_then(|hooks| hooks.after_walk.as_ref()) {
                 pause()?;
@@ -460,16 +462,19 @@ impl SourceLogBoot {
                     .and_then(|n| n.checked_add(1))
                     .context("checkpoint receipt count overflow")
             })?;
+            let start = source_checkpoint::capture_start(&activation, financial_era, count);
             let candidate = source_checkpoint::serialize(
                 CheckpointData {
-                    format_version: 1,
+                    format_version: 2,
+                    generation: generation.unwrap_or(0),
+                    receipt_count: Some(count),
                     scanner_version: 1,
                     reducer_version: ACTIVITY_REDUCER_VERSION,
                     financial_era,
                     activation: activation.clone(),
                     tail: tail.clone(),
                     prefix_blake3: digest.finalize().to_hex().to_string(),
-                    receipts: index.checkpoint_prefix(count, &tail)?,
+                    receipts: index.checkpoint_suffix(start, count, &tail)?,
                     activity: reducers.activity,
                     daily_boundary: reducers.daily_boundary,
                 },
@@ -478,6 +483,10 @@ impl SourceLogBoot {
                 )?,
                 capture_unix_ms,
             )?;
+            info!(
+                manifest_bytes = candidate.bytes.len(),
+                "source checkpoint manifest serialized"
+            );
             return match source_checkpoint::publish(&candidate, 1)? {
                 PublishOutcome::Published(receipt) => Ok((receipt, validated)),
                 outcome => anyhow::bail!("source checkpoint publication refused: {outcome:?}"),
@@ -565,8 +574,6 @@ impl SourceLogBoot {
         let era = crate::paper_recovery::paper_era(crate::paper_recovery::scan_paper_log(
             paper_log_path,
         )?);
-        crate::paper_recovery::feed_latch_basis(&era)?;
-        obligations.retire_feed_incidents(&era, paper_state)?;
         if let Some(candidates) = self.reducers.daily_boundary.take()
             && let Some(anchor) = recover_daily_boundary_anchor_from_era(&era, &mut obligations)
                 .context("recover causal daily boundary")?

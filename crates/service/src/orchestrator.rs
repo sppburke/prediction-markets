@@ -447,6 +447,7 @@ pub struct Orchestrator<
     source_receipts: Option<SourceReceiptIndex>,
     frame_source_log: Option<crate::activity_ingest::SourceLogHandle>,
     frame_stale_secs: i64,
+    frame_identity_resolver: Option<Arc<crate::asset_identity::AssetIdentityResolver>>,
     qualification_start: Option<pe_event_log::AppendReceipt>,
     admission_builder: Option<crate::live_venue_adapter::LiveAdmissionBuilder>,
     boundary_mark_fetcher: Option<Arc<HistoricalMarkAdapter>>,
@@ -454,7 +455,6 @@ pub struct Orchestrator<
         crate::paper_recovery::RiskHaltOwner,
         pe_risk_engine::RiskHaltCause,
     )>,
-    feed_latch: crate::frame_admission::FeedLatchBasis,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1583,17 +1583,54 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .frame_source_log
             .clone()
             .ok_or_else(|| "frame source writer missing".to_owned())?;
-        let writer_lock = self.watchlist_writer_lock.clone();
-        let guard = match &writer_lock {
-            Some(lock) => Some(lock.lock().await),
-            None => None,
-        };
         let source = index
             .source_envelope(receipt)
             .map_err(|error| error.to_string())?;
         let observation =
             pe_source_polymarket_public::parse_activity_trade_observation(&source.payload)
                 .map_err(|error| error.to_string())?;
+        let parts = observation.group_id.components();
+        let identity = if let (Some(resolver), Some(asset)) =
+            (&self.frame_identity_resolver, &parts.asset)
+        {
+            match resolver.resolve_live([asset.clone()]).await {
+                Ok(resolved) => resolved.verified.get(asset).and_then(|verified| {
+                    if Some(&verified.condition_id) != parts.condition_id.as_ref()
+                        || Some(verified.outcome) != parts.outcome
+                    {
+                        return None;
+                    }
+                    let provenance = resolved.provenance.get(asset)?.clone();
+                    let receipt = index
+                        .receipt_at(pe_core_types::EventSeq(provenance.source_log_sequence))
+                        .ok()??
+                        .0;
+                    let page = index.source_envelope(receipt).ok()?;
+                    let authenticated = crate::bucket_commit::verify_binding_identity(
+                        &crate::bucket_commit::CompleteActivityPage::from(page),
+                        &provenance,
+                    )
+                    .ok()?;
+                    (authenticated == *verified).then_some(
+                        crate::frame_admission::FrameIdentityProof {
+                            provenance,
+                            receipt,
+                        },
+                    )
+                }),
+                Err(error) => {
+                    warn!(wallet = %observation.wallet, error = %error, "frame identity unavailable; using REST");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let writer_lock = self.watchlist_writer_lock.clone();
+        let guard = match &writer_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         let watchlist = self.live_watchlist.snapshot();
         let entry = watchlist
             .entries
@@ -1614,7 +1651,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 sequence,
                 this_hash: tail.last_hash,
             });
-        let latch = self.feed_latch.clone();
+        let latch = crate::frame_admission::FeedLatchBasis::default();
         let admitted_at = self.financial_now();
         let route = self
             .bucket_engine
@@ -1639,6 +1676,11 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     },
                     latch,
                     paper_prefix,
+                    identity,
+                    freshness_policy: PaperFreshnessPolicy {
+                        activity_ws_enabled: self.activity_ws_enabled,
+                        copy_latency_budget_secs: self.copy_latency_budget_secs,
+                    },
                 },
             )
             .map_err(|error| error.to_string())?;
@@ -1657,7 +1699,12 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         let admission_receipt = source_log
             .append(EnvelopeIn {
                 source_id: SourceId(source_id.to_owned()),
-                schema_version: 1,
+                schema_version: if matches!(&route, crate::bucket_commit::FrameRoute::Admission(_))
+                {
+                    2
+                } else {
+                    1
+                },
                 parser_version: 1,
                 observed_at: pe_core_types::SourceTimestamp(admitted_at),
                 received_at: pe_core_types::ReceivedAt(admitted_at),
@@ -1693,18 +1740,17 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         self.resume_committed_rows(&[id]).await
     }
 
-    fn apply_feed_audit_update(
+    fn apply_reconciliation_update(
         &mut self,
-        update: crate::orchestrator_control::FeedAuditUpdate,
-    ) -> Result<crate::orchestrator_control::FeedAuditAcknowledgement, String> {
-        use crate::orchestrator_control::{FeedAuditAcknowledgement, FeedAuditUpdate};
-        use crate::paper_recovery::{HaltState, PaperLogRecord};
+        update: crate::orchestrator_control::ReconciliationUpdate,
+    ) -> Result<crate::orchestrator_control::ReconciliationAcknowledgement, String> {
+        use crate::orchestrator_control::{ReconciliationAcknowledgement, ReconciliationUpdate};
         let index = self
             .source_receipts
             .as_ref()
-            .ok_or_else(|| "feed audit source index is missing".to_owned())?;
+            .ok_or_else(|| "reconciliation source index is missing".to_owned())?;
         match update {
-            FeedAuditUpdate::RetireObservation {
+            ReconciliationUpdate::RetireObservation {
                 receipt,
                 source_trade_id,
                 unbound,
@@ -1715,120 +1761,11 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 unbound,
                 verified_read.as_deref(),
             ),
-            FeedAuditUpdate::Frontier(frontier, read) => self
+            ReconciliationUpdate::Frontier(frontier, read) => self
                 .bucket_engine
                 .publish_frontier(frontier, index, read.as_deref())
-                .map(|()| FeedAuditAcknowledgement::Applied),
-            FeedAuditUpdate::Incident(incident, read) => {
-                let identity = self
-                    .bucket_engine
-                    .admitted_frame(incident.frame_receipt)
-                    .ok_or_else(|| "incident has no durable admitted frame".to_owned())?;
-                let row = self
-                    .paper_state
-                    .decision_pending_for(&identity.source_trade_id)
-                    .map_err(|error| error.to_string())?
-                    .ok_or_else(|| "incident decision missing".to_owned())?;
-                let frame =
-                    DecisionContinuationV3::from_durable(&row).map_err(|e| e.to_string())?;
-                frame
-                    .verify_activity_frame_with_index(index)
-                    .map_err(|error| error.to_string())?;
-                let read = match read {
-                    Some(read) => read,
-                    None => Arc::new(
-                        crate::bucket_commit::verified_commitment_bindings(
-                            incident.deciding_commitment_receipt,
-                            index,
-                        )
-                        .map_err(|error| error.to_string())?,
-                    ),
-                };
-                if read.receipt != incident.deciding_commitment_receipt
-                    || frame.observed_source_receipt != Some(incident.frame_receipt)
-                    || incident.engagement_receipt.is_some()
-                {
-                    return Err("incident differs from authenticated read/frame".to_owned());
-                }
-                crate::feed_audit::verify_incident_conclusion(&frame, &incident, &read)
-                    .map_err(|error| error.to_string())?;
-                let era = crate::paper_recovery::paper_era(
-                    self.paper_writer.snapshot().map_err(|e| e.to_string())?,
-                );
-                // Engagement trips the latch immediately; a contradicted REST target
-                // keeps its ordering work until its group has a durable disposition.
-                let disposed = crate::feed_audit::counterpart_disposed(
-                    &self.paper_state,
-                    incident.counterpart_identity.as_ref(),
-                )
-                .map_err(|error| error.to_string())?;
-                if !crate::feed_audit::audited_receipts(&era).contains(&incident.frame_receipt) {
-                    let incident_index = index.clone();
-                    let receipt =
-                        self.append_paper_record(&PaperLogRecord::FeedIncidentChanged {
-                            incident: incident.clone(),
-                            state: HaltState::Engaged,
-                        })?;
-                    incident_index.remember_frame_incident(&incident);
-                    self.feed_latch = crate::frame_admission::FeedLatchBasis {
-                        latest_incident: Some(receipt),
-                        release: None,
-                    };
-                    {
-                        let mut health = self
-                            .health
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        health.feed_latch = self.feed_latch.clone();
-                        health.feed_incident = Some(incident.clone());
-                    }
-                    error!(cause = ?incident.cause, frame_receipt = ?incident.frame_receipt, deciding_commitment = ?incident.deciding_commitment_receipt,
-                    counterpart = ?incident.counterpart_identity, engagement = ?receipt, "feed audit incident engaged; frames wait for history");
-                }
-                if disposed {
-                    self.bucket_engine
-                        .retire_frame_audit(incident.frame_receipt);
-                }
-                Ok(FeedAuditAcknowledgement::Applied)
-            }
-            FeedAuditUpdate::Release {
-                expected_engagement_hash,
-            } => {
-                let era = crate::paper_recovery::paper_era(
-                    self.paper_writer.snapshot().map_err(|e| e.to_string())?,
-                );
-                let basis =
-                    crate::paper_recovery::feed_latch_basis(&era).map_err(|e| e.to_string())?;
-                if !basis.engaged()
-                    || basis
-                        .latest_incident
-                        .is_none_or(|receipt| receipt.this_hash != expected_engagement_hash)
-                {
-                    return Ok(FeedAuditAcknowledgement::Applied);
-                }
-                let Some(mut incident) = crate::feed_audit::latest_incident(&era) else {
-                    return Err("latest feed engagement is missing".to_owned());
-                };
-                incident.engagement_receipt = basis.latest_incident;
-                let release = self.append_paper_record(&PaperLogRecord::FeedIncidentChanged {
-                    incident,
-                    state: HaltState::Released,
-                })?;
-                self.feed_latch = crate::frame_admission::FeedLatchBasis {
-                    latest_incident: basis.latest_incident,
-                    release: Some(release),
-                };
-                self.publish_feed_latch_health();
-                Ok(FeedAuditAcknowledgement::Applied)
-            }
+                .map(|()| ReconciliationAcknowledgement::Applied),
         }
-    }
-
-    fn publish_feed_latch_health(&self) {
-        self.health
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .feed_latch = self.feed_latch.clone();
     }
 
     async fn apply_control_message(&mut self, message: OrchestratorControl) {
@@ -1839,11 +1776,11 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     self.intake_stopped = true;
                 }
             }
-            OrchestratorControl::FeedAuditUpdate {
+            OrchestratorControl::ReconciliationUpdate {
                 update,
                 acknowledged,
             } => {
-                let result = self.apply_feed_audit_update(update);
+                let result = self.apply_reconciliation_update(update);
                 let _ = acknowledged.send(result);
             }
             OrchestratorControl::PrepareAdmissions {
@@ -2297,15 +2234,6 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
 
         let bucket_engine = BucketCommitEngine::load(paper_state.clone(), leader_ledger)
             .map_err(|error| anyhow::anyhow!("load bucket commit engine: {error}"))?;
-        let feed_era = crate::paper_recovery::paper_era(paper_writer.snapshot()?);
-        let feed_latch = crate::paper_recovery::feed_latch_basis(&feed_era)?;
-        {
-            let mut health = health
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            health.feed_latch = feed_latch.clone();
-            health.feed_incident = crate::feed_audit::latest_incident(&feed_era);
-        }
         verify_retained_terminal_decisions(
             &paper_state,
             config.live_journal.as_ref().map(LiveJournalAccess::path),
@@ -2367,12 +2295,12 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             financial_log_paths: None,
             source_receipts: None,
             frame_source_log: None,
+            frame_identity_resolver: None,
             frame_stale_secs: 0,
             qualification_start: None,
             admission_builder: None,
             boundary_mark_fetcher: None,
             active_risk_halts: HashSet::new(),
-            feed_latch,
         })
     }
 
@@ -2388,30 +2316,9 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .ok_or_else(|| "frame source index missing".to_owned())?;
         self.bucket_engine
             .restore_frame_prefix(all, undelivered, &index)?;
-        self.refresh_feed_latch()?;
-        self.publish_feed_latch_health();
         for receipt in undelivered {
             self.apply_activity_frame(*receipt).await?;
         }
-        Ok(())
-    }
-
-    /// Refresh after a synchronized incident/release edge; boot uses this same era reducer.
-    pub(crate) fn refresh_feed_latch(&mut self) -> Result<(), String> {
-        let era = crate::paper_recovery::paper_era(
-            self.paper_writer
-                .snapshot()
-                .map_err(|error| error.to_string())?,
-        );
-        if let Some(index) = &self.source_receipts {
-            self.bucket_engine.verify_feed_incidents(&era, index)?;
-        }
-        self.feed_latch =
-            crate::paper_recovery::feed_latch_basis(&era).map_err(|error| error.to_string())?;
-        self.health
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .feed_incident = crate::feed_audit::latest_incident(&era);
         Ok(())
     }
 
@@ -2421,8 +2328,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         mut self,
         source_log: crate::activity_ingest::SourceLogHandle,
         poll_round_stale_secs: i64,
+        identity_resolver: Arc<crate::asset_identity::AssetIdentityResolver>,
     ) -> Self {
         self.frame_source_log = Some(source_log);
+        self.frame_identity_resolver = Some(identity_resolver);
         self.frame_stale_secs = poll_round_stale_secs;
         self
     }
@@ -2471,8 +2380,6 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             &paper_log_path,
         )?);
         self.active_risk_halts = crate::paper_recovery::active_risk_halts(&era);
-        self.feed_latch = crate::paper_recovery::feed_latch_basis(&era)?;
-        self.publish_feed_latch_health();
         self.qualification_start = era.start.as_ref().map(|(receipt, _)| *receipt);
         self.financial_log_paths = Some((paper_log_path, source_log_path));
         self.bucket_engine

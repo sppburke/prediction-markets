@@ -346,9 +346,9 @@ async fn late_group_then_strict_decrement_in_one_read_both_become_durable() {
     let (engine_tx, engine_rx) = oneshot::channel();
     let control = tokio::spawn(async move {
         while let Some(command) = control_rx.recv().await {
-            if let OrchestratorControl::FeedAuditUpdate { acknowledged, .. } = command {
+            if let OrchestratorControl::ReconciliationUpdate { acknowledged, .. } = command {
                 let _ = acknowledged.send(Ok(
-                    pe_service::orchestrator_control::FeedAuditAcknowledgement::Applied,
+                    pe_service::orchestrator_control::ReconciliationAcknowledgement::Applied,
                 ));
                 continue;
             }
@@ -468,9 +468,9 @@ async fn recorded_poll(
     let control = tokio::spawn(async move {
         let mut commits = Vec::new();
         while let Some(command) = control_rx.recv().await {
-            if let OrchestratorControl::FeedAuditUpdate { acknowledged, .. } = command {
+            if let OrchestratorControl::ReconciliationUpdate { acknowledged, .. } = command {
                 let _ = acknowledged.send(Ok(
-                    pe_service::orchestrator_control::FeedAuditAcknowledgement::Applied,
+                    pe_service::orchestrator_control::ReconciliationAcknowledgement::Applied,
                 ));
                 continue;
             }
@@ -1064,20 +1064,20 @@ fn start_recorded_poller_with_completion_stop(
         let mut captures = 0;
         while let Some(command) = control_rx.recv().await {
             match command {
-                OrchestratorControl::FeedAuditUpdate {
+                OrchestratorControl::ReconciliationUpdate {
                     update,
                     acknowledged,
                 } => {
                     if real_owner {
                         real_tx
-                            .send(OrchestratorControl::FeedAuditUpdate {
+                            .send(OrchestratorControl::ReconciliationUpdate {
                                 update,
                                 acknowledged,
                             })
                             .await
                             .unwrap();
                     } else {
-                        if let pe_service::orchestrator_control::FeedAuditUpdate::RetireObservation {
+                        if let pe_service::orchestrator_control::ReconciliationUpdate::RetireObservation {
                             receipt, unbound, ..
                         } = update
                         {
@@ -1086,7 +1086,7 @@ fn start_recorded_poller_with_completion_stop(
                             actor_paper.retire_activity_observation(receipt, unbound).unwrap();
                         }
                         let _ = acknowledged.send(Ok(
-                            pe_service::orchestrator_control::FeedAuditAcknowledgement::Applied,
+                            pe_service::orchestrator_control::ReconciliationAcknowledgement::Applied,
                         ));
                     }
                 }
@@ -3092,7 +3092,8 @@ async fn binding_restart_requires_durable_target_revision() {
 }
 
 /// PASS: authentic enclosing receipts and recomputed digests reach raw binding validation;
-/// boot and continuation reconstruction reject semantic mutations and missing nonempty read proofs.
+/// boot authenticates surviving-obligation commitments; continuation and qualification still
+/// reject every semantic mutation and missing nonempty read proof.
 #[tokio::test(start_paused = true)]
 async fn binding_tamper_and_generation_substitution_are_rejected() {
     let dir = tempfile::tempdir().unwrap();
@@ -3210,20 +3211,23 @@ async fn binding_tamper_and_generation_substitution_are_rejected() {
         frame.payload = serde_json::to_vec(&value).unwrap();
         let path = dir.path().join(format!("{change}.log"));
         write_source_prefix(&path, &frames);
-        let rebuilt = pe_service::trade_poller::rebuild_reconciliation_obligations(&path, &paper);
-        if change == "bindings" {
-            assert_eq!(
-                rebuilt.unwrap().len(),
-                1,
-                "an empty commitment cannot discharge a corrected observation"
+        let index = pe_service::risk_inputs::SourceReceiptIndex::replay(&path).unwrap();
+        let rebuilt = pe_service::trade_poller::rebuild_reconciliation_obligations_with_index(
+            &path, &paper, &index,
+        );
+        if matches!(change, "schema" | "parser" | "version") {
+            assert!(
+                rebuilt.is_err(),
+                "{change}: generation must be checked during the walk"
             );
         } else {
-            let error = rebuilt.unwrap_err().to_string();
-            if !matches!(change, "schema" | "parser" | "version") {
-                assert!(error.contains(expected), "{change}: {error}");
-            }
+            assert!(
+                rebuilt.unwrap().is_empty(),
+                "{change}: exact durable retirement owns the observation"
+            );
+            let receipt = index.receipt_at(commitment_frame.seq).unwrap().unwrap().0;
+            assert_eq!(index.read_verification_count(receipt), 0);
         }
-        let index = pe_service::risk_inputs::SourceReceiptIndex::replay(&path).unwrap();
         let receipt = index.receipt_at(commitment_frame.seq).unwrap().unwrap().0;
         // Rebind to the actual synchronized replacement, so receipt authentication succeeds.
         let mut changed = continuation.clone();

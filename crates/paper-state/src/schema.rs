@@ -40,6 +40,19 @@ pub(crate) const SCHEMA: &str = "
 PRAGMA journal_mode = WAL;
 PRAGMA synchronous = NORMAL;
 
+-- Verified token identities retain their original recorded-page provenance across restarts.
+CREATE TABLE IF NOT EXISTS asset_identities (
+    generation      TEXT    NOT NULL,
+    token           TEXT    NOT NULL,
+    condition_id    TEXT    NOT NULL,
+    outcome         INTEGER NOT NULL,
+    source_log_sequence INTEGER NOT NULL,
+    canonical_page_hash TEXT NOT NULL,
+    PRIMARY KEY (generation, token)
+);
+CREATE INDEX IF NOT EXISTS idx_asset_identities_condition_outcome
+ON asset_identities (generation, condition_id, outcome);
+
 -- Input dedup: version two keys on reconciled `g2:` activity group identity.
 -- The public view plus trigger is intentional. The v1 binary's exact
 -- `INSERT OR IGNORE INTO seen_trades (source_trade_id)` shape must fail even

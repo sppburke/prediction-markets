@@ -106,8 +106,11 @@ async fn apply_boot_scores_and_release(
         .filter(|wallet| !fetched_wallets.contains(wallet))
         .collect::<HashSet<_>>();
     if !unscored.is_empty() {
+        let mut removed = unscored.iter().map(ToString::to_string).collect::<Vec<_>>();
+        removed.sort_unstable();
         warn!(
             wallets = unscored.len(),
+            ?removed,
             "boot score refresh: wallets absent from the current batch leave live until a ranked change"
         );
         live.remove_fenced(&unscored);

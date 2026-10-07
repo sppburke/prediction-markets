@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use pe_core_types::{EventSeq, MarketId, OutcomeId, Price, ReceivedAt, SourceTradeId};
+use pe_core_types::{EventSeq, MarketId, OutcomeId, Price, ReceivedAt};
 use pe_event_log::{AppendReceipt, EventEnvelope, LogTailBinding, Reader};
 use pe_paper_state::FinancialSnapshot;
 use pe_risk_engine::{
@@ -907,13 +907,11 @@ fn paper_fill_source_receipts(era: &PaperEra) -> Result<Vec<AppendReceipt>, Risk
 ///
 /// Boot replays the source log once to retain each receipt, receive millisecond, and frame byte
 /// offset. The sole synchronized source-log coordinator records each later append before
-/// acknowledging its receipt, so runtime paper risk, incident release, and exact envelope retrieval
+/// acknowledging its receipt, so runtime paper risk and exact envelope retrieval
 /// never need to replay the growing source prefix.
 #[derive(Default)]
 struct SourceReceiptIndexState {
     frames: Vec<SourceFrameMetadata>,
-    frame_bindings: HashMap<(EventSeq, blake3::Hash), (SourceTradeId, AppendReceipt)>,
-    frame_incidents: HashMap<(EventSeq, blake3::Hash), (Option<SourceTradeId>, AppendReceipt)>,
     next_byte_offset: Option<u64>,
     verified_feed_frontiers:
         HashMap<pe_core_types::WalletAddress, crate::frame_admission::FeedHistoryFrontier>,
@@ -921,13 +919,15 @@ struct SourceReceiptIndexState {
     read_verifications: HashMap<(EventSeq, blake3::Hash), usize>,
     #[cfg(feature = "scenario")]
     frame_verifications: HashMap<(EventSeq, blake3::Hash), usize>,
+    #[cfg(feature = "scenario")]
+    binding_verification_categories: HashMap<(EventSeq, blake3::Hash), [usize; 3]>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct SourceFrameMetadata {
-    receipt: AppendReceipt,
-    received_millis: i64,
-    byte_offset: Option<u64>,
+    pub(crate) receipt: AppendReceipt,
+    pub(crate) received_millis: i64,
+    pub(crate) byte_offset: Option<u64>,
 }
 
 #[derive(Clone, Default)]
@@ -946,6 +946,43 @@ pub(crate) struct SourceReceiptIndexStaging {
 }
 
 impl SourceReceiptIndexStaging {
+    pub(crate) fn restore_record(
+        &mut self,
+        frame: SourceFrameMetadata,
+        binding: &LogTailBinding,
+    ) -> Result<(), RiskInputsUnavailable> {
+        let sequence =
+            u64::try_from(self.frames.len()).map_err(|_| RiskInputsUnavailable::Overflow)?;
+        if frame.receipt.sequence.0 != sequence
+            || frame.byte_offset.is_none_or(|offset| {
+                offset < pe_event_log::HEADER_LEN
+                    || offset >= binding.physical_tail
+                    || self.frames.last().is_some_and(|previous| {
+                        previous
+                            .byte_offset
+                            .is_none_or(|previous| offset <= previous)
+                    })
+            })
+            || (sequence == 0 && frame.byte_offset != Some(pe_event_log::HEADER_LEN))
+        {
+            return Err(RiskInputsUnavailable::PriceConflict);
+        }
+        self.frames.push(frame);
+        Ok(())
+    }
+
+    pub(crate) fn validate_checkpoint(
+        &self,
+        binding: &LogTailBinding,
+    ) -> Result<(), RiskInputsUnavailable> {
+        SourceReceiptIndex::checkpoint_metadata_valid(
+            &self.canonical_source_log_path,
+            &self.frames,
+            binding,
+        )?;
+        Ok(())
+    }
+
     /// Observe one verified source frame while constructing an external projection (#572).
     pub(crate) fn observe(
         &mut self,
@@ -996,14 +1033,14 @@ impl SourceReceiptIndexStaging {
         SourceReceiptIndex {
             state: Arc::new(RwLock::new(SourceReceiptIndexState {
                 frames: self.frames,
-                frame_bindings: HashMap::new(),
-                frame_incidents: HashMap::new(),
                 next_byte_offset: Some(physical_tail),
                 verified_feed_frontiers: HashMap::new(),
                 #[cfg(feature = "scenario")]
                 read_verifications: HashMap::new(),
                 #[cfg(feature = "scenario")]
                 frame_verifications: HashMap::new(),
+                #[cfg(feature = "scenario")]
+                binding_verification_categories: HashMap::new(),
             })),
             source_log_path: Some(Arc::new(self.canonical_source_log_path)),
         }
@@ -1011,6 +1048,38 @@ impl SourceReceiptIndexStaging {
 }
 
 impl SourceReceiptIndex {
+    /// Retirement, surviving-obligation and open-continuation authentication counts.
+    #[cfg(feature = "scenario")]
+    pub fn binding_verification_counts(&self, receipt: AppendReceipt) -> [usize; 3] {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .binding_verification_categories
+            .get(&(receipt.sequence, receipt.this_hash))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    #[cfg(feature = "scenario")]
+    pub(crate) fn record_binding_verification_category(
+        &self,
+        receipt: AppendReceipt,
+        category: usize,
+    ) {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(count) = state
+            .binding_verification_categories
+            .entry((receipt.sequence, receipt.this_hash))
+            .or_default()
+            .get_mut(category)
+        {
+            *count += 1;
+        }
+    }
+
     #[cfg(feature = "scenario")]
     pub fn read_verification_count(&self, receipt: AppendReceipt) -> usize {
         self.state
@@ -1057,96 +1126,6 @@ impl SourceReceiptIndex {
             .or_default() += 1;
     }
 
-    /// First authenticated counterpart owns this receipt. Later stamps need read-proven equivalence.
-    pub(crate) fn remember_frame_bindings(
-        &self,
-        read: &crate::bucket_commit::VerifiedCommitment,
-    ) -> Result<(), crate::bucket_commit::CompleteActivityReadError> {
-        let mut state = self
-            .state
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for binding in read
-            .bindings
-            .iter()
-            .filter(|binding| binding.frame_admission_receipt.is_some())
-        {
-            let key = (
-                binding.stream_receipt.sequence,
-                binding.stream_receipt.this_hash,
-            );
-            if let Some(previous) = state.frame_bindings.get(&key) {
-                let (left, right) = (&previous.0, &binding.history_group_id);
-                if left != right
-                    && read.restamp_pairs.get(left) != Some(right)
-                    && read.restamp_pairs.get(right) != Some(left)
-                {
-                    return Err(crate::bucket_commit::complete_activity_read_error(
-                        "authenticated frame counterpart changed without restamp equivalence",
-                    ));
-                }
-            }
-        }
-        for binding in read
-            .bindings
-            .iter()
-            .filter(|binding| binding.frame_admission_receipt.is_some())
-        {
-            state
-                .frame_bindings
-                .entry((
-                    binding.stream_receipt.sequence,
-                    binding.stream_receipt.this_hash,
-                ))
-                .or_insert_with(|| (binding.history_group_id.clone(), read.receipt));
-        }
-        Ok(())
-    }
-
-    /// An authenticated incident fixes the counterpart, including an absence with no target.
-    pub(crate) fn remember_frame_incident(&self, incident: &crate::paper_recovery::FeedIncident) {
-        self.state
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .frame_incidents
-            .entry((
-                incident.frame_receipt.sequence,
-                incident.frame_receipt.this_hash,
-            ))
-            .or_insert_with(|| {
-                (
-                    incident.counterpart_identity.clone(),
-                    incident.deciding_commitment_receipt,
-                )
-            });
-    }
-
-    /// Bindings take precedence over incidents: a late binding fixes an absent frame forever.
-    /// The receipt is the first proof, so later commitments reference a bounded proof chain.
-    pub(crate) fn frame_counterpart_basis(
-        &self,
-        receipt: AppendReceipt,
-    ) -> Option<(Option<SourceTradeId>, AppendReceipt)> {
-        let state = self
-            .state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let key = (receipt.sequence, receipt.this_hash);
-        state
-            .frame_bindings
-            .get(&key)
-            .map(|(identity, proof)| (Some(identity.clone()), *proof))
-            .or_else(|| state.frame_incidents.get(&key).cloned())
-    }
-
-    pub(crate) fn frame_counterpart(
-        &self,
-        receipt: AppendReceipt,
-    ) -> Option<Option<SourceTradeId>> {
-        self.frame_counterpart_basis(receipt)
-            .map(|(target, _)| target)
-    }
-
     pub(crate) fn remember_verified_frontier(
         &self,
         frontier: &crate::frame_admission::FeedHistoryFrontier,
@@ -1186,8 +1165,9 @@ impl SourceReceiptIndex {
         self.source_log_path.as_deref().map(PathBuf::as_path)
     }
 
-    pub(crate) fn checkpoint_prefix(
+    pub(crate) fn checkpoint_suffix(
         &self,
+        start: usize,
         count: usize,
         binding: &LogTailBinding,
     ) -> Result<Vec<SourceFrameMetadata>, RiskInputsUnavailable> {
@@ -1198,8 +1178,7 @@ impl SourceReceiptIndex {
         let frames = state
             .frames
             .get(..count)
-            .ok_or(RiskInputsUnavailable::PriceConflict)?
-            .to_vec();
+            .ok_or(RiskInputsUnavailable::PriceConflict)?;
         if frames.last().map(|frame| frame.receipt.sequence) != binding.last_sequence
             || frames
                 .last()
@@ -1210,7 +1189,10 @@ impl SourceReceiptIndex {
         {
             return Err(RiskInputsUnavailable::PriceConflict);
         }
-        Ok(frames)
+        Ok(frames
+            .get(start..)
+            .ok_or(RiskInputsUnavailable::PriceConflict)?
+            .to_vec())
     }
 
     pub(crate) fn checkpoint_metadata_valid(
