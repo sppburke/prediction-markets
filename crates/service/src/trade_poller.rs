@@ -1098,6 +1098,26 @@ impl WalletAttempt {
     }
 }
 
+/// An idle frozen attempt drops what frame admission resolved, as the current obligations do, and
+/// ends when nothing is left; its published receipts go with it. A running attempt removes its own
+/// admissions before each read and is pruned here once it has joined.
+fn prune_idle_attempts(
+    attempts: &mut HashMap<WalletAddress, WalletAttempt>,
+    busy: &HashSet<WalletAddress>,
+    admitted: &HashSet<SourceTradeId>,
+) {
+    attempts.retain(|wallet, attempt| {
+        if busy.contains(wallet) {
+            return true;
+        }
+        for groups in attempt.selected.values_mut() {
+            groups.retain(|_, obligation| !admitted.contains(&obligation.group_id));
+        }
+        attempt.selected.retain(|_, groups| !groups.is_empty());
+        !attempt.selected.is_empty()
+    });
+}
+
 #[derive(PartialEq, Eq)]
 enum RoundStage {
     Boundary,
@@ -1355,6 +1375,11 @@ impl TradePoller {
                     stopping = true;
                     continue;
                 }
+                prune_idle_attempts(
+                    &mut attempts,
+                    &busy_wallets,
+                    &self.obligations.retired_frame_ids,
+                );
                 let now = (self.now)();
                 if let Some((wallet, handoff, handle)) = &refresh_visit
                     && self.obligations.by_wallet.contains_key(wallet)
@@ -3170,6 +3195,62 @@ mod tests {
     use crate::paper_recovery::{
         PAPER_LOG_SCHEMA_VERSION, PaperLogRecord, PortfolioMark, QualificationStarted, TailBinding,
     };
+
+    #[test]
+    fn idle_attempts_release_admitted_selections_and_running_ones_keep_theirs() {
+        let wallet = |byte: u8| WalletAddress::from_hex(&format!("0x{byte:0>40}")).unwrap();
+        let receipt = |sequence: u64| AppendReceipt {
+            sequence: pe_core_types::EventSeq(sequence),
+            this_hash: blake3::Hash::from_bytes([u8::try_from(sequence).unwrap(); 32]),
+        };
+        let obligation = |group: &str, sequence: u64| Obligation {
+            qualifying_buy: false,
+            group_id: SourceTradeId(group.to_owned()),
+            received_at: OffsetDateTime::UNIX_EPOCH,
+            receipt: receipt(sequence),
+            bindings: Vec::new(),
+        };
+        let attempt = |entries: &[(&str, u64)]| WalletAttempt {
+            selected: BTreeMap::from([(
+                1,
+                entries
+                    .iter()
+                    .map(|(group, sequence)| ((*group).to_owned(), obligation(group, *sequence)))
+                    .collect(),
+            )]),
+            deadline: None,
+            last_fixed_end: Some(1),
+        };
+        // Idle: one admitted selection (released), one with an admitted and a still-outstanding
+        // selection (keeps the outstanding one), and a running attempt whose selection is admitted.
+        let mut attempts = HashMap::from([
+            (wallet(1), attempt(&[("admitted-a", 1)])),
+            (wallet(2), attempt(&[("admitted-b", 2), ("outstanding", 3)])),
+            (wallet(3), attempt(&[("admitted-c", 4)])),
+        ]);
+        let busy = HashSet::from([wallet(3)]);
+        let admitted = ["admitted-a", "admitted-b", "admitted-c"]
+            .into_iter()
+            .map(|group| SourceTradeId(group.to_owned()))
+            .collect::<HashSet<_>>();
+        prune_idle_attempts(&mut attempts, &busy, &admitted);
+        assert!(!attempts.contains_key(&wallet(1)));
+        assert_eq!(
+            attempts[&wallet(2)].selected[&1].keys().collect::<Vec<_>>(),
+            vec!["outstanding"]
+        );
+        assert!(attempts[&wallet(3)].selected[&1].contains_key("admitted-c"));
+        let held = HeldObligations::default().with_selections(
+            attempts
+                .iter()
+                .map(|(wallet, attempt)| (wallet, &attempt.selected)),
+        );
+        assert_eq!(held.receipts, vec![receipt(3), receipt(4)]);
+        assert_eq!(held.wallets, HashSet::from([wallet(2), wallet(3)]));
+        // Once the running attempt joins, the next pass releases its admitted selection too.
+        prune_idle_attempts(&mut attempts, &HashSet::new(), &admitted);
+        assert_eq!(attempts.keys().collect::<Vec<_>>(), vec![&wallet(2)]);
+    }
 
     #[test]
     fn missing_attempt_is_ready_in_the_same_second_until_its_deadline() {
