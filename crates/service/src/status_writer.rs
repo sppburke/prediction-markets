@@ -134,6 +134,10 @@ pub struct StatusSnapshot {
     /// #530: split websocket / REST-poll source health (enabled mode only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_health: Option<SourceHealthStatus>,
+    /// Free space on a durable filesystem is under the disk warning level. An alarm only:
+    /// readiness is unaffected, and the floor stops the service.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub disk_low: bool,
     pub uptime_secs: u64,
     /// Execution mode string (`shadow` | `paper` | `live_tiny` | `promoted`).
     pub mode: String,
@@ -268,6 +272,7 @@ pub fn build_snapshot(
         tasks: Vec::new(),
         status_error: None,
         source_health: None,
+        disk_low: false,
         updated_at: OffsetDateTime::from_unix_timestamp(now_unix)
             .ok()
             .and_then(|t| t.format(&Rfc3339).ok())
@@ -377,11 +382,14 @@ pub async fn run_status_writer(
             .as_ref()
             .map(|c| c.load(Ordering::Relaxed))
             .unwrap_or(0);
-        let source_health = health.as_ref().and_then(|h| {
+        let (source_health, disk_low) = health.as_ref().map_or((None, false), |h| {
             let h = h.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            h.activity_ws_enabled.then(|| {
-                SourceHealthStatus::from_health(&h, OffsetDateTime::now_utc(), Instant::now())
-            })
+            (
+                h.activity_ws_enabled.then(|| {
+                    SourceHealthStatus::from_health(&h, OffsetDateTime::now_utc(), Instant::now())
+                }),
+                h.disk_low,
+            )
         });
         let applied_config = runtime_config.snapshot();
         let now_unix = OffsetDateTime::now_utc().unix_timestamp();
@@ -434,6 +442,7 @@ pub async fn run_status_writer(
             live_accounts.as_ref().map(|l| l.snapshot()).as_deref(),
         );
         snap.source_health = source_health;
+        snap.disk_low = disk_low;
         if let Some((wallets, at)) = effective_live {
             snap.live_wallets = Some(wallets);
             snap.live_wallets_at_unix_ms = Some(at);
@@ -749,6 +758,35 @@ mod tests {
         assert!(
             json.get("source_health").is_none(),
             "byte-identical disabled shape"
+        );
+    }
+
+    #[test]
+    fn disk_low_appears_in_status_only_while_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let paper_state = PaperStateDb::open(&dir.path().join("p.db")).unwrap();
+        let mut snap = build_snapshot(
+            &paper_state,
+            "paper",
+            false,
+            1,
+            1_000_000,
+            0,
+            &[],
+            0,
+            0,
+            None,
+        );
+        assert!(
+            serde_json::to_value(&snap)
+                .unwrap()
+                .get("disk_low")
+                .is_none()
+        );
+        snap.disk_low = true;
+        assert_eq!(
+            serde_json::to_value(&snap).unwrap()["disk_low"],
+            serde_json::json!(true)
         );
     }
 

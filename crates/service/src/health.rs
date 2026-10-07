@@ -252,9 +252,6 @@ pub fn readiness_issues(
     if h.configuration_generation_pending {
         issues.push("configuration_generation_pending");
     }
-    if h.disk_low {
-        issues.push("disk_low");
-    }
     if h.task_status.critical_failed() {
         issues.push("critical_task_failed");
     }

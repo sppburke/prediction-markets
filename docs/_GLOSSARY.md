@@ -867,7 +867,7 @@ call count.
 | Key | Default | Meaning |
 |---|---:|---|
 | `source_freshness_window_seconds` | 60 | Seconds without an event before a source is considered stale in `/health/ready` |
-| `DISK_FREE_WARN_BYTES` | 15,000,000,000 bytes (15 GB) | Compiled `disk_monitor` constant, no TOML/env key. Below this on any durable filesystem, readiness reports `disk_low` and one ERROR logs the transition; recovery to at least this clears the issue and logs INFO. |
+| `DISK_FREE_WARN_BYTES` | 15,000,000,000 bytes (15 GB) | Compiled `disk_monitor` constant, no TOML/env key. Below this on any durable filesystem, `status.json` reports `disk_low: true` and one ERROR logs the transition; readiness is unaffected (an alarm only; the floor stops the service). Recovery to at least this clears the flag and logs INFO. |
 | `DISK_FREE_FLOOR_BYTES` | 5,000,000,000 bytes (5 GB) | Compiled `disk_monitor` constant, no TOML/env key. Startup refuses before writable initialization below this; a runtime sample below it fails the critical owner and requests coordinated shutdown. |
 | `DISK_SAMPLE_SECS` | 60 s | Compiled `disk_monitor` constant, no TOML/env key. The named critical owner samples immediately, then at this cadence regardless of `status_interval_secs`; sampling errors WARN and retry at the next tick without initiating shutdown. |
 

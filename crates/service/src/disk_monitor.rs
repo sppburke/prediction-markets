@@ -346,16 +346,17 @@ mod tests {
                 .unwrap(),
             DiskTransition::Recovered
         );
-        let state = health.lock().unwrap();
         let now = OffsetDateTime::from_unix_timestamp(10_000).unwrap();
-        assert!(!state.disk_low);
-        assert!(!readiness_issues(&state, now, Instant::now()).contains(&"disk_low"));
-        drop(state);
+        assert!(!health.lock().unwrap().disk_low);
+        let ready_before = readiness_issues(&health.lock().unwrap(), now, Instant::now());
         monitor
             .sample_with(&health, |_| Ok(DISK_FREE_WARN_BYTES - 1))
             .unwrap();
-        assert!(
-            readiness_issues(&health.lock().unwrap(), now, Instant::now()).contains(&"disk_low")
+        // The warning is an alarm, not a readiness condition: the service still works.
+        assert!(health.lock().unwrap().disk_low);
+        assert_eq!(
+            readiness_issues(&health.lock().unwrap(), now, Instant::now()),
+            ready_before
         );
     }
 
