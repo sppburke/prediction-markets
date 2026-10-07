@@ -826,6 +826,7 @@ struct RunningPoll {
     requests: mpsc::Receiver<RequestedPage>,
     progress: mpsc::Receiver<pe_service::trade_poller::PollerProgress>,
     waits: mpsc::Receiver<pe_service::trade_poller::PollerWait>,
+    held: tokio::sync::watch::Receiver<pe_service::trade_poller::HeldObligations>,
     stop: oneshot::Sender<()>,
     poller: tokio::task::JoinHandle<Result<(), pe_service::trade_poller::TradePollerOwnerError>>,
     coordinator_gate: Arc<Mutex<(bool, Option<std::task::Waker>)>>,
@@ -851,6 +852,11 @@ impl RunningPoll {
     }
 
     async fn observe(&self, row: Value) -> pe_event_log::AppendReceipt {
+        self.observe_with(row, true).await
+    }
+
+    /// The feed marks a trigger qualifying only for a non-combo BUY with nonzero shares.
+    async fn observe_with(&self, row: Value, qualifying_buy: bool) -> pe_event_log::AppendReceipt {
         use pe_service::activity_ingest::{ACTIVITY_WS_SOURCE_ID, ReconciliationTrigger};
         let payload = serde_json::to_vec(&row).unwrap();
         let parsed =
@@ -872,7 +878,7 @@ impl RunningPoll {
             .unwrap();
         self.triggers
             .send(ReconciliationTrigger {
-                qualifying_buy: true,
+                qualifying_buy,
                 wallet: parsed.wallet,
                 source_time: parsed.source_time.0,
                 source_trade_id: parsed.group_id.key().clone(),
@@ -1229,6 +1235,9 @@ fn start_recorded_poller_with_completion_stop(
     {
         obligations.set_boundary_anchor(anchor);
     }
+    let (held_tx, held) = tokio::sync::watch::channel(
+        pe_service::trade_poller::HeldObligations::from(&obligations),
+    );
     let poller = TradePoller::new(
         TradePollerConfig {
             base_url: BASE_URL.to_owned(),
@@ -1262,7 +1271,8 @@ fn start_recorded_poller_with_completion_stop(
     } else {
         progress_tx
     })
-    .with_wait_observer(wait_tx);
+    .with_wait_observer(wait_tx)
+    .with_held_obligations(held_tx);
     let mut run = Box::pin(poller.run_until(async move {
         if let Some(target) = stop_after_completion {
             // Completed is emitted synchronously inside the join arm, after the select's
@@ -1308,6 +1318,7 @@ fn start_recorded_poller_with_completion_stop(
             requests,
             progress,
             waits,
+            held,
             stop,
             poller,
             coordinator_gate,
@@ -2499,6 +2510,65 @@ async fn sent_backstop_commit_ack_precedes_same_wallet_urgent_handoff() {
         .send(serde_json::to_vec(&[first_row, later]).unwrap())
         .unwrap();
     assert_eq!(running.completed(wallet()).await, vec![receipt]);
+    running.finish().await;
+}
+
+/// PASS: the daily source retention pins what the poller publishes as held. A frozen attempt
+/// whose read failed keeps its selection; when a qualifying observation of the same trade then
+/// replaces the selected one in the current obligations, the poller still publishes the replaced
+/// receipt for the retry that reads it, and releases it only once that attempt is done.
+#[tokio::test(start_paused = true)]
+async fn frozen_attempt_keeps_a_replaced_observation_held_until_it_releases_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut running, _) = start_recorded_poller(&dir, &[wallet()]);
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    running.round_completed().await;
+    let qualifying = stream_row(wallet(), "replaced-observation", EPOCH);
+    let mut zero = qualifying.clone();
+    zero["size"] = json!("0");
+    zero["usdcSize"] = json!("0");
+    let replaced = running.observe_with(zero, false).await;
+    running.requests.recv().await.unwrap().respond.fail();
+    running.completed(wallet()).await;
+    let replacement = running.observe_with(qualifying.clone(), true).await;
+    let retry = running.requests.recv().await.unwrap();
+    let held = running
+        .held
+        .wait_for(|held| held.receipts.contains(&replacement))
+        .await
+        .unwrap()
+        .clone();
+    assert!(
+        held.receipts.contains(&replaced),
+        "the retry still reads the replaced observation: {held:?}"
+    );
+    assert!(held.wallets.contains(&wallet()));
+    retry
+        .respond
+        .send(serde_json::to_vec(std::slice::from_ref(&qualifying)).unwrap())
+        .unwrap();
+    assert_eq!(running.completed(wallet()).await, vec![replaced]);
+    running
+        .held
+        .wait_for(|held| !held.receipts.contains(&replaced))
+        .await
+        .unwrap();
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(serde_json::to_vec(&[qualifying]).unwrap())
+        .unwrap();
+    assert_eq!(running.completed(wallet()).await, vec![replacement]);
     running.finish().await;
 }
 

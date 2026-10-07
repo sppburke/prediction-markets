@@ -141,18 +141,14 @@ impl From<&ReconciliationObligations> for HeldObligations {
     fn from(obligations: &ReconciliationObligations) -> Self {
         // The same frames recovery would route again, plus the evidence their bindings name.
         let (mut receipts, _) = obligations.frame_recovery_receipts();
-        for binding in obligations
-            .by_wallet
-            .values()
-            .flat_map(BTreeMap::values)
-            .flat_map(BTreeMap::values)
-            .flat_map(|obligation| &obligation.bindings)
-        {
-            receipts.push(binding.stream_receipt);
-            receipts.extend(binding.identity_receipt);
-            receipts.extend(binding.counterpart_basis_receipt);
-            receipts.extend(binding.frame_admission_receipt);
-        }
+        receipts.extend(
+            obligations
+                .by_wallet
+                .values()
+                .flat_map(BTreeMap::values)
+                .flat_map(BTreeMap::values)
+                .flat_map(|obligation| binding_receipts(&obligation.bindings)),
+        );
         receipts.sort_by_key(|receipt| receipt.sequence);
         receipts.dedup();
         Self {
@@ -160,6 +156,38 @@ impl From<&ReconciliationObligations> for HeldObligations {
             receipts,
         }
     }
+}
+
+impl HeldObligations {
+    /// A running or retrying reconciliation reads its frozen selection, which coalescing may
+    /// already have replaced in the current obligations; hold it until the attempt releases it.
+    fn with_selections<'a>(
+        mut self,
+        selections: impl IntoIterator<Item = (&'a WalletAddress, &'a WalletObligations)>,
+    ) -> Self {
+        for (wallet, selected) in selections {
+            for obligation in selected.values().flat_map(BTreeMap::values) {
+                self.wallets.insert(*wallet);
+                self.receipts.push(obligation.receipt);
+                self.receipts.extend(binding_receipts(&obligation.bindings));
+            }
+        }
+        self.receipts.sort_by_key(|receipt| receipt.sequence);
+        self.receipts.dedup();
+        self
+    }
+}
+
+/// The source evidence one observation's bindings name.
+fn binding_receipts(
+    bindings: &[ObservationBinding],
+) -> impl Iterator<Item = pe_event_log::AppendReceipt> + '_ {
+    bindings.iter().flat_map(|binding| {
+        std::iter::once(binding.stream_receipt)
+            .chain(binding.identity_receipt)
+            .chain(binding.counterpart_basis_receipt)
+            .chain(binding.frame_admission_receipt)
+    })
 }
 
 fn insert_coalesced_obligation(
@@ -1549,7 +1577,13 @@ impl TradePoller {
                 }
             }
             if let Some(held) = &self.held_obligations {
-                held.send_replace(HeldObligations::from(&self.obligations));
+                held.send_replace(
+                    HeldObligations::from(&self.obligations).with_selections(
+                        attempts
+                            .iter()
+                            .map(|(wallet, attempt)| (wallet, &attempt.selected)),
+                    ),
+                );
             }
             if stopping && tasks.is_empty() {
                 break;
