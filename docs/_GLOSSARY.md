@@ -172,8 +172,8 @@ pub enum Side { Buy, Sell }                   // venue adapters map Yes/No → S
 `SourceTradeId` is generation-aware (#544). Historical version-one frames retain their
 transaction-hash identity. A version-two normalized activity group is keyed by
 `g2:<lowercase BLAKE3>` over the canonical length-prefixed group components; its
-`transaction_hash` remains separate audit evidence and never participates in deduplication or
-causal ordering. Only the exact 67-byte lowercase `g2:` encoding is version two. `ShareAmount`
+`transaction_hash` remains separate evidence and does not define group identity or causal
+ordering; frame/REST copy ownership uses the tuple defined below. Only the exact 67-byte lowercase `g2:` encoding is version two. `ShareAmount`
 and `CollateralAmount` preserve venue decimals exactly to six places as checked `u64` atomics;
 lossy fractional input, negative input, and overflow are rejected rather than rounded.
 
@@ -337,7 +337,8 @@ Where the docs use vague qualifiers, these are the canonical defaults. They live
 | `positions_max_offset` | 10,000 | **Module const** in `source-polymarket-public` (not a TOML/env key). Each explicit `redeemable=false` and `redeemable=true` current-position partition is walked independently through this offset. A full terminal page is typed-incomplete (#544). |
 | <a id="anchor_refresh_secs"></a>`anchor_refresh_secs` | 3,600 | **Module const** `ANCHOR_REFRESH_SECS` in `service::trade_poller` (not a TOML/env key). Seconds between best-effort per-wallet position re-anchors and the refresh-only cooldown for every terminal `Deferred`. Refresh deadlines use monotonic time captured immediately after terminal completion, before coordinator handling, and gate normal selection, retry selection and queued launch. Successful anchoring clears the refresh deadline; cancelled, skipped and unstarted work create none. Cooldowns survive membership/ranking-batch changes and reset on restart. Admission uses [`admission_retry_secs`](#admission_retry_secs). An owner-selected operational default, not a calibrated value. |
 | <a id="admission_retry_secs"></a>`admission_retry_secs` | 300 | **Module const** `ADMISSION_RETRY_SECS` in `service::watchlist_admission` (not a TOML/env key). In-memory cooldown from a `WalletTransient` bracket failure's monotonic completion time until the wallet becomes eligible again: boot's `boot_transient_retry_at` in `main.rs` and runtime maintenance's `park_persistent` use the same constant. Cooldowns survive ranking-batch changes and reset on restart; successful admission clears the wallet's cooldown. |
-| `bracket_identity_chunk_retry` | 4 additional retries; waits of 2, 4, 8 and 16 s | Compiled retry schedule in `service::asset_identity` (`resolve_for_bracket` / `fetch_and_record_chunks`), not a TOML/env key. An admission bracket retries a chunk whose fetch exhausted the fetcher's transient retries; each retry passes through the shared rate gate. Rate-limited, fatal, parse and recording failures receive no additional chunk retry. The poller's `resolve` retains one attempt per chunk, including the fetcher's own retry policy. |
+| `bracket_identity_chunk_retry` | 4 additional retries; waits of 2, 4, 8 and 16 s | Compiled retry schedule in `service::asset_identity` (`resolve_historical_for_bracket` / `resolve_inner`), not a TOML/env key. An admission bracket retries a chunk whose fetch exhausted the fetcher's transient retries; each retry passes through the shared rate gate. Rate-limited, fatal, parse and recording failures receive no additional chunk retry. The poller's `resolve_live` retains one attempt per chunk, including the fetcher's own retry policy. |
+| `asset_identities` | Installed activation binding | Additive paper-state cache keyed by `(generation, token)`, with a non-unique index on `(generation, condition_id, outcome)`. Generation is canonical JSON of the installed migration activation tails, stable across restarts; first-migration boot stays memory-only. Resolution checks memory, then an indexed lookup for requested misses in this generation, then Gamma (open before closed). One resolver mutex serializes one fetch attempt for a miss chunk of at most `gamma_batch_size` tokens: recheck memory and the table, fetch open before closed leftovers, verify and compare intersecting original pages, save, then release. Transient bracket retry backoff sleeps with the mutex released; each retry reacquires it and rechecks memory and the table before fetching remaining misses. Original pages are authenticated once per distinct receipt within a request. The mutex is first-in, first-out: a waiting live lookup can be preceded by one fetch attempt from each caller already queued, while each caller releases it between attempts and chunks. Rows contain token, condition, outcome, original source-log sequence and canonical page hash; identities and provenance are rebuilt from those columns. Before restore, each original page is read once through the receipt index and authenticated against its envelope hash, source/schema/parser/content-type contract, canonical hash and the existing Gamma identity verifier. Invalid rows are deleted and fetched again; valid rows retain original provenance. Every verified market's tokens are saved, siblings included. Before using fresh identities, the verifier checks fresh pages together with original pages intersecting by token or condition. Synchronized boot pages retain raw bytes, evidence and receipts until `boot.extend` indexes them. A conflict evicts every involved condition's identities, including cached siblings, and commits independent `meta` markers keyed by `rejected_asset_condition:<generation>:<condition_id>`, whose value is the conflict page's receipt sequence. Rows stay available as evidence; all tokens of a marked condition remain unverified across restarts, even when it has no row of its own. Memory hits check the rejected-condition set; table and Gamma identities check the condition marker before entering memory. Non-conflicting progress before a failed chunk is kept while the original error still rejects admission. Missing token identities are never saved. A completed open-and-closed lookup records absent tokens in `meta` under `absent_asset_token:<generation>:<token>`, with the last recorded page's receipt sequence; failed lookups record no absences. Historical bracket and anchor/re-entry lookups return marked tokens as unresolved without Gamma requests, including across restarts. Live frame and decision lookups ignore absence markers and can discover later listings. Authenticated identities take precedence over absence markers. Rejected-condition markers remain authoritative for both lookup purposes. Observed tokens of rejected conditions also retain `rejected_asset_token:<generation>:<token>` markers with a recorded receipt sequence, committed with the condition markers; historical lookups skip these tokens even when ambiguity left no identity row. Foreign generations neither satisfy lookup nor block insertion. Every mutation commits before acknowledgement at boot and runtime. `PaperStateDb` holds its connection mutex across an autocommit check and its own short transaction, with at most `ASSET_IDENTITY_INSERT_LIMIT` rows per statement (matching `gamma_batch_size`). Rejection and absence markers commit with their accompanying row changes. While a bracket batch is open, the resolver releases the connection mutex and retries asynchronously every 10 ms, failing after 30 s without acknowledging identities. No boot buffer, existing-data migration or backfill. |
 | `bracket_concurrency` | 4 | **Module const** `BRACKET_CONCURRENCY` in `service` (not a TOML/env key). Maximum wallet brackets in flight at once during the boot bracket and runtime admission batches (#555 addendum D9). Chosen from the measured per-wallet peak of ~304 MB resident on the largest wallet against the 2 GB production host; every bracket still reads the wallet's full history three times. |
 | `redeem_residual_limit_atomic` | 100 | **Exclusive module const** `REDEEM_RESIDUAL_LIMIT_ATOMIC` in `position-ledger` (#557). A REDEEM underflow residual of 1..=99 atomic units clamps the position closed and is recorded in the version-3 effect document; 100 or more fences. `ShareAmount` has six decimal places, so 100 atomic units equal one ten-thousandth of a position: the limit is one four-decimal `/positions` reporting quantum and accepts venue-display quantization residue without hiding a full reported quantum. SELL and MERGE remain strict, and the tolerance cannot stack within a bucket. |
 | `rehearsal_quiescence` | production unit policy at run time | The #545 rehearsal reads the production `pe-service` unit's `TimeoutStopSec` as its exact quiescence bound and requires `KillSignal` to be SIGINT, the signal handled by the service. The harness owns no separate numeric shutdown bound (#586). |
@@ -374,7 +375,7 @@ the next-whole-second wake; periodic work retains its cadence. A held urgent slo
 
 **Installed-boot anchor reuse.** An ordinary installed boot reuses a wallet's `leader_positions`
 mirror only when the wallet is unfenced and history-complete, has a delivery cursor and non-null
-activity cutoff, has an installed anchor no older than `ANCHOR_REFRESH_SECS`, and has
+activity cutoff, has an installed anchor regardless of age, and has
 `reanchor_required = false`. Any failed condition selects the wallet for `validate_direct`.
 The durable `position_anchors` proof selected by coverage must also retain all three full-history
 activity walks: each walk includes its original page-zero request with exclusive start zero and
@@ -385,8 +386,10 @@ temporary projection without deleting the durable anchor. Only reused wallets an
 by direct validation can enter the boot universe; a deferred walk cannot reuse an old complete flag.
 When Supabase is configured and `maintenance_interval_secs` is positive, an ordinary progressive
 boot skips validation waves if a post-Start membership record has replayed, even when all anchors
-are stale. Stale-anchor structural members await runtime admission, whose first maintenance tick
-runs at startup. Without that record, an eligible reused wallet still skips fresh boot validation;
+are stale. Reusable stale anchors stay live while the unchanged runtime refresh rechecks them in
+the background. Structural members that fail the reuse conditions await runtime admission, whose
+first maintenance tick runs at startup. Without that record, an eligible reused wallet still skips
+fresh boot validation;
 otherwise boot validates `BRACKET_CONCURRENCY`-sized waves until a wallet passes the final fence,
 durable-history and acceptance filters. A successful bracket without seeded history does not stop
 the waves. Migration, `--exit-after-anchors` and disabled maintenance retain complete validation.
@@ -395,7 +398,7 @@ When a required `validate_direct` walk fails, boot defers every wallet-scoped fa
 the legacy deferral predicate (including the invalid-price row observed in #594, transient and
 rate-limited source reads). Only accepted wallets install anchors atomically, and only their seeded
 history promotes to complete. Deferred wallets stay unvalidated for runtime admission; a wallet
-reused on a fresh anchor is not re-read at boot. Shared infrastructure and consistency failures
+reused on an installed anchor is not re-read at boot. Shared infrastructure and consistency failures
 outside the legacy predicate retain their boot failure policy. Runtime-refresh error conversion is
 unchanged: a deferred refresh keeps the current anchor usable under existing eligibility rules and
 starts the refresh-only cooldown (#597). A deferred routine refresh still gets its immediate
@@ -557,34 +560,41 @@ The paper wire-2 core hash remains separately bound in both cases.
 **Frame authority (#730 Part 2).** After source synchronization, the first qualifying frame in
 receipt order is classified against the admission-time confirmed ledger, consumed history and
 earlier frames. Only positive-share, non-combo BUY Entries from copy-eligible, history-complete,
-unfenced wallets without a re-anchor requirement can enter, with a current frontier and clear
-feed latch, after the financial Start. Before Start, synchronized frames only trigger
+unfenced wallets without a re-anchor requirement can enter with a current frontier after the
+financial Start. Before Start, synchronized frames only trigger
 reconciliation, as in Part 1; they create no admission, decision or incident.
 An earlier unresolved BUY blocks later frames of that wallet/market only; REST
 winning first consumes history before frame admission. The frame transaction writes gate,
 wallet-market history and pending decision together. Later declines never undo consumption.
 Frames create no activity-group/revision rows, leader-balance effects or delivery-cursor progress.
-REST applies and binds each authenticated counterpart once, including aliases, without another
-decision or any change to the frame's pending row, terminal or Prepared inputs. This suppression
-survives negative audits, release and restart; equal identifiers retain the frame-owned gate and
-single terminal. A later-discovered earlier BUY with a different verified identity is audit-only:
-it neither latches nor changes the decision; genuine late arrivals retain causal re-anchoring.
+REST applies each matching counterpart once, including aliases, without another decision or
+any change to the frame's pending row, terminal or Prepared inputs. Copy ownership survives
+restart; equal identifiers retain the frame-owned gate and single terminal. Genuine late
+arrivals retain causal re-anchoring.
 
 The admission capture retains the frame receipt, source/receive/admission clocks, compact
 `AdmissionLedgerCapture`, append-only activity row boundary, frame-market anchor balances and
 post-anchor groups, a single market-consumption fact, and only
 the admitting wallet's preceding unresolved BUYs or obligations. Eligibility, history/fence/coverage,
-frontier/staleness and paper-prefix incident/release basis remain frozen. Durable anchor/group
+frontier/staleness and paper prefix remain frozen. Historical incident/release fields remain
+decodable and frozen proofs remain verifiable. Durable anchor/group
 owners authenticate the scoped rebuild through the recovery reducer; the frame transaction's
 `wallet_market_history_v2` row proves first consumption. Configuration, sizing basis and quality
 live in continuation facts; frame payload/hash and parser/schema contracts resolve from its
 receipt. The continuation stores the scoped body once; the compact source-log admission artifact stores
-only its version, frame receipt and `capture_digest` (the domain-separated frame revision).
+its version, frame receipt and `capture_digest` (the domain-separated frame revision).
+Version-two admissions additionally freeze the shared resolver’s verified asset provenance and
+original Gamma receipt, authenticate the condition and outcome before consuming history, and
+record admission without a feed check. Version-one admissions retain their original digest and
+verification rules. Unavailable or mismatched identity routes to REST without consuming history. Eligibility and
+copy freshness are checked again after identity resolution, before history is consumed.
 Classification uses the position rebuilt from these inputs. Resolved
-barriers retire through the owner's acknowledged match/disposition or incident path at runtime;
-boot rebuilds the same coalesced unresolved receipts. The poller and owner share one same-identity
-rule: retain the admitted receipt, otherwise the earliest positive-share, non-combo BUY, then the earliest synchronized
-receipt, including across source epochs. Admission supersedes an earlier excluded zero-share receipt of that identity.
+barriers for fallback observations retire through the owner's acknowledged disposition at runtime;
+boot rebuilds the same coalesced unresolved receipts. An admitted frame leaves the unresolved
+set immediately and creates no reconciliation obligation. Its durable decision rejects repeated
+feed messages as `identity_seen`. For remaining observations, retain the earliest positive-share,
+non-combo BUY, then the earliest synchronized receipt, including across source epochs. Admission
+supersedes an earlier excluded zero-share receipt of that identity.
 Unrelated wallets/positions/history cannot grow the body.
 
 First-entry history is per wallet and market. Continuation 7 copies each wallet's first entry
@@ -597,102 +607,69 @@ fee reserve, affordability, caps and the admission minimum. Below-minimum signed
 shares. Historical paper, ordinary live and backtest retain `Dollar`; Kelly and Contract remain
 exact-or-decline. Economic wire 2 alone never selects partial sizing.
 
-**Feed history frontier and audit.** Versioned `FeedHistoryFrontier` values under the
-`feed_history_frontiers` key in `meta` authenticate the latest contiguous complete read's fixed end H,
-commitment, pages and occurrences. Publish only after every bucket and observation-retirement
-acknowledgement. The serialized owner's current ordering barrier is the authority: H cannot cross
-any unresolved wallet observation whose authenticated source time is at or before H, including a
-qualifying frame routed to history without admission. Launches, failed acknowledgements and incomplete reads never
-advance H. Empty reads first persist a proofless payload-2 commitment. Authenticate restored
-frontiers and freeze their bounds in admission inputs. For frame receipt r and admission a,
+**Frame/REST copy ownership.** A durable frame decision owns one TRADE counterpart key:
+wallet, transaction hash, verified asset and side. Every matching REST group is disposed without
+another copy, regardless of candidate count, quantity, price or timestamp; partial fills aggregate
+within their group. Read-proven restamp pairs retain their existing collapse and ledger semantics.
+A different asset or side in the same transaction is an independent leg and keeps ordinary routing,
+including when it arrives alone after restart. An eligible BUY in a different, unconsumed market
+can copy; SELLs and same-market legs retain the entry gates. The frame's asset and side come from its recorded
+feed message. REST winning first retains exact-ID and consumed-market refusal. A feed/REST asset
+disagreement is a different trade under this key; runtime no longer checks for feed contradictions
+or absence and produces no feed incidents. Economics and financial semantic versions are unchanged.
+
+**Feed history frontier.** Versioned `FeedHistoryFrontier` values under the
+`feed_history_frontiers` key in `meta` record the latest contiguous complete read's fixed end H,
+commitment, pages and occurrences. Publish a freshly authenticated frontier only after every bucket
+and ordinary observation-retirement acknowledgement. H cannot cross an unresolved wallet
+observation whose authenticated source time is at or before H, including a qualifying fallback.
+Admitted frames create no barrier. Launches, failed acknowledgements and incomplete reads never
+advance H. Empty reads first persist a proofless payload-2 commitment.
+
+Boot starts with an empty verified-frontier map. Persisted `fixed_end` is only a read-start hint:
+`start = min(start, fixed_end − 1)`, without frontier verification. The stored collection is loaded
+once as unverified hints; publication overlays this invocation's authenticated entries so a wallet's
+fresh read preserves every other wallet's hint. Hints never authorize admission. Feed copies resume after the
+first fresh REST read publishes a frontier; until then frames use REST fallback. Open frame
+continuations still authenticate their own frozen frontier. For frame receipt r and admission a,
 history is required if H is absent, H > r, a − H exceeds `poll_round_stale_secs`, or an earlier
-wallet obligation has waited longer than that bound. `poll_round_stale_secs` is boot-resolved as
-3 × `trade_poll_interval_secs` and frozen in `FrameAdmissionInputs`; equality passes. It is not a
-new configuration key.
+fallback obligation has waited longer than that bound. `poll_round_stale_secs` is boot-resolved as
+3 × `trade_poll_interval_secs` and frozen in `FrameAdmissionInputs`; equality passes.
 
-An admitted frame remains an audit obligation, even after fencing, until its matched, contradicted
-or absent conclusion is recorded (a negative conclusion acknowledged by the orchestrator) and
-its fixed counterpart group has a durable disposition under any revision. Absence has no
-counterpart and retires on acknowledgement. Its frozen receipt cannot be replaced by another
-observation of the same identity.
-For a still-unbound frame, discover counterparts by authenticated wallet/transaction and asset
-disambiguation before side comparison, preserving verified bindings, restamp equivalence and ambiguity.
-Once authenticated, its counterpart identity stays fixed through commitment-before-bucket crashes,
-audit retirement, release and restart; another transaction leg receives its own decision. A different
-identifier is equivalent only through an authenticated restamp pair. Retained authenticated
-counterparts, matched or contradicted, win over later absence and commit their recorded read
-through the bucket owner. An earlier match suppresses only later absence. Any authenticated read binding an admitted
-frame to a contradicting counterpart journals one incident for that frame, before or after
-audit retirement, including a changed revision. Changed revisions follow REST's existing
-revision routing and fence. Production, boot and qualification
-retire the audit once the conclusion is recorded (a negative conclusion acknowledged) and the
-fixed counterpart group has a durable disposition under any revision. A match confirms
-an ordinary positive-share TRADE with the same effective side, condition and outcome; combo,
-zero-share or disagreeing counterparts contradict. Positive quantity, price and time differences
-are audit facts. Absence matures at frozen frame source time + `copy_latency_budget_secs`:
-search retained authenticated counterparts first, then require a successful complete `(0, fixed_end]`
-read ending at or after maturity. Cursor-bounded, immature or failed reads prove no absence;
-negative audits retain the deciding commitment's proof, including empty bindings. Qualification
-retains only authenticated bindings/restamp pairs for selection and releases reconstructed aggregates,
-effective identities and read indexes after each authentication.
-Boot keeps a frame's obligation while any retained commitment concludes negatively without a
-journaled incident for that frame, even if catch-up already disposed a group matched by an
-earlier commitment. The first retained-read attempt journals the pending negative before retirement.
-Replaying an older retained read keeps the ordering barrier unless the counterpart is matched
-in that read or its group is already disposed; a counterpart learned from a later read alone
-cannot release it. Qualification verifies every recorded incident against its deciding read
-and exposes unresolved audits. Incident completeness is proven by production scenarios and
-audited on deployed data using [AC16's recipe](29-ACTIVITY-LATENCY-MEASUREMENT.md#730-acceptance-measurement).
-A match or contradiction fixes the frame's counterpart, so a later read cannot rebind it to
-another transaction leg. After an absence incident, counterpart discovery still disambiguates
-multiple same-transaction groups by the frame's asset and leaves multiple remaining candidates
-unresolved. The first uniquely resolved later authenticated group becomes the frame's late
-counterpart: it applies to the leader ledger once and creates no second decision.
-Its first binding fixes that counterpart durably; later reads cannot replace it with another leg.
-Only authenticated restamp equivalence can change its identifier.
-A frame whose transaction REST already decided for that wallet under another identifier is
-admitted like any frame. Its audit matches an independent leg to that leg's own group through
-the equal-ID branch, with no second decision; a market/asset misreport contradicts and latches.
-Admission performs no source-log counterpart search.
-Once a read commitment is enqueued, reconciliation drains its acknowledgement, authenticates it
-and retains its binding/proof before honoring preemption.
-Later frame bindings carry `counterpart_basis_receipt`, referencing the first binding commitment
-or the full-history absence proof for a late counterpart. Synchronization, boot and sealed replay
-authenticate that basis with the same counterpart rule; initial and historical bindings omit it.
+**Ordinary observation retirement and recovery.** Binding commitments continue to bind fallback
+observations to their authenticated REST targets, including corrections with a different group ID.
+During the hash-chained source-log walk, `ActivityCandidates` records each commitment’s bindings
+and obligation receipts. Boot first drops admitted-frame candidates, exact durable observation
+retirements and observations whose own group is disposed. Parsed bindings locate commitments;
+they never prove retirement by themselves. Only commitments needed to prove an ordinary
+obligation’s retirement, support a surviving ordinary obligation or verify an open continuation
+are authenticated. Scenario counters distinguish these three uses. Deployed checkpoint format 1,
+activity reducer 2 stores only commitment receipts; hydration reads each payload once through the
+receipt index, without re-authenticating the complete read, and advances to reducer 3. Reducer 1
+still requires a full walk. Runtime publication prunes current work through the shared paper-state
+handle, then requires a complete `wal_checkpoint(PASSIVE)` durability barrier before installing
+the pruned manifest: busy is zero and every WAL frame is checkpointed. The barrier never waits on
+readers under the connection mutex and retains `synchronous=NORMAL`. An incomplete or failed
+barrier skips publication until the next hourly attempt. Read-only preparation and compatibility
+conversion keep unpruned candidates. Manifest bytes and retained collection counts are logged.
+New commitments produce no frame bindings or counterpart-basis receipts. Historical commitment
+fields and basis-bearing proofs remain decodable and verifiable when selected by an open
+continuation or qualification. Qualification retains feed-audit verification and the frozen
+paper-prefix latch comparison for version-one frame admissions and skips both for version two;
+economic and financial versions are unchanged.
 
-**Feed incidents and history fallback.** `PaperLogRecord::FeedIncidentChanged { incident, state }`
-journals contradiction or absence before the audit ordering barrier retires. A contradiction
-engages the latch as soon as the audit concludes, before any routing of that read (including
-retained-read recovery), but retains reconciliation and ordering work across acknowledgement
-and restart until its fixed counterpart group has a durable disposition under any revision,
-including late-group re-anchor handling. Qualification applies the same group-disposition rule;
-an acknowledged absence retires immediately because it has no counterpart. Repeated engagement
-requests acknowledge the existing incident once. The synchronized
-paper era rebuilds one process-wide latch before boot admissions: `Engaged` sets the latest
-incident, and `Released` must reference that latest engagement. While latched, frames wait for
-history; admitted work completes. `status.json` reports `source_health.feed_latch` and `source_health.feed_incident`, the
-structured error `feed audit incident engaged; frames wait for history` carries the same
-incident, and qualification checks each frame's frozen latch basis against its paper prefix.
-Release uses
-only the existing `risk_halt_release_hash` row and the latest unreleased engagement's `this_hash`.
-The owner rechecks that identity immediately before durable release; a newer incident makes a
-queued older release a no-op. Independent risk halts retain their own release path; malformed,
-stale or repeated values and restart cannot clear the latch.
-
-A qualifying frame routed to history appends one versioned audit-only artifact under
+A qualifying frame routed to history appends one versioned artifact under
 `pe-service.activity-frame-fallback`, with `frame_receipt`, `routing_clock`, typed `reason`,
-evaluated `frontier` and `latest_incident_basis`. `FrameFallbackReason` encodes `latched`,
-`history_behind`, `earlier_unresolved_buy` or `wallet_not_ready`. Wallet and market are derived
-from the authenticated frame. This artifact consumes no entry and is not a decision input;
-measure routing from the earliest authenticated artifact per frame, never current status.
-`pe-service.activity-frame-admission` authenticates the digest of the frozen frame admission
-inputs in the pending continuation; it does not duplicate the inputs. Ordinary non-admitted
-obligations retire through the owner acknowledgement, retaining their exact receipt and whether
-retirement was unbound under
-`retired_activity_observation:<sequence>` in `meta` so fence clearance and restart cannot
-restore an obsolete ordering barrier. Bound observations still require their authenticated
-disposed target during obligation rebuild. Admitted audits retire only through an authenticated
-disposed match or an acknowledged incident.
+evaluated `frontier` and the compatible `latest_incident_basis` field. Current reasons are
+`history_behind`, `earlier_unresolved_buy`, `wallet_not_ready`, `identity_unverified` and
+`copy_expired`; historical `latched` and paper-log
+incident records remain decodable. Wallet and market derive from the authenticated frame. This
+artifact consumes no entry and is not a decision input; measure routing from the earliest artifact
+per frame. `pe-service.activity-frame-admission` authenticates the frozen admission digest.
+Ordinary obligations retire through the owner acknowledgement, retaining their exact receipt and
+whether retirement was unbound under `retired_activity_observation:<sequence>` in `meta` so fence
+clearance and restart cannot restore an obsolete ordering barrier. Bound observations retain their
+disposed-target retirement semantics. Independent risk halts keep their existing release path.
 
 **History-only bracket disposition.** `history_only_bracket` (`HISTORY_ONLY_BRACKET`) records an
 admitted first entry whose copying a causal bracket suppresses. It is an applied activity
@@ -733,9 +710,8 @@ their typed error are status evidence, not a second revision.
 After `QualificationStarted`, optional text row `risk_halt_release_hash` is incident control, not
 economic configuration. The boot and poll paths partition it before exact-key parsing and exclude
 it from the applied economic hash. A value must be exactly 64 lowercase hexadecimal characters
-and name the append hash of the latest unreleased feed engagement or a currently active
-`RiskHaltChanged` engagement. A feed release clears only the process-wide feed latch; a risk
-release may release only that same absolute-loss cause, or a latency cause held by a missing
+and name the append hash of a currently active `RiskHaltChanged` engagement. A risk release
+may release only that same absolute-loss cause, or a historical latency cause held by a missing
 sample; the synchronized release consumes it. Missing, empty, malformed, stale, already-consumed, or cause-mismatched
 values only warn and change neither economics nor halt state.
 
@@ -894,6 +870,14 @@ call count.
 | Key | Default | Meaning |
 |---|---:|---|
 | `source_freshness_window_seconds` | 60 | Seconds without an event before a source is considered stale in `/health/ready` |
+| `DISK_FREE_WARN_BYTES` | 15,000,000,000 bytes (15 GB) | Compiled `disk_monitor` constant, no TOML/env key. Below this on any durable filesystem, `status.json` reports `disk_low: true` and one ERROR logs the transition; readiness is unaffected (an alarm only; the floor stops the service). Recovery to at least this clears the flag and logs INFO. |
+| `DISK_FREE_FLOOR_BYTES` | 5,000,000,000 bytes (5 GB) | Compiled `disk_monitor` constant, no TOML/env key. Startup refuses before writable initialization below this; a runtime sample below it fails the critical owner and requests coordinated shutdown. |
+| `DISK_SAMPLE_SECS` | 60 s | Compiled `disk_monitor` constant, no TOML/env key. The named critical owner samples immediately, then at this cadence regardless of `status_interval_secs`; sampling errors WARN and retry at the next tick without initiating shutdown. |
+
+Disk checks cover the parent directories of `source_event_log_path`, `paper_state_db_path`,
+`event_log_path`, `status_path`, and `jsonl_log_path`, once per device. Before a parent exists,
+its nearest existing directory supplies the filesystem sample; startup creates no directory for
+this check.
 
 ### Agent-friendly log layout
 
@@ -922,8 +906,20 @@ synchronized under the exclusive writer lock; interior corruption and every othe
 fatal. Append, flush, or synchronization uncertainty poisons the writer. The account-tagged
 `live_journal.log` uses its native verified replay for the same binding fields. An ordinary
 installed boot holds that lock while binding the recorded activation prefix. A compatible
-`<source-log>.boot-checkpoint` restores receipt metadata and raw activity/boundary candidates after
-checksum, version, mode, path, activation and tail checks. With readable inactive authority,
+`<source-log>.boot-checkpoint` is the format-2 manifest: scanner/reducer versions, mode,
+activation, generation, path/tail/offset, prefix hash, reducer projections and `receipt_count`,
+without a receipt list. `<source-log>.boot-checkpoint.receipts` holds fixed 80-byte records:
+32-byte receipt hash, little-endian receive milliseconds (`i64`), little-endian byte offset
+(`u64`, absent encoded as `u64::MAX`), and BLAKE3 of the preceding 48 bytes. Record position i
+implies source sequence i, matching the dense in-memory receipt index. Boot reads the named
+records sequentially into that index, validating every checksum, offset bound/order and the
+manifest's last sequence/hash. Invalid receipt records quarantine both the manifest and receipts
+file under the existing invalidation lock and select a full verified walk; the next publication
+creates a fresh receipts file from record zero using that rebuilt index. Bytes beyond `receipt_count`
+are uncommitted garbage. A format-1 manifest converts once, synchronizing its sidecar before
+atomically replacing the manifest; failed conversion retains format 1 and its boot index.
+Compatibility still requires checksum, version, mode, path, activation and tail checks. With
+readable inactive authority,
 boot defers the exact raw-prefix BLAKE3 check and scanner-verifies only the suffix; its completion
 line records `prefix_verification="deferred"`, the loaded binding and `prefix_blake3`. Missing,
 damaged or incompatible artifacts, shortened files, and active or unreadable authority select a
@@ -932,7 +928,8 @@ incomplete-tail repair remain unchanged. Runtime indexed reads verify individual
 
 The critical `source_checkpoint` owner starts after HTTP listening. Its single cancellable blocking
 job slot verifies the loaded prefix, continues the same hasher to the frozen boot tail, then
-serializes and publishes the frozen initial receipt prefix and pre-consumption reducers. A mismatch,
+serializes and publishes the frozen initial manifest and pre-consumption reducers, capturing
+only receipts beyond the installed manifest count. A mismatch,
 read error or binding inequality quarantines checkpoint use and triggers coordinated restart. A
 failure before the quarantine is durable (checkpoint lock, invalidation-record read, quarantine
 rename or its directory sync) carries `CheckpointInvalidationFailed` and exits 78; with no
@@ -945,14 +942,20 @@ no further publication; an already-started publication finishes.
 
 All publishers share one persistent `<checkpoint>.lock` inode and the durable
 `<checkpoint>.invalidation` record (`generation`, `active`; absence means generation zero/inactive).
-Invalidation atomically quarantines the artifact before advancing active authority. Publication
+Invalidation quarantines the manifest and discards the receipts file, synchronizing their directory
+before advancing active authority. Publication
 compares artifact applicability, reducer version, tail, binding and prefix under the lock and
-installs only an authorized candidate; a verified current-generation publication clears active
+installs only an authorized candidate. Under that lock it writes only new receipt records at
+their positions, preserving committed bytes, then fsyncs the sidecar before the manifest's
+existing temporary-file/fsync/rename/directory-fsync install. A crash before manifest installation
+leaves the previous manifest and its receipt prefix valid. `--prepare-source-checkpoint` uses
+the same format-2 publication path. A verified current-generation publication clears active
 only after durable installation. Clearance is automatic on a verified current-generation
 publication, whether by the next boot's full walk or `--prepare-source-checkpoint`; there is no
 separate clearance command. Unreadable authority makes boots full-walk and refuses publication
-until quiesced recovery removes and syncs the checkpoint before removing and syncing the record.
-Preparation reads authority first, captures open rows and feed frontiers before its finite source
+until quiesced recovery removes both checkpoint files and syncs their directory before removing
+and syncing the record. The persistent lock remains; raw logs are unchanged.
+Preparation reads authority first, captures open rows before its finite source
 bound, and full-walks when the record is active or undecodable. A proven wrong prefix digest
 invalidates only the still-current artifact and generation; if either changed, preparation starts
 again. Its durable publication receipt is documented in the
@@ -986,9 +989,10 @@ side main; path, prefix, hash, identity, or phase drift fails closed. Pre-bounda
 audit/replay history and cannot create v2 state. Once v2 input has appended or active state has
 committed, rollback to v1 is refused; restart the v2-compatible binary to resume roll-forward.
 
-Ordinary production has one named supervisor over 17 retained owners. Activity ingest, public
+Ordinary production has one named supervisor over 18 retained owners. Activity ingest, public
 poll/reconciliation, orchestrator, resolution poller, configured live-account/fan-out owners,
-watchlist refresh/projection, maintenance, capacity/config workers, source checkpoint, status writer, and HTTP server
+watchlist refresh/projection, maintenance, capacity/config workers, source checkpoint, disk monitor,
+status writer, and HTTP server
 are critical: an unexpected typed error, early return, channel close, or join failure sticks in
 readiness/status and initiates ordered shutdown. Supabase analytics, liquidity snapshots, and JSON
 tracing appenders are best-effort and degrade status without failing trading readiness. Shutdown

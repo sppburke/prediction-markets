@@ -351,9 +351,9 @@ fn poller_harness_with_fetcher(
         let mut hold_admission = hold_admission;
         while let Some(command) = control_rx.recv().await {
             match command {
-                OrchestratorControl::FeedAuditUpdate { acknowledged, .. } => {
+                OrchestratorControl::ReconciliationUpdate { acknowledged, .. } => {
                     let _ = acknowledged.send(Ok(
-                        pe_service::orchestrator_control::FeedAuditAcknowledgement::Applied,
+                        pe_service::orchestrator_control::ReconciliationAcknowledgement::Applied,
                     ));
                 }
                 OrchestratorControl::PrepareAdmissions { acknowledged, .. } => {
@@ -490,9 +490,9 @@ async fn refresh_outcome_for_install_rejection(
         let mut rejection = Some(rejection);
         while let Some(command) = control_rx.recv().await {
             match command {
-                OrchestratorControl::FeedAuditUpdate { acknowledged, .. } => {
+                OrchestratorControl::ReconciliationUpdate { acknowledged, .. } => {
                     let _ = acknowledged.send(Ok(
-                        pe_service::orchestrator_control::FeedAuditAcknowledgement::Applied,
+                        pe_service::orchestrator_control::ReconciliationAcknowledgement::Applied,
                     ));
                 }
                 OrchestratorControl::PrepareAdmissions { acknowledged, .. } => {

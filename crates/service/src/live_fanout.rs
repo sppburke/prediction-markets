@@ -9983,6 +9983,7 @@ mod tests {
             poll_round_stale_secs: 90,
             latch: FeedLatchBasis::default(),
             paper_prefix: None,
+            identity: None,
         };
         sources.push((
             admission_receipt,

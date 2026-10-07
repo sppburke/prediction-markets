@@ -3723,7 +3723,7 @@ mod tests {
                                 .unwrap();
                         }
                         OrchestratorControl::ActivityFrameDecision { .. }
-                        | OrchestratorControl::FeedAuditUpdate { .. }
+                        | OrchestratorControl::ReconciliationUpdate { .. }
                         | OrchestratorControl::ResolutionCandidate { .. }
                         | OrchestratorControl::RiskHaltChange { .. }
                         | OrchestratorControl::DailyBoundary { .. }

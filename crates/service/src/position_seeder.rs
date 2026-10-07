@@ -1172,7 +1172,7 @@ impl CausalPositionValidator {
         let tokens = mapping.tokens().cloned().collect::<Vec<_>>();
         let resolved = self
             .asset_identity
-            .resolve_for_bracket(tokens.clone())
+            .resolve_historical_for_bracket(tokens.clone())
             .await
             .map_err(|source| CausalPositionError::Identity { wallet, source })?;
         for (asset, identity) in &resolved.verified {

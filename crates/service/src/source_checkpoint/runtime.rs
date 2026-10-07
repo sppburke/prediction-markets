@@ -8,7 +8,7 @@ use pe_event_log::{LogError, LogTailBinding, Scanner};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use super::{CheckpointData, PublishError, PublishOutcome, SerializedCandidate};
 use crate::risk_inputs::SourceReceiptIndex;
@@ -141,6 +141,7 @@ pub struct SourceCheckpointOwner {
     receipts: SourceReceiptIndex,
     slot: CheckpointJobSlot,
     pending: Option<Arc<SerializedCandidate>>,
+    paper_state: Option<Arc<pe_paper_state::PaperStateDb>>,
     attempt: u32,
     last_published_capture: Option<u64>,
     #[cfg(feature = "scenario")]
@@ -164,11 +165,18 @@ impl SourceCheckpointOwner {
             receipts,
             slot,
             pending: None,
+            paper_state: None,
             attempt: 0,
             last_published_capture: None,
             #[cfg(feature = "scenario")]
             hooks: Arc::new(CheckpointOwnerHooks::default()),
         }
+    }
+
+    #[must_use]
+    pub fn with_paper_state(mut self, paper_state: Arc<pe_paper_state::PaperStateDb>) -> Self {
+        self.paper_state = Some(paper_state);
+        self
     }
 
     #[cfg(feature = "scenario")]
@@ -260,6 +268,7 @@ impl SourceCheckpointOwner {
         let quarantine_failed = self.slot.quarantine_failed.clone();
         #[cfg(feature = "scenario")]
         let hooks = self.hooks.clone();
+        let paper_state = self.paper_state.clone();
         let result = self.slot.execute(move |cancel| {
             let mut frozen = frozen;
             if matches!(frozen.prefix, FrozenPrefix::Deferred { .. }) {
@@ -316,7 +325,24 @@ impl SourceCheckpointOwner {
                     &hooks,
                 ).map_err(TaskFailure::typed)?;
             }
+            if let Some(paper_state) = &paper_state {
+                let mut activity = frozen.reducers.activity.clone();
+                activity.prune(paper_state, &receipts).map_err(TaskFailure::typed)?;
+                if let Err(error) = paper_state.sync_checkpoint_dispositions() {
+                    warn!(%error, "source checkpoint disposition barrier failed; publication skipped");
+                    return Ok(JobOutput::Candidate(Box::new(frozen), None));
+                }
+                frozen.reducers.activity = activity;
+            }
             let candidate = candidate(&frozen, &receipts).map_err(TaskFailure::typed)?;
+            if let Some(candidate) = &candidate {
+                let (activity_triggers, activity_candidates, activity_commitments, routed_frame_receipts) =
+                    frozen.reducers.activity.checkpoint_counts();
+                let daily_boundary_entries = frozen.reducers.daily_boundary.as_ref().map_or(0, |entries| entries.len());
+                info!(manifest_bytes = candidate.bytes.len(), activity_triggers, activity_candidates,
+                    activity_commitments, daily_boundary_entries, routed_frame_receipts,
+                    "source checkpoint manifest serialized");
+            }
             Ok(JobOutput::Candidate(Box::new(frozen), candidate.map(Arc::new)))
         }).await?;
         if let JobOutput::Candidate(frozen, candidate) = result {
@@ -519,9 +545,12 @@ fn candidate(
             usize::try_from(seq.0).ok().and_then(|n| n.checked_add(1))
         })
         .ok_or_else(|| anyhow::anyhow!("checkpoint receipt count overflow"))?;
+    let start = super::capture_start(&frozen.activation, frozen.financial_era, count);
     Ok(Some(super::serialize(
         CheckpointData {
-            format_version: 1,
+            format_version: 2,
+            generation,
+            receipt_count: Some(count),
             scanner_version: 1,
             reducer_version: ACTIVITY_REDUCER_VERSION,
             financial_era: frozen.financial_era,
@@ -529,7 +558,7 @@ fn candidate(
             tail: frozen.tail.clone(),
             prefix_blake3: digest.finalize().to_hex().to_string(),
             receipts: receipts
-                .checkpoint_prefix(count, &frozen.tail)
+                .checkpoint_suffix(start, count, &frozen.tail)
                 .map_err(anyhow::Error::from)?,
             activity: frozen.reducers.activity.clone(),
             daily_boundary: frozen.reducers.daily_boundary.clone(),
@@ -726,6 +755,7 @@ mod tests {
         assert_eq!(
             super::super::load_checkpoint(&tail.path, &fixture.activation, false)
                 .unwrap()
+                .unwrap()
                 .data
                 .tail,
             candidate.tail
@@ -735,6 +765,7 @@ mod tests {
         restarted.initialize_for_scenario().await.unwrap();
         assert_eq!(
             super::super::load_checkpoint(&tail.path, &fixture.activation, false)
+                .unwrap()
                 .unwrap()
                 .data
                 .tail,
@@ -968,13 +999,11 @@ mod tests {
             );
             let loaded = super::super::load_checkpoint(&tail.path, &fixture.activation, false)
                 .unwrap()
-                .data;
+                .unwrap();
+            let staging = loaded.staging;
+            let loaded = loaded.data;
             assert_eq!(loaded.tail, tail);
-            let receipts =
-                SourceReceiptIndex::restore_staging(&tail.path, loaded.receipts, &loaded.tail)
-                    .unwrap()
-                    .complete(&loaded.tail)
-                    .unwrap();
+            let receipts = staging.complete(&loaded.tail).unwrap();
             let mut reducers = Reducers::new(loaded.financial_era);
             reducers.activity = loaded.activity;
             reducers.daily_boundary = loaded.daily_boundary;
@@ -998,6 +1027,7 @@ mod tests {
             restarted.initialize_for_scenario().await.unwrap();
             assert_eq!(
                 super::super::load_checkpoint(&tail.path, &fixture.activation, false)
+                    .unwrap()
                     .unwrap()
                     .data
                     .tail,
