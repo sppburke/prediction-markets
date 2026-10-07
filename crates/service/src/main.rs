@@ -187,7 +187,16 @@ fn main() -> Result<()> {
         .build()
         .context("build service runtime")?;
     let result = runtime.block_on(run());
+    #[cfg(feature = "scenario")]
+    let teardown = std::time::Instant::now();
     runtime.shutdown_timeout(pe_service::supervisor::POST_ABORT_JOIN_BOUND);
+    #[cfg(feature = "scenario")]
+    if env::args().nth(1).as_deref() == Some("--scenario-runtime-exit-cap") {
+        println!(
+            "scenario runtime teardown_ms={}",
+            teardown.elapsed().as_millis()
+        );
+    }
     result
 }
 

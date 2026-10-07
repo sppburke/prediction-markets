@@ -2110,6 +2110,57 @@ for state in reset switched started verified; do
   assert_rolled_back "$root" true "$expected_starts"
 done
 
+if shard_owns 2; then
+# Release-2 census: a known pe-service binary (by path), a renamed copy of one (by size and hash) and a process
+# whose argv names the generation config (relative to its cwd) are reported with their identity; a program merely
+# named like pe-service is not; an allowed PID is listed but never counted; killed processes disappear.
+# Assertions use only this test's own PIDs.
+census_dir="$TEST_TMP/census"
+mkdir -p "$census_dir/root/smoke-test"
+: > "$census_dir/root/smoke-test/service.toml"
+tail_bin=$(command -v tail)
+cp "$tail_bin" "$census_dir/pe-service.bak-census"
+cp "$tail_bin" "$census_dir/pe-service"
+cp "$tail_bin" "$census_dir/renamed"
+"$census_dir/pe-service.bak-census" -f /dev/null & known_pid=$!
+"$census_dir/renamed" -f /dev/null & renamed_pid=$!
+(cd "$census_dir/root" && exec python3 -c 'import time; time.sleep(600)' smoke-test/service.toml) & config_pid=$!
+bash -c 'exec -a pe-service-live-canary sleep 600' & canary_pid=$!
+sleep 0.5
+census() {
+  set +e
+  "$SCRIPT_DIR/pe_service_census.sh" --config smoke-test/service.toml --cwd-root "$census_dir/root" \
+    --binary "$census_dir/pe-service" --binary-glob "$census_dir/pe-service.bak-*" "$@" > "$census_dir/out.jsonl"
+  census_rc=$?
+  set -e
+}
+census --allow "$known_pid"
+[[ "$census_rc" == 3 ]] || fail "census did not report matches (rc=$census_rc)"
+python3 - "$census_dir/out.jsonl" "$known_pid" "$renamed_pid" "$config_pid" "$canary_pid" <<'PYCHECK' || fail "census records are wrong"
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1])]
+summary, records = rows[-1], {row["pid"]: row for row in rows[:-1]}
+known, renamed, config, canary = map(int, sys.argv[2:])
+assert "binary-path" in records[known]["reasons"] and records[known]["allowed"], records.get(known)
+assert "known-binary-hash" in records[renamed]["reasons"] and not records[renamed]["allowed"], records.get(renamed)
+assert "config-argument" in records[config]["reasons"], records.get(config)
+assert canary not in records, records.get(canary)
+for pid in (known, renamed, config):
+    assert records[pid]["start_unix"] > 0 and records[pid]["argv"], records[pid]
+assert records[renamed]["exe_sha256"], records[renamed]
+assert known not in summary["matches"] and renamed in summary["matches"] and config in summary["matches"], summary
+PYCHECK
+kill "$known_pid" "$renamed_pid" "$config_pid" "$canary_pid"
+wait "$known_pid" "$renamed_pid" "$config_pid" "$canary_pid" 2>/dev/null || true
+census
+python3 - "$census_dir/out.jsonl" "$known_pid" "$renamed_pid" "$config_pid" <<'PYCHECK' || fail "census still reports killed processes"
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1])]
+assert not {int(pid) for pid in sys.argv[2:]} & {row.get("pid") for row in rows[:-1]}
+PYCHECK
+echo "release-2 process census: PASS"
+fi
+
 (( SHARD_TOTAL > 1 )) || echo "activation crash matrix: PASS"
 echo "archive stamp exactly once and fresh service starts at most once: PASS"
 echo "rollback durable-fact restore and forward-refusal matrix: PASS"

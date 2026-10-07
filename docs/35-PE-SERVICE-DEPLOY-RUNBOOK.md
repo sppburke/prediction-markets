@@ -6,7 +6,10 @@
 > [`36-POLYMARKET-V2-CANARY-RUNBOOK.md`](36-POLYMARKET-V2-CANARY-RUNBOOK.md).
 
 **Purpose.** The repeatable procedure for building the `pe-service` release binary and
-deploying it to the VPS with one restart and no stop-before-swap window.
+deploying it to the VPS. Since release 2 (#744) the binary is swapped only while the unit is
+disabled and stopped and a fresh process census is clear, followed by one start (steps 4–5).
+Earlier releases swapped the binary under the running process and restarted once; that order is
+unsafe while a pre-#744 binary may run, because an already-loaded old checkpoint cannot be fenced.
 
 ## Historical issue #557 generation activation
 
@@ -983,6 +986,14 @@ Hash comparisons decide what remains, but never substitute for process clearance
    is prior, complete step 4's disable/stop and clearance before step 5. Other unit-policy or
    ownership drift stops the deploy for a reviewed correction.
 
+   **Resuming a stopped deploy.** When the unit is disabled and inactive with `MainPID=0`, there is
+   no `/proc/$pid/exe` to hash and, after the swap, no staged file: skip those commands. If
+   `target/release/pe-service` still hashes to the prior binary and the staged file exists, go to
+   step 4's cleared census and swap. If it already hashes to the desired binary, run
+   `target/release/pe-service --version` and `--verify-staged-identity` against step 1, then go to
+   step 4's cleared census and on to step 5. In both cases the unit stays disabled and stopped
+   until that fresh clearance.
+
    Before activation, while the old service still runs, prepare the disposable source checkpoint
    with the staged binary against the exact installed paper-state path:
 
@@ -1032,18 +1043,32 @@ Hash comparisons decide what remains, but never substitute for process clearance
    the launch deadline.
 
 4. **Census, stop and atomic swap.** While the old unit still serves and its executable is still
-   installed, run O2's recorded census command. Match every process whose executable is any
-   pe-service binary (installed, `.bak-*` or staged), or whose argv names this generation's config,
-   whether or not it holds state files open. Record PID, `/proc` start time, executable hash (read
-   `/proc/<pid>/exe` even for a deleted/replaced executable), and the config argument. Account for
-   the proved unit MainPID; report every other match. Before stopping a verified stray, repeat the
-   census and check its PID/start-time/hash/config identity, then record its exit.
+   installed, run the census (`scripts/deploy/pe_service_census.sh`, read-only). It matches every
+   process whose executable is any pe-service binary (installed, `.bak-*` or staged, by name or by
+   size and sha256), or whose argv names this generation's config resolved against the process cwd,
+   whether or not it holds state files open. It records PID, `/proc` start time, executable path and
+   sha256 (read through `/proc/<pid>/exe`, so a deleted or replaced executable still hashes), cwd
+   and argv, one JSON line per match and a summary line. Exit 0 is clear, 3 is matches found, 2 is a
+   candidate that could not be inspected; anything but 0 is not clear.
+
+   ```bash
+   pid=$(systemctl show pe-service -p MainPID --value)
+   census() { scripts/deploy/pe_service_census.sh --config smoke-test/service.toml \
+     --cwd-root /home/sean/prediction-markets --binary target/release/pe-service \
+     --binary-glob 'target/release/pe-service*' --binary-glob '/tmp/pe-service.new.*' "$@"; }
+   census --allow "$pid" > "$art/census.serving.jsonl" || true   # the unit's MainPID is listed, not counted
+   tail -1 "$art/census.serving.jsonl"
+   ```
+
+   Report every other match. Before stopping a verified stray, repeat the census, check its
+   PID/start-time/hash/config identity against the first record, then record its exit.
 
    Tell the owner before the pre-approved stop/start. In the same shell holding the deploy lock,
    with `$art` from step 3, record the baseline and stop the unit before touching its executable:
 
    ```bash
    set -euo pipefail
+   pid=$(systemctl show pe-service -p MainPID --value)
    cp status.json "$art/status.before.json"
    systemctl show pe-service -p InvocationID -p MainPID -p ExecStart -p WorkingDirectory > "$art/unit.before"
    [ -f target/release/pe-service.bak-<prior-sha12> ] || cp -p target/release/pe-service target/release/pe-service.bak-<prior-sha12>
@@ -1057,8 +1082,9 @@ Hash comparisons decide what remains, but never substitute for process clearance
    [ ! -e "/proc/$pid" ]
    ```
 
-   Repeat the census now; it must be readable and clear of **every** match, including an old boot
-   paused after checkpoint load and any preparation. Save the clearance alongside both unit-state
+   Repeat the census now, without `--allow`; it must exit 0, clear of **every** match, including an
+   old boot paused after checkpoint load and any preparation:
+   `census > "$art/census.cleared.jsonl"`. Save the clearance alongside both unit-state
    receipts. If any match remains or cannot be inspected, leave the unit disabled and stopped,
    tell the owner, and do not swap/start. Every interrupted deploy repeats this census on resume;
    a previous receipt grants no clearance. Only after this fresh clearance:
@@ -1817,8 +1843,8 @@ serving-path `Erased`/`Retired` or failed boot; retain scripts and receipts with
 
 Follow the guarded [Procedure](#procedure): staged preparation while the old unit serves must keep
 epoch zero/format 2, install no fence and erase nothing. The first census runs while the old unit
-serves with its executable still installed. Repeat and verify each stray's identity before stopping
-it. Then disable and stop the unit, confirm both states and its process exit, and clear another
+serves with its executable still installed (`scripts/deploy/pe_service_census.sh`, step 4). Repeat
+and verify each stray's identity before stopping it. Then disable and stop the unit, confirm both states and its process exit, and clear another
 readable census before swapping the binary. Keep the unit disabled/stopped over every interruption.
 Every resume reruns and clears the census before starting, or before accepting an already healthy
 new unit; old receipts only document history. A blocked/unreadable census stops deployment and is
@@ -1843,8 +1869,11 @@ confirm the exit cap at the next restart.
 
 Loss/rejection of `.boot-checkpoint` alone is recoverable from the coherent authority, durable
 receipts prefix, every verified pin and suffix through `retained_tail`; feed files are not rebuild
-inputs. A missing/invalid `.retention`, missing/invalid receipts prefix, corrupt pin or suffix, or
-suffix ending before `retained_tail` refuses boot. Restore one coherent capture, never individual
+inputs. A rebuild verifies every pin before listening, so a missing/invalid `.retention`,
+missing/invalid receipts prefix, corrupt pin or suffix, or suffix ending before `retained_tail`
+refuses boot. With an epoch-matched checkpoint the boot listens first and verifies every pin after
+listening: a failure is treated like a digest mismatch (invalidation and a critical failure), and the
+restart's rebuild then refuses. Listening alone therefore does not prove the pins. Restore one coherent capture, never individual
 stale companions, and never delete receipts by hand. Rebind moved captures with the existing
 migration-path rebinder; do not rewrite logs or offsets. Only an incomplete final append beyond
 `retained_tail` may be repaired automatically.
