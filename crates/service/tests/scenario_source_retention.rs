@@ -1039,6 +1039,7 @@ async fn retention_pins_financial_inputs_recent_decisions_and_commit_time_update
         "old_completed",
         "recent_completed",
         "updated_during_copy",
+        "recent_changed_during_copy",
     ] {
         let mut fixture = Fixture::with_evidence(Some(true), 8);
         install_retention_fence(&fixture.path).unwrap();
@@ -1105,7 +1106,11 @@ async fn retention_pins_financial_inputs_recent_decisions_and_commit_time_update
                         WALLET,
                         facts.to_string(),
                         include_str!("fixtures/decision_replay_origin_main_v2_terminal.json"),
-                        if case == "recent_completed" { NOW } else { OLD },
+                        if matches!(case, "recent_completed" | "recent_changed_during_copy") {
+                            NOW
+                        } else {
+                            OLD
+                        },
                     ],
                 )
                 .unwrap();
@@ -1113,7 +1118,14 @@ async fn retention_pins_financial_inputs_recent_decisions_and_commit_time_update
                 fixture.state.financial_last_prepared_seq().unwrap(),
                 Some(prepared.sequence)
             );
-            if case == "updated_during_copy" {
+            // A row written during the copy: an old row that newly needs its inputs, or a recent
+            // row whose inputs preparation already derived and must not reuse.
+            let written = match case {
+                "updated_during_copy" => Some(NOW),
+                "recent_changed_during_copy" => Some(NOW + 1),
+                _ => None,
+            };
+            if let Some(updated_at) = written {
                 let path = fixture._dir.path().join("paper.db");
                 fixture.context.hooks = Arc::new(RetentionHooks {
                     after_feed_copy: Some(Arc::new(move || {
@@ -1121,7 +1133,7 @@ async fn retention_pins_financial_inputs_recent_decisions_and_commit_time_update
                             .and_then(|connection| {
                                 connection.execute(
                                     "UPDATE decision_pending SET updated_at_unix = ?1",
-                                    [NOW],
+                                    [updated_at],
                                 )
                             })
                             .map_err(std::io::Error::other)?;
@@ -1135,7 +1147,7 @@ async fn retention_pins_financial_inputs_recent_decisions_and_commit_time_update
         owner.initialize_for_scenario().await.unwrap();
         owner.retention_for_scenario().await.unwrap();
         // The commit runs inside the orchestrator: it reuses the preparation's derivations and
-        // derives again only a row written since (here the row updated during the copy).
+        // derives again only a row written since (the rows updated during the copy).
         let committed = logs
             .text()
             .lines()
@@ -1149,7 +1161,10 @@ async fn retention_pins_financial_inputs_recent_decisions_and_commit_time_update
         );
         assert_eq!(
             committed["decision_rows_derived"],
-            u64::from(case == "updated_during_copy"),
+            u64::from(matches!(
+                case,
+                "updated_during_copy" | "recent_changed_during_copy"
+            )),
             "{case}"
         );
         let authority = RetentionAuthority::load(&fixture.path).unwrap().unwrap();
