@@ -88,13 +88,14 @@ describe("Auth.js session contract (#508 Phase C)", () => {
     const session = callbacks.session({
       session: {
         expires: "2099-01-01T00:00:00.000Z",
+        // Forged extra claims on purpose: the assertion lets the test pass fields the type forbids.
         user: {
           email: "viewer@example.com",
           name: "must be stripped",
           image: "must be stripped",
           role: "admin",
           account_id: "forged",
-        },
+        } as { email: string },
       },
     });
     expect(session).toEqual({
