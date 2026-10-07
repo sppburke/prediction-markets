@@ -342,10 +342,11 @@ def _write_v2_export_manifest(out_dir: str, counts: dict[str, int], projection: 
 
 
 def _compact_projection_rows(con, path: str) -> Iterator[dict]:
+    # File order is the spool's (wallet_hex, source_time_unix, source_trade_id) order: the
+    # COPY and this scan preserve insertion order, and any reordering fails the digest.
+    # Sorting all 48.6M rows instead ran out of DuckDB memory on Forge (#739, 10/7).
     names = list(PROJECTION_TYPES)
-    cursor = con.execute(
-        f"SELECT {', '.join(names)} FROM read_parquet('{_q(path)}') "
-        "ORDER BY wallet_hex, source_time_unix, source_trade_id")
+    cursor = con.execute(f"SELECT {', '.join(names)} FROM read_parquet('{_q(path)}')")
     while batch := cursor.fetchmany(PROJECTION_BATCH_SIZE):
         for row in batch:
             yield dict(zip(names, row, strict=True))
