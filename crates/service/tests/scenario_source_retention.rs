@@ -784,6 +784,52 @@ async fn retention_keeps_every_frame_the_running_poller_still_holds() {
 }
 
 #[tokio::test]
+async fn retention_releases_a_held_frame_at_the_next_advance() {
+    // One running owner: the poller holds the old feed observation through the first advance, then
+    // releases it on the same channel; the next advance drops its pin and an exact read is erased.
+    let fixture = Fixture::new(Some(true));
+    install_retention_fence(&fixture.path).unwrap();
+    let (held, rx) = tokio::sync::watch::channel(pe_service::trade_poller::HeldObligations {
+        wallets: std::collections::HashSet::from([WalletAddress::from_hex(WALLET).unwrap()]),
+        receipts: vec![fixture.feed],
+    });
+    let mut owner = fixture
+        .owner(CheckpointOwnerHooks::default())
+        .with_held_obligations(rx);
+    owner.initialize_for_scenario().await.unwrap();
+    owner.retention_for_scenario().await.unwrap();
+    let first = RetentionAuthority::load(&fixture.path).unwrap().unwrap();
+    assert!(
+        first
+            .pin(fixture.feed.sequence)
+            .is_some_and(|pin| !pin.reducer)
+    );
+    assert!(
+        fixture
+            .index
+            .source_envelope_with_pause(fixture.feed, &mut || {})
+            .is_ok()
+    );
+    held.send_replace(pe_service::trade_poller::HeldObligations::default());
+    let future = NOW + 9 * 24 * 3600;
+    owner.set_scenario_hooks(Arc::new(CheckpointOwnerHooks {
+        clock: Some(Arc::new(move || Ok(u64::try_from(future).unwrap() * 1000))),
+        ..Default::default()
+    }));
+    owner.retention_for_scenario().await.unwrap();
+    let second = RetentionAuthority::load(&fixture.path).unwrap().unwrap();
+    assert_eq!(second.epoch, first.epoch + 1);
+    assert!(second.pin(fixture.feed.sequence).is_none());
+    assert_eq!(
+        fixture
+            .index
+            .source_envelope_with_pause(fixture.feed, &mut || {})
+            .unwrap_err(),
+        pe_service::risk_inputs::RiskInputsUnavailable::Erased
+    );
+}
+
+#[tokio::test]
 async fn retention_deferred_check_rejects_a_corrupt_non_reducer_pin() {
     let fixture = Fixture::new(Some(true));
     install_retention_fence(&fixture.path).unwrap();
