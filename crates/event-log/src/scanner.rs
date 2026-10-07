@@ -318,6 +318,20 @@ impl ScanState {
     }
 }
 
+/// The retained tail is fsynced before its authority commits and the log only grows afterwards, so a
+/// log shorter than it lost committed frames, whatever bound the caller walks to.
+fn require_retained_length(file: &File, retained: Option<&LogTailBinding>) -> Result<(), LogError> {
+    match retained {
+        Some(tail) if file.metadata()?.len() < tail.physical_tail => {
+            Err(crate::RetentionError::Invalid(
+                "event log is shorter than its committed retained tail".into(),
+            )
+            .into())
+        }
+        _ => Ok(()),
+    }
+}
+
 pub(crate) fn fresh_state(authority: Option<&RetentionAuthority>) -> ScanState {
     match authority {
         Some(authority) => ScanState::at_frame(
@@ -492,6 +506,7 @@ pub(crate) fn walk_locked<'a>(
         .as_ref()
         .map(|authority| authority.retained_tail.resolve(path))
         .transpose()?;
+    require_retained_length(file, retained.as_ref())?;
     let mut retention = PrefixTracker::new(retained.as_ref(), &resolved_path);
     retention.observe(&state);
     let require_retained = request.boundary == WalkBoundary::PhysicalEof
@@ -718,6 +733,7 @@ pub(crate) fn walk_hashed(
         .as_ref()
         .map(|authority| authority.retained_tail.resolve(path))
         .transpose()?;
+    require_retained_length(file, retained.as_ref())?;
     let mut retention = PrefixTracker::new(retained.as_ref(), &resolved_path);
     if resume.is_some_and(|binding| {
         retained

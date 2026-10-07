@@ -505,8 +505,46 @@ fn retention_shortened_committed_window_refuses_every_writer_without_truncation(
             )
             .is_err()
         );
+        // Preparation bounds its walk by the current file length; a shortened log must still refuse.
+        assert!(
+            Scanner::walk_bounded(
+                &fixture.path,
+                cut,
+                &activation,
+                None,
+                &mut blake3::Hasher::new(),
+                &mut |_, _| {}
+            )
+            .is_err()
+        );
+        assert!(Scanner::verify_prefix(&fixture.binding(4)).is_err());
         assert_eq!(std::fs::read(&fixture.path).unwrap(), before);
     }
+}
+
+#[test]
+fn retention_interior_bound_below_retained_tail_walks_an_intact_log() {
+    let fixture = Fixture::new();
+    fixture.commit();
+    fixture.erase();
+    let activation = fixture.binding(1);
+    let interior = fixture.binding(4);
+    let mut digest = blake3::Hasher::new();
+    let walked = Scanner::walk_bounded(
+        &fixture.path,
+        interior.physical_tail,
+        &activation,
+        None,
+        &mut digest,
+        &mut |_, _| {},
+    )
+    .unwrap();
+    assert_eq!(walked, interior);
+    // `verify_prefix` checks the interior prefix and the complete suffix, returning the full tail.
+    assert_eq!(
+        Scanner::verify_prefix(&interior).unwrap(),
+        fixture.binding(7)
+    );
 }
 
 #[test]
