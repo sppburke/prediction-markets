@@ -143,6 +143,29 @@
 >
 > **CLOB `/markets?closed=true` does NOT populate `tokens[].winner` on old markets (2026-06-18, issue #369 PR1 live reconciliation).** Response: `{count, limit, next_cursor, data:[…]}`; each market carries snake_case `condition_id`, `closed`, `end_date_iso`, and `tokens:[{outcome, price, token_id, winner}]`; `next_cursor` terminator is `LTE=`. **Gotcha:** for old markets (≈2022–2023) the resolved winner is reflected only in the terminal token `price` (~1.0 winner / ~0.0 loser) — `tokens[].winner` is `false` on **every** token, so `clob.rs::winner_index` reports the market as voided. Measured against `source='polygon'` over 848,098 traded markets: 0 winner *contradictions* (99.976% agreement) but 202 CLOB-null-vs-polygon-winner, **all** in 2022–2023; by 2024 winner-flag coverage is complete (2024 0/11,674, 2025 2/125,388, 2026 10/709,318 null). Benign for issue #369 because the 1.19M `source='polygon'` rows are kept; CLOB only needs correctness for new markets. Also confirmed: 0 traded multi-outcome (>2-token) markets, so the positional `winner_index`↔`outcome_id` mapping risk is empirically binary-only.
 
+### Forge forward activity window lookup (#747)
+
+Last checked: **2026-10-07**. Re-verify by: **2026-12-06**.
+The [official user activity reference](https://docs.polymarket.com/api-reference/core/get-user-activity)
+supports ASC/DESC ordering, bounded timestamps, `limit=1`, and offsets through 5,000.
+The collection lookup is exactly
+`/activity?user=W&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&limit=1&offset=4999&sortDirection=ASC&start=lo+1&end=E`:
+`lo` is exclusive, so its wire start is `lo + 1`. Empty means read through `E`; otherwise its
+row’s second `b` places the descending window end at `b − 1`, or `b` when `b − 1 ≤ lo`.
+Only the descending pages supply receipt evidence; the lookup has no completeness authority.
+
+Five separately captured live checks on 2026-10-07 (10:34 AM, 12:22 PM, 1:05 PM, 1:48 PM,
+2:07 PM CT) are in `/mnt/data/pm-evidence/giants-20261007/evidence/venue/` (`r3`, `r6`, `r7`,
+`r8`, `r9`). For wallet `0x7e531479cc3da5f014c891de002ca6fcdf94a456`, ASC offset 4,999/limit 1
+returned `b=1786327777`; DESC pages with wire `start=1`, `end=1786327776`, limit 500 and offsets
+0 through 4,500 returned nine full pages plus 499 rows: exactly 4,999. The final capture used
+`E=1791381404` and the same parameters (with explicit `sortBy=TIMESTAMP` on its boundary/pages);
+a lookup with `start=1791377804&end=1791381404` was empty. The second checked wallet,
+`0x9f47f1fcb1701bf9eaf31236ad39875e5d60af93`, returned `b=1721617075` with wire start 1.
+Reproduce the exact lookup and paginate DESC through `b − 1` before deploying a changed venue
+contract; timestamp ties can place fewer rows in a window, and a saturated terminal second remains
+incomplete. These captures verify boundary sizing, not immutability of later historical responses.
+
 > **Incremental bootstrap acquisition (#648), Last checked: 2026-09-17;
 > re-verify by 2026-11-16.** Re-read the [official activity reference](https://docs.polymarket.com/api-reference/core/get-user-activity):
 > positive wire start is required for full DESC history, and bounded windows retain stable offset

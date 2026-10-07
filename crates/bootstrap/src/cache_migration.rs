@@ -12,7 +12,7 @@ use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr as _;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, OnceLock};
 use std::thread;
@@ -35,8 +35,8 @@ use pe_source_polymarket_public::{
 };
 use pe_source_polymarket_public::{
     ActivityReadError, CLOB_RESOLUTION_PARSER_VERSION, CLOB_RESOLUTION_SCHEMA_VERSION,
-    ClobCoverageManifest, ClobToken, ReconciliationFetcher, aggregate_activity_rows,
-    fetch_complete_activity_semantic,
+    ClobCoverageManifest, ClobToken, ReconciliationFetcher, activity_window_end,
+    aggregate_activity_rows, fetch_activity_window_semantic, fetch_complete_activity_semantic,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
 use serde::{Deserialize, Serialize};
@@ -81,6 +81,66 @@ const FRESH_COLLECTION_VERSION: u32 = 1;
 /// in `docs/_GLOSSARY.md`). Each wallet pages serially, so this width sets throughput
 /// until the fetcher's shared rate gate binds; it leaves the gate's budget unchanged.
 const MAX_ACTIVITY_WALLET_FETCHES: usize = 32;
+/// Shared proved walk rows held through wallet commit (`docs/_GLOSSARY.md`).
+const ACTIVITY_WALK_HELD_ROWS: u64 = 2_000_000;
+
+struct ActivityCollectionLimits {
+    wallet_budget: Option<Duration>,
+    held_rows: Arc<AtomicU64>,
+}
+
+impl From<Option<Duration>> for ActivityCollectionLimits {
+    fn from(wallet_budget: Option<Duration>) -> Self {
+        Self {
+            wallet_budget,
+            held_rows: Arc::new(AtomicU64::new(0)),
+        }
+    }
+}
+
+struct HeldWalkRows {
+    count: Arc<AtomicU64>,
+    rows: u64,
+}
+
+impl HeldWalkRows {
+    fn keep(&mut self, rows: usize) -> Result<(), BootstrapError> {
+        let rows = u64::try_from(rows).map_err(|_| BootstrapError::Internal)?;
+        self.rows = checked_activity_count(self.rows, rows)?;
+        self.count.fetch_add(rows, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+impl Drop for HeldWalkRows {
+    fn drop(&mut self) {
+        self.count.fetch_sub(self.rows, Ordering::SeqCst);
+    }
+}
+
+struct CompletionSendWait<'a> {
+    started: Instant,
+    elapsed: &'a AtomicU64,
+    error: &'a OnceLock<BootstrapError>,
+}
+
+impl Drop for CompletionSendWait<'_> {
+    fn drop(&mut self) {
+        let Ok(millis) = u64::try_from(self.started.elapsed().as_millis()) else {
+            let _ = self.error.set(BootstrapError::Internal);
+            return;
+        };
+        if self
+            .elapsed
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |elapsed| {
+                elapsed.checked_add(millis)
+            })
+            .is_err()
+        {
+            let _ = self.error.set(BootstrapError::Internal);
+        }
+    }
+}
 /// Quiet-history threshold (`activity_quiet_after_secs` in `docs/_GLOSSARY.md`).
 const QUIET_AFTER_SECS: i64 = 2_592_000;
 /// Quiet-wallet polling period (`activity_repoll_period_secs` in `docs/_GLOSSARY.md`).
@@ -1062,7 +1122,7 @@ pub async fn populate_activity_v2(
         &identity,
         None,
         completed_at_unix,
-        None,
+        None.into(),
     )
     .await
 }
@@ -1145,7 +1205,7 @@ pub async fn populate_activity_fresh_v2_with_clock(
         &identity,
         FULL_HISTORY_START_EXCLUSIVE,
         completed_at_unix,
-        wallet_budget,
+        wallet_budget.into(),
     )
     .await
 }
@@ -1228,7 +1288,7 @@ pub async fn populate_activity_bulk_root_v2_with_clock(
         &identity,
         FULL_HISTORY_START_EXCLUSIVE,
         completed_at_unix,
-        wallet_budget,
+        wallet_budget.into(),
     )
     .await?;
     if already_sealed {
@@ -1582,7 +1642,11 @@ fn begin_or_resume_fresh_collection(
                     if receipt.excluded() {
                         prior_exclusions.insert(receipt.wallet_hex.clone());
                     }
-                    if receipt.excluded() && !deferred {
+                    if let Some((mode, _)) = receipt.continuation() {
+                        if mode == ActivityReadMode::Full {
+                            full.insert(receipt.wallet_hex.clone());
+                        }
+                    } else if receipt.excluded() && !deferred {
                         full.insert(receipt.wallet_hex.clone());
                     } else if let Some(record) = &recorded
                         && (deferred
@@ -1882,6 +1946,151 @@ fn log_collection_run(
     Ok(())
 }
 
+enum WalkRead {
+    Probe(pe_source_polymarket_public::CompleteActivityRead),
+    Proved(
+        pe_source_polymarket_public::CompleteActivityRead,
+        Option<String>,
+    ),
+    NoProgress(String),
+}
+
+struct ActivityWalk<'a> {
+    fetcher: &'a dyn ReconciliationFetcher,
+    base_url: &'a str,
+    wallet: WalletAddress,
+    wallet_hex: &'a str,
+    start: i64,
+    end: i64,
+    deadline: Option<tokio::time::Instant>,
+    held: HeldWalkRows,
+}
+
+impl ActivityWalk<'_> {
+    fn expired(&self) -> bool {
+        self.deadline
+            .is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+    }
+
+    async fn read(&mut self, skip_probe: bool) -> Result<WalkRead, BootstrapError> {
+        if !skip_probe {
+            match fetch_activity_window_semantic(
+                self.fetcher,
+                self.base_url,
+                self.wallet,
+                self.start,
+                self.end,
+            )
+            .await
+            {
+                Ok(Some(read)) => return Ok(WalkRead::Probe(read)),
+                Ok(None) => {}
+                Err(error) if excludes_wallet(&error) => {
+                    return Ok(WalkRead::NoProgress(error.to_string()));
+                }
+                Err(error) if recoverable_retry_wait(&error).is_some() => {}
+                Err(error) => return Err(activity_read_failure(self.wallet_hex, error)),
+            }
+        }
+        let mut read = pe_source_polymarket_public::CompleteActivityRead {
+            requested_wallet: self.wallet,
+            fixed_end: self.start,
+            rows: Vec::new(),
+            pages: Vec::new(),
+        };
+        let mut reason = None;
+        'windows: loop {
+            // A walk always attempts its first window, including after an expired probe.
+            if !read.pages.is_empty()
+                && (self.expired()
+                    || self.held.count.load(Ordering::SeqCst) >= ACTIVITY_WALK_HELD_ROWS)
+            {
+                reason = Some(
+                    if self.expired() {
+                        "acquisition budget exhausted"
+                    } else {
+                        "activity walk held-row limit reached"
+                    }
+                    .to_owned(),
+                );
+                break;
+            }
+            let lo = read.fixed_end;
+            let mut top = None;
+            let window = loop {
+                let outcome = async {
+                    let end = match top {
+                        Some(end) => end,
+                        None => {
+                            let end = activity_window_end(
+                                self.fetcher,
+                                self.base_url,
+                                self.wallet,
+                                lo,
+                                self.end,
+                            )
+                            .await?;
+                            top = Some(end);
+                            end
+                        }
+                    };
+                    fetch_activity_window_semantic(
+                        self.fetcher,
+                        self.base_url,
+                        self.wallet,
+                        lo,
+                        end,
+                    )
+                    .await
+                }
+                .await;
+                match outcome {
+                    Ok(Some(window)) => break window,
+                    Ok(None) => {
+                        reason = Some("looked-up activity window remained full".to_owned());
+                        break 'windows;
+                    }
+                    Err(error) if excludes_wallet(&error) => {
+                        reason = Some(error.to_string());
+                        break 'windows;
+                    }
+                    Err(error) => {
+                        let Some((deadline, wait)) =
+                            self.deadline.zip(recoverable_retry_wait(&error))
+                        else {
+                            return Err(activity_read_failure(self.wallet_hex, error));
+                        };
+                        if self.expired()
+                            || tokio::time::timeout_at(deadline, tokio::time::sleep(wait))
+                                .await
+                                .is_err()
+                            || self.expired()
+                        {
+                            reason = Some(format!("acquisition budget exhausted: {error}"));
+                            break 'windows;
+                        }
+                        tracing::warn!(wallet = self.wallet_hex, %error, "activity window failed; retrying within the wallet budget");
+                    }
+                }
+            };
+            self.held.keep(window.rows.len())?;
+            read.fixed_end = window.fixed_end;
+            read.rows.extend(window.rows);
+            read.pages.extend(window.pages);
+            if read.fixed_end == self.end {
+                break;
+            }
+        }
+        if read.pages.is_empty() {
+            Ok(WalkRead::NoProgress(
+                reason.ok_or(BootstrapError::Internal)?,
+            ))
+        } else {
+            Ok(WalkRead::Proved(read, reason))
+        }
+    }
+}
+
 async fn collect_activity_v2(
     mut connection: Connection,
     fetcher: &dyn ReconciliationFetcher,
@@ -1889,7 +2098,7 @@ async fn collect_activity_v2(
     identity: &ActivityIdentity,
     history_start_exclusive: Option<i64>,
     completed_at_unix: i64,
-    wallet_budget: Option<Duration>,
+    limits: ActivityCollectionLimits,
 ) -> Result<ActivityCoverageManifestV2, BootstrapError> {
     let ActivityIdentity {
         generation,
@@ -1946,9 +2155,15 @@ async fn collect_activity_v2(
         connection.pragma_update(None, "temp_store", "FILE")?;
     }
     let proof_ref = proof.as_ref();
+    let wallet_budget = limits.wallet_budget;
+    let held_rows = &limits.held_rows;
+    let (sender, mut receiver) = mpsc::channel(MAX_ACTIVITY_WALLET_FETCHES);
+    let first_error = Arc::new(OnceLock::new());
+    let producer_blocked = AtomicU64::new(0);
+    let fetch_completed = AtomicU64::new(0);
     let reads = stream::iter(missing.into_iter().map(|wallet_hex| async move {
         if proof_ref.is_some_and(|proof| proof.deferred(&wallet_hex)) {
-            return Ok(excluded_completion(wallet_hex, "dormant_deferred".to_owned()));
+            return Ok(excluded_completion(wallet_hex, "dormant_deferred".to_owned(), fixed_end_unix));
         }
         let wallet =
             WalletAddress::from_hex(&wallet_hex).map_err(|error| BootstrapError::Invalid {
@@ -1960,79 +2175,98 @@ async fn collect_activity_v2(
         // the reason and an explicit failed acquisition without claiming a read.
         let start_exclusive =
             proof_ref.map_or(history_start_exclusive, |proof| Some(proof.start(&wallet_hex)));
-        // An enabled budget is one non-resetting deadline over the whole
-        // acquisition, started when this read is first polled: recoverable
-        // failures are retried in place under it, and expiry records the
-        // exclusion instead of holding the generation open (#681).
+        // One deadline starts when this wallet is first polled. Identity 4
+        // checks it between proved windows and before outer retries; legacy
+        // reads retain their timed whole-history acquisition (#681, #747).
         let deadline = wallet_budget.map(|budget| tokio::time::Instant::now() + budget);
-        let mut attempts = 0u32;
-        let mut last_failure = None;
-        let complete = loop {
-            attempts += 1;
-            let read = fetch_complete_activity_semantic(
-                fetcher,
-                base_url,
-                wallet,
-                start_exclusive,
-                fixed_end_unix,
-                if proof_ref.is_some_and(|proof| proof.identity.version == 4) {
-                    pe_source_polymarket_public::activity::ActivityRowAcceptance::Acquisition3
-                } else {
-                    pe_source_polymarket_public::activity::ActivityRowAcceptance::Strict
-                },
-            );
-            let outcome = match deadline {
-                Some(deadline) => tokio::time::timeout_at(deadline, read).await,
-                None => Ok(read.await),
+        let (complete, _held_walk_rows, stopped) = if let Some(proof) = proof_ref.filter(|proof| proof.identity.version == 4) {
+            let mut walk = ActivityWalk {
+                fetcher, base_url, wallet, wallet_hex: &wallet_hex,
+                start: proof.start(&wallet_hex), end: fixed_end_unix, deadline,
+                held: HeldWalkRows { count: Arc::clone(held_rows), rows: 0 },
             };
-            match outcome {
-                Ok(Ok(complete)) => break complete,
-                Ok(Err(error)) if excludes_wallet(&error) => {
-                    tracing::warn!(
-                        wallet = %wallet_hex,
-                        generation,
-                        %error,
-                        "activity wallet excluded from the generation: venue history cannot be read"
-                    );
-                    return Ok::<_, BootstrapError>(excluded_completion(wallet_hex, error.to_string()));
+            match walk.read(proof.skip_probe(&wallet_hex)).await? {
+                WalkRead::Proved(complete, reason) => (complete, Some(walk.held), reason),
+                WalkRead::NoProgress(reason) => {
+                    tracing::warn!(wallet = %wallet_hex, generation, %reason, "activity wallet acquisition stopped without progress");
+                    return Ok(excluded_completion(wallet_hex, reason, fixed_end_unix));
                 }
-                Ok(Err(error)) => {
-                    let Some((deadline, wait)) = deadline.zip(recoverable_retry_wait(&error)) else {
-                        return Err(activity_read_failure(&wallet_hex, error));
-                    };
-                    tracing::warn!(
-                        wallet = %wallet_hex,
-                        generation,
-                        attempts,
-                        %error,
-                        "activity read failed; retrying within the wallet budget"
-                    );
-                    last_failure = Some(error.to_string());
-                    if tokio::time::timeout_at(deadline, tokio::time::sleep(wait))
-                        .await
-                        .is_ok()
-                    {
-                        continue;
-                    }
-                }
-                Err(_elapsed) => {}
+                WalkRead::Probe(complete) => (complete, None, None),
             }
-            let reason = format!(
-                "acquisition budget of {} s exhausted after {attempts} attempt(s){}",
-                wallet_budget.map_or(0, |budget| budget.as_secs()),
-                last_failure
-                    .as_deref()
-                    .map_or_else(String::new, |failure| format!(": {failure}")),
-            );
-            tracing::warn!(
-                wallet = %wallet_hex,
-                generation,
-                %reason,
-                "activity wallet excluded from the generation: acquisition budget exhausted"
-            );
-            return Ok(excluded_completion(wallet_hex, reason));
+        } else {
+            let mut attempts = 0u32;
+            let mut last_failure = None;
+            let complete = loop {
+                attempts += 1;
+                let read = fetch_complete_activity_semantic(
+                    fetcher,
+                    base_url,
+                    wallet,
+                    start_exclusive,
+                    fixed_end_unix,
+                    if proof_ref.is_some_and(|proof| proof.identity.version == 4) {
+                        pe_source_polymarket_public::activity::ActivityRowAcceptance::Acquisition3
+                    } else {
+                        pe_source_polymarket_public::activity::ActivityRowAcceptance::Strict
+                    },
+                );
+                let outcome = match deadline {
+                    Some(deadline) => tokio::time::timeout_at(deadline, read).await,
+                    None => Ok(read.await),
+                };
+                match outcome {
+                    Ok(Ok(complete)) => break complete,
+                    Ok(Err(error)) if excludes_wallet(&error) => {
+                        tracing::warn!(
+                            wallet = %wallet_hex,
+                            generation,
+                            %error,
+                            "activity wallet excluded from the generation: venue history cannot be read"
+                        );
+                        return Ok::<_, BootstrapError>(excluded_completion(wallet_hex, error.to_string(), fixed_end_unix));
+                    }
+                    Ok(Err(error)) => {
+                        let Some((deadline, wait)) = deadline.zip(recoverable_retry_wait(&error)) else {
+                            return Err(activity_read_failure(&wallet_hex, error));
+                        };
+                        tracing::warn!(
+                            wallet = %wallet_hex,
+                            generation,
+                            attempts,
+                            %error,
+                            "activity read failed; retrying within the wallet budget"
+                        );
+                        last_failure = Some(error.to_string());
+                        if tokio::time::timeout_at(deadline, tokio::time::sleep(wait))
+                            .await
+                            .is_ok()
+                        {
+                            continue;
+                        }
+                    }
+                    Err(_elapsed) => {}
+                }
+                let reason = format!(
+                    "acquisition budget of {} s exhausted after {attempts} attempt(s){}",
+                    wallet_budget.map_or(0, |budget| budget.as_secs()),
+                    last_failure
+                        .as_deref()
+                        .map_or_else(String::new, |failure| format!(": {failure}")),
+                );
+                tracing::warn!(
+                    wallet = %wallet_hex,
+                    generation,
+                    %reason,
+                    "activity wallet excluded from the generation: acquisition budget exhausted"
+                );
+                return Ok(excluded_completion(wallet_hex, reason, fixed_end_unix));
+            };
+            (complete, None, None)
         };
-        let mut exclusion_reason: Option<String> = None;
+        if let Some(reason) = &stopped {
+            tracing::warn!(wallet = %wallet_hex, generation, %reason, acquired_end = complete.fixed_end, "activity wallet acquisition stopped with proved windows");
+        }
+        let mut exclusion_reason = stopped;
         let fetched_source_row_count = u64::try_from(complete.rows.len()).map_err(|_| BootstrapError::Internal)?;
         // The rows are needed only to aggregate: free them before the aggregate
         // sort, since a wallet can hold millions of rows (#588).
@@ -2076,6 +2310,8 @@ async fn collect_activity_v2(
         };
         Ok::<_, BootstrapError>(WalletActivityCompletion {
             wallet_hex,
+            acquired_end: complete.fixed_end,
+            _held_walk_rows,
             pages,
             aggregates,
             source_row_count,
@@ -2084,18 +2320,31 @@ async fn collect_activity_v2(
             exclusion_reason,
         })
     }))
-    .map(|read| async move {
-        let completion = read.await;
-        (completion, Instant::now())
+    .map(|read| {
+        let sender = &sender;
+        let first_error = &first_error;
+        let producer_blocked = &producer_blocked;
+        let fetch_completed = &fetch_completed;
+        async move {
+            match read.await {
+                Ok(completion) => {
+                    let Ok(millis) = u64::try_from(began.elapsed().as_millis()) else {
+                        let _ = first_error.set(BootstrapError::Internal);
+                        return false;
+                    };
+                    fetch_completed.fetch_max(millis, Ordering::Relaxed);
+                    let waiting = CompletionSendWait { started: Instant::now(), elapsed: producer_blocked, error: first_error };
+                    let sent = sender.send(completion).await;
+                    drop(waiting);
+                    sent.is_ok()
+                }
+                Err(error) => { let _ = first_error.set(error); false }
+            }
+        }
     })
     .buffer_unordered(MAX_ACTIVITY_WALLET_FETCHES);
-    // One reader batch can queue behind the serial writer. A full queue pauses
-    // polling the bounded reader stream; no wallet completion is dropped on success.
-    let (sender, mut receiver) = mpsc::channel(MAX_ACTIVITY_WALLET_FETCHES);
     let (finished_sender, mut finished_receiver) = oneshot::channel();
-    // Arbitrate at the point of failure, including a writer failure while the
-    // producer is polling a read. A later drain failure cannot replace it.
-    let first_error = Arc::new(OnceLock::new());
+    // The first observed failure wins, including a writer failure while reads progress.
     let writer_error = Arc::clone(&first_error);
     let writer_reference = reference_sha256.clone();
     let writer_proof = proof.clone();
@@ -2145,29 +2394,12 @@ async fn collect_activity_v2(
             let _ = finished_sender.send(());
             (connection, counts, writer_completed)
         })?;
-    let mut producer_blocked = Duration::ZERO;
-    let mut producer_wait_started = None;
-    let mut fetch_completed = began;
     let writer_finished = {
         let produce = async {
             futures::pin_mut!(reads);
-            while let Some((completion, read_completed)) = reads.next().await {
-                fetch_completed = fetch_completed.max(read_completed);
-                match completion {
-                    Ok(completion) => {
-                        let waiting = Instant::now();
-                        producer_wait_started = Some(waiting);
-                        let sent = sender.send(completion).await;
-                        producer_blocked += waiting.elapsed();
-                        producer_wait_started = None;
-                        if sent.is_err() {
-                            break;
-                        }
-                    }
-                    Err(error) => {
-                        let _ = first_error.set(error);
-                        break;
-                    }
+            while let Some(sent) = reads.next().await {
+                if !sent {
+                    break;
                 }
             }
         };
@@ -2177,10 +2409,8 @@ async fn collect_activity_v2(
             () = produce => false,
         }
     };
-    if let Some(waiting) = producer_wait_started {
-        producer_blocked += waiting.elapsed();
-    }
-    let fetch_completed = fetch_completed.duration_since(began);
+    let fetch_completed = Duration::from_millis(fetch_completed.load(Ordering::Relaxed));
+    let producer_blocked = Duration::from_millis(producer_blocked.load(Ordering::Relaxed));
     // Stop reads, close the queue and drain accepted wallets after a read error.
     // Await termination before joining so SQLite cannot block the async runtime.
     // No return path after spawn may bypass this join: the caller holds the lock.
@@ -2297,7 +2527,33 @@ pub async fn collect_activity_v2_for_test(
         &identity,
         FULL_HISTORY_START_EXCLUSIVE,
         completed_at_unix,
-        None,
+        None.into(),
+    )
+    .await
+}
+
+/// Collect with a scenario-owned shared row count and non-resetting wallet budget.
+#[cfg(feature = "scenario")]
+pub async fn collect_activity_v2_with_limits_for_test(
+    connection: Connection,
+    fetcher: &dyn ReconciliationFetcher,
+    base_url: &str,
+    completed_at_unix: i64,
+    held_rows: Arc<AtomicU64>,
+    wallet_budget: Option<Duration>,
+) -> Result<ActivityCoverageManifestV2, BootstrapError> {
+    let identity = activity_identity(&connection)?;
+    collect_activity_v2(
+        connection,
+        fetcher,
+        base_url,
+        &identity,
+        FULL_HISTORY_START_EXCLUSIVE,
+        completed_at_unix,
+        ActivityCollectionLimits {
+            wallet_budget,
+            held_rows,
+        },
     )
     .await
 }
@@ -2311,12 +2567,15 @@ pub fn commit_activity_batch_for_test(
     pages: Vec<ReconciliationPageEvidence>,
     aggregates: Vec<ActivityAggregate>,
 ) -> Result<(), BootstrapError> {
-    let proof = CollectionProof::load(connection, 1)?.ok_or(BootstrapError::Internal)?;
+    let generation = activity_identity(connection)?.generation;
+    let proof = CollectionProof::load(connection, generation)?.ok_or(BootstrapError::Internal)?;
     let source_row_count = aggregates.iter().try_fold(0, |count, aggregate| {
         checked_activity_count(count, aggregate.row_count)
     })?;
     let completion = WalletActivityCompletion {
         wallet_hex,
+        acquired_end: proof.identity.fixed_end_unix,
+        _held_walk_rows: None,
         pages,
         aggregates,
         source_row_count,
@@ -2349,9 +2608,15 @@ fn excludes_wallet(error: &ActivityReadError) -> bool {
 
 /// The receipt of a wallet excluded from the generation: no page evidence, no
 /// aggregates, an explicit failed acquisition carrying the reason.
-fn excluded_completion(wallet_hex: String, reason: String) -> WalletActivityCompletion {
+fn excluded_completion(
+    wallet_hex: String,
+    reason: String,
+    acquired_end: i64,
+) -> WalletActivityCompletion {
     WalletActivityCompletion {
         wallet_hex,
+        acquired_end,
+        _held_walk_rows: None,
         pages: Vec::new(),
         aggregates: Vec::new(),
         source_row_count: 0,
@@ -2535,11 +2800,13 @@ struct WalletActivityCompletion {
     /// failed while parsing has no page evidence to keep. This reason is also
     /// the exclusion marker for legacy receipts without acquisition proofs.
     exclusion_reason: Option<String>,
-    /// Rows that entered `aggregates`; zero for a wallet excluded from the
-    /// generation, whose `pages` still record the rows the venue returned.
+    /// Rows that entered `aggregates`, including a proved partial. The writer
+    /// keeps fetched counts inside the acquisition on an excluded receipt.
     source_row_count: u64,
     fetched_source_row_count: u64,
     aggregation_status: AggregationStatus,
+    acquired_end: i64,
+    _held_walk_rows: Option<HeldWalkRows>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2621,6 +2888,30 @@ struct ActivityAcquisition {
 }
 
 impl ActivityWalletReceiptProof {
+    fn partial(&self) -> bool {
+        self.acquisition.as_ref().is_some_and(|acquisition| {
+            acquisition.version == 3
+                && acquisition.disposition == ActivityDisposition::Excluded
+                && acquisition.exclusion_reason == Some(ActivityExclusionReason::AcquisitionFailure)
+                && acquisition.aggregation_status == AggregationStatus::Complete
+        })
+    }
+
+    fn continuation(&self) -> Option<(ActivityReadMode, i64)> {
+        let acquisition = self.acquisition.as_ref()?;
+        if acquisition.version != 3
+            || acquisition.disposition != ActivityDisposition::Excluded
+            || acquisition.exclusion_reason != Some(ActivityExclusionReason::AcquisitionFailure)
+        {
+            return None;
+        }
+        if self.partial() {
+            Some((ActivityReadMode::Incremental, acquisition.fixed_end_unix))
+        } else {
+            Some((acquisition.mode.clone(), acquisition.start_exclusive))
+        }
+    }
+
     fn excluded(&self) -> bool {
         self.acquisition.as_ref().map_or_else(
             || {

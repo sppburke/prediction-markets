@@ -72,8 +72,8 @@ struct HistoryPart {
     source_rows: u64,
 }
 
-/// One owner for effective history. Exclusions remain audit records; only a
-/// complete full read or an explicit repair supersedes earlier commitments.
+/// One owner for effective history. Complete and partial full reads supersede
+/// earlier commitments; exclusions without a part remain audit records.
 pub(super) struct HistoryChain {
     wallet: String,
     parts: Vec<HistoryPart>,
@@ -131,7 +131,7 @@ impl HistoryChain {
             let repair = identity.repair_wallets.as_ref().is_some_and(|repairs| {
                 repairs.binary_search_by(|w| w.as_str().cmp(wallet)).is_ok()
             });
-            if repair && receipt.excluded() {
+            if repair && receipt.excluded() && !receipt.partial() {
                 chain.parts.clear();
                 chain.parts.push(HistoryPart {
                     start: 0,
@@ -140,7 +140,7 @@ impl HistoryChain {
                     count: 0,
                     source_rows: 0,
                 });
-            } else if !receipt.excluded() {
+            } else if !receipt.excluded() || receipt.partial() {
                 let acquisition =
                     receipt
                         .acquisition
@@ -507,6 +507,7 @@ pub(super) struct CollectionProof {
     base_link: Option<String>,
     pub(super) history: Option<Arc<HistoryProof>>,
     data_version: i64,
+    large_certified_wallets: BTreeSet<String>,
 }
 
 impl CollectionProof {
@@ -528,8 +529,12 @@ impl CollectionProof {
         let bulk_root = connection
             .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?
             == CACHE_SCHEMA_VERSION_BULK_ROOT;
+        let mut large_certified_wallets = BTreeSet::new();
         let history = if identity.version == 4 {
             verify_history_certificates(connection)?;
+            large_certified_wallets = connection.prepare(
+                "SELECT wallet_hex FROM activity_wallet_history_v3 WHERE source_row_count >= 5500",
+            )?.query_map([], |row| row.get::<_, String>(0))?.collect::<Result<_, _>>()?;
             Some(Arc::new(HistoryProof::load(connection, &identity)?))
         } else {
             None
@@ -585,6 +590,7 @@ impl CollectionProof {
             base_link,
             history,
             data_version,
+            large_certified_wallets,
         }))
     }
 
@@ -625,8 +631,21 @@ impl CollectionProof {
         if self.mode(wallet) == ActivityReadMode::Full {
             0
         } else {
-            self.identity.start_exclusive.unwrap_or(0)
+            self.history
+                .as_ref()
+                .and_then(|history| history.continuations.get(wallet))
+                .map_or(self.identity.start_exclusive.unwrap_or(0), |(_, start)| {
+                    *start
+                })
         }
+    }
+
+    pub(super) fn skip_probe(&self, wallet: &str) -> bool {
+        self.history
+            .as_ref()
+            .is_some_and(|history| history.continuations.contains_key(wallet))
+            || (self.mode(wallet) == ActivityReadMode::Full
+                && self.large_certified_wallets.contains(wallet))
     }
 
     fn predecessor(
@@ -701,6 +720,7 @@ impl CollectionProof {
                     repairs.binary_search_by(|w| w.as_str().cmp(wallet)).is_ok()
                 });
                 if repaired
+                    || receipt.partial()
                     || (!receipt.excluded()
                         && receipt
                             .acquisition
@@ -767,7 +787,12 @@ impl CollectionProof {
         if acquisition.version != if self.identity.version == 4 { 3 } else { 2 }
             || acquisition.mode != self.mode(&receipt.wallet_hex)
             || acquisition.start_exclusive != self.start(&receipt.wallet_hex)
-            || acquisition.fixed_end_unix != self.identity.fixed_end_unix
+            || (acquisition.fixed_end_unix != self.identity.fixed_end_unix
+                && (acquisition.version != 3
+                    || acquisition.aggregation_status == AggregationStatus::NotAttempted
+                    || complete))
+            || acquisition.fixed_end_unix > self.identity.fixed_end_unix
+            || acquisition.fixed_end_unix <= acquisition.start_exclusive
             || (self.identity.version != 4
                 && acquisition.predecessor
                     != self.predecessor(connection, &receipt.wallet_hex, carried)?)
@@ -908,6 +933,8 @@ impl CollectionProof {
                 || receipt.ordered_aggregate_digest != aggregate_digest(&[])?
                 || acquisition.exclusion_reason.is_none()
                 || (acquisition.aggregation_status == AggregationStatus::Complete
+                    && !(receipt.partial()
+                        && acquisition.fixed_end_unix < self.identity.fixed_end_unix)
                     && (acquisition.exclusion_reason
                         != Some(ActivityExclusionReason::CrossBoundaryCollision)
                         || acquisition.mode != ActivityReadMode::Incremental
@@ -1008,6 +1035,7 @@ pub(super) struct HistoryProof {
     records: BTreeMap<u64, (FreshCollectionIdentity, Option<ActivityCoverageManifestV2>)>,
     links: BTreeMap<u64, String>,
     last_fetched: BTreeMap<String, (u64, Option<String>)>,
+    continuations: BTreeMap<String, (ActivityReadMode, i64)>,
 }
 
 impl HistoryProof {
@@ -1029,6 +1057,7 @@ impl HistoryProof {
         let mut records = BTreeMap::new();
         let mut links = BTreeMap::new();
         let mut last_fetched = BTreeMap::<String, (u64, Option<String>)>::new();
+        let mut continuations = BTreeMap::new();
         let mut identity = head.clone();
         loop {
             let manifest = stored_activity_manifest(connection, identity.generation)?;
@@ -1036,7 +1065,12 @@ impl HistoryProof {
                 links.insert(identity.generation, manifest_link(manifest, &identity)?);
                 verify_archived_identity(connection, identity.generation, &identity, true)?;
                 verify_historical_receipts_with(connection, manifest, &identity, |receipt| {
-                    if !receipt.excluded()
+                    if Some(identity.generation) == head.base_generation
+                        && let Some(continuation) = receipt.continuation()
+                    {
+                        continuations.insert(receipt.wallet_hex.clone(), continuation);
+                    }
+                    if (!receipt.excluded() || receipt.partial())
                         && let Some(acquisition) = receipt.acquisition.as_ref()
                         && (acquisition.mode == ActivityReadMode::Full
                             || acquisition
@@ -1047,7 +1081,7 @@ impl HistoryProof {
                         // Its fetched rows do not make a certified quiet history active.
                         let change = (
                             identity.generation,
-                            (acquisition.mode == ActivityReadMode::Full)
+                            (acquisition.mode == ActivityReadMode::Full && !receipt.partial())
                                 .then(|| receipt.ordered_aggregate_digest.clone()),
                         );
                         let latest = last_fetched
@@ -1086,6 +1120,7 @@ impl HistoryProof {
             records,
             links,
             last_fetched,
+            continuations,
         })
     }
 
@@ -1297,9 +1332,6 @@ fn validate_pages(
             return invalid("activity page request does not match its proof".to_owned());
         }
         windows.entry((lo, bounds.end)).or_default().push(page);
-    }
-    if !windows.contains_key(&(start, end)) {
-        return invalid("activity proof omitted original read window".to_owned());
     }
     let mut leaves = Vec::new();
     for ((lo, hi), mut pages) in windows {
@@ -1855,7 +1887,9 @@ fn commit_history_wallet(
             .is_some_and(|repairs| repairs.binary_search(wallet).is_ok());
         let collision = check_collisions(&transaction, proof, completion)?;
         let incomplete = completion.aggregation_status != AggregationStatus::Complete;
-        let excluded = incomplete || collision;
+        let partial =
+            !incomplete && !collision && completion.acquired_end < identity.fixed_end_unix;
+        let excluded = incomplete || collision || partial;
         let chain = HistoryChain::load(
             &transaction,
             wallet,
@@ -1871,7 +1905,7 @@ fn commit_history_wallet(
             version: 3,
             mode: mode.clone(),
             start_exclusive: proof.start(wallet),
-            fixed_end_unix: identity.fixed_end_unix,
+            fixed_end_unix: completion.acquired_end,
             aggregation_status: completion.aggregation_status.clone(),
             fetched_aggregate_digest: if incomplete {
                 None
@@ -1904,6 +1938,8 @@ fn commit_history_wallet(
                 Some(ActivityExclusionReason::AggregationFailure)
             } else if collision {
                 Some(ActivityExclusionReason::CrossBoundaryCollision)
+            } else if partial {
+                Some(ActivityExclusionReason::AcquisitionFailure)
             } else {
                 None
             },
@@ -1952,7 +1988,7 @@ fn commit_history_wallet(
                 [wallet],
             )?)
             .map_err(|_| BootstrapError::Internal)?;
-        } else if excluded {
+        } else if excluded && !partial {
             if !proof.deferred(wallet) && chain.has_history_proof() {
                 chain.verify_stored(scan, &transaction, &mut counts.rows_verified)?;
             }
@@ -1966,7 +2002,7 @@ fn commit_history_wallet(
             )?)
             .map_err(|_| BootstrapError::Internal)?;
         }
-        if !excluded && !unchanged_full {
+        if (!excluded || partial) && !unchanged_full {
             for aggregate in &completion.aggregates {
                 insert_activity_aggregate_strict(&transaction, generation, wallet, aggregate)?;
             }
@@ -2014,8 +2050,12 @@ fn commit_history_wallet(
     )?;
         drop(_authorization);
         transaction.commit()?;
-        counts.rows_inserted = if !excluded && !unchanged_full {
-            receipt.aggregate_count
+        counts.rows_inserted = if (!excluded || partial) && !unchanged_full {
+            receipt
+                .acquisition
+                .as_ref()
+                .and_then(|acquisition| acquisition.fetched_aggregate_count)
+                .ok_or(BootstrapError::Internal)?
         } else {
             0
         };

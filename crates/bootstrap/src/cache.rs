@@ -1012,6 +1012,7 @@ impl WalletCache {
 
     /// Load only version-two activity aggregates. Sealed v1 rows are
     /// structurally outside this query and therefore cannot seed a v2 consumer.
+    #[cfg(feature = "scenario")]
     pub fn activity_aggregates_v2(&self) -> Result<Vec<StoredActivityAggregateV2>, BootstrapError> {
         self.require_v2_schema()?;
         let mut statement = self.conn.prepare(

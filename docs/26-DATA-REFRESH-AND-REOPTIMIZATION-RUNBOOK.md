@@ -134,6 +134,63 @@ published batch 86. From the first format-3 preparation onward, keep a format-3-
 fix forward. Never downgrade a format-3 cache in place. Supabase's additive objects remain installed;
 `cache-restore-prior` is paused integrity recovery, not release rollback.
 
+For #747, the prior binary rejects multi-window, shortened and resumed receipts. The first new
+generation can write these shapes. Before preparing a candidate holding them, prove inactivity and
+no request, abandon the unprepared candidate through [recovery](#recovery-and-damage-boundaries),
+and reinstall the prior binary/checkout pair. After preparation, retain a release that reads them
+and fix forward; never downgrade that cache in place.
+
+### Large-wallet collection progress (#747, AC9)
+
+Keep one resumable operator record across cycles for wallets logged with `acquisition budget
+exhausted` or holding partial receipts, until their first successful finalize or a documented
+existing unreadable-row/aggregation exclusion. Run this read-only query against each cycle’s cache,
+replacing the tracked-wallet `VALUES` with the record’s wallet set. It reports receipt-proved source
+rows, separately from inserted-row changes; empty proved windows advance the frontier too.
+
+```sql
+WITH tracked(wallet_hex) AS (VALUES ('0xTRACKED_WALLET')),
+head(generation) AS (SELECT MAX(generation) FROM activity_coverage_manifests_v2),
+receipts AS (
+  SELECT r.wallet_hex, r.generation, r.fixed_end_unix AS frozen_end,
+         json_extract(r.acquisition_json, '$.version') AS acquisition_version,
+         json_extract(r.acquisition_json, '$.mode') AS mode,
+         json_extract(r.acquisition_json, '$.start_exclusive') AS start,
+         json_extract(r.acquisition_json, '$.fixed_end_unix') AS acquired_end,
+         json_extract(r.acquisition_json, '$.aggregation_status') AS aggregation_status,
+         json_extract(r.acquisition_json, '$.exclusion_reason') AS reason,
+         json_extract(r.acquisition_json, '$.fetched_source_row_count') AS proved_source_rows,
+         json_extract(r.acquisition_json, '$.disposition') AS disposition
+  FROM activity_wallet_coverage_staging_v2 r JOIN tracked USING (wallet_hex)
+)
+SELECT wallet_hex, generation, frozen_end,
+       CASE WHEN acquisition_version = 3 AND disposition = 'excluded'
+                 AND reason = 'acquisition_failure'
+            THEN CASE WHEN aggregation_status = 'complete' THEN acquired_end ELSE start END
+            ELSE NULL END AS continuation_frontier,
+       CASE WHEN acquisition_version = 3 AND disposition = 'excluded'
+                 AND reason = 'acquisition_failure' AND aggregation_status = 'not_attempted'
+                 AND mode = 'full' THEN 1 ELSE 0 END AS restarts_full,
+       proved_source_rows,
+       disposition = 'complete' AS head_receipt_complete
+FROM receipts JOIN head USING (generation) ORDER BY wallet_hex;
+```
+
+Record frozen end, frontier and full restarts, proved source rows, and head completeness every cycle.
+A complete receipt has no continuation; record its acquired end as the completion frontier.
+`E − frontier` and sampled raw-row arrival estimates diagnose stalls only, never decide pass/fail.
+Bind every observation to generation, stage PID and binary revision. Reuse the read-only
+[memory sampling procedure](#wallet-cache-tuning-measurement-and-rollback-606) every 30 seconds for
+`cache-populate-activity-v2` and `cache-finalize-v2`, including `VmHWM`; do not reuse its trade-row rules.
+Every tracked wallet must advance by a proved window each cycle. Collection `MemAvailable` must be
+at least 4,500,000,000 B; finalize’s last sampled `VmHWM` at most 10,552,823,808 B and minimum
+`MemAvailable` at least 5,517,873,152 B. These are sampled extrema and the finalize lines are a
+no-regression gate, not demonstrated margin. Record every failed observation, its cause and explicit
+resolution by later wallet advance/completion or existing exclusion, or a later passing measurement
+of the same memory stage. The first cycle must add no error class. Keep the issue open until no
+wallet remains tracked, all failed observations are resolved, and three ordinary publications pass
+the existing batch-application, bounded-membership and service-health checks.
+
 ## Wallet-cache tuning measurement and rollback (#606)
 
 Run this comparison on Forge through the existing
@@ -841,8 +898,10 @@ pe-bootstrap cache-finalize-v2 --db "$SIDE"                # certify, checkpoint
 [`_GLOSSARY.md`](_GLOSSARY.md#history-format-3-and-classifier-6-739).
 The collector validates predecessor records and certificates and derives the wallet union before
 sampling/freezing the settled end. New roots read full history; polled successors read
-`(previous_end,new_end]` for wallets with usable predecessor history. New wallets, genuine previous
-exclusions and explicit repairs read full history. Generation numbers may have gaps; the frozen
+`(previous_end,new_end]` for wallets with usable predecessor history; identity-4 acquisition
+failures resume from their receipt’s continuation frontier instead. A partial resumes incrementally;
+a no-progress read keeps its mode and start. New wallets, other previous exclusions and explicit
+repairs read full history. Generation numbers may have gaps; the frozen
 identity binds the predecessor. Acquisition 3 keeps otherwise valid rows missing a condition id or
 token for scoped classification/ignored-record accounting; acquisition 2 and public service readers
 retain strict acceptance.
@@ -861,7 +920,7 @@ Identity-4 successors defer quiet wallets using the unchanged
 A deferred predecessor stays quiet; committed rows since certification make a wallet active;
 otherwise the quiet decision uses certified newest activity, not an activity-index probe.
 Due complete wallets read incrementally; due `dormant_deferred` wallets read full history. Roots,
-new wallets, genuine exclusions and repairs never defer. Top-ups use the same rule, resume keeps
+new wallets, continuing acquisitions, other exclusions and repairs never defer. Top-ups use the same rule, resume keeps
 the frozen list, and admission/completion report deferrals separately from failures. A pause
 lengthens the predecessor interval; deferred wallets whose weekly instant fell inside it read in full.
 
@@ -870,9 +929,10 @@ projection/binding and invalidates finalization. Incremental collection strictly
 rows and their fetched-set receipt in one wallet transaction; no carry or re-stamping occurs.
 The receipt-chain verifier owns effective history. An unchanged automatic full read writes only its
 receipt, without a history read/write or per-aggregate identity probe. A differing full read checks
-stored history before replacing it; a foreign-wallet identity is fatal. Explicit repairs always
-replace after logging stored/certified digests, with empty history if acquisition fails. Other
-exclusions and deferrals keep retained rows and never reset the chain. Historical manifests are
+stored history before replacing it; a foreign-wallet identity is fatal. A full partial also checks
+and replaces retained history; an incremental partial inserts its proved rows. Explicit repairs
+always replace after logging stored/certified digests, keeping a proved partial or empty history
+when no window was proved. Other exclusions and deferrals keep retained rows and never reset the chain. Historical manifests are
 commitments, not queryable snapshots. Keep staging evidence and `H0`; resumed staging leaves progress
 intact and never recaptures a changed installed baseline. Activation preserves old fixed bytes at `D`.
 
@@ -884,13 +944,23 @@ Format-3 consumers use receipt availability and head certificates, never generat
 of activity rows or the `activity_type` mirror.
 
 A wallet whose acquisition cannot be parsed, identified, bounded or bucketed, or has an incremental
-same-wallet identity collision, is excluded with its reason/evidence retained. Missing condition/token
+same-wallet identity collision, is excluded with its reason/evidence retained. Identity 4 probes one
+unsplit window, then walks forward with the verified [ascending boundary lookup](15-SOURCES.md#forge-forward-activity-window-lookup-747).
+Continuing acquisitions and full reads certified with at least 5,500 source rows skip the probe.
+The lookup places bounds only; descending terminal pages prove every kept window. A saturated
+one-second window remains fatal, and a looked-up window that is still full stops without keeping it. Missing condition/token
 alone follows acquisition 3's acceptance above. Every non-deferral failed acquisition with retained
-history verifies it in the exclusion transaction, in either read mode, except an explicit repair's
-replacement. Excluded receipts have zero admitted counts and no current projection; older rows stay
-untouched except for a repair. With `bootstrap_polymarket_wallet_timeout_secs` set, recoverable failures
-retry in place under that budget and expiry records an exclusion (#681). Resume skips it; the next
-generation reads the wallet in full. Equal-revision incremental collisions also exclude. Missing
+history verifies it in the exclusion transaction, in either read mode, except an explicit repair’s
+replacement. A partial atomically commits proved rows and an excluded `acquisition_failure` receipt
+with complete aggregation and an acquired end strictly between its start and the generation end;
+zero-row partials are valid history parts. Excluded receipts keep zero outer counts, the empty digest,
+SQL `fixed_end_unix` equal to the frozen end and no current certificate/projection/spool rows.
+With `bootstrap_polymarket_wallet_timeout_secs` set, identity 4 checks one non-resetting deadline
+before outer retries and further walk windows, never cancels a page fetch in flight, and keeps proved
+windows on expiry. A walk always attempts its first window. The shared held-row bound comes from
+[`ACTIVITY_WALK_HELD_ROWS`](_GLOSSARY.md#polymarket-public-source-pollingconfig).
+Same-generation resume skips the committed receipt; the next generation continues acquisition
+failures in their own mode from the receipt frontier. Aggregation failures and collisions read full. Equal-revision incremental collisions also exclude. Missing
 proof, foreign-wallet collisions or unreceipted current rows fail the cache closed.
 
 Incremental reads do not discover revisions wholly before the lower bound. Select repair wallets
@@ -905,8 +975,10 @@ Selection is the frozen `repair_wallets` subset in identity 4; it cannot change 
 Repairs reconcile revisions/deletions and logical history damage, preserve cumulative drops, and
 cannot repair structural SQLite damage or damaged certificates/receipts/manifests/state. Follow
 [the damage boundary](#recovery-and-damage-boundaries) before selecting a repair. The shared paced
-fetcher, bounded reads/channel and single writer remain; transient exhaustion exits
-`rank_and_push_tempfail_exit`, while permanent errors stop the cycle.
+fetcher, bounded reads/channel and single writer remain. Under a budget, a window whose page
+exhausts its internal retries retries in place while the deadline allows, retaining earlier proved
+windows; without a budget, transient exhaustion exits `rank_and_push_tempfail_exit`. Permanent
+errors stop the cycle.
 
 **Verified pass, spool and export.** Finalize visits every available wallet once (complete,
 non-excluded head receipt, even with zero fetched rows), verifies its effective history, classifies
@@ -1148,7 +1220,7 @@ forward. Confirm the host paths before cutover and keep the prior until publicat
 A failed history check reports expected/observed digests and stops the cycle. Pause, preserve evidence,
 abandon the failed unprepared candidate under the guards above, stage from the installed cache and
 admit a new generation with `--full-read-wallets` for the named wallets. Repair logs stored/certified
-digests and replaces history, with nothing if download fails, so repeated failed downloads do not
+digests and replaces history, retaining proved partial windows or nothing if no window was proved, so repeated failed downloads do not
 keep a damaged wallet blocking later cycles. The pass verifies replacement before preparation;
 cumulative drops survive. This applies to history damage at rest in an otherwise readable installed
 format-3 cache; outgoing validation needs neither history nor a retired backup.
@@ -1245,7 +1317,10 @@ to the owner. Record each completed step and resume it, rather than starting ano
 
 For each cycle record stage durations, rows read/written and commitments, drops and ignored records,
 peak RSS, spool/export/spill/WAL bytes and both drives' free space. Collection timing separates fetch
-completion, writer completion, blocked-producer time and final drain. Report publication-to-publication
+completion, writer completion, blocked-producer time and final drain. Since #747,
+`producer_blocked_ms` is the summed time individual wallet futures wait to send to the writer,
+including overlapping waits; it is not comparable with earlier cycles’ wall-clock blocked time.
+Unfinished reads continue while other completions await a full queue. Report publication-to-publication
 cadence; report the first ordinary cycle separately. Forecasts are not measurements. A cycle exceeding
 the canonical freshness/cadence goal is reported to the owner the same day with options; closure needs
 measured ordinary cadence meeting the owner's goal. Rollback before preparation uses the guarded

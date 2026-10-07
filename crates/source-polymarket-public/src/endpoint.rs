@@ -157,6 +157,12 @@ pub enum PolymarketEndpoint {
         start: Option<i64>,
         offset: u32,
     },
+    /// Ascending one-row lookup that places a forward activity window boundary (#747).
+    UserPositionActivityWindowEnd {
+        user: String,
+        start: i64,
+        end: i64,
+    },
     /// Live open positions for a single wallet via `/positions`.
     ///
     /// `redeemable`: when `Some(false)`, restrict to live (unresolved) positions.
@@ -188,9 +194,9 @@ impl PolymarketEndpoint {
             Self::UserTradeActivity { .. } | Self::UserTradeActivityPage { .. } => {
                 "user_trade_activity"
             }
-            Self::UserPositionActivity { .. } | Self::UserPositionActivityPage { .. } => {
-                "user_position_activity"
-            }
+            Self::UserPositionActivity { .. }
+            | Self::UserPositionActivityPage { .. }
+            | Self::UserPositionActivityWindowEnd { .. } => "user_position_activity",
             Self::CurrentPositions { .. } | Self::CurrentPositionsReconciliationPage { .. } => {
                 "current_positions"
             }
@@ -261,6 +267,9 @@ impl PolymarketEndpoint {
                 }
                 url
             }
+            Self::UserPositionActivityWindowEnd { user, start, end } => format!(
+                "{base}/activity?user={user}&type={POSITION_CHANGING_ACTIVITY_TYPES}&limit=1&offset=4999&sortDirection=ASC&start={start}&end={end}"
+            ),
             Self::CurrentPositions {
                 user,
                 limit,
@@ -301,6 +310,20 @@ impl PolymarketEndpoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn activity_window_lookup_url() {
+        let endpoint = PolymarketEndpoint::UserPositionActivityWindowEnd {
+            user: "0xabc".to_owned(),
+            start: 11,
+            end: 100,
+        };
+        assert_eq!(endpoint.key(), "user_position_activity");
+        assert_eq!(
+            endpoint.url("https://data.example"),
+            "https://data.example/activity?user=0xabc&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&limit=1&offset=4999&sortDirection=ASC&start=11&end=100"
+        );
+    }
 
     #[test]
     fn leaderboard_profit_monthly() {
