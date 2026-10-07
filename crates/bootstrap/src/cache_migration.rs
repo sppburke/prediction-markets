@@ -1771,7 +1771,8 @@ fn transition_excluded_wallet(
         let manifest =
             stored_activity_manifest(connection, generation)?.ok_or(BootstrapError::Internal)?;
         if !verified_chains.contains(&generation) {
-            let verified = incremental::verify_record_chain(connection, &identity)?;
+            let verified =
+                incremental::verify_record_chain(connection, &identity, verified_chains)?;
             tracing::info!(generation, ?verified, "activity record chain verified");
             verified_chains.extend(verified);
         }

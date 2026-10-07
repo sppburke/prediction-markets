@@ -1015,6 +1015,17 @@ impl HistoryProof {
         connection: &Connection,
         head: &FreshCollectionIdentity,
     ) -> Result<Self, BootstrapError> {
+        Self::load_until(connection, head, |_| false)
+    }
+
+    /// Walks `head`'s chain toward its root, stopping at the first predecessor
+    /// `verified` names once the link into it checks: a walk from that
+    /// predecessor, in the same transaction, already checked the rest.
+    fn load_until(
+        connection: &Connection,
+        head: &FreshCollectionIdentity,
+        verified: impl Fn(u64) -> bool,
+    ) -> Result<Self, BootstrapError> {
         let mut records = BTreeMap::new();
         let mut links = BTreeMap::new();
         let mut last_fetched = BTreeMap::<String, (u64, Option<String>)>::new();
@@ -1066,6 +1077,9 @@ impl HistoryProof {
             {
                 return invalid("history chain manifest commitment mismatch".to_owned());
             }
+            if verified(prior.generation) {
+                break;
+            }
             identity = prior;
         }
         Ok(Self {
@@ -1101,14 +1115,17 @@ impl HistoryProof {
     }
 }
 
-/// Returns every generation whose manifest and receipts the chain walk verified:
-/// `head` and each predecessor it links to, each checked exactly as a walk
-/// starting there would check it.
+/// Verifies `head`'s chain down to its root or to a generation in `verified`,
+/// whose own walk covered the rest; returns the generations whose manifest and
+/// receipts this walk checked.
 pub(super) fn verify_record_chain(
     connection: &Connection,
     head: &FreshCollectionIdentity,
+    verified: &BTreeSet<u64>,
 ) -> Result<Vec<u64>, BootstrapError> {
-    let proof = HistoryProof::load(connection, head)?;
+    let proof = HistoryProof::load_until(connection, head, |generation| {
+        verified.contains(&generation)
+    })?;
     Ok(proof
         .records
         .iter()

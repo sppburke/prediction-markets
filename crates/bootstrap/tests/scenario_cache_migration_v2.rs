@@ -15689,6 +15689,63 @@ async fn history_v3_transition_certifies_prior_complete_exclusions_and_leaves_pr
     );
 }
 
+// Records a hand-built identity-3 successor of the current legacy generation
+// and collects it, returning its manifest.
+async fn history_v3_legacy_successor(
+    side: &std::path::Path,
+    source: &DatasetFetcher,
+    manifest: &pe_bootstrap::cache_migration::ActivityCoverageManifestV2,
+    end: i64,
+    wallets: &[&str],
+    full_reads: &[&str],
+) -> pe_bootstrap::cache_migration::ActivityCoverageManifestV2 {
+    let prior = fresh_record(side);
+    let generation = prior["generation"].as_u64().unwrap() + 1;
+    let link = whole_json_digest(
+        &serde_json::json!({"version":1, "manifest":manifest, "collection_identity":prior}),
+    );
+    let mut identity = serde_json::json!({
+        "version":3, "generation":generation, "fixed_end_unix":end,
+        "wallets":wallets, "base_generation":generation - 1,
+        "base_manifest_sha256":link, "start_exclusive":prior["fixed_end_unix"],
+        "full_read_wallets":full_reads, "deferred_wallets":[],
+        "quiet_after_secs":2_592_000, "repoll_period_secs":604_800,
+    });
+    identity["digest"] = Value::from(whole_json_digest(&identity));
+    Connection::open(side)
+        .unwrap()
+        .execute(
+            "UPDATE cache_v2_migration_state SET fresh_collection_json = ?1",
+            [identity.to_string()],
+        )
+        .unwrap();
+    history_v3_collect(side, source, generation, end, &[])
+        .await
+        .unwrap()
+}
+
+// Collects the transition while capturing its record-chain verification events.
+async fn history_v3_transition_chain_events(
+    side: &std::path::Path,
+    source: &DatasetFetcher,
+    generation: u64,
+    end: i64,
+) -> Vec<Value> {
+    let log = CheckLog::default();
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    history_v3_collect(side, source, generation, end, &[])
+        .await
+        .unwrap();
+    drop(guard);
+    log.take_named("activity record chain verified")
+}
+
 // Forge's generation 8 had 255 wallets excluded in all seven earlier generations;
 // re-verifying the record chain per wallet and generation cost ~30 s each (#739).
 #[tokio::test]
@@ -15716,28 +15773,15 @@ async fn history_v3_transition_verifies_each_earlier_record_chain_once_for_all_e
     // transition walks back through generations 2 and 1 for both of them.
     for generation in 2..=3_u64 {
         let end = FRESH_END + i64::try_from(generation).unwrap() - 1;
-        let prior = fresh_record(&side);
-        let link = whole_json_digest(
-            &serde_json::json!({"version":1, "manifest":manifest, "collection_identity":prior}),
-        );
-        let mut identity = serde_json::json!({
-            "version":3, "generation":generation, "fixed_end_unix":end,
-            "wallets":[WALLET,WALLET_B,WALLET_C], "base_generation":generation - 1,
-            "base_manifest_sha256":link, "start_exclusive":end - 1,
-            "full_read_wallets":[WALLET_B,WALLET_C], "deferred_wallets":[],
-            "quiet_after_secs":2_592_000, "repoll_period_secs":604_800,
-        });
-        identity["digest"] = Value::from(whole_json_digest(&identity));
-        Connection::open(&side)
-            .unwrap()
-            .execute(
-                "UPDATE cache_v2_migration_state SET fresh_collection_json = ?1",
-                [identity.to_string()],
-            )
-            .unwrap();
-        manifest = history_v3_collect(&side, &source, generation, end, &[])
-            .await
-            .unwrap();
+        manifest = history_v3_legacy_successor(
+            &side,
+            &source,
+            &manifest,
+            end,
+            &[WALLET, WALLET_B, WALLET_C],
+            &[WALLET_B, WALLET_C],
+        )
+        .await;
     }
     let legacy = fresh_record(&side);
 
@@ -15770,19 +15814,7 @@ async fn history_v3_transition_verifies_each_earlier_record_chain_once_for_all_e
         0
     );
 
-    let log = CheckLog::default();
-    let writer = log.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .json()
-        .with_ansi(false)
-        .with_writer(move || writer.clone())
-        .finish();
-    let guard = tracing::subscriber::set_default(subscriber);
-    history_v3_collect(&side, &source, 4, FRESH_END + 3, &[])
-        .await
-        .unwrap();
-    drop(guard);
-    let verified = log.take_named("activity record chain verified");
+    let verified = history_v3_transition_chain_events(&side, &source, 4, FRESH_END + 3).await;
     assert_eq!(verified.len(), 1, "{verified:?}");
     assert_eq!(verified[0]["fields"]["generation"], 2);
     assert_eq!(verified[0]["fields"]["verified"], "[1, 2]");
@@ -15813,6 +15845,87 @@ async fn history_v3_transition_verifies_each_earlier_record_chain_once_for_all_e
             )
         ),
         0
+    );
+}
+
+// A later walk that starts above an already verified generation stops there:
+// WALLET_B (empty and complete in generation 1, absent from 2, excluded in 3)
+// verifies generation 1 first, then WALLET_C's walk from 2 links into it.
+#[tokio::test]
+async fn history_v3_transition_stops_each_chain_walk_at_a_verified_generation() {
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "transition-chain-gap.db", &[WALLET_B, WALLET_C]);
+    history_v3_freeze_legacy_root(&side, &[WALLET, WALLET_B, WALLET_C]);
+    let mut source = DatasetFetcher {
+        rows: vec![
+            dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END),
+            dataset_row(WALLET_C, "0xc", "c", "BUY", FRESH_END),
+        ],
+        ..Default::default()
+    };
+    let mut manifest = history_v3_collect(&side, &source, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    manifest = history_v3_legacy_successor(
+        &side,
+        &source,
+        &manifest,
+        FRESH_END + 1,
+        &[WALLET, WALLET_C],
+        &[],
+    )
+    .await;
+    for wallet in [WALLET_B, WALLET_C] {
+        let mut bad = dataset_row(
+            wallet,
+            "0xd",
+            &format!("bad-{wallet}"),
+            "BUY",
+            FRESH_END + 2,
+        );
+        bad["price"] = Value::from("3");
+        source.rows.push(bad);
+    }
+    history_v3_legacy_successor(
+        &side,
+        &source,
+        &manifest,
+        FRESH_END + 2,
+        &[WALLET, WALLET_B, WALLET_C],
+        &[WALLET_B],
+    )
+    .await;
+    assert_eq!(
+        count(
+            &side,
+            "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2 WHERE generation = 3 AND exclusion_reason IS NOT NULL"
+        ),
+        2
+    );
+
+    let verified = history_v3_transition_chain_events(&side, &source, 4, FRESH_END + 3).await;
+    assert_eq!(verified.len(), 2, "{verified:?}");
+    assert_eq!(verified[0]["fields"]["generation"], 1);
+    assert_eq!(verified[0]["fields"]["verified"], "[1]");
+    assert_eq!(verified[1]["fields"]["generation"], 2);
+    assert_eq!(verified[1]["fields"]["verified"], "[2]");
+    assert_eq!(
+        count(
+            &side,
+            &format!(
+                "SELECT COUNT(*) FROM activity_wallet_history_v3 WHERE wallet_hex = '{WALLET_B}' AND generation = 1 AND aggregate_count = 0"
+            )
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &side,
+            &format!(
+                "SELECT COUNT(*) FROM activity_wallet_history_v3 WHERE wallet_hex = '{WALLET_C}' AND generation = 2 AND aggregate_count = 1"
+            )
+        ),
+        1
     );
 }
 
