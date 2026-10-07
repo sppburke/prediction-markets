@@ -1111,7 +1111,7 @@ pub(crate) fn live_source_receipts(
 
 /// The source evidence owner shared by replay and retention. Receipt closures are collected from
 /// the same authenticators that replay uses, including recursively consulted counterpart bases.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct DecisionSourceInputs {
     pub(crate) receipts: Vec<AppendReceipt>,
     pub(crate) payload_hashes: std::collections::BTreeSet<String>,

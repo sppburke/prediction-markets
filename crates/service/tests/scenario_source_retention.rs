@@ -1032,6 +1032,8 @@ async fn retention_pins_financial_inputs_recent_decisions_and_commit_time_update
         CanonicalFillResult, ExpectedAuthority, FinancialPayload, FinancialResult,
         PaperFillOperationIdentity,
     };
+    let logs = support::RetentionLogs::default();
+    let _subscriber = tracing::subscriber::set_default(logs.subscriber());
     for case in [
         "pending",
         "old_completed",
@@ -1132,6 +1134,24 @@ async fn retention_pins_financial_inputs_recent_decisions_and_commit_time_update
         let mut owner = fixture.owner(CheckpointOwnerHooks::default());
         owner.initialize_for_scenario().await.unwrap();
         owner.retention_for_scenario().await.unwrap();
+        // The commit runs inside the orchestrator: it reuses the preparation's derivations and
+        // derives again only a row written since (here the row updated during the copy).
+        let committed = logs
+            .text()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .rfind(|event| event["message"] == "source retention committed")
+            .unwrap();
+        assert_eq!(
+            committed["decision_rows"],
+            u64::from(case != "pending"),
+            "{case}"
+        );
+        assert_eq!(
+            committed["decision_rows_derived"],
+            u64::from(case == "updated_during_copy"),
+            "{case}"
+        );
         let authority = RetentionAuthority::load(&fixture.path).unwrap().unwrap();
         for receipt in &fixture.evidence {
             if case == "old_completed" {

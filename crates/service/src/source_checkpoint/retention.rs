@@ -7,12 +7,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context as _, ensure};
-use pe_core_types::{EventSeq, WalletAddress};
+use pe_core_types::{EventSeq, SourceTradeId, WalletAddress};
 use pe_event_log::{
     AppendReceipt, EventEnvelope, FeedArchiveWriter, LogTailBinding, Reader, RetentionAuthority,
     RetentionBoundary, RetentionPin, Scanner, TailBinding,
 };
-use pe_paper_state::{DecisionPendingState, PaperStateDb};
+use pe_paper_state::{DecisionPendingRow, DecisionPendingState, PaperStateDb};
 use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
 use tracing::info;
@@ -20,7 +20,8 @@ use tracing::info;
 use super::{Authority, CheckpointLock};
 use crate::activity_ingest::ACTIVITY_WS_SOURCE_ID;
 use crate::decision_replay::{
-    commitment_source_receipts, decision_source_inputs, economic_source_receipts,
+    DecisionSourceInputs, commitment_source_receipts, decision_source_inputs,
+    economic_source_receipts,
 };
 use crate::orchestrator_control::OrchestratorControl;
 use crate::paper_recovery::{FinancialPayload, PaperLog, PaperLogFrame, PaperLogRecord, paper_era};
@@ -98,6 +99,7 @@ pub struct RetentionCommitRequest {
     expected_generation: Option<u64>,
     cutoff: i64,
     payload_receipts: HashMap<String, Vec<AppendReceipt>>,
+    decision_rows: DecisionPinCache,
 }
 
 pub enum RetentionCommitOutcome {
@@ -281,12 +283,27 @@ fn collect_receipts(
 struct DecisionPins {
     receipts: Vec<AppendReceipt>,
     payload_hashes: BTreeSet<String>,
+    rows: usize,
+    derived: usize,
 }
+
+/// One decision row's share of the decision pins, kept with the exact row it was derived from.
+struct DecisionRowPins {
+    row: DecisionPendingRow,
+    observed: Option<AppendReceipt>,
+    inputs: Option<DecisionSourceInputs>,
+}
+
+/// Decision pins by row. Preparation derives every row off the serving path; the commit runs inside the
+/// orchestrator, so it reuses an entry while its row is unchanged and derives only rows written since.
+#[derive(Default)]
+struct DecisionPinCache(HashMap<SourceTradeId, DecisionRowPins>);
 
 fn decision_pins(
     context: &RetentionContext,
     index: &SourceReceiptIndex,
     cutoff: i64,
+    cache: &mut DecisionPinCache,
 ) -> anyhow::Result<DecisionPins> {
     let era = paper_era(context.paper_log.snapshot()?);
     let local_last = context.paper_state.financial_last_prepared_seq()?;
@@ -346,19 +363,39 @@ fn decision_pins(
         }
     }
     let mut payload_hashes = BTreeSet::new();
+    let mut previous = std::mem::take(&mut cache.0);
+    let total = rows.len();
+    let mut derived = 0;
     for row in rows {
-        let continuation = crate::bucket_commit::DecisionContinuationV3::from_durable(&row)?;
-        if continuation.is_activity_frame() {
-            receipts.extend(continuation.observed_source_receipt);
-        }
-        if row.state == DecisionPendingState::Open
-            || row.updated_at_unix >= cutoff
-            || financial_decisions.contains(&row.source_trade_id)
+        let mut entry = match previous.remove(&row.source_trade_id) {
+            Some(entry) if entry.row == row => entry,
+            _ => {
+                let continuation =
+                    crate::bucket_commit::DecisionContinuationV3::from_durable(&row)?;
+                DecisionRowPins {
+                    observed: continuation
+                        .observed_source_receipt
+                        .filter(|_| continuation.is_activity_frame()),
+                    row,
+                    inputs: None,
+                }
+            }
+        };
+        receipts.extend(entry.observed);
+        if entry.row.state == DecisionPendingState::Open
+            || entry.row.updated_at_unix >= cutoff
+            || financial_decisions.contains(&entry.row.source_trade_id)
         {
-            let inputs = decision_source_inputs(&row, index)?;
-            receipts.extend(inputs.receipts);
-            payload_hashes.extend(inputs.payload_hashes);
+            if entry.inputs.is_none() {
+                entry.inputs = Some(decision_source_inputs(&entry.row, index)?);
+                derived += 1;
+            }
+            if let Some(inputs) = &entry.inputs {
+                receipts.extend(inputs.receipts.iter().copied());
+                payload_hashes.extend(inputs.payload_hashes.iter().cloned());
+            }
         }
+        cache.0.insert(entry.row.source_trade_id.clone(), entry);
     }
     for sequence in (context.database_inputs)()?.identity_sequences {
         receipts.push(receipt_at(index, sequence)?);
@@ -366,6 +403,8 @@ fn decision_pins(
     Ok(DecisionPins {
         receipts,
         payload_hashes,
+        rows: total,
+        derived,
     })
 }
 
@@ -518,7 +557,8 @@ pub(crate) fn prepare(
         return Ok(PreparedRetention::Deferred("snapshot_behind_boundary"));
     }
     let mut pins = BTreeMap::new();
-    let decisions = decision_pins(context, index, cutoff)?;
+    let mut decision_rows = DecisionPinCache::default();
+    let decisions = decision_pins(context, index, cutoff, &mut decision_rows)?;
     for receipt in decisions.receipts {
         cancelled(cancel)?;
         add_pin(&mut pins, index, boundary, receipt, false)?;
@@ -672,6 +712,7 @@ pub(crate) fn prepare(
             expected_generation: frozen.authority_generation,
             cutoff,
             payload_receipts,
+            decision_rows,
             authority: RetentionAuthority {
                 format_version: 1,
                 epoch: next_epoch,
@@ -729,6 +770,7 @@ fn ensure_receipts(
 pub(crate) fn commit(
     mut request: RetentionCommitRequest,
 ) -> anyhow::Result<RetentionCommitOutcome> {
+    let started = std::time::Instant::now();
     let path = request.receipts.current_tail_binding()?.path;
     let _lock = CheckpointLock::acquire(&path)?;
     if super::retention_epoch(&path)? != request.expected_epoch {
@@ -753,7 +795,13 @@ pub(crate) fn commit(
         .cloned()
         .map(|pin| (pin.sequence, pin))
         .collect::<BTreeMap<_, _>>();
-    let decisions = decision_pins(&request.context, &request.receipts, request.cutoff)?;
+    let decisions = decision_pins(
+        &request.context,
+        &request.receipts,
+        request.cutoff,
+        &mut request.decision_rows,
+    )?;
+    let (decision_rows, decision_rows_derived) = (decisions.rows, decisions.derived);
     for receipt in decisions.receipts {
         add_pin(
             &mut pins,
@@ -802,6 +850,9 @@ pub(crate) fn commit(
         epoch = request.authority.epoch,
         boundary_sequence = request.authority.boundary.sequence.0,
         boundary_offset = request.authority.boundary.offset,
+        decision_rows,
+        decision_rows_derived,
+        elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         "source retention committed"
     );
     #[cfg(feature = "scenario")]
