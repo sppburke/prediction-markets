@@ -62,6 +62,21 @@ fn input(source: &str, payload: Vec<u8>, unix: i64) -> EnvelopeIn {
     }
 }
 
+fn feed_input(transaction: &str, unix: i64) -> EnvelopeIn {
+    let payload = format!(
+        r#"{{"proxyWallet":"{WALLET}","conditionId":"0x{}","asset":"123","side":"BUY","size":"100","price":"0.50","timestamp":"{OLD}","transactionHash":"{transaction}","outcomeIndex":"0"}}"#,
+        "11".repeat(32)
+    );
+    let mut envelope = input(
+        pe_service::activity_ingest::ACTIVITY_WS_SOURCE_ID,
+        payload.into_bytes(),
+        unix,
+    );
+    envelope.schema_version = pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION;
+    envelope.parser_version = pe_source_polymarket_public::ACTIVITY_PARSER_VERSION;
+    envelope
+}
+
 fn append_paper(log: &PaperLog, record: &PaperLogRecord) -> AppendReceipt {
     let mut envelope = input("pe-service.paper", serde_json::to_vec(record).unwrap(), NOW);
     envelope.schema_version = 2;
@@ -133,18 +148,7 @@ impl Fixture {
             .append_synced(input("old-raw", noise(32_000, 2), OLD + 1))
             .unwrap();
         let feed_offset = writer.verified_tail().unwrap().physical_tail;
-        let payload = format!(
-            r#"{{"proxyWallet":"{WALLET}","conditionId":"0x{}","asset":"123","side":"BUY","size":"100","price":"0.50","timestamp":"{OLD}","transactionHash":"0xfeed","outcomeIndex":"0"}}"#,
-            "11".repeat(32)
-        );
-        let mut envelope = input(
-            pe_service::activity_ingest::ACTIVITY_WS_SOURCE_ID,
-            payload.into_bytes(),
-            OLD + 2,
-        );
-        envelope.schema_version = pe_source_polymarket_public::ACTIVITY_SCHEMA_VERSION;
-        envelope.parser_version = pe_source_polymarket_public::ACTIVITY_PARSER_VERSION;
-        let feed = writer.append_synced(envelope).unwrap();
+        let feed = writer.append_synced(feed_input("0xfeed", OLD + 2)).unwrap();
         let feed_end = writer.verified_tail().unwrap().physical_tail;
         writer
             .append_synced(input("old-raw", noise(64_000, 3), OLD + 3))
@@ -1162,4 +1166,70 @@ async fn retention_obligation_pins_authenticated_closure_without_a_decision_owne
         manifest(&fixture.path)["activity"]["routed_frames"],
         serde_json::json!([fixture.feed.sequence.0])
     );
+}
+
+#[tokio::test]
+async fn retention_waits_until_the_owner_snapshot_reaches_past_the_boundary() {
+    // Frames appended after the owner's capture can become the boundary: an old-dated feed
+    // observation its reducers never saw (with receipts published by a concurrent preparation),
+    // or a lone current frame starting exactly at the frozen tail.
+    for late_observation in [true, false] {
+        let mut fixture = Fixture::new(Some(true));
+        let old_end = pe_event_log::Reader::read_at(
+            &fixture.path,
+            fixture.feed_end,
+            pe_core_types::EventSeq(3),
+            fixture.feed.this_hash,
+        )
+        .unwrap()
+        .1;
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&fixture.path)
+            .unwrap()
+            .set_len(old_end)
+            .unwrap();
+        fixture.index = SourceReceiptIndex::replay(&fixture.path).unwrap();
+        install_retention_fence(&fixture.path).unwrap();
+        let mut owner = fixture.owner(CheckpointOwnerHooks::default());
+        owner.initialize_for_scenario().await.unwrap();
+        let mut writer = Writer::open(&fixture.path).unwrap();
+        let mut appended = Vec::new();
+        if late_observation {
+            let receipt = writer.append_synced(feed_input("0xlate", OLD + 4)).unwrap();
+            owner
+                .record_synced_append_for_scenario(receipt, &feed_input("0xlate", OLD + 4))
+                .unwrap();
+            appended.push(receipt);
+        }
+        let receipt = writer
+            .append_synced(input("recent", b"recent".to_vec(), NOW))
+            .unwrap();
+        owner
+            .record_synced_append_for_scenario(receipt, &input("recent", b"recent".to_vec(), NOW))
+            .unwrap();
+        appended.push(receipt);
+        drop(writer);
+        if late_observation {
+            let mut preparation = fixture.owner(CheckpointOwnerHooks::default());
+            preparation.initialize_for_scenario().await.unwrap();
+        }
+        owner.retention_for_scenario().await.unwrap();
+        assert!(
+            RetentionAuthority::load(&fixture.path).unwrap().is_none(),
+            "{late_observation}"
+        );
+        owner.publish_hourly_for_scenario().await.unwrap();
+        owner.retention_for_scenario().await.unwrap();
+        let authority = RetentionAuthority::load(&fixture.path).unwrap().unwrap();
+        assert_eq!(authority.epoch, 1);
+        assert_eq!(authority.boundary.sequence, receipt.sequence);
+        assert_eq!(manifest(&fixture.path)["retention_epoch"], 1);
+        assert!(Scanner::verify(&fixture.path).is_ok());
+        if late_observation {
+            let pin = authority.pin(appended[0].sequence).unwrap();
+            assert!(pin.reducer);
+            assert_eq!(pin.wallet, Some(WalletAddress::from_hex(WALLET).unwrap()));
+        }
+    }
 }

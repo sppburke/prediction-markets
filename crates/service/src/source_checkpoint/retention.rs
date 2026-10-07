@@ -498,6 +498,11 @@ pub(crate) fn prepare(
             boundary_current: true,
         });
     }
+    // Reducer pins and finishing both start from the frozen snapshot, so it must already reach
+    // past the boundary. A frame appended after the last capture waits for the next capture.
+    if frozen.tail.physical_tail <= boundary.offset {
+        return Ok(PreparedRetention::Deferred("snapshot_behind_boundary"));
+    }
     let mut pins = BTreeMap::new();
     let decisions = decision_pins(context, index, cutoff)?;
     for receipt in decisions.receipts {
