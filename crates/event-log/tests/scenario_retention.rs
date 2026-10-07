@@ -478,6 +478,7 @@ fn retention_shortened_committed_window_refuses_every_writer_without_truncation(
         assert!(Scanner::verify(&fixture.path).is_err());
         assert!(Scanner::walk_prefix(&tail, &mut |_, _| {}).is_err());
         assert!(Reader::replay(&fixture.path).is_err());
+        assert!(Reader::tail(&fixture.path, Duration::from_millis(1)).is_err());
         assert!(Writer::open(&fixture.path).is_err());
         assert!(Writer::open_verified(&fixture.path, Some(&activation), &mut |_, _| {}).is_err());
         assert!(Writer::open_with_expected_tail(&fixture.path, &tail).is_err());

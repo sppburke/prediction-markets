@@ -320,7 +320,10 @@ impl ScanState {
 
 /// The retained tail is fsynced before its authority commits and the log only grows afterwards, so a
 /// log shorter than it lost committed frames, whatever bound the caller walks to.
-fn require_retained_length(file: &File, retained: Option<&LogTailBinding>) -> Result<(), LogError> {
+pub(crate) fn require_retained_length(
+    file: &File,
+    retained: Option<&LogTailBinding>,
+) -> Result<(), LogError> {
     match retained {
         Some(tail) if file.metadata()?.len() < tail.physical_tail => {
             Err(crate::RetentionError::Invalid(

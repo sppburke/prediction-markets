@@ -113,6 +113,8 @@ impl ReplayIter {
             .as_ref()
             .map(|authority| authority.retained_tail.resolve(path))
             .transpose()?;
+        // Refuse before yielding a frame, so an early-stopping consumer cannot accept a shortened log.
+        crate::scanner::require_retained_length(reader.get_ref(), retained_tail.as_ref())?;
         Ok(Self {
             reader,
             state,
