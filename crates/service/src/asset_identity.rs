@@ -14,7 +14,7 @@ use pe_paper_state::{
     PaperStateError,
 };
 use pe_source_core::SourceError;
-use pe_source_polymarket_public::gamma_markets::{clob_token_ids, verify_token_identities};
+use pe_source_polymarket_public::gamma_markets::verify_token_identities;
 use pe_source_polymarket_public::{
     GAMMA_BATCH_SIZE, GAMMA_MARKETS_PARSER_VERSION, GAMMA_MARKETS_SCHEMA_VERSION,
     GAMMA_MARKETS_SOURCE_ID, GammaMarketsClient, GammaMarketsError, MarketFilter,
@@ -1354,6 +1354,28 @@ fn page_markets(pages: &[IdentityPage]) -> Vec<(Option<String>, Vec<String>)> {
     candidates
 }
 
+/// The Gamma decoder's `clobTokenIds` coercion (`deserialize_clob_token_ids` in
+/// pe-source-polymarket-public's gamma_markets.rs), so enumeration and verification agree on
+/// every token: a stringified array of strings, or a native array with each entry coerced to its
+/// string form, positions preserved; any other shape yields no tokens. It is mirrored here because
+/// that crate is a Forge runtime input held unchanged until #740 merges;
+/// `clob_token_ids_matches_the_gamma_decoder` pins the two together.
+fn clob_token_ids(value: &serde_json::Value) -> Vec<String> {
+    match value {
+        serde_json::Value::String(encoded) => {
+            serde_json::from_str::<Vec<String>>(encoded).unwrap_or_default()
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(|item| match item {
+                serde_json::Value::String(token) => token.clone(),
+                other => other.to_string(),
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn identity_store_error(error: impl std::fmt::Display) -> SourceError {
     SourceError::Fatal {
         message: format!("asset identity cache failed: {error}"),
@@ -1932,6 +1954,67 @@ mod tests {
             original.provenance[&token].source_log_sequence
         );
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn clob_token_ids_matches_the_gamma_decoder() {
+        let probes = [
+            "a",
+            "",
+            "b",
+            "123",
+            "null",
+            "true",
+            "{\"token\":\"b\"}",
+            "[\"c\"]",
+            "malformed",
+        ]
+        .map(|probe| PolymarketTokenId(probe.to_owned()));
+        for value in [
+            serde_json::json!("[\"a\",\"\",\"b\"]"),
+            serde_json::json!(["a", 123, "", null, true, {"token": "b"}, ["c"]]),
+            serde_json::json!(["a", 123]),
+            serde_json::json!("[\"a\",123]"),
+            serde_json::json!("malformed"),
+            serde_json::json!("{}"),
+            serde_json::json!([]),
+            serde_json::json!(null),
+            serde_json::json!(123),
+            serde_json::json!(true),
+            serde_json::json!({"token": "a"}),
+        ] {
+            let page = (
+                MetadataPageEvidence {
+                    request_url: String::new(),
+                    raw_page_hash: String::new(),
+                    canonical_page_hash: "page".to_owned(),
+                    received_at: pe_core_types::ReceivedAt(time::OffsetDateTime::UNIX_EPOCH),
+                    source_id: pe_core_types::SourceId(GAMMA_MARKETS_SOURCE_ID.into()),
+                    schema_version: GAMMA_MARKETS_SCHEMA_VERSION,
+                    parser_version: GAMMA_MARKETS_PARSER_VERSION,
+                },
+                serde_json::to_vec(&serde_json::json!([
+                    {"conditionId": "condition", "clobTokenIds": value}
+                ]))
+                .unwrap(),
+            );
+            let enumerated = page_markets(std::slice::from_ref(&page))
+                .into_iter()
+                .flat_map(|(_, ids)| ids)
+                .collect::<Vec<_>>();
+            assert_eq!(enumerated, clob_token_ids(&value), "{value}");
+            // The verifier decodes pages with the Gamma decoder; it reports exactly the tokens it
+            // finds listed, so its keys over the probes must equal the enumerated tokens.
+            let decoded = verify_token_identities(&probes, std::slice::from_ref(&page))
+                .into_keys()
+                .collect::<BTreeSet<_>>();
+            let listed = probes
+                .iter()
+                .filter(|probe| enumerated.contains(&probe.0))
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            assert_eq!(decoded, listed, "{value}");
+        }
     }
 
     #[tokio::test]

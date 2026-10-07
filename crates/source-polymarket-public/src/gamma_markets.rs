@@ -898,34 +898,28 @@ where
 
 /// Decode Gamma's `clobTokenIds` into outcome-ordered token ids. Gamma sends a stringified JSON array
 /// (`"[\"id0\",\"id1\"]"` — the live `/markets` form); a native JSON array is also accepted. Any other
-/// shape, malformed inner JSON, or a null yields an empty vec — token mapping is
+/// shape, malformed inner JSON, a null, or a missing field yields an empty vec — token mapping is
 /// best-effort and must never drop a market's mids. **Positions are preserved** (no compaction or
 /// blank-dropping) so `clob_token_ids[outcome_id]` stays aligned with the outcome (issue #382 Phase 3b).
-pub fn clob_token_ids(value: &serde_json::Value) -> Vec<String> {
-    use serde_json::Value;
-
-    match value {
-        // Stringified JSON array — the live `/markets` encoding.
-        Value::String(s) => serde_json::from_str::<Vec<String>>(s).unwrap_or_default(),
-        // Native JSON array; coerce each entry to its string form, order preserved.
-        Value::Array(items) => items
-            .iter()
-            .map(|v| match v {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            })
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
 fn deserialize_clob_token_ids<'de, D>(d: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    Ok(Option::<serde_json::Value>::deserialize(d)?
-        .as_ref()
-        .map_or_else(Vec::new, clob_token_ids))
+    use serde_json::Value;
+
+    Ok(match Option::<Value>::deserialize(d)? {
+        // Stringified JSON array — the live `/markets` encoding.
+        Some(Value::String(s)) => serde_json::from_str::<Vec<String>>(&s).unwrap_or_default(),
+        // Native JSON array; coerce each entry to its string form, order preserved.
+        Some(Value::Array(items)) => items
+            .into_iter()
+            .map(|v| match v {
+                Value::String(s) => s,
+                other => other.to_string(),
+            })
+            .collect(),
+        _ => Vec::new(),
+    })
 }
 
 /// Parse Gamma's `outcomePrices` field — a JSON-encoded decimal-string array such as
@@ -1484,44 +1478,6 @@ mod tests {
         );
         assert_eq!(raws[2].volume, None);
         assert!(raws[2].clob_token_ids.is_empty());
-    }
-
-    #[test]
-    fn clob_token_ids_preserves_decoder_shapes_and_positions() {
-        for (value, expected) in [
-            (
-                serde_json::json!("[\"a\",\"\",\"b\"]"),
-                ids(&["a", "", "b"]),
-            ),
-            (
-                serde_json::json!(["a", 123, "", null, true, {"token": "b"}, ["c"]]),
-                ids(&[
-                    "a",
-                    "123",
-                    "",
-                    "null",
-                    "true",
-                    "{\"token\":\"b\"}",
-                    "[\"c\"]",
-                ]),
-            ),
-            (serde_json::json!("[\"a\",123]"), Vec::new()),
-            (serde_json::json!("malformed"), Vec::new()),
-            (serde_json::json!("{}"), Vec::new()),
-            (serde_json::json!([]), Vec::new()),
-            (serde_json::json!(null), Vec::new()),
-            (serde_json::json!(123), Vec::new()),
-            (serde_json::json!(true), Vec::new()),
-            (serde_json::json!({"token": "a"}), Vec::new()),
-        ] {
-            let raw: GammaMarketRaw = serde_json::from_value(serde_json::json!({
-                "conditionId": "condition",
-                "clobTokenIds": value,
-            }))
-            .unwrap();
-            assert_eq!(raw.clob_token_ids, expected);
-            assert_eq!(clob_token_ids(&value), expected);
-        }
     }
 
     #[test]
