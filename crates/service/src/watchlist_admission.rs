@@ -448,6 +448,11 @@ struct AdmissionQueue {
     keys: HashMap<WalletAddress, u64>,
 }
 
+/// Keeps catch-up brackets serialized with departed-wallet deletion.
+pub struct RetentionAdmissionGuard<'a> {
+    _attempt: tokio::sync::MutexGuard<'a, AdmissionQueue>,
+}
+
 impl AdmissionQueue {
     fn offer(&mut self, wallet: WalletAddress) -> Result<(), AdmissionError> {
         if !self.keys.contains_key(&wallet) {
@@ -510,6 +515,13 @@ impl Drop for AdmissionLaunchLog {
 }
 
 impl AdmissionPreparer {
+    /// Acquire outside the orchestrator and hold through the retirement acknowledgement.
+    pub async fn lock_for_retention(&self) -> RetentionAdmissionGuard<'_> {
+        RetentionAdmissionGuard {
+            _attempt: self.inner.attempt.lock().await,
+        }
+    }
+
     pub fn new(
         control_tx: mpsc::Sender<OrchestratorControl>,
         paper_state: Arc<PaperStateDb>,

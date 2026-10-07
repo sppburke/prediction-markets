@@ -1137,6 +1137,14 @@ impl SourceReceiptIndex {
             .insert(frontier.wallet, frontier.clone());
     }
 
+    pub(crate) fn forget_verified_frontier(&self, wallet: pe_core_types::WalletAddress) {
+        self.state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .verified_feed_frontiers
+            .remove(&wallet);
+    }
+
     pub(crate) fn verify_frame_frontier(
         &self,
         frontier: &crate::frame_admission::FeedHistoryFrontier,

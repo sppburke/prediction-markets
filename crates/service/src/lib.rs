@@ -12,6 +12,7 @@ pub mod build_info;
 pub mod clob_book;
 pub mod config;
 pub mod config_poller;
+pub mod database_retention;
 pub mod decision_replay;
 pub mod demotion_stat;
 pub mod disk_monitor;

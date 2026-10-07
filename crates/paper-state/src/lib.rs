@@ -88,6 +88,9 @@ pub enum PaperStateError {
     /// Identity mutations must wait for the caller-owned activity batch to end.
     #[error("identity mutation requires an autocommit connection")]
     IdentityBatchOpen,
+    /// Retention must not join a caller-owned reconciliation batch.
+    #[error("retention requires an autocommit connection")]
+    RetentionBatchOpen,
     /// Filesystem synchronization failed while persisting boot metadata.
     #[error("paper-state synchronization failed: {0}")]
     Synchronization(#[from] std::io::Error),
@@ -797,7 +800,193 @@ pub struct PaperStateDb {
     conn: Mutex<Connection>,
 }
 
+/// Durable reasons a departed wallet must keep its working state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WalletRetentionWait {
+    Fenced,
+    OpenDecision,
+    RecentDecision,
+    RecentAnchor,
+    RecentValidation,
+    FinancialProjectionBehind,
+}
+
+/// One transaction's result and time holding the shared connection (excluding lock acquisition).
+#[derive(Debug)]
+pub struct RetentionTransaction<T> {
+    pub result: T,
+    pub lock_time: std::time::Duration,
+}
+
 impl PaperStateDb {
+    /// Blank only superseded nonblank proofs; balances and cutoff columns stay intact.
+    /// Each call owns one bounded transaction and releases the connection before returning.
+    pub fn blank_superseded_anchor_proofs(
+        &self,
+        limit: usize,
+    ) -> Result<RetentionTransaction<usize>, PaperStateError> {
+        let limit =
+            i64::try_from(limit).map_err(|error| PaperStateError::Internal(error.to_string()))?;
+        let mut conn = self.lock();
+        let started = std::time::Instant::now();
+        if !conn.is_autocommit() {
+            return Err(PaperStateError::RetentionBatchOpen);
+        }
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changed = tx.execute(
+            "UPDATE position_anchors SET proof_json = '{}' WHERE rowid IN (
+                SELECT old.rowid FROM position_anchors old
+                WHERE old.proof_json != '{}'
+                  AND old.anchor_seq < (SELECT MAX(newest.anchor_seq)
+                      FROM position_anchors newest WHERE newest.wallet_hex = old.wallet_hex)
+                ORDER BY old.wallet_hex, old.anchor_seq LIMIT ?1)",
+            params![limit],
+        )?;
+        tx.commit()?;
+        Ok(RetentionTransaction {
+            result: changed,
+            lock_time: started.elapsed(),
+        })
+    }
+
+    /// Page through wallets with working state. Retained market history alone is not a candidate.
+    pub fn retention_wallets(
+        &self,
+        after: Option<WalletAddress>,
+        limit: usize,
+    ) -> Result<Vec<WalletAddress>, PaperStateError> {
+        let limit =
+            i64::try_from(limit).map_err(|error| PaperStateError::Internal(error.to_string()))?;
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT wallet_hex FROM (
+                SELECT wallet_hex FROM activity_groups UNION
+                SELECT wallet_hex FROM decision_pending UNION
+                SELECT wallet_hex FROM entry_gate_results UNION
+                SELECT wallet_hex FROM position_anchors UNION
+                SELECT wallet_hex FROM position_validations UNION
+                SELECT wallet_hex FROM wallet_history_status_v2 UNION
+                SELECT wallet_hex FROM leader_positions UNION
+                SELECT wallet_hex FROM poll_cursors UNION
+                SELECT json_extract(value, '$.wallet') AS wallet_hex FROM json_each(
+                    (SELECT value FROM meta WHERE key = 'feed_history_frontiers'), '$.frontiers')
+            ) WHERE (?1 IS NULL OR wallet_hex > ?1) ORDER BY wallet_hex LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(
+            params![after.map(|wallet| wallet.to_string()), limit],
+            |row| row.get::<_, String>(0),
+        )?;
+        rows.map(|row| {
+            WalletAddress::from_hex(&row?)
+                .map_err(|error| PaperStateError::Corrupt(error.to_string()))
+        })
+        .collect()
+    }
+
+    /// Recheck recorded clocks, never revision or no-copy trade clocks.
+    pub fn wallet_retention_wait(
+        &self,
+        wallet: WalletAddress,
+        recent_since_unix: i64,
+        latest_prepared: Option<EventSeq>,
+    ) -> Result<Option<WalletRetentionWait>, PaperStateError> {
+        tx_wallet_retention_wait(&self.lock(), wallet, recent_since_unix, latest_prepared)
+    }
+
+    /// The orchestrator calls this only after its structural-membership recheck.
+    /// Recheck all durable guards and delete one wallet atomically, retaining first-entry history.
+    pub fn retire_wallet(
+        &self,
+        wallet: WalletAddress,
+        recent_since_unix: i64,
+        latest_prepared: Option<EventSeq>,
+    ) -> Result<RetentionTransaction<Option<WalletRetentionWait>>, PaperStateError> {
+        let mut conn = self.lock();
+        let started = std::time::Instant::now();
+        if !conn.is_autocommit() {
+            return Err(PaperStateError::RetentionBatchOpen);
+        }
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(reason) =
+            tx_wallet_retention_wait(&tx, wallet, recent_since_unix, latest_prepared)?
+        {
+            return Ok(RetentionTransaction {
+                result: Some(reason),
+                lock_time: started.elapsed(),
+            });
+        }
+        let wallet_hex = wallet.to_string();
+        // A temporary indexed set avoids a wallet-sized Rust allocation or SQLite parameter list.
+        tx.execute_batch("CREATE TEMP TABLE wallet_retirement_trade_ids (source_trade_id TEXT PRIMARY KEY NOT NULL);")?;
+        tx.execute(
+            "INSERT INTO wallet_retirement_trade_ids
+                SELECT source_trade_id FROM activity_groups WHERE wallet_hex = ?1 UNION
+                SELECT source_trade_id FROM decision_pending WHERE wallet_hex = ?1 UNION
+                SELECT source_trade_id FROM entry_gate_results WHERE wallet_hex = ?1",
+            params![wallet_hex],
+        )?;
+        for table in [
+            "seen_trades_v2",
+            "no_copy_dispositions",
+            "activity_group_revisions",
+        ] {
+            tx.execute(&format!("DELETE FROM {table} WHERE source_trade_id IN (SELECT source_trade_id FROM wallet_retirement_trade_ids)"), [])?;
+        }
+        tx.execute(
+            "DELETE FROM activity_groups WHERE wallet_hex = ?1",
+            params![wallet_hex],
+        )?;
+        tx.execute(
+            "DELETE FROM decision_pending WHERE wallet_hex = ?1 AND state = 'terminal'",
+            params![wallet_hex],
+        )?;
+        for table in [
+            "entry_gate_results",
+            "position_anchors",
+            "position_validations",
+            "wallet_history_status_v2",
+            "leader_positions",
+            "poll_cursors",
+        ] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE wallet_hex = ?1"),
+                params![wallet_hex],
+            )?;
+        }
+        let frontiers: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT value FROM meta WHERE key = 'feed_history_frontiers'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(bytes) = frontiers {
+            let mut value: serde_json::Value = serde_json::from_slice(&bytes)?;
+            if value["version"] != 1 {
+                return Err(PaperStateError::Corrupt(
+                    "unsupported frontier collection".to_owned(),
+                ));
+            }
+            let frontiers = value["frontiers"].as_array_mut().ok_or_else(|| {
+                PaperStateError::Corrupt("invalid frontier collection".to_owned())
+            })?;
+            for frontier in frontiers.iter() {
+                let _: WalletAddress = serde_json::from_value(frontier["wallet"].clone())?;
+            }
+            frontiers.retain(|frontier| frontier["wallet"].as_str() != Some(wallet_hex.as_str()));
+            tx.execute(
+                "UPDATE meta SET value = ?1 WHERE key = 'feed_history_frontiers'",
+                params![serde_json::to_vec(&value)?],
+            )?;
+        }
+        tx.execute_batch("DROP TABLE wallet_retirement_trade_ids;")?;
+        tx.commit()?;
+        Ok(RetentionTransaction {
+            result: None,
+            lock_time: started.elapsed(),
+        })
+    }
+
     /// Open or create the database at `path`, running idempotent DDL.
     ///
     /// A freshly created database (or one predating versioning, `user_version == 0`)
@@ -5649,6 +5838,51 @@ fn tx_last_applied(tx: &Transaction<'_>) -> Result<Option<u64>, PaperStateError>
         )
         .optional()?;
     raw.map(parse_u64).transpose()
+}
+
+fn tx_wallet_retention_wait(
+    conn: &Connection,
+    wallet: WalletAddress,
+    recent_since_unix: i64,
+    latest_prepared: Option<EventSeq>,
+) -> Result<Option<WalletRetentionWait>, PaperStateError> {
+    let wallet_hex = wallet.to_string();
+    for (query, reason) in [
+        (
+            "SELECT 1 FROM wallet_fences WHERE wallet_hex = ?1",
+            WalletRetentionWait::Fenced,
+        ),
+        (
+            "SELECT 1 FROM decision_pending WHERE wallet_hex = ?1 AND state = 'open'",
+            WalletRetentionWait::OpenDecision,
+        ),
+        (
+            "SELECT 1 FROM decision_pending WHERE wallet_hex = ?1 AND updated_at_unix >= ?2",
+            WalletRetentionWait::RecentDecision,
+        ),
+        (
+            "SELECT 1 FROM position_anchors WHERE wallet_hex = ?1 AND anchored_at_unix >= ?2",
+            WalletRetentionWait::RecentAnchor,
+        ),
+        (
+            "SELECT 1 FROM position_validations WHERE wallet_hex = ?1 AND recorded_at_unix >= ?2",
+            WalletRetentionWait::RecentValidation,
+        ),
+    ] {
+        let mut stmt = conn.prepare(query)?;
+        let exists = if stmt.parameter_count() == 1 {
+            stmt.exists(params![wallet_hex])?
+        } else {
+            stmt.exists(params![wallet_hex, recent_since_unix])?
+        };
+        if exists {
+            return Ok(Some(reason));
+        }
+    }
+    if tx_financial_last_prepared(conn)? != latest_prepared {
+        return Ok(Some(WalletRetentionWait::FinancialProjectionBehind));
+    }
+    Ok(None)
 }
 
 fn tx_financial_start(conn: &Connection) -> Result<Option<AppendReceipt>, PaperStateError> {

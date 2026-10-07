@@ -3552,6 +3552,53 @@ pub struct BucketCommitEngine {
 }
 
 impl BucketCommitEngine {
+    /// Delete durable working state before dropping the corresponding runtime projections.
+    pub fn retire_wallet(
+        &mut self,
+        wallet: WalletAddress,
+        recent_since_unix: i64,
+        latest_prepared: Option<pe_core_types::EventSeq>,
+    ) -> Result<
+        pe_paper_state::RetentionTransaction<Option<pe_paper_state::WalletRetentionWait>>,
+        BucketCommitError,
+    > {
+        let retired = self
+            .paper_state
+            .retire_wallet(wallet, recent_since_unix, latest_prepared)?;
+        if retired.result.is_none() {
+            for frame in self
+                .earlier_frames
+                .iter()
+                .filter(|frame| frame.wallet == wallet)
+            {
+                self.routed_frame_receipts.remove(&frame.receipt.sequence);
+            }
+            if let Some(frames) = self.frame_decisions.get(&wallet) {
+                for frame in frames {
+                    if let Some(receipt) = frame.observed_source_receipt {
+                        self.routed_frame_receipts.remove(&receipt.sequence);
+                    }
+                }
+            }
+            let mut snapshots = self.ledger.snapshots().clone();
+            snapshots.remove(&wallet);
+            self.ledger = PositionLedger::from_snapshots(snapshots);
+            self.complete_history.remove(&wallet);
+            self.frame_decisions.remove(&wallet);
+            self.frame_transactions
+                .retain(|(owner, _), _| *owner != wallet);
+            self.admitted_frame_receipts
+                .retain(|_, (owner, _)| *owner != wallet);
+            self.earlier_frames.retain(|frame| frame.wallet != wallet);
+            self.verified_frontiers.remove(&wallet);
+            self.frontier_hints.remove(&wallet);
+            if let Some(index) = &self.frame_source_index {
+                index.forget_verified_frontier(wallet);
+            }
+        }
+        Ok(retired)
+    }
+
     /// Load every durable decision boundary before producers start.
     pub fn load(
         paper_state: Arc<PaperStateDb>,
