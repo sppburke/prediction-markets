@@ -564,7 +564,7 @@ pub fn update_installed_log_paths(paths: &PaperMigrationPaths) -> Result<bool> {
             ..recorded.live_journal.clone()
         },
     };
-    Scanner::verify_prefix(&configured.source)
+    crate::source_log_boot::rebuild_source_log(&paths.source_log, false, Some(&configured.source))
         .context("verify recorded source-log prefix at the configured path")?;
     Scanner::verify_prefix(&configured.paper)
         .context("verify recorded paper-log prefix at the configured path")?;
@@ -623,7 +623,12 @@ fn verify_boundary_prefixes(
         "configured live journal no longer matches the migration record"
     );
     if !source_verified {
-        Scanner::verify_prefix(&boundary.source).context("verify recorded source-log prefix")?;
+        crate::source_log_boot::rebuild_source_log(
+            &paths.source_log,
+            false,
+            Some(&boundary.source),
+        )
+        .context("verify recorded source-log prefix")?;
     }
     Scanner::verify_prefix(&boundary.paper).context("verify recorded paper-log prefix")?;
     LiveJournal::verified_tail(&paths.live_journal)

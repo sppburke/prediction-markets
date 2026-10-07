@@ -43,6 +43,10 @@ impl SourceEventSink {
     /// silently running websocket-blind.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LogError> {
         let path = path.as_ref().to_owned();
+        if pe_event_log::RetentionAuthority::load(&path)?.is_some() {
+            return crate::source_log_boot::reopen_source_sink(&path)
+                .map_err(|error| LogError::Io(std::io::Error::other(error)));
+        }
         let writer = Writer::open(&path)?;
         Ok(Self::from_writer(path, writer))
     }
@@ -173,9 +177,9 @@ impl SourceEventSink {
         if std::mem::take(&mut self.fail_next_reopen) {
             return false;
         }
-        match Writer::open(&self.path) {
-            Ok(writer) => {
-                self.writer = Some(writer);
+        match crate::source_log_boot::reopen_source_sink(&self.path) {
+            Ok(reopened) => {
+                self.writer = reopened.writer;
                 true
             }
             Err(error) => {

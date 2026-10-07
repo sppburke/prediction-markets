@@ -23,7 +23,9 @@ use pe_core_types::{
     MarketId, MarketOutcomeId, PolymarketTokenId, ReceivedAt, ReconstructionQuality, SourceId,
     SourceTimestamp, SourceTradeId, VenueMarketId, WalletAddress,
 };
-use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, EventEnvelope, Reader};
+#[cfg(test)]
+use pe_event_log::Reader;
+use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, EventEnvelope};
 use pe_paper_state::{NoCopyDisposition, PaperStateDb};
 use pe_position_ledger::LedgerEffect;
 use pe_source_core::SourceError;
@@ -875,11 +877,10 @@ pub fn recover_daily_boundary(
     let Some(anchor) = recover_daily_boundary_anchor(paper_log_path, obligations)? else {
         return Ok(());
     };
-    let mut candidates = DailyBoundaryCandidates::default();
-    for item in Reader::replay(source_log_path)? {
-        let (_sequence, envelope) = item?;
-        candidates.observe_daily_boundary(&envelope)?;
-    }
+    let mut rebuilt = crate::source_log_boot::rebuild_source_log(source_log_path, true, None)
+        .map_err(source_rebuild_error)?;
+    rebuilt.reducers.take_daily_error()?;
+    let candidates = rebuilt.reducers.daily_boundary.unwrap_or_default();
     recover_daily_boundary_from_candidates(candidates, anchor, obligations);
     Ok(())
 }
@@ -905,40 +906,20 @@ fn rebuild_reconciliation_obligations_indexed(
     paper_state: &PaperStateDb,
     source_receipts: Option<&SourceReceiptIndex>,
 ) -> Result<ReconciliationObligations, ObligationRebuildError> {
-    let mut candidates = ActivityCandidates::default();
-    if let Some(index) = source_receipts {
-        for item in Reader::replay(source_log_path)? {
-            let (_, envelope) = item?;
-            candidates.observe_activity(&envelope)?;
-        }
-        return candidates.into_obligations(paper_state, index);
+    let mut rebuilt = crate::source_log_boot::rebuild_source_log(source_log_path, false, None)
+        .map_err(source_rebuild_error)?;
+    rebuilt.reducers.take_activity_error()?;
+    rebuilt
+        .reducers
+        .activity
+        .into_obligations(paper_state, source_receipts.unwrap_or(&rebuilt.index))
+}
+
+fn source_rebuild_error(error: anyhow::Error) -> ObligationRebuildError {
+    match error.downcast::<pe_event_log::LogError>() {
+        Ok(error) => ObligationRebuildError::Log(error),
+        Err(error) => ObligationRebuildError::Binding(format!("{error:#}")),
     }
-    let mut staging = SourceReceiptIndex::staging(source_log_path)
-        .map_err(|error| ObligationRebuildError::Binding(error.to_string()))?;
-    let mut last_sequence = None;
-    let mut last_hash = blake3::Hash::from_bytes([0; 32]);
-    for item in Reader::replay_with_offsets(source_log_path)? {
-        let (offset, sequence, envelope) = item?;
-        staging
-            .observe(offset, &envelope)
-            .map_err(|error| ObligationRebuildError::Binding(error.to_string()))?;
-        last_sequence = Some(sequence);
-        last_hash = envelope.this_hash;
-        candidates.observe_activity(&envelope)?;
-    }
-    let binding = pe_event_log::LogTailBinding {
-        path: std::fs::canonicalize(source_log_path)
-            .map_err(|error| ObligationRebuildError::Binding(error.to_string()))?,
-        physical_tail: std::fs::metadata(source_log_path)
-            .map_err(|error| ObligationRebuildError::Binding(error.to_string()))?
-            .len(),
-        last_sequence,
-        last_hash,
-    };
-    let index = staging
-        .complete(&binding)
-        .map_err(|error| ObligationRebuildError::Binding(error.to_string()))?;
-    candidates.into_obligations(paper_state, &index)
 }
 
 #[derive(Debug, thiserror::Error)]

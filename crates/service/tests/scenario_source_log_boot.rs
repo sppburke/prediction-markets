@@ -4847,3 +4847,1022 @@ async fn runtime_checkpoint_prunes_only_after_successful_disposition_barrier() {
         );
     }
 }
+
+/// Install only the authority and dense receipt metadata; erasure is a separate step.
+fn retention_capture(
+    source: &Path,
+    boundary_sequence: u64,
+    pins: &[(AppendReceipt, bool)],
+) -> pe_event_log::RetentionAuthority {
+    let tail = Scanner::verify(source).unwrap();
+    let frames: Vec<_> = pe_event_log::Reader::replay_with_offsets(source)
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    let boundary_index = usize::try_from(boundary_sequence).unwrap();
+    let mut receipts = std::fs::File::create(checkpoint_sidecar(source, ".receipts")).unwrap();
+    for (offset, sequence, envelope) in &frames {
+        receipts
+            .write_all(
+                &pe_event_log::ReceiptRecord {
+                    receipt: AppendReceipt {
+                        sequence: *sequence,
+                        this_hash: envelope.this_hash,
+                    },
+                    received_millis: i64::try_from(
+                        envelope.received_at.0.unix_timestamp_nanos() / 1_000_000,
+                    )
+                    .unwrap(),
+                    byte_offset: Some(*offset),
+                }
+                .encode(),
+            )
+            .unwrap();
+    }
+    receipts.sync_all().unwrap();
+    let mut retained: Vec<_> = pins
+        .iter()
+        .map(|(receipt, reducer)| {
+            let (offset, _, envelope) = &frames[usize::try_from(receipt.sequence.0).unwrap()];
+            assert_eq!(receipt.this_hash, envelope.this_hash);
+            pe_event_log::RetentionPin {
+                sequence: receipt.sequence,
+                offset: *offset,
+                hash: receipt.this_hash,
+                predecessor_hash: envelope.prev_hash,
+                reducer: *reducer,
+                wallet: if *reducer && envelope.source_id.0 == ACTIVITY_WS_SOURCE_ID {
+                    Some(
+                        pe_source_polymarket_public::parse_activity_trade_observation(
+                            &envelope.payload,
+                        )
+                        .unwrap()
+                        .wallet,
+                    )
+                } else {
+                    None
+                },
+            }
+        })
+        .collect();
+    retained.sort_by_key(|pin| pin.sequence);
+    let authority = pe_event_log::RetentionAuthority {
+        format_version: 1,
+        epoch: 1,
+        advanced_at: NOW_UNIX + 8 * 86_400,
+        boundary: pe_event_log::RetentionBoundary {
+            sequence: EventSeq(boundary_sequence),
+            offset: frames[boundary_index].0,
+        },
+        chain_head: frames[boundary_index - 1].2.this_hash,
+        pins: retained,
+        retained_tail: (&tail).into(),
+        feed: Vec::new(),
+    };
+    authority.write(source).unwrap();
+    authority
+}
+
+fn erase_retention_frames(source: &Path, authority: &pe_event_log::RetentionAuthority) {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut receipts = std::fs::File::open(checkpoint_sidecar(source, ".receipts")).unwrap();
+    let records: Vec<_> = (0..=authority.boundary.sequence.0)
+        .map(|sequence| {
+            pe_event_log::ReceiptRecord::read(&mut receipts, EventSeq(sequence)).unwrap()
+        })
+        .collect();
+    let header = std::fs::read(source).unwrap()[..5].to_vec();
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(source)
+        .unwrap();
+    for sequence in 0..authority.boundary.sequence.0 {
+        if authority.pin(EventSeq(sequence)).is_some() {
+            continue;
+        }
+        let i = usize::try_from(sequence).unwrap();
+        let start = records[i].byte_offset.unwrap();
+        let length = records[i + 1].byte_offset.unwrap() - start;
+        file.seek(SeekFrom::Start(start)).unwrap();
+        file.write_all(&vec![0; usize::try_from(length).unwrap()])
+            .unwrap();
+    }
+    file.sync_all().unwrap();
+    file.rewind().unwrap();
+    let mut actual_header = vec![0; 5];
+    file.read_exact(&mut actual_header).unwrap();
+    assert_eq!(actual_header, header);
+}
+
+#[test]
+fn retention_exact_read_rechecks_commit_before_punch_shared_block_and_failed_io() {
+    use pe_service::risk_inputs::RiskInputsUnavailable;
+    for physical_case in ["before_punch", "shared_block", "after_punch"] {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.log");
+        let erased = append(&source, envelope("old", 1, 1, b"{}", NOW_UNIX));
+        if physical_case != "shared_block" {
+            let mut seed = 123_u32;
+            let padding: Vec<_> = (0..20_000)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    u8::try_from(seed >> 24).unwrap()
+                })
+                .collect();
+            append(&source, envelope("padding", 1, 1, &padding, NOW_UNIX));
+        }
+        let pinned = append(&source, envelope("pin", 1, 1, b"{}", NOW_UNIX));
+        append(&source, envelope("retained", 1, 1, b"{}", NOW_UNIX + 1));
+        let index = SourceReceiptIndex::replay(&source).unwrap();
+        let authority = retention_capture(&source, pinned.sequence.0 + 1, &[(pinned, false)]);
+        assert_eq!(
+            authority.pins[0].offset / 4096 == pe_event_log::HEADER_LEN / 4096,
+            physical_case == "shared_block"
+        );
+        let outcome = index.source_envelope_with_pause(erased, &mut || {
+            index.install_retention(authority.clone()).unwrap();
+            if physical_case == "after_punch" {
+                erase_retention_frames(&source, &authority);
+            }
+        });
+        assert_eq!(
+            outcome.unwrap_err(),
+            RiskInputsUnavailable::Erased,
+            "{physical_case}"
+        );
+        assert_eq!(
+            index
+                .source_envelope_with_pause(pinned, &mut || {})
+                .unwrap()
+                .this_hash,
+            pinned.this_hash
+        );
+        assert_eq!(
+            index.receipt_at(erased.sequence).unwrap().unwrap().0,
+            erased
+        );
+        // The prefix remains durable metadata after the physical evidence has gone.
+        erase_retention_frames(&source, &authority);
+        let replay = SourceReceiptIndex::replay(&source).unwrap();
+        assert_eq!(
+            replay.receipt_at(erased.sequence).unwrap(),
+            index.receipt_at(erased.sequence).unwrap()
+        );
+        assert_eq!(
+            replay
+                .source_envelope_with_pause(erased, &mut || {})
+                .unwrap_err(),
+            RiskInputsUnavailable::Erased
+        );
+    }
+}
+
+#[test]
+fn retention_dependency_pin_categories_stay_readable_without_feeding_reducers() {
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("source.log");
+    let categories = [
+        "membership",
+        "migration_activation",
+        "decision_observation",
+        "complete_bound",
+        "authority_commitment",
+        "commitment_page",
+        "binding_evidence",
+        "counterpart_basis",
+        "economic",
+        "gamma_admission",
+        "clob_long",
+        "clob_compact",
+        "book",
+        "risk_price",
+        "failed_price",
+        "frame_observation",
+        "identity_page",
+        "financial_prepared",
+        "frame_admission",
+        "frontier_page",
+        "frontier_commitment",
+        "earlier_frame",
+    ];
+    let pins: Vec<_> = categories
+        .iter()
+        .map(|category| {
+            (
+                append(
+                    &source,
+                    envelope(category, 1, 1, category.as_bytes(), NOW_UNIX),
+                ),
+                false,
+            )
+        })
+        .collect();
+    let erased = append(&source, envelope("padding", 1, 1, b"{}", NOW_UNIX));
+    append(&source, envelope("suffix", 1, 1, b"{}", NOW_UNIX + 1));
+    let authority = retention_capture(&source, erased.sequence.0 + 1, &pins);
+    erase_retention_frames(&source, &authority);
+    let index = SourceReceiptIndex::replay(&source).unwrap();
+    for ((receipt, _), category) in pins.iter().zip(categories) {
+        assert_eq!(
+            index
+                .source_envelope_with_pause(*receipt, &mut || {})
+                .unwrap()
+                .payload,
+            category.as_bytes()
+        );
+    }
+    let paper = PaperStateDb::open(&dir.path().join("paper.db")).unwrap();
+    assert!(
+        rebuild_reconciliation_obligations(&source, &paper)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+fn retention_recovery_fixture() -> (
+    tempfile::TempDir,
+    PaperMigrationPaths,
+    pe_event_log::RetentionAuthority,
+) {
+    let (dir, paths) = installed_fixture();
+    append_paper_record(&paths.paper_log, &start_record());
+    let first = append(
+        &paths.source_log,
+        activity_envelope("0xold-bound", NOW_UNIX + 1),
+    );
+    let second = append(
+        &paths.source_log,
+        activity_envelope("0xold-unbound", NOW_UNIX + 2),
+    );
+    let routed = append(
+        &paths.source_log,
+        envelope(
+            pe_service::frame_admission::FRAME_FALLBACK_SOURCE_ID,
+            1,
+            1,
+            &serde_json::to_vec(&pe_service::frame_admission::FrameFallbackArtifact {
+                version: 1,
+                frame_receipt: first,
+                routing_clock: OffsetDateTime::from_unix_timestamp(NOW_UNIX + 3).unwrap(),
+                reason: pe_service::frame_admission::FrameFallbackReason::HistoryBehind,
+                frontier: None,
+                latest_incident_basis: Default::default(),
+            })
+            .unwrap(),
+            NOW_UNIX + 3,
+        ),
+    );
+    let wallet = WalletAddress::from_hex(WALLET).unwrap();
+    let payload = serde_json::to_vec(&serde_json::json!([{
+        "proxyWallet": wallet, "timestamp": NOW_UNIX + 1, "conditionId": format!("0x{}", "11".repeat(32)),
+        "type": "TRADE", "size": "100", "usdcSize": "50", "transactionHash": "0xold-bound",
+        "price": "0.5", "asset": "123", "side": "BUY", "outcomeIndex": 0, "outcome": "Yes", "isCombo": false,
+    }])).unwrap();
+    let mut writer = Writer::open(&paths.source_log).unwrap();
+    let (read, _) = support::append_committed_read_v2(
+        &mut writer,
+        wallet,
+        &payload,
+        NOW_UNIX + 4,
+        NOW_UNIX + 5,
+    );
+    let pages =
+        serde_json::from_str::<serde_json::Value>(&read.decision_inputs_json).unwrap()["pages"]
+            .clone();
+    let aggregate = &read.aggregates[0];
+    let binding = pe_service::bucket_commit::ObservationBinding {
+        stream_group_id: pe_source_polymarket_public::parse_activity_trade_observation(
+            &activity_payload("0xold-bound", NOW_UNIX + 1),
+        )
+        .unwrap()
+        .group_id
+        .key()
+        .clone(),
+        stream_receipt: first,
+        history_group_id: aggregate.group_id.key().clone(),
+        semantic_revision: aggregate.semantic_revision.as_str().to_owned(),
+        page_raw_hash: read.page.raw_hash.clone(),
+        page_occurrence_index: 0,
+        identity_provenance: None,
+        identity_receipt: None,
+        counterpart_basis_receipt: None,
+        frame_admission_receipt: None,
+    };
+    let commitment = writer
+        .append_synced(envelope(
+            pe_service::bucket_commit::ACTIVITY_READ_COMMITMENT_SOURCE_ID,
+            2,
+            1,
+            &pe_service::bucket_commit::activity_read_commitment_payload_v2(
+                wallet,
+                NOW_UNIX + 4,
+                std::slice::from_ref(&read.page),
+                &serde_json::from_value::<Vec<_>>(pages).unwrap(),
+                &[binding],
+            )
+            .unwrap(),
+            NOW_UNIX + 6,
+        ))
+        .unwrap();
+    drop(writer);
+    let daily = append(
+        &paths.source_log,
+        envelope(
+            DAILY_BOUNDARY_SOURCE_ID,
+            1,
+            1,
+            &serde_json::to_vec(
+                &serde_json::json!({"kind":"daily_boundary","cutoff_unix":NOW_UNIX + 86_400}),
+            )
+            .unwrap(),
+            NOW_UNIX + 7,
+        ),
+    );
+    let padding = append(
+        &paths.source_log,
+        envelope("padding", 1, 1, b"{}", NOW_UNIX + 8),
+    );
+    append(
+        &paths.source_log,
+        envelope("suffix", 1, 1, b"{}", NOW_UNIX + 9),
+    );
+    append(
+        &paths.source_log,
+        envelope("suffix", 1, 1, b"{}", NOW_UNIX + 10),
+    );
+    SourceLogBoot::prepare_checkpoint(&paths.fixed_main).unwrap();
+    let activation = recorded_source(&paths);
+    let authority = retention_capture(
+        &paths.source_log,
+        padding.sequence.0 + 1,
+        &[
+            (
+                AppendReceipt {
+                    sequence: activation.last_sequence.unwrap(),
+                    this_hash: activation.last_hash,
+                },
+                false,
+            ),
+            (first, true),
+            (second, true),
+            (routed, true),
+            (read.page.receipt, false),
+            (commitment, true),
+            (daily, true),
+        ],
+    );
+    (dir, paths, authority)
+}
+
+#[test]
+fn retention_rebuild_checkpoint_loss_stale_epoch_poison_preparation_and_migration_agree() {
+    let (_dir, paths, authority) = retention_recovery_fixture();
+    let paper = PaperStateDb::open(&paths.fixed_main).unwrap();
+    assert!(paper.decision_pending_history().unwrap().is_empty());
+    let expected = rebuild_reconciliation_obligations(&paths.source_log, &paper).unwrap();
+    assert_eq!(expected.len(), 2);
+    erase_retention_frames(&paths.source_log, &authority);
+    for checkpoint in [true, false] {
+        if !checkpoint {
+            std::fs::remove_file(pe_service::source_checkpoint::checkpoint_path(
+                &paths.source_log,
+            ))
+            .unwrap();
+        }
+        let mut opened = SourceLogBoot::open(&paths, true).unwrap().unwrap();
+        opened.boot.extend(&mut opened.sink).unwrap();
+        let mut expected_with_boundary = expected.clone();
+        pe_service::trade_poller::recover_daily_boundary(
+            &paths.source_log,
+            &paths.paper_log,
+            &mut expected_with_boundary,
+        )
+        .unwrap();
+        assert_eq!(
+            opened.boot.obligations(&paper, &paths.paper_log).unwrap(),
+            expected_with_boundary
+        );
+        assert_eq!(expected_with_boundary.frame_recovery_receipts().1.len(), 1);
+        opened
+            .boot
+            .prepare_installed(paths.clone(), NOW_UNIX + 20)
+            .unwrap();
+        opened.sink.poison_for_scenario();
+        assert!(opened.sink.try_reopen());
+        assert_eq!(
+            rebuild_reconciliation_obligations(&paths.source_log, &paper).unwrap(),
+            expected
+        );
+        assert_eq!(
+            pe_service::trade_poller::rebuild_reconciliation_obligations_with_index(
+                &paths.source_log,
+                &paper,
+                &opened.boot.receipt_index()
+            )
+            .unwrap(),
+            expected
+        );
+    }
+    let (prepared, validated) = SourceLogBoot::prepare_checkpoint(&paths.fixed_main).unwrap();
+    assert_eq!(validated, 0);
+    assert_eq!(
+        prepared.tail.physical_tail,
+        authority.retained_tail.physical_tail
+    );
+    assert_eq!(
+        checkpoint_json(&paths.source_log)["activity"]["routed_frames"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    PaperMigrationBoot::prepare(paths.clone(), NOW_UNIX + 21).unwrap();
+}
+
+#[test]
+fn retention_rebuild_refuses_missing_metadata_corrupt_dependency_and_committed_tail_cuts() {
+    for fault in [
+        "authority",
+        "receipts",
+        "receipt_checksum",
+        "dependency",
+        "activation_pin",
+        "boundary_cut",
+        "whole_frame_cut",
+        "partial_retained_tail",
+        "append_partial",
+    ] {
+        let (_dir, paths, authority) = retention_recovery_fixture();
+        erase_retention_frames(&paths.source_log, &authority);
+        std::fs::remove_file(pe_service::source_checkpoint::checkpoint_path(
+            &paths.source_log,
+        ))
+        .unwrap();
+        let retained_index = matches!(fault, "dependency" | "activation_pin")
+            .then(|| SourceReceiptIndex::replay(&paths.source_log).unwrap());
+        match fault {
+            "authority" => {
+                std::fs::remove_file(pe_event_log::retention_path(&paths.source_log)).unwrap()
+            }
+            "receipts" => {
+                std::fs::remove_file(checkpoint_sidecar(&paths.source_log, ".receipts")).unwrap()
+            }
+            "receipt_checksum" => {
+                let file = checkpoint_sidecar(&paths.source_log, ".receipts");
+                let mut bytes = std::fs::read(&file).unwrap();
+                bytes[0] ^= 1;
+                std::fs::write(file, bytes).unwrap();
+            }
+            "dependency" | "activation_pin" => {
+                use std::io::{Seek as _, SeekFrom};
+                let pin = authority
+                    .pins
+                    .iter()
+                    .find(|pin| {
+                        !pin.reducer
+                            && ((pin.sequence == recorded_source(&paths).last_sequence.unwrap())
+                                == (fault == "activation_pin"))
+                    })
+                    .unwrap();
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&paths.source_log)
+                    .unwrap();
+                file.seek(SeekFrom::Start(pin.offset + 8)).unwrap();
+                file.write_all(&[0xff; 16]).unwrap();
+            }
+            "boundary_cut" | "whole_frame_cut" | "partial_retained_tail" => {
+                let cut = match fault {
+                    "boundary_cut" => authority.boundary.offset,
+                    "partial_retained_tail" => authority.retained_tail.physical_tail - 3,
+                    _ => {
+                        let mut receipts =
+                            std::fs::File::open(checkpoint_sidecar(&paths.source_log, ".receipts"))
+                                .unwrap();
+                        let mut offset = 0;
+                        for seq in 0..=authority.retained_tail.last_sequence.unwrap().0 {
+                            offset =
+                                pe_event_log::ReceiptRecord::read(&mut receipts, EventSeq(seq))
+                                    .unwrap()
+                                    .byte_offset
+                                    .unwrap();
+                        }
+                        offset
+                    }
+                };
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&paths.source_log)
+                    .unwrap()
+                    .set_len(cut)
+                    .unwrap();
+            }
+            "append_partial" => {
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&paths.source_log)
+                    .unwrap()
+                    .write_all(&[1, 2])
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        if let Some(index) = retained_index {
+            assert!(index.verify_retention_pins().is_err(), "{fault}");
+        }
+        let before = std::fs::read(&paths.source_log).unwrap();
+        if fault == "append_partial" {
+            let opened = SourceLogBoot::open(&paths, true).unwrap().unwrap();
+            assert_eq!(
+                opened.binding.physical_tail,
+                authority.retained_tail.physical_tail
+            );
+            assert_eq!(
+                file_len(&paths.source_log),
+                authority.retained_tail.physical_tail
+            );
+        } else {
+            assert!(SourceLogBoot::open(&paths, true).is_err(), "{fault}");
+            assert_eq!(
+                std::fs::read(&paths.source_log).unwrap(),
+                before,
+                "{fault}: no truncation"
+            );
+            assert!(
+                SourceReceiptIndex::replay(&paths.source_log).is_err(),
+                "{fault}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn retention_qualification_returns_retired_before_selecting_pre_start_duplicate() {
+    use pe_service::qualification::{QualificationError, QualifyOptions};
+    let (_dir, paths) = installed_fixture();
+    let payload = serde_json::to_vec(&serde_json::json!([{
+        "proxyWallet": WALLET, "timestamp": NOW_UNIX, "conditionId": "condition", "type": "TRADE",
+        "size": "2", "usdcSize": "1", "transactionHash": "pre-start", "price": "0.5", "asset": "123", "side": "BUY", "outcomeIndex": 0,
+    }])).unwrap();
+    append(
+        &paths.source_log,
+        envelope(
+            pe_service::trade_poller::ACTIVITY_POLL_SOURCE_ID,
+            ACTIVITY_SCHEMA_VERSION,
+            ACTIVITY_PARSER_VERSION,
+            &payload,
+            NOW_UNIX,
+        ),
+    );
+    append_paper_record(&paths.paper_log, &start_record());
+    append(
+        &paths.source_log,
+        envelope(
+            pe_service::trade_poller::ACTIVITY_POLL_SOURCE_ID,
+            ACTIVITY_SCHEMA_VERSION,
+            ACTIVITY_PARSER_VERSION,
+            &payload,
+            NOW_UNIX + 1,
+        ),
+    );
+    let boundary = append(
+        &paths.source_log,
+        envelope("suffix", 1, 1, b"{}", NOW_UNIX + 2),
+    );
+    retention_capture(&paths.source_log, boundary.sequence.0, &[]);
+    let output = paths.source_log.with_extension("report.json");
+    std::fs::write(&output, "previous report").unwrap();
+    let error = pe_service::qualification::run_qualify(&QualifyOptions {
+        paper_log: paths.paper_log,
+        source_log: paths.source_log,
+        live_journal: Some(paths.live_journal),
+        paper_state: paths.fixed_main,
+        seal_hash: "invalid-selection-must-not-run".to_owned(),
+        output: output.clone(),
+    })
+    .await
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        QualificationError::EventLog(pe_event_log::LogError::Retired { .. })
+    ));
+    assert_eq!(std::fs::read_to_string(output).unwrap(), "previous report");
+}
+
+struct RetentionCompletedAuthority;
+
+impl pe_service::supabase_state::SupabaseStateTrait for RetentionCompletedAuthority {
+    async fn commit_fill_v2(
+        &self,
+        _: &pe_service::supabase_sink::SupabaseFillRow,
+    ) -> Result<
+        pe_service::supabase_state::FillV2Outcome,
+        pe_service::supabase_state::SupabaseStateError,
+    > {
+        panic!("completed pairs must never call an authority RPC")
+    }
+    async fn commit_prepared_fill(
+        &self,
+        _: &PreparedFillRequest,
+    ) -> Result<CanonicalFillResult, pe_service::supabase_state::SupabaseStateError> {
+        panic!("completed pairs must never call an authority RPC")
+    }
+    async fn apply_prepared_resolution(
+        &self,
+        _: &pe_service::supabase_state::PreparedResolutionRequest,
+    ) -> Result<
+        pe_service::paper_recovery::CanonicalResolutionResult,
+        pe_service::supabase_state::SupabaseStateError,
+    > {
+        panic!("completed pairs must never call an authority RPC")
+    }
+}
+
+#[tokio::test]
+async fn retention_completed_pairs_reproject_old_frame_admission_and_frontier_with_or_without_checkpoint()
+ {
+    for checkpoint in [true, false] {
+        let (_dir, paths) = installed_fixture();
+        let start = append_paper_record(&paths.paper_log, &start_record());
+        let paper = Arc::new(PaperStateDb::open(&paths.fixed_main).unwrap());
+        paper
+            .reset_financial_era(
+                start,
+                CollateralAmount::from_decimal_exact(dec!(10)).unwrap(),
+            )
+            .unwrap();
+        install_mixed_current_open_continuations(&paper, &paths.source_log, start);
+        let row = paper
+            .decision_pending_history()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.wallet == WalletAddress([0xce; 20]))
+            .unwrap();
+        let wire: serde_json::Value = serde_json::from_str(&row.frozen_inputs_json).unwrap();
+        let proof: pe_service::frame_admission::FrameDecisionProof =
+            serde_json::from_value(wire["decision_inputs"].clone()).unwrap();
+        for pending in paper.open_decision_pending().unwrap() {
+            paper
+                .close_decision_pending(&pending.source_trade_id, "{}", "fill", NOW_UNIX + 25_010)
+                .unwrap();
+        }
+        let ordinary = append(
+            &paths.source_log,
+            envelope("old-fill-observation", 1, 1, b"{}", NOW_UNIX + 25_003),
+        );
+        let mut previous = None;
+        let mut latest = None;
+        for (receipt, wallet, source_id) in [
+            (
+                ordinary,
+                WalletAddress([0xaa; 20]),
+                SourceTradeId("ordinary-completed".to_owned()),
+            ),
+            (
+                proof.inputs.frame_receipt,
+                row.wallet,
+                row.source_trade_id.clone(),
+            ),
+        ] {
+            let mut economic = support::economic_prepared(receipt, start);
+            economic.observation.as_mut().unwrap().provenance = if wallet == row.wallet {
+                "activity_ws"
+            } else {
+                "reconciled_rest"
+            }
+            .to_owned();
+            let prepared = append_paper_record(
+                &paths.paper_log,
+                &PaperLogRecord::FinancialPrepared {
+                    expected_authority: ExpectedAuthority {
+                        qualification_start_receipt: start,
+                        prior_completed_prepared_sequence: previous,
+                    },
+                    payload: FinancialPayload::Fill {
+                        operation: PaperFillOperationIdentity {
+                            leader_wallet: wallet,
+                            source_trade_id: source_id,
+                            observed_at_bucket: NOW_UNIX + 25_000,
+                        },
+                        economic,
+                    },
+                },
+            );
+            append_paper_record(
+                &paths.paper_log,
+                &PaperLogRecord::FinancialFinal {
+                    prepared_receipt: prepared,
+                    result: FinancialResult::Fill {
+                        canonical: CanonicalFillResult {
+                            outcome: "applied".to_owned(),
+                            bankroll: if previous.is_none() { dec!(9) } else { dec!(8) },
+                            applied_prepared_seq: prepared.sequence,
+                            quantity: pe_core_types::ShareAmount::from_whole(2).unwrap(),
+                            principal: CollateralAmount::from_decimal_exact(dec!(1)).unwrap(),
+                            fee: CollateralAmount::ZERO,
+                            fill_price: pe_core_types::Price::new(dec!(0.5)).unwrap(),
+                        },
+                    },
+                },
+            );
+            previous = Some(prepared.sequence);
+            latest = Some(prepared.sequence);
+        }
+        assert_eq!(paper.financial_last_prepared_seq().unwrap(), None);
+        assert!(paper.open_decision_pending().unwrap().is_empty());
+        let padding = append(
+            &paths.source_log,
+            envelope("old-padding", 1, 1, b"{}", NOW_UNIX + 25_004),
+        );
+        let recent = append(
+            &paths.source_log,
+            envelope("recent", 1, 1, b"{}", NOW_UNIX + 8 * 86_400),
+        );
+        let activation = recorded_source(&paths);
+        let mut pins = vec![
+            (
+                AppendReceipt {
+                    sequence: activation.last_sequence.unwrap(),
+                    this_hash: activation.last_hash,
+                },
+                false,
+            ),
+            (proof.inputs.frame_receipt, false),
+            (proof.admission_receipt, false),
+            (proof.inputs.frontier.commitment, false),
+        ];
+        pins.extend(
+            proof
+                .inputs
+                .frontier
+                .page_occurrences
+                .iter()
+                .map(|page| (page.receipt, false)),
+        );
+        let authority = retention_capture(&paths.source_log, padding.sequence.0 + 1, &pins);
+        assert!(authority.advanced_at - row.updated_at_unix > 7 * 86_400);
+        erase_retention_frames(&paths.source_log, &authority);
+        SourceLogBoot::prepare_checkpoint(&paths.fixed_main).unwrap();
+        if !checkpoint {
+            std::fs::remove_file(pe_service::source_checkpoint::checkpoint_path(
+                &paths.source_log,
+            ))
+            .unwrap();
+        }
+        let opened = SourceLogBoot::open(&paths, true).unwrap().unwrap();
+        let index = opened.boot.receipt_index();
+        drop(opened);
+        let before_decision = paper
+            .decision_pending_for(&row.source_trade_id)
+            .unwrap()
+            .unwrap();
+        let paper_log = pe_service::paper_recovery::PaperLog::open(&paths.paper_log).unwrap();
+        assert_eq!(
+            pe_service::supabase_state::reconcile_active_financial_frames(
+                &RetentionCompletedAuthority,
+                &paper,
+                if checkpoint {
+                    pe_service::supabase_state::SourceEvidence::Index(&index)
+                } else {
+                    pe_service::supabase_state::SourceEvidence::Log(&paths.source_log)
+                },
+                &paper_log,
+            )
+            .await
+            .unwrap(),
+            0
+        );
+        let era = paper_era(scan_paper_log(&paths.paper_log).unwrap());
+        let received = pe_service::risk_inputs::completed_prepared_before_boundary(
+            &era,
+            &paths.source_log,
+            NOW_UNIX + 8 * 86_400,
+            recent,
+        )
+        .unwrap();
+        assert_eq!(received.len(), 2);
+        assert_eq!(
+            received,
+            pe_service::risk_inputs::completed_prepared_before_boundary_indexed(
+                &era,
+                &index,
+                NOW_UNIX + 8 * 86_400,
+                recent
+            )
+            .unwrap()
+        );
+        assert_eq!(paper.fills_count().unwrap(), 2);
+        assert_eq!(paper.bankroll().unwrap(), Some(dec!(8)));
+        assert_eq!(paper.financial_last_prepared_seq().unwrap(), latest);
+        assert_eq!(
+            paper
+                .decision_pending_for(&row.source_trade_id)
+                .unwrap()
+                .unwrap(),
+            before_decision
+        );
+        assert_eq!(
+            index
+                .source_envelope_with_pause(proof.admission_receipt, &mut || {})
+                .unwrap()
+                .this_hash,
+            proof.admission_receipt.this_hash
+        );
+        assert!(
+            index
+                .source_envelope_with_pause(ordinary, &mut || {})
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn retention_preparation_retries_advance_after_checkpoint_loss() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let (_dir, paths) = installed_fixture();
+    append(&paths.source_log, envelope("old", 1, 1, b"{}", NOW_UNIX));
+    let boundary = append(
+        &paths.source_log,
+        envelope("suffix", 1, 1, b"{}", NOW_UNIX + 1),
+    );
+    SourceLogBoot::prepare_checkpoint(&paths.fixed_main).unwrap();
+    let once = Arc::new(AtomicBool::new(false));
+    let source = paths.source_log.clone();
+    let activation = recorded_source(&paths);
+    let hooks = pe_service::source_checkpoint::PreparationHooks {
+        before_cached_hash: Some(Arc::new(move || {
+            if !once.swap(true, Ordering::SeqCst) {
+                let authority = retention_capture(
+                    &source,
+                    boundary.sequence.0,
+                    &[(
+                        AppendReceipt {
+                            sequence: activation.last_sequence.unwrap(),
+                            this_hash: activation.last_hash,
+                        },
+                        false,
+                    )],
+                );
+                erase_retention_frames(&source, &authority);
+                std::fs::remove_file(pe_service::source_checkpoint::checkpoint_path(&source))
+                    .unwrap();
+            }
+            Ok(())
+        })),
+        ..Default::default()
+    };
+    let original = pe_service::source_checkpoint::read_authority(&paths.source_log).unwrap();
+    SourceLogBoot::prepare_checkpoint_with_hooks(&paths.fixed_main, &hooks).unwrap();
+    assert_eq!(
+        pe_service::source_checkpoint::read_authority(&paths.source_log).unwrap(),
+        original
+    );
+}
+
+#[test]
+fn retention_moved_capture_rebinds_and_rebuilds_after_checkpoint_loss() {
+    let (_origin, paths, authority) = retention_recovery_fixture();
+    let paper = PaperStateDb::open(&paths.fixed_main).unwrap();
+    let expected = rebuild_reconciliation_obligations(&paths.source_log, &paper).unwrap();
+    paper.sync_checkpoint_dispositions().unwrap();
+    drop(paper);
+    erase_retention_frames(&paths.source_log, &authority);
+    let moved = tempfile::tempdir().unwrap();
+    let configured = paths_in(moved.path());
+    for (from, to) in [
+        (&paths.fixed_main, &configured.fixed_main),
+        (&paths.source_log, &configured.source_log),
+        (&paths.paper_log, &configured.paper_log),
+        (&paths.live_journal, &configured.live_journal),
+        (
+            &pe_event_log::retention_path(&paths.source_log),
+            &pe_event_log::retention_path(&configured.source_log),
+        ),
+        (
+            &checkpoint_sidecar(&paths.source_log, ".receipts"),
+            &checkpoint_sidecar(&configured.source_log, ".receipts"),
+        ),
+    ] {
+        std::fs::copy(from, to).unwrap();
+    }
+    let bytes = std::fs::read(&configured.source_log).unwrap();
+    assert!(pe_service::paper_migration::update_installed_log_paths(&configured).unwrap());
+    assert_eq!(std::fs::read(&configured.source_log).unwrap(), bytes);
+    assert!(!pe_service::source_checkpoint::checkpoint_path(&configured.source_log).exists());
+    let mut opened = SourceLogBoot::open(&configured, true).unwrap().unwrap();
+    assert_eq!(
+        opened.binding.path,
+        std::fs::canonicalize(&configured.source_log).unwrap()
+    );
+    opened.boot.extend(&mut opened.sink).unwrap();
+    let paper = PaperStateDb::open(&configured.fixed_main).unwrap();
+    let mut expected = expected;
+    pe_service::trade_poller::recover_daily_boundary(
+        &configured.source_log,
+        &configured.paper_log,
+        &mut expected,
+    )
+    .unwrap();
+    assert_eq!(
+        opened
+            .boot
+            .obligations(&paper, &configured.paper_log)
+            .unwrap(),
+        expected
+    );
+    opened
+        .boot
+        .prepare_installed(configured, NOW_UNIX + 20)
+        .unwrap();
+}
+
+#[test]
+fn retention_complete_prefix_era_commands_refuse_before_selection() {
+    use pe_service::qualification::{FinancialEraCommand, QualificationError};
+    let (dir, paths, _) = retention_recovery_fixture();
+    let manifest = serde_json::json!({
+        "kind": "financial-era-v1", "state": "prepared", "activation_id": "fixture", "generation": "fixture",
+        "fresh_bankroll": 10_000_000, "target_revision": "fixture", "artifact_blake3": "fixture", "static_config_hash": "fixture",
+        "ranking_batch_id": 1, "membership": [], "schema_version": 3, "parser_version": 1,
+        "financial_semantic_version": 3, "start_unix": NOW_UNIX,
+        "paths": { "paper_log": paths.paper_log, "source_log": paths.source_log,
+            "live_journal": paths.live_journal, "paper_state": paths.fixed_main },
+        "old_artifact_sha256": "fixture", "target_artifact_sha256": "fixture", "old_config_sha256": "fixture",
+        "target_config_sha256": "fixture", "old_environment_sha256": "fixture", "target_environment_sha256": "fixture", "preparation": null,
+    });
+    let path = dir.path().join("financial-era.json");
+    std::fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    for command in [
+        FinancialEraCommand::Prepare,
+        FinancialEraCommand::Start,
+        FinancialEraCommand::RollbackCheck,
+    ] {
+        let error =
+            pe_service::qualification::run_financial_era(command, &path, &Default::default(), None)
+                .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                QualificationError::EventLog(pe_event_log::LogError::Retired { .. })
+            ),
+            "{command:?}: {error}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn retention_open_continuation_census_and_preparation_authenticate_pinned_closure() {
+    let (_dir, paths) = installed_fixture();
+    let paper = Arc::new(PaperStateDb::open(&paths.fixed_main).unwrap());
+    install_committed_open_read(&paper, &paths.source_log);
+    let old: Vec<_> = pe_event_log::Reader::replay(&paths.source_log)
+        .unwrap()
+        .map(|item| {
+            let (sequence, envelope) = item.unwrap();
+            (
+                AppendReceipt {
+                    sequence,
+                    this_hash: envelope.this_hash,
+                },
+                false,
+            )
+        })
+        .collect();
+    let padding = append(
+        &paths.source_log,
+        envelope("old-padding", 1, 1, b"{}", NOW_UNIX + 25_004),
+    );
+    append(
+        &paths.source_log,
+        envelope("recent", 1, 1, b"{}", NOW_UNIX + 8 * 86_400),
+    );
+    let authority = retention_capture(&paths.source_log, padding.sequence.0 + 1, &old);
+    erase_retention_frames(&paths.source_log, &authority);
+    let index = SourceReceiptIndex::replay(&paths.source_log).unwrap();
+    assert_eq!(
+        pe_service::bucket_commit::validate_open_continuations(&paper, &index).unwrap(),
+        1
+    );
+    assert_eq!(
+        SourceLogBoot::prepare_checkpoint(&paths.fixed_main)
+            .unwrap()
+            .1,
+        1
+    );
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_pe-service"));
+    command
+        .env_clear()
+        .arg("--validate-open-continuations")
+        .arg("--paper-state")
+        .arg(&paths.fixed_main)
+        .arg("--source-log")
+        .arg(&paths.source_log);
+    let output = support::bounded_command_output(command).await;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"open_rows=1 validated=1\n");
+}

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use pe_core_types::{EventSeq, MarketId, OutcomeId, Price, ReceivedAt};
-use pe_event_log::{AppendReceipt, EventEnvelope, LogTailBinding, Reader};
+use pe_event_log::{AppendReceipt, EventEnvelope, LogTailBinding, Reader, RetentionAuthority};
 use pe_paper_state::FinancialSnapshot;
 use pe_risk_engine::{
     EquityInputs, PnlWindow, RiskHaltCause, RiskMathError, RiskSnapshot, current_equity,
@@ -72,6 +72,8 @@ pub(crate) fn apply_global_risk_halts(
 )]
 #[serde(rename_all = "snake_case")]
 pub enum RiskInputsUnavailable {
+    #[error("source frame has been erased by retention")]
+    Erased,
     #[error("financial snapshot sequence does not match the completed paper-log prefix")]
     SnapshotSequenceMismatch,
     #[error("the paper log has an unmatched FinancialPrepared record")]
@@ -912,6 +914,7 @@ fn paper_fill_source_receipts(era: &PaperEra) -> Result<Vec<AppendReceipt>, Risk
 #[derive(Default)]
 struct SourceReceiptIndexState {
     frames: Vec<SourceFrameMetadata>,
+    retention: Option<Arc<RetentionAuthority>>,
     next_byte_offset: Option<u64>,
     verified_feed_frontiers:
         HashMap<pe_core_types::WalletAddress, crate::frame_admission::FeedHistoryFrontier>,
@@ -943,9 +946,24 @@ pub struct SourceReceiptIndex {
 pub(crate) struct SourceReceiptIndexStaging {
     canonical_source_log_path: PathBuf,
     frames: Vec<SourceFrameMetadata>,
+    retention: Option<Arc<RetentionAuthority>>,
 }
 
 impl SourceReceiptIndexStaging {
+    pub(crate) fn retention(&self) -> Option<&RetentionAuthority> {
+        self.retention.as_deref()
+    }
+
+    pub(crate) fn frame_metadata(&self, sequence: EventSeq) -> Option<&SourceFrameMetadata> {
+        usize::try_from(sequence.0)
+            .ok()
+            .and_then(|sequence| self.frames.get(sequence))
+    }
+
+    pub(crate) fn validate_retention(&self) -> Result<(), RiskInputsUnavailable> {
+        SourceReceiptIndex::validate_retention(&self.frames, self.retention.as_deref())
+    }
+
     pub(crate) fn restore_record(
         &mut self,
         frame: SourceFrameMetadata,
@@ -1026,6 +1044,7 @@ impl SourceReceiptIndexStaging {
         {
             return Err(RiskInputsUnavailable::PriceConflict);
         }
+        SourceReceiptIndex::validate_retention(&self.frames, self.retention.as_deref())?;
         Ok(self.complete_at(binding.physical_tail))
     }
 
@@ -1033,6 +1052,7 @@ impl SourceReceiptIndexStaging {
         SourceReceiptIndex {
             state: Arc::new(RwLock::new(SourceReceiptIndexState {
                 frames: self.frames,
+                retention: self.retention,
                 next_byte_offset: Some(physical_tail),
                 verified_feed_frontiers: HashMap::new(),
                 #[cfg(feature = "scenario")]
@@ -1130,9 +1150,18 @@ impl SourceReceiptIndex {
         &self,
         frontier: &crate::frame_admission::FeedHistoryFrontier,
     ) {
-        self.state
+        let mut state = self
+            .state
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Verification may finish after the commit cleared this cache.
+        if std::iter::once(frontier.commitment)
+            .chain(frontier.page_occurrences.iter().map(|page| page.receipt))
+            .any(|receipt| Self::require_retained(&state, receipt.sequence).is_err())
+        {
+            return;
+        }
+        state
             .verified_feed_frontiers
             .insert(frontier.wallet, frontier.clone());
     }
@@ -1249,6 +1278,9 @@ impl SourceReceiptIndex {
         Ok(SourceReceiptIndexStaging {
             canonical_source_log_path,
             frames,
+            retention: RetentionAuthority::load(path)
+                .map_err(|_| RiskInputsUnavailable::PriceConflict)?
+                .map(Arc::new),
         })
     }
 
@@ -1261,24 +1293,128 @@ impl SourceReceiptIndex {
         Ok(SourceReceiptIndexStaging {
             canonical_source_log_path,
             frames: Vec::new(),
+            retention: RetentionAuthority::load(source_log_path)
+                .map_err(|_| RiskInputsUnavailable::PriceConflict)?
+                .map(Arc::new),
         })
     }
 
     /// Rebuild the complete verified source-log projection at boot.
     pub fn replay(source_log_path: &Path) -> Result<Self, RiskInputsUnavailable> {
-        let mut staging = Self::staging(source_log_path)?;
-        for item in Reader::replay_with_offsets(source_log_path)
-            .map_err(|_| RiskInputsUnavailable::PriceMissing)?
+        crate::source_log_boot::rebuild_source_log(source_log_path, false, None)
+            .map(|rebuilt| rebuilt.index)
+            .map_err(|_| RiskInputsUnavailable::PriceConflict)
+    }
+
+    fn validate_retention(
+        frames: &[SourceFrameMetadata],
+        retention: Option<&RetentionAuthority>,
+    ) -> Result<(), RiskInputsUnavailable> {
+        let Some(authority) = retention else {
+            return Ok(());
+        };
+        let boundary = usize::try_from(authority.boundary.sequence.0)
+            .map_err(|_| RiskInputsUnavailable::Overflow)?;
+        if frames
+            .get(boundary.saturating_sub(1))
+            .is_none_or(|frame| frame.receipt.this_hash != authority.chain_head)
+            || frames
+                .get(boundary)
+                .is_some_and(|frame| frame.byte_offset != Some(authority.boundary.offset))
         {
-            let (byte_offset, _sequence, envelope) =
-                item.map_err(|_| RiskInputsUnavailable::PriceMissing)?;
-            staging.observe(byte_offset, &envelope)?;
+            return Err(RiskInputsUnavailable::PriceConflict);
         }
-        // The verified reader already proved the file ends at a complete frame boundary.
-        let physical_tail = std::fs::metadata(source_log_path)
-            .map_err(|_| RiskInputsUnavailable::PriceMissing)?
-            .len();
-        Ok(staging.complete_at(physical_tail))
+        for pin in &authority.pins {
+            let sequence =
+                usize::try_from(pin.sequence.0).map_err(|_| RiskInputsUnavailable::Overflow)?;
+            if frames.get(sequence).is_none_or(|frame| {
+                frame.receipt.this_hash != pin.hash || frame.byte_offset != Some(pin.offset)
+            }) || sequence
+                .checked_sub(1)
+                .and_then(|n| frames.get(n))
+                .map_or(blake3::Hash::from_bytes([0; 32]), |frame| {
+                    frame.receipt.this_hash
+                })
+                != pin.predecessor_hash
+            {
+                return Err(RiskInputsUnavailable::PriceConflict);
+            }
+        }
+        Ok(())
+    }
+
+    /// Switch exact reads as soon as the committed authority becomes visible.
+    pub fn install_retention(
+        &self,
+        authority: RetentionAuthority,
+    ) -> Result<(), RiskInputsUnavailable> {
+        authority
+            .validate()
+            .map_err(|_| RiskInputsUnavailable::PriceConflict)?;
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.retention.as_ref().is_some_and(|old| {
+            old.epoch > authority.epoch || (old.epoch == authority.epoch && **old != authority)
+        }) {
+            return Err(RiskInputsUnavailable::PriceConflict);
+        }
+        Self::validate_retention(&state.frames, Some(&authority))?;
+        let captured = authority
+            .retained_tail
+            .last_sequence
+            .and_then(|seq| usize::try_from(seq.0).ok())
+            .ok_or(RiskInputsUnavailable::PriceConflict)?;
+        let captured_end = state
+            .frames
+            .get(
+                captured
+                    .checked_add(1)
+                    .ok_or(RiskInputsUnavailable::Overflow)?,
+            )
+            .and_then(|frame| frame.byte_offset)
+            .or(state.next_byte_offset);
+        if state
+            .frames
+            .get(captured)
+            .is_none_or(|frame| frame.receipt.this_hash != authority.retained_tail.last_hash)
+            || captured_end != Some(authority.retained_tail.physical_tail)
+        {
+            return Err(RiskInputsUnavailable::PriceConflict);
+        }
+        state.verified_feed_frontiers.clear();
+        state.retention = Some(Arc::new(authority));
+        Ok(())
+    }
+
+    /// Epoch captured by checkpoint verification and publication.
+    pub fn retention_epoch(&self) -> u64 {
+        self.state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retention
+            .as_ref()
+            .map_or(0, |authority| authority.epoch)
+    }
+
+    /// Check every committed pin, including dependencies with no reducer owner.
+    pub fn verify_retention_pins(&self) -> Result<(), RiskInputsUnavailable> {
+        let retention = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retention
+            .clone();
+        if let Some(authority) = retention {
+            for pin in &authority.pins {
+                self.source_envelope(AppendReceipt {
+                    sequence: pin.sequence,
+                    this_hash: pin.hash,
+                })?;
+            }
+        }
+        Ok(())
     }
 
     /// Snapshot the synchronized indexed source tail without reading the log (GitHub issue #574).
@@ -1577,6 +1713,28 @@ impl SourceReceiptIndex {
         &self,
         receipt: AppendReceipt,
     ) -> Result<pe_event_log::EventEnvelope, RiskInputsUnavailable> {
+        self.source_envelope_inner(
+            receipt,
+            #[cfg(feature = "scenario")]
+            None,
+        )
+    }
+
+    /// Pause after lookup and before physical I/O to exercise a concurrent retention commit.
+    #[cfg(feature = "scenario")]
+    pub fn source_envelope_with_pause(
+        &self,
+        receipt: AppendReceipt,
+        pause: &mut dyn FnMut(),
+    ) -> Result<EventEnvelope, RiskInputsUnavailable> {
+        self.source_envelope_inner(receipt, Some(pause))
+    }
+
+    fn source_envelope_inner(
+        &self,
+        receipt: AppendReceipt,
+        #[cfg(feature = "scenario")] pause: Option<&mut dyn FnMut()>,
+    ) -> Result<EventEnvelope, RiskInputsUnavailable> {
         let sequence_index =
             usize::try_from(receipt.sequence.0).map_err(|_| RiskInputsUnavailable::Overflow)?;
         let (metadata, previous_hash) = {
@@ -1584,6 +1742,7 @@ impl SourceReceiptIndex {
                 .state
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Self::require_retained(&state, receipt.sequence)?;
             let metadata = state
                 .frames
                 .get(sequence_index)
@@ -1605,15 +1764,51 @@ impl SourceReceiptIndex {
         let byte_offset = metadata
             .byte_offset
             .ok_or(RiskInputsUnavailable::PriceMissing)?;
-        let (envelope, _) =
-            Reader::read_at(path.as_ref(), byte_offset, receipt.sequence, previous_hash)
-                .map_err(|_| RiskInputsUnavailable::PriceConflict)?;
+        #[cfg(feature = "scenario")]
+        if let Some(pause) = pause {
+            pause();
+        }
+        let read = Reader::read_at(path.as_ref(), byte_offset, receipt.sequence, previous_hash);
+        // The commit may have advanced while the index lock was released, even if no
+        // bytes have been punched yet. A physical failure follows the same rule.
+        let state = self
+            .state
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Self::require_retained(&state, receipt.sequence)?;
+        let (envelope, end) = read.map_err(|_| RiskInputsUnavailable::PriceConflict)?;
+        if state
+            .retention
+            .as_ref()
+            .is_some_and(|authority| authority.pin(receipt.sequence).is_some())
+        {
+            let expected_end = sequence_index
+                .checked_add(1)
+                .and_then(|next| state.frames.get(next))
+                .and_then(|frame| frame.byte_offset)
+                .or(state.next_byte_offset);
+            if expected_end != Some(end) {
+                return Err(RiskInputsUnavailable::PriceConflict);
+            }
+        }
         if envelope.this_hash != receipt.this_hash
             || received_at_millis(&envelope.received_at)? != metadata.received_millis
         {
             return Err(RiskInputsUnavailable::PriceConflict);
         }
         Ok(envelope)
+    }
+
+    fn require_retained(
+        state: &SourceReceiptIndexState,
+        sequence: EventSeq,
+    ) -> Result<(), RiskInputsUnavailable> {
+        if state.retention.as_ref().is_some_and(|authority| {
+            sequence < authority.boundary.sequence && authority.pin(sequence).is_none()
+        }) {
+            return Err(RiskInputsUnavailable::Erased);
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1699,31 +1894,14 @@ fn source_receipt_index(
             return Err(RiskInputsUnavailable::PriceConflict);
         }
     }
-    let Some(max_sequence) = wanted.last_key_value().map(|(sequence, _)| *sequence) else {
+    if wanted.is_empty() {
         return Ok(BTreeMap::new());
-    };
-    let mut received_millis = BTreeMap::new();
-    for item in Reader::replay(source_log_path).map_err(|_| RiskInputsUnavailable::PriceMissing)? {
-        let (_sequence, envelope) = item.map_err(|_| RiskInputsUnavailable::PriceMissing)?;
-        if envelope.seq > max_sequence {
-            break;
-        }
-        let Some(receipt) = wanted.get(&envelope.seq) else {
-            continue;
-        };
-        if envelope.this_hash != receipt.this_hash {
-            return Err(RiskInputsUnavailable::PriceConflict);
-        }
-        let millis = received_at_millis(&envelope.received_at)?;
-        received_millis.insert(envelope.seq, (*receipt, millis));
-        if envelope.seq == max_sequence {
-            break;
-        }
     }
-    if received_millis.len() != wanted.len() {
-        return Err(RiskInputsUnavailable::PriceMissing);
-    }
-    Ok(received_millis)
+    let index = SourceReceiptIndex::replay(source_log_path)?;
+    wanted
+        .into_iter()
+        .map(|(sequence, receipt)| Ok((sequence, (receipt, index.received_millis(receipt)?))))
+        .collect()
 }
 
 fn source_receipt_received_millis(
@@ -2798,6 +2976,77 @@ mod tests {
             index.tail_with_last_frame(),
             Err(RiskInputsUnavailable::PriceMissing)
         ));
+    }
+
+    #[test]
+    fn retention_commit_does_not_recapture_an_erased_verified_frontier() {
+        let old = receipt(0, 1);
+        let retained = receipt(1, 2);
+        for erased_commitment in [true, false] {
+            let index = SourceReceiptIndex {
+                state: Arc::new(RwLock::new(SourceReceiptIndexState {
+                    frames: vec![
+                        SourceFrameMetadata {
+                            receipt: old,
+                            received_millis: 0,
+                            byte_offset: Some(pe_event_log::HEADER_LEN),
+                        },
+                        SourceFrameMetadata {
+                            receipt: retained,
+                            received_millis: 1,
+                            byte_offset: Some(128),
+                        },
+                    ],
+                    next_byte_offset: Some(256),
+                    ..SourceReceiptIndexState::default()
+                })),
+                source_log_path: None,
+            };
+            let frontier = crate::frame_admission::FeedHistoryFrontier {
+                version: 1,
+                wallet: WalletAddress([1; 20]),
+                fixed_end: 0,
+                commitment: if erased_commitment { old } else { retained },
+                page_occurrences: vec![crate::bucket_commit::PageOccurrence {
+                    request_url: "recorded-page".to_owned(),
+                    raw_hash: "recorded-hash".to_owned(),
+                    receipt: if erased_commitment { retained } else { old },
+                }],
+                pages: Vec::new(),
+            };
+            index.remember_verified_frontier(&frontier);
+            assert!(index.verify_frame_frontier(&frontier).is_ok());
+            index
+                .install_retention(RetentionAuthority {
+                    format_version: 1,
+                    epoch: 1,
+                    advanced_at: 1,
+                    boundary: pe_event_log::RetentionBoundary {
+                        sequence: retained.sequence,
+                        offset: 128,
+                    },
+                    chain_head: old.this_hash,
+                    pins: Vec::new(),
+                    retained_tail: pe_event_log::TailBinding {
+                        physical_tail: 256,
+                        last_sequence: Some(retained.sequence),
+                        last_hash: retained.this_hash,
+                    },
+                    feed: Vec::new(),
+                })
+                .unwrap();
+            // A verification that started before the commit now attempts to cache its result.
+            index.remember_verified_frontier(&frontier);
+            assert!(
+                index
+                    .state
+                    .read()
+                    .unwrap()
+                    .verified_feed_frontiers
+                    .is_empty()
+            );
+            assert!(index.verify_frame_frontier(&frontier).is_err());
+        }
     }
 
     /// PASS: an empty externally observed projection becomes the same path-bound index as replay,

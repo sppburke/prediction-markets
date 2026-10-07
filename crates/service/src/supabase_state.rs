@@ -20,7 +20,7 @@ use pe_core_types::{
     CollateralAmount, EventSeq, MarketId, OutcomeId, PolymarketConditionId, Price, ReceivedAt,
     ShareAmount, Side, SourceId, SourceTimestamp, SourceTradeId, VenueMarketId, WalletAddress,
 };
-use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, EventEnvelope, Reader};
+use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, EventEnvelope};
 use pe_execution_core::EconomicPrepared;
 use pe_paper_state::{FillRecord, FillRow, PaperPositionRow, PaperStateDb, PaperStateError};
 use pe_risk_engine::{BinaryPayout, aggregate_resolution_credit};
@@ -1058,6 +1058,20 @@ pub async fn reconcile_active_financial_frames<S: SupabaseStateTrait + ?Sized>(
         if (local_last.is_none_or(|last| frame.receipt.sequence > last)
             || existing_final.is_none()
             || needs_terminal)
+            && recovery_index.is_none()
+            && let SourceEvidence::Log(path) = source_evidence
+        {
+            recovery_index = Some(
+                SourceReceiptIndex::replay(path)
+                    .map_err(|error| SupabaseStateError::Corrupt(error.to_string()))?,
+            );
+        }
+        let source_evidence = recovery_index
+            .as_ref()
+            .map_or(source_evidence, SourceEvidence::Index);
+        if (local_last.is_none_or(|last| frame.receipt.sequence > last)
+            || existing_final.is_none()
+            || needs_terminal)
             && let FinancialPayload::Fill { operation, .. } = payload
             && let Some(row) = paper_state.decision_pending_for(&operation.source_trade_id)?
         {
@@ -1066,16 +1080,10 @@ pub async fn reconcile_active_financial_frames<S: SupabaseStateTrait + ?Sized>(
             if continuation.is_activity_frame() {
                 let index = match source_evidence {
                     SourceEvidence::Index(index) => index,
-                    SourceEvidence::Log(path) => {
-                        if recovery_index.is_none() {
-                            recovery_index =
-                                Some(SourceReceiptIndex::replay(path).map_err(|error| {
-                                    SupabaseStateError::Corrupt(error.to_string())
-                                })?);
-                        }
-                        recovery_index.as_ref().ok_or_else(|| {
-                            SupabaseStateError::Corrupt("recovery source index missing".to_owned())
-                        })?
+                    SourceEvidence::Log(_) => {
+                        return Err(SupabaseStateError::Corrupt(
+                            "recovery source index missing".to_owned(),
+                        ));
                     }
                 };
                 continuation
@@ -1417,28 +1425,14 @@ pub(crate) fn resolution_source_received_at(
 ) -> Result<i64, SupabaseStateError> {
     match source_evidence {
         SourceEvidence::Log(source_log_path) => {
-            let replay = Reader::replay(source_log_path).map_err(|error| {
-                SupabaseStateError::Corrupt(format!(
-                    "open source log for resolution evidence: {error}"
-                ))
-            })?;
-            for frame in replay {
-                let (sequence, envelope) = frame.map_err(|error| {
-                    SupabaseStateError::Corrupt(format!("read source resolution evidence: {error}"))
-                })?;
-                if sequence == receipt.sequence {
-                    return validate_resolution_source_envelope(
-                        &envelope,
-                        receipt,
-                        condition,
-                        payout_json,
-                    );
-                }
-            }
-            Err(SupabaseStateError::Corrupt(format!(
-                "resolution source receipt {} is absent",
-                receipt.sequence.0
-            )))
+            let index = SourceReceiptIndex::replay(source_log_path)
+                .map_err(|error| SupabaseStateError::Corrupt(error.to_string()))?;
+            resolution_source_received_at(
+                SourceEvidence::Index(&index),
+                receipt,
+                condition,
+                payout_json,
+            )
         }
         SourceEvidence::Index(index) => {
             let Some((indexed_receipt, _received_millis)) =
@@ -1520,26 +1514,9 @@ fn source_receipt_received_at(
 ) -> Result<i64, SupabaseStateError> {
     match source_evidence {
         SourceEvidence::Log(source_log_path) => {
-            let replay = Reader::replay(source_log_path).map_err(|error| {
-                SupabaseStateError::Corrupt(format!("open source log for fill evidence: {error}"))
-            })?;
-            for frame in replay {
-                let (sequence, envelope) = frame.map_err(|error| {
-                    SupabaseStateError::Corrupt(format!("read source fill evidence: {error}"))
-                })?;
-                if sequence != receipt.sequence {
-                    continue;
-                }
-                if envelope.this_hash != receipt.this_hash {
-                    return Err(SupabaseStateError::Corrupt(
-                        "fill source receipt hash differs from its envelope".to_owned(),
-                    ));
-                }
-                return Ok(envelope.received_at.0.unix_timestamp());
-            }
-            Err(SupabaseStateError::Corrupt(
-                "fill source receipt is absent from the source log".to_owned(),
-            ))
+            let index = SourceReceiptIndex::replay(source_log_path)
+                .map_err(|error| SupabaseStateError::Corrupt(error.to_string()))?;
+            source_receipt_received_at(SourceEvidence::Index(&index), receipt)
         }
         SourceEvidence::Index(index) => {
             let Some((indexed_receipt, received_millis)) =
@@ -2054,19 +2031,11 @@ mod tests {
                     .to_string(),
                 "corrupt supabase value: fill source receipt hash differs from its envelope"
             );
-            let expected_absent = match evidence {
-                SourceEvidence::Log(_) => {
-                    "corrupt supabase value: fill source receipt is absent from the source log"
-                }
-                SourceEvidence::Index(_) => {
-                    "corrupt supabase value: fill source receipt is absent from the source receipt index"
-                }
-            };
             assert_eq!(
                 source_receipt_received_at(evidence, absent)
                     .unwrap_err()
                     .to_string(),
-                expected_absent
+                "corrupt supabase value: fill source receipt is absent from the source receipt index"
             );
         }
     }
