@@ -1,6 +1,7 @@
 //! The verified history pass and its durable, flat projection commitment.
 
 use super::*;
+use pe_copy_signal_engine::PositionState;
 use pe_position_ledger::{
     DropCause, MarketLookup, Scope, ScopeKind, ScopeLookups, SecondRecord,
     classify_scoped_historical_second,
@@ -156,7 +157,7 @@ struct WalletClassifier {
     wallet_hex: String,
     generation: u64,
     drops: BTreeMap<Scope, ScopeDrop>,
-    positions: HashMap<MarketOutcomeId, (ShareAmount, ShareAmount)>,
+    positions: HashMap<MarketOutcomeId, PositionState>,
     history: HashSet<String>,
     ignored: BTreeMap<String, u64>,
     quality: ReconstructionQuality,
@@ -222,12 +223,12 @@ impl WalletClassifier {
                 .flat_map(LedgerMutation::touched_keys)
                 .collect::<HashSet<_>>();
             let mut ledger = PositionLedger::new();
-            ledger.replace_wallet_snapshot(self.wallet, HashMap::new());
-            for key in &keys {
-                if let Some(state) = self.positions.get(key) {
-                    ledger.restore(self.wallet, key, Some(*state));
-                }
-            }
+            ledger.replace_wallet_snapshot(
+                self.wallet,
+                keys.iter()
+                    .filter_map(|key| self.positions.get(key).map(|state| (key.clone(), *state)))
+                    .collect(),
+            );
             let classified = classify_scoped_historical_second(
                 &ledger,
                 self.wallet,
@@ -307,10 +308,12 @@ impl WalletClassifier {
                     ),
                 })?;
             if let Some(snapshot) = ledger.position(&self.wallet) {
-                self.positions
-                    .extend(snapshot.positions.iter().map(|(key, state)| {
-                        (key.clone(), (state.long_contracts, state.short_contracts))
-                    }));
+                self.positions.extend(
+                    snapshot
+                        .positions
+                        .iter()
+                        .map(|(key, state)| (key.clone(), *state)),
+                );
             }
             self.history.extend(
                 classified
@@ -504,6 +507,7 @@ pub(super) fn rebuild_ranker_projection(
                             None => Ok(ClassifiedChunk::Rows(rows)),
                         }
                     })();
+                    drop(input.aggregates);
                     if send_output.send(classified).is_err() {
                         break;
                     }
@@ -950,6 +954,7 @@ fn finalize_with_chunk(
 mod tests {
     use super::super::activity_fixtures::{built_aggregates, wallet_hex};
     use super::*;
+    use pe_core_types::Side;
 
     #[test]
     fn projection_chunks_keep_whole_seconds_within_the_target_or_largest_second() {

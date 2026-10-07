@@ -932,7 +932,7 @@ receipt, without a history read/write or per-aggregate identity probe. A differi
 stored history before replacing it; a foreign-wallet identity is fatal. A full partial also checks
 and replaces retained history; an incremental partial inserts its proved rows. Explicit repairs
 always replace after logging stored/certified digests, keeping a proved partial or empty history
-when no window was proved. Other exclusions and deferrals keep retained rows and never reset the chain. Historical manifests are
+when no window was proved or proved windows failed aggregation. Other exclusions and deferrals keep retained rows and never reset the chain. Historical manifests are
 commitments, not queryable snapshots. Keep staging evidence and `H0`; resumed staging leaves progress
 intact and never recaptures a changed installed baseline. Activation preserves old fixed bytes at `D`.
 
@@ -949,9 +949,10 @@ unsplit window, then walks forward with the verified [ascending boundary lookup]
 Continuing acquisitions and full reads certified with at least 5,500 source rows skip the probe.
 The lookup places bounds only; descending terminal pages prove every kept window. A saturated
 one-second window remains fatal, and a looked-up window that is still full stops without keeping it. Missing condition/token
-alone follows acquisition 3's acceptance above. Every non-deferral failed acquisition with retained
-history verifies it in the exclusion transaction, in either read mode, except an explicit repair's
-replacement. A partial atomically commits proved rows and an excluded `acquisition_failure` receipt
+alone follows acquisition 3's acceptance above. Every non-deferral failed acquisition without a
+partial verifies retained history in the exclusion transaction, in either read mode, except an
+explicit repair's replacement. Partial history parts are verified at finalize when the wallet
+completes. A partial atomically commits proved rows and an excluded `acquisition_failure` receipt
 with complete aggregation and an acquired end strictly between its start and the generation end;
 zero-row partials are valid history parts. Excluded receipts keep zero outer counts, the empty digest,
 SQL `fixed_end_unix` equal to the frozen end and no current certificate/projection/spool rows.
@@ -977,8 +978,9 @@ cannot repair structural SQLite damage or damaged certificates/receipts/manifest
 [the damage boundary](#recovery-and-damage-boundaries) before selecting a repair. The shared paced
 fetcher, bounded reads/channel and single writer remain. Under a budget, a window whose page
 exhausts its internal retries retries in place while the deadline allows, retaining earlier proved
-windows; without a budget, transient exhaustion exits `rank_and_push_tempfail_exit`. Permanent
-errors stop the cycle.
+windows. A recoverable identity-4 probe failure advances to the walk regardless of budget;
+without a budget, transient exhaustion in a walk window or legacy read exits
+`rank_and_push_tempfail_exit`. Permanent errors stop the cycle.
 
 **Verified pass, spool and export.** Finalize visits every available wallet once (complete,
 non-excluded head receipt, even with zero fetched rows), verifies its effective history while
@@ -1222,7 +1224,8 @@ forward. Confirm the host paths before cutover and keep the prior until publicat
 A failed history check reports expected/observed digests and stops the cycle. Pause, preserve evidence,
 abandon the failed unprepared candidate under the guards above, stage from the installed cache and
 admit a new generation with `--full-read-wallets` for the named wallets. Repair logs stored/certified
-digests and replaces history, retaining proved partial windows or nothing if no window was proved, so repeated failed downloads do not
+digests and replaces history, retaining proved partial windows or nothing if no window was proved
+or proved windows failed aggregation, so repeated failed downloads do not
 keep a damaged wallet blocking later cycles. The pass verifies replacement before preparation;
 cumulative drops survive. This applies to history damage at rest in an otherwise readable installed
 format-3 cache; outgoing validation needs neither history nor a retired backup.

@@ -18,7 +18,9 @@ use tracing_subscriber::EnvFilter;
 
 /// Transient-error retries per page for the activity collection
 /// (`activity_collection_transient_retries` in `docs/_GLOSSARY.md`). One failing page
-/// ends the collector with exit 75 without a wallet budget. With a budget,
+/// in a legacy read or identity-4 walk window ends the collector with exit 75
+/// without a wallet budget. An identity-4 recoverable probe failure advances to
+/// the walk regardless of budget. With a budget,
 /// identity 4 retries the failed window in place while the deadline allows and
 /// keeps proved windows when it stops; identities 1–3 retry the whole read.
 const ACTIVITY_COLLECTION_TRANSIENT_RETRIES: u32 = 16;

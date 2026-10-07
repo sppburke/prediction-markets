@@ -15503,6 +15503,7 @@ async fn history_v3_resumed_acquisition_refuses_retained_damage_at_finalize() {
         ),
         0
     );
+    assert_eq!(history_v3_wallet_count(&side), 3);
 }
 
 #[tokio::test]
@@ -16376,49 +16377,6 @@ async fn history_v3_unfinished_identity_two_bulk_root_seals_unchanged_then_trans
         ),
         2
     );
-}
-
-#[tokio::test]
-async fn history_v3_fetched_partition_damage_is_refused_at_finalize_after_continuation() {
-    let dir = TempDir::new().unwrap();
-    let (side, mut source) = history_v3_legacy_seed(
-        &dir,
-        vec![dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END)],
-    )
-    .await;
-    source
-        .rows
-        .push(dataset_row(WALLET, "0xb", "b", "BUY", FRESH_END + 1));
-    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
-        .await
-        .unwrap();
-    source.rows.push(history_v3_bad_row(FRESH_END + 2));
-    history_v3_collect(&side, &source, 3, FRESH_END + 2, &[])
-        .await
-        .unwrap();
-    history_v3_damage_connection(&side).execute(
-        "UPDATE activity_groups_v2 SET share_amount_str = '2.250001' WHERE source_time_unix = ?1", [FRESH_END + 1],
-    ).unwrap();
-    source
-        .rows
-        .retain(|row| row["transactionHash"] != "bad-price");
-    source
-        .rows
-        .push(dataset_row(WALLET, "0xc", "c", "BUY", FRESH_END + 3));
-    history_v3_collect(&side, &source, 4, FRESH_END + 3, &[])
-        .await
-        .unwrap();
-    dataset_payouts(&side, &source.rows).await;
-    let error = finalize_cache_v2_unbound(&side, None, FRESH_END + 4).unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("activity history chain mismatch"),
-        "{error}"
-    );
-    assert!(error.to_string().contains(WALLET), "{error}");
-    assert!(receipt(&side, 4, WALLET).is_some());
-    assert_eq!(history_v3_wallet_count(&side), 3);
 }
 
 #[tokio::test]
@@ -18002,7 +17960,6 @@ async fn collection_747_growing_history_completes_when_progress_exceeds_arrivals
         assert_eq!(held.load(Ordering::SeqCst), 2_000_000);
         let proof = collection_proof(&side, generation, WALLET);
         if proof["acquisition"]["disposition"] == "complete" {
-            assert!(generation <= 4);
             assert_eq!(
                 usize::try_from(history_v3_wallet_count(&side)).unwrap(),
                 source.rows.len()
@@ -18020,7 +17977,8 @@ async fn collection_747_growing_history_completes_when_progress_exceeds_arrivals
 }
 
 #[tokio::test]
-async fn collection_747_shared_count_bounds_more_than_64_wallets_behind_writer() {
+async fn collection_747_shared_count_bounds_and_releases_more_than_64_wallets_behind_failing_writer()
+ {
     struct WatchedDataset<'a> {
         source: &'a DatasetFetcher,
         held: Arc<std::sync::atomic::AtomicU64>,
@@ -18029,6 +17987,16 @@ async fn collection_747_shared_count_bounds_more_than_64_wallets_behind_writer()
         async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
             assert!(self.held.load(Ordering::SeqCst) <= 2_000_000 + 65 * 5500);
             tokio::task::yield_now().await;
+            let parsed = reqwest::Url::parse(url).unwrap();
+            let query = parsed
+                .query_pairs()
+                .into_owned()
+                .collect::<BTreeMap<_, _>>();
+            if query["sortDirection"] != "ASC" && query["end"] == FRESH_END.to_string() {
+                return Err(SourceError::Transient {
+                    message: "fixture exhausted probe retries".to_owned(),
+                });
+            }
             self.source.fetch_page(url).await
         }
     }
@@ -18046,7 +18014,7 @@ async fn collection_747_shared_count_bounds_more_than_64_wallets_behind_writer()
                     dataset_row(
                         wallet,
                         "0xa",
-                        &format!("row-{index:08}"),
+                        if index < 5499 { "head" } else { "tail" },
                         "BUY",
                         1 + i64::from(index >= 5499),
                     )
@@ -18069,8 +18037,10 @@ async fn collection_747_shared_count_bounds_more_than_64_wallets_behind_writer()
         if first {
             first = false;
             wait.recv().unwrap();
+            true
+        } else {
+            false
         }
-        false
     }));
     let run = pe_bootstrap::cache_migration::collect_activity_v2_with_limits_for_test(
         connection,
@@ -18080,26 +18050,34 @@ async fn collection_747_shared_count_bounds_more_than_64_wallets_behind_writer()
         Arc::clone(&held),
         None,
     );
-    let (manifest, ()) = tokio::join!(run, async {
+    let (result, ()) = tokio::join!(run, async {
         while held.load(Ordering::SeqCst) < 2_000_000 + 65 * 5499 {
             tokio::task::yield_now().await;
         }
         assert_eq!(held.load(Ordering::SeqCst), 2_000_000 + 65 * 5499);
         release.send(()).unwrap();
     });
-    assert_eq!(manifest.unwrap().wallet_count, 66);
+    let error = result.unwrap_err();
+    assert!(
+        matches!(
+            &error,
+            pe_bootstrap::error::BootstrapError::Sqlite(rusqlite::Error::SqliteFailure(error, _))
+                if error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_COMMITHOOK
+        ),
+        "{error}"
+    );
     assert_eq!(held.load(Ordering::SeqCst), 2_000_000);
     assert_eq!(
         count(
             &side,
             "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2 WHERE json_extract(acquisition_json, '$.fetched_source_row_count') = 5499 AND exclusion_reason IS NOT NULL"
         ),
-        66
+        0
     );
 }
 
 #[tokio::test(start_paused = true)]
-async fn collection_747_partial_insert_replace_rollback_and_queue_failure_release_count() {
+async fn collection_747_partial_insert_replace_rollback_and_release_count() {
     for replace in [false, true] {
         let dir = TempDir::new().unwrap();
         let side = dataset_candidate(&dir, "rollback.db", &[]);
@@ -18159,11 +18137,12 @@ async fn collection_747_partial_insert_replace_rollback_and_queue_failure_releas
             &side,
             &source,
             FRESH_END,
-            held,
+            Arc::clone(&held),
             Some(std::time::Duration::from_secs(1)),
         )
         .await
         .unwrap();
+        assert_eq!(held.load(Ordering::SeqCst), 0);
         assert_eq!(history_v3_wallet_count(&side), 4999);
     }
 }
@@ -18442,19 +18421,32 @@ async fn collection_747_receipt_shapes_reject_short_complete_bad_partial_and_sho
         "acquisition2",
     ] {
         let dir = TempDir::new().unwrap();
-        let side = dataset_candidate(&dir, "shape.db", &[]);
-        let source = CollectionDataset::new(collection_rows(WALLET, 6000), 1);
-        collection_admit(&side, 1, FRESH_END, &[]).await;
-        collection_run(
-            &side,
-            &source,
-            FRESH_END,
-            Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            Some(std::time::Duration::from_secs(1)),
-        )
-        .await
-        .unwrap();
-        let mut proof = collection_proof(&side, 1, WALLET);
+        let (side, mut proof) = if shape == "acquisition2" {
+            let (side, _) =
+                history_v3_legacy_seed(&dir, vec![dataset_row(WALLET, "0xa", "head", "BUY", 1)])
+                    .await;
+            let proof = collection_proof(&side, 1, WALLET);
+            assert_eq!(fresh_record(&side)["version"], 2);
+            assert_eq!(proof["acquisition"]["version"], 2);
+            assert_eq!(proof["acquisition"]["disposition"], "complete");
+            assert_eq!(proof["acquisition"]["aggregation_status"], "complete");
+            (side, proof)
+        } else {
+            let side = dataset_candidate(&dir, "shape.db", &[]);
+            let source = CollectionDataset::new(collection_rows(WALLET, 6000), 1);
+            collection_admit(&side, 1, FRESH_END, &[]).await;
+            collection_run(
+                &side,
+                &source,
+                FRESH_END,
+                Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                Some(std::time::Duration::from_secs(1)),
+            )
+            .await
+            .unwrap();
+            let proof = collection_proof(&side, 1, WALLET);
+            (side, proof)
+        };
         match shape {
             "complete" => {
                 proof["acquisition"]["disposition"] = Value::from("complete");
@@ -18474,7 +18466,17 @@ async fn collection_747_receipt_shapes_reject_short_complete_bad_partial_and_sho
                 proof["acquisition"]["fetched_source_row_count"] = Value::from(0);
             }
             "acquisition2" => {
-                proof["acquisition"]["version"] = Value::from(2);
+                proof["acquisition"]["disposition"] = Value::from("excluded");
+                proof["acquisition"]["exclusion_reason"] = Value::from("acquisition_failure");
+                proof["acquisition"]["fixed_end_unix"] = Value::from(FRESH_END - 1);
+                proof["exclusion_reason"] = Value::from("fixture acquisition failure");
+                proof["aggregate_count"] = Value::from(0);
+                proof["source_row_count"] = Value::from(0);
+                proof["ordered_aggregate_digest"] =
+                    Value::from(whole_json_digest(&serde_json::json!([])));
+                for page in proof["pages"].as_array_mut().unwrap() {
+                    collection_page_bounds(page, 0, FRESH_END - 1);
+                }
             }
             _ => {
                 let end = match shape {

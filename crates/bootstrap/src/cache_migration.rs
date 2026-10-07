@@ -19,14 +19,17 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use futures::{StreamExt as _, stream};
+#[cfg(feature = "scenario")]
+use pe_core_types::Side;
 use pe_core_types::{
     CollateralAmount, MarketId, MarketOutcomeId, OutcomeId, ReconstructionQuality, ShareAmount,
-    Side, SourceTimestamp, VenueMarketId, WalletAddress,
+    SourceTimestamp, VenueMarketId, WalletAddress,
 };
 use pe_position_ledger::{
-    EntryClassification, LedgerEffect, LedgerError, LedgerMutation, PositionLedger, SecondVerdict,
-    classify_complete_historical_second,
+    EntryClassification, LedgerEffect, LedgerError, LedgerMutation, PositionLedger,
 };
+#[cfg(feature = "scenario")]
+use pe_position_ledger::{SecondVerdict, classify_complete_historical_second};
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
     ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ActivityAggregate, ActivitySemanticRevision,
@@ -2204,11 +2207,7 @@ async fn collect_activity_v2(
                     wallet,
                     start_exclusive,
                     fixed_end_unix,
-                    if proof_ref.is_some_and(|proof| proof.identity.version == 4) {
-                        pe_source_polymarket_public::activity::ActivityRowAcceptance::Acquisition3
-                    } else {
-                        pe_source_polymarket_public::activity::ActivityRowAcceptance::Strict
-                    },
+                    pe_source_polymarket_public::activity::ActivityRowAcceptance::Strict,
                 );
                 let outcome = match deadline {
                     Some(deadline) => tokio::time::timeout_at(deadline, read).await,
@@ -2519,15 +2518,13 @@ pub async fn collect_activity_v2_for_test(
     base_url: &str,
     completed_at_unix: i64,
 ) -> Result<ActivityCoverageManifestV2, BootstrapError> {
-    let identity = activity_identity(&connection)?;
-    collect_activity_v2(
+    collect_activity_v2_with_limits_for_test(
         connection,
         fetcher,
         base_url,
-        &identity,
-        FULL_HISTORY_START_EXCLUSIVE,
         completed_at_unix,
-        None.into(),
+        Arc::new(AtomicU64::new(0)),
+        None,
     )
     .await
 }
@@ -4063,6 +4060,7 @@ type PayoutTokens = BTreeMap<String, (Vec<String>, String, bool)>;
 
 // Aggregates retain the loader's (source_time_unix, source_trade_id) order.
 // Borrow contiguous seconds so classification uses the validated vector itself.
+#[cfg(feature = "scenario")]
 fn classify_loaded_wallet(
     wallet_hex: &str,
     aggregates: &[ActivityAggregate],
