@@ -1770,6 +1770,14 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
 
     async fn apply_control_message(&mut self, message: OrchestratorControl) {
         match message {
+            OrchestratorControl::RetentionCommit {
+                request,
+                acknowledged,
+            } => {
+                let result = crate::source_checkpoint::retention::commit(*request)
+                    .map_err(|error| format!("{error:#}"));
+                let _ = acknowledged.send(result);
+            }
             OrchestratorControl::ActivityFrameDecision { receipt } => {
                 if let Err(error) = self.apply_activity_frame(receipt).await {
                     self.pending_load_failure = Some(error);

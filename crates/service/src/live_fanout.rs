@@ -229,42 +229,7 @@ fn source_envelopes_for_live_events(
     source_receipts: &SourceReceiptIndex,
     events: &[LiveJournalEvent],
 ) -> Result<Vec<EventEnvelope>, ProjectionReducerError> {
-    let mut receipts = Vec::new();
-    for event in events {
-        match &event.payload {
-            LiveJournalPayload::AdmissionEvaluated(admission) => {
-                receipts.extend([
-                    admission.economic.admission.receipts.gamma,
-                    admission.economic.admission.receipts.clob_long,
-                    admission.economic.admission.receipts.clob_compact,
-                    admission.economic.book_receipt,
-                ]);
-                receipts.extend(admission.economic.risk.price_receipts.iter().copied());
-                if let Some(observation) = &admission.economic.observation {
-                    receipts.extend([
-                        observation.source_receipt,
-                        observation.complete_bound_receipt,
-                    ]);
-                }
-            }
-            LiveJournalPayload::ResolutionFinalized(resolution) => {
-                receipts.push(resolution.source_append_receipt);
-            }
-            LiveJournalPayload::RedemptionCustodyReconciled(custody) => {
-                receipts.extend(custody.venue_position_receipts.iter().copied());
-            }
-            LiveJournalPayload::AccountPortfolioMarked(mark) => {
-                receipts.extend(
-                    mark.venue_position_evidence
-                        .pages
-                        .iter()
-                        .map(|page| page.receipt),
-                );
-                receipts.extend(mark.prices.iter().map(|price| price.receipt));
-            }
-            _ => {}
-        }
-    }
+    let mut receipts = crate::decision_replay::live_source_receipts(events).collect::<Vec<_>>();
     receipts.sort_by_key(|receipt| receipt.sequence);
     if receipts
         .windows(2)

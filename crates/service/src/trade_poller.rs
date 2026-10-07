@@ -509,6 +509,12 @@ impl ActivityCandidates {
         }
         self.binding_commitments = commitments;
         self.recorded_bindings = recorded;
+        let remaining_sequences = remaining
+            .iter()
+            .map(|(sequence, _)| *sequence)
+            .collect::<HashSet<_>>();
+        self.routed_frames
+            .retain(|sequence| remaining_sequences.contains(sequence));
         self.by_wallet = obligations.by_wallet;
         self.frame_candidates = obligations.frame_candidates;
         self.frame_candidates

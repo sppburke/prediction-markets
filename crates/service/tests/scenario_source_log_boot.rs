@@ -2446,7 +2446,8 @@ fn checkpoint_corrupt_receipt_quarantines_both_rebuilds_and_boots_cleanly() {
             pe_service::source_checkpoint::read_authority(&paths.source_log).unwrap(),
             Authority::Readable(InvalidationRecord {
                 generation: 1,
-                active: true
+                active: true,
+                retention_fence: false
             })
         );
         assert!(pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap() > before);
@@ -2473,7 +2474,8 @@ fn checkpoint_corrupt_receipt_quarantines_both_rebuilds_and_boots_cleanly() {
             pe_service::source_checkpoint::read_authority(&paths.source_log).unwrap(),
             Authority::Readable(InvalidationRecord {
                 generation: 1,
-                active: false
+                active: false,
+                retention_fence: false
             })
         );
         assert_checkpoint_assisted_boot(&paths, &prepared);
@@ -2984,6 +2986,7 @@ fn write_checkpoint_record(source_log: &Path, generation: u64, active: bool) {
         serde_json::to_vec(&pe_service::source_checkpoint::InvalidationRecord {
             generation,
             active,
+            retention_fence: false,
         })
         .unwrap(),
     )
@@ -3152,7 +3155,8 @@ fn wrong_prefix_checkpoint_repaired_by_preparation() {
             read_authority(&paths.source_log).unwrap(),
             Authority::Readable(InvalidationRecord {
                 generation: expected_generation,
-                active: false
+                active: false,
+                retention_fence: false
             }),
             "{case}"
         );
@@ -3217,10 +3221,12 @@ fn unusable_checkpoint_replaced_by_verified_candidate() {
 }
 
 /// PASS: a real preparation command paused after verification cannot publish over an interrupted
-/// invalidation. Its refusal preserves the undecodable quarantine, and the next boot full-walks.
+/// invalidation. Its refusal preserves the active record, and the next boot full-walks.
 #[tokio::test]
 async fn checkpoint_cli_publisher_refused_after_interrupted_invalidation() {
-    use pe_service::source_checkpoint::{Authority, InvalidationError, InvalidationHooks};
+    use pe_service::source_checkpoint::{
+        Authority, InvalidationError, InvalidationHooks, InvalidationRecord,
+    };
     use std::sync::atomic::Ordering;
     for inactive_record in [false, true] {
         let (dir, paths) = installed_fixture();
@@ -3249,19 +3255,23 @@ async fn checkpoint_cli_publisher_refused_after_interrupted_invalidation() {
         .await
         .unwrap();
         let hooks = InvalidationHooks::default();
-        hooks.fail_record_write.store(true, Ordering::SeqCst);
+        hooks.fail_quarantine_sync.store(true, Ordering::SeqCst);
         assert!(matches!(
             pe_service::source_checkpoint::invalidate_with_hooks(&paths.source_log, &hooks),
-            Err(InvalidationError::Io(_))
+            Err(InvalidationError::QuarantineFailed(_))
         ));
         std::fs::write(pause.with_extension("resume"), b"resume").unwrap();
         let output = publisher.await.unwrap();
         assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("UnreadableRecord"));
-        assert!(!pe_service::source_checkpoint::checkpoint_path(&paths.source_log).exists());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("GenerationChanged"));
+        assert!(pe_service::source_checkpoint::checkpoint_path(&paths.source_log).exists());
         assert_eq!(
             pe_service::source_checkpoint::read_authority(&paths.source_log).unwrap(),
-            Authority::Unreadable
+            Authority::Readable(InvalidationRecord {
+                generation: 1,
+                active: true,
+                retention_fence: false
+            })
         );
         let before = pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap();
         let opened = SourceLogBoot::open(&paths, false).unwrap().unwrap();
@@ -3269,13 +3279,17 @@ async fn checkpoint_cli_publisher_refused_after_interrupted_invalidation() {
         publish_owner_initial(opened.boot).unwrap();
         assert_eq!(
             pe_service::source_checkpoint::read_authority(&paths.source_log).unwrap(),
-            Authority::Unreadable
+            Authority::Readable(InvalidationRecord {
+                generation: 1,
+                active: false,
+                retention_fence: false
+            })
         );
     }
 }
 
-/// PASS: quiesced recovery removes the checkpoint before resetting the record even in the durable
-/// image preceding a failed quarantine sync; full verification and publication restore later boots.
+/// PASS: quiesced recovery installs an active record before removing checkpoint state even in
+/// the durable image preceding a failed directory sync; full verification and publication restore later boots.
 #[tokio::test]
 async fn checkpoint_failed_quarantine_sync_durable_image_recovers_with_full_walk() {
     use pe_service::source_checkpoint::{
@@ -3321,15 +3335,19 @@ async fn checkpoint_failed_quarantine_sync_durable_image_recovers_with_full_walk
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.starts_with("source checkpoint recovery checkpoint="));
-    assert_eq!(stdout.matches("removed=true").count(), 3);
+    assert_eq!(stdout.matches("removed=true").count(), 2);
     assert!(!sidecar.exists());
     assert!(!checkpoint_sidecar(&paths.source_log, ".receipts").exists());
-    assert!(!checkpoint_record_path(&paths.source_log).exists());
+    assert!(checkpoint_record_path(&paths.source_log).exists());
     assert_eq!(std::fs::read(&paths.fixed_main).unwrap(), before_db);
     assert_eq!(std::fs::read(&paths.source_log).unwrap(), before_log);
     assert_eq!(
         pe_service::source_checkpoint::read_authority(&paths.source_log).unwrap(),
-        Authority::Readable(InvalidationRecord::default())
+        Authority::Readable(InvalidationRecord {
+            generation: 4,
+            active: true,
+            retention_fence: false
+        })
     );
     let before = pe_event_log::scan_metrics::decoded_count(&paths.source_log).unwrap();
     let opened = SourceLogBoot::open(&paths, false).unwrap().unwrap();
@@ -3586,7 +3604,8 @@ async fn checkpoint_prefix_mismatch_invalidates_and_full_walks() {
         pe_service::source_checkpoint::Authority::Readable(
             pe_service::source_checkpoint::InvalidationRecord {
                 generation,
-                active: false
+                active: false,
+                retention_fence: false
             }
         )
     );
