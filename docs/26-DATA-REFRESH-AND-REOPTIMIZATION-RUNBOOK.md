@@ -144,8 +144,8 @@ and fix forward; never downgrade that cache in place.
 
 Keep one resumable operator record across cycles for wallets logged with `acquisition budget
 exhausted` or holding partial receipts, until their first successful finalize or a documented
-existing unreadable-row/aggregation exclusion. Run this read-only query against each cycle’s cache,
-replacing the tracked-wallet `VALUES` with the record’s wallet set. It reports receipt-proved source
+existing unreadable-row/aggregation exclusion. Run this read-only query against each cycle's cache,
+replacing the tracked-wallet `VALUES` with the record's wallet set. It reports receipt-proved source
 rows, separately from inserted-row changes; empty proved windows advance the frontier too.
 
 ```sql
@@ -183,7 +183,7 @@ Bind every observation to generation, stage PID and binary revision. Reuse the r
 [memory sampling procedure](#wallet-cache-tuning-measurement-and-rollback-606) every 30 seconds for
 `cache-populate-activity-v2` and `cache-finalize-v2`, including `VmHWM`; do not reuse its trade-row rules.
 Every tracked wallet must advance by a proved window each cycle. Collection `MemAvailable` must be
-at least 4,500,000,000 B; finalize’s last sampled `VmHWM` at most 10,552,823,808 B and minimum
+at least 4,500,000,000 B; finalize's last sampled `VmHWM` at most 10,552,823,808 B and minimum
 `MemAvailable` at least 5,517,873,152 B. These are sampled extrema and the finalize lines are a
 no-regression gate, not demonstrated margin. Record every failed observation, its cause and explicit
 resolution by later wallet advance/completion or existing exclusion, or a later passing measurement
@@ -899,7 +899,7 @@ pe-bootstrap cache-finalize-v2 --db "$SIDE"                # certify, checkpoint
 The collector validates predecessor records and certificates and derives the wallet union before
 sampling/freezing the settled end. New roots read full history; polled successors read
 `(previous_end,new_end]` for wallets with usable predecessor history; identity-4 acquisition
-failures resume from their receipt’s continuation frontier instead. A partial resumes incrementally;
+failures resume from their receipt's continuation frontier instead. A partial resumes incrementally;
 a no-progress read keeps its mode and start. New wallets, other previous exclusions and explicit
 repairs read full history. Generation numbers may have gaps; the frozen
 identity binds the predecessor. Acquisition 3 keeps otherwise valid rows missing a condition id or
@@ -950,7 +950,7 @@ Continuing acquisitions and full reads certified with at least 5,500 source rows
 The lookup places bounds only; descending terminal pages prove every kept window. A saturated
 one-second window remains fatal, and a looked-up window that is still full stops without keeping it. Missing condition/token
 alone follows acquisition 3's acceptance above. Every non-deferral failed acquisition with retained
-history verifies it in the exclusion transaction, in either read mode, except an explicit repair’s
+history verifies it in the exclusion transaction, in either read mode, except an explicit repair's
 replacement. A partial atomically commits proved rows and an excluded `acquisition_failure` receipt
 with complete aggregation and an acquired end strictly between its start and the generation end;
 zero-row partials are valid history parts. Excluded receipts keep zero outer counts, the empty digest,
@@ -981,8 +981,10 @@ windows; without a budget, transient exhaustion exits `rank_and_push_tempfail_ex
 errors stop the cycle.
 
 **Verified pass, spool and export.** Finalize visits every available wallet once (complete,
-non-excluded head receipt, even with zero fetched rows), verifies its effective history, classifies
-with `classify_scoped_historical_second`, and writes its new certificate and cumulative drops.
+non-excluded head receipt, even with zero fetched rows), verifies its effective history while
+classifying it with `classify_scoped_historical_second` in whole-second chunks of at most
+`projection_chunk_aggregates` (#747), and writes its new certificate and cumulative drops after the
+wallet's last chunk; a failed check or scan commits no certificate or spool.
 It reports ignored activity by type, drops by cause and neg-risk markets missing a group id.
 `ranker_entries_v2` stays empty. The [projection spool contract](_GLOSSARY.md#history-format-3-and-classifier-6-739)
 binds `<candidate>.projection-v3.jsonl` in `ranker_projection_inputs_json` with `oracle_version`,
@@ -1319,7 +1321,7 @@ For each cycle record stage durations, rows read/written and commitments, drops 
 peak RSS, spool/export/spill/WAL bytes and both drives' free space. Collection timing separates fetch
 completion, writer completion, blocked-producer time and final drain. Since #747,
 `producer_blocked_ms` is the summed time individual wallet futures wait to send to the writer,
-including overlapping waits; it is not comparable with earlier cycles’ wall-clock blocked time.
+including overlapping waits; it is not comparable with earlier cycles' wall-clock blocked time.
 Unfinished reads continue while other completions await a full queue. Report publication-to-publication
 cadence; report the first ordinary cycle separately. Forecasts are not measurements. A cycle exceeding
 the canonical freshness/cadence goal is reported to the owner the same day with options; closure needs

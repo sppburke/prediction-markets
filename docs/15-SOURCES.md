@@ -151,12 +151,11 @@ supports ASC/DESC ordering, bounded timestamps, `limit=1`, and offsets through 5
 The collection lookup is exactly
 `/activity?user=W&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&limit=1&offset=4999&sortDirection=ASC&start=lo+1&end=E`:
 `lo` is exclusive, so its wire start is `lo + 1`. Empty means read through `E`; otherwise its
-row’s second `b` places the descending window end at `b − 1`, or `b` when `b − 1 ≤ lo`.
+row's second `b` places the descending window end at `b − 1`, or `b` when `b − 1 ≤ lo`.
 Only the descending pages supply receipt evidence; the lookup has no completeness authority.
 
-Five separately captured live checks on 2026-10-07 (10:34 AM, 12:22 PM, 1:05 PM, 1:48 PM,
-2:07 PM CT) are in `/mnt/data/pm-evidence/giants-20261007/evidence/venue/` (`r3`, `r6`, `r7`,
-`r8`, `r9`). For wallet `0x7e531479cc3da5f014c891de002ca6fcdf94a456`, ASC offset 4,999/limit 1
+Five separately captured live checks on 2026-10-07 (10:34 AM, 12:22 PM, 1:05 PM, 1:48 PM and
+2:07 PM CT) agree. For wallet `0x7e531479cc3da5f014c891de002ca6fcdf94a456`, ASC offset 4,999/limit 1
 returned `b=1786327777`; DESC pages with wire `start=1`, `end=1786327776`, limit 500 and offsets
 0 through 4,500 returned nine full pages plus 499 rows: exactly 4,999. The final capture used
 `E=1791381404` and the same parameters (with explicit `sortBy=TIMESTAMP` on its boundary/pages);
