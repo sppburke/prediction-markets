@@ -12,7 +12,7 @@ mod support;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use pe_core_types::{CollateralAmount, ReceivedAt, SourceId, SourceTimestamp, WalletAddress};
 use pe_event_log::{
@@ -20,17 +20,14 @@ use pe_event_log::{
     Scanner, Writer,
 };
 use pe_paper_state::PaperStateDb;
-use pe_service::orchestrator_control::OrchestratorControl;
 use pe_service::paper_recovery::{
     PaperLog, PaperLogRecord, QualificationSealed, QualificationStarted, SealReason, TailBinding,
 };
 use pe_service::risk_inputs::SourceReceiptIndex;
 use pe_service::source_checkpoint::{
     CheckpointJobSlot, CheckpointOwnerHooks, RetentionContext, RetentionDatabaseInputs,
-    RetentionHooks, SourceCheckpointOwner, checkpoint_path, commit_for_scenario,
-    install_retention_fence, receipts_path,
+    RetentionHooks, SourceCheckpointOwner, checkpoint_path, install_retention_fence, receipts_path,
 };
-use tokio::sync::mpsc;
 
 const NOW: i64 = 1_800_000_000;
 const OLD: i64 = NOW - 8 * 24 * 3600;
@@ -121,7 +118,6 @@ struct Fixture {
     index: SourceReceiptIndex,
     state: Arc<PaperStateDb>,
     seeds: Arc<AtomicBool>,
-    installed_epoch: Arc<AtomicU64>,
     context: RetentionContext,
     control: tokio::task::JoinHandle<()>,
     feed: AppendReceipt,
@@ -215,25 +211,9 @@ impl Fixture {
             }
         }
         let seeds = Arc::new(AtomicBool::new(false));
-        let installed_epoch = Arc::new(AtomicU64::new(0));
-        let (tx, mut rx) = mpsc::channel(4);
-        let control = tokio::spawn(async move {
-            while let Some(message) = rx.recv().await {
-                let OrchestratorControl::RetentionCommit {
-                    request,
-                    acknowledged,
-                } = message
-                else {
-                    panic!("unexpected control");
-                };
-                let result = tokio::task::spawn_blocking(move || commit_for_scenario(*request))
-                    .await
-                    .unwrap();
-                let _ = acknowledged.send(result.map_err(|error| format!("{error:#}")));
-            }
-        });
+        let (_, _, tx, control) =
+            support::retention_controls(paper.as_ref().clone(), state.clone(), index.clone());
         let seed_flag = seeds.clone();
-        let epoch_flag = installed_epoch.clone();
         let context = RetentionContext {
             paper_state: state.clone(),
             paper_log: paper.clone(),
@@ -245,9 +225,6 @@ impl Fixture {
                     dispatch_seeds_exist: seed_flag.load(Ordering::Acquire),
                 })
             }),
-            install_boundary: Arc::new(move |authority| {
-                epoch_flag.store(authority.epoch, Ordering::Release);
-            }),
             hooks: Arc::new(RetentionHooks::default()),
         };
         Self {
@@ -257,7 +234,6 @@ impl Fixture {
             index,
             state,
             seeds,
-            installed_epoch,
             context,
             control,
             feed,
@@ -366,7 +342,7 @@ async fn retention_crashes_finish_committed_epoch_before_any_new_advance() {
         }
         let authority = RetentionAuthority::load(&fixture.path).unwrap().unwrap();
         assert_eq!(authority.epoch, 1);
-        assert_eq!(fixture.installed_epoch.load(Ordering::Acquire), 1);
+        assert_eq!(fixture.index.retention_epoch(), 1);
         assert_eq!(manifest(&fixture.path)["retention_epoch"], 1);
         assert_eq!(fs::read(&fixture.path).unwrap()[..4096], header);
         assert!(Scanner::verify(&fixture.path).is_ok());
@@ -476,8 +452,30 @@ async fn retention_visible_authority_switches_index_while_sync_retries_fail() {
     let mut owner = fixture.owner(CheckpointOwnerHooks::default());
     owner.initialize_for_scenario().await.unwrap();
     let original = fs::read(&fixture.path).unwrap();
+    let erased = fixture
+        .index
+        .receipt_at(pe_core_types::EventSeq(1))
+        .unwrap()
+        .unwrap()
+        .0;
+    let index = fixture.index.clone();
+    let (entered, paused) = std::sync::mpsc::channel();
+    let (release, resume) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        index.source_envelope_with_pause(erased, &mut || {
+            entered.send(()).unwrap();
+            resume.recv().unwrap();
+        })
+    });
+    paused.recv().unwrap();
     owner.retention_for_scenario().await.unwrap();
-    assert_eq!(fixture.installed_epoch.load(Ordering::Acquire), 1);
+    release.send(()).unwrap();
+    assert_eq!(
+        reader.join().unwrap().unwrap_err(),
+        pe_service::risk_inputs::RiskInputsUnavailable::Erased
+    );
+    assert_eq!(fs::read(&fixture.path).unwrap(), original);
+    assert_eq!(fixture.index.retention_epoch(), 1);
     let archive = fs::read(pe_event_log::feed_path(&fixture.path, 1)).unwrap();
     for _ in 0..2 {
         owner.retention_for_scenario().await.unwrap();
@@ -491,6 +489,38 @@ async fn retention_visible_authority_switches_index_while_sync_retries_fail() {
         fs::read(pe_event_log::feed_path(&fixture.path, 1)).unwrap(),
         archive
     );
+}
+
+#[test]
+fn retention_database_inputs_include_all_identity_generations_and_finalized_seeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("paper.db");
+    let state = PaperStateDb::open(&path).unwrap();
+    let sql = rusqlite::Connection::open(&path).unwrap();
+    for (generation, sequence) in [("previous", 1), ("current", 2)] {
+        sql.execute(
+            "INSERT INTO asset_identities VALUES (?1, '123', 'condition', 0, ?2, 'hash')",
+            rusqlite::params![generation, sequence],
+        )
+        .unwrap();
+    }
+    let inputs = RetentionDatabaseInputs::read(&state).unwrap();
+    assert_eq!(
+        inputs.identity_sequences,
+        vec![pe_core_types::EventSeq(1), pe_core_types::EventSeq(2)]
+    );
+    assert!(!inputs.dispatch_seeds_exist);
+    sql.execute(
+        "INSERT INTO dispatch_seeds VALUES ('dispatch', 'ready', '{}', NULL, 'trade', 1, 2)",
+        [],
+    )
+    .unwrap();
+    assert!(
+        RetentionDatabaseInputs::read(&state)
+            .unwrap()
+            .dispatch_seeds_exist
+    );
+    drop(state);
 }
 
 #[tokio::test]
@@ -579,7 +609,7 @@ async fn retention_authority_before_rename_leaves_epoch_and_index_unchanged() {
     let original = fs::read(&fixture.path).unwrap();
     owner.retention_for_scenario().await.unwrap();
     assert!(RetentionAuthority::load(&fixture.path).unwrap().is_none());
-    assert_eq!(fixture.installed_epoch.load(Ordering::Acquire), 0);
+    assert_eq!(fixture.index.retention_epoch(), 0);
     assert_eq!(fs::read(&fixture.path).unwrap(), original);
     assert_eq!(manifest(&fixture.path)["format_version"], 2);
 }
@@ -639,7 +669,7 @@ async fn retention_fault_before_index_switch_still_installs_visible_boundary() {
     let mut owner = fixture.owner(CheckpointOwnerHooks::default());
     owner.initialize_for_scenario().await.unwrap();
     owner.retention_for_scenario().await.unwrap();
-    assert_eq!(fixture.installed_epoch.load(Ordering::Acquire), 1);
+    assert_eq!(fixture.index.retention_epoch(), 1);
     assert_eq!(
         RetentionAuthority::load(&fixture.path)
             .unwrap()
@@ -676,7 +706,7 @@ async fn retention_deferred_check_rejects_a_corrupt_non_reducer_pin() {
     bytes[usize::try_from(pin.offset + 20).unwrap()] ^= 1;
     fs::write(&fixture.path, bytes).unwrap();
     let error = owner.initialize_for_scenario().await.unwrap_err();
-    assert!(error.message.contains("CRC"), "{error:?}");
+    assert!(error.message.contains("retained pin"), "{error:?}");
     assert!(!checkpoint_path(&fixture.path).exists());
     assert_eq!(fs::read(receipts_path(&fixture.path)).unwrap(), prefix);
     assert!(

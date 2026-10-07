@@ -1194,6 +1194,19 @@ impl PaperStateDb {
             .map_err(PaperStateError::from)
     }
 
+    /// Distinct source-log sequences that recorded asset identities, ascending; the daily source
+    /// retention keeps those frames readable.
+    pub fn asset_identity_source_sequences(&self) -> Result<Vec<i64>, PaperStateError> {
+        let conn = self.lock();
+        let mut statement = conn.prepare(
+            "SELECT DISTINCT source_log_sequence FROM asset_identities ORDER BY source_log_sequence",
+        )?;
+        statement
+            .query_map([], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(PaperStateError::from)
+    }
+
     /// Point lookup of a condition's monotonic rejection, independent of its token rows.
     pub fn asset_identity_condition_rejection(
         &self,
@@ -3868,6 +3881,15 @@ impl PaperStateDb {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    /// Whether any dispatch seed exists; the daily source retention pauses while one does.
+    pub fn dispatch_seeds_exist(&self) -> Result<bool, PaperStateError> {
+        self.lock()
+            .query_row("SELECT EXISTS(SELECT 1 FROM dispatch_seeds)", [], |row| {
+                row.get(0)
+            })
+            .map_err(PaperStateError::from)
     }
 
     /// Every `pending_paper` seed, oldest first (boot stuck-seed finalization input).

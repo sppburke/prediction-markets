@@ -338,6 +338,13 @@ impl QualificationReport {
 pub async fn run_qualify(
     options: &QualifyOptions,
 ) -> Result<(QualificationVerdict, String), QualificationError> {
+    run_qualify_with_verifier(options, verify_qualification(options)).await
+}
+
+async fn run_qualify_with_verifier(
+    options: &QualifyOptions,
+    verifier: impl std::future::Future<Output = Result<QualificationReport, QualificationError>>,
+) -> Result<(QualificationVerdict, String), QualificationError> {
     require_complete_source_prefix(&options.source_log)?;
     // A former current-generation Start cannot publish another report after the paper cutover,
     // even when a later paper-log frame is unreadable.
@@ -346,8 +353,11 @@ pub async fn run_qualify(
     {
         return insufficient("QualificationStarted predates the current paper financial semantic");
     }
-    let report = match verify_qualification(options).await {
+    let report = match verifier.await {
         Ok(report) => report,
+        Err(error @ QualificationError::EventLog(pe_event_log::LogError::Retired { .. })) => {
+            return Err(error);
+        }
         Err(error) => QualificationReport::insufficient(&options.seal_hash, error.to_string()),
     };
     let mut bytes = serde_json::to_vec(&report)?;
@@ -1555,6 +1565,7 @@ fn sealed_source_envelopes(
     path: &Path,
     prefix: &TailBinding,
 ) -> Result<Vec<EventEnvelope>, QualificationError> {
+    require_complete_source_prefix(path)?;
     let Some(last_sequence) = prefix.last_sequence else {
         return Ok(Vec::new());
     };
@@ -1567,6 +1578,7 @@ fn sealed_source_envelopes(
         }
         envelopes.push(envelope);
     }
+    require_complete_source_prefix(path)?;
     if envelopes
         .last()
         .is_none_or(|envelope| envelope.seq != last_sequence || envelope.this_hash != expected_hash)
@@ -2018,7 +2030,17 @@ fn tail_hash(binding: &TailBinding) -> Result<blake3::Hash, QualificationError> 
 }
 
 fn verify_recorded_prefix(path: &Path, recorded: &TailBinding) -> Result<(), QualificationError> {
-    let current = Scanner::verify(path)?;
+    verify_recorded_prefix_with_capture(path, recorded, |path| Scanner::verify(path))
+}
+
+fn verify_recorded_prefix_with_capture(
+    path: &Path,
+    recorded: &TailBinding,
+    capture: impl FnOnce(&Path) -> Result<LogTailBinding, pe_event_log::LogError>,
+) -> Result<(), QualificationError> {
+    require_complete_source_prefix(path)?;
+    let current = capture(path)?;
+    require_complete_source_prefix(path)?;
     let expected = LogTailBinding {
         path: current.path,
         physical_tail: recorded.physical_tail,
@@ -2026,6 +2048,7 @@ fn verify_recorded_prefix(path: &Path, recorded: &TailBinding) -> Result<(), Qua
         last_hash: tail_hash(recorded)?,
     };
     Scanner::verify_prefix(&expected)?;
+    require_complete_source_prefix(path)?;
     Ok(())
 }
 
@@ -6417,6 +6440,61 @@ mod tests {
             Err(QualificationError::InsufficientEvidence(reason))
                 if reason.contains("changes its Start boundary")
         ));
+    }
+
+    #[tokio::test]
+    async fn qualification_retired_inside_verifier_keeps_existing_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.log");
+        let mut writer = Writer::open(&source).unwrap();
+        for _ in 0..2 {
+            writer
+                .append_synced(start_envelope(&started("fixture"), 100).unwrap())
+                .unwrap();
+        }
+        let tail = writer.verified_tail().unwrap();
+        drop(writer);
+        let frames = Reader::replay_with_offsets(&source)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        let options = QualifyOptions {
+            paper_log: dir.path().join("paper.log"),
+            source_log: source.clone(),
+            live_journal: None,
+            paper_state: dir.path().join("paper.db"),
+            seal_hash: "fixture".to_owned(),
+            output: dir.path().join("report.json"),
+        };
+        fs::write(&options.output, b"existing report\n").unwrap();
+        let error = run_qualify_with_verifier(&options, async {
+            verify_recorded_prefix_with_capture(&source, &TailBinding::from(&tail), |_| {
+                pe_event_log::RetentionAuthority {
+                    format_version: 1,
+                    epoch: 1,
+                    advanced_at: 100,
+                    boundary: pe_event_log::RetentionBoundary {
+                        sequence: frames[1].1,
+                        offset: frames[1].0,
+                    },
+                    chain_head: frames[0].2.this_hash,
+                    pins: Vec::new(),
+                    retained_tail: (&tail).into(),
+                    feed: Vec::new(),
+                }
+                .write(&source)
+                .unwrap();
+                Ok(tail.clone())
+            })?;
+            unreachable!()
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            QualificationError::EventLog(pe_event_log::LogError::Retired { .. })
+        ));
+        assert_eq!(fs::read(&options.output).unwrap(), b"existing report\n");
     }
 
     /// PASS: a diagnostic invocation without the live journal emits typed insufficient evidence

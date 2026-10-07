@@ -127,7 +127,7 @@ pub(crate) struct RebuiltSourceLog {
 }
 
 impl SourceLogRebuild {
-    fn new(path: &Path, financial_era: bool) -> Result<Self> {
+    pub(crate) fn new(path: &Path, financial_era: bool) -> Result<Self> {
         let mut staging = SourceReceiptIndex::staging(path)?;
         let mut reducers = Reducers::new(financial_era);
         if let Some(authority) = staging.retention().cloned() {
@@ -204,7 +204,7 @@ impl SourceLogRebuild {
         }
     }
 
-    fn observe(&mut self, offset: u64, envelope: &EventEnvelope) {
+    pub(crate) fn observe(&mut self, offset: u64, envelope: &EventEnvelope) {
         if self.index_error.is_none()
             && let Err(error) = self.staging.observe(offset, envelope)
         {
@@ -213,7 +213,7 @@ impl SourceLogRebuild {
         self.reducers.observe(envelope);
     }
 
-    fn complete(self, tail: &LogTailBinding) -> Result<RebuiltSourceLog> {
+    pub(crate) fn complete(self, tail: &LogTailBinding) -> Result<RebuiltSourceLog> {
         if let Some(error) = self.index_error {
             return Err(error.into());
         }
@@ -288,28 +288,6 @@ pub(crate) fn reopen_source_sink(path: &Path) -> Result<SourceEventSink> {
     Ok(sink)
 }
 
-fn retention_epoch(path: &Path) -> Result<u64> {
-    Ok(pe_event_log::RetentionAuthority::load(path)?.map_or(0, |authority| authority.epoch))
-}
-
-fn checkpoint_epoch_matches(path: &Path, epoch: u64, checksum: &[u8; 64]) -> bool {
-    #[derive(serde::Deserialize)]
-    struct Epoch {
-        #[serde(default)]
-        retention_epoch: u64,
-    }
-    std::fs::read(source_checkpoint::checkpoint_path(path))
-        .ok()
-        .and_then(|bytes| {
-            let body = bytes.get(source_checkpoint::CHECKPOINT_HEADER_LEN..)?;
-            if blake3::hash(body).to_hex().as_bytes() != checksum {
-                return None;
-            }
-            serde_json::from_slice::<Epoch>(body).ok()
-        })
-        .is_some_and(|header| header.retention_epoch == epoch)
-}
-
 /// The published boot projections of one installed source log.
 pub struct SourceLogBoot {
     receipt_index: SourceReceiptIndex,
@@ -364,16 +342,14 @@ impl SourceLogBoot {
         };
         let started = Instant::now();
         let loading_started = std::time::Instant::now();
-        let epoch = retention_epoch(&paths.source_log)?;
+        let epoch = source_checkpoint::retention_epoch(&paths.source_log)?;
         let authority = source_checkpoint::read_authority(&paths.source_log);
         let mut checkpoint = if authority
             .as_ref()
             .is_ok_and(|value| value.permits_checkpoint())
         {
             source_checkpoint::load_checkpoint(&paths.source_log, prefix.binding(), financial_era)?
-                .filter(|loaded| {
-                    checkpoint_epoch_matches(&paths.source_log, epoch, &loaded.checksum)
-                })
+                .filter(|loaded| loaded.retention_epoch == epoch)
         } else {
             None
         };
@@ -571,7 +547,7 @@ impl SourceLogBoot {
         loop {
             let activation = source_checkpoint::installed_activation(paper_path)?;
             let path = &activation.path;
-            let epoch = retention_epoch(path)?;
+            let epoch = source_checkpoint::retention_epoch(path)?;
             let attempt = (|| -> Result<Option<(PublicationReceipt, usize)>> {
                 // The authority belongs to the verification, not to its eventual publication.
                 let authority = source_checkpoint::read_authority(path)?;
@@ -588,7 +564,7 @@ impl SourceLogBoot {
                 }
                 let cached = if authority.permits_checkpoint() {
                     source_checkpoint::load_checkpoint(path, &activation, financial_era)?
-                        .filter(|loaded| checkpoint_epoch_matches(path, epoch, &loaded.checksum))
+                        .filter(|loaded| loaded.retention_epoch == epoch)
                 } else {
                     None
                 };
@@ -614,13 +590,14 @@ impl SourceLogBoot {
                         if digest.finalize().to_hex().as_str() == loaded.data.prefix_blake3 {
                             verified = Some((loaded, digest));
                         } else {
-                            if retention_epoch(path)? != epoch {
+                            if source_checkpoint::retention_epoch(path)? != epoch {
                                 return Ok(None);
                             }
                             match source_checkpoint::invalidate_if_current(
                                 path,
                                 generation
                                     .context("cached checkpoint requires readable authority")?,
+                                epoch,
                                 &loaded.checksum,
                             )? {
                                 ConditionalInvalidation::Invalidated(current) => {
@@ -702,20 +679,22 @@ impl SourceLogBoot {
                         "checkpoint preparation authority unreadable; quiesced recovery required",
                     )?,
                     capture_unix_ms,
+                    epoch,
                 )?;
                 info!(
                     manifest_bytes = candidate.bytes.len(),
                     "source checkpoint manifest serialized"
                 );
-                if retention_epoch(path)? != epoch {
+                if source_checkpoint::retention_epoch(path)? != epoch {
                     return Ok(None);
                 }
                 match source_checkpoint::publish(&candidate, 1)? {
                     PublishOutcome::Published(receipt) => Ok(Some((receipt, validated))),
+                    PublishOutcome::RetentionChanged { .. } => Ok(None),
                     outcome => anyhow::bail!("source checkpoint publication refused: {outcome:?}"),
                 }
             })();
-            if retention_epoch(path)? != epoch {
+            if source_checkpoint::retention_epoch(path)? != epoch {
                 continue;
             }
             if let Some(prepared) = attempt? {
@@ -728,6 +707,11 @@ impl SourceLogBoot {
     #[cfg(feature = "scenario")]
     pub fn set_scenario_hooks(&mut self, hooks: Arc<SourceLogBootHooks>) {
         self.hooks = Some(hooks);
+    }
+
+    #[cfg(feature = "scenario")]
+    pub fn checkpoint_assisted_for_scenario(&self) -> bool {
+        matches!(self.checkpoint.prefix, FrozenPrefix::Deferred { .. })
     }
 
     /// The verified receipt projection (shared, `Arc`-backed).

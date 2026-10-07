@@ -45,6 +45,8 @@ enum OwnerError {
     Projection(#[from] anyhow::Error),
     #[error("source checkpoint serialization: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("source checkpoint retained pin: {0}")]
+    RetainedPin(crate::risk_inputs::RiskInputsUnavailable),
     #[error("source checkpoint clock or scenario seam: {0}")]
     Io(#[from] std::io::Error),
     #[error("source checkpoint blocking job join: {0}")]
@@ -153,6 +155,8 @@ pub struct SourceCheckpointOwner {
     slot: CheckpointJobSlot,
     pending: Option<Arc<SerializedCandidate>>,
     paper_state: Option<Arc<pe_paper_state::PaperStateDb>>,
+    database_retention: Option<crate::database_retention::DatabaseRetention>,
+    obligation_wallets: Option<tokio::sync::watch::Receiver<HashSet<pe_core_types::WalletAddress>>>,
     attempt: u32,
     last_published_capture: Option<u64>,
     retention: Option<RetentionContext>,
@@ -178,16 +182,19 @@ impl SourceCheckpointOwner {
         receipts: SourceReceiptIndex,
         slot: CheckpointJobSlot,
     ) -> Self {
+        let retention_epoch = receipts.retention_epoch();
         Self {
             frozen: Some(frozen),
             receipts,
             slot,
             pending: None,
             paper_state: None,
+            database_retention: None,
+            obligation_wallets: None,
             attempt: 0,
             last_published_capture: None,
             retention: None,
-            retention_epoch: 0,
+            retention_epoch,
             finishing_retention: false,
             retention_walk_complete: false,
             retention_tail: None,
@@ -204,6 +211,17 @@ impl SourceCheckpointOwner {
         self
     }
 
+    #[must_use]
+    pub fn with_database_retention(
+        mut self,
+        retention: crate::database_retention::DatabaseRetention,
+        obligation_wallets: tokio::sync::watch::Receiver<HashSet<pe_core_types::WalletAddress>>,
+    ) -> Self {
+        self.database_retention = Some(retention);
+        self.obligation_wallets = Some(obligation_wallets);
+        self
+    }
+
     /// Construct the actual owner around recorded fixtures without installing migration metadata.
     #[cfg(feature = "scenario")]
     pub fn for_retention_scenario(
@@ -213,16 +231,7 @@ impl SourceCheckpointOwner {
         deferred: bool,
     ) -> anyhow::Result<Self> {
         let tail = receipts.current_tail_binding()?;
-        let authority = pe_event_log::RetentionAuthority::load(&tail.path)?;
-        let mut reducers = Reducers::new(true);
-        if let Some(authority) = &authority {
-            for pin in &authority.pins {
-                let (envelope, _) = authority.verify_pin(&tail.path, pin)?;
-                if pin.reducer {
-                    reducers.observe(&envelope);
-                }
-            }
-        }
+        let mut rebuild = crate::source_log_boot::SourceLogRebuild::new(&tail.path, true)?;
         let mut digest = blake3::Hasher::new();
         let actual = Scanner::walk_bounded(
             &tail.path,
@@ -230,10 +239,16 @@ impl SourceCheckpointOwner {
             &activation,
             None,
             &mut digest,
-            &mut |_, envelope| reducers.observe(envelope),
+            &mut |offset, envelope| rebuild.observe(offset, envelope),
         )?;
         require_binding(&tail, actual)?;
+        let rebuilt = rebuild.complete(&tail)?;
+        let mut reducers = rebuilt.reducers;
         reducers.take_error()?;
+        anyhow::ensure!(
+            rebuilt.index.retention_epoch() == receipts.retention_epoch(),
+            "scenario index retention epoch differs"
+        );
         let prefix = if deferred {
             FrozenPrefix::Deferred {
                 tail: tail.clone(),
@@ -257,7 +272,6 @@ impl SourceCheckpointOwner {
         ))
     }
 
-    /// Lane D supplies the receipt-index boundary installer and the database input owner.
     /// The service boot must already have installed the retention fence before listening.
     pub fn with_retention(mut self, context: RetentionContext) -> anyhow::Result<Self> {
         let path = &self.receipts.current_tail_binding()?.path;
@@ -265,6 +279,9 @@ impl SourceCheckpointOwner {
         self.retention_epoch = authority.as_ref().map_or(0, |authority| authority.epoch);
         self.finishing_retention = authority.is_some();
         self.paper_state = Some(context.paper_state.clone());
+        if let Some(frozen) = &self.frozen {
+            self.published_observation_wallets = retention::observation_wallets(frozen)?;
+        }
         self.retention = Some(context);
         Ok(self)
     }
@@ -390,7 +407,7 @@ impl SourceCheckpointOwner {
             let mut frozen = frozen;
             if matches!(frozen.prefix, FrozenPrefix::Deferred { .. }) {
                 let started = Instant::now();
-                let verified = verify_deferred(&frozen, &cancel,
+                let verified = verify_deferred(&frozen, &receipts, &cancel,
                     #[cfg(feature = "scenario")]
                     &hooks,
                 );
@@ -583,12 +600,17 @@ impl SourceCheckpointOwner {
         let mut result = self
             .retention_inner(&context, &mut punched, &mut skip, &mut database_boundary)
             .await;
+        let mut database_report = crate::database_retention::DatabaseRetentionReport::default();
         if !self.finishing_retention
             && let Some(boundary_current) = database_boundary
-            && let Err(error) =
-                self.database_retention(boundary_current, self.retention_walk_complete)
         {
-            result = Err(error);
+            match self
+                .database_retention(boundary_current, self.retention_walk_complete)
+                .await
+            {
+                Ok(report) => database_report = report,
+                Err(error) => result = Err(error),
+            }
         }
         if result.is_err() && skip.is_none() {
             skip = Some("retention_failed");
@@ -614,10 +636,11 @@ impl SourceCheckpointOwner {
                     .last()
                     .filter(|entry| entry.epoch == authority.epoch))
                 .map_or(0, |entry| entry.frame_count),
-            anchors_blanked = 0,
-            wallets_swapped_out = 0,
-            wallets_waiting = "database_retention_not_integrated",
-            database_lock_ms = 0,
+            anchors_blanked = database_report.anchors_blanked,
+            wallets_swapped_out = database_report.wallets_swapped_out,
+            wallets_waiting = ?database_report.wallets_waiting,
+            database_lock_ms = ?database_report.transaction_lock_times.iter().map(|time| time.as_millis()).collect::<Vec<_>>(),
+            cancelled = database_report.cancelled,
             skip_reason = skip,
             elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
             "source retention"
@@ -760,9 +783,8 @@ impl SourceCheckpointOwner {
                             &hooks,
                         )?;
                     }
-                    let authority = pe_event_log::RetentionAuthority::load(&tail.path)?;
                     let wallets =
-                        retention::verified_window(&mut frozen, authority.as_ref(), tail, &cancel)?;
+                        retention::verified_window(&mut frozen, &receipts, tail, &cancel)?;
                     let mut activity = frozen.reducers.activity.clone();
                     activity.prune(&paper_state, &receipts)?;
                     paper_state.sync_checkpoint_dispositions()?;
@@ -907,11 +929,14 @@ impl SourceCheckpointOwner {
         Ok(())
     }
 
-    fn database_retention(
+    async fn database_retention(
         &self,
         boundary_current: bool,
         walk_completed: bool,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<crate::database_retention::DatabaseRetentionReport> {
+        let Some(database) = &self.database_retention else {
+            return Ok(crate::database_retention::DatabaseRetentionReport::default());
+        };
         let path = self.receipts.current_tail_binding()?.path;
         let authority = pe_event_log::RetentionAuthority::load(&path)?;
         let reducer_pin_wallets = authority.as_ref().map_or_else(HashSet::new, |authority| {
@@ -922,11 +947,25 @@ impl SourceCheckpointOwner {
                 .filter_map(|pin| pin.wallet)
                 .collect()
         });
-        // LANE D INTEGRATION: run_database_retention(boundary_current, walk_completed,
-        // &self.window_wallets, &reducer_pin_wallets, &self.published_observation_wallets,
-        // &self.slot.cancelled). Steps 8–9 belong to the database retention owner.
-        let _ = (boundary_current, walk_completed, reducer_pin_wallets);
-        Ok(())
+        let obligation_wallets = self
+            .obligation_wallets
+            .as_ref()
+            .map(|wallets| wallets.borrow().clone())
+            .unwrap_or_default();
+        Ok(crate::database_retention::run_database_retention(
+            database,
+            crate::database_retention::DatabaseRetentionInputs {
+                now_unix: i64::try_from(self.unix_ms()? / 1000)?,
+                committed_boundary_current: boundary_current,
+                verified_walk_complete: walk_completed,
+                walk_wallets: &self.window_wallets,
+                reducer_pin_wallets: &reducer_pin_wallets,
+                published_observation_wallets: &self.published_observation_wallets,
+                obligation_wallets: &obligation_wallets,
+            },
+            &self.slot.cancelled,
+        )
+        .await?)
     }
 }
 
@@ -942,6 +981,7 @@ fn require_binding(expected: &LogTailBinding, actual: LogTailBinding) -> Result<
 
 fn verify_deferred(
     frozen: &FrozenCheckpoint,
+    receipts: &SourceReceiptIndex,
     cancel: &AtomicBool,
     #[cfg(feature = "scenario")] hooks: &CheckpointOwnerHooks,
 ) -> Result<blake3::Hasher, OwnerError> {
@@ -956,16 +996,15 @@ fn verify_deferred(
     if let Some(hook) = &hooks.before_hash {
         hook()?;
     }
-    if let Some(authority) = pe_event_log::RetentionAuthority::load(&tail.path)
-        .map_err(|error| OwnerError::Io(std::io::Error::other(error)))?
-    {
-        for pin in &authority.pins {
-            if cancel.load(Ordering::Acquire) {
-                return Err(OwnerError::Cancelled);
-            }
-            authority.verify_pin(&tail.path, pin)?;
-        }
+    if cancel.load(Ordering::Acquire) {
+        return Err(OwnerError::Cancelled);
     }
+    receipts
+        .verify_retention_pins_cancellable(Some(cancel))
+        .map_err(|error| match error {
+            crate::risk_inputs::RiskInputsUnavailable::Cancelled => OwnerError::Cancelled,
+            error => OwnerError::RetainedPin(error),
+        })?;
     let mut digest =
         Scanner::hash_prefix_cancellable(&tail.path, tail.physical_tail, Some(cancel))?;
     let actual = digest.finalize().to_hex().to_string();
@@ -1045,7 +1084,7 @@ fn candidate(
         })
         .ok_or_else(|| anyhow::anyhow!("checkpoint receipt count overflow"))?;
     let start = super::capture_start(&frozen.activation, frozen.financial_era, count);
-    Ok(Some(super::serialize_for_epoch(
+    Ok(Some(super::serialize(
         CheckpointData {
             format_version: 2,
             generation,

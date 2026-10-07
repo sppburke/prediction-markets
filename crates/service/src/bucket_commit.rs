@@ -2393,7 +2393,8 @@ pub(crate) fn verified_commitment_bindings(
 ) -> Result<VerifiedCommitment, CompleteActivityReadError> {
     #[cfg(feature = "scenario")]
     source_receipts.record_read_verification(receipt);
-    let read = verified_commitment_bindings_at_depth(
+    let epoch = source_receipts.retention_epoch();
+    let mut read = verified_commitment_bindings_at_depth(
         receipt,
         &mut |receipt| {
             source_receipts
@@ -2404,12 +2405,14 @@ pub(crate) fn verified_commitment_bindings(
         0,
         Some(binding_filter),
     )?;
+    read.retention_epoch = Some(epoch);
     Ok(read)
 }
 
 /// An authenticated commitment: its bindings and the restamp pairs its complete read proves.
 #[derive(Debug)]
 pub struct VerifiedCommitment {
+    pub(crate) retention_epoch: Option<u64>,
     pub(crate) receipt: AppendReceipt,
     pub(crate) frontier: Option<crate::frame_admission::FeedHistoryFrontier>,
     pub(crate) bindings: Vec<ObservationBinding>,
@@ -2462,6 +2465,7 @@ pub fn verified_read_for_routing(
 ) -> Result<VerifiedCommitment, CompleteActivityReadError> {
     #[cfg(feature = "scenario")]
     index.record_read_verification(receipt);
+    let epoch = index.retention_epoch();
     let inputs = json!({"fixed_end": fixed_end, "pages": pages});
     let verifier = ActivityReadVerification {
         binding_filter: None,
@@ -2478,6 +2482,7 @@ pub fn verified_read_for_routing(
             .map(CompleteActivityPage::from)
     })?;
     let read = VerifiedCommitment {
+        retention_epoch: Some(epoch),
         receipt,
         frontier: Some(crate::frame_admission::FeedHistoryFrontier {
             version: 1,
@@ -2563,6 +2568,7 @@ fn verified_commitment_bindings_at_depth(
         .ok_or_else(|| complete_activity_read_error("v2 commitment bindings are absent"))?;
     if bindings.is_empty() && commitment.read_proof.is_none() {
         return Ok(VerifiedCommitment {
+            retention_epoch: None,
             receipt,
             frontier: None,
             bindings: Vec::new(),
@@ -2604,6 +2610,7 @@ fn verified_commitment_bindings_at_depth(
         .cloned()
         .collect::<Vec<_>>();
     Ok(VerifiedCommitment {
+        retention_epoch: None,
         receipt,
         frontier: Some(crate::frame_admission::FeedHistoryFrontier {
             version: 1,
@@ -3766,6 +3773,9 @@ impl BucketCommitEngine {
             .frame_source_index
             .as_ref()
             .ok_or_else(|| "frame source index absent".to_owned())?;
+        if read.is_some_and(|read| read.retention_epoch != Some(index.retention_epoch())) {
+            return Err("retention epoch changed before observation retirement".to_owned());
+        }
         let source = index
             .source_envelope(receipt)
             .map_err(|error| error.to_string())?;
@@ -3896,11 +3906,13 @@ impl BucketCommitEngine {
         index: &SourceReceiptIndex,
         read: Option<&VerifiedCommitment>,
     ) -> Result<(), String> {
-        if let Some(read) = read {
-            if read.frontier.as_ref() != Some(&frontier) {
-                return Err("frontier differs from authenticated read".to_owned());
-            }
-        } else {
+        let epoch = index.retention_epoch();
+        if let Some(read) = read
+            && read.frontier.as_ref() != Some(&frontier)
+        {
+            return Err("frontier differs from authenticated read".to_owned());
+        }
+        if read.is_none_or(|read| read.retention_epoch != Some(epoch)) {
             index
                 .verify_frame_frontier(&frontier)
                 .map_err(|error| error.to_string())?;
@@ -3938,7 +3950,9 @@ impl BucketCommitEngine {
                 return Err("frontier read skips the previous fixed end".to_owned());
             }
         }
-        index.remember_verified_frontier(&frontier);
+        index
+            .remember_verified_frontier(&frontier, epoch)
+            .map_err(|error| error.to_string())?;
         frontiers.insert(frontier.wallet, frontier);
         let mut hints = self.frontier_hints.clone();
         hints.extend(frontiers.clone());
@@ -4636,6 +4650,29 @@ impl BucketCommitEngine {
         frozen_basis: FrozenDecisionBasis,
         paper_freshness_policy: Option<PaperFreshnessPolicy>,
     ) -> Result<BucketCommitResult, BucketCommitError> {
+        let mut context = context.clone();
+        if let Some(read) = context.verified_read.as_ref() {
+            let index = self.frame_source_index.as_ref().ok_or_else(|| {
+                BucketCommitError::Invariant("authenticated read source index absent".to_owned())
+            })?;
+            if read.retention_epoch != Some(index.retention_epoch()) {
+                let epoch = index.retention_epoch();
+                let mut fresh =
+                    verified_commitment_bindings_with_lookup(read.receipt, &mut |receipt| {
+                        index
+                            .source_envelope(receipt)
+                            .map(CompleteActivityPage::from)
+                    })
+                    .map_err(|error| BucketCommitError::Invariant(error.to_string()))?;
+                if index.retention_epoch() != epoch {
+                    return Err(BucketCommitError::Invariant(
+                        "retention epoch changed during decision verification".to_owned(),
+                    ));
+                }
+                fresh.retention_epoch = Some(epoch);
+                context.verified_read = Some(std::sync::Arc::new(fresh));
+            }
+        }
         if let Some(read) = context.verified_read.as_ref()
             && (context.read_commitment
                 != Some(ActivityReadCommitmentReceipt::BindingsV2(read.receipt))
@@ -4650,7 +4687,6 @@ impl BucketCommitEngine {
         // Durable frame decisions own copies by wallet, transaction, asset and side,
         // including after terminalization and restart.
         let frame_decisions = self.frames_for_aggregates(&aggregates);
-        let mut context = context.clone();
         let mut frame_gate_ids = HashSet::new();
         for frame in frame_decisions {
             let facts = frame;
@@ -7400,6 +7436,139 @@ pub(crate) mod continuation_v3_tests {
             Some(ActivityReadCommitmentReceipt::BindingsV2(commitment)),
         );
         (continuation, aggregate, metadata_receipt)
+    }
+
+    #[test]
+    fn retention_epoch_reauthenticates_binding_dependencies_before_publication_and_decision() {
+        let mut fixture = binding_fixture("valid");
+        let path = fixture.dir.path().join("binding.log");
+        let mut writer = Writer::open(&path).unwrap();
+        let at = time::OffsetDateTime::from_unix_timestamp(101).unwrap();
+        writer
+            .append_synced(EnvelopeIn {
+                source_id: SourceId("suffix".to_owned()),
+                schema_version: 1,
+                parser_version: 1,
+                observed_at: SourceTimestamp(at),
+                received_at: ReceivedAt(at),
+                content_type: ContentType::Json,
+                payload: b"{}".to_vec(),
+            })
+            .unwrap();
+        drop(writer);
+        fixture.index = SourceReceiptIndex::replay(&path).unwrap();
+        let continuation = &fixture.continuation;
+        let pages: Vec<ReconciliationPageEvidence> =
+            serde_json::from_value(continuation.facts.decision_inputs["pages"].clone()).unwrap();
+        let read = std::sync::Arc::new(
+            verified_read_for_routing(
+                continuation.read_commitment.unwrap(),
+                continuation.facts.wallet,
+                100,
+                &continuation.page_occurrences,
+                &pages,
+                &fixture.index,
+            )
+            .unwrap(),
+        );
+        let frontier = read.frontier.as_ref().unwrap().clone();
+        fixture
+            .index
+            .remember_verified_frontier(&frontier, 0)
+            .unwrap();
+        fixture.index.verify_frame_frontier(&frontier).unwrap();
+        let state = binding_state(&fixture);
+        let before = state.decision_pending_history().unwrap();
+        let mut engine = BucketCommitEngine::load(state.clone(), PositionLedger::new())
+            .unwrap()
+            .with_source_receipt_index(fixture.index.clone());
+        let frames = Reader::replay_with_offsets(&path)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        let suffix = frames.last().unwrap();
+        let erased = continuation.observed_source_receipt.unwrap();
+        let tail = fixture.index.current_tail_binding().unwrap();
+        let authority = pe_event_log::RetentionAuthority {
+            format_version: 1,
+            epoch: 1,
+            advanced_at: 101,
+            boundary: pe_event_log::RetentionBoundary {
+                sequence: suffix.1,
+                offset: suffix.0,
+            },
+            chain_head: suffix.2.prev_hash,
+            pins: frames
+                .iter()
+                .filter(|(_, sequence, _)| *sequence < suffix.1 && *sequence != erased.sequence)
+                .map(|(offset, sequence, frame)| pe_event_log::RetentionPin {
+                    sequence: *sequence,
+                    offset: *offset,
+                    hash: frame.this_hash,
+                    predecessor_hash: frame.prev_hash,
+                    reducer: false,
+                    wallet: None,
+                })
+                .collect(),
+            retained_tail: (&tail).into(),
+            feed: Vec::new(),
+        };
+        authority.write(&path).unwrap();
+        fixture.index.install_retention(authority).unwrap();
+        assert!(
+            fixture
+                .index
+                .remember_verified_frontier(&frontier, 0)
+                .is_err()
+        );
+        assert!(
+            fixture
+                .index
+                .verify_frame_frontier(&frontier)
+                .unwrap_err()
+                .to_string()
+                .contains("erased")
+        );
+        assert!(
+            engine
+                .publish_frontier(frontier, &fixture.index, Some(&read))
+                .unwrap_err()
+                .contains("erased")
+        );
+        assert!(engine.verified_frontiers.is_empty());
+        let context = BucketDecisionContext {
+            verified_read: Some(read),
+            applied_configuration: continuation.facts.applied_configuration.clone(),
+            decision_inputs_json: continuation.facts.decision_inputs.to_string(),
+            page_occurrences: continuation.page_occurrences.clone(),
+            observed_source_receipts: HashMap::new(),
+            read_commitment: continuation
+                .read_commitment
+                .map(ActivityReadCommitmentReceipt::BindingsV2),
+            reconstruction_quality: continuation.facts.reconstruction_quality,
+            signal_config: SignalConfig::default(),
+            copy_eligible: true,
+            bracket_commit: false,
+            recorded_at_unix: 101,
+            observation_provenance: HashMap::new(),
+            no_copy_dispositions: HashMap::new(),
+            identity_overrides: HashMap::new(),
+            identity_unresolved: HashSet::new(),
+            restamp_twins: HashSet::new(),
+            history_status: None,
+        };
+        assert!(
+            engine
+                .commit(
+                    vec![fixture.aggregate.clone()],
+                    &context,
+                    continuation.facts.frozen_basis
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("erased")
+        );
+        assert_eq!(state.decision_pending_history().unwrap(), before);
     }
 
     /// PASS: raw stream/history/metadata evidence authenticates a correction and its oldest clock;

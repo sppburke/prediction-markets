@@ -74,6 +74,10 @@ pub(crate) fn apply_global_risk_halts(
 pub enum RiskInputsUnavailable {
     #[error("source frame has been erased by retention")]
     Erased,
+    #[error("source evidence verification cancelled")]
+    Cancelled,
+    #[error("source retention epoch changed during verification")]
+    RetentionChanged,
     #[error("financial snapshot sequence does not match the completed paper-log prefix")]
     SnapshotSequenceMismatch,
     #[error("the paper log has an unmatched FinancialPrepared record")]
@@ -917,13 +921,25 @@ struct SourceReceiptIndexState {
     retention: Option<Arc<RetentionAuthority>>,
     next_byte_offset: Option<u64>,
     verified_feed_frontiers:
-        HashMap<pe_core_types::WalletAddress, crate::frame_admission::FeedHistoryFrontier>,
+        HashMap<pe_core_types::WalletAddress, (u64, crate::frame_admission::FeedHistoryFrontier)>,
     #[cfg(feature = "scenario")]
     read_verifications: HashMap<(EventSeq, blake3::Hash), usize>,
     #[cfg(feature = "scenario")]
     frame_verifications: HashMap<(EventSeq, blake3::Hash), usize>,
     #[cfg(feature = "scenario")]
     binding_verification_categories: HashMap<(EventSeq, blake3::Hash), [usize; 3]>,
+}
+
+pub(crate) struct RetentionIndexInstall<'a> {
+    state: std::sync::RwLockWriteGuard<'a, SourceReceiptIndexState>,
+    authority: Arc<RetentionAuthority>,
+}
+
+impl RetentionIndexInstall<'_> {
+    pub(crate) fn install_retention(mut self) {
+        self.state.verified_feed_frontiers.clear();
+        self.state.retention = Some(self.authority);
+    }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1149,21 +1165,26 @@ impl SourceReceiptIndex {
     pub(crate) fn remember_verified_frontier(
         &self,
         frontier: &crate::frame_admission::FeedHistoryFrontier,
-    ) {
+        verified_epoch: u64,
+    ) -> Result<(), crate::frame_admission::FrameAdmissionError> {
         let mut state = self
             .state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Verification may finish after the commit cleared this cache.
-        if std::iter::once(frontier.commitment)
-            .chain(frontier.page_occurrences.iter().map(|page| page.receipt))
-            .any(|receipt| Self::require_retained(&state, receipt.sequence).is_err())
+        if state
+            .retention
+            .as_ref()
+            .map_or(0, |authority| authority.epoch)
+            != verified_epoch
         {
-            return;
+            return Err(crate::frame_admission::FrameAdmissionError::InvalidPrefix(
+                "retention epoch changed during frontier verification",
+            ));
         }
         state
             .verified_feed_frontiers
-            .insert(frontier.wallet, frontier.clone());
+            .insert(frontier.wallet, (verified_epoch, frontier.clone()));
+        Ok(())
     }
 
     pub(crate) fn forget_verified_frontier(&self, wallet: pe_core_types::WalletAddress) {
@@ -1178,24 +1199,33 @@ impl SourceReceiptIndex {
         &self,
         frontier: &crate::frame_admission::FeedHistoryFrontier,
     ) -> Result<(), crate::frame_admission::FrameAdmissionError> {
-        if self
-            .state
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .verified_feed_frontiers
-            .get(&frontier.wallet)
-            == Some(frontier)
-        {
-            return Ok(());
-        }
+        let epoch = {
+            let state = self
+                .state
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let epoch = state
+                .retention
+                .as_ref()
+                .map_or(0, |authority| authority.epoch);
+            if state
+                .verified_feed_frontiers
+                .get(&frontier.wallet)
+                .is_some_and(|(verified_epoch, cached)| {
+                    *verified_epoch == epoch && cached == frontier
+                })
+            {
+                return Ok(());
+            }
+            epoch
+        };
         #[cfg(feature = "scenario")]
         self.record_read_verification(frontier.commitment);
         frontier.verify(&mut |receipt| {
             self.source_envelope(receipt)
                 .map(crate::bucket_commit::CompleteActivityPage::from)
         })?;
-        self.remember_verified_frontier(frontier);
-        Ok(())
+        self.remember_verified_frontier(frontier, epoch)
     }
 
     pub(crate) fn canonical_path(&self) -> Option<&Path> {
@@ -1343,15 +1373,15 @@ impl SourceReceiptIndex {
         Ok(())
     }
 
-    /// Switch exact reads as soon as the committed authority becomes visible.
-    pub fn install_retention(
+    /// Validate while holding the index lock, before making the authority visible.
+    pub(crate) fn prepare_retention_install(
         &self,
         authority: RetentionAuthority,
-    ) -> Result<(), RiskInputsUnavailable> {
+    ) -> Result<RetentionIndexInstall<'_>, RiskInputsUnavailable> {
         authority
             .validate()
             .map_err(|_| RiskInputsUnavailable::PriceConflict)?;
-        let mut state = self
+        let state = self
             .state
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1383,8 +1413,19 @@ impl SourceReceiptIndex {
         {
             return Err(RiskInputsUnavailable::PriceConflict);
         }
-        state.verified_feed_frontiers.clear();
-        state.retention = Some(Arc::new(authority));
+        Ok(RetentionIndexInstall {
+            state,
+            authority: Arc::new(authority),
+        })
+    }
+
+    /// Switch exact reads as soon as the committed authority becomes visible.
+    pub fn install_retention(
+        &self,
+        authority: RetentionAuthority,
+    ) -> Result<(), RiskInputsUnavailable> {
+        self.prepare_retention_install(authority)?
+            .install_retention();
         Ok(())
     }
 
@@ -1400,19 +1441,33 @@ impl SourceReceiptIndex {
 
     /// Check every committed pin, including dependencies with no reducer owner.
     pub fn verify_retention_pins(&self) -> Result<(), RiskInputsUnavailable> {
+        self.verify_retention_pins_cancellable(None)
+    }
+
+    pub(crate) fn verify_retention_pins_cancellable(
+        &self,
+        cancel: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<(), RiskInputsUnavailable> {
         let retention = self
             .state
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .retention
             .clone();
+        let epoch = retention.as_ref().map_or(0, |authority| authority.epoch);
         if let Some(authority) = retention {
             for pin in &authority.pins {
+                if cancel.is_some_and(|cancel| cancel.load(std::sync::atomic::Ordering::Acquire)) {
+                    return Err(RiskInputsUnavailable::Cancelled);
+                }
                 self.source_envelope(AppendReceipt {
                     sequence: pin.sequence,
                     this_hash: pin.hash,
                 })?;
             }
+        }
+        if self.retention_epoch() != epoch {
+            return Err(RiskInputsUnavailable::RetentionChanged);
         }
         Ok(())
     }
@@ -3014,7 +3069,7 @@ mod tests {
                 }],
                 pages: Vec::new(),
             };
-            index.remember_verified_frontier(&frontier);
+            let _ = index.remember_verified_frontier(&frontier, 0);
             assert!(index.verify_frame_frontier(&frontier).is_ok());
             index
                 .install_retention(RetentionAuthority {
@@ -3036,7 +3091,7 @@ mod tests {
                 })
                 .unwrap();
             // A verification that started before the commit now attempts to cache its result.
-            index.remember_verified_frontier(&frontier);
+            let _ = index.remember_verified_frontier(&frontier, 0);
             assert!(
                 index
                     .state

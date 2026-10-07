@@ -5,12 +5,12 @@
 
 pub(crate) mod retention;
 mod runtime;
+#[cfg(feature = "scenario")]
+pub use retention::RetentionHooks;
 pub use retention::{
     RetentionCommitOutcome, RetentionCommitRequest, RetentionContext, RetentionDatabaseInputs,
     SOURCE_RETENTION_ADVANCE_SECS, SOURCE_RETENTION_BUFFER_SECS,
 };
-#[cfg(feature = "scenario")]
-pub use retention::{RetentionHooks, commit_for_scenario};
 pub use runtime::{
     CHECKPOINT_PUBLISH_SECS, CHECKPOINT_RETRY_SECS, CheckpointJobSlot, SourceCheckpointOwner,
 };
@@ -55,6 +55,7 @@ pub(crate) struct CheckpointData {
 /// The checksum identifies the exact artifact checked by a preparation, even when reducer maps
 /// serialize in different orders at the same tail.
 pub(crate) struct LoadedCheckpoint {
+    pub(crate) retention_epoch: u64,
     pub(crate) data: CheckpointData,
     pub(crate) checksum: [u8; 64],
     pub(crate) staging: SourceReceiptIndexStaging,
@@ -358,6 +359,7 @@ fn load_with_finalization(
     if header.reducer_version != 2 && header.reducer_version != ACTIVITY_REDUCER_VERSION {
         return Ok(None);
     }
+    let retention_epoch = header.retention_epoch;
     drop(header);
     let mut data: CheckpointData = match serde_json::from_slice(&bytes[CHECKPOINT_HEADER_LEN..]) {
         Ok(data) => data,
@@ -370,7 +372,7 @@ fn load_with_finalization(
         data.format_version = 2;
         data.generation = read_authority(path)?.generation().unwrap_or(0);
         data.receipt_count = Some(frames.len());
-        let converted = serialize_manifest(&data).map_err(io::Error::other)?;
+        let converted = serialize_manifest(&data, 0).map_err(io::Error::other)?;
         let conversion = write_receipts(path, 0, &frames, true, finalization)
             .and_then(|()| finalization.checkpoint_write(&checkpoint_path(path), &converted));
         if let Err(error) = conversion {
@@ -403,6 +405,7 @@ fn load_with_finalization(
         }
     };
     Ok(Some(LoadedCheckpoint {
+        retention_epoch,
         data,
         checksum,
         staging,
@@ -449,14 +452,6 @@ pub struct SerializedCandidate {
 }
 
 pub(crate) fn serialize(
-    data: CheckpointData,
-    authority_generation: u64,
-    capture_unix_ms: u64,
-) -> Result<SerializedCandidate, serde_json::Error> {
-    serialize_for_epoch(data, authority_generation, capture_unix_ms, 0)
-}
-
-pub(crate) fn serialize_for_epoch(
     mut data: CheckpointData,
     authority_generation: u64,
     capture_unix_ms: u64,
@@ -471,7 +466,7 @@ pub(crate) fn serialize_for_epoch(
     let receipt_count = data.receipt_count.unwrap_or(data.receipts.len());
     let receipt_start = receipt_count.saturating_sub(data.receipts.len());
     let receipts = std::mem::take(&mut data.receipts);
-    let encoded = serialize_manifest_for_epoch(&data, retention_epoch)?;
+    let encoded = serialize_manifest(&data, retention_epoch)?;
     Ok(SerializedCandidate {
         bytes: encoded,
         activation: data.activation,
@@ -488,11 +483,7 @@ pub(crate) fn serialize_for_epoch(
     })
 }
 
-fn serialize_manifest(data: &CheckpointData) -> Result<Vec<u8>, serde_json::Error> {
-    serialize_manifest_for_epoch(data, 0)
-}
-
-fn serialize_manifest_for_epoch(
+fn serialize_manifest(
     data: &CheckpointData,
     retention_epoch: u64,
 ) -> Result<Vec<u8>, serde_json::Error> {
@@ -941,16 +932,8 @@ pub(crate) enum ConditionalInvalidation {
     Changed,
 }
 
-/// A preparation may invalidate only the exact artifact and authority it hashed.
+/// A preparation may invalidate only the exact artifact, authority and retention epoch it hashed.
 pub(crate) fn invalidate_if_current(
-    source_log: &Path,
-    generation: u64,
-    checksum: &[u8; 64],
-) -> Result<ConditionalInvalidation, InvalidationError> {
-    invalidate_if_current_epoch(source_log, generation, 0, checksum)
-}
-
-pub(crate) fn invalidate_if_current_epoch(
     source_log: &Path,
     generation: u64,
     epoch: u64,
@@ -1219,7 +1202,7 @@ mod tests {
         }
 
         fn candidate(&self, tail: usize, version: u32, generation: u64) -> SerializedCandidate {
-            serialize(self.data(tail, version), generation, CAPTURE).unwrap()
+            serialize(self.data(tail, version), generation, CAPTURE, 0).unwrap()
         }
 
         fn stage(&self, candidate: &SerializedCandidate) {
@@ -1368,7 +1351,7 @@ mod tests {
         assert_eq!(start, 1);
         let mut data = fixture.data(2, 2);
         data.receipts = index.checkpoint_suffix(start, count, tail).unwrap();
-        let candidate = serialize(data, 0, CAPTURE).unwrap();
+        let candidate = serialize(data, 0, CAPTURE, 0).unwrap();
         assert_eq!(candidate.receipts.len(), 2);
         receipt(attempt(&candidate, &mut DurableFinalization).unwrap());
         let appended = std::fs::read(receipts_path(&fixture.path)).unwrap();
@@ -1400,7 +1383,7 @@ mod tests {
             .unwrap()
             .checkpoint_suffix(start, count, &data.tail)
             .unwrap();
-        serialize(data, 0, CAPTURE).unwrap()
+        serialize(data, 0, CAPTURE, 0).unwrap()
     }
 
     #[test]
@@ -1582,7 +1565,7 @@ mod tests {
         let loaded = load_checkpoint(&fixture.path, &fixture.activation, false)
             .unwrap()
             .unwrap();
-        let candidate = serialize(loaded.data, 4, CAPTURE).unwrap();
+        let candidate = serialize(loaded.data, 4, CAPTURE, 0).unwrap();
         assert!(candidate.receipts.is_empty());
         fixture.record(5, false);
         assert!(matches!(
@@ -1600,7 +1583,7 @@ mod tests {
         let loaded = load_checkpoint(&fixture.path, &fixture.activation, false)
             .unwrap()
             .unwrap();
-        let current_candidate = serialize(loaded.data, 5, CAPTURE).unwrap();
+        let current_candidate = serialize(loaded.data, 5, CAPTURE, 0).unwrap();
         receipt(attempt(&current_candidate, &mut seam).unwrap());
         assert_eq!(seam.checkpoint_writes, 2);
         assert_eq!(
@@ -1658,7 +1641,7 @@ mod tests {
                 .finalize()
                 .to_hex()
                 .to_string();
-        let candidate = serialize(data, 0, CAPTURE).unwrap();
+        let candidate = serialize(data, 0, CAPTURE, 0).unwrap();
         receipt(attempt(&candidate, &mut DurableFinalization).unwrap());
         assert_eq!(
             std::fs::metadata(receipts_path(&fixture.path))
@@ -1729,7 +1712,7 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
-            let candidate = serialize(data, 0, CAPTURE).unwrap();
+            let candidate = serialize(data, 0, CAPTURE, 0).unwrap();
             assert_eq!(
                 attempt(&candidate, &mut DurableFinalization).unwrap(),
                 PublishOutcome::Refused(if conflict == "prefix" {
@@ -1777,7 +1760,7 @@ mod tests {
                 "boundary" => data.daily_boundary = Some(DailyBoundaryCandidates::default()),
                 _ => {}
             }
-            let mut current = serialize(data, 0, CAPTURE).unwrap();
+            let mut current = serialize(data, 0, CAPTURE, 0).unwrap();
             if fault == "checksum" {
                 current.bytes[0] ^= 1;
             }
@@ -2003,7 +1986,7 @@ mod tests {
         different[0] ^= 1;
         for (generation, checksum) in [(1, checksum), (0, &different)] {
             assert!(matches!(
-                invalidate_if_current(&fixture.path, generation, checksum).unwrap(),
+                invalidate_if_current(&fixture.path, generation, 0, checksum).unwrap(),
                 ConditionalInvalidation::Changed
             ));
             assert_eq!(
@@ -2020,7 +2003,7 @@ mod tests {
             );
         }
         assert!(matches!(
-            invalidate_if_current(&fixture.path, 0, checksum).unwrap(),
+            invalidate_if_current(&fixture.path, 0, 0, checksum).unwrap(),
             ConditionalInvalidation::Invalidated(1)
         ));
         assert!(!checkpoint_path(&fixture.path).exists());
@@ -2056,7 +2039,12 @@ mod tests {
         );
         // The preparation CLI still reports its own precondition failures as ordinary I/O.
         assert!(matches!(
-            invalidate_if_current(&fixture.path, 0, candidate.bytes[..64].try_into().unwrap()),
+            invalidate_if_current(
+                &fixture.path,
+                0,
+                0,
+                candidate.bytes[..64].try_into().unwrap()
+            ),
             Err(InvalidationError::Io(_))
         ));
     }
@@ -2150,7 +2138,7 @@ mod tests {
         let fixture = Fixture::new();
         let mut data = fixture.data(1, 2);
         data.prefix_blake3 = blake3::hash(b"wrong").to_hex().to_string();
-        let wrong = serialize(data, 1, CAPTURE).unwrap();
+        let wrong = serialize(data, 1, CAPTURE, 0).unwrap();
         fixture.stage(&wrong);
         fixture.record(1, true);
         let candidate = fixture.candidate(1, 2, 1);
@@ -2216,7 +2204,12 @@ mod tests {
             Err(InvalidationError::QuarantineFailed(_))
         ));
         assert!(matches!(
-            invalidate_if_current(&fixture.path, 0, candidate.bytes[..64].try_into().unwrap()),
+            invalidate_if_current(
+                &fixture.path,
+                0,
+                0,
+                candidate.bytes[..64].try_into().unwrap()
+            ),
             Err(InvalidationError::Io(_))
         ));
         assert_eq!(
@@ -2266,7 +2259,7 @@ mod tests {
                 .finalize()
                 .to_hex()
                 .to_string();
-        let next = serialize_for_epoch(data, 0, CAPTURE, 1).unwrap();
+        let next = serialize(data, 0, CAPTURE, 1).unwrap();
         let prefix = std::fs::read(receipts_path(&fixture.path)).unwrap()[..80].to_vec();
         assert_ne!(old.prefix_blake3, next.prefix_blake3);
         receipt(attempt(&next, &mut DurableFinalization).unwrap());
@@ -2289,13 +2282,8 @@ mod tests {
                 }
             );
             assert!(matches!(
-                invalidate_if_current_epoch(
-                    &fixture.path,
-                    0,
-                    0,
-                    old.bytes[..64].try_into().unwrap()
-                )
-                .unwrap(),
+                invalidate_if_current(&fixture.path, 0, 0, old.bytes[..64].try_into().unwrap())
+                    .unwrap(),
                 ConditionalInvalidation::Changed
             ));
         }

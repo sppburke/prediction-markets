@@ -1177,3 +1177,64 @@ pub fn terminal_evidence(
         document_blake3,
     })
 }
+
+pub fn retention_controls(
+    paper: pe_service::paper_recovery::PaperLog,
+    state: Arc<pe_paper_state::PaperStateDb>,
+    index: pe_service::risk_inputs::SourceReceiptIndex,
+) -> (
+    pe_service::live_watchlist::LiveWatchlist,
+    pe_service::watchlist_admission::AdmissionPreparer,
+    mpsc::Sender<OrchestratorControl>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (tx, rx) = mpsc::channel(4);
+    let live = pe_service::live_watchlist::LiveWatchlist::new(pe_trader_index::Watchlist {
+        entries: Vec::new(),
+        snapshot_at: SourceTimestamp(time::OffsetDateTime::UNIX_EPOCH),
+        active_count: 0,
+        incubator_count: 0,
+    });
+    let preparer =
+        pe_service::watchlist_admission::AdmissionPreparer::new(tx.clone(), state.clone());
+    let orchestrator = pe_service::orchestrator::Orchestrator::new(
+        live.clone(),
+        pe_service::orchestrator::OrchestratorConfig {
+            bankroll: rust_decimal::Decimal::ZERO,
+            mode: pe_strategy_winner_follow::ExecutionMode::Paper,
+            signal_config: Default::default(),
+            max_resolution_horizon_secs: 0,
+            min_resolution_horizon_secs: 0,
+            max_fill_price: rust_decimal::Decimal::ZERO,
+            min_fill_price: rust_decimal::Decimal::ZERO,
+            price_impact_cap_bps: 100,
+            entry_gate_config: pe_service::entry_gate::CopyEntryGateConfig,
+            runtime_config: None,
+            live_accounts: None,
+            live_journal: None,
+            activity_ws_enabled: false,
+            copy_latency_budget_secs: 120,
+            watchlist_writer_lock: None,
+        },
+        pe_strategy_winner_follow::WinnerFollowStrategy::new(Default::default()),
+        paper.clone(),
+        state.clone(),
+        pe_service::paper_recovery::build_leader_ledger(&state).unwrap(),
+        pe_service::health::new_shared_health(false),
+        pe_service::mid_price_cache::MidPriceCache::with_fetcher(
+            pe_source_polymarket_public::FixtureFetcher::new(std::collections::HashMap::new()),
+            String::new(),
+        ),
+        rx,
+        None,
+        None,
+        None,
+        Arc::new(pe_service::clob_book::FixtureClobBookFetcher::new(
+            std::collections::HashMap::new(),
+        )),
+    )
+    .unwrap()
+    .with_source_receipt_index(index.clone());
+    let control = tokio::spawn(orchestrator.run(std::future::pending::<()>()));
+    (live, preparer, tx, control)
+}

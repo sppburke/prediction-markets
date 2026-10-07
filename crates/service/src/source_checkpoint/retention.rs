@@ -40,11 +40,24 @@ pub struct RetentionDatabaseInputs {
     pub dispatch_seeds_exist: bool,
 }
 
-type DatabaseInputs = Arc<dyn Fn() -> anyhow::Result<RetentionDatabaseInputs> + Send + Sync>;
-type InstallBoundary = Arc<dyn Fn(&RetentionAuthority) + Send + Sync>;
+impl RetentionDatabaseInputs {
+    pub fn read(paper_state: &PaperStateDb) -> anyhow::Result<Self> {
+        let identity_sequences = paper_state
+            .asset_identity_source_sequences()?
+            .into_iter()
+            .map(|sequence| u64::try_from(sequence).map(EventSeq))
+            .collect::<Result<Vec<_>, _>>()
+            .context("asset identity source sequence is negative")?;
+        Ok(Self {
+            identity_sequences,
+            dispatch_seeds_exist: paper_state.dispatch_seeds_exist()?,
+        })
+    }
+}
 
-/// Boot supplies the existing owners. Installing the boundary is an infallible index-lock update;
-/// it must revoke exact reads immediately, including when authority directory synchronization fails.
+type DatabaseInputs = Arc<dyn Fn() -> anyhow::Result<RetentionDatabaseInputs> + Send + Sync>;
+
+/// Boot supplies the existing paper and orchestrator owners.
 #[derive(Clone)]
 pub struct RetentionContext {
     pub paper_state: Arc<PaperStateDb>,
@@ -52,7 +65,6 @@ pub struct RetentionContext {
     pub live_journal_path: Option<PathBuf>,
     pub control: mpsc::Sender<OrchestratorControl>,
     pub database_inputs: DatabaseInputs,
-    pub install_boundary: InstallBoundary,
     #[cfg(feature = "scenario")]
     pub hooks: Arc<RetentionHooks>,
 }
@@ -745,6 +757,9 @@ pub(crate) fn commit(
         request.authority.boundary,
     )?;
     request.authority.pins = pins.into_values().collect();
+    let installer = request
+        .receipts
+        .prepare_retention_install(request.authority.clone())?;
     let result = {
         #[cfg(feature = "scenario")]
         if let Some(write) = &request.context.hooks.authority_write {
@@ -768,7 +783,7 @@ pub(crate) fn commit(
         .before_index_switch
         .as_ref()
         .map(|hook| hook());
-    (request.context.install_boundary)(&request.authority);
+    installer.install_retention();
     info!(
         epoch = request.authority.epoch,
         boundary_sequence = request.authority.boundary.sequence.0,
@@ -805,16 +820,11 @@ pub(crate) fn send_commit(
 /// Verify the complete bounded retained window and collect only this job's wallet witnesses.
 pub(crate) fn verified_window(
     frozen: &mut FrozenCheckpoint,
-    authority: Option<&RetentionAuthority>,
+    receipts: &SourceReceiptIndex,
     tail: LogTailBinding,
     cancel: &AtomicBool,
 ) -> anyhow::Result<HashSet<WalletAddress>> {
-    if let Some(authority) = authority {
-        for pin in &authority.pins {
-            cancelled(cancel)?;
-            authority.verify_pin(&tail.path, pin)?;
-        }
-    }
+    receipts.verify_retention_pins_cancellable(Some(cancel))?;
     let mut digest = blake3::Hasher::new();
     let mut wallets = HashSet::new();
     let mut observe_error = None;
@@ -924,12 +934,4 @@ fn punch_range(file: &File, start: u64, end: u64) -> anyhow::Result<u64> {
         end - start,
     )?;
     Ok(end - start)
-}
-
-/// Drive the same single-owner commit handler in deterministic control-channel fixtures.
-#[cfg(feature = "scenario")]
-pub fn commit_for_scenario(
-    request: RetentionCommitRequest,
-) -> anyhow::Result<RetentionCommitOutcome> {
-    commit(request)
 }

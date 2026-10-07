@@ -704,7 +704,7 @@ impl ReconciliationObligations {
         serde_json::Value::Array(rows)
     }
 
-    fn wallets(&self) -> impl Iterator<Item = WalletAddress> + '_ {
+    pub fn wallets(&self) -> impl Iterator<Item = WalletAddress> + '_ {
         self.by_wallet.keys().copied()
     }
 
@@ -995,6 +995,7 @@ pub struct TradePoller {
     refresh_cooldown: HashMap<WalletAddress, tokio::time::Instant>,
     now: Arc<dyn Fn() -> OffsetDateTime + Send + Sync>,
     source_receipts: Option<SourceReceiptIndex>,
+    obligation_wallets: Option<watch::Sender<HashSet<WalletAddress>>>,
     #[cfg(feature = "scenario")]
     crash_boundary: Option<Arc<Mutex<Option<ReconciliationCrashBoundary>>>>,
     #[cfg(feature = "scenario")]
@@ -1165,6 +1166,7 @@ impl TradePoller {
             refresh_cooldown: HashMap::new(),
             now: Arc::new(OffsetDateTime::now_utc),
             source_receipts: None,
+            obligation_wallets: None,
             #[cfg(feature = "scenario")]
             crash_boundary: None,
             #[cfg(feature = "scenario")]
@@ -1201,6 +1203,16 @@ impl TradePoller {
     #[must_use]
     pub fn with_source_receipt_index(mut self, index: SourceReceiptIndex) -> Self {
         self.source_receipts = Some(index);
+        self
+    }
+
+    #[must_use]
+    pub fn with_obligation_wallets(
+        mut self,
+        wallets: watch::Sender<HashSet<WalletAddress>>,
+    ) -> Self {
+        wallets.send_replace(self.obligations.wallets().collect());
+        self.obligation_wallets = Some(wallets);
         self
     }
 
@@ -1505,6 +1517,9 @@ impl TradePoller {
                         refresh_visit = Some((wallet, handoff, handle));
                     }
                 }
+            }
+            if let Some(wallets) = &self.obligation_wallets {
+                wallets.send_replace(self.obligations.wallets().collect());
             }
             if stopping && tasks.is_empty() {
                 break;
