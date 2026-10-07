@@ -3773,11 +3773,29 @@ impl BucketCommitEngine {
             .frame_source_index
             .as_ref()
             .ok_or_else(|| "frame source index absent".to_owned())?;
-        // A read verified before an advance is authenticated again under the current boundary
-        // (the orchestrator serializes both); an erased dependency still refuses.
+        let group_disposed = self
+            .paper_state
+            .activity_group_state(source_trade_id)
+            .map_err(|error| error.to_string())?
+            .is_some();
+        let source = match index.source_envelope(receipt) {
+            Ok(source) => source,
+            // An advance erases an observation once its exact group is durably disposed; that
+            // disposition already retires it.
+            Err(crate::risk_inputs::RiskInputsUnavailable::Erased) if group_disposed => {
+                self.retire_observation_barrier(receipt);
+                return Ok(ReconciliationAcknowledgement::Applied);
+            }
+            Err(error) => return Err(error.to_string()),
+        };
+        // The read only supplies a bound disposition when the exact group has none. One verified
+        // before an advance is authenticated again under the current boundary (the orchestrator
+        // serializes both); an erased dependency still refuses.
         let reauthenticated;
         let read = match read {
-            Some(stale) if stale.retention_epoch != Some(index.retention_epoch()) => {
+            Some(stale)
+                if !group_disposed && stale.retention_epoch != Some(index.retention_epoch()) =>
+            {
                 let mut fresh =
                     verified_commitment_bindings_with_lookup(stale.receipt, &mut |receipt| {
                         index
@@ -3791,9 +3809,6 @@ impl BucketCommitEngine {
             }
             read => read,
         };
-        let source = index
-            .source_envelope(receipt)
-            .map_err(|error| error.to_string())?;
         let observation =
             parse_activity_trade_observation(&source.payload).map_err(|error| error.to_string())?;
         let mut bound_disposition = false;
@@ -7590,7 +7605,11 @@ pub(crate) mod continuation_v3_tests {
     /// the read again under the new boundary; an erased read dependency still refuses.
     #[test]
     fn retention_epoch_reauthenticates_observation_retirement() {
-        for erase_page in [false, true] {
+        for case in [
+            "retained",
+            "erased_page",
+            "disposed_group_erased_observation",
+        ] {
             let mut fixture = binding_fixture("valid");
             let path = fixture.dir.path().join("binding.log");
             let mut writer = Writer::open(&path).unwrap();
@@ -7622,18 +7641,49 @@ pub(crate) mod continuation_v3_tests {
             )
             .unwrap();
             let state = binding_state(&fixture);
-            let mut engine = BucketCommitEngine::load(state, PositionLedger::new())
+            let mut engine = BucketCommitEngine::load(state.clone(), PositionLedger::new())
                 .unwrap()
                 .with_source_receipt_index(fixture.index.clone());
             let observed = continuation.observed_source_receipt.unwrap();
-            let group = parse_activity_trade_observation(
+            let observation = parse_activity_trade_observation(
                 &fixture.index.source_envelope(observed).unwrap().payload,
             )
-            .unwrap()
-            .group_id
-            .key()
-            .clone();
-            let erased = continuation.page_occurrences[0].receipt;
+            .unwrap();
+            let group = observation.group_id.key().clone();
+            let erased = match case {
+                "erased_page" => Some(continuation.page_occurrences[0].receipt),
+                "disposed_group_erased_observation" => Some(observed),
+                _ => None,
+            };
+            if case == "disposed_group_erased_observation" {
+                // The exact group is durably disposed before the advance erases its observation.
+                let epoch = observation.source_time.0.unix_timestamp();
+                state
+                    .commit_activity_bucket(&pe_paper_state::ActivityBucketCommit {
+                        wallet: observation.wallet,
+                        source_epoch: epoch,
+                        dispositions: vec![pe_paper_state::ActivityDispositionRecord {
+                            source_trade_id: group.clone(),
+                            transaction_hash: "0xdisposed".to_owned(),
+                            wallet: observation.wallet,
+                            source_epoch: epoch,
+                            semantic_revision: "fixture".to_owned(),
+                            activity_type: "TRADE".to_owned(),
+                            disposition: "ledger_only".to_owned(),
+                            proof_json: "{}".to_owned(),
+                            no_copy: None,
+                        }],
+                        leader_positions: Vec::new(),
+                        gate_results: Vec::new(),
+                        history_effects: Vec::new(),
+                        history_status: None,
+                        pending: Vec::new(),
+                        fence: None,
+                        reanchor: None,
+                        advance_cursor: false,
+                    })
+                    .unwrap();
+            }
             let frames = Reader::replay_with_offsets(&path)
                 .unwrap()
                 .map(Result::unwrap)
@@ -7652,7 +7702,8 @@ pub(crate) mod continuation_v3_tests {
                 pins: frames
                     .iter()
                     .filter(|(_, sequence, _)| {
-                        *sequence < suffix.1 && !(erase_page && *sequence == erased.sequence)
+                        *sequence < suffix.1
+                            && erased.is_none_or(|erased| *sequence != erased.sequence)
                     })
                     .map(|(offset, sequence, frame)| pe_event_log::RetentionPin {
                         sequence: *sequence,
@@ -7669,8 +7720,8 @@ pub(crate) mod continuation_v3_tests {
             authority.write(&path).unwrap();
             fixture.index.install_retention(authority).unwrap();
             let result = engine.retire_observation(observed, &group, false, Some(&read));
-            if erase_page {
-                assert!(result.unwrap_err().contains("erased"), "{erase_page}");
+            if case == "erased_page" {
+                assert!(result.unwrap_err().contains("erased"), "{case}");
             } else {
                 assert!(matches!(
                     result.unwrap(),

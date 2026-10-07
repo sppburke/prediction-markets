@@ -850,14 +850,16 @@ impl PaperStateDb {
     }
 
     /// Page through wallets with working state. Retained market history alone is not a candidate.
+    /// The page holds the shared connection like a transaction, so it reports the same lock time.
     pub fn retention_wallets(
         &self,
         after: Option<WalletAddress>,
         limit: usize,
-    ) -> Result<Vec<WalletAddress>, PaperStateError> {
+    ) -> Result<RetentionTransaction<Vec<WalletAddress>>, PaperStateError> {
         let limit =
             i64::try_from(limit).map_err(|error| PaperStateError::Internal(error.to_string()))?;
         let conn = self.lock();
+        let started = std::time::Instant::now();
         let mut stmt = conn.prepare(
             "SELECT wallet_hex FROM (
                 SELECT wallet_hex FROM activity_groups UNION
@@ -876,11 +878,16 @@ impl PaperStateDb {
             params![after.map(|wallet| wallet.to_string()), limit],
             |row| row.get::<_, String>(0),
         )?;
-        rows.map(|row| {
-            WalletAddress::from_hex(&row?)
-                .map_err(|error| PaperStateError::Corrupt(error.to_string()))
+        let result = rows
+            .map(|row| {
+                WalletAddress::from_hex(&row?)
+                    .map_err(|error| PaperStateError::Corrupt(error.to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(RetentionTransaction {
+            result,
+            lock_time: started.elapsed(),
         })
-        .collect()
     }
 
     /// Recheck recorded clocks, never revision or no-copy trade clocks.

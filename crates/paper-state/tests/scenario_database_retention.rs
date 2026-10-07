@@ -138,9 +138,12 @@ fn retention_deletes_all_trade_id_owners_and_preserves_history_and_other_wallet(
     db.publish_feed_history_frontiers(&serde_json::json!({"version":1,"frontiers":[
         {"wallet":wallet(1)}, {"wallet":wallet(2)}]}))
         .unwrap();
-    assert_eq!(db.retention_wallets(None, 1).unwrap(), vec![wallet(1)]);
     assert_eq!(
-        db.retention_wallets(Some(wallet(1)), 1).unwrap(),
+        db.retention_wallets(None, 1).unwrap().result,
+        vec![wallet(1)]
+    );
+    assert_eq!(
+        db.retention_wallets(Some(wallet(1)), 1).unwrap().result,
         vec![wallet(2)]
     );
     assert_eq!(db.retire_wallet(wallet(1), 100, None).unwrap().result, None);
@@ -168,7 +171,10 @@ fn retention_deletes_all_trade_id_owners_and_preserves_history_and_other_wallet(
         db.feed_history_frontiers().unwrap(),
         serde_json::json!({"version":1,"frontiers":[{"wallet":wallet(2)}]})
     );
-    assert_eq!(db.retention_wallets(None, 10).unwrap(), vec![wallet(2)]);
+    assert_eq!(
+        db.retention_wallets(None, 10).unwrap().result,
+        vec![wallet(2)]
+    );
     assert_eq!(db.retire_wallet(wallet(1), 100, None).unwrap().result, None);
 }
 

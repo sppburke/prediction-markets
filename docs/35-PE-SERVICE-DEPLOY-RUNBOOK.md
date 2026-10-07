@@ -957,11 +957,13 @@ Hash comparisons decide what remains, but never substitute for process clearance
    publication. Restore only this task's recorded Forge flag, enablement, and activity independently.
    The wrapper's later cutover finalization binds its targeted writes and does not replace this
    pre-capture finalization.
-2. **Ship** hash-qualified, with the reviewed census script (the VPS checkout does not carry
-   `scripts/`; record `sha256sum scripts/deploy/pe_service_census.sh` from the release checkout as
-   `<census-sha256>`):
+2. **Ship** hash-qualified, with the reviewed census script and ownership helper (the VPS checkout
+   does not carry `scripts/`; record `sha256sum scripts/deploy/pe_service_census.sh
+   scripts/deploy/generation_common.sh` from the release checkout as `<census-sha256>` and
+   `<common-sha256>`):
    `scp -i ~/.ssh/id_personal target/release/pe-service sean@82.22.32.225:/tmp/pe-service.new.<desired-sha12>`
    `scp -i ~/.ssh/id_personal scripts/deploy/pe_service_census.sh sean@82.22.32.225:/home/sean/pe-service-census.<desired-sha12>.sh`
+   `scp -i ~/.ssh/id_personal scripts/deploy/generation_common.sh sean@82.22.32.225:/home/sean/pe-generation-common.<desired-sha12>.sh`
 3. **Preflight and checkpoint preparation on the VPS** (lock first; the service keeps running):
 
    ```bash
@@ -971,7 +973,9 @@ Hash comparisons decide what remains, but never substitute for process clearance
    systemctl show pe-service -p MainPID -p InvocationID -p ExecMainStartTimestamp -p NRestarts -p ExecStart -p WorkingDirectory -p FragmentPath -p DropInPaths -p UnitFileState -p WantedBy -p Restart -p RestartUSec -p KillSignal
    pid=$(systemctl show pe-service -p MainPID --value)
    sha256sum target/release/pe-service "/proc/$pid/exe" /tmp/pe-service.new.<desired-sha12> .env smoke-test/service.toml
-   echo '<census-sha256>  /home/sean/pe-service-census.<desired-sha12>.sh' | sha256sum -c -
+   printf '%s  %s\n' '<census-sha256>' /home/sean/pe-service-census.<desired-sha12>.sh \
+     '<common-sha256>' /home/sean/pe-generation-common.<desired-sha12>.sh | sha256sum -c - \
+     || { echo 'staged census or ownership helper differs from the release'; exit 1; }
    chmod 0755 /home/sean/pe-service-census.<desired-sha12>.sh
    chmod 0755 /tmp/pe-service.new.<desired-sha12>
    /tmp/pe-service.new.<desired-sha12> --version
@@ -1115,9 +1119,10 @@ Hash comparisons decide what remains, but never substitute for process clearance
 
    Verify an eligible paper copy and one exact settlement, the recovered wallet's old-market
    first-entry refusal, unsafe-wallet quarantine, later progressive admissions and Supabase
-   projection convergence. Run `verify_installed_unit_owner` from
-   `scripts/deploy/generation_common.sh` to prove the stable unit PID runs the installed binary with
-   its exact argv, environment and cwd. Check the invalidation fence is present before the first
+   projection convergence. Prove ownership with the staged, hash-checked helper from step 2:
+   `( . /home/sean/pe-generation-common.<desired-sha12>.sh && verify_installed_unit_owner ) && echo owned`
+   (a subshell, because the helper exits on failure); it proves the stable unit PID runs the
+   installed binary with its exact argv, environment and cwd. Check the invalidation fence is present before the first
    retention tick. Record the prepare output, every census, disabled/stopped states, ownership proof
    and restart timings. Full/checkpoint restart preserves retained history, ledger and financial
    state. Retention checkpoints require fix-forward recovery as documented in the release-2 section;
