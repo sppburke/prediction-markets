@@ -1497,6 +1497,7 @@ fn begin_or_resume_fresh_collection(
     let mut due = BTreeSet::new();
     let mut prior_exclusions = BTreeSet::new();
     let mut transition = Vec::new();
+    let mut verified_chains = BTreeSet::new();
     let history_proof = collection_proof
         .as_ref()
         .and_then(|proof| proof.history.as_deref());
@@ -1567,6 +1568,7 @@ fn begin_or_resume_fresh_collection(
                                 &transaction,
                                 manifest.generation,
                                 receipt,
+                                &mut verified_chains,
                             )?
                         {
                             transition.push(certificate);
@@ -1734,11 +1736,17 @@ fn fresh_collection_record(
     stored.map(|json| decode_fresh_identity(&json)).transpose()
 }
 
+/// `verified_chains` holds the generations whose record chains this admission
+/// transaction already verified. The transaction holds those receipts and
+/// manifests still, so a repeat could only repeat the answer: on Forge it cost
+/// ~30 s per generation for each of 255 wallets excluded in all seven earlier
+/// generations (#739).
 fn transition_excluded_wallet(
     scan: &mut aggregate_scan::Scan,
     connection: &Connection,
     head: u64,
     excluded: &ActivityWalletReceiptProof,
+    verified_chains: &mut BTreeSet<u64>,
 ) -> Result<Option<incremental::HistoryCertificate>, BootstrapError> {
     let generations = connection
         .prepare(
@@ -1762,7 +1770,11 @@ fn transition_excluded_wallet(
         })?;
         let manifest =
             stored_activity_manifest(connection, generation)?.ok_or(BootstrapError::Internal)?;
-        incremental::verify_record_chain(connection, &identity)?;
+        if !verified_chains.contains(&generation) {
+            let verified = incremental::verify_record_chain(connection, &identity)?;
+            tracing::info!(generation, ?verified, "activity record chain verified");
+            verified_chains.extend(verified);
+        }
         let receipt = incremental::predecessor_receipt(
             connection,
             &manifest,

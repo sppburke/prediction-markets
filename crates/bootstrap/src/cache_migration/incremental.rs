@@ -1101,11 +1101,20 @@ impl HistoryProof {
     }
 }
 
+/// Returns every generation whose manifest and receipts the chain walk verified:
+/// `head` and each predecessor it links to, each checked exactly as a walk
+/// starting there would check it.
 pub(super) fn verify_record_chain(
     connection: &Connection,
     head: &FreshCollectionIdentity,
-) -> Result<(), BootstrapError> {
-    HistoryProof::load(connection, head).map(|_| ())
+) -> Result<Vec<u64>, BootstrapError> {
+    let proof = HistoryProof::load(connection, head)?;
+    Ok(proof
+        .records
+        .iter()
+        .filter(|(_, (_, manifest))| manifest.is_some())
+        .map(|(generation, _)| *generation)
+        .collect())
 }
 
 pub(super) fn predecessor_receipt(
