@@ -1828,17 +1828,22 @@ on mismatch. A plain SQLite copy is allowed only for this stopped, checkpointed 
 inputs use SQLite's online `.backup`.
 
 Before launching, record the binary hash, authority endpoint/key-file path, every override, bind
-and exact commands. Confirm the memory cap (8.3 GB) and four-CPU pin on the service process itself, rather
-than only its launcher. Resume relaunches the same progressed directory and financial state without
+and exact commands. Confirm the memory cap (8.3 GB), the four-CPU pin and the CPU weight (10000, so unrelated
+jobs on a shared host yield on those CPUs; the readiness samplers run at the same weight) on the service process
+itself, rather than only its launcher. Resume relaunches the same progressed directory and financial state without
 copying, reseeding or validating its original-copy hashes. `rehearsal545.sh` reusable-capture hash
 validation is for an unchanged capture; O1's progressed resume uses its separately recorded command.
 
 Capture epoch, boundary, pins, allocated bytes before/after, net freed space including feed copies,
 lock times and pauses for every database hold (drain-list reads, blanking, candidate pages, eligibility
 checks, removals and drains; largest eligible wallet included), the two wallet indexes' build time at the
-first open, copy latency and memory. During advance, blanking, removals and
-drains, readiness must stay true with no stale-copy refusal; any failure is fixed and re-measured
-before deployment. Apply the glossary's retention rehearsal space and timing gates.
+first open, copy latency and memory. Record the rehearsal's readiness and issues every 1 s, and
+production's every 5 s, throughout the advance (its preparation included), blanking, removals and
+drains: every rehearsal readiness sample must be true (a probe timeout fails), with no stale-copy
+refusal, and any failure is fixed and re-measured before deployment. An upstream outage in that
+window leaves O1 incomplete, and it is repeated before O2; production's samples tell an outage from
+a rehearsal failure but never excuse a failed rehearsal sample. Apply the glossary's retention
+rehearsal space and timing gates.
 
 The kill command waits for `source retention committed`, verifies the authority's new epoch and
 SIGKILLs only the recorded service PID before punching. **After the process dies**, record both
@@ -1898,15 +1903,24 @@ Follow the guarded [Procedure](#procedure): staged preparation while the old uni
 epoch zero/format 2, install no fence and erase nothing. The first census runs while the old unit
 serves with its executable still installed (the staged census script, step 4). Repeat
 and verify each stray's identity before stopping it. Then disable and stop the unit, confirm both states and its process exit, and clear another
-readable census before swapping the binary. Keep the unit disabled/stopped over every interruption.
-A resume does not start a previously booted binary (fence present, or an invalidation record the
-service cannot read), a status-78 binary, or an attempt whose outcome was never recorded until its
-required recovery is recorded. Each attempt records `recovery-required` in the deploy's artifact
-directory before `enable`; only its verified activation, or a failure before `start` was issued
-with the unit proven disabled and stopped, removes it. Normalization also records a status 78, or a
-status that cannot be read, before any disable or stop. While the file exists the unit stays
-disabled and stopped: establish the attempt's outcome from the unit's journal and record the
-recovery below before removing it.
+readable census before swapping the binary. The unit stays disabled and stopped through clearance
+and the swap, until activation begins. Each attempt records `recovery-required` in the deploy's
+artifact directory before `enable`; only its verified activation, or a failure before `start` was
+issued with the unit then proven disabled and stopped, removes it. A signal between `enable` and
+`start`, a failed `enable` or a failed `start` disables the unit again. A SIGKILL or power loss
+after `enable` can leave the desired unit enabled, and a reboot then starts it with no earlier
+process alive: the latch stops an unverified deployment retry, not a systemd activation. A resume
+first normalizes an unfinished activation (a status 78, or a status that cannot be read, is recorded
+before any disable or stop) and does not start a previously booted binary (fence present, or an
+invalidation record the service cannot read), a status-78 binary, or an attempt whose outcome was
+never recorded until its required recovery is recorded: establish the attempt's outcome from the
+unit's journal and record the recovery below before removing the latch. A desired unit already
+running may instead be accepted after its current ownership verification, which removes the latch.
+The staged deploy script handles first activation only: after a previously booted desired binary
+stops, record the required recovery (preserving the fence and the retention inventory), then resume
+through a fresh cleared census and the guarded activation and verification of
+[Procedure](#procedure) steps 5–6, recording the attempt's latch before `enable`; never rerun the
+epoch-0 preparation or remove the fence to satisfy it.
 Every resume reruns the census: before a start it must find no matching process, and when
 accepting an already healthy desired unit it may contain only that unit's freshly
 ownership-verified MainPID; old receipts only document history. A blocked/unreadable census stops deployment and is
