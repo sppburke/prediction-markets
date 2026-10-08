@@ -134,7 +134,10 @@ published batch 86. From the first format-3 preparation onward, keep a format-3-
 fix forward. Never downgrade a format-3 cache in place. Supabase's additive objects remain installed;
 `cache-restore-prior` is paused integrity recovery, not release rollback.
 
-For #747, the prior binary rejects multi-window, shortened and resumed receipts. The first new
+For #747, install on Forge only after pe-service runs a build containing #747: an older service
+classes a copied listing's `CausalAmbiguity` as a shared failure and aborts the admission attempt
+(`watchlist_admission.rs`), so record the running service revision in the deployment record first.
+The prior binary rejects multi-window, shortened and resumed receipts. The first new
 generation can write these shapes. Before preparing a candidate holding them, prove inactivity and
 no request, abandon the unprepared candidate through [recovery](#recovery-and-damage-boundaries),
 and reinstall the prior binary/checkout pair. After preparation, retain a release that reads them
@@ -163,7 +166,7 @@ receipts AS (
          json_extract(r.acquisition_json, '$.disposition') AS disposition
   FROM activity_wallet_coverage_staging_v2 r JOIN tracked USING (wallet_hex)
 )
-SELECT wallet_hex, generation, frozen_end,
+SELECT wallet_hex, generation, frozen_end, mode, start, reason,
        CASE WHEN acquisition_version = 3 AND disposition = 'excluded'
                  AND reason = 'acquisition_failure'
             THEN CASE WHEN aggregation_status = 'complete' THEN acquired_end ELSE start END
@@ -176,7 +179,9 @@ SELECT wallet_hex, generation, frozen_end,
 FROM receipts JOIN head USING (generation) ORDER BY wallet_hex;
 ```
 
-Record frozen end, frontier and full restarts, proved source rows, and head completeness every cycle.
+Record frozen end, mode, start, reason, frontier and full restarts, proved source rows, and head
+completeness every cycle. A `cross_boundary_collision` reason followed by a `full` read from start 0
+is a restart; a wallet that restarts again at the same frontier is escalated to the owner.
 A complete receipt has no continuation; record its acquired end as the completion frontier.
 `E − frontier` and sampled raw-row arrival estimates diagnose stalls only, never decide pass/fail.
 Bind every observation to generation, stage PID and binary revision. Reuse the read-only
