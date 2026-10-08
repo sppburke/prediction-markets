@@ -6536,6 +6536,8 @@ mod tests {
             );
             let mut sync = admission_sync(1);
             sync.failures.insert(failed, 1);
+            // An earlier failure's cooldown, already over: prepared admission must clear it.
+            sync.cooldowns.insert(failed, tokio::time::Instant::now());
             // Additions go first; the member then prepares, but the full live set refuses it.
             admission_tick(&h, &preparer, &mut sync).await;
             assert!(!sync.reentries_first);
