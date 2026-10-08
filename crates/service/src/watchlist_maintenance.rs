@@ -1366,9 +1366,8 @@ impl BatchSync {
     /// Whether a live-absent structural member may launch in a live re-entry call: not parked,
     /// not cooling and, in a call that runs before its tick's additions, without a failure record.
     fn reentry_launchable(&self, wallet: &WalletAddress, before_additions: bool) -> bool {
-        !self.knockout_deferred.contains(wallet)
-            && !self.cooling(wallet)
-            && !(before_additions && self.failures.contains_key(wallet))
+        let waits_behind_additions = before_additions && self.failures.contains_key(wallet);
+        !(self.knockout_deferred.contains(wallet) || self.cooling(wallet) || waits_behind_additions)
     }
 
     /// A wallet's failure record ends once it is live, whichever path admitted it.
