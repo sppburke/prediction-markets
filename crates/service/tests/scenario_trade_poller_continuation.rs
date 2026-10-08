@@ -799,6 +799,85 @@ async fn poller_multipage_commitment_survives_restart() {
     assert_eq!(paper.open_decision_pending().unwrap(), rows);
 }
 
+#[tokio::test]
+async fn copied_listing_read_commits_once_and_repeats_without_fence() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_path = dir.path().join("source.log");
+    let state_path = dir.path().join("paper.db");
+    let paper = Arc::new(PaperStateDb::open(&state_path).unwrap());
+    support::install_empty_anchor(&paper, wallet(), 0);
+    paper
+        .record_reconciled_history_status(&WalletHistoryStatusRecord {
+            wallet: wallet(),
+            complete: true,
+            proof_json: "{}".to_owned(),
+            updated_at_unix: 1,
+        })
+        .unwrap();
+    let original = activity_row(
+        "TRADE",
+        "0xcopied-listing",
+        MARKET_A,
+        "BUY",
+        "3",
+        "asset-a",
+        EPOCH,
+    );
+    let expected = aggregate(original.clone());
+    let mut copy = original.clone();
+    copy["timestamp"] = json!(EPOCH + 2);
+    let page = serde_json::to_vec(&[copy, original]).unwrap();
+    let fetcher = Arc::new(QueueFetcher::new(page.clone()));
+    let commits = recorded_poll(Arc::clone(&paper), &source_path, Arc::clone(&fetcher)).await;
+    assert_eq!(fetcher.calls(), 1);
+    let aggregates: Vec<_> = commits
+        .iter()
+        .flat_map(|(aggregates, _, _)| aggregates)
+        .collect();
+    assert_eq!(aggregates.len(), 1);
+    assert_eq!(
+        aggregates[0],
+        &ActivityAggregate {
+            row_count: 2,
+            ..expected.clone()
+        }
+    );
+    assert_eq!(
+        commits
+            .iter()
+            .map(|(_, _, result)| result.pending.len())
+            .sum::<usize>(),
+        1
+    );
+    let positions = paper.leader_positions().unwrap();
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0].market_id, market(MARKET_A));
+    assert_eq!(positions[0].long_contracts, expected.share_sum);
+
+    drop(paper);
+    let paper = Arc::new(PaperStateDb::open(&state_path).unwrap());
+    let index = pe_service::risk_inputs::SourceReceiptIndex::replay(&source_path).unwrap();
+    let rows = paper.open_decision_pending().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].source_trade_id, *expected.group_id.key());
+    assert_eq!(
+        pe_service::bucket_commit::validate_open_continuations(&paper, &index).unwrap(),
+        1
+    );
+    assert_eq!(paper.leader_positions().unwrap(), positions);
+
+    let fetcher = Arc::new(QueueFetcher::new(page));
+    let repeat = recorded_poll(Arc::clone(&paper), &source_path, Arc::clone(&fetcher)).await;
+    assert_eq!(fetcher.calls(), 1);
+    assert_eq!(repeat.len(), 1);
+    assert!(repeat[0].2.already_committed);
+    assert!(repeat[0].2.pending.is_empty());
+    assert!(repeat[0].2.newly_fenced.is_none());
+    assert_eq!(paper.open_decision_pending().unwrap(), rows);
+    assert_eq!(paper.leader_positions().unwrap(), positions);
+    assert!(paper.wallet_fences().unwrap().is_empty());
+}
+
 // These barriers connect the actual poller to the durable coordinator and bucket owner. Each
 // response and completion is explicitly released; paused time never schedules a wallet read.
 use support::{GatedFetcher, RequestedPage};

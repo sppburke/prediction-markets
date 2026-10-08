@@ -414,6 +414,11 @@ fn duplicate_rows_are_multiset_members_and_permutation_is_stable() {
     assert_eq!(single.row_count, 1);
     assert_eq!(duplicate.row_count, 2);
     assert_ne!(single.semantic_revision, duplicate.semantic_revision);
+    // Rows sharing a time are separate fills and sum, never deduplicated.
+    assert_eq!(
+        duplicate.share_sum,
+        single.share_sum.checked_add(single.share_sum).unwrap()
+    );
 
     let mut second = row.clone();
     second["price"] = json!("0.75");
@@ -529,6 +534,8 @@ fn mixed_member_timestamps_are_typed_causal_ambiguity() {
     let first = base_row("TRADE");
     let mut second = first.clone();
     second["timestamp"] = json!(1_788_000_001_i64);
+    // An exact later copy is the earliest listing (#747); any other later row is not.
+    second["size"] = json!("2.000000");
     assert!(matches!(
         aggregate_activity_rows(&parse_rows(&[first, second])),
         Err(ActivityAggregationError::CausalAmbiguity {

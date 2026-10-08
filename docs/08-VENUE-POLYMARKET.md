@@ -98,7 +98,8 @@ Polymarket is the primary Winner-Follow venue because its public data surfaces s
 - leaderboard rankings;
 - public trades filtered by user/profile address;
 - public current and closed positions;
-- user activity;
+- user activity (see the [verified ascending collection lookup](15-SOURCES.md#forge-forward-activity-window-lookup-747)
+  and [fills listed twice](15-SOURCES.md#activity-listing-a-transactions-fills-twice-747));
 - market data/orderbook websockets for watched markets;
 - transaction hashes for timing verification.
 

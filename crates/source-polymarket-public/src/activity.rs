@@ -4,7 +4,7 @@
 //! observations, bootstrap, restart, and replay. Complete fixed-end REST
 //! responses may additionally be aggregated with [`aggregate_activity_rows`].
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 
 use pe_core_types::{
@@ -1057,7 +1057,8 @@ pub enum ActivityAggregationError {
 }
 
 /// Group and aggregate one complete fixed-end response without deduplicating
-/// member rows. Returned groups are sorted by version-two key for persistence.
+/// member rows that share a time. Returned groups are sorted by version-two key
+/// for persistence.
 pub fn aggregate_activity_rows(
     rows: &[NormalizedActivity],
 ) -> Result<Vec<ActivityAggregate>, ActivityAggregationError> {
@@ -1083,20 +1084,27 @@ fn aggregate_group(
             group_id: group_id.to_string(),
         });
     };
-    let expected = first.source_time.0.unix_timestamp();
+    // Source-row accounting counts every listed row, repeated copies included.
+    let row_count =
+        u64::try_from(members.len()).map_err(|_| ActivityAggregationError::AmountOverflow {
+            group_id: group_id.to_string(),
+        })?;
+    let listing;
+    let members = if members
+        .iter()
+        .all(|member| member.source_time == first.source_time)
+    {
+        members
+    } else {
+        listing = earliest_listing(&group_id, members)?;
+        listing.as_slice()
+    };
+    let first = members[0];
     let is_combo = first.is_combo;
     let mut share_sum = ShareAmount::ZERO;
     let mut source_usdc_sum = CollateralAmount::ZERO;
     let mut price_weighted_share_sum = Decimal::ZERO;
     for member in members {
-        let actual = member.source_time.0.unix_timestamp();
-        if actual != expected {
-            return Err(ActivityAggregationError::CausalAmbiguity {
-                group_id: group_id.to_string(),
-                expected,
-                actual,
-            });
-        }
         if member.is_combo != is_combo {
             return Err(ActivityAggregationError::MixedComboState {
                 group_id: group_id.to_string(),
@@ -1127,10 +1135,6 @@ fn aggregate_group(
                 })?;
     }
     let semantic_revision = derive_semantic_revision(&group_id, members)?;
-    let row_count =
-        u64::try_from(members.len()).map_err(|_| ActivityAggregationError::AmountOverflow {
-            group_id: group_id.to_string(),
-        })?;
     Ok(ActivityAggregate {
         group_id,
         row_count,
@@ -1141,6 +1145,56 @@ fn aggregate_group(
         is_combo,
         semantic_revision,
     })
+}
+
+/// The venue sometimes lists a transaction's fills a second time, every row
+/// repeated 1-8 s later (docs/08, #747). When each later time repeats the
+/// earliest time's rows exactly, the group is that earliest listing; any other
+/// mix of times stays causally ambiguous (#544). Rows sharing a time are never
+/// compared, so equal real fills in one transaction still sum.
+fn earliest_listing<'a>(
+    group_id: &SourceActivityGroupId,
+    members: &[&'a NormalizedActivity],
+) -> Result<Vec<&'a NormalizedActivity>, ActivityAggregationError> {
+    let mut listings = BTreeMap::<i64, Vec<&'a NormalizedActivity>>::new();
+    for member in members {
+        listings
+            .entry(member.source_time.0.unix_timestamp())
+            .or_default()
+            .push(member);
+    }
+    let content = |rows: &[&NormalizedActivity]| {
+        let mut content = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.share_amount.atomic(),
+                    row.price,
+                    row.source_usdc_amount.atomic(),
+                    row.is_combo,
+                )
+            })
+            .collect::<Vec<_>>();
+        content.sort_unstable();
+        content
+    };
+    let mut listings = listings.into_iter();
+    let Some((expected, earliest)) = listings.next() else {
+        return Err(ActivityAggregationError::EmptyGroup {
+            group_id: group_id.to_string(),
+        });
+    };
+    let earliest_content = content(&earliest);
+    for (actual, rows) in listings {
+        if content(&rows) != earliest_content {
+            return Err(ActivityAggregationError::CausalAmbiguity {
+                group_id: group_id.to_string(),
+                expected,
+                actual,
+            });
+        }
+    }
+    Ok(earliest)
 }
 
 fn derive_semantic_revision(
@@ -1421,6 +1475,111 @@ mod tests {
         assert!(parse_activity_trade_observation(non_trade).is_err());
         let missing_asset = br#"{"proxyWallet":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","conditionId":"0xcondition","side":"BUY","size":"5","price":"0.5","timestamp":"1704067200","transactionHash":"0xabc","outcomeIndex":"0"}"#;
         assert!(parse_activity_trade_observation(missing_asset).is_err());
+    }
+
+    fn listed_row(raw: &str) -> NormalizedActivity {
+        let context = ActivityParseContext {
+            source_id: SourceId("polymarket-activity-test".to_owned()),
+            observed_at: SourceTimestamp(
+                time::OffsetDateTime::from_unix_timestamp(1_731_582_900).unwrap(),
+            ),
+            received_at: ReceivedAt(
+                time::OffsetDateTime::from_unix_timestamp(1_731_582_901).unwrap(),
+            ),
+            transport: ActivityTransport::Rest,
+        };
+        parse_activity_row(raw.as_bytes(), None, &context).unwrap()
+    }
+
+    fn fill(time: i64, size: &str, usdc: &str, combo: bool) -> NormalizedActivity {
+        listed_row(&format!(
+            r#"{{"proxyWallet":"0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","timestamp":{time},"conditionId":"0xcondition","type":"TRADE","size":{size},"usdcSize":{usdc},"transactionHash":"0xabc","price":0.5,"asset":"123","side":"BUY","outcomeIndex":0,"isCombo":{combo}}}"#
+        ))
+    }
+
+    #[test]
+    fn a_fill_listed_again_later_counts_once_at_the_earliest_time() {
+        // Live capture 2026-10-07 (wallet 0x9f47f1…, tx 0x0493b71e…): the venue lists one
+        // fill twice, the copy 2 s later; on-chain the shares moved once, in block
+        // 64,272,719 at 1731582862 (#747).
+        let original = r#"{"proxyWallet":"0x9f47f1fcb1701bf9eaf31236ad39875e5d60af93","timestamp":1731582862,"conditionId":"0x339ea91e747d04777adfb737a264debeddd1b90f527abe02ce2cbee395455169","type":"TRADE","size":48.93,"usdcSize":1.02753,"transactionHash":"0x0493b71ef43397afe8291d7353ad9aad6c2166e9c99eeebea65d64bb8e326836","price":0.021,"asset":"35255375360012657117305792246090443224690221462734865996427532233323562581158","side":"SELL","outcomeIndex":0,"outcome":"Yes"}"#;
+        let rows = [
+            listed_row(original),
+            listed_row(&original.replace("1731582862", "1731582864")),
+        ];
+        let alone = aggregate_activity_rows(&rows[..1]).unwrap();
+        let listed = aggregate_activity_rows(&rows).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].row_count, 2);
+        assert_eq!(
+            ActivityAggregate {
+                row_count: 1,
+                ..listed[0].clone()
+            },
+            alone[0]
+        );
+        let reversed = [rows[1].clone(), rows[0].clone()];
+        assert_eq!(aggregate_activity_rows(&reversed).unwrap(), listed);
+    }
+
+    #[test]
+    fn only_exact_later_copies_of_the_earliest_listing_aggregate() {
+        let earliest = [fill(10, "1", "0.5", false), fill(10, "2", "1", false)];
+        let once = aggregate_activity_rows(&earliest).unwrap().remove(0);
+        for times in [vec![12], vec![12, 15]] {
+            let mut rows = earliest.to_vec();
+            for time in &times {
+                rows.extend([fill(*time, "2", "1", false), fill(*time, "1", "0.5", false)]);
+            }
+            let listed = aggregate_activity_rows(&rows).unwrap().remove(0);
+            assert_eq!(listed.row_count, 2 * (1 + times.len() as u64));
+            assert_eq!(
+                ActivityAggregate {
+                    row_count: 2,
+                    ..listed
+                },
+                once
+            );
+        }
+        let six = (0..6)
+            .map(|_| fill(20, "1", "0.5", false))
+            .collect::<Vec<_>>();
+        let mut twelve = six.clone();
+        twelve.extend((0..6).map(|_| fill(26, "1", "0.5", false)));
+        assert_eq!(
+            ActivityAggregate {
+                row_count: 6,
+                ..aggregate_activity_rows(&twelve).unwrap().remove(0)
+            },
+            aggregate_activity_rows(&six).unwrap().remove(0)
+        );
+        for later in [
+            vec![fill(12, "1", "0.5", false), fill(12, "3", "1", false)],
+            vec![fill(12, "1", "0.5", false), fill(12, "2", "1.5", false)],
+            vec![fill(12, "1", "0.5", false), fill(12, "2", "1", true)],
+            vec![fill(12, "1", "0.5", false), {
+                let mut repriced = fill(12, "2", "1", false);
+                repriced.price = Price(Decimal::new(6, 1));
+                repriced
+            }],
+            vec![fill(12, "1", "0.5", false)],
+            vec![
+                fill(12, "1", "0.5", false),
+                fill(12, "2", "1", false),
+                fill(12, "2", "1", false),
+            ],
+        ] {
+            let mut rows = earliest.to_vec();
+            rows.extend(later);
+            assert!(matches!(
+                aggregate_activity_rows(&rows),
+                Err(ActivityAggregationError::CausalAmbiguity {
+                    expected: 10,
+                    actual: 12,
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]
