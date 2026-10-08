@@ -1899,11 +1899,14 @@ epoch zero/format 2, install no fence and erase nothing. The first census runs w
 serves with its executable still installed (the staged census script, step 4). Repeat
 and verify each stray's identity before stopping it. Then disable and stop the unit, confirm both states and its process exit, and clear another
 readable census before swapping the binary. Keep the unit disabled/stopped over every interruption.
-A resume never starts a new binary that has booted before (fence present, or an invalidation
-record the service cannot read) or that exited 78. Before any disable or stop of the new binary's
-unit, a status 78, or a status that cannot be read, is recorded durably as `recovery-required` in
-the deploy's artifact directory; the unit then stays disabled and stopped until the recovery below
-is recorded.
+A resume does not start a previously booted binary (fence present, or an invalidation record the
+service cannot read), a status-78 binary, or an attempt whose outcome was never recorded until its
+required recovery is recorded. Each attempt records `recovery-required` in the deploy's artifact
+directory before `enable`; only its verified activation, or a failure before `start` was issued
+with the unit proven disabled and stopped, removes it. Normalization also records a status 78, or a
+status that cannot be read, before any disable or stop. While the file exists the unit stays
+disabled and stopped: establish the attempt's outcome from the unit's journal and record the
+recovery below before removing it.
 Every resume reruns the census: before a start it must find no matching process, and when
 accepting an already healthy desired unit it may contain only that unit's freshly
 ownership-verified MainPID; old receipts only document history. A blocked/unreadable census stops deployment and is
