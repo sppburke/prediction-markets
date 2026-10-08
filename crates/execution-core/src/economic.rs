@@ -379,6 +379,7 @@ mod tests {
                     PolymarketTokenId("22".to_owned()),
                 ],
                 neg_risk: false,
+                neg_risk_market_id: None,
                 minimum_tick_size: Price::new(dec!(0.01)).unwrap(),
                 minimum_order_size: ShareAmount::from_atomic(1_000_000),
                 scheduled_end_unix: Some(now + 3_600),

@@ -668,6 +668,7 @@ pub fn continuation_hooks(epoch: i64) -> Arc<pe_service::orchestrator::ScenarioH
                     PolymarketTokenId("sentinel-1".to_owned()),
                 ],
                 neg_risk: false,
+                neg_risk_market_id: None,
                 minimum_tick_size: Price::new(rust_decimal_macros::dec!(0.01)).unwrap(),
                 minimum_order_size: ShareAmount::from_whole(1).unwrap(),
                 scheduled_end_unix: None,

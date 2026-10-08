@@ -2585,8 +2585,11 @@ async fn tick_financial_resolution(
         .map(|position| position.market_id.0.0)
         .collect::<std::collections::BTreeSet<_>>();
 
+    let conditions_count = conditions.len();
+    let mut failed = 0;
     for condition in conditions.into_iter().map(PolymarketConditionId) {
         if let Err(error) = resolve_financial_condition(
+            paper_state,
             clob_base_url,
             fetcher,
             source_log,
@@ -2595,15 +2598,21 @@ async fn tick_financial_resolution(
         )
         .await
         {
+            failed += 1;
             warn!(condition = %condition.0, error = %format!("{error:#}"), "financial resolution condition failed; continuing");
         }
     }
+    info!(
+        conditions = conditions_count,
+        failed, "financial resolution pass completed"
+    );
     Ok(())
 }
 
 async fn resolve_financial_condition(
+    paper_state: &PaperStateDb,
     clob_base_url: &str,
-    fetcher: &ReqwestFetcher,
+    fetcher: &impl PageFetcher,
     source_log: &pe_service::activity_ingest::SourceLogHandle,
     control: &mpsc::Sender<pe_service::orchestrator_control::OrchestratorControl>,
     condition: PolymarketConditionId,
@@ -2637,6 +2646,13 @@ async fn resolve_financial_condition(
         "CLOB resolution condition differs from request"
     );
     let ClobPayoutResolution::Resolved(payout) = parsed.resolution_evidence().payout else {
+        if parsed.neg_risk == Some(true)
+            && let Some(group) = parsed.neg_risk_market_id.as_deref()
+        {
+            paper_state
+                .record_market_group(&condition.0, group)
+                .context("record unresolved neg-risk market group")?;
+        }
         return Ok(());
     };
     let (acknowledged, acknowledgement) = tokio::sync::oneshot::channel();
@@ -2680,6 +2696,99 @@ mod tests {
     use rusqlite::params;
 
     const NOW: i64 = 10_000;
+
+    #[cfg(feature = "scenario")]
+    #[tokio::test]
+    async fn resolution_poll_records_neg_risk_group() {
+        use pe_source_polymarket_public::FixtureFetcher;
+        use rusqlite::OptionalExtension as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let paper = PaperStateDb::open(&dir.path().join("paper.db")).unwrap();
+        let connection = rusqlite::Connection::open(dir.path().join("paper.db")).unwrap();
+        let mut writer = pe_event_log::Writer::open(dir.path().join("source.log")).unwrap();
+        let (source, mut source_rx) = pe_service::activity_ingest::SourceLogHandle::channel(1);
+        let (control, mut control_rx) = mpsc::channel(1);
+        for (id, grouped, resolved, fails) in [
+            ("grouped", true, false, false),
+            ("ungrouped", false, false, false),
+            ("failed", true, false, true),
+            ("resolved", true, true, false),
+        ] {
+            if fails {
+                connection.execute_batch("CREATE TRIGGER fail_group_insert BEFORE INSERT ON meta WHEN NEW.key LIKE 'neg_risk_group:%' BEGIN SELECT RAISE(FAIL, 'group insert failed'); END;").unwrap();
+            }
+            let payload = serde_json::to_vec(&serde_json::json!({
+                "condition_id": id,
+                "closed": resolved,
+                "neg_risk": true,
+                "neg_risk_market_id": if grouped { Some("group") } else { None },
+                "is_50_50_outcome": false,
+                "tokens": [
+                    {"token_id":"11", "outcome":"Yes", "winner":resolved, "price":if resolved { "1" } else { "0.5" }},
+                    {"token_id":"22", "outcome":"No", "winner":false, "price":if resolved { "0" } else { "0.5" }}
+                ]
+            })).unwrap();
+            let fetcher = FixtureFetcher::new(std::collections::HashMap::from([(
+                format!("fixture://clob/markets/{id}"),
+                payload.clone(),
+            )]));
+            let resolve = resolve_financial_condition(
+                &paper,
+                "fixture://clob",
+                &fetcher,
+                &source,
+                &control,
+                PolymarketConditionId(id.to_owned()),
+            );
+            tokio::pin!(resolve);
+            assert!(futures::poll!(&mut resolve).is_pending());
+            let (envelope, appended) = source_rx.recv_for_test().await.unwrap();
+            assert_eq!(envelope.source_id.0, "polymarket.clob.market");
+            assert_eq!(envelope.payload, payload);
+            let receipt = writer.append_synced(envelope).unwrap();
+            appended.send(receipt).unwrap();
+            if resolved {
+                assert!(futures::poll!(&mut resolve).is_pending());
+                let pe_service::orchestrator_control::OrchestratorControl::ResolutionCandidate {
+                    condition,
+                    payout_by_outcome_index_json,
+                    receipt: candidate_receipt,
+                    acknowledged,
+                } = control_rx.recv().await.unwrap()
+                else {
+                    unreachable!();
+                };
+                assert_eq!(condition.0, id);
+                assert_eq!(payout_by_outcome_index_json, "[\"1\",\"0\"]");
+                assert_eq!(candidate_receipt, receipt);
+                acknowledged.send(Ok(())).unwrap();
+            }
+            let result = resolve.await;
+            if fails {
+                assert!(format!("{:#}", result.unwrap_err()).contains("group insert failed"));
+            } else {
+                result.unwrap();
+            }
+            let group: Option<String> = connection
+                .query_row(
+                    "SELECT value FROM meta WHERE key = ?1",
+                    params![format!("neg_risk_group:{id}")],
+                    |row| row.get(0),
+                )
+                .optional()
+                .unwrap();
+            assert_eq!(
+                group.as_deref(),
+                if grouped && !resolved && !fails {
+                    Some("group")
+                } else {
+                    None
+                }
+            );
+            assert!(control_rx.try_recv().is_err());
+        }
+    }
 
     #[derive(Clone)]
     struct LogSink(Arc<std::sync::Mutex<Vec<u8>>>);

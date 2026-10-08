@@ -1997,6 +1997,40 @@ impl PaperStateDb {
         Ok(())
     }
 
+    /// Record a market's neg-risk group once.
+    pub fn record_market_group(
+        &self,
+        market_id: &str,
+        group_id: &str,
+    ) -> Result<(), PaperStateError> {
+        self.lock().execute(
+            "INSERT INTO meta (key, value) VALUES ('neg_risk_group:' || ?1, ?2) \
+             ON CONFLICT(key) DO NOTHING",
+            params![market_id, group_id],
+        )?;
+        Ok(())
+    }
+
+    /// Find the lowest sibling market holding an unsettled YES buy.
+    pub fn held_yes_in_group(
+        &self,
+        market_id: &str,
+        group_id: &str,
+    ) -> Result<Option<String>, PaperStateError> {
+        Ok(self
+            .lock()
+            .query_row(
+                "SELECT f.market_id FROM fills f \
+                 JOIN meta g ON g.key = 'neg_risk_group:' || f.market_id \
+                 WHERE g.value = ?2 AND f.market_id <> ?1 AND f.outcome_id = 0 AND f.side = 'buy' \
+                 AND NOT EXISTS (SELECT 1 FROM settled_markets s WHERE s.market_id = f.market_id) \
+                 ORDER BY f.market_id LIMIT 1",
+                params![market_id, group_id],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
     /// Acknowledged retirement of a non-admitted source observation. Keep its exact receipt
     /// after fence clearance so boot cannot recreate an ordering barrier for disposed work.
     pub fn retire_activity_observation(
@@ -9061,6 +9095,78 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].outcome_prices_json, "[\"1\",\"0\"]");
         assert_eq!(rows[0].credit_applied, dec!(12.50));
+    }
+
+    #[test]
+    fn group_yes_lookup() {
+        let (dir, db) = db();
+        db.init_bankroll(dec!(1000)).unwrap();
+        for (id, outcome, group) in [
+            ("incoming", 0, Some("group")),
+            ("no", 1, Some("group")),
+            ("settled", 0, Some("group")),
+            ("other", 0, Some("other-group")),
+            ("unmapped", 0, None),
+        ] {
+            let mut record = fill(id, Side::Buy, 5, dec!(0.5));
+            record.market_id = MarketId(VenueMarketId(id.to_owned()));
+            record.outcome_id = OutcomeId(outcome);
+            db.commit_fill(
+                &SourceTradeId(id.to_owned()),
+                &leader(5, 0),
+                &record,
+                EventSeq(1),
+            )
+            .unwrap();
+            if let Some(group) = group {
+                db.record_market_group(id, group).unwrap();
+            }
+        }
+        db.record_settled_market(
+            &MarketId(VenueMarketId("settled".to_owned())),
+            "[\"1\",\"0\"]",
+            dec!(5),
+            1_700_000_000,
+        )
+        .unwrap();
+        assert_eq!(db.held_yes_in_group("incoming", "group").unwrap(), None);
+        for id in ["b", "a"] {
+            let mut record = fill(id, Side::Buy, 5, dec!(0.5));
+            record.market_id = MarketId(VenueMarketId(id.to_owned()));
+            db.commit_fill(
+                &SourceTradeId(id.to_owned()),
+                &leader(5, 0),
+                &record,
+                EventSeq(2),
+            )
+            .unwrap();
+            db.record_market_group(id, "group").unwrap();
+            assert_eq!(
+                db.held_yes_in_group("incoming", "group")
+                    .unwrap()
+                    .as_deref(),
+                Some(id)
+            );
+        }
+        db.record_market_group("a", "replacement").unwrap();
+        assert_eq!(
+            db.held_yes_in_group("incoming", "group")
+                .unwrap()
+                .as_deref(),
+            Some("a")
+        );
+        assert_eq!(
+            db.held_yes_in_group("incoming", "replacement").unwrap(),
+            None
+        );
+        drop(db);
+        let db = PaperStateDb::open(&dir.path().join("paper_state.db")).unwrap();
+        assert_eq!(
+            db.held_yes_in_group("incoming", "group")
+                .unwrap()
+                .as_deref(),
+            Some("a")
+        );
     }
 
     #[test]
