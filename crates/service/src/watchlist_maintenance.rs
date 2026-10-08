@@ -6394,12 +6394,13 @@ mod tests {
         #[tokio::test(start_paused = true)]
         async fn failed_reentry_waits_behind_additions() {
             let _io = paused_io();
-            let (retained, bench) = (wallet(1), wallet(2));
+            let (retained, bench, fresh) = (wallet(1), wallet(2), wallet(3));
             let mut fake = Fake::new(Some(1));
-            fake.latest_ranking = vec![row(1, 1, retained), row(1, 2, bench)];
-            let mut h = harness(fake, &[retained]).await;
-            h.applied = AppliedWatchlistCapacity::new(2);
-            h.live.remove_fenced(&set(&[retained]));
+            fake.latest_ranking = vec![row(1, 1, retained), row(1, 2, bench), row(1, 3, fresh)];
+            fake.ranking_entries = fake.latest_ranking.clone();
+            let mut h = harness(fake, &[retained, fresh]).await;
+            h.applied = AppliedWatchlistCapacity::new(3);
+            h.live.remove_fenced(&set(&[retained, fresh]));
             // Nothing is busy and no bracket spends the clock: every call that may launch does.
             let preparer = admission_preparer(&h, Arc::new(StdMutex::new(HashSet::new())), false);
             let bytes = Arc::new(StdMutex::new(Vec::new()));
@@ -6439,6 +6440,10 @@ mod tests {
             };
             tick(&mut sync).await;
             assert!(sync.reentries_first);
+            assert!(
+                members(&h.live).contains(&fresh),
+                "a never-failed member keeps first claim"
+            );
             assert!(members(&h.live).contains(&bench), "additions start");
             assert!(
                 !members(&h.live).contains(&retained),
@@ -6455,9 +6460,17 @@ mod tests {
                 .iter()
                 .filter(|l| l["path"] == "reentry" && l["started"] != 0)
                 .collect::<Vec<_>>();
-            assert_eq!(reentries.len(), 1);
-            assert_eq!(reentries[0]["first"], false);
-            assert_eq!(launched(reentries[0])[0].0, retained.to_string());
+            assert_eq!(reentries.len(), 2);
+            assert_eq!(reentries[0]["first"], true);
+            let first = launched(reentries[0]);
+            assert_eq!(
+                first.len(),
+                1,
+                "only the never-failed member goes before additions"
+            );
+            assert_eq!(first[0].0, fresh.to_string());
+            assert_eq!(reentries[1]["first"], false);
+            assert_eq!(launched(reentries[1])[0].0, retained.to_string());
             tick(&mut sync).await;
             assert!(!sync.failures.contains_key(&retained));
             assert_eq!(
@@ -6502,6 +6515,98 @@ mod tests {
                 .collect::<Vec<_>>();
             assert_eq!(reentries.len(), 1);
             assert_eq!(launched(&reentries[0])[0].0, retained.to_string());
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn failure_record_clears_only_when_live() {
+            let _io = paused_io();
+            let (resident, failed) = (wallet(1), wallet(2));
+            let mut fake = Fake::new(Some(1));
+            fake.ranking_entries = vec![row(1, 1, resident), row(1, 2, failed)];
+            let mut h = harness(fake, &[resident, failed]).await;
+            h.applied = AppliedWatchlistCapacity::new(1);
+            h.live.remove_fenced(&set(&[failed]));
+            let preparer = admission_preparer(&h, Arc::new(StdMutex::new(HashSet::new())), false);
+            let bytes = Arc::new(StdMutex::new(Vec::new()));
+            let _logs = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .json()
+                    .with_writer(CapturedLogs(bytes.clone()))
+                    .finish(),
+            );
+            let mut sync = admission_sync(1);
+            sync.failures.insert(failed, 1);
+            // Additions go first; the member then prepares, but the full live set refuses it.
+            admission_tick(&h, &preparer, &mut sync).await;
+            assert!(!sync.reentries_first);
+            assert_eq!(sync.accepted, 1, "its preparation succeeded");
+            assert!(
+                !members(&h.live).contains(&failed),
+                "the locked application refused it"
+            );
+            assert!(!sync.cooldowns.contains_key(&failed));
+            assert_eq!(
+                sync.failures[&failed], 1,
+                "preparation alone keeps the record"
+            );
+            assert!(log_fields(&bytes, "admission retry backoff cleared").is_empty());
+            // With room, the record still keeps it behind additions, then it is admitted.
+            h.applied = AppliedWatchlistCapacity::new(2);
+            admission_tick(&h, &preparer, &mut sync).await;
+            assert!(sync.reentries_first);
+            assert!(!members(&h.live).contains(&failed));
+            admission_tick(&h, &preparer, &mut sync).await;
+            assert!(members(&h.live).contains(&failed));
+            assert_eq!(sync.failures[&failed], 1);
+            // The next tick starts with it live: the record ends, logged once.
+            admission_tick(&h, &preparer, &mut sync).await;
+            assert!(!sync.failures.contains_key(&failed));
+            let cleared = log_fields(&bytes, "admission retry backoff cleared");
+            assert_eq!(cleared.len(), 1);
+            assert_eq!(cleared[0]["wallet"], failed.to_string());
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn failed_member_skipped_before_additions_without_ranking_read() {
+            let _io = paused_io();
+            let failed = wallet(1);
+            let mut fake = Fake::new(Some(1));
+            fake.ranking_entries = vec![row(1, 1, failed)];
+            let pinned_reads = Arc::clone(&fake.pinned_ranking_hits);
+            let h = harness(fake, &[failed]).await;
+            h.live.remove_fenced(&set(&[failed]));
+            let mut sync = admission_sync(1);
+            sync.failures.insert(failed, 1);
+            let mut attempted = HashSet::new();
+            for before_additions in [true, false] {
+                let report = live_reentry_tick(
+                    &h.live,
+                    &h.paper_state,
+                    &cfg(),
+                    &h.client,
+                    &h.base_url,
+                    "anon",
+                    "",
+                    &h.writer_lock,
+                    &h.applied,
+                    h.applied.load(),
+                    &h.preparer,
+                    &mut sync,
+                    None,
+                    &mut attempted,
+                    NOW,
+                    None,
+                    before_additions,
+                )
+                .await;
+                if before_additions {
+                    assert!(report.is_none());
+                    assert_eq!(pinned_reads.load(Ordering::SeqCst), 0, "no ranking read");
+                } else {
+                    assert_eq!(report.unwrap().admitted, vec![failed]);
+                    assert_eq!(pinned_reads.load(Ordering::SeqCst), 1);
+                }
+            }
         }
 
         #[tokio::test(start_paused = true)]
