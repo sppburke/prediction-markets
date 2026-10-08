@@ -14,10 +14,11 @@ use crate::orchestrator_control::OrchestratorControl;
 use crate::paper_recovery::{PaperLog, PaperLogFrame, PaperLogRecord, ScannedPaperFrame};
 use crate::watchlist_admission::AdmissionPreparer;
 
-/// Superseded proofs blanked per transaction. Each run's transactions resume after the last key
-/// blanked; on 10/8 in production, 16-row batches that rescanned the blank rows held the shared
-/// connection for up to 5.3 s.
-const BLANK_BATCH_ROWS: usize = 4;
+/// Superseded proofs blanked per transaction. A transaction's hold grows with the proof bytes it
+/// clears (about 0.047 s per MB on the production VPS on 10/8, where 16-row batches of 2.9 MB proofs
+/// held the shared connection for up to 5.3 s), so each transaction clears one proof. Each run's
+/// transactions resume after the last key blanked.
+const BLANK_BATCH_ROWS: usize = 1;
 /// A page walks every row of its wallets' tables; one 128-wallet page held 0.53 s in production on 10/8.
 const CANDIDATE_PAGE_WALLETS: usize = 32;
 /// Trade ids a drain transaction removes (about four row deletions each; 2.6 ms per trade id in

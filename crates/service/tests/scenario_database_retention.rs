@@ -1063,7 +1063,7 @@ async fn retention_pauses_after_every_hold_and_drains_listed_wallets_first() {
     let start = tokio::time::Instant::now();
     let _subscriber = tracing::subscriber::set_default(logs.subscriber_on_tokio_clock(start));
     let (fixture, fenced, departed) = job_fixture().await;
-    // Keep an anchor-bearing wallet: eight consecutive full blanking batches, then the empty batch.
+    // Keep an anchor-bearing wallet: thirty-two single-proof blanking batches, then the empty batch.
     for seq in 0..33 {
         fixture
             .sql
@@ -1111,7 +1111,7 @@ async fn retention_pauses_after_every_hold_and_drains_listed_wallets_first() {
         (1, 2, Some(0))
     );
     let holds = holds(&logs);
-    assert_eq!(holds.len(), 154);
+    assert_eq!(holds.len(), 178);
     let listed = wallet().to_string();
     let list = "source retention drain list read";
     let drain = "source retention drain transaction";
@@ -1136,7 +1136,7 @@ async fn retention_pauses_after_every_hold_and_drains_listed_wallets_first() {
             .filter(|hold| hold.message == transaction && hold.wallet.is_none())
             .map(|hold| hold.count.unwrap())
             .collect::<Vec<_>>(),
-        vec![4, 4, 4, 4, 4, 4, 4, 4, 0]
+        [vec![1; 32], vec![0]].concat()
     );
     assert_eq!(
         holds
