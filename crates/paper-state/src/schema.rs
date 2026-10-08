@@ -52,6 +52,10 @@ CREATE TABLE IF NOT EXISTS asset_identities (
 );
 CREATE INDEX IF NOT EXISTS idx_asset_identities_condition_outcome
 ON asset_identities (generation, condition_id, outcome);
+-- The daily source retention reads every distinct identity sequence, on every hourly tick, while holding the shared
+-- connection; this covering index answers it without scanning the table (built once, at the first open that adds it).
+CREATE INDEX IF NOT EXISTS idx_asset_identities_source_log_sequence
+ON asset_identities (source_log_sequence);
 
 -- Input dedup: version two keys on reconciled `g2:` activity group identity.
 -- The public view plus trigger is intentional. The v1 binary's exact

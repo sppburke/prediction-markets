@@ -1063,7 +1063,7 @@ async fn retention_pauses_after_every_hold_and_drains_listed_wallets_first() {
     let start = tokio::time::Instant::now();
     let _subscriber = tracing::subscriber::set_default(logs.subscriber_on_tokio_clock(start));
     let (fixture, fenced, departed) = job_fixture().await;
-    // Keep an anchor-bearing wallet: two consecutive full blanking batches, then the empty batch.
+    // Keep an anchor-bearing wallet: thirty-two single-proof blanking batches, then the empty batch.
     for seq in 0..33 {
         fixture
             .sql
@@ -1073,7 +1073,7 @@ async fn retention_pauses_after_every_hold_and_drains_listed_wallets_first() {
             )
             .unwrap();
     }
-    // 128 fenced candidates plus the departed one produce a full page and a partial page.
+    // 128 fenced candidates plus the departed one produce four full pages and a partial page.
     for byte in 4..=130 {
         let w = WalletAddress([byte; 20]).to_string();
         fixture
@@ -1111,7 +1111,7 @@ async fn retention_pauses_after_every_hold_and_drains_listed_wallets_first() {
         (1, 2, Some(0))
     );
     let holds = holds(&logs);
-    assert_eq!(holds.len(), 145);
+    assert_eq!(holds.len(), 178);
     let listed = wallet().to_string();
     let list = "source retention drain list read";
     let drain = "source retention drain transaction";
@@ -1136,7 +1136,7 @@ async fn retention_pauses_after_every_hold_and_drains_listed_wallets_first() {
             .filter(|hold| hold.message == transaction && hold.wallet.is_none())
             .map(|hold| hold.count.unwrap())
             .collect::<Vec<_>>(),
-        vec![16, 16, 0]
+        [vec![1; 32], vec![0]].concat()
     );
     assert_eq!(
         holds
@@ -1144,7 +1144,7 @@ async fn retention_pauses_after_every_hold_and_drains_listed_wallets_first() {
             .filter(|hold| hold.message == scan)
             .map(|hold| hold.count.unwrap())
             .collect::<Vec<_>>(),
-        vec![128, 1, 0]
+        vec![32, 32, 32, 32, 1, 0]
     );
     assert_eq!(
         holds
@@ -1173,18 +1173,16 @@ async fn admission_drain_pauses_after_the_list_read_and_every_transaction_before
     assert_eq!(result.deferred[0].kind, "history.missing");
     assert!(fixture.db.retirement_drains().unwrap().result.is_empty());
     let holds = holds(&logs);
+    let drain = "source retention drain transaction";
+    let mut expected = vec![("source retention drain list read", 1)];
+    expected.extend([(drain, 64); 7]);
+    expected.extend([(drain, 53), (drain, 1), (drain, 0)]);
     assert_eq!(
         holds
             .iter()
             .map(|hold| (hold.message.as_str(), hold.count.unwrap()))
             .collect::<Vec<_>>(),
-        vec![
-            ("source retention drain list read", 1),
-            ("source retention drain transaction", 500),
-            ("source retention drain transaction", 1),
-            ("source retention drain transaction", 1),
-            ("source retention drain transaction", 0),
-        ]
+        expected
     );
     assert_paced(&holds, returned_at);
     fixture.finish().await;

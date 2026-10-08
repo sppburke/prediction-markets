@@ -1842,11 +1842,16 @@ lock times and pauses for every database hold (drain-list reads, blanking, candi
 checks, removals and drains; largest eligible wallet included), the two wallet indexes' build time at the
 first open, copy latency and memory. Record the rehearsal's readiness and issues every 1 s, and
 production's every 5 s, throughout the advance (its preparation included), blanking, removals and
-drains: every rehearsal readiness sample must be true (a probe timeout fails), with no stale-copy
-refusal, and any failure is fixed and re-measured before deployment. An upstream outage in that
-window leaves O1 incomplete, and it is repeated before O2; production's samples tell an outage from
-a rehearsal failure but never excuse a failed rehearsal sample. Apply the glossary's retention
-rehearsal space and timing gates.
+drains. The rehearsal's serving windows run from the advance's preparation start through
+`source retention committed` in the fresh subrun (killed there) and through the `source retention`
+summary in the swap-out subrun; the resumed crash-rebuild boot's window runs from its first ready
+sample through the finished epoch and the 60-minute soak, and its earlier startup samples are kept
+and recorded but not gated. Every rehearsal readiness sample inside a serving window must be true (a
+probe timeout fails), with no stale-copy refusal, and any failure is fixed and re-measured before
+deployment. An upstream outage in that window leaves O1 incomplete, and it is repeated before O2;
+production's samples tell an outage from a rehearsal failure but never excuse a failed rehearsal
+sample. Apply the glossary's retention rehearsal and observation gates (space, timing and the
+per-kind hold bounds).
 
 The kill command waits for `source retention committed`, verifies the authority's new epoch and
 SIGKILLs only the recorded service PID before punching. **After the process dies**, record both
@@ -1939,7 +1944,8 @@ At the first hourly tick, retain `source retention committed` before rehash and 
 wallets swapped out/waiting with reasons, wallets and trade ids drained, wallets still listed for
 draining (expected `Some(0)`; `None` can indicate a cancelled or failed run, or a skip before
 database work; distinguish these using `cancelled`, `skip_reason` and the logged error), skip
-reason and elapsed time, plus every database hold's lock-time line.
+reason and elapsed time, plus every database hold's lock-time line, checked by hold kind against
+the glossary's retention rehearsal and observation gates.
 Verify the authority matches the published format-3 epoch, inventory the committed feed files,
 measure allocated/net free-space change and copy latency, and inspect readiness/task health and
 journal for serving-path `Erased`/`Retired`. Compare pre-advance Prepared/Final records and Supabase
