@@ -148,15 +148,25 @@ fn progressive_boot_enabled(
         && cfg.maintenance_interval_secs > 0
 }
 
+/// Cooldown end for a boot transient bracket failure, logged as the wallet's first counted failure;
+/// the maintenance loop seeds that wallet's failure record from the same cooldowns.
 fn boot_transient_retry_at(
+    wallet: &WalletAddress,
+    kind: &str,
     class: pe_service::position_seeder::FailureClass,
     completed_at: Option<tokio::time::Instant>,
 ) -> Option<tokio::time::Instant> {
-    completed_at
-        .filter(|_| class == pe_service::position_seeder::FailureClass::WalletTransient)
-        .map(|terminal| {
-            terminal + Duration::from_secs(pe_service::watchlist_admission::ADMISSION_RETRY_SECS)
-        })
+    let terminal = completed_at
+        .filter(|_| class == pe_service::position_seeder::FailureClass::WalletTransient)?;
+    let retry_after = pe_service::watchlist_admission::admission_retry_after(1);
+    info!(
+        wallet = %wallet,
+        kind,
+        consecutive_failures = 1_u32,
+        retry_after_secs = retry_after.as_secs(),
+        "admission retry backoff"
+    );
+    Some(terminal + retry_after)
 }
 
 fn boot_wave_has_eligible_wallet<'a>(
@@ -1062,9 +1072,12 @@ async fn run() -> Result<()> {
                 {
                     boot_persistent_deferred.insert(*wallet);
                 }
-                if let Some(retry_at) =
-                    boot_transient_retry_at(error.class(), outcome.failure_completed_at(wallet))
-                {
+                if let Some(retry_at) = boot_transient_retry_at(
+                    wallet,
+                    error.kind(),
+                    error.class(),
+                    outcome.failure_completed_at(wallet),
+                ) {
                     boot_cooldowns.insert(*wallet, retry_at);
                 }
             }
@@ -2668,22 +2681,66 @@ mod tests {
 
     const NOW: i64 = 10_000;
 
+    #[derive(Clone)]
+    struct LogSink(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogSink {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn boot_transient_deferral_eligibility() {
         use pe_service::position_seeder::FailureClass;
+        let bytes = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = LogSink(bytes.clone());
+        let _logs = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .json()
+                .with_writer(move || sink.clone())
+                .finish(),
+        );
+        let wallet = WalletAddress([7; 20]);
+        let kind = "validation.intervening_activity";
         let completed = tokio::time::Instant::now();
         tokio::time::advance(Duration::from_secs(30)).await;
-        let retry_at =
-            boot_transient_retry_at(FailureClass::WalletTransient, Some(completed)).unwrap();
+        let retry_at = boot_transient_retry_at(
+            &wallet,
+            kind,
+            FailureClass::WalletTransient,
+            Some(completed),
+        )
+        .unwrap();
         assert_eq!(retry_at, completed + Duration::from_secs(300));
         tokio::time::advance(Duration::from_secs(269)).await;
         assert!(tokio::time::Instant::now() < retry_at);
         tokio::time::advance(Duration::from_secs(1)).await;
         assert_eq!(tokio::time::Instant::now(), retry_at);
         for class in [FailureClass::WalletPersistent, FailureClass::Shared] {
-            assert!(boot_transient_retry_at(class, Some(completed)).is_none());
+            assert!(boot_transient_retry_at(&wallet, kind, class, Some(completed)).is_none());
         }
-        assert!(boot_transient_retry_at(FailureClass::WalletTransient, None).is_none());
+        assert!(
+            boot_transient_retry_at(&wallet, kind, FailureClass::WalletTransient, None).is_none()
+        );
+        // Exactly one backoff line: the counted first failure, never the uncounted calls.
+        let logs = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        let backoffs = logs
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|line| line["fields"]["message"] == "admission retry backoff")
+            .map(|line| line["fields"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(backoffs.len(), 1);
+        assert_eq!(backoffs[0]["wallet"], wallet.to_string());
+        assert_eq!(backoffs[0]["kind"], kind);
+        assert_eq!(backoffs[0]["consecutive_failures"], 1);
+        assert_eq!(backoffs[0]["retry_after_secs"], 300);
     }
 
     #[test]

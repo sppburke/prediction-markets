@@ -33,6 +33,21 @@ use crate::watchlist_maintenance::MembershipCommit;
 
 const ADMISSION_PREPARE_ACK_TIMEOUT_SECS: u64 = 30;
 pub const ADMISSION_RETRY_SECS: u64 = 300;
+pub const ADMISSION_RETRY_MAX_SECS: u64 = 21_600;
+
+/// Cooldown after a wallet's `consecutive_failures`-th consecutive transient admission-bracket
+/// failure: [`ADMISSION_RETRY_SECS`] doubled per earlier failure, capped at
+/// [`ADMISSION_RETRY_MAX_SECS`]. A count of 0 or 1 is the base cooldown.
+#[must_use]
+pub fn admission_retry_after(consecutive_failures: u32) -> Duration {
+    let doublings = consecutive_failures.saturating_sub(1).min(16);
+    Duration::from_secs(
+        ADMISSION_RETRY_SECS
+            .saturating_mul(1_u64 << doublings)
+            .min(ADMISSION_RETRY_MAX_SECS),
+    )
+}
+
 pub(crate) const CAPACITY_CONFIG_SOURCE_ID: &str = "pe-service.watchlist-capacity-config";
 pub(crate) const RANKING_MEMBERSHIP_SOURCE_ID: &str = "pe-service.watchlist-ranking";
 pub(crate) const MEMBERSHIP_ADMISSION_SOURCE_ID: &str = "pe-service.watchlist-admission";
