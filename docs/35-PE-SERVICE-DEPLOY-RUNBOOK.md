@@ -1845,7 +1845,9 @@ readiness times. The glossary's listening/readiness gates apply to the next boot
 is finished.
 Use the recorded evidence decoder (`source_mix.py`) to compare every below-boundary snapshot feed
 frame byte-for-byte with the epoch-1 file and compare both counts with the authority entry. Then soak
-for 60 minutes.
+for 60 minutes. Then, once the authority and checkpoint epochs match and the punches and log fsync are
+complete, stop the recorded service and invoke the same recorded resume command without copying or
+reseeding; record listening and readiness times and require at most 60 s and 300 s before O2.
 
 Measure normal swap-out in another fresh subrun with its own sparse state, checkpoint kept, and a
 fresh local authority holding the matching fills, after stopping the earlier subrun. Record paths,
@@ -1855,10 +1857,16 @@ Run each actual-6e09b86 case separately and record its pause or release point an
 against the durable inventory (`paper_state.db` and its WAL, `paper.log`, `live_journal.log`, the
 source log, checkpoint, receipts, invalidation record, authority and committed feed files; 6e09b86's
 own diagnostic logs are outside it). Before the fresh boot, on the restored, unfenced base, start a
-6e09b86 preparation; once its initial checkpoint load has released the lock, hold
-`<log>.boot-checkpoint.lock` so it blocks entering publication, confirm in `/proc/locks` that it
-waits on that lock having read at least the whole log (`rchar` in `/proc/<pid>/io`; the command
-prints only its final receipt), SIGSTOP it and release the lock. After the fresh and
+6e09b86 preparation, identified by its executable. Observe (10 ms polling, within 600 s) its FLOCK on
+`<log>.boot-checkpoint.lock` in `/proc/locks` for the initial checkpoint load, then, within 1,800 s,
+that hold's release and its walk underway (no lock of its PID; `rchar` in `/proc/<pid>/io` at least
+1 GB past the release). Hold the checkpoint lock so it blocks entering publication, and within
+3,600 s confirm a waiting FLOCK of its PID with `rchar` at least the log's size (the command prints
+only its final receipt). While holding the lock, SIGSTOP it and confirm within 10 s that it is
+stopped and has not acquired the lock; release the lock and confirm within 10 s that it holds and
+awaits none. If a phase is not established in time, kill that recorded PID, release the lock, keep
+the failed-window receipt, restore a fresh unfenced base and repeat once; a second failure stops O1.
+After the fresh and
 resume boots have installed the fence, advanced and punched, and the service is stopped, record the
 inventory, SIGCONT the preparation and require it to exit refusing publication (`UnreadableRecord`)
 with the inventory unchanged. A 6e09b86 boot against the fenced, punched run refuses at its walk,
@@ -1869,7 +1877,11 @@ on a copy restored from the base and after a recorded clear census, launch 6e09b
 source log (otherwise record the window actually reached and repeat on a fresh copy); prove O2's
 census reports it and clearance refuses to start the new binary, kill that recorded PID, and confirm
 a final census is clear. An old-unit crash during the deploy is covered by O2's ordering (disabled
-and stopped before the swap, a fresh cleared census before any start). Stop on a serving-path
+and stopped before the swap, a fresh cleared census before any start) and by the deploy unit-state
+harness attached to the issue evidence (the deploy script's own normalization functions against a
+stubbed `systemctl`). Before O2, rerun that harness against the approved deploy script, record the
+script's SHA-256 and the successful raw result, and stop O2 if either is missing or the run fails.
+Stop on a serving-path
 `Erased`/`Retired` or failed boot; retain scripts and receipts with the issue evidence.
 
 ### O2 — deployment
@@ -1920,8 +1932,13 @@ listening: a failure is treated like a digest mismatch (invalidation and a criti
 restart's rebuild then refuses. Listening alone therefore does not prove the pins. Restore retained
 evidence only from one coherent capture verified against the current financial, paper, live and
 migration bindings; never roll those authorities back to make a capture fit, never restore individual
-stale companions, and never delete receipts by hand. Run the stopped fence, receipts-prefix, pin and
-retained-tail checks before restart; without compatible evidence, stay stopped and fix forward. Rebind moved captures with the existing
+stale companions, and never delete receipts by hand. Before restart, with the service stopped: run
+the quiesced recovery command above when it is required, then the compatible binary's
+`--prepare-source-checkpoint --paper-state <installed-path>`, which verifies the retained tail, every
+pin and the open continuations; require it to succeed, its retention epoch to match the authority and
+the fence to be installed. Check the restored inventory and its bindings against current financial,
+paper, live and migration state separately: preparation success alone does not certify capture
+compatibility. Any failed check keeps the service stopped; fix forward. Rebind moved captures with the existing
 migration-path rebinder; do not rewrite logs or offsets. Only an incomplete final append beyond
 `retained_tail` may be repaired automatically.
 
