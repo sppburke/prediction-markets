@@ -330,7 +330,8 @@ mod admission_tests {
         );
         let ranked = HashMap::from([(candidate, 1234)]);
         let preparer = AdmissionPreparer::with_validator(tx, state.clone(), validator);
-        let deadline = Instant::now() + Duration::from_secs(3600);
+        let day = Duration::from_secs(86_400);
+        let deadline = Instant::now() + 2 * day;
         let additions = [candidate];
         let prepare = preparer.prepare_with_cursors(
             &additions,
@@ -338,19 +339,21 @@ mod admission_tests {
             Some(deadline),
             AdmissionContext::Other,
         );
-        // Pauses follow measured lock times, so drive the paused clock by hand: it moves only here,
-        // and only after checking for the group's drain commit. Preparation is then parked in that
-        // transaction's pause (at least 50 ms) when the clock passes the deadline, so the gate
-        // result's transaction never starts.
+        // Pauses follow measured lock times, so the test moves the paused clock itself (tokio does not
+        // auto-advance while this task keeps yielding). One day ends the drain-list read's pause
+        // whatever it measured; the group's drain transaction then commits and preparation parks in
+        // its pause (at least 50 ms) until the second day passes the deadline, so the gate result's
+        // transaction never starts.
         let drive = async {
-            for _ in 0..100_000 {
+            tokio::time::advance(day).await;
+            for _ in 0..1_000 {
                 if !seen(&state, "left") {
                     break;
                 }
-                tokio::time::advance(Duration::from_millis(10)).await;
+                tokio::task::yield_now().await;
             }
             assert!(!seen(&state, "left"), "the group's transaction committed");
-            tokio::time::advance(Duration::from_secs(3600)).await;
+            tokio::time::advance(day).await;
         };
         let (outcome, ()) = tokio::join!(prepare, drive);
         let outcome = outcome.unwrap();
