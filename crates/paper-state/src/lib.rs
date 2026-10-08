@@ -792,6 +792,11 @@ pub struct AssetIdentityRow {
 const ASSET_IDENTITY_LOOKUP: &str = "SELECT token, condition_id, outcome, source_log_sequence, canonical_page_hash \
      FROM asset_identities WHERE generation = ?1 AND token IN (SELECT value FROM json_each(?2))";
 
+/// Every distinct source-log sequence that recorded an asset identity, ascending. It reads only the covering index
+/// `idx_asset_identities_source_log_sequence`, so the hourly retention read holds the shared connection briefly.
+const ASSET_IDENTITY_SOURCE_SEQUENCES: &str =
+    "SELECT DISTINCT source_log_sequence FROM asset_identities ORDER BY source_log_sequence";
+
 const ASSET_IDENTITY_CONDITION_LOOKUP: &str = "SELECT token, condition_id, outcome, source_log_sequence, canonical_page_hash FROM asset_identities \
      WHERE generation = ?1 AND condition_id IN (SELECT value FROM json_each(?2))";
 
@@ -1431,12 +1436,10 @@ impl PaperStateDb {
     }
 
     /// Distinct source-log sequences that recorded asset identities, ascending; the daily source
-    /// retention keeps those frames readable.
+    /// retention keeps those frames readable. Answered from a covering index, not a table scan.
     pub fn asset_identity_source_sequences(&self) -> Result<Vec<i64>, PaperStateError> {
         let conn = self.lock();
-        let mut statement = conn.prepare(
-            "SELECT DISTINCT source_log_sequence FROM asset_identities ORDER BY source_log_sequence",
-        )?;
+        let mut statement = conn.prepare(ASSET_IDENTITY_SOURCE_SEQUENCES)?;
         statement
             .query_map([], |row| row.get(0))?
             .collect::<Result<Vec<_>, _>>()
@@ -7116,6 +7119,43 @@ mod tests {
                 "SEARCH asset_identities USING INDEX idx_asset_identities_condition_outcome"
             ) && detail.contains("generation=? AND condition_id=?")),
             "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn asset_identity_source_sequences_read_only_the_covering_index() {
+        let (_dir, db) = db();
+        let row = |token: &str, sequence: i64| AssetIdentityRow {
+            source_log_sequence: sequence,
+            ..asset_identity_row(token, "condition")
+        };
+        db.insert_asset_identities(
+            "generation",
+            &[row("token-a", 7), row("token-b", 3), row("token-c", 7)],
+        )
+        .unwrap();
+        db.insert_asset_identities("other", &[row("token-d", 11)])
+            .unwrap();
+        assert_eq!(
+            db.asset_identity_source_sequences().unwrap(),
+            vec![3, 7, 11]
+        );
+        let conn = db.lock();
+        let plan = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {ASSET_IDENTITY_SOURCE_SEQUENCES}"
+            ))
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            plan,
+            vec![
+                "SCAN asset_identities USING COVERING INDEX idx_asset_identities_source_log_sequence"
+            ],
+            "the hourly retention read must not scan the table or sort into a temporary tree"
         );
     }
 
