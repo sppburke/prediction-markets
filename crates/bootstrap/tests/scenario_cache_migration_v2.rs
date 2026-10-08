@@ -5779,14 +5779,15 @@ async fn fresh_generation_on_recurring_base_preserves_the_prior_and_resumes_only
     assert_eq!(sha256_file(&fixed).unwrap(), stage.cache_sha256);
 }
 
-/// One fill reported as two rows with different venue timestamps (the shape
-/// the aggregator refuses as causally ambiguous; observed on Forge for
-/// `0x04902c…` on 2026-09-17).
+/// One transaction's group listed at two venue timestamps where the later row
+/// is not an exact copy of the earlier one: the shape the aggregator refuses as
+/// causally ambiguous. (Exact copies, observed on Forge for `0x04902c…` on
+/// 2026-09-17, are the earliest listing since #747.)
 fn ambiguous_fill_rows(wallet: &str) -> Vec<u8> {
-    let rows = [FRESH_END - 1, FRESH_END - 3].map(|epoch| {
+    let rows = [(FRESH_END - 1, "105"), (FRESH_END - 3, "210")].map(|(epoch, size)| {
         serde_json::json!({
             "proxyWallet": wallet, "type": "TRADE", "conditionId": market_for(wallet, FRESH_END - 1),
-            "asset": "123", "outcome": "Yes", "side": "BUY", "size": "210",
+            "asset": "123", "outcome": "Yes", "side": "BUY", "size": size,
             "usdcSize": "112.41", "price": "0.5352857143", "timestamp": epoch,
             "transactionHash": "trade-shared", "outcomeIndex": "0",
         })
@@ -10687,10 +10688,13 @@ async fn incremental_full_replacement_rolls_back_deletion_and_keeps_failed_histo
     assert_eq!(fresh_record(&side)["fixed_end_unix"], FRESH_END + 2);
     assert_eq!(generation_rows(&side, 1), 0);
     let repaired = query_values(&side, "SELECT * FROM activity_groups_v2");
-    // Two new rows with the same semantic group but different times are unbucketable.
+    // Two new rows with the same semantic group at different times, the later
+    // not an exact copy of the earlier, are unbucketable.
+    let mut later = dataset_row(WALLET, "0xmarket", "bad", "BUY", FRESH_END + 4);
+    later["size"] = Value::from("2.500002");
     source.rows = vec![
         dataset_row(WALLET, "0xmarket", "bad", "BUY", FRESH_END + 3),
-        dataset_row(WALLET, "0xmarket", "bad", "BUY", FRESH_END + 4),
+        later,
     ];
     let excluded = populate_activity_fresh_v2(
         &side,
@@ -11220,9 +11224,11 @@ async fn incremental_exclusion_cannot_hide_missing_predecessor_rows_on_restart()
     )
     .await
     .unwrap();
+    let mut later = dataset_row(WALLET, "0xmarket", "bad", "BUY", FRESH_END + 2);
+    later["size"] = Value::from("2.500002");
     source.rows = vec![
         dataset_row(WALLET, "0xmarket", "bad", "BUY", FRESH_END + 1),
-        dataset_row(WALLET, "0xmarket", "bad", "BUY", FRESH_END + 2),
+        later,
     ];
     scenario_sql_connection(&side).unwrap().execute_batch("CREATE TRIGGER stop_exclusion BEFORE INSERT ON activity_wallet_coverage_staging_v2 WHEN NEW.generation = 7 BEGIN SELECT RAISE(ABORT, 'pause'); END").unwrap();
     populate_activity_fresh_v2(
@@ -13202,7 +13208,11 @@ async fn quiet_wallet_weekly_deferral_recovery_and_topups() {
             dataset_row(WALLET_B, "0xactive", "active", "BUY", root_end),
             dataset_row(WALLET_C, "0xrepair", "repair", "BUY", old),
             dataset_row(WALLET_D, "0xbad", "bad", "BUY", root_end - 2),
-            dataset_row(WALLET_D, "0xbad", "bad", "BUY", root_end - 1),
+            {
+                let mut later = dataset_row(WALLET_D, "0xbad", "bad", "BUY", root_end - 1);
+                later["size"] = Value::from("2.500002");
+                later
+            },
         ],
         ..Default::default()
     };
@@ -18566,6 +18576,8 @@ async fn collection_747_group_across_windows_fails_aggregation_at_partial_end() 
     let side = dataset_candidate(&dir, "aggregation.db", &[]);
     let mut rows = collection_rows(WALLET, 12_000);
     rows[4999]["transactionHash"] = rows[4998]["transactionHash"].clone();
+    // A later row of the same group that is not an exact copy stays ambiguous.
+    rows[4999]["size"] = serde_json::json!("2.500002");
     let source = CollectionDataset::new(rows, 1);
     collection_admit(&side, 1, FRESH_END, &[]).await;
     collection_run(
@@ -18727,6 +18739,42 @@ async fn collection_747_cross_generation_collision_records_partial_end_and_reads
         fresh_record(&side)["full_read_wallets"],
         serde_json::json!([WALLET])
     );
+    // Row 4999 is an exact copy of row 4998 one second later: the full read
+    // holds both and records one group at the earlier second (#747).
+    collection_run(
+        &side,
+        &source,
+        FRESH_END + 2,
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        None,
+    )
+    .await
+    .unwrap();
+    let proof = collection_proof(&side, 3, WALLET);
+    assert_eq!(proof["acquisition"]["disposition"], "complete");
+    assert_eq!(proof["aggregate_count"], 11_999);
+    assert_eq!(proof["source_row_count"], 12_000);
+    let copied = query_values(
+        &side,
+        &format!(
+            "SELECT row_count, source_time_unix FROM activity_groups_v2 WHERE coverage_generation = 3 AND transaction_hash = '{}'",
+            source.source.rows[4998]["transactionHash"]
+                .as_str()
+                .unwrap()
+        ),
+    );
+    assert_eq!(
+        copied,
+        vec![vec![
+            rusqlite::types::Value::Integer(2),
+            rusqlite::types::Value::Integer(
+                source.source.rows[4998]["timestamp"].as_i64().unwrap()
+            )
+        ]]
+    );
+    dataset_payouts(&side, &source.source.rows).await;
+    finalize_cache_v2_unbound(&side, None, FRESH_END + 3).unwrap();
+    assert_eq!(history_v3_wallet_count(&side), 11_999);
 }
 
 #[tokio::test(start_paused = true)]

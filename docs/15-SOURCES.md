@@ -165,6 +165,19 @@ Reproduce the exact lookup and paginate DESC through `b − 1` before deploying 
 contract; timestamp ties can place fewer rows in a window, and a saturated terminal second remains
 incomplete. These captures verify boundary sizing, not immutability of later historical responses.
 
+### Activity listing a transaction's fills twice (#747)
+
+Last checked: **2026-10-07**. Re-verify by: **2026-12-06**.
+`/activity` and `/trades?takerOnly=false` sometimes list every fill of a transaction a second
+time, identical except that the copy's `timestamp` is 1–8 s later. A live re-read on 2026-10-07 of
+all 299 wallets generation 9 excluded for mixed timestamps found 338 such groups, all `TRADE`, each
+with exactly two times, and in every one the later rows equal the earlier rows as a multiset of
+(size, price, `usdcSize`). Polygonscan for four of them (transactions `0x0493b71e…6836`,
+`0xbb900f69…0687` and `0x6cd07ac3…63c8`) shows the block time equal to the earlier listing and each
+earlier-listed fill transferred once; raw RPC receipts were not obtainable from the checking
+networks. `aggregate_activity_rows` therefore treats a group whose later times exactly repeat its
+earliest time's rows as that earliest listing and still refuses any other mixed-time group.
+
 > **Incremental bootstrap acquisition (#648), Last checked: 2026-09-17;
 > re-verify by 2026-11-16.** Re-read the [official activity reference](https://docs.polymarket.com/api-reference/core/get-user-activity):
 > positive wire start is required for full DESC history, and bounded windows retain stable offset
