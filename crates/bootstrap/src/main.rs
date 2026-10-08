@@ -3,9 +3,10 @@ use pe_bootstrap::{
     cache::WalletCache,
     cache_migration::{
         CacheActivationRequest, PriorCacheBinding, SupabasePublicationProbe,
-        activate_cache_v2_with_handoff, finalize_cache_v2, migrate_cache_v2,
+        activate_cache_v2_with_handoff, finalize_cache_v2_with_export_manifest, migrate_cache_v2,
         populate_activity_bulk_root_v2_with_clock, populate_activity_fresh_v2_with_clock,
-        populate_activity_v2, restore_prior_cache, stage_cache_cycle_v2, verify_frozen_payload_v1,
+        populate_activity_v2, restore_prior_cache_with_final_stage_record, stage_cache_cycle_v2,
+        verify_frozen_payload_v1,
     },
     config, coverage,
     error::BootstrapError,
@@ -119,6 +120,7 @@ async fn main() {
         let mut db_arg: Option<std::path::PathBuf> = None;
         let mut manifest_arg: Option<std::path::PathBuf> = None;
         let mut frozen_payload_arg: Option<std::path::PathBuf> = None;
+        let mut export_manifest_arg: Option<std::path::PathBuf> = None;
         let mut stage_record_arg: Option<std::path::PathBuf> = None;
         let mut fixed_db_arg: Option<std::path::PathBuf> = None;
         let mut backup_arg: Option<std::path::PathBuf> = None;
@@ -230,6 +232,12 @@ async fn main() {
                 frozen_payload_arg = Some(std::path::PathBuf::from(rest[i]));
             } else if let Some(v) = a.strip_prefix("--frozen-payload=") {
                 frozen_payload_arg = Some(std::path::PathBuf::from(v));
+            } else if a == "--export-manifest" && i + 1 < rest.len() {
+                i += 1;
+                flag_values.insert(rest[i]);
+                export_manifest_arg = Some(std::path::PathBuf::from(rest[i]));
+            } else if let Some(v) = a.strip_prefix("--export-manifest=") {
+                export_manifest_arg = Some(std::path::PathBuf::from(v));
             } else if a == "--stage-record" && i + 1 < rest.len() {
                 i += 1;
                 flag_values.insert(rest[i]);
@@ -564,9 +572,10 @@ async fn main() {
                     &bootstrap_config.cache_path,
                 )
                     .and_then(|_lock| {
-                        finalize_cache_v2(
+                        finalize_cache_v2_with_export_manifest(
                             &bootstrap_config.cache_path,
                             stage_record_arg.as_deref(),
+                            export_manifest_arg.as_deref(),
                             now,
                         )
                             .and_then(json_report)
@@ -651,7 +660,7 @@ async fn main() {
                     match prepared {
                         Ok((fixed, backup, displaced, sha256, schema_version,
                             publication_request, pending_pointer, probe)) => {
-                            restore_prior_cache(
+                            restore_prior_cache_with_final_stage_record(
                             &fixed,
                             &backup,
                             &displaced,
@@ -659,6 +668,7 @@ async fn main() {
                             &publication_request,
                             &pending_pointer,
                             &probe,
+                            final_stage_record_arg.as_deref(),
                         )
                             .await
                             .map(|()| serde_json::json!({"restored": fixed}))
@@ -1095,7 +1105,11 @@ async fn main() {
                     tracing::error!("activate-next: --batch-id is required");
                     std::process::exit(1);
                 };
-                match pile::activate_next(&mut cache, batch_id) {
+                match pile::activate_next(
+                    &mut cache,
+                    batch_id,
+                    bootstrap_config.activation_batch_wallets,
+                ) {
                     Ok(batch) => {
                         if let Some(path) = audit_csv.as_deref()
                             && let Err(e) = pile::write_activation_audit_csv(&batch, path)
@@ -1110,7 +1124,13 @@ async fn main() {
                             std::process::exit(1);
                         }
                         let activated = batch.wallet_hexes.len();
-                        if activated == 0 {
+                        if batch.requested_count == 0 {
+                            tracing::info!(
+                                batch_id = batch.batch_id,
+                                reused = batch.reused,
+                                "activate-next: activation batch size is 0; admitting no new wallets"
+                            );
+                        } else if activated == 0 {
                             tracing::warn!(
                                 batch_id = batch.batch_id,
                                 "activate-next: no inactive non-infrastructure wallets remain; skipping"

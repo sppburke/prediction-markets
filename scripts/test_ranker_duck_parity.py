@@ -35,6 +35,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+from decimal import Decimal
 import math
 import os
 import sqlite3
@@ -156,11 +157,11 @@ def build_parity_cache(path: str) -> None:
     conn.close()
 
 
-def run_pass1(db: str, out_dir: str, engine: str, parquet_dir: str, max_age_hours: str = "0") -> int:
+def run_pass1(db: str, out_dir: str, engine: str, parquet_dir: str, max_age_hours: str = "0", min_active_months: str = "2") -> int:
     argv = ["rank_72hr_buyandhold.py", "--db", db, "--out-dir", out_dir,
             "--universe-from-trades",
             "--win-start", WIN_START_ISO, "--win-end", WIN_END_ISO, "--as-of", AS_OF_ISO,
-            "--min-avg-per-month", "1", "--min-active-months", "2",
+            "--min-avg-per-month", "1", "--min-active-months", min_active_months,
             "--target-n", "5", "--floor-tstat", "0.0", "--scheduled-only"]
     env = {"PE_RANKER_ENGINE": engine, "PE_RANKER_PARQUET_DIR": parquet_dir,
            "PE_RANKER_PARQUET_MAX_AGE_HOURS": max_age_hours}
@@ -206,7 +207,16 @@ def positions_set(path: str) -> set[tuple]:
 
 def whole_projection_digest(rows: list[dict]) -> str:
     """Original whole-list implementation, retained only as a test reference."""
-    return hashlib.sha256(json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return hashlib.sha256(json.dumps(rows, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+
+
+ESCAPED_ASSET = 'token"\n\\'
+
+
+def payout_tokens(asset: str, outcome: int) -> str:
+    """A binary market's payout token list with `asset` at index `outcome`."""
+    return json.dumps([{"token_id": asset if index == outcome else f"{asset}-other"}
+                       for index in range(2)])
 
 
 def build_certified_cache(db: str) -> tuple[list[dict], int, str]:
@@ -227,13 +237,13 @@ def build_certified_cache(db: str) -> tuple[list[dict], int, str]:
                  "ON activity_groups_v2(source_trade_id COLLATE BINARY)")
     conn.execute(
         "CREATE TABLE clob_payout_evidence_v2 (market_id TEXT PRIMARY KEY, "
-        "payout_vector_json TEXT, end_date_unix INTEGER, payout_status TEXT)"
+        "payout_vector_json TEXT, end_date_unix INTEGER, payout_status TEXT, tokens_json TEXT)"
     )
     conn.execute(
         "CREATE TABLE activity_coverage_manifests_v2 (generation INTEGER PRIMARY KEY, "
         "reference_sha256 TEXT, wallet_count INTEGER, receipt_set_digest TEXT, "
         "aggregate_digest TEXT, source_row_count INTEGER, cursors_json TEXT, page_hashes_json TEXT, "
-        "completed_at_unix INTEGER)"
+        "completed_at_unix INTEGER, group_count INTEGER)"
     )
     conn.execute(
         "CREATE TABLE clob_payout_coverage_manifests_v2 "
@@ -243,7 +253,7 @@ def build_certified_cache(db: str) -> tuple[list[dict], int, str]:
     conn.execute(
         "CREATE TABLE cache_v2_migration_state (singleton INTEGER PRIMARY KEY, "
         "phase TEXT, ranker_projection_count INTEGER, ranker_projection_digest TEXT, "
-        "ranker_classifier_version INTEGER)"
+        "ranker_classifier_version INTEGER, fresh_collection_json TEXT)"
     )
     gid = "g2:" + "a" * 64
     entry = ts(2026, 2, 5)
@@ -254,13 +264,14 @@ def build_certified_cache(db: str) -> tuple[list[dict], int, str]:
          "0.500000000000", "0.490000", entry),
     )
     conn.execute(
-        "INSERT INTO clob_payout_evidence_v2 VALUES (?,?,?,?)",
-        ("condition", '[\"0.5\",\"0.5\"]', entry + 3600, "resolved"),
+        "INSERT INTO clob_payout_evidence_v2 VALUES (?,?,?,?,?)",
+        ("condition", '[\"0.5\",\"0.5\"]', entry + 3600, "resolved",
+         json.dumps([{"token_id": ESCAPED_ASSET}, {"token_id": "token"}])),
     )
     marker = json.dumps({"receipt_storage": "activity_wallet_coverage_staging_v2", "version": 1},
                         sort_keys=True, separators=(",", ":"))
-    conn.execute("INSERT INTO activity_coverage_manifests_v2 VALUES (?,?,?,?,?,?,?,?,?)",
-                 (7, "b" * 64, 1, "c" * 64, "d" * 64, 5, marker, "[]", entry))
+    conn.execute("INSERT INTO activity_coverage_manifests_v2 VALUES (?,?,?,?,?,?,?,?,?,?)",
+                 (7, "b" * 64, 1, "c" * 64, "d" * 64, 5, marker, "[]", entry, 5))
     conn.execute("INSERT INTO clob_payout_coverage_manifests_v2 VALUES (?,?,?,?,?)",
                  (8, "end_cursor", entry, "{}", "e" * 64))
     rows = [{
@@ -277,18 +288,22 @@ def build_certified_cache(db: str) -> tuple[list[dict], int, str]:
     # three batches on both SQLite and the exported Parquet relation.
     for ordinal in (4, 3, 2, 1):
         row = {**rows[0], "source_trade_id": f"g2:{ordinal:064x}",
-               "wallet_hex": W("b"), "asset": 'token"\n\\'}
+               "wallet_hex": W("b"), "asset": ESCAPED_ASSET, "outcome_id": 0}
         rows.append(row)
         conn.execute("INSERT INTO ranker_entries_v2 VALUES (?,?,?)",
                      (row["source_trade_id"], 7, 1))
         conn.execute("INSERT INTO activity_groups_v2 VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                     (row["source_trade_id"], 7, W("b"), "condition", row["asset"], 1,
+                     (row["source_trade_id"], 7, W("b"), "condition", row["asset"], 0,
                       "buy", "1.250000", "0.500000000000", "0.490000", entry))
     rows.sort(key=lambda row: row["source_trade_id"])
-    conn.execute("INSERT INTO cache_v2_migration_state VALUES (?,?,?,?,?)",
-                 (1, "finalized", len(rows), whole_projection_digest(rows), 1))
-    # Watermark-only columns and acquisition view; no receipt table is
-    # needed by either the watermark or the Parquet exporter.
+    conn.execute("INSERT INTO cache_v2_migration_state VALUES (?,?,?,?,?,?)",
+                 (1, "finalized", len(rows), whole_projection_digest(rows), 1, '{"generation":7}'))
+    # Watermark-only columns, receipts and acquisition view; the Parquet
+    # exporter needs none of them.
+    conn.execute("CREATE TABLE activity_wallet_coverage_staging_v2 (generation INTEGER, "
+                 "wallet_hex TEXT, aggregate_count INTEGER, PRIMARY KEY (generation, wallet_hex))")
+    conn.execute("INSERT INTO activity_wallet_coverage_staging_v2 VALUES (7, ?, 1), (7, ?, 4)",
+                 (W("a"), W("b")))
     conn.execute("CREATE VIEW active_tradeable_wallets AS SELECT DISTINCT wallet_hex FROM activity_groups_v2")
     conn.execute("ALTER TABLE activity_groups_v2 ADD COLUMN activity_type TEXT DEFAULT 'TRADE'")
     conn.execute("ALTER TABLE clob_payout_evidence_v2 ADD COLUMN coverage_generation INTEGER DEFAULT 8")
@@ -303,6 +318,70 @@ def build_certified_cache(db: str) -> tuple[list[dict], int, str]:
     conn.commit()
     conn.close()
     return rows, entry, marker
+
+
+def build_format_three_cache(db: str):
+    """Python-built C2-C5 fixture; activity mirrors deliberately disagree."""
+    import rank_cycle_manifest as cycle
+
+    rows, entry, _ = build_certified_cache(db)
+    rows = [{**row, "classifier_version": 6} for row in rows]
+    rows.sort(key=lambda row: (row["wallet_hex"], row["source_time_unix"], row["source_trade_id"]))
+    for index, row in enumerate(rows):
+        row["condition_id"] = f"0x{index + 1:064x}"
+        row["asset"] = "tökén雪" if row["wallet_hex"] == W("a") else f"{ESCAPED_ASSET}-{index}"
+        row["price_weighted_share_amount_str"] = f"{Decimal('0.35') + Decimal(index) * Decimal('0.04'):.12f}"
+    drops = [{"cause": "conversion", "dropped_at_unix": entry - 60,
+              "scope_id": "0xa", "scope_kind": "event"},
+             {"cause": "underflow", "dropped_at_unix": entry,
+              "scope_id": "0xb", "scope_kind": "market"}]
+    encoded_drops = json.dumps(drops, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    certificates = [dict(zip(cycle.CERTIFICATE_COLUMNS, values, strict=True)) for values in (
+        (W("a"), 7, entry, entry, 100, 200, "a" * 64, encoded_drops),
+        (W("b"), 7, entry, entry - 3600, 400, 800, "b" * 64, "[]"),
+        (W("f"), 6, entry + 999, entry + 999, 900, 1800, "f" * 64, encoded_drops),
+    )]
+    identity = {"version": 4, "generation": 7, "base_generation": None,
+                "base_manifest_sha256": None, "start_exclusive": 0, "fixed_end_unix": entry + 10,
+                "wallets": [W("a"), W("b"), W("f")], "full_read_wallets": [W("a"), W("b"), W("f")],
+                "deferred_wallets": [], "repair_wallets": [], "quiet_after_secs": 2_592_000,
+                "repoll_period_secs": 604_800, "certified_digest": hashlib.sha256(b"[]").hexdigest()}
+    identity["digest"] = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":"),
+                                                  ensure_ascii=False).encode()).hexdigest()
+    spool = Path(db + ".projection-v3.jsonl")
+    spool.write_bytes(b"".join(json.dumps(row, sort_keys=True, separators=(",", ":"),
+                                        ensure_ascii=False).encode() + b"\n" for row in rows))
+    inputs = {"activity_generation": 7, "activity_reference_sha256": identity["digest"],
+              "activity_aggregate_digest": "a" * 64, "activity_manifest_sha256": "b" * 64,
+              "activity_identity_sha256": "c" * 64, "payout_generation": 8,
+              "payout_manifest_sha256": "d" * 64, "payout_evidence_digest": "e" * 64,
+              "oracle_version": 6, "certificate_digest": whole_projection_digest(certificates),
+              "projection_spool": {"path_name": spool.name, "size_bytes": spool.stat().st_size,
+                                   "lines": len(rows), "sha256": hashlib.sha256(spool.read_bytes()).hexdigest()}}
+    with sqlite3.connect(db) as conn:
+        conn.execute("ALTER TABLE cache_v2_migration_state ADD COLUMN ranker_projection_inputs_json TEXT")
+        conn.execute("UPDATE cache_v2_migration_state SET ranker_classifier_version=6, fresh_collection_json=?, "
+                     "ranker_projection_inputs_json=?, ranker_projection_digest=?",
+                     (json.dumps(identity), json.dumps(inputs), whole_projection_digest(rows)))
+        conn.execute("ALTER TABLE clob_payout_evidence_v2 ADD COLUMN raw_page_sha256 TEXT")
+        conn.execute("ALTER TABLE clob_payout_evidence_v2 ADD COLUMN neg_risk_market_id TEXT")
+        conn.execute("DELETE FROM clob_payout_evidence_v2")
+        conn.executemany("INSERT INTO clob_payout_evidence_v2 VALUES (?,?,?,?,?,?,?,?,?)",
+                         [(row["condition_id"], row["payout_vector_json"], row["end_date_unix"], "resolved",
+                           payout_tokens(row["asset"], row["outcome_id"]), 8, 1, "a" * 64,
+                           "0xa" if row["wallet_hex"] == W("a") else None) for row in rows])
+        conn.execute("CREATE TABLE activity_wallet_history_v3 (wallet_hex TEXT PRIMARY KEY, generation INTEGER NOT NULL, "
+                     "newest_source_unix INTEGER, newest_trade_unix INTEGER, aggregate_count INTEGER NOT NULL, "
+                     "source_row_count INTEGER NOT NULL, ordered_digest TEXT NOT NULL, scope_drops_json TEXT NOT NULL)")
+        conn.executemany("INSERT INTO activity_wallet_history_v3 VALUES (?,?,?,?,?,?,?,?)",
+                         [tuple(row[column] for column in cycle.CERTIFICATE_COLUMNS) for row in certificates])
+        conn.execute("ALTER TABLE activity_wallet_coverage_staging_v2 ADD COLUMN fixed_end_unix INTEGER")
+        conn.execute("ALTER TABLE activity_wallet_coverage_staging_v2 ADD COLUMN exclusion_reason TEXT")
+        conn.execute("UPDATE activity_wallet_coverage_staging_v2 SET fixed_end_unix=?", (entry + 10,))
+        conn.execute("INSERT INTO activity_wallet_coverage_staging_v2 VALUES (7, ?, 0, ?, 'dormant_deferred')",
+                     (W("f"), entry + 10))
+        conn.execute("UPDATE activity_groups_v2 SET activity_type='REDEEM', coverage_generation=1")
+    return rows, entry, certificates
 
 
 # Frozen manifest reader from 982f294, before projection-only exports.
@@ -332,19 +411,34 @@ def _export_certified_cache(db: str, pq: str, expected_wallets: set[str] | None 
     try:
         con.execute("LOAD sqlite_scanner")
         con.execute(f"ATTACH '{exp._q(os.path.abspath(db))}' AS src (TYPE sqlite, READ_ONLY)")
-        counts = {table: exp._export_table(con, pq, table, 100) for table in exp.V2_TABLES}
-        projection = exp._verify_v2_projection(con, pq)
-        exp._write_v2_export_manifest(pq, counts, projection)
+        raw_identity = con.execute(
+            "SELECT fresh_collection_json FROM src.cache_v2_migration_state").fetchone()[0]
+        three = raw_identity is not None and json.loads(raw_identity)["version"] == 4
+        if three:
+            # Change 4: format 3 exports the committed spool, with no marker join.
+            projection = exp._export_v3_projection(con, db, pq, 100)
+            payout_count = exp._export_table(con, pq, "clob_payout_evidence_v2", 100)
+            exp._write_v3_export_manifest(pq, payout_count, projection)
+        else:
+            counts = {table: exp._export_table(con, pq, table, 100) for table in exp.V2_TABLES}
+            projection = exp._verify_v2_projection(con, pq)
+            exp._write_v2_export_manifest(pq, counts, projection)
         if expected_wallets is not None:
             # Retained excluded history remains audit data in activity_groups_v2;
             # neither the source nor exported ranker projection may admit it.
-            with sqlite3.connect(db) as source:
-                source_wallets = {wallet for (wallet,) in source.execute(
-                    "SELECT g.wallet_hex FROM ranker_entries_v2 r JOIN activity_groups_v2 g "
-                    "ON g.source_trade_id = r.source_trade_id "
-                    "AND g.coverage_generation = r.activity_generation "
-                    "JOIN clob_payout_evidence_v2 p ON p.market_id = g.condition_id")}
-            exported_wallets = {row["wallet_hex"] for row in exp._projection_rows(con)}
+            if three:
+                spool = Path(db).with_name(Path(db).name + ".projection-v3.jsonl")
+                source_wallets = {json.loads(line)["wallet_hex"] for line in spool.read_text().splitlines()}
+                exported_wallets = {row["wallet_hex"] for row in exp._compact_projection_rows(
+                    con, str(Path(pq) / "projection.parquet"))}
+            else:
+                with sqlite3.connect(db) as source:
+                    source_wallets = {wallet for (wallet,) in source.execute(
+                        "SELECT g.wallet_hex FROM ranker_entries_v2 r JOIN activity_groups_v2 g "
+                        "ON g.source_trade_id = r.source_trade_id "
+                        "AND g.coverage_generation = r.activity_generation "
+                        "JOIN clob_payout_evidence_v2 p ON p.market_id = g.condition_id")}
+                exported_wallets = {row["wallet_hex"] for row in exp._projection_rows(con)}
             for prefix, wallets in (("src", source_wallets), ("exported", exported_wallets)):
                 assert wallets == expected_wallets, (prefix, wallets, expected_wallets)
         return projection
@@ -382,17 +476,25 @@ def assert_certified_full_incremental_equivalence(full: str, incremental: str) -
             with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as sqlite:
                 all_wallets = [row[0] for row in sqlite.execute("SELECT DISTINCT wallet_hex FROM activity_groups_v2")]
                 last = publisher._wallet_last_trade(sqlite, all_wallets)
-                newest = publisher._newest_trade_unix(sqlite)
+                newest = cycle.newest_trade_unix(sqlite)
             positions = pd.concat(ranker_duck.duck_extract_positions_v2(engine, wallets, 0, 2**62),
                                   ignore_index=True)
             engine.close()
             watermark = cycle.snapshot(Path(db), "2027-01-15", {}, {})["source_watermark"]["activity"]
-            results.append((wallets, last, newest, positions, projection, watermark))
+            with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as sqlite:
+                # Change 2: manifests commit fetched sets; certificates commit effective history.
+                certificates = sqlite.execute(
+                    "SELECT wallet_hex, generation, newest_source_unix, newest_trade_unix, "
+                    "aggregate_count, source_row_count, ordered_digest, scope_drops_json "
+                    "FROM activity_wallet_history_v3 WHERE generation = ? ORDER BY wallet_hex",
+                    (watermark["generation"],)).fetchall()
+            results.append((wallets, last, newest, positions, projection, watermark, certificates))
         a, b = results
         assert a[:3] == b[:3], "wallet universe or publisher source times changed"
         pd.testing.assert_frame_equal(a[3], b[3], check_exact=True)
         assert a[4] == b[4], "exported projection certification changed"
-        for field in ("generation", "count", "newest_source_unix", "wallet_count", "aggregate_digest", "source_row_count"):
+        assert a[6] == b[6], ("effective certified history changed", a[6], b[6])
+        for field in ("generation", "count", "newest_source_unix", "wallet_count"):
             assert a[5][field] == b[5][field], field
         assert a[5]["reference_sha256"] != b[5]["reference_sha256"]
         assert a[5]["receipt_set_digest"] != b[5]["receipt_set_digest"]
@@ -469,11 +571,48 @@ def assert_certified_deferred_publication_equivalence(
         print("PASS: deferral preserves exact published entries with independently bound provenance")
 
 
+def assert_certified_excluded_newest_is_stale(db: str, excluded: str, process_now: int) -> None:
+    """AC5: an older excluded certificate cannot lend freshness to this head."""
+    import push_ranking_to_supabase as publisher
+    import rank_cycle_manifest as cycle
+
+    with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as con:
+        con.execute("BEGIN")
+        excluded_newest = con.execute(
+            "SELECT newest_trade_unix FROM activity_wallet_history_v3 WHERE wallet_hex = ?",
+            (excluded,)).fetchone()[0]
+        certificates = cycle.finalized_certificates(con)
+        assert excluded not in certificates["wallets"]
+        assert excluded_newest > certificates["newest_trade_unix"]
+        assert process_now - certificates["newest_trade_unix"] > 24 * 3600
+    with mock.patch.object(publisher, "_request_once") as network:
+        try:
+            publisher.filter_active_rows([], db, 720, 24, process_now)
+        except publisher.CacheStaleError as error:
+            assert "newest trade" in str(error), error
+        else:
+            raise AssertionError("excluded certificate supplied publisher freshness")
+    network.assert_not_called()
+
+
+def certified_publication_history(db: str, wallet: str, process_now: int) -> str:
+    """Read freshness, eligibility, stamps and scopes for Rust mirror-damage checks."""
+    import push_ranking_to_supabase as publisher
+
+    history = {}
+    result = publisher.filter_active_rows(
+        [{"wallet": wallet, "survives": True}], db, 720, 24, process_now,
+        publication_history=history)
+    assert result[0] and result[0][0]["wallet"] == wallet
+    return json.dumps({"result": result, "history": history}, sort_keys=True)
+
+
 class DuckParityTest(unittest.TestCase):
     @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
     def test_certified_subset_matches_full_export_through_publication(self):
         import latency_shift_rerank as latency
         import push_ranking_to_supabase as publisher
+        import rank_cycle_manifest
         from test_latency_shift_ref_oracle import FIXTURE_DDL
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -503,9 +642,9 @@ class DuckParityTest(unittest.TestCase):
                                               "price_weighted_share_amount_str", "wallet_hex",
                                               "source_trade_id")),
                     )
-                    conn.execute("INSERT INTO clob_payout_evidence_v2 VALUES (?,?,?,?,?,?)",
+                    conn.execute("INSERT INTO clob_payout_evidence_v2 VALUES (?,?,?,?,?,?,?)",
                                  (row["condition_id"], row["payout_vector_json"], row["end_date_unix"],
-                                  "resolved", 8, now))
+                                  "resolved", payout_tokens(row["asset"], row["outcome_id"]), 8, now))
                     conn.execute("INSERT INTO token_conditions VALUES (?,?,?,?)",
                                  (row["asset"], row["condition_id"], now, row["outcome_id"]))
                     conn.execute("INSERT INTO ranker_price_pages VALUES (?,?,?,1,'complete',1,"
@@ -528,8 +667,8 @@ class DuckParityTest(unittest.TestCase):
                 conn.execute("UPDATE cache_v2_migration_state SET ranker_projection_digest=?",
                              (whole_projection_digest(rows),))
                 conn.execute("UPDATE clob_payout_coverage_manifests_v2 SET completed_at_unix=?", (now,))
-                conn.execute("ALTER TABLE activity_coverage_manifests_v2 ADD COLUMN group_count INTEGER")
                 conn.execute("UPDATE activity_coverage_manifests_v2 SET group_count=7")
+                conn.execute("UPDATE activity_wallet_coverage_staging_v2 SET aggregate_count = aggregate_count + 1")
 
             # Authentic version-one reference: SELECT * for every table, with
             # the original manifest shape. Never use the narrowed export helper.
@@ -621,7 +760,7 @@ class DuckParityTest(unittest.TestCase):
             self.assertEqual({r["wallet_hex"]: r["last_trade_unix"] for r in results[0][1]},
                              {W("a"): now - 10, W("b"): now - 11})
             with sqlite3.connect(db) as conn:
-                self.assertEqual(publisher._newest_trade_unix(conn), now - 10)
+                self.assertEqual(rank_cycle_manifest.newest_trade_unix(conn), now - 10)
             # The universe is the certified projection's wallets under either
             # export shape; full history's uncertified wallets, even one that
             # sorts first, never enter it.
@@ -874,6 +1013,177 @@ class DuckParityTest(unittest.TestCase):
             self.assertAlmostEqual(float(frame.iloc[0]["price"]), 0.4)
             self.assertAlmostEqual(float(frame.iloc[0]["payoff"]), 0.5)
             print("PASS: schema-two projection verified; SQLite refused; half payout exact")
+
+    @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
+    def test_schema_two_scores_the_traded_token(self) -> None:
+        """PASS: a position whose stored outcome index disagrees with its traded
+        token takes the token's place in the payout evidence, for both outcome
+        and payoff; an asset missing from its market's tokens is a structurally
+        invalid projected row (#690). FAIL: the stored index is scored, or the
+        missing asset is silently dropped."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "v2.db")
+            rows, entry, _ = build_certified_cache(db)
+            # Wallet a bought "token", stored as outcome 1, but the evidence lists
+            # it first and outcome 0 won.
+            for row in rows:
+                row["payout_vector_json"] = '["1","0"]'
+            with sqlite3.connect(db) as conn:
+                conn.execute("UPDATE cache_v2_migration_state SET ranker_projection_digest = ?",
+                             (whole_projection_digest(rows),))
+                conn.execute("UPDATE clob_payout_evidence_v2 SET payout_vector_json = ?, tokens_json = ?",
+                             ('["1","0"]', json.dumps([{"token_id": "token"}, {"token_id": ESCAPED_ASSET}])))
+            pq = str(Path(tmp) / "scored")
+            export(db, pq)
+            engine = ranker_duck.get_engine(force="auto", parquet_dir=pq, max_age_hours=0, schema_version=2)
+            [frame] = ranker_duck.duck_extract_positions_v2(engine, [W("a")], entry - 1, entry + 1)
+            self.assertEqual(int(frame.iloc[0]["outcome_id"]), 0)
+            self.assertAlmostEqual(float(frame.iloc[0]["payoff"]), 1.0)
+            with sqlite3.connect(db) as conn:
+                conn.execute("UPDATE clob_payout_evidence_v2 SET tokens_json = ?",
+                             (json.dumps([{"token_id": "elsewhere"}, {"token_id": ESCAPED_ASSET}]),))
+            pq = str(Path(tmp) / "unmatched")
+            export(db, pq)
+            engine = ranker_duck.get_engine(force="auto", parquet_dir=pq, max_age_hours=0, schema_version=2)
+            with self.assertRaisesRegex(RuntimeError, "structurally invalid"):
+                list(ranker_duck.duck_extract_positions_v2(engine, [W("a")], entry - 1, entry + 1))
+            print("PASS: pass one scores the traded token; an unmatched asset is invalid")
+
+    @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
+    def test_historical_schema_two_without_fresh_collection_column_exports(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db, pq = str(Path(tmp) / "historical.db"), str(Path(tmp) / "export")
+            rows, _, _ = build_certified_cache(db)
+            with sqlite3.connect(db) as conn:
+                conn.execute("ALTER TABLE cache_v2_migration_state DROP COLUMN fresh_collection_json")
+            export(db, pq)
+            manifest = json.loads((Path(pq) / exp.V2_EXPORT_MANIFEST).read_text())
+            self.assertEqual(manifest["version"], 2)
+            self.assertEqual(set(manifest["tables"]), set(exp.V2_TABLES))
+            self.assertEqual(manifest["projection"]["count"], len(rows))
+            self.assertEqual(manifest["projection"]["digest"], whole_projection_digest(rows))
+            engine = ranker_duck.get_engine(force="duck", parquet_dir=pq, schema_version=2)
+            try:
+                self.assertEqual(rk.load_universe_from_export(engine), [W("a"), W("b")])
+            finally:
+                engine.close()
+
+    @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
+    def test_format_three_compact_export_and_pass_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "candidate.db")
+            rows, entry, _ = build_format_three_cache(db)
+            pq = str(Path(tmp) / "custom-export")
+            export(db, pq)
+            manifest = json.loads((Path(pq) / exp.V2_EXPORT_MANIFEST).read_text())
+            self.assertEqual(manifest["version"], 3)
+            self.assertEqual(set(manifest["tables"]), {"projection", "clob_payout_evidence_v2"})
+            self.assertEqual(manifest["projection"]["digest"], whole_projection_digest(rows))
+            self.assertEqual(manifest["projection"]["count"], len(rows))
+            self.assertEqual(manifest["projection"]["oracle_version"], 6)
+            with self.assertRaisesRegex(ranker_duck.SchemaTwoEngineError, "invalid shape"):
+                _version_one_manifest_reader(pq)
+            engine = ranker_duck.get_engine(force="duck", parquet_dir=pq, schema_version=2)
+            try:
+                self.assertEqual(rk.load_universe_from_export(engine), [W("a"), W("b")])
+                [positions] = ranker_duck.duck_extract_positions_v2(engine, [W("a")], entry - 1, entry + 1)
+                self.assertEqual(int(positions.iloc[0]["outcome_id"]), 1)
+                self.assertEqual(float(positions.iloc[0]["payoff"]), 0.5)
+                self.assertEqual(list(exp._compact_projection_rows(engine, str(Path(pq) / "projection.parquet"))), rows)
+            finally:
+                engine.close()
+            with mock.patch.object(rk, "greedy_max_group_sharpe", side_effect=AssertionError("unused selection")):
+                self.assertEqual(run_pass1(db, str(Path(tmp) / "rank"), "duck", pq, min_active_months="1"), 0)
+            ranked = read_rows(str(Path(tmp) / "rank/ranked_72hr_buyandhold.csv"))
+            self.assertEqual(next(row for row in ranked if row["wallet"] == W("b"))["eligible"], "True")
+            self.assertFalse((Path(tmp) / "rank/250_72hr_buyandhold_variance.txt").exists())
+            self.assertFalse((Path(pq) / "activity_groups_v2.parquet").exists())
+            self.assertIn("tökén雪".encode(), Path(db + ".projection-v3.jsonl").read_bytes())
+
+    @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
+    def test_format_three_reader_requires_complete_typed_projection_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db, pq = str(Path(tmp) / "candidate.db"), str(Path(tmp) / "export")
+            build_format_three_cache(db)
+            export(db, pq)
+            path = Path(pq) / exp.V2_EXPORT_MANIFEST
+            original = json.loads(path.read_text())
+            self.assertEqual(ranker_duck._load_v2_export_manifest(pq), original)
+            cases = [(field, value)
+                     for field in ("count", "classifier_version", "oracle_version", "activity_generation")
+                     for value in (None, True, float(original["projection"][field]),
+                                   str(original["projection"][field]))]
+            cases += [(field, value)
+                      for field in ("digest", "spool_sha256")
+                      for value in (None, "a" * 63, "a" * 65, "A" * 64, "g" * 64, 64)]
+            for field, value in cases:
+                with self.subTest(field=field, value=value):
+                    changed = json.loads(json.dumps(original))
+                    if value is None:
+                        del changed["projection"][field]
+                    else:
+                        changed["projection"][field] = value
+                    path.write_text(json.dumps(changed))
+                    with self.assertRaisesRegex(ranker_duck.SchemaTwoEngineError, "projection summary"):
+                        ranker_duck.get_engine(force="duck", parquet_dir=pq, schema_version=2)
+
+    @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
+    def test_format_three_export_retry_uses_kept_spool_and_hashes_guard_reader(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = str(Path(tmp) / "candidate.db")
+            rows, _, _ = build_format_three_cache(db)
+            pq = str(Path(tmp) / "export")
+            spool = Path(db + ".projection-v3.jsonl").read_bytes()
+            with mock.patch.object(exp, "_write_v3_export_manifest", side_effect=OSError("interrupted export")):
+                with self.assertRaisesRegex(OSError, "interrupted export"):
+                    export(db, pq)
+            self.assertFalse((Path(pq) / exp.V2_EXPORT_MANIFEST).exists())
+            for _ in range(2):
+                export(db, pq)
+                self.assertEqual(Path(db + ".projection-v3.jsonl").read_bytes(), spool)
+                manifest = json.loads((Path(pq) / exp.V2_EXPORT_MANIFEST).read_text())
+                self.assertEqual(manifest["projection"]["digest"], whole_projection_digest(rows))
+            path = Path(pq) / "projection.parquet"
+            path.write_bytes(path.read_bytes() + b"altered")
+            with self.assertRaisesRegex(ranker_duck.SchemaTwoEngineError, "Parquet hash mismatch"):
+                ranker_duck.get_engine(force="duck", parquet_dir=pq, schema_version=2)
+
+    @unittest.skipUnless(HAVE_DUCKDB, "duckdb not installed")
+    def test_format_three_spool_commitment_and_parquet_tampering_refused(self):
+        for mutation in ("missing", "size", "sha256", "dropped", "foreign", "duplicate", "altered"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as tmp:
+                db = str(Path(tmp) / "candidate.db")
+                rows, _, _ = build_format_three_cache(db)
+                pq = str(Path(tmp) / "export")
+                spool = Path(db + ".projection-v3.jsonl")
+                if mutation == "missing":
+                    spool.unlink()
+                elif mutation == "size":
+                    spool.write_bytes(spool.read_bytes() + b" ")
+                elif mutation == "sha256":
+                    spool.write_bytes(spool.read_bytes().replace(b"buy", b"sel"))
+                if mutation in ("missing", "size", "sha256"):
+                    with self.assertRaises((ValueError, FileNotFoundError)):
+                        export(db, pq)
+                else:
+                    original = exp._compact_projection_rows
+                    def tamper(con, path):
+                        relation = f"read_parquet('{exp._q(path)}')"
+                        if mutation == "dropped":
+                            query = f"SELECT * FROM {relation} WHERE source_trade_id != '{rows[-1]['source_trade_id']}'"
+                        elif mutation == "foreign":
+                            query = f"SELECT * REPLACE ('{W('f')}' AS wallet_hex) FROM {relation}"
+                        elif mutation == "duplicate":
+                            query = f"SELECT * FROM {relation} UNION ALL SELECT * FROM {relation} LIMIT {len(rows) + 1}"
+                        else:
+                            query = f"SELECT * REPLACE ('1.250001' AS share_amount_str) FROM {relation}"
+                        con.execute(f"COPY ({query}) TO '{exp._q(path)}.changed' (FORMAT PARQUET)")
+                        os.replace(path + ".changed", path)
+                        yield from original(con, path)
+                    with mock.patch.object(exp, "_compact_projection_rows", side_effect=tamper):
+                        with self.assertRaisesRegex(ValueError, "Parquet projection count/digest mismatch"):
+                            export(db, pq)
+                self.assertFalse((Path(pq) / exp.V2_EXPORT_MANIFEST).exists())
 
     def test_v2_repaired_payouts_do_not_change_v1_ranking_or_survivors(self) -> None:
         """#544 boundary: stored repaired payouts are replay evidence only.

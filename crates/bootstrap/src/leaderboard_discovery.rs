@@ -109,7 +109,7 @@ pub async fn run_leaderboard_discovery<F: PageFetcher + Send + Sync>(
 }
 
 /// Discovery variant used by the full pipeline to defer global activation to
-/// its single controlled 20,000-wallet batch.
+/// its single controlled, recorded activation batch (`pile::activate_next`).
 pub async fn run_leaderboard_discovery_with_policy<F: PageFetcher + Send + Sync>(
     fetcher: &LeaderboardFetcher<F>,
     categories: &[LeaderboardCategory],

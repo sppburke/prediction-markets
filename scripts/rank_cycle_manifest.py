@@ -11,15 +11,149 @@ import stat
 import tempfile
 from pathlib import Path
 
-from latency_shift_rerank import ORACLE_VERSION
 from partial_backfill_wallets import partial_backfill_wallets
 
 MANIFEST_VERSION = 1
+# Payout, finalize, export, both ranking passes and re-finalize after a completed
+# collection; a head that cannot also cover them takes the cycle's one top-up
+# (`candidate_top_up_reserve_hours` in docs/_GLOSSARY.md).
+TOP_UP_RESERVE_HOURS = 7
 
 
 def _one(connection: sqlite3.Connection, query: str, args=()):
     row = connection.execute(query, args).fetchone()
     return None if row is None else row[0]
+
+
+# A wallet's newest trade in the latest completed activity generation: one
+# descending walk of `idx_activity_groups_v2_wallet_time` that stops at the
+# first match instead of reading the wallet's history.
+WALLET_NEWEST_TRADE_V2 = (
+    "SELECT g.source_time_unix FROM activity_groups_v2 g "
+    "WHERE g.wallet_hex = {wallet} AND g.activity_type = 'TRADE' "
+    "AND g.coverage_generation = (SELECT MAX(generation) FROM activity_coverage_manifests_v2) "
+    "ORDER BY g.source_time_unix DESC LIMIT 1"
+)
+
+CERTIFICATE_COLUMNS = (
+    "wallet_hex", "generation", "newest_source_unix", "newest_trade_unix",
+    "aggregate_count", "source_row_count", "ordered_digest", "scope_drops_json",
+)
+DROP_CAUSES = {"conversion", "order_dependent", "overflow", "underflow",
+               "unknown_condition", "unknown_type", "unmapped"}
+
+
+def certificate_digest(rows) -> str:
+    digest = hashlib.sha256(b"[")
+    for index, row in enumerate(rows):
+        if index:
+            digest.update(b",")
+        digest.update(json.dumps(row, sort_keys=True, separators=(",", ":"),
+                                 ensure_ascii=False, allow_nan=False).encode())
+    digest.update(b"]")
+    return digest.hexdigest()
+
+
+def decode_scope_drops(raw: str) -> list[dict]:
+    drops = json.loads(raw)
+    if not isinstance(drops, list):
+        raise ValueError("invalid certificate scope drops")
+    previous = None
+    for drop in drops:
+        if (not isinstance(drop, dict)
+                or set(drop) != {"cause", "dropped_at_unix", "scope_id", "scope_kind"}
+                or drop["cause"] not in DROP_CAUSES
+                or drop["scope_kind"] not in ("event", "market")
+                or not isinstance(drop["scope_id"], str)
+                or re.fullmatch(r"0x[0-9a-f]+", drop["scope_id"]) is None
+                or type(drop["dropped_at_unix"]) is not int):
+            raise ValueError("invalid certificate scope drop")
+        scope = (drop["scope_kind"], drop["scope_id"])
+        if previous is not None and scope <= previous:
+            raise ValueError("certificate scope drops are not sorted and unique")
+        previous = scope
+    if json.dumps(drops, sort_keys=True, separators=(",", ":"), ensure_ascii=False) != raw:
+        raise ValueError("certificate scope drops are not canonical")
+    return drops
+
+
+def finalized_certificates(connection: sqlite3.Connection) -> dict | None:
+    """Verify all certificates, retaining only this finalized pass's wallets."""
+    columns = {row[1] for row in connection.execute("PRAGMA table_info(cache_v2_migration_state)")}
+    if "fresh_collection_json" not in columns:
+        return None
+    raw = _one(connection, "SELECT fresh_collection_json FROM cache_v2_migration_state WHERE singleton = 1")
+    if raw is None or json.loads(raw).get("version") in (None, 1, 2, 3):
+        return None
+    identity = _fresh_identity(raw)
+    phase, classifier, inputs_raw = connection.execute(
+        "SELECT phase, ranker_classifier_version, ranker_projection_inputs_json "
+        "FROM cache_v2_migration_state WHERE singleton = 1").fetchone()
+    inputs = json.loads(inputs_raw) if inputs_raw is not None else {}
+    generation = identity["generation"]
+    if (phase != "finalized" or classifier != 6 or type(inputs.get("oracle_version")) is not int
+            or inputs["oracle_version"] != 6
+            or inputs.get("activity_generation") != generation
+            or _one(connection, "SELECT MAX(generation) FROM activity_coverage_manifests_v2") != generation):
+        raise ValueError("format-three certificates require the finalized head")
+    current = {}
+    count = source_rows = 0
+    newest = None
+
+    def rows():
+        nonlocal count, source_rows, newest
+        for values in connection.execute(
+                f"SELECT {', '.join(CERTIFICATE_COLUMNS)} FROM activity_wallet_history_v3 ORDER BY wallet_hex"):
+            row = dict(zip(CERTIFICATE_COLUMNS, values, strict=True))
+            yield row
+            if row["generation"] == generation:
+                current[row["wallet_hex"]] = row
+                count += row["aggregate_count"]
+                source_rows += row["source_row_count"]
+                trade = row["newest_trade_unix"]
+                if trade is not None:
+                    newest = trade if newest is None else max(newest, trade)
+
+    if certificate_digest(rows()) != inputs.get("certificate_digest"):
+        raise ValueError("activity_wallet_history_v3 certificate digest mismatch")
+    for row in current.values():
+        decode_scope_drops(row["scope_drops_json"])
+    return {"generation": generation, "classifier_version": classifier,
+            "wallets": current, "count": count, "source_row_count": source_rows,
+            "newest_trade_unix": newest}
+
+
+def newest_trade_unix(connection: sqlite3.Connection) -> int | None:
+    """The cache's newest trade, the watermark the publisher's freshness gate reads.
+
+    Schema one reads ``trades``. Schema two reads only ``TRADE`` groups of its
+    latest completed generation (#544). Certification admits that generation's
+    rows only under its wallet receipts with aggregates, so the newest of those
+    wallets' newest trades is the generation's newest trade. Receipts are
+    retained in the staging table, or embedded in an authentic legacy manifest.
+    """
+    schema = int(_one(connection, "PRAGMA user_version") or 0)
+    if schema == -2:
+        raise ValueError("unfinished bulk root (schema -2); resume cache-populate-activity-v2 --bulk-root before any other command")
+    if schema >= 2:
+        certificates = finalized_certificates(connection)
+        if certificates is not None:
+            return certificates["newest_trade_unix"]
+        value = _one(
+            connection,
+            "WITH latest AS (SELECT generation, cursors_json FROM activity_coverage_manifests_v2 "
+            "ORDER BY generation DESC LIMIT 1), "
+            "wallets(wallet_hex) AS ("
+            "SELECT r.wallet_hex FROM activity_wallet_coverage_staging_v2 r, latest "
+            "WHERE r.generation = latest.generation AND r.aggregate_count > 0 "
+            "UNION ALL SELECT json_extract(e.value, '$.wallet_hex') FROM latest, json_each(latest.cursors_json) e "
+            "WHERE json_type(latest.cursors_json) = 'array' "
+            "AND json_extract(e.value, '$.aggregate_count') > 0) "
+            "SELECT MAX((" + WALLET_NEWEST_TRADE_V2.format(wallet="wallets.wallet_hex") + ")) FROM wallets",
+        )
+    else:
+        value = _one(connection, "SELECT MAX(timestamp_unix) FROM trades")
+    return None if value is None else int(value)
 
 
 def _wallet_universe(connection: sqlite3.Connection) -> dict:
@@ -37,6 +171,10 @@ def _wallet_universe(connection: sqlite3.Connection) -> dict:
 
 
 def snapshot(db_path: Path, day_utc: str, versions: dict, configuration: dict) -> dict:
+    # Imported here: the reranker pulls in NumPy, and the publisher's pure re-push
+    # imports this module for `newest_trade_unix` without analytics installed.
+    from latency_shift_rerank import ORACLE_VERSION
+
     versions = {**versions, "ranker": ORACLE_VERSION}
     connection = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
@@ -46,6 +184,7 @@ def snapshot(db_path: Path, day_utc: str, versions: dict, configuration: dict) -
             raise ValueError("unfinished bulk root (schema -2); resume cache-populate-activity-v2 --bulk-root before any other command")
         universe = _wallet_universe(connection)
         if schema >= 2:
+            certificates = finalized_certificates(connection)
             activity_generation = _one(
                 connection,
                 "SELECT MAX(generation) FROM activity_coverage_manifests_v2",
@@ -54,19 +193,33 @@ def snapshot(db_path: Path, day_utc: str, versions: dict, configuration: dict) -
                 connection,
                 "SELECT MAX(generation) FROM clob_payout_coverage_manifests_v2",
             )
-            # One pass over the generation instead of two: at the cutover's scale
-            # each full scan of the activity table is roughly half an hour, and
-            # this snapshot runs inside the publication freshness window (#588).
-            activity_count, activity_newest = connection.execute(
-                "SELECT COUNT(*), MAX(CASE WHEN activity_type = 'TRADE' "
-                "THEN source_time_unix END) "
-                "FROM activity_groups_v2 WHERE coverage_generation = ?",
+            # This snapshot runs inside the publication freshness window (#588).
+            # Finalize certified the latest generation's row count as its
+            # manifest's group count. A finalized fresh identity of that generation
+            # proves no row has moved since: fresh admission clears `finalized`
+            # before any carry, and the frozen collector refuses a fresh identity.
+            # Any other cache, including one from before #588 without the identity
+            # column, counts its rows; the newest trade is read per wallet.
+            certified = any(
+                row[1] == "fresh_collection_json"
+                for row in connection.execute("PRAGMA table_info(cache_v2_migration_state)")
+            ) and _one(
+                connection,
+                "SELECT phase = 'finalized' AND json_extract(fresh_collection_json, '$.generation') = ? "
+                "FROM cache_v2_migration_state WHERE singleton = 1",
                 (activity_generation,),
-            ).fetchone()
+            )
             activity = {
                 "generation": activity_generation,
-                "count": activity_count,
-                "newest_source_unix": activity_newest,
+                "count": certificates["count"] if certificates is not None else _one(
+                    connection,
+                    "SELECT group_count FROM activity_coverage_manifests_v2 WHERE generation = ?"
+                    if certified
+                    else "SELECT COUNT(*) FROM activity_groups_v2 WHERE coverage_generation = ?",
+                    (activity_generation,),
+                ),
+                "newest_source_unix": (certificates["newest_trade_unix"] if certificates is not None
+                                       else newest_trade_unix(connection)),
                 "cursor": _one(
                     connection,
                     "SELECT cursors_json FROM activity_coverage_manifests_v2 "
@@ -101,7 +254,7 @@ def snapshot(db_path: Path, day_utc: str, versions: dict, configuration: dict) -
                     "WHERE generation = ?",
                     (activity_generation,),
                 ),
-                "source_row_count": _one(
+                "source_row_count": certificates["source_row_count"] if certificates is not None else _one(
                     connection,
                     "SELECT source_row_count FROM activity_coverage_manifests_v2 "
                     "WHERE generation = ?",
@@ -168,9 +321,7 @@ def snapshot(db_path: Path, day_utc: str, versions: dict, configuration: dict) -
             activity = {
                 "generation": 1,
                 "count": _one(connection, "SELECT COUNT(*) FROM trades"),
-                "newest_source_unix": _one(
-                    connection, "SELECT MAX(timestamp_unix) FROM trades"
-                ),
+                "newest_source_unix": newest_trade_unix(connection),
                 "cursor": None,
             }
             cursor = connection.execute(
@@ -306,7 +457,8 @@ def retire_completed_cycle(root: Path, out: Path | None = None) -> int:
         os.fsync(directory)
     finally:
         os.close(directory)
-    pattern = re.compile(r"wallet_cache\.(" + CYCLE_PATTERN + r")\.(prior|side|displaced)\.db(?:-wal|-shm)?")
+    pattern = re.compile(r"wallet_cache\.(" + CYCLE_PATTERN + r")\.(?:"
+                         r"(?:prior|side|displaced)\.db(?:-wal|-shm)?|side\.db\.projection-v3\.jsonl)")
     deleted = 0
     deferred = False
     for path in sorted(fixed.parent.iterdir()):
@@ -340,12 +492,18 @@ def _fresh_identity(raw: str | None) -> dict | None:
     if raw is None:
         return None
     identity = json.loads(raw)
+    if not isinstance(identity, dict):
+        raise ValueError("malformed candidate activity identity")
     version = identity.get("version")
+    if type(version) is not int:
+        raise ValueError("unsupported candidate activity identity version")
     expected = {"version", "generation", "fixed_end_unix", "wallets", "digest"}
-    if version in (2, 3):
+    if version in (2, 3, 4):
         expected |= {"base_generation", "base_manifest_sha256", "start_exclusive", "full_read_wallets"}
-        if version == 3:
+        if version >= 3:
             expected |= {"deferred_wallets", "quiet_after_secs", "repoll_period_secs"}
+        if version == 4:
+            expected |= {"repair_wallets", "certified_digest"}
     elif version != 1:
         raise ValueError("unsupported candidate activity identity version")
     if set(identity) != expected:
@@ -358,6 +516,38 @@ def _fresh_identity(raw: str | None) -> dict | None:
         raise ValueError("invalid candidate generation")
     if type(identity["fixed_end_unix"]) is not int or identity["fixed_end_unix"] <= 0:
         raise ValueError("invalid candidate fixed end")
+    if version == 4:
+        wallets = identity["wallets"]
+        full = identity["full_read_wallets"]
+        deferred = identity["deferred_wallets"]
+        repair = identity["repair_wallets"]
+        for values in (wallets, full, deferred, repair):
+            if (not isinstance(values, list)
+                    or any(not isinstance(wallet, str) or re.fullmatch(r"0x[0-9a-f]{40}", wallet) is None
+                           for wallet in values)
+                    or values != sorted(set(values))):
+                raise ValueError("invalid format-three wallet list")
+        if (not set(full) <= set(wallets) or not set(deferred) <= set(wallets)
+                or set(full) & set(deferred) or not set(repair) <= set(full)):
+            raise ValueError("invalid format-three wallet subsets")
+        start = identity["start_exclusive"]
+        base = identity["base_generation"]
+        base_hash = identity["base_manifest_sha256"]
+        if (type(start) is not int or not 0 <= start < identity["fixed_end_unix"]
+                or identity["fixed_end_unix"] > 253402300799
+                or type(identity["quiet_after_secs"]) is not int
+                or identity["quiet_after_secs"] != 2_592_000
+                or type(identity["repoll_period_secs"]) is not int
+                or identity["repoll_period_secs"] != 604_800
+                or not isinstance(identity["certified_digest"], str)
+                or re.fullmatch(r"[0-9a-f]{64}", identity["certified_digest"]) is None):
+            raise ValueError("invalid format-three identity bounds or certificate digest")
+        if base is None:
+            if base_hash is not None or start != 0 or full != wallets or deferred:
+                raise ValueError("invalid format-three root identity")
+        elif (type(base) is not int or not 0 < base < identity["generation"] or start == 0
+              or not isinstance(base_hash, str) or re.fullmatch(r"[0-9a-f]{64}", base_hash) is None):
+            raise ValueError("invalid format-three predecessor binding")
     return identity
 
 
@@ -372,7 +562,7 @@ def _bulk_root_eligible(side: sqlite3.Connection, schema: int, head: dict | None
     if generation != 1 or schema not in (2, -2):
         return False
     if schema == -2:
-        if head is None or head["version"] != 2 or head["generation"] != 1 or head["base_generation"] is not None:
+        if head is None or head["version"] not in (2, 4) or head["generation"] != 1 or head["base_generation"] is not None:
             return False
     elif head is not None:
         # An ordinary collection, even an empty interrupted one, cannot convert.
@@ -506,9 +696,11 @@ def candidate_targets(prior_path: Path | None, side_path: Path, *, after_collect
             age = now - head["fixed_end_unix"]
             if age < 0:
                 raise ValueError("activity head fixed end is in the future")
-            if age > max_staleness_hours * 3600:
-                if top_up_used:
+            if top_up_used:
+                # The last allowed head proceeds while it can still pass the publisher.
+                if age > max_staleness_hours * 3600:
                     raise ValueError("activity top-up is stale; preserve the cycle, no second top-up is permitted")
+            elif head["version"] < 4 or age + TOP_UP_RESERVE_HOURS * 3600 > max_staleness_hours * 3600:
                 generation = initial + 1
         return targets(generation)
 

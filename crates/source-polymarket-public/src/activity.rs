@@ -385,12 +385,34 @@ pub enum ActivityParseError {
     },
 }
 
+/// Row acceptance selected by the bootstrap acquisition contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivityRowAcceptance {
+    Strict,
+    /// Retain absent condition IDs and TRADE assets for scoped classification.
+    Acquisition3,
+}
+
 /// Parse one complete REST response. A missing, invalid, or mismatched payload
 /// wallet invalidates the whole response and yields no partial window.
 pub fn parse_activity_response(
     raw: &[u8],
     requested_wallet: WalletAddress,
     context: &ActivityParseContext,
+) -> Result<NormalizedActivityWindow, ActivityParseError> {
+    parse_activity_response_with_acceptance(
+        raw,
+        requested_wallet,
+        context,
+        ActivityRowAcceptance::Strict,
+    )
+}
+
+pub(crate) fn parse_activity_response_with_acceptance(
+    raw: &[u8],
+    requested_wallet: WalletAddress,
+    context: &ActivityParseContext,
+    row_acceptance: ActivityRowAcceptance,
 ) -> Result<NormalizedActivityWindow, ActivityParseError> {
     let raw_rows: Vec<Box<RawValue>> =
         serde_json::from_slice(raw).map_err(|error| ActivityParseError::Json {
@@ -403,6 +425,7 @@ pub fn parse_activity_response(
             Some(requested_wallet),
             context,
             row_index,
+            row_acceptance,
         )?);
     }
     Ok(NormalizedActivityWindow {
@@ -422,7 +445,13 @@ pub fn parse_activity_row(
         serde_json::from_slice(raw).map_err(|error| ActivityParseError::Json {
             message: error.to_string(),
         })?;
-    parse_row(raw_row.get(), requested_wallet, context, 0)
+    parse_row(
+        raw_row.get(),
+        requested_wallet,
+        context,
+        0,
+        ActivityRowAcceptance::Strict,
+    )
 }
 
 /// Parse one payload accepted under the `activity/trades` websocket envelope.
@@ -555,13 +584,14 @@ fn parse_row(
     requested_wallet: Option<WalletAddress>,
     context: &ActivityParseContext,
     row_index: usize,
+    row_acceptance: ActivityRowAcceptance,
 ) -> Result<NormalizedActivity, ActivityParseError> {
     let mut raw: RawActivity =
         serde_json::from_str(raw_row).map_err(|error| ActivityParseError::Json {
             message: format!("row {row_index}: {error}"),
         })?;
     let wallet = parse_wallet(raw.proxy_wallet.take(), requested_wallet, row_index)?;
-    let parsed = normalize_row(raw, wallet, context, raw_row)
+    let parsed = normalize_row(raw, wallet, context, raw_row, row_acceptance)
         .map_err(|source| ActivityParseError::InvalidRow { row_index, source })?;
     Ok(parsed)
 }
@@ -601,6 +631,7 @@ fn normalize_row(
     wallet: WalletAddress,
     context: &ActivityParseContext,
     raw_row: &str,
+    row_acceptance: ActivityRowAcceptance,
 ) -> Result<NormalizedActivity, ActivityValidationError> {
     let activity_type = required_string(raw.activity_type, "type")?;
     let activity_type = ActivityType::from(activity_type);
@@ -661,6 +692,7 @@ fn normalize_row(
         side,
         share_amount,
         raw.is_combo.unwrap_or(false),
+        row_acceptance,
     )?;
 
     Ok(NormalizedActivity {
@@ -819,6 +851,7 @@ fn validate_type_specific(
     side: Option<Side>,
     share_amount: ShareAmount,
     is_combo: bool,
+    row_acceptance: ActivityRowAcceptance,
 ) -> Result<(), ActivityValidationError> {
     // A zero-share position-changing row has an arithmetically zero effect and
     // is retained raw-only (#544 fix 2): effect-field validation (mapping,
@@ -835,12 +868,12 @@ fn validate_type_specific(
     }
     match activity_type {
         ActivityType::Trade => {
-            if condition_id.is_none() {
+            if condition_id.is_none() && row_acceptance == ActivityRowAcceptance::Strict {
                 return Err(ActivityValidationError::MissingField {
                     field: "conditionId",
                 });
             }
-            if asset.is_none() {
+            if asset.is_none() && row_acceptance == ActivityRowAcceptance::Strict {
                 return Err(ActivityValidationError::MissingField { field: "asset" });
             }
             if outcome.is_none() {
@@ -851,14 +884,14 @@ fn validate_type_specific(
             }
         }
         ActivityType::Split | ActivityType::Merge => {
-            if condition_id.is_none() {
+            if condition_id.is_none() && row_acceptance == ActivityRowAcceptance::Strict {
                 return Err(ActivityValidationError::MissingField {
                     field: "conditionId",
                 });
             }
         }
         ActivityType::Redeem => {
-            if condition_id.is_none() {
+            if condition_id.is_none() && row_acceptance == ActivityRowAcceptance::Strict {
                 return Err(ActivityValidationError::MissingField {
                     field: "conditionId",
                 });

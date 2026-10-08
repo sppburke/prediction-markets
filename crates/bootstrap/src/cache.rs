@@ -277,6 +277,7 @@ CREATE TABLE IF NOT EXISTS market_liquidity (
 -- `evidence_count` records the rows the completion copied into
 -- clob_payout_evidence_v2; NULL marks coverage written before that accounting,
 -- which cannot be verified (#672).
+-- `group_version` is 1 for walks that parse neg_risk_market_id; NULL marks older coverage.
 CREATE TABLE IF NOT EXISTS clob_payout_coverage_manifests_v2 (
     generation                  INTEGER PRIMARY KEY NOT NULL,
     manifest_json               TEXT    NOT NULL,
@@ -295,12 +296,15 @@ CREATE TABLE IF NOT EXISTS clob_payout_coverage_manifests_v2 (
     schema_version              INTEGER NOT NULL CHECK (schema_version = 2),
     parser_version              INTEGER NOT NULL CHECK (parser_version = 2),
     completed_at_unix           INTEGER NOT NULL,
-    evidence_count              INTEGER NULL
+    evidence_count              INTEGER NULL,
+    group_version               INTEGER NULL
 );
 
 CREATE TABLE IF NOT EXISTS clob_payout_evidence_v2 (
     market_id              TEXT    PRIMARY KEY NOT NULL,
     end_date_unix          INTEGER NULL,
+    neg_risk_market_id     TEXT    NULL,
+    neg_risk              INTEGER NULL,
     is_50_50_outcome       INTEGER NULL CHECK (is_50_50_outcome IN (0,1)),
     payout_status          TEXT    NOT NULL CHECK (payout_status IN (
         'resolved','unresolved_open','unresolved_incomplete',
@@ -359,6 +363,8 @@ CREATE TABLE IF NOT EXISTS clob_payout_evidence_staging_v2 (
     generation             INTEGER NOT NULL,
     market_id              TEXT    NOT NULL,
     end_date_unix          INTEGER NULL,
+    neg_risk_market_id     TEXT    NULL,
+    neg_risk              INTEGER NULL,
     is_50_50_outcome       INTEGER NULL CHECK (is_50_50_outcome IN (0,1)),
     payout_status          TEXT    NOT NULL CHECK (payout_status IN (
         'resolved','unresolved_open','unresolved_incomplete',
@@ -2946,6 +2952,10 @@ impl WalletCache {
                 item.payout.payout_vector_json(),
                 bool_to_sql(item.closed),
                 tokens_json,
+                bool_to_sql(item.neg_risk),
+                item.neg_risk_market_id
+                    .as_deref()
+                    .filter(|value| !value.is_empty()),
             ));
         }
 
@@ -3013,8 +3023,8 @@ impl WalletCache {
                 "INSERT INTO clob_payout_evidence_staging_v2 \
                  (generation, market_id, end_date_unix, is_50_50_outcome, payout_status, \
                   payout_vector_json, closed, tokens_json, raw_page_sha256, \
-                  page_ordinal, schema_version, parser_version, fetched_at_unix, origin) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
+                  page_ordinal, schema_version, parser_version, fetched_at_unix, neg_risk_market_id, neg_risk, origin) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, \
                          'clob_closed_walk_v2') \
                  ON CONFLICT(generation, market_id) DO UPDATE SET \
                     end_date_unix = excluded.end_date_unix, \
@@ -3023,6 +3033,8 @@ impl WalletCache {
                     payout_vector_json = excluded.payout_vector_json, \
                     closed = excluded.closed, \
                     tokens_json = excluded.tokens_json, \
+                    neg_risk_market_id = excluded.neg_risk_market_id, \
+                    neg_risk = excluded.neg_risk, \
                     raw_page_sha256 = excluded.raw_page_sha256, \
                     page_ordinal = excluded.page_ordinal, \
                     schema_version = excluded.schema_version, \
@@ -3038,6 +3050,8 @@ impl WalletCache {
                 payout_vector,
                 closed,
                 tokens,
+                neg_risk,
+                neg_risk_market_id,
             ) in stored_rows
             {
                 // A market the venue repeats — within a page or across pages —
@@ -3061,6 +3075,8 @@ impl WalletCache {
                     i64::from(CLOB_RESOLUTION_SCHEMA_VERSION),
                     i64::from(CLOB_RESOLUTION_PARSER_VERSION),
                     fetched_at_unix,
+                    neg_risk_market_id,
+                    neg_risk,
                 ])?;
             }
         }
@@ -3226,10 +3242,10 @@ impl WalletCache {
             "INSERT INTO clob_payout_evidence_v2 \
              (market_id, end_date_unix, is_50_50_outcome, payout_status, payout_vector_json, closed, \
               tokens_json, raw_page_sha256, coverage_generation, page_ordinal, \
-              schema_version, parser_version, fetched_at_unix, origin) \
+              schema_version, parser_version, fetched_at_unix, origin, neg_risk_market_id, neg_risk) \
              SELECT market_id, end_date_unix, is_50_50_outcome, payout_status, payout_vector_json, closed, \
                     tokens_json, raw_page_sha256, generation, page_ordinal, schema_version, \
-                    parser_version, fetched_at_unix, origin \
+                    parser_version, fetched_at_unix, origin, neg_risk_market_id, neg_risk \
              FROM clob_payout_evidence_staging_v2 WHERE generation = ?1",
             params![generation],
         )?;
@@ -3249,7 +3265,8 @@ impl WalletCache {
             });
         }
         tx.execute(
-            "UPDATE clob_payout_coverage_manifests_v2 SET evidence_count = ?2 WHERE generation = ?1",
+            "UPDATE clob_payout_coverage_manifests_v2 \
+             SET evidence_count = ?2, group_version = 1 WHERE generation = ?1",
             params![generation, evidence_count],
         )?;
         tx.execute(
@@ -4995,33 +5012,57 @@ fn add_column_if_missing(
 /// reach the walk: the schema-one opener, the schema-two early return that
 /// `cache-populate-payout-v2` uses, and the schema-two schema owner (#672).
 ///
-/// A walk interrupted before the counter existed kept its staged rows but would
-/// start counting from zero, so the completion could no longer tell a repeat
-/// from a loss in that prefix. Such a walk is discarded and restarts from page
-/// one; installed evidence from earlier generations is untouched.
+/// A walk interrupted before the counter or group columns existed cannot prove
+/// its prefix complete. Discard it and restart from page one; installed evidence
+/// from earlier generations is untouched. Columns and reset commit together,
+/// including when the schema owner calls this inside a transaction.
 pub(crate) fn ensure_clob_payout_counts(conn: &Connection) -> Result<(), BootstrapError> {
-    let counter_missing = !column_exists(conn, "clob_payout_walk_state_v2", "distinct_markets")?;
-    add_column_if_missing(
-        conn,
-        "clob_payout_walk_state_v2",
-        "distinct_markets",
-        "INTEGER NOT NULL DEFAULT 0",
-    )?;
-    add_column_if_missing(
-        conn,
-        "clob_payout_coverage_manifests_v2",
-        "evidence_count",
-        "INTEGER NULL",
-    )?;
-    if counter_missing {
-        conn.execute_batch(
-            "BEGIN IMMEDIATE; \
-             DELETE FROM clob_payout_evidence_staging_v2; \
-             DELETE FROM clob_payout_walk_pages_v2; \
-             DELETE FROM clob_payout_walk_state_v2; \
-             COMMIT;",
+    conn.execute_batch("SAVEPOINT clob_payout_columns")?;
+    let migrated = (|| -> Result<(), BootstrapError> {
+        let counter_missing =
+            !column_exists(conn, "clob_payout_walk_state_v2", "distinct_markets")?;
+        let group_missing =
+            !column_exists(
+                conn,
+                "clob_payout_evidence_staging_v2",
+                "neg_risk_market_id",
+            )? || !column_exists(conn, "clob_payout_evidence_v2", "neg_risk_market_id")?;
+        add_column_if_missing(
+            conn,
+            "clob_payout_walk_state_v2",
+            "distinct_markets",
+            "INTEGER NOT NULL DEFAULT 0",
         )?;
+        for column in ["evidence_count", "group_version"] {
+            add_column_if_missing(
+                conn,
+                "clob_payout_coverage_manifests_v2",
+                column,
+                "INTEGER NULL",
+            )?;
+        }
+        for table in ["clob_payout_evidence_staging_v2", "clob_payout_evidence_v2"] {
+            add_column_if_missing(conn, table, "neg_risk_market_id", "TEXT NULL")?;
+        }
+        let flag_missing = !column_exists(conn, "clob_payout_evidence_staging_v2", "neg_risk")?
+            || !column_exists(conn, "clob_payout_evidence_v2", "neg_risk")?;
+        for table in ["clob_payout_evidence_staging_v2", "clob_payout_evidence_v2"] {
+            add_column_if_missing(conn, table, "neg_risk", "INTEGER NULL")?;
+        }
+        if counter_missing || group_missing || flag_missing {
+            conn.execute_batch(
+                "DELETE FROM clob_payout_evidence_staging_v2; \
+                 DELETE FROM clob_payout_walk_pages_v2; \
+                 DELETE FROM clob_payout_walk_state_v2;",
+            )?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = migrated {
+        conn.execute_batch("ROLLBACK TO clob_payout_columns; RELEASE clob_payout_columns")?;
+        return Err(error);
     }
+    conn.execute_batch("RELEASE clob_payout_columns")?;
     Ok(())
 }
 
@@ -6971,6 +7012,226 @@ mod tests {
                 .unwrap();
             assert_eq!(present, 1, "{table}.{column} must be migrated");
         }
+    }
+
+    fn stage_group_page(
+        cache: &mut WalletCache,
+        generation: u64,
+        next_cursor: &str,
+    ) -> ClobCoveragePage {
+        let raw = format!(
+            r#"{{"data":[{{"condition_id":"0xmarket","closed":false,"neg_risk_market_id":"0xgroup"}}],"next_cursor":"{next_cursor}"}}"#
+        );
+        let parsed = pe_source_polymarket_public::parse_clob_markets_page(raw.as_bytes()).unwrap();
+        let page = ClobCoveragePage::from_response(0, None, raw.as_bytes(), &parsed).unwrap();
+        let evidence = parsed
+            .data
+            .iter()
+            .map(|market| market.resolution_evidence())
+            .collect::<Vec<_>>();
+        cache
+            .commit_clob_payout_page_v2(generation, &page, &evidence, 100)
+            .unwrap();
+        page
+    }
+
+    #[test]
+    fn clob_payout_neg_risk_migration_restarts_walk_and_keeps_installed_evidence() {
+        for missing in ["neg_risk", "neg_risk_market_id"] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("cache.db");
+            let mut cache = WalletCache::open(&path).unwrap();
+            let first = cache.begin_or_resume_clob_payout_walk_v2(100).unwrap();
+            let page = stage_group_page(&mut cache, first.generation, "LTE=");
+            cache
+                .complete_clob_payout_walk_v2(
+                    &ClobCoverageManifest::complete(first.generation, vec![page]).unwrap(),
+                    101,
+                )
+                .unwrap();
+            let installed = cache.clob_payout_evidence_v2("0xmarket").unwrap().unwrap();
+            let next = cache.begin_or_resume_clob_payout_walk_v2(200).unwrap();
+            stage_group_page(&mut cache, next.generation, "PAGE2");
+            cache.conn.execute_batch(&format!("ALTER TABLE clob_payout_evidence_staging_v2 DROP COLUMN {missing}; ALTER TABLE clob_payout_evidence_v2 DROP COLUMN {missing};")).unwrap();
+            drop(cache);
+            let mut cache = WalletCache::open(&path).unwrap();
+            assert!(cache.clob_payout_walk_state_v2().unwrap().is_none());
+            assert!(
+                cache
+                    .clob_payout_coverage_pages_v2(next.generation)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                cache.clob_payout_evidence_v2("0xmarket").unwrap(),
+                Some(installed)
+            );
+            let flag: Option<i64> = cache
+                .conn
+                .query_row("SELECT neg_risk FROM clob_payout_evidence_v2", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(flag, None);
+            assert!(
+                column_exists(&cache.conn, "clob_payout_evidence_staging_v2", "neg_risk").unwrap()
+            );
+            let restarted = cache.begin_or_resume_clob_payout_walk_v2(201).unwrap();
+            assert_eq!(restarted.next_page_ordinal, 0);
+            assert_eq!(restarted.next_cursor, None);
+        }
+    }
+
+    #[test]
+    fn clob_payout_group_migration_restarts_pre_group_walk_and_keeps_installed_evidence() {
+        for schema_version in [CACHE_SCHEMA_VERSION_V1, CACHE_SCHEMA_VERSION_V2] {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("cache.db");
+            let (installed, manifest) = {
+                let mut cache = WalletCache::open(&path).unwrap();
+                let first = cache.begin_or_resume_clob_payout_walk_v2(100).unwrap();
+                let page = stage_group_page(&mut cache, first.generation, "LTE=");
+                let manifest =
+                    ClobCoverageManifest::complete(first.generation, vec![page]).unwrap();
+                cache.complete_clob_payout_walk_v2(&manifest, 101).unwrap();
+                let installed = cache.clob_payout_evidence_v2("0xmarket").unwrap().unwrap();
+                let second = cache.begin_or_resume_clob_payout_walk_v2(200).unwrap();
+                stage_group_page(&mut cache, second.generation, "PAGE2");
+                cache
+                    .conn
+                    .execute_batch(&format!(
+                        "ALTER TABLE clob_payout_evidence_v2 DROP COLUMN neg_risk_market_id; \
+                     ALTER TABLE clob_payout_evidence_staging_v2 DROP COLUMN neg_risk_market_id; \
+                     ALTER TABLE clob_payout_coverage_manifests_v2 DROP COLUMN group_version; \
+                     PRAGMA user_version = {schema_version};"
+                    ))
+                    .unwrap();
+                (installed, manifest)
+            };
+            let mut cache = WalletCache::open(&path).unwrap();
+            for (table, column) in [
+                ("clob_payout_evidence_v2", "neg_risk_market_id"),
+                ("clob_payout_evidence_staging_v2", "neg_risk_market_id"),
+                ("clob_payout_coverage_manifests_v2", "group_version"),
+            ] {
+                assert!(column_exists(&cache.conn, table, column).unwrap());
+            }
+            assert_eq!(
+                cache.clob_payout_evidence_v2("0xmarket").unwrap(),
+                Some(installed)
+            );
+            assert_eq!(
+                cache.latest_clob_payout_coverage_manifest_v2().unwrap(),
+                Some(manifest)
+            );
+            let group: Option<String> = cache
+                .conn
+                .query_row(
+                    "SELECT neg_risk_market_id FROM clob_payout_evidence_v2",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(group, None);
+            let version: Option<i64> = cache
+                .conn
+                .query_row(
+                    "SELECT group_version FROM clob_payout_coverage_manifests_v2",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(version, None);
+            assert_eq!(cache.clob_payout_walk_state_v2().unwrap(), None);
+            assert!(cache.clob_payout_coverage_pages_v2(2).unwrap().is_empty());
+            let staged: i64 = cache
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM clob_payout_evidence_staging_v2",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(staged, 0);
+            let resumed = cache.begin_or_resume_clob_payout_walk_v2(300).unwrap();
+            assert_eq!(resumed.generation, 2);
+            assert_eq!(resumed.next_cursor, None);
+            assert_eq!(resumed.next_page_ordinal, 0);
+            stage_group_page(&mut cache, resumed.generation, "PAGE2");
+            drop(cache);
+            let cache = WalletCache::open(&path).unwrap();
+            let state = cache.clob_payout_walk_state_v2().unwrap().unwrap();
+            assert_eq!(state.next_cursor.as_deref(), Some("PAGE2"));
+            assert_eq!(state.next_page_ordinal, 1);
+            let group: Option<String> = cache
+                .conn
+                .query_row(
+                    "SELECT neg_risk_market_id FROM clob_payout_evidence_staging_v2",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(group.as_deref(), Some("0xgroup"));
+        }
+    }
+
+    #[test]
+    fn clob_payout_group_migration_rolls_back_columns_when_reset_fails() {
+        let dir = TempDir::new().unwrap();
+        let mut cache = WalletCache::open(&dir.path().join("cache.db")).unwrap();
+        let walk = cache.begin_or_resume_clob_payout_walk_v2(100).unwrap();
+        stage_group_page(&mut cache, walk.generation, "PAGE2");
+        cache
+            .conn
+            .execute_batch(
+                "ALTER TABLE clob_payout_evidence_v2 DROP COLUMN neg_risk_market_id; \
+             ALTER TABLE clob_payout_evidence_staging_v2 DROP COLUMN neg_risk_market_id; \
+             ALTER TABLE clob_payout_coverage_manifests_v2 DROP COLUMN group_version; \
+             CREATE TRIGGER reject_payout_reset BEFORE DELETE ON clob_payout_walk_state_v2 \
+             BEGIN SELECT RAISE(ABORT, 'reset refused'); END;",
+            )
+            .unwrap();
+        let transaction = cache.conn.transaction().unwrap();
+        let error = ensure_clob_payout_counts(&transaction).unwrap_err();
+        assert!(error.to_string().contains("reset refused"));
+        assert!(
+            !column_exists(
+                &transaction,
+                "clob_payout_evidence_staging_v2",
+                "neg_risk_market_id"
+            )
+            .unwrap()
+        );
+        assert!(
+            !column_exists(
+                &transaction,
+                "clob_payout_evidence_v2",
+                "neg_risk_market_id"
+            )
+            .unwrap()
+        );
+        assert!(
+            !column_exists(
+                &transaction,
+                "clob_payout_coverage_manifests_v2",
+                "group_version"
+            )
+            .unwrap()
+        );
+        let staged: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM clob_payout_evidence_staging_v2",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(staged, 1);
+        transaction
+            .execute_batch("DROP TRIGGER reject_payout_reset")
+            .unwrap();
+        ensure_clob_payout_counts(&transaction).unwrap();
+        transaction.commit().unwrap();
+        assert_eq!(cache.clob_payout_walk_state_v2().unwrap(), None);
     }
 
     /// FAIL: the column is still absent after the reopen, or the statement still cannot prepare.

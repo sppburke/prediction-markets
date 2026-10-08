@@ -14,6 +14,10 @@ other five required tables remain full exports. Full activity history, including
 publisher freshness evidence, stays in SQLite. Manifest version 2 declares this
 scope so older readers refuse it.
 
+Format three exports the committed projection spool and payout evidence only.
+Its manifest is written after the Parquet projection reproduces the finalized
+count and UTF-8 digest; normalized activity stays in SQLite.
+
 SQLite stays the system-of-record; this is a read-only snapshot. sqlite_scanner
 preserves the declared column types (INTEGER->BIGINT, TEXT->VARCHAR), so the DuckDB
 ranker queries see `outcome_id`/`contracts` as BIGINT and `price_str` as VARCHAR —
@@ -60,6 +64,14 @@ V2_TABLES = (
     "cache_v2_migration_state",
 )
 V2_EXPORT_MANIFEST = "schema_v2_export_manifest.json"
+V3_TABLES = ("clob_payout_evidence_v2", "projection")
+PROJECTION_TYPES = {
+    "activity_generation": "BIGINT", "asset": "VARCHAR", "classifier_version": "BIGINT",
+    "condition_id": "VARCHAR", "end_date_unix": "BIGINT", "outcome_id": "BIGINT",
+    "payout_vector_json": "VARCHAR", "price_weighted_share_amount_str": "VARCHAR",
+    "share_amount_str": "VARCHAR", "side": "VARCHAR", "source_time_unix": "BIGINT",
+    "source_trade_id": "VARCHAR", "source_usdc_amount_str": "VARCHAR", "wallet_hex": "VARCHAR",
+}
 PROJECTION_BATCH_SIZE = 1024
 CERTIFIED_ACTIVITY_SQL = (
     "SELECT g.* FROM ranker_entries_v2 AS r "
@@ -234,7 +246,8 @@ def _projection_digest(rows: Iterable[dict]) -> tuple[int, str]:
     for row in rows:
         if count:
             digest.update(b",")
-        digest.update(json.dumps(row, sort_keys=True, separators=(",", ":")).encode())
+        digest.update(json.dumps(row, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                                 allow_nan=False).encode())
         count += 1
     digest.update(b"]")
     return count, digest.hexdigest()
@@ -328,6 +341,77 @@ def _write_v2_export_manifest(out_dir: str, counts: dict[str, int], projection: 
     log(f"schema-two export manifest -> {final}")
 
 
+def _compact_projection_rows(con, path: str) -> Iterator[dict]:
+    # File order is the spool's (wallet_hex, source_time_unix, source_trade_id) order: the
+    # COPY and this scan preserve insertion order, and any reordering fails the digest.
+    # Sorting all 48.6M rows instead ran out of DuckDB memory on Forge (#739, 10/7).
+    names = list(PROJECTION_TYPES)
+    cursor = con.execute(f"SELECT {', '.join(names)} FROM read_parquet('{_q(path)}')")
+    while batch := cursor.fetchmany(PROJECTION_BATCH_SIZE):
+        for row in batch:
+            yield dict(zip(names, row, strict=True))
+
+
+def _export_v3_projection(con, db_path: str, out_dir: str, row_group_size: int) -> dict:
+    import json
+    from rank_cycle_manifest import _fresh_identity
+
+    phase, count, digest, classifier, raw_inputs, raw_identity = con.execute(
+        "SELECT phase, ranker_projection_count, ranker_projection_digest, "
+        "ranker_classifier_version, ranker_projection_inputs_json, fresh_collection_json "
+        "FROM src.cache_v2_migration_state WHERE singleton = 1").fetchone()
+    inputs = json.loads(raw_inputs)
+    identity = _fresh_identity(raw_identity)
+    if (phase != "finalized" or classifier != 6 or type(inputs.get("oracle_version")) is not int
+            or inputs["oracle_version"] != 6
+            or identity["version"] != 4 or inputs["activity_generation"] != identity["generation"]):
+        raise ValueError("format-three projection requires finalized classifier/oracle 6")
+    commitment = inputs["projection_spool"]
+    path_name = commitment["path_name"]
+    if path_name != os.path.basename(db_path) + ".projection-v3.jsonl":
+        raise ValueError("format-three projection spool path mismatch")
+    spool = os.path.join(os.path.dirname(os.path.abspath(db_path)), path_name)
+    if (os.path.getsize(spool) != commitment["size_bytes"]
+            or _file_sha256(spool) != commitment["sha256"]):
+        raise ValueError("format-three projection spool size/SHA-256 mismatch")
+    if commitment["lines"] != count:
+        raise ValueError("format-three projection spool count mismatch")
+    final = os.path.join(out_dir, "projection.parquet")
+    temporary = final + ".tmp"
+    columns = ", ".join(f"'{name}': '{dtype}'" for name, dtype in PROJECTION_TYPES.items())
+    con.execute(
+        f"COPY (SELECT * FROM read_json('{_q(spool)}', format='newline_delimited', "
+        f"columns={{{columns}}})) TO '{_q(temporary)}' "
+        f"(FORMAT PARQUET, COMPRESSION zstd, ROW_GROUP_SIZE {int(row_group_size)})")
+    actual_count, actual_digest = _projection_digest(_compact_projection_rows(con, temporary))
+    if actual_count != count or actual_digest != digest:
+        raise ValueError("format-three Parquet projection count/digest mismatch")
+    os.replace(temporary, final)
+    log(f"projection: {count:,} rows -> {final}")
+    return {"count": count, "digest": digest, "classifier_version": classifier,
+            "oracle_version": inputs["oracle_version"], "activity_generation": identity["generation"],
+            "spool_sha256": commitment["sha256"]}
+
+
+def _write_v3_export_manifest(out_dir: str, payout_count: int, projection: dict) -> None:
+    import json
+
+    counts = {"clob_payout_evidence_v2": payout_count, "projection": projection["count"]}
+    value = {"version": 3, "activity_scope": "projection_spool", "projection": projection,
+             "tables": {table: {"count": counts[table],
+                                "sha256": _file_sha256(os.path.join(out_dir, f"{table}.parquet"))}
+                        for table in V3_TABLES}}
+    final = os.path.join(out_dir, V2_EXPORT_MANIFEST)
+    temporary = final + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as destination:
+        json.dump(value, destination, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        destination.write("\n")
+        destination.flush()
+        os.fsync(destination.fileno())
+    os.replace(temporary, final)
+    log(f"format-three export manifest -> {final}")
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--db", default="data/wallet_cache.db")
@@ -339,6 +423,16 @@ def main() -> int:
         schema = int(sqlite.execute("PRAGMA user_version").fetchone()[0])
         if schema == -2:
             raise ValueError("unfinished bulk root (schema -2); resume cache-populate-activity-v2 --bulk-root before any other command")
+        format_three = False
+        if schema >= 2:
+            import json
+            columns = {row[1] for row in sqlite.execute("PRAGMA table_info(cache_v2_migration_state)")}
+            raw = (sqlite.execute("SELECT fresh_collection_json FROM cache_v2_migration_state WHERE singleton = 1").fetchone()[0]
+                   if "fresh_collection_json" in columns else None)
+            identity_version = None if raw is None else json.loads(raw).get("version")
+            if identity_version not in (None, 1, 2, 3, 4):
+                raise ValueError("unsupported candidate activity identity version")
+            format_three = identity_version == 4
 
     import duckdb
 
@@ -351,7 +445,11 @@ def main() -> int:
     con.execute(f"ATTACH '{db_abs}' AS src (TYPE sqlite, READ_ONLY);")
 
     t0 = time.time()
-    if schema >= 2:
+    if format_three:
+        projection = _export_v3_projection(con, a.db, a.out_dir, a.row_group_size)
+        payout_count = _export_table(con, a.out_dir, "clob_payout_evidence_v2", a.row_group_size)
+        _write_v3_export_manifest(a.out_dir, payout_count, projection)
+    elif schema >= 2:
         counts = {}
         for tbl in V2_TABLES:
             _attached_columns(con, tbl)

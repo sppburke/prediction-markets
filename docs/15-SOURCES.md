@@ -38,6 +38,27 @@
 
 ## Polymarket
 
+> **CLOB neg-risk groups (#739/#588), Last checked: 2026-10-05; re-verify by
+> 2026-12-04.** The official [long-market schema](https://docs.polymarket.com/api-spec/clob-openapi.yaml)
+> exposes boolean `neg_risk` and string `neg_risk_market_id`. The approved #739 source pass records
+> these fields on every row of the first [CLOB `/markets` cursor page](https://clob.polymarket.com/markets)
+> (1,000 rows), and matching CLOB/Gamma group ids on six live neg-risk markets in four groups.
+> Empty group ids become NULL; a neg-risk market without a group id remains ungrouped. The complete
+> read-only walk recorded 45 such markets; neither a Gamma event id nor `market_events` substitutes
+> for the CLOB group. Provenance: [#739's approved evidence](https://github.com/sppburke/prediction-markets/issues/739),
+> `one-go/clob-groups-summary-1005.out` and `one-go/clob-neg-risk-without-group-1005.txt`.
+> A separate read-only comparison on 2026-10-06 at 02:58 AM CT found that `/markets` ignores
+> `closed=true`: the first and two late pages matched without it, including open markets and group
+> ids (`one-go/closed-probe/summary.txt`, #739). The payout walk therefore obtains groups from the
+> same all-market cursor traversal; the query parameter is not proof that returned rows are closed.
+>
+> Polymarket's [negative-risk page](https://docs.polymarket.com/concepts/negative-risk) explains
+> conversion between a No position and Yes positions in the event's other outcomes, and augmented
+> events whose outcomes can be named later. This is the event-scope basis; ordinary independent
+> markets are not grouped by a Gamma event. Page/schema were also read directly for this docs lane
+> on 2026-10-06 (Markdown page and OpenAPI `Market` properties); no fresh live-market probe was run.
+> The tracked dates below retain the supplied 2026-10-05 source-pass provenance.
+
 > **Closed prices, closure clocks and minimum shares (#730 Part 1), Last checked:
 > 2026-10-03; re-verify by 2026-12-02.** The captured official
 > [market details](https://docs.polymarket.com/market-data/market-details) describe `closed`
@@ -273,6 +294,9 @@
 | https://polygon.publicnode.com (`eth_chainId`, `eth_getTransactionReceipt`, `eth_getBlockByNumber`) | 2026-09-05 | 2026-12-04 |
 | https://docs.polymarket.com/api-reference/tags/get-tag-by-id | 2026-07-18 | 2026-09-16 |
 | https://clob.polymarket.com/markets/{condition_id} | 2026-09-01 | 2026-10-31 |
+| https://clob.polymarket.com/markets (`neg_risk`, `neg_risk_market_id`) | 2026-10-05 | 2026-12-04 |
+| https://docs.polymarket.com/api-spec/clob-openapi.yaml (`Market` neg-risk fields) | 2026-10-05 | 2026-12-04 |
+| https://docs.polymarket.com/concepts/negative-risk | 2026-10-05 | 2026-12-04 |
 | https://clob.polymarket.com/book?token_id={tokenId} | 2026-07-18 | 2026-09-16 |
 | https://clob.polymarket.com/prices-history?market={tokenId} | 2026-09-01 | 2026-10-31 |
 | https://clob.polymarket.com/prices-history?market={tokenId}&startTs={start}&endTs={cutoff}&fidelity=1 | 2026-09-18 | 2026-11-17 |
@@ -348,6 +372,11 @@ Treat as research inspiration; not a production decision input unless an authori
 | https://crowdintel.xyz/docs | 2026-05-02 | 2026-07-01 |
 
 ## Last research pass
+
+- 2026-10-05 (#739/#588, supplied source-pass evidence): CLOB `/markets` neg-risk fields and group
+  identity, plus the official negative-risk conversion/augmented-event semantics. The 2026-10-06
+  `closed=true` comparison is separately dated in the provenance note above. This documentation lane
+  read the official Markdown page and OpenAPI schema on 2026-10-06, without a new live API probe.
 
 - 2026-09-27: For the paper fill-rule change, re-read the official Gamma list/get market response
   schemas (`secondsDelay` is nullable), compact CLOB market info (tokens, minimum size/tick,
