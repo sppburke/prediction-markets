@@ -329,18 +329,31 @@ mod admission_tests {
             identity,
         );
         let ranked = HashMap::from([(candidate, 1234)]);
-        // The drain list read's pause ends at 50 ms; the group's drain transaction then commits before
-        // the deadline (75 ms), which passes during that transaction's pause (at least 50 ms), so the
-        // gate result's transaction never starts.
-        let outcome = AdmissionPreparer::with_validator(tx, state.clone(), validator)
-            .prepare_with_cursors(
-                &[candidate],
-                Some(&ranked),
-                Some(Instant::now() + Duration::from_millis(75)),
-                AdmissionContext::Other,
-            )
-            .await
-            .unwrap();
+        let preparer = AdmissionPreparer::with_validator(tx, state.clone(), validator);
+        let deadline = Instant::now() + Duration::from_secs(3600);
+        let additions = [candidate];
+        let prepare = preparer.prepare_with_cursors(
+            &additions,
+            Some(&ranked),
+            Some(deadline),
+            AdmissionContext::Other,
+        );
+        // Pauses follow measured lock times, so drive the paused clock by hand: it moves only here,
+        // and only after checking for the group's drain commit. Preparation is then parked in that
+        // transaction's pause (at least 50 ms) when the clock passes the deadline, so the gate
+        // result's transaction never starts.
+        let drive = async {
+            for _ in 0..100_000 {
+                if !seen(&state, "left") {
+                    break;
+                }
+                tokio::time::advance(Duration::from_millis(10)).await;
+            }
+            assert!(!seen(&state, "left"), "the group's transaction committed");
+            tokio::time::advance(Duration::from_secs(3600)).await;
+        };
+        let (outcome, ()) = tokio::join!(prepare, drive);
+        let outcome = outcome.unwrap();
         assert_eq!(outcome.unstarted, vec![candidate]);
         assert!(outcome.started.is_empty() && outcome.deferred.is_empty());
         assert!(outcome.admitted.is_empty());
