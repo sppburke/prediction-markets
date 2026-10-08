@@ -486,8 +486,18 @@ fn retention_drain_list_absent_means_empty_and_malformed_fails_closed() {
     }
 }
 
+/// One SQLite value, compared exactly: its storage class, a text's or blob's raw bytes, a real's bit pattern.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Cell {
+    Null,
+    Integer(i64),
+    Real(u64),
+    Text(Vec<u8>),
+    Blob(Vec<u8>),
+}
+
 /// Every table's rows, sorted, for comparing two databases table by table.
-fn table_rows(sql: &Connection) -> std::collections::BTreeMap<String, Vec<String>> {
+fn table_rows(sql: &Connection) -> std::collections::BTreeMap<String, Vec<Vec<Cell>>> {
     let tables: Vec<String> = sql
         .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
         .unwrap()
@@ -500,22 +510,17 @@ fn table_rows(sql: &Connection) -> std::collections::BTreeMap<String, Vec<String
         .map(|table| {
             let mut statement = sql.prepare(&format!("SELECT * FROM {table}")).unwrap();
             let columns = statement.column_count();
-            let mut rows: Vec<String> = statement
+            let mut rows: Vec<Vec<Cell>> = statement
                 .query_map([], |row| {
                     Ok((0..columns)
                         .map(|i| match row.get_ref(i).unwrap() {
-                            rusqlite::types::ValueRef::Null => "NULL".to_owned(),
-                            rusqlite::types::ValueRef::Integer(v) => v.to_string(),
-                            rusqlite::types::ValueRef::Real(v) => v.to_string(),
-                            rusqlite::types::ValueRef::Text(v) => {
-                                String::from_utf8_lossy(v).into_owned()
-                            }
-                            rusqlite::types::ValueRef::Blob(v) => {
-                                format!("blob:{}", String::from_utf8_lossy(v))
-                            }
+                            rusqlite::types::ValueRef::Null => Cell::Null,
+                            rusqlite::types::ValueRef::Integer(v) => Cell::Integer(v),
+                            rusqlite::types::ValueRef::Real(v) => Cell::Real(v.to_bits()),
+                            rusqlite::types::ValueRef::Text(v) => Cell::Text(v.to_vec()),
+                            rusqlite::types::ValueRef::Blob(v) => Cell::Blob(v.to_vec()),
                         })
-                        .collect::<Vec<_>>()
-                        .join("|"))
+                        .collect())
                 })
                 .unwrap()
                 .collect::<Result<_, _>>()
@@ -601,11 +606,12 @@ fn retention_removal_and_drains_delete_exactly_the_one_transaction_set() {
         db.feed_history_frontiers().unwrap(),
         serde_json::json!({"version":1,"frontiers":[{"wallet":wallet(2)}]})
     );
-    let other_meta = |rows: &[String]| -> Vec<String> {
+    let other_meta = |rows: &[Vec<Cell>]| -> Vec<Vec<Cell>> {
         rows.iter()
             .filter(|row| {
-                !row.starts_with("feed_history_frontiers|")
-                    && !row.starts_with("wallet_retirement_drains|")
+                !matches!(row.first(), Some(Cell::Text(key))
+                    if key.as_slice() == b"feed_history_frontiers"
+                        || key.as_slice() == b"wallet_retirement_drains")
             })
             .cloned()
             .collect()

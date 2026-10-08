@@ -1910,8 +1910,9 @@ issued with the unit then proven disabled and stopped, removes it. A signal betw
 `start`, a failed `enable` or a failed `start` disables the unit again. A SIGKILL or power loss
 after `enable` can leave the desired unit enabled, and a reboot then starts it with no earlier
 process alive: the latch stops an unverified deployment retry, not a systemd activation. A resume
-first normalizes an unfinished activation (a status 78, or a status that cannot be read, is recorded
-before any disable or stop) and does not start a previously booted binary (fence present, or an
+first normalizes an unfinished activation: it tries to record a status 78, or a status that cannot
+be read, before any disable or stop, and when that record cannot be written it still disables and
+stops the unit and then fails the run. It does not start a previously booted binary (fence present, or an
 invalidation record the service cannot read), a status-78 binary, or an attempt whose outcome was
 never recorded until its required recovery is recorded: establish the attempt's outcome from the
 unit's journal and record the recovery below before removing the latch. A desired unit already
