@@ -32,8 +32,8 @@ The wrapper exports its `.env`: set `MAX_CACHE_STALENESS_HOURS` to the
 and `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS=0` before that cycle. Keep existing CLOB concurrency
 unless the runbook's read-only probe justifies raising `PE_BOOTSTRAP_CLOB_CONCURRENCY`; never edit
 cycle configuration in flight. After exact-request activation/publication, the owner selects the
-ordinary batch and explicitly consents to restart. The first ordinary cycle keeps the interim
-bound; remove it between cycles after that preparation and before the second ordinary cycle.
+ordinary batch and explicitly consents to restart. Ordinary cycles keep the interim bound through
+the quiet-wallet re-read wave; remove it between cycles once the glossary's removal condition holds.
 
 ## Install
 

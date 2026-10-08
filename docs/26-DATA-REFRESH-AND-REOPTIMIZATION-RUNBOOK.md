@@ -631,7 +631,8 @@ resolve deterministically via `(timestamp_unix, source_trade_id)`).
 > drop the override on subsequent runs (#370).
 
 > **Backfill is built in.** Step 0 backfills before ranking, and the push aborts if the
-> cache's newest trade is >24 h old (the issue #350 WS3 freshness guard above). A
+> cache's newest trade is older than `upload_max_cache_staleness_hours` ([glossary](_GLOSSARY.md);
+> the issue #350 WS3 freshness guard above). A
 > standalone Part-1 run is only needed for a faster iteration loop or to debug.
 
 ### Overrides (research / re-push)
@@ -1318,11 +1319,11 @@ to the owner. Record each completed step and resume it, rather than starting ano
 9. Recompute both drives' capacity headroom, retention horizon and stage forecasts from measured
    classifier-6 spool bytes, positions and reference demand at the [shared floor](_GLOSSARY.md#ranking-horizon-floor).
    Set `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS` to the owner's ordinary-cycle choice. **Explicit owner
-   restart consent** is required before setting flag `run` and starting the loop unit. The first
-   ordinary cycle keeps the [interim freshness override](_GLOSSARY.md#catch-up-freshness): deferred
-   wallets due after the catch-up read in full and fetch their unwarmed reference pages. After it
-   prepares, remove that override by a `.env` edit between cycles, before the second ordinary cycle
-   starts. Observe three ordinary publications under the existing batch-application,
+   restart consent** is required before setting flag `run` and starting the loop unit. Ordinary
+   cycles keep the [interim freshness override](_GLOSSARY.md#catch-up-freshness) through the
+   quiet-wallet re-read wave: deferred wallets due after the catch-up read in full and fetch their
+   unwarmed reference pages. Remove that override by a `.env` edit between cycles once its glossary
+   removal condition holds. Observe three ordinary publications under the existing batch-application,
    bounded-membership and service-health checks.
 
 For each cycle record stage durations, rows read/written and commitments, drops and ignored records,
@@ -1520,8 +1521,8 @@ prepared request through acceptance and resume rather than recreating it.
 Classifier 6 / format 3 changes no loop unit, flag or lock lifecycle. Its
 [catch-up procedure](#classifier-6-catch-up-and-coordinated-release-739) owns the stopped installation,
 detached one-shot acceptance, exact pending-request handoff and explicit owner restart consent.
-The [interim `.env` freshness bound](_GLOSSARY.md#catch-up-freshness) covers catch-up and the first
-ordinary cycle only; remove it between cycles before the second ordinary cycle. Normal cycles use
+The [interim `.env` freshness bound](_GLOSSARY.md#catch-up-freshness) covers catch-up and the
+quiet-wallet re-read wave; remove it between cycles once its removal condition holds. Normal cycles use
 the canonical freshness checks, the owner's frozen activation batch and the one
 [`MIN_TTR_SECS` scoring value](_GLOSSARY.md#ranking-horizon-floor), with batch limits taken from the
 validated oracle manifest. Scope/coverage publication is atomic; the supervisor adds no special stage.
