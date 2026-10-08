@@ -1269,6 +1269,17 @@ pub fn retention_controls_at(
 #[derive(Clone, Default)]
 pub struct RetentionLogs(Arc<std::sync::Mutex<Vec<u8>>>);
 
+struct TokioClock(tokio::time::Instant);
+
+impl tracing_subscriber::fmt::time::FormatTime for TokioClock {
+    fn format_time(
+        &self,
+        writer: &mut tracing_subscriber::fmt::format::Writer<'_>,
+    ) -> std::fmt::Result {
+        write!(writer, "{}", self.0.elapsed().as_micros())
+    }
+}
+
 impl std::io::Write for RetentionLogs {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         self.0.lock().unwrap().extend_from_slice(bytes);
@@ -1298,6 +1309,20 @@ impl RetentionLogs {
             .json()
             .flatten_event(true)
             .without_time()
+            .with_writer(self.clone())
+            .finish()
+    }
+
+    /// As [`Self::subscriber`], stamping each event with microseconds of Tokio time since `start`.
+    /// With paused time only sleeps advance that clock, so event gaps are exactly the pauses between them.
+    pub fn subscriber_on_tokio_clock(
+        &self,
+        start: tokio::time::Instant,
+    ) -> impl tracing::Subscriber + Send + Sync + 'static {
+        tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_timer(TokioClock(start))
             .with_writer(self.clone())
             .finish()
     }

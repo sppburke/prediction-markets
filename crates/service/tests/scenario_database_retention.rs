@@ -15,8 +15,8 @@ use pe_position_ledger::PositionLedger;
 use pe_service::bucket_commit::{AnchorInstallError, BucketCommitEngine};
 use pe_service::clob_book::FixtureClobBookFetcher;
 use pe_service::database_retention::{
-    DatabaseRetention, DatabaseRetentionInputs, DatabaseRetentionReport, RETENTION_BUFFER_SECS,
-    RetentionWait, run_database_retention,
+    DatabaseRetention, DatabaseRetentionInputs, DatabaseRetentionReport, RetentionWait,
+    run_database_retention,
 };
 use pe_service::entry_gate::{CopyEntryGate, CopyEntryGateConfig};
 use pe_service::health::new_shared_health;
@@ -26,6 +26,7 @@ use pe_service::orchestrator::{Orchestrator, OrchestratorConfig};
 use pe_service::orchestrator_control::OrchestratorControl;
 use pe_service::paper_recovery::{MembershipReason, PaperLog, PaperLogRecord, build_leader_ledger};
 use pe_service::position_seeder::{AnchorExpectation, AnchorInstall, AnchorProof, ledger_capture};
+use pe_service::source_checkpoint::SOURCE_RETENTION_BUFFER_SECS as RETENTION_BUFFER_SECS;
 use pe_source_polymarket_public::FixtureFetcher;
 use pe_strategy_winner_follow::{ExecutionMode, WinnerFollowConfig, WinnerFollowStrategy};
 use pe_trader_index::Watchlist;
@@ -251,8 +252,13 @@ async fn retention_orchestrator_clears_running_ledger_cursor_and_persisted_front
     assert_eq!(report.anchors_blanked, 1);
     assert_eq!(report.wallets_swapped_out, 1);
     assert!(report.wallets_waiting.is_empty());
-    // One blanking batch, two candidate pages (the second empty) and one retirement.
-    assert_eq!(report.transaction_lock_times.len(), 4);
+    // The removal and one drain transaction (this wallet has no groups or gate results left, so
+    // it clears the list entry).
+    assert_eq!(
+        (report.wallets_drained, report.wallets_listed),
+        (1, Some(0))
+    );
+    assert!(fixture.db.retirement_drains().unwrap().result.is_empty());
     let (captured, capture) = oneshot::channel();
     fixture
         .tx
@@ -420,7 +426,11 @@ async fn retention_attempt_lock_waits_rechecks_and_stays_held_through_acknowledg
         let empty = HashSet::new();
         let run = fixture.run(NOW, &empty, &empty, &empty, true, true);
         tokio::pin!(run);
-        assert!(futures::poll!(&mut run).is_pending());
+        // Paced blanking and paging finish well within this; the job then waits for the lock.
+        tokio::select! {
+            _ = &mut run => panic!("the job finished while the attempt lock was held"),
+            () = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+        }
         assert!(fixture.db.cursor(&wallet()).unwrap().is_some());
         // A bracket completed before releasing its lock; the job must repeat its guard query.
         fixture
@@ -471,8 +481,10 @@ async fn retention_attempt_lock_waits_rechecks_and_stays_held_through_acknowledg
         &cancel,
     );
     tokio::pin!(run);
-    assert!(futures::poll!(&mut run).is_pending());
-    let message = rx.recv().await.unwrap();
+    let message = tokio::select! {
+        _ = &mut run => panic!("the job finished before handing off its removal"),
+        message = rx.recv() => message.unwrap(),
+    };
     let lock = preparer.lock_for_retention();
     tokio::pin!(lock);
     assert!(futures::poll!(&mut lock).is_pending());
@@ -540,7 +552,10 @@ async fn retention_cancelled_while_waiting_for_admission_leaves_wallet_intact() 
             &cancel,
         );
         tokio::pin!(run);
-        assert!(futures::poll!(&mut run).is_pending());
+        tokio::select! {
+            _ = &mut run => panic!("the job finished while the attempt lock was held"),
+            () = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+        }
         cancel.store(true, Ordering::Release);
         assert!(run.await.unwrap().cancelled);
         assert!(fixture.db.cursor(&wallet()).unwrap().is_some());
@@ -890,4 +905,292 @@ async fn retention_forgets_engine_and_shared_index_verified_frontiers() {
         "the old engine frontier must not suppress a returning wallet's publication"
     );
     fixture.finish().await;
+}
+
+fn seed_trade_rows(sql: &Connection, wallet: WalletAddress, groups: usize) {
+    let w = wallet.to_string();
+    for n in 0..groups {
+        let id = format!("group-{w}-{n}");
+        sql.execute(
+            "INSERT INTO activity_groups VALUES (?1, 'tx', ?2, 1, 'r', 'TRADE', 'applied', '{}')",
+            params![id, w],
+        )
+        .unwrap();
+        sql.execute(
+            "INSERT INTO seen_trades_v2 VALUES (?1, 2, 'tx')",
+            params![id],
+        )
+        .unwrap();
+        sql.execute(
+            "INSERT INTO activity_group_revisions VALUES (?1, 'r', 'tx', 'applied', '{}', 1)",
+            params![id],
+        )
+        .unwrap();
+    }
+    let gate = format!("gate-{w}");
+    sql.execute(
+        "INSERT INTO entry_gate_results VALUES (?1, ?2, 'market', 1, 'admitted', 1)",
+        params![gate, w],
+    )
+    .unwrap();
+    sql.execute(
+        "INSERT INTO seen_trades_v2 VALUES (?1, 2, 'tx')",
+        params![gate],
+    )
+    .unwrap();
+}
+
+fn rows(sql: &Connection, table: &str) -> i64 {
+    sql.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+        row.get(0)
+    })
+    .unwrap()
+}
+
+/// Remove the wallet through the orchestrator and stop before its drain, as a stop mid-drain leaves it.
+async fn remove_without_drain(fixture: &Fixture) {
+    let _attempt = fixture.preparer.lock_for_retention().await;
+    let (acknowledged, ack) = oneshot::channel();
+    fixture
+        .tx
+        .send(OrchestratorControl::RetireWallet {
+            wallet: wallet(),
+            recent_since_unix: NOW - RETENTION_BUFFER_SECS,
+            acknowledged,
+        })
+        .await
+        .unwrap();
+    assert_eq!(ack.await.unwrap().unwrap().waiting, None);
+    assert_eq!(
+        fixture.db.retirement_drains().unwrap().result,
+        vec![wallet()]
+    );
+}
+
+/// A listed wallet (removed earlier; three groups and a gate result left), a fenced candidate, and an
+/// eligible departed candidate with one group and a gate result.
+async fn job_fixture() -> (Fixture, WalletAddress, WalletAddress) {
+    let fixture = Fixture::new(Some(NOW - RETENTION_BUFFER_SECS), false);
+    seed_trade_rows(&fixture.sql, wallet(), 3);
+    remove_without_drain(&fixture).await;
+    let fenced = WalletAddress([2; 20]);
+    let departed = WalletAddress([3; 20]);
+    fixture
+        .sql
+        .execute(
+            "INSERT INTO wallet_fences VALUES (?1, 'fenced-trade', 'fixture', '{}', 1)",
+            params![fenced.to_string()],
+        )
+        .unwrap();
+    fixture
+        .sql
+        .execute(
+            "INSERT INTO poll_cursors(wallet_hex,last_ts_unix) VALUES (?1,1)",
+            params![fenced.to_string()],
+        )
+        .unwrap();
+    seed_trade_rows(&fixture.sql, departed, 1);
+    (fixture, fenced, departed)
+}
+
+/// One database hold as the job logged it, stamped on Tokio's clock.
+struct Hold {
+    message: String,
+    wallet: Option<String>,
+    at_micros: u128,
+    held_micros: u128,
+}
+
+fn micros(value: &serde_json::Value) -> u128 {
+    value
+        .as_u64()
+        .map(u128::from)
+        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+        .unwrap()
+}
+
+fn holds(logs: &support::RetentionLogs) -> Vec<Hold> {
+    logs.text()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| {
+            matches!(
+                event["message"].as_str(),
+                Some(
+                    "source retention drain list read"
+                        | "source retention drain transaction"
+                        | "source retention database transaction"
+                        | "source retention database scan"
+                        | "source retention eligibility check"
+                )
+            )
+        })
+        .map(|event| Hold {
+            message: event["message"].as_str().unwrap().to_owned(),
+            wallet: event["wallet"].as_str().map(str::to_owned),
+            at_micros: micros(&event["timestamp"]),
+            held_micros: micros(&event["lock_time_micros"]),
+        })
+        .collect()
+}
+
+#[tokio::test(start_paused = true)]
+async fn retention_pauses_after_every_hold_and_drains_listed_wallets_first() {
+    let logs = support::RetentionLogs::default();
+    let _subscriber = tracing::subscriber::set_default(
+        logs.subscriber_on_tokio_clock(tokio::time::Instant::now()),
+    );
+    let (fixture, fenced, departed) = job_fixture().await;
+    // Another writer holds the database, so the first drain transaction holds the connection past the
+    // floor while it waits; its pause must last at least that long.
+    let (locked, ready) = std::sync::mpsc::channel();
+    let path = fixture._dir.path().join("paper.db");
+    let writer = std::thread::spawn(move || {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        locked.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        conn.execute_batch("COMMIT").unwrap();
+    });
+    ready.recv().unwrap();
+    let empty = HashSet::new();
+    let report = fixture.run(NOW, &empty, &empty, &empty, true, true).await;
+    writer.join().unwrap();
+    assert!(matches!(
+        report.wallets_waiting.as_slice(),
+        [(wallet, RetentionWait::Durable(WalletRetentionWait::Fenced))] if *wallet == fenced
+    ));
+    assert_eq!(
+        (
+            report.wallets_swapped_out,
+            report.wallets_drained,
+            report.wallets_listed
+        ),
+        (1, 2, Some(0))
+    );
+    let holds = holds(&logs);
+    let listed = wallet().to_string();
+    let departed = departed.to_string();
+    let fenced = fenced.to_string();
+    let list = "source retention drain list read";
+    let drain = "source retention drain transaction";
+    let transaction = "source retention database transaction";
+    let scan = "source retention database scan";
+    let check = "source retention eligibility check";
+    // The drain list read; the listed wallet drains first (groups, gate result, the transaction
+    // that clears its entry); then blanking, the first page, the fenced wallet's check, the departed
+    // wallet's two checks (before and after taking the admission lock), its removal and drain, the
+    // empty page, and the final read of the (now empty) list.
+    assert_eq!(
+        holds
+            .iter()
+            .map(|hold| (hold.message.as_str(), hold.wallet.as_deref()))
+            .collect::<Vec<_>>(),
+        vec![
+            (list, None),
+            (drain, Some(listed.as_str())),
+            (drain, Some(listed.as_str())),
+            (drain, Some(listed.as_str())),
+            (transaction, None),
+            (scan, None),
+            (check, Some(fenced.as_str())),
+            (check, Some(departed.as_str())),
+            (check, Some(departed.as_str())),
+            (transaction, Some(departed.as_str())),
+            (drain, Some(departed.as_str())),
+            (drain, Some(departed.as_str())),
+            (drain, Some(departed.as_str())),
+            (scan, None),
+            (list, None),
+        ]
+    );
+    assert!(
+        holds[1].held_micros >= 100_000,
+        "the first drain transaction waited for the other writer"
+    );
+    let floor = 50_000;
+    for (index, pair) in holds.windows(2).enumerate() {
+        let required = pair[0].held_micros.max(floor);
+        let gap = pair[1].at_micros - pair[0].at_micros;
+        assert!(
+            gap >= required,
+            "hold {index} ({}) was followed after {gap} us, not {required} us",
+            pair[0].message
+        );
+    }
+    fixture.finish().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn retention_cancelled_during_a_pause_starts_no_further_hold_and_the_next_job_resumes() {
+    // Cancel during the pause after the drain list read, the first drain transaction, blanking, the
+    // first page, the fenced wallet's check, the departed wallet's second check and its removal. No
+    // further hold starts (the cancelled run leaves the list unread); whatever is still listed
+    // drains first in the next job.
+    for stop_after in [0, 1, 4, 5, 6, 8, 9] {
+        let logs = support::RetentionLogs::default();
+        let _subscriber = tracing::subscriber::set_default(
+            logs.subscriber_on_tokio_clock(tokio::time::Instant::now()),
+        );
+        let (fixture, _, departed) = job_fixture().await;
+        let empty = HashSet::new();
+        let cancel = AtomicBool::new(false);
+        let inputs = || DatabaseRetentionInputs {
+            now_unix: NOW,
+            committed_boundary_current: true,
+            verified_walk_complete: true,
+            walk_wallets: &empty,
+            reducer_pin_wallets: &empty,
+            published_observation_wallets: &empty,
+            obligation_wallets: &empty,
+        };
+        let report = {
+            let run = run_database_retention(&fixture.retention, inputs(), &cancel);
+            tokio::pin!(run);
+            loop {
+                tokio::select! {
+                    biased;
+                    () = tokio::time::sleep(std::time::Duration::from_millis(1)) => {
+                        if holds(&logs).len() > stop_after {
+                            cancel.store(true, Ordering::Release);
+                        }
+                    }
+                    report = &mut run => break report.unwrap(),
+                }
+            }
+        };
+        assert!(report.cancelled, "stop after hold {stop_after}");
+        assert_eq!(
+            holds(&logs).len(),
+            stop_after + 1,
+            "stop after hold {stop_after}"
+        );
+        assert_eq!(report.wallets_listed, None, "stop after hold {stop_after}");
+        let listed = fixture.db.retirement_drains().unwrap().result;
+        match stop_after {
+            0 | 1 => assert_eq!(listed, vec![wallet()]),
+            9 => assert_eq!(listed, vec![departed]),
+            _ => assert!(listed.is_empty(), "stop after hold {stop_after}"),
+        }
+        // Only the fenced wallet's check (hold 6) records a wait before these boundaries.
+        assert_eq!(
+            report.wallets_waiting.len(),
+            usize::from(stop_after >= 6),
+            "stop after hold {stop_after}"
+        );
+        cancel.store(false, Ordering::Release);
+        let report = run_database_retention(&fixture.retention, inputs(), &cancel)
+            .await
+            .unwrap();
+        assert!(!report.cancelled);
+        assert_eq!(report.wallets_listed, Some(0));
+        for table in ["activity_groups", "entry_gate_results"] {
+            assert_eq!(
+                rows(&fixture.sql, table),
+                0,
+                "{table} after resuming from hold {stop_after}"
+            );
+        }
+        fixture.finish().await;
+    }
 }

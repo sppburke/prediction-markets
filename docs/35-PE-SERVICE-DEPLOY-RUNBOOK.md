@@ -924,7 +924,9 @@ excluded instead by their own runbook precondition that the service is STOPPED w
 Release 2 uses one stop/start: prepare while the old service runs, census all pe-service
 processes, then disable and stop the unit and clear a fresh census before swapping the binary.
 The unit stays disabled and stopped across any interruption until clearance and the swap are
-complete. Every resume reruns the census; earlier clearance records are audit receipts only.
+complete. Every resume reruns the census: before a start it must find no matching process, and
+when accepting an already healthy desired unit it may contain only that unit's freshly
+ownership-verified MainPID. Earlier clearance records are audit receipts only.
 Hash comparisons decide what remains, but never substitute for process clearance.
 
 1. **Build from a clean checkout at the exact reviewed SHA** and record both identities:
@@ -1826,10 +1828,11 @@ copying, reseeding or validating its original-copy hashes. `rehearsal545.sh` reu
 validation is for an unchanged capture; O1's progressed resume uses its separately recorded command.
 
 Capture epoch, boundary, pins, allocated bytes before/after, net freed space including feed copies,
-lock times for every database transaction (largest eligible wallet included), copy latency and memory.
-During advance, blanking and retirements, readiness must stay true with no stale-copy refusal; any
-failure is fixed and re-measured before deployment. If the largest wallet is ineligible, also measure
-the large-wallet retirement fixture. Apply the glossary's retention rehearsal space and timing gates.
+lock times and pauses for every database hold (drain-list reads, blanking, candidate pages, eligibility
+checks, removals and drains; largest eligible wallet included), the two wallet indexes' build time at the
+first open, copy latency and memory. During advance, blanking, removals and
+drains, readiness must stay true with no stale-copy refusal; any failure is fixed and re-measured
+before deployment. Apply the glossary's retention rehearsal space and timing gates.
 
 The kill command waits for `source retention committed`, verifies the authority's new epoch and
 SIGKILLs only the recorded service PID before punching. **After the process dies**, record both
@@ -1846,11 +1849,28 @@ for 60 minutes.
 
 Measure normal swap-out in another fresh subrun with its own sparse state, checkpoint kept, and a
 fresh local authority holding the matching fills, after stopping the earlier subrun. Record paths,
-PID, lock times and copy latency through its first advance and retirements. For the census test,
-launch 6e09b86 against a separate copy, SIGSTOP immediately after `source checkpoint loaded`, and
-prove O2's census reports it and clearance refuses to start the new binary. Kill that recorded PID.
-Repeat with an old boot started after a prior clearance and before a resumed census. Stop on a
-serving-path `Erased`/`Retired` or failed boot; retain scripts and receipts with the issue evidence.
+PID, lock times and copy latency through its first advance and retirements.
+
+Run each actual-6e09b86 case separately and record its pause or release point and pass condition,
+against the durable inventory (`paper_state.db` and its WAL, `paper.log`, `live_journal.log`, the
+source log, checkpoint, receipts, invalidation record, authority and committed feed files; 6e09b86's
+own diagnostic logs are outside it). Before the fresh boot, on the restored, unfenced base, start a
+6e09b86 preparation; once its initial checkpoint load has released the lock, hold
+`<log>.boot-checkpoint.lock` so it blocks entering publication, confirm in `/proc/locks` that it
+waits on that lock having read at least the whole log (`rchar` in `/proc/<pid>/io`; the command
+prints only its final receipt), SIGSTOP it and release the lock. After the fresh and
+resume boots have installed the fence, advanced and punched, and the service is stopped, record the
+inventory, SIGCONT the preparation and require it to exit refusing publication (`UnreadableRecord`)
+with the inventory unchanged. A 6e09b86 boot against the fenced, punched run refuses at its walk,
+never listens and leaves the inventory unchanged; its `--prepare-source-checkpoint` started after
+the fence refuses and leaves the inventory unchanged. For the census test,
+on a copy restored from the base and after a recorded clear census, launch 6e09b86, SIGSTOP it at
+`source checkpoint loaded`, and confirm in `/proc` that it holds no write descriptor or lock on the
+source log (otherwise record the window actually reached and repeat on a fresh copy); prove O2's
+census reports it and clearance refuses to start the new binary, kill that recorded PID, and confirm
+a final census is clear. An old-unit crash during the deploy is covered by O2's ordering (disabled
+and stopped before the swap, a fresh cleared census before any start). Stop on a serving-path
+`Erased`/`Retired` or failed boot; retain scripts and receipts with the issue evidence.
 
 ### O2 — deployment
 
@@ -1859,8 +1879,9 @@ epoch zero/format 2, install no fence and erase nothing. The first census runs w
 serves with its executable still installed (the staged census script, step 4). Repeat
 and verify each stray's identity before stopping it. Then disable and stop the unit, confirm both states and its process exit, and clear another
 readable census before swapping the binary. Keep the unit disabled/stopped over every interruption.
-Every resume reruns and clears the census before starting, or before accepting an already healthy
-new unit; old receipts only document history. A blocked/unreadable census stops deployment and is
+Every resume reruns the census: before a start it must find no matching process, and when
+accepting an already healthy desired unit it may contain only that unit's freshly
+ownership-verified MainPID; old receipts only document history. A blocked/unreadable census stops deployment and is
 reported to the owner. After the swap/hash check, enable and start, run `verify_installed_unit_owner`
 and prove the fence exists before the first retention job. Record all preparation/census/unit-state
 receipts and restart timings. The stop/start is pre-approved; tell the owner before doing it.
@@ -1869,14 +1890,24 @@ receipts and restart timings. The stop/start is pre-approved; tell the owner bef
 
 At the first hourly tick, retain `source retention committed` before rehash and the run's
 `source retention` summary: epoch/boundary, pins, punched bytes/feed frames, proofs blanked,
-wallets swapped out/waiting with reasons, skip reason, elapsed time and transaction lock times.
+wallets swapped out/waiting with reasons, wallets and trade ids drained, wallets still listed for
+draining (expected `Some(0)`; `None` means the run was cancelled), skip reason and elapsed time, plus
+every database hold's lock-time line.
 Verify the authority matches the published format-3 epoch, inventory the committed feed files,
 measure allocated/net free-space change and copy latency, and inspect readiness/task health and
 journal for serving-path `Erased`/`Retired`. Compare pre-advance Prepared/Final records and Supabase
-`paper_fills` with post-advance state; all must remain, with later activity accounted for separately.
-Report skips and fix failures forward. After the canonical advance interval, verify the second
-advance and disk/database trend, post evidence and close the issue. #602 and #619 close on merge;
-confirm the exit cap at the next restart.
+`paper_fills` with post-advance state: every recorded Prepared/Final and every recorded `paper_fills`
+`idempotency_key` must remain, with unchanged financial values; later activity is accounted for separately.
+Before the first advance, record the pre-advance Prepared/Final identities and counts, the
+Supabase `paper_fills` count and `idempotency_key` set with their financial values, and the current epoch;
+a resumed observation continues from that record without resetting it. O3 passes only once the authority and checkpoint epochs match, the committed
+feed inventory validates, the health and financial checks pass and the drain list is empty. A skip,
+a pending epoch, an unfinished drain or a failed check is reported, keeps the issue open, and a
+failure is fixed forward. After the canonical advance interval, the second advance must pass the same
+checks for its epoch, and the two authorities' `advanced_at` values and epoch history must show no advance
+before the interval and exactly one at the next eligible hourly tick; record the disk/database trend, post
+evidence and only then close the issue.
+#602 and #619 close on merge; confirm the exit cap at the next restart.
 
 ### Recovery of a retained log
 
@@ -1886,8 +1917,11 @@ inputs. A rebuild verifies every pin before listening, so a missing/invalid `.re
 missing/invalid receipts prefix, corrupt pin or suffix, or suffix ending before `retained_tail`
 refuses boot. With an epoch-matched checkpoint the boot listens first and verifies every pin after
 listening: a failure is treated like a digest mismatch (invalidation and a critical failure), and the
-restart's rebuild then refuses. Listening alone therefore does not prove the pins. Restore one coherent capture, never individual
-stale companions, and never delete receipts by hand. Rebind moved captures with the existing
+restart's rebuild then refuses. Listening alone therefore does not prove the pins. Restore retained
+evidence only from one coherent capture verified against the current financial, paper, live and
+migration bindings; never roll those authorities back to make a capture fit, never restore individual
+stale companions, and never delete receipts by hand. Run the stopped fence, receipts-prefix, pin and
+retained-tail checks before restart; without compatible evidence, stay stopped and fix forward. Rebind moved captures with the existing
 migration-path rebinder; do not rewrite logs or offsets. Only an incomplete final append beyond
 `retained_tail` may be repaired automatically.
 

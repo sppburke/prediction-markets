@@ -6196,7 +6196,7 @@ fn record_failed_catch_up_group(
 
 #[tokio::test]
 async fn retention_terminalized_during_boot_waits_through_two_advances_and_checkpoint_loss() {
-    use pe_service::database_retention::RETENTION_BUFFER_SECS;
+    use pe_service::source_checkpoint::SOURCE_RETENTION_BUFFER_SECS as RETENTION_BUFFER_SECS;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     let (_dir, paths) = installed_fixture();
@@ -6391,7 +6391,14 @@ async fn retention_returning_wallet_catches_up_in_process_after_reboot_and_check
     use std::sync::atomic::AtomicU64;
     use tokio::sync::{Mutex, oneshot};
 
-    for mode in ["same_process", "reboot", "checkpoint_loss"] {
+    for (mode, interrupted) in [
+        ("same_process", false),
+        ("reboot", false),
+        ("checkpoint_loss", false),
+        ("same_process", true),
+        ("reboot", true),
+        ("checkpoint_loss", true),
+    ] {
         let (_dir, paths) = installed_fixture();
         let start = append_paper_record(&paths.paper_log, &start_record());
         seal_retention_start(&paths, start);
@@ -6418,7 +6425,48 @@ async fn retention_returning_wallet_catches_up_in_process_after_reboot_and_check
                 rusqlite::params![observation.wallet.to_string(), old_market.0.0],
             )
             .unwrap();
+        // Gate results under the group's own trade id and under a gate-only trade id.
+        let group_trade = observation.group_id.key().0.clone();
+        let old_trades = [group_trade.as_str(), "gate-only"];
+        {
+            let conn = Connection::open(&paths.fixed_main).unwrap();
+            for trade in old_trades {
+                conn.execute(
+                    "INSERT INTO entry_gate_results VALUES (?1, ?2, ?3, ?4, 'not_first_entry', 1)",
+                    rusqlite::params![
+                        trade,
+                        observation.wallet.to_string(),
+                        old_market.0.0,
+                        observation.source_time.0.unix_timestamp()
+                    ],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO seen_trades_v2 VALUES ('gate-only', 2, 'tx')",
+                [],
+            )
+            .unwrap();
+        }
+        let old_gates = || -> i64 {
+            Connection::open(&paths.fixed_main)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM entry_gate_results WHERE source_trade_id IN (?1, ?2)",
+                    rusqlite::params![old_trades[0], old_trades[1]],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
         pe_service::source_checkpoint::install_retention_fence(&paths.source_log).unwrap();
+        if interrupted {
+            // The group's drain transaction commits; the gate results' transaction then fails, as a stop
+            // mid-drain leaves it.
+            Connection::open(&paths.fixed_main)
+                .unwrap()
+                .execute_batch("CREATE TRIGGER interrupt_drain BEFORE DELETE ON entry_gate_results BEGIN SELECT RAISE(ABORT, 'interrupted'); END;")
+                .unwrap();
+        }
         let clock = Arc::new(AtomicU64::new(u64::try_from(now).unwrap()));
         let (mut owner, mut task, obligations, mut tx, mut hooks) =
             retention_boot_runtime_with_control(&paths, &state, clock.clone());
@@ -6434,8 +6482,29 @@ async fn retention_returning_wallet_catches_up_in_process_after_reboot_and_check
             state
                 .activity_group_state(observation.group_id.key())
                 .unwrap()
-                .is_none()
+                .is_none(),
+            "{mode}/interrupted={interrupted}"
         );
+        assert_eq!(
+            old_gates(),
+            if interrupted { 2 } else { 0 },
+            "{mode}/interrupted={interrupted}"
+        );
+        assert_eq!(
+            state.retirement_drains().unwrap().result,
+            if interrupted {
+                vec![observation.wallet]
+            } else {
+                Vec::new()
+            },
+            "{mode}/interrupted={interrupted}"
+        );
+        if interrupted {
+            Connection::open(&paths.fixed_main)
+                .unwrap()
+                .execute_batch("DROP TRIGGER interrupt_drain;")
+                .unwrap();
+        }
         assert!(!state.wallet_history_complete(&observation.wallet).unwrap());
         assert!(
             state
@@ -6549,8 +6618,89 @@ async fn retention_returning_wallet_catches_up_in_process_after_reboot_and_check
         )
         .with_clock(Arc::new(move || now));
         let preparer = AdmissionPreparer::with_validator(tx.clone(), state.clone(), validator);
+        // At every catch-up write of the wallet, record how many old gate rows remain.
+        let probe = |table: &str| {
+            format!(
+                "CREATE TRIGGER probe_{table} AFTER INSERT ON {table} WHEN NEW.wallet_hex = '{wallet}' BEGIN \
+                 INSERT INTO drain_order_probe SELECT '{table}', COUNT(*) FROM entry_gate_results \
+                 WHERE source_trade_id IN ('{}', 'gate-only'); END;",
+                old_trades[0]
+            )
+        };
+        Connection::open(&paths.fixed_main)
+            .unwrap()
+            .execute_batch(&format!(
+                "CREATE TABLE drain_order_probe (write TEXT NOT NULL, old_gates INTEGER NOT NULL); {} {} {}",
+                probe("activity_groups"),
+                probe("position_anchors"),
+                probe("poll_cursors")
+            ))
+            .unwrap();
         let result = preparer.prepare(&[wallet]).await.unwrap();
         assert_eq!(result.admitted, vec![wallet], "{mode}: {result:?}");
+        assert!(
+            state.retirement_drains().unwrap().result.is_empty(),
+            "{mode}/interrupted={interrupted}"
+        );
+        assert_eq!(old_gates(), 0, "{mode}/interrupted={interrupted}");
+        assert!(
+            !state
+                .is_seen(&SourceTradeId("gate-only".to_owned()))
+                .unwrap()
+        );
+        {
+            let conn = Connection::open(&paths.fixed_main).unwrap();
+            let writes: Vec<(String, i64)> = conn
+                .prepare("SELECT write, old_gates FROM drain_order_probe")
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            for table in ["activity_groups", "position_anchors"] {
+                assert!(
+                    writes.iter().any(|(write, _)| write == table),
+                    "{mode}/interrupted={interrupted}: catch-up wrote no {table} row: {writes:?}"
+                );
+            }
+            assert!(
+                writes.iter().all(|(_, old)| *old == 0),
+                "{mode}/interrupted={interrupted}: a catch-up write preceded the drain: {writes:?}"
+            );
+            conn.execute_batch(
+                "DROP TRIGGER probe_activity_groups; DROP TRIGGER probe_position_anchors; \
+                 DROP TRIGGER probe_poll_cursors; DROP TABLE drain_order_probe;",
+            )
+            .unwrap();
+        }
+        // The returned wallet is no longer listed, so a later drain leaves its rebuilt rows alone.
+        let rebuilt: i64 = Connection::open(&paths.fixed_main)
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM activity_groups WHERE wallet_hex = ?1",
+                [wallet.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(rebuilt > 0, "{mode}: catch-up rebuilt no group");
+        assert!(
+            state
+                .drain_retired_wallet(wallet, 500)
+                .unwrap()
+                .result
+                .finished
+        );
+        assert_eq!(
+            Connection::open(&paths.fixed_main)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM activity_groups WHERE wallet_hex = ?1",
+                    [wallet.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            rebuilt
+        );
         assert!(result.deferred.is_empty());
         assert!(state.wallet_history_complete(&wallet).unwrap());
         assert!(state.position_validation_current(&wallet).unwrap());

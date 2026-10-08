@@ -818,6 +818,124 @@ pub struct RetentionTransaction<T> {
     pub lock_time: std::time::Duration,
 }
 
+/// Candidate wallets with working state after `?1` (`''` for the first page), at most `?2`. Every wallet
+/// table is read through an index: one `activity_groups` seek per wallet, and an index range of at most `?2`
+/// wallets for each other table. Frontier-only candidates come from the `feed_history_frontiers` JSON in `meta`.
+const RETENTION_CANDIDATES_SQL: &str = "WITH RECURSIVE groups(wallet_hex) AS (
+    SELECT (SELECT MIN(wallet_hex) FROM activity_groups WHERE wallet_hex > ?1)
+    UNION ALL
+    SELECT (SELECT MIN(wallet_hex) FROM activity_groups WHERE wallet_hex > groups.wallet_hex)
+    FROM groups WHERE groups.wallet_hex IS NOT NULL LIMIT ?2
+)
+SELECT wallet_hex FROM (
+    SELECT wallet_hex FROM groups WHERE wallet_hex IS NOT NULL
+    UNION SELECT * FROM (SELECT DISTINCT wallet_hex FROM decision_pending
+        WHERE wallet_hex > ?1 ORDER BY 1 LIMIT ?2)
+    UNION SELECT * FROM (SELECT DISTINCT wallet_hex FROM entry_gate_results
+        WHERE wallet_hex > ?1 ORDER BY 1 LIMIT ?2)
+    UNION SELECT * FROM (SELECT DISTINCT wallet_hex FROM position_anchors
+        WHERE wallet_hex > ?1 ORDER BY 1 LIMIT ?2)
+    UNION SELECT * FROM (SELECT DISTINCT wallet_hex FROM position_validations
+        WHERE wallet_hex > ?1 ORDER BY 1 LIMIT ?2)
+    UNION SELECT * FROM (SELECT DISTINCT wallet_hex FROM wallet_history_status_v2
+        WHERE wallet_hex > ?1 ORDER BY 1 LIMIT ?2)
+    UNION SELECT * FROM (SELECT DISTINCT wallet_hex FROM leader_positions
+        WHERE wallet_hex > ?1 ORDER BY 1 LIMIT ?2)
+    UNION SELECT * FROM (SELECT DISTINCT wallet_hex FROM poll_cursors
+        WHERE wallet_hex > ?1 ORDER BY 1 LIMIT ?2)
+    UNION SELECT * FROM (SELECT DISTINCT json_extract(value, '$.wallet') AS wallet_hex
+        FROM json_each((SELECT value FROM meta WHERE key = 'feed_history_frontiers'), '$.frontiers')
+        WHERE wallet_hex > ?1 ORDER BY 1 LIMIT ?2)
+) ORDER BY wallet_hex LIMIT ?2";
+/// Up to `?2` of a listed wallet's group trade ids, through the wallet index.
+const DRAIN_GROUP_IDS_SQL: &str = "INSERT INTO wallet_drain_trade_ids
+    SELECT source_trade_id FROM activity_groups WHERE wallet_hex = ?1 LIMIT ?2";
+/// Up to `?2` of a listed wallet's gate-result trade ids, through the wallet index.
+const DRAIN_GATE_IDS_SQL: &str = "INSERT INTO wallet_drain_trade_ids
+    SELECT source_trade_id FROM entry_gate_results WHERE wallet_hex = ?1 LIMIT ?2";
+const RETIREMENT_DECISION_IDS_SQL: &str = "INSERT INTO wallet_retirement_trade_ids
+    SELECT source_trade_id FROM decision_pending WHERE wallet_hex = ?1";
+const RETIREMENT_TERMINAL_DECISIONS_SQL: &str =
+    "DELETE FROM decision_pending WHERE wallet_hex = ?1 AND state = 'terminal'";
+/// Durable reasons a wallet waits, checked in order through wallet indexes.
+const RETENTION_WAIT_QUERIES: [(&str, WalletRetentionWait); 5] = [
+    (
+        "SELECT 1 FROM wallet_fences WHERE wallet_hex = ?1",
+        WalletRetentionWait::Fenced,
+    ),
+    (
+        "SELECT 1 FROM decision_pending WHERE wallet_hex = ?1 AND state = 'open'",
+        WalletRetentionWait::OpenDecision,
+    ),
+    (
+        "SELECT 1 FROM decision_pending WHERE wallet_hex = ?1 AND updated_at_unix >= ?2",
+        WalletRetentionWait::RecentDecision,
+    ),
+    (
+        "SELECT 1 FROM position_anchors WHERE wallet_hex = ?1 AND anchored_at_unix >= ?2",
+        WalletRetentionWait::RecentAnchor,
+    ),
+    (
+        "SELECT 1 FROM position_validations WHERE wallet_hex = ?1 AND recorded_at_unix >= ?2",
+        WalletRetentionWait::RecentValidation,
+    ),
+];
+
+/// One drain transaction of a removed wallet: trade ids deleted, and whether its list entry is gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalletDrain {
+    pub trade_ids: usize,
+    pub finished: bool,
+}
+
+/// `meta` list of wallets that retention removed and whose trade rows are not yet drained.
+const RETIREMENT_DRAINS_KEY: &str = "wallet_retirement_drains";
+
+fn retirement_drains_in(conn: &Connection) -> Result<Vec<String>, PaperStateError> {
+    let bytes: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT value FROM meta WHERE key = ?1",
+            params![RETIREMENT_DRAINS_KEY],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(bytes) = bytes else {
+        return Ok(Vec::new());
+    };
+    let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+    if value["version"] != 1 {
+        return Err(PaperStateError::Corrupt(
+            "unsupported retirement drain list".to_owned(),
+        ));
+    }
+    let wallets = value["wallets"]
+        .as_array()
+        .ok_or_else(|| PaperStateError::Corrupt("invalid retirement drain list".to_owned()))?
+        .iter()
+        .map(|wallet| {
+            let text = wallet.as_str().ok_or_else(|| {
+                PaperStateError::Corrupt("invalid retirement drain wallet".to_owned())
+            })?;
+            WalletAddress::from_hex(text)
+                .map(|wallet| wallet.to_string())
+                .map_err(|error| PaperStateError::Corrupt(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(wallets)
+}
+
+fn write_retirement_drains(conn: &Connection, wallets: &[String]) -> Result<(), PaperStateError> {
+    let mut wallets = wallets.to_vec();
+    wallets.sort();
+    wallets.dedup();
+    let bytes = serde_json::to_vec(&serde_json::json!({"version": 1, "wallets": wallets}))?;
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![RETIREMENT_DRAINS_KEY, bytes],
+    )?;
+    Ok(())
+}
+
 impl PaperStateDb {
     /// Blank only superseded nonblank proofs; balances and cutoff columns stay intact.
     /// Each call owns one bounded transaction and releases the connection before returning.
@@ -851,6 +969,8 @@ impl PaperStateDb {
 
     /// Page through wallets with working state. Retained market history alone is not a candidate.
     /// The page holds the shared connection like a transaction, so it reports the same lock time.
+    /// `activity_groups` is read with one index seek per wallet and every other wallet table with an
+    /// index range of at most `limit` wallets (see [`RETENTION_CANDIDATES_SQL`]).
     pub fn retention_wallets(
         &self,
         after: Option<WalletAddress>,
@@ -860,22 +980,12 @@ impl PaperStateDb {
             i64::try_from(limit).map_err(|error| PaperStateError::Internal(error.to_string()))?;
         let conn = self.lock();
         let started = std::time::Instant::now();
-        let mut stmt = conn.prepare(
-            "SELECT wallet_hex FROM (
-                SELECT wallet_hex FROM activity_groups UNION
-                SELECT wallet_hex FROM decision_pending UNION
-                SELECT wallet_hex FROM entry_gate_results UNION
-                SELECT wallet_hex FROM position_anchors UNION
-                SELECT wallet_hex FROM position_validations UNION
-                SELECT wallet_hex FROM wallet_history_status_v2 UNION
-                SELECT wallet_hex FROM leader_positions UNION
-                SELECT wallet_hex FROM poll_cursors UNION
-                SELECT json_extract(value, '$.wallet') AS wallet_hex FROM json_each(
-                    (SELECT value FROM meta WHERE key = 'feed_history_frontiers'), '$.frontiers')
-            ) WHERE (?1 IS NULL OR wallet_hex > ?1) ORDER BY wallet_hex LIMIT ?2",
-        )?;
+        let mut stmt = conn.prepare(RETENTION_CANDIDATES_SQL)?;
         let rows = stmt.query_map(
-            params![after.map(|wallet| wallet.to_string()), limit],
+            params![
+                after.map_or_else(String::new, |wallet| wallet.to_string()),
+                limit
+            ],
             |row| row.get::<_, String>(0),
         )?;
         let result = rows
@@ -890,18 +1000,28 @@ impl PaperStateDb {
         })
     }
 
-    /// Recheck recorded clocks, never revision or no-copy trade clocks.
+    /// Recheck recorded clocks, never revision or no-copy trade clocks. Reports how long the check
+    /// held the shared connection, like a retention transaction.
     pub fn wallet_retention_wait(
         &self,
         wallet: WalletAddress,
         recent_since_unix: i64,
         latest_prepared: Option<EventSeq>,
-    ) -> Result<Option<WalletRetentionWait>, PaperStateError> {
-        tx_wallet_retention_wait(&self.lock(), wallet, recent_since_unix, latest_prepared)
+    ) -> Result<RetentionTransaction<Option<WalletRetentionWait>>, PaperStateError> {
+        let conn = self.lock();
+        let started = std::time::Instant::now();
+        let result = tx_wallet_retention_wait(&conn, wallet, recent_since_unix, latest_prepared)?;
+        Ok(RetentionTransaction {
+            result,
+            lock_time: started.elapsed(),
+        })
     }
 
     /// The orchestrator calls this only after its structural-membership recheck.
-    /// Recheck all durable guards and delete one wallet atomically, retaining first-entry history.
+    /// Recheck all durable guards and, in one transaction, remove what makes the wallet known —
+    /// decisions with their trade rows, anchors, validations, history status, positions, cursor and
+    /// frontier hint — and list it for draining. Its groups and gate results, with their trade rows,
+    /// stay until [`Self::drain_retired_wallet`] removes them; first-entry history is retained.
     pub fn retire_wallet(
         &self,
         wallet: WalletAddress,
@@ -925,13 +1045,7 @@ impl PaperStateDb {
         let wallet_hex = wallet.to_string();
         // A temporary indexed set avoids a wallet-sized Rust allocation or SQLite parameter list.
         tx.execute_batch("CREATE TEMP TABLE wallet_retirement_trade_ids (source_trade_id TEXT PRIMARY KEY NOT NULL);")?;
-        tx.execute(
-            "INSERT INTO wallet_retirement_trade_ids
-                SELECT source_trade_id FROM activity_groups WHERE wallet_hex = ?1 UNION
-                SELECT source_trade_id FROM decision_pending WHERE wallet_hex = ?1 UNION
-                SELECT source_trade_id FROM entry_gate_results WHERE wallet_hex = ?1",
-            params![wallet_hex],
-        )?;
+        tx.execute(RETIREMENT_DECISION_IDS_SQL, params![wallet_hex])?;
         for table in [
             "seen_trades_v2",
             "no_copy_dispositions",
@@ -939,16 +1053,8 @@ impl PaperStateDb {
         ] {
             tx.execute(&format!("DELETE FROM {table} WHERE source_trade_id IN (SELECT source_trade_id FROM wallet_retirement_trade_ids)"), [])?;
         }
-        tx.execute(
-            "DELETE FROM activity_groups WHERE wallet_hex = ?1",
-            params![wallet_hex],
-        )?;
-        tx.execute(
-            "DELETE FROM decision_pending WHERE wallet_hex = ?1 AND state = 'terminal'",
-            params![wallet_hex],
-        )?;
+        tx.execute(RETIREMENT_TERMINAL_DECISIONS_SQL, params![wallet_hex])?;
         for table in [
-            "entry_gate_results",
             "position_anchors",
             "position_validations",
             "wallet_history_status_v2",
@@ -986,10 +1092,94 @@ impl PaperStateDb {
                 params![serde_json::to_vec(&value)?],
             )?;
         }
+        let mut drains = retirement_drains_in(&tx)?;
+        drains.push(wallet_hex);
+        write_retirement_drains(&tx, &drains)?;
         tx.execute_batch("DROP TABLE wallet_retirement_trade_ids;")?;
         tx.commit()?;
         Ok(RetentionTransaction {
             result: None,
+            lock_time: started.elapsed(),
+        })
+    }
+
+    /// Wallets removed by retention whose trade rows are not yet drained, in address order, read
+    /// as one hold of the connection.
+    pub fn retirement_drains(
+        &self,
+    ) -> Result<RetentionTransaction<Vec<WalletAddress>>, PaperStateError> {
+        let conn = self.lock();
+        let started = std::time::Instant::now();
+        let listed = retirement_drains_in(&conn)?;
+        let lock_time = started.elapsed();
+        drop(conn);
+        let result = listed
+            .iter()
+            .map(|wallet| {
+                WalletAddress::from_hex(wallet)
+                    .map_err(|error| PaperStateError::Corrupt(error.to_string()))
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(RetentionTransaction { result, lock_time })
+    }
+
+    /// One bounded drain transaction of a listed wallet: up to `limit` trade ids from its groups,
+    /// or once none remain from its gate results, lose their seen-trade, no-copy and revision rows
+    /// and then the group or gate rows. The transaction that finds none left removes the list
+    /// entry; for a wallet that is not listed it changes nothing.
+    pub fn drain_retired_wallet(
+        &self,
+        wallet: WalletAddress,
+        limit: usize,
+    ) -> Result<RetentionTransaction<WalletDrain>, PaperStateError> {
+        let limit =
+            i64::try_from(limit).map_err(|error| PaperStateError::Internal(error.to_string()))?;
+        let mut conn = self.lock();
+        let started = std::time::Instant::now();
+        if !conn.is_autocommit() {
+            return Err(PaperStateError::RetentionBatchOpen);
+        }
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let wallet_hex = wallet.to_string();
+        let mut drains = retirement_drains_in(&tx)?;
+        if !drains.contains(&wallet_hex) {
+            return Ok(RetentionTransaction {
+                result: WalletDrain {
+                    trade_ids: 0,
+                    finished: true,
+                },
+                lock_time: started.elapsed(),
+            });
+        }
+        tx.execute_batch(
+            "CREATE TEMP TABLE wallet_drain_trade_ids (source_trade_id TEXT PRIMARY KEY NOT NULL);",
+        )?;
+        let mut owner = "activity_groups";
+        let mut trade_ids = tx.execute(DRAIN_GROUP_IDS_SQL, params![wallet_hex, limit])?;
+        if trade_ids == 0 {
+            owner = "entry_gate_results";
+            trade_ids = tx.execute(DRAIN_GATE_IDS_SQL, params![wallet_hex, limit])?;
+        }
+        if trade_ids == 0 {
+            drains.retain(|listed| listed != &wallet_hex);
+            write_retirement_drains(&tx, &drains)?;
+        } else {
+            for table in [
+                "seen_trades_v2",
+                "no_copy_dispositions",
+                "activity_group_revisions",
+                owner,
+            ] {
+                tx.execute(&format!("DELETE FROM {table} WHERE source_trade_id IN (SELECT source_trade_id FROM wallet_drain_trade_ids)"), [])?;
+            }
+        }
+        tx.execute_batch("DROP TABLE wallet_drain_trade_ids;")?;
+        tx.commit()?;
+        Ok(RetentionTransaction {
+            result: WalletDrain {
+                trade_ids,
+                finished: trade_ids == 0,
+            },
             lock_time: started.elapsed(),
         })
     }
@@ -5876,28 +6066,7 @@ fn tx_wallet_retention_wait(
     latest_prepared: Option<EventSeq>,
 ) -> Result<Option<WalletRetentionWait>, PaperStateError> {
     let wallet_hex = wallet.to_string();
-    for (query, reason) in [
-        (
-            "SELECT 1 FROM wallet_fences WHERE wallet_hex = ?1",
-            WalletRetentionWait::Fenced,
-        ),
-        (
-            "SELECT 1 FROM decision_pending WHERE wallet_hex = ?1 AND state = 'open'",
-            WalletRetentionWait::OpenDecision,
-        ),
-        (
-            "SELECT 1 FROM decision_pending WHERE wallet_hex = ?1 AND updated_at_unix >= ?2",
-            WalletRetentionWait::RecentDecision,
-        ),
-        (
-            "SELECT 1 FROM position_anchors WHERE wallet_hex = ?1 AND anchored_at_unix >= ?2",
-            WalletRetentionWait::RecentAnchor,
-        ),
-        (
-            "SELECT 1 FROM position_validations WHERE wallet_hex = ?1 AND recorded_at_unix >= ?2",
-            WalletRetentionWait::RecentValidation,
-        ),
-    ] {
+    for (query, reason) in RETENTION_WAIT_QUERIES {
         let mut stmt = conn.prepare(query)?;
         let exists = if stmt.parameter_count() == 1 {
             stmt.exists(params![wallet_hex])?
@@ -8306,6 +8475,79 @@ mod tests {
         assert_eq!(groups[0].proof_json, proof_a);
         assert_eq!(groups[1].proof_json, proof_b);
         assert!(db.activity_groups_after(&wallet, 101).unwrap().is_empty());
+    }
+
+    #[test]
+    fn retention_queries_read_every_table_through_an_index() {
+        let (_dir, db) = db();
+        let conn = db.lock();
+        conn.execute_batch(
+            "CREATE TEMP TABLE wallet_drain_trade_ids (source_trade_id TEXT PRIMARY KEY NOT NULL);
+             CREATE TEMP TABLE wallet_retirement_trade_ids (source_trade_id TEXT PRIMARY KEY NOT NULL);",
+        )
+        .unwrap();
+        let wallet = wallet().to_string();
+        let mut statements: Vec<(&str, Vec<rusqlite::types::Value>)> = vec![
+            (
+                RETENTION_CANDIDATES_SQL,
+                vec![String::new().into(), 128_i64.into()],
+            ),
+            (
+                RETENTION_CANDIDATES_SQL,
+                vec![wallet.clone().into(), 128_i64.into()],
+            ),
+            (
+                DRAIN_GROUP_IDS_SQL,
+                vec![wallet.clone().into(), 500_i64.into()],
+            ),
+            (
+                DRAIN_GATE_IDS_SQL,
+                vec![wallet.clone().into(), 500_i64.into()],
+            ),
+            (RETIREMENT_DECISION_IDS_SQL, vec![wallet.clone().into()]),
+            (
+                RETIREMENT_TERMINAL_DECISIONS_SQL,
+                vec![wallet.clone().into()],
+            ),
+        ];
+        for (query, _) in RETENTION_WAIT_QUERIES {
+            let parameters = if query.contains("?2") {
+                vec![wallet.clone().into(), 100_i64.into()]
+            } else {
+                vec![wallet.clone().into()]
+            };
+            statements.push((query, parameters));
+        }
+        for (query, parameters) in statements {
+            let plan: Vec<String> = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+                .unwrap()
+                .query_map(rusqlite::params_from_iter(parameters), |row| row.get(3))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            for table in [
+                "activity_groups",
+                "decision_pending",
+                "entry_gate_results",
+                "position_anchors",
+                "position_validations",
+                "wallet_history_status_v2",
+                "leader_positions",
+                "poll_cursors",
+                "wallet_fences",
+            ] {
+                assert!(
+                    plan.iter()
+                        .all(|detail| !detail.starts_with(&format!("SCAN {table}"))),
+                    "{table} must be read through an index, not walked: {plan:?} for {query}"
+                );
+            }
+            assert!(
+                plan.iter().any(|detail| detail.starts_with("SEARCH ")),
+                "no indexed read in {plan:?} for {query}"
+            );
+        }
     }
 
     #[test]

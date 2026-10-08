@@ -236,6 +236,104 @@ mod admission_tests {
         assert!(state.cursor(&wallet(1)).unwrap().is_none());
         drop(held);
     }
+
+    /// A wallet retention removed but did not drain: a group and a gate result left, with their trade rows.
+    fn listed_with_leftovers(
+        path: &std::path::Path,
+        state: &PaperStateDb,
+        candidate: WalletAddress,
+    ) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute(
+            "INSERT INTO activity_groups VALUES ('left', 'tx', ?1, 1, 'r', 'TRADE', 'applied', '{}')",
+            [candidate.to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entry_gate_results VALUES ('left-gate', ?1, 'market', 1, 'admitted', 1)",
+            [candidate.to_string()],
+        )
+        .unwrap();
+        for id in ["left", "left-gate"] {
+            conn.execute("INSERT INTO seen_trades_v2 VALUES (?1, 2, 'tx')", [id])
+                .unwrap();
+        }
+        assert_eq!(
+            state.retire_wallet(candidate, 0, None).unwrap().result,
+            None
+        );
+        assert_eq!(state.retirement_drains().unwrap().result, vec![candidate]);
+    }
+
+    fn seen(state: &PaperStateDb, id: &str) -> bool {
+        state
+            .is_seen(&pe_core_types::SourceTradeId(id.to_owned()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn preparation_drains_a_listed_wallet_even_when_its_fence_check_defers_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("paper.db");
+        let state = Arc::new(PaperStateDb::open(&path).unwrap());
+        let candidate = wallet(8);
+        listed_with_leftovers(&path, &state, candidate);
+        // A fence the wallet holds defers it at the fence check; the drain runs before that check.
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO wallet_fences VALUES (?1, 'left', 'fixture', '{}', 1)",
+                [candidate.to_string()],
+            )
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        let outcome = AdmissionPreparer::new(tx, state.clone())
+            .prepare(&[candidate])
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome.deferred.as_slice(),
+            [deferral] if deferral.wallet == candidate && deferral.stage == "fence"
+        ));
+        assert!(outcome.started.is_empty() && outcome.admitted.is_empty());
+        assert!(rx.try_recv().is_err());
+        assert!(state.retirement_drains().unwrap().result.is_empty());
+        assert!(!seen(&state, "left") && !seen(&state, "left-gate"));
+        assert_eq!(state.last_activity_group_epoch(&candidate).unwrap(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn preparation_deadline_mid_drain_leaves_the_wallet_listed_and_unstarted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("paper.db");
+        let state = Arc::new(PaperStateDb::open(&path).unwrap());
+        let candidate = wallet(9);
+        listed_with_leftovers(&path, &state, candidate);
+        let (tx, mut rx) = mpsc::channel(1);
+        // The drain list read's pause ends at 50 ms; the group's drain transaction then commits before
+        // the deadline (75 ms), which passes during that transaction's pause (at least 50 ms), so the
+        // gate result's transaction never starts.
+        let outcome = AdmissionPreparer::new(tx, state.clone())
+            .prepare_with_cursors(
+                &[candidate],
+                None,
+                Some(Instant::now() + Duration::from_millis(75)),
+                AdmissionContext::Other,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.unstarted, vec![candidate]);
+        assert!(outcome.started.is_empty() && outcome.deferred.is_empty());
+        assert!(outcome.admitted.is_empty());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(state.retirement_drains().unwrap().result, vec![candidate]);
+        assert!(!seen(&state, "left"), "the group's transaction committed");
+        assert!(
+            seen(&state, "left-gate"),
+            "the gate result's transaction never started"
+        );
+        assert!(state.cursor(&candidate).unwrap().is_none());
+    }
 }
 
 impl AdmissionError {
@@ -658,7 +756,39 @@ impl AdmissionPreparer {
         let mut admitted = Vec::new();
         let mut deferred = Vec::new();
         let mut eligible = Vec::new();
-        for wallet in additions {
+        // A wallet retention removed but has not drained is drained before anything reads it; one
+        // the deadline interrupts stays listed and unstarted.
+        let mut ready = Vec::with_capacity(additions.len());
+        let past_deadline = || deadline.is_some_and(|end| Instant::now() >= end);
+        let drained = async {
+            let listed = crate::database_retention::drain_list(&preparer.paper_state).await?;
+            for wallet in additions {
+                if listed.contains(wallet)
+                    && crate::database_retention::drain_retired_wallet(
+                        &preparer.paper_state,
+                        *wallet,
+                        &past_deadline,
+                    )
+                    .await?
+                    .is_none()
+                {
+                    unstarted.push(*wallet);
+                } else {
+                    ready.push(*wallet);
+                }
+            }
+            Ok::<(), pe_paper_state::PaperStateError>(())
+        };
+        if let Err(error) = drained.await {
+            return Err(AdmissionAbort {
+                started,
+                unstarted,
+                admitted,
+                cause: AdmissionError::PaperState(error),
+                deferred,
+            });
+        }
+        for wallet in &ready {
             match self.check_recovery_fence(wallet) {
                 Ok(()) => eligible.push(*wallet),
                 Err(error) if error.class() != FailureClass::Shared => {

@@ -147,6 +147,43 @@ fn retention_deletes_all_trade_id_owners_and_preserves_history_and_other_wallet(
         vec![wallet(2)]
     );
     assert_eq!(db.retire_wallet(wallet(1), 100, None).unwrap().result, None);
+    // The removal takes what makes the wallet known and its decisions' trade rows; its group and
+    // gate result stay listed for draining.
+    for table in [
+        "decision_pending",
+        "position_anchors",
+        "position_validations",
+        "wallet_history_status_v2",
+        "leader_positions",
+        "poll_cursors",
+    ] {
+        assert_eq!(count(&sql, table), 1, "{table}");
+    }
+    assert_eq!(count(&sql, "activity_groups"), 2);
+    assert_eq!(count(&sql, "entry_gate_results"), 2);
+    for table in [
+        "seen_trades_v2",
+        "no_copy_dispositions",
+        "activity_group_revisions",
+    ] {
+        assert_eq!(count(&sql, table), 5, "{table}");
+    }
+    assert_eq!(db.retirement_drains().unwrap().result, vec![wallet(1)]);
+    assert_eq!(
+        db.feed_history_frontiers().unwrap(),
+        serde_json::json!({"version":1,"frontiers":[{"wallet":wallet(2)}]})
+    );
+    // A wallet that is not listed is never drained.
+    let unlisted = db.drain_retired_wallet(wallet(2), 10).unwrap().result;
+    assert_eq!((unlisted.trade_ids, unlisted.finished), (0, true));
+    assert_eq!(count(&sql, "activity_groups"), 2);
+    // Groups first, then gate results, one bounded transaction each; the empty one clears the entry.
+    let drains: Vec<_> = (0..3)
+        .map(|_| db.drain_retired_wallet(wallet(1), 1).unwrap().result)
+        .map(|drain| (drain.trade_ids, drain.finished))
+        .collect();
+    assert_eq!(drains, vec![(1, false), (1, false), (0, true)]);
+    assert!(db.retirement_drains().unwrap().result.is_empty());
     for table in [
         "activity_groups",
         "decision_pending",
@@ -168,14 +205,92 @@ fn retention_deletes_all_trade_id_owners_and_preserves_history_and_other_wallet(
     }
     assert_eq!(count(&sql, "wallet_market_history_v2"), 2);
     assert_eq!(
-        db.feed_history_frontiers().unwrap(),
-        serde_json::json!({"version":1,"frontiers":[{"wallet":wallet(2)}]})
-    );
-    assert_eq!(
         db.retention_wallets(None, 10).unwrap().result,
         vec![wallet(2)]
     );
     assert_eq!(db.retire_wallet(wallet(1), 100, None).unwrap().result, None);
+    let again = db.drain_retired_wallet(wallet(1), 10).unwrap().result;
+    assert_eq!((again.trade_ids, again.finished), (0, true));
+    assert!(db.retirement_drains().unwrap().result.is_empty());
+}
+
+#[test]
+fn retention_candidate_pages_equal_the_sorted_union_of_every_working_state_source() {
+    let (_dir, db, sql) = fixture();
+    let mut expected = Vec::new();
+    for (n, statement) in [
+        (
+            1,
+            "INSERT INTO activity_groups VALUES ('g1', 'tx', ?1, 1, 'r', 'TRADE', 'applied', '{}')",
+        ),
+        (
+            2,
+            "INSERT INTO activity_groups VALUES ('g2', 'tx', ?1, 2, 'r', 'TRADE', 'applied', '{}')",
+        ),
+        (
+            3,
+            "INSERT INTO decision_pending VALUES ('d3', 'r', ?1, 1, '{}', '{}', 'terminal', 'no_copy', 1)",
+        ),
+        (
+            4,
+            "INSERT INTO entry_gate_results VALUES ('e4', ?1, 'market', 1, 'admitted', 1)",
+        ),
+        (
+            5,
+            "INSERT INTO position_anchors VALUES (?1, 0, 1, 1, '[]', 'hash', '{}')",
+        ),
+        (
+            6,
+            "INSERT INTO position_validations VALUES (?1, 'hash', 'proof', '{}', 'g', '{}', 1)",
+        ),
+        (
+            7,
+            "INSERT INTO wallet_history_status_v2 VALUES (?1, 1, '{}', 1)",
+        ),
+        (
+            8,
+            "INSERT INTO leader_positions VALUES (?1, 'market', 0, '10', '0')",
+        ),
+        (
+            9,
+            "INSERT INTO poll_cursors(wallet_hex, last_ts_unix) VALUES (?1, 1)",
+        ),
+    ] {
+        sql.execute(statement, params![wallet(n).to_string()])
+            .unwrap();
+        expected.push(wallet(n));
+    }
+    // Several groups for one wallet still make one candidate; market history alone makes none.
+    sql.execute(
+        "INSERT INTO activity_groups VALUES ('g1b', 'tx', ?1, 3, 'r', 'TRADE', 'applied', '{}')",
+        params![wallet(1).to_string()],
+    )
+    .unwrap();
+    sql.execute(
+        "INSERT INTO wallet_market_history_v2 VALUES (?1, 'market', 1, 'x', 'activity_v2')",
+        params![wallet(11).to_string()],
+    )
+    .unwrap();
+    db.publish_feed_history_frontiers(
+        &serde_json::json!({"version":1,"frontiers":[{"wallet":wallet(10)}]}),
+    )
+    .unwrap();
+    expected.push(wallet(10));
+    expected.sort_by_key(ToString::to_string);
+    for limit in [1, 2, 4, 128] {
+        let mut after = None;
+        let mut pages = Vec::new();
+        loop {
+            let page = db.retention_wallets(after, limit).unwrap().result;
+            assert!(page.len() <= limit);
+            let Some(last) = page.last().copied() else {
+                break;
+            };
+            pages.extend(page);
+            after = Some(last);
+        }
+        assert_eq!(pages, expected, "limit {limit}");
+    }
 }
 
 #[test]
@@ -212,7 +327,9 @@ fn retention_rechecks_fence_open_decision_recorded_clocks_and_financial_marker()
     ] {
         sql.execute(mutation, params![w]).unwrap();
         assert_eq!(
-            db.wallet_retention_wait(wallet(1), 100, None).unwrap(),
+            db.wallet_retention_wait(wallet(1), 100, None)
+                .unwrap()
+                .result,
             Some(expected)
         );
         assert_eq!(
@@ -265,6 +382,7 @@ fn retention_wallet_deletion_rolls_back_all_tables_and_frontier_on_failure() {
     }
     assert_eq!(count(&sql, "seen_trades_v2"), 3);
     assert_eq!(count(&sql, "activity_group_revisions"), 3);
+    assert!(db.retirement_drains().unwrap().result.is_empty());
     assert_eq!(
         db.feed_history_frontiers().unwrap()["frontiers"]
             .as_array()
@@ -274,10 +392,27 @@ fn retention_wallet_deletion_rolls_back_all_tables_and_frontier_on_failure() {
     );
     sql.execute_batch("DROP TRIGGER fail_retirement;").unwrap();
     assert_eq!(db.retire_wallet(wallet(1), 100, None).unwrap().result, None);
+    // A failed drain transaction changes nothing and keeps the wallet listed.
+    sql.execute_batch("CREATE TRIGGER fail_drain BEFORE DELETE ON activity_groups BEGIN SELECT RAISE(ABORT, 'injected'); END;").unwrap();
+    assert!(db.drain_retired_wallet(wallet(1), 10).is_err());
+    assert_eq!(count(&sql, "activity_groups"), 1);
+    assert_eq!(count(&sql, "seen_trades_v2"), 2);
+    assert_eq!(db.retirement_drains().unwrap().result, vec![wallet(1)]);
+    sql.execute_batch("DROP TRIGGER fail_drain;").unwrap();
+    while !db
+        .drain_retired_wallet(wallet(1), 10)
+        .unwrap()
+        .result
+        .finished
+    {}
+    assert_eq!(count(&sql, "activity_groups"), 0);
+    assert_eq!(count(&sql, "entry_gate_results"), 0);
+    assert_eq!(count(&sql, "seen_trades_v2"), 0);
+    assert!(db.retirement_drains().unwrap().result.is_empty());
 }
 
 #[test]
-fn retention_largest_wallet_fixture_records_single_transaction_lock_time() {
+fn retention_largest_wallet_fixture_drains_in_bounded_transactions() {
     let (_dir, db, sql) = fixture();
     let w = wallet(1).to_string();
     sql.execute("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i < 179573)
@@ -285,9 +420,68 @@ fn retention_largest_wallet_fixture_records_single_transaction_lock_time() {
     sql.execute_batch("INSERT INTO seen_trades_v2 SELECT source_trade_id, 2, transaction_hash FROM activity_groups;
         INSERT INTO activity_group_revisions SELECT source_trade_id, semantic_revision, transaction_hash, disposition, proof_json, source_epoch FROM activity_groups;").unwrap();
     let retired = db.retire_wallet(wallet(1), 999999, None).unwrap();
-    eprintln!("179573-group retirement lock_time={:?}", retired.lock_time);
     assert_eq!(retired.result, None);
+    let (mut transactions, mut trade_ids, mut longest) = (0, 0, retired.lock_time);
+    loop {
+        let drain = db.drain_retired_wallet(wallet(1), 500).unwrap();
+        assert!(drain.result.trade_ids <= 500);
+        transactions += 1;
+        trade_ids += drain.result.trade_ids;
+        longest = longest.max(drain.lock_time);
+        if drain.result.finished {
+            break;
+        }
+    }
+    eprintln!(
+        "179573-group removal lock_time={:?}; drain transactions={transactions} longest={longest:?}",
+        retired.lock_time
+    );
+    assert_eq!(trade_ids, 179_573);
+    assert_eq!(transactions, 179_573_usize.div_ceil(500) + 1);
     assert_eq!(count(&sql, "activity_groups"), 0);
     assert_eq!(count(&sql, "activity_group_revisions"), 0);
     assert_eq!(count(&sql, "seen_trades_v2"), 0);
+}
+
+#[test]
+fn retention_drain_list_absent_means_empty_and_malformed_fails_closed() {
+    let (_dir, db, sql) = fixture();
+    seed(&sql, wallet(1));
+    // Absent: nothing is listed, and draining an unlisted wallet changes nothing.
+    assert!(db.retirement_drains().unwrap().result.is_empty());
+    let drain = db.drain_retired_wallet(wallet(1), 500).unwrap().result;
+    assert_eq!((drain.trade_ids, drain.finished), (0, true));
+    assert_eq!(count(&sql, "activity_groups"), 1);
+    // Malformed or unsupported: the list read, a drain and a removal all refuse, and nothing changes.
+    for (value, label) in [
+        (
+            br#"{"version":2,"wallets":[]}"#.to_vec(),
+            "unsupported version",
+        ),
+        (
+            br#"{"version":1,"wallets":["not-a-wallet"]}"#.to_vec(),
+            "invalid wallet",
+        ),
+        (br#"{"version":1}"#.to_vec(), "missing wallets"),
+        (b"not json".to_vec(), "not json"),
+    ] {
+        sql.execute(
+            "INSERT INTO meta (key, value) VALUES ('wallet_retirement_drains', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![value],
+        )
+        .unwrap();
+        assert!(db.retirement_drains().is_err(), "{label}");
+        assert!(db.drain_retired_wallet(wallet(1), 500).is_err(), "{label}");
+        assert!(db.retire_wallet(wallet(1), 100, None).is_err(), "{label}");
+        for table in [
+            "activity_groups",
+            "decision_pending",
+            "entry_gate_results",
+            "position_anchors",
+            "poll_cursors",
+        ] {
+            assert_eq!(count(&sql, table), 1, "{label}: {table}");
+        }
+    }
 }
