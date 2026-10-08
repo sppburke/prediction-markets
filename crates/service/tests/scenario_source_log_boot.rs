@@ -6431,7 +6431,7 @@ async fn retention_returning_wallet_catches_up_in_process_after_reboot_and_check
         {
             let conn = Connection::open(&paths.fixed_main).unwrap();
             if interrupted {
-                for n in 0..502 {
+                for n in 0..450 {
                     let id = format!("left-group-{n:03}");
                     conn.execute(
                         "INSERT INTO activity_groups VALUES (?1, 'tx', ?2, ?3, 'r', 'TRADE', 'applied', '{}')",
@@ -6487,10 +6487,10 @@ async fn retention_returning_wallet_catches_up_in_process_after_reboot_and_check
                 [], |row| row.get(0),
             ).unwrap()
         };
-        assert_eq!(old_groups(), if interrupted { 503 } else { 1 });
+        assert_eq!(old_groups(), if interrupted { 451 } else { 1 });
         pe_service::source_checkpoint::install_retention_fence(&paths.source_log).unwrap();
         if interrupted {
-            // One full 500-id transaction commits. Fail the next with three groups still remaining,
+            // Seven full 64-id transactions commit. Fail the next with three groups still remaining,
             // and gate results overlapping both the deleted groups and the remaining ones.
             Connection::open(&paths.fixed_main)
                 .unwrap()
@@ -6517,7 +6517,7 @@ async fn retention_returning_wallet_catches_up_in_process_after_reboot_and_check
                 .filter(|event| event["message"] == "source retention drain transaction")
                 .map(|event| event["trade_ids"].clone())
                 .collect();
-            assert_eq!(committed, vec![serde_json::json!(500)], "{mode}");
+            assert_eq!(committed, vec![serde_json::json!(64); 7], "{mode}");
             assert_eq!(first_logs.last_run()["wallets_listed"], "None", "{mode}");
             assert_eq!(first_logs.last_run()["cancelled"], false, "{mode}");
             assert_eq!(
@@ -6540,7 +6540,7 @@ async fn retention_returning_wallet_catches_up_in_process_after_reboot_and_check
         );
         assert_eq!(
             old_gates(),
-            if interrupted { 504 } else { 0 },
+            if interrupted { 452 } else { 0 },
             "{mode}/interrupted={interrupted}"
         );
         assert_eq!(
