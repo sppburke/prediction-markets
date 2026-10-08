@@ -20,6 +20,7 @@ pub struct LiveMarketEvidence {
     pub condition_id: PolymarketConditionId,
     pub ordered_outcome_token_ids: [PolymarketTokenId; 2],
     pub neg_risk: bool,
+    pub neg_risk_market_id: Option<String>,
     pub minimum_tick_size: Price,
     pub minimum_order_size: ShareAmount,
     pub scheduled_end_unix: Option<i64>,
@@ -223,6 +224,7 @@ fn validate_market(
         condition_id: expected_condition.clone(),
         ordered_outcome_token_ids,
         neg_risk: gamma_neg_risk,
+        neg_risk_market_id: clob.neg_risk_market_id,
         minimum_tick_size: gamma_tick,
         minimum_order_size: gamma_minimum,
         scheduled_end_unix,
@@ -369,9 +371,14 @@ mod tests {
     fn negrisk_market_is_admitted_and_carried() {
         let evidence = validate(&gamma(true), &clob(true)).unwrap();
         assert!(evidence.neg_risk);
+        assert_eq!(evidence.neg_risk_market_id, None);
         assert_eq!(evidence.ordered_outcome_token_ids[0].0, "11");
         assert_eq!(evidence.ordered_outcome_token_ids[1].0, "22");
         assert_eq!(evidence.scheduled_end_unix, Some(1_786_449_600));
+        let mut row = clob(true);
+        row["neg_risk_market_id"] = json!("0xgroup");
+        let evidence = validate(&gamma(true), &row).unwrap();
+        assert_eq!(evidence.neg_risk_market_id.as_deref(), Some("0xgroup"));
     }
 
     #[test]

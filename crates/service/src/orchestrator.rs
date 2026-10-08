@@ -3840,6 +3840,55 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             }
         }
 
+        // Gate E (docs/19): a YES copy skips while another market of its neg-risk group holds an open YES.
+        if !already_staged
+            && admission.market.neg_risk
+            && signal.outcome_id.0 == 0
+            && let Some(group) = admission.market.neg_risk_market_id.as_deref()
+        {
+            record_clock(
+                &mut decision_evidence,
+                "group_yes_gate",
+                self.financial_now(),
+            );
+            match self.paper_state.held_yes_in_group(&condition_id.0, group) {
+                Ok(Some(sibling)) => {
+                    info!(
+                        reason = "group_yes_held",
+                        market = %signal.market_id,
+                        group,
+                        sibling,
+                        "signal did not produce order",
+                    );
+                    drop(early_book);
+                    self.no_fill_or_rollback(
+                        &trade,
+                        &leader_row,
+                        None,
+                        &format!("group_yes_held:{group}:{sibling}"),
+                        &rb,
+                        Some(&signal.market_id),
+                        decision_evidence.as_ref(),
+                    )
+                    .await;
+                    return;
+                }
+                Ok(None) => {
+                    if let Err(error) = self.paper_state.record_market_group(&condition_id.0, group)
+                    {
+                        error!(%error, trade = %trade.source_trade_id, "record neg-risk market group failed");
+                        self.intake_stopped = true;
+                        return;
+                    }
+                }
+                Err(error) => {
+                    error!(%error, trade = %trade.source_trade_id, "read held YES in neg-risk group failed");
+                    self.intake_stopped = true;
+                    return;
+                }
+            }
+        }
+
         // Market-liveness + observability (the Gamma mid). Historically (#339) this mid
         // was ALSO the sizing/gating basis, but it is a 60 s-TTL per-outcome MARK price
         // that can diverge sharply from the leader's just-executed trade price (observed
@@ -4865,6 +4914,7 @@ mod tests {
         use pe_copy_signal_engine::TradeProvenance;
         use pe_core_types::{Price, ShareAmount};
         use pe_execution_core::LiveAdmissionArtifact;
+        use pe_paper_state::DecisionPendingState;
         use pe_strategy_winner_follow::{PerTradeCap, SizingMode};
         use std::sync::atomic::AtomicUsize;
         use tokio::sync::oneshot;
@@ -5032,6 +5082,7 @@ mod tests {
                         PolymarketTokenId("456".to_owned()),
                     ],
                     neg_risk: false,
+                    neg_risk_market_id: None,
                     minimum_tick_size: Price::new(dec!(0.01)).unwrap(),
                     minimum_order_size: ShareAmount::from_whole(5).unwrap(),
                     scheduled_end_unix: None,
@@ -5097,6 +5148,79 @@ mod tests {
                     self.trade.source_trade_id
                 );
                 serde_json::from_str(&row.post_commit_inputs_json).unwrap()
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn group_gate_bypass_and_store_errors() {
+            for (neg_risk, group, insert_failure) in [
+                (false, Some("group"), false),
+                (true, None, false),
+                (true, Some("group"), false),
+                (true, Some("group"), true),
+            ] {
+                let mut harness = Harness::new(TradeProvenance::RestPoll, true, false);
+                {
+                    let mut admissions = harness.hooks.admission_artifacts.lock().unwrap();
+                    admissions[0].market.neg_risk = neg_risk;
+                    admissions[0].market.neg_risk_market_id = group.map(str::to_owned);
+                }
+                let connection =
+                    rusqlite::Connection::open(harness._fixture.dir.path().join("paper.db"))
+                        .unwrap();
+                connection.execute_batch(if insert_failure {
+                    "CREATE TRIGGER fail_group_insert BEFORE INSERT ON meta WHEN NEW.key LIKE 'neg_risk_group:%' BEGIN SELECT RAISE(FAIL, 'group insert failed'); END;"
+                } else {
+                    "ALTER TABLE settled_markets RENAME TO unavailable_settled_markets;"
+                }).unwrap();
+                harness.release.take().unwrap().send(()).unwrap();
+                harness.owner.handle_trade_once(harness.trade.clone()).await;
+                assert_eq!(harness.books.started.lock().unwrap().len(), 1);
+                let fails = neg_risk && group.is_some();
+                assert_eq!(harness.owner.intake_stopped, fails);
+                let row = harness
+                    .owner
+                    .paper_state
+                    .decision_pending_for(&harness.trade.source_trade_id)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    row.state,
+                    if fails {
+                        DecisionPendingState::Open
+                    } else {
+                        DecisionPendingState::Terminal
+                    }
+                );
+                if fails {
+                    assert!(row.terminal_disposition.is_none());
+                } else {
+                    assert_eq!(
+                        harness.evidence().body.book.unwrap().outcome,
+                        "below_minimum"
+                    );
+                }
+                let seeds: usize = connection
+                    .query_row("SELECT COUNT(*) FROM dispatch_seeds", [], |row| row.get(0))
+                    .unwrap();
+                assert_eq!(seeds, 0);
+                assert_eq!(
+                    harness
+                        .owner
+                        .paper_state
+                        .financial_last_prepared_seq()
+                        .unwrap(),
+                    None
+                );
+                assert!(harness.owner.paper_state.list_fills().unwrap().is_empty());
+                let mappings: usize = connection
+                    .query_row(
+                        "SELECT COUNT(*) FROM meta WHERE key LIKE 'neg_risk_group:%'",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(mappings, 0);
             }
         }
 

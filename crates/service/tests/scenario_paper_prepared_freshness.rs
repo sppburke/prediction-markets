@@ -556,7 +556,8 @@ impl Harness {
         ordinal: u32,
         paper_rule: Option<(Decimal, Decimal, Option<i64>)>,
     ) -> Recorded {
-        self.record_with_economics(ordinal, paper_rule, None).await
+        self.record_with_economics(ordinal, paper_rule, None, None)
+            .await
     }
 
     async fn record_with_economics(
@@ -564,6 +565,7 @@ impl Harness {
         ordinal: u32,
         paper_rule: Option<(Decimal, Decimal, Option<i64>)>,
         economics: Option<BookEconomics>,
+        group: Option<&str>,
     ) -> Recorded {
         let condition = format!("0x{ordinal:064x}");
         let token = (ordinal * 2 + 11).to_string();
@@ -598,6 +600,9 @@ impl Harness {
         gamma[0].as_object_mut().unwrap().remove("secondsDelay");
         gamma[0]["makerBaseFee"] = 1000.into();
         gamma[0]["takerBaseFee"] = 1000.into();
+        if group.is_some() {
+            gamma[0]["negRisk"] = json!(true);
+        }
         self.prices
             .markets
             .lock()
@@ -611,6 +616,10 @@ impl Harness {
         long["tokens"][1]["token_id"] = other.clone().into();
         long["maker_base_fee"] = 1000.into();
         long["taker_base_fee"] = 1000.into();
+        if let Some(group) = group {
+            long["neg_risk"] = json!(true);
+            long["neg_risk_market_id"] = json!(group);
+        }
         if let Some((_, _, delay)) = paper_rule {
             match delay {
                 Some(seconds) => long["seconds_delay"] = seconds.into(),
@@ -628,6 +637,9 @@ impl Harness {
         compact["t"][1]["t"] = other.into();
         compact["mbf"] = 1000.into();
         compact["tbf"] = 1000.into();
+        if group.is_some() {
+            compact["nr"] = json!(true);
+        }
         let mut book: Value =
             serde_json::from_slice(include_bytes!("fixtures/golden_stream_v1/book.json")).unwrap();
         book["market"] = condition.clone().into();
@@ -709,6 +721,47 @@ impl Harness {
             gamma,
             admission,
         }
+    }
+    async fn record_group_entry(
+        &self,
+        ordinal: u32,
+        leader: WalletAddress,
+        outcome: usize,
+        group: &str,
+    ) -> Recorded {
+        let mut recorded = self
+            .record_with_economics(ordinal, None, None, Some(group))
+            .await;
+        let market = &recorded.admission.market;
+        let token = market.ordered_outcome_token_ids[outcome].0.clone();
+        let mut activity: Value = serde_json::from_slice(&recorded.activity).unwrap();
+        activity[0]["proxyWallet"] = leader.to_string().into();
+        activity[0]["asset"] = token.clone().into();
+        activity[0]["outcomeIndex"] = json!(outcome);
+        activity[0]["outcome"] = json!(if outcome == 0 { "Yes" } else { "No" });
+        recorded.activity = serde_json::to_vec(&activity).unwrap();
+        let read = support::producer_shaped_read_v2(
+            leader,
+            &recorded.activity,
+            recorded.epoch,
+            recorded.epoch,
+            support::scenario_receipt(1),
+        );
+        recorded.id = read.aggregates[0].group_id.key().clone();
+        if outcome == 1 {
+            let payload = serde_json::to_vec(&json!({
+                "market": market.condition_id.0,
+                "asset_id": token,
+                "asks": [{"price": "0.50", "size": "100"}],
+            }))
+            .unwrap();
+            let receipt = self.append("polymarket.clob.book", &payload).await;
+            let mut book = OrderBook::from_book_json(&payload).unwrap();
+            book.source_receipt = Some(receipt);
+            book.fetched_at_ms = u64::try_from(EPOCH * 1000).unwrap();
+            self.books.values.lock().unwrap().insert(token, book);
+        }
+        recorded
     }
     fn start(&mut self, enabled: bool) {
         self.start_owner(enabled, false);
@@ -4147,6 +4200,7 @@ async fn floor_fill_without_mid() {
                     depth: dec!(1000),
                     fee_free: true,
                 }),
+                None,
             )
             .await;
         h.freeze(&recorded, true).await;
@@ -4218,6 +4272,7 @@ async fn semantic_three_partial_replay() {
                     depth: dec!(20.123457),
                     fee_free: false,
                 }),
+                None,
             )
             .await;
         h.attempt(&recorded, at());
@@ -4287,6 +4342,169 @@ async fn homogeneous_same_second_production_and_qualification() {
     let report = h.qualify_one_fill().await;
     assert!(report.replay.exact, "{:?}", report.replay);
     assert_eq!(report.replay.fills, 1);
+}
+
+#[tokio::test]
+async fn sibling_group_yes_is_skipped_before_staging() {
+    let other = WalletAddress::from_hex("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+    for (outcome, group, skipped) in [
+        (0, "group", true),
+        (1, "group", false),
+        (0, "other-group", false),
+    ] {
+        let mut h = Harness::new_with_leaders(3, runtime(), vec![wallet(), other]).await;
+        let held = h.record_group_entry(1, wallet(), 0, "group").await;
+        h.freeze(&held, true).await;
+        h.set_continuation_version(&held, 7);
+        h.attempt(&held, at());
+        h.arm();
+        h.start(true);
+        h.barrier().await;
+        h.stop().await;
+        assert_eq!(
+            h.terminal(&held).terminal_disposition.as_deref(),
+            Some("fill")
+        );
+        let second = h.record_group_entry(2, other, outcome, group).await;
+        h.freeze(&second, true).await;
+        h.set_continuation_version(&second, 7);
+        h.attempt(&second, at() + time::Duration::seconds(1));
+        h.start(true);
+        h.barrier().await;
+        h.stop().await;
+        let row = h.terminal(&second);
+        let replay = replay_decision_pending(&row).unwrap();
+        let evidence = &replay.post_boundary.body;
+        if skipped {
+            assert_eq!(row.terminal_disposition.as_deref(), Some("no_fill"));
+            assert_eq!(
+                evidence.terminal.reason,
+                format!(
+                    "group_yes_held:{group}:{}",
+                    held.admission.market.condition_id.0
+                )
+            );
+            assert!(
+                evidence
+                    .clocks
+                    .iter()
+                    .any(|clock| clock.purpose == "group_yes_gate")
+            );
+            assert_eq!(evidence.terminal.dispatch_id, None);
+        } else {
+            assert_eq!(row.terminal_disposition.as_deref(), Some("fill"));
+            assert!(evidence.terminal.dispatch_id.is_some());
+        }
+        let expected = 1 + usize::from(!skipped);
+        assert_eq!(h.prepared_count(), expected);
+        assert_eq!(h.paper.list_fills().unwrap().len(), expected);
+        assert_eq!(h.authority.inner.lock().unwrap().fills.len(), expected);
+        let connection = rusqlite::Connection::open(h.dir.path().join("paper.db")).unwrap();
+        let seeds: usize = connection
+            .query_row("SELECT COUNT(*) FROM dispatch_seeds", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(seeds, expected);
+    }
+}
+
+#[tokio::test]
+async fn staged_decision_keeps_admission_when_sibling_maps_later() {
+    let other = WalletAddress::from_hex("0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").unwrap();
+    let mut h = Harness::new_with_leaders(3, runtime(), vec![wallet(), other]).await;
+    let held = h.record_group_entry(1, wallet(), 0, "group").await;
+    h.freeze(&held, true).await;
+    h.set_continuation_version(&held, 7);
+    h.attempt(&held, at());
+    h.start(true);
+    h.barrier().await;
+    h.stop().await;
+    assert_eq!(
+        h.terminal(&held).terminal_disposition.as_deref(),
+        Some("fill")
+    );
+    let connection = rusqlite::Connection::open(h.dir.path().join("paper.db")).unwrap();
+    connection
+        .execute(
+            "DELETE FROM meta WHERE key = ?1",
+            [format!(
+                "neg_risk_group:{}",
+                held.admission.market.condition_id.0
+            )],
+        )
+        .unwrap();
+    let second = h.record_group_entry(2, other, 0, "group").await;
+    h.freeze(&second, true).await;
+    h.set_continuation_version(&second, 7);
+    h.arm();
+    h.attempt(&second, at() + time::Duration::seconds(1));
+    *h.prices.gate.market.lock().unwrap() = Some(held.admission.market.condition_id.0.clone());
+    h.prices.gate.blocked.store(true, Ordering::SeqCst);
+    h.start(true);
+    h.prices.gate.started.notified().await;
+    h.stop().await;
+    assert_eq!(h.terminal(&second).state, DecisionPendingState::Open);
+    assert_eq!(h.prepared_count(), 1);
+    let seed = h.paper.pending_dispatch_seeds().unwrap().remove(0);
+    h.paper
+        .record_market_group(&held.admission.market.condition_id.0, "group")
+        .unwrap();
+    assert_eq!(
+        h.paper
+            .held_yes_in_group(&second.admission.market.condition_id.0, "group")
+            .unwrap()
+            .as_deref(),
+        Some(held.admission.market.condition_id.0.as_str())
+    );
+    connection.execute_batch("CREATE TABLE outcome_transitions (kind TEXT NOT NULL, identity TEXT NOT NULL);
+        CREATE TRIGGER count_seed_flip AFTER UPDATE OF state ON dispatch_seeds WHEN OLD.state = 'pending_paper' AND NEW.state = 'ready' BEGIN INSERT INTO outcome_transitions VALUES ('seed', NEW.dispatch_id); END;
+        CREATE TRIGGER count_paper_terminal AFTER UPDATE OF state ON decision_pending WHEN OLD.state = 'open' AND NEW.state = 'terminal' BEGIN INSERT INTO outcome_transitions VALUES ('terminal', NEW.source_trade_id); END;").unwrap();
+    h.prices.gate.blocked.store(false, Ordering::SeqCst);
+    h.attempt(&second, at() + time::Duration::seconds(1));
+    h.start(true);
+    h.barrier().await;
+    h.stop().await;
+    let terminal = h.terminal(&second);
+    assert_eq!(terminal.terminal_disposition.as_deref(), Some("fill"));
+    let replay = replay_decision_pending(&terminal).unwrap();
+    assert_eq!(
+        replay.post_boundary.body.terminal.dispatch_id.as_deref(),
+        Some(seed.dispatch_id.as_str())
+    );
+    assert!(
+        replay
+            .post_boundary
+            .body
+            .clocks
+            .iter()
+            .all(|clock| clock.purpose != "group_yes_gate")
+    );
+    assert_eq!(h.prepared_count(), 2);
+    assert_eq!(h.paper.list_fills().unwrap().len(), 2);
+    assert_eq!(h.authority.inner.lock().unwrap().fills.len(), 2);
+    for _ in 0..2 {
+        let recovery = pe_service::dispatch_recovery::resume_dispatch_seeds(
+            &h.dir.path().join("paper.log"),
+            &h.paper,
+        )
+        .unwrap();
+        assert_eq!(recovery.flipped_fill, 0);
+        assert_eq!(recovery.left_pending, 0);
+    }
+    assert_eq!(h.terminal(&second), terminal);
+    for (kind, identity) in [("seed", &seed.dispatch_id), ("terminal", &second.id.0)] {
+        let count: usize = connection
+            .query_row(
+                "SELECT count(*) FROM outcome_transitions WHERE kind = ?1 AND identity = ?2",
+                rusqlite::params![kind, identity],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+    let seeds: usize = connection
+        .query_row("SELECT COUNT(*) FROM dispatch_seeds", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(seeds, 1);
 }
 
 #[tokio::test]
@@ -6511,6 +6729,7 @@ async fn frame_below_minimum_counts_and_terminal_survive_rest_and_financial_boot
                 depth: dec!(0.000199),
                 fee_free: true,
             }),
+            None,
         )
         .await;
     let initial_rows = h.paper.leader_positions().unwrap();

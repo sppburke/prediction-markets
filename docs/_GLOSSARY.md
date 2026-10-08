@@ -531,7 +531,7 @@ above can clear an eligible fence; unsafe or unprovable fences remain quarantine
 | 4 | Activity-page schema 3 / parser 2 | Envelope schema 1 / parser 1 / payload 1 / domain `prediction-edge/activity-read-commitment/v1` | Legacy complete-second proof. |
 | 5 | Activity-page schema 3 / parser 2 | Envelope schema 2 / parser 1 / payload 2 / domain `prediction-edge/activity-read-commitment/v2`, with observation bindings | Frozen `PaperFreshnessPolicy`, repaired complete-second proof, and precise final paper Prepared freshness clock. |
 | 6 | Same source and commitment contract as 5 | Same payload-2 commitment and authenticated observation bindings as 5 | Paper financial semantic 2: delay-tolerant paper admission, current-book ladder without a leader-price ceiling, signed ladder intent limit, and economic wire 2. Checkpoint and terminal-evidence wire numbers remain unchanged. |
-| 7 | `source_authority` is required: `activity_frame` or `complete_read`; historical encodings omit it | Complete reads retain the payload-2 contract; frames freeze their authenticated receipt and admission prefix without decision-time REST pages or target | Paper financial semantic 3: receipt-order frame decisions, per-wallet first entries without a cross-leader paper hold, partial Dollar sizing, one per-ask band check and no decision mid gate. |
+| 7 | `source_authority` is required: `activity_frame` or `complete_read`; historical encodings omit it | Complete reads retain the payload-2 contract; frames freeze their authenticated receipt and admission prefix without decision-time REST pages or target | Paper financial semantic 3: receipt-order frame decisions, per-wallet first entries without a same-market cross-leader paper hold, subject to shared copy-scope gate E, partial Dollar sizing, one per-ask band check and no decision mid gate. |
 
 The first durable payload-2 commitment is itself a compatibility-boundary write: the poller
 appends it before bucket application and boot authenticates it, so a reader without the v2
@@ -602,7 +602,9 @@ supersedes an earlier excluded zero-share receipt of that identity.
 Unrelated wallets/positions/history cannot grow the body.
 
 First-entry history is per wallet and market. Continuation 7 copies each wallet's first entry
-whatever the paper book holds there, on the same or opposite outcome; a held-outcome fill
+whatever the paper book holds there, on the same or opposite outcome, subject to
+[copy-scope gate E](19-WINNER-FOLLOW-STRATEGY.md#copy-scope-gates-service-side-issue-290):
+a YES skips while another market of its neg-risk group holds an open YES. A held-outcome fill
 accumulates and leader statistics remain per fill. Continuations through 6 retain the
 outcome-keyed `paper_held` check. Only continuation-7 paper Dollar decisions use `BuySizing::DollarUpTo`:
 sign the lesser of requested principal and collateral-rounded in-band capacity once, preserving

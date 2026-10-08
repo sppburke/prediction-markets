@@ -45,6 +45,8 @@ async def probe(name, url, subscriptions, seconds):
                     types[et] = types.get(et, 0) + 1
                     if types[et] <= 2:
                         print(f"  [{et}] keys: {sorted(it.keys())[:14]}")
+                        if isinstance(it.get("payload"), dict):
+                            print(f"  [{et}] payload keys: {sorted(it['payload'].keys())}")
                     for p, k, v in scan(it):
                         hits.setdefault(f"{et}{p}.{k}", set()).add(v)
     except Exception as e:
@@ -64,13 +66,11 @@ async def main():
         [{"assets_ids": ASSETS, "type": "market"}],
         75,
     )
-    for url, subs, label in [
-        ("wss://ws-live-data.polymarket.com", [
-            {"action": "subscribe", "subscriptions": [{"topic": "activity", "type": "trades"}]},
-            {"type": "subscribe", "channel": "activity"},
-            {"topics": ["activity/trades"], "type": "subscribe"},
-        ], "UI live-data (guessed protocols)"),
-    ]:
-        await probe(label, url, subs, 60)
+    await probe(
+        "Activity live-data",
+        "wss://ws-live-data.polymarket.com",
+        [{"action": "subscribe", "subscriptions": [{"topic": "activity", "type": "trades"}]}],
+        60,
+    )
 
 asyncio.run(main())

@@ -1351,6 +1351,8 @@ do not change the owner's requested mode.
 
 ## Rollback
 
+**#752 group YES gate:** no forward-only boundary; pre-#752 builds such as `7e43d59` read `meta` by exact key, decode the new reason and ignore the group mappings.
+
 **Release-2 retention prerequisite:** fix forward. Once the fence is installed, 6e09b86 cannot
 use/publish a checkpoint; after the first punch it refuses the source log. Never reverse to that
 binary or restore stale state. Preserve all retained evidence, durable receipt commitments, compact

@@ -43,6 +43,8 @@
 > exposes boolean `neg_risk` and string `neg_risk_market_id`. The approved #739 source pass records
 > these fields on every row of the first [CLOB `/markets` cursor page](https://clob.polymarket.com/markets)
 > (1,000 rows), and matching CLOB/Gamma group ids on six live neg-risk markets in four groups.
+> Single-market `/markets/{condition_id}` rows also carry these fields: the 2026-10-07 capture
+> and 2026-10-08 fetch in [#752](https://github.com/sppburke/prediction-markets/issues/752) cover the open YES holdings.
 > Empty group ids become NULL; a neg-risk market without a group id remains ungrouped. The complete
 > read-only walk recorded 45 such markets; neither a Gamma event id nor `market_events` substitutes
 > for the CLOB group. Provenance: [#739's approved evidence](https://github.com/sppburke/prediction-markets/issues/739),
@@ -120,10 +122,12 @@
 > (transport/envelope/constants) and `pe-service::activity_ingest` (readers, liveness,
 > fan-in); the service's `trade_parser` normalizes identically to the REST path. The CLOB
 > market channel remains wallet-anonymous — the note below stands for THAT feed.
-> Last checked: 2026-10-05 (`scripts/probe_activity_ws.py` at 6:09 AM CT: the activity subscription
-> delivered 2,002 `trades` frames in 60 s with envelope keys `connection_id`, `payload`, `timestamp`,
-> `topic` and `type`, and `payload.proxyWallet` present; 2026-10-04: 2,694 and 1,970 frames in 60 s,
-> same keys). A 45 s payload-key capture at 6:11 AM CT (1,816 payloads; 2,726 on 2026-10-04) found `asset`,
+> Last checked: 2026-10-08 (`scripts/probe_activity_ws.py` at 3:53 PM CT for #752, sending only
+> production's subscription: 2,537 `trades` frames in 60 s, no connection error, envelope keys
+> `connection_id`, `payload`, `timestamp`, `topic` and `type`, and both sampled payloads carrying
+> `asset`, `conditionId`, `outcomeIndex`, `price`, `proxyWallet`, `side`, `size`, `timestamp` and
+> `transactionHash`; 2026-10-05: 2,002 frames in 60 s; 2026-10-04: 2,694 and 1,970, same keys).
+> A 45 s payload-key capture on 2026-10-05 at 6:11 AM CT (1,816 payloads; 2,726 on 2026-10-04) found `asset`,
 > `conditionId`, `outcome`, `outcomeIndex`, `price`, `proxyWallet`, `side`, `size`, `timestamp` and
 > `transactionHash` on every payload (plus display fields, and `fee` on 694) and **no combo flag**:
 > frame admission therefore treats feed trades as non-combo; none of the 4 combo BUYs in watched
@@ -329,7 +333,7 @@ earliest time's rows as that earliest listing and still refuses any other mixed-
 | https://docs.polygon.technology/pos/concepts/finality/finality | 2026-09-05 | 2026-12-04 |
 | https://polygon.publicnode.com (`eth_chainId`, `eth_getTransactionReceipt`, `eth_getBlockByNumber`) | 2026-09-05 | 2026-12-04 |
 | https://docs.polymarket.com/api-reference/tags/get-tag-by-id | 2026-07-18 | 2026-09-16 |
-| https://clob.polymarket.com/markets/{condition_id} | 2026-09-01 | 2026-10-31 |
+| https://clob.polymarket.com/markets/{condition_id} | 2026-10-08 | 2026-12-07 |
 | https://clob.polymarket.com/markets (`neg_risk`, `neg_risk_market_id`) | 2026-10-05 | 2026-12-04 |
 | https://docs.polymarket.com/api-spec/clob-openapi.yaml (`Market` neg-risk fields) | 2026-10-05 | 2026-12-04 |
 | https://docs.polymarket.com/concepts/negative-risk | 2026-10-05 | 2026-12-04 |
