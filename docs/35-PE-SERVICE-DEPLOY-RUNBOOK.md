@@ -1363,6 +1363,12 @@ closure-receipt, ordinary-live-admission and restamp-pair boundaries and every p
 below. Reader failures do not waive these conditions; after a boundary preserve state and fix
 forward without deleting records or restoring stale state.
 
+**#747 copied-listing boundary:** a build containing #747 aggregates a transaction whose fills the
+venue lists again 1–8 s later as its earliest listing. From the first read commitment holding such a
+copy, an older target cannot verify or replay that commitment (both re-aggregate recorded pages):
+preserve state and fix forward. Forge installs #747 only after this service runs a build containing it
+([docs/26](26-DATA-REFRESH-AND-REOPTIMIZATION-RUNBOOK.md)).
+
 **#595 paper-service compatibility boundary:** preserve state and fix forward for this rollout
 until boot compatibility with the previous executable is proved. A filtered membership record
 retains the existing paper format, but this rollout has no old-binary boot rehearsal. The first

@@ -3587,6 +3587,7 @@ dependencies = [
  "figment",
  "fs2",
  "futures",
+ "pe-copy-signal-engine",
  "pe-core-types",
  "pe-position-ledger",
  "pe-source-core",

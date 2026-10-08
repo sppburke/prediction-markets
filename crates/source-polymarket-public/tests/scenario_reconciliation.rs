@@ -1483,10 +1483,32 @@ async fn semantic_read_matches_the_default_read_without_row_provenance() {
     bucketed.sort_by(order);
     assert_eq!(direct, bucketed);
 
-    // One fill reported at two venue seconds: the same exclusion text either way.
-    let mixed = InclusiveActivityApi::new(vec![
+    // One fill listed again two venue seconds later (#747) is one group at the
+    // earlier second either way; a later row that is not an exact copy keeps the
+    // exclusion text either way.
+    let copied = InclusiveActivityApi::new(vec![
         activity_row(20, "0xsplit".to_owned(), "asset-split".to_owned(), 0),
         activity_row(22, "0xsplit".to_owned(), "asset-split".to_owned(), 0),
+    ]);
+    let read = fetch_complete_activity_semantic(
+        &copied,
+        BASE,
+        wallet(),
+        None,
+        100,
+        ActivityRowAcceptance::Strict,
+    )
+    .await
+    .unwrap();
+    let direct = aggregate_activity_rows(&read.rows).unwrap();
+    assert_eq!(read.buckets().unwrap(), vec![direct.clone()]);
+    assert_eq!(direct.len(), 1);
+    assert_eq!(direct[0].source_time.0.unix_timestamp(), 20);
+    let mut differing = activity_row(22, "0xsplit".to_owned(), "asset-split".to_owned(), 0);
+    differing["size"] = json!("2.000000");
+    let mixed = InclusiveActivityApi::new(vec![
+        activity_row(20, "0xsplit".to_owned(), "asset-split".to_owned(), 0),
+        differing,
     ]);
     let read = fetch_complete_activity_semantic(
         &mixed,

@@ -205,6 +205,105 @@ pub async fn fetch_complete_activity_semantic(
     .await
 }
 
+/// Place a forward window using the 5,000th ascending row. Descending pages,
+/// not this lookup, provide the committed coverage evidence.
+pub async fn activity_window_end(
+    fetcher: &dyn ReconciliationFetcher,
+    base_url: &str,
+    requested_wallet: WalletAddress,
+    lo: i64,
+    fixed_end: i64,
+) -> Result<i64, ActivityReadError> {
+    let start = lo.checked_add(1).ok_or(ActivityReadError::InvalidSplit {
+        start: Some(lo),
+        end: fixed_end,
+        boundary: lo,
+    })?;
+    let url = PolymarketEndpoint::UserPositionActivityWindowEnd {
+        user: requested_wallet.to_string(),
+        start,
+        end: fixed_end,
+    }
+    .url(base_url);
+    let raw = fetcher
+        .fetch(&url)
+        .await
+        .map_err(|source| ActivityReadError::Fetch { url, source })?;
+    let received_at = ReceivedAt::now_utc();
+    let page = parse_activity_response_with_acceptance(
+        &raw,
+        requested_wallet,
+        &ActivityParseContext {
+            source_id: SourceId("polymarket-public.activity-reconciliation".to_owned()),
+            observed_at: SourceTimestamp(received_at.0),
+            received_at,
+            transport: ActivityTransport::Rest,
+        },
+        ActivityRowAcceptance::Acquisition3,
+    )?;
+    if page.rows.len() > 1 {
+        return Err(ActivityReadError::PageTooLarge {
+            row_count: u32::try_from(page.rows.len())
+                .map_err(|_| ActivityReadError::RowCountOverflow)?,
+            limit: 1,
+        });
+    }
+    let Some(row) = page.rows.first() else {
+        return Ok(fixed_end);
+    };
+    let boundary = row.source_time.0.unix_timestamp();
+    if boundary <= lo || boundary > fixed_end {
+        return Err(ActivityReadError::RowOutsideBounds {
+            timestamp: boundary,
+            start: Some(lo),
+            end: fixed_end,
+        });
+    }
+    let before = boundary
+        .checked_sub(1)
+        .ok_or(ActivityReadError::InvalidSplit {
+            start: Some(lo),
+            end: fixed_end,
+            boundary,
+        })?;
+    Ok(if before <= lo { boundary } else { before })
+}
+
+/// Read one unsplit semantic window. A full multi-second window returns `None`;
+/// a full terminal second remains the existing fatal saturation error.
+pub async fn fetch_activity_window_semantic(
+    fetcher: &dyn ReconciliationFetcher,
+    base_url: &str,
+    requested_wallet: WalletAddress,
+    start: i64,
+    fixed_end: i64,
+) -> Result<Option<CompleteActivityRead>, ActivityReadError> {
+    match fetch_activity_segment(
+        fetcher,
+        base_url,
+        requested_wallet,
+        ActivityRequestBounds {
+            start: Some(start),
+            end: fixed_end,
+        },
+        false,
+        ActivityRowAcceptance::Acquisition3,
+    )
+    .await?
+    {
+        SegmentResult::Complete(segment) => {
+            assemble_activity(requested_wallet, fixed_end, vec![segment]).map(Some)
+        }
+        SegmentResult::Saturated { .. } if start.checked_add(1) == Some(fixed_end) => {
+            Err(ActivityReadError::SaturatedTerminalSecond {
+                end: fixed_end,
+                offset: ACTIVITY_MAX_OFFSET,
+            })
+        }
+        SegmentResult::Saturated { .. } => Ok(None),
+    }
+}
+
 async fn fetch_complete_activity_with(
     fetcher: &dyn ReconciliationFetcher,
     base_url: &str,
@@ -283,6 +382,14 @@ async fn fetch_complete_activity_with(
         }
     }
 
+    assemble_activity(requested_wallet, fixed_end, complete)
+}
+
+fn assemble_activity(
+    requested_wallet: WalletAddress,
+    fixed_end: i64,
+    mut complete: Vec<ActivitySegment>,
+) -> Result<CompleteActivityRead, ActivityReadError> {
     complete.sort_by_key(|segment| (segment.bounds.end, segment.bounds.start));
     // Rows sit inside their segment's bounds and completed segments are
     // disjoint ascending intervals, so sorting each segment and concatenating
@@ -1194,6 +1301,93 @@ mod tests {
             fetch_complete_positions(&PositionFixture, "https://example.test", wallet, &mapping)
                 .await,
             Err(PositionReadError::ConflictingActivityMapping { .. })
+        ));
+    }
+    struct ActivityFixture {
+        rows: usize,
+        timestamp: i64,
+    }
+
+    impl ReconciliationFetcher for ActivityFixture {
+        fn fetch<'a>(
+            &'a self,
+            url: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
+            Box::pin(async move {
+                let url = reqwest::Url::parse(url).unwrap();
+                let query = url.query_pairs().into_owned().collect::<BTreeMap<_, _>>();
+                let offset = query["offset"].parse::<usize>().unwrap();
+                let limit = query["limit"].parse::<usize>().unwrap();
+                let row = serde_json::json!({
+                    "proxyWallet":"0x1111111111111111111111111111111111111111",
+                    "type":"TRADE", "conditionId":format!("0x{}", "88".repeat(32)),
+                    "asset":"123", "outcome":"Yes", "side":"BUY", "size":"1",
+                    "usdcSize":"0.5", "price":"0.5", "timestamp":self.timestamp,
+                    "transactionHash":"fixture", "outcomeIndex":0,
+                });
+                Ok(
+                    serde_json::to_vec(&vec![row; self.rows.saturating_sub(offset).min(limit)])
+                        .unwrap(),
+                )
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn activity_window_end_empty_boundary_and_terminal_second() {
+        let wallet = WalletAddress::from_hex("0x1111111111111111111111111111111111111111").unwrap();
+        for (rows, timestamp, expected) in [(0, 20, 100), (5000, 20, 19), (5000, 11, 11)] {
+            assert_eq!(
+                activity_window_end(
+                    &ActivityFixture { rows, timestamp },
+                    "https://data.example",
+                    wallet,
+                    10,
+                    100
+                )
+                .await
+                .unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn activity_window_semantic_complete_full_and_saturated_second() {
+        let wallet = WalletAddress::from_hex("0x1111111111111111111111111111111111111111").unwrap();
+        for rows in [0, 5000, 5499] {
+            let read = fetch_activity_window_semantic(
+                &ActivityFixture {
+                    rows,
+                    timestamp: 11,
+                },
+                "https://data.example",
+                wallet,
+                10,
+                11,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(read.rows.len(), rows);
+            assert_eq!(read.fixed_end, 11);
+        }
+        let fixture = ActivityFixture {
+            rows: 5500,
+            timestamp: 11,
+        };
+        assert!(
+            fetch_activity_window_semantic(&fixture, "https://data.example", wallet, 10, 20)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            fetch_activity_window_semantic(&fixture, "https://data.example", wallet, 10, 11).await,
+            Err(ActivityReadError::SaturatedTerminalSecond {
+                end: 11,
+                offset: 5000
+            })
         ));
     }
 }

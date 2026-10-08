@@ -1012,6 +1012,7 @@ impl WalletCache {
 
     /// Load only version-two activity aggregates. Sealed v1 rows are
     /// structurally outside this query and therefore cannot seed a v2 consumer.
+    #[cfg(feature = "scenario")]
     pub fn activity_aggregates_v2(&self) -> Result<Vec<StoredActivityAggregateV2>, BootstrapError> {
         self.require_v2_schema()?;
         let mut statement = self.conn.prepare(
@@ -1098,6 +1099,7 @@ impl WalletCache {
         Ok(aggregates)
     }
 
+    #[cfg(feature = "scenario")]
     fn require_v2_schema(&self) -> Result<(), BootstrapError> {
         let found = self.schema_version()?;
         if found == CACHE_SCHEMA_VERSION_V2 {
@@ -4704,18 +4706,21 @@ impl WalletCache {
     }
 }
 
+#[cfg(feature = "scenario")]
 fn to_u64_i64(value: i64, field: &str) -> Result<u64, BootstrapError> {
     u64::try_from(value).map_err(|_| BootstrapError::Cache {
         message: format!("{field} is negative"),
     })
 }
 
+#[cfg(feature = "scenario")]
 fn parse_u16_i64(value: i64) -> Result<u16, BootstrapError> {
     u16::try_from(value).map_err(|_| BootstrapError::Cache {
         message: format!("v2 activity outcome {value} is outside u16 range"),
     })
 }
 
+#[cfg(feature = "scenario")]
 fn parse_decimal(value: &str, field: &str) -> Result<Decimal, BootstrapError> {
     Decimal::from_str(value).map_err(|error| BootstrapError::Cache {
         message: format!("invalid {field} {value:?}: {error}"),
