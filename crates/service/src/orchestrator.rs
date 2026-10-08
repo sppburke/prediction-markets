@@ -1770,6 +1770,14 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
 
     async fn apply_control_message(&mut self, message: OrchestratorControl) {
         match message {
+            OrchestratorControl::RetentionCommit {
+                request,
+                acknowledged,
+            } => {
+                let result = crate::source_checkpoint::retention::commit(*request)
+                    .map_err(|error| format!("{error:#}"));
+                let _ = acknowledged.send(result);
+            }
             OrchestratorControl::ActivityFrameDecision { receipt } => {
                 if let Err(error) = self.apply_activity_frame(receipt).await {
                     self.pending_load_failure = Some(error);
@@ -1781,6 +1789,52 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 acknowledged,
             } => {
                 let result = self.apply_reconciliation_update(update);
+                let _ = acknowledged.send(result);
+            }
+            OrchestratorControl::RetireWallet {
+                wallet,
+                recent_since_unix,
+                acknowledged,
+            } => {
+                let writer_lock = self.watchlist_writer_lock.clone();
+                let _writer = match &writer_lock {
+                    Some(lock) => Some(lock.lock().await),
+                    None => None,
+                };
+                let result = if self
+                    .live_watchlist
+                    .structural_membership()
+                    .contains(&wallet)
+                {
+                    Ok(crate::database_retention::WalletRetirement {
+                        waiting: Some(crate::database_retention::RetentionWait::StructuralMember),
+                        lock_time: None,
+                    })
+                } else {
+                    self.paper_writer
+                        .snapshot()
+                        .map_err(|error| error.to_string())
+                        .and_then(|frames| {
+                            let (_, latest_prepared) =
+                                crate::database_retention::retention_paper_state(&frames);
+                            self.bucket_engine
+                                .retire_wallet(wallet, recent_since_unix, latest_prepared)
+                                .map(|retired| {
+                                    if retired.result.is_none()
+                                        && let Some(index) = &self.source_receipts
+                                    {
+                                        index.forget_verified_frontier(wallet);
+                                    }
+                                    crate::database_retention::WalletRetirement {
+                                        waiting: retired
+                                            .result
+                                            .map(crate::database_retention::RetentionWait::Durable),
+                                        lock_time: Some(retired.lock_time),
+                                    }
+                                })
+                                .map_err(|error| error.to_string())
+                        })
+                };
                 let _ = acknowledged.send(result);
             }
             OrchestratorControl::PrepareAdmissions {

@@ -1065,6 +1065,146 @@ pub fn replay_decision_pending_with_control(
     Ok(replayed)
 }
 
+/// All source inputs consumed by live recovery. Retention pauses on this same enumeration.
+pub(crate) fn live_source_receipts(
+    events: &[pe_execution_core::live_journal::LiveJournalEvent],
+) -> impl Iterator<Item = AppendReceipt> {
+    use pe_execution_core::live_journal::LiveJournalPayload;
+    let mut receipts = Vec::new();
+    for event in events {
+        match &event.payload {
+            LiveJournalPayload::AdmissionEvaluated(admission) => {
+                receipts.extend([
+                    admission.economic.admission.receipts.gamma,
+                    admission.economic.admission.receipts.clob_long,
+                    admission.economic.admission.receipts.clob_compact,
+                    admission.economic.book_receipt,
+                ]);
+                receipts.extend(admission.economic.risk.price_receipts.iter().copied());
+                if let Some(observation) = &admission.economic.observation {
+                    receipts.extend([
+                        observation.source_receipt,
+                        observation.complete_bound_receipt,
+                    ]);
+                }
+            }
+            LiveJournalPayload::ResolutionFinalized(resolution) => {
+                receipts.push(resolution.source_append_receipt);
+            }
+            LiveJournalPayload::RedemptionCustodyReconciled(custody) => {
+                receipts.extend(custody.venue_position_receipts.iter().copied());
+            }
+            LiveJournalPayload::AccountPortfolioMarked(mark) => {
+                receipts.extend(
+                    mark.venue_position_evidence
+                        .pages
+                        .iter()
+                        .map(|page| page.receipt),
+                );
+                receipts.extend(mark.prices.iter().map(|price| price.receipt));
+            }
+            _ => {}
+        }
+    }
+    receipts.into_iter()
+}
+
+/// The source evidence owner shared by replay and retention. Receipt closures are collected from
+/// the same authenticators that replay uses, including recursively consulted counterpart bases.
+#[derive(Clone, Default)]
+pub(crate) struct DecisionSourceInputs {
+    pub(crate) receipts: Vec<AppendReceipt>,
+    pub(crate) payload_hashes: std::collections::BTreeSet<String>,
+}
+
+pub(crate) fn economic_source_receipts(economic: &EconomicPrepared) -> Vec<AppendReceipt> {
+    let mut receipts = vec![
+        economic.admission.receipts.gamma,
+        economic.admission.receipts.clob_long,
+        economic.admission.receipts.clob_compact,
+        economic.book_receipt,
+    ];
+    receipts.extend(economic.risk.price_receipts.iter().copied());
+    if let Some(observation) = &economic.observation {
+        receipts.extend([
+            observation.source_receipt,
+            observation.complete_bound_receipt,
+        ]);
+    }
+    receipts
+}
+
+pub(crate) fn commitment_source_receipts(
+    receipt: AppendReceipt,
+    index: &crate::risk_inputs::SourceReceiptIndex,
+) -> anyhow::Result<Vec<AppendReceipt>> {
+    let mut receipts = Vec::new();
+    crate::bucket_commit::verified_commitment_bindings_with_lookup(receipt, &mut |receipt| {
+        let envelope = index.source_envelope(receipt)?;
+        receipts.push(receipt);
+        Ok::<_, crate::risk_inputs::RiskInputsUnavailable>(
+            crate::bucket_commit::CompleteActivityPage::from(envelope),
+        )
+    })?;
+    Ok(receipts)
+}
+
+pub(crate) fn decision_source_inputs(
+    row: &DecisionPendingRow,
+    index: &crate::risk_inputs::SourceReceiptIndex,
+) -> anyhow::Result<DecisionSourceInputs> {
+    let continuation = DecisionContinuationV3::from_durable(row)?;
+    let mut inputs = DecisionSourceInputs {
+        receipts: continuation.authority_receipts()?,
+        ..Default::default()
+    };
+    if continuation.version() >= 3 {
+        let mut lookup = |receipt| {
+            let envelope = index.source_envelope(receipt)?;
+            inputs.receipts.push(receipt);
+            Ok::<_, crate::risk_inputs::RiskInputsUnavailable>(
+                crate::bucket_commit::CompleteActivityPage::from(envelope),
+            )
+        };
+        if continuation.is_activity_frame() {
+            continuation.verify_activity_frame(&mut lookup)?;
+        } else {
+            continuation.reconstruct_complete_activity_read_with_bindings(&mut lookup)?;
+        }
+    }
+    if row.post_commit_inputs_json != "{}" {
+        let book = if row.state == DecisionPendingState::Terminal {
+            let replayed = replay_decision_pending(row)?;
+            if let Some(decline) = &replayed.post_boundary.body.terminal.decline {
+                match &decline.inputs {
+                    WinnerFollowDecisionInputs::Evaluated { economic } => {
+                        inputs.receipts.extend(economic_source_receipts(economic))
+                    }
+                    WinnerFollowDecisionInputs::RiskInputsUnavailable { evidence, .. } => inputs
+                        .receipts
+                        .extend(evidence.price_receipts.iter().copied()),
+                }
+            }
+            replayed.post_boundary.body.book
+        } else {
+            decode_checkpoint(&row.post_commit_inputs_json)?.body.book
+        };
+        if let Some(hash) = book.and_then(|book| book.response_blake3) {
+            inputs.payload_hashes.insert(hash);
+        }
+    }
+    inputs.receipts.sort_by_key(|receipt| receipt.sequence);
+    anyhow::ensure!(
+        !inputs
+            .receipts
+            .windows(2)
+            .any(|pair| pair[0].sequence == pair[1].sequence && pair[0] != pair[1]),
+        "decision source receipts conflict"
+    );
+    inputs.receipts.dedup();
+    Ok(inputs)
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -1269,6 +1409,86 @@ mod tests {
             terminal_disposition: Some(terminal.disposition),
             updated_at_unix: 1_700_000_001,
         }
+    }
+
+    #[test]
+    fn retention_inputs_share_complete_read_binding_authentication() {
+        let fixture = crate::bucket_commit::continuation_v3_tests::binding_fixture("valid");
+        let continuation = &fixture.continuation;
+        let row = DecisionPendingRow {
+            source_trade_id: continuation.facts.source_trade_id.clone(),
+            semantic_revision: continuation.facts.semantic_revision.clone(),
+            wallet: continuation.facts.wallet,
+            source_epoch: continuation.facts.source_epoch,
+            frozen_inputs_json: serde_json::to_string(continuation).unwrap(),
+            post_commit_inputs_json: "{}".into(),
+            state: DecisionPendingState::Open,
+            terminal_disposition: None,
+            updated_at_unix: 100,
+        };
+        let inputs = decision_source_inputs(&row, &fixture.index).unwrap();
+        for receipt in continuation
+            .authority_receipts()
+            .unwrap()
+            .into_iter()
+            .chain([fixture.metadata_receipt])
+        {
+            assert!(inputs.receipts.contains(&receipt));
+            assert_eq!(
+                fixture.index.source_envelope(receipt).unwrap().this_hash,
+                receipt.this_hash
+            );
+        }
+        let closure =
+            commitment_source_receipts(continuation.read_commitment.unwrap(), &fixture.index)
+                .unwrap();
+        assert!(closure.contains(&fixture.metadata_receipt));
+        assert!(
+            inputs
+                .receipts
+                .iter()
+                .all(|receipt| closure.contains(receipt))
+        );
+
+        let invalid = crate::bucket_commit::continuation_v3_tests::binding_fixture("metadata_hash");
+        let mut row = row;
+        row.frozen_inputs_json = serde_json::to_string(&invalid.continuation).unwrap();
+        assert!(decision_source_inputs(&row, &invalid.index).is_err());
+        assert!(
+            commitment_source_receipts(
+                invalid.continuation.read_commitment.unwrap(),
+                &invalid.index
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn retention_inputs_include_failed_price_receipts_and_recorded_book_hash() {
+        let failed = AppendReceipt {
+            sequence: EventSeq(12),
+            this_hash: blake3::hash(b"failed-price"),
+        };
+        let mut inputs = unavailable_inputs();
+        let WinnerFollowDecisionInputs::RiskInputsUnavailable { evidence, .. } = &mut inputs else {
+            panic!("fixture inputs");
+        };
+        evidence.price_receipts = vec![failed];
+        let row = terminal_row(
+            "failed-price",
+            AuthorityEvidence::not_read("strategy_declined"),
+            TerminalDispositionEvidence::declined(&WinnerFollowError::NoEdge, inputs),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.log");
+        drop(pe_event_log::Writer::open(&path).unwrap());
+        let index = crate::risk_inputs::SourceReceiptIndex::replay(&path).unwrap();
+        let captured = decision_source_inputs(&row, &index).unwrap();
+        assert_eq!(captured.receipts, vec![failed]);
+        assert_eq!(
+            captured.payload_hashes.into_iter().collect::<Vec<_>>(),
+            vec!["book-blake3"]
+        );
     }
 
     fn assert_byte_exact_replay(row: &DecisionPendingRow) -> ReplayedDecision {

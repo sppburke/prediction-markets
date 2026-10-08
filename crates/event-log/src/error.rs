@@ -23,6 +23,18 @@ impl std::fmt::Display for PoisonReason {
 
 #[derive(Debug, Error)]
 pub enum LogError {
+    #[error(transparent)]
+    Retention(#[from] crate::retention::RetentionError),
+
+    #[error("prefix ending at {physical_tail} was retired below boundary {boundary_offset}")]
+    Retired {
+        physical_tail: u64,
+        boundary_offset: u64,
+    },
+
+    #[error("feed archive epoch {epoch}: {message}")]
+    FeedArchive { epoch: u64, message: String },
+
     #[error("event-log scan cancelled")]
     Cancelled,
 

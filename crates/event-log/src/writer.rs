@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use crate::envelope::{EnvelopeIn, EventEnvelope, HashInput, compute_hashes};
 use crate::frame::{HEADER_LEN, write_file_header, write_frame};
 use crate::scanner::{LogTailBinding, PrefixVerdict, ScanOutcome, inspect_open, walk_locked};
-use crate::{LogError, PoisonReason};
+use crate::{LogError, PoisonReason, RetentionAuthority};
 
 trait DurableWrite: Write + Send + Sync {
     fn sync_all(&self) -> std::io::Result<()>;
@@ -114,6 +114,11 @@ impl Writer {
 
         let file_len = file.metadata()?.len();
         if file_len == 0 {
+            if RetentionAuthority::load(path)?.is_some() {
+                return Err(LogError::BadHeader {
+                    path: path.to_owned(),
+                });
+            }
             write_file_header(&mut file)?;
             file.flush()?;
             file.sync_all()?;
@@ -171,7 +176,7 @@ impl Writer {
         })?;
 
         if file.metadata()?.len() == 0 {
-            if expected_prefix.is_some() {
+            if expected_prefix.is_some() || RetentionAuthority::load(path)?.is_some() {
                 return Err(LogError::BadHeader {
                     path: path.to_owned(),
                 });
@@ -269,6 +274,10 @@ impl Writer {
                 LogError::Io(error)
             }
         })?;
+        let authority = RetentionAuthority::load(path)?;
+        if let Some(authority) = &authority {
+            authority.authenticate_binding(path, expected)?;
+        }
         let prefix_started = std::time::Instant::now();
         let file_len = if prefix_mode == CheckpointPrefix::Defer {
             Some(file.metadata()?.len())
@@ -278,13 +287,17 @@ impl Writer {
         let resume = checkpoint.and_then(|(tail, expected_hash)| {
             if tail.path != std::fs::canonicalize(path).ok()?
                 || tail.physical_tail < expected.physical_tail
+                || authority
+                    .as_ref()
+                    .is_some_and(|authority| tail.physical_tail < authority.boundary.offset)
             {
                 return None;
             }
             if let Some(file_len) = file_len {
                 return (file_len >= tail.physical_tail).then_some(tail);
             }
-            let hash = crate::scanner::hash_open_prefix(&file, tail.physical_tail, None).ok()?;
+            let hash =
+                crate::scanner::hash_open_prefix(path, &file, tail.physical_tail, None).ok()?;
             if hash.finalize().to_hex().as_str() != expected_hash {
                 return None;
             }
@@ -335,6 +348,9 @@ impl Writer {
         expected: &LogTailBinding,
     ) -> Result<Self, LogError> {
         let path = path.as_ref();
+        if let Some(authority) = RetentionAuthority::load(path)? {
+            authority.authenticate_binding(path, expected)?;
+        }
         let scan = crate::scanner::Scanner::inspect(path)?;
         let tail = &scan.verified_tail;
         // A binding names one canonical file (#572): a byte-identical twin must not authorize

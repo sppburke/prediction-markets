@@ -181,9 +181,52 @@ fn effective_live_wallet_list(live: &LiveWatchlist, paper: &PaperStateDb) -> Res
     Ok(wallets)
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build service runtime")?;
+    let result = runtime.block_on(run());
+    #[cfg(feature = "scenario")]
+    let teardown = std::time::Instant::now();
+    runtime.shutdown_timeout(pe_service::supervisor::POST_ABORT_JOIN_BOUND);
+    #[cfg(feature = "scenario")]
+    if env::args().nth(1).as_deref() == Some("--scenario-runtime-exit-cap") {
+        println!(
+            "scenario runtime teardown_ms={}",
+            teardown.elapsed().as_millis()
+        );
+    }
+    result
+}
+
+async fn run() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
+    #[cfg(feature = "scenario")]
+    if args
+        .first()
+        .is_some_and(|arg| arg == "--scenario-runtime-exit-cap")
+    {
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let stuck = move || {
+            let _ = started.send(());
+            loop {
+                std::thread::park();
+            }
+        };
+        match args.get(1).map(String::as_str) {
+            Some("blocking") => {
+                tokio::task::spawn_blocking(stuck);
+            }
+            Some("async") => {
+                tokio::spawn(async move { stuck() });
+            }
+            _ => anyhow::bail!("exit-cap scenario requires blocking or async"),
+        }
+        ready.await.context("wait for synchronous scenario work")?;
+        println!("scenario main finished");
+        return Ok(());
+    }
     let exit_after_anchors = args
         .iter()
         .any(|argument| argument == "--exit-after-anchors");
@@ -1190,6 +1233,19 @@ async fn main() -> Result<()> {
         TaskName::DiskMonitor,
         disk_monitor.run(health.clone(), shutdown.subscribe()),
     );
+    pe_service::source_checkpoint::install_retention_fence(&cfg.source_event_log_path)
+        .map_err(|error| {
+            // Like a boot quarantine failure: status 78 stops systemd restarts for quiesced recovery.
+            if matches!(
+                error,
+                pe_service::source_checkpoint::InvalidationError::QuarantineFailed(_)
+            ) {
+                eprintln!("pe-service: install source retention fence before listening: {error}");
+                std::process::exit(78);
+            }
+            error
+        })
+        .context("install source retention fence before listening")?;
     let listener = tokio::net::TcpListener::bind(&cfg.bind)
         .await
         .with_context(|| format!("bind {}", cfg.bind))?;
@@ -1275,6 +1331,36 @@ async fn main() -> Result<()> {
         obligations = obligations.len(),
         "activity obligations rebuilt"
     );
+
+    let boot_obligation_wallets = obligations
+        .wallets()
+        .collect::<std::collections::HashSet<_>>();
+    let (held_obligations_tx, held_obligations_rx) = watch::channel(
+        pe_service::trade_poller::HeldObligations::from(&obligations),
+    );
+    let database_retention = pe_service::database_retention::DatabaseRetention::new(
+        Arc::clone(&paper_state),
+        paper_writer.clone(),
+        live_watchlist.clone(),
+        admission_preparer.clone(),
+        control_tx.clone(),
+        boot_obligation_wallets,
+    )
+    .context("capture database retention boot obligations and paper prefix")?;
+    let retention_database = Arc::clone(&paper_state);
+    let retention_context = pe_service::source_checkpoint::RetentionContext {
+        paper_state: Arc::clone(&paper_state),
+        paper_log: Arc::new(paper_writer.clone()),
+        live_journal_path: supabase_state
+            .as_ref()
+            .map(|_| live_journal_path(&cfg.event_log_path)),
+        control: control_tx.clone(),
+        database_inputs: Arc::new(move || {
+            pe_service::source_checkpoint::RetentionDatabaseInputs::read(&retention_database)
+        }),
+        #[cfg(feature = "scenario")]
+        hooks: Arc::new(pe_service::source_checkpoint::RetentionHooks::default()),
+    };
 
     let (boot_frame_prefix, boot_frame_deliveries) = obligations.frame_recovery_receipts();
 
@@ -1379,6 +1465,7 @@ async fn main() -> Result<()> {
             Some(poller_admission_preparer),
         )
         .with_source_receipt_index(poller_source_receipts)
+        .with_held_obligations(held_obligations_tx)
         .run_until(public_poll_shutdown.wait_for(ShutdownPhase::StopProducers))
         .await
         .map(|()| TaskExit::CleanShutdown)
@@ -1982,7 +2069,11 @@ async fn main() -> Result<()> {
     if let Some(boot) = source_log_boot.take() {
         let owner = boot
             .into_checkpoint_owner(checkpoint_slot.clone())
-            .with_paper_state(Arc::clone(&paper_state));
+            .with_paper_state(Arc::clone(&paper_state))
+            .with_database_retention(database_retention)
+            .with_held_obligations(held_obligations_rx)
+            .with_retention(retention_context)
+            .context("attach daily source and database retention")?;
         #[cfg(feature = "scenario")]
         let owner = {
             let mut owner = owner;
@@ -2491,7 +2582,7 @@ async fn tick_financial_resolution(
         )
         .await
         {
-            warn!(condition = %condition.0, error = %error, "financial resolution condition failed; continuing");
+            warn!(condition = %condition.0, error = %format!("{error:#}"), "financial resolution condition failed; continuing");
         }
     }
     Ok(())

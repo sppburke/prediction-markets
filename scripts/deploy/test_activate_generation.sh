@@ -132,6 +132,20 @@ set -e
   fail "digest-bound adoption replaced the destination with unreviewed bytes"
 grep -q 'source hash changed before adoption' "$TEST_TMP/adopt.err" ||
   fail "digest-bound adoption refusal was not explicit"
+
+# Sparse adoption preserves holes and hashes a file larger than the chunk size correctly.
+python3 - "$adopt_source" <<'PY'
+import sys
+with open(sys.argv[1], "wb") as source:
+    source.write(b"head")
+    source.seek(16 * 1024 * 1024)
+    source.write(b"tail")
+PY
+PE_ACTIVATION_TESTING=1 PE_ACTIVATION_TEST_ROOT="$TEST_TMP" bash -c \
+  'source "$1"; atomic_adopt "$2" "$3" 0600 sparse-adopt' \
+  bash "$SCRIPT_DIR/generation_common.sh" "$adopt_source" "$adopt_destination"
+cmp "$adopt_source" "$adopt_destination" || fail "sparse adoption changed bytes"
+[[ $(stat -c '%b' "$adopt_destination") -lt 1024 ]] || fail "sparse adoption allocated the holes"
 fi
 
 write_shims() {
@@ -601,6 +615,10 @@ EOF
   for name in boot-checkpoint boot-checkpoint.receipts boot-checkpoint.invalidation; do
     printf '%s\n' "old-$name" > "$service/old/source_events.log.$name"
   done
+  printf '%s\n' '{"authority":{"epoch":1,"feed":[{"epoch":1}]},"checksum":"0"}' > "$service/old/source_events.log.retention"
+  mkdir -p "$service/old/source_events.log.feed/nested"
+  printf 'EDGE\001retained-feed\n' > "$service/old/source_events.log.feed/1.frames"
+  printf '%s\n' nested-feed > "$service/old/source_events.log.feed/nested/evidence.frames"
   printf '%s\n' old-live > "$service/old/live_journal.log"
   printf '%s\n' old-db > "$service/old/paper_state.db"
   printf '%s\n' old-history > "$service/old/wallet_market_history.json"
@@ -691,6 +709,21 @@ assert_verified() {
       "$root/prediction-markets/gen/557/pre-t0/source_log.$name" ||
       fail "archive omitted or changed checkpoint companion $name"
   done
+  for name in retention feed/1.frames feed/nested/evidence.frames; do
+    cmp "$root/prediction-markets/old/source_events.log.$name" \
+      "$root/prediction-markets/gen/557/pre-t0/source_log.$name" ||
+      fail "archive omitted or changed retained evidence $name"
+  done
+  python3 - "$root/pe-activation.json" <<'PY' || fail "retention archive inventory hashes mismatched"
+import hashlib, json, sys
+value = json.load(open(sys.argv[1], encoding="utf-8"))["archive_artifacts"]
+for name in ("source_log_retention", "source_log_feed/1_frames", "source_log_feed/nested/evidence_frames"):
+    row = value[name]
+    digest = hashlib.sha256()
+    with open(row["path"], "rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""): digest.update(chunk)
+    assert row["sha256"] == digest.hexdigest()
+PY
   python3 -c 'import json,sys
 value=json.load(open(sys.argv[1], encoding="utf-8"))
 assert value["ranking_batch_id"] == 7
@@ -783,6 +816,7 @@ artifact_boundaries=(
   stage-binary rendered-config rendered-rehearsal-config rendered-env rendered-rehearsal-env
   archive-paper-state archive-paper_log archive-source_log archive-live_journal
   archive-boot-checkpoint archive-boot-checkpoint.receipts archive-boot-checkpoint.invalidation
+  archive-retention archive-feed
   archive-legacy_history archive-config archive-env archive-binary archive-status
   adopted-config adopted-env adopted-binary db-commit service-started
 )
@@ -2075,6 +2109,57 @@ for state in reset switched started verified; do
   [[ "$state" != started && "$state" != verified ]] || expected_starts=2
   assert_rolled_back "$root" true "$expected_starts"
 done
+
+if shard_owns 2; then
+# Release-2 census: a known pe-service binary (by path), a renamed copy of one (by size and hash) and a process
+# whose argv names the generation config (relative to its cwd) are reported with their identity; a program merely
+# named like pe-service is not; an allowed PID is listed but never counted; killed processes disappear.
+# Assertions use only this test's own PIDs.
+census_dir="$TEST_TMP/census"
+mkdir -p "$census_dir/root/smoke-test"
+: > "$census_dir/root/smoke-test/service.toml"
+tail_bin=$(command -v tail)
+cp "$tail_bin" "$census_dir/pe-service.bak-census"
+cp "$tail_bin" "$census_dir/pe-service"
+cp "$tail_bin" "$census_dir/renamed"
+"$census_dir/pe-service.bak-census" -f /dev/null & known_pid=$!
+"$census_dir/renamed" -f /dev/null & renamed_pid=$!
+(cd "$census_dir/root" && exec python3 -c 'import time; time.sleep(600)' smoke-test/service.toml) & config_pid=$!
+bash -c 'exec -a pe-service-live-canary sleep 600' & canary_pid=$!
+sleep 0.5
+census() {
+  set +e
+  "$SCRIPT_DIR/pe_service_census.sh" --config smoke-test/service.toml --cwd-root "$census_dir/root" \
+    --binary "$census_dir/pe-service" --binary-glob "$census_dir/pe-service.bak-*" "$@" > "$census_dir/out.jsonl"
+  census_rc=$?
+  set -e
+}
+census --allow "$known_pid"
+[[ "$census_rc" == 3 ]] || fail "census did not report matches (rc=$census_rc)"
+python3 - "$census_dir/out.jsonl" "$known_pid" "$renamed_pid" "$config_pid" "$canary_pid" <<'PYCHECK' || fail "census records are wrong"
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1])]
+summary, records = rows[-1], {row["pid"]: row for row in rows[:-1]}
+known, renamed, config, canary = map(int, sys.argv[2:])
+assert "binary-path" in records[known]["reasons"] and records[known]["allowed"], records.get(known)
+assert "known-binary-hash" in records[renamed]["reasons"] and not records[renamed]["allowed"], records.get(renamed)
+assert "config-argument" in records[config]["reasons"], records.get(config)
+assert canary not in records, records.get(canary)
+for pid in (known, renamed, config):
+    assert records[pid]["start_unix"] > 0 and records[pid]["argv"], records[pid]
+assert records[renamed]["exe_sha256"], records[renamed]
+assert known not in summary["matches"] and renamed in summary["matches"] and config in summary["matches"], summary
+PYCHECK
+kill "$known_pid" "$renamed_pid" "$config_pid" "$canary_pid"
+wait "$known_pid" "$renamed_pid" "$config_pid" "$canary_pid" 2>/dev/null || true
+census
+python3 - "$census_dir/out.jsonl" "$known_pid" "$renamed_pid" "$config_pid" <<'PYCHECK' || fail "census still reports killed processes"
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1])]
+assert not {int(pid) for pid in sys.argv[2:]} & {row.get("pid") for row in rows[:-1]}
+PYCHECK
+echo "release-2 process census: PASS"
+fi
 
 (( SHARD_TOTAL > 1 )) || echo "activation crash matrix: PASS"
 echo "archive stamp exactly once and fresh service starts at most once: PASS"

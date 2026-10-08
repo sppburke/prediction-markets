@@ -3,7 +3,14 @@
 //! Source-log verification and candidate serialization precede the persistent checkpoint lock. A
 //! serialized candidate keeps its authority and capture time through every publication retry.
 
+pub(crate) mod retention;
 mod runtime;
+#[cfg(feature = "scenario")]
+pub use retention::RetentionHooks;
+pub use retention::{
+    RetentionCommitOutcome, RetentionCommitRequest, RetentionContext, RetentionDatabaseInputs,
+    SOURCE_RETENTION_ADVANCE_SECS, SOURCE_RETENTION_BUFFER_SECS,
+};
 pub use runtime::{
     CHECKPOINT_PUBLISH_SECS, CHECKPOINT_RETRY_SECS, CheckpointJobSlot, SourceCheckpointOwner,
 };
@@ -15,7 +22,7 @@ use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use pe_event_log::LogTailBinding;
+use pe_event_log::{LogTailBinding, RECEIPT_RECORD_LEN, ReceiptRecord, RetentionAuthority};
 use serde::{Deserialize, Serialize, de::IgnoredAny};
 use thiserror::Error;
 use tracing::info;
@@ -25,7 +32,6 @@ use crate::source_log_boot::ACTIVITY_REDUCER_VERSION;
 use crate::trade_poller::{ActivityCandidates, DailyBoundaryCandidates};
 
 pub(crate) const CHECKPOINT_HEADER_LEN: usize = 65;
-const RECEIPT_RECORD_LEN: u64 = 80;
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct CheckpointData {
@@ -49,6 +55,7 @@ pub(crate) struct CheckpointData {
 /// The checksum identifies the exact artifact checked by a preparation, even when reducer maps
 /// serialize in different orders at the same tail.
 pub(crate) struct LoadedCheckpoint {
+    pub(crate) retention_epoch: u64,
     pub(crate) data: CheckpointData,
     pub(crate) checksum: [u8; 64],
     pub(crate) staging: SourceReceiptIndexStaging,
@@ -63,6 +70,8 @@ struct HeaderView {
     activation: LogTailBinding,
     tail: LogTailBinding,
     prefix_blake3: String,
+    #[serde(default)]
+    retention_epoch: u64,
     #[serde(default, rename = "generation")]
     _generation: u64,
     receipt_count: Option<usize>,
@@ -101,31 +110,23 @@ fn receipt_position(count: usize) -> io::Result<u64> {
 }
 
 fn encode_record(frame: &SourceFrameMetadata) -> [u8; 80] {
-    let mut bytes = [0; 80];
-    bytes[..32].copy_from_slice(frame.receipt.this_hash.as_bytes());
-    bytes[32..40].copy_from_slice(&frame.received_millis.to_le_bytes());
-    bytes[40..48].copy_from_slice(&frame.byte_offset.unwrap_or(u64::MAX).to_le_bytes());
-    let checksum = blake3::hash(&bytes[..48]);
-    bytes[48..].copy_from_slice(checksum.as_bytes());
-    bytes
+    ReceiptRecord {
+        receipt: frame.receipt,
+        received_millis: frame.received_millis,
+        byte_offset: frame.byte_offset,
+    }
+    .encode()
 }
 
 fn read_record(reader: &mut impl Read, sequence: usize) -> io::Result<SourceFrameMetadata> {
-    let mut bytes = [0; 80];
-    reader.read_exact(&mut bytes)?;
-    if bytes[48..] != *blake3::hash(&bytes[..48]).as_bytes() {
-        return Err(io::Error::other("checkpoint receipt checksum mismatch"));
-    }
-    let hash = bytes[..32].try_into().map_err(io::Error::other)?;
-    let received = bytes[32..40].try_into().map_err(io::Error::other)?;
-    let offset = u64::from_le_bytes(bytes[40..48].try_into().map_err(io::Error::other)?);
+    let record = ReceiptRecord::read(
+        reader,
+        pe_core_types::EventSeq(u64::try_from(sequence).map_err(io::Error::other)?),
+    )?;
     Ok(SourceFrameMetadata {
-        receipt: pe_event_log::AppendReceipt {
-            sequence: pe_core_types::EventSeq(u64::try_from(sequence).map_err(io::Error::other)?),
-            this_hash: blake3::Hash::from_bytes(hash),
-        },
-        received_millis: i64::from_le_bytes(received),
-        byte_offset: (offset != u64::MAX).then_some(offset),
+        receipt: record.receipt,
+        received_millis: record.received_millis,
+        byte_offset: record.byte_offset,
     })
 }
 
@@ -167,6 +168,12 @@ fn record_path(source_log: &Path) -> PathBuf {
 pub struct InvalidationRecord {
     pub generation: u64,
     pub active: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub retention_fence: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 /// Undecodable records are quarantines, never an absent or inactive record.
@@ -207,12 +214,36 @@ pub fn read_authority(source_log: &Path) -> io::Result<Authority> {
     }
 }
 
-struct CheckpointLock {
+/// Install the old-reader fence at service boot, before any listener or producer starts.
+/// Staged preparation deliberately never calls this function.
+pub fn install_retention_fence(source_log: &Path) -> Result<(), InvalidationError> {
+    let _lock = CheckpointLock::acquire(source_log).map_err(InvalidationError::QuarantineFailed)?;
+    let Authority::Readable(mut record) =
+        read_authority(source_log).map_err(InvalidationError::QuarantineFailed)?
+    else {
+        return Err(InvalidationError::QuarantineFailed(io::Error::other(
+            "invalidation record unreadable; quiesced recovery required",
+        )));
+    };
+    record.retention_fence = true;
+    let bytes = record_bytes(record).map_err(InvalidationError::QuarantineFailed)?;
+    DurableFinalization
+        .record_write(&record_path(source_log), &bytes)
+        .map_err(InvalidationError::QuarantineFailed)
+}
+
+pub(crate) fn retention_epoch(source_log: &Path) -> io::Result<u64> {
+    Ok(RetentionAuthority::load(source_log)
+        .map_err(io::Error::other)?
+        .map_or(0, |authority| authority.epoch))
+}
+
+pub(crate) struct CheckpointLock {
     _file: File,
 }
 
 impl CheckpointLock {
-    fn acquire(source_log: &Path) -> io::Result<Self> {
+    pub(crate) fn acquire(source_log: &Path) -> io::Result<Self> {
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -253,7 +284,7 @@ fn check_artifact(
         1 => header.receipts.as_ref().is_some_and(|receipts| {
             SourceReceiptIndex::checkpoint_metadata_valid(path, receipts, &header.tail).is_ok()
         }),
-        2 => {
+        2 | 3 => {
             header.receipts.is_none()
                 && header.receipt_count == tail_receipt_count(&header.tail).ok()
                 && std::fs::canonicalize(path)? == header.tail.path
@@ -263,7 +294,10 @@ fn check_artifact(
         }
         _ => false,
     };
-    if header.scanner_version != 1
+    let epoch = retention_epoch(path)?;
+    if header.retention_epoch != epoch
+        || (header.format_version == 3) != (epoch > 0)
+        || header.scanner_version != 1
         || header.financial_era != financial_era
         || header.activation != *activation
         || header.tail.path != activation.path
@@ -279,7 +313,7 @@ fn check_artifact(
     }
     if !receipts_valid {
         return Ok((
-            if header.format_version == 2 {
+            if matches!(header.format_version, 2 | 3) {
                 ArtifactCheck::InvalidReceipts
             } else {
                 ArtifactCheck::Inapplicable
@@ -325,6 +359,7 @@ fn load_with_finalization(
     if header.reducer_version != 2 && header.reducer_version != ACTIVITY_REDUCER_VERSION {
         return Ok(None);
     }
+    let retention_epoch = header.retention_epoch;
     drop(header);
     let mut data: CheckpointData = match serde_json::from_slice(&bytes[CHECKPOINT_HEADER_LEN..]) {
         Ok(data) => data,
@@ -337,7 +372,7 @@ fn load_with_finalization(
         data.format_version = 2;
         data.generation = read_authority(path)?.generation().unwrap_or(0);
         data.receipt_count = Some(frames.len());
-        let converted = serialize_manifest(&data).map_err(io::Error::other)?;
+        let converted = serialize_manifest(&data, 0).map_err(io::Error::other)?;
         let conversion = write_receipts(path, 0, &frames, true, finalization)
             .and_then(|()| finalization.checkpoint_write(&checkpoint_path(path), &converted));
         if let Err(error) = conversion {
@@ -370,6 +405,7 @@ fn load_with_finalization(
         }
     };
     Ok(Some(LoadedCheckpoint {
+        retention_epoch,
         data,
         checksum,
         staging,
@@ -391,7 +427,7 @@ pub(crate) fn capture_start(
     count: usize,
 ) -> usize {
     match check_artifact(&activation.path, activation, financial_era) {
-        Ok((ArtifactCheck::Valid(current), _)) if current.format_version == 2 => {
+        Ok((ArtifactCheck::Valid(current), _)) if matches!(current.format_version, 2 | 3) => {
             current.receipt_count.unwrap_or(0).min(count)
         }
         _ => 0,
@@ -408,6 +444,7 @@ pub struct SerializedCandidate {
     prefix_blake3: String,
     reducer_version: u32,
     authority_generation: u64,
+    retention_epoch: u64,
     capture_unix_ms: u64,
     receipt_start: usize,
     receipt_count: usize,
@@ -418,12 +455,18 @@ pub(crate) fn serialize(
     mut data: CheckpointData,
     authority_generation: u64,
     capture_unix_ms: u64,
+    retention_epoch: u64,
 ) -> Result<SerializedCandidate, serde_json::Error> {
+    data.format_version = if retention_epoch == 0 {
+        data.format_version
+    } else {
+        3
+    };
     data.generation = authority_generation;
     let receipt_count = data.receipt_count.unwrap_or(data.receipts.len());
     let receipt_start = receipt_count.saturating_sub(data.receipts.len());
     let receipts = std::mem::take(&mut data.receipts);
-    let encoded = serialize_manifest(&data)?;
+    let encoded = serialize_manifest(&data, retention_epoch)?;
     Ok(SerializedCandidate {
         bytes: encoded,
         activation: data.activation,
@@ -432,6 +475,7 @@ pub(crate) fn serialize(
         prefix_blake3: data.prefix_blake3,
         reducer_version: data.reducer_version,
         authority_generation,
+        retention_epoch,
         capture_unix_ms,
         receipt_start,
         receipt_count,
@@ -439,10 +483,29 @@ pub(crate) fn serialize(
     })
 }
 
-fn serialize_manifest(data: &CheckpointData) -> Result<Vec<u8>, serde_json::Error> {
+fn serialize_manifest(
+    data: &CheckpointData,
+    retention_epoch: u64,
+) -> Result<Vec<u8>, serde_json::Error> {
+    #[derive(Serialize)]
+    struct Manifest<'a> {
+        #[serde(flatten)]
+        data: &'a CheckpointData,
+        #[serde(skip_serializing_if = "is_zero")]
+        retention_epoch: u64,
+    }
+    fn is_zero(value: &u64) -> bool {
+        *value == 0
+    }
     let mut encoded = vec![b'0'; CHECKPOINT_HEADER_LEN];
     encoded[64] = b'\n';
-    serde_json::to_writer(&mut encoded, &data)?;
+    serde_json::to_writer(
+        &mut encoded,
+        &Manifest {
+            data,
+            retention_epoch,
+        },
+    )?;
     let checksum = blake3::hash(&encoded[CHECKPOINT_HEADER_LEN..]).to_hex();
     encoded[..64].copy_from_slice(checksum.as_bytes());
     Ok(encoded)
@@ -476,6 +539,7 @@ pub enum PublishOutcome {
     Published(PublicationReceipt),
     Refused(RefusalReason),
     GenerationChanged { candidate: u64, current: u64 },
+    RetentionChanged { candidate: u64, current: u64 },
 }
 
 #[derive(Debug, Error)]
@@ -490,10 +554,6 @@ pub enum InvalidationError {
     QuarantineFailed(#[source] io::Error),
     #[error("source checkpoint invalidation I/O: {0}")]
     Io(#[from] io::Error),
-    #[error("source checkpoint authority unreadable; quiesced recovery required")]
-    UnreadableRecord,
-    #[error("source checkpoint generation exhausted")]
-    GenerationOverflow,
 }
 
 pub(crate) fn unix_ms() -> io::Result<u64> {
@@ -512,8 +572,11 @@ trait Finalization {
     fn receipts_remove(&mut self, path: &Path) -> io::Result<bool> {
         remove_if_present(path)
     }
-    fn quarantine_rename(&mut self, from: &Path, to: &Path) -> io::Result<()> {
-        std::fs::rename(from, to)
+    fn checkpoint_remove(&mut self, path: &Path) -> io::Result<bool> {
+        remove_if_present(path)
+    }
+    fn receipts_trim(&mut self, file: &File, length: u64) -> io::Result<()> {
+        file.set_len(length)
     }
     fn sync_directory(&mut self, target: &Path) -> io::Result<()> {
         sync_directory(target)
@@ -637,16 +700,39 @@ fn publish_with_finalization(
                 current: record.generation,
             });
         }
+        let epoch = retention_epoch(path)?;
+        if candidate.retention_epoch != epoch {
+            return Ok(PublishOutcome::RetentionChanged {
+                candidate: candidate.retention_epoch,
+                current: epoch,
+            });
+        }
+        let retention = RetentionAuthority::load(path).map_err(io::Error::other)?;
+        if retention.is_some() {
+            RetentionAuthority::sync_directory(path).map_err(io::Error::other)?;
+        }
+        let prefix_count = retained_receipt_count(retention.as_ref())?;
+        if let Some(authority) = &retention {
+            verify_receipts_prefix(path, authority)?;
+        }
         let (check, bytes) = check_artifact(path, &candidate.activation, candidate.financial_era)?;
         drop(bytes);
-        let mut installed_count = 0;
+        let mut installed_count = prefix_count;
         match check {
             ArtifactCheck::Absent => decision = "replace_absent",
             ArtifactCheck::Invalid => decision = "replace_invalid",
             ArtifactCheck::InvalidReceipts => decision = "replace_invalid_receipts",
             ArtifactCheck::Inapplicable => decision = "replace_inapplicable",
             ArtifactCheck::Valid(current) => {
-                if current.reducer_version > candidate.reducer_version {
+                if current.retention_epoch > candidate.retention_epoch {
+                    return Ok(PublishOutcome::RetentionChanged {
+                        candidate: candidate.retention_epoch,
+                        current: current.retention_epoch,
+                    });
+                }
+                if current.retention_epoch < candidate.retention_epoch {
+                    decision = "replace_older_epoch";
+                } else if current.reducer_version > candidate.reducer_version {
                     return Ok(PublishOutcome::Refused(RefusalReason::NewerReducer));
                 }
                 if current.reducer_version < candidate.reducer_version {
@@ -668,7 +754,7 @@ fn publish_with_finalization(
                 } else {
                     decision = "replace_earlier_tail";
                 }
-                if current.format_version == 2 {
+                if matches!(current.format_version, 2 | 3) {
                     if !installed_receipts_valid(path, &current)? {
                         return Err(
                             io::Error::other("installed checkpoint receipts invalid").into()
@@ -683,7 +769,9 @@ fn publish_with_finalization(
             }
         }
         let write_started = Instant::now();
-        let start = installed_count.min(candidate.receipt_count);
+        let start = installed_count
+            .min(candidate.receipt_count)
+            .max(prefix_count);
         let frames = candidate
             .receipts
             .get(
@@ -733,53 +821,109 @@ fn record_bytes(record: InvalidationRecord) -> io::Result<Vec<u8>> {
     serde_json::to_vec(&record).map_err(io::Error::other)
 }
 
-/// Establish a durable quarantine of both files before changing the authority generation.
-/// A quarantine failure is typed separately so the runtime owner can suppress automatic restart.
+/// Revoke old candidates before removing any checkpoint state. Every failure preserves the
+/// fence and the retained receipts prefix; a visible active record remains a quarantine.
 pub fn invalidate(source_log: &Path) -> Result<u64, InvalidationError> {
     let _lock = CheckpointLock::acquire(source_log).map_err(InvalidationError::QuarantineFailed)?;
     invalidate_locked(source_log, &mut DurableFinalization)
+}
+
+fn retained_receipt_count(authority: Option<&RetentionAuthority>) -> io::Result<usize> {
+    authority.map_or(Ok(0), |authority| {
+        usize::try_from(authority.boundary.sequence.0).map_err(io::Error::other)
+    })
+}
+
+pub(crate) fn verify_receipts_prefix(
+    path: &Path,
+    authority: &RetentionAuthority,
+) -> io::Result<()> {
+    let count = retained_receipt_count(Some(authority))?;
+    let mut reader = BufReader::new(File::open(receipts_path(path))?);
+    if reader.get_ref().metadata()?.len() < receipt_position(count)? {
+        return Err(io::Error::other("retained checkpoint receipts are missing"));
+    }
+    let mut previous_offset = None;
+    let mut previous_hash = blake3::Hash::from_bytes([0; 32]);
+    for sequence in 0..count {
+        let frame = read_record(&mut reader, sequence)?;
+        let offset = frame
+            .byte_offset
+            .ok_or_else(|| io::Error::other("retained receipt has no offset"))?;
+        if offset < pe_event_log::HEADER_LEN
+            || offset >= authority.boundary.offset
+            || previous_offset.is_some_and(|previous| offset <= previous)
+        {
+            return Err(io::Error::other("retained receipt offsets differ"));
+        }
+        if let Some(pin) = authority.pin(frame.receipt.sequence)
+            && (pin.offset != offset
+                || pin.hash != frame.receipt.this_hash
+                || pin.predecessor_hash != previous_hash)
+        {
+            return Err(io::Error::other("retained pin receipt differs"));
+        }
+        previous_offset = Some(offset);
+        previous_hash = frame.receipt.this_hash;
+    }
+    if previous_hash != authority.chain_head {
+        return Err(io::Error::other("retained receipt chain head differs"));
+    }
+    Ok(())
+}
+
+fn trim_checkpoint_state(
+    path: &Path,
+    finalization: &mut impl Finalization,
+) -> io::Result<(bool, bool)> {
+    let retention = RetentionAuthority::load(path).map_err(io::Error::other)?;
+    let checkpoint_removed = finalization.checkpoint_remove(&checkpoint_path(path))?;
+    finalization.sync_directory(&checkpoint_path(path))?;
+    let receipts_removed = if let Some(authority) = &retention {
+        verify_receipts_prefix(path, authority)?;
+        let file = OpenOptions::new().write(true).open(receipts_path(path))?;
+        finalization.receipts_trim(
+            &file,
+            receipt_position(retained_receipt_count(Some(authority))?)?,
+        )?;
+        finalization.receipts_sync(&file)?;
+        false
+    } else {
+        finalization.receipts_remove(&receipts_path(path))?
+    };
+    finalization.sync_directory(&receipts_path(path))?;
+    Ok((checkpoint_removed, receipts_removed))
 }
 
 fn invalidate_locked(
     path: &Path,
     finalization: &mut impl Finalization,
 ) -> Result<u64, InvalidationError> {
-    let authority = read_authority(path).map_err(InvalidationError::QuarantineFailed)?;
-    let checkpoint = checkpoint_path(path);
-    let record = record_path(path);
-    let renamed = match finalization.quarantine_rename(&checkpoint, &record) {
-        Ok(()) => true,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-        Err(error) => return Err(InvalidationError::QuarantineFailed(error)),
+    let Authority::Readable(current) =
+        read_authority(path).map_err(InvalidationError::QuarantineFailed)?
+    else {
+        return Err(InvalidationError::QuarantineFailed(io::Error::other(
+            "invalidation record unreadable; quiesced recovery required",
+        )));
     };
-    let receipts_removed = finalization
-        .receipts_remove(&receipts_path(path))
-        .map_err(InvalidationError::QuarantineFailed)?;
-    if renamed || receipts_removed {
-        finalization
-            .sync_directory(&record)
-            .map_err(InvalidationError::QuarantineFailed)?;
-    }
-    let Authority::Readable(current) = authority else {
-        return Err(InvalidationError::UnreadableRecord);
-    };
-    let generation = current
-        .generation
-        .checked_add(1)
-        .ok_or(InvalidationError::GenerationOverflow)?;
-    let bytes = record_bytes(InvalidationRecord {
+    let generation = current.generation.checked_add(1).ok_or_else(|| {
+        InvalidationError::QuarantineFailed(io::Error::other("checkpoint generation exhausted"))
+    })?;
+    let record = InvalidationRecord {
         generation,
         active: true,
-    })?;
+        ..current
+    };
+    remove_own_temporaries(path).map_err(InvalidationError::QuarantineFailed)?;
+    let bytes = record_bytes(record).map_err(InvalidationError::QuarantineFailed)?;
     finalization
-        .record_write(&record, &bytes)
-        .map_err(|error| {
-            if renamed {
-                InvalidationError::Io(error)
-            } else {
-                InvalidationError::QuarantineFailed(error)
-            }
-        })?;
+        .record_write(&record_path(path), &bytes)
+        .map_err(InvalidationError::QuarantineFailed)?;
+    // An interrupted rename is synced again by quiesced recovery before removal proceeds.
+    finalization
+        .sync_directory(&record_path(path))
+        .map_err(InvalidationError::QuarantineFailed)?;
+    trim_checkpoint_state(path, finalization).map_err(InvalidationError::QuarantineFailed)?;
     Ok(generation)
 }
 
@@ -788,14 +932,17 @@ pub(crate) enum ConditionalInvalidation {
     Changed,
 }
 
-/// A preparation may invalidate only the exact artifact and authority it hashed.
+/// A preparation may invalidate only the exact artifact, authority and retention epoch it hashed.
 pub(crate) fn invalidate_if_current(
     source_log: &Path,
     generation: u64,
+    epoch: u64,
     checksum: &[u8; 64],
 ) -> Result<ConditionalInvalidation, InvalidationError> {
     let _lock = CheckpointLock::acquire(source_log)?;
-    if read_authority(source_log)?.generation() != Some(generation) {
+    if retention_epoch(source_log)? != epoch
+        || read_authority(source_log)?.generation() != Some(generation)
+    {
         return Ok(ConditionalInvalidation::Changed);
     }
     let mut file = match File::open(checkpoint_path(source_log)) {
@@ -830,7 +977,7 @@ pub struct RecoveryReceipt {
 }
 
 /// The operator must stop and drain the service and finish or terminate every preparation first.
-/// Remove and sync both checkpoint files before resetting authority; the persistent lock stays.
+/// Install a fenced active generation before removing checkpoint state; retained receipts stay.
 pub fn recover_quiesced(source_log: &Path) -> io::Result<RecoveryReceipt> {
     recover_with_finalization(source_log, &mut DurableFinalization)
 }
@@ -843,11 +990,33 @@ fn recover_with_finalization(
     let checkpoint = checkpoint_path(path);
     let receipts = receipts_path(path);
     let record = record_path(path);
-    let checkpoint_removed = remove_if_present(&checkpoint)?;
-    let receipts_removed = finalization.receipts_remove(&receipts)?;
-    finalization.sync_directory(&checkpoint)?;
-    let record_removed = remove_if_present(&record)?;
+    let mut current = match read_authority(path)? {
+        Authority::Readable(current) => current,
+        // Quiesced recovery is the sole way to replace unreadable authority. Fence conservatively.
+        Authority::Unreadable => InvalidationRecord {
+            retention_fence: true,
+            ..Default::default()
+        },
+    };
+    current.retention_fence |= RetentionAuthority::load(path)
+        .map_err(io::Error::other)?
+        .is_some();
+    let generation = current
+        .generation
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("checkpoint generation exhausted"))?;
+    remove_own_temporaries(path)?;
+    finalization.record_write(
+        &record,
+        &record_bytes(InvalidationRecord {
+            generation,
+            active: true,
+            ..current
+        })?,
+    )?;
     finalization.sync_directory(&record)?;
+    let (checkpoint_removed, receipts_removed) = trim_checkpoint_state(path, finalization)?;
+    let record_removed = false;
     Ok(RecoveryReceipt {
         checkpoint,
         checkpoint_removed,
@@ -933,12 +1102,6 @@ pub fn invalidate_with_hooks(
     use std::sync::atomic::Ordering;
     struct ScenarioFinalization<'a>(&'a InvalidationHooks);
     impl Finalization for ScenarioFinalization<'_> {
-        fn quarantine_rename(&mut self, from: &Path, to: &Path) -> io::Result<()> {
-            if self.0.fail_quarantine_rename.swap(false, Ordering::SeqCst) {
-                return Err(io::Error::other("scenario quarantine rename"));
-            }
-            std::fs::rename(from, to)
-        }
         fn sync_directory(&mut self, path: &Path) -> io::Result<()> {
             if self.0.fail_quarantine_sync.swap(false, Ordering::SeqCst) {
                 return Err(io::Error::other("scenario quarantine sync"));
@@ -946,7 +1109,9 @@ pub fn invalidate_with_hooks(
             sync_directory(path)
         }
         fn record_write(&mut self, target: &Path, bytes: &[u8]) -> io::Result<()> {
-            if self.0.fail_record_write.swap(false, Ordering::SeqCst) {
+            if self.0.fail_quarantine_rename.swap(false, Ordering::SeqCst)
+                || self.0.fail_record_write.swap(false, Ordering::SeqCst)
+            {
                 return Err(io::Error::other("scenario record write"));
             }
             crate::qualification::write_report(target, bytes)
@@ -1037,7 +1202,7 @@ mod tests {
         }
 
         fn candidate(&self, tail: usize, version: u32, generation: u64) -> SerializedCandidate {
-            serialize(self.data(tail, version), generation, CAPTURE).unwrap()
+            serialize(self.data(tail, version), generation, CAPTURE, 0).unwrap()
         }
 
         fn stage(&self, candidate: &SerializedCandidate) {
@@ -1056,7 +1221,12 @@ mod tests {
         fn record(&self, generation: u64, active: bool) {
             crate::qualification::write_report(
                 &record_path(&self.path),
-                &record_bytes(InvalidationRecord { generation, active }).unwrap(),
+                &record_bytes(InvalidationRecord {
+                    generation,
+                    active,
+                    retention_fence: false,
+                })
+                .unwrap(),
             )
             .unwrap();
         }
@@ -1133,11 +1303,11 @@ mod tests {
             }
             file.sync_all()
         }
-        fn quarantine_rename(&mut self, from: &Path, to: &Path) -> io::Result<()> {
+        fn checkpoint_remove(&mut self, path: &Path) -> io::Result<bool> {
             if self.fails(Fault::QuarantineRename) {
-                return Err(io::Error::other("injected quarantine rename"));
+                return Err(io::Error::other("injected checkpoint removal"));
             }
-            std::fs::rename(from, to)
+            remove_if_present(path)
         }
         fn sync_directory(&mut self, target: &Path) -> io::Result<()> {
             if self.fails(Fault::QuarantineSync) {
@@ -1181,7 +1351,7 @@ mod tests {
         assert_eq!(start, 1);
         let mut data = fixture.data(2, 2);
         data.receipts = index.checkpoint_suffix(start, count, tail).unwrap();
-        let candidate = serialize(data, 0, CAPTURE).unwrap();
+        let candidate = serialize(data, 0, CAPTURE, 0).unwrap();
         assert_eq!(candidate.receipts.len(), 2);
         receipt(attempt(&candidate, &mut DurableFinalization).unwrap());
         let appended = std::fs::read(receipts_path(&fixture.path)).unwrap();
@@ -1213,7 +1383,7 @@ mod tests {
             .unwrap()
             .checkpoint_suffix(start, count, &data.tail)
             .unwrap();
-        serialize(data, 0, CAPTURE).unwrap()
+        serialize(data, 0, CAPTURE, 0).unwrap()
     }
 
     #[test]
@@ -1395,7 +1565,7 @@ mod tests {
         let loaded = load_checkpoint(&fixture.path, &fixture.activation, false)
             .unwrap()
             .unwrap();
-        let candidate = serialize(loaded.data, 4, CAPTURE).unwrap();
+        let candidate = serialize(loaded.data, 4, CAPTURE, 0).unwrap();
         assert!(candidate.receipts.is_empty());
         fixture.record(5, false);
         assert!(matches!(
@@ -1413,7 +1583,7 @@ mod tests {
         let loaded = load_checkpoint(&fixture.path, &fixture.activation, false)
             .unwrap()
             .unwrap();
-        let current_candidate = serialize(loaded.data, 5, CAPTURE).unwrap();
+        let current_candidate = serialize(loaded.data, 5, CAPTURE, 0).unwrap();
         receipt(attempt(&current_candidate, &mut seam).unwrap());
         assert_eq!(seam.checkpoint_writes, 2);
         assert_eq!(
@@ -1471,7 +1641,7 @@ mod tests {
                 .finalize()
                 .to_hex()
                 .to_string();
-        let candidate = serialize(data, 0, CAPTURE).unwrap();
+        let candidate = serialize(data, 0, CAPTURE, 0).unwrap();
         receipt(attempt(&candidate, &mut DurableFinalization).unwrap());
         assert_eq!(
             std::fs::metadata(receipts_path(&fixture.path))
@@ -1542,7 +1712,7 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
-            let candidate = serialize(data, 0, CAPTURE).unwrap();
+            let candidate = serialize(data, 0, CAPTURE, 0).unwrap();
             assert_eq!(
                 attempt(&candidate, &mut DurableFinalization).unwrap(),
                 PublishOutcome::Refused(if conflict == "prefix" {
@@ -1590,7 +1760,7 @@ mod tests {
                 "boundary" => data.daily_boundary = Some(DailyBoundaryCandidates::default()),
                 _ => {}
             }
-            let mut current = serialize(data, 0, CAPTURE).unwrap();
+            let mut current = serialize(data, 0, CAPTURE, 0).unwrap();
             if fault == "checksum" {
                 current.bytes[0] ^= 1;
             }
@@ -1721,7 +1891,8 @@ mod tests {
             read_authority(&fixture.path).unwrap(),
             Authority::Readable(InvalidationRecord {
                 generation,
-                active: false
+                active: false,
+                retention_fence: false
             })
         );
         assert_eq!(
@@ -1756,56 +1927,50 @@ mod tests {
 
     #[test]
     fn interrupted_invalidation_at_each_durable_boundary() {
-        for previous in [None, Some(false), Some(true)] {
-            for present in [false, true] {
-                for fault in [
-                    Fault::QuarantineRename,
-                    Fault::ReceiptsRemove,
-                    Fault::QuarantineSync,
-                    Fault::RecordBeforeWrite,
-                    Fault::RecordAfterRename,
-                ] {
-                    let fixture = Fixture::new();
-                    if let Some(active) = previous {
-                        fixture.record(7, active);
+        for fault in [
+            Fault::QuarantineRename,
+            Fault::ReceiptsRemove,
+            Fault::QuarantineSync,
+            Fault::RecordBeforeWrite,
+            Fault::RecordAfterRename,
+        ] {
+            let fixture = Fixture::new();
+            let candidate = fixture.candidate(1, 2, 7);
+            fixture.stage(&candidate);
+            fixture.record(7, false);
+            install_retention_fence(&fixture.path).unwrap();
+            let old_record = std::fs::read(record_path(&fixture.path)).unwrap();
+            let old_receipts = std::fs::read(receipts_path(&fixture.path)).unwrap();
+            let result = invalidate_locked(&fixture.path, &mut Failure::new(fault));
+            assert!(matches!(
+                result,
+                Err(InvalidationError::QuarantineFailed(_))
+            ));
+            if fault == Fault::RecordBeforeWrite {
+                assert_eq!(
+                    std::fs::read(record_path(&fixture.path)).unwrap(),
+                    old_record
+                );
+                assert_eq!(
+                    std::fs::read(receipts_path(&fixture.path)).unwrap(),
+                    old_receipts
+                );
+                assert_eq!(
+                    std::fs::read(checkpoint_path(&fixture.path)).unwrap(),
+                    candidate.bytes
+                );
+            } else {
+                assert_eq!(
+                    attempt(&candidate, &mut DurableFinalization).unwrap(),
+                    PublishOutcome::GenerationChanged {
+                        candidate: 7,
+                        current: 8
                     }
-                    let candidate = fixture.candidate(1, 2, previous.map_or(0, |_| 7));
-                    if present {
-                        fixture.stage(&candidate);
-                    }
-                    let mut seam = Failure::new(fault);
-                    let _lock = CheckpointLock::acquire(&fixture.path).unwrap();
-                    let result = invalidate_locked(&fixture.path, &mut seam);
-                    drop(_lock);
-                    if matches!(fault, Fault::QuarantineRename | Fault::ReceiptsRemove)
-                        || present && fault == Fault::QuarantineSync
-                        || !present
-                            && matches!(fault, Fault::RecordBeforeWrite | Fault::RecordAfterRename)
-                    {
-                        assert!(
-                            matches!(result, Err(InvalidationError::QuarantineFailed(_))),
-                            "{present} {fault:?}"
-                        );
-                    } else if present
-                        && matches!(fault, Fault::RecordBeforeWrite | Fault::RecordAfterRename)
-                    {
-                        assert!(matches!(result, Err(InvalidationError::Io(_))));
-                    } else {
-                        assert!(result.is_ok());
-                    }
-                    if present && matches!(fault, Fault::QuarantineSync | Fault::RecordBeforeWrite)
-                    {
-                        assert_eq!(
-                            read_authority(&fixture.path).unwrap(),
-                            Authority::Unreadable
-                        );
-                        assert_eq!(
-                            attempt(&candidate, &mut DurableFinalization).unwrap(),
-                            PublishOutcome::Refused(RefusalReason::UnreadableRecord)
-                        );
-                        assert!(!checkpoint_path(&fixture.path).exists());
-                    }
-                }
+                );
+                let Authority::Readable(record) = read_authority(&fixture.path).unwrap() else {
+                    panic!("record unreadable");
+                };
+                assert!(record.active && record.retention_fence);
             }
         }
     }
@@ -1821,7 +1986,7 @@ mod tests {
         different[0] ^= 1;
         for (generation, checksum) in [(1, checksum), (0, &different)] {
             assert!(matches!(
-                invalidate_if_current(&fixture.path, generation, checksum).unwrap(),
+                invalidate_if_current(&fixture.path, generation, 0, checksum).unwrap(),
                 ConditionalInvalidation::Changed
             ));
             assert_eq!(
@@ -1838,7 +2003,7 @@ mod tests {
             );
         }
         assert!(matches!(
-            invalidate_if_current(&fixture.path, 0, checksum).unwrap(),
+            invalidate_if_current(&fixture.path, 0, 0, checksum).unwrap(),
             ConditionalInvalidation::Invalidated(1)
         ));
         assert!(!checkpoint_path(&fixture.path).exists());
@@ -1847,7 +2012,8 @@ mod tests {
             read_authority(&fixture.path).unwrap(),
             Authority::Readable(InvalidationRecord {
                 generation: 1,
-                active: true
+                active: true,
+                retention_fence: false
             })
         );
     }
@@ -1873,7 +2039,12 @@ mod tests {
         );
         // The preparation CLI still reports its own precondition failures as ordinary I/O.
         assert!(matches!(
-            invalidate_if_current(&fixture.path, 0, candidate.bytes[..64].try_into().unwrap()),
+            invalidate_if_current(
+                &fixture.path,
+                0,
+                0,
+                candidate.bytes[..64].try_into().unwrap()
+            ),
             Err(InvalidationError::Io(_))
         ));
     }
@@ -1914,7 +2085,8 @@ mod tests {
             read_authority(&fixture.path).unwrap(),
             Authority::Readable(InvalidationRecord {
                 generation: 4,
-                active: false
+                active: false,
+                retention_fence: false
             })
         );
     }
@@ -1953,7 +2125,8 @@ mod tests {
                     read_authority(&fixture.path).unwrap(),
                     Authority::Readable(InvalidationRecord {
                         generation: 2,
-                        active: false
+                        active: false,
+                        retention_fence: false
                     })
                 );
             }
@@ -1965,7 +2138,7 @@ mod tests {
         let fixture = Fixture::new();
         let mut data = fixture.data(1, 2);
         data.prefix_blake3 = blake3::hash(b"wrong").to_hex().to_string();
-        let wrong = serialize(data, 1, CAPTURE).unwrap();
+        let wrong = serialize(data, 1, CAPTURE, 0).unwrap();
         fixture.stage(&wrong);
         fixture.record(1, true);
         let candidate = fixture.candidate(1, 2, 1);
@@ -1978,13 +2151,14 @@ mod tests {
             read_authority(&fixture.path).unwrap(),
             Authority::Readable(InvalidationRecord {
                 generation: 1,
-                active: false
+                active: false,
+                retention_fence: false
             })
         );
     }
 
     #[test]
-    fn unreadable_invalidation_quarantines_surviving_checkpoint() {
+    fn unreadable_invalidation_leaves_surviving_checkpoint_unchanged() {
         for present in [false, true] {
             let fixture = Fixture::new();
             let candidate = fixture.candidate(1, 2, 0);
@@ -1994,10 +2168,10 @@ mod tests {
             std::fs::write(record_path(&fixture.path), b"unreadable").unwrap();
             assert!(matches!(
                 invalidate(&fixture.path),
-                Err(InvalidationError::UnreadableRecord)
+                Err(InvalidationError::QuarantineFailed(_))
             ));
-            assert!(!checkpoint_path(&fixture.path).exists());
-            assert!(!receipts_path(&fixture.path).exists());
+            assert_eq!(checkpoint_path(&fixture.path).exists(), present);
+            assert_eq!(receipts_path(&fixture.path).exists(), present);
             assert_eq!(
                 read_authority(&fixture.path).unwrap(),
                 Authority::Unreadable
@@ -2030,7 +2204,12 @@ mod tests {
             Err(InvalidationError::QuarantineFailed(_))
         ));
         assert!(matches!(
-            invalidate_if_current(&fixture.path, 0, candidate.bytes[..64].try_into().unwrap()),
+            invalidate_if_current(
+                &fixture.path,
+                0,
+                0,
+                candidate.bytes[..64].try_into().unwrap()
+            ),
             Err(InvalidationError::Io(_))
         ));
         assert_eq!(
@@ -2039,31 +2218,231 @@ mod tests {
         );
     }
 
+    fn retained_authority(fixture: &Fixture) -> RetentionAuthority {
+        use pe_event_log::{RetentionBoundary, RetentionPin, TailBinding};
+        let first = &fixture.tails[0];
+        let first_frame = fixture.data(0, 3).receipts.remove(0);
+        RetentionAuthority {
+            format_version: 1,
+            epoch: 1,
+            advanced_at: 1_700_000_000,
+            boundary: RetentionBoundary {
+                sequence: pe_core_types::EventSeq(1),
+                offset: first.physical_tail,
+            },
+            chain_head: first.last_hash,
+            pins: vec![RetentionPin {
+                sequence: pe_core_types::EventSeq(0),
+                offset: first_frame.byte_offset.unwrap(),
+                hash: first.last_hash,
+                predecessor_hash: blake3::Hash::from_bytes([0; 32]),
+                reducer: false,
+                wallet: None,
+            }],
+            retained_tail: TailBinding::from(&fixture.tails[2]),
+            feed: vec![],
+        }
+    }
+
     #[test]
-    fn quiesced_recovery_orders_removal_and_sync() {
-        for fail_at in [0, 1, 2] {
+    fn retention_epoch_replaces_same_tail_digest_and_refuses_old_candidates() {
+        let fixture = Fixture::new();
+        let old = fixture.candidate(2, 3, 0);
+        fixture.stage(&old);
+        let mut data = fixture.data(2, 3);
+        let authority = retained_authority(&fixture);
+        authority.write(&fixture.path).unwrap();
+        data.activation = fixture.tails[0].clone();
+        data.prefix_blake3 =
+            pe_event_log::Scanner::hash_prefix(&fixture.path, data.tail.physical_tail)
+                .unwrap()
+                .finalize()
+                .to_hex()
+                .to_string();
+        let next = serialize(data, 0, CAPTURE, 1).unwrap();
+        let prefix = std::fs::read(receipts_path(&fixture.path)).unwrap()[..80].to_vec();
+        assert_ne!(old.prefix_blake3, next.prefix_blake3);
+        receipt(attempt(&next, &mut DurableFinalization).unwrap());
+        let body: serde_json::Value = serde_json::from_slice(&next.bytes[65..]).unwrap();
+        assert_eq!(body["format_version"], 3);
+        assert_eq!(body["retention_epoch"], 1);
+        assert_eq!(
+            &std::fs::read(receipts_path(&fixture.path)).unwrap()[..80],
+            prefix
+        );
+        for present in [true, false] {
+            if !present {
+                std::fs::remove_file(checkpoint_path(&fixture.path)).unwrap();
+            }
+            assert_eq!(
+                attempt(&old, &mut DurableFinalization).unwrap(),
+                PublishOutcome::RetentionChanged {
+                    candidate: 0,
+                    current: 1
+                }
+            );
+            assert!(matches!(
+                invalidate_if_current(&fixture.path, 0, 0, old.bytes[..64].try_into().unwrap())
+                    .unwrap(),
+                ConditionalInvalidation::Changed
+            ));
+        }
+    }
+
+    #[test]
+    fn fenced_invalidation_and_quiesced_recovery_preserve_receipts_prefix_at_every_step() {
+        for recovery in [false, true] {
+            // Record before/after rename, checkpoint unlink, receipt trim/fsync and each directory sync.
+            for step in 0..=7 {
+                let fixture = Fixture::new();
+                let old = fixture.candidate(2, 3, 0);
+                fixture.stage(&old);
+                install_retention_fence(&fixture.path).unwrap();
+                retained_authority(&fixture).write(&fixture.path).unwrap();
+                let prefix = std::fs::read(receipts_path(&fixture.path)).unwrap()[..80].to_vec();
+                let old_record = std::fs::read(record_path(&fixture.path)).unwrap();
+                struct BoundaryFailure {
+                    next: usize,
+                    fail: usize,
+                }
+                impl BoundaryFailure {
+                    fn check(&mut self) -> io::Result<()> {
+                        let step = self.next;
+                        self.next += 1;
+                        if step == self.fail {
+                            Err(io::Error::other("injected finalization failure"))
+                        } else {
+                            Ok(())
+                        }
+                    }
+                }
+                impl Finalization for BoundaryFailure {
+                    fn record_write(&mut self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+                        self.check()?;
+                        crate::qualification::write_report(path, bytes)?;
+                        self.check()
+                    }
+                    fn checkpoint_remove(&mut self, path: &Path) -> io::Result<bool> {
+                        self.check()?;
+                        remove_if_present(path)
+                    }
+                    fn receipts_trim(&mut self, file: &File, length: u64) -> io::Result<()> {
+                        self.check()?;
+                        file.set_len(length)
+                    }
+                    fn receipts_sync(&mut self, file: &File) -> io::Result<()> {
+                        self.check()?;
+                        file.sync_all()
+                    }
+                    fn sync_directory(&mut self, path: &Path) -> io::Result<()> {
+                        self.check()?;
+                        sync_directory(path)
+                    }
+                }
+                let mut seam = BoundaryFailure {
+                    next: 0,
+                    fail: step,
+                };
+                if recovery {
+                    assert!(recover_with_finalization(&fixture.path, &mut seam).is_err());
+                } else {
+                    assert!(matches!(
+                        invalidate_locked(&fixture.path, &mut seam),
+                        Err(InvalidationError::QuarantineFailed(_))
+                    ));
+                }
+                assert_eq!(
+                    &std::fs::read(receipts_path(&fixture.path)).unwrap()[..80],
+                    prefix
+                );
+                let Authority::Readable(record) = read_authority(&fixture.path).unwrap() else {
+                    panic!("fence lost");
+                };
+                assert!(record.retention_fence);
+                if step == 0 {
+                    assert_eq!(
+                        std::fs::read(record_path(&fixture.path)).unwrap(),
+                        old_record
+                    );
+                    assert_eq!(
+                        std::fs::read(checkpoint_path(&fixture.path)).unwrap(),
+                        old.bytes
+                    );
+                    assert_eq!(
+                        std::fs::metadata(receipts_path(&fixture.path))
+                            .unwrap()
+                            .len(),
+                        240
+                    );
+                } else {
+                    assert!(record.active);
+                    assert_eq!(
+                        attempt(&old, &mut DurableFinalization).unwrap(),
+                        PublishOutcome::GenerationChanged {
+                            candidate: 0,
+                            current: 1
+                        }
+                    );
+                }
+                recover_quiesced(&fixture.path).unwrap();
+                assert_eq!(std::fs::read(receipts_path(&fixture.path)).unwrap(), prefix);
+            }
+        }
+    }
+
+    #[test]
+    fn fence_refuses_old_record_codec_and_epoch_zero_preparation_keeps_old_format() {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct OldRecord {
+            #[serde(rename = "generation")]
+            _generation: u64,
+            #[serde(rename = "active")]
+            _active: bool,
+        }
+        let fixture = Fixture::new();
+        let candidate = fixture.candidate(2, 3, 0);
+        receipt(attempt(&candidate, &mut DurableFinalization).unwrap());
+        assert!(!record_path(&fixture.path).exists());
+        let body: serde_json::Value = serde_json::from_slice(&candidate.bytes[65..]).unwrap();
+        assert_eq!(body["format_version"], 2);
+        assert!(body.get("retention_epoch").is_none());
+        install_retention_fence(&fixture.path).unwrap();
+        let bytes = std::fs::read(record_path(&fixture.path)).unwrap();
+        assert!(serde_json::from_slice::<OldRecord>(&bytes).is_err());
+        invalidate(&fixture.path).unwrap();
+        assert!(
+            serde_json::from_slice::<OldRecord>(
+                &std::fs::read(record_path(&fixture.path)).unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn quiesced_recovery_orders_active_record_before_removal() {
+        for fail_at in 0..=3 {
             let fixture = Fixture::new();
             let candidate = fixture.candidate(1, 2, 0);
             fixture.stage(&candidate);
-            std::fs::write(record_path(&fixture.path), b"quarantine").unwrap();
+            install_retention_fence(&fixture.path).unwrap();
             struct OrderedRecovery {
-                checkpoint: PathBuf,
-                receipts: PathBuf,
-                record: PathBuf,
+                path: PathBuf,
                 calls: usize,
                 fail_at: usize,
             }
             impl Finalization for OrderedRecovery {
                 fn sync_directory(&mut self, target: &Path) -> io::Result<()> {
                     self.calls += 1;
-                    assert!(!self.checkpoint.exists());
-                    assert!(!self.receipts.exists());
+                    let Authority::Readable(record) = read_authority(&self.path)? else {
+                        panic!("unreadable recovery record");
+                    };
+                    assert!(record.active && record.retention_fence);
                     if self.calls == 1 {
-                        assert_eq!(target, self.checkpoint);
-                        assert!(self.record.exists());
+                        assert!(checkpoint_path(&self.path).exists());
+                        assert!(receipts_path(&self.path).exists());
                     } else {
-                        assert_eq!(target, self.record);
-                        assert!(!self.record.exists());
+                        assert!(!checkpoint_path(&self.path).exists());
                     }
                     if self.calls == self.fail_at {
                         return Err(io::Error::other("recovery directory sync"));
@@ -2072,9 +2451,7 @@ mod tests {
                 }
             }
             let mut seam = OrderedRecovery {
-                checkpoint: checkpoint_path(&fixture.path),
-                receipts: receipts_path(&fixture.path),
-                record: record_path(&fixture.path),
+                path: fixture.path.clone(),
                 calls: 0,
                 fail_at,
             };
@@ -2082,37 +2459,44 @@ mod tests {
                 recover_with_finalization(&fixture.path, &mut seam).is_ok(),
                 fail_at == 0
             );
-            assert_eq!(seam.calls, if fail_at == 1 { 1 } else { 2 });
-            assert_eq!(record_path(&fixture.path).exists(), fail_at == 1);
-            recover_quiesced(&fixture.path).unwrap();
+            assert_eq!(
+                attempt(&candidate, &mut DurableFinalization).unwrap(),
+                PublishOutcome::GenerationChanged {
+                    candidate: 0,
+                    current: 1
+                }
+            );
+            let recovered = recover_quiesced(&fixture.path).unwrap();
+            assert!(!recovered.record_removed);
+            assert!(read_authority(&fixture.path).unwrap().generation().unwrap() >= 1);
+            assert!(!read_authority(&fixture.path).unwrap().permits_checkpoint());
         }
     }
 
     #[test]
     fn quiesced_recovery_procedure() {
-        for fault in [None, Some(Fault::QuarantineSync)] {
-            let fixture = Fixture::new();
-            let candidate = fixture.candidate(1, 2, 0);
-            fixture.stage(&candidate);
-            std::fs::write(record_path(&fixture.path), b"quarantine").unwrap();
-            if let Some(fault) = fault {
-                let result = recover_with_finalization(&fixture.path, &mut Failure::new(fault));
-                assert!(result.is_err());
-                assert!(!checkpoint_path(&fixture.path).exists());
-                assert!(record_path(&fixture.path).exists());
-            }
-            let receipt = recover_quiesced(&fixture.path).unwrap();
-            assert_eq!(receipt.checkpoint_removed, fault.is_none());
-            assert_eq!(receipt.receipts_removed, fault.is_none());
-            assert!(receipt.record_removed);
-            assert!(!checkpoint_path(&fixture.path).exists());
-            assert!(!receipts_path(&fixture.path).exists());
-            assert_eq!(
-                read_authority(&fixture.path).unwrap(),
-                Authority::Readable(InvalidationRecord::default())
-            );
-            assert!(suffixed(&checkpoint_path(&fixture.path), ".lock").exists());
-            super::tests::receipt(attempt(&candidate, &mut DurableFinalization).unwrap());
-        }
+        let fixture = Fixture::new();
+        let candidate = fixture.candidate(1, 2, 0);
+        fixture.stage(&candidate);
+        std::fs::write(record_path(&fixture.path), b"quarantine").unwrap();
+        let recovered = recover_quiesced(&fixture.path).unwrap();
+        assert!(recovered.checkpoint_removed && recovered.receipts_removed);
+        assert!(!recovered.record_removed);
+        assert!(!checkpoint_path(&fixture.path).exists());
+        let Authority::Readable(record) = read_authority(&fixture.path).unwrap() else {
+            panic!("unreadable recovery record");
+        };
+        assert!(record.active && record.retention_fence);
+        receipt(
+            attempt(
+                &fixture.candidate(1, 2, record.generation),
+                &mut DurableFinalization,
+            )
+            .unwrap(),
+        );
+        assert!(read_authority(&fixture.path).unwrap().permits_checkpoint());
+        assert!(
+            matches!(read_authority(&fixture.path).unwrap(), Authority::Readable(record) if record.retention_fence)
+        );
     }
 }

@@ -485,7 +485,8 @@ cursor; an earlier cutoff (for example after a clock rollback) refuses it and th
 fenced. Exact fence comparison, history repair, authoritative
 balances, validation, coverage, history completion and fence deletion commit together. Version-one
 anchor proof optionally binds the exact deleted record in `cleared_fence`. Projections publish only
-after commit. Original effects, dispositions, proofs and earlier decisions remain immutable.
+after commit. Retained original effects, dispositions, proofs and earlier decisions remain immutable;
+intentional paper-evidence disposal follows the source-retention contract below.
 Known disposed revisions with matching canonical transaction identity are idempotent while any
 fence is active and, after clearance, within anchor coverage; this recognition never widens
 clearance eligibility. Every newly retained non-original revision advances the existing coverage generation once
@@ -908,34 +909,40 @@ synchronized under the exclusive writer lock; interior corruption and every othe
 fatal. Append, flush, or synchronization uncertainty poisons the writer. The account-tagged
 `live_journal.log` uses its native verified replay for the same binding fields. An ordinary
 installed boot holds that lock while binding the recorded activation prefix. A compatible
-`<source-log>.boot-checkpoint` is the format-2 manifest: scanner/reducer versions, mode,
-activation, generation, path/tail/offset, prefix hash, reducer projections and `receipt_count`,
-without a receipt list. `<source-log>.boot-checkpoint.receipts` holds fixed 80-byte records:
+`<source-log>.boot-checkpoint` is format 2 at retention epoch zero and format 3 once an authority
+exists: scanner/reducer versions, mode, activation, generation, path/tail/offset, window hash,
+reducer projections and `receipt_count`, without a receipt list; format 3 also binds `retention_epoch`.
+`<source-log>.boot-checkpoint.receipts` holds fixed 80-byte records:
 32-byte receipt hash, little-endian receive milliseconds (`i64`), little-endian byte offset
 (`u64`, absent encoded as `u64::MAX`), and BLAKE3 of the preceding 48 bytes. Record position i
 implies source sequence i, matching the dense in-memory receipt index. Boot reads the named
 records sequentially into that index, validating every checksum, offset bound/order and the
-manifest's last sequence/hash. Invalid receipt records quarantine both the manifest and receipts
-file under the existing invalidation lock and select a full verified walk; the next publication
-creates a fresh receipts file from record zero using that rebuilt index. Bytes beyond `receipt_count`
-are uncommitted garbage. A format-1 manifest converts once, synchronizing its sidecar before
+manifest's last sequence/hash. Records below the retention boundary are durable metadata,
+including old fills' receipt times, and survive checkpoint loss, invalidation and recovery. Invalid
+records in that prefix beside a punched log require restoration of a coherent capture. Without
+retention, invalid records select a full verified walk and a fresh receipts file from record zero.
+Bytes beyond `receipt_count` are uncommitted garbage only above the committed retention boundary.
+A format-1 manifest converts once, synchronizing its sidecar before
 atomically replacing the manifest; failed conversion retains format 1 and its boot index.
 Compatibility still requires checksum, version, mode, path, activation and tail checks. With
 readable inactive authority,
 boot defers the exact raw-prefix BLAKE3 check and scanner-verifies only the suffix; its completion
 line records `prefix_verification="deferred"`, the loaded binding and `prefix_blake3`. Missing,
-damaged or incompatible artifacts, shortened files, and active or unreadable authority select a
-full verified walk; actual frame corruption still refuses. Activation-prefix authority and
-incomplete-tail repair remain unchanged. Runtime indexed reads verify individual frames.
+damaged or incompatible checkpoints and active or unreadable invalidation authority select a
+verified rebuild. With retention, rebuild authenticates every pin, restores the dense receipts
+prefix, feeds reducer pins in receipt order, then walks the suffix through the committed
+`retained_tail`. A shortened suffix before that tail refuses without truncation; only an incomplete
+final append beyond it may be repaired. Runtime indexed reads verify individual retained frames.
 
 The critical `source_checkpoint` owner starts after HTTP listening. Its single cancellable blocking
 job slot verifies the loaded prefix, continues the same hasher to the frozen boot tail, then
 serializes and publishes the frozen initial manifest and pre-consumption reducers, capturing
 only receipts beyond the installed manifest count. A mismatch,
 read error or binding inequality quarantines checkpoint use and triggers coordinated restart. A
-failure before the quarantine is durable (checkpoint lock, invalidation-record read, quarantine
-rename or its directory sync) carries `CheckpointInvalidationFailed` and exits 78; with no
-checkpoint present, a failed invalidation-record write is itself that quarantine failure.
+failure to durably install quarantine (checkpoint lock, invalidation-record read, record rename
+or directory sync) carries `CheckpointInvalidationFailed` and exits 78, including when no
+checkpoint is present. Before rename nothing changes; after rename the visible active record
+refuses pre-invalidation candidates even if its directory sync failed.
 The checkpoint-invalidation systemd drop-in prevents automatic restart for this status. Main
 retains and bounds the blocking-child join independently of async supervision; the job slot
 carries a quarantine failure to main even after shutdown stopped the owner, and status 78 takes
@@ -943,24 +950,31 @@ precedence over join/shutdown timeouts. Cancellation discards late computation r
 no further publication; an already-started publication finishes.
 
 All publishers share one persistent `<checkpoint>.lock` inode and the durable
-`<checkpoint>.invalidation` record (`generation`, `active`; absence means generation zero/inactive).
-Invalidation quarantines the manifest and discards the receipts file, synchronizing their directory
-before advancing active authority. Publication
+`<checkpoint>.invalidation` record (`generation`, `active`, and the installed old-binary fence;
+absence means generation zero/inactive). Invalidation first atomically installs and syncs the
+active next-generation record, preserving the fence, then removes the manifest and cuts receipts
+back to the durable prefix below the retention boundary (removing them only without retention).
+The record never contains checkpoint bytes. Publication
 compares artifact applicability, reducer version, tail, binding and prefix under the lock and
 installs only an authorized candidate. Under that lock it writes only new receipt records at
 their positions, preserving committed bytes, then fsyncs the sidecar before the manifest's
 existing temporary-file/fsync/rename/directory-fsync install. A crash before manifest installation
-leaves the previous manifest and its receipt prefix valid. `--prepare-source-checkpoint` uses
-the same format-2 publication path. A verified current-generation publication clears active
+leaves the previous manifest and its receipt prefix valid. Publication compares the captured
+retention epoch with the authority under the lock; a newer epoch may replace a same-tail checkpoint
+with a changed window digest, and an older epoch is refused. `--prepare-source-checkpoint` uses
+the same publication path and never installs the fence. A verified current-generation publication
+clears active
 only after durable installation. Clearance is automatic on a verified current-generation
 publication, whether by the next boot's full walk or `--prepare-source-checkpoint`; there is no
 separate clearance command. Unreadable authority makes boots full-walk and refuses publication
-until quiesced recovery removes both checkpoint files and syncs their directory before removing
-and syncing the record. The persistent lock remains; raw logs are unchanged.
+until quiesced recovery. Once fenced, recovery installs and syncs a fenced active next-generation
+record before removing the checkpoint and retaining the receipts prefix. The persistent lock,
+retention authority and feed files remain. Never delete the receipts file by hand.
 Preparation reads authority first, captures open rows before its finite source
 bound, and full-walks when the record is active or undecodable. A proven wrong prefix digest
-invalidates only the still-current artifact and generation; if either changed, preparation starts
-again. Its durable publication receipt is documented in the
+invalidates only the still-current artifact, generation and retention epoch; if any changed,
+preparation starts again, including after an authority commit before checkpoint publication.
+Its durable publication receipt is documented in the
 [deploy runbook](35-PE-SERVICE-DEPLOY-RUNBOOK.md#737-release-1-checkpoint-restart-and-rollback).
 
 Hourly scanner-verified extensions reuse the frozen reducers and hasher and retain their originating
@@ -976,6 +990,35 @@ which detects external length drift but not equal-length rewrites of verified by
 |---|---|---|
 | `CHECKPOINT_PUBLISH_SECS` | 3,600 s | `source_checkpoint`: hourly incremental capture/publication interval; no TOML/env setting. |
 | `CHECKPOINT_RETRY_SECS` | 60 s | `source_checkpoint`: retained serialized-candidate publication retry; no TOML/env setting. |
+
+### Paper source retention (release 2)
+
+| Term / compiled policy | Canonical value / contract |
+|---|---|
+| Troubleshooting buffer | 7 days by frame receipt time; decisions updated within this buffer retain all recorded source inputs. No TOML/env setting. |
+| Advance cadence | At most once per 24 hours after `advanced_at`; first attempt on the owner's first hourly tick, after `CHECKPOINT_PUBLISH_SECS`. Startup finishes a committed epoch but never moves the boundary. |
+| Boundary and pins | Punch unpinned whole 4 KiB blocks below the first frame in the buffer, never beyond the last frame or through the header block. Pins are sorted unique sequences with offset, hash and predecessor hash. Membership since Start, activation binding, decision and financial evidence, identity pages, outstanding obligation closures, every receipt the running poller still holds (current obligations and frozen attempt selections) and reducer inputs stay readable. Reducer pins alone are replayed into reducers. |
+| Pauses | The entire job, including finishing a committed epoch, pauses without a Start, while the latest Start is unsealed, or while a source-referencing live-journal record or any dispatch seed holds evidence. Live evidence is never erased. |
+| `<source-log>.retention` | Versioned checksummed authority, atomically installed and directory-synced: epoch, advance time, boundary, chain head, pins, pathless synced `retained_tail`, and committed feed entries (epoch, frame count, length, BLAKE3). A missing/invalid authority beside a punched log refuses boot. |
+| `<source-log>.feed/<epoch>.frames` | Compact verbatim feed frames in sequence order, kept long-term. Only committed epochs are read/captured; empty epochs have no file. Each file authenticates its count, length, hash and frames against dense receipt records. Feed files are audit evidence, not boot rebuild inputs. |
+| Receipts prefix | `<source-log>.boot-checkpoint.receipts` stays dense from sequence zero. Records below the boundary are durable retention metadata and survive every invalidation/recovery intermediate state; publication replaces only the suffix. Disk and in-memory metadata remain unbounded in this release. |
+| Old-binary fence | The service installs a field in the existing invalidation record before listening and never removes it; staged preparation never writes it. An old executable refuses checkpoint use/publication after the fence. A checkpoint loaded earlier cannot be revoked, so deploy must clear the process census with the unit disabled and stopped before swapping the binary. Recovery is fix forward. |
+| `Erased` | Exact source read below the boundary without a pin fails closed, even if bytes survive in a shared block. Recheck the index after physical I/O, on success or failure, to cover a concurrent commit. Retained reads still verify normally. |
+| `Retired` | A full-prefix walk ending at/below the boundary, qualification re-verification or complete-prefix era tool refuses before selection once required history has retired. Sealing stays at boundary zero. |
+| Superseded anchor proofs | Blank `proof_json` to `{}` 16 rows per cancellable transaction, keeping each wallet's newest proof and every row's balances/cutoffs; skip already blank rows. No `VACUUM`. |
+| Retention database pacing | Every hold of the shared connection by the retention job — drain-list read, blanking batch (16 rows), candidate page (128 wallets), eligibility check that reads the database, wallet removal, drain transaction (at most 500 trade ids, terminal ones included) — logs its lock time and is followed by a pause at least as long as it held the connection, never under 50 ms; cancellation (for admission drains, the deadline) is checked before the next hold, and a cancelled job does not read the drain list again. Admission preparation's drains follow the same rule; its drain-list read is paced only when it then drains a listed addition, and a read that finds none of its additions listed starts no retention work and takes no pause. A check answered in memory holds nothing and takes no pause. This bounds the job's duty cycle only, not mutex fairness or any waiter's maximum wait. Wallet-scoped reads are index searches: a page takes one `activity_groups` seek per wallet and an index range of at most 128 wallets from each other wallet table, and eligibility checks, the removal's decision selection and drains use the `decision_pending(wallet_hex)` and `entry_gate_results(wallet_hex)` indexes. Frontier-only candidates come from the `meta` JSON collection, and blanking scans the anchor index. |
+| Departed-wallet swap-out | Require a complete verified committed-window walk and local projection through the latest Prepared. Under the admission lock, recheck: outside structural membership, unfenced, no open or recently updated decision, no recent anchor/validation, departure outside the buffer and within this process's boot paper prefix (or no membership record), no obligation at boot or held by the running poller, no retained-window feed/read commitment, and no authority reducer pin or last-published reducer observation naming the wallet. |
+| Swap-out effects | One orchestrator transaction (the removal) deletes the wallet's decisions with their seen/no-copy/revision rows, its anchors/validations, history-complete status, leader positions, cursor and persisted frontier hint, and lists it in `meta` `wallet_retirement_drains` (version 1, sorted unique wallets; absent means empty; a malformed or unsupported entry fails closed); acknowledgement drops running state and verified feed frontier. Still under the admission lock, drain transactions of at most 500 trade ids then delete its groups, then its gate results, each with their seen/no-copy/revision rows; the one that finds none left delists the wallet, and a drain of an unlisted wallet changes nothing. Serving and recovery decisions cannot reach listed leftovers under the existing eligibility guards; retention and explicit diagnostics may observe them, coherent whole-database copies carry both the leftovers and the drain list, boot does not drain them and no reader filters them. A listed wallet is drained first by the next job, or by admission preparation before its fence check, cursor seeding and catch-up (a deadline mid-drain leaves it listed and unstarted). Keep `wallet_market_history_v2` and fences. A returning wallet rebuilds by CatchUp and cannot re-copy an entered market. |
+| Retention rehearsal gates | First snapshot advance frees at least 26 GB allocated net of feed copies while serving; the next boot listens within 60 s and is ready within 5 min. Record every database hold's lock time and pause, memory and copy latency with readiness true and no stale-copy rejection. Include the largest eligible wallet; a 179,573-group fixture drains in transactions of at most 500 trade ids. |
+| Runtime exit cap | `POST_ABORT_JOIN_BOUND` = 10 s. After the async entry point returns, explicit runtime `shutdown_timeout` bounds synchronous tasks that outlive async supervision; exit codes are unchanged. |
+
+The authority commits before the new window is verified and its format-3 checkpoint published;
+only durable publication permits punching. A post-rename authority sync failure switches the index
+immediately but must complete its directory sync before publication/punching. The same process or
+next boot finishes that epoch first, without rewriting its committed feed file. Rebuilds need the
+coherent authority, receipts prefix, verified pins and suffix through `retained_tail`; checkpoint
+loss alone is recoverable. Replay and immutability apply to retained paper evidence and all live
+evidence; retired bytes remain authenticated receipt commitments.
 
 The runtime qualification seal verifies the sealed prefix with one scanner walk bounded by the
 caller's candidate (the just-recorded mark tail at a completion boundary, the receipt-index tail on

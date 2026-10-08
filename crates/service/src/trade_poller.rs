@@ -23,7 +23,9 @@ use pe_core_types::{
     MarketId, MarketOutcomeId, PolymarketTokenId, ReceivedAt, ReconstructionQuality, SourceId,
     SourceTimestamp, SourceTradeId, VenueMarketId, WalletAddress,
 };
-use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, EventEnvelope, Reader};
+#[cfg(test)]
+use pe_event_log::Reader;
+use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn, EventEnvelope};
 use pe_paper_state::{NoCopyDisposition, PaperStateDb};
 use pe_position_ledger::LedgerEffect;
 use pe_source_core::SourceError;
@@ -126,6 +128,67 @@ struct Obligation {
 
 type WalletObligations = BTreeMap<i64, BTreeMap<String, Obligation>>;
 type CoalescedObligations = HashMap<WalletAddress, WalletObligations>;
+
+/// What the running poller still holds: its wallets (database retention waits on them) and every
+/// source receipt it may still read for them (the daily source retention keeps those readable).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HeldObligations {
+    pub wallets: HashSet<WalletAddress>,
+    pub receipts: Vec<pe_event_log::AppendReceipt>,
+}
+
+impl From<&ReconciliationObligations> for HeldObligations {
+    fn from(obligations: &ReconciliationObligations) -> Self {
+        // The same frames recovery would route again, plus the evidence their bindings name.
+        let (mut receipts, _) = obligations.frame_recovery_receipts();
+        receipts.extend(
+            obligations
+                .by_wallet
+                .values()
+                .flat_map(BTreeMap::values)
+                .flat_map(BTreeMap::values)
+                .flat_map(|obligation| binding_receipts(&obligation.bindings)),
+        );
+        receipts.sort_by_key(|receipt| receipt.sequence);
+        receipts.dedup();
+        Self {
+            wallets: obligations.wallets().collect(),
+            receipts,
+        }
+    }
+}
+
+impl HeldObligations {
+    /// A running or retrying reconciliation reads its frozen selection, which coalescing may
+    /// already have replaced in the current obligations; hold it until the attempt releases it.
+    fn with_selections<'a>(
+        mut self,
+        selections: impl IntoIterator<Item = (&'a WalletAddress, &'a WalletObligations)>,
+    ) -> Self {
+        for (wallet, selected) in selections {
+            for obligation in selected.values().flat_map(BTreeMap::values) {
+                self.wallets.insert(*wallet);
+                self.receipts.push(obligation.receipt);
+                self.receipts.extend(binding_receipts(&obligation.bindings));
+            }
+        }
+        self.receipts.sort_by_key(|receipt| receipt.sequence);
+        self.receipts.dedup();
+        self
+    }
+}
+
+/// The source evidence one observation's bindings name.
+fn binding_receipts(
+    bindings: &[ObservationBinding],
+) -> impl Iterator<Item = pe_event_log::AppendReceipt> + '_ {
+    bindings.iter().flat_map(|binding| {
+        std::iter::once(binding.stream_receipt)
+            .chain(binding.identity_receipt)
+            .chain(binding.counterpart_basis_receipt)
+            .chain(binding.frame_admission_receipt)
+    })
+}
 
 fn insert_coalesced_obligation(
     by_wallet: &mut CoalescedObligations,
@@ -507,6 +570,12 @@ impl ActivityCandidates {
         }
         self.binding_commitments = commitments;
         self.recorded_bindings = recorded;
+        let remaining_sequences = remaining
+            .iter()
+            .map(|(sequence, _)| *sequence)
+            .collect::<HashSet<_>>();
+        self.routed_frames
+            .retain(|sequence| remaining_sequences.contains(sequence));
         self.by_wallet = obligations.by_wallet;
         self.frame_candidates = obligations.frame_candidates;
         self.frame_candidates
@@ -696,7 +765,7 @@ impl ReconciliationObligations {
         serde_json::Value::Array(rows)
     }
 
-    fn wallets(&self) -> impl Iterator<Item = WalletAddress> + '_ {
+    pub fn wallets(&self) -> impl Iterator<Item = WalletAddress> + '_ {
         self.by_wallet.keys().copied()
     }
 
@@ -875,11 +944,10 @@ pub fn recover_daily_boundary(
     let Some(anchor) = recover_daily_boundary_anchor(paper_log_path, obligations)? else {
         return Ok(());
     };
-    let mut candidates = DailyBoundaryCandidates::default();
-    for item in Reader::replay(source_log_path)? {
-        let (_sequence, envelope) = item?;
-        candidates.observe_daily_boundary(&envelope)?;
-    }
+    let mut rebuilt = crate::source_log_boot::rebuild_source_log(source_log_path, true, None)
+        .map_err(source_rebuild_error)?;
+    rebuilt.reducers.take_daily_error()?;
+    let candidates = rebuilt.reducers.daily_boundary.unwrap_or_default();
     recover_daily_boundary_from_candidates(candidates, anchor, obligations);
     Ok(())
 }
@@ -905,40 +973,20 @@ fn rebuild_reconciliation_obligations_indexed(
     paper_state: &PaperStateDb,
     source_receipts: Option<&SourceReceiptIndex>,
 ) -> Result<ReconciliationObligations, ObligationRebuildError> {
-    let mut candidates = ActivityCandidates::default();
-    if let Some(index) = source_receipts {
-        for item in Reader::replay(source_log_path)? {
-            let (_, envelope) = item?;
-            candidates.observe_activity(&envelope)?;
-        }
-        return candidates.into_obligations(paper_state, index);
+    let mut rebuilt = crate::source_log_boot::rebuild_source_log(source_log_path, false, None)
+        .map_err(source_rebuild_error)?;
+    rebuilt.reducers.take_activity_error()?;
+    rebuilt
+        .reducers
+        .activity
+        .into_obligations(paper_state, source_receipts.unwrap_or(&rebuilt.index))
+}
+
+fn source_rebuild_error(error: anyhow::Error) -> ObligationRebuildError {
+    match error.downcast::<pe_event_log::LogError>() {
+        Ok(error) => ObligationRebuildError::Log(error),
+        Err(error) => ObligationRebuildError::Binding(format!("{error:#}")),
     }
-    let mut staging = SourceReceiptIndex::staging(source_log_path)
-        .map_err(|error| ObligationRebuildError::Binding(error.to_string()))?;
-    let mut last_sequence = None;
-    let mut last_hash = blake3::Hash::from_bytes([0; 32]);
-    for item in Reader::replay_with_offsets(source_log_path)? {
-        let (offset, sequence, envelope) = item?;
-        staging
-            .observe(offset, &envelope)
-            .map_err(|error| ObligationRebuildError::Binding(error.to_string()))?;
-        last_sequence = Some(sequence);
-        last_hash = envelope.this_hash;
-        candidates.observe_activity(&envelope)?;
-    }
-    let binding = pe_event_log::LogTailBinding {
-        path: std::fs::canonicalize(source_log_path)
-            .map_err(|error| ObligationRebuildError::Binding(error.to_string()))?,
-        physical_tail: std::fs::metadata(source_log_path)
-            .map_err(|error| ObligationRebuildError::Binding(error.to_string()))?
-            .len(),
-        last_sequence,
-        last_hash,
-    };
-    let index = staging
-        .complete(&binding)
-        .map_err(|error| ObligationRebuildError::Binding(error.to_string()))?;
-    candidates.into_obligations(paper_state, &index)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1008,6 +1056,7 @@ pub struct TradePoller {
     refresh_cooldown: HashMap<WalletAddress, tokio::time::Instant>,
     now: Arc<dyn Fn() -> OffsetDateTime + Send + Sync>,
     source_receipts: Option<SourceReceiptIndex>,
+    held_obligations: Option<watch::Sender<HeldObligations>>,
     #[cfg(feature = "scenario")]
     crash_boundary: Option<Arc<Mutex<Option<ReconciliationCrashBoundary>>>>,
     #[cfg(feature = "scenario")]
@@ -1047,6 +1096,26 @@ impl WalletAttempt {
     fn ready(&self, now: OffsetDateTime) -> bool {
         self.last_fixed_end.is_none() || self.deadline.is_some_and(|deadline| now <= deadline)
     }
+}
+
+/// An idle frozen attempt drops what frame admission resolved, as the current obligations do, and
+/// ends when nothing is left; its published receipts go with it. A running attempt removes its own
+/// admissions before each read and is pruned here once it has joined.
+fn prune_idle_attempts(
+    attempts: &mut HashMap<WalletAddress, WalletAttempt>,
+    busy: &HashSet<WalletAddress>,
+    admitted: &HashSet<SourceTradeId>,
+) {
+    attempts.retain(|wallet, attempt| {
+        if busy.contains(wallet) {
+            return true;
+        }
+        for groups in attempt.selected.values_mut() {
+            groups.retain(|_, obligation| !admitted.contains(&obligation.group_id));
+        }
+        attempt.selected.retain(|_, groups| !groups.is_empty());
+        !attempt.selected.is_empty()
+    });
 }
 
 #[derive(PartialEq, Eq)]
@@ -1178,6 +1247,7 @@ impl TradePoller {
             refresh_cooldown: HashMap::new(),
             now: Arc::new(OffsetDateTime::now_utc),
             source_receipts: None,
+            held_obligations: None,
             #[cfg(feature = "scenario")]
             crash_boundary: None,
             #[cfg(feature = "scenario")]
@@ -1214,6 +1284,13 @@ impl TradePoller {
     #[must_use]
     pub fn with_source_receipt_index(mut self, index: SourceReceiptIndex) -> Self {
         self.source_receipts = Some(index);
+        self
+    }
+
+    #[must_use]
+    pub fn with_held_obligations(mut self, held: watch::Sender<HeldObligations>) -> Self {
+        held.send_replace(HeldObligations::from(&self.obligations));
+        self.held_obligations = Some(held);
         self
     }
 
@@ -1298,6 +1375,11 @@ impl TradePoller {
                     stopping = true;
                     continue;
                 }
+                prune_idle_attempts(
+                    &mut attempts,
+                    &busy_wallets,
+                    &self.obligations.retired_frame_ids,
+                );
                 let now = (self.now)();
                 if let Some((wallet, handoff, handle)) = &refresh_visit
                     && self.obligations.by_wallet.contains_key(wallet)
@@ -1518,6 +1600,15 @@ impl TradePoller {
                         refresh_visit = Some((wallet, handoff, handle));
                     }
                 }
+            }
+            if let Some(held) = &self.held_obligations {
+                held.send_replace(
+                    HeldObligations::from(&self.obligations).with_selections(
+                        attempts
+                            .iter()
+                            .map(|(wallet, attempt)| (wallet, &attempt.selected)),
+                    ),
+                );
             }
             if stopping && tasks.is_empty() {
                 break;
@@ -3104,6 +3195,62 @@ mod tests {
     use crate::paper_recovery::{
         PAPER_LOG_SCHEMA_VERSION, PaperLogRecord, PortfolioMark, QualificationStarted, TailBinding,
     };
+
+    #[test]
+    fn idle_attempts_release_admitted_selections_and_running_ones_keep_theirs() {
+        let wallet = |byte: u8| WalletAddress::from_hex(&format!("0x{byte:0>40}")).unwrap();
+        let receipt = |sequence: u64| AppendReceipt {
+            sequence: pe_core_types::EventSeq(sequence),
+            this_hash: blake3::Hash::from_bytes([u8::try_from(sequence).unwrap(); 32]),
+        };
+        let obligation = |group: &str, sequence: u64| Obligation {
+            qualifying_buy: false,
+            group_id: SourceTradeId(group.to_owned()),
+            received_at: OffsetDateTime::UNIX_EPOCH,
+            receipt: receipt(sequence),
+            bindings: Vec::new(),
+        };
+        let attempt = |entries: &[(&str, u64)]| WalletAttempt {
+            selected: BTreeMap::from([(
+                1,
+                entries
+                    .iter()
+                    .map(|(group, sequence)| ((*group).to_owned(), obligation(group, *sequence)))
+                    .collect(),
+            )]),
+            deadline: None,
+            last_fixed_end: Some(1),
+        };
+        // Idle: one admitted selection (released), one with an admitted and a still-outstanding
+        // selection (keeps the outstanding one), and a running attempt whose selection is admitted.
+        let mut attempts = HashMap::from([
+            (wallet(1), attempt(&[("admitted-a", 1)])),
+            (wallet(2), attempt(&[("admitted-b", 2), ("outstanding", 3)])),
+            (wallet(3), attempt(&[("admitted-c", 4)])),
+        ]);
+        let busy = HashSet::from([wallet(3)]);
+        let admitted = ["admitted-a", "admitted-b", "admitted-c"]
+            .into_iter()
+            .map(|group| SourceTradeId(group.to_owned()))
+            .collect::<HashSet<_>>();
+        prune_idle_attempts(&mut attempts, &busy, &admitted);
+        assert!(!attempts.contains_key(&wallet(1)));
+        assert_eq!(
+            attempts[&wallet(2)].selected[&1].keys().collect::<Vec<_>>(),
+            vec!["outstanding"]
+        );
+        assert!(attempts[&wallet(3)].selected[&1].contains_key("admitted-c"));
+        let held = HeldObligations::default().with_selections(
+            attempts
+                .iter()
+                .map(|(wallet, attempt)| (wallet, &attempt.selected)),
+        );
+        assert_eq!(held.receipts, vec![receipt(3), receipt(4)]);
+        assert_eq!(held.wallets, HashSet::from([wallet(2), wallet(3)]));
+        // Once the running attempt joins, the next pass releases its admitted selection too.
+        prune_idle_attempts(&mut attempts, &HashSet::new(), &admitted);
+        assert_eq!(attempts.keys().collect::<Vec<_>>(), vec![&wallet(2)]);
+    }
 
     #[test]
     fn missing_attempt_is_ready_in_the_same_second_until_its_deadline() {

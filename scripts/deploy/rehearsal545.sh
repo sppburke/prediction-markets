@@ -321,29 +321,62 @@ for name in paper.log source_events.log live_journal.log; do
   }
 done
 
-mkdir -p "$copy_dir"
+copy_dir=$(realpath -m "$copy_dir")
+copy_stage="$copy_dir.staging-$sha"
 copy_manifest="$copy_dir/copied.sha256"
 source_identity="$copy_dir/source.identity"
-[[ ! -L "$copy_manifest" && ! -L "$source_identity" ]] || {
-  echo "FATAL: rehearsal copy authority files must not be symlinks" >&2
-  exit 1
-}
-validate_copy_manifest() {
-  python3 - "$copy_manifest" <<'PY'
-import os, re, sys
+mkdir -p "$(dirname "$copy_dir")"
+[[ ! -L "$copy_dir" && ! -L "$copy_stage" ]] || die "rehearsal capture directory must not be a symlink"
 
-expected = {
-    "paper_state.db", "paper.log", "source_events.log", "live_journal.log",
-    "wallet_market_history.json", "source.identity",
+capture_inventory() {
+  python3 - "$1" <<'PY'
+import json, os, sys
+root = sys.argv[1]
+names = {"paper_state.db", "paper.log", "source_events.log", "live_journal.log",
+         "wallet_market_history.json", "source.identity"}
+for suffix in ("boot-checkpoint", "boot-checkpoint.receipts", "boot-checkpoint.invalidation", "retention"):
+    name = "source_events.log." + suffix
+    if os.path.lexists(os.path.join(root, name)):
+        names.add(name)
+authority = os.path.join(root, "source_events.log.retention")
+if os.path.lexists(authority):
+    with open(authority, encoding="utf-8") as source:
+        value = json.load(source)["authority"]
+    epoch = value["epoch"]
+    if type(epoch) is not int or epoch < 0:
+        raise SystemExit("invalid retention epoch")
+    epochs = set()
+    for entry in value["feed"]:
+        committed = entry["epoch"]
+        if type(committed) is not int or not 0 < committed <= epoch or committed in epochs:
+            raise SystemExit("invalid committed feed epoch")
+        epochs.add(committed)
+        names.add(f"source_events.log.feed/{committed}.frames")
+for name in sorted(names):
+    path = os.path.join(root, name)
+    if name == "source.identity" and not os.path.lexists(path):
+        continue
+    if not os.path.isfile(path) or os.path.islink(path):
+        raise SystemExit(f"capture input is not a regular file: {name}")
+    parent = os.path.dirname(path)
+    while parent != root:
+        if os.path.islink(parent):
+            raise SystemExit(f"capture input has a linked directory: {name}")
+        parent = os.path.dirname(parent)
+    print(name)
+PY
 }
-for suffix in ("", ".receipts", ".invalidation"):
-    name = "source_events.log.boot-checkpoint" + suffix
-    path = os.path.join(os.path.dirname(sys.argv[1]), name)
-    if os.path.lexists(path):
-        if not os.path.isfile(path) or os.path.islink(path):
-            raise SystemExit("rehearsal checkpoint companion is not a regular file")
-        expected.add(name)
+
+validate_copy_manifest() {
+  local directory=$1 inventory
+  inventory=$(capture_inventory "$directory") || return
+  python3 - "$directory/copied.sha256" "$inventory" <<'PY' || return
+import os, re, sys
+expected = set(sys.argv[2].splitlines())
+expected.add("source.identity")
 seen = set()
+if os.path.islink(sys.argv[1]):
+    raise SystemExit("rehearsal copy hash manifest must not be a symlink")
 with open(sys.argv[1], encoding="utf-8") as source:
     for line in source:
         match = re.fullmatch(r"[0-9a-f]{64}  ([^\n]+)\n?", line)
@@ -354,82 +387,148 @@ if seen != expected:
     raise SystemExit("rehearsal copy hash manifest has the wrong file inventory")
 PY
   (
-    cd "$copy_dir"
+    cd "$directory"
     sha256sum --strict -c copied.sha256 >/dev/null
   )
 }
-if [[ -f "$copy_manifest" ]]; then
-  [[ -f "$source_identity" ]] || { echo "FATAL: rehearsal source identity is missing" >&2; exit 1; }
-  grep -Fxq "activation_id=$activation_id" "$source_identity" \
-    && grep -Fxq "generation_dir=$active_generation" "$source_identity" || {
-      echo "FATAL: existing rehearsal copy belongs to another active generation" >&2
-      exit 1
-    }
-  for name in paper_state.db paper.log source_events.log live_journal.log wallet_market_history.json; do
-    [[ -f "$copy_dir/$name" && ! -L "$copy_dir/$name" ]] || {
-      echo "FATAL: reusable rehearsal copy is missing regular $name" >&2
-      exit 1
-    }
-  done
-  validate_copy_manifest || {
-    echo "FATAL: reusable rehearsal copy failed recorded hash validation" >&2
-    exit 1
-  }
-  [[ "$(sqlite3 -readonly "$copy_dir/paper_state.db" 'pragma quick_check;')" == ok ]] || {
-    echo "FATAL: reusable rehearsal database failed SQLite integrity" >&2
-    exit 1
-  }
-  for name in paper.log source_events.log live_journal.log; do
-    magic=$(od -An -tx1 -N5 "$copy_dir/$name" | tr -d ' \n')
-    [[ "$magic" == "4544474501" ]] || {
-      echo "FATAL: reusable $name lost its EDGE-v1 framing" >&2
-      exit 1
-    }
-  done
-else
-  if find "$copy_dir" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
-    echo "FATAL: uncheckpointed rehearsal copy exists: $copy_dir" >&2
-    exit 1
+
+validate_copy_identity() {
+  local identity="$1/source.identity"
+  [[ -f "$identity" && ! -L "$identity" ]] || die "rehearsal source identity is missing or linked"
+  grep -Fxq "activation_id=$activation_id" "$identity" \
+    && grep -Fxq "generation_dir=$active_generation" "$identity" ||
+    die "existing rehearsal copy belongs to another active generation"
+}
+
+adopt_copy_stage() {
+  python3 - "$copy_stage" "$copy_dir" <<'PY'
+import os, sys
+stage, destination = sys.argv[1:]
+for root, directories, files in os.walk(stage, topdown=False):
+    for name in files:
+        with open(os.path.join(root, name), "rb") as source:
+            os.fsync(source.fileno())
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try: os.fsync(directory)
+    finally: os.close(directory)
+os.replace(stage, destination)
+directory = os.open(os.path.dirname(destination), os.O_RDONLY | os.O_DIRECTORY)
+try: os.fsync(directory)
+finally: os.close(directory)
+PY
+}
+
+if [[ ! -f "$copy_manifest" ]]; then
+  if [[ -d "$copy_dir" ]] && find "$copy_dir" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+    die "uncheckpointed rehearsal copy exists: $copy_dir"
   fi
-  # Capture the companions under the service's publication/invalidation lock.
-  exec 8<>"$active_generation/source_events.log.boot-checkpoint.lock"
-  flock -x 8
-  for name in source_events.log.boot-checkpoint{,.receipts,.invalidation}; do
-    if [[ -e "$active_generation/$name" || -L "$active_generation/$name" ]]; then
-      [[ -f "$active_generation/$name" && ! -L "$active_generation/$name" ]] || {
-        echo "FATAL: active checkpoint companion is not regular $name" >&2
-        exit 1
-      }
-      cp -p "$active_generation/$name" "$copy_dir/$name"
+  if [[ -f "$copy_stage/copied.sha256" ]]; then
+    validate_copy_identity "$copy_stage"
+    grep -Fxq "capture_sha=$sha" "$copy_stage/source.identity" || die "staging belongs to another capture"
+    validate_copy_manifest "$copy_stage" || die "completed rehearsal staging failed recorded hash validation"
+    adopt_copy_stage
+  else
+    if [[ -d "$copy_stage" ]]; then
+      if find "$copy_stage" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+        validate_copy_identity "$copy_stage"
+        grep -Fxq "capture_sha=$sha" "$copy_stage/source.identity" || die "staging belongs to another capture"
+      fi
+      # Only this destination and revision's incomplete staging is disposable.
+      rm -rf -- "$copy_stage"
     fi
-  done
-  flock -u 8
-  exec 8>&-
-  sqlite3 -readonly "$active_generation/paper_state.db" ".backup '$copy_dir/paper_state.db'"
-  for name in paper.log source_events.log live_journal.log wallet_market_history.json; do
-    cp -p "$active_generation/$name" "$copy_dir/$name"
-  done
-  source_identity_stage=$(mktemp "$root/.source.identity.XXXXXX")
-  printf 'activation_id=%s\ngeneration_dir=%s\n' "$activation_id" "$active_generation" \
-    > "$source_identity_stage"
-  atomic_adopt "$source_identity_stage" "$source_identity" 0600 rehearsal-source-identity
-  rm -f "$source_identity_stage"
-  copy_manifest_stage=$(mktemp "$root/.copied.sha256.XXXXXX")
-  (
-    cd "$copy_dir"
-    sha256sum paper_state.db paper.log source_events.log live_journal.log \
-      wallet_market_history.json source.identity > "$copy_manifest_stage"
-    for name in source_events.log.boot-checkpoint{,.receipts,.invalidation}; do
-      [[ ! -f "$name" ]] || sha256sum "$name" >> "$copy_manifest_stage"
+    exec 8<>"$active_generation/source_events.log.boot-checkpoint.lock"
+    flock -x 8
+    inventory=$(capture_inventory "$active_generation")
+    # The SQLite backup is dense; the other staging files retain sparse allocation. The stage
+    # shares its destination filesystem, so its final rename needs no second-copy allowance.
+    python3 - "$active_generation" "$copy_stage" "$inventory" "$activation_id" "$sha" \
+      "$harness_deploy_dir/../../crates/service/src/disk_monitor.rs" <<'PY'
+import errno, os, re, sqlite3, sys
+root, stage, inventory, activation, revision, defaults = sys.argv[1:]
+with open(defaults, encoding="utf-8") as source:
+    match = re.search(r"pub const DISK_FREE_FLOOR_BYTES: u64 = ([0-9_]+);", source.read())
+if match is None:
+    raise SystemExit("cannot derive DISK_FREE_FLOOR_BYTES")
+floor = int(match.group(1).replace("_", ""))
+parent = os.path.dirname(stage)
+space = os.statvfs(parent)
+block = space.f_frsize
+
+def rounded(length):
+    return ((length + block - 1) // block) * block
+
+def sparse_allocation(path):
+    length = os.stat(path).st_size
+    allocated = 0
+    with open(path, "rb") as source:
+        offset = 0
+        while offset < length:
+            try:
+                data = os.lseek(source.fileno(), offset, os.SEEK_DATA)
+                hole = min(os.lseek(source.fileno(), data, os.SEEK_HOLE), length)
+            except OSError as error:
+                if error.errno == errno.ENXIO:
+                    break
+                if error.errno in (errno.EINVAL, errno.ENOTSUP):
+                    return rounded(length)
+                raise
+            allocated += rounded(hole) - (data // block) * block
+            offset = hole
+    return allocated
+
+with sqlite3.connect("file:" + os.path.join(root, "paper_state.db") + "?mode=ro", uri=True) as db:
+    backup = rounded(db.execute("pragma page_count").fetchone()[0] * db.execute("pragma page_size").fetchone()[0])
+names = inventory.splitlines()
+needed = backup + sum(sparse_allocation(os.path.join(root, name)) for name in names if name not in ("paper_state.db", "source.identity"))
+identity = f"activation_id={activation}\ngeneration_dir={root}\ncapture_sha={revision}\n"
+manifest_names = set(names) | {"source.identity"}
+manifest_bytes = sum(67 + len(os.fsencode(name)) for name in manifest_names)
+# Identity and both manifest copies coexist; reserve directory/journal blocks per entry.
+needed += rounded(len(identity.encode())) + 2 * rounded(manifest_bytes)
+needed += block * (3 + len(manifest_names))
+available = space.f_bavail * block
+if available < needed + floor:
+    raise SystemExit(f"REHEARSAL545_FAIL reason=insufficient_free_space filesystem={os.stat(parent).st_dev} available={available} peak_allocation={needed} floor={floor}")
+print(f"rehearsal capture space filesystem={os.stat(parent).st_dev} peak_allocation={needed} floor={floor} available={available}")
+PY
+    mkdir -m 0700 "$copy_stage"
+    printf 'activation_id=%s\ngeneration_dir=%s\ncapture_sha=%s\n' \
+      "$activation_id" "$active_generation" "$sha" > "$copy_stage/source.identity"
+    while IFS= read -r name; do
+      case "$name" in paper_state.db|paper.log|source_events.log|live_journal.log|wallet_market_history.json|source.identity) continue ;; esac
+      mkdir -p "$(dirname "$copy_stage/$name")"
+      cp -p --sparse=always -- "$active_generation/$name" "$copy_stage/$name"
+    done <<< "$inventory"
+    sqlite3 -readonly "$active_generation/paper_state.db" ".backup '$copy_stage/paper_state.db'"
+    for name in paper.log source_events.log live_journal.log wallet_market_history.json; do
+      cp -p --sparse=always -- "$active_generation/$name" "$copy_stage/$name"
     done
-  )
-  atomic_adopt "$copy_manifest_stage" "$copy_manifest" 0600 rehearsal-copy-manifest
-  rm -f "$copy_manifest_stage"
-  validate_copy_manifest || {
-    echo "FATAL: new rehearsal copy failed recorded hash validation" >&2
-    exit 1
-  }
+    flock -u 8
+    exec 8>&-
+    maybe_crash rehearsal-inputs-copied
+    stage_inventory=$(capture_inventory "$copy_stage")
+    copy_manifest_stage=$(mktemp "$copy_stage/.copied.sha256.XXXXXX")
+    (
+      cd "$copy_stage"
+      while IFS= read -r name; do
+        sha256sum "$name"
+      done <<< "$stage_inventory"
+    ) > "$copy_manifest_stage"
+    atomic_adopt "$copy_manifest_stage" "$copy_stage/copied.sha256" 0600 rehearsal-copy-manifest
+    rm -f "$copy_manifest_stage"
+    validate_copy_manifest "$copy_stage" || die "new rehearsal copy failed recorded hash validation"
+    maybe_crash rehearsal-staging-complete
+    adopt_copy_stage
+  fi
 fi
+validate_copy_identity "$copy_dir"
+validate_copy_manifest "$copy_dir" || die "reusable rehearsal copy failed recorded hash validation"
+[[ "$(sqlite3 -readonly "$copy_dir/paper_state.db" 'pragma quick_check;')" == ok ]] ||
+  die "reusable rehearsal database failed SQLite integrity"
+for name in paper.log source_events.log live_journal.log; do
+  magic=$(od -An -tx1 -N5 "$copy_dir/$name" | tr -d ' \n')
+  [[ "$magic" == "4544474501" ]] || die "reusable $name lost its EDGE-v1 framing"
+done
 copy_manifest_sha256=$(sha256sum "$copy_manifest" | awk '{print $1}')
 
 # Issue #584: bind the checkpointed copy's terminal pre-#545 continuation inventory before any

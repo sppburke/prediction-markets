@@ -236,6 +236,165 @@ mod admission_tests {
         assert!(state.cursor(&wallet(1)).unwrap().is_none());
         drop(held);
     }
+
+    /// A wallet retention removed but did not drain: a group and a gate result left, with their trade rows.
+    fn listed_with_leftovers(
+        path: &std::path::Path,
+        state: &PaperStateDb,
+        candidate: WalletAddress,
+    ) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute(
+            "INSERT INTO activity_groups VALUES ('left', 'tx', ?1, 1, 'r', 'TRADE', 'applied', '{}')",
+            [candidate.to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO entry_gate_results VALUES ('left-gate', ?1, 'market', 1, 'admitted', 1)",
+            [candidate.to_string()],
+        )
+        .unwrap();
+        for id in ["left", "left-gate"] {
+            conn.execute("INSERT INTO seen_trades_v2 VALUES (?1, 2, 'tx')", [id])
+                .unwrap();
+        }
+        assert_eq!(
+            state.retire_wallet(candidate, 0, None).unwrap().result,
+            None
+        );
+        assert_eq!(state.retirement_drains().unwrap().result, vec![candidate]);
+    }
+
+    fn seen(state: &PaperStateDb, id: &str) -> bool {
+        state
+            .is_seen(&pe_core_types::SourceTradeId(id.to_owned()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn preparation_drains_a_listed_wallet_even_when_its_fence_check_defers_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("paper.db");
+        let state = Arc::new(PaperStateDb::open(&path).unwrap());
+        let candidate = wallet(8);
+        listed_with_leftovers(&path, &state, candidate);
+        // A fence the wallet holds defers it at the fence check; the drain runs before that check.
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute(
+                "INSERT INTO wallet_fences VALUES (?1, 'left', 'fixture', '{}', 1)",
+                [candidate.to_string()],
+            )
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        let outcome = AdmissionPreparer::new(tx, state.clone())
+            .prepare(&[candidate])
+            .await
+            .unwrap();
+        assert!(matches!(
+            outcome.deferred.as_slice(),
+            [deferral] if deferral.wallet == candidate && deferral.stage == "fence"
+        ));
+        assert!(outcome.started.is_empty() && outcome.admitted.is_empty());
+        assert!(rx.try_recv().is_err());
+        assert!(state.retirement_drains().unwrap().result.is_empty());
+        assert!(!seen(&state, "left") && !seen(&state, "left-gate"));
+        assert_eq!(state.last_activity_group_epoch(&candidate).unwrap(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn preparation_deadline_mid_drain_leaves_the_wallet_listed_and_unstarted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("paper.db");
+        let state = Arc::new(PaperStateDb::open(&path).unwrap());
+        let candidate = wallet(9);
+        listed_with_leftovers(&path, &state, candidate);
+        let (tx, mut rx) = mpsc::channel(1);
+        let fetcher = Arc::new(pe_source_polymarket_public::FixtureFetcher::new(
+            HashMap::new(),
+        ));
+        let identity = Arc::new(crate::asset_identity::AssetIdentityResolver::new(
+            fetcher.clone(),
+            "https://fixture.invalid".to_owned(),
+            pe_source_polymarket_public::GAMMA_BATCH_SIZE,
+            Arc::new(Mutex::new(
+                crate::source_event_sink::SourceEventSink::open(dir.path().join("source.log"))
+                    .unwrap(),
+            )),
+        ));
+        let validator = CausalPositionValidator::new(
+            fetcher,
+            "https://fixture.invalid",
+            "admission-test",
+            identity,
+        );
+        let ranked = HashMap::from([(candidate, 1234)]);
+        let preparer = AdmissionPreparer::with_validator(tx, state.clone(), validator);
+        let day = Duration::from_secs(86_400);
+        let deadline = Instant::now() + 2 * day;
+        let additions = [candidate];
+        let prepare = preparer.prepare_with_cursors(
+            &additions,
+            Some(&ranked),
+            Some(deadline),
+            AdmissionContext::Other,
+        );
+        // Pauses follow measured lock times, so the test moves the paused clock itself (tokio does not
+        // auto-advance while this task keeps yielding). One day ends the drain-list read's pause
+        // whatever it measured; the group's drain transaction then commits and preparation parks in
+        // its pause (at least 50 ms) until the second day passes the deadline, so the gate result's
+        // transaction never starts.
+        let drive = async {
+            tokio::time::advance(day).await;
+            for _ in 0..1_000 {
+                if !seen(&state, "left") {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert!(!seen(&state, "left"), "the group's transaction committed");
+            tokio::time::advance(day).await;
+        };
+        let (outcome, ()) = tokio::join!(prepare, drive);
+        let outcome = outcome.unwrap();
+        assert_eq!(outcome.unstarted, vec![candidate]);
+        assert!(outcome.started.is_empty() && outcome.deferred.is_empty());
+        assert!(outcome.admitted.is_empty());
+        assert!(rx.try_recv().is_err());
+        assert_eq!(state.retirement_drains().unwrap().result, vec![candidate]);
+        assert!(!seen(&state, "left"), "the group's transaction committed");
+        assert!(
+            seen(&state, "left-gate"),
+            "the gate result's transaction never started"
+        );
+        assert!(state.cursor(&candidate).unwrap().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn preparation_without_listed_additions_takes_no_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("paper.db");
+        let state = Arc::new(PaperStateDb::open(&path).unwrap());
+        let candidate = wallet(8);
+        let other = wallet(9);
+        let (tx, _rx) = mpsc::channel(1);
+        let preparer = AdmissionPreparer::new(tx, state.clone());
+        for listed in [false, true] {
+            if listed {
+                listed_with_leftovers(&path, &state, other);
+            }
+            let start = Instant::now();
+            let result = preparer.prepare(&[candidate]).await.unwrap();
+            assert_eq!(Instant::now(), start);
+            assert_eq!(result.deferred[0].kind, "history.missing");
+            assert!(result.admitted.is_empty());
+            assert_eq!(
+                state.retirement_drains().unwrap().result,
+                if listed { vec![other] } else { Vec::new() }
+            );
+        }
+        assert!(seen(&state, "left") && seen(&state, "left-gate"));
+    }
 }
 
 impl AdmissionError {
@@ -448,6 +607,11 @@ struct AdmissionQueue {
     keys: HashMap<WalletAddress, u64>,
 }
 
+/// Keeps catch-up brackets serialized with departed-wallet deletion.
+pub struct RetentionAdmissionGuard<'a> {
+    _attempt: tokio::sync::MutexGuard<'a, AdmissionQueue>,
+}
+
 impl AdmissionQueue {
     fn offer(&mut self, wallet: WalletAddress) -> Result<(), AdmissionError> {
         if !self.keys.contains_key(&wallet) {
@@ -510,6 +674,13 @@ impl Drop for AdmissionLaunchLog {
 }
 
 impl AdmissionPreparer {
+    /// Acquire outside the orchestrator and hold through the retirement acknowledgement.
+    pub async fn lock_for_retention(&self) -> RetentionAdmissionGuard<'_> {
+        RetentionAdmissionGuard {
+            _attempt: self.inner.attempt.lock().await,
+        }
+    }
+
     pub fn new(
         control_tx: mpsc::Sender<OrchestratorControl>,
         paper_state: Arc<PaperStateDb>,
@@ -593,6 +764,22 @@ impl AdmissionPreparer {
             .await
     }
 
+    #[cfg(feature = "scenario")]
+    pub async fn scenario_prepare_ranked_until(
+        &self,
+        additions: &[WalletAddress],
+        ranked_last_trade: &HashMap<WalletAddress, i64>,
+        deadline: Option<Instant>,
+    ) -> Result<AdmissionOutcome, AdmissionAbort> {
+        self.prepare_ranked_until(
+            additions,
+            ranked_last_trade,
+            deadline,
+            AdmissionContext::Other,
+        )
+        .await
+    }
+
     /// Reject fences before validation and require complete history after the accepted
     /// anchor installation is acknowledged. Validator-free callers require complete
     /// history before handing preparation to the orchestrator.
@@ -646,7 +833,43 @@ impl AdmissionPreparer {
         let mut admitted = Vec::new();
         let mut deferred = Vec::new();
         let mut eligible = Vec::new();
-        for wallet in additions {
+        // A wallet retention removed but has not drained is drained before anything reads it; one
+        // the deadline interrupts stays listed and unstarted.
+        let mut ready = Vec::with_capacity(additions.len());
+        let past_deadline = || deadline.is_some_and(|end| Instant::now() >= end);
+        let drained = async {
+            let read = preparer.paper_state.retirement_drains()?;
+            let listed = read.result;
+            if additions.iter().any(|wallet| listed.contains(wallet)) {
+                crate::database_retention::pace_drain_list_read(listed.len(), read.lock_time).await;
+            }
+            for wallet in additions {
+                if listed.contains(wallet)
+                    && crate::database_retention::drain_retired_wallet(
+                        &preparer.paper_state,
+                        *wallet,
+                        &past_deadline,
+                    )
+                    .await?
+                    .is_none()
+                {
+                    unstarted.push(*wallet);
+                } else {
+                    ready.push(*wallet);
+                }
+            }
+            Ok::<(), pe_paper_state::PaperStateError>(())
+        };
+        if let Err(error) = drained.await {
+            return Err(AdmissionAbort {
+                started,
+                unstarted,
+                admitted,
+                cause: AdmissionError::PaperState(error),
+                deferred,
+            });
+        }
+        for wallet in &ready {
             match self.check_recovery_fence(wallet) {
                 Ok(()) => eligible.push(*wallet),
                 Err(error) if error.class() != FailureClass::Shared => {

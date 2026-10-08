@@ -1301,7 +1301,9 @@ mod tests {
                             }))
                             .unwrap();
                     }
-                    OrchestratorControl::ActivityFrameDecision { .. }
+                    OrchestratorControl::RetentionCommit { .. }
+                    | OrchestratorControl::ActivityFrameDecision { .. }
+                    | OrchestratorControl::RetireWallet { .. }
                     | OrchestratorControl::ReconciliationUpdate { .. }
                     | OrchestratorControl::ResolutionCandidate { .. }
                     | OrchestratorControl::RiskHaltChange { .. }

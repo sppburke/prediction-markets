@@ -174,6 +174,8 @@ CREATE TABLE IF NOT EXISTS entry_gate_results (
     result          TEXT    NOT NULL,
     history_consumed INTEGER NOT NULL CHECK(history_consumed IN (0, 1))
 );
+-- Retention reads a wallet's gate results (candidate pages, drains) by wallet.
+CREATE INDEX IF NOT EXISTS idx_entry_gate_results_wallet ON entry_gate_results(wallet_hex);
 
 CREATE TABLE IF NOT EXISTS wallet_history_status_v2 (
     wallet_hex      TEXT    PRIMARY KEY NOT NULL,
@@ -204,6 +206,8 @@ CREATE TABLE IF NOT EXISTS decision_pending (
     terminal_disposition   TEXT,
     updated_at_unix        INTEGER NOT NULL
 );
+-- Retention reads a wallet's decisions (eligibility checks, candidate pages, removal) by wallet.
+CREATE INDEX IF NOT EXISTS idx_decision_pending_wallet ON decision_pending(wallet_hex);
 
 -- Per-wallet fences clear only with exact-fence comparison, repaired history, and an
 -- authoritative causal anchor in the same install_anchors transaction.

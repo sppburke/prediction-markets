@@ -8,11 +8,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use blake3::Hash;
 use pe_core_types::EventSeq;
 
-use crate::LogError;
 use crate::envelope::{ChainError, EventEnvelope, verify_chain};
 use crate::frame::{
     FrameReadError, HEADER_LEN, MAX_FRAME_BYTES, read_frame_observed, verify_file_header,
 };
+use crate::{LogError, RetentionAuthority};
 
 /// Exact identity of a completely verified append-only log prefix (#544).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -92,6 +92,14 @@ impl Scanner {
         sealed: &LogTailBinding,
         observer: &mut dyn FnMut(u64, &EventEnvelope),
     ) -> Result<Option<LogTailBinding>, LogError> {
+        if let Some(authority) = RetentionAuthority::load(&sealed.path)?
+            && sealed.physical_tail <= authority.boundary.offset
+        {
+            return Err(LogError::Retired {
+                physical_tail: sealed.physical_tail,
+                boundary_offset: authority.boundary.offset,
+            });
+        }
         let file = File::open(&sealed.path)?;
         let (outcome, verdict) = walk_locked(
             &sealed.path,
@@ -165,7 +173,7 @@ impl Scanner {
         cancel: Option<&AtomicBool>,
     ) -> Result<blake3::Hasher, LogError> {
         check_cancelled(cancel)?;
-        hash_open_prefix(&File::open(path)?, physical_tail, cancel)
+        hash_open_prefix(path, &File::open(path)?, physical_tail, cancel)
     }
 }
 
@@ -191,9 +199,20 @@ impl PrefixVerdict {
             ))),
         }
     }
+
+    /// A walk that reaches the end of the log must have passed the committed retained tail.
+    pub(crate) fn require_retained(self) -> Result<(), LogError> {
+        match self {
+            Self::NotRequested | Self::Matched => Ok(()),
+            Self::Shorter | Self::Mismatch => Err(crate::RetentionError::Invalid(
+                "event log does not reach its committed retained tail".into(),
+            )
+            .into()),
+        }
+    }
 }
 
-struct PrefixTracker<'a> {
+pub(crate) struct PrefixTracker<'a> {
     expected: Option<&'a LogTailBinding>,
     /// The binding names one canonical file; a binding for another file can never match.
     same_file: bool,
@@ -201,7 +220,7 @@ struct PrefixTracker<'a> {
 }
 
 impl<'a> PrefixTracker<'a> {
-    fn new(expected: Option<&'a LogTailBinding>, resolved_path: &Path) -> Self {
+    pub(crate) fn new(expected: Option<&'a LogTailBinding>, resolved_path: &Path) -> Self {
         Self {
             expected,
             same_file: expected.is_none_or(|expected| expected.path == resolved_path),
@@ -209,7 +228,7 @@ impl<'a> PrefixTracker<'a> {
         }
     }
 
-    fn observe(&mut self, state: &ScanState) {
+    pub(crate) fn observe(&mut self, state: &ScanState) {
         let Some(expected) = self.expected else {
             return;
         };
@@ -222,7 +241,7 @@ impl<'a> PrefixTracker<'a> {
         }
     }
 
-    fn verdict(&self, final_state: &ScanState) -> PrefixVerdict {
+    pub(crate) fn verdict(&self, final_state: &ScanState) -> PrefixVerdict {
         match self.expected {
             None => PrefixVerdict::NotRequested,
             Some(_) if !self.same_file => PrefixVerdict::Mismatch,
@@ -299,6 +318,34 @@ impl ScanState {
     }
 }
 
+/// The retained tail is fsynced before its authority commits and the log only grows afterwards, so a
+/// log shorter than it lost committed frames, whatever bound the caller walks to.
+pub(crate) fn require_retained_length(
+    file: &File,
+    retained: Option<&LogTailBinding>,
+) -> Result<(), LogError> {
+    match retained {
+        Some(tail) if file.metadata()?.len() < tail.physical_tail => {
+            Err(crate::RetentionError::Invalid(
+                "event log is shorter than its committed retained tail".into(),
+            )
+            .into())
+        }
+        _ => Ok(()),
+    }
+}
+
+pub(crate) fn fresh_state(authority: Option<&RetentionAuthority>) -> ScanState {
+    match authority {
+        Some(authority) => ScanState::at_frame(
+            authority.boundary.sequence,
+            authority.chain_head,
+            authority.boundary.offset,
+        ),
+        None => ScanState::after_header(),
+    }
+}
+
 pub(crate) enum ScanStep {
     Frame(EventEnvelope),
     Eof,
@@ -312,7 +359,7 @@ pub(crate) fn read_verified_frame(
     read_verified_frame_observed(reader, state, &mut |_| {})
 }
 
-fn read_verified_frame_observed(
+pub(crate) fn read_verified_frame_observed(
     reader: &mut (impl Read + Seek),
     state: &mut ScanState,
     raw: &mut dyn FnMut(&[u8]),
@@ -356,7 +403,29 @@ fn read_verified_frame_observed(
             byte_offset: frame_start,
             source,
         })?;
-    let expected_sequence = EventSeq(state.next_sequence);
+    verify_envelope(
+        &envelope,
+        EventSeq(state.next_sequence),
+        state.previous_hash,
+        frame_start,
+    )?;
+
+    state.physical_tail = reader.stream_position()?;
+    state.previous_hash = envelope.this_hash;
+    state.next_sequence = state
+        .next_sequence
+        .checked_add(1)
+        .ok_or(LogError::SequenceOverflow)?;
+    Ok(ScanStep::Frame(envelope))
+}
+
+/// Shared decoded-envelope verification for non-contiguous archived frames.
+pub(crate) fn verify_envelope(
+    envelope: &EventEnvelope,
+    expected_sequence: EventSeq,
+    previous_hash: Hash,
+    frame_start: u64,
+) -> Result<(), LogError> {
     if envelope.seq != expected_sequence {
         return Err(LogError::SequenceMismatch {
             byte_offset: frame_start,
@@ -375,7 +444,7 @@ fn read_verified_frame_observed(
         });
     }
 
-    match verify_chain(&envelope, &state.previous_hash) {
+    match verify_chain(envelope, &previous_hash) {
         Ok(()) => {}
         Err(ChainError::PrevHashMismatch { expected, actual }) => {
             return Err(LogError::ChainBroken {
@@ -401,13 +470,7 @@ fn read_verified_frame_observed(
         }
     }
 
-    state.physical_tail = reader.stream_position()?;
-    state.previous_hash = envelope.this_hash;
-    state.next_sequence = state
-        .next_sequence
-        .checked_add(1)
-        .ok_or(LogError::SequenceOverflow)?;
-    Ok(ScanStep::Frame(envelope))
+    Ok(())
 }
 
 pub(crate) fn inspect_open(path: &Path, file: &File) -> Result<ScanOutcome, LogError> {
@@ -433,14 +496,36 @@ pub(crate) fn walk_locked<'a>(
     crate::scan_metrics::record(&resolved_path);
     let mut reader = BufReader::new(file);
     verify_file_header(path, &mut reader)?;
-    let mut state = ScanState::after_header();
+    let authority = RetentionAuthority::load(path)?;
+    let mut state = fresh_state(authority.as_ref());
+    reader.seek(SeekFrom::Start(state.physical_tail()))?;
     let mut prefix = PrefixTracker::new(request.expected_prefix, &resolved_path);
+    if let (Some(authority), Some(expected)) = (&authority, request.expected_prefix) {
+        authority.authenticate_binding(path, expected)?;
+        prefix.matched = expected.physical_tail <= authority.boundary.offset;
+    }
     prefix.observe(&state);
+    let retained = authority
+        .as_ref()
+        .map(|authority| authority.retained_tail.resolve(path))
+        .transpose()?;
+    require_retained_length(file, retained.as_ref())?;
+    let mut retention = PrefixTracker::new(retained.as_ref(), &resolved_path);
+    retention.observe(&state);
+    let require_retained = request.boundary == WalkBoundary::PhysicalEof
+        || retained.as_ref().is_some_and(|tail| {
+            request
+                .expected_prefix
+                .is_some_and(|expected| expected.physical_tail >= tail.physical_tail)
+        });
 
     loop {
         if request.boundary == WalkBoundary::ExpectedPrefix
             && let Some(verdict) = prefix.verdict_before_read(&state)
         {
+            if require_retained {
+                retention.verdict(&state).require_retained()?;
+            }
             return Ok((
                 ScanOutcome {
                     verified_tail: tail_binding(resolved_path, &state),
@@ -456,8 +541,12 @@ pub(crate) fn walk_locked<'a>(
                 crate::scan_metrics::record_decoded(&resolved_path);
                 observer(frame_start, &envelope);
                 prefix.observe(&state);
+                retention.observe(&state);
             }
             ScanStep::Eof => {
+                if require_retained {
+                    retention.verdict(&state).require_retained()?;
+                }
                 let verdict = prefix.verdict(&state);
                 return Ok((
                     ScanOutcome {
@@ -468,6 +557,9 @@ pub(crate) fn walk_locked<'a>(
                 ));
             }
             ScanStep::Incomplete(incomplete_tail) => {
+                if require_retained {
+                    retention.verdict(&state).require_retained()?;
+                }
                 let verdict = prefix.verdict(&state);
                 return Ok((
                     ScanOutcome {
@@ -510,13 +602,22 @@ impl<R: Seek> Seek for BoundedReader<R> {
 }
 
 pub(crate) fn hash_open_prefix(
+    path: &Path,
     file: &File,
     physical_tail: u64,
     cancel: Option<&AtomicBool>,
 ) -> Result<blake3::Hasher, LogError> {
     let mut reader = BufReader::new(file);
-    reader.seek(SeekFrom::Start(0))?;
-    hash_reader_prefix(&mut reader, physical_tail, cancel)
+    let authority = RetentionAuthority::load(path)?;
+    let offset = authority
+        .as_ref()
+        .map_or(0, |authority| authority.boundary.offset);
+    let length = physical_tail.checked_sub(offset).ok_or(LogError::Retired {
+        physical_tail,
+        boundary_offset: offset,
+    })?;
+    reader.seek(SeekFrom::Start(offset))?;
+    hash_reader_prefix(&mut reader, length, cancel)
 }
 
 fn check_cancelled(cancel: Option<&AtomicBool>) -> Result<(), LogError> {
@@ -575,6 +676,21 @@ pub(crate) fn walk_hashed(
         cursor: 0,
         bound: bound.unwrap_or(u64::MAX),
     };
+    let authority = RetentionAuthority::load(path)?;
+    if let Some(authority) = &authority {
+        if let Some(expected) = expected {
+            authority.authenticate_binding(path, expected)?;
+        }
+        if let Some(resume) = resume {
+            authority.authenticate_binding(path, resume)?;
+            if resume.physical_tail < authority.boundary.offset {
+                return Err(LogError::Retired {
+                    physical_tail: resume.physical_tail,
+                    boundary_offset: authority.boundary.offset,
+                });
+            }
+        }
+    }
     let mut state = if let Some(resume) = resume {
         if resume.physical_tail > reader.bound {
             return Err(LogError::Io(std::io::Error::other(
@@ -598,16 +714,41 @@ pub(crate) fn walk_hashed(
         reader.seek(SeekFrom::Start(0))?;
         verify_file_header(path, &mut reader)?;
         *digest = blake3::Hasher::new();
-        // These are the bytes just read and checked by verify_file_header.
-        digest.update(crate::frame::MAGIC);
-        digest.update(&[crate::frame::VERSION]);
-        ScanState::after_header()
+        if authority.is_none() {
+            // These are the bytes just read and checked by verify_file_header.
+            digest.update(crate::frame::MAGIC);
+            digest.update(&[crate::frame::VERSION]);
+        }
+        let state = fresh_state(authority.as_ref());
+        reader.seek(SeekFrom::Start(state.physical_tail()))?;
+        state
     };
     let mut prefix = PrefixTracker::new(expected, &resolved_path);
-    if resume.is_some() {
+    if resume.is_some()
+        || authority.as_ref().is_some_and(|authority| {
+            expected.is_some_and(|binding| binding.physical_tail <= authority.boundary.offset)
+        })
+    {
         prefix.matched = true;
-    } // Caller authenticated the checkpoint's activation binding.
+    } // Caller authenticated the checkpoint's activation binding; retired bindings were point-read above.
     prefix.observe(&state);
+    let retained = authority
+        .as_ref()
+        .map(|authority| authority.retained_tail.resolve(path))
+        .transpose()?;
+    require_retained_length(file, retained.as_ref())?;
+    let mut retention = PrefixTracker::new(retained.as_ref(), &resolved_path);
+    if resume.is_some_and(|binding| {
+        retained
+            .as_ref()
+            .is_some_and(|tail| binding.physical_tail > tail.physical_tail)
+    }) {
+        retention.matched = true; // The caller authenticated this tail within the current epoch.
+    }
+    retention.observe(&state);
+    let require_retained = retained
+        .as_ref()
+        .is_some_and(|tail| bound.is_none_or(|bound| bound >= tail.physical_tail));
     loop {
         check_cancelled(cancel)?;
         let start = state.physical_tail();
@@ -621,8 +762,12 @@ pub(crate) fn walk_hashed(
                 *digest = candidate;
                 observer(start, &envelope);
                 prefix.observe(&state);
+                retention.observe(&state);
             }
             ScanStep::Eof => {
+                if require_retained {
+                    retention.verdict(&state).require_retained()?;
+                }
                 return Ok((
                     ScanOutcome {
                         verified_tail: tail_binding(resolved_path, &state),
@@ -632,6 +777,9 @@ pub(crate) fn walk_hashed(
                 ));
             }
             ScanStep::Incomplete(tail) => {
+                if require_retained {
+                    retention.verdict(&state).require_retained()?;
+                }
                 return Ok((
                     ScanOutcome {
                         verified_tail: tail_binding(resolved_path, &state),

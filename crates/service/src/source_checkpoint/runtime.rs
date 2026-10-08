@@ -1,5 +1,6 @@
 //! Runtime ownership of a verified, incrementally extended checkpoint prefix.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -10,6 +11,7 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
+use super::retention::{self, PreparedRetention, RetentionCommitOutcome, RetentionContext};
 use super::{CheckpointData, PublishError, PublishOutcome, SerializedCandidate};
 use crate::risk_inputs::SourceReceiptIndex;
 use crate::source_log_boot::{ACTIVITY_REDUCER_VERSION, FrozenCheckpoint, FrozenPrefix, Reducers};
@@ -43,6 +45,8 @@ enum OwnerError {
     Projection(#[from] anyhow::Error),
     #[error("source checkpoint serialization: {0}")]
     Serialization(#[from] serde_json::Error),
+    #[error("source checkpoint retained pin: {0}")]
+    RetainedPin(crate::risk_inputs::RiskInputsUnavailable),
     #[error("source checkpoint clock or scenario seam: {0}")]
     Io(#[from] std::io::Error),
     #[error("source checkpoint blocking job join: {0}")]
@@ -54,6 +58,15 @@ enum OwnerError {
 enum JobOutput {
     Candidate(Box<FrozenCheckpoint>, Option<Arc<SerializedCandidate>>),
     Publication(Result<PublishOutcome, PublishError>),
+    RetentionPrepared(Box<FrozenCheckpoint>, PreparedRetention),
+    RetentionCommitted(RetentionCommitOutcome),
+    RetentionWindow(
+        Box<FrozenCheckpoint>,
+        HashSet<pe_core_types::WalletAddress>,
+        Option<Arc<SerializedCandidate>>,
+    ),
+    Punched(u64),
+    Paused(&'static str),
 }
 
 type Job = JoinHandle<Result<JobOutput, TaskFailure>>;
@@ -142,8 +155,19 @@ pub struct SourceCheckpointOwner {
     slot: CheckpointJobSlot,
     pending: Option<Arc<SerializedCandidate>>,
     paper_state: Option<Arc<pe_paper_state::PaperStateDb>>,
+    database_retention: Option<crate::database_retention::DatabaseRetention>,
+    held_obligations: Option<tokio::sync::watch::Receiver<crate::trade_poller::HeldObligations>>,
     attempt: u32,
     last_published_capture: Option<u64>,
+    retention: Option<RetentionContext>,
+    retention_epoch: u64,
+    finishing_retention: bool,
+    retention_walk_complete: bool,
+    retention_tail: Option<LogTailBinding>,
+    /// A publication failure inside the job ends the owner, as it does in the hourly loop.
+    publication_failure: Option<TaskFailure>,
+    window_wallets: HashSet<pe_core_types::WalletAddress>,
+    published_observation_wallets: HashSet<pe_core_types::WalletAddress>,
     #[cfg(feature = "scenario")]
     hooks: Arc<CheckpointOwnerHooks>,
 }
@@ -160,14 +184,25 @@ impl SourceCheckpointOwner {
         receipts: SourceReceiptIndex,
         slot: CheckpointJobSlot,
     ) -> Self {
+        let retention_epoch = receipts.retention_epoch();
         Self {
             frozen: Some(frozen),
             receipts,
             slot,
             pending: None,
             paper_state: None,
+            database_retention: None,
+            held_obligations: None,
             attempt: 0,
             last_published_capture: None,
+            retention: None,
+            retention_epoch,
+            finishing_retention: false,
+            retention_walk_complete: false,
+            retention_tail: None,
+            publication_failure: None,
+            window_wallets: HashSet::new(),
+            published_observation_wallets: HashSet::new(),
             #[cfg(feature = "scenario")]
             hooks: Arc::new(CheckpointOwnerHooks::default()),
         }
@@ -179,6 +214,99 @@ impl SourceCheckpointOwner {
         self
     }
 
+    #[must_use]
+    pub fn with_database_retention(
+        mut self,
+        retention: crate::database_retention::DatabaseRetention,
+    ) -> Self {
+        self.database_retention = Some(retention);
+        self
+    }
+
+    /// What the running poller still holds; the daily job keeps those frames readable.
+    #[must_use]
+    pub fn with_held_obligations(
+        mut self,
+        held: tokio::sync::watch::Receiver<crate::trade_poller::HeldObligations>,
+    ) -> Self {
+        self.held_obligations = Some(held);
+        self
+    }
+
+    /// Construct the actual owner around recorded fixtures without installing migration metadata.
+    #[cfg(feature = "scenario")]
+    pub fn for_retention_scenario(
+        activation: LogTailBinding,
+        receipts: SourceReceiptIndex,
+        slot: CheckpointJobSlot,
+        deferred: bool,
+    ) -> anyhow::Result<Self> {
+        let tail = receipts.current_tail_binding()?;
+        let mut rebuild = crate::source_log_boot::SourceLogRebuild::new(&tail.path, true)?;
+        let mut digest = blake3::Hasher::new();
+        let actual = Scanner::walk_bounded(
+            &tail.path,
+            tail.physical_tail,
+            &activation,
+            None,
+            &mut digest,
+            &mut |offset, envelope| rebuild.observe(offset, envelope),
+        )?;
+        require_binding(&tail, actual)?;
+        let rebuilt = rebuild.complete(&tail)?;
+        let mut reducers = rebuilt.reducers;
+        reducers.take_error()?;
+        anyhow::ensure!(
+            rebuilt.index.retention_epoch() == receipts.retention_epoch(),
+            "scenario index retention epoch differs"
+        );
+        let prefix = if deferred {
+            FrozenPrefix::Deferred {
+                tail: tail.clone(),
+                prefix_blake3: digest.finalize().to_hex().to_string(),
+            }
+        } else {
+            FrozenPrefix::Verified(Box::new(digest))
+        };
+        Ok(Self::new(
+            FrozenCheckpoint {
+                authority_generation: super::read_authority(&tail.path)?.generation(),
+                capture_unix_ms: 0,
+                financial_era: true,
+                activation,
+                tail,
+                prefix,
+                reducers,
+            },
+            receipts,
+            slot,
+        ))
+    }
+
+    /// The service boot must already have installed the retention fence before listening.
+    pub fn with_retention(mut self, context: RetentionContext) -> anyhow::Result<Self> {
+        let path = &self.receipts.current_tail_binding()?.path;
+        let authority = pe_event_log::RetentionAuthority::load(path)?;
+        self.retention_epoch = authority.as_ref().map_or(0, |authority| authority.epoch);
+        self.finishing_retention = authority.is_some();
+        self.paper_state = Some(context.paper_state.clone());
+        if let Some(frozen) = &self.frozen {
+            self.published_observation_wallets = retention::observation_wallets(frozen)?;
+        }
+        self.retention = Some(context);
+        Ok(self)
+    }
+
+    #[cfg(feature = "scenario")]
+    pub fn retention_window_for_scenario(&self) -> Option<&HashSet<pe_core_types::WalletAddress>> {
+        self.retention_walk_complete.then_some(&self.window_wallets)
+    }
+
+    #[cfg(feature = "scenario")]
+    pub async fn retention_for_scenario(&mut self) -> Result<(), TaskFailure> {
+        self.run_retention().await
+    }
+
     #[cfg(feature = "scenario")]
     pub fn set_scenario_hooks(&mut self, hooks: Arc<CheckpointOwnerHooks>) {
         self.hooks = hooks;
@@ -187,7 +315,12 @@ impl SourceCheckpointOwner {
     #[cfg(feature = "scenario")]
     pub async fn initialize_for_scenario(&mut self) -> Result<(), TaskFailure> {
         self.capture(None).await?;
-        self.attempt_publication().await
+        if self.finishing_retention {
+            self.pending = None;
+            self.run_retention().await
+        } else {
+            self.attempt_publication().await
+        }
     }
 
     #[cfg(feature = "scenario")]
@@ -242,18 +375,29 @@ impl SourceCheckpointOwner {
         );
         hourly.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         self.capture(None).await?;
-        self.attempt_publication().await?;
+        if self.finishing_retention {
+            self.pending = None;
+            self.run_retention().await?;
+        } else {
+            self.attempt_publication().await?;
+        }
         let mut retry_at = tokio::time::Instant::now() + Duration::from_secs(CHECKPOINT_RETRY_SECS);
         loop {
             tokio::select! {
                 biased;
                 _ = hourly.tick() => {
-                    let tail = self.receipts.current_tail_binding().map_err(TaskFailure::typed)?;
-                    let capture = self.unix_ms().map_err(TaskFailure::typed)?;
-                    self.capture(Some((tail, capture))).await?;
-                    self.attempt_publication().await?;
+                    if !self.finishing_retention {
+                        let tail = self.receipts.current_tail_binding().map_err(TaskFailure::typed)?;
+                        let capture = self.unix_ms().map_err(TaskFailure::typed)?;
+                        self.capture(Some((tail, capture))).await?;
+                        self.attempt_publication().await?;
+                    }
+                    self.run_retention().await?;
                 }
-                _ = tokio::time::sleep_until(retry_at), if self.pending.is_some() => self.attempt_publication().await?,
+                _ = tokio::time::sleep_until(retry_at), if self.pending.is_some() || self.finishing_retention => {
+                    if self.finishing_retention { self.run_retention().await?; }
+                    else { self.attempt_publication().await?; }
+                },
             }
             retry_at = tokio::time::Instant::now() + Duration::from_secs(CHECKPOINT_RETRY_SECS);
         }
@@ -269,11 +413,12 @@ impl SourceCheckpointOwner {
         #[cfg(feature = "scenario")]
         let hooks = self.hooks.clone();
         let paper_state = self.paper_state.clone();
+        let epoch = self.retention_epoch;
         let result = self.slot.execute(move |cancel| {
             let mut frozen = frozen;
             if matches!(frozen.prefix, FrozenPrefix::Deferred { .. }) {
                 let started = Instant::now();
-                let verified = verify_deferred(&frozen, &cancel,
+                let verified = verify_deferred(&frozen, &receipts, &cancel,
                     #[cfg(feature = "scenario")]
                     &hooks,
                 );
@@ -334,7 +479,7 @@ impl SourceCheckpointOwner {
                 }
                 frozen.reducers.activity = activity;
             }
-            let candidate = candidate(&frozen, &receipts).map_err(TaskFailure::typed)?;
+            let candidate = candidate(&frozen, &receipts, epoch).map_err(TaskFailure::typed)?;
             if let Some(candidate) = &candidate {
                 let (activity_triggers, activity_candidates, activity_commitments, routed_frame_receipts) =
                     frozen.reducers.activity.checkpoint_counts();
@@ -420,12 +565,23 @@ impl SourceCheckpointOwner {
                 Ok(PublishOutcome::Published(receipt)) => {
                     self.last_published_capture = Some(receipt.capture_unix_ms);
                     self.pending = None;
+                    if let Some(frozen) = &self.frozen {
+                        self.published_observation_wallets =
+                            retention::observation_wallets(frozen).map_err(TaskFailure::typed)?;
+                    }
                 }
                 Ok(PublishOutcome::GenerationChanged { candidate, current }) => {
                     return Err(TaskFailure::typed(OwnerError::GenerationChanged {
                         candidate,
                         current,
                     }));
+                }
+                Ok(PublishOutcome::RetentionChanged { current, .. }) => {
+                    self.pending = None;
+                    self.retention_epoch = current;
+                    self.retention_walk_complete = false;
+                    self.retention_tail = None;
+                    self.finishing_retention = current > 0;
                 }
                 Ok(PublishOutcome::Refused(_)) => self.pending = None,
                 Err(PublishError::Io(error)) => error!(%error, capture_unix_ms = capture,
@@ -439,6 +595,401 @@ impl SourceCheckpointOwner {
             hook(self.last_published_capture);
         }
         Ok(())
+    }
+    async fn run_retention(&mut self) -> Result<(), TaskFailure> {
+        let Some(context) = self.retention.clone() else {
+            return Ok(());
+        };
+        let started = Instant::now();
+        let mut punched = 0;
+        let mut skip = None;
+        let mut database_boundary = None;
+        if !self.finishing_retention {
+            self.retention_walk_complete = false;
+            self.window_wallets.clear();
+        }
+        let mut result = self
+            .retention_inner(&context, &mut punched, &mut skip, &mut database_boundary)
+            .await;
+        let mut database_report = crate::database_retention::DatabaseRetentionReport::default();
+        if !self.finishing_retention
+            && let Some(boundary_current) = database_boundary
+        {
+            match self
+                .database_retention(boundary_current, self.retention_walk_complete)
+                .await
+            {
+                Ok(report) => database_report = report,
+                Err(error) => result = Err(error),
+            }
+        }
+        if result.is_err() && skip.is_none() {
+            skip = Some("retention_failed");
+        }
+        let authority = self.receipts.current_tail_binding().ok().and_then(|tail| {
+            pe_event_log::RetentionAuthority::load(&tail.path)
+                .ok()
+                .flatten()
+        });
+        info!(
+            epoch = authority.as_ref().map_or(0, |authority| authority.epoch),
+            boundary = authority
+                .as_ref()
+                .map_or(0, |authority| authority.boundary.sequence.0),
+            pins = authority
+                .as_ref()
+                .map_or(0, |authority| authority.pins.len()),
+            bytes_punched = punched,
+            feed_frames = authority
+                .as_ref()
+                .and_then(|authority| authority
+                    .feed
+                    .last()
+                    .filter(|entry| entry.epoch == authority.epoch))
+                .map_or(0, |entry| entry.frame_count),
+            anchors_blanked = database_report.anchors_blanked,
+            wallets_swapped_out = database_report.wallets_swapped_out,
+            wallets_waiting = ?database_report.wallets_waiting,
+            wallets_drained = database_report.wallets_drained,
+            trade_ids_drained = database_report.trade_ids_drained,
+            wallets_listed = ?database_report.wallets_listed,
+            cancelled = database_report.cancelled,
+            skip_reason = skip,
+            elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            "source retention"
+        );
+        if let Some(failure) = self.publication_failure.take() {
+            return Err(failure);
+        }
+        // Storage failures before a commit defer. A committed authority remains unfinished and is
+        // retried before the next daily gate, retaining its immutable archive and exact candidate.
+        if let Err(error) = result {
+            warn!(%error, finishing = self.finishing_retention, "source retention deferred");
+        }
+        Ok(())
+    }
+
+    async fn retention_inner(
+        &mut self,
+        context: &RetentionContext,
+        punched: &mut u64,
+        skip: &mut Option<&'static str>,
+        database_boundary: &mut Option<bool>,
+    ) -> anyhow::Result<()> {
+        let receipts = self.receipts.clone();
+        if !self.finishing_retention {
+            if self.pending.is_some() {
+                *skip = Some("checkpoint_publication_pending");
+                return Ok(());
+            }
+            let frozen = self.frozen.take().ok_or(OwnerError::Cancelled)?;
+            let job_context = context.clone();
+            let now = i64::try_from(self.unix_ms()? / 1000)?;
+            let held = self
+                .held_obligations
+                .as_ref()
+                .map(|held| held.borrow().receipts.clone())
+                .unwrap_or_default();
+            let output = self
+                .slot
+                .execute(move |cancel| {
+                    let prepared =
+                        retention::prepare(&frozen, &job_context, &receipts, &held, now, &cancel);
+                    // Restore the owner's frozen state even when preparation fails.
+                    let prepared = match prepared {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            warn!(%error, "source retention preparation deferred");
+                            PreparedRetention::Deferred("preparation_failed")
+                        }
+                    };
+                    Ok(JobOutput::RetentionPrepared(Box::new(frozen), prepared))
+                })
+                .await
+                .map_err(|error| anyhow::anyhow!("{}", error.message))?;
+            let JobOutput::RetentionPrepared(frozen, prepared) = output else {
+                return Err(OwnerError::Cancelled.into());
+            };
+            self.frozen = Some(*frozen);
+            match prepared {
+                PreparedRetention::Deferred(reason) => {
+                    *skip = Some(reason);
+                    if matches!(reason, "preparation_failed" | "disposition_barrier") {
+                        *database_boundary = Some(false);
+                    }
+                    return Ok(());
+                }
+                PreparedRetention::Nothing {
+                    tail,
+                    boundary_current,
+                } => {
+                    *database_boundary = Some(boundary_current);
+                    self.build_retention_window(context, tail).await?;
+                    return Ok(());
+                }
+                PreparedRetention::Advance(request) => {
+                    *database_boundary = Some(false);
+                    let output = self
+                        .slot
+                        .execute(move |_| {
+                            retention::send_commit(*request)
+                                .map(JobOutput::RetentionCommitted)
+                                .map_err(TaskFailure::typed)
+                        })
+                        .await
+                        .map_err(|error| anyhow::anyhow!("{}", error.message))?;
+                    match output {
+                        JobOutput::RetentionCommitted(RetentionCommitOutcome::Deferred(reason)) => {
+                            *skip = Some(reason);
+                            *database_boundary = None;
+                            return Ok(());
+                        }
+                        JobOutput::RetentionCommitted(RetentionCommitOutcome::Committed {
+                            authority,
+                            directory_synced,
+                        }) => {
+                            self.finishing_retention = true;
+                            self.retention_walk_complete = false;
+                            self.retention_tail = Some(
+                                authority
+                                    .retained_tail
+                                    .resolve(&self.receipts.current_tail_binding()?.path)?,
+                            );
+                            self.retention_epoch = authority.epoch;
+                            *database_boundary = Some(true);
+                            self.pending = None;
+                            // A visible authority is committed even if its directory is unsynced.
+                            if !directory_synced {
+                                *skip = Some("authority_directory_sync");
+                            }
+                            #[cfg(feature = "scenario")]
+                            if let Some(hook) = &context.hooks.after_commit {
+                                hook()?;
+                            }
+                        }
+                        _ => return Err(OwnerError::Cancelled.into()),
+                    }
+                }
+            }
+        }
+        *database_boundary = Some(true);
+        self.finish_retention(context, punched, skip).await
+    }
+
+    async fn build_retention_window(
+        &mut self,
+        context: &RetentionContext,
+        tail: LogTailBinding,
+    ) -> anyhow::Result<()> {
+        self.retention_walk_complete = false;
+        let frozen = self.frozen.take().ok_or(OwnerError::Cancelled)?;
+        let receipts = self.receipts.clone();
+        let epoch = self.retention_epoch;
+        let capture = self.unix_ms()?;
+        let paper_state = context.paper_state.clone();
+        #[cfg(feature = "scenario")]
+        let hooks = self.hooks.clone();
+        let output = self
+            .slot
+            .execute(move |cancel| {
+                let mut frozen = frozen;
+                let work = (|| -> anyhow::Result<_> {
+                    if tail.physical_tail > frozen.tail.physical_tail {
+                        extend(
+                            &mut frozen,
+                            tail.clone(),
+                            capture,
+                            &cancel,
+                            #[cfg(feature = "scenario")]
+                            &hooks,
+                        )?;
+                    }
+                    let wallets =
+                        retention::verified_window(&mut frozen, &receipts, tail, &cancel)?;
+                    let mut activity = frozen.reducers.activity.clone();
+                    activity.prune(&paper_state, &receipts)?;
+                    paper_state.sync_checkpoint_dispositions()?;
+                    frozen.reducers.activity = activity;
+                    frozen.capture_unix_ms = capture;
+                    let candidate = candidate(&frozen, &receipts, epoch)?.map(Arc::new);
+                    Ok((wallets, candidate))
+                })();
+                match work {
+                    Ok((wallets, candidate)) => Ok(JobOutput::RetentionWindow(
+                        Box::new(frozen),
+                        wallets,
+                        candidate,
+                    )),
+                    Err(error) => {
+                        warn!(%error, "source retention bounded walk deferred");
+                        Ok(JobOutput::RetentionPrepared(
+                            Box::new(frozen),
+                            PreparedRetention::Deferred("window_walk_failed"),
+                        ))
+                    }
+                }
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("{}", error.message))?;
+        match output {
+            JobOutput::RetentionWindow(frozen, wallets, candidate) => {
+                self.frozen = Some(*frozen);
+                self.window_wallets = wallets;
+                self.retention_walk_complete = true;
+                self.pending = candidate;
+                self.attempt = 0;
+                Ok(())
+            }
+            JobOutput::RetentionPrepared(frozen, _) => {
+                self.frozen = Some(*frozen);
+                anyhow::bail!("retention bounded walk or disposition barrier failed")
+            }
+            _ => Err(OwnerError::Cancelled.into()),
+        }
+    }
+
+    async fn finish_retention(
+        &mut self,
+        context: &RetentionContext,
+        punched: &mut u64,
+        skip: &mut Option<&'static str>,
+    ) -> anyhow::Result<()> {
+        let receipts = self.receipts.clone();
+        let tail = receipts.current_tail_binding()?;
+        let job_context = context.clone();
+        let path = tail.path.clone();
+        let output = self
+            .slot
+            .execute(move |_| {
+                if let Some(reason) =
+                    retention::pause_reason(&job_context).map_err(TaskFailure::typed)?
+                {
+                    return Ok(JobOutput::Paused(reason));
+                }
+                retention::sync_authority(&job_context, &path).map_err(TaskFailure::typed)?;
+                Ok(JobOutput::Punched(0))
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("{}", error.message))?;
+        if let JobOutput::Paused(reason) = output {
+            *skip = Some(reason);
+            return Ok(());
+        }
+        if !self.retention_walk_complete {
+            self.build_retention_window(
+                context,
+                self.retention_tail.clone().unwrap_or_else(|| tail.clone()),
+            )
+            .await?;
+        }
+        let capture = self
+            .pending
+            .as_ref()
+            .map(|candidate| candidate.capture_unix_ms);
+        let verified_epoch = self.retention_epoch;
+        // A changed generation needs an owner restart; retrying would keep an inadmissible candidate.
+        if let Err(failure) = self.attempt_publication().await {
+            let message = failure.message.clone();
+            self.publication_failure = Some(failure);
+            anyhow::bail!("source checkpoint publication failed: {message}");
+        }
+        if self.retention_epoch != verified_epoch {
+            *skip = Some("epoch_changed");
+            return Ok(());
+        }
+        if self.pending.is_some()
+            || capture.is_some_and(|capture| self.last_published_capture != Some(capture))
+        {
+            *skip = Some("checkpoint_publication_pending");
+            return Ok(());
+        }
+        #[cfg(feature = "scenario")]
+        if let Some(hook) = &context.hooks.after_publication {
+            hook()?;
+        }
+        let job_context = context.clone();
+        let epoch = self.retention_epoch;
+        let activation = self
+            .frozen
+            .as_ref()
+            .ok_or(OwnerError::Cancelled)?
+            .activation
+            .clone();
+        let financial_era = self
+            .frozen
+            .as_ref()
+            .ok_or(OwnerError::Cancelled)?
+            .financial_era;
+        let output = self.slot.execute(move |cancel| {
+            if let Some(reason) = retention::pause_reason(&job_context).map_err(TaskFailure::typed)? {
+                return Ok(JobOutput::Paused(reason));
+            }
+            let _lock = super::CheckpointLock::acquire(&tail.path).map_err(TaskFailure::typed)?;
+            let authority = pe_event_log::RetentionAuthority::load(&tail.path).map_err(TaskFailure::typed)?
+                .ok_or_else(|| TaskFailure::typed(OwnerError::AuthorityUnavailable))?;
+            if authority.epoch != epoch { return Ok(JobOutput::Paused("epoch_changed")); }
+            // A refused publication is never a license to punch: require a compatible installed
+            // checkpoint through the committed tail and synchronize its directory again.
+            let (check, _) = super::check_artifact(&tail.path, &activation, financial_era).map_err(TaskFailure::typed)?;
+            if !matches!(check, super::ArtifactCheck::Valid(ref header) if header.retention_epoch == epoch
+                && header.tail.physical_tail >= authority.retained_tail.physical_tail) {
+                return Ok(JobOutput::Paused("checkpoint_not_durable"));
+            }
+            super::sync_directory(&super::checkpoint_path(&tail.path)).map_err(TaskFailure::typed)?;
+            let bytes = retention::punch(&tail.path, &authority, &cancel,
+                #[cfg(feature = "scenario")] &job_context.hooks,
+            ).map_err(TaskFailure::typed)?;
+            Ok(JobOutput::Punched(bytes))
+        }).await.map_err(|error| anyhow::anyhow!("{}", error.message))?;
+        match output {
+            JobOutput::Punched(bytes) => {
+                *punched = bytes;
+                self.finishing_retention = false;
+                self.retention_tail = None;
+            }
+            JobOutput::Paused(reason) => *skip = Some(reason),
+            _ => return Err(OwnerError::Cancelled.into()),
+        }
+        Ok(())
+    }
+
+    async fn database_retention(
+        &self,
+        boundary_current: bool,
+        walk_completed: bool,
+    ) -> anyhow::Result<crate::database_retention::DatabaseRetentionReport> {
+        let Some(database) = &self.database_retention else {
+            return Ok(crate::database_retention::DatabaseRetentionReport::default());
+        };
+        let path = self.receipts.current_tail_binding()?.path;
+        let authority = pe_event_log::RetentionAuthority::load(&path)?;
+        let reducer_pin_wallets = authority.as_ref().map_or_else(HashSet::new, |authority| {
+            authority
+                .pins
+                .iter()
+                .filter(|pin| pin.reducer)
+                .filter_map(|pin| pin.wallet)
+                .collect()
+        });
+        let obligation_wallets = self
+            .held_obligations
+            .as_ref()
+            .map(|held| held.borrow().wallets.clone())
+            .unwrap_or_default();
+        Ok(crate::database_retention::run_database_retention(
+            database,
+            crate::database_retention::DatabaseRetentionInputs {
+                now_unix: i64::try_from(self.unix_ms()? / 1000)?,
+                committed_boundary_current: boundary_current,
+                verified_walk_complete: walk_completed,
+                walk_wallets: &self.window_wallets,
+                reducer_pin_wallets: &reducer_pin_wallets,
+                published_observation_wallets: &self.published_observation_wallets,
+                obligation_wallets: &obligation_wallets,
+            },
+            &self.slot.cancelled,
+        )
+        .await?)
     }
 }
 
@@ -454,6 +1005,7 @@ fn require_binding(expected: &LogTailBinding, actual: LogTailBinding) -> Result<
 
 fn verify_deferred(
     frozen: &FrozenCheckpoint,
+    receipts: &SourceReceiptIndex,
     cancel: &AtomicBool,
     #[cfg(feature = "scenario")] hooks: &CheckpointOwnerHooks,
 ) -> Result<blake3::Hasher, OwnerError> {
@@ -468,6 +1020,15 @@ fn verify_deferred(
     if let Some(hook) = &hooks.before_hash {
         hook()?;
     }
+    if cancel.load(Ordering::Acquire) {
+        return Err(OwnerError::Cancelled);
+    }
+    receipts
+        .verify_retention_pins_cancellable(Some(cancel))
+        .map_err(|error| match error {
+            crate::risk_inputs::RiskInputsUnavailable::Cancelled => OwnerError::Cancelled,
+            error => OwnerError::RetainedPin(error),
+        })?;
     let mut digest =
         Scanner::hash_prefix_cancellable(&tail.path, tail.physical_tail, Some(cancel))?;
     let actual = digest.finalize().to_hex().to_string();
@@ -530,6 +1091,7 @@ fn extend(
 fn candidate(
     frozen: &FrozenCheckpoint,
     receipts: &SourceReceiptIndex,
+    retention_epoch: u64,
 ) -> Result<Option<SerializedCandidate>, OwnerError> {
     let Some(generation) = frozen.authority_generation else {
         error!(reason = %OwnerError::AuthorityUnavailable, capture_unix_ms = frozen.capture_unix_ms, "source checkpoint candidate refused");
@@ -565,6 +1127,7 @@ fn candidate(
         },
         generation,
         frozen.capture_unix_ms,
+        retention_epoch,
     )?))
 }
 
@@ -744,7 +1307,7 @@ mod tests {
         owner.initialize_for_scenario().await.unwrap();
         let generation = super::super::invalidate(&fixture.activation.path).unwrap();
         let fresh = fixture.owner(CheckpointJobSlot::default(), false, generation);
-        let candidate = candidate(fresh.frozen.as_ref().unwrap(), &fixture.receipts)
+        let candidate = candidate(fresh.frozen.as_ref().unwrap(), &fixture.receipts, 0)
             .unwrap()
             .unwrap();
         super::super::publish(&candidate, 1).unwrap();
@@ -979,7 +1542,8 @@ mod tests {
                     super::super::read_authority(&tail.path).unwrap(),
                     super::super::Authority::Readable(super::super::InvalidationRecord {
                         generation,
-                        active: true
+                        active: true,
+                        retention_fence: false
                     })
                 );
             }

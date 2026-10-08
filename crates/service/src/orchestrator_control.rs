@@ -33,12 +33,25 @@ pub struct AdmissionLedgerCapture {
 
 /// A control-plane update consumed ahead of trade events by the orchestrator's biased select.
 pub enum OrchestratorControl {
+    /// Commit a retention boundary while dispatch staging is excluded by the single owner.
+    RetentionCommit {
+        request: Box<crate::source_checkpoint::retention::RetentionCommitRequest>,
+        acknowledged: oneshot::Sender<
+            Result<crate::source_checkpoint::retention::RetentionCommitOutcome, String>,
+        >,
+    },
     /// A synchronized frame, delivered in source receipt order.
     ActivityFrameDecision { receipt: AppendReceipt },
     /// Reconciliation acknowledgements are serialized with admissions by the existing owner.
     ReconciliationUpdate {
         update: ReconciliationUpdate,
         acknowledged: oneshot::Sender<Result<ReconciliationAcknowledgement, String>>,
+    },
+    /// The caller holds the admission attempt lock through acknowledgement.
+    RetireWallet {
+        wallet: WalletAddress,
+        recent_since_unix: i64,
+        acknowledged: oneshot::Sender<Result<crate::database_retention::WalletRetirement, String>>,
     },
     /// Durable history/fence checks and Lane D's position bracket completed for
     /// these wallets. The orchestrator rechecks its loaded fence set before ack.

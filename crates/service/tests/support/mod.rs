@@ -1177,3 +1177,161 @@ pub fn terminal_evidence(
         document_blake3,
     })
 }
+
+pub fn retention_controls(
+    paper: pe_service::paper_recovery::PaperLog,
+    state: Arc<pe_paper_state::PaperStateDb>,
+    index: pe_service::risk_inputs::SourceReceiptIndex,
+) -> (
+    pe_service::live_watchlist::LiveWatchlist,
+    pe_service::watchlist_admission::AdmissionPreparer,
+    mpsc::Sender<OrchestratorControl>,
+    tokio::task::JoinHandle<()>,
+) {
+    retention_controls_at(paper, state, index, None, None)
+}
+
+pub fn retention_controls_at(
+    paper: pe_service::paper_recovery::PaperLog,
+    state: Arc<pe_paper_state::PaperStateDb>,
+    index: pe_service::risk_inputs::SourceReceiptIndex,
+    terminal_at: Option<time::OffsetDateTime>,
+    hooks: Option<Arc<pe_service::orchestrator::ScenarioHooks>>,
+) -> (
+    pe_service::live_watchlist::LiveWatchlist,
+    pe_service::watchlist_admission::AdmissionPreparer,
+    mpsc::Sender<OrchestratorControl>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (tx, rx) = mpsc::channel(4);
+    let live = pe_service::live_watchlist::LiveWatchlist::new(pe_trader_index::Watchlist {
+        entries: Vec::new(),
+        snapshot_at: SourceTimestamp(time::OffsetDateTime::UNIX_EPOCH),
+        active_count: 0,
+        incubator_count: 0,
+    });
+    let preparer =
+        pe_service::watchlist_admission::AdmissionPreparer::new(tx.clone(), state.clone());
+    let mut orchestrator = pe_service::orchestrator::Orchestrator::new(
+        live.clone(),
+        pe_service::orchestrator::OrchestratorConfig {
+            bankroll: rust_decimal::Decimal::ZERO,
+            mode: pe_strategy_winner_follow::ExecutionMode::Paper,
+            signal_config: Default::default(),
+            max_resolution_horizon_secs: 0,
+            min_resolution_horizon_secs: 0,
+            max_fill_price: rust_decimal::Decimal::ZERO,
+            min_fill_price: rust_decimal::Decimal::ZERO,
+            price_impact_cap_bps: 100,
+            entry_gate_config: pe_service::entry_gate::CopyEntryGateConfig,
+            runtime_config: None,
+            live_accounts: None,
+            live_journal: None,
+            activity_ws_enabled: false,
+            copy_latency_budget_secs: 120,
+            watchlist_writer_lock: None,
+        },
+        pe_strategy_winner_follow::WinnerFollowStrategy::new(Default::default()),
+        paper.clone(),
+        state.clone(),
+        pe_service::paper_recovery::build_leader_ledger(&state).unwrap(),
+        pe_service::health::new_shared_health(false),
+        pe_service::mid_price_cache::MidPriceCache::with_fetcher(
+            pe_source_polymarket_public::FixtureFetcher::new(std::collections::HashMap::new()),
+            String::new(),
+        ),
+        rx,
+        None,
+        None,
+        None,
+        Arc::new(pe_service::clob_book::FixtureClobBookFetcher::new(
+            std::collections::HashMap::new(),
+        )),
+    )
+    .unwrap()
+    .with_source_receipt_index(index.clone());
+    if let Some(hooks) = hooks {
+        orchestrator.set_scenario_hooks(hooks);
+    }
+    let control = tokio::spawn(async move {
+        let run = orchestrator.run(std::future::pending::<()>());
+        if let Some(at) = terminal_at {
+            pe_service::orchestrator::SCENARIO_TERMINAL_CLOCK
+                .scope(at, run)
+                .await;
+        } else {
+            run.await;
+        }
+    });
+    (live, preparer, tx, control)
+}
+
+#[derive(Clone, Default)]
+pub struct RetentionLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+struct TokioClock(tokio::time::Instant);
+
+impl tracing_subscriber::fmt::time::FormatTime for TokioClock {
+    fn format_time(
+        &self,
+        writer: &mut tracing_subscriber::fmt::format::Writer<'_>,
+    ) -> std::fmt::Result {
+        write!(writer, "{}", self.0.elapsed().as_micros())
+    }
+}
+
+impl std::io::Write for RetentionLogs {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for RetentionLogs {
+    type Writer = Self;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+impl RetentionLogs {
+    pub fn text(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+
+    pub fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + 'static {
+        tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .without_time()
+            .with_writer(self.clone())
+            .finish()
+    }
+
+    /// As [`Self::subscriber`], stamping each event with microseconds of Tokio time since `start`.
+    /// With paused time only sleeps advance that clock, so event gaps are exactly the pauses between them.
+    pub fn subscriber_on_tokio_clock(
+        &self,
+        start: tokio::time::Instant,
+    ) -> impl tracing::Subscriber + Send + Sync + 'static {
+        tracing_subscriber::fmt()
+            .json()
+            .flatten_event(true)
+            .with_timer(TokioClock(start))
+            .with_writer(self.clone())
+            .finish()
+    }
+
+    pub fn last_run(&self) -> serde_json::Value {
+        self.text()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .rfind(|event| event["message"] == "source retention")
+            .unwrap()
+    }
+}
