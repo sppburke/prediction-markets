@@ -310,13 +310,32 @@ mod admission_tests {
         let candidate = wallet(9);
         listed_with_leftovers(&path, &state, candidate);
         let (tx, mut rx) = mpsc::channel(1);
+        let fetcher = Arc::new(pe_source_polymarket_public::FixtureFetcher::new(
+            HashMap::new(),
+        ));
+        let identity = Arc::new(crate::asset_identity::AssetIdentityResolver::new(
+            fetcher.clone(),
+            "https://fixture.invalid".to_owned(),
+            pe_source_polymarket_public::GAMMA_BATCH_SIZE,
+            Arc::new(Mutex::new(
+                crate::source_event_sink::SourceEventSink::open(dir.path().join("source.log"))
+                    .unwrap(),
+            )),
+        ));
+        let validator = CausalPositionValidator::new(
+            fetcher,
+            "https://fixture.invalid",
+            "admission-test",
+            identity,
+        );
+        let ranked = HashMap::from([(candidate, 1234)]);
         // The drain list read's pause ends at 50 ms; the group's drain transaction then commits before
         // the deadline (75 ms), which passes during that transaction's pause (at least 50 ms), so the
         // gate result's transaction never starts.
-        let outcome = AdmissionPreparer::new(tx, state.clone())
+        let outcome = AdmissionPreparer::with_validator(tx, state.clone(), validator)
             .prepare_with_cursors(
                 &[candidate],
-                None,
+                Some(&ranked),
                 Some(Instant::now() + Duration::from_millis(75)),
                 AdmissionContext::Other,
             )
@@ -333,6 +352,32 @@ mod admission_tests {
             "the gate result's transaction never started"
         );
         assert!(state.cursor(&candidate).unwrap().is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn preparation_without_listed_additions_takes_no_pause() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("paper.db");
+        let state = Arc::new(PaperStateDb::open(&path).unwrap());
+        let candidate = wallet(8);
+        let other = wallet(9);
+        let (tx, _rx) = mpsc::channel(1);
+        let preparer = AdmissionPreparer::new(tx, state.clone());
+        for listed in [false, true] {
+            if listed {
+                listed_with_leftovers(&path, &state, other);
+            }
+            let start = Instant::now();
+            let result = preparer.prepare(&[candidate]).await.unwrap();
+            assert_eq!(Instant::now(), start);
+            assert_eq!(result.deferred[0].kind, "history.missing");
+            assert!(result.admitted.is_empty());
+            assert_eq!(
+                state.retirement_drains().unwrap().result,
+                if listed { vec![other] } else { Vec::new() }
+            );
+        }
+        assert!(seen(&state, "left") && seen(&state, "left-gate"));
     }
 }
 
@@ -703,6 +748,22 @@ impl AdmissionPreparer {
             .await
     }
 
+    #[cfg(feature = "scenario")]
+    pub async fn scenario_prepare_ranked_until(
+        &self,
+        additions: &[WalletAddress],
+        ranked_last_trade: &HashMap<WalletAddress, i64>,
+        deadline: Option<Instant>,
+    ) -> Result<AdmissionOutcome, AdmissionAbort> {
+        self.prepare_ranked_until(
+            additions,
+            ranked_last_trade,
+            deadline,
+            AdmissionContext::Other,
+        )
+        .await
+    }
+
     /// Reject fences before validation and require complete history after the accepted
     /// anchor installation is acknowledged. Validator-free callers require complete
     /// history before handing preparation to the orchestrator.
@@ -761,7 +822,11 @@ impl AdmissionPreparer {
         let mut ready = Vec::with_capacity(additions.len());
         let past_deadline = || deadline.is_some_and(|end| Instant::now() >= end);
         let drained = async {
-            let listed = crate::database_retention::drain_list(&preparer.paper_state).await?;
+            let read = preparer.paper_state.retirement_drains()?;
+            let listed = read.result;
+            if additions.iter().any(|wallet| listed.contains(wallet)) {
+                crate::database_retention::pace_drain_list_read(listed.len(), read.lock_time).await;
+            }
             for wallet in additions {
                 if listed.contains(wallet)
                     && crate::database_retention::drain_retired_wallet(

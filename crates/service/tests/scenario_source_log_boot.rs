@@ -6430,6 +6430,23 @@ async fn retention_returning_wallet_catches_up_in_process_after_reboot_and_check
         let old_trades = [group_trade.as_str(), "gate-only"];
         {
             let conn = Connection::open(&paths.fixed_main).unwrap();
+            if interrupted {
+                for n in 0..502 {
+                    let id = format!("left-group-{n:03}");
+                    conn.execute(
+                        "INSERT INTO activity_groups VALUES (?1, 'tx', ?2, ?3, 'r', 'TRADE', 'applied', '{}')",
+                        rusqlite::params![id, observation.wallet.to_string(), NOW_UNIX + 2],
+                    ).unwrap();
+                    conn.execute("INSERT INTO seen_trades_v2 VALUES (?1, 2, 'tx')", [&id])
+                        .unwrap();
+                    conn.execute("INSERT INTO activity_group_revisions VALUES (?1, 'r', 'tx', 'applied', '{}', 1)", [&id]).unwrap();
+                    conn.execute("INSERT INTO no_copy_dispositions VALUES (?1, 'rest_poll', 1, 'fixture', 1)", [&id]).unwrap();
+                    conn.execute(
+                        "INSERT INTO entry_gate_results VALUES (?1, ?2, ?3, ?4, 'not_first_entry', 1)",
+                        rusqlite::params![id, observation.wallet.to_string(), old_market.0.0, NOW_UNIX + 2],
+                    ).unwrap();
+                }
+            }
             for trade in old_trades {
                 conn.execute(
                     "INSERT INTO entry_gate_results VALUES (?1, ?2, ?3, ?4, 'not_first_entry', 1)",
@@ -6447,24 +6464,39 @@ async fn retention_returning_wallet_catches_up_in_process_after_reboot_and_check
                 [],
             )
             .unwrap();
+            conn.execute_batch(
+                "CREATE TABLE drain_old_trade_ids (source_trade_id TEXT PRIMARY KEY NOT NULL); \
+                 INSERT INTO drain_old_trade_ids SELECT source_trade_id FROM activity_groups \
+                 UNION SELECT source_trade_id FROM entry_gate_results;",
+            )
+            .unwrap();
         }
         let old_gates = || -> i64 {
             Connection::open(&paths.fixed_main)
                 .unwrap()
                 .query_row(
-                    "SELECT COUNT(*) FROM entry_gate_results WHERE source_trade_id IN (?1, ?2)",
-                    rusqlite::params![old_trades[0], old_trades[1]],
+                    "SELECT COUNT(*) FROM entry_gate_results WHERE source_trade_id IN (SELECT source_trade_id FROM drain_old_trade_ids)",
+                    [],
                     |row| row.get(0),
                 )
                 .unwrap()
         };
+        let old_groups = || -> i64 {
+            Connection::open(&paths.fixed_main).unwrap().query_row(
+                "SELECT COUNT(*) FROM activity_groups WHERE source_trade_id IN (SELECT source_trade_id FROM drain_old_trade_ids)",
+                [], |row| row.get(0),
+            ).unwrap()
+        };
+        assert_eq!(old_groups(), if interrupted { 503 } else { 1 });
         pe_service::source_checkpoint::install_retention_fence(&paths.source_log).unwrap();
         if interrupted {
-            // The group's drain transaction commits; the gate results' transaction then fails, as a stop
-            // mid-drain leaves it.
+            // One full 500-id transaction commits. Fail the next with three groups still remaining,
+            // and gate results overlapping both the deleted groups and the remaining ones.
             Connection::open(&paths.fixed_main)
                 .unwrap()
-                .execute_batch("CREATE TRIGGER interrupt_drain BEFORE DELETE ON entry_gate_results BEGIN SELECT RAISE(ABORT, 'interrupted'); END;")
+                .execute_batch("CREATE TRIGGER interrupt_drain BEFORE DELETE ON activity_groups \
+                    WHEN (SELECT COUNT(*) FROM activity_groups WHERE wallet_hex = OLD.wallet_hex) <= 3 \
+                    BEGIN SELECT RAISE(ABORT, 'interrupted'); END;")
                 .unwrap();
         }
         let clock = Arc::new(AtomicU64::new(u64::try_from(now).unwrap()));
@@ -6472,7 +6504,28 @@ async fn retention_returning_wallet_catches_up_in_process_after_reboot_and_check
             retention_boot_runtime_with_control(&paths, &state, clock.clone());
         assert!(obligations.is_empty());
         owner.initialize_for_scenario().await.unwrap();
-        owner.retention_for_scenario().await.unwrap();
+        let first_logs = support::RetentionLogs::default();
+        {
+            let _subscriber = tracing::subscriber::set_default(first_logs.subscriber());
+            owner.retention_for_scenario().await.unwrap();
+        }
+        if interrupted {
+            let committed: Vec<serde_json::Value> = first_logs
+                .text()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|event| event["message"] == "source retention drain transaction")
+                .map(|event| event["trade_ids"].clone())
+                .collect();
+            assert_eq!(committed, vec![serde_json::json!(500)], "{mode}");
+            assert_eq!(first_logs.last_run()["wallets_listed"], "None", "{mode}");
+            assert_eq!(first_logs.last_run()["cancelled"], false, "{mode}");
+            assert_eq!(
+                first_logs.last_run()["skip_reason"],
+                "retention_failed",
+                "{mode}"
+            );
+        }
         let authority = pe_event_log::RetentionAuthority::load(&paths.source_log)
             .unwrap()
             .unwrap();
@@ -6487,7 +6540,12 @@ async fn retention_returning_wallet_catches_up_in_process_after_reboot_and_check
         );
         assert_eq!(
             old_gates(),
-            if interrupted { 2 } else { 0 },
+            if interrupted { 504 } else { 0 },
+            "{mode}/interrupted={interrupted}"
+        );
+        assert_eq!(
+            old_groups(),
+            if interrupted { 3 } else { 0 },
             "{mode}/interrupted={interrupted}"
         );
         assert_eq!(
@@ -6550,13 +6608,20 @@ async fn retention_returning_wallet_catches_up_in_process_after_reboot_and_check
         let base = "https://api.example.com";
         let wallet = observation.wallet;
         let new_market = MarketId(VenueMarketId(format!("0x{}", "22".repeat(32))));
-        let activity = serde_json::to_vec(&serde_json::json!([{
+        let returning_trade = serde_json::json!({
             "proxyWallet":wallet, "timestamp":NOW_UNIX + 10, "conditionId":new_market.0.0,
             "type":"TRADE", "size":"25", "usdcSize":"12.5", "transactionHash":"0xreturn",
             "price":"0.5", "asset":"456", "side":"BUY", "outcomeIndex":0,
             "outcome":"Yes", "isCombo":false
-        }]))
-        .unwrap();
+        });
+        let returned_group = pe_source_polymarket_public::parse_activity_trade_observation(
+            &serde_json::to_vec(&returning_trade).unwrap(),
+        )
+        .unwrap()
+        .group_id
+        .key()
+        .clone();
+        let activity = serde_json::to_vec(&vec![returning_trade]).unwrap();
         let positions = serde_json::to_vec(&serde_json::json!([{
             "proxyWallet":wallet, "asset":"456", "conditionId":new_market.0.0,
             "size":"25", "outcomeIndex":0, "negativeRisk":false
@@ -6618,31 +6683,44 @@ async fn retention_returning_wallet_catches_up_in_process_after_reboot_and_check
         )
         .with_clock(Arc::new(move || now));
         let preparer = AdmissionPreparer::with_validator(tx.clone(), state.clone(), validator);
-        // At every catch-up write of the wallet, record how many old gate rows remain.
+        // Probe ranked seeding and catch-up writes against every leftover trade table and the list.
+        let old_rows = ["activity_groups", "entry_gate_results", "seen_trades_v2", "no_copy_dispositions", "activity_group_revisions"]
+            .map(|table| format!("(SELECT COUNT(*) FROM {table} WHERE source_trade_id IN (SELECT source_trade_id FROM drain_old_trade_ids))"))
+            .join(" + ");
         let probe = |table: &str| {
+            let cursor = if table == "poll_cursors" {
+                "NEW.last_ts_unix"
+            } else {
+                "NULL"
+            };
             format!(
                 "CREATE TRIGGER probe_{table} AFTER INSERT ON {table} WHEN NEW.wallet_hex = '{wallet}' BEGIN \
-                 INSERT INTO drain_order_probe SELECT '{table}', COUNT(*) FROM entry_gate_results \
-                 WHERE source_trade_id IN ('{}', 'gate-only'); END;",
-                old_trades[0]
+                 INSERT INTO drain_order_probe SELECT '{table}', {old_rows}, \
+                 (SELECT COUNT(*) FROM json_each((SELECT value FROM meta WHERE key = 'wallet_retirement_drains'), '$.wallets') \
+                 WHERE value = '{wallet}'), {cursor}; END;"
             )
         };
         Connection::open(&paths.fixed_main)
             .unwrap()
             .execute_batch(&format!(
-                "CREATE TABLE drain_order_probe (write TEXT NOT NULL, old_gates INTEGER NOT NULL); {} {} {}",
+                "CREATE TABLE drain_order_probe (write TEXT NOT NULL, old_rows INTEGER NOT NULL, listed INTEGER NOT NULL, cursor INTEGER); {} {} {}",
                 probe("activity_groups"),
                 probe("position_anchors"),
                 probe("poll_cursors")
             ))
             .unwrap();
-        let result = preparer.prepare(&[wallet]).await.unwrap();
+        let ranked_seed = NOW_UNIX + 10;
+        let result = preparer
+            .scenario_prepare_ranked_until(&[wallet], &HashMap::from([(wallet, ranked_seed)]), None)
+            .await
+            .unwrap();
         assert_eq!(result.admitted, vec![wallet], "{mode}: {result:?}");
         assert!(
             state.retirement_drains().unwrap().result.is_empty(),
             "{mode}/interrupted={interrupted}"
         );
         assert_eq!(old_gates(), 0, "{mode}/interrupted={interrupted}");
+        assert_eq!(old_groups(), 0, "{mode}/interrupted={interrupted}");
         assert!(
             !state
                 .is_seen(&SourceTradeId("gate-only".to_owned()))
@@ -6650,21 +6728,32 @@ async fn retention_returning_wallet_catches_up_in_process_after_reboot_and_check
         );
         {
             let conn = Connection::open(&paths.fixed_main).unwrap();
-            let writes: Vec<(String, i64)> = conn
-                .prepare("SELECT write, old_gates FROM drain_order_probe")
+            let writes: Vec<(String, i64, i64, Option<i64>)> = conn
+                .prepare("SELECT write, old_rows, listed, cursor FROM drain_order_probe")
                 .unwrap()
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
                 .unwrap()
                 .collect::<Result<_, _>>()
                 .unwrap();
-            for table in ["activity_groups", "position_anchors"] {
+            for table in ["activity_groups", "position_anchors", "poll_cursors"] {
                 assert!(
-                    writes.iter().any(|(write, _)| write == table),
+                    writes.iter().any(|(write, _, _, _)| write == table),
                     "{mode}/interrupted={interrupted}: catch-up wrote no {table} row: {writes:?}"
                 );
             }
             assert!(
-                writes.iter().all(|(_, old)| *old == 0),
+                writes
+                    .iter()
+                    .any(|(write, _, _, cursor)| write == "poll_cursors"
+                        && *cursor == Some(ranked_seed)),
+                "{mode}/interrupted={interrupted}: ranked cursor was not inserted: {writes:?}"
+            );
+            assert!(
+                writes
+                    .iter()
+                    .all(|(_, old, listed, _)| *old == 0 && *listed == 0),
                 "{mode}/interrupted={interrupted}: a catch-up write preceded the drain: {writes:?}"
             );
             conn.execute_batch(
@@ -6673,7 +6762,7 @@ async fn retention_returning_wallet_catches_up_in_process_after_reboot_and_check
             )
             .unwrap();
         }
-        // The returned wallet is no longer listed, so a later drain leaves its rebuilt rows alone.
+        // Only the returning group was rebuilt; the ranked cursor survived its accepted bracket.
         let rebuilt: i64 = Connection::open(&paths.fixed_main)
             .unwrap()
             .query_row(
@@ -6682,14 +6771,14 @@ async fn retention_returning_wallet_catches_up_in_process_after_reboot_and_check
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(rebuilt > 0, "{mode}: catch-up rebuilt no group");
+        assert_eq!(rebuilt, 1, "{mode}: catch-up rebuilt the wrong groups");
         assert!(
             state
-                .drain_retired_wallet(wallet, 500)
+                .activity_group_state(&returned_group)
                 .unwrap()
-                .result
-                .finished
+                .is_some()
         );
+        assert_eq!(state.cursor(&wallet).unwrap(), Some(ranked_seed));
         assert_eq!(
             Connection::open(&paths.fixed_main)
                 .unwrap()
@@ -6700,6 +6789,12 @@ async fn retention_returning_wallet_catches_up_in_process_after_reboot_and_check
                 )
                 .unwrap(),
             rebuilt
+        );
+        assert!(
+            state
+                .activity_group_state(&returned_group)
+                .unwrap()
+                .is_some()
         );
         assert!(result.deferred.is_empty());
         assert!(state.wallet_history_complete(&wallet).unwrap());
@@ -6785,6 +6880,66 @@ async fn retention_returning_wallet_catches_up_in_process_after_reboot_and_check
         assert!(obligations.is_empty(), "{mode}");
         assert!(obligations.frame_recovery_receipts().0.is_empty(), "{mode}");
         assert!(obligations.frame_recovery_receipts().1.is_empty(), "{mode}");
+        drop(opened);
+        // A fresh boot consumes the recorded catch-up inputs before the subsequent retention job.
+        let later_logs = support::RetentionLogs::default();
+        let (mut later_owner, later_task, _) =
+            retention_boot_runtime(&paths, &state, clock.clone());
+        {
+            let _subscriber = tracing::subscriber::set_default(later_logs.subscriber());
+            later_owner.initialize_for_scenario().await.unwrap();
+            clock.store(
+                u64::try_from(now + pe_service::source_checkpoint::SOURCE_RETENTION_ADVANCE_SECS)
+                    .unwrap(),
+                std::sync::atomic::Ordering::Release,
+            );
+            later_owner.retention_for_scenario().await.unwrap();
+        }
+        assert_eq!(
+            later_logs.last_run()["wallets_listed"],
+            "Some(0)",
+            "{mode}/interrupted={interrupted}: {}",
+            later_logs.text()
+        );
+        assert_eq!(
+            later_logs.last_run()["wallets_drained"],
+            0,
+            "{mode}/interrupted={interrupted}"
+        );
+        assert_eq!(
+            Connection::open(&paths.fixed_main)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM activity_groups WHERE wallet_hex = ?1",
+                    [wallet.to_string()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1,
+            "{mode}/interrupted={interrupted}"
+        );
+        assert!(
+            state
+                .activity_group_state(&returned_group)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(state.cursor(&wallet).unwrap(), Some(ranked_seed));
+        assert!(state.wallet_history_complete(&wallet).unwrap());
+        assert!(state.position_validation_current(&wallet).unwrap());
+        assert_eq!(state.position_anchors(&wallet).unwrap().len(), 1);
+        assert_eq!(
+            ledger_capture(
+                &pe_service::paper_recovery::build_leader_ledger(&state).unwrap(),
+                &state,
+                wallet
+            )
+            .unwrap(),
+            ledger_capture(&expected, &state, wallet).unwrap()
+        );
+        drop(later_owner);
+        later_task.abort();
+        let _ = later_task.await;
     }
 }
 

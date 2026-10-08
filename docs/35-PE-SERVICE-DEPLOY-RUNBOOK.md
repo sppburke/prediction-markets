@@ -1903,8 +1903,9 @@ receipts and restart timings. The stop/start is pre-approved; tell the owner bef
 At the first hourly tick, retain `source retention committed` before rehash and the run's
 `source retention` summary: epoch/boundary, pins, punched bytes/feed frames, proofs blanked,
 wallets swapped out/waiting with reasons, wallets and trade ids drained, wallets still listed for
-draining (expected `Some(0)`; `None` means the run was cancelled), skip reason and elapsed time, plus
-every database hold's lock-time line.
+draining (expected `Some(0)`; `None` can indicate a cancelled or failed run, or a skip before
+database work; distinguish these using `cancelled`, `skip_reason` and the logged error), skip
+reason and elapsed time, plus every database hold's lock-time line.
 Verify the authority matches the published format-3 epoch, inventory the committed feed files,
 measure allocated/net free-space change and copy latency, and inspect readiness/task health and
 journal for serving-path `Erased`/`Retired`. Compare pre-advance Prepared/Final records and Supabase

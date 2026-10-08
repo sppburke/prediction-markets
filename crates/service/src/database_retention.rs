@@ -87,13 +87,17 @@ pub async fn drain_list(
     paper_state: &PaperStateDb,
 ) -> Result<Vec<WalletAddress>, pe_paper_state::PaperStateError> {
     let read = paper_state.retirement_drains()?;
+    pace_drain_list_read(read.result.len(), read.lock_time).await;
+    Ok(read.result)
+}
+
+pub(crate) async fn pace_drain_list_read(wallets: usize, lock_time: Duration) {
     tracing::info!(
-        wallets = read.result.len(),
-        lock_time_micros = read.lock_time.as_micros(),
+        wallets,
+        lock_time_micros = lock_time.as_micros(),
         "source retention drain list read"
     );
-    pace(read.lock_time).await;
-    Ok(read.result)
+    pace(lock_time).await;
 }
 
 /// Drain a listed wallet's remaining trade rows in paced transactions until its list entry is gone.
@@ -267,6 +271,7 @@ pub async fn run_database_retention(
 ) -> Result<DatabaseRetentionReport, DatabaseRetentionError> {
     let mut report = DatabaseRetentionReport::default();
     run_database_retention_steps(state, inputs, cancel, &mut report).await?;
+    report.cancelled |= cancel.load(Ordering::Acquire);
     if !report.cancelled {
         report.wallets_listed = Some(drain_list(&state.paper_state).await?.len());
     }
@@ -432,4 +437,29 @@ async fn run_database_retention_steps(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn retention_pacing_waits_for_floor_or_full_lock_time() {
+        for held in [
+            Duration::ZERO,
+            Duration::from_millis(49),
+            Duration::from_millis(125),
+        ] {
+            let required = held.max(PAUSE_FLOOR);
+            let start = tokio::time::Instant::now();
+            let pause = pace(held);
+            tokio::pin!(pause);
+            assert!(futures::poll!(pause.as_mut()).is_pending());
+            tokio::time::advance(required - Duration::from_millis(1)).await;
+            assert!(futures::poll!(pause.as_mut()).is_pending());
+            tokio::time::advance(Duration::from_millis(1)).await;
+            assert!(futures::poll!(pause.as_mut()).is_ready());
+            assert_eq!(start.elapsed(), required);
+        }
+    }
 }
