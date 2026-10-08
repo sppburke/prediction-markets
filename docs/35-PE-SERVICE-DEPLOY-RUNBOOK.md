@@ -1828,9 +1828,10 @@ on mismatch. A plain SQLite copy is allowed only for this stopped, checkpointed 
 inputs use SQLite's online `.backup`.
 
 Before launching, record the binary hash, authority endpoint/key-file path, every override, bind
-and exact commands. Confirm the memory cap (8.3 GB), the four-CPU pin and the CPU weight (10000, so unrelated
-jobs on a shared host yield on those CPUs; the readiness samplers run at the same weight) on the service process
-itself, rather than only its launcher. Resume relaunches the same progressed directory and financial state without
+and exact commands. Confirm the memory cap (8.3 GB), the four-CPU pin and the CPU weight (10000: a relative
+scheduling preference over unrelated jobs on a shared host, not CPU isolation; the readiness samplers run at the
+same weight, and each process's cgroup path and effective weight are recorded) on the service process itself,
+rather than only its launcher. Resume relaunches the same progressed directory and financial state without
 copying, reseeding or validating its original-copy hashes. `rehearsal545.sh` reusable-capture hash
 validation is for an unchanged capture; O1's progressed resume uses its separately recorded command.
 
@@ -1948,7 +1949,9 @@ a resumed observation continues from that record without resetting it. O3 passes
 feed inventory validates, the health and financial checks pass and the drain list is empty. A skip,
 a pending epoch, an unfinished drain or a failed check is reported, keeps the issue open, and a
 failure is fixed forward. After the canonical advance interval, the second advance must pass the same
-checks for its epoch, and the two authorities' `advanced_at` values and epoch history must show no advance
+checks for its epoch against a fresh pre-advance baseline recorded for that epoch as above (a resumed
+observation continues from it without resetting it), and the two authorities' `advanced_at` values and
+epoch history must show no advance
 before the interval and exactly one at the next eligible hourly tick; record the disk/database trend, post
 evidence and only then close the issue.
 #602 and #619 close on merge; confirm the exit cap at the next restart.
