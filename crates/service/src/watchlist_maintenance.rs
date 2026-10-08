@@ -1287,6 +1287,8 @@ pub(crate) struct BatchSync {
     reentries_first: bool,
     attempted_batch_id: Option<i64>,
     cooldowns: HashMap<WalletAddress, tokio::time::Instant>,
+    /// Consecutive transient admission-bracket failures per wallet since it was last live (#749).
+    failures: HashMap<WalletAddress, u32>,
     parking_batch: Option<i64>,
     started: usize,
     accepted: usize,
@@ -1307,9 +1309,10 @@ fn park_persistent(
             let terminal = deferral
                 .completed_at
                 .unwrap_or_else(tokio::time::Instant::now);
+            let failures = sync.failures.get(&deferral.wallet).copied().unwrap_or(1);
             sync.cooldowns.insert(
                 deferral.wallet,
-                terminal + Duration::from_secs(crate::watchlist_admission::ADMISSION_RETRY_SECS),
+                terminal + crate::watchlist_admission::admission_retry_after(failures),
             );
         }
     }
@@ -1329,10 +1332,63 @@ fn park_persistent(
 }
 
 impl BatchSync {
+    /// Loop-start state: each boot transient bracket failure (`cooldowns`) is that wallet's first
+    /// failure.
+    fn at_boot(
+        marker: Option<i64>,
+        capacity_generation: u64,
+        knockout_deferred: HashSet<WalletAddress>,
+        cooldowns: HashMap<WalletAddress, tokio::time::Instant>,
+    ) -> Self {
+        let failures = cooldowns.keys().map(|wallet| (*wallet, 1)).collect();
+        Self {
+            marker,
+            capacity_generation,
+            knockout_deferred,
+            parking_batch: marker,
+            reentries_first: true,
+            attempted_batch_id: None,
+            cooldowns,
+            failures,
+            started: 0,
+            accepted: 0,
+            deferred: 0,
+            unstarted: 0,
+        }
+    }
+
     fn cooling(&self, wallet: &WalletAddress) -> bool {
         self.cooldowns
             .get(wallet)
             .is_some_and(|end| tokio::time::Instant::now() < *end)
+    }
+
+    /// Whether a live-absent structural member may launch in a live re-entry call: not parked,
+    /// not cooling and, in a call that runs before its tick's additions, without a failure record.
+    fn reentry_launchable(&self, wallet: &WalletAddress, before_additions: bool) -> bool {
+        !self.knockout_deferred.contains(wallet)
+            && !self.cooling(wallet)
+            && !(before_additions && self.failures.contains_key(wallet))
+    }
+
+    /// A wallet's failure record ends once it is live, whichever path admitted it.
+    fn clear_live_failures(&mut self, live: &LiveWatchlist) {
+        if self.failures.is_empty() {
+            return;
+        }
+        let present = live
+            .snapshot()
+            .entries
+            .iter()
+            .map(|entry| entry.wallet)
+            .collect::<HashSet<_>>();
+        self.failures.retain(|wallet, _| {
+            let live = present.contains(wallet);
+            if live {
+                info!(wallet = %wallet, "admission retry backoff cleared");
+            }
+            !live
+        });
     }
 
     fn completed(
@@ -1347,6 +1403,23 @@ impl BatchSync {
         self.accepted += admitted.len();
         self.deferred += deferred.len();
         self.unstarted += unstarted.len();
+        // Each preparation outcome arrives here once; later parkings of its deferrals do not count.
+        for deferral in deferred {
+            if deferral.class == crate::position_seeder::FailureClass::WalletTransient
+                && started.contains(&deferral.wallet)
+            {
+                let failures = self.failures.entry(deferral.wallet).or_insert(0);
+                *failures = failures.saturating_add(1);
+                info!(
+                    wallet = %deferral.wallet,
+                    kind = deferral.kind,
+                    consecutive_failures = *failures,
+                    retry_after_secs =
+                        crate::watchlist_admission::admission_retry_after(*failures).as_secs(),
+                    "admission retry backoff"
+                );
+            }
+        }
         park_persistent(self, paper, deferred);
         for wallet in admitted {
             self.cooldowns.remove(wallet);
@@ -1417,6 +1490,7 @@ async fn live_reentry_tick(
     attempted: &mut HashSet<WalletAddress>,
     now_unix: i64,
     deadline: Option<tokio::time::Instant>,
+    before_additions: bool,
 ) -> Option<LiveReentryReport> {
     let batch_id = sync.marker?;
     // Read the applied batch only when a structural member is live-absent and retryable this
@@ -1429,9 +1503,8 @@ async fn live_reentry_tick(
         .collect::<HashSet<_>>();
     if !live.structural_membership().iter().any(|wallet| {
         !present.contains(wallet)
-            && !sync.knockout_deferred.contains(wallet)
             && !attempted.contains(wallet)
-            && !sync.cooling(wallet)
+            && sync.reentry_launchable(wallet, before_additions)
     }) {
         return None;
     }
@@ -1463,8 +1536,9 @@ async fn live_reentry_tick(
     let mut deferred = Vec::new();
     let retryable = planned_live_reentries(live, entries)
         .into_iter()
-        .filter(|wallet| !sync.knockout_deferred.contains(wallet))
-        .filter(|wallet| !attempted.contains(wallet) && !sync.cooling(wallet))
+        .filter(|wallet| {
+            !attempted.contains(wallet) && sync.reentry_launchable(wallet, before_additions)
+        })
         .map(|wallet| (wallet, paper_state.activity(&wallet).unwrap_or(None)))
         .collect::<Vec<_>>();
     // Statistics decide only a stale-ranked wallet with a usable clock: load them once, then.
@@ -1626,6 +1700,7 @@ impl ScenarioMaintenanceState {
                 attempted_batch_id: None,
                 knockout_deferred: HashSet::new(),
                 cooldowns: HashMap::new(),
+                failures: HashMap::new(),
                 started: 0,
                 accepted: 0,
                 deferred: 0,
@@ -1706,19 +1781,12 @@ pub async fn run_maintenance_loop(
     // Either way, a newer publication remains a transition for the first tick. A `None` marker
     // (the pre-Start batch read failed) is an ordinary transition too (#542): the first tick
     // applies the batch it triggers on rather than adopting the identifier without applying it.
-    let mut sync = BatchSync {
-        marker: initial_batch_marker,
-        capacity_generation: applied_capacity.load().generation,
-        knockout_deferred: boot_persistent_deferred,
-        parking_batch: initial_batch_marker,
-        reentries_first: true,
-        attempted_batch_id: None,
-        cooldowns: boot_cooldowns,
-        started: 0,
-        accepted: 0,
-        deferred: 0,
-        unstarted: 0,
-    };
+    let mut sync = BatchSync::at_boot(
+        initial_batch_marker,
+        applied_capacity.load().generation,
+        boot_persistent_deferred,
+        boot_cooldowns,
+    );
     loop {
         let capacity_epoch = applied_capacity.load();
         maintenance_tick(
@@ -1863,6 +1931,7 @@ async fn maintenance_tick_inner(
     let cap = capacity_epoch.target;
     let mut held_batch: Option<(i64, Watchlist, HashMap<WalletAddress, i64>)> = None;
     let mut attempted_reentries = HashSet::new();
+    sync.clear_live_failures(live);
     sync.reentries_first = !sync.reentries_first;
     if sync.reentries_first {
         let report = live_reentry_tick(
@@ -1882,6 +1951,7 @@ async fn maintenance_tick_inner(
             &mut attempted_reentries,
             now_unix,
             Some(deadline),
+            true,
         )
         .await;
         record_live_reentry(preparer, sync, cfg.membership_mode, report).await;
@@ -2252,6 +2322,7 @@ async fn maintenance_tick_inner(
                                     &mut attempted_reentries,
                                     now_unix,
                                     Some(deadline),
+                                    false,
                                 )
                                 .await;
                                 record_live_reentry(preparer, sync, cfg.membership_mode, report)
@@ -2318,6 +2389,7 @@ async fn maintenance_tick_inner(
             &mut attempted_reentries,
             now_unix,
             Some(deadline),
+            sync.reentries_first,
         )
         .await
     };
@@ -3773,6 +3845,7 @@ mod tests {
                     reentries_first: true,
                     attempted_batch_id: None,
                     cooldowns: HashMap::new(),
+                    failures: HashMap::new(),
                     started: 0,
                     accepted: 0,
                     deferred: 0,
@@ -3827,6 +3900,7 @@ mod tests {
                     reentries_first: true,
                     attempted_batch_id: None,
                     cooldowns: HashMap::new(),
+                    failures: HashMap::new(),
                     started: 0,
                     accepted: 0,
                     deferred: 0,
@@ -4166,6 +4240,7 @@ mod tests {
                 reentries_first: true,
                 attempted_batch_id: None,
                 cooldowns: HashMap::new(),
+                failures: HashMap::new(),
                 started: 0,
                 accepted: 0,
                 deferred: 0,
@@ -4205,6 +4280,7 @@ mod tests {
                 reentries_first: true,
                 attempted_batch_id: None,
                 cooldowns: HashMap::new(),
+                failures: HashMap::new(),
                 started: 0,
                 accepted: 0,
                 deferred: 0,
@@ -4642,6 +4718,7 @@ mod tests {
                 reentries_first: true,
                 attempted_batch_id: None,
                 cooldowns: HashMap::new(),
+                failures: HashMap::new(),
                 started: 0,
                 accepted: 0,
                 deferred: 0,
@@ -4708,6 +4785,7 @@ mod tests {
                     reentries_first: true,
                     attempted_batch_id: None,
                     cooldowns: HashMap::new(),
+                    failures: HashMap::new(),
                     started: 0,
                     accepted: 0,
                     deferred: 0,
@@ -4783,6 +4861,7 @@ mod tests {
                 reentries_first: true,
                 attempted_batch_id: None,
                 cooldowns: HashMap::new(),
+                failures: HashMap::new(),
                 started: 0,
                 accepted: 0,
                 deferred: 0,
@@ -4808,6 +4887,7 @@ mod tests {
                 &mut attempted,
                 NOW,
                 None,
+                true,
             )
             .await
             .unwrap();
@@ -4838,6 +4918,7 @@ mod tests {
                 &mut attempted,
                 NOW,
                 None,
+                true,
             )
             .await;
             // Nothing is retryable (one wallet live, one parked): no ranking read, no report.
@@ -4857,6 +4938,7 @@ mod tests {
                 reentries_first: true,
                 attempted_batch_id: None,
                 cooldowns: HashMap::new(),
+                failures: HashMap::new(),
                 started: 0,
                 accepted: 0,
                 deferred: 0,
@@ -4997,6 +5079,7 @@ mod tests {
                 reentries_first: true,
                 attempted_batch_id: None,
                 cooldowns: HashMap::new(),
+                failures: HashMap::new(),
                 started: 0,
                 accepted: 0,
                 deferred: 0,
@@ -5051,6 +5134,7 @@ mod tests {
                 reentries_first: true,
                 attempted_batch_id: None,
                 cooldowns: HashMap::new(),
+                failures: HashMap::new(),
                 started: 0,
                 accepted: 0,
                 deferred: 0,
@@ -5401,6 +5485,7 @@ mod tests {
         fn admission_sync(marker: i64) -> BatchSync {
             BatchSync {
                 cooldowns: HashMap::new(),
+                failures: HashMap::new(),
                 parking_batch: Some(marker),
                 reentries_first: true,
                 attempted_batch_id: None,
@@ -5433,6 +5518,8 @@ mod tests {
         struct AdmissionFetcher {
             paper: Arc<PaperStateDb>,
             busy: Arc<StdMutex<HashSet<WalletAddress>>>,
+            /// Wallets whose positions read is malformed: a `Shared`-class bracket failure.
+            shared: HashSet<WalletAddress>,
             activity_reads: StdMutex<HashMap<WalletAddress, usize>>,
             spend_budget: bool,
         }
@@ -5457,6 +5544,8 @@ mod tests {
                     if first && self.spend_budget {
                         tokio::time::advance(Duration::from_secs(11)).await;
                     }
+                } else if url.contains("redeemable=false") && self.shared.contains(&wallet) {
+                    return Ok(b"{".to_vec());
                 } else if url.contains("redeemable=false")
                     && self.busy.lock().unwrap().contains(&wallet)
                 {
@@ -5474,9 +5563,19 @@ mod tests {
             busy: Arc<StdMutex<HashSet<WalletAddress>>>,
             spend_budget: bool,
         ) -> AdmissionPreparer {
+            admission_preparer_with_shared(h, busy, HashSet::new(), spend_budget)
+        }
+
+        fn admission_preparer_with_shared(
+            h: &Harness,
+            busy: Arc<StdMutex<HashSet<WalletAddress>>>,
+            shared: HashSet<WalletAddress>,
+            spend_budget: bool,
+        ) -> AdmissionPreparer {
             let fetcher: Arc<dyn ReconciliationFetcher> = Arc::new(AdmissionFetcher {
                 paper: h.paper_state.clone(),
                 busy,
+                shared,
                 activity_reads: StdMutex::new(HashMap::new()),
                 spend_budget,
             });
@@ -6170,16 +6269,320 @@ mod tests {
             let preparer = admission_preparer(&h, busy.clone(), true);
             let mut sync = admission_sync(1);
             admission_tick(&h, &preparer, &mut sync).await;
+            assert!(!sync.reentries_first);
             assert_eq!(sync.started, 1);
             assert_eq!(sync.deferred, 1);
+            assert_eq!(sync.failures[&wallet], 1);
             assert!(members(&h.live).is_empty());
             busy.lock().unwrap().clear();
             tokio::time::advance(Duration::from_secs(300)).await;
+            // Re-entries go first on this tick, so the failed member is not launched.
             admission_tick(&h, &preparer, &mut sync).await;
+            assert!(sync.reentries_first);
+            assert_eq!(sync.started, 0);
+            assert!(members(&h.live).is_empty());
+            // Additions go first on the next tick; the member follows them and is admitted.
+            admission_tick(&h, &preparer, &mut sync).await;
+            assert!(!sync.reentries_first);
             assert_eq!(sync.started, 1);
             assert_eq!(sync.accepted, 1);
             assert_eq!(members(&h.live), set(&[wallet]));
             assert!(!sync.cooldowns.contains_key(&wallet));
+            assert_eq!(
+                sync.failures[&wallet], 1,
+                "only being live clears the record"
+            );
+            admission_tick(&h, &preparer, &mut sync).await;
+            assert!(!sync.failures.contains_key(&wallet));
+        }
+
+        fn transient(
+            wallet: WalletAddress,
+            stage: &'static str,
+            completed_at: tokio::time::Instant,
+        ) -> crate::watchlist_admission::Deferral {
+            crate::watchlist_admission::Deferral {
+                completed_at: Some(completed_at),
+                wallet,
+                stage,
+                class: crate::position_seeder::FailureClass::WalletTransient,
+                kind: "validation.intervening_activity",
+                message: "busy".to_owned(),
+            }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn admission_retry_backoff_doubles_to_cap() {
+            let dir = tempfile::tempdir().unwrap();
+            let paper = PaperStateDb::open(&dir.path().join("paper.db")).unwrap();
+            let bytes = Arc::new(StdMutex::new(Vec::new()));
+            let _logs = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .json()
+                    .with_writer(CapturedLogs(bytes.clone()))
+                    .finish(),
+            );
+            let (failing, other) = (wallet(1), wallet(2));
+            let mut sync = admission_sync(1);
+            let mut delays = Vec::new();
+            for n in 1..=9_u32 {
+                let completion = tokio::time::Instant::now();
+                tokio::time::advance(Duration::from_secs(30)).await;
+                let stage = if n % 2 == 0 {
+                    "anchor_install"
+                } else {
+                    "validation"
+                };
+                let failure = transient(failing, stage, completion);
+                sync.completed(&paper, &[failing], &[], std::slice::from_ref(&failure), &[]);
+                let delay = Duration::from_secs((300_u64 << (n - 1)).min(21_600));
+                assert_eq!(sync.failures[&failing], n);
+                assert_eq!(sync.cooldowns[&failing], completion + delay);
+                // Callers park the same deferral again; it neither counts nor moves the cooldown.
+                park_persistent(&mut sync, &paper, std::slice::from_ref(&failure));
+                assert_eq!(sync.failures[&failing], n);
+                assert_eq!(sync.cooldowns[&failing], completion + delay);
+                delays.push(delay.as_secs());
+            }
+            assert_eq!(
+                delays,
+                [300, 600, 1_200, 2_400, 4_800, 9_600, 19_200, 21_600, 21_600]
+            );
+            // Not bracket failures: an unstarted wallet's fence deferral, a persistent outcome, and
+            // seed, proof-capture and apply-time deferrals parked outside `completed`.
+            let now = tokio::time::Instant::now();
+            sync.completed(
+                &paper,
+                &[],
+                &[],
+                &[transient(other, "fence", now)],
+                &[other],
+            );
+            let mut persistent = transient(other, "validation", now);
+            persistent.class = crate::position_seeder::FailureClass::WalletPersistent;
+            persistent.kind = "positions.missing_activity_mapping";
+            sync.completed(&paper, &[other], &[], &[persistent], &[]);
+            let mut seed = transient(failing, "seed", now);
+            seed.class = crate::position_seeder::FailureClass::WalletPersistent;
+            seed.kind = "seed.missing_cursor";
+            park_persistent(
+                &mut sync,
+                &paper,
+                &[
+                    seed,
+                    transient(failing, "proof", now),
+                    transient(failing, "apply", now),
+                ],
+            );
+            assert!(!sync.failures.contains_key(&other));
+            assert_eq!(sync.failures[&failing], 9);
+            // A prepared admission clears the cooldown but not the record: only being live does.
+            sync.completed(&paper, &[failing], &[failing], &[], &[]);
+            assert!(!sync.cooldowns.contains_key(&failing));
+            assert_eq!(sync.failures[&failing], 9);
+            let logs = log_fields(&bytes, "admission retry backoff");
+            assert_eq!(
+                logs.iter()
+                    .map(|l| l["retry_after_secs"].as_u64().unwrap())
+                    .collect::<Vec<_>>(),
+                delays,
+                "one line per counted failure"
+            );
+            assert_eq!(logs[8]["consecutive_failures"], 9);
+            assert_eq!(logs[0]["wallet"], failing.to_string());
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn failed_reentry_waits_behind_additions() {
+            let _io = paused_io();
+            let (retained, bench) = (wallet(1), wallet(2));
+            let mut fake = Fake::new(Some(1));
+            fake.latest_ranking = vec![row(1, 1, retained), row(1, 2, bench)];
+            let mut h = harness(fake, &[retained]).await;
+            h.applied = AppliedWatchlistCapacity::new(2);
+            h.live.remove_fenced(&set(&[retained]));
+            // Nothing is busy and no bracket spends the clock: every call that may launch does.
+            let preparer = admission_preparer(&h, Arc::new(StdMutex::new(HashSet::new())), false);
+            let bytes = Arc::new(StdMutex::new(Vec::new()));
+            let _logs = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .json()
+                    .with_writer(CapturedLogs(bytes.clone()))
+                    .finish(),
+            );
+            let mut sync = admission_sync(1);
+            sync.reentries_first = false;
+            sync.failures.insert(retained, 1);
+            let mut evicted = HashSet::new();
+            let config = MaintenanceConfig {
+                interval_secs: 10,
+                membership_mode: MembershipMode::Knockout,
+                ..cfg()
+            };
+            let mut tick = async |sync: &mut BatchSync| {
+                maintenance_tick(
+                    &h.live,
+                    &h.paper_state,
+                    &h.client,
+                    &h.base_url,
+                    "anon",
+                    "",
+                    &h.writer_lock,
+                    &h.applied,
+                    &preparer,
+                    &config,
+                    h.applied.load(),
+                    &mut evicted,
+                    sync,
+                    NOW,
+                )
+                .await;
+            };
+            tick(&mut sync).await;
+            assert!(sync.reentries_first);
+            assert!(members(&h.live).contains(&bench), "additions start");
+            assert!(
+                !members(&h.live).contains(&retained),
+                "the failed member waits"
+            );
+            tick(&mut sync).await;
+            assert!(!sync.reentries_first);
+            assert!(
+                members(&h.live).contains(&retained),
+                "it follows the additions"
+            );
+            let launches = log_fields(&bytes, "admission launch order");
+            let reentries = launches
+                .iter()
+                .filter(|l| l["path"] == "reentry" && l["started"] != 0)
+                .collect::<Vec<_>>();
+            assert_eq!(reentries.len(), 1);
+            assert_eq!(reentries[0]["first"], false);
+            assert_eq!(launched(reentries[0])[0].0, retained.to_string());
+            tick(&mut sync).await;
+            assert!(!sync.failures.contains_key(&retained));
+            assert_eq!(
+                log_fields(&bytes, "admission retry backoff cleared").len(),
+                1
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn post_swap_reentry_admits_failed_member() {
+            let _io = paused_io();
+            let (retained, newcomer) = (wallet(1), wallet(2));
+            let mut fake = Fake::new(Some(2));
+            fake.ranking_entries = vec![
+                row(1, 1, retained),
+                row(2, 1, retained),
+                row(2, 2, newcomer),
+            ];
+            let mut h = harness(fake, &[retained]).await;
+            h.applied = AppliedWatchlistCapacity::new(2);
+            h.live.remove_fenced(&set(&[retained]));
+            let preparer = admission_preparer(&h, Arc::new(StdMutex::new(HashSet::new())), false);
+            let bytes = Arc::new(StdMutex::new(Vec::new()));
+            let _logs = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .json()
+                    .with_writer(CapturedLogs(bytes.clone()))
+                    .finish(),
+            );
+            let mut sync = admission_sync(1);
+            sync.reentries_first = false;
+            sync.failures.insert(retained, 1);
+            // A re-entry-first tick that applies batch 2: the first call skips the failed member;
+            // the post-swap call follows the swap's additions and launches it.
+            admission_tick_in_mode(&h, &preparer, &mut sync, MembershipMode::FullRerank, 10).await;
+            assert!(sync.reentries_first);
+            assert_eq!(sync.marker, Some(2));
+            assert_eq!(members(&h.live), set(&[retained, newcomer]));
+            let reentries = log_fields(&bytes, "admission launch order")
+                .into_iter()
+                .filter(|l| l["path"] == "reentry" && l["started"] != 0)
+                .collect::<Vec<_>>();
+            assert_eq!(reentries.len(), 1);
+            assert_eq!(launched(&reentries[0])[0].0, retained.to_string());
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn boot_failure_counts_as_first() {
+            let _io = paused_io();
+            let wallet = wallet(1);
+            let mut fake = Fake::new(Some(1));
+            fake.ranking_entries = vec![row(1, 1, wallet)];
+            let h = harness(fake, &[wallet]).await;
+            h.live.remove_fenced(&set(&[wallet]));
+            let preparer = admission_preparer(&h, Arc::new(StdMutex::new(set(&[wallet]))), false);
+            let bytes = Arc::new(StdMutex::new(Vec::new()));
+            let _logs = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .json()
+                    .with_writer(CapturedLogs(bytes.clone()))
+                    .finish(),
+            );
+            let boot_cooldowns = HashMap::from([(
+                wallet,
+                tokio::time::Instant::now() + crate::watchlist_admission::admission_retry_after(1),
+            )]);
+            let mut sync = BatchSync::at_boot(
+                Some(1),
+                h.applied.load().generation,
+                HashSet::new(),
+                boot_cooldowns,
+            );
+            assert_eq!(sync.failures[&wallet], 1);
+            tokio::time::advance(Duration::from_secs(300)).await;
+            let before = tokio::time::Instant::now();
+            admission_tick(&h, &preparer, &mut sync).await;
+            let after = tokio::time::Instant::now();
+            assert!(
+                !sync.reentries_first,
+                "the first loop tick prepares additions first"
+            );
+            assert_eq!(sync.failures[&wallet], 2);
+            let delay = Duration::from_secs(600);
+            assert!(sync.cooldowns[&wallet] >= before + delay);
+            assert!(sync.cooldowns[&wallet] <= after + delay);
+            let logs = log_fields(&bytes, "admission retry backoff");
+            assert_eq!(logs.len(), 1);
+            assert_eq!(logs[0]["consecutive_failures"], 2);
+            assert_eq!(logs[0]["retry_after_secs"], 600);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn shared_abort_counts_its_transient_failure_once() {
+            let _io = paused_io();
+            let (failing, broken) = (wallet(1), wallet(2));
+            let mut fake = Fake::new(Some(1));
+            fake.ranking_entries = vec![row(1, 1, failing), row(1, 2, broken)];
+            let h = harness(fake, &[failing, broken]).await;
+            h.live.remove_fenced(&set(&[failing, broken]));
+            let preparer = admission_preparer_with_shared(
+                &h,
+                Arc::new(StdMutex::new(set(&[failing]))),
+                set(&[broken]),
+                false,
+            );
+            let bytes = Arc::new(StdMutex::new(Vec::new()));
+            let _logs = tracing::subscriber::set_default(
+                tracing_subscriber::fmt()
+                    .json()
+                    .with_writer(CapturedLogs(bytes.clone()))
+                    .finish(),
+            );
+            let mut sync = admission_sync(1);
+            sync.reentries_first = false;
+            admission_tick(&h, &preparer, &mut sync).await;
+            assert!(sync.reentries_first);
+            assert_eq!(sync.started, 2, "one call launched both");
+            assert_eq!(sync.failures.get(&failing), Some(&1));
+            assert!(
+                !sync.failures.contains_key(&broken),
+                "the shared cause counts for nobody"
+            );
+            assert_eq!(log_fields(&bytes, "admission retry backoff").len(), 1);
+            assert!(members(&h.live).is_empty());
         }
     }
     #[tokio::test(start_paused = true)]
@@ -6195,6 +6598,7 @@ mod tests {
             capacity_generation: 0,
             knockout_deferred: HashSet::new(),
             cooldowns: HashMap::new(),
+            failures: HashMap::new(),
             started: 0,
             accepted: 0,
             deferred: 0,

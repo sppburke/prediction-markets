@@ -1048,8 +1048,10 @@ Hash comparisons decide what remains, but never substitute for process clearance
    prefix hash and verified continuation through the frozen boot tail.
    Compare these stages with the captured restart baseline; BLAKE2 throughput is not a BLAKE3 restart
    measurement. The launch deadline uses [`maintenance_interval_secs`](./_GLOSSARY.md#configuration-defaults--concrete-values);
-   the admission cooldown is `ADMISSION_RETRY_SECS`, defined by
-   [`admission_retry_secs`](./_GLOSSARY.md#admission_retry_secs). Re-anchor cadence and the refresh-only
+   the admission cooldown starts at `ADMISSION_RETRY_SECS` and doubles per consecutive bracket
+   failure up to `ADMISSION_RETRY_MAX_SECS`, defined by
+   [`admission_retry_secs`](./_GLOSSARY.md#admission_retry_secs) and
+   [`admission_retry_max_secs`](./_GLOSSARY.md#admission_retry_max_secs). Re-anchor cadence and the refresh-only
    cooldown remain [`anchor_refresh_secs`](./_GLOSSARY.md#anchor_refresh_secs); started work may overrun
    the launch deadline.
 
