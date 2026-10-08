@@ -13,6 +13,10 @@ path = "src/main.rs"
 name = "pe_bootstrap"
 path = "src/lib.rs"
 
+[[example]]
+name = "classifier_v6_sample"
+required-features = ["scenario"]
+
 [features]
 # Gates bootstrap's `tests/scenario_*.rs` integration tests so a plain
 # `cargo test` (without `--all-features`) skips them.
@@ -36,7 +40,7 @@ figment         = { workspace = true }
 futures         = { workspace = true }
 fs2             = { workspace = true }
 reqwest         = { workspace = true }
-rusqlite        = { version = "0.32", features = ["bundled"] }
+rusqlite        = { version = "0.32", features = ["bundled", "functions"] }
 rust_decimal    = { workspace = true }
 serde           = { workspace = true }
 serde_json      = { workspace = true }

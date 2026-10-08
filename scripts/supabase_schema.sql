@@ -49,6 +49,20 @@ alter table ranking_entries add column if not exists last_trade_unix bigint;
 -- reason as the column above; NULL means "no verdict recorded" (a pre-#518 batch or a legacy
 -- replayed publication) and is NOT admitted, because missing evidence never confers eligibility.
 alter table ranking_entries add column if not exists survives boolean;
+alter table ranking_batches add column if not exists classifier_version integer;
+alter table ranking_entries add column if not exists history_through_unix bigint;
+
+create table if not exists ranking_scope_drops (
+  batch_id        bigint not null references ranking_batches(batch_id) on delete cascade,
+  wallet_hex      text not null,
+  scope_kind      text not null check (scope_kind in ('market', 'event')),
+  scope_id        text not null,
+  dropped_at_unix bigint not null,
+  cause           text not null check (cause in (
+    'conversion', 'order_dependent', 'overflow', 'underflow',
+    'unknown_condition', 'unknown_type', 'unmapped')),
+  primary key (batch_id, wallet_hex, scope_kind, scope_id)
+);
 
 -- Atomic, idempotent ranking publication. PostgREST executes each RPC request in one
 -- transaction: the new epoch is therefore invisible until all entries exist, and any
@@ -165,6 +179,66 @@ $$;
 revoke all on function publish_ranking_batch(text, jsonb, jsonb)
   from public, anon, authenticated;
 grant execute on function publish_ranking_batch(text, jsonb, jsonb)
+  to service_role;
+
+create or replace function publish_ranking_batch_v2(
+  p_publish_key text,
+  p_batch       jsonb,
+  p_entries     jsonb,
+  p_scope_drops jsonb
+) returns bigint
+language plpgsql
+as $$
+declare
+  v_batch_id bigint;
+  v_expected integer;
+  v_actual   integer;
+begin
+  if jsonb_typeof(p_scope_drops) is distinct from 'array' then
+    raise exception 'scope drops payload must be a JSON array';
+  end if;
+  if p_batch->>'classifier_version' is null then
+    raise exception 'batch requires classifier_version';
+  end if;
+  v_batch_id := publish_ranking_batch(p_publish_key, p_batch, p_entries);
+  update ranking_batches
+     set classifier_version = (p_batch->>'classifier_version')::integer
+   where batch_id = v_batch_id;
+
+  update ranking_entries stored
+     set history_through_unix = entry.history_through_unix
+    from jsonb_to_recordset(p_entries) as entry(rank integer, history_through_unix bigint)
+   where stored.batch_id = v_batch_id and stored.rank = entry.rank
+     and entry.history_through_unix is not null;
+  get diagnostics v_actual = row_count;
+  if v_actual <> jsonb_array_length(p_entries) then
+    raise exception 'every entry requires history_through_unix';
+  end if;
+
+  insert into ranking_scope_drops (
+    batch_id, wallet_hex, scope_kind, scope_id, dropped_at_unix, cause
+  )
+  select v_batch_id, dropped.wallet_hex, dropped.scope_kind, dropped.scope_id,
+         dropped.dropped_at_unix, dropped.cause
+    from jsonb_to_recordset(p_scope_drops) as dropped(
+      wallet_hex text, scope_kind text, scope_id text, dropped_at_unix bigint, cause text
+    )
+   where exists (select 1 from ranking_entries entry
+                 where entry.batch_id = v_batch_id and entry.wallet_hex = dropped.wallet_hex)
+  on conflict (batch_id, wallet_hex, scope_kind, scope_id) do nothing;
+  v_expected := jsonb_array_length(p_scope_drops);
+  select count(*) into v_actual from ranking_scope_drops where batch_id = v_batch_id;
+  if v_actual <> v_expected then
+    raise exception 'published batch % has % scope drops; expected %',
+      v_batch_id, v_actual, v_expected;
+  end if;
+  return v_batch_id;
+end;
+$$;
+
+revoke all on function publish_ranking_batch_v2(text, jsonb, jsonb, jsonb)
+  from public, anon, authenticated;
+grant execute on function publish_ranking_batch_v2(text, jsonb, jsonb, jsonb)
   to service_role;
 notify pgrst, 'reload schema';
 
@@ -496,6 +570,11 @@ alter table ranking_entries enable row level security;
 drop policy if exists "ranking_entries_anon_read" on ranking_entries;
 create policy "ranking_entries_anon_read" on ranking_entries for select to anon using (true);
 grant select on ranking_entries to anon;
+
+alter table ranking_scope_drops enable row level security;
+drop policy if exists "ranking_scope_drops_anon_read" on ranking_scope_drops;
+create policy "ranking_scope_drops_anon_read" on ranking_scope_drops for select to anon using (true);
+grant select on ranking_scope_drops to anon;
 
 -- `latest_ranking` evaluates `(select max(batch_id) from ranking_batches)`; under
 -- security_invoker the anon caller runs that subquery, so anon needs read access here too.

@@ -298,6 +298,17 @@ pub struct BootstrapConfig {
     #[serde(default = "default_backfill_limit", alias = "bootstrap_backfill_limit")]
     pub backfill_limit: usize,
 
+    /// Inactive wallets admitted by one `pe-bootstrap activate-next` batch (one
+    /// per full cycle). `0` admits none. A resumed cycle must use the value its
+    /// first `activate-next` recorded: the recorded batch is reloaded only when
+    /// its requested count matches. Canonical default in `docs/_GLOSSARY.md`
+    /// "Bootstrap defaults". `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS` overrides.
+    #[serde(
+        default = "default_activation_batch_wallets",
+        alias = "bootstrap_activation_batch_wallets"
+    )]
+    pub activation_batch_wallets: usize,
+
     // ── Winner-discovery (issue #324) ─────────────────────────────────────────
     /// Base URL for the Polymarket leaderboard endpoint. When absent, falls back
     /// to `polymarket_base_url`. `PE_BOOTSTRAP_LEADERBOARD_BASE_URL` overrides.
@@ -539,6 +550,11 @@ const fn default_backfill_limit() -> usize {
     0
 }
 
+/// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults".
+const fn default_activation_batch_wallets() -> usize {
+    crate::pile::PIPELINE_ACTIVATION_BATCH_WALLETS
+}
+
 fn default_clob_base_url() -> String {
     DEFAULT_CLOB_BASE_URL.to_owned()
 }
@@ -666,6 +682,7 @@ impl Default for BootstrapConfig {
             skip_trade_fetch: false,
             write_snapshot: false,
             backfill_limit: default_backfill_limit(),
+            activation_batch_wallets: default_activation_batch_wallets(),
             leaderboard_base_url: None,
             leaderboard_request_interval_ms: default_leaderboard_request_interval_ms(),
             leaderboard_top_n: default_leaderboard_top_n(),
@@ -1060,6 +1077,32 @@ mod tests {
             assert_eq!(cfg.purge_bulk_min_wallets, 7_500);
             Ok(())
         });
+    }
+
+    /// The activation batch defaults to the canonical 20,000 wallets, takes `0`
+    /// (admit none) and a smaller count through the production environment loader,
+    /// and refuses a malformed value instead of falling back to the default.
+    #[test]
+    fn activation_batch_wallets_default_and_env() {
+        assert_eq!(BootstrapConfig::default().activation_batch_wallets, 20_000);
+        for (raw, expected) in [("0", 0_usize), ("2500", 2_500)] {
+            figment::Jail::expect_with(|jail| {
+                jail.create_file("config.toml", r#"output_path = "/tmp/watchlist.json""#)?;
+                jail.set_env("PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS", raw);
+                let cfg = load(Some(std::path::Path::new("config.toml")))
+                    .map_err(|e| figment::Error::from(e.to_string()))?;
+                assert_eq!(cfg.activation_batch_wallets, expected);
+                Ok(())
+            });
+        }
+        for raw in ["-1", "many"] {
+            figment::Jail::expect_with(|jail| {
+                jail.create_file("config.toml", r#"output_path = "/tmp/watchlist.json""#)?;
+                jail.set_env("PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS", raw);
+                assert!(load(Some(std::path::Path::new("config.toml"))).is_err());
+                Ok(())
+            });
+        }
     }
 
     #[test]

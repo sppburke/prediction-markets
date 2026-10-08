@@ -10,20 +10,22 @@ import sys
 import tempfile
 import unittest
 
-from rank_cycle_manifest import _fresh_identity, candidate_targets
+from rank_cycle_manifest import TOP_UP_RESERVE_HOURS, _fresh_identity, candidate_targets
 import test_rank_and_push as wrapper_tests
 
 
-def identity(generation=1, base=None, version=2):
+def identity(generation=1, base=None, version=4):
     value = dict(version=version, generation=generation, fixed_end_unix=100,
                  wallets=["0x" + "1" * 40])
     if version >= 2:
         value.update(base_generation=base, base_manifest_sha256="a" * 64 if base else None,
                      start_exclusive=90 if base else 0, full_read_wallets=value["wallets"])
-    if version == 3:
+    if version >= 3:
         value.update(deferred_wallets=value["wallets"] if base else [],
                      full_read_wallets=[] if base else value["wallets"],
                      quiet_after_secs=2_592_000, repoll_period_secs=604_800)
+    if version == 4:
+        value.update(repair_wallets=[], certified_digest=hashlib.sha256(b"[]").hexdigest())
     value["digest"] = hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     return json.dumps(value)
 
@@ -42,6 +44,87 @@ class CandidateTargetsTest(unittest.TestCase):
 
     def targets(self, **kwargs):
         return candidate_targets(self.prior, self.side, include_bulk_root=True, **kwargs)
+
+    def test_version_four_identity_and_old_reader_refusal(self):
+        raw = identity()
+        decoded = _fresh_identity(raw)
+        self.assertEqual(decoded["version"], 4)
+        self.assertEqual(decoded["repair_wallets"], [])
+        self.assertEqual(decoded["certified_digest"], hashlib.sha256(b"[]").hexdigest())
+        # Frozen pre-release Python decoder's version gate, before any field/digest check.
+        def old_reader(raw):
+            version = json.loads(raw).get("version")
+            if version not in (1, 2, 3):
+                raise ValueError("unsupported candidate activity identity version")
+        with self.assertRaisesRegex(ValueError, "unsupported"):
+            old_reader(raw)
+        for key, value in (("generation", 2**63), ("wallets", ["0xABC"]), ("repair_wallets", ["0x" + "2" * 40]),
+                           ("deferred_wallets", decoded["wallets"]), ("certified_digest", "A" * 64),
+                           ("quiet_after_secs", 1), ("repoll_period_secs", 1),
+                           ("base_manifest_sha256", "a" * 64), ("start_exclusive", 1)):
+            with self.subTest(key=key):
+                malformed = {**decoded, key: value}
+                content = {k: v for k, v in malformed.items() if k != "digest"}
+                malformed["digest"] = hashlib.sha256(json.dumps(content, sort_keys=True, separators=(",", ":"),
+                                                                ensure_ascii=False).encode()).hexdigest()
+                with self.assertRaisesRegex(ValueError, "invalid candidate generation" if key == "generation" else "format-three"):
+                    _fresh_identity(json.dumps(malformed))
+
+    def test_fresh_format_two_root_always_admits_successor(self):
+        root = identity(version=2)
+        with sqlite3.connect(self.side) as c:
+            c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (root,))
+            c.execute("INSERT INTO activity_coverage_manifests_v2(generation, reference_sha256, collection_identity_json) "
+                      "VALUES (1, ?, ?)", (json.loads(root)["digest"], root))
+        self.assertEqual(self.targets(after_collection=True, now=100, max_staleness_hours=24), (2, 1, 0, 0, 0))
+
+    def test_format_three_snapshot_counts_certified_available_history(self):
+        from test_ranker_duck_parity import build_format_three_cache
+        from rank_cycle_manifest import snapshot
+        db = Path(self.tmp.name) / "certified.db"
+        _, entry, _ = build_format_three_cache(str(db))
+        activity = snapshot(db, "2026-02-05", {}, {})["source_watermark"]["activity"]
+        self.assertEqual((activity["count"], activity["source_row_count"], activity["newest_source_unix"]),
+                         (500, 1000, entry))
+        with sqlite3.connect(db) as c:
+            c.execute("UPDATE activity_wallet_history_v3 SET newest_trade_unix=newest_trade_unix+1")
+        with self.assertRaisesRegex(ValueError, "certificate digest mismatch"):
+            snapshot(db, "2026-02-05", {}, {})
+
+    def test_completed_classifier_three_request_retires_then_format_three_admission_succeeds(self):
+        from rank_cycle_manifest import retire_completed_cycle
+        from push_ranking_to_supabase import build_publish_request, save_publish_request
+        root = Path(self.tmp.name) / "eval-results"
+        out = root / "cron-20261006T000000Z"
+        out.mkdir(parents=True)
+        fixed = Path(self.tmp.name) / "wallet_cache.db"
+        fixed.write_bytes(b"installed format two")
+        candidate = fixed.with_name(f"wallet_cache.{out.name}.side.db")
+        backup = fixed.with_name(f"wallet_cache.{out.name}.displaced.db")
+        backup.write_bytes(b"old rollback file")
+        spool = Path(str(candidate) + ".projection-v3.jsonl")
+        spool.write_bytes(b"retained spool\n")
+        activation = {"side_path": str(candidate), "fixed_path": str(fixed),
+                      "prior_cache_backup_path": str(backup), "expected_sha256": "a" * 64}
+        request = build_publish_request({"ttr_floor_secs": 30},
+                                        [{"rank": 1, "wallet_hex": "0x" + "1" * 40}], 0, activation)
+        self.assertNotIn("classifier_version", request["batch"])
+        save_publish_request(str(out / "ranking_publish_request.json"), request)
+        (out / "accepted_cycle_manifest.json").write_text(json.dumps(
+            {"version": 1, "configuration": {"cache_lane": "fresh_v2"}}))
+        (root / "rank_and_push.pending").write_text("retained request")
+        self.assertEqual(retire_completed_cycle(root, out), 2)
+        self.assertTrue(spool.exists())
+        (root / "rank_and_push.pending").unlink()
+        self.assertEqual(retire_completed_cycle(root, out), 0)
+        self.assertFalse(spool.exists())
+        self.assertFalse(backup.exists())
+        self.assertTrue((out / "ranking_publish_request.json").exists())
+        # The same process accepts a new format-three root after historical retention.
+        with sqlite3.connect(self.side) as c:
+            c.execute("PRAGMA user_version=-2")
+            c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (identity(),))
+        self.assertEqual(self.targets(), (1, 1, 0, 1, 0))
 
     def test_version_three_identity_decodes_with_deferred_wallets_and_constants(self):
         raw = identity(2, 1, version=3)
@@ -83,7 +166,7 @@ class CandidateTargetsTest(unittest.TestCase):
                       (json.loads(initial)["digest"], initial))
         self.assertEqual(self.targets(), (2, 1, 0, 0, 1))
         self.assertEqual(self.targets(after_collection=True, now=100, max_staleness_hours=24),
-                         (2, 1, 0, 0, 1))
+                         (3, 1, 0, 0, 0))
         top_up = identity(3, 2, version=3)
         with sqlite3.connect(self.side) as c:
             c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (top_up,))
@@ -92,6 +175,12 @@ class CandidateTargetsTest(unittest.TestCase):
         self.assertEqual(self.targets(), (3, 1, 0, 0, 1))
         self.assertEqual(self.targets(after_collection=True, now=100, max_staleness_hours=24),
                          (3, 1, 0, 0, 1))
+        # The used top-up is the last head: it proceeds while it can still pass the
+        # publisher, reserve or not, and is refused only once it cannot.
+        self.assertEqual(self.targets(after_collection=True, now=100 + 86400, max_staleness_hours=24),
+                         (3, 1, 0, 0, 1))
+        with self.assertRaisesRegex(ValueError, "activity top-up is stale"):
+            self.targets(after_collection=True, now=101 + 86400, max_staleness_hours=24)
         for head, message in ((identity(3, 1, version=3), "single top-up"),
                               (identity(2, None, version=3), "initial activity head")):
             with self.subTest(head=head):
@@ -128,7 +217,7 @@ class CandidateTargetsTest(unittest.TestCase):
     def test_each_fresh_admission_exclusion(self):
         mutations = (
             "INSERT INTO activity_groups_v2(source_trade_id) VALUES ('row')",
-            "INSERT INTO activity_wallet_coverage_staging_v2 VALUES (1)",
+            "INSERT INTO activity_wallet_coverage_staging_v2(generation) VALUES (1)",
             "INSERT INTO activity_coverage_manifests_v2(generation) VALUES (1)",
             "INSERT INTO cache_frozen_payload_verifications VALUES (1)",
             "INSERT INTO ranker_entries_v2 VALUES ('row')",
@@ -186,7 +275,7 @@ class CandidateTargetsTest(unittest.TestCase):
             c.executescript("""PRAGMA user_version=-2;
                 DROP INDEX idx_activity_groups_v2_source_trade_id;
                 INSERT INTO activity_groups_v2(source_trade_id) VALUES ('retained');
-                INSERT INTO activity_wallet_coverage_staging_v2 VALUES (1);""")
+                INSERT INTO activity_wallet_coverage_staging_v2(generation) VALUES (1);""")
             c.execute("UPDATE cache_v2_migration_state SET fresh_collection_json=?", (identity(),))
         self.assertEqual(self.targets(), (1, 1, 0, 1, 0))
         with self.assertRaisesRegex(ValueError, "unfinished bulk root"):
@@ -207,7 +296,12 @@ class CandidateTargetsTest(unittest.TestCase):
         self.assertEqual(self.targets(), (1, 1, 1, 0, 1))
         self.assertEqual(self.targets(after_collection=True, now=100, max_staleness_hours=24), (1, 1, 1, 0, 1))
         self.assertEqual(self.targets(after_collection=True, now=90000, max_staleness_hours=24), (2, 1, 0, 0, 0))
-        self.assertEqual(self.targets(after_collection=True, now=86500, max_staleness_hours=24), (1, 1, 1, 0, 1))
+        # The initial head tops up once it cannot also cover the rest of the cycle.
+        reserve = TOP_UP_RESERVE_HOURS * 3600
+        self.assertEqual(self.targets(after_collection=True, now=100 + 86400 - reserve,
+                                      max_staleness_hours=24), (1, 1, 1, 0, 1))
+        self.assertEqual(self.targets(after_collection=True, now=101 + 86400 - reserve,
+                                      max_staleness_hours=24), (2, 1, 0, 0, 0))
         with sqlite3.connect(self.side) as c:
             c.execute("UPDATE activity_coverage_manifests_v2 SET reference_sha256=?", ("b" * 64,))
         self.assertEqual(self.targets(), (1, 1, 1, 0, 0))

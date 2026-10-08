@@ -3,6 +3,33 @@
 use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 
+/// C3's commitment, shared by admission and finalization. The stored drop array
+/// is a JSON string in this envelope, not a nested array.
+pub(super) fn certificate_digest(connection: &rusqlite::Connection) -> rusqlite::Result<String> {
+    let mut statement = connection.prepare(
+        "SELECT wallet_hex, generation, newest_source_unix, newest_trade_unix,
+                aggregate_count, source_row_count, ordered_digest, scope_drops_json
+         FROM activity_wallet_history_v3 ORDER BY wallet_hex",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut digest = JsonArrayDigest::new();
+    while let Some(row) = rows.next()? {
+        digest
+            .push(&serde_json::json!({
+                "wallet_hex": row.get::<_, String>(0)?,
+                "generation": row.get::<_, i64>(1)?,
+                "newest_source_unix": row.get::<_, Option<i64>>(2)?,
+                "newest_trade_unix": row.get::<_, Option<i64>>(3)?,
+                "aggregate_count": row.get::<_, i64>(4)?,
+                "source_row_count": row.get::<_, i64>(5)?,
+                "ordered_digest": row.get::<_, String>(6)?,
+                "scope_drops_json": row.get::<_, String>(7)?,
+            }))
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    }
+    Ok(digest.finish())
+}
+
 pub(super) struct JsonArrayDigest {
     hash: Sha256,
     populated: bool,

@@ -11,6 +11,11 @@ via Supabase `latest_ranking` — admitted by the maintenance tick (knockout mod
 the next batch swap (`full_rerank`, the cutover production mode) — never directly. This is the
 only sanctioned path for adding new wallets; see `AGENTS.md` "Do not add wallets" rule.
 
+The ranking uses [classifier 6 and its scoped drops](_GLOSSARY.md#history-format-3-and-classifier-6-739)
+and the shared [ranking/copy horizon floor](_GLOSSARY.md#ranking-horizon-floor). Discovery is
+acquisition, not first-entry classification; pe-service release 2's alignment is coordinated on
+[#588](https://github.com/sppburke/prediction-markets/issues/588).
+
 ## Required environment
 
 No mandatory environment variables. The `winner-discovery` subcommand does not
@@ -47,6 +52,10 @@ pairing: both discovery and backfill defer the global rule, and one
 `bootstrap_pipeline_activation_batch_wallets`, records the exact batch in
 SQLite, and exports `activated_wallets.csv` into the run directory. Empty or
 partially depleted candidate piles warn without failing the cycle.
+
+The [one-time classifier-6 catch-up](26-DATA-REFRESH-AND-REOPTIMIZATION-RUNBOOK.md#classifier-6-catch-up-and-coordinated-release-739)
+records an activation batch of zero. Before the first ordinary cycle, the owner selects the
+ordinary batch size; a recorded cycle keeps that value through retries.
 
 There is no separate eval/export stage or candidates JSON: `winner-discovery` fetches
 the leaderboard + datadash slices and upserts new wallets (recording the
@@ -104,7 +113,13 @@ behaviour of the `SRC_502_GAP` (64) and `SRC_DATADASH` (128) bits.
   writes `data/eval-results/rank_and_push.cycle` before discovery or activation.
   If a transient pre-publication stage fails, the next zero-argument retry
   reuses that run directory, its deterministic activation batch ID, and the
-  already-committed cohort; it does not admit another 20,000 wallets.
+  already-committed cohort; it does not admit another batch. The batch size
+  (`PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS`; default
+  `bootstrap_pipeline_activation_batch_wallets`; `0` admits none) must not
+  change between the attempt and its retry: the committed batch reloads only
+  under the count it recorded, and a changed count stops `activate-next`.
+  The [classifier-6 catch-up](26-DATA-REFRESH-AND-REOPTIMIZATION-RUNBOOK.md#classifier-6-catch-up-and-coordinated-release-739)
+  and first ordinary cycle are distinct batches; change the owner's count only between them.
 - **Bounded inside the wrapper.** `--skip-discovery` skips both discovery and
   controlled activation. Backfill launched by the wrapper always defers global
   activation, so no wrapper override can silently activate an unbounded cohort.

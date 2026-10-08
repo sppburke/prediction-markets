@@ -21,7 +21,7 @@ use rusqlite::{Connection, Row, Rows, params};
 
 use super::{ActivityAggregate, BootstrapError, StoredActivityRow, decode_activity_aggregate};
 
-/// The carry loop's keyset window and this pipeline's measured knee agree.
+/// This pipeline's measured knee (#670).
 const BATCH_ROWS: usize = 512;
 /// A four-core host runs this many workers beside its reader and consumer.
 const MAX_WORKERS: usize = 3;
@@ -43,6 +43,13 @@ const SELECT_AGGREGATES: &str =
          FROM activity_groups_v2
          WHERE coverage_generation = ?1 AND wallet_hex = ?2
          ORDER BY source_time_unix, source_trade_id";
+
+const SELECT_HISTORY: &str =
+    "SELECT source_trade_id, semantic_revision, components_json, row_count,
+            share_amount_str, price_weighted_share_amount_str, source_usdc_amount_str,
+            source_time_unix, is_combo
+     FROM activity_groups_v2 WHERE wallet_hex = ?1
+     ORDER BY source_time_unix, source_trade_id";
 
 /// One batch of stored rows, packed into two buffers instead of six owned
 /// strings and three integer reads per row. Workers rebuild the owned values
@@ -266,6 +273,21 @@ impl Scan {
         let outcome = self.stream(&mut rows, wallet_hex, &mut cursor, consume);
         // Whatever ended the wallet, the pool must hold nothing when the next
         // wallet starts, or its batches would be consumed out of order.
+        self.discard(&mut cursor);
+        outcome
+    }
+
+    /// Format three reads insertion-independent history; neither mirror is an input.
+    pub(super) fn for_each_history(
+        &mut self,
+        connection: &Connection,
+        wallet_hex: &str,
+        consume: impl FnMut(ActivityAggregate, Option<&[u8]>) -> Result<(), BootstrapError>,
+    ) -> Result<Option<BootstrapError>, BootstrapError> {
+        let mut statement = connection.prepare(SELECT_HISTORY)?;
+        let mut rows = statement.query(params![wallet_hex])?;
+        let mut cursor = Cursor::default();
+        let outcome = self.stream(&mut rows, wallet_hex, &mut cursor, consume);
         self.discard(&mut cursor);
         outcome
     }

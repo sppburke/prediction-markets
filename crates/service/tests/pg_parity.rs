@@ -8,14 +8,16 @@
 //!
 //! **Self-skips when `PE_TEST_PG_URL` is unset**, so it never runs (and never fails) under
 //! the local `cargo nextest run --workspace --all-features` gate, which has no Postgres. CI
-//! sets `PE_TEST_PG_URL` to its `services: postgres` and loads both schema files first.
+//! sets `PE_TEST_PG_URL` to a schema-loaded template database. Each case clones that
+//! template into its own database and drops the clone at the end, including on failure.
 //! Run locally:
 //!   docker run -d --name pg -e POSTGRES_PASSWORD=postgres -p 5432:5432 postgres:16
 //!   psql "$URL" -c "create role anon; create role authenticated; create role service_role;"
-//!   psql "$URL" -f scripts/supabase_schema.sql -f scripts/supabase_paper_state_schema.sql
-//!   PE_TEST_PG_URL="$URL" cargo nextest run -p pe-service --features scenario --test pg_parity
+//!   psql "$URL" -c "create database pe_ci_template;"
+//!   psql "$TEMPLATE_URL" -f scripts/supabase_schema.sql -f scripts/supabase_paper_state_schema.sql
+//!   PE_TEST_PG_URL="$TEMPLATE_URL" cargo nextest run -p pe-service --features scenario --test pg_parity
 //!
-//! Phases (one sequential test so the shared `paper_bankroll` singleton is not raced):
+//! Phases stay sequential within each isolated scenario:
 //!   PG-PARITY — SQL `commit_fill` bankroll + positions == `PaperStateDb::commit_fill`.
 //!   PG-AC2    — a duplicate `idempotency_key` debits once.
 //!   PG-AC8    — a duplicate `apply_resolution` market credits once.
@@ -29,22 +31,75 @@
     clippy::arithmetic_side_effects
 )]
 
-use std::str::FromStr;
+use std::{process::Command, str::FromStr};
 
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tokio_postgres::{Client, NoTls};
 
-/// The pg tests share one database and nextest runs each test in its OWN PROCESS — an
-/// in-process mutex cannot serialize them. A session-scoped Postgres advisory lock does:
-/// the returned connection holds it for the test's lifetime and releases it on drop.
-async fn pg_lock(url: &str) -> Client {
-    let client = connect(url).await;
-    client
-        .batch_execute("select pg_advisory_lock(715_511)")
+struct PgDatabase {
+    name: String,
+    admin_url: String,
+    url: String,
+    _directory: tempfile::TempDir,
+}
+
+impl Drop for PgDatabase {
+    fn drop(&mut self) {
+        // Cleanup is synchronous so it completes before the test runtime is torn down.
+        // FORCE also closes any connections left by a failed scenario.
+        let result = Command::new("psql")
+            .args([
+                &self.admin_url,
+                "-X",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-c",
+                &format!("DROP DATABASE \"{}\" WITH (FORCE)", self.name),
+            ])
+            .output();
+        match result {
+            Ok(output) if output.status.success() => {}
+            error => {
+                eprintln!("failed to drop test database {}: {error:?}", self.name);
+                assert!(std::thread::panicking(), "test database cleanup failed");
+            }
+        }
+    }
+}
+
+async fn pg_database(url: &str) -> PgDatabase {
+    let config = tokio_postgres::Config::from_str(url).expect("parse template connection");
+    let template = config.get_dbname().expect("template database name");
+    let mut database_url = reqwest::Url::parse(url).expect("parse template URL");
+    database_url.set_path("/postgres");
+    let admin_url = database_url.to_string();
+    let admin = connect(&admin_url).await;
+    let directory = tempfile::Builder::new()
+        .prefix("pe_pg_parity_")
+        .tempdir()
+        .expect("allocate unique test database name");
+    let name = directory
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("test database name is UTF-8")
+        .to_owned();
+    admin
+        .batch_execute(&format!(
+            "CREATE DATABASE \"{name}\" TEMPLATE \"{}\"",
+            template.replace('"', "\"\"")
+        ))
         .await
-        .unwrap();
-    client
+        .expect("clone schema-loaded template");
+    database_url.set_path(&format!("/{name}"));
+    let url = database_url.to_string();
+    PgDatabase {
+        name,
+        admin_url,
+        url,
+        _directory: directory,
+    }
 }
 
 /// Reload the exact checked-in financial schema so parity cannot accidentally exercise a stale
@@ -240,7 +295,8 @@ async fn pg_watchlist_replace_parity_and_concurrency() {
         );
         return;
     };
-    let _guard = pg_lock(&url).await;
+    let database = pg_database(&url).await;
+    let url = database.url.clone();
     let client = connect(&url).await;
     client
         .batch_execute(
@@ -359,9 +415,10 @@ async fn pg_parity_and_concurrency() {
         );
         return;
     };
-    let _guard = pg_lock(&url).await;
-    load_financial_schema(&_guard).await;
+    let database = pg_database(&url).await;
+    let url = database.url.clone();
     let client = connect(&url).await;
+    load_financial_schema(&client).await;
 
     reset(&client, START).await;
     let applied = sql_commit_fill(
@@ -386,9 +443,10 @@ async fn pg_financial_rpcs_require_seeded_start_before_mutation() {
         eprintln!("SKIP: PE_TEST_PG_URL unset — Start-bypass test runs only in CI / local pg");
         return;
     };
-    let _guard = pg_lock(&url).await;
-    load_financial_schema(&_guard).await;
+    let database = pg_database(&url).await;
+    let url = database.url.clone();
     let client = connect(&url).await;
+    load_financial_schema(&client).await;
     client
         .batch_execute(
             "delete from paper_fills; delete from paper_positions; \
@@ -472,7 +530,8 @@ async fn pg_cas_predicated_update_rehearsal() {
         );
         return;
     };
-    let _guard = pg_lock(&url).await;
+    let database = pg_database(&url).await;
+    let url = database.url.clone();
     let client = connect(&url).await;
     // Isolated key: never a seeded production row, so this cannot race pg_parity.
     client
@@ -581,9 +640,10 @@ async fn pg_511_v2_outcomes_and_in_rpc_credit() {
         eprintln!("SKIP: PE_TEST_PG_URL unset");
         return;
     };
-    let _guard = pg_lock(&url).await;
-    load_financial_schema(&_guard).await;
+    let database = pg_database(&url).await;
+    let url = database.url.clone();
     let client = connect(&url).await;
+    load_financial_schema(&client).await;
     reset(&client, "1000").await;
 
     // applied: 1000 − principal 4.2 − fee .01 = 995.79.
@@ -622,8 +682,11 @@ async fn pg_511_concurrent_fill_vs_resolution_conserves_money() {
         eprintln!("SKIP: PE_TEST_PG_URL unset");
         return;
     };
-    let _guard = pg_lock(&url).await;
-    load_financial_schema(&_guard).await;
+    let database = pg_database(&url).await;
+    let url = database.url.clone();
+    let schema_client = connect(&url).await;
+    load_financial_schema(&schema_client).await;
+    drop(schema_client);
     for fill_first in [true, false] {
         let a = connect(&url).await;
         reset(&a, "1000").await;
@@ -698,9 +761,10 @@ async fn pg_511_v2_acl_service_role_only() {
         eprintln!("SKIP: PE_TEST_PG_URL unset");
         return;
     };
-    let _guard = pg_lock(&url).await;
-    load_financial_schema(&_guard).await;
+    let database = pg_database(&url).await;
+    let url = database.url.clone();
     let client = connect(&url).await;
+    load_financial_schema(&client).await;
     let inventory = client
         .query(
             "select p.proname, pg_get_function_identity_arguments(p.oid) \

@@ -14,7 +14,7 @@
 # What `bash scripts/rank_and_push.sh` does (no args), in order:
 #   Step 0  refresh data (always-on; --skip-discovery / --skip-backfill to bypass):
 #     discover     pe-bootstrap winner-discovery --defer-activation  ingest without bulk activation
-#     activate     pe-bootstrap activate-next     at most the next audited 20,000 non-infra wallets
+#     activate     pe-bootstrap activate-next     at most the next audited batch of non-infra wallets (glossary default)
 #     backfill     pe-bootstrap backfill --defer-activation  trade history for every active wallet
 #     events       pe-bootstrap events            condition→event + fee maps (eligibility gate)
 #     resolutions  pe-bootstrap resolutions       CLOB→Gamma resolutions + schedule end_dates, run
@@ -260,6 +260,7 @@ fi
 # SUPABASE_SECRET_KEY from the environment) sees them. Sourcing only before the verify step
 # would leave the push stage without credentials.
 set -a; source .env; set +a
+MIN_TTR_SECS=10
 
 # Neutralize PE_BOOTSTRAP_FETCH_RESOLUTIONS for the `backfill` stage (issue #383). `.env` sets
 # it =1 (.env:30) and the `set -a; source .env` above exports it GLOBALLY, so without this unset
@@ -756,7 +757,7 @@ refresh_data() {
   # the ranker reads.
   export PE_BOOTSTRAP_CACHE_PATH="$DB"
 
-  echo "── Step 0: data refresh (discover → activate 20,000 → backfill → events → resolutions) ──"
+  echo "── Step 0: data refresh (discover → activate the next batch → backfill → events → resolutions) ──"
 
   if [[ "$SKIP_DISCOVERY" == "1" ]]; then
     echo "   discovery skipped (--skip-discovery)"
@@ -1001,7 +1002,7 @@ if [[ "$SKIP_RANK" == "0" ]]; then
     --db "$DB" --ranked-csv "$RANKED_CSV" --positions-csv "$POSITIONS_CSV" \
     --out-dir "$OUT_DIR" \
     --latency-shift-secs "$LATENCY_SHIFT_SECS" --fill-window-secs "$FILL_WINDOW_SECS" \
-    --min-trl "$MIN_TRL" --min-ttr-secs 60 --ttr-max-secs "$TTR_MAX_SECS" \
+    --min-trl "$MIN_TRL" --min-ttr-secs "$MIN_TTR_SECS" --ttr-max-secs "$TTR_MAX_SECS" \
     --floor-tstat "$FLOOR_TSTAT" --emit-targets "$TARGETS_CSV"
 
   echo "── Stage 2b/3: targeted reference fetch into the ranker price store (#536) ────"
@@ -1022,8 +1023,14 @@ if [[ "$SKIP_RANK" == "0" ]]; then
     # targeted writes so activation is bound to the exact ranked cache bytes.
     # The candidate snapshot already captured the finalized inputs alongside
     # export and ranking; the fetch changes only the price store.
+    EXPORT_MANIFEST_ARGS=()
+    EXPORT_MANIFEST="$PARQUET_DIR/schema_v2_export_manifest.json"
+    if [[ "$("$PYTHON_BIN" -c 'import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])' "$EXPORT_MANIFEST")" == "3" ]]; then
+      EXPORT_MANIFEST_ARGS=(--export-manifest "$EXPORT_MANIFEST")
+    fi
     "$PE_BOOTSTRAP_BIN" cache-finalize-v2 --db "$DB" \
-      --stage-record "$CACHE_STAGE_RECORD" "${BOOTSTRAP_CONFIG_ARGS[@]}"
+      "${EXPORT_MANIFEST_ARGS[@]}" --stage-record "$CACHE_STAGE_RECORD" "${BOOTSTRAP_CONFIG_ARGS[@]}"
   fi
 
   echo "── Stage 2c/3: pass-2 reference-oracle rerank (adds hit_rate) ─────────────────"
@@ -1034,7 +1041,7 @@ if [[ "$SKIP_RANK" == "0" ]]; then
     --half-life-days "$HALF_LIFE_DAYS" --as-of "$AS_OF" \
     --min-trl "$MIN_TRL" --min-avg-per-month "$MIN_AVG_PER_MONTH" \
     --min-active-months "$MIN_ACTIVE_MONTHS" \
-    --min-ttr-secs 60 --ttr-max-secs "$TTR_MAX_SECS" \
+    --min-ttr-secs "$MIN_TTR_SECS" --ttr-max-secs "$TTR_MAX_SECS" \
     --price-min "$PRICE_MIN" --price-max "$PRICE_MAX" \
     --floor-tstat "$FLOOR_TSTAT" --git-sha "$GIT_SHA" \
     --pipeline-versions-file "$PIPELINE_VERSIONS_FILE" \
@@ -1070,14 +1077,9 @@ else
   [[ -n "$ACTIVE_WINDOW_HOURS" ]] && FILTER_ARGS+=(--active-window-hours "$ACTIVE_WINDOW_HOURS")
   [[ -n "$MAX_CACHE_STALENESS_HOURS" ]] && FILTER_ARGS+=(--max-cache-staleness-hours "$MAX_CACHE_STALENESS_HOURS")
 
-  # TTR provenance: pass the actual ranking TTR bounds so the durable request reflects
-  # the shape these entries were ranked at.
+  # Batch limits come from the oracle manifest bound to the ranked CSV.
   PUSH_ARGS+=(
     --ranked-csv "$LATENCY_CSV" --top-n "$TOP_N"
-    --band-lo "$PRICE_MIN" --band-hi "$PRICE_MAX"
-    --ttr-floor-secs 60
-    --ttr-max-secs "$TTR_MAX_SECS"
-    --latency-shift-secs "$LATENCY_SHIFT_SECS"
     "${FILTER_ARGS[@]}"
     --git-sha "$GIT_SHA" --notes "${NOTES:-rank_and_push.sh $GIT_SHA}"
     --request-file "$PUBLISH_REQUEST_FILE"

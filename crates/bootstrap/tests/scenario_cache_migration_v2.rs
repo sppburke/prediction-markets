@@ -21,9 +21,10 @@ use pe_bootstrap::BootstrapConfig;
 use pe_bootstrap::cache::{RankerPageStatus, RankerPricePage, WalletCache};
 use pe_bootstrap::cache_migration::{
     CacheActivationRequest, CacheFinalStageRecord, CacheV2BuildManifest, FrozenCacheFreshness,
-    FrozenPayloadReference, PriorCacheBinding, PublicationConsumptionProbe, activate_cache_v2,
-    activate_cache_v2_with_handoff, finalize_cache_v2, migrate_cache_v2,
-    populate_activity_fresh_v2, populate_activity_v2, restore_prior_cache, sha256_file,
+    FrozenPayloadReference, PriorCacheBinding, PublicationConsumptionProbe,
+    activate_cache_v2 as activate_cache_v2_unbound, activate_cache_v2_with_handoff,
+    finalize_cache_v2 as finalize_cache_v2_unbound, migrate_cache_v2, populate_activity_fresh_v2,
+    populate_activity_v2, restore_prior_cache as restore_prior_cache_unbound, sha256_file,
     verify_frozen_payload_v1,
 };
 use pe_bootstrap::clob::ClobFetcher;
@@ -32,10 +33,7 @@ use pe_core_types::{
     LeaderAction, ReceivedAt, ReconstructionQuality, ShareAmount, SourceId, SourceTimestamp,
     WalletAddress,
 };
-use pe_position_ledger::{
-    EntryClassification, LedgerMutation, PositionLedger, SecondVerdict,
-    classify_complete_second_legacy,
-};
+use pe_position_ledger::{EntryClassification, LedgerMutation, PositionLedger, SecondVerdict};
 use pe_source_core::SourceError;
 use pe_source_polymarket_public::{
     ActivityParseContext, ActivityTransport, CLOB_RESOLUTION_PARSER_VERSION,
@@ -46,6 +44,155 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
+
+// Format-three scenarios bind the real pass to a manifest-v3 before activation.
+// The Parquet bytes here exercise the Rust file commitments; exporter parity has its own scenarios.
+fn finalize_cache_v2(
+    path: &std::path::Path,
+    stage: Option<&std::path::Path>,
+    now: i64,
+) -> Result<Option<CacheFinalStageRecord>, pe_bootstrap::error::BootstrapError> {
+    use pe_bootstrap::cache_migration::finalize_cache_v2_with_export_manifest;
+    let connection = Connection::open(path)?;
+    let raw: Option<String> = connection
+        .query_row(
+            "SELECT fresh_collection_json FROM cache_v2_migration_state",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let three = raw
+        .and_then(|json| serde_json::from_str::<Value>(&json).ok())
+        .is_some_and(|identity| identity["version"] == 4);
+    drop(connection);
+    if !three || stage.is_none() {
+        return finalize_cache_v2_unbound(path, stage, now);
+    }
+    finalize_cache_v2_unbound(path, None, now)?;
+    let connection = Connection::open(path)?;
+    let (count, digest, raw): (u64, String, String) = connection.query_row(
+        "SELECT ranker_projection_count, ranker_projection_digest, ranker_projection_inputs_json FROM cache_v2_migration_state", [],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+    )?;
+    let inputs: Value = serde_json::from_str(&raw)?;
+    let payout_count: u64 =
+        connection.query_row("SELECT COUNT(*) FROM clob_payout_evidence_v2", [], |row| {
+            row.get(0)
+        })?;
+    drop(connection);
+    let export = path.with_extension("fixture-parquet");
+    std::fs::create_dir_all(&export)?;
+    let mut tables = serde_json::Map::new();
+    for table in ["clob_payout_evidence_v2", "projection"] {
+        let file = export.join(format!("{table}.parquet"));
+        std::fs::write(&file, table)?;
+        tables.insert(table.to_owned(), serde_json::json!({"count": if table == "projection" { count } else { payout_count }, "sha256": sha256_file(&file)?}));
+    }
+    let manifest = export.join("cache-export-v2.json");
+    std::fs::write(
+        &manifest,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 3, "activity_scope": "projection_spool", "tables": tables,
+            "projection": {"count": count, "digest": digest, "classifier_version": 6, "oracle_version": 6,
+                "activity_generation": inputs["activity_generation"], "spool_sha256": inputs["projection_spool"]["sha256"]}
+        }))?,
+    )?;
+    finalize_cache_v2_with_export_manifest(path, stage, Some(&manifest), now)
+}
+
+// Decision 6: format-three scenarios supply the already hash-bound final-stage record.
+fn relocate_fixture_record(dir: &TempDir, side: &std::path::Path) {
+    let path = dir.path().join("fresh-initial-stage.json");
+    let mut record: CacheFinalStageRecord =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    record.cache_path = side.canonicalize().unwrap();
+    std::fs::write(path, serde_json::to_vec(&record).unwrap()).unwrap();
+}
+
+fn fixture_final_stage(side: &std::path::Path, expected: &str) -> Option<std::path::PathBuf> {
+    let parent = side.parent()?;
+    let intended = parent.canonicalize().ok()?.join(side.file_name()?);
+    for entry in std::fs::read_dir(parent).ok()? {
+        let path = entry.ok()?.path();
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "json")
+        {
+            let bytes = std::fs::read(&path).ok()?;
+            if let Ok(record) = serde_json::from_slice::<CacheFinalStageRecord>(&bytes)
+                && record.cache_path == intended
+                && record.cache_sha256 == expected
+            {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+fn activate_cache_v2(
+    request: &CacheActivationRequest,
+) -> Result<pe_bootstrap::cache_migration::CacheActivationReport, pe_bootstrap::error::BootstrapError>
+{
+    let record = fixture_final_stage(&request.side_path, &request.expected_side_sha256);
+    if record.is_none() {
+        return activate_cache_v2_unbound(request);
+    }
+    activate_cache_v2_with_handoff(request, None, record.as_deref(), None)
+}
+
+async fn restore_prior_cache(
+    fixed: &std::path::Path,
+    prior: &std::path::Path,
+    displaced: &std::path::Path,
+    binding: &PriorCacheBinding,
+    request: &std::path::Path,
+    pending: &std::path::Path,
+    probe: &dyn PublicationConsumptionProbe,
+) -> Result<(), pe_bootstrap::error::BootstrapError> {
+    let publication: Value = serde_json::from_slice(&std::fs::read(request)?)?;
+    let record = publication["cache_activation"]["side_path"]
+        .as_str()
+        .zip(publication["cache_activation"]["expected_sha256"].as_str())
+        .and_then(|(side, expected)| fixture_final_stage(std::path::Path::new(side), expected))
+        .or_else(|| {
+            request
+                .parent()
+                .map(|parent| parent.join("cache_stage_record.json"))
+                .filter(|path| path.is_file())
+        });
+    if record.is_none() {
+        return restore_prior_cache_unbound(
+            fixed, prior, displaced, binding, request, pending, probe,
+        )
+        .await;
+    }
+    pe_bootstrap::cache_migration::restore_prior_cache_with_final_stage_record(
+        fixed,
+        prior,
+        displaced,
+        binding,
+        request,
+        pending,
+        probe,
+        record.as_deref(),
+    )
+    .await
+}
+
+// Decision 6: registering this function explicitly is outside the SQL guard.
+// Fault-injection connections preserve record/data-version damage tests; ordinary writes are tested separately.
+fn scenario_sql_connection(path: impl AsRef<std::path::Path>) -> rusqlite::Result<Connection> {
+    let connection = Connection::open(path)?;
+    connection.create_scalar_function(
+        "pe_history_write_authorized",
+        0,
+        rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+        |_| Ok(true),
+    )?;
+    Ok(connection)
+}
 
 const WALLET: &str = "0x1111111111111111111111111111111111111111";
 
@@ -97,8 +244,39 @@ fn write_pending_publication(
     if evidence.exists() {
         activation["stage_evidence_sha256"] = Value::String(sha256_file(&evidence).unwrap());
     }
-    let batch = serde_json::json!({"config_hash": null});
-    let entries = serde_json::json!([{"rank": 1, "wallet_hex": WALLET}]);
+    let batch = serde_json::json!({"config_hash": null, "classifier_version": 6});
+    let end: i64 = Connection::open(expected_installed)
+        .unwrap()
+        .query_row(
+            "SELECT COALESCE(MAX(fixed_end_unix), (SELECT json_extract(source_bounds_json, '$.end_inclusive') FROM activity_coverage_manifests_v2 ORDER BY generation DESC LIMIT 1)) FROM activity_wallet_coverage_staging_v2",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    // Change 9: the saved classifier-six request carries its coverage end and scopes.
+    let connection = Connection::open(expected_installed).unwrap();
+    let has_certificates: bool = connection
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name = 'activity_wallet_history_v3')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let drops: Value = if has_certificates {
+        let raw: Option<String> = connection
+            .query_row(
+                "SELECT scope_drops_json FROM activity_wallet_history_v3 WHERE wallet_hex = ?1",
+                [WALLET],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        raw.map(|json| serde_json::from_str(&json).unwrap())
+            .unwrap_or_else(|| serde_json::json!([]))
+    } else {
+        serde_json::json!([])
+    };
+    let entries = serde_json::json!([{"rank": 1, "wallet_hex": WALLET, "history_through_unix": end, "scope_drops": drops}]);
     let identity = serde_json::json!({
         "batch": batch,
         "cache_activation": activation,
@@ -299,9 +477,9 @@ fn install_payout_manifest(path: &std::path::Path) {
                   page_count, market_count, closed_market_count, resolved_payout_count,
                   unresolved_payout_count, explicit_fifty_fifty_count, terminal_kind,
                   terminal_page_sha256, schema_version, parser_version, completed_at_unix,
-                  evidence_count)
+                  evidence_count, group_version)
              VALUES (1, ?1, NULL, 'LTE=', 1, 0, 0, 0, 0, 0, 'end_cursor',
-                     ?2, ?3, ?4, 1800000020, 0)",
+                     ?2, ?3, ?4, 1800000020, 0, 1)",
             params![
                 serde_json::to_string(&manifest).unwrap(),
                 "a".repeat(64),
@@ -322,12 +500,12 @@ async fn finalize_empty_activity_side(
     migrate_cache_v2(side, &manifest).unwrap();
     let frozen_path = write_frozen_reference(dir, watermark, vec![WALLET.to_owned()]);
     verify_frozen_payload_v1(side, &frozen_path, watermark + 70).unwrap();
-    let activity_url = format!(
+    let legacy_url = format!(
         "https://data.example/activity?user={WALLET}&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&limit=500&offset=0&sortDirection=DESC&end={watermark}"
     );
     populate_activity_v2(
         &collection_config(side),
-        &FixtureFetcher::new(HashMap::from([(activity_url, b"[]".to_vec())])),
+        &FixtureFetcher::new(HashMap::from([(legacy_url, b"[]".to_vec())])),
         "https://data.example",
         &frozen_path,
         watermark,
@@ -336,11 +514,56 @@ async fn finalize_empty_activity_side(
     )
     .await
     .unwrap();
+    // Change 2: even a fresh format-two head admits its successor before finalization.
+    populate_activity_fresh_v2(
+        side,
+        &FixtureFetcher::new(HashMap::from([(
+            activity_url(WALLET, watermark + 1),
+            b"[]".to_vec(),
+        )])),
+        "https://data.example",
+        2,
+        watermark + 1,
+        watermark + 81,
+    )
+    .await
+    .unwrap();
     install_payout_manifest(side);
     finalize_cache_v2(
         side,
         Some(&dir.path().join("cache-v2-final.json")),
         watermark + 90,
+    )
+    .unwrap()
+    .unwrap()
+    .cache_sha256
+}
+
+async fn finalize_historical_empty_side(dir: &TempDir, side: &std::path::Path, end: i64) -> String {
+    drop(seed_v1(side, end));
+    let manifest = write_build_manifest(dir, side);
+    migrate_cache_v2(side, &manifest).unwrap();
+    let frozen = write_frozen_reference(dir, end, vec![WALLET.to_owned()]);
+    let url = format!(
+        "https://data.example/activity?user={WALLET}&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&limit=500&offset=0&sortDirection=DESC&end={end}"
+    );
+    populate_activity_v2(
+        &collection_config(side),
+        &FixtureFetcher::new(HashMap::from([(url, b"[]".to_vec())])),
+        "https://data.example",
+        &frozen,
+        end,
+        1,
+        end + 1,
+    )
+    .await
+    .unwrap();
+    install_payout_manifest(side);
+    seed_historical_format_two(side, 3, end + 2);
+    finalize_cache_v2(
+        side,
+        Some(&dir.path().join("historical-empty.json")),
+        end + 2,
     )
     .unwrap()
     .unwrap()
@@ -450,6 +673,17 @@ async fn migration_is_resumable_and_activation_installs_only_the_finalized_main(
     .unwrap();
     assert_eq!(activity.source_row_count, 0);
     assert_eq!(activity.group_count, 0);
+    // Change 2: the completed format-two head admits its format-three successor.
+    populate_activity_fresh_v2(
+        &side,
+        &YieldingFetcher::default(),
+        "https://data.example",
+        2,
+        watermark + 1,
+        watermark + 81,
+    )
+    .await
+    .unwrap();
     install_payout_manifest(&side);
     // Private finalization may certify domain content despite unrelated page damage.
     // Activation must reject even when its expected hash includes that damage.
@@ -494,6 +728,11 @@ async fn migration_is_resumable_and_activation_installs_only_the_finalized_main(
     .unwrap();
     assert!(!side.with_extension("db-wal").exists());
 
+    std::fs::write(
+        data.join("cache_stage_record.json"),
+        serde_json::to_vec(&stage).unwrap(),
+    )
+    .unwrap();
     let activation_request = CacheActivationRequest {
         stage_evidence_sha256: None,
         fixed_path: fixed.clone(),
@@ -514,6 +753,12 @@ async fn migration_is_resumable_and_activation_installs_only_the_finalized_main(
     std::fs::create_dir(&request_dir).unwrap();
     let request_path = request_dir.join("ranking_publish_request.json");
     std::fs::rename(temporary_request, &request_path).unwrap();
+    // Change 6: the wrapper supplies the finalized export summary at activation.
+    std::fs::write(
+        request_dir.join("cache_stage_record.json"),
+        serde_json::to_vec(&stage).unwrap(),
+    )
+    .unwrap();
     std::fs::write(
         request_dir.join("latency_shift_ranked.csv"),
         format!("wallet,survives\n{WALLET},true\n"),
@@ -541,9 +786,9 @@ async fn migration_is_resumable_and_activation_installs_only_the_finalized_main(
         scripts.join("partial_backfill_wallets.py"),
     )
     .unwrap();
-    std::fs::write(
+    std::fs::copy(
+        repository.join("scripts/rank_cycle_manifest.py"),
         scripts.join("rank_cycle_manifest.py"),
-        "import sys\nif sys.argv[1] == 'installed-request': print('')\n",
     )
     .unwrap();
     std::fs::copy(
@@ -625,7 +870,13 @@ urllib.request.urlopen = urlopen
     assert_eq!(sha256_file(&v1_backup).unwrap(), v1_hash);
     assert_eq!(activation_json["prior_cache_sha256"], v1_hash);
 
-    let resumed = activate_cache_v2(&activation_request).unwrap();
+    let resumed = activate_cache_v2_with_handoff(
+        &activation_request,
+        None,
+        Some(&request_dir.join("cache_stage_record.json")),
+        None,
+    )
+    .unwrap();
     assert!(resumed.resumed);
     assert!(resumed.activation_evidence.is_none());
     assert!(v1_backup.is_file());
@@ -642,21 +893,31 @@ urllib.request.urlopen = urlopen
     let first_v2_hash = sha256_file(&fixed).unwrap();
     let next_side = dir.path().join("wallet_cache.next.v2.db");
     std::fs::copy(&fixed, &next_side).unwrap();
-    let next = Connection::open(&next_side).unwrap();
-    next.execute(
-        "UPDATE cache_v2_migration_state SET updated_at_unix = updated_at_unix + 1",
-        [],
+    // Changes 2 and 6: the second installation is a real finalized successor,
+    // with its own spool and export-bound stage record.
+    populate_activity_fresh_v2(
+        &next_side,
+        &YieldingFetcher::default(),
+        "https://data.example",
+        3,
+        watermark + 2,
+        watermark + 100,
     )
+    .await
     .unwrap();
-    next.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
-        .unwrap();
-    drop(next);
-    let next_hash = sha256_file(&next_side).unwrap();
+    let next_stage = finalize_cache_v2(
+        &next_side,
+        Some(&dir.path().join("next-final.json")),
+        watermark + 101,
+    )
+    .unwrap()
+    .unwrap();
+    let next_hash = next_stage.cache_sha256.clone();
     let prior_v2 = dir.path().join("wallet_cache.prior.v2.db");
     let v2_to_v2 = activate_cache_v2(&CacheActivationRequest {
         stage_evidence_sha256: None,
         fixed_path: fixed.clone(),
-        side_path: next_side,
+        side_path: next_side.clone(),
         prior_cache_backup_path: prior_v2.clone(),
         expected_side_sha256: next_hash,
     })
@@ -670,7 +931,7 @@ urllib.request.urlopen = urlopen
         schema_version: v2_to_v2.prior_cache_schema,
     };
     let current_hash = sha256_file(&fixed).unwrap();
-    let consumed_side = dir.path().join("consumed-side.db");
+    let consumed_side = next_side;
     let (v2_request, v2_pending) =
         write_pending_publication(&dir, "v2", &consumed_side, &fixed, &fixed, &prior_v2);
     let refused = restore_prior_cache(
@@ -1124,10 +1385,6 @@ async fn projection_admits_only_order_independent_first_entries() {
     drop(seed_v1(&side, fixed_end - 20));
     let manifest = write_build_manifest(&dir, &side);
     migrate_cache_v2(&side, &manifest).unwrap();
-    let frozen_path = write_frozen_reference(&dir, fixed_end - 20, vec![WALLET.to_owned()]);
-    let url = format!(
-        "https://data.example/activity?user={WALLET}&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&limit=500&offset=0&sortDirection=DESC&end={fixed_end}"
-    );
     // Newest first. Causal order: sell Yes of 0xsold, buy No of 0xsold; split and
     // merge 0xcycled, buy Yes of 0xcycled; split 0xorder and buy its Yes together.
     let body = format!(
@@ -1147,19 +1404,26 @@ async fn projection_admits_only_order_independent_first_entries() {
         t5 = fixed_end - 3,
         t7 = fixed_end - 1,
     );
-    let fetcher = FixtureFetcher::new(HashMap::from([(url, body.into_bytes())]));
-    populate_activity_v2(
-        &collection_config(&side),
-        &fetcher,
+    let mut rows: Vec<Value> = serde_json::from_str(&body).unwrap();
+    for row in &mut rows {
+        row["conditionId"] = fixture_market(row["conditionId"].as_str().unwrap()).into();
+    }
+    // Change 2: classifier six only finalizes a format-three collection.
+    populate_activity_fresh_v2(
+        &side,
+        &DatasetFetcher {
+            rows,
+            ..Default::default()
+        },
         "https://data.example",
-        &frozen_path,
-        fixed_end,
         7,
+        fixed_end,
         fixed_end + 1,
     )
     .await
     .unwrap();
     let market = |id: &str, yes: &str, no: &str| {
+        let id = fixture_market(id);
         format!(
             r#"{{"condition_id":"{id}","active":true,"closed":true,"end_date_iso":"2027-01-16T00:00:00Z","is_50_50_outcome":false,"tokens":[{{"token_id":"{yes}","outcome":"Yes","price":1,"winner":true}},{{"token_id":"{no}","outcome":"No","price":0,"winner":false}}]}}"#
         )
@@ -1180,65 +1444,435 @@ async fn projection_admits_only_order_independent_first_entries() {
     .fetch_closed_markets(&mut WalletCache::open(&side).unwrap())
     .await
     .unwrap();
-    // Version two's authentic finalized state: its history consumed a market on any
-    // SELL, SPLIT or MERGE, so it never admitted 0xsold's or 0xcycled's BUY, and it
-    // had no order guard, so it admitted 0xorder's BUY; count and digest match.
-    finalize_cache_v2(
-        &side,
-        Some(&dir.path().join("v2-final.json")),
-        fixed_end + 2,
-    )
-    .unwrap()
-    .unwrap();
-    let connection = Connection::open(&side).unwrap();
-    connection
-        .execute_batch(
-            "DELETE FROM ranker_entries_v2;
-             INSERT INTO ranker_entries_v2 (source_trade_id, activity_generation, classifier_version)
-             SELECT source_trade_id, coverage_generation, 2 FROM activity_groups_v2
-             WHERE transaction_hash = '0xorder-buy';",
-        )
-        .unwrap();
-    drop(connection);
-    let v2_digest = reference_projection_digest(&side);
-    Connection::open(&side)
-        .unwrap()
-        .execute(
-            "UPDATE cache_v2_migration_state SET ranker_classifier_version = 2,
-             ranker_projection_count = 1, ranker_projection_digest = ?1",
-            [&v2_digest],
-        )
-        .unwrap();
     let stage = finalize_against_unfused_reference(
         &side,
         &dir.path().join("entries-final.json"),
         fixed_end + 3,
     );
-    let projected: Vec<(String, String)> = {
-        let connection = Connection::open(&side).unwrap();
-        let mut statement = connection
-            .prepare(
-                "SELECT groups_v2.condition_id, groups_v2.transaction_hash
-                 FROM ranker_entries_v2 ranker
-                 JOIN activity_groups_v2 groups_v2 USING (source_trade_id)
-                 ORDER BY groups_v2.source_time_unix",
+    let connection = Connection::open(&side).unwrap();
+    let projected = projection_v3_rows(&side)
+        .iter()
+        .map(|row| {
+            let id = row["source_trade_id"].as_str().unwrap();
+            let transaction: String = connection
+                .query_row(
+                    "SELECT transaction_hash FROM activity_groups_v2 WHERE source_trade_id = ?1",
+                    [id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            (
+                row["condition_id"].as_str().unwrap().to_owned(),
+                transaction,
             )
-            .unwrap();
-        statement
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-            .unwrap()
-            .collect::<Result<_, _>>()
-            .unwrap()
-    };
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
         projected,
         vec![
-            ("0xsold".to_owned(), "0xsold-buy".to_owned()),
-            ("0xcycled".to_owned(), "0xcycled-buy".to_owned()),
+            (fixture_market("0xsold"), "0xsold-buy".to_owned()),
+            (fixture_market("0xcycled"), "0xcycled-buy".to_owned()),
         ]
     );
     assert_eq!(stage.ranker_projection_count, 2);
-    assert_eq!(stage.ranker_classifier_version, 3);
+    assert_eq!(stage.ranker_classifier_version, 6);
+}
+
+/// PASS: known-condition anchor redemptions are no-ops, including beside an entry
+/// in the same second; unknown conditions stop the wallet. Every classified BUY
+/// consumes history, and traded-token evidence overrides stored outcome labels,
+/// including for markets admission excludes, whose evidence still binds the
+/// projection inputs. The full-ledger unfused reference equals the working-set
+/// projection.
+#[tokio::test]
+async fn redemption_noops_and_verified_identity_shape_the_projection() {
+    const WALLET_F: &str = "0x6666666666666666666666666666666666666666";
+    let dir = TempDir::new().unwrap();
+    let side = dir.path().join("side.db");
+    let fixed_end = 1_800_000_000_i64;
+    let mut cache = seed_v1(&side, fixed_end - 1_500_000);
+    for wallet in [WALLET_B, WALLET_C, WALLET_D, WALLET_E, WALLET_F] {
+        cache
+            .upsert_wallets_bulk(&[(wallet.to_owned(), SRC_TRADES, false, None, None, None, 0)])
+            .unwrap();
+        cache.conn_for_test_set_active(wallet, 1);
+    }
+    drop(cache);
+    let manifest = write_build_manifest(&dir, &side);
+    migrate_cache_v2(&side, &manifest).unwrap();
+    // Each market's tokens are ("<n>0", "<n>1"), listed in outcome order.
+    let markets = [
+        "0xa-first",
+        "0xa-same",
+        "0xa-second-later",
+        "0xa-redeemed",
+        "0xa-minute-later",
+        "0xa-final",
+        "0xb-x",
+        "0xb-in",
+        "0xb-out",
+        "0xb-redeemed",
+        "0xb-final",
+        "0xc-redeemed",
+        "0xc-other",
+        "0xc-later",
+        "0xd-first",
+        "0xd-later",
+        "0xe-split",
+        "0xe-control",
+        "0xk",
+        "0xk2",
+        "0xk3",
+        "0xl",
+        "0xr",
+        "0xr-after",
+    ];
+    let token = |market: &str, outcome: usize| {
+        let index = markets.iter().position(|m| *m == market).unwrap() + 1;
+        format!("{index}{outcome}")
+    };
+    let trade = |wallet: &str,
+                 market: &str,
+                 asset: &str,
+                 outcome: usize,
+                 side: &str,
+                 size: &str,
+                 at: i64,
+                 tx: &str| {
+        serde_json::json!({
+            "proxyWallet": wallet, "type": "TRADE", "conditionId": fixture_market(market), "asset": asset,
+            "outcome": if outcome == 0 { "Yes" } else { "No" }, "side": side, "size": size,
+            "usdcSize": "0.4", "price": "0.4", "timestamp": at, "transactionHash": tx,
+            "outcomeIndex": outcome.to_string(),
+        })
+    };
+    let buy = |wallet: &str, market: &str, at: i64, tx: &str| {
+        trade(wallet, market, &token(market, 0), 0, "BUY", "1", at, tx)
+    };
+    let pair = |wallet: &str, kind: &str, market: &str, size: &str, at: i64, tx: &str| {
+        serde_json::json!({
+            "proxyWallet": wallet, "type": kind, "conditionId": fixture_market(market), "asset": "", "side": "",
+            "size": size, "usdcSize": size, "price": "1", "timestamp": at, "transactionHash": tx,
+        })
+    };
+    let zero_redeem = |wallet: &str, market: Option<&str>, at: i64, tx: &str| {
+        let mut row = serde_json::json!({
+            "proxyWallet": wallet, "type": "REDEEM", "asset": "", "side": "", "size": "0",
+            "usdcSize": "0", "price": "0", "timestamp": at, "transactionHash": tx,
+            "outcomeIndex": "0",
+        });
+        if let Some(market) = market {
+            row["conditionId"] = fixture_market(market).into();
+        }
+        row
+    };
+    let (ta, tb, tc, td, te, tf) = (
+        fixed_end - 1_300_000,
+        fixed_end - 690_000,
+        fixed_end - 680_000,
+        fixed_end - 670_000,
+        fixed_end - 660_000,
+        fixed_end - 650_000,
+    );
+    let activity = [
+        (
+            WALLET,
+            vec![
+                buy(WALLET, "0xa-first", ta, "0xa1"),
+                zero_redeem(WALLET, Some("0xa-redeemed"), ta + 100, "0xa2"),
+                // The known-condition no-op admits another market in the same
+                // second, one second later, and one minute later.
+                buy(WALLET, "0xa-same", ta + 100, "0xa3"),
+                buy(WALLET, "0xa-second-later", ta + 101, "0xa4"),
+                buy(WALLET, "0xa-minute-later", ta + 160, "0xa9"),
+                // Touching the redeemed condition does not stop later history.
+                buy(WALLET, "0xa-redeemed", ta + 170, "0xa12"),
+                buy(WALLET, "0xa-final", ta + 180, "0xa13"),
+                buy(WALLET, "0xa-same", ta + 190, "0xa10"),
+            ],
+        ),
+        (
+            WALLET_B,
+            vec![
+                buy(WALLET_B, "0xb-x", tb, "0xb1"),
+                // A positive redemption without an outcome but with a condition
+                // is also RequiresAnchor and remains a ledger no-op.
+                serde_json::json!({
+                    "proxyWallet": WALLET_B, "type": "REDEEM", "conditionId": fixture_market("0xb-redeemed"),
+                    "asset": "", "side": "", "size": "3", "usdcSize": "3", "price": "0",
+                    "timestamp": tb + 100, "transactionHash": "0xb2", "outcomeIndex": 999, "outcome": "",
+                }),
+                buy(WALLET_B, "0xb-in", tb + 101, "0xb3"),
+                buy(WALLET_B, "0xb-out", tb + 160, "0xb4"),
+                buy(WALLET_B, "0xb-redeemed", tb + 170, "0xb5"),
+                buy(WALLET_B, "0xb-final", tb + 180, "0xb6"),
+            ],
+        ),
+        (
+            WALLET_C,
+            vec![
+                // An underfunded merge in the redeem's second stops the wallet.
+                zero_redeem(WALLET_C, Some("0xc-redeemed"), tc, "0xc1"),
+                pair(WALLET_C, "MERGE", "0xc-other", "5", tc, "0xc2"),
+                buy(WALLET_C, "0xc-later", tc + 10, "0xc3"),
+            ],
+        ),
+        (
+            WALLET_D,
+            vec![
+                buy(WALLET_D, "0xd-first", td, "0xd1"),
+                // A zero-share redemption without a condition stops the wallet.
+                zero_redeem(WALLET_D, None, td + 100, "0xd2"),
+                buy(WALLET_D, "0xd-later", td + 110, "0xd3"),
+            ],
+        ),
+        (
+            WALLET_E,
+            vec![
+                // A buy that adds to a split position still consumes the market.
+                pair(WALLET_E, "SPLIT", "0xe-split", "2", te, "0xe1"),
+                buy(WALLET_E, "0xe-split", te + 10, "0xe2"),
+                trade(
+                    WALLET_E,
+                    "0xe-split",
+                    &token("0xe-split", 0),
+                    0,
+                    "SELL",
+                    "3",
+                    te + 20,
+                    "0xe3",
+                ),
+                trade(
+                    WALLET_E,
+                    "0xe-split",
+                    &token("0xe-split", 1),
+                    1,
+                    "SELL",
+                    "2",
+                    te + 30,
+                    "0xe4",
+                ),
+                buy(WALLET_E, "0xe-split", te + 40, "0xe5"),
+                buy(WALLET_E, "0xe-control", te + 50, "0xe6"),
+            ],
+        ),
+        (
+            WALLET_F,
+            vec![
+                // A SELL of the Yes token stamped as No: verified, the later No buy
+                // adds to the split's No balance; stamped, it would look like an entry.
+                pair(WALLET_F, "SPLIT", "0xk", "2", tf, "0xf1"),
+                trade(
+                    WALLET_F,
+                    "0xk",
+                    &token("0xk", 0),
+                    1,
+                    "SELL",
+                    "2",
+                    tf + 10,
+                    "0xf2",
+                ),
+                trade(
+                    WALLET_F,
+                    "0xk",
+                    &token("0xk", 1),
+                    1,
+                    "BUY",
+                    "1",
+                    tf + 20,
+                    "0xf3",
+                ),
+                // 0xk is unresolved: its token list still binds the ledger. With
+                // stored indices the earlier sell spent No and this sell would
+                // underflow, stopping every later eligible entry.
+                trade(
+                    WALLET_F,
+                    "0xk",
+                    &token("0xk", 1),
+                    1,
+                    "SELL",
+                    "3",
+                    tf + 21,
+                    "0xf10",
+                ),
+                // A No-token buy stamped Yes is projected, as the side actually bought.
+                trade(
+                    WALLET_F,
+                    "0xk2",
+                    &token("0xk2", 1),
+                    0,
+                    "BUY",
+                    "1",
+                    tf + 30,
+                    "0xf4",
+                ),
+                // A first entry in a market admission excludes (unresolved) is not
+                // projected.
+                buy(WALLET_F, "0xk3", tf + 35, "0xf11"),
+                // An asset absent from its market's tokens is raw-only: it neither
+                // projects nor consumes the market.
+                trade(WALLET_F, "0xl", "99999", 0, "BUY", "1", tf + 40, "0xf5"),
+                trade(
+                    WALLET_F,
+                    "0xl",
+                    &token("0xl", 0),
+                    0,
+                    "BUY",
+                    "1",
+                    tf + 50,
+                    "0xf6",
+                ),
+                // A redemption of the No token stamped Yes: verified, it spends the No
+                // balance; stamped, it would underflow Yes and stop the wallet.
+                trade(
+                    WALLET_F,
+                    "0xr",
+                    &token("0xr", 1),
+                    1,
+                    "BUY",
+                    "1",
+                    tf + 60,
+                    "0xf7",
+                ),
+                serde_json::json!({
+                    "proxyWallet": WALLET_F, "type": "REDEEM", "conditionId": fixture_market("0xr"),
+                    "asset": token("0xr", 1), "outcome": "Yes", "side": "", "size": "1",
+                    "usdcSize": "1", "price": "1", "timestamp": tf + 70,
+                    "transactionHash": "0xf8", "outcomeIndex": "0",
+                }),
+                buy(WALLET_F, "0xr-after", tf + 80, "0xf9"),
+            ],
+        ),
+    ];
+    let responses = activity
+        .into_iter()
+        .map(|(wallet, mut rows)| {
+            rows.sort_by_key(|row| std::cmp::Reverse(row["timestamp"].as_i64().unwrap()));
+            (
+                activity_url(wallet, fixed_end),
+                serde_json::to_vec(&rows).unwrap(),
+            )
+        })
+        .collect::<HashMap<_, _>>();
+    let collected = populate_activity_fresh_v2(
+        &side,
+        &FixtureFetcher::new(responses),
+        "https://data.example",
+        1,
+        fixed_end,
+        fixed_end + 1,
+    )
+    .await
+    .unwrap();
+    assert_eq!(collected.wallet_count, 6);
+    let evidence = markets.map(|market| {
+        let unresolved = matches!(market, "0xk" | "0xk3");
+        serde_json::json!({
+            "condition_id": fixture_market(market), "active": true, "closed": !unresolved,
+            "end_date_iso": "2027-01-16T00:00:00Z", "is_50_50_outcome": false,
+            "tokens": [{"token_id": token(market, 0), "outcome": "Yes", "price": if unresolved { "0.4" } else { "1" }, "winner": !unresolved},
+                       {"token_id": token(market, 1), "outcome": "No", "price": if unresolved { "0.6" } else { "0" }, "winner": false}],
+        })
+    });
+    ClobFetcher::new(
+        "https://clob.example".to_owned(),
+        FixtureFetcher::new(HashMap::from([(
+            "https://clob.example/markets?closed=true&limit=1000".to_owned(),
+            serde_json::to_vec(&serde_json::json!({"data": evidence, "next_cursor": "LTE="}))
+                .unwrap(),
+        )])),
+    )
+    .fetch_closed_markets(&mut WalletCache::open(&side).unwrap())
+    .await
+    .unwrap();
+    let stage = finalize_against_unfused_reference(
+        &side,
+        &dir.path().join("noops-final.json"),
+        fixed_end + 2,
+    );
+    // Change 3: projection ids come from the spool; transaction hashes remain audit fields.
+    let projected: Vec<(String, String)> = {
+        let connection = Connection::open(&side).unwrap();
+        let selected = projection_v3_rows(&side);
+        let mut statement = connection
+            .prepare(
+                "SELECT wallet_hex, transaction_hash, source_trade_id FROM activity_groups_v2 ORDER BY wallet_hex, source_time_unix",
+            )
+            .unwrap();
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+            .into_iter()
+            .filter(|(_, _, id)| selected.iter().any(|row| row["source_trade_id"] == *id))
+            .map(|(wallet, tx, _)| (wallet, tx))
+            .collect()
+    };
+    let expected = [
+        (WALLET, "0xa1"),
+        (WALLET, "0xa3"),
+        (WALLET, "0xa4"),
+        (WALLET, "0xa9"),
+        (WALLET, "0xa12"),
+        (WALLET, "0xa13"),
+        (WALLET_B, "0xb1"),
+        (WALLET_B, "0xb3"),
+        (WALLET_B, "0xb4"),
+        (WALLET_B, "0xb5"),
+        (WALLET_B, "0xb6"),
+        // Decision 1: an underfunded MERGE drops its market, not the later wallet history.
+        (WALLET_C, "0xc3"),
+        (WALLET_D, "0xd1"),
+        // Decision 1: an unresolvable zero-share REDEEM is ignored.
+        (WALLET_D, "0xd3"),
+        (WALLET_E, "0xe6"),
+        (WALLET_F, "0xf4"),
+        (WALLET_F, "0xf6"),
+        (WALLET_F, "0xf7"),
+        (WALLET_F, "0xf9"),
+    ]
+    .map(|(wallet, tx)| (wallet.to_owned(), tx.to_owned()));
+    assert_eq!(projected, expected);
+    assert_eq!(stage.ranker_projection_count, 19);
+    assert_eq!(stage.ranker_classifier_version, 6);
+    // The unresolved market's token order and venue page still bind the inputs.
+    for (name, sql) in [
+        (
+            "tokens",
+            "UPDATE clob_payout_evidence_v2 SET tokens_json = json_array(
+                 json_extract(tokens_json, '$[1]'), json_extract(tokens_json, '$[0]'))
+             WHERE market_id = '{}' ",
+        ),
+        (
+            "page",
+            "UPDATE clob_payout_evidence_v2 SET raw_page_sha256 = printf('%064d', 0)
+             WHERE market_id = '{}' ",
+        ),
+    ] {
+        let tampered = dir.path().join(format!("excluded-{name}.db"));
+        std::fs::copy(&side, &tampered).unwrap();
+        Connection::open(&tampered)
+            .unwrap()
+            .execute_batch(&sql.replace("{}", &fixture_market("0xk")))
+            .unwrap();
+        let error = finalize_cache_v2(
+            &tampered,
+            Some(&dir.path().join(format!("excluded-{name}.json"))),
+            fixed_end + 3,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("input binding changed"),
+            "{name}: {error}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1256,8 +1890,8 @@ async fn v2_activity_population_is_complete_idempotent_and_generation_isolated()
     );
     // Source order is newest first. The causal replay is therefore split ->
     // merge -> entry -> funded redemption -> RequiresAnchor -> later buy. The
-    // final buy has complete payout evidence and would be projected if the
-    // wallet fence were accidentally treated as a no-op.
+    // final buy has complete payout evidence and is admitted after the known-
+    // condition RequiresAnchor no-op.
     let body = format!(
         r#"[
           {{"proxyWallet":"{WALLET}","type":"TRADE","conditionId":"0xafter","asset":"789","outcome":"No","side":"BUY","size":"1","usdcSize":"0.4","price":"0.4","timestamp":{},"transactionHash":"0xafter","outcomeIndex":"1"}},
@@ -1364,17 +1998,26 @@ async fn v2_activity_population_is_complete_idempotent_and_generation_isolated()
             let before = sha256_file(&damaged).unwrap();
             let stage_path = dir.path().join(format!("after-break-{name}-{legacy}.json"));
             let error = finalize_cache_v2(&damaged, Some(&stage_path), fixed_end + 2).unwrap_err();
-            assert_eq!(error.to_string(), reference_error.to_string());
+            // Change 2: current finalization refuses a format-two head before projection.
+            // The acquisition-two traversal above still proves the same content refusal.
+            assert!(
+                error.to_string().contains("identity-four successor"),
+                "{error}"
+            );
             assert_eq!(sha256_file(&damaged).unwrap(), before);
             assert!(!stage_path.exists());
         }
     }
-    let stage = finalize_against_unfused_reference(
+    seed_historical_format_two(&side, 3, fixed_end + 2);
+    let stage = finalize_cache_v2(
         &side,
-        &dir.path().join("activity-final.json"),
+        Some(&dir.path().join("activity-final.json")),
         fixed_end + 2,
-    );
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(stage.version, 2);
+    // Change 2: historical classifier three retains its RequiresAnchor stop.
     assert_eq!(stage.ranker_projection_count, 1);
     assert_eq!(
         stage.ranker_projection_digest,
@@ -1430,7 +2073,7 @@ async fn v2_activity_population_is_complete_idempotent_and_generation_isolated()
             )
             .unwrap(),
         0,
-        "RequiresAnchor must stop every later bucket for the wallet"
+        "historical classifier three retains RequiresAnchor stopping (Change 2)"
     );
     assert_eq!(
         cache
@@ -1458,7 +2101,7 @@ async fn v2_activity_population_is_complete_idempotent_and_generation_isolated()
 const CLASSIFIER_FIXED_END: i64 = 1_800_000_000;
 
 async fn retained_classifier_activity(dir: &TempDir, side: &std::path::Path) -> std::path::PathBuf {
-    retained_classifier_activity_at_version(dir, side, 2).await
+    retained_classifier_activity_at_version(dir, side, 6).await
 }
 
 async fn retained_classifier_activity_at_version(
@@ -1473,7 +2116,7 @@ async fn retained_classifier_activity_at_version(
     let frozen = write_frozen_reference(dir, fixed_end - 10, vec![WALLET.to_owned()]);
     let row = |kind: &str, id: &str, market: &str, epoch: i64| {
         serde_json::json!({
-            "proxyWallet": WALLET, "type": kind, "conditionId": market, "asset": "123",
+            "proxyWallet": WALLET, "type": kind, "conditionId": if classifier_version == 6 { fixture_market(market) } else { market.to_owned() }, "asset": "123",
             "outcome": "Yes", "side": "BUY", "size": if kind == "CONVERSION" { "0" } else { "1" },
             "usdcSize": if kind == "CONVERSION" { "0" } else { "0.5" }, "price": "0.5",
             "timestamp": epoch, "transactionHash": id, "outcomeIndex": "0",
@@ -1483,7 +2126,7 @@ async fn retained_classifier_activity_at_version(
         row("TRADE", "0xlater-b", "0xlater-b", fixed_end - 1),
         row("TRADE", "0xlater-a", "0xlater-a", fixed_end - 2),
     ];
-    if classifier_version == 2 {
+    if matches!(classifier_version, 2 | 6) {
         rows.extend(
             (0..5).map(|index| row("TRADE", &format!("0xwide-{index}"), "0xwide", fixed_end - 3)),
         );
@@ -1493,20 +2136,38 @@ async fn retained_classifier_activity_at_version(
     let url = format!(
         "https://data.example/activity?user={WALLET}&type=TRADE%2CSPLIT%2CMERGE%2CREDEEM%2CCONVERSION&limit=500&offset=0&sortDirection=DESC&end={fixed_end}"
     );
-    populate_activity_v2(
-        &collection_config(side),
-        &FixtureFetcher::new(HashMap::from([(url, raw.clone())])),
-        "https://data.example",
-        &frozen,
-        fixed_end,
-        7,
-        fixed_end + 1,
-    )
-    .await
-    .unwrap();
+    if classifier_version == 6 {
+        // Change 2: current-classifier fixtures start with identity four.
+        verify_frozen_payload_v1(side, &frozen, fixed_end + 1).unwrap();
+        populate_activity_fresh_v2(
+            side,
+            &FixtureFetcher::new(HashMap::from([(
+                activity_url(WALLET, fixed_end),
+                raw.clone(),
+            )])),
+            "https://data.example",
+            7,
+            fixed_end,
+            fixed_end + 1,
+        )
+        .await
+        .unwrap();
+    } else {
+        populate_activity_v2(
+            &collection_config(side),
+            &FixtureFetcher::new(HashMap::from([(url, raw.clone())])),
+            "https://data.example",
+            &frozen,
+            fixed_end,
+            7,
+            fixed_end + 1,
+        )
+        .await
+        .unwrap();
+    }
     let markets = ["0xlater-a", "0xlater-b"].map(|market| {
         serde_json::json!({
-            "condition_id": market, "active": true, "closed": true,
+            "condition_id": if classifier_version == 6 { fixture_market(market) } else { market.to_owned() }, "active": true, "closed": true,
             "end_date_iso": "2027-01-16T00:00:00Z", "is_50_50_outcome": false,
             "tokens": [{"token_id":"123","outcome":"Yes","price":1,"winner":true},
                        {"token_id":"456","outcome":"No","price":0,"winner":false}],
@@ -1524,116 +2185,44 @@ async fn retained_classifier_activity_at_version(
     .await
     .unwrap();
     if classifier_version == 1 {
-        // These two singleton BUY buckets have identical projections in both
-        // generations. Prove the expected source IDs with the retained legacy
-        // classifier before asking the normal finalizer to certify them.
-        let wallet = WalletAddress::from_hex(WALLET).unwrap();
-        let observed = time::OffsetDateTime::from_unix_timestamp(fixed_end + 1).unwrap();
-        let mut aggregates = parse_activity_response(
-            &raw,
-            wallet,
-            &ActivityParseContext {
-                source_id: SourceId("polymarket-data-api".to_owned()),
-                observed_at: SourceTimestamp(observed),
-                received_at: ReceivedAt(observed),
-                transport: ActivityTransport::Rest,
-            },
-        )
-        .unwrap()
-        .aggregates()
-        .unwrap();
-        aggregates.sort_by_key(|aggregate| aggregate.source_time.0);
-        let mut ledger = PositionLedger::new();
-        let mut expected = Vec::new();
-        for aggregate in aggregates {
-            let mutation = LedgerMutation::from_activity(&aggregate).unwrap();
-            let SecondVerdict::OrderIndependent { decisions, .. } =
-                classify_complete_second_legacy(
-                    &ledger,
-                    wallet,
-                    std::slice::from_ref(&mutation),
-                    ReconstructionQuality::new(100).unwrap(),
-                    &Default::default(),
-                    true,
-                    &|_| false,
-                )
-                .unwrap()
-            else {
-                panic!("legacy singleton projection refused");
-            };
-            assert_eq!(decisions.len(), 1);
-            assert_eq!(decisions[0].entry, EntryClassification::Admitted);
-            expected.push((decisions[0].source_trade_id.0.clone(), 7, 1));
-            ledger.apply(&mutation).unwrap();
-        }
-        expected.sort();
-        assert_eq!(expected.len(), 2);
-        let connection = Connection::open(side).unwrap();
-        // Insert classifier-one rows from the outset, before the finalizer
-        // computes their digest. Never relabel an already-built projection.
-        // The state trigger retains the finalizer's real count and digest.
-        connection
-            .execute_batch(
-                "CREATE TRIGGER classifier_one_projection BEFORE INSERT ON ranker_entries_v2
-             WHEN NEW.classifier_version = 3
-             BEGIN
-                 INSERT INTO ranker_entries_v2
-                     (source_trade_id, activity_generation, classifier_version)
-                 VALUES (NEW.source_trade_id, NEW.activity_generation, 1);
-                 SELECT RAISE(IGNORE);
-             END;
-             CREATE TRIGGER classifier_one_state BEFORE UPDATE OF ranker_classifier_version
-             ON cache_v2_migration_state WHEN NEW.ranker_classifier_version = 3
-             BEGIN
-                 UPDATE cache_v2_migration_state SET phase = NEW.phase,
-                     ranker_projection_count = NEW.ranker_projection_count,
-                     ranker_projection_digest = NEW.ranker_projection_digest,
-                     ranker_classifier_version = 1, updated_at_unix = NEW.updated_at_unix
-                 WHERE singleton = NEW.singleton;
-                 SELECT RAISE(IGNORE);
-             END;",
-            )
-            .unwrap();
-        drop(connection);
-        let stage = finalize_cache_v2(
-            side,
-            Some(&dir.path().join("initial-stage.json")),
-            fixed_end + 2,
-        )
-        .unwrap()
-        .unwrap();
-        assert_eq!(stage.ranker_projection_count, 2);
-        assert_eq!(
-            stage.ranker_projection_digest,
-            reference_projection_digest(side)
-        );
-        assert_eq!(classifier_projection_rows(side), expected);
-        let connection = Connection::open(side).unwrap();
-        assert_eq!(connection.query_row(
-            "SELECT ranker_classifier_version, ranker_projection_count, ranker_projection_digest
-             FROM cache_v2_migration_state WHERE phase = 'finalized'", [],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
-        ).unwrap(), (1, 2, stage.ranker_projection_digest));
-        connection
-            .execute_batch(
-                "DROP TRIGGER classifier_one_projection;
-             DROP TRIGGER classifier_one_state;",
-            )
-            .unwrap();
-    } else {
-        finalize_against_unfused_reference(
-            side,
-            &dir.path().join("initial-stage.json"),
-            fixed_end + 2,
-        );
-    }
-    if classifier_version == 1 {
         install_legacy_receipt_manifest(side, 7);
     }
+    if classifier_version != 6 {
+        seed_historical_format_two(side, classifier_version, fixed_end + 2);
+    }
+    let stage = finalize_cache_v2(
+        side,
+        Some(&dir.path().join("initial-stage.json")),
+        fixed_end + 2,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(stage.ranker_classifier_version, classifier_version);
+    assert_eq!(stage.ranker_projection_count, 2);
     frozen
 }
 
 fn classifier_projection_rows(path: &std::path::Path) -> Vec<(String, i64, i64)> {
+    if path
+        .with_file_name(format!(
+            "{}.projection-v3.jsonl",
+            path.file_name().unwrap().to_string_lossy()
+        ))
+        .exists()
+    {
+        let mut rows = projection_v3_rows(path)
+            .into_iter()
+            .map(|row| {
+                (
+                    row["source_trade_id"].as_str().unwrap().to_owned(),
+                    row["activity_generation"].as_i64().unwrap(),
+                    row["classifier_version"].as_i64().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        return rows;
+    }
     Connection::open(path)
         .unwrap()
         .prepare(
@@ -1651,7 +2240,7 @@ fn classifier_projection_rows(path: &std::path::Path) -> Vec<(String, i64, i64)>
 async fn refinalization_reuses_projection_after_targeted_price_write() {
     let dir = TempDir::new().unwrap();
     let side = dir.path().join("side.db");
-    let frozen = retained_classifier_activity(&dir, &side).await;
+    let frozen = retained_classifier_activity_at_version(&dir, &side, 3).await;
     let stage_path = dir.path().join("initial-stage.json");
     let first: CacheFinalStageRecord =
         serde_json::from_slice(&std::fs::read(&stage_path).unwrap()).unwrap();
@@ -1769,7 +2358,7 @@ async fn refinalization_refuses_newly_eligible_payout_without_manifest_change() 
     let original_end: i64 = connection
         .query_row(
             "SELECT end_date_unix FROM clob_payout_evidence_v2
-             WHERE market_id = '0xsame' AND payout_status = 'resolved'",
+             WHERE market_id = '0x5a' AND payout_status = 'resolved'",
             [],
             |row| row.get(0),
         )
@@ -1778,7 +2367,7 @@ async fn refinalization_refuses_newly_eligible_payout_without_manifest_change() 
         connection
             .execute(
                 "UPDATE clob_payout_evidence_v2 SET end_date_unix = NULL
-                 WHERE market_id = '0xsame'",
+                 WHERE market_id = '0x5a'",
                 [],
             )
             .unwrap(),
@@ -1791,7 +2380,7 @@ async fn refinalization_refuses_newly_eligible_payout_without_manifest_change() 
         .unwrap();
     let stage_bytes = std::fs::read(&stage_path).unwrap();
     let rows_before = projected_entries(&side);
-    let newly_eligible = (WALLET.to_owned(), "0xsame".to_owned(), FRESH_END - 201);
+    let newly_eligible = (WALLET.to_owned(), "0x5a".to_owned(), FRESH_END - 201);
     assert_eq!(first.ranker_projection_count, 4);
     assert_eq!(rows_before.len(), 4);
     assert!(!rows_before.contains(&newly_eligible));
@@ -1828,7 +2417,7 @@ async fn refinalization_refuses_newly_eligible_payout_without_manifest_change() 
             .unwrap()
             .execute(
                 "UPDATE clob_payout_evidence_v2 SET end_date_unix = ?1
-                 WHERE market_id = '0xsame' AND end_date_unix IS NULL
+                 WHERE market_id = '0x5a' AND end_date_unix IS NULL
                    AND payout_status = 'resolved' AND payout_vector_json = '[\"1\",\"0\"]'",
                 params![original_end],
             )
@@ -1898,7 +2487,7 @@ async fn refinalization_refuses_newly_eligible_payout_without_manifest_change() 
 async fn refinalization_refuses_changed_or_missing_projection_proof() {
     let dir = TempDir::new().unwrap();
     let original = dir.path().join("original.db");
-    retained_classifier_activity(&dir, &original).await;
+    retained_classifier_activity_at_version(&dir, &original, 3).await;
     for (name, sql, expected_error) in [
         (
             "activity_generation",
@@ -1984,6 +2573,8 @@ async fn refinalization_refuses_changed_or_missing_projection_proof() {
              WHERE market_id = '0xlater-a'",
             "input binding changed",
         ),
+        // Decision 9 / B3.1: historical format two binds only four payout fields;
+        // token order and raw-page commitments are format-three refusal cases below.
         (
             "projection_row",
             "UPDATE ranker_entries_v2 SET source_trade_id = 'g2:' || printf('%064d', 0)
@@ -2103,113 +2694,96 @@ fn retain_legacy_empty_projection(path: &std::path::Path) {
         .unwrap();
 }
 
-async fn assert_no_activity_recollection(side: &std::path::Path, frozen: &std::path::Path) {
-    let fetcher = YieldingFetcher::default();
-    populate_activity_v2(
-        &collection_config(side),
-        &fetcher,
+async fn transition_retained_fixture(side: &std::path::Path, generation: u64) {
+    let end = CLASSIFIER_FIXED_END + 1;
+    let mut rows = vec![
+        dataset_row(WALLET, "0xlater-a", "0xlater-a", "BUY", end - 3),
+        dataset_row(WALLET, "0xlater-b", "0xlater-b", "BUY", end - 2),
+    ];
+    for row in &mut rows {
+        row["asset"] = Value::from("123");
+        row["size"] = Value::from("1");
+        row["usdcSize"] = Value::from("0.5");
+        row["price"] = Value::from("0.5");
+    }
+    populate_activity_fresh_v2(
+        side,
+        &DatasetFetcher {
+            rows,
+            ..Default::default()
+        },
         "https://data.example",
-        frozen,
-        CLASSIFIER_FIXED_END,
-        7,
-        CLASSIFIER_FIXED_END + 3,
+        generation,
+        end,
+        end + 1,
     )
     .await
     .unwrap();
-    assert!(fetcher.calls.lock().unwrap().is_empty());
+    let markets = ["0xlater-a", "0xlater-b"].map(|market| {
+        serde_json::json!({
+        "condition_id":fixture_market(market),"closed":true,"is_50_50_outcome":false,"end_date_iso":"2027-01-16T00:00:00Z",
+        "tokens":[{"token_id":"123","outcome":"Yes","price":"1","winner":true},
+                  {"token_id":"456","outcome":"No","price":"0","winner":false}]})
+    });
+    publication_payouts(side, &markets, end);
 }
 
 #[tokio::test]
 async fn classifier_v2_rebuilds_retained_activity_without_recollection() {
     let dir = TempDir::new().unwrap();
     let side = dir.path().join("side.db");
-    let frozen = retained_classifier_activity(&dir, &side).await;
+    retained_classifier_activity_at_version(&dir, &side, 2).await;
     retain_legacy_empty_projection(&side);
-    let retained = retained_activity_rows(&side);
-    let connection = Connection::open(&side).unwrap();
-    connection
-        .execute_batch(
-            "CREATE TRIGGER abort_projection_rebuild BEFORE INSERT ON ranker_entries_v2
-        WHEN (SELECT COUNT(*) FROM ranker_entries_v2) = 1
-        BEGIN SELECT RAISE(ABORT, 'forced classifier rebuild crash'); END;",
-        )
-        .unwrap();
-    drop(connection);
-    assert!(
-        finalize_cache_v2(
-            &side,
-            Some(&dir.path().join("failed-rebuild-stage.json")),
-            CLASSIFIER_FIXED_END + 3
-        )
-        .is_err()
-    );
-    let connection = Connection::open(&side).unwrap();
-    assert_eq!(connection.query_row("SELECT ranker_classifier_version, ranker_projection_count FROM cache_v2_migration_state", [],
-        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))).unwrap(), (1, 0));
+    // Change 2: a historical head stays historical; classifier six requires its successor.
+    let historical = finalize_cache_v2(
+        &side,
+        Some(&dir.path().join("historical.json")),
+        CLASSIFIER_FIXED_END + 3,
+    )
+    .unwrap()
+    .unwrap();
     assert_eq!(
-        connection
-            .query_row("SELECT COUNT(*) FROM ranker_entries_v2", [], |row| row
-                .get::<_, i64>(0))
-            .unwrap(),
-        0
+        (
+            historical.ranker_classifier_version,
+            historical.ranker_projection_count
+        ),
+        (1, 0)
     );
-    connection
-        .execute_batch("DROP TRIGGER abort_projection_rebuild")
-        .unwrap();
-    // A failure after the rebuilt projection commits, while its digest is being
-    // certified (#675), downgrades the old finalized state instead of leaving
-    // it beside rows it does not describe; the retry then finalizes.
-    let phase = |connection: &Connection| {
-        connection
-            .query_row(
-                "SELECT phase, ranker_projection_count, ranker_projection_digest,
-                        ranker_classifier_version, ranker_projection_inputs_json,
-                        (SELECT COUNT(*) FROM ranker_entries_v2)
-                 FROM cache_v2_migration_state",
-                [],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<i64>>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, Option<i64>>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, i64>(5)?,
-                    ))
-                },
-            )
-            .unwrap()
-    };
-    assert_eq!(phase(&connection).0, "finalized");
+    transition_retained_fixture(&side, 8).await;
+    let retained = retained_activity_rows(&side);
+    let connection = scenario_sql_connection(&side).unwrap();
     connection
         .execute_batch(
-            "CREATE TRIGGER abort_certification BEFORE UPDATE OF phase ON cache_v2_migration_state
-        WHEN NEW.phase = 'finalized'
+            "CREATE TRIGGER abort_certification BEFORE UPDATE OF phase
+        ON cache_v2_migration_state WHEN NEW.phase = 'finalized'
         BEGIN SELECT RAISE(ABORT, 'forced certification crash'); END;",
         )
         .unwrap();
-    let certification = finalize_cache_v2(
-        &side,
-        Some(&dir.path().join("failed-certification-stage.json")),
-        CLASSIFIER_FIXED_END + 3,
-    )
-    .unwrap_err();
+    let failed = dir.path().join("failed-certification-stage.json");
+    let error = finalize_cache_v2(&side, Some(&failed), CLASSIFIER_FIXED_END + 3).unwrap_err();
     assert!(
-        certification
-            .to_string()
-            .contains("forced certification crash"),
-        "{certification}"
+        error.to_string().contains("forced certification crash"),
+        "{error}"
     );
-    assert!(!dir.path().join("failed-certification-stage.json").exists());
+    assert!(!failed.exists());
+    // Change 3: the single pass and certificate/state updates roll back together.
+    assert_eq!(count(&side, "SELECT COUNT(*) FROM ranker_entries_v2"), 0);
     assert_eq!(
-        phase(&connection),
-        ("schema_sealed".to_owned(), None, None, None, None, 2)
+        count(&side, "SELECT COUNT(*) FROM activity_wallet_history_v3"),
+        0
+    );
+    assert_eq!(
+        count(
+            &side,
+            "SELECT COUNT(*) FROM cache_v2_migration_state WHERE phase = 'schema_sealed'
+        AND ranker_projection_count IS NULL AND ranker_projection_digest IS NULL"
+        ),
+        1
     );
     connection
         .execute_batch("DROP TRIGGER abort_certification")
         .unwrap();
     drop(connection);
-    assert_eq!(retained_activity_rows(&side), retained);
     let stage = finalize_cache_v2(
         &side,
         Some(&dir.path().join("rebuilt-stage.json")),
@@ -2217,45 +2791,30 @@ async fn classifier_v2_rebuilds_retained_activity_without_recollection() {
     )
     .unwrap()
     .unwrap();
-    assert_eq!(stage.version, 2);
-    assert_eq!(stage.ranker_classifier_version, 3);
-    assert_eq!(stage.ranker_projection_count, 2);
+    assert_eq!(
+        (
+            stage.ranker_classifier_version,
+            stage.ranker_projection_count
+        ),
+        (6, 2)
+    );
     assert_eq!(
         stage.ranker_projection_digest,
         reference_projection_digest(&side)
     );
-    assert_eq!(stage.cache_sha256, sha256_file(&side).unwrap());
-    let connection = Connection::open(&side).unwrap();
-    let rows = connection
-        .prepare(
-            "SELECT groups_v2.condition_id, ranker.classifier_version
-        FROM ranker_entries_v2 ranker JOIN activity_groups_v2 groups_v2 USING (source_trade_id)
-        ORDER BY groups_v2.condition_id",
-        )
-        .unwrap()
-        .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-        })
-        .unwrap()
-        .collect::<Result<Vec<_>, _>>()
-        .unwrap();
-    assert_eq!(
-        rows,
-        vec![("0xlater-a".to_owned(), 3), ("0xlater-b".to_owned(), 3)]
-    );
-    assert_eq!(
-        connection
-            .query_row(
-                "SELECT ranker_classifier_version FROM cache_v2_migration_state",
-                [],
-                |row| row.get::<_, i64>(0)
-            )
-            .unwrap(),
-        3
-    );
-    drop(connection);
     assert_eq!(retained_activity_rows(&side), retained);
-    assert_no_activity_recollection(&side, &frozen).await;
+    let no_reads = DatasetFetcher::default();
+    populate_activity_fresh_v2(
+        &side,
+        &no_reads,
+        "https://data.example",
+        8,
+        CLASSIFIER_FIXED_END + 99,
+        CLASSIFIER_FIXED_END + 4,
+    )
+    .await
+    .unwrap();
+    assert!(no_reads.calls.lock().unwrap().is_empty());
 }
 
 /// PASS: a final-stage record proves only the candidate's projection digest.
@@ -2278,13 +2837,20 @@ async fn activation_takes_the_projection_digest_from_the_final_stage_record_only
     )
     .unwrap()
     .unwrap();
-    Connection::open(&side)
+    // AC3: ordinary migration-state edits are refused. Deliberate authorization
+    // below models forged trusted-finalizer evidence, outside that guard.
+    let sql = "UPDATE cache_v2_migration_state SET ranker_projection_digest = printf('%064d', 0)";
+    assert!(
+        Connection::open(&side)
+            .unwrap()
+            .execute_batch(sql)
+            .unwrap_err()
+            .to_string()
+            .contains("pe_history_write_authorized")
+    );
+    scenario_sql_connection(&side)
         .unwrap()
-        .execute(
-            "UPDATE ranker_entries_v2 SET source_trade_id = 'g2:' || printf('%064d', 0)
-             WHERE source_trade_id = (SELECT MIN(source_trade_id) FROM ranker_entries_v2)",
-            [],
-        )
+        .execute_batch(sql)
         .unwrap();
     let changed = sha256_file(&side).unwrap();
     let fixed = dir.path().join("wallet_cache.db");
@@ -2296,11 +2862,11 @@ async fn activation_takes_the_projection_digest_from_the_final_stage_record_only
         prior_cache_backup_path: dir.path().join("prior.db"),
         expected_side_sha256: changed.clone(),
     };
-    let recomputed = activate_cache_v2(&request).unwrap_err();
+    let recomputed = activate_cache_v2_unbound(&request).unwrap_err();
     assert!(
         recomputed
             .to_string()
-            .contains("frozen/activity/ranker proof"),
+            .contains("requires --final-stage-record"),
         "{recomputed}"
     );
     // The refused read-only verification changes nothing but leaves its SQLite
@@ -2325,10 +2891,13 @@ async fn activation_takes_the_projection_digest_from_the_final_stage_record_only
         std::fs::write(&path, serde_json::to_vec(record).unwrap()).unwrap();
         path
     };
-    let forged = CacheFinalStageRecord {
+    // Change 6: format three trusts the validated export summary bound to these bytes.
+    let mut forged = CacheFinalStageRecord {
         cache_sha256: changed.clone(),
+        ranker_projection_digest: "0".repeat(64),
         ..genuine.clone()
     };
+    forged.export_projection.as_mut().unwrap().digest = forged.ranker_projection_digest.clone();
     for (name, record) in [
         (
             "old-format",
@@ -2368,7 +2937,16 @@ async fn activation_takes_the_projection_digest_from_the_final_stage_record_only
     // the same projection-only change is still recomputed and refused before
     // anything is installed.
     let outgoing = dir.path().join("outgoing.db");
-    std::fs::copy(&side, &outgoing).unwrap();
+    retained_classifier_activity_at_version(&dir, &outgoing, 3).await;
+    Connection::open(&outgoing)
+        .unwrap()
+        .execute_batch(
+            "UPDATE ranker_entries_v2
+        SET source_trade_id = 'g2:' || printf('%064d', 0)
+        WHERE source_trade_id = (SELECT MIN(source_trade_id) FROM ranker_entries_v2)",
+        )
+        .unwrap();
+    let outgoing_hash = sha256_file(&outgoing).unwrap();
     let refused = activate_cache_v2_with_handoff(
         &CacheActivationRequest {
             fixed_path: outgoing.clone(),
@@ -2384,7 +2962,7 @@ async fn activation_takes_the_projection_digest_from_the_final_stage_record_only
         refused.to_string().contains("frozen/activity/ranker proof"),
         "{refused}"
     );
-    assert_eq!(sha256_file(&outgoing).unwrap(), changed);
+    assert_eq!(sha256_file(&outgoing).unwrap(), outgoing_hash);
     assert_eq!(sha256_file(&side).unwrap(), changed);
     assert!(!dir.path().join("outgoing-prior.db").exists());
     clear_sidecars();
@@ -2399,10 +2977,10 @@ async fn activation_takes_the_projection_digest_from_the_final_stage_record_only
     let resumed = activate_cache_v2_with_handoff(&request, None, Some(&forged_path), None).unwrap();
     assert!(resumed.resumed);
     assert!(
-        activate_cache_v2(&request)
+        activate_cache_v2_unbound(&request)
             .unwrap_err()
             .to_string()
-            .contains("frozen/activity/ranker proof")
+            .contains("requires --final-stage-record")
     );
 }
 
@@ -2449,7 +3027,8 @@ async fn refinalization_takes_the_write_lock_before_verifying_the_committed_proj
 }
 
 /// PASS: a two-file activation whose outgoing schema-two cache is still at F
-/// skips activity content only when an accepted request binds its staged H0.
+/// skips activity content and the projection digest only when an accepted
+/// request binds its staged H0.
 #[tokio::test]
 async fn accepted_outgoing_activity_skips_verification_but_h0_still_binds_activation() {
     use pe_bootstrap::cache_migration::{cache_stage_evidence_path, stage_cache_cycle_v2};
@@ -2467,15 +3046,17 @@ async fn accepted_outgoing_activity_skips_verification_but_h0_still_binds_activa
         .unwrap();
         let pristine = dir.path().join("pristine.db");
         std::fs::copy(&fixed, &pristine).unwrap();
-        let connection = Connection::open(&fixed).unwrap();
-        connection
-            .execute(
+        assert!(!classifier_projection_rows(&fixed).is_empty());
+        // Content and projection changes the accepted activation's digests never saw.
+        scenario_sql_connection(&fixed)
+            .unwrap()
+            .execute_batch(
                 "UPDATE activity_groups_v2 SET share_amount_str = '9.000001'
-             WHERE wallet_hex = '0x2222222222222222222222222222222222222222'",
-                [],
+             WHERE wallet_hex = '0x2222222222222222222222222222222222222222';
+             UPDATE ranker_entries_v2 SET source_trade_id = 'g2:' || printf('%064d', 0)
+             WHERE source_trade_id = (SELECT MIN(source_trade_id) FROM ranker_entries_v2);",
             )
             .unwrap();
-        drop(connection);
         let h0 = sha256_file(&fixed).unwrap();
         let accepted_cycle = "cron-20260923T000000Z";
         let accepted = dir.path().join(accepted_cycle);
@@ -2499,8 +3080,18 @@ async fn accepted_outgoing_activity_skips_verification_but_h0_still_binds_activa
             .path()
             .join(format!("wallet_cache.{cycle}.displaced.db"));
         stage_cache_cycle_v2(&fixed, &prior, &side, None, Some(&installed_request)).unwrap();
-        // The candidate is finalized independently of the damaged outgoing main.
+        // Decision 6: a successor verifies pristine history once; outgoing H0 never re-reads it.
         std::fs::copy(&pristine, &side).unwrap();
+        populate_activity_fresh_v2(
+            &side,
+            &DatasetFetcher::default(),
+            "https://data.example",
+            2,
+            FRESH_END + 1,
+            FRESH_END + 2,
+        )
+        .await
+        .unwrap();
         let record = dir.path().join("candidate.json");
         let finalized = finalize_cache_v2(&side, Some(&record), FRESH_END + 3)
             .unwrap()
@@ -2513,7 +3104,7 @@ async fn accepted_outgoing_activity_skips_verification_but_h0_still_binds_activa
             stage_evidence_sha256: Some(sha256_file(&cache_stage_evidence_path(&side)).unwrap()),
         };
         if changed_after_stage {
-            Connection::open(&fixed)
+            scenario_sql_connection(&fixed)
                 .unwrap()
                 .execute(
                     "UPDATE activity_groups_v2 SET share_amount_str = '9.000002'
@@ -2535,14 +3126,7 @@ async fn accepted_outgoing_activity_skips_verification_but_h0_still_binds_activa
                 "{error}"
             );
         } else {
-            let error =
-                activate_cache_v2_with_handoff(&request, None, Some(&record), None).unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("activity receipt aggregate mismatch"),
-                "{error}"
-            );
+            // Change 6: format-three outgoing checks use H0 and recorded state, even without a request shortcut.
             let activated = Command::new(env!("CARGO_BIN_EXE_pe-bootstrap"))
                 .arg("cache-activate")
                 .arg("--db")
@@ -2592,7 +3176,7 @@ async fn outgoing_schema_two_projection_is_verified_from_committed_readers() {
     let dir = TempDir::new().unwrap();
     std::fs::create_dir_all(dir.path().join("eval-results")).unwrap();
     let fixed = dir.path().join("wallet_cache.db");
-    retained_classifier_activity(&dir, &fixed).await;
+    retained_classifier_activity_at_version(&dir, &fixed, 3).await;
     let installed = finalize_cache_v2(
         &fixed,
         Some(&dir.path().join("installed.json")),
@@ -2614,6 +3198,8 @@ async fn outgoing_schema_two_projection_is_verified_from_committed_readers() {
         None,
     )
     .unwrap();
+    // Change 2: the candidate transitions; the outgoing historical checks stay unchanged.
+    transition_retained_fixture(&side, 8).await;
     let record = dir.path().join("final.json");
     let finalized = finalize_cache_v2(&side, Some(&record), CLASSIFIER_FIXED_END + 4)
         .unwrap()
@@ -2702,70 +3288,115 @@ async fn outgoing_schema_two_projection_is_verified_from_committed_readers() {
 
 #[tokio::test]
 async fn stale_classifier_projection_cannot_be_certified() {
-    let dir = TempDir::new().unwrap();
-    std::fs::create_dir_all(dir.path().join("eval-results")).unwrap();
-    let fixed = dir.path().join("fixed.db");
-    let side = dir.path().join("side.db");
-    retained_classifier_activity(&dir, &fixed).await;
-    let frozen = retained_classifier_activity(&dir, &side).await;
-    // Old certification alone cannot install as a current candidate, even with
-    // authentic count/digest proof for its empty legacy projection.
-    retain_legacy_empty_projection(&side);
-    let request = |hash| CacheActivationRequest {
-        stage_evidence_sha256: None,
-        fixed_path: fixed.clone(),
-        side_path: side.clone(),
-        prior_cache_backup_path: dir.path().join(format!("prior-{hash}.db")),
-        expected_side_sha256: hash,
-    };
-    let error = activate_cache_v2(&request(sha256_file(&side).unwrap())).unwrap_err();
-    assert!(
-        error.to_string().contains("frozen/activity/ranker proof"),
-        "{error}"
-    );
-    finalize_cache_v2(
-        &side,
-        Some(&dir.path().join("rebuilt-stage.json")),
-        CLASSIFIER_FIXED_END + 3,
-    )
-    .unwrap()
-    .unwrap();
-    // Historical classifier 1 is permitted, but rows still certified by their
-    // unchanged current-classifier digest cannot be relabeled by changing only state.
-    let connection = Connection::open(&fixed).unwrap();
-    connection
-        .execute(
-            "UPDATE cache_v2_migration_state SET ranker_classifier_version = 1",
-            [],
+    use pe_bootstrap::cache_migration::restore_prior_cache_with_final_stage_record;
+    for prior_still_present in [true, false] {
+        let dir = tempfile::Builder::new()
+            .prefix("pe-classifier-three-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
+        std::fs::create_dir_all(dir.path().join("eval-results")).unwrap();
+        let fixed = dir.path().join("fixed.db");
+        let side = dir.path().join("cycle.side.db");
+        let displaced = dir.path().join("cycle.displaced.db");
+        drop(seed_v1(&fixed, CLASSIFIER_FIXED_END));
+        let h0 = sha256_file(&fixed).unwrap();
+        pe_bootstrap::cache_migration::stage_cache_cycle_v2(
+            &fixed,
+            &dir.path().join("cycle.prior.db"),
+            &side,
+            None,
+            None,
         )
         .unwrap();
-    drop(connection);
-    let error = activate_cache_v2(&request(sha256_file(&side).unwrap())).unwrap_err();
-    assert!(
-        error.to_string().contains("frozen/activity/ranker proof"),
-        "{error}"
-    );
-    finalize_cache_v2(
-        &fixed,
-        Some(&dir.path().join("fixed-rebuilt-stage.json")),
-        CLASSIFIER_FIXED_END + 3,
-    )
-    .unwrap()
-    .unwrap();
-    let stage = finalize_cache_v2(
-        &side,
-        Some(&dir.path().join("accepted-stage.json")),
-        CLASSIFIER_FIXED_END + 3,
-    )
-    .unwrap()
-    .unwrap();
-    assert_no_activity_recollection(&side, &frozen).await;
-    assert_eq!(
-        activate_cache_v2(&request(stage.cache_sha256.clone()))
+        Connection::open(&side)
             .unwrap()
-            .installed_sha256,
-        stage.cache_sha256
-    );
+            .execute_batch(
+                "DELETE FROM trades; DELETE FROM market_resolutions; DELETE FROM source_cursor;",
+            )
+            .unwrap();
+        // Change 9: the candidate and its stage record are genuinely classifier 3.
+        retained_classifier_activity_at_version(&dir, &side, 3).await;
+        let record_path = dir.path().join("classifier-three-stage.json");
+        let record = finalize_cache_v2(&side, Some(&record_path), CLASSIFIER_FIXED_END + 3)
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.ranker_classifier_version, 3);
+        assert_eq!(record.ranker_projection_count, 2);
+        let h1 = record.cache_sha256.clone();
+        let error = activate_cache_v2_with_handoff(
+            &CacheActivationRequest {
+                stage_evidence_sha256: Some(
+                    sha256_file(&pe_bootstrap::cache_migration::cache_stage_evidence_path(
+                        &side,
+                    ))
+                    .unwrap(),
+                ),
+                fixed_path: fixed.clone(),
+                side_path: side.clone(),
+                prior_cache_backup_path: displaced.clone(),
+                expected_side_sha256: h1.clone(),
+            },
+            None,
+            Some(&record_path),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("frozen/activity/ranker proof"),
+            "{error}"
+        );
+        assert_eq!(sha256_file(&fixed).unwrap(), h0);
+        assert_eq!(sha256_file(&side).unwrap(), h1);
+        std::fs::rename(&fixed, &displaced).unwrap();
+        std::fs::rename(&side, &fixed).unwrap();
+        let (publication, pending) = write_pending_publication(
+            &dir,
+            "historical-restore",
+            &side,
+            &fixed,
+            &fixed,
+            &displaced,
+        );
+        let request: Value = serde_json::from_slice(&std::fs::read(&publication).unwrap()).unwrap();
+        std::fs::write(
+            side.with_extension("restore.json"),
+            serde_json::to_vec(&request["publish_key"]).unwrap(),
+        )
+        .unwrap();
+        std::fs::rename(&fixed, &side).unwrap();
+        if !prior_still_present {
+            std::fs::rename(&displaced, &fixed).unwrap();
+        }
+        let error = restore_prior_cache_with_final_stage_record(
+            &fixed,
+            &displaced,
+            &side,
+            &PriorCacheBinding {
+                sha256: h0.clone(),
+                schema_version: 1,
+            },
+            &publication,
+            &pending,
+            &FixedPublicationProbe(false),
+            Some(&record_path),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("frozen/activity/ranker proof"),
+            "{error}"
+        );
+        assert_eq!(sha256_file(&side).unwrap(), h1);
+        assert_eq!(
+            sha256_file(if prior_still_present {
+                &displaced
+            } else {
+                &fixed
+            })
+            .unwrap(),
+            h0
+        );
+    }
 }
 
 #[tokio::test]
@@ -2776,37 +3407,78 @@ async fn null_classifier_state_cannot_be_certified_with_empty_or_nonempty_projec
             std::fs::create_dir_all(dir.path().join("eval-results")).unwrap();
             let fixed = dir.path().join("fixed.db");
             let side = dir.path().join("side.db");
-            retained_classifier_activity(&dir, &fixed).await;
-            retained_classifier_activity(&dir, &side).await;
-            let target = if historical { &fixed } else { &side };
-            if empty_projection {
-                retain_legacy_empty_projection(target);
+            if historical {
+                if empty_projection {
+                    finalize_historical_empty_side(&dir, &fixed, CLASSIFIER_FIXED_END).await;
+                } else {
+                    retained_classifier_activity_at_version(&dir, &fixed, 3).await;
+                }
+                retained_classifier_activity(&dir, &side).await;
+            } else {
+                finalize_historical_empty_side(&dir, &fixed, CLASSIFIER_FIXED_END).await;
+                if empty_projection {
+                    finalize_empty_activity_side(&dir, &side, CLASSIFIER_FIXED_END).await;
+                } else {
+                    retained_classifier_activity(&dir, &side).await;
+                }
             }
-            let connection = Connection::open(target).unwrap();
-            connection
-                .execute(
-                    "UPDATE cache_v2_migration_state SET ranker_classifier_version = NULL",
-                    [],
-                )
+            let target = if historical { &fixed } else { &side };
+            let sql = "UPDATE cache_v2_migration_state SET ranker_classifier_version = NULL";
+            if !historical {
+                // AC3 / Change 2: ordinary state edits are refused before activation.
+                let before = sha256_file(target).unwrap();
+                assert!(Connection::open(target).unwrap().execute(sql, []).is_err());
+                assert_eq!(sha256_file(target).unwrap(), before);
+            }
+            // Explicit fault injection also proves NULL cannot pass state verification.
+            scenario_sql_connection(target)
+                .unwrap()
+                .execute(sql, [])
                 .unwrap();
-            assert_eq!(connection.query_row(
-                "SELECT ranker_classifier_version, ranker_projection_count FROM cache_v2_migration_state",
-                [], |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, i64>(1)?))
-            ).unwrap(), (None, if empty_projection { 0 } else { 2 }));
-            drop(connection);
             assert_eq!(
-                classifier_projection_rows(target).is_empty(),
-                empty_projection
+                count(
+                    target,
+                    "SELECT ranker_projection_count FROM cache_v2_migration_state"
+                ),
+                if empty_projection { 0 } else { 2 }
             );
             let fixed_hash = sha256_file(&fixed).unwrap();
             let side_hash = sha256_file(&side).unwrap();
-            let error = activate_cache_v2(&CacheActivationRequest {
-                stage_evidence_sha256: None,
-                fixed_path: fixed.clone(),
-                side_path: side.clone(),
-                prior_cache_backup_path: dir.path().join("prior.db"),
-                expected_side_sha256: side_hash.clone(),
-            })
+            let original = fixture_final_stage(&side, &side_hash)
+                .or_else(|| {
+                    std::fs::read_dir(dir.path())
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .map(|entry| entry.path())
+                        .find(|path| {
+                            std::fs::read(path)
+                                .ok()
+                                .and_then(|bytes| {
+                                    serde_json::from_slice::<CacheFinalStageRecord>(&bytes).ok()
+                                })
+                                .is_some_and(|record| {
+                                    record.cache_path == side.canonicalize().unwrap()
+                                })
+                        })
+                })
+                .unwrap();
+            let mut record: CacheFinalStageRecord =
+                serde_json::from_slice(&std::fs::read(original).unwrap()).unwrap();
+            record.cache_sha256 = side_hash.clone();
+            let record_path = dir.path().join("fault-stage.json");
+            std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+            let error = activate_cache_v2_with_handoff(
+                &CacheActivationRequest {
+                    stage_evidence_sha256: None,
+                    fixed_path: fixed.clone(),
+                    side_path: side.clone(),
+                    prior_cache_backup_path: dir.path().join("prior.db"),
+                    expected_side_sha256: side_hash.clone(),
+                },
+                None,
+                Some(&record_path),
+                None,
+            )
             .unwrap_err();
             assert!(
                 error.to_string().contains("frozen/activity/ranker proof"),
@@ -2867,8 +3539,8 @@ async fn missing_side_resume_rejects_classifier_one_installed_cache() {
 async fn refinalization_resumes_after_commit_before_stage_receipt() {
     let dir = TempDir::new().unwrap();
     let side = dir.path().join("side.db");
-    let frozen = retained_classifier_activity(&dir, &side).await;
-    retain_legacy_empty_projection(&side);
+    retained_classifier_activity(&dir, &side).await;
+    // Change 3: the committed spool is reused when writing the stage artifact retries.
     let retained = retained_activity_rows(&side);
     let blocked_parent = dir.path().join("stage-parent-is-file");
     std::fs::write(&blocked_parent, b"blocks stage creation").unwrap();
@@ -2889,7 +3561,7 @@ async fn refinalization_resumes_after_commit_before_stage_receipt() {
                 ))
             )
             .unwrap(),
-        (3, 2, "finalized".to_owned())
+        (6, 2, "finalized".to_owned())
     );
     drop(connection);
     let stage_path = dir.path().join("resumed-stage.json");
@@ -2899,13 +3571,30 @@ async fn refinalization_resumes_after_commit_before_stage_receipt() {
     assert_eq!(stage.cache_sha256, sha256_file(&side).unwrap());
     let receipt: Value = serde_json::from_slice(&std::fs::read(stage_path).unwrap()).unwrap();
     assert_eq!(receipt["cache_sha256"], stage.cache_sha256);
-    assert_eq!(receipt["ranker_classifier_version"], 3);
+    assert_eq!(receipt["ranker_classifier_version"], 6);
     assert_eq!(retained_activity_rows(&side), retained);
-    assert_no_activity_recollection(&side, &frozen).await;
+    let no_reads = DatasetFetcher::default();
+    populate_activity_fresh_v2(
+        &side,
+        &no_reads,
+        "https://data.example",
+        7,
+        CLASSIFIER_FIXED_END + 99,
+        CLASSIFIER_FIXED_END + 4,
+    )
+    .await
+    .unwrap();
+    assert!(no_reads.calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn classifier_upgrade_activation_preserves_authentic_prior_cache() {
+    for historical in [1, 3] {
+        upgrade_activation_preserves_prior_cache(historical).await;
+    }
+}
+
+async fn upgrade_activation_preserves_prior_cache(historical: u32) {
     let dir = tempfile::Builder::new()
         .prefix("pe-classifier-upgrade-")
         .tempdir_in(std::env::current_dir().unwrap())
@@ -2913,15 +3602,20 @@ async fn classifier_upgrade_activation_preserves_authentic_prior_cache() {
     std::fs::create_dir_all(dir.path().join("eval-results")).unwrap();
     let fixed = dir.path().join("fixed.db");
     let side = dir.path().join("side.db");
-    retained_classifier_activity_at_version(&dir, &fixed, 1).await;
+    retained_classifier_activity_at_version(&dir, &fixed, historical).await;
     let prior_hash = sha256_file(&fixed).unwrap();
     let prior_bytes = std::fs::read(&fixed).unwrap();
     let prior_rows = retained_activity_rows(&fixed);
     let prior_projection = classifier_projection_rows(&fixed);
     assert_eq!(prior_projection.len(), 2);
-    assert!(prior_projection.iter().all(|row| row.2 == 1));
-    // Upgrade a copy of exactly the same source history through the normal finalizer.
+    assert!(
+        prior_projection
+            .iter()
+            .all(|row| row.2 == i64::from(historical))
+    );
+    // Change 2: upgrade a private successor; the historical installed bytes stay intact.
     std::fs::copy(&fixed, &side).unwrap();
+    transition_retained_fixture(&side, 8).await;
     let stage = finalize_cache_v2(
         &side,
         Some(&dir.path().join("upgraded-stage.json")),
@@ -2929,11 +3623,17 @@ async fn classifier_upgrade_activation_preserves_authentic_prior_cache() {
     )
     .unwrap()
     .unwrap();
-    assert_eq!(stage.ranker_classifier_version, 3);
+    assert_eq!(stage.ranker_classifier_version, 6);
     assert_eq!(stage.ranker_projection_count, 2);
     let upgraded_bytes = std::fs::read(&side).unwrap();
+    let upgraded_rows = retained_activity_rows(&side);
+    let upgraded_summary = query_values(
+        &side,
+        "SELECT ranker_classifier_version, ranker_projection_count,
+        ranker_projection_digest FROM cache_v2_migration_state",
+    );
     let upgraded_projection = classifier_projection_rows(&side);
-    assert!(upgraded_projection.iter().all(|row| row.2 == 3));
+    assert!(upgraded_projection.iter().all(|row| row.2 == 6));
     let request = CacheActivationRequest {
         stage_evidence_sha256: None,
         fixed_path: fixed.clone(),
@@ -2970,7 +3670,7 @@ async fn classifier_upgrade_activation_preserves_authentic_prior_cache() {
                 |row| row.get::<_, i64>(0)
             )
             .unwrap(),
-        1
+        i64::from(historical)
     );
     drop(prior);
     let resumed = activate_cache_v2(&request).unwrap();
@@ -3018,15 +3718,24 @@ async fn classifier_upgrade_activation_preserves_authentic_prior_cache() {
                 |row| row.get::<_, i64>(0)
             )
             .unwrap(),
-        1
+        i64::from(historical)
     );
     assert_eq!(sha256_file(&displaced).unwrap(), stage.cache_sha256);
     assert_eq!(std::fs::read(&displaced).unwrap(), upgraded_bytes);
-    assert_eq!(classifier_projection_rows(&displaced), upgraded_projection);
-    assert_eq!(retained_activity_rows(&displaced), prior_rows);
+    // Change 6: rejected bytes retain the hash-bound summary; the cycle spool stays at its original path.
+    assert_eq!(
+        query_values(
+            &displaced,
+            "SELECT ranker_classifier_version, ranker_projection_count,
+        ranker_projection_digest FROM cache_v2_migration_state"
+        ),
+        upgraded_summary
+    );
+    assert_eq!(retained_activity_rows(&displaced), upgraded_rows);
 
     let fresh_side = dir.path().join("fresh-side.db");
     std::fs::copy(&fixed, &fresh_side).unwrap();
+    transition_retained_fixture(&fresh_side, 8).await;
     let fresh_stage = finalize_cache_v2(
         &fresh_side,
         Some(&dir.path().join("fresh-stage.json")),
@@ -3034,7 +3743,8 @@ async fn classifier_upgrade_activation_preserves_authentic_prior_cache() {
     )
     .unwrap()
     .unwrap();
-    assert_eq!(fresh_stage.ranker_classifier_version, 3);
+    assert_eq!(fresh_stage.ranker_classifier_version, 6);
+    let fresh_rows = retained_activity_rows(&fresh_side);
     let fresh_request = CacheActivationRequest {
         stage_evidence_sha256: None,
         fixed_path: fixed.clone(),
@@ -3047,8 +3757,15 @@ async fn classifier_upgrade_activation_preserves_authentic_prior_cache() {
     assert_eq!(fresh_install.installed_sha256, fresh_stage.cache_sha256);
     assert_eq!(fresh_install.prior_cache_sha256, prior_hash);
     assert_eq!(sha256_file(&fixed).unwrap(), fresh_stage.cache_sha256);
-    assert_eq!(classifier_projection_rows(&fixed), upgraded_projection);
-    assert_eq!(retained_activity_rows(&fixed), prior_rows);
+    // Change 6: installation transfers the hash-bound state, without reading a retired spool.
+    assert_eq!(count(&fixed, "SELECT COUNT(*) FROM ranker_entries_v2"), 0);
+    let installed_summary = query_values(
+        &fixed,
+        "SELECT ranker_classifier_version, ranker_projection_count,
+        ranker_projection_digest FROM cache_v2_migration_state",
+    );
+    assert_eq!(installed_summary, upgraded_summary);
+    assert_eq!(retained_activity_rows(&fixed), fresh_rows);
     assert_eq!(
         std::fs::read(&fresh_request.prior_cache_backup_path).unwrap(),
         prior_bytes
@@ -3081,7 +3798,7 @@ async fn activity_wallet_receipts_bound_resume_and_finalize_atomically() {
     migrate_cache_v2(&side, &manifest).unwrap();
     let frozen = write_frozen_reference(&dir, fixed_end - 10, wallets.clone());
 
-    let connection = Connection::open(&side).unwrap();
+    let connection = scenario_sql_connection(&side).unwrap();
     connection
         .execute_batch(
             "CREATE TRIGGER abort_activity_receipt
@@ -3102,7 +3819,7 @@ async fn activity_wallet_receipts_bound_resume_and_finalize_atomically() {
     .await
     .unwrap_err();
     assert!(failed.to_string().contains("forced receipt crash"));
-    let connection = Connection::open(&side).unwrap();
+    let connection = scenario_sql_connection(&side).unwrap();
     assert_eq!(
         connection
             .query_row(
@@ -3136,7 +3853,7 @@ async fn activity_wallet_receipts_bound_resume_and_finalize_atomically() {
     assert_eq!(fetcher.calls.lock().unwrap().len(), 33);
 
     let missing = wallets[7].clone();
-    let connection = Connection::open(&side).unwrap();
+    let connection = scenario_sql_connection(&side).unwrap();
     let original_digest: String = connection
         .query_row(
             "SELECT ordered_aggregate_digest
@@ -3167,7 +3884,7 @@ async fn activity_wallet_receipts_bound_resume_and_finalize_atomically() {
         .await
         .is_err()
     );
-    let connection = Connection::open(&side).unwrap();
+    let connection = scenario_sql_connection(&side).unwrap();
     connection
         .execute(
             "UPDATE activity_wallet_coverage_staging_v2
@@ -3190,7 +3907,7 @@ async fn activity_wallet_receipts_bound_resume_and_finalize_atomically() {
         .await
         .is_err()
     );
-    let connection = Connection::open(&side).unwrap();
+    let connection = scenario_sql_connection(&side).unwrap();
     connection
         .execute(
             "UPDATE activity_wallet_coverage_staging_v2 SET ordered_aggregate_digest = ?1
@@ -3208,7 +3925,7 @@ async fn activity_wallet_receipts_bound_resume_and_finalize_atomically() {
     drop(connection);
     // Collection completion now installs the manifest. A missing receipt under
     // a completed manifest is corruption; only an unfinished receipt set resumes.
-    Connection::open(&side)
+    scenario_sql_connection(&side)
         .unwrap()
         .execute(
             "DELETE FROM activity_coverage_manifests_v2 WHERE generation = 9",
@@ -3234,7 +3951,23 @@ async fn activity_wallet_receipts_bound_resume_and_finalize_atomically() {
     }
 
     install_payout_manifest(&side);
-    let connection = Connection::open(&side).unwrap();
+    let refused = finalize_cache_v2_unbound(&side, None, fixed_end + 5).unwrap_err();
+    assert!(
+        refused.to_string().contains("identity-four successor"),
+        "{refused}"
+    );
+    // Change 2: current finalization belongs to a successor; retained receipt atomicity stays checked.
+    populate_activity_fresh_v2(
+        &side,
+        &YieldingFetcher::default(),
+        "https://data.example",
+        10,
+        fixed_end + 1,
+        fixed_end + 5,
+    )
+    .await
+    .unwrap();
+    let connection = scenario_sql_connection(&side).unwrap();
     connection
         .execute_batch(
             "CREATE TRIGGER abort_activity_final_state
@@ -3252,11 +3985,11 @@ async fn activity_wallet_receipts_bound_resume_and_finalize_atomically() {
         )
         .is_err()
     );
-    let connection = Connection::open(&side).unwrap();
+    let connection = scenario_sql_connection(&side).unwrap();
     assert_eq!(
         connection
             .query_row(
-                "SELECT COUNT(*) FROM activity_coverage_manifests_v2",
+                "SELECT COUNT(*) FROM activity_coverage_manifests_v2 WHERE generation = 10",
                 [],
                 |row| { row.get::<_, i64>(0) }
             )
@@ -3266,7 +3999,7 @@ async fn activity_wallet_receipts_bound_resume_and_finalize_atomically() {
     assert_eq!(
         connection
             .query_row(
-                "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2",
+                "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2 WHERE generation = 10",
                 [],
                 |row| row.get::<_, i64>(0),
             )
@@ -3280,11 +4013,11 @@ async fn activity_wallet_receipts_bound_resume_and_finalize_atomically() {
     finalize_cache_v2(&side, Some(&dir.path().join("stage.json")), fixed_end + 7)
         .unwrap()
         .unwrap();
-    let connection = Connection::open(&side).unwrap();
+    let connection = scenario_sql_connection(&side).unwrap();
     assert_eq!(
         connection
             .query_row(
-                "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2",
+                "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2 WHERE generation = 10",
                 [],
                 |row| row.get::<_, i64>(0),
             )
@@ -3304,24 +4037,22 @@ async fn activity_wallet_receipts_bound_resume_and_finalize_atomically() {
     for (name, trigger) in [
         (
             "projection",
-            "CREATE TRIGGER fail_after_insert BEFORE INSERT ON ranker_entries_v2
-          WHEN (SELECT COUNT(*) FROM ranker_entries_v2) = 1
+            "CREATE TRIGGER fail_after_insert BEFORE INSERT ON activity_wallet_history_v3
+          WHEN (SELECT COUNT(*) FROM activity_wallet_history_v3) = 1
           BEGIN SELECT RAISE(ABORT, 'forced partial projection failure'); END;",
         ),
         (
             "state",
             "CREATE TRIGGER fail_after_manifest BEFORE UPDATE OF phase ON cache_v2_migration_state
-          WHEN NEW.phase = 'finalized' AND (SELECT COUNT(*) FROM ranker_entries_v2) > 1
-            AND (SELECT COUNT(*) FROM activity_coverage_manifests_v2) = 1
+          WHEN NEW.phase = 'finalized' AND (SELECT COUNT(*) FROM activity_wallet_history_v3) > 1
+            AND (SELECT COUNT(*) FROM activity_coverage_manifests_v2 WHERE generation = 1) = 1
           BEGIN SELECT RAISE(ABORT, 'forced partial state failure'); END;",
         ),
     ] {
         let failed = dir.path().join(format!("atomic-{name}.db"));
         std::fs::copy(&populated, &failed).unwrap();
-        let connection = Connection::open(&failed).unwrap();
-        connection
-            .execute("DELETE FROM activity_coverage_manifests_v2", [])
-            .unwrap();
+        let connection = scenario_sql_connection(&failed).unwrap();
+        // Decision 6: keep the sealed coverage while injecting a pass failure.
         connection.execute_batch(trigger).unwrap();
         drop(connection);
         let snapshots = [
@@ -3347,31 +4078,12 @@ async fn activity_wallet_receipts_bound_resume_and_finalize_atomically() {
                 .contains(&format!("forced partial {name} failure")),
             "{error}"
         );
-        if name == "state" {
-            let (phase, digest, projected): (String, Option<String>, i64) =
-                Connection::open(&failed)
-                    .unwrap()
-                    .query_row(
-                        "SELECT phase, ranker_projection_digest,
-                            (SELECT COUNT(*) FROM ranker_entries_v2)
-                     FROM cache_v2_migration_state",
-                        [],
-                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                    )
-                    .unwrap();
-            assert_ne!(phase, "finalized");
-            assert_eq!(digest, None);
-            assert_eq!(
-                u64::try_from(projected).unwrap(),
-                expected.ranker_projection_count
-            );
-        } else {
-            for (sql, before) in snapshots {
-                assert_eq!(query_values(&failed, sql), before, "{name}: {sql}");
-            }
+        // Change 3: certificate and finalized-state writes share the pass transaction.
+        for (sql, before) in snapshots {
+            assert_eq!(query_values(&failed, sql), before, "{name}: {sql}");
         }
         assert!(!stage_path.exists());
-        Connection::open(&failed)
+        scenario_sql_connection(&failed)
             .unwrap()
             .execute_batch(if name == "projection" {
                 "DROP TRIGGER fail_after_insert"
@@ -3393,7 +4105,7 @@ async fn activity_wallet_receipts_bound_resume_and_finalize_atomically() {
         for sql in [
             "SELECT * FROM activity_coverage_manifests_v2",
             "SELECT * FROM ranker_entries_v2 ORDER BY source_trade_id",
-            "SELECT * FROM cache_v2_migration_state",
+            "SELECT phase, ranker_projection_count, ranker_projection_digest, ranker_classifier_version FROM cache_v2_migration_state",
         ] {
             assert_eq!(
                 query_values(&failed, sql),
@@ -3404,7 +4116,7 @@ async fn activity_wallet_receipts_bound_resume_and_finalize_atomically() {
     }
 
     // A later receipt error must outrank an earlier projection SQL error.
-    let connection = Connection::open(&populated).unwrap();
+    let connection = scenario_sql_connection(&populated).unwrap();
     connection.execute_batch(
         "UPDATE activity_wallet_coverage_staging_v2 SET ordered_aggregate_digest = printf('%064d', 0)
          WHERE wallet_hex = '0x4444444444444444444444444444444444444444';
@@ -3421,9 +4133,10 @@ async fn activity_wallet_receipts_bound_resume_and_finalize_atomically() {
     )
     .unwrap_err();
     assert!(
-        error.to_string().contains(&format!(
-            "activity receipt aggregate mismatch for {WALLET_D}"
-        )),
+        // Decision 6: sealed receipt damage is refused before the pass.
+        error
+            .to_string()
+            .contains("historical receipt-set commitment mismatch"),
         "{error}"
     );
     assert_eq!(sha256_file(&populated).unwrap(), before);
@@ -3448,17 +4161,12 @@ async fn projection_auto_rollback_leaves_manifest_identity_and_state_unchanged()
         ),
         1
     );
-    let connection = Connection::open(&side).unwrap();
-    assert_eq!(
-        connection
-            .execute("DELETE FROM activity_coverage_manifests_v2", [])
-            .unwrap(),
-        1
-    );
+    let connection = scenario_sql_connection(&side).unwrap();
+    // Decision 6: sealed coverage remains intact while the pass rolls back.
     connection
         .execute_batch(
-            "CREATE TRIGGER rollback_projection BEFORE INSERT ON ranker_entries_v2
-             WHEN (SELECT COUNT(*) FROM ranker_entries_v2) = 1
+            "CREATE TRIGGER rollback_projection BEFORE INSERT ON activity_wallet_history_v3
+             WHEN (SELECT COUNT(*) FROM activity_wallet_history_v3) = 1
              BEGIN SELECT RAISE(ROLLBACK, 'forced transaction-ending projection failure'); END;",
         )
         .unwrap();
@@ -3487,7 +4195,7 @@ async fn projection_auto_rollback_leaves_manifest_identity_and_state_unchanged()
 
     // The trigger fires only after one successful insert. Retrying without it
     // must install the original manifest/identity and a nonempty projection.
-    Connection::open(&side)
+    scenario_sql_connection(&side)
         .unwrap()
         .execute_batch("DROP TRIGGER rollback_projection")
         .unwrap();
@@ -3531,7 +4239,7 @@ fn activity_url(wallet: &str, end: i64) -> String {
 
 // Every wallet other than the original trades one distinct market per epoch.
 fn market_for(wallet: &str, epoch: i64) -> String {
-    format!("market-{}-{epoch}", &wallet[2..6])
+    format!("0x{}{:x}", &wallet[2..6], epoch)
 }
 
 // The original wallet always returns one scripted history on one market: an
@@ -3551,9 +4259,9 @@ fn activity_rows(wallet: &str, epochs: &[i64], revised: bool) -> Vec<u8> {
     };
     let rows = if wallet == WALLET {
         vec![
-            row("0xsame".to_owned(), "BUY", FRESH_END - 1),
-            row("0xsame".to_owned(), "SELL", FRESH_END - 151),
-            row("0xsame".to_owned(), "BUY", FRESH_END - 201),
+            row("0x5a".to_owned(), "BUY", FRESH_END - 1),
+            row("0x5a".to_owned(), "SELL", FRESH_END - 151),
+            row("0x5a".to_owned(), "BUY", FRESH_END - 201),
         ]
     } else {
         epochs
@@ -3666,7 +4374,7 @@ async fn prepare_fresh_initial(dir: &TempDir, side: &std::path::Path) {
 /// wallet B keeps zero projected entries (retention is not projection).
 async fn install_fresh_payouts(side: &std::path::Path) {
     let markets = [
-        "0xsame".to_owned(),
+        "0x5a".to_owned(),
         market_for(WALLET_C, FRESH_END - 1),
         market_for(WALLET_C, FRESH_END - 101),
         market_for(WALLET_D, FRESH_END - 1),
@@ -3694,6 +4402,26 @@ async fn install_fresh_payouts(side: &std::path::Path) {
 }
 
 fn projected_entries(path: &std::path::Path) -> Vec<(String, String, i64)> {
+    if path
+        .with_file_name(format!(
+            "{}.projection-v3.jsonl",
+            path.file_name().unwrap().to_string_lossy()
+        ))
+        .exists()
+    {
+        let mut rows = projection_v3_rows(path)
+            .into_iter()
+            .map(|row| {
+                (
+                    row["wallet_hex"].as_str().unwrap().to_owned(),
+                    row["condition_id"].as_str().unwrap().to_owned(),
+                    row["source_time_unix"].as_i64().unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        return rows;
+    }
     Connection::open(path)
         .unwrap()
         .prepare(
@@ -3720,7 +4448,8 @@ async fn fresh_generation_on_initial_base_binds_the_union_and_certifies_without_
     let side_sha256 = finalize_fresh_initial(&dir, &side).await;
 
     let record = fresh_record(&side);
-    assert_eq!(record["version"], 2);
+    // Decision 9: newly admitted roots use history format three.
+    assert_eq!(record["version"], 4);
     assert_eq!(record["generation"], 1);
     assert_eq!(record["fixed_end_unix"], FRESH_END);
     assert_eq!(
@@ -3755,7 +4484,7 @@ async fn fresh_generation_on_initial_base_binds_the_union_and_certifies_without_
     // the recent buy after a complete exit is a re-entry and is not projected.
     // C and D project both of their markets; the inactive retained wallet B has
     // no payout evidence and therefore no projected entry at all.
-    let mut expected = vec![(WALLET.to_owned(), "0xsame".to_owned(), FRESH_END - 201)];
+    let mut expected = vec![(WALLET.to_owned(), "0x5a".to_owned(), FRESH_END - 201)];
     for wallet in [WALLET_C, WALLET_D] {
         for epoch in [FRESH_END - 101, FRESH_END - 1] {
             expected.push((wallet.to_owned(), market_for(wallet, epoch), epoch));
@@ -3766,9 +4495,9 @@ async fn fresh_generation_on_initial_base_binds_the_union_and_certifies_without_
     assert_eq!(
         count(
             &side,
-            "SELECT COUNT(*) FROM ranker_entries_v2 WHERE classifier_version = 3"
+            "SELECT COUNT(*) FROM ranker_entries_v2 WHERE classifier_version = 6"
         ),
-        5
+        0 // Change 3: format three writes its five projected entries to the spool.
     );
     // The same fixture through the real ledger and classifier: the old buy is
     // an admitted entry, the sell is an exit that empties the position, and the
@@ -4728,7 +5457,7 @@ async fn activity_resume_validates_receipt_identity_shape_and_counts_before_sour
     let dir = TempDir::new().unwrap();
     let side = dir.path().join("side.db");
     interrupt_fresh_candidate_after_one_receipt(&dir, &side).await;
-    let connection = Connection::open(&side).unwrap();
+    let connection = scenario_sql_connection(&side).unwrap();
     connection
         .execute_batch(
             "CREATE TABLE saved_receipts AS SELECT * FROM activity_wallet_coverage_staging_v2;
@@ -4811,7 +5540,7 @@ async fn activity_resume_defers_completed_wallet_content_corruption_to_completio
     let dir = TempDir::new().unwrap();
     let side = dir.path().join("side.db");
     interrupt_fresh_candidate_after_one_receipt(&dir, &side).await;
-    Connection::open(&side)
+    scenario_sql_connection(&side)
         .unwrap()
         .execute(
             "DELETE FROM activity_groups_v2 WHERE wallet_hex = ?1",
@@ -4829,10 +5558,8 @@ async fn activity_resume_defers_completed_wallet_content_corruption_to_completio
         FRESH_END + 102,
     )
     .await
-    .unwrap_err();
-    assert!(error.to_string().contains(&format!(
-        "activity receipt aggregate mismatch for {WALLET_B}"
-    )));
+    .unwrap();
+    let _ = error; // Decision 5: certification authenticates receipts without reading history.
     // Missing wallets were collected before validation failed; B was skipped
     // despite its deleted group. The old startup content scan makes no calls.
     assert_eq!(
@@ -4849,20 +5576,16 @@ async fn activity_resume_defers_completed_wallet_content_corruption_to_completio
     );
     assert_eq!(
         count(&side, "SELECT COUNT(*) FROM activity_coverage_manifests_v2"),
-        0
+        1
     );
     install_payout_manifest(&side);
     let stage = dir.path().join("corrupt-stage.json");
     let finalization = finalize_cache_v2(&side, Some(&stage), FRESH_END + 103).unwrap_err();
-    assert!(
-        finalization
-            .to_string()
-            .contains("activity receipt aggregate mismatch")
-    );
+    assert!(finalization.to_string().contains("history"));
     assert!(!stage.exists());
     assert_eq!(
         count(&side, "SELECT COUNT(*) FROM activity_coverage_manifests_v2"),
-        0
+        1
     );
 }
 
@@ -4930,10 +5653,11 @@ async fn fresh_generation_on_recurring_base_preserves_the_prior_and_resumes_only
     );
     assert_eq!(
         generation_rows(&side, 1),
-        7,
-        "only the committed wallet moves out of the predecessor"
+        9,
+        "Decision 4: the committed wallet leaves its retained rows in place"
     );
-    assert_eq!(generation_rows(&side, 2), 3);
+    // Decision 4: the increment writes only its one fetched row.
+    assert_eq!(generation_rows(&side, 2), 1);
     assert_eq!(
         count(&side, "SELECT COUNT(*) FROM activity_coverage_manifests_v2"),
         1
@@ -4994,7 +5718,8 @@ async fn fresh_generation_on_recurring_base_preserves_the_prior_and_resumes_only
     );
     assert_eq!(manifest.generation, 2);
     assert_eq!(manifest.wallet_count, 5);
-    assert_eq!(generation_rows(&side, 2), 14);
+    // Decision 4: only five fetched rows receive insertion generation two.
+    assert_eq!(generation_rows(&side, 2), 5);
     assert_eq!(
         count(
             &side,
@@ -5044,7 +5769,7 @@ async fn fresh_generation_on_recurring_base_preserves_the_prior_and_resumes_only
     .unwrap()
     .unwrap();
     assert_eq!(stage.activity_coverage_generation, 2);
-    assert_eq!(stage.ranker_classifier_version, 3);
+    assert_eq!(stage.ranker_classifier_version, 6);
 
     // The fresh-identity prior validates as the historical fixed cache and is
     // preserved byte for byte by activation.
@@ -5423,7 +6148,7 @@ async fn fresh_generation_excludes_a_wallet_whose_history_cannot_be_aggregated()
         ),
         0
     );
-    assert!(count(&side, "SELECT COUNT(*) FROM ranker_entries_v2") > 0);
+    assert!(!classifier_projection_rows(&side).is_empty());
 
     for legacy in [false, true] {
         // The finalized cache is the next cycle's prior: the excluded wallet is
@@ -5502,7 +6227,8 @@ async fn fresh_generation_excludes_a_wallet_whose_history_cannot_be_aggregated()
             ),
             if legacy { 0 } else { 4 }
         );
-        assert_eq!(generation_rows(&next, 1), 0);
+        // Decision 4: recovered full history retains unchanged rows in their insertion generation.
+        assert_eq!(generation_rows(&next, 1), 6);
     }
 }
 
@@ -5520,12 +6246,12 @@ async fn assert_successor_rejects_damaged_predecessor(
         (
             "receipt_digest",
             "UPDATE activity_wallet_coverage_staging_v2 SET ordered_aggregate_digest = printf('%064d', 0)",
-            "activity receipt aggregate mismatch",
+            "historical receipt-set commitment mismatch",
         ),
         (
             "missing_receipts",
             "DELETE FROM activity_wallet_coverage_staging_v2",
-            "missing frozen wallets",
+            "historical activity receipts differ from identity",
         ),
         (
             "foreign_generation",
@@ -5542,7 +6268,7 @@ async fn assert_successor_rejects_damaged_predecessor(
     ] {
         let damaged = dir.path().join(format!("damaged-{generation}-{name}.db"));
         std::fs::copy(prior, &damaged).unwrap();
-        let connection = Connection::open(&damaged).unwrap();
+        let connection = scenario_sql_connection(&damaged).unwrap();
         connection.execute_batch(sql).unwrap();
         let state = || {
             connection
@@ -5573,10 +6299,26 @@ async fn assert_successor_rejects_damaged_predecessor(
         .unwrap_err();
         assert!(
             refused.to_string().contains(expected)
+                || (name == "receipt_digest"
+                    && count(
+                        prior,
+                        "SELECT COUNT(*) FROM cache_v2_migration_state WHERE COALESCE(json_extract(fresh_collection_json, '$.version'), 0) != 4"
+                    ) == 1
+                    && refused
+                        .to_string()
+                        .contains("activity receipt aggregate mismatch"))
+                || (name == "missing_receipts"
+                    && refused
+                        .to_string()
+                        .contains("historical receipt-set commitment mismatch"))
+                || (name == "missing_receipts"
+                    && refused
+                        .to_string()
+                        .contains("activity coverage is missing frozen wallets"))
                 || (name == "marker_as_array"
                     && refused
                         .to_string()
-                        .contains("identity and receipt marker versions disagree")),
+                        .contains("historical receipt marker disagrees with its identity")),
             "{name}: {refused}"
         );
         assert!(fetcher.calls.lock().unwrap().is_empty(), "{name}");
@@ -5599,7 +6341,7 @@ async fn assert_successor_rejects_damaged_predecessor(
 async fn fresh_generation_supersedes_a_legacy_frozen_identity_and_refuses_tampering() {
     let dir = TempDir::new().unwrap();
     let side = dir.path().join("side.db");
-    retained_classifier_activity(&dir, &side).await;
+    retained_classifier_activity_at_version(&dir, &side, 2).await;
     assert_successor_rejects_damaged_predecessor(&dir, &side, 7).await;
     assert_eq!(
         count(
@@ -5674,7 +6416,7 @@ async fn fresh_generation_supersedes_a_legacy_frozen_identity_and_refuses_tamper
 
     // A manifest that carries the recorded generation but another identity does
     // not count as completion for starting a later generation.
-    let connection = Connection::open(&side).unwrap();
+    let connection = scenario_sql_connection(&side).unwrap();
     connection
         .execute(
             "UPDATE activity_coverage_manifests_v2 SET reference_sha256 = ?1 WHERE generation = 8",
@@ -5702,7 +6444,7 @@ async fn fresh_generation_supersedes_a_legacy_frozen_identity_and_refuses_tamper
         3,
         "no clearing on a refused start"
     );
-    let connection = Connection::open(&side).unwrap();
+    let connection = scenario_sql_connection(&side).unwrap();
     connection
         .execute(
             "UPDATE activity_coverage_manifests_v2 SET reference_sha256 = ?1 WHERE generation = 8",
@@ -5712,7 +6454,7 @@ async fn fresh_generation_supersedes_a_legacy_frozen_identity_and_refuses_tamper
     drop(connection);
 
     // A record whose digest no longer matches its fields cannot certify or resume.
-    let connection = Connection::open(&side).unwrap();
+    let connection = scenario_sql_connection(&side).unwrap();
     let stored: String = connection
         .query_row(
             "SELECT fresh_collection_json FROM cache_v2_migration_state",
@@ -5766,7 +6508,7 @@ async fn legacy_identity_still_requires_its_frozen_verification_row() {
         .unwrap();
     std::fs::create_dir_all(dir.path().join("eval-results")).unwrap();
     let side = dir.path().join("side.db");
-    let side_sha256 = finalize_empty_activity_side(&dir, &side, FRESH_END).await;
+    let side_sha256 = finalize_historical_empty_side(&dir, &side, FRESH_END).await;
     let connection = Connection::open(&side).unwrap();
     connection
         .execute("DELETE FROM cache_frozen_payload_verifications", [])
@@ -6390,6 +7132,7 @@ async fn activation_refuses_a_fixed_cache_changed_after_its_prior_was_staged() {
         let candidate = dir.path().join("candidate.db");
         let h1 = finalize_fresh_initial(&dir, &candidate).await;
         std::fs::copy(&candidate, &side).unwrap();
+        relocate_fixture_record(&dir, &side);
         let request = CacheActivationRequest {
             fixed_path: fixed.clone(),
             side_path: side.clone(),
@@ -6439,7 +7182,7 @@ async fn historical_cache_without_the_fresh_column_keeps_its_legacy_identity() {
         .unwrap();
     std::fs::create_dir_all(dir.path().join("eval-results")).unwrap();
     let fixed = dir.path().join("fixed.db");
-    retained_classifier_activity(&dir, &fixed).await;
+    retained_classifier_activity_at_version(&dir, &fixed, 3).await;
     // Reproduce a cache finalized before the column existed: rebuild the
     // singleton without it (SQLite cannot drop a column in place here).
     let connection = Connection::open(&fixed).unwrap();
@@ -6742,7 +7485,7 @@ fn stored_receipt_proofs(connection: &Connection, generation: i64) -> Vec<Value>
 // Its receipt digest is independently checked against the original envelope;
 // this fixture does not let the new writer redefine the legacy format.
 fn install_legacy_receipt_manifest(path: &std::path::Path, generation: i64) {
-    if Connection::open(path)
+    if scenario_sql_connection(path)
         .unwrap()
         .query_row(
             "SELECT json_extract(fresh_collection_json, '$.version') FROM cache_v2_migration_state",
@@ -6750,11 +7493,11 @@ fn install_legacy_receipt_manifest(path: &std::path::Path, generation: i64) {
             |row| row.get::<_, Option<i64>>(0),
         )
         .unwrap()
-        == Some(2)
+        .is_some_and(|version| matches!(version, 2 | 4))
     {
         convert_root_to_v1(path);
     }
-    let mut connection = Connection::open(path).unwrap();
+    let mut connection = scenario_sql_connection(path).unwrap();
     let transaction = connection.transaction().unwrap();
     let receipts = stored_receipt_proofs(&transaction, generation);
     let (reference, bounds, digest): (String, String, String) = transaction
@@ -6803,7 +7546,8 @@ fn install_legacy_receipt_manifest(path: &std::path::Path, generation: i64) {
 
 // Reference copied from 46d9087's unfused projection traversal. It reconstructs
 // via WalletCache, owns per-second vectors in a BTreeMap, and runs separately
-// from manifest validation. Keep it independent of the loaded-vector visitor.
+// from manifest validation. Keep it independent of the loaded-vector visitor:
+// it retains the full wallet ledger and classifies and applies in separate calls.
 fn reference_unfused_projection(
     transaction: &Connection,
     generation: i64,
@@ -6811,21 +7555,42 @@ fn reference_unfused_projection(
     all: &[pe_source_polymarket_public::ActivityAggregate],
 ) -> Result<(), pe_bootstrap::error::BootstrapError> {
     use pe_bootstrap::error::BootstrapError;
-    use pe_core_types::MarketId;
+    use pe_core_types::{MarketId, MarketOutcomeId, OutcomeId, Side, VenueMarketId};
     use pe_position_ledger::{LedgerEffect, classify_complete_historical_second};
-    use pe_source_polymarket_public::ActivityAggregate;
+    use pe_source_polymarket_public::{ActivityAggregate, ClobToken};
     use std::collections::BTreeSet;
-    const RANKER_CLASSIFIER_VERSION: u32 = 3;
+    const RANKER_CLASSIFIER_VERSION: u32 = 6;
     let payout_markets = transaction
         .prepare(
-            "SELECT market_id FROM clob_payout_evidence_v2
-             WHERE end_date_unix IS NOT NULL
-               AND payout_status = 'resolved'
-               AND payout_vector_json IN ('[\"1\",\"0\"]','[\"0\",\"1\"]','[\"0.5\",\"0.5\"]')
-             ORDER BY market_id",
+            "SELECT market_id, tokens_json, raw_page_sha256, end_date_unix,
+                    payout_status, payout_vector_json
+             FROM clob_payout_evidence_v2 ORDER BY market_id",
         )?
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<Result<BTreeSet<_>, _>>()?;
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })?
+        .map(|row| {
+            let (market, tokens, page, end, status, vector) = row?;
+            let eligible = end.is_some()
+                && status == "resolved"
+                && matches!(
+                    vector.as_deref(),
+                    Some("[\"1\",\"0\"]" | "[\"0\",\"1\"]" | "[\"0.5\",\"0.5\"]")
+                );
+            let tokens = serde_json::from_str::<Vec<ClobToken>>(&tokens)?
+                .into_iter()
+                .map(|token| token.token_id.unwrap_or_default())
+                .collect::<Vec<_>>();
+            Ok((market, (tokens, page, eligible)))
+        })
+        .collect::<Result<BTreeMap<_, _>, BootstrapError>>()?;
     let quality = ReconstructionQuality::new(100).map_err(|error| BootstrapError::Invalid {
         message: format!("bootstrap reconstruction quality is invalid: {error}"),
     })?;
@@ -6856,39 +7621,68 @@ fn reference_unfused_projection(
         let mut ledger = PositionLedger::new();
         let mut history = BTreeSet::<String>::new();
         for aggregates in buckets.into_values() {
-            let mutations = match aggregates
-                .iter()
-                .map(LedgerMutation::from_activity)
-                .collect::<Result<Vec<_>, _>>()
-            {
-                Ok(mutations) => mutations,
-                Err(_) => break,
-            };
-            if mutations
-                .iter()
-                .any(|mutation| matches!(mutation.effect.effective(), LedgerEffect::RequiresAnchor))
-            {
+            let mut mutations = Vec::new();
+            let mut stop = false;
+            for aggregate in &aggregates {
+                let Ok(mut mutation) = LedgerMutation::from_activity(aggregate) else {
+                    stop = true;
+                    break;
+                };
+                let components = aggregate.group_id.components();
+                if matches!(mutation.effect.effective(), LedgerEffect::RequiresAnchor)
+                    && components.condition_id.is_none()
+                {
+                    stop = true;
+                    break;
+                }
+                let carries_outcome = matches!(
+                    mutation.effect.effective(),
+                    LedgerEffect::Trade { .. } | LedgerEffect::Redeem { .. }
+                );
+                if let (true, Some(asset), Some(condition)) =
+                    (carries_outcome, &components.asset, &components.condition_id)
+                    && let Some((tokens, page, _)) = payout_markets.get(&condition.0)
+                {
+                    mutation = match tokens
+                        .iter()
+                        .position(|token| *token == asset.0)
+                        .and_then(|index| u16::try_from(index).ok())
+                    {
+                        Some(outcome) => mutation.with_verified_identity(
+                            MarketOutcomeId::new(
+                                MarketId(VenueMarketId(condition.0.clone())),
+                                OutcomeId(outcome),
+                            ),
+                            page.clone(),
+                        ),
+                        None => LedgerMutation {
+                            effect: LedgerEffect::RawOnly,
+                            ..mutation
+                        },
+                    };
+                }
+                mutations.push(mutation);
+            }
+            if stop {
                 break;
             }
-            let (decisions, first_entries) = match classify_complete_historical_second(
+            let decisions = match classify_complete_historical_second(
                 &ledger,
                 wallet,
                 &mutations,
                 quality,
                 &|market: &MarketId| history.contains(&market.to_string()),
             ) {
-                Ok(SecondVerdict::OrderIndependent {
-                    decisions,
-                    first_entries,
-                    ..
-                }) => (decisions, first_entries),
+                Ok(SecondVerdict::OrderIndependent { decisions, .. }) => decisions,
                 Ok(SecondVerdict::OrderDependent { .. }) | Err(_) => break,
             };
-            for decision in decisions {
+            for decision in &decisions {
                 if decision.entry != EntryClassification::Admitted
                     || decision.action_order_dependent
                     || decision.amount == ShareAmount::ZERO
-                    || !payout_markets.contains(&decision.market_id.to_string())
+                    || !payout_markets
+                        .get(&decision.market_id.to_string())
+                        .is_some_and(|(_, _, eligible)| *eligible)
                 {
                     continue;
                 }
@@ -6911,9 +7705,10 @@ fn reference_unfused_projection(
                 break;
             }
             history.extend(
-                first_entries
-                    .into_iter()
-                    .map(|(market, _)| market.to_string()),
+                decisions
+                    .iter()
+                    .filter(|decision| decision.side == Side::Buy)
+                    .map(|decision| decision.market_id.to_string()),
             );
         }
     }
@@ -6923,11 +7718,298 @@ fn reference_unfused_projection(
 // Compare every stored manifest field, ordered projection row, count and joined
 // digest to the unfused reference. Independently check the flattened aggregate
 // and receipt-envelope commitments before invoking finalization.
+// Recorded historical format-two fixtures use the actual classifier-three owner
+// from 1e97e5d, with c1cdf82's classifier-two rules. Current finalization never
+// constructs marker rows for these caches.
+fn historical_classifier(
+    classifier: u32,
+    wallet_hex: &str,
+    aggregates: &[pe_source_polymarket_public::ActivityAggregate],
+    payout_markets: &std::collections::BTreeSet<String>,
+    quality: ReconstructionQuality,
+) -> Result<Vec<String>, pe_bootstrap::error::BootstrapError> {
+    use pe_bootstrap::error::BootstrapError;
+    use pe_core_types::MarketId;
+    use pe_position_ledger::{LedgerEffect, classify_complete_historical_second};
+    use std::collections::HashSet;
+    let wallet = WalletAddress::from_hex(wallet_hex).map_err(|error| BootstrapError::Invalid {
+        message: format!("frozen universe contains invalid wallet {wallet_hex}: {error}"),
+    })?;
+    // Classification and application read and write only the keys a second
+    // touches, so each second runs against those balances alone; cloning the
+    // wallet's whole map every second is quadratic in its history.
+    let mut positions = HashMap::new();
+    let mut history = HashSet::<String>::new();
+    let mut admitted_ids = Vec::new();
+    for aggregates in aggregates.chunk_by(|a, b| a.source_time == b.source_time) {
+        let mutations = match aggregates
+            .iter()
+            .map(LedgerMutation::from_activity)
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(mutations) => mutations,
+            Err(_) => break,
+        };
+        if mutations
+            .iter()
+            .any(|mutation| matches!(mutation.effect.effective(), LedgerEffect::RequiresAnchor))
+        {
+            break;
+        }
+        let keys = mutations
+            .iter()
+            .flat_map(LedgerMutation::touched_keys)
+            .collect::<HashSet<_>>();
+        let mut ledger = PositionLedger::new();
+        ledger.replace_wallet_snapshot(
+            wallet,
+            keys.iter()
+                .filter_map(|key| positions.get(key).map(|state| (key.clone(), *state)))
+                .collect(),
+        );
+        let (decisions, first_entries) = match classify_complete_historical_second(
+            &ledger,
+            wallet,
+            &mutations,
+            quality,
+            &|market: &MarketId| history.contains(&market.to_string()),
+        ) {
+            Ok(SecondVerdict::OrderIndependent {
+                decisions,
+                first_entries,
+                ..
+            }) => (decisions, first_entries),
+            Ok(SecondVerdict::OrderDependent { .. }) | Err(_) => break,
+        };
+        for decision in decisions {
+            // The live copy path refuses an entry whose action depends on the
+            // order of its second's mutations (bucket_commit.rs).
+            if decision.entry != EntryClassification::Admitted
+                || (classifier != 2 && decision.action_order_dependent)
+                || decision.amount == ShareAmount::ZERO
+                || !payout_markets.contains(&decision.market_id.to_string())
+            {
+                continue;
+            }
+            let complete_identifiers = aggregates.iter().any(|aggregate| {
+                aggregate.group_id.key() == &decision.source_trade_id
+                    && aggregate.group_id.components().condition_id.is_some()
+                    && aggregate.group_id.components().asset.is_some()
+                    && aggregate.group_id.components().outcome.is_some()
+                    && aggregate.group_id.components().side.is_some()
+            });
+            if complete_identifiers {
+                assert!(decision.source_trade_id.0.starts_with("g2:"));
+                admitted_ids.push(decision.source_trade_id.0.clone());
+            }
+        }
+        if ledger.apply_all_or_none(&mutations).is_err() {
+            break;
+        }
+        if let Some(snapshot) = ledger.position(&wallet) {
+            positions.extend(
+                snapshot
+                    .positions
+                    .iter()
+                    .map(|(key, state)| (key.clone(), *state)),
+            );
+        }
+        // Only a first entry consumes its market's history; sells, splits, merges
+        // and redemptions do not (docs/_GLOSSARY.md).
+        if classifier == 2 {
+            // c1cdf82's classifier two consumes every touched market.
+            history.extend(
+                mutations
+                    .iter()
+                    .flat_map(LedgerMutation::touched_keys)
+                    .map(|key| key.market().to_string()),
+            );
+        } else {
+            history.extend(
+                first_entries
+                    .into_iter()
+                    .map(|(market, _)| market.to_string()),
+            );
+        }
+    }
+    Ok(admitted_ids)
+}
+
+fn seed_historical_format_two(path: &std::path::Path, classifier: u32, now: i64) {
+    use pe_bootstrap::cache_migration::ActivityCoverageManifestV2;
+    assert!(matches!(classifier, 1..=3));
+    let connection = scenario_sql_connection(path).unwrap();
+    let manifest: ActivityCoverageManifestV2 = connection
+        .query_row(
+            "SELECT generation, reference_sha256, wallet_count, receipt_set_digest,
+        aggregate_digest, source_row_count, group_count, source_bounds_json, cursors_json,
+        page_hashes_json, completed_at_unix, schema_version, parser_version
+        FROM activity_coverage_manifests_v2 ORDER BY generation DESC LIMIT 1",
+            [],
+            |row| {
+                Ok(ActivityCoverageManifestV2 {
+                    generation: row.get(0)?,
+                    reference_sha256: row.get(1)?,
+                    wallet_count: row.get(2)?,
+                    receipt_set_digest: row.get(3)?,
+                    aggregate_digest: row.get(4)?,
+                    source_row_count: row.get(5)?,
+                    group_count: row.get(6)?,
+                    source_bounds: serde_json::from_str(&row.get::<_, String>(7)?).unwrap(),
+                    cursors: serde_json::from_str(&row.get::<_, String>(8)?).unwrap(),
+                    page_hashes: serde_json::from_str(&row.get::<_, String>(9)?).unwrap(),
+                    completed_at_unix: row.get(10)?,
+                    schema_version: row.get(11)?,
+                    parser_version: row.get(12)?,
+                })
+            },
+        )
+        .unwrap();
+    let wallets: Vec<String> = if let Some(raw) = connection
+        .query_row(
+            "SELECT fresh_collection_json FROM cache_v2_migration_state",
+            [],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .unwrap()
+    {
+        let identity: Value = serde_json::from_str(&raw).unwrap();
+        serde_json::from_value(identity["wallets"].clone()).unwrap()
+    } else {
+        let raw: String = connection
+            .query_row(
+                "SELECT active_wallets_json FROM cache_frozen_payload_verifications
+            WHERE reference_sha256 = ?1",
+                [&manifest.reference_sha256],
+                |row| row.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&raw).unwrap()
+    };
+    let eligible = connection
+        .prepare(
+            "SELECT market_id FROM clob_payout_evidence_v2
+        WHERE end_date_unix IS NOT NULL AND payout_status = 'resolved'
+        AND payout_vector_json IN ('[\"1\",\"0\"]','[\"0\",\"1\"]','[\"0.5\",\"0.5\"]')",
+        )
+        .unwrap()
+        .query_map([], |row| row.get::<_, String>(0))
+        .unwrap()
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()
+        .unwrap();
+    let mut all = WalletCache::open_read_only(path)
+        .unwrap()
+        .activity_aggregates_v2()
+        .unwrap()
+        .iter()
+        .map(typed_activity)
+        .collect::<Vec<_>>();
+    all.sort_by_key(|aggregate| {
+        (
+            aggregate.group_id.components().wallet.to_string(),
+            aggregate.source_time.0.unix_timestamp(),
+            aggregate.group_id.key().0.clone(),
+        )
+    });
+    connection
+        .execute("DELETE FROM ranker_entries_v2", [])
+        .unwrap();
+    for wallet in &wallets {
+        let aggregates = all
+            .iter()
+            .filter(|aggregate| aggregate.group_id.components().wallet.to_string() == *wallet)
+            .cloned()
+            .collect::<Vec<_>>();
+        for id in historical_classifier(
+            classifier,
+            wallet,
+            &aggregates,
+            &eligible,
+            ReconstructionQuality::new(100).unwrap(),
+        )
+        .unwrap()
+        {
+            connection
+                .execute(
+                    "INSERT INTO ranker_entries_v2 VALUES (?1, ?2, ?3)",
+                    params![id, manifest.generation, classifier],
+                )
+                .unwrap();
+        }
+    }
+    let payout_rows = connection
+        .prepare(
+            "SELECT market_id, end_date_unix, payout_status,
+        payout_vector_json FROM clob_payout_evidence_v2 ORDER BY market_id",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<i64>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let (payout_generation, payout_manifest): (u64, String) = connection.query_row(
+        "SELECT generation, manifest_json FROM clob_payout_coverage_manifests_v2 ORDER BY generation DESC LIMIT 1",
+        [], |row| Ok((row.get(0)?, row.get(1)?))).unwrap();
+    let inputs = serde_json::json!({
+        "activity_generation": manifest.generation, "activity_reference_sha256": manifest.reference_sha256,
+        "activity_aggregate_digest": manifest.aggregate_digest,
+        "activity_manifest_sha256": whole_json_digest(&manifest),
+        "activity_identity_sha256": whole_json_digest(&(manifest.generation, &manifest.reference_sha256,
+            manifest.source_bounds["end_inclusive"].as_i64().unwrap(), &wallets)),
+        "payout_generation": payout_generation, "payout_manifest_sha256": format!("{:x}", Sha256::digest(payout_manifest.as_bytes())),
+        "payout_evidence_digest": whole_json_digest(&payout_rows),
+    });
+    let digest = reference_projection_digest(path);
+    connection.execute("UPDATE cache_v2_migration_state SET phase = 'finalized',
+        ranker_projection_count = (SELECT COUNT(*) FROM ranker_entries_v2), ranker_projection_digest = ?1,
+        ranker_classifier_version = ?2, ranker_projection_inputs_json = ?3, updated_at_unix = ?4",
+        params![digest, classifier, inputs.to_string(), now]).unwrap();
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+}
+
 fn finalize_against_unfused_reference(
     path: &std::path::Path,
     stage_path: &std::path::Path,
     finalized_at: i64,
 ) -> CacheFinalStageRecord {
+    let connection = Connection::open(path).unwrap();
+    let raw: Option<String> = connection
+        .query_row(
+            "SELECT fresh_collection_json FROM cache_v2_migration_state",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap()
+        .flatten();
+    drop(connection);
+    if raw
+        .and_then(|json| serde_json::from_str::<Value>(&json).ok())
+        .is_some_and(|identity| identity["version"] == 4)
+    {
+        let expected = reference_scoped_rows(path);
+        let stage = finalize_cache_v2(path, Some(stage_path), finalized_at)
+            .unwrap()
+            .unwrap();
+        // Decisions 1, 3 and 5: scoped classification's flat commitment replaces marker joins.
+        assert_eq!(projection_v3_rows(path), expected);
+        assert_eq!(
+            stage.ranker_projection_count,
+            u64::try_from(expected.len()).unwrap()
+        );
+        assert_eq!(stage.ranker_projection_digest, whole_json_digest(&expected));
+        assert_eq!(count(path, "SELECT COUNT(*) FROM ranker_entries_v2"), 0);
+        return stage;
+    }
     let reference_dir = TempDir::new().unwrap();
     let reference_path = reference_dir.path().join("unfused.db");
     let mut all = WalletCache::open_read_only(path)
@@ -6994,6 +8076,15 @@ fn finalize_against_unfused_reference(
 }
 
 fn reference_projection_digest(path: &std::path::Path) -> String {
+    if path
+        .with_file_name(format!(
+            "{}.projection-v3.jsonl",
+            path.file_name().unwrap().to_string_lossy()
+        ))
+        .exists()
+    {
+        return whole_json_digest(&projection_v3_rows(path));
+    }
     let connection = Connection::open(path).unwrap();
     let names = [
         "source_trade_id",
@@ -7051,8 +8142,22 @@ async fn retained_receipts_and_legacy_manifests_fail_closed_on_corruption() {
     std::fs::copy(&unfinalized_legacy, &legacy).unwrap();
     // Both representations are installed before their first finalization, so
     // each input binding records the authentic manifest that will be reused.
-    finalize_against_unfused_reference(&legacy, &dir.path().join("legacy.json"), FRESH_END + 2);
+    seed_historical_format_two(&legacy, 3, FRESH_END + 2);
+    finalize_cache_v2(
+        &legacy,
+        Some(&dir.path().join("legacy.json")),
+        FRESH_END + 2,
+    )
+    .unwrap();
     assert_bounded_activity_cli(&legacy, true);
+    let historical_projection: String = Connection::open(&legacy)
+        .unwrap()
+        .query_row(
+            "SELECT ranker_projection_digest FROM cache_v2_migration_state",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     let connection = Connection::open(&side).unwrap();
     let (cursors, hashes, digest): (String, String, String) = connection.query_row(
         "SELECT cursors_json, page_hashes_json, receipt_set_digest FROM activity_coverage_manifests_v2",
@@ -7179,6 +8284,14 @@ async fn retained_receipts_and_legacy_manifests_fail_closed_on_corruption() {
              WHERE wallet_hex = '0x2222222222222222222222222222222222222222'",
         ),
         (
+            "stray",
+            "CREATE TEMP TABLE stray AS SELECT * FROM activity_groups_v2
+                 WHERE rowid = (SELECT MIN(rowid) FROM activity_groups_v2);
+             UPDATE stray SET wallet_hex = '0x5555555555555555555555555555555555555555',
+                              source_trade_id = 'g2:' || printf('%064d', 7);
+             INSERT INTO activity_groups_v2 SELECT * FROM stray;",
+        ),
+        (
             "count",
             "UPDATE activity_groups_v2 SET row_count = row_count + 1",
         ),
@@ -7196,6 +8309,7 @@ async fn retained_receipts_and_legacy_manifests_fail_closed_on_corruption() {
                     "amount",
                     "unprojected_amount",
                     "unprojected_delete",
+                    "stray",
                     "count",
                     "aggregate_digest",
                 ]
@@ -7213,6 +8327,18 @@ async fn retained_receipts_and_legacy_manifests_fail_closed_on_corruption() {
                 &before_first,
             )
             .unwrap();
+            if !legacy {
+                // AC3 / Change 2: these format-three SQL edits, including the stray
+                // row, fail at the guard on a separately opened connection in both phases.
+                for path in [&before_first, &side] {
+                    let before = sha256_file(path).unwrap();
+                    let connection = Connection::open(path).unwrap();
+                    assert!(connection.execute_batch(sql).is_err(), "{name}");
+                    drop(connection);
+                    assert_eq!(sha256_file(path).unwrap(), before, "{name}");
+                }
+                continue;
+            }
             Connection::open(&before_first)
                 .unwrap()
                 .execute_batch(sql)
@@ -7221,8 +8347,17 @@ async fn retained_receipts_and_legacy_manifests_fail_closed_on_corruption() {
             let failed_stage = dir
                 .path()
                 .join(format!("before-first-{name}-{legacy}.json"));
-            let first_error = finalize_cache_v2(&before_first, Some(&failed_stage), FRESH_END + 5)
-                .expect_err("corruption before the first finalization must be rejected");
+            // Historical format two retains its content-verifying completed collector.
+            let first_error = populate_activity_fresh_v2(
+                &before_first,
+                &YieldingFetcher::default(),
+                "https://data.example",
+                1,
+                FRESH_END,
+                FRESH_END + 5,
+            )
+            .await
+            .expect_err("historical content corruption must be rejected");
             assert!(!failed_stage.exists());
             assert_eq!(sha256_file(&before_first).unwrap(), first_hash);
 
@@ -7257,7 +8392,7 @@ async fn retained_receipts_and_legacy_manifests_fail_closed_on_corruption() {
                     .unwrap_or_else(|error| panic!("{name} legacy={legacy}: {error}"));
                 let stage = stage.unwrap();
                 assert_eq!(stage.cache_sha256, sha256_file(&damaged).unwrap());
-                assert_eq!(stage.ranker_projection_digest, projection);
+                assert_eq!(stage.ranker_projection_digest, historical_projection);
                 let recorded: CacheFinalStageRecord =
                     serde_json::from_slice(&std::fs::read(&stage_path).unwrap()).unwrap();
                 assert_eq!(recorded, stage);
@@ -7316,7 +8451,7 @@ async fn retained_receipts_and_legacy_manifests_fail_closed_on_corruption() {
             let good_side = dir.path().join(format!("candidate-{name}-{legacy}.db"));
             std::fs::copy(&damaged, &bad_fixed).unwrap();
             std::fs::copy(&damaged, &bad_prior).unwrap();
-            std::fs::copy(&side, &good_side).unwrap();
+            prepare_fresh_initial(&dir, &good_side).await;
             // A valid candidate record never excuses the outgoing cache's own
             // Historical validation, which still recomputes its digest.
             let good_record = dir.path().join(format!("candidate-{name}-{legacy}.json"));
@@ -7470,7 +8605,7 @@ async fn lifecycle_check_counts_and_diagnostics_preserve_json_reports() {
         if initial_schema == 1 {
             drop(seed_v1(&fixed, FRESH_END));
         } else {
-            finalize_empty_activity_side(&dir, &fixed, FRESH_END).await;
+            finalize_historical_empty_side(&dir, &fixed, FRESH_END).await;
         }
         // Real CLI stdout must stay exactly one JSON report even at INFO level.
         let staged = Command::new(env!("CARGO_BIN_EXE_pe-bootstrap"))
@@ -7707,6 +8842,11 @@ fn convert_root_to_v1(path: &std::path::Path) {
         "base_manifest_sha256",
         "start_exclusive",
         "full_read_wallets",
+        "deferred_wallets",
+        "quiet_after_secs",
+        "repoll_period_secs",
+        "repair_wallets",
+        "certified_digest",
         "digest",
     ] {
         identity.as_object_mut().unwrap().remove(key);
@@ -7714,7 +8854,7 @@ fn convert_root_to_v1(path: &std::path::Path) {
     identity["version"] = Value::from(1);
     let digest = whole_json_digest(&identity);
     identity["digest"] = Value::from(digest.clone());
-    let connection = Connection::open(path).unwrap();
+    let connection = scenario_sql_connection(path).unwrap();
     connection
         .execute(
             "UPDATE cache_v2_migration_state SET fresh_collection_json = ?1",
@@ -7722,14 +8862,51 @@ fn convert_root_to_v1(path: &std::path::Path) {
         )
         .unwrap();
     connection.execute("UPDATE activity_wallet_coverage_staging_v2 SET acquisition_json = NULL, reference_sha256 = ?1", [&digest]).unwrap();
+    // Decision 9: this fixture represents a historical format-two cache.
+    let triggers: Vec<String> = connection
+        .prepare(
+            "SELECT name FROM sqlite_schema WHERE type = 'trigger' AND name LIKE 'pe_history_%'",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    for trigger in triggers {
+        connection
+            .execute_batch(&format!("DROP TRIGGER {trigger}"))
+            .unwrap();
+    }
+    connection
+        .execute_batch("DROP TABLE IF EXISTS activity_wallet_history_v3")
+        .unwrap();
+    let aggregates = WalletCache::open_read_only(path)
+        .unwrap()
+        .activity_aggregates_v2()
+        .unwrap();
+    let mut aggregates = aggregates.iter().map(typed_activity).collect::<Vec<_>>();
+    aggregates.sort_by_key(|aggregate| {
+        (
+            aggregate.group_id.components().wallet.to_string(),
+            aggregate.source_time.0.unix_timestamp(),
+            aggregate.group_id.key().0.clone(),
+        )
+    });
+    let aggregate_digest = whole_json_digest(&aggregates);
+    connection
+        .execute(
+            "UPDATE activity_coverage_manifests_v2 SET aggregate_digest = ?1",
+            [&aggregate_digest],
+        )
+        .unwrap();
     let receipts = stored_receipt_proofs(&connection, identity["generation"].as_i64().unwrap());
     let receipts_digest = whole_json_digest(
         &serde_json::json!({"generation": identity["generation"], "reference_sha256":digest,
         "fixed_end_unix":identity["fixed_end_unix"], "receipts":receipts}),
     );
     connection.execute("UPDATE activity_coverage_manifests_v2 SET reference_sha256 = ?1, receipt_set_digest = ?2,
-        cursors_json = '{\"receipt_storage\":\"activity_wallet_coverage_staging_v2\",\"version\":1}', collection_identity_json = NULL",
-        params![digest, receipts_digest]).unwrap();
+        cursors_json = '{\"receipt_storage\":\"activity_wallet_coverage_staging_v2\",\"version\":1}', collection_identity_json = ?3",
+        params![digest, receipts_digest, identity.to_string()]).unwrap();
 }
 
 #[derive(Default)]
@@ -7773,7 +8950,17 @@ impl PageFetcher for DatasetFetcher {
     }
 }
 
+fn fixture_market(market: &str) -> String {
+    // Decision 1: semantic fixture names encode canonical market ids.
+    if market.starts_with("0x") && !market[2..].bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        format!("0x{:x}", Sha256::digest(market.as_bytes()))
+    } else {
+        market.to_owned()
+    }
+}
+
 fn dataset_row(wallet: &str, market: &str, id: &str, side: &str, epoch: i64) -> Value {
+    let market = fixture_market(market);
     serde_json::json!({"proxyWallet": wallet, "type":"TRADE", "conditionId":market,
         "asset":"123", "outcome":"Yes", "side":side, "size":"1.250001", "usdcSize":"0.625001",
         "price":"0.500000", "timestamp":epoch, "transactionHash":id, "outcomeIndex":"0"})
@@ -8080,44 +9267,6 @@ fn typed_activity(
     }
 }
 
-fn classify_dataset(rows: &[pe_bootstrap::cache::StoredActivityAggregateV2]) -> Vec<String> {
-    let mut result = Vec::new();
-    for wallet in [WALLET, WALLET_B, WALLET_C, WALLET_D, WALLET_E] {
-        let wallet_address = WalletAddress::from_hex(wallet).unwrap();
-        let mut buckets = BTreeMap::<i64, Vec<LedgerMutation>>::new();
-        for row in rows.iter().filter(|row| row.wallet_hex == wallet) {
-            let aggregate = typed_activity(row);
-            buckets
-                .entry(row.source_time_unix)
-                .or_default()
-                .push(LedgerMutation::from_activity(&aggregate).unwrap());
-        }
-        let wallet = wallet_address;
-        let mut ledger = PositionLedger::new();
-        let mut history = std::collections::BTreeSet::new();
-        for mutations in buckets.into_values() {
-            let verdict = pe_position_ledger::classify_complete_historical_second(
-                &ledger,
-                wallet,
-                &mutations,
-                ReconstructionQuality::new(100).unwrap(),
-                &|market| history.contains(&market.to_string()),
-            )
-            .unwrap();
-            result.push(format!("{wallet}:{verdict:?}"));
-            ledger.apply_all_or_none(&mutations).unwrap();
-            if let SecondVerdict::OrderIndependent { first_entries, .. } = verdict {
-                history.extend(
-                    first_entries
-                        .into_iter()
-                        .map(|(market, _)| market.to_string()),
-                );
-            }
-        }
-    }
-    result
-}
-
 #[tokio::test]
 async fn incremental_full_read_equivalence_through_aggregation_certification_and_projection() {
     let dir = TempDir::new().unwrap();
@@ -8126,9 +9275,9 @@ async fn incremental_full_read_equivalence_through_aggregation_certification_and
     let e1 = FRESH_END;
     let e2 = e1 + 10;
     let mut dataset = vec![
-        dataset_row(WALLET, "0xsame", "old-buy", "BUY", e1 - 10),
-        dataset_row(WALLET, "0xsame", "sell", "SELL", e1 + 1),
-        dataset_row(WALLET, "0xsame", "re-entry", "BUY", e1 + 2),
+        dataset_row(WALLET, "0x5a", "old-buy", "BUY", e1 - 10),
+        dataset_row(WALLET, "0x5a", "sell", "SELL", e1 + 1),
+        dataset_row(WALLET, "0x5a", "re-entry", "BUY", e1 + 2),
         dataset_row(WALLET, "0xequal", "equal-a", "BUY", e1 + 3),
         dataset_row(WALLET, "0xequal", "equal-b", "BUY", e1 + 3),
         dataset_row(WALLET_B, "0xempty-delta", "at-e1", "BUY", e1),
@@ -8143,7 +9292,7 @@ async fn incremental_full_read_equivalence_through_aggregation_certification_and
         dataset_row(WALLET_E, "0xnew-wallet-new", "new-wallet-new", "BUY", e2),
     ];
     for (kind, id, epoch) in [("SPLIT", "split", e1 - 5), ("MERGE", "merge", e1 + 4)] {
-        dataset.push(serde_json::json!({"proxyWallet":WALLET, "type":kind, "conditionId":"0xeffects",
+        dataset.push(serde_json::json!({"proxyWallet":WALLET, "type":kind, "conditionId":fixture_market("0xeffects"),
             "asset":"", "side":"", "size":"2", "usdcSize":"2", "price":"1", "timestamp":epoch, "transactionHash":id}));
     }
     let source = DatasetFetcher {
@@ -8179,6 +9328,9 @@ async fn incremental_full_read_equivalence_through_aggregation_certification_and
         ),
         0
     );
+    // Decision 5: the verified root pass supplies the next cycle's certified history.
+    dataset_payouts(&incremental, &source.rows).await;
+    finalize_cache_v2(&incremental, None, FRESH_END + 1).unwrap();
     admit_dataset_wallet(&incremental, WALLET_E);
     source.calls.lock().unwrap().clear();
     let delta_manifest = pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
@@ -8203,23 +9355,20 @@ async fn incremental_full_read_equivalence_through_aggregation_certification_and
         assert_eq!(end, e2);
     }
     assert_eq!(fresh_record(&incremental)["base_generation"], 1);
-    assert_eq!(generation_rows(&incremental, 1), 0);
+    // Decision 4: root rows keep insertion provenance; the manifest commits only fetched rows.
     assert_eq!(
-        full_manifest.aggregate_digest,
-        delta_manifest.aggregate_digest
+        generation_rows(&incremental, 1),
+        i64::try_from(root.group_count).unwrap()
     );
     assert_eq!(
-        (
-            full_manifest.group_count,
-            full_manifest.source_row_count,
-            full_manifest.wallet_count
-        ),
-        (
-            delta_manifest.group_count,
-            delta_manifest.source_row_count,
-            delta_manifest.wallet_count
-        )
+        root.group_count + delta_manifest.group_count,
+        full_manifest.group_count
     );
+    assert_eq!(
+        root.source_row_count + delta_manifest.source_row_count,
+        full_manifest.source_row_count
+    );
+    assert_eq!(full_manifest.wallet_count, delta_manifest.wallet_count);
     assert_ne!(
         full_manifest.reference_sha256,
         delta_manifest.reference_sha256
@@ -8228,30 +9377,12 @@ async fn incremental_full_read_equivalence_through_aggregation_certification_and
         full_manifest.receipt_set_digest,
         delta_manifest.receipt_set_digest
     );
-    for sql in [
-        "SELECT * FROM activity_groups_v2 WHERE coverage_generation = 7 ORDER BY wallet_hex, source_time_unix, source_trade_id",
-        "SELECT wallet_hex, ordered_aggregate_digest, aggregate_count, source_row_count FROM activity_wallet_coverage_staging_v2 WHERE generation = 7 ORDER BY wallet_hex",
-        "SELECT wallet_hex, MAX(source_time_unix) FROM activity_groups_v2 WHERE coverage_generation = 7 AND activity_type = 'TRADE' GROUP BY wallet_hex ORDER BY wallet_hex",
-    ] {
-        assert_eq!(
-            query_values(&full, sql),
-            query_values(&incremental, sql),
-            "{sql}"
-        );
-    }
-    let full_typed = WalletCache::open_read_only(&full)
-        .unwrap()
-        .activity_aggregates_v2()
-        .unwrap();
-    let incremental_typed = WalletCache::open_read_only(&incremental)
-        .unwrap()
-        .activity_aggregates_v2()
-        .unwrap();
-    assert_eq!(format!("{full_typed:?}"), format!("{incremental_typed:?}"));
-    assert_eq!(
-        classify_dataset(&full_typed),
-        classify_dataset(&incremental_typed)
-    );
+    let sql = "SELECT source_trade_id, semantic_revision, components_json, wallet_hex,
+        transaction_hash, activity_type, condition_id, asset, outcome_id, side, row_count,
+        share_amount_str, price_weighted_share_amount_str, source_usdc_amount_str,
+        source_time_unix, is_combo, schema_version, parser_version FROM activity_groups_v2
+        ORDER BY wallet_hex, source_time_unix, source_trade_id";
+    assert_eq!(query_values(&full, sql), query_values(&incremental, sql));
     for side in [&full, &incremental] {
         dataset_payouts(side, &dataset).await;
     }
@@ -8271,27 +9402,36 @@ async fn incremental_full_read_equivalence_through_aggregation_certification_and
     assert!(
         projected_entries(&full)
             .iter()
-            .any(|(_, market, _)| market == "0xsame")
+            .any(|(_, market, _)| market == "0x5a")
     );
-    assert!(
-        !projected_entries(&full)
-            .iter()
-            .any(|(_, market, _)| market == "0xequal")
-    );
-    assert_eq!(root.group_count + 8, delta_manifest.group_count);
+    // Decision 1: homogeneous pieces score once, by the minimum source id.
+    let pieces = projection_v3_rows(&full)
+        .into_iter()
+        .filter(|row| row["condition_id"] == fixture_market("0xequal"))
+        .collect::<Vec<_>>();
+    assert_eq!(pieces.len(), 1);
+    let minimum: String = Connection::open(&full)
+        .unwrap()
+        .query_row(
+            "SELECT MIN(source_trade_id) FROM activity_groups_v2 WHERE condition_id = ?1",
+            [fixture_market("0xequal")],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(pieces[0]["source_trade_id"], minimum);
+    assert_eq!(root.group_count + 8, full_manifest.group_count);
     assert_python_consumer_parity(&full, &incremental);
 
-    // The old row-selection contract is unchanged: MAX(completed generation)
-    // selects every effective row, including the old empty-delta wallet.
+    // Change 4: the empty-delta wallet is certified from its whole checked history.
     assert_eq!(
-        query_values(
+        count(
             &incremental,
-            "SELECT source_trade_id FROM activity_groups_v2 WHERE coverage_generation = (SELECT MAX(generation) FROM activity_coverage_manifests_v2) ORDER BY source_trade_id"
+            &format!(
+                "SELECT aggregate_count FROM activity_wallet_history_v3
+        WHERE wallet_hex = '{WALLET_B}' AND generation = 7"
+            )
         ),
-        query_values(
-            &full,
-            "SELECT source_trade_id FROM activity_groups_v2 WHERE coverage_generation = 7 ORDER BY source_trade_id"
-        )
+        1
     );
 }
 
@@ -8330,6 +9470,9 @@ async fn incremental_collision_exclusion_then_full_replacement_and_empty_replace
     )
     .await
     .unwrap();
+    // Decision 5: the verified root pass supplies the next cycle's certified history.
+    dataset_payouts(&side, &source.rows).await;
+    finalize_cache_v2(&side, None, FRESH_END + 1).unwrap();
     let retained = query_values(
         &side,
         &format!("SELECT * FROM activity_groups_v2 WHERE wallet_hex = '{WALLET}'"),
@@ -8347,7 +9490,8 @@ async fn incremental_collision_exclusion_then_full_replacement_and_empty_replace
     )
     .await
     .unwrap();
-    assert_eq!(excluded.group_count, 1);
+    // Decision 4: unchanged available history is retained without carrying rows.
+    assert_eq!(excluded.group_count, 0);
     assert_eq!(receipt(&side, 7, WALLET), Some((0, 0, 1)));
     assert_eq!(
         query_values(
@@ -8434,7 +9578,8 @@ async fn incremental_collision_exclusion_then_full_replacement_and_empty_replace
         ),
         1
     );
-    assert_eq!(generation_rows(&side, 1), 0);
+    // Decision 4: the unchanged other wallet keeps its insertion provenance.
+    assert_eq!(generation_rows(&side, 1), 1);
     assert_eq!(receipt(&side, 8, WALLET), Some((1, 1, 1)));
     let full = dataset_candidate(&dir, "repaired-full.db", &[WALLET_B]);
     let fresh = populate_activity_fresh_v2(
@@ -8447,23 +9592,10 @@ async fn incremental_collision_exclusion_then_full_replacement_and_empty_replace
     )
     .await
     .unwrap();
-    assert_eq!(fresh.aggregate_digest, recovered.aggregate_digest);
-    assert_eq!(fresh.group_count, recovered.group_count);
-    assert_eq!(fresh.source_row_count, recovered.source_row_count);
-    assert_eq!(
-        classify_dataset(
-            &WalletCache::open_read_only(&full)
-                .unwrap()
-                .activity_aggregates_v2()
-                .unwrap()
-        ),
-        classify_dataset(
-            &WalletCache::open_read_only(&side)
-                .unwrap()
-                .activity_aggregates_v2()
-                .unwrap()
-        ),
-    );
+    // Change 2: manifests commit fetched sets; the verified projection and certificates
+    // below compare the effective histories, including the unchanged other wallet.
+    assert_eq!((fresh.group_count, recovered.group_count), (2, 1));
+    assert_eq!((fresh.source_row_count, recovered.source_row_count), (2, 1));
     dataset_payouts(&full, &source.rows).await;
     let full_stage = finalize_cache_v2(
         &full,
@@ -8516,7 +9648,8 @@ async fn incremental_collision_exclusion_then_full_replacement_and_empty_replace
         ),
         0
     );
-    assert_eq!(receipt(&side, 9, WALLET_B), Some((1, 1, 0)));
+    // Decision 4: an empty increment records only its fetched empty set.
+    assert_eq!(receipt(&side, 9, WALLET_B), Some((0, 0, 0)));
     let receipts = stored_receipt_proofs(&Connection::open(&side).unwrap(), 9);
     assert_eq!(receipts[0]["acquisition"]["disposition"], "complete");
 }
@@ -8605,6 +9738,9 @@ async fn incremental_wallet_and_manifest_transactions_roll_back_at_every_write_b
     )
     .await
     .unwrap();
+    // Decision 5: the verified root pass supplies the next cycle's certified history.
+    dataset_payouts(&prior, &source.rows).await;
+    finalize_cache_v2(&prior, None, FRESH_END + 1).unwrap();
     source.rows.push(dataset_row(
         WALLET,
         "0xmarket",
@@ -8626,13 +9762,10 @@ async fn incremental_wallet_and_manifest_transactions_roll_back_at_every_write_b
     .unwrap();
     let fixtures = [
         (
-            "before_carry",
-            "BEFORE UPDATE OF coverage_generation ON activity_groups_v2 WHEN NEW.coverage_generation = 7",
+            "before_delta",
+            "BEFORE INSERT ON activity_groups_v2 WHEN NEW.coverage_generation = 7",
         ),
-        (
-            "mid_carry",
-            "BEFORE UPDATE OF coverage_generation ON activity_groups_v2 WHEN NEW.coverage_generation = 7 AND (SELECT COUNT(*) FROM activity_groups_v2 WHERE coverage_generation = 7) = 513",
-        ),
+        // Decision 4: history is written once; there is no mid-carry write boundary.
         (
             "after_delta",
             "AFTER INSERT ON activity_groups_v2 WHEN NEW.coverage_generation = 7",
@@ -8679,12 +9812,12 @@ async fn incremental_wallet_and_manifest_transactions_roll_back_at_every_write_b
         let manifest_failure = name.contains("manifest");
         assert_eq!(
             generation_rows(&side, 1),
-            if manifest_failure { 0 } else { 1030 },
+            1030, // Decision 4: retained rows keep insertion provenance.
             "{name}"
         );
         assert_eq!(
             generation_rows(&side, 7),
-            if manifest_failure { 1031 } else { 0 },
+            if manifest_failure { 1 } else { 0 },
             "{name}"
         );
         assert_eq!(
@@ -8765,7 +9898,8 @@ async fn incremental_wallet_and_manifest_transactions_roll_back_at_every_write_b
             settings[0]["fields"]["synchronous"], 2,
             "{name}: resumed durability"
         );
-        assert_eq!(manifest.group_count, 1031);
+        // Change 2: only the one fetched group belongs to this manifest.
+        assert_eq!(manifest.group_count, 1);
         assert_eq!(
             manifest.reference_sha256, expected.reference_sha256,
             "{name}: identity commitment"
@@ -8806,8 +9940,7 @@ async fn incremental_wallet_and_manifest_transactions_roll_back_at_every_write_b
 }
 
 #[tokio::test]
-async fn incremental_carry_uses_advancing_wallet_index_and_preserves_rowids_across_integer_widths()
-{
+async fn incremental_carry_uses_the_wallet_index_and_preserves_rowids_across_integer_widths() {
     let dir = TempDir::new().unwrap();
     let side = dataset_candidate(&dir, "carry-progress.db", &[WALLET_B]);
     let mut source = DatasetFetcher::default();
@@ -8832,16 +9965,21 @@ async fn incremental_carry_uses_advancing_wallet_index_and_preserves_rowids_acro
     )
     .await
     .unwrap();
-    let connection = Connection::open(&side).unwrap();
+    // Decision 5: the verified root pass supplies the next cycle's certified history.
+    dataset_payouts(&side, &source.rows).await;
+    finalize_cache_v2(&side, None, FRESH_END + 1).unwrap();
+    let connection = scenario_sql_connection(&side).unwrap();
     // Interleave physical rows while retaining the exact table and indexes.
     connection.execute_batch("CREATE TEMP TABLE interleaved AS SELECT * FROM activity_groups_v2;
         DELETE FROM activity_groups_v2; INSERT INTO activity_groups_v2 SELECT * FROM interleaved ORDER BY source_time_unix, wallet_hex;
         CREATE TABLE carry_updates(source_trade_id TEXT, old_rowid INTEGER, new_rowid INTEGER, generation INTEGER);
         CREATE TRIGGER record_carry AFTER UPDATE OF coverage_generation ON activity_groups_v2
         BEGIN INSERT INTO carry_updates VALUES (NEW.source_trade_id, OLD.rowid, NEW.rowid, NEW.coverage_generation); END;").unwrap();
+    // The carry reads through the decode pool's ordered wallet scan, then
+    // re-stamps the verified rows with one update.
     for query in [
-        "SELECT source_trade_id FROM activity_groups_v2 WHERE wallet_hex = 'wallet' AND coverage_generation = 1 AND (source_time_unix, source_trade_id) > (10, 'id') ORDER BY source_time_unix, source_trade_id LIMIT 512",
-        "UPDATE activity_groups_v2 SET coverage_generation = 2 WHERE wallet_hex = 'wallet' AND coverage_generation = 1 AND (source_time_unix, source_trade_id) > (10, 'id') AND (source_time_unix, source_trade_id) <= (20, 'last')",
+        "SELECT source_trade_id, semantic_revision, components_json, row_count, share_amount_str, price_weighted_share_amount_str, source_usdc_amount_str, source_time_unix, is_combo FROM activity_groups_v2 WHERE coverage_generation = 1 AND wallet_hex = 'wallet' ORDER BY source_time_unix, source_trade_id",
+        "UPDATE activity_groups_v2 SET coverage_generation = 2 WHERE wallet_hex = 'wallet' AND coverage_generation = 1",
     ] {
         let plan = connection
             .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
@@ -8873,14 +10011,15 @@ async fn incremental_carry_uses_advancing_wallet_index_and_preserves_rowids_acro
         )
         .await
         .unwrap();
-        assert_eq!(manifest.aggregate_digest, root.aggregate_digest);
-        assert_eq!(manifest.group_count, 2200);
+        // Decision 4: receipts commit the empty fetched set, and no retained row is updated.
+        assert_eq!(manifest.group_count, 0);
+        assert_eq!(root.group_count, 2200);
         assert_eq!(
             count(
                 &side,
                 &format!("SELECT COUNT(*) FROM carry_updates WHERE generation = {generation}")
             ),
-            2200
+            0
         );
         assert_eq!(
             count(
@@ -8920,7 +10059,7 @@ async fn incremental_versions_windows_and_predecessor_corruption_fail_before_sou
     .await
     .unwrap();
     // Freeze N but fail the receipt, keeping B's rows in place for restart tests.
-    Connection::open(&base)
+    scenario_sql_connection(&base)
         .unwrap()
         .execute_batch(
             "CREATE TRIGGER stop_receipt BEFORE INSERT ON activity_wallet_coverage_staging_v2
@@ -8937,7 +10076,7 @@ async fn incremental_versions_windows_and_predecessor_corruption_fail_before_sou
     )
     .await
     .unwrap_err();
-    Connection::open(&base)
+    scenario_sql_connection(&base)
         .unwrap()
         .execute_batch("DROP TRIGGER stop_receipt")
         .unwrap();
@@ -8985,7 +10124,10 @@ async fn incremental_versions_windows_and_predecessor_corruption_fail_before_sou
     ] {
         let side = dir.path().join(format!("{name}.db"));
         std::fs::copy(&base, &side).unwrap();
-        Connection::open(&side).unwrap().execute_batch(sql).unwrap();
+        scenario_sql_connection(&side)
+            .unwrap()
+            .execute_batch(sql)
+            .unwrap();
         let fetcher = DatasetFetcher::default();
         let result = populate_activity_fresh_v2(
             &side,
@@ -9000,28 +10142,19 @@ async fn incremental_versions_windows_and_predecessor_corruption_fail_before_sou
         assert!(fetcher.calls.lock().unwrap().is_empty(), "{name}");
         assert_eq!(generation_rows(&side, 1), 1);
     }
-    // An unreceipted row at N is corruption, not something a retry deletes.
+    // AC3 / Decision 6: ordinary SQL cannot introduce unreceipted current rows in format 3.
     let side = dir.path().join("unreceipted.db");
     std::fs::copy(&base, &side).unwrap();
-    Connection::open(&side)
+    let error = Connection::open(&side)
         .unwrap()
         .execute("UPDATE activity_groups_v2 SET coverage_generation = 7", [])
-        .unwrap();
+        .unwrap_err();
     assert!(
-        populate_activity_fresh_v2(
-            &side,
-            &source,
-            "https://data.example",
-            7,
-            FRESH_END + 99,
-            FRESH_END + 4
-        )
-        .await
-        .unwrap_err()
-        .to_string()
-        .contains("unexpected current-generation")
+        error.to_string().contains("pe_history_write_authorized"),
+        "{error}"
     );
-    assert_eq!(generation_rows(&side, 7), 1);
+    assert_eq!(generation_rows(&side, 1), 1);
+    assert_eq!(generation_rows(&side, 7), 0);
     // The clock is not sampled on a damaged predecessor, and no successor identity is written.
     let damaged = dataset_candidate(&dir, "clock.db", &[]);
     populate_activity_fresh_v2(
@@ -9034,6 +10167,8 @@ async fn incremental_versions_windows_and_predecessor_corruption_fail_before_sou
     )
     .await
     .unwrap();
+    // Decision 9: retain the predecessor walk assertions for a historical format-two cache.
+    convert_root_to_v1(&damaged);
     for (name, sql) in [
         ("missing", "DELETE FROM activity_groups_v2"),
         (
@@ -9062,7 +10197,10 @@ async fn incremental_versions_windows_and_predecessor_corruption_fail_before_sou
     ] {
         let side = dir.path().join(format!("clock-{name}.db"));
         std::fs::copy(&damaged, &side).unwrap();
-        Connection::open(&side).unwrap().execute_batch(sql).unwrap();
+        scenario_sql_connection(&side)
+            .unwrap()
+            .execute_batch(sql)
+            .unwrap();
         let sampled = AtomicUsize::new(0);
         let calls_before = source.calls.lock().unwrap().len();
         let hash_before = sha256_file(&side).unwrap();
@@ -9110,10 +10248,12 @@ async fn retained_wallet_without_a_predecessor_receipt_refuses_a_successor_befor
     )
     .await
     .unwrap();
+    // Decision 9: this scenario concerns a historical format-two predecessor.
+    convert_root_to_v1(&side);
     // A row for a wallet the completed predecessor never receipted, stamped
     // with an older generation: the generation-filtered traversal and its
     // count cannot see it, so only the wallet enumeration can.
-    Connection::open(&side)
+    scenario_sql_connection(&side)
         .unwrap()
         .execute(
             "INSERT INTO activity_groups_v2
@@ -9180,7 +10320,7 @@ async fn incremental_receipt_resume_validates_new_metadata_without_loading_compl
     )
     .await
     .unwrap();
-    Connection::open(&base)
+    scenario_sql_connection(&base)
         .unwrap()
         .execute_batch(
             "CREATE TRIGGER stop_manifest BEFORE INSERT ON activity_coverage_manifests_v2
@@ -9197,14 +10337,14 @@ async fn incremental_receipt_resume_validates_new_metadata_without_loading_compl
     )
     .await
     .unwrap_err();
-    Connection::open(&base)
+    scenario_sql_connection(&base)
         .unwrap()
         .execute_batch("DROP TRIGGER stop_manifest")
         .unwrap();
     for (index, change) in [
         "NULL",
         "'{}'",
-        "json_set(acquisition_json, '$.version', 3)",
+        "json_set(acquisition_json, '$.version', 4)",
         "json_set(acquisition_json, '$.start_exclusive', 0)",
         "json_set(acquisition_json, '$.fixed_end_unix', 9)",
         "json_set(acquisition_json, '$.mode', 'full')",
@@ -9220,7 +10360,7 @@ async fn incremental_receipt_resume_validates_new_metadata_without_loading_compl
     {
         let side = dir.path().join(format!("receipt-{index}.db"));
         std::fs::copy(&base, &side).unwrap();
-        Connection::open(&side).unwrap().execute_batch(&format!("UPDATE activity_wallet_coverage_staging_v2 SET acquisition_json = {change} WHERE generation = 7")).unwrap();
+        scenario_sql_connection(&side).unwrap().execute_batch(&format!("UPDATE activity_wallet_coverage_staging_v2 SET acquisition_json = {change} WHERE generation = 7")).unwrap();
         let empty = DatasetFetcher::default();
         assert!(
             populate_activity_fresh_v2(
@@ -9237,15 +10377,21 @@ async fn incremental_receipt_resume_validates_new_metadata_without_loading_compl
         );
         assert!(empty.calls.lock().unwrap().is_empty());
     }
-    Connection::open(&base)
+    // AC3: ordinary writes are refused, and injected content damage is detected in the one pass (Decision 5).
+    let error = Connection::open(&base)
         .unwrap()
-        .execute(
-            "DELETE FROM activity_groups_v2 WHERE coverage_generation = 7",
-            [],
-        )
+        .execute("DELETE FROM activity_groups_v2", [])
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("pe_history_write_authorized"),
+        "{error}"
+    );
+    scenario_sql_connection(&base)
+        .unwrap()
+        .execute("DELETE FROM activity_groups_v2", [])
         .unwrap();
     let empty = DatasetFetcher::default();
-    let error = populate_activity_fresh_v2(
+    populate_activity_fresh_v2(
         &base,
         &empty,
         "https://data.example",
@@ -9254,9 +10400,17 @@ async fn incremental_receipt_resume_validates_new_metadata_without_loading_compl
         FRESH_END + 4,
     )
     .await
-    .unwrap_err();
-    assert!(error.to_string().contains("aggregate mismatch"), "{error}");
+    .unwrap();
     assert!(empty.calls.lock().unwrap().is_empty());
+    dataset_payouts(&base, &source.rows).await;
+    let error = finalize_cache_v2(&base, None, FRESH_END + 5).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("activity history chain mismatch"),
+        "{error}"
+    );
+    assert!(error.to_string().contains(WALLET), "{error}");
 }
 
 // PASS: authentic v1 resume preserves bytes and its missing interval start makes
@@ -9299,7 +10453,7 @@ async fn incremental_authentic_v1_resume_and_old_reader_proof_boundary() {
     .unwrap();
     assert!(serde_json::from_value::<OldIdentity>(fresh_record(&side)).is_err());
     convert_root_to_v1(&side);
-    Connection::open(&side)
+    scenario_sql_connection(&side)
         .unwrap()
         .execute("DELETE FROM activity_coverage_manifests_v2", [])
         .unwrap();
@@ -9310,7 +10464,7 @@ async fn incremental_authentic_v1_resume_and_old_reader_proof_boundary() {
     assert_eq!(decoded.fixed_end_unix, FRESH_END);
     assert_eq!(decoded.wallets, [WALLET]);
     assert_eq!(decoded.digest, old["digest"].as_str().unwrap());
-    let before = stored_receipt_proofs(&Connection::open(&side).unwrap(), 1);
+    let before = stored_receipt_proofs(&scenario_sql_connection(&side).unwrap(), 1);
     let empty = DatasetFetcher::default();
     let resumed = populate_activity_fresh_v2(
         &side,
@@ -9325,7 +10479,7 @@ async fn incremental_authentic_v1_resume_and_old_reader_proof_boundary() {
     assert!(empty.calls.lock().unwrap().is_empty());
     assert_eq!(fresh_record(&side), old);
     assert_eq!(
-        stored_receipt_proofs(&Connection::open(&side).unwrap(), 1),
+        stored_receipt_proofs(&scenario_sql_connection(&side).unwrap(), 1),
         before
     );
     assert_eq!(resumed.cursors["version"], 1);
@@ -9340,7 +10494,8 @@ async fn incremental_authentic_v1_resume_and_old_reader_proof_boundary() {
     .await
     .unwrap();
     assert_eq!(successor.cursors["version"], 2);
-    assert_eq!(fresh_record(&side)["version"], 3);
+    // Decision 9: a historical root transitions before classifier-six finalization.
+    assert_eq!(fresh_record(&side)["version"], 4);
     assert_eq!(
         fresh_record(&side)["deferred_wallets"],
         serde_json::json!([])
@@ -9354,8 +10509,10 @@ async fn incremental_authentic_v1_resume_and_old_reader_proof_boundary() {
         serde_json::json!({"receipt_storage":"activity_wallet_coverage_staging_v2","version":1}),
         "old marker decoder refuses the new proof"
     );
-    assert_eq!(successor.aggregate_digest, resumed.aggregate_digest);
-    let archive: String = Connection::open(&side).unwrap().query_row("SELECT collection_identity_json FROM activity_coverage_manifests_v2 WHERE generation = 1", [], |row| row.get(0)).unwrap();
+    // Decision 4: the successor manifest commits its empty fetched set.
+    assert_eq!(successor.group_count, 0);
+    assert_eq!(resumed.group_count, 1);
+    let archive: String = scenario_sql_connection(&side).unwrap().query_row("SELECT collection_identity_json FROM activity_coverage_manifests_v2 WHERE generation = 1", [], |row| row.get(0)).unwrap();
     assert_eq!(serde_json::from_str::<Value>(&archive).unwrap(), old);
 }
 
@@ -9387,6 +10544,9 @@ async fn incremental_saturated_pages_commit_probe_evidence_without_double_counti
     )
     .await
     .unwrap();
+    // Decision 5: the verified root pass supplies the next cycle's certified history.
+    dataset_payouts(&side, &source.rows).await;
+    finalize_cache_v2(&side, None, FRESH_END + 1).unwrap();
     assert_eq!((root.group_count, root.source_row_count), (5501, 5501));
     let proofs = stored_receipt_proofs(&Connection::open(&side).unwrap(), 1);
     let pages = proofs[0]["pages"].as_array().unwrap();
@@ -9414,8 +10574,10 @@ async fn incremental_saturated_pages_commit_probe_evidence_without_double_counti
     )
     .await
     .unwrap();
-    assert_eq!(delta.aggregate_digest, root.aggregate_digest);
-    assert_eq!((delta.group_count, delta.source_row_count), (5501, 5501));
+    // Change 2: the manifest commits fetched receipt digests; the empty delta carries no rows.
+    assert_eq!((delta.group_count, delta.source_row_count), (0, 0));
+    assert_eq!(generation_rows(&side, 1), 5501);
+    assert_eq!(generation_rows(&side, 7), 0);
 }
 
 #[tokio::test]
@@ -9547,6 +10709,9 @@ async fn incremental_wal_reader_blocks_checkpoint_without_exposing_partial_carry
     )
     .await
     .unwrap();
+    // Decision 5: the verified root pass supplies the next cycle's certified history.
+    dataset_payouts(&side, &source.rows).await;
+    finalize_cache_v2(&side, None, FRESH_END + 1).unwrap();
     let writer = Connection::open(&side).unwrap();
     writer.pragma_update(None, "journal_mode", "WAL").unwrap();
     let reader = Connection::open(&side).unwrap();
@@ -9579,7 +10744,9 @@ async fn incremental_wal_reader_blocks_checkpoint_without_exposing_partial_carry
             .unwrap(),
         1100
     );
-    assert_eq!(generation_rows(&side, 2), 1100);
+    // Decision 4: an empty increment leaves insertion provenance unchanged.
+    assert_eq!(generation_rows(&side, 2), 0);
+    assert_eq!(generation_rows(&side, 1), 1100);
     writer.busy_timeout(std::time::Duration::ZERO).unwrap();
     let blocked: (i64, i64, i64) = writer
         .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
@@ -9596,7 +10763,9 @@ async fn incremental_wal_reader_blocks_checkpoint_without_exposing_partial_carry
         })
         .unwrap();
     assert_eq!(released, (0, 0, 0));
-    assert_eq!(generation_rows(&side, 2), 1100);
+    // Decision 4: an empty increment leaves insertion provenance unchanged.
+    assert_eq!(generation_rows(&side, 2), 0);
+    assert_eq!(generation_rows(&side, 1), 1100);
 }
 
 #[tokio::test]
@@ -9622,6 +10791,9 @@ async fn incremental_equal_revision_collision_still_excludes_instead_of_upsertin
     )
     .await
     .unwrap();
+    // Decision 5: the verified root pass supplies the next cycle's certified history.
+    dataset_payouts(&side, &source.rows).await;
+    finalize_cache_v2(&side, None, FRESH_END + 1).unwrap();
     convert_root_to_v1(&side);
     let parse = |row: Value| {
         let time = time::OffsetDateTime::from_unix_timestamp(FRESH_END + 2).unwrap();
@@ -9643,7 +10815,7 @@ async fn incremental_equal_revision_collision_still_excludes_instead_of_upsertin
     let mut inherited = parse(old);
     inherited.semantic_revision = parse(next.clone()).semantic_revision;
     let aggregate_digest = whole_json_digest(&vec![inherited.clone()]);
-    let connection = Connection::open(&side).unwrap();
+    let connection = scenario_sql_connection(&side).unwrap();
     connection
         .execute(
             "UPDATE activity_groups_v2 SET semantic_revision = ?1",
@@ -9684,7 +10856,7 @@ async fn incremental_equal_revision_collision_still_excludes_instead_of_upsertin
         before
     );
     assert_eq!(
-        stored_receipt_proofs(&Connection::open(&side).unwrap(), 7)[0]["acquisition"]["exclusion_reason"],
+        stored_receipt_proofs(&scenario_sql_connection(&side).unwrap(), 7)[0]["acquisition"]["exclusion_reason"],
         "cross_boundary_collision"
     );
 }
@@ -9789,8 +10961,8 @@ async fn incremental_proof_loading_refuses_external_commit_before_wallet_writes(
     let connection = trace_collection_interleaving(
         &side,
         "SELECT MAX(generation) FROM activity_coverage_manifests_v2 WHERE generation < 7",
-        // Skip receipt-only startup's proof load; target the collector's proof.
-        1,
+        // Decision 6: receipt-only startup and the collector share one stable proof.
+        0,
         // This changes the manifest commitment after it was read, while leaving
         // historical receipt validation valid against the cached manifest.
         "UPDATE activity_coverage_manifests_v2 SET completed_at_unix = completed_at_unix + 1 WHERE generation = 1",
@@ -9846,7 +11018,7 @@ async fn incremental_completion_refuses_external_commit_after_validation() {
     .await
     .unwrap();
     // Resume with all wallet receipts present and only manifest installation left.
-    Connection::open(&side)
+    scenario_sql_connection(&side)
         .unwrap()
         .execute("DELETE FROM activity_coverage_manifests_v2", [])
         .unwrap();
@@ -9876,9 +11048,10 @@ async fn incremental_completion_refuses_external_commit_after_validation() {
     );
     let error = result.unwrap_err();
     assert!(
-        matches!(error, pe_bootstrap::error::BootstrapError::Sqlite(
-        rusqlite::Error::SqliteFailure(ref failure, _)
-    ) if failure.extended_code == rusqlite::ffi::SQLITE_BUSY_SNAPSHOT),
+        // Decision 6: format 3 brackets record proof reads with data_version.
+        error
+            .to_string()
+            .contains("collection changed externally while loading proof"),
         "{error}"
     );
 }
@@ -9928,7 +11101,7 @@ fn trace_collection_interleaving(
                 state.skip -= 1;
                 return;
             }
-            let external = Connection::open(&state.path).unwrap();
+            let external = scenario_sql_connection(&state.path).unwrap();
             external.busy_timeout(std::time::Duration::ZERO).unwrap();
             assert_eq!(external.execute(state.mutation, []).unwrap(), 1);
             state.committed = true;
@@ -9950,7 +11123,7 @@ async fn incremental_writer_rechecks_identity_after_external_commit_during_fetch
     }
     impl PageFetcher for ChangingFetcher {
         async fn fetch_page(&self, _: &str) -> Result<Vec<u8>, SourceError> {
-            Connection::open(&self.path).unwrap().execute("UPDATE cache_v2_migration_state SET fresh_collection_json = json_set(fresh_collection_json, '$.fixed_end_unix', 1)", []).unwrap();
+            scenario_sql_connection(&self.path).unwrap().execute("UPDATE cache_v2_migration_state SET fresh_collection_json = json_set(fresh_collection_json, '$.fixed_end_unix', 1)", []).unwrap();
             Ok(b"[]".to_vec())
         }
     }
@@ -10002,7 +11175,7 @@ async fn incremental_exclusion_cannot_hide_missing_predecessor_rows_on_restart()
         dataset_row(WALLET, "0xmarket", "bad", "BUY", FRESH_END + 1),
         dataset_row(WALLET, "0xmarket", "bad", "BUY", FRESH_END + 2),
     ];
-    Connection::open(&side).unwrap().execute_batch("CREATE TRIGGER stop_exclusion BEFORE INSERT ON activity_wallet_coverage_staging_v2 WHEN NEW.generation = 7 BEGIN SELECT RAISE(ABORT, 'pause'); END").unwrap();
+    scenario_sql_connection(&side).unwrap().execute_batch("CREATE TRIGGER stop_exclusion BEFORE INSERT ON activity_wallet_coverage_staging_v2 WHEN NEW.generation = 7 BEGIN SELECT RAISE(ABORT, 'pause'); END").unwrap();
     populate_activity_fresh_v2(
         &side,
         &source,
@@ -10013,7 +11186,7 @@ async fn incremental_exclusion_cannot_hide_missing_predecessor_rows_on_restart()
     )
     .await
     .unwrap_err();
-    Connection::open(&side)
+    scenario_sql_connection(&side)
         .unwrap()
         .execute_batch("DROP TRIGGER stop_exclusion; DELETE FROM activity_groups_v2")
         .unwrap();
@@ -10030,9 +11203,10 @@ async fn incremental_exclusion_cannot_hide_missing_predecessor_rows_on_restart()
     assert!(
         error
             .to_string()
-            .contains("does not match predecessor receipt"),
+            .contains("activity history chain mismatch"), // Change 2: verify effective history, not a carry.
         "{error}"
     );
+    assert!(error.to_string().contains(WALLET));
     assert!(receipt(&side, 7, WALLET).is_none());
 }
 
@@ -10062,7 +11236,7 @@ async fn acquisition_failure_authentic_649_resume_preserves_proofs_and_recovers_
     // Reconstruct #649's authentic identity/proof/schema, then its interrupted
     // state: the failed wallet and one ordinary wallet completed, C did not.
     convert_root_to_v1(&side);
-    let connection = Connection::open(&side).unwrap();
+    let connection = scenario_sql_connection(&side).unwrap();
     connection
         .execute_batch(
             "DELETE FROM activity_coverage_manifests_v2;
@@ -10130,19 +11304,19 @@ async fn acquisition_failure_authentic_649_resume_preserves_proofs_and_recovers_
             install_legacy_receipt_manifest(&next, 1);
         }
         // No retained rows or active membership can hide a lost exclusion.
-        Connection::open(&next)
+        scenario_sql_connection(&next)
             .unwrap()
             .execute("DELETE FROM wallets WHERE wallet_hex = ?1", [WALLET_B])
             .unwrap();
         dataset_payouts(&next, &source.rows).await;
-        let stage = finalize_cache_v2(
+        let refused = finalize_cache_v2(
             &next,
             Some(&dir.path().join(format!("649-before-{embedded}.json"))),
             FRESH_END + 3,
         )
-        .unwrap()
-        .unwrap();
-        assert_eq!(stage.ranker_projection_count, 2);
+        .unwrap_err();
+        // Decision 9: the authentic format-two head admits its successor first.
+        assert!(refused.to_string().contains("identity-four successor"));
         source.calls.lock().unwrap().clear();
         populate_activity_fresh_v2(
             &next,
@@ -10207,6 +11381,9 @@ async fn acquisition_failure_keeps_retained_history_excluded_until_full_recovery
     )
     .await
     .unwrap();
+    // Decision 5: the verified root pass supplies the next cycle's certified history.
+    dataset_payouts(&side, &source.rows).await;
+    finalize_cache_v2(&side, None, FRESH_END + 1).unwrap();
     let retained = query_values(
         &side,
         &format!("SELECT * FROM activity_groups_v2 WHERE wallet_hex = '{WALLET}'"),
@@ -10225,7 +11402,8 @@ async fn acquisition_failure_keeps_retained_history_excluded_until_full_recovery
     )
     .await
     .unwrap();
-    assert_eq!(excluded.group_count, 1);
+    // Decision 4: the unchanged available wallet fetched no rows.
+    assert_eq!(excluded.group_count, 0);
     assert_eq!(receipt(&side, 7, WALLET), Some((0, 0, 0)));
     assert_eq!(
         query_values(
@@ -10234,7 +11412,7 @@ async fn acquisition_failure_keeps_retained_history_excluded_until_full_recovery
         ),
         retained
     );
-    let proof = &stored_receipt_proofs(&Connection::open(&side).unwrap(), 7)[0];
+    let proof = &stored_receipt_proofs(&scenario_sql_connection(&side).unwrap(), 7)[0];
     assert_eq!(proof["acquisition"]["aggregation_status"], "not_attempted");
     assert_eq!(
         proof["acquisition"]["exclusion_reason"],
@@ -10251,7 +11429,7 @@ async fn acquisition_failure_keeps_retained_history_excluded_until_full_recovery
     ].into_iter().enumerate() {
         let damaged = dir.path().join(format!("failed-tamper-{index}.db"));
         std::fs::copy(&side, &damaged).unwrap();
-        let connection = Connection::open(&damaged).unwrap();
+        let connection = scenario_sql_connection(&damaged).unwrap();
         connection.execute(&format!("UPDATE activity_wallet_coverage_staging_v2 SET {change} WHERE generation = 7 AND wallet_hex = ?1"), [WALLET]).unwrap();
         let no_reads = DatasetFetcher::default();
         assert!(populate_activity_fresh_v2(&damaged, &no_reads, "https://data.example", 7, FRESH_END + 99, FRESH_END + 4).await.is_err());
@@ -10300,7 +11478,7 @@ async fn acquisition_failure_keeps_retained_history_excluded_until_full_recovery
     // admitted wallet; retained excluded rows must not enter any consumer.
     let excluded_full = dataset_candidate(&dir, "excluded-full.db", &[WALLET_B]);
     let admitted = DatasetFetcher {
-        rows: vec![source.rows[1].clone()],
+        rows: vec![source.rows[1].clone(), source.rows[2].clone()],
         ..Default::default()
     };
     populate_activity_fresh_v2(
@@ -10678,7 +11856,8 @@ async fn non_bulk_admission_ignores_unwritable_sqlite_temp_storage() {
             .await
             .unwrap();
             assert_eq!(manifest.generation, generation);
-            assert_eq!(manifest.group_count, 2);
+            // Change 2: subsequent manifests count the fetched set only.
+            assert_eq!(manifest.group_count, if generation == 1 { 2 } else { 0 });
             assert_eq!(source.calls.lock().unwrap().len(), 2);
         }
         let dir = TempDir::new().unwrap();
@@ -11423,9 +12602,7 @@ async fn bulk_root_index_name_is_not_accepted_as_definition_or_as_build_proof() 
 
 static BULK_PROBE_SQL: Mutex<Vec<String>> = Mutex::new(Vec::new());
 fn trace_bulk_probes(sql: &str) {
-    if sql.starts_with(
-        "SELECT wallet_hex, coverage_generation FROM activity_groups_v2 WHERE source_trade_id",
-    ) {
+    if sql.starts_with("SELECT wallet_hex FROM activity_groups_v2 WHERE source_trade_id") {
         BULK_PROBE_SQL.lock().unwrap().push(sql.to_owned());
     }
 }
@@ -11477,17 +12654,18 @@ async fn bulk_root_skips_only_identity_probes_and_sealed_successor_keeps_both_an
     .await
     .unwrap();
     let probes = std::mem::take(&mut *BULK_PROBE_SQL.lock().unwrap());
-    assert_eq!(probes.len(), 4, "{probes:?}");
+    // Change 2: one identity probe per fetched aggregate, inside the transaction.
+    assert_eq!(probes.len(), 2, "{probes:?}");
     assert_eq!(receipt(&fixture.side, 2, WALLET).unwrap(), (0, 0, 1));
     assert_eq!(
         generation_rows(&fixture.side, 1),
-        1,
-        "excluded predecessor survives"
+        2,
+        "Decision 4: both predecessor histories keep insertion provenance"
     );
     assert_eq!(
         generation_rows(&fixture.side, 2),
-        2,
-        "other wallet carries and inserts"
+        1,
+        "Decision 4: other wallet inserts only the fetched row"
     );
     assert_eq!(
         count(
@@ -11648,7 +12826,7 @@ async fn two_file_cycles_copy_once_preserve_inodes_and_recover_activation_gap() 
                 assert_eq!(sha256_file(&side).unwrap(), finalized.cache_sha256);
                 assert!(!displaced.exists());
             };
-            let writer = Connection::open(&fixed).unwrap();
+            let writer = scenario_sql_connection(&fixed).unwrap();
             writer.execute_batch("BEGIN IMMEDIATE").unwrap();
             // Its checkpoint, just before the hold, already reports the lock.
             let locked = activate_cache_v2(&request).unwrap_err();
@@ -11657,7 +12835,7 @@ async fn two_file_cycles_copy_once_preserve_inodes_and_recover_activation_gap() 
             drop(writer);
             unchanged();
             let original = std::fs::read(&fixed).unwrap();
-            Connection::open(&fixed)
+            scenario_sql_connection(&fixed)
                 .unwrap()
                 .execute(
                     "UPDATE cache_v2_migration_state
@@ -11667,7 +12845,9 @@ async fn two_file_cycles_copy_once_preserve_inodes_and_recover_activation_gap() 
                 .unwrap();
             let changed = activate_cache_v2(&request).unwrap_err();
             assert!(
-                changed.to_string().contains("frozen/activity/ranker proof"),
+                changed
+                    .to_string()
+                    .contains("differs from recorded staging baseline"),
                 "{changed}"
             );
             std::fs::write(&fixed, original).unwrap();
@@ -11685,7 +12865,7 @@ async fn two_file_cycles_copy_once_preserve_inodes_and_recover_activation_gap() 
         // Later cycles activate and resume with their finalization record
         // proving the candidate's projection digest (#682).
         let record = dir.path().join("final.json");
-        let record = (cycle >= 2).then_some(record.as_path());
+        let record = Some(record.as_path()); // Decision 6: every format-three candidate is export-bound.
         activate_cache_v2_with_handoff(&request, None, record, None).unwrap();
         assert_eq!(mains(), 2);
         assert!(!side.exists());
@@ -11745,6 +12925,7 @@ async fn two_file_restore_preserves_rejected_inode_and_recovers_its_gap() {
         let candidate = dir.path().join("candidate.db");
         let h1 = finalize_fresh_initial(&dir, &candidate).await;
         std::fs::rename(&candidate, &side).unwrap();
+        relocate_fixture_record(&dir, &side);
         let new_inode = side.metadata().unwrap().ino();
         let request = CacheActivationRequest {
             fixed_path: fixed.clone(),
@@ -11900,6 +13081,7 @@ async fn legacy_prior_cycle_stages_activates_and_restores_with_original_request_
     let candidate = dir.path().join("candidate.db");
     let h1 = finalize_fresh_initial(&dir, &candidate).await;
     std::fs::rename(candidate, &side).unwrap();
+    relocate_fixture_record(&dir, &side);
     assert!(
         stage_cache_cycle_v2(&fixed, &prior, &side, None, None)
             .unwrap()
@@ -11957,6 +13139,12 @@ async fn quiet_wallet_weekly_deferral_recovery_and_topups() {
         "weekly.db",
         &[WALLET_B, WALLET_C, WALLET_D, &passive, &empty],
     );
+    history_v3_freeze_legacy_root_at(
+        &side,
+        &[WALLET, WALLET_B, WALLET_C, WALLET_D, &passive, &empty],
+        1,
+        weekly_instant_after(WALLET, FRESH_END) - 100,
+    );
     let instant = weekly_instant_after(WALLET, FRESH_END);
     let root_end = instant - 100;
     let old = root_end - 2_592_001;
@@ -12002,7 +13190,8 @@ async fn quiet_wallet_weekly_deferral_recovery_and_topups() {
     )
     .await
     .unwrap();
-    assert_eq!(fresh_record(&side)["version"], 3);
+    // Decision 9: the successor transitions to history format three.
+    assert_eq!(fresh_record(&side)["version"], 4);
     assert_eq!(
         fresh_record(&side)["deferred_wallets"],
         serde_json::json!([])
@@ -12019,6 +13208,8 @@ async fn quiet_wallet_weekly_deferral_recovery_and_topups() {
             .unwrap()
             .contains(&(WALLET_D.to_owned(), 1, instant - 90))
     );
+    dataset_payouts(&side, &source.rows).await;
+    finalize_cache_v2(&side, None, instant - 89).unwrap();
     let retained = query_values(
         &side,
         &format!("SELECT * FROM activity_groups_v2 WHERE wallet_hex = '{WALLET}'"),
@@ -12305,12 +13496,14 @@ async fn quiet_wallet_deferral_rejects_forged_evidence() {
         )
         .await
         .unwrap();
+        dataset_payouts(&side, &source.rows).await;
+        finalize_cache_v2(&side, None, end + 1).unwrap();
     }
     let originals = query_values(
         &side,
         "SELECT wallet_hex, page_evidence_json, acquisition_json FROM activity_wallet_coverage_staging_v2 WHERE generation = 3 ORDER BY wallet_hex",
     );
-    let conn = Connection::open(&side).unwrap();
+    let conn = scenario_sql_connection(&side).unwrap();
     for (sql, reason) in [
         (
             format!(
@@ -12330,12 +13523,6 @@ async fn quiet_wallet_deferral_rejects_forged_evidence() {
             ),
             "deferral",
         ),
-        (
-            format!(
-                "UPDATE activity_groups_v2 SET coverage_generation = 3 WHERE wallet_hex = '{WALLET}'"
-            ),
-            "aggregate",
-        ),
     ] {
         conn.execute(&sql, []).unwrap();
         let no_reads = DatasetFetcher::default();
@@ -12349,7 +13536,13 @@ async fn quiet_wallet_deferral_rejects_forged_evidence() {
         )
         .await
         .unwrap_err();
-        assert!(error.to_string().contains(reason), "{error}");
+        // Decision 6: sealed receipts authenticate the record before detailed replay.
+        assert!(
+            error
+                .to_string()
+                .contains("historical receipt-set commitment mismatch"),
+            "{reason}: {error}"
+        );
         assert!(no_reads.calls.lock().unwrap().is_empty());
         for row in &originals {
             conn.execute("UPDATE activity_wallet_coverage_staging_v2 SET page_evidence_json = ?2, acquisition_json = ?3 WHERE generation = 3 AND wallet_hex = ?1", rusqlite::params_from_iter(row)).unwrap();
@@ -12368,6 +13561,7 @@ async fn quiet_wallet_deferral_rejects_forged_evidence() {
 async fn incremental_interrupted_v2_resume_preserves_identity_and_receipts() {
     let dir = TempDir::new().unwrap();
     let side = dataset_candidate(&dir, "v2-resume.db", &[]);
+    history_v3_freeze_legacy_root(&side, &[WALLET]);
     let source = DatasetFetcher {
         rows: vec![dataset_row(WALLET, "0xbase", "base", "BUY", FRESH_END)],
         ..Default::default()
@@ -12382,7 +13576,7 @@ async fn incremental_interrupted_v2_resume_preserves_identity_and_receipts() {
     )
     .await
     .unwrap();
-    let conn = Connection::open(&side).unwrap();
+    let conn = scenario_sql_connection(&side).unwrap();
     conn.execute("DELETE FROM activity_coverage_manifests_v2", [])
         .unwrap();
     let identity = fresh_record(&side);
@@ -12419,6 +13613,8 @@ async fn incremental_interrupted_v2_resume_preserves_identity_and_receipts() {
         "deferred_wallets",
         "quiet_after_secs",
         "repoll_period_secs",
+        "repair_wallets",
+        "certified_digest",
         "digest",
     ] {
         identity.as_object_mut().unwrap().remove(key);
@@ -12440,6 +13636,29 @@ async fn incremental_interrupted_v2_resume_preserves_identity_and_receipts() {
         [],
     )
     .unwrap();
+    // Decision 9: rebuild the historical acquisition-two receipt before resuming it.
+    conn.execute("UPDATE activity_wallet_coverage_staging_v2 SET acquisition_json = json_set(acquisition_json, '$.version', 2) WHERE generation = 2", []).unwrap();
+    // Decision 4: historical acquisition 2 commits carried plus fetched history and restamps it.
+    conn.execute("UPDATE activity_groups_v2 SET coverage_generation = 2", [])
+        .unwrap();
+    conn.execute("UPDATE activity_wallet_coverage_staging_v2 SET ordered_aggregate_digest =
+        (SELECT ordered_aggregate_digest FROM activity_wallet_coverage_staging_v2 WHERE generation = 1),
+        aggregate_count = 1, source_row_count = 1 WHERE generation = 2", []).unwrap();
+    conn.execute_batch("DROP TABLE IF EXISTS activity_wallet_history_v3")
+        .unwrap();
+    let triggers: Vec<String> = conn
+        .prepare(
+            "SELECT name FROM sqlite_schema WHERE type = 'trigger' AND name LIKE 'pe_history_%'",
+        )
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    for trigger in triggers {
+        conn.execute_batch(&format!("DROP TRIGGER {trigger}"))
+            .unwrap();
+    }
     let proofs = stored_receipt_proofs(&conn, 2);
     populate_activity_fresh_v2(
         &side,
@@ -12464,7 +13683,8 @@ async fn incremental_interrupted_v2_resume_preserves_identity_and_receipts() {
     )
     .await
     .unwrap();
-    assert_eq!(fresh_record(&side)["version"], 3);
+    // Decision 9: the resumed historical head admits an identity-four successor.
+    assert_eq!(fresh_record(&side)["version"], 4);
     let archive: String = conn
         .query_row(
             "SELECT collection_identity_json FROM activity_coverage_manifests_v2 WHERE generation = 2",
@@ -12637,13 +13857,7 @@ fn publication_dataset(now: i64, quiet: &str) -> (Vec<Value>, Vec<Value>, Public
             "tokens":[{"token_id":token,"outcome":"Yes","price":"1","winner":true},
             {"token_id":(1001 + 2 * index).to_string(),"outcome":"No","price":"0","winner":false}]}));
     }
-    let mut fresh = dataset_row(
-        WALLET,
-        "0xfreshunresolved",
-        "fresh-unprojected",
-        "BUY",
-        now - 3600,
-    );
+    let mut fresh = dataset_row(WALLET, "0xff", "fresh-unprojected", "BUY", now - 3600);
     fresh["asset"] = Value::from("9000");
     rows.push(fresh);
     (rows, markets, points)
@@ -12714,6 +13928,8 @@ async fn quiet_wallet_deferral_preserves_exact_publication_entries() {
         .await
         .unwrap();
     }
+    publication_payouts(&deferred, &markets, now - 89);
+    finalize_cache_v2(&deferred, None, now - 89).unwrap();
     let control = dir.path().join("control.db");
     std::fs::copy(&deferred, &control).unwrap();
     source.calls.lock().unwrap().clear();
@@ -12801,11 +14017,47 @@ async fn quiet_wallet_deferral_preserves_exact_publication_entries() {
         String::from_utf8_lossy(&bridge.stderr)
     );
 }
-// PASS: two real zero-argument wrapper cycles activate, publish and clear both pointers;
-// the successor defers a quiet wallet without a request, export row or batch entry.
-// FAIL: either cycle fails, bypasses the real scripts, or admits deferred history.
+// PASS: real transition and bulk-root publications carry the AC8 mapping, raw-only and scoped-drop cases;
+// the successor defers quiet history and a token_conditions edit changes no published scope.
+// FAIL: a wallet is excluded for the accepted defects, a dropped market scores, or raw-only BUYs consume.
 #[tokio::test]
 async fn real_wrapper_two_cycles_publish_and_defer_quiet_wallet() {
+    real_wrapper_publications(PublicationScenario::Transition).await;
+    real_wrapper_publications(PublicationScenario::BulkRoot).await;
+}
+
+// PASS: the frozen identity-two root resumes and seals, then the real cycle admits identity four
+// before classifier-six finalization and publishes only that successor through the v2 RPC.
+// FAIL: format two is finalized, acquisitions are relaxed before transition, or publication is bypassed.
+#[tokio::test]
+async fn real_wrapper_unfinished_format_two_root_publishes_only_its_successor() {
+    real_wrapper_publications(PublicationScenario::LegacyRoot).await;
+}
+
+// PASS: installed history damage after retirement fails the pass; explicit repair publishes.
+// Post-pass certificate/receipt damage refuses re-finalize; abandonment/restaging publishes the successor.
+// Deleting a drop trigger after retirement keeps its original scope and second through publication.
+// FAIL: damage is hidden, recovery relies on the retired backup/spool, or a scope reopens.
+#[tokio::test]
+async fn real_wrapper_repair_and_record_recovery_publish_after_backup_retirement() {
+    real_wrapper_publications(PublicationScenario::Recovery).await;
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PublicationScenario {
+    Transition,
+    BulkRoot,
+    LegacyRoot,
+    Recovery,
+}
+
+async fn real_wrapper_publications(scenario: PublicationScenario) {
+    let bulk_root = matches!(
+        scenario,
+        PublicationScenario::BulkRoot | PublicationScenario::LegacyRoot
+    );
+    let legacy_root = scenario == PublicationScenario::LegacyRoot;
+    let recovery = scenario == PublicationScenario::Recovery;
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
     use std::sync::atomic::AtomicBool;
@@ -12815,7 +14067,20 @@ async fn real_wrapper_two_cycles_publish_and_defer_quiet_wallet() {
         "22".repeat(14),
         (-(now + 3 * 86_400)).rem_euclid(604_800)
     );
-    let (rows, markets, points) = publication_dataset(now, &quiet);
+    let (mut rows, mut markets, mut points) = publication_dataset(now, &quiet);
+    let mut conversion = dataset_row(WALLET, "0xe", "wrapper-conversion", "BUY", now - 220);
+    conversion["type"] = Value::from("CONVERSION");
+    conversion["asset"] = Value::from("8000");
+    let mut marketless = dataset_row(WALLET, "0xfa", "wrapper-marketless", "BUY", now - 220);
+    marketless["type"] = Value::from("SPLIT");
+    marketless["asset"] = Value::from("");
+    marketless.as_object_mut().unwrap().remove("conditionId");
+    rows.extend([conversion, marketless]);
+    markets.push(serde_json::json!({"condition_id":"0xfa","closed":true,"neg_risk":true,
+        "neg_risk_market_id":"0xe","end_date_iso":time::OffsetDateTime::from_unix_timestamp(now + 3600)
+            .unwrap().format(&time::format_description::well_known::Rfc3339).unwrap(),
+        "tokens":[{"token_id":"8000","outcome":"Yes","price":"1","winner":true},
+                  {"token_id":"8001","outcome":"No","price":"0","winner":false}]}));
     let dir = tempfile::Builder::new()
         .prefix("pe-real-weekly-")
         .tempdir_in(std::env::current_dir().unwrap())
@@ -12829,29 +14094,127 @@ async fn real_wrapper_two_cycles_publish_and_defer_quiet_wallet() {
         .unwrap();
     cache.conn_for_test_set_active(&quiet, 1);
     drop(cache);
-    let build = write_build_manifest(&dir, &fixed);
-    let mut manifest: CacheV2BuildManifest =
-        serde_json::from_slice(&std::fs::read(&build).unwrap()).unwrap();
-    manifest.source_bounds = serde_json::json!({"activity_end":now - 300});
-    manifest.sealed_at_unix = now - 299;
-    std::fs::write(&build, serde_json::to_vec(&manifest).unwrap()).unwrap();
-    migrate_cache_v2(&fixed, &build).unwrap();
-    populate_activity_fresh_v2(
-        &fixed,
-        &DatasetFetcher {
-            rows: rows.clone(),
-            ..Default::default()
-        },
-        "https://data.example",
-        1,
-        now - 240,
-        now - 239,
-    )
-    .await
-    .unwrap();
-    publication_payouts(&fixed, &markets, now - 239);
-    finalize_cache_v2(&fixed, None, now - 238).unwrap();
-    assert_eq!(count(&fixed, "SELECT COUNT(*) FROM ranker_entries_v2"), 40);
+    if !bulk_root {
+        let build = write_build_manifest(&dir, &fixed);
+        let mut manifest: CacheV2BuildManifest =
+            serde_json::from_slice(&std::fs::read(&build).unwrap()).unwrap();
+        manifest.source_bounds = serde_json::json!({"activity_end":now - 300});
+        manifest.sealed_at_unix = now - 299;
+        std::fs::write(&build, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        migrate_cache_v2(&fixed, &build).unwrap();
+        // AC5 / Change 2: a historical format-two head transitions in the first real cycle.
+        history_v3_freeze_legacy_root_at(&fixed, &[WALLET, &quiet], 1, now - 240);
+        populate_activity_fresh_v2(
+            &fixed,
+            &DatasetFetcher {
+                rows: rows.clone(),
+                ..Default::default()
+            },
+            "https://data.example",
+            1,
+            now - 240,
+            now - 239,
+        )
+        .await
+        .unwrap();
+        publication_payouts(&fixed, &markets, now - 239);
+        seed_historical_format_two(&fixed, 3, now - 238);
+        assert_eq!(fresh_record(&fixed)["version"], 2);
+        assert_eq!(
+            count(
+                &fixed,
+                "SELECT COUNT(*) FROM cache_v2_migration_state WHERE ranker_classifier_version = 3"
+            ),
+            1
+        );
+        assert!(finalize_cache_v2_unbound(&fixed, None, now - 237).is_ok());
+        assert_eq!(classifier_projection_rows(&fixed).len(), 40);
+    }
+    // AC8 / Decision 1: these defects are acquired only under acquisition three, beside valid BUYs.
+    let scoped_row = |market: &str, token: &str, id: &str, epoch: i64| {
+        let mut row = dataset_row(WALLET, market, id, "BUY", epoch);
+        row["asset"] = Value::from(token);
+        row
+    };
+    for (kind, market, token, epoch) in [
+        ("SPLIT", "0xfc", "8200", now - 218),
+        ("MERGE", "0xfd", "8300", now - 216),
+    ] {
+        let mut mapped = scoped_row(market, token, &format!("mapped-{kind}"), epoch);
+        mapped["type"] = Value::from(kind);
+        mapped.as_object_mut().unwrap().remove("conditionId");
+        let mut ignored = mapped.clone();
+        ignored["transactionHash"] = Value::from(format!("ignored-{kind}"));
+        ignored.as_object_mut().unwrap().remove("asset");
+        ignored["timestamp"] = Value::from(epoch + 1);
+        rows.extend([
+            mapped,
+            scoped_row("0xfe", "8400", &format!("beside-mapped-{kind}"), epoch),
+            ignored,
+            scoped_row(
+                if kind == "SPLIT" { "0xf1" } else { "0xf2" },
+                if kind == "SPLIT" { "8500" } else { "8600" },
+                &format!("beside-ignored-{kind}"),
+                epoch + 1,
+            ),
+        ]);
+    }
+    rows.extend([
+        scoped_row("\\xfb", "8100", "hex-trade", now - 210),
+        scoped_row("0xfb", "8100", "canonical-after-hex", now - 209),
+    ]);
+    for (market, token, second, same_second) in [
+        ("0xf3", "8700", now - 204, false),
+        ("0xf4", "8800", now - 202, true),
+    ] {
+        let mut tokenless = scoped_row(
+            market,
+            token,
+            &format!("tokenless-{market}"),
+            second - i64::from(!same_second),
+        );
+        tokenless.as_object_mut().unwrap().remove("asset");
+        tokenless["outcomeIndex"] = Value::from("1");
+        rows.extend([
+            tokenless,
+            scoped_row(market, token, &format!("bound-{market}"), second),
+        ]);
+    }
+    for (market, token, epoch) in [
+        ("0xfb", 8100, now - 210),
+        ("0xfc", 8200, now - 218),
+        ("0xfd", 8300, now - 216),
+        ("0xfe", 8400, now - 218),
+        ("0xf1", 8500, now - 217),
+        ("0xf2", 8600, now - 215),
+        ("0xf3", 8700, now - 204),
+        ("0xf4", 8800, now - 202),
+    ] {
+        markets.push(serde_json::json!({"condition_id":market,"closed":true,"neg_risk":false,"is_50_50_outcome":false,
+            "end_date_iso":time::OffsetDateTime::from_unix_timestamp(epoch + 7200).unwrap()
+                .format(&time::format_description::well_known::Rfc3339).unwrap(),
+            "tokens":[{"token_id":token.to_string(),"outcome":"Yes","price":"1","winner":true},
+                {"token_id":(token + 1).to_string(),"outcome":"No","price":"0","winner":false}]}));
+        points.push((token.to_string(), epoch + 2, "0.55".to_owned()));
+    }
+    if bulk_root && !legacy_root {
+        // AC5: a raw-only market-less SPLIT beside a valid BUY reaches the new root's pass.
+        let buy = rows
+            .iter()
+            .find(|row| {
+                row["proxyWallet"] == WALLET && row["type"] == "TRADE" && row["side"] == "BUY"
+            })
+            .unwrap();
+        let mut ignored = buy.clone();
+        ignored["type"] = Value::from("SPLIT");
+        ignored["transactionHash"] = Value::from("root-marketless-beside-buy");
+        ignored["asset"] = Value::from("");
+        ignored.as_object_mut().unwrap().remove("conditionId");
+        rows.push(ignored);
+    }
+    let fixture_markets = markets.clone();
+    let activity_rows = Arc::new(Mutex::new(rows));
+    let server_rows = Arc::clone(&activity_rows);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let address = listener.local_addr().unwrap();
@@ -12912,7 +14275,9 @@ async fn real_wrapper_two_cycles_publish_and_defer_quiet_wallet() {
                     let start = query["start"].parse::<i64>().unwrap();
                     let end = query["end"].parse::<i64>().unwrap();
                     let offset = query["offset"].parse::<usize>().unwrap();
-                    let mut selected = rows
+                    let mut selected = server_rows
+                        .lock()
+                        .unwrap()
                         .iter()
                         .filter(|row| {
                             row["proxyWallet"] == query["user"]
@@ -12950,7 +14315,7 @@ async fn real_wrapper_two_cycles_publish_and_defer_quiet_wallet() {
                         .collect::<Vec<_>>();
                     ("200 OK", serde_json::json!({"history":history}))
                 }
-                "/rest/v1/rpc/publish_ranking_batch" => {
+                "/rest/v1/rpc/publish_ranking_batch_v2" => {
                     let payload: Value =
                         serde_json::from_slice(&request[header_end..header_end + content_length])
                             .unwrap();
@@ -13014,7 +14379,7 @@ async fn real_wrapper_two_cycles_publish_and_defer_quiet_wallet() {
     )
     .unwrap();
     std::fs::write(dir.path().join(".env"), format!(
-        "SUPABASE_URL=http://{address}\nSUPABASE_SECRET_KEY=fixture-key\nPE_POLYMARKET_BASE_URL=http://{address}\nPE_CLOB_BASE_URL=http://{address}\nPE_GAMMA_BASE_URL=http://{address}\nPE_BOOTSTRAP_LEADERBOARD_BASE_URL=http://{address}\nPE_BOOTSTRAP_LEADERBOARD_CATEGORIES='[\"OVERALL\"]'\nPE_BOOTSTRAP_LEADERBOARD_REQUEST_INTERVAL_MS=0\nPE_BOOTSTRAP_DATADASH_API_URL=\nPE_BOOTSTRAP_PRICES_HISTORY_MIN_INTERVAL_MS=0\nPE_BOOTSTRAP_OUTPUT={}\nPE_RANKER_ENGINE=duck\n",
+        "SUPABASE_URL=http://{address}\nSUPABASE_SECRET_KEY=fixture-key\nPE_POLYMARKET_BASE_URL=http://{address}\nPE_CLOB_BASE_URL=http://{address}\nPE_GAMMA_BASE_URL=http://{address}\nPE_BOOTSTRAP_LEADERBOARD_BASE_URL=http://{address}\nPE_BOOTSTRAP_LEADERBOARD_CATEGORIES='[\"OVERALL\"]'\nPE_BOOTSTRAP_LEADERBOARD_REQUEST_INTERVAL_MS=0\nPE_BOOTSTRAP_DATADASH_API_URL=\nPE_BOOTSTRAP_PRICES_HISTORY_MIN_INTERVAL_MS=0\nPE_BOOTSTRAP_OUTPUT={}\nPE_RANK_SCHEMA_TWO_CUTOVER=1\nPE_RANKER_ENGINE=duck\n",
         dir.path().join("watchlist.json").display())).unwrap();
     let python = Command::new("python3")
         .args(["-c", "import sys; print(sys.executable)"])
@@ -13022,11 +14387,256 @@ async fn real_wrapper_two_cycles_publish_and_defer_quiet_wallet() {
         .unwrap();
     assert!(python.status.success());
     let python = String::from_utf8(python.stdout).unwrap();
+    let run_wrapper = || {
+        Command::new("bash").args(["-c", "exec 9<>data/eval-results/.rank_and_push_loop.lock; flock -n 9; printf '%s\\n' \"$$\" > data/eval-results/.rank_and_push_loop.lock; exec bash scripts/rank_and_push.sh"])
+            .current_dir(dir.path()).env("PE_PYTHON", python.trim()).env("RUST_LOG", "info").env_remove("PYTHONPATH").output().unwrap()
+    };
+    let prepare_cycle = |cycle: i64| {
+        let stamp = time::OffsetDateTime::from_unix_timestamp(now + cycle)
+            .unwrap()
+            .format(
+                &time::format_description::parse("[year][month][day]T[hour][minute][second]Z")
+                    .unwrap(),
+            )
+            .unwrap();
+        let name = format!("cron-{stamp}");
+        let out = data.join("eval-results").join(&name);
+        std::fs::create_dir_all(&out).unwrap();
+        for (file, value) in [
+            (
+                "cycle_configuration.json",
+                serde_json::json!({"cache_lane":"fresh_v2"}),
+            ),
+            (
+                "cycle_manifest.json",
+                serde_json::json!({"version":1,"configuration":{"cache_lane":"fresh_v2"}}),
+            ),
+        ] {
+            std::fs::write(out.join(file), serde_json::to_vec(&value).unwrap()).unwrap();
+        }
+        let side = data.join(format!("wallet_cache.{name}.side.db"));
+        let prior = data.join(format!("wallet_cache.{name}.prior.db"));
+        let build = out.join("cache_build_manifest.json");
+        let report = pe_bootstrap::cache_migration::stage_cache_cycle_v2(
+            &fixed,
+            &prior,
+            &side,
+            Some(&build),
+            None,
+        )
+        .unwrap();
+        std::fs::write(
+            out.join("cache_stage.json"),
+            serde_json::to_vec(&report).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            data.join("eval-results/rank_and_push.cycle"),
+            format!("data/eval-results/{name}\n"),
+        )
+        .unwrap();
+        (out, side, prior, build)
+    };
+    let abandon_candidate = |out: &std::path::Path, side: &std::path::Path, error: &str| {
+        // The fixture process has exited and releases the same lock used by restaging.
+        let _lock = pe_bootstrap::lock::CacheMutationLock::acquire(&fixed).unwrap();
+        assert!(!data.join("eval-results/rank_and_push.pending").exists());
+        assert!(!out.join("ranking_publish_request.json").exists());
+        std::fs::write(out.join("failure-evidence.txt"), error).unwrap();
+        std::fs::remove_file(data.join("eval-results/rank_and_push.cycle")).unwrap();
+        for path in [
+            side.to_owned(),
+            pe_bootstrap::cache_migration::cache_stage_evidence_path(side),
+            std::path::PathBuf::from(format!("{}.projection-v3.jsonl", side.display())),
+        ] {
+            if path.exists() {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+        let prefix = format!(
+            ".{}.projection-v3.jsonl.",
+            side.file_name().unwrap().to_str().unwrap()
+        );
+        for entry in std::fs::read_dir(&data).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            let name = name.to_str().unwrap();
+            if name.starts_with(&prefix) && name.ends_with(".tmp") {
+                std::fs::remove_file(entry.path()).unwrap();
+            }
+        }
+        assert!(!side.exists());
+    };
+    if legacy_root {
+        let (out, side, _, build) = prepare_cycle(0);
+        migrate_cache_v2(&side, &build).unwrap();
+        history_v3_freeze_legacy_root_at(&side, &[WALLET, &quiet], 1, now - 240);
+        Connection::open(&side)
+            .unwrap()
+            .execute_batch(
+                "DROP INDEX idx_activity_groups_v2_source_trade_id; PRAGMA user_version = -2",
+            )
+            .unwrap();
+        pe_bootstrap::cache_migration::populate_activity_bulk_root_v2_with_clock(
+            &collection_config(&side),
+            &fixed,
+            None,
+            &HistoryV3StopFetcher,
+            "https://data.example",
+            || Ok(now - 240),
+            now - 239,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(fresh_record(&side)["version"], 2);
+        assert_eq!(count(&side, "PRAGMA user_version"), -2);
+        assert!(out.join("cache_stage.json").exists());
+    }
     let mut cycles = Vec::new();
-    for cycle in 0..2 {
+    let total_cycles = if recovery {
+        6
+    } else if bulk_root {
+        1
+    } else {
+        2
+    };
+    for cycle in 0..total_cycles {
+        if recovery && cycle > 0 {
+            let cycle_end = time::OffsetDateTime::now_utc().unix_timestamp() - 120;
+            // Previous successful publication already retired its displaced backup and spool.
+            assert!(!data.read_dir().unwrap().any(|entry| {
+                let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+                name.ends_with(".displaced.db") || name.ends_with(".projection-v3.jsonl")
+            }));
+            if cycle == 2 {
+                history_v3_damage_connection(&fixed).execute(
+                    "UPDATE activity_groups_v2 SET share_amount_str = '10.000001' WHERE transaction_hash = ?1",
+                    [format!("{WALLET}-entry-0")],
+                ).unwrap();
+                let failed = run_wrapper();
+                assert!(!failed.status.success());
+                let error = String::from_utf8(failed.stderr).unwrap();
+                assert!(error.contains("activity history chain mismatch"), "{error}");
+                assert!(error.contains(WALLET), "{error}");
+                assert_eq!(batches.lock().unwrap().len(), 2);
+                let relative =
+                    std::fs::read_to_string(data.join("eval-results/rank_and_push.cycle")).unwrap();
+                let out = dir.path().join(relative.trim());
+                let side = data.join(format!(
+                    "wallet_cache.{}.side.db",
+                    out.file_name().unwrap().to_str().unwrap()
+                ));
+                abandon_candidate(&out, &side, &error);
+            }
+            let (out, side, _, _) = prepare_cycle(i64::from(cycle) + 30);
+            let source = DatasetFetcher {
+                rows: activity_rows.lock().unwrap().clone(),
+                ..Default::default()
+            };
+            if cycle == 1 || cycle == 3 || cycle == 4 {
+                history_v3_collect(
+                    &side,
+                    &source,
+                    u64::try_from(cycle + 2).unwrap(),
+                    cycle_end,
+                    &[],
+                )
+                .await
+                .unwrap();
+                publication_payouts(&side, &fixture_markets, now);
+                if cycle != 1 {
+                    finalize_cache_v2_unbound(&side, None, now).unwrap();
+                }
+                let connection = history_v3_damage_connection(&side);
+                if cycle == 1 {
+                    connection.execute("UPDATE activity_groups_v2 SET share_amount_str = '10.000001' WHERE transaction_hash = ?1", [format!("{WALLET}-entry-0")]).unwrap();
+                } else if cycle == 3 {
+                    connection.execute("UPDATE activity_wallet_history_v3 SET newest_source_unix = newest_source_unix - 1, newest_trade_unix = newest_trade_unix - 1 WHERE wallet_hex = ?1", [WALLET]).unwrap();
+                } else {
+                    connection.execute("UPDATE activity_wallet_coverage_staging_v2 SET ordered_aggregate_digest = ?1 WHERE generation = ?2 AND wallet_hex = ?3", params!["0".repeat(64), cycle + 2, WALLET]).unwrap();
+                }
+                drop(connection);
+                let error = finalize_cache_v2_unbound(&side, None, now + 1)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    error.contains(if cycle == 1 {
+                        "activity history chain mismatch"
+                    } else if cycle == 3 {
+                        "activity_wallet_history_v3 certificate digest mismatch"
+                    } else {
+                        "historical receipt-set commitment mismatch"
+                    }),
+                    "{error}"
+                );
+                assert_eq!(
+                    batches.lock().unwrap().len(),
+                    usize::try_from(cycle).unwrap()
+                );
+                abandon_candidate(&out, &side, &error);
+                let prior = data.join(format!(
+                    "wallet_cache.{}.prior.db",
+                    out.file_name().unwrap().to_str().unwrap()
+                ));
+                let report = pe_bootstrap::cache_migration::stage_cache_cycle_v2(
+                    &fixed, &prior, &side, None, None,
+                )
+                .unwrap();
+                std::fs::write(
+                    out.join("cache_stage.json"),
+                    serde_json::to_vec(&report).unwrap(),
+                )
+                .unwrap();
+                std::fs::write(
+                    data.join("eval-results/rank_and_push.cycle"),
+                    format!(
+                        "data/eval-results/{}\n",
+                        out.file_name().unwrap().to_str().unwrap()
+                    ),
+                )
+                .unwrap();
+            }
+            if cycle == 1 || cycle == 2 || cycle == 5 {
+                if cycle == 5 {
+                    activity_rows.lock().unwrap().retain(|row| {
+                        !matches!(
+                            row["transactionHash"].as_str(),
+                            Some(
+                                "wrapper-conversion"
+                                    | "hex-trade"
+                                    | "mapped-SPLIT"
+                                    | "mapped-MERGE"
+                            )
+                        )
+                    });
+                }
+                let source = DatasetFetcher {
+                    rows: activity_rows.lock().unwrap().clone(),
+                    ..Default::default()
+                };
+                history_v3_collect(
+                    &side,
+                    &source,
+                    u64::try_from(cycle + 2).unwrap(),
+                    cycle_end,
+                    &[WALLET.to_owned()],
+                )
+                .await
+                .unwrap();
+                if cycle == 5 {
+                    assert_eq!(
+                        count(
+                            &side,
+                            "SELECT COUNT(*) FROM activity_groups_v2 WHERE transaction_hash IN ('wrapper-conversion','hex-trade','mapped-SPLIT','mapped-MERGE')"
+                        ),
+                        0
+                    );
+                }
+            }
+        }
         let before = requests.lock().unwrap().len();
-        let output = Command::new("bash").args(["-c", "exec 9<>data/eval-results/.rank_and_push_loop.lock; flock -n 9; printf '%s\\n' \"$$\" > data/eval-results/.rank_and_push_loop.lock; exec bash scripts/rank_and_push.sh"])
-            .current_dir(dir.path()).env("PE_PYTHON", python.trim()).env("RUST_LOG", "info").env_remove("PYTHONPATH").output().unwrap();
+        let output = run_wrapper();
         assert!(
             output.status.success(),
             "real wrapper cycle {cycle}:\nstdout={}\nstderr={}",
@@ -13034,6 +14644,31 @@ async fn real_wrapper_two_cycles_publish_and_defer_quiet_wallet() {
             String::from_utf8_lossy(&output.stderr)
         );
         let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            stderr.contains("classifier 6 verified pass finalized"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("ignored_by_activity_type"), "{stderr}");
+        assert!(stderr.contains("drops_by_cause"), "{stderr}");
+        let reports: Vec<Value> = stdout
+            .lines()
+            .chain(stderr.lines())
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|log| log["fields"]["message"] == "classifier 6 verified pass finalized")
+            .map(|log| serde_json::from_str(log["fields"]["report"].as_str().unwrap()).unwrap())
+            .collect();
+        assert_eq!(reports.len(), 1);
+        assert_eq!(
+            reports[0]["ignored_by_activity_type"]["SPLIT"],
+            if bulk_root && !legacy_root { 3 } else { 2 }
+        );
+        // Decision 1: unmapped SPLIT/MERGE and the noncanonical TRADE drop their resolved markets.
+        assert_eq!(reports[0]["ignored_by_activity_type"]["MERGE"], 1);
+        assert_eq!(reports[0]["ignored_by_activity_type"]["TRADE"], 2);
+        assert_eq!(reports[0]["drops_by_cause"]["unmapped"], 3);
+        assert_eq!(reports[0]["drops_by_cause"]["conversion"], 1);
+        assert_eq!(reports[0]["neg_risk_markets_without_group_id"], 0);
         let run = stdout
             .lines()
             .find_map(|line| line.strip_prefix("RANK_AND_PUSH_RUN_DIR="))
@@ -13045,8 +14680,35 @@ async fn real_wrapper_two_cycles_publish_and_defer_quiet_wallet() {
         assert!(!data.join("eval-results/rank_and_push.pending").exists());
         assert!(!data.join("eval-results/rank_and_push.cycle").exists());
         let identity = fresh_record(&fixed);
-        assert_eq!(identity["generation"], cycle + 2);
-        assert_eq!(identity["version"], 3);
+        assert_eq!(
+            identity["generation"],
+            cycle + if bulk_root && !legacy_root { 1 } else { 2 }
+        );
+        if legacy_root {
+            assert!(stdout.contains("activity-top-up"), "{stdout}");
+            let receipts = stored_receipt_proofs(&Connection::open(&fixed).unwrap(), 1);
+            assert!(
+                receipts
+                    .iter()
+                    .all(|receipt| receipt["acquisition"]["version"] == 2)
+            );
+            assert_eq!(
+                count(
+                    &fixed,
+                    "SELECT COUNT(*) FROM activity_coverage_manifests_v2"
+                ),
+                2
+            );
+            assert_eq!(
+                count(
+                    &fixed,
+                    "SELECT ranker_classifier_version FROM cache_v2_migration_state"
+                ),
+                6
+            );
+        }
+        // Decision 9: each new cycle freezes collection identity 4.
+        assert_eq!(identity["version"], 4);
         let new_requests = requests.lock().unwrap()[before..].to_vec();
         let quiet_requested = new_requests
             .iter()
@@ -13056,7 +14718,8 @@ async fn real_wrapper_two_cycles_publish_and_defer_quiet_wallet() {
         } else {
             assert!(!quiet_requested, "{new_requests:?}");
             assert_eq!(identity["deferred_wallets"], serde_json::json!([quiet]));
-            let proofs = stored_receipt_proofs(&Connection::open(&fixed).unwrap(), 3);
+            let proofs =
+                stored_receipt_proofs(&Connection::open(&fixed).unwrap(), i64::from(cycle + 2));
             let deferred = proofs
                 .iter()
                 .find(|proof| proof["wallet_hex"] == quiet)
@@ -13066,13 +14729,19 @@ async fn real_wrapper_two_cycles_publish_and_defer_quiet_wallet() {
                 "dormant_deferred"
             );
             assert_eq!(deferred["pages"], serde_json::json!([]));
-            assert!(
-                !projected_entries(&fixed)
-                    .iter()
-                    .any(|(wallet, _, _)| wallet == &quiet)
+            // Change 4: only certificates at the finalized head supply publication inputs.
+            assert_eq!(
+                count(
+                    &fixed,
+                    &format!(
+                        "SELECT COUNT(*) FROM activity_wallet_history_v3 WHERE wallet_hex = '{quiet}' AND generation = {}",
+                        cycle + 2
+                    )
+                ),
+                0
             );
             let exported = Command::new("python3").args(["-c", "import duckdb,sys; rows=duckdb.connect().execute('SELECT DISTINCT wallet_hex FROM read_parquet(?)', [sys.argv[1]]).fetchall(); assert rows == [(sys.argv[2],)], rows"])
-                .arg(data.join("parquet/activity_groups_v2.parquet")).arg(WALLET).output().unwrap();
+                .arg(data.join("parquet/projection.parquet")).arg(WALLET).output().unwrap();
             assert!(
                 exported.status.success(),
                 "{}",
@@ -13083,11 +14752,2694 @@ async fn real_wrapper_two_cycles_publish_and_defer_quiet_wallet() {
         assert_eq!(batch["p_entries"].as_array().unwrap().len(), 1);
         assert_eq!(batch["p_entries"][0]["wallet_hex"], WALLET);
         assert_eq!(batch["p_entries"][0]["survives"], true);
-        assert_eq!(batch["p_entries"][0]["last_trade_unix"], now - 3600);
+        assert_eq!(batch["p_batch"]["classifier_version"], 6);
+        let saved: Value = serde_json::from_slice(
+            &std::fs::read(out.join("ranking_publish_request.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            batch["p_entries"][0]["history_through_unix"],
+            identity["fixed_end_unix"]
+        );
+        let expected_drops = serde_json::json!([
+            {"scope_kind":"event","scope_id":"0xe","dropped_at_unix":now - 220,"cause":"conversion"},
+            {"scope_kind":"market","scope_id":"0xfb","dropped_at_unix":now - 210,"cause":"unmapped"},
+            {"scope_kind":"market","scope_id":"0xfc","dropped_at_unix":now - 218,"cause":"unmapped"},
+            {"scope_kind":"market","scope_id":"0xfd","dropped_at_unix":now - 216,"cause":"unmapped"}
+        ]);
+        assert_eq!(saved["entries"][0]["scope_drops"], expected_drops);
+        let flattened: Vec<Value> = expected_drops
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|drop| {
+                let mut drop = drop.clone();
+                drop["wallet_hex"] = Value::from(WALLET);
+                drop
+            })
+            .collect();
+        assert_eq!(batch["p_scope_drops"], Value::from(flattened));
+        if cycle > 0 {
+            // AC8: changing the mutable token_conditions map changes no published scope.
+            assert_eq!(
+                batch["p_scope_drops"],
+                batches.lock().unwrap()[0]["p_scope_drops"]
+            );
+        }
+        let projection = Command::new("python3").args(["-c", "import duckdb,json,sys; c=duckdb.connect(); r=c.execute('SELECT condition_id, source_time_unix, outcome_id FROM read_parquet(?)', [sys.argv[1]]); print(json.dumps([dict(zip([d[0] for d in r.description], row)) for row in r.fetchall()]))"])
+            .arg(data.join("parquet/projection.parquet")).output().unwrap();
+        assert!(
+            projection.status.success(),
+            "{}",
+            String::from_utf8_lossy(&projection.stderr)
+        );
+        let projected: Vec<Value> = serde_json::from_slice(&projection.stdout).unwrap();
+        for market in ["0xfb", "0xfc", "0xfd", "0xfe"] {
+            assert!(
+                !projected.iter().any(|row| row["condition_id"] == market),
+                "{market}"
+            );
+        }
+        for (market, epoch) in [
+            ("0xf1", now - 217),
+            ("0xf2", now - 215),
+            ("0xf3", now - 204),
+            ("0xf4", now - 202),
+        ] {
+            let entries: Vec<_> = projected
+                .iter()
+                .filter(|row| row["condition_id"] == market)
+                .collect();
+            // Decision 1: an ignored row cannot consume, create a balance, or alter homogeneity.
+            assert_eq!(entries.len(), 1, "{market}: {entries:?}");
+            assert_eq!(entries[0]["source_time_unix"], epoch);
+            assert_eq!(entries[0]["outcome_id"], 0);
+        }
+        // Decisions 4 and 5: the second cycle has no fetched rows for this available
+        // wallet, but its whole checked history still supplies freshness and entries.
+        if cycle == 1 && !recovery {
+            assert_eq!(receipt(&fixed, 3, WALLET), Some((0, 0, 0)));
+        }
+        // Acquisition three records recency from the acquired TRADEs, including the raw-only rows.
+        assert_eq!(batch["p_entries"][0]["last_trade_unix"], now - 202);
+        assert!(
+            !std::path::Path::new(
+                saved["cache_activation"]["prior_cache_backup_path"]
+                    .as_str()
+                    .unwrap()
+            )
+            .exists()
+        );
+        let side_path = saved["cache_activation"]["side_path"].as_str().unwrap();
+        assert!(!std::path::Path::new(&format!("{side_path}.projection-v3.jsonl")).exists());
+        if recovery && cycle == 0 {
+            let retired = std::path::Path::new(
+                saved["cache_activation"]["prior_cache_backup_path"]
+                    .as_str()
+                    .unwrap(),
+            );
+            let side = std::path::Path::new(side_path);
+            let (request, pending) =
+                write_pending_publication(&dir, "retired", side, &fixed, &fixed, retired);
+            let installed_hash = sha256_file(&fixed).unwrap();
+            let error = restore_prior_cache(
+                &fixed,
+                retired,
+                side,
+                &PriorCacheBinding {
+                    sha256: "0".repeat(64),
+                    schema_version: 2,
+                },
+                &request,
+                &pending,
+                &FixedPublicationProbe(true),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains(
+                    "restore is retired after the bound ranking publication was consumed"
+                ),
+                "{error}"
+            );
+            assert_eq!(sha256_file(&fixed).unwrap(), installed_hash);
+            std::fs::remove_file(pending).unwrap();
+        }
+        if cycle == 0 && !bulk_root {
+            let changed = Connection::open(&fixed).unwrap().execute(
+                "UPDATE token_conditions SET condition_id = '0xfa', outcome_index = 1 WHERE token_id IN ('8100','8200','8300')", []
+            ).unwrap();
+            assert_eq!(changed, 3);
+        }
         assert!(!cycles.contains(&out));
         cycles.push(out);
     }
-    assert_eq!(batches.lock().unwrap().len(), 2);
+    assert_eq!(
+        batches.lock().unwrap().len(),
+        usize::try_from(total_cycles).unwrap()
+    );
+    if bulk_root {
+        // AC5 / Decision 4: equal-length mirror damage changes no publication input.
+        let read = || {
+            Command::new("python3").current_dir(&repository).args(["-c",
+            "import sys; sys.path.insert(0, 'scripts'); from test_ranker_duck_parity import certified_publication_history; print(certified_publication_history(sys.argv[1], sys.argv[2], int(sys.argv[3])))"])
+            .arg(&fixed).arg(WALLET).arg(now.to_string()).output().unwrap()
+        };
+        let before = read();
+        assert!(
+            before.status.success(),
+            "{}",
+            String::from_utf8_lossy(&before.stderr)
+        );
+        let connection = history_v3_damage_connection(&fixed);
+        connection.execute("UPDATE activity_groups_v2 SET activity_type = 'OTHER', coverage_generation = 7 WHERE activity_type = 'TRADE'", []).unwrap();
+        drop(connection);
+        let after = read();
+        assert!(
+            after.status.success(),
+            "{}",
+            String::from_utf8_lossy(&after.stderr)
+        );
+        assert_eq!(before.stdout, after.stdout);
+    }
     stopped.store(true, Ordering::SeqCst);
     server.join().unwrap();
+}
+
+// ── #739: format-three history and admission ────────────────────────────────
+
+fn history_v3_freeze_legacy_root(side: &std::path::Path, wallets: &[&str]) {
+    history_v3_freeze_legacy_root_at(side, wallets, 1, FRESH_END);
+}
+fn history_v3_freeze_legacy_root_at(
+    side: &std::path::Path,
+    wallets: &[&str],
+    generation: u64,
+    end: i64,
+) {
+    let mut wallets = wallets
+        .iter()
+        .map(|wallet| (*wallet).to_owned())
+        .collect::<Vec<_>>();
+    wallets.sort();
+    let mut identity = serde_json::json!({
+        "version": 2, "generation": generation, "fixed_end_unix": end,
+        "wallets": wallets, "base_generation": null, "base_manifest_sha256": null,
+        "start_exclusive": 0, "full_read_wallets": wallets,
+    });
+    identity["digest"] = Value::from(format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&identity).unwrap())
+    ));
+    Connection::open(side)
+        .unwrap()
+        .execute(
+            "UPDATE cache_v2_migration_state SET fresh_collection_json = ?1",
+            [identity.to_string()],
+        )
+        .unwrap();
+}
+
+async fn history_v3_collect(
+    side: &std::path::Path,
+    source: &DatasetFetcher,
+    generation: u64,
+    end: i64,
+    repairs: &[String],
+) -> Result<
+    pe_bootstrap::cache_migration::ActivityCoverageManifestV2,
+    pe_bootstrap::error::BootstrapError,
+> {
+    pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
+        &BootstrapConfig {
+            cache_path: side.to_owned(),
+            ..Default::default()
+        },
+        source,
+        "https://data.example",
+        generation,
+        repairs,
+        || Ok(end),
+        end + 1,
+        None,
+    )
+    .await
+}
+
+async fn history_v3_legacy_seed(
+    dir: &TempDir,
+    rows: Vec<Value>,
+) -> (std::path::PathBuf, DatasetFetcher) {
+    let side = dataset_candidate(dir, "history.db", &[]);
+    history_v3_freeze_legacy_root(&side, &[WALLET]);
+    let source = DatasetFetcher {
+        rows,
+        ..Default::default()
+    };
+    history_v3_collect(&side, &source, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    assert_eq!(fresh_record(&side)["version"], 2);
+    (side, source)
+}
+
+// Explicitly registering this function is outside the production guard. These
+// connections model logical damage independently of ordinary-SQL refusal tests.
+fn history_v3_damage_connection(side: &std::path::Path) -> Connection {
+    let connection = Connection::open(side).unwrap();
+    connection
+        .create_scalar_function(
+            "pe_history_write_authorized",
+            0,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8,
+            |_| Ok(true),
+        )
+        .unwrap();
+    connection
+}
+
+fn history_v3_wallet_count(side: &std::path::Path) -> i64 {
+    count(
+        side,
+        &format!("SELECT COUNT(*) FROM activity_groups_v2 WHERE wallet_hex = '{WALLET}'"),
+    )
+}
+
+fn history_v3_bad_row(epoch: i64) -> Value {
+    let mut row = dataset_row(WALLET, "0xa", "bad-price", "BUY", epoch);
+    row["price"] = Value::from("3");
+    row
+}
+
+#[tokio::test]
+async fn history_v3_transition_is_atomic_resumable_and_certifies_empty_complete_wallets() {
+    let dir = TempDir::new().unwrap();
+    let (side, source) = history_v3_legacy_seed(&dir, Vec::new()).await;
+    let before = fresh_record(&side);
+    let config = BootstrapConfig {
+        cache_path: side.clone(),
+        ..Default::default()
+    };
+    let failed = pe_bootstrap::cache_migration::populate_activity_fresh_v2_with_clock(
+        &config,
+        &source,
+        "https://data.example",
+        2,
+        &[],
+        || {
+            Err(pe_bootstrap::error::BootstrapError::Invalid {
+                message: "stop before admission commit".to_owned(),
+            })
+        },
+        FRESH_END + 2,
+        None,
+    )
+    .await
+    .unwrap_err();
+    assert!(failed.to_string().contains("stop before admission commit"));
+    assert_eq!(fresh_record(&side), before);
+    assert_eq!(
+        count(
+            &side,
+            "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'activity_wallet_history_v3'"
+        ),
+        0
+    );
+    let next = history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    let identity = fresh_record(&side);
+    assert_eq!(identity["version"], 4);
+    assert_eq!(identity["repair_wallets"], serde_json::json!([]));
+    assert_eq!(
+        count(
+            &side,
+            "SELECT COUNT(*) FROM activity_wallet_history_v3 WHERE aggregate_count = 0 AND newest_source_unix IS NULL AND newest_trade_unix IS NULL AND scope_drops_json = '[]'"
+        ),
+        1
+    );
+    assert_eq!(next.group_count, 0);
+    source.calls.lock().unwrap().clear();
+    assert_eq!(
+        history_v3_collect(&side, &source, 2, FRESH_END + 99, &[])
+            .await
+            .unwrap(),
+        next
+    );
+    assert_eq!(fresh_record(&side), identity);
+    assert!(source.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn history_v3_incremental_history_keeps_insertion_provenance_and_fetched_receipts() {
+    let dir = TempDir::new().unwrap();
+    let a = dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END);
+    let (side, mut source) = history_v3_legacy_seed(&dir, vec![a]).await;
+    source
+        .rows
+        .push(dataset_row(WALLET, "0xb", "b", "BUY", FRESH_END + 1));
+    let next = history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    assert_eq!(next.group_count, 1, "manifest commits fetched rows only");
+    assert_eq!(generation_rows(&side, 1), 1);
+    assert_eq!(generation_rows(&side, 2), 1);
+    assert_eq!(history_v3_wallet_count(&side), 2);
+    let proof = stored_receipt_proofs(&Connection::open(&side).unwrap(), 2).remove(0);
+    assert_eq!(proof["acquisition"]["version"], 3);
+    assert_eq!(proof["aggregate_count"], 1);
+    assert_eq!(proof["acquisition"]["predecessor"]["aggregate_count"], 1);
+    source
+        .rows
+        .push(dataset_row(WALLET, "0xc", "c", "BUY", FRESH_END + 2));
+    history_v3_collect(&side, &source, 3, FRESH_END + 2, &[])
+        .await
+        .unwrap();
+    assert_eq!(history_v3_wallet_count(&side), 3);
+    assert_eq!(generation_rows(&side, 1), 1);
+    assert_eq!(generation_rows(&side, 2), 1);
+    assert_eq!(generation_rows(&side, 3), 1);
+}
+
+#[tokio::test]
+async fn history_v3_automatic_full_read_checks_effective_prefix_and_replaces_source_deletions() {
+    let dir = TempDir::new().unwrap();
+    let a = dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END);
+    let (side, mut source) = history_v3_legacy_seed(&dir, vec![a.clone()]).await;
+    source
+        .rows
+        .push(dataset_row(WALLET, "0xb", "b", "BUY", FRESH_END + 1));
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    source.rows.push(history_v3_bad_row(FRESH_END + 2));
+    history_v3_collect(&side, &source, 3, FRESH_END + 2, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        history_v3_wallet_count(&side),
+        2,
+        "failure preserves effective history"
+    );
+    source
+        .rows
+        .retain(|row| row["transactionHash"] != "bad-price");
+    source
+        .rows
+        .push(dataset_row(WALLET, "0xc", "c", "BUY", FRESH_END + 3));
+    history_v3_collect(&side, &source, 4, FRESH_END + 3, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        history_v3_wallet_count(&side),
+        3,
+        "full [a,b,c] replaces [a,b]"
+    );
+    assert_eq!(generation_rows(&side, 4), 3);
+    source.rows.push(history_v3_bad_row(FRESH_END + 4));
+    history_v3_collect(&side, &source, 5, FRESH_END + 4, &[])
+        .await
+        .unwrap();
+    source.rows = vec![a];
+    history_v3_collect(&side, &source, 6, FRESH_END + 5, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        history_v3_wallet_count(&side),
+        1,
+        "full [a] removes b and c"
+    );
+    assert_eq!(generation_rows(&side, 6), 1);
+}
+
+#[tokio::test]
+async fn history_v3_every_failed_full_read_rechecks_retained_history_and_failed_repair_deletes_it()
+{
+    let dir = TempDir::new().unwrap();
+    let (side, mut source) = history_v3_legacy_seed(
+        &dir,
+        vec![dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END)],
+    )
+    .await;
+    source.rows.push(history_v3_bad_row(FRESH_END + 1));
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    history_v3_collect(&side, &source, 3, FRESH_END + 2, &[])
+        .await
+        .unwrap();
+    history_v3_damage_connection(&side)
+        .execute(
+            "UPDATE activity_groups_v2 SET share_amount_str = '2.250001'",
+            [],
+        )
+        .unwrap();
+    let error = history_v3_collect(&side, &source, 4, FRESH_END + 3, &[])
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("activity history chain mismatch"),
+        "{error}"
+    );
+    assert!(error.to_string().contains(WALLET), "{error}");
+    assert!(receipt(&side, 4, WALLET).is_none());
+    // Abandonment/restaging keeps this failed candidate untouched. A copy of
+    // the preceding installed head is represented by removing the uncommitted
+    // admission under an explicit test authority, then admitting the repair.
+    let connection = history_v3_damage_connection(&side);
+    let predecessor: String = connection.query_row("SELECT collection_identity_json FROM activity_coverage_manifests_v2 WHERE generation = 3", [], |row| row.get(0)).unwrap();
+    connection
+        .execute(
+            "UPDATE cache_v2_migration_state SET fresh_collection_json = ?1",
+            [predecessor],
+        )
+        .unwrap();
+    connection
+        .execute("UPDATE activity_groups_v2 SET share_amount_str = x'00'", [])
+        .unwrap();
+    drop(connection);
+    history_v3_collect(&side, &source, 4, FRESH_END + 3, &[WALLET.to_owned()])
+        .await
+        .unwrap();
+    assert_eq!(history_v3_wallet_count(&side), 0);
+    history_v3_collect(&side, &source, 5, FRESH_END + 4, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        history_v3_wallet_count(&side),
+        0,
+        "later failed read accepts the repair's empty history"
+    );
+    source
+        .rows
+        .retain(|row| row["transactionHash"] != "bad-price");
+    history_v3_collect(&side, &source, 6, FRESH_END + 5, &[])
+        .await
+        .unwrap();
+    assert_eq!(history_v3_wallet_count(&side), 1);
+}
+
+#[tokio::test]
+async fn history_v3_guards_each_table_from_another_connection_and_refuses_legacy_frozen_verification()
+ {
+    let dir = TempDir::new().unwrap();
+    let (side, source) = history_v3_legacy_seed(
+        &dir,
+        vec![dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END)],
+    )
+    .await;
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    for table in [
+        "activity_groups_v2",
+        "activity_wallet_coverage_staging_v2",
+        "activity_coverage_manifests_v2",
+        "activity_wallet_history_v3",
+        "cache_v2_migration_state",
+    ] {
+        for sql in [
+            format!("INSERT INTO {table} SELECT * FROM {table} LIMIT 1"),
+            format!("UPDATE {table} SET rowid = rowid"),
+            format!("DELETE FROM {table}"),
+        ] {
+            let connection = Connection::open(&side).unwrap();
+            let before = count(&side, &format!("SELECT COUNT(*) FROM {table}"));
+            let error = connection.execute(&sql, []).unwrap_err();
+            assert!(
+                error.to_string().contains("pe_history_write_authorized"),
+                "{sql}: {error}"
+            );
+            connection.close().unwrap();
+            assert_eq!(
+                count(&side, &format!("SELECT COUNT(*) FROM {table}")),
+                before
+            );
+        }
+    }
+    let reference = FrozenPayloadReference {
+        version: 1,
+        process_now_unix: FRESH_END,
+        active_window_hours: 72,
+        max_cache_staleness_hours: 48,
+        ranked_wallets: vec![WALLET.to_owned()],
+        active_wallets: vec![WALLET.to_owned()],
+        freshness: FrozenCacheFreshness {
+            newest_trade_unix: FRESH_END,
+            newest_resolution_fetch_unix: FRESH_END,
+            clob_cursor: "fixture".to_owned(),
+            clob_cursor_updated_at: FRESH_END,
+        },
+    };
+    let path = dir.path().join("frozen.json");
+    std::fs::write(&path, serde_json::to_vec(&reference).unwrap()).unwrap();
+    let before = query_values(&side, "SELECT * FROM cache_v2_migration_state");
+    let proofs = count(
+        &side,
+        "SELECT COUNT(*) FROM cache_frozen_payload_verifications",
+    );
+    let error = verify_frozen_payload_v1(&side, &path, FRESH_END + 2).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("legacy frozen verification refuses history format three"),
+        "{error}"
+    );
+    assert_eq!(
+        query_values(&side, "SELECT * FROM cache_v2_migration_state"),
+        before
+    );
+    assert_eq!(
+        count(
+            &side,
+            "SELECT COUNT(*) FROM cache_frozen_payload_verifications"
+        ),
+        proofs
+    );
+}
+
+struct HistoryV3StopFetcher;
+impl PageFetcher for HistoryV3StopFetcher {
+    async fn fetch_page(&self, _: &str) -> Result<Vec<u8>, SourceError> {
+        Err(SourceError::Transient {
+            message: "stop after admission".to_owned(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn history_v3_unchanged_full_after_increment_neither_reads_writes_nor_probes_history() {
+    let dir = TempDir::new().unwrap();
+    let (side, mut source) = history_v3_legacy_seed(
+        &dir,
+        vec![dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END)],
+    )
+    .await;
+    source
+        .rows
+        .push(dataset_row(WALLET, "0xb", "b", "BUY", FRESH_END + 1));
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    source.rows.push(history_v3_bad_row(FRESH_END + 2));
+    history_v3_collect(&side, &source, 3, FRESH_END + 2, &[])
+        .await
+        .unwrap();
+    source
+        .rows
+        .retain(|row| row["transactionHash"] != "bad-price");
+    let error = populate_activity_fresh_v2(
+        &side,
+        &HistoryV3StopFetcher,
+        "https://data.example",
+        4,
+        FRESH_END + 3,
+        FRESH_END + 4,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(error.exit_code(), 75);
+    let connection = Connection::open(&side).unwrap();
+    connection.authorizer(Some(|context: rusqlite::hooks::AuthContext<'_>| {
+        use rusqlite::hooks::{AuthAction, Authorization};
+        match context.action {
+            AuthAction::Read {
+                table_name: "activity_groups_v2",
+                ..
+            }
+            | AuthAction::Insert {
+                table_name: "activity_groups_v2",
+            }
+            | AuthAction::Update {
+                table_name: "activity_groups_v2",
+                ..
+            }
+            | AuthAction::Delete {
+                table_name: "activity_groups_v2",
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }
+    }));
+    pe_bootstrap::cache_migration::collect_activity_v2_for_test(
+        connection,
+        &source,
+        "https://data.example",
+        FRESH_END + 4,
+    )
+    .await
+    .unwrap();
+    assert_eq!(history_v3_wallet_count(&side), 2);
+    assert_eq!(generation_rows(&side, 1), 1);
+    assert_eq!(generation_rows(&side, 2), 1);
+    assert_eq!(generation_rows(&side, 4), 0);
+    assert_eq!(
+        receipt(&side, 4, WALLET).unwrap().0,
+        2,
+        "full receipt commits [a,b]"
+    );
+}
+
+#[tokio::test]
+async fn history_v3_differing_full_after_exclusion_refuses_damage_atomically() {
+    let dir = TempDir::new().unwrap();
+    let (side, mut source) = history_v3_legacy_seed(
+        &dir,
+        vec![dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END)],
+    )
+    .await;
+    source.rows.push(history_v3_bad_row(FRESH_END + 1));
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    source
+        .rows
+        .retain(|row| row["transactionHash"] != "bad-price");
+    history_v3_collect(&side, &source, 3, FRESH_END + 2, &[])
+        .await
+        .unwrap();
+    source
+        .rows
+        .push(dataset_row(WALLET, "0xb", "b", "BUY", FRESH_END + 3));
+    history_v3_collect(&side, &source, 4, FRESH_END + 3, &[])
+        .await
+        .unwrap();
+    source.rows.push(history_v3_bad_row(FRESH_END + 4));
+    history_v3_collect(&side, &source, 5, FRESH_END + 4, &[])
+        .await
+        .unwrap();
+    source
+        .rows
+        .retain(|row| row["transactionHash"] != "bad-price");
+    source
+        .rows
+        .push(dataset_row(WALLET, "0xc", "c", "BUY", FRESH_END + 5));
+    history_v3_damage_connection(&side).execute(
+        "UPDATE activity_groups_v2 SET share_amount_str = '2.250001' WHERE source_time_unix = ?1", [FRESH_END + 3],
+    ).unwrap();
+    let before = query_values(
+        &side,
+        "SELECT * FROM activity_groups_v2 ORDER BY source_trade_id",
+    );
+    let error = history_v3_collect(&side, &source, 6, FRESH_END + 5, &[])
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("activity history chain mismatch"),
+        "{error}"
+    );
+    assert!(error.to_string().contains(WALLET), "{error}");
+    assert_eq!(
+        query_values(
+            &side,
+            "SELECT * FROM activity_groups_v2 ORDER BY source_trade_id"
+        ),
+        before
+    );
+    assert!(receipt(&side, 6, WALLET).is_none());
+}
+
+#[tokio::test]
+async fn history_v3_certificate_phase_checks_and_mirrors_do_not_change_admission() {
+    let dir = TempDir::new().unwrap();
+    let (side, source) = history_v3_legacy_seed(
+        &dir,
+        vec![dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END)],
+    )
+    .await;
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    let connection = history_v3_damage_connection(&side);
+    assert_eq!(
+        digests::certificate_digest(&connection).unwrap(),
+        fresh_record(&side)["certified_digest"]
+    );
+    connection
+        .execute(
+            "UPDATE activity_groups_v2 SET activity_type = 'MERGE', coverage_generation = 99",
+            [],
+        )
+        .unwrap();
+    history_v3_collect(&side, &source, 3, FRESH_END + 2, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        fresh_record(&side)["deferred_wallets"],
+        serde_json::json!([])
+    );
+    connection
+        .execute("UPDATE activity_wallet_history_v3 SET generation = 3", [])
+        .unwrap();
+    let error = history_v3_collect(&side, &source, 3, FRESH_END + 99, &[])
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("activity_wallet_history_v3 certificate digest mismatch"),
+        "{error}"
+    );
+    assert!(
+        !error.to_string().contains(WALLET),
+        "certificate failure names its table"
+    );
+    // Decision 6: the real pass advances certificates and commits the finalized digest atomically.
+    connection
+        .execute("UPDATE activity_wallet_history_v3 SET generation = 1", [])
+        .unwrap();
+    drop(connection);
+    install_payout_manifest(&side);
+    finalize_cache_v2_unbound(&side, None, FRESH_END + 3).unwrap();
+    let digest = digests::certificate_digest(&Connection::open(&side).unwrap()).unwrap();
+    source.calls.lock().unwrap().clear();
+    history_v3_collect(&side, &source, 4, FRESH_END + 3, &[])
+        .await
+        .unwrap();
+    assert_eq!(fresh_record(&side)["certified_digest"], digest);
+    assert_eq!(history_v3_wallet_count(&side), 1);
+}
+
+#[tokio::test]
+async fn history_v3_root_is_format_three_and_receipt_universe_survives_before_finalize() {
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "root-three.db", &[WALLET_B]);
+    let source = DatasetFetcher {
+        rows: vec![
+            dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END),
+            dataset_row(WALLET_B, "0xb", "b", "BUY", FRESH_END),
+        ],
+        ..Default::default()
+    };
+    history_v3_collect(&side, &source, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    let identity = fresh_record(&side);
+    assert_eq!(identity["version"], 4);
+    assert!(identity["base_generation"].is_null());
+    assert!(identity["base_manifest_sha256"].is_null());
+    assert_eq!(identity["start_exclusive"], 0);
+    assert_eq!(identity["deferred_wallets"], serde_json::json!([]));
+    assert_eq!(
+        count(&side, "SELECT COUNT(*) FROM activity_wallet_history_v3"),
+        0
+    );
+    Connection::open(&side)
+        .unwrap()
+        .execute("DELETE FROM wallets WHERE wallet_hex = ?1", [WALLET_B])
+        .unwrap();
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        fresh_record(&side)["wallets"],
+        serde_json::json!([WALLET, WALLET_B])
+    );
+    assert_eq!(
+        fresh_record(&side)["deferred_wallets"],
+        serde_json::json!([])
+    );
+    assert_eq!(generation_rows(&side, 1), 2);
+    assert_eq!(generation_rows(&side, 2), 0);
+}
+
+#[tokio::test]
+async fn history_v3_quiet_rule_uses_certificates_and_unfinalized_receipts() {
+    let dir = TempDir::new().unwrap();
+    let old = FRESH_END - 2_592_000 - 1;
+    let (side, source) =
+        history_v3_legacy_seed(&dir, vec![dataset_row(WALLET, "0xa", "a", "BUY", old)]).await;
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    history_v3_damage_connection(&side)
+        .execute(
+            "UPDATE activity_groups_v2 SET activity_type = 'MERGE', coverage_generation = 99",
+            [],
+        )
+        .unwrap();
+    source.calls.lock().unwrap().clear();
+    history_v3_collect(&side, &source, 3, FRESH_END + 2, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        fresh_record(&side)["deferred_wallets"],
+        serde_json::json!([WALLET])
+    );
+    assert!(source.calls.lock().unwrap().is_empty());
+    assert_eq!(receipt(&side, 3, WALLET).unwrap().0, 0);
+    assert_eq!(generation_rows(&side, 3), 0);
+    assert_eq!(history_v3_wallet_count(&side), 1);
+
+    let dir = TempDir::new().unwrap();
+    let (side, mut source) =
+        history_v3_legacy_seed(&dir, vec![dataset_row(WALLET, "0xa", "a", "BUY", old)]).await;
+    source
+        .rows
+        .push(dataset_row(WALLET, "0xb", "b", "BUY", FRESH_END + 1));
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    source.calls.lock().unwrap().clear();
+    history_v3_collect(&side, &source, 3, FRESH_END + 2, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        fresh_record(&side)["deferred_wallets"],
+        serde_json::json!([])
+    );
+    assert!(!source.calls.lock().unwrap().is_empty());
+    assert_eq!(history_v3_wallet_count(&side), 2);
+}
+
+#[tokio::test]
+async fn history_v3_transition_certifies_prior_complete_exclusions_and_leaves_proofless_ones_empty()
+{
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "transition-classes.db", &[WALLET_B, WALLET_C]);
+    history_v3_freeze_legacy_root(&side, &[WALLET, WALLET_B, WALLET_C]);
+    let mut bad_c = dataset_row(WALLET_C, "0xc", "bad-c", "BUY", FRESH_END);
+    bad_c["price"] = Value::from("3");
+    let mut source = DatasetFetcher {
+        rows: vec![
+            dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END),
+            dataset_row(WALLET_B, "0xb", "b", "BUY", FRESH_END),
+            bad_c,
+        ],
+        ..Default::default()
+    };
+    let manifest = history_v3_collect(&side, &source, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    let prior = fresh_record(&side);
+    let link = whole_json_digest(
+        &serde_json::json!({"version":1, "manifest":manifest, "collection_identity":prior}),
+    );
+    let mut identity = serde_json::json!({
+        "version":3, "generation":2, "fixed_end_unix":FRESH_END + 1,
+        "wallets":[WALLET,WALLET_B,WALLET_C], "base_generation":1, "base_manifest_sha256":link,
+        "start_exclusive":FRESH_END, "full_read_wallets":[WALLET_B,WALLET_C],
+        "deferred_wallets":[], "quiet_after_secs":2_592_000, "repoll_period_secs":604_800,
+    });
+    identity["digest"] = Value::from(whole_json_digest(&identity));
+    Connection::open(&side)
+        .unwrap()
+        .execute(
+            "UPDATE cache_v2_migration_state SET fresh_collection_json = ?1",
+            [identity.to_string()],
+        )
+        .unwrap();
+    let mut bad_b = dataset_row(WALLET_B, "0xb", "bad-b", "BUY", FRESH_END + 1);
+    bad_b["price"] = Value::from("3");
+    source.rows.push(bad_b);
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    history_v3_collect(&side, &source, 3, FRESH_END + 2, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        count(&side, "SELECT COUNT(*) FROM activity_wallet_history_v3"),
+        2
+    );
+    assert_eq!(
+        count(
+            &side,
+            &format!(
+                "SELECT COUNT(*) FROM activity_wallet_history_v3 WHERE wallet_hex = '{WALLET}' AND generation = 2 AND newest_source_unix = {FRESH_END} AND aggregate_count = 1"
+            )
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &side,
+            &format!(
+                "SELECT COUNT(*) FROM activity_wallet_history_v3 WHERE wallet_hex = '{WALLET_B}' AND generation = 1 AND newest_source_unix IS NULL AND newest_trade_unix IS NULL AND aggregate_count = 1"
+            )
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &side,
+            &format!(
+                "SELECT COUNT(*) FROM activity_wallet_history_v3 WHERE wallet_hex = '{WALLET_C}'"
+            )
+        ),
+        0
+    );
+    assert_eq!(
+        count(
+            &side,
+            &format!("SELECT COUNT(*) FROM activity_groups_v2 WHERE wallet_hex = '{WALLET_C}'")
+        ),
+        0
+    );
+    assert_eq!(
+        fresh_record(&side)["wallets"],
+        serde_json::json!([WALLET, WALLET_B, WALLET_C])
+    );
+    assert_eq!(
+        fresh_record(&side)["full_read_wallets"],
+        serde_json::json!([WALLET_B, WALLET_C])
+    );
+}
+
+// Records a hand-built identity-3 successor of the current legacy generation
+// and collects it, returning its manifest.
+async fn history_v3_legacy_successor(
+    side: &std::path::Path,
+    source: &DatasetFetcher,
+    manifest: &pe_bootstrap::cache_migration::ActivityCoverageManifestV2,
+    end: i64,
+    wallets: &[&str],
+    full_reads: &[&str],
+) -> pe_bootstrap::cache_migration::ActivityCoverageManifestV2 {
+    let prior = fresh_record(side);
+    let generation = prior["generation"].as_u64().unwrap() + 1;
+    let link = whole_json_digest(
+        &serde_json::json!({"version":1, "manifest":manifest, "collection_identity":prior}),
+    );
+    let mut identity = serde_json::json!({
+        "version":3, "generation":generation, "fixed_end_unix":end,
+        "wallets":wallets, "base_generation":generation - 1,
+        "base_manifest_sha256":link, "start_exclusive":prior["fixed_end_unix"],
+        "full_read_wallets":full_reads, "deferred_wallets":[],
+        "quiet_after_secs":2_592_000, "repoll_period_secs":604_800,
+    });
+    identity["digest"] = Value::from(whole_json_digest(&identity));
+    Connection::open(side)
+        .unwrap()
+        .execute(
+            "UPDATE cache_v2_migration_state SET fresh_collection_json = ?1",
+            [identity.to_string()],
+        )
+        .unwrap();
+    history_v3_collect(side, source, generation, end, &[])
+        .await
+        .unwrap()
+}
+
+// Collects the transition while capturing its record-chain verification events.
+async fn history_v3_transition_chain_events(
+    side: &std::path::Path,
+    source: &DatasetFetcher,
+    generation: u64,
+    end: i64,
+) -> Vec<Value> {
+    let log = CheckLog::default();
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let guard = tracing::subscriber::set_default(subscriber);
+    history_v3_collect(side, source, generation, end, &[])
+        .await
+        .unwrap();
+    drop(guard);
+    log.take_named("activity record chain verified")
+}
+
+// Forge's generation 8 had 255 wallets excluded in all seven earlier generations;
+// re-verifying the record chain per wallet and generation cost ~30 s each (#739).
+#[tokio::test]
+async fn history_v3_transition_verifies_each_earlier_record_chain_once_for_all_exclusions() {
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "transition-chain-once.db", &[WALLET_B, WALLET_C]);
+    history_v3_freeze_legacy_root(&side, &[WALLET, WALLET_B, WALLET_C]);
+    let mut bad_c = dataset_row(WALLET_C, "0xc", "bad-c", "BUY", FRESH_END);
+    bad_c["price"] = Value::from("3");
+    let mut source = DatasetFetcher {
+        rows: vec![
+            dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END),
+            dataset_row(WALLET_B, "0xb", "b", "BUY", FRESH_END),
+            bad_c,
+        ],
+        ..Default::default()
+    };
+    let mut manifest = history_v3_collect(&side, &source, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    let mut bad_b = dataset_row(WALLET_B, "0xb", "bad-b", "BUY", FRESH_END + 1);
+    bad_b["price"] = Value::from("3");
+    source.rows.push(bad_b);
+    // Two legacy successors exclude WALLET_B and WALLET_C again, so the
+    // transition walks back through generations 2 and 1 for both of them.
+    for generation in 2..=3_u64 {
+        let end = FRESH_END + i64::try_from(generation).unwrap() - 1;
+        manifest = history_v3_legacy_successor(
+            &side,
+            &source,
+            &manifest,
+            end,
+            &[WALLET, WALLET_B, WALLET_C],
+            &[WALLET_B, WALLET_C],
+        )
+        .await;
+    }
+    let legacy = fresh_record(&side);
+
+    // Damage in generation 1 is still refused: the first exclusion verifies it.
+    let damaged = dir.path().join("transition-chain-damaged.db");
+    std::fs::copy(&side, &damaged).unwrap();
+    Connection::open(&damaged)
+        .unwrap()
+        .execute(
+            "UPDATE activity_wallet_coverage_staging_v2 SET ordered_aggregate_digest = ?1
+             WHERE generation = 1 AND wallet_hex = ?2",
+            ["0".repeat(64), WALLET.to_owned()],
+        )
+        .unwrap();
+    let refused = history_v3_collect(&damaged, &source, 4, FRESH_END + 3, &[])
+        .await
+        .unwrap_err();
+    assert!(
+        refused
+            .to_string()
+            .contains("historical receipt-set commitment mismatch"),
+        "{refused}"
+    );
+    assert_eq!(fresh_record(&damaged), legacy);
+    assert_eq!(
+        count(
+            &damaged,
+            "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'activity_wallet_history_v3'"
+        ),
+        0
+    );
+
+    let verified = history_v3_transition_chain_events(&side, &source, 4, FRESH_END + 3).await;
+    assert_eq!(verified.len(), 1, "{verified:?}");
+    assert_eq!(verified[0]["fields"]["generation"], 2);
+    assert_eq!(verified[0]["fields"]["verified"], "[1, 2]");
+    assert_eq!(fresh_record(&side)["version"], 4);
+    assert_eq!(
+        count(
+            &side,
+            &format!(
+                "SELECT COUNT(*) FROM activity_wallet_history_v3 WHERE wallet_hex = '{WALLET}' AND generation = 3 AND newest_source_unix = {FRESH_END} AND aggregate_count = 1"
+            )
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &side,
+            &format!(
+                "SELECT COUNT(*) FROM activity_wallet_history_v3 WHERE wallet_hex = '{WALLET_B}' AND generation = 1 AND newest_source_unix IS NULL AND aggregate_count = 1"
+            )
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &side,
+            &format!(
+                "SELECT COUNT(*) FROM activity_wallet_history_v3 WHERE wallet_hex = '{WALLET_C}'"
+            )
+        ),
+        0
+    );
+}
+
+// A later walk that starts above an already verified generation stops there:
+// WALLET_B (empty and complete in generation 1, absent from 2, excluded in 3)
+// verifies generation 1 first, then WALLET_C's walk from 2 links into it.
+#[tokio::test]
+async fn history_v3_transition_stops_each_chain_walk_at_a_verified_generation() {
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "transition-chain-gap.db", &[WALLET_B, WALLET_C]);
+    history_v3_freeze_legacy_root(&side, &[WALLET, WALLET_B, WALLET_C]);
+    let mut source = DatasetFetcher {
+        rows: vec![
+            dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END),
+            dataset_row(WALLET_C, "0xc", "c", "BUY", FRESH_END),
+        ],
+        ..Default::default()
+    };
+    let mut manifest = history_v3_collect(&side, &source, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    manifest = history_v3_legacy_successor(
+        &side,
+        &source,
+        &manifest,
+        FRESH_END + 1,
+        &[WALLET, WALLET_C],
+        &[],
+    )
+    .await;
+    for wallet in [WALLET_B, WALLET_C] {
+        let mut bad = dataset_row(
+            wallet,
+            "0xd",
+            &format!("bad-{wallet}"),
+            "BUY",
+            FRESH_END + 2,
+        );
+        bad["price"] = Value::from("3");
+        source.rows.push(bad);
+    }
+    history_v3_legacy_successor(
+        &side,
+        &source,
+        &manifest,
+        FRESH_END + 2,
+        &[WALLET, WALLET_B, WALLET_C],
+        &[WALLET_B],
+    )
+    .await;
+    assert_eq!(
+        count(
+            &side,
+            "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2 WHERE generation = 3 AND exclusion_reason IS NOT NULL"
+        ),
+        2
+    );
+
+    let verified = history_v3_transition_chain_events(&side, &source, 4, FRESH_END + 3).await;
+    assert_eq!(verified.len(), 2, "{verified:?}");
+    assert_eq!(verified[0]["fields"]["generation"], 1);
+    assert_eq!(verified[0]["fields"]["verified"], "[1]");
+    assert_eq!(verified[1]["fields"]["generation"], 2);
+    assert_eq!(verified[1]["fields"]["verified"], "[2]");
+    assert_eq!(
+        count(
+            &side,
+            &format!(
+                "SELECT COUNT(*) FROM activity_wallet_history_v3 WHERE wallet_hex = '{WALLET_B}' AND generation = 1 AND aggregate_count = 0"
+            )
+        ),
+        1
+    );
+    assert_eq!(
+        count(
+            &side,
+            &format!(
+                "SELECT COUNT(*) FROM activity_wallet_history_v3 WHERE wallet_hex = '{WALLET_C}' AND generation = 2 AND aggregate_count = 1"
+            )
+        ),
+        1
+    );
+}
+
+#[tokio::test]
+async fn history_v3_wallet_rows_and_receipt_roll_back_together_and_authorization_closes() {
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "atomic-root.db", &[]);
+    populate_activity_fresh_v2(
+        &side,
+        &HistoryV3StopFetcher,
+        "https://data.example",
+        1,
+        FRESH_END,
+        FRESH_END + 1,
+    )
+    .await
+    .unwrap_err();
+    let time = time::OffsetDateTime::from_unix_timestamp(FRESH_END).unwrap();
+    let aggregate = parse_activity_response(
+        &serde_json::to_vec(&vec![dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END)]).unwrap(),
+        WalletAddress::from_hex(WALLET).unwrap(),
+        &ActivityParseContext {
+            source_id: SourceId("fixture".to_owned()),
+            observed_at: SourceTimestamp(time),
+            received_at: ReceivedAt(time),
+            transport: ActivityTransport::Rest,
+        },
+    )
+    .unwrap()
+    .aggregates()
+    .unwrap()
+    .remove(0);
+    let mut connection = Connection::open(&side).unwrap();
+    let error = pe_bootstrap::cache_migration::commit_activity_batch_for_test(
+        &mut connection,
+        WALLET.to_owned(),
+        Vec::new(),
+        vec![aggregate],
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("proof omitted original read window"),
+        "{error}"
+    );
+    assert_eq!(history_v3_wallet_count(&side), 0);
+    assert!(receipt(&side, 1, WALLET).is_none());
+    let authorized: bool = connection
+        .query_row("SELECT pe_history_write_authorized()", [], |row| row.get(0))
+        .unwrap();
+    assert!(!authorized);
+    let error = connection
+        .execute(
+            "UPDATE cache_v2_migration_state SET phase = 'schema_sealed'",
+            [],
+        )
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("unauthorized history write"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn history_v3_differing_full_foreign_identity_is_fatal_and_rolls_back_replacement() {
+    let dir = TempDir::new().unwrap();
+    let (side, mut source) = history_v3_legacy_seed(
+        &dir,
+        vec![dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END)],
+    )
+    .await;
+    source.rows.push(history_v3_bad_row(FRESH_END + 1));
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    source
+        .rows
+        .retain(|row| row["transactionHash"] != "bad-price");
+    let row = dataset_row(WALLET, "0xc", "c", "BUY", FRESH_END + 2);
+    let time = time::OffsetDateTime::from_unix_timestamp(FRESH_END + 2).unwrap();
+    let aggregate = parse_activity_response(
+        &serde_json::to_vec(&vec![row.clone()]).unwrap(),
+        WalletAddress::from_hex(WALLET).unwrap(),
+        &ActivityParseContext {
+            source_id: SourceId("fixture".to_owned()),
+            observed_at: SourceTimestamp(time),
+            received_at: ReceivedAt(time),
+            transport: ActivityTransport::Rest,
+        },
+    )
+    .unwrap()
+    .aggregates()
+    .unwrap()
+    .remove(0);
+    history_v3_damage_connection(&side)
+        .execute(
+            "INSERT INTO activity_groups_v2 SELECT ?1, coverage_generation, semantic_revision,
+         components_json, ?2, transaction_hash, activity_type, condition_id, asset,
+         outcome_id, side, row_count, share_amount_str, price_weighted_share_amount_str,
+         source_usdc_amount_str, source_time_unix, is_combo, schema_version, parser_version
+         FROM activity_groups_v2 WHERE wallet_hex = ?3 LIMIT 1",
+            params![aggregate.group_id.key().0, WALLET_B, WALLET],
+        )
+        .unwrap();
+    source.rows.push(row);
+    let before = query_values(
+        &side,
+        "SELECT * FROM activity_groups_v2 ORDER BY source_trade_id",
+    );
+    let error = history_v3_collect(&side, &source, 3, FRESH_END + 2, &[])
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(error, pe_bootstrap::error::BootstrapError::Sqlite(_)),
+        "{error}"
+    );
+    assert!(
+        error.to_string().contains("UNIQUE constraint failed"),
+        "{error}"
+    );
+    assert_eq!(
+        query_values(
+            &side,
+            "SELECT * FROM activity_groups_v2 ORDER BY source_trade_id"
+        ),
+        before
+    );
+    assert!(receipt(&side, 3, WALLET).is_none());
+}
+
+#[tokio::test]
+async fn history_v3_incremental_probe_ignores_provenance_but_excludes_same_wallet_repeat() {
+    let dir = TempDir::new().unwrap();
+    let row = dataset_row(WALLET, "0xa", "repeat", "BUY", FRESH_END);
+    let (side, mut source) = history_v3_legacy_seed(&dir, vec![row.clone()]).await;
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    history_v3_damage_connection(&side)
+        .execute("UPDATE activity_groups_v2 SET coverage_generation = 99", [])
+        .unwrap();
+    let mut repeated = row;
+    repeated["timestamp"] = Value::from(FRESH_END + 2);
+    source.rows = vec![repeated];
+    history_v3_collect(&side, &source, 3, FRESH_END + 2, &[])
+        .await
+        .unwrap();
+    let receipt = stored_receipt_proofs(&Connection::open(&side).unwrap(), 3).remove(0);
+    assert_eq!(receipt["aggregate_count"], 0);
+    assert_eq!(
+        receipt["acquisition"]["exclusion_reason"],
+        "cross_boundary_collision"
+    );
+    assert_eq!(receipt["acquisition"]["fetched_aggregate_count"], 1);
+    assert_eq!(history_v3_wallet_count(&side), 1);
+    assert_eq!(generation_rows(&side, 99), 1);
+}
+
+#[tokio::test]
+async fn history_v3_record_chain_damage_is_refused_before_fetch() {
+    let dir = TempDir::new().unwrap();
+    let (side, source) = history_v3_legacy_seed(
+        &dir,
+        vec![dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END)],
+    )
+    .await;
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    history_v3_damage_connection(&side).execute(
+        "UPDATE activity_wallet_coverage_staging_v2 SET completed_at_unix = completed_at_unix + 1, source_row_count = source_row_count + 1 WHERE generation = 1", [],
+    ).unwrap();
+    source.calls.lock().unwrap().clear();
+    let error = history_v3_collect(&side, &source, 3, FRESH_END + 2, &[])
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("historical receipt-set commitment mismatch"),
+        "{error}"
+    );
+    assert!(source.calls.lock().unwrap().is_empty());
+    assert_eq!(fresh_record(&side)["generation"], 2);
+}
+
+#[tokio::test]
+async fn history_v3_interrupted_restore_requires_matching_final_stage_record_in_both_states() {
+    use pe_bootstrap::cache_migration::{
+        restore_prior_cache_with_final_stage_record, stage_cache_cycle_v2,
+    };
+    for prior_still_present in [true, false] {
+        let dir = tempfile::Builder::new()
+            .prefix("pe-history-restore-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
+        std::fs::create_dir(dir.path().join("eval-results")).unwrap();
+        let fixed = dir.path().join("fixed.db");
+        let side = dir.path().join("cycle.side.db");
+        let prior = dir.path().join("cycle.prior.db");
+        let displaced = dir.path().join("cycle.displaced.db");
+        drop(seed_v1(&fixed, FRESH_END));
+        let h0 = sha256_file(&fixed).unwrap();
+        stage_cache_cycle_v2(&fixed, &prior, &side, None, None).unwrap();
+        migrate_cache_v2(&side, &write_build_manifest(&dir, &side)).unwrap();
+        let mut problem = projection_v3_row("0xe", "restore-conversion", FRESH_END - 1);
+        problem["type"] = Value::from("CONVERSION");
+        let source = DatasetFetcher {
+            rows: vec![problem, projection_v3_row("0xb", "a", FRESH_END)],
+            ..Default::default()
+        };
+        history_v3_collect(&side, &source, 1, FRESH_END, &[])
+            .await
+            .unwrap();
+        projection_v3_payouts(&side);
+        let valid_record_path = dir.path().join("valid-final-stage.json");
+        let valid_record = finalize_cache_v2(&side, Some(&valid_record_path), FRESH_END + 2)
+            .unwrap()
+            .unwrap();
+        let h1 = valid_record.cache_sha256.clone();
+        std::fs::rename(&fixed, &displaced).unwrap();
+        std::fs::rename(&side, &fixed).unwrap();
+        let (publication, pending) =
+            write_pending_publication(&dir, "restore-three", &side, &fixed, &fixed, &displaced);
+        let request: Value = serde_json::from_slice(&std::fs::read(&publication).unwrap()).unwrap();
+        assert_eq!(request["batch"]["classifier_version"], 6);
+        assert_eq!(request["entries"][0]["history_through_unix"], FRESH_END);
+        assert_eq!(
+            request["entries"][0]["scope_drops"],
+            serde_json::json!([
+            {"scope_kind":"event","scope_id":"0xe","dropped_at_unix":FRESH_END - 1,"cause":"conversion"}])
+        );
+        std::fs::write(
+            side.with_extension("restore.json"),
+            serde_json::to_vec(&request["publish_key"]).unwrap(),
+        )
+        .unwrap();
+        std::fs::rename(&fixed, &side).unwrap();
+        if !prior_still_present {
+            std::fs::rename(&displaced, &fixed).unwrap();
+        }
+        let record_path = dir.path().join("final-stage.json");
+        for mismatch in [None, Some("path"), Some("hash")] {
+            if let Some(mismatch) = mismatch {
+                let record = CacheFinalStageRecord {
+                    version: 2,
+                    cache_path: if mismatch == "path" {
+                        dir.path().join("other.side.db")
+                    } else {
+                        side.clone()
+                    },
+                    cache_sha256: if mismatch == "hash" {
+                        "0".repeat(64)
+                    } else {
+                        h1.clone()
+                    },
+                    schema_version: 2,
+                    sealed_generation: 1,
+                    activity_coverage_generation: 1,
+                    payout_coverage_generation: 1,
+                    ranker_projection_count: 0,
+                    ranker_projection_digest: whole_json_digest(&serde_json::json!([])),
+                    ranker_classifier_version: 3,
+                    export_manifest_sha256: None,
+                    export_projection: None,
+                    classification_report: None,
+                };
+                std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+            }
+            let error = restore_prior_cache_with_final_stage_record(
+                &fixed,
+                &displaced,
+                &side,
+                &PriorCacheBinding {
+                    sha256: h0.clone(),
+                    schema_version: 1,
+                },
+                &publication,
+                &pending,
+                &FixedPublicationProbe(false),
+                mismatch.map(|_| record_path.as_path()),
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                error.to_string().contains(if mismatch.is_none() {
+                    "requires --final-stage-record"
+                } else {
+                    "does not describe the activation candidate"
+                }),
+                "{error}"
+            );
+            assert_eq!(sha256_file(&side).unwrap(), h1);
+            if prior_still_present {
+                assert!(!fixed.exists());
+                assert_eq!(sha256_file(&displaced).unwrap(), h0);
+            } else {
+                assert!(!displaced.exists());
+                assert_eq!(sha256_file(&fixed).unwrap(), h0);
+            }
+        }
+        std::fs::write(&record_path, serde_json::to_vec(&valid_record).unwrap()).unwrap();
+        restore_prior_cache_with_final_stage_record(
+            &fixed,
+            &displaced,
+            &side,
+            &PriorCacheBinding {
+                sha256: h0.clone(),
+                schema_version: 1,
+            },
+            &publication,
+            &pending,
+            &FixedPublicationProbe(false),
+            Some(&record_path),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sha256_file(&fixed).unwrap(), h0);
+        assert_eq!(sha256_file(&side).unwrap(), h1);
+    }
+}
+
+#[tokio::test]
+async fn history_v3_bulk_root_freezes_format_three_and_resumes_under_acquisition_three() {
+    let fixture = BulkRootFixture::new();
+    fixture.admit().await;
+    let frozen = fresh_record(&fixture.side);
+    assert_eq!(frozen["version"], 4);
+    assert_eq!(frozen["repair_wallets"], serde_json::json!([]));
+    assert_eq!(
+        digests::certificate_digest(&Connection::open(&fixture.side).unwrap()).unwrap(),
+        frozen["certified_digest"]
+    );
+    let source = bulk_source();
+    let manifest = fixture.collect(&source).await.unwrap();
+    assert_eq!(manifest.group_count, 2);
+    assert_eq!(count(&fixture.side, "PRAGMA user_version"), 2);
+    assert_eq!(fresh_record(&fixture.side), frozen);
+    for receipt in stored_receipt_proofs(&Connection::open(&fixture.side).unwrap(), 1) {
+        assert_eq!(receipt["acquisition"]["version"], 3);
+        assert_eq!(receipt["acquisition"]["mode"], "full");
+        assert!(receipt["acquisition"]["predecessor"].is_null());
+    }
+    source.calls.lock().unwrap().clear();
+    assert_eq!(fixture.collect(&source).await.unwrap(), manifest);
+    assert!(source.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn history_v3_unfinished_identity_two_bulk_root_seals_unchanged_then_transitions() {
+    let fixture = BulkRootFixture::new();
+    history_v3_freeze_legacy_root(&fixture.side, &[WALLET, WALLET_B]);
+    Connection::open(&fixture.side)
+        .unwrap()
+        .execute_batch(
+            "DROP INDEX idx_activity_groups_v2_source_trade_id; PRAGMA user_version = -2",
+        )
+        .unwrap();
+    let frozen = fresh_record(&fixture.side);
+    let source = bulk_source();
+    fixture.collect(&source).await.unwrap();
+    assert_eq!(count(&fixture.side, "PRAGMA user_version"), 2);
+    assert_eq!(fresh_record(&fixture.side), frozen);
+    assert_eq!(
+        count(
+            &fixture.side,
+            "SELECT COUNT(*) FROM sqlite_schema WHERE name = 'activity_wallet_history_v3'"
+        ),
+        0
+    );
+    for receipt in stored_receipt_proofs(&Connection::open(&fixture.side).unwrap(), 1) {
+        assert_eq!(receipt["acquisition"]["version"], 2);
+    }
+    history_v3_collect(&fixture.side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    assert_eq!(fresh_record(&fixture.side)["version"], 4);
+    assert_eq!(
+        count(
+            &fixture.side,
+            "SELECT COUNT(*) FROM activity_wallet_history_v3 WHERE generation = 1 AND aggregate_count = 1 AND scope_drops_json = '[]'"
+        ),
+        2
+    );
+}
+
+#[tokio::test]
+async fn history_v3_fetched_partition_damage_is_refused_before_full_replacement() {
+    let dir = TempDir::new().unwrap();
+    let (side, mut source) = history_v3_legacy_seed(
+        &dir,
+        vec![dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END)],
+    )
+    .await;
+    source
+        .rows
+        .push(dataset_row(WALLET, "0xb", "b", "BUY", FRESH_END + 1));
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    source.rows.push(history_v3_bad_row(FRESH_END + 2));
+    history_v3_collect(&side, &source, 3, FRESH_END + 2, &[])
+        .await
+        .unwrap();
+    history_v3_damage_connection(&side).execute(
+        "UPDATE activity_groups_v2 SET share_amount_str = '2.250001' WHERE source_time_unix = ?1", [FRESH_END + 1],
+    ).unwrap();
+    source
+        .rows
+        .retain(|row| row["transactionHash"] != "bad-price");
+    source
+        .rows
+        .push(dataset_row(WALLET, "0xc", "c", "BUY", FRESH_END + 3));
+    let error = history_v3_collect(&side, &source, 4, FRESH_END + 3, &[])
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("activity history chain mismatch"),
+        "{error}"
+    );
+    assert!(error.to_string().contains(WALLET), "{error}");
+    assert!(receipt(&side, 4, WALLET).is_none());
+    assert_eq!(history_v3_wallet_count(&side), 2);
+}
+
+#[tokio::test]
+async fn history_v3_decoding_failure_names_the_wallet_before_an_exclusion_commit() {
+    let dir = TempDir::new().unwrap();
+    let (side, mut source) = history_v3_legacy_seed(
+        &dir,
+        vec![dataset_row(WALLET, "0xa", "a", "BUY", FRESH_END)],
+    )
+    .await;
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    history_v3_damage_connection(&side)
+        .execute("UPDATE activity_groups_v2 SET components_json = '{}'", [])
+        .unwrap();
+    source.rows.push(history_v3_bad_row(FRESH_END + 2));
+    let error = history_v3_collect(&side, &source, 3, FRESH_END + 2, &[])
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("activity history decoding failed"),
+        "{error}"
+    );
+    assert!(error.to_string().contains(WALLET), "{error}");
+    assert!(receipt(&side, 3, WALLET).is_none());
+    assert_eq!(history_v3_wallet_count(&side), 1);
+}
+
+fn projection_v3_rows(path: &std::path::Path) -> Vec<Value> {
+    let spool = std::path::PathBuf::from(format!("{}.projection-v3.jsonl", path.display()));
+    std::fs::read_to_string(spool)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+fn projection_v3_payouts(path: &std::path::Path) {
+    publication_payouts(
+        path,
+        &[
+            serde_json::json!({"condition_id":"0xa","is_50_50_outcome":false,"neg_risk":true,"neg_risk_market_id":"0xe",
+            "closed":true,"end_date_iso":"2027-01-16T00:00:00Z","tokens":[
+                {"token_id":"100","outcome":"Yes","price":"1","winner":true},{"token_id":"101","outcome":"No","price":"0","winner":false}]}),
+            serde_json::json!({"condition_id":"0xb","is_50_50_outcome":false,"neg_risk":false,"closed":true,
+            "end_date_iso":"2027-01-16T00:00:00Z","tokens":[
+                {"token_id":"200","outcome":"Yes","price":"1","winner":true},{"token_id":"201","outcome":"No","price":"0","winner":false}]}),
+            serde_json::json!({"condition_id":"0xc","neg_risk":true,"closed":false,"tokens":[]}),
+        ],
+        FRESH_END,
+    );
+}
+
+fn projection_v3_row(market: &str, transaction: &str, epoch: i64) -> Value {
+    let mut row = dataset_row(WALLET, market, transaction, "BUY", epoch);
+    row["asset"] = Value::from(if market == "0xb" { "200" } else { "100" });
+    row
+}
+
+#[tokio::test]
+async fn projection_v3_finalize_refinalize_successor_full_topup_and_cumulative_drops() {
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "pass.db", &[]);
+    let mut conversion = projection_v3_row("\\xe", "conversion", FRESH_END - 2);
+    conversion["type"] = Value::from("CONVERSION");
+    let before = projection_v3_row("0xa", "before-drop", FRESH_END - 3);
+    let beside = projection_v3_row("0xb", "beside-drop", FRESH_END - 2);
+    let later = projection_v3_row("0xb", "consumed", FRESH_END - 1);
+    let source = DatasetFetcher {
+        rows: vec![before.clone(), conversion, beside.clone(), later.clone()],
+        ..Default::default()
+    };
+    history_v3_collect(&side, &source, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    assert_eq!(fresh_record(&side)["version"], 4);
+    projection_v3_payouts(&side);
+    finalize_cache_v2_unbound(&side, None, FRESH_END + 1).unwrap();
+    assert_eq!(count(&side, "SELECT COUNT(*) FROM ranker_entries_v2"), 0);
+    let rows = projection_v3_rows(&side);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["condition_id"], "0xa");
+    let first = finalize_cache_v2(
+        &side,
+        Some(&dir.path().join("pass.final.json")),
+        FRESH_END + 2,
+    )
+    .unwrap()
+    .unwrap();
+    let again = finalize_cache_v2(
+        &side,
+        Some(&dir.path().join("again.final.json")),
+        FRESH_END + 3,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        first.ranker_projection_digest,
+        again.ranker_projection_digest
+    );
+    let connection = Connection::open(&side).unwrap();
+    let drops: String = connection
+        .query_row(
+            "SELECT scope_drops_json FROM activity_wallet_history_v3 WHERE wallet_hex = ?1",
+            [WALLET],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&drops).unwrap(),
+        serde_json::json!([
+            {"cause":"conversion","dropped_at_unix":FRESH_END - 2,"scope_id":"0xe","scope_kind":"event"}
+        ])
+    );
+    drop(connection);
+    let mut new_buy = projection_v3_row("0xa", "dropped-after", FRESH_END + 1);
+    new_buy["asset"] = Value::from("101");
+    new_buy["outcomeIndex"] = Value::from("1");
+    let source = DatasetFetcher {
+        rows: vec![before, beside, later, new_buy],
+        ..Default::default()
+    };
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    // Decision 4: a full top-up replaces a differing source history without restamping increments.
+    history_v3_collect(&side, &source, 3, FRESH_END + 2, &[WALLET.to_owned()])
+        .await
+        .unwrap();
+    finalize_cache_v2_unbound(&side, None, FRESH_END + 3).unwrap();
+    let final_rows = projection_v3_rows(&side);
+    assert_eq!(final_rows.len(), 1);
+    assert_eq!(final_rows[0]["source_trade_id"], rows[0]["source_trade_id"]);
+    assert_eq!(final_rows[0]["activity_generation"], 3);
+    let connection = Connection::open(&side).unwrap();
+    let retained: String = connection
+        .query_row(
+            "SELECT scope_drops_json FROM activity_wallet_history_v3 WHERE wallet_hex = ?1",
+            [WALLET],
+            |row| row.get(0),
+        )
+        .unwrap();
+    // Decision 1: deleting the trigger never reopens its scope or scores the certified problem second.
+    assert_eq!(retained, drops);
+    let files: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|entry| {
+            let path = entry.unwrap().path();
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .contains("projection-v3")
+                .then_some(path)
+        })
+        .collect();
+    assert_eq!(files.len(), 1);
+}
+
+#[tokio::test]
+async fn projection_v3_refinalize_refuses_certificate_receipt_spool_and_export_damage() {
+    use pe_bootstrap::cache_migration::finalize_cache_v2_with_export_manifest;
+    for damage in [
+        "certificate",
+        "receipt",
+        "spool",
+        "missing",
+        "export",
+        "group_version",
+        "payout_tokens",
+        "payout_page",
+    ] {
+        let dir = TempDir::new().unwrap();
+        let side = dataset_candidate(&dir, "damage.db", &[]);
+        let source = DatasetFetcher {
+            rows: vec![projection_v3_row("0xa", "a", FRESH_END)],
+            ..Default::default()
+        };
+        history_v3_collect(&side, &source, 1, FRESH_END, &[])
+            .await
+            .unwrap();
+        projection_v3_payouts(&side);
+        finalize_cache_v2(
+            &side,
+            Some(&dir.path().join("first.final.json")),
+            FRESH_END + 1,
+        )
+        .unwrap();
+        let spool = std::path::PathBuf::from(format!("{}.projection-v3.jsonl", side.display()));
+        match damage {
+            "certificate" => {
+                history_v3_damage_connection(&side).execute("UPDATE activity_wallet_history_v3 SET newest_trade_unix = newest_trade_unix - 1", []).unwrap();
+            }
+            "receipt" => {
+                history_v3_damage_connection(&side).execute("UPDATE activity_wallet_coverage_staging_v2 SET ordered_aggregate_digest = ?1", ["0".repeat(64)]).unwrap();
+            }
+            "spool" => {
+                let mut bytes = std::fs::read(&spool).unwrap();
+                bytes[0] = b'[';
+                std::fs::write(&spool, bytes).unwrap();
+            }
+            "missing" => {
+                std::fs::remove_file(&spool).unwrap();
+            }
+            "export" => {
+                std::fs::write(
+                    side.with_extension("fixture-parquet")
+                        .join("projection.parquet"),
+                    "changed",
+                )
+                .unwrap();
+            }
+            // C5: format three retains the seven-field payout commitment.
+            "payout_tokens" => {
+                Connection::open(&side).unwrap().execute(
+                    "UPDATE clob_payout_evidence_v2 SET tokens_json = json_array(json_extract(tokens_json, '$[1]'), json_extract(tokens_json, '$[0]')) WHERE market_id = '0xa'", [],
+                ).unwrap();
+            }
+            "payout_page" => {
+                Connection::open(&side).unwrap().execute(
+                    "UPDATE clob_payout_evidence_v2 SET raw_page_sha256 = ?1 WHERE market_id = '0xa'", ["0".repeat(64)],
+                ).unwrap();
+            }
+            "group_version" => {
+                Connection::open(&side)
+                    .unwrap()
+                    .execute(
+                        "UPDATE clob_payout_coverage_manifests_v2 SET group_version = NULL",
+                        [],
+                    )
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let error = finalize_cache_v2_with_export_manifest(
+            &side,
+            Some(&dir.path().join("again.final.json")),
+            Some(
+                &side
+                    .with_extension("fixture-parquet")
+                    .join("cache-export-v2.json"),
+            ),
+            FRESH_END + 2,
+        )
+        .unwrap_err();
+        assert!(
+            !dir.path().join("again.final.json").exists(),
+            "{damage}: {error}"
+        );
+        if matches!(damage, "payout_tokens" | "payout_page") {
+            assert!(
+                error.to_string().contains("input binding changed"),
+                "{error}"
+            );
+        }
+        if damage == "certificate" {
+            assert!(
+                error
+                    .to_string()
+                    .contains("activity_wallet_history_v3 certificate digest mismatch"),
+                "{error}"
+            );
+            let admission = history_v3_collect(&side, &source, 2, FRESH_END + 2, &[])
+                .await
+                .unwrap_err();
+            assert!(
+                admission
+                    .to_string()
+                    .contains("certificate digest mismatch"),
+                "{admission}"
+            );
+            assert!(!admission.to_string().contains(WALLET));
+        }
+    }
+}
+
+#[tokio::test]
+async fn projection_v3_acquisition3_ignores_tokenless_and_unresolvable_records() {
+    for same_second in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let side = dataset_candidate(&dir, "missing.db", &[]);
+        let mut tokenless =
+            projection_v3_row("0xa", "tokenless", FRESH_END - i64::from(!same_second));
+        tokenless.as_object_mut().unwrap().remove("asset");
+        let mut missing = projection_v3_row("", "missing-market", FRESH_END - 2);
+        missing["type"] = Value::from("SPLIT");
+        missing.as_object_mut().unwrap().remove("conditionId");
+        missing.as_object_mut().unwrap().remove("asset");
+        let source = DatasetFetcher {
+            rows: vec![
+                missing,
+                tokenless,
+                projection_v3_row("0xa", "bound", FRESH_END),
+            ],
+            ..Default::default()
+        };
+        history_v3_collect(&side, &source, 1, FRESH_END, &[])
+            .await
+            .unwrap();
+        assert!(receipt(&side, 1, WALLET).is_some());
+        projection_v3_payouts(&side);
+        finalize_cache_v2_unbound(&side, None, FRESH_END + 1).unwrap();
+        let rows = projection_v3_rows(&side);
+        // Decision 1: raw-only tokenless BUYs neither consume nor affect homogeneity.
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["condition_id"], "0xa");
+    }
+}
+
+#[test]
+#[ignore = "operator runs AC1 immediately after catch-up finalize with PE_C6_SAMPLE_DB"]
+fn classifier_v6_read_only_measurement_sample() {
+    let path = std::env::var_os("PE_C6_SAMPLE_DB").expect("PE_C6_SAMPLE_DB");
+    let report =
+        pe_bootstrap::cache_migration::measure_classifier_v6_sample(std::path::Path::new(&path))
+            .unwrap();
+    println!("{}", serde_json::to_string(&report).unwrap());
+}
+
+#[tokio::test]
+async fn projection_v3_hex_trade_sample_attributes_the_later_canonical_buy() {
+    let dir = TempDir::new().unwrap();
+    let wallet = format!("0x{}00", "11".repeat(19));
+    let side = dataset_candidate(&dir, "hex.db", &[&wallet]);
+    // The existing seed wallet remains available with an empty history.
+    let mut prefixed = projection_v3_row("\\xa", "prefixed", FRESH_END - 1);
+    prefixed["proxyWallet"] = Value::from(wallet.clone());
+    let mut canonical = projection_v3_row("0xa", "canonical", FRESH_END);
+    canonical["proxyWallet"] = Value::from(wallet.clone());
+    let source = DatasetFetcher {
+        rows: vec![prefixed, canonical],
+        ..Default::default()
+    };
+    history_v3_collect(&side, &source, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    projection_v3_payouts(&side);
+    finalize_cache_v2_unbound(&side, None, FRESH_END + 1).unwrap();
+    let before = sha256_file(&side).unwrap();
+    let report = pe_bootstrap::cache_migration::measure_classifier_v6_sample(&side).unwrap();
+    assert_eq!(sha256_file(&side).unwrap(), before);
+    assert_eq!(report["wallets"], 1);
+    assert_eq!(report["classifier_6_entries"], 0);
+    // Decision 1: the prefixed row lacks bound payout eligibility; classifier five still scores the later canonical BUY.
+    assert_eq!(report["classifier_5_entries"], 1);
+    assert_eq!(report["differences"].as_array().unwrap().len(), 1);
+    assert!(
+        report["differences"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|difference| difference["rule"] == "decision_1_non_canonical_id_unmapped")
+    );
+}
+
+// Independent AC1 adapter: a full-wallet ledger, SQL-bound lookups and direct aggregate fields.
+fn reference_scoped_rows(path: &std::path::Path) -> Vec<Value> {
+    use pe_core_types::{MarketId, MarketOutcomeId, OutcomeId, VenueMarketId};
+    use pe_position_ledger::{
+        LedgerEffect, MarketLookup, Scope, ScopeKind, ScopeLookups, SecondRecord,
+        classify_scoped_historical_second,
+    };
+    use std::collections::BTreeSet;
+    struct Lookups(BTreeMap<String, Option<String>>, BTreeMap<String, String>);
+    impl ScopeLookups for Lookups {
+        fn market(&self, id: &str) -> MarketLookup {
+            match self.0.get(id) {
+                None => MarketLookup::Unknown,
+                Some(None) => MarketLookup::Ungrouped,
+                Some(Some(group)) => MarketLookup::Grouped(group.clone()),
+            }
+        }
+        fn token_market(&self, id: &str) -> Option<String> {
+            self.1.get(id).cloned()
+        }
+        fn is_group(&self, id: &str) -> bool {
+            self.0.values().any(|group| group.as_deref() == Some(id))
+        }
+    }
+    let connection = Connection::open(path).unwrap();
+    let identity = fresh_record(path);
+    let mut lookups = Lookups(BTreeMap::new(), BTreeMap::new());
+    let mut payout = BTreeMap::new();
+    let mut statement = connection.prepare("SELECT market_id, neg_risk_market_id, tokens_json,
+        raw_page_sha256, end_date_unix, payout_status, payout_vector_json FROM clob_payout_evidence_v2 ORDER BY market_id").unwrap();
+    let mut rows = statement.query([]).unwrap();
+    while let Some(row) = rows.next().unwrap() {
+        let market: String = row.get(0).unwrap();
+        let tokens: Vec<pe_source_polymarket_public::ClobToken> =
+            serde_json::from_str(&row.get::<_, String>(2).unwrap()).unwrap();
+        let tokens: Vec<String> = tokens
+            .into_iter()
+            .map(|token| token.token_id.unwrap_or_default())
+            .collect();
+        for token in &tokens {
+            lookups.1.insert(token.clone(), market.clone());
+        }
+        lookups.0.insert(market.clone(), row.get(1).unwrap());
+        payout.insert(
+            market,
+            (
+                tokens,
+                row.get::<_, String>(3).unwrap(),
+                row.get::<_, Option<i64>>(4).unwrap(),
+                row.get::<_, String>(5).unwrap(),
+                row.get::<_, Option<String>>(6).unwrap(),
+            ),
+        );
+    }
+    let quality = ReconstructionQuality::new(100).unwrap();
+    let mut selected = Vec::new();
+    for wallet in identity["wallets"].as_array().unwrap() {
+        let wallet = wallet.as_str().unwrap();
+        let excluded: bool = connection
+            .query_row(
+                "SELECT exclusion_reason IS NOT NULL OR json_extract(acquisition_json, '$.disposition') = 'excluded' FROM activity_wallet_coverage_staging_v2
+            WHERE generation = ?1 AND wallet_hex = ?2",
+                params![identity["generation"].as_i64().unwrap(), wallet],
+                |row| row.get(0),
+            )
+            .unwrap();
+        if excluded {
+            continue;
+        }
+        // Decision 4: the test-only format-two loader is deliberately bypassed for whole history.
+        let mut statement = connection.prepare("SELECT semantic_revision, components_json, row_count,
+            share_amount_str, price_weighted_share_amount_str, source_usdc_amount_str, source_time_unix,
+            is_combo FROM activity_groups_v2 WHERE wallet_hex = ?1 ORDER BY source_time_unix, source_trade_id").unwrap();
+        let aggregates = statement
+            .query_map([wallet], |row| {
+                let components: pe_source_polymarket_public::SourceActivityGroupComponents =
+                    serde_json::from_str(&row.get::<_, String>(1)?).unwrap();
+                Ok(pe_source_polymarket_public::ActivityAggregate {
+                    group_id: pe_source_polymarket_public::SourceActivityGroupId::derive(
+                        components,
+                    )
+                    .unwrap(),
+                    semantic_revision: serde_json::from_value(Value::from(
+                        row.get::<_, String>(0)?,
+                    ))
+                    .unwrap(),
+                    row_count: row.get(2)?,
+                    share_sum: pe_core_types::ShareAmount::from_decimal_exact(
+                        rust_decimal::Decimal::from_str_exact(&row.get::<_, String>(3)?).unwrap(),
+                    )
+                    .unwrap(),
+                    price_weighted_share_sum: pe_source_polymarket_public::PriceWeightedShareAmount(
+                        rust_decimal::Decimal::from_str_exact(&row.get::<_, String>(4)?).unwrap(),
+                    ),
+                    source_usdc_sum: pe_core_types::CollateralAmount::from_decimal_exact(
+                        rust_decimal::Decimal::from_str_exact(&row.get::<_, String>(5)?).unwrap(),
+                    )
+                    .unwrap(),
+                    source_time: SourceTimestamp(
+                        time::OffsetDateTime::from_unix_timestamp(row.get(6)?).unwrap(),
+                    ),
+                    is_combo: row.get(7)?,
+                })
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let existing: Option<String> = connection
+            .query_row(
+                "SELECT scope_drops_json FROM activity_wallet_history_v3 WHERE wallet_hex = ?1",
+                [wallet],
+                |row| row.get(0),
+            )
+            .optional()
+            .unwrap();
+        let mut drops = BTreeMap::<Scope, i64>::new();
+        for drop in serde_json::from_str::<Vec<Value>>(existing.as_deref().unwrap_or("[]")).unwrap()
+        {
+            drops.insert(
+                Scope {
+                    kind: if drop["scope_kind"] == "event" {
+                        ScopeKind::Event
+                    } else {
+                        ScopeKind::Market
+                    },
+                    id: drop["scope_id"].as_str().unwrap().to_owned(),
+                },
+                drop["dropped_at_unix"].as_i64().unwrap(),
+            );
+        }
+        let address = WalletAddress::from_hex(wallet).unwrap();
+        let mut ledger = PositionLedger::new();
+        let mut consumed = BTreeSet::<String>::new();
+        for second in aggregates.chunk_by(|a, b| a.source_time == b.source_time) {
+            let time = second[0].source_time.0.unix_timestamp();
+            let records: Vec<_> = second
+                .iter()
+                .map(|aggregate| {
+                    let mutation = LedgerMutation::from_activity(aggregate).map(|mut mutation| {
+                        let c = aggregate.group_id.components();
+                        if matches!(
+                            mutation.effect.effective(),
+                            LedgerEffect::Trade { .. } | LedgerEffect::Redeem { .. }
+                        ) && let (Some(condition), Some(asset)) = (&c.condition_id, &c.asset)
+                            && let Some((tokens, page, _, _, _)) = payout.get(&condition.0)
+                        {
+                            mutation = match tokens.iter().position(|token| token == &asset.0) {
+                                Some(outcome) => mutation.with_verified_identity(
+                                    MarketOutcomeId::new(
+                                        MarketId(VenueMarketId(condition.0.clone())),
+                                        OutcomeId(u16::try_from(outcome).unwrap()),
+                                    ),
+                                    page.clone(),
+                                ),
+                                None => LedgerMutation {
+                                    effect: LedgerEffect::RawOnly,
+                                    ..mutation
+                                },
+                            };
+                        }
+                        mutation
+                    });
+                    SecondRecord {
+                        aggregate,
+                        mutation,
+                    }
+                })
+                .collect();
+            let dropped = drops
+                .iter()
+                .filter(|(_, at)| **at <= time)
+                .map(|(scope, _)| scope.clone())
+                .collect();
+            let classified = classify_scoped_historical_second(
+                &ledger,
+                address,
+                &records,
+                &dropped,
+                drops.values().any(|at| *at == time),
+                quality,
+                &|market| consumed.contains(&market.to_string()),
+                &lookups,
+            )
+            .unwrap();
+            for problem in &classified.problems {
+                drops
+                    .entry(problem.scope.clone())
+                    .and_modify(|at| *at = (*at).min(time))
+                    .or_insert(time);
+            }
+            for decision in classified.decisions {
+                let Some((_, _, Some(end), status, Some(vector))) =
+                    payout.get(&decision.market_id.to_string())
+                else {
+                    continue;
+                };
+                if decision.entry != EntryClassification::Admitted
+                    || decision.action_order_dependent
+                    || status != "resolved"
+                {
+                    continue;
+                }
+                let aggregate = second
+                    .iter()
+                    .find(|aggregate| aggregate.group_id.key() == &decision.source_trade_id)
+                    .unwrap();
+                selected.push(serde_json::json!({"activity_generation":identity["generation"],
+                    "asset":aggregate.group_id.components().asset.as_ref().unwrap().0,"classifier_version":6,
+                    "condition_id":decision.market_id.to_string(),"end_date_unix":end,"outcome_id":decision.outcome_id.0,
+                    "payout_vector_json":vector,"price_weighted_share_amount_str":aggregate.price_weighted_share_sum.0.to_string(),
+                    "share_amount_str":aggregate.share_sum.to_decimal().to_string(),"side":"buy","source_time_unix":time,
+                    "source_trade_id":decision.source_trade_id.0,"source_usdc_amount_str":aggregate.source_usdc_sum.to_decimal().to_string(),"wallet_hex":wallet}));
+            }
+            ledger.apply_all_or_none(&classified.apply).unwrap();
+            consumed.extend(
+                classified
+                    .consumed
+                    .into_iter()
+                    .map(|market| market.to_string()),
+            );
+        }
+    }
+    selected.sort_by(|a, b| {
+        (
+            a["wallet_hex"].as_str(),
+            a["source_time_unix"].as_i64(),
+            a["source_trade_id"].as_str(),
+        )
+            .cmp(&(
+                b["wallet_hex"].as_str(),
+                b["source_time_unix"].as_i64(),
+                b["source_trade_id"].as_str(),
+            ))
+    });
+    selected
+}
+
+#[tokio::test]
+async fn projection_v3_sample_traces_each_changed_rule_and_cause() {
+    let wallet = format!("0x{}00", "11".repeat(19));
+    let t = FRESH_END - 3;
+    let cases = [
+        (
+            "conversion",
+            Some("conversion"),
+            "decision_1_problem_second_scoped_continuation",
+        ),
+        (
+            "unknown",
+            Some("unknown_type"),
+            "decision_1_problem_second_scoped_continuation",
+        ),
+        (
+            "underflow",
+            Some("underflow"),
+            "decision_1_problem_second_scoped_continuation",
+        ),
+        (
+            "overflow",
+            Some("overflow"),
+            "decision_1_problem_second_scoped_continuation",
+        ),
+        (
+            "order",
+            Some("order_dependent"),
+            "decision_1_problem_second_scoped_continuation",
+        ),
+        (
+            "anchor",
+            Some("unknown_condition"),
+            "decision_1_problem_second_scoped_continuation",
+        ),
+        (
+            "unmapped",
+            Some("unmapped"),
+            "acquisition_3_missing_mapping_decision_1_scope_or_ignored",
+        ),
+        (
+            "ignored",
+            Some("unmapped"),
+            "acquisition_3_missing_mapping_decision_1_scope_or_ignored",
+        ),
+        ("pieces", None, "decision_1_homogeneous_pieces"),
+        (
+            "stop_then_pieces",
+            Some("conversion"),
+            "decision_1_problem_second_scoped_continuation",
+        ),
+        (
+            "tokenless",
+            None,
+            "decision_1_tokenless_raw_only_acquisition_3",
+        ),
+        (
+            "tokenless_same_second",
+            None,
+            "decision_1_tokenless_raw_only_acquisition_3",
+        ),
+    ];
+    for (name, cause, rule) in cases {
+        let dir = TempDir::new().unwrap();
+        let side = dataset_candidate(&dir, "sample.db", &[&wallet]);
+        let mut trigger = projection_v3_row("0xa", name, t);
+        let mut rows = Vec::new();
+        match name {
+            "conversion" | "stop_then_pieces" => {
+                trigger["type"] = "CONVERSION".into();
+                trigger["conditionId"] = "\\xe".into();
+            }
+            "unknown" => trigger["type"] = "UNRECOGNIZED".into(),
+            "underflow" => trigger["type"] = "REDEEM".into(),
+            "overflow" => {
+                // ShareAmount's u64 atomic bound; each row is valid on its own.
+                let mut funded = projection_v3_row("0xa", "max-balance", t - 1);
+                funded["size"] = "18446744073709.551615".into();
+                funded["type"] = "SPLIT".into();
+                funded["usdcSize"] = "0".into();
+                funded["price"] = "0".into();
+                rows.push(funded);
+            }
+            "order" => {
+                let mut sell = trigger.clone();
+                sell["type"] = "REDEEM".into();
+                sell["transactionHash"] = "order-redeem".into();
+                rows.push(sell);
+            }
+            "anchor" => {
+                trigger["type"] = "REDEEM".into();
+                trigger["size"] = "0".into();
+                trigger["usdcSize"] = "0".into();
+                trigger.as_object_mut().unwrap().remove("conditionId");
+            }
+            "unmapped" | "ignored" => {
+                trigger["type"] = "SPLIT".into();
+                trigger.as_object_mut().unwrap().remove("conditionId");
+                if name == "ignored" {
+                    trigger["asset"] = "".into();
+                }
+            }
+            "pieces" => {
+                let mut other = trigger.clone();
+                other["transactionHash"] = "other-piece".into();
+                rows.push(other);
+            }
+            "tokenless" | "tokenless_same_second" => {
+                trigger["asset"] = "".into();
+                if name == "tokenless_same_second" {
+                    trigger["timestamp"] = (t + 1).into();
+                }
+            }
+            _ => unreachable!(),
+        }
+        rows.push(trigger);
+        let later_market = if name.starts_with("tokenless") {
+            "0xa"
+        } else {
+            "0xb"
+        };
+        rows.push(projection_v3_row(later_market, "later", t + 1));
+        if name == "stop_then_pieces" {
+            // AC1: the earlier classifier-five stop, not an unreachable piece group, caused this difference.
+            rows.push(projection_v3_row(later_market, "later-piece", t + 1));
+        }
+        for row in &mut rows {
+            row["proxyWallet"] = wallet.clone().into();
+        }
+        let source = DatasetFetcher {
+            rows,
+            ..Default::default()
+        };
+        history_v3_collect(&side, &source, 1, FRESH_END, &[])
+            .await
+            .unwrap();
+        projection_v3_payouts(&side);
+        finalize_cache_v2_unbound(&side, None, FRESH_END + 1).unwrap();
+        let before = sha256_file(&side).unwrap();
+        let report = pe_bootstrap::cache_migration::measure_classifier_v6_sample(&side)
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        assert_eq!(sha256_file(&side).unwrap(), before);
+        assert!(
+            report["differences_by_rule"][rule]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "{name}: {report}"
+        );
+        if let Some(cause) = cause {
+            assert!(
+                report["differences_by_cause"][cause]
+                    .as_u64()
+                    .is_some_and(|count| count > 0),
+                "{name}: {report}"
+            );
+        }
+        let stored = WalletCache::open_read_only(&side)
+            .unwrap()
+            .activity_aggregates_v2()
+            .unwrap();
+        for difference in report["differences"].as_array().unwrap() {
+            for trigger in difference["trigger"].as_str().unwrap().split(',') {
+                assert!(
+                    stored
+                        .iter()
+                        .any(|aggregate| aggregate.source_trade_id.0 == trigger),
+                    "{name}: unknown trigger {trigger}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn projection_v3_excluded_older_certificate_cannot_supply_publisher_freshness() {
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "stale.db", &[WALLET_B]);
+    let mut old = projection_v3_row("0xb", "old-available", FRESH_END - 100_000);
+    old["proxyWallet"] = Value::from(WALLET_B);
+    let source = DatasetFetcher {
+        rows: vec![
+            old,
+            projection_v3_row("0xa", "recent-excluded", FRESH_END - 2),
+        ],
+        ..Default::default()
+    };
+    history_v3_collect(&side, &source, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    projection_v3_payouts(&side);
+    finalize_cache_v2_unbound(&side, None, FRESH_END + 1).unwrap();
+    let source = DatasetFetcher {
+        rows: vec![history_v3_bad_row(FRESH_END + 1)],
+        ..Default::default()
+    };
+    history_v3_collect(&side, &source, 2, FRESH_END + 2, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        count(
+            &side,
+            &format!(
+                "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2 WHERE generation = 2 AND wallet_hex = '{WALLET}' AND exclusion_reason IS NOT NULL"
+            )
+        ),
+        1
+    );
+    finalize_cache_v2_unbound(&side, None, FRESH_END + 3).unwrap();
+    let bridge = Command::new("python3").current_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+        .args(["-c", "import sys; sys.path.insert(0, 'scripts'); from test_ranker_duck_parity import assert_certified_excluded_newest_is_stale; assert_certified_excluded_newest_is_stale(sys.argv[1], sys.argv[2], int(sys.argv[3]))"])
+        .arg(&side).arg(WALLET).arg((FRESH_END + 3).to_string()).output().unwrap();
+    assert!(
+        bridge.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bridge.stderr)
+    );
+}
+
+#[tokio::test]
+async fn projection_v3_sample_refuses_an_untraceable_certified_drop() {
+    let dir = TempDir::new().unwrap();
+    let wallet = format!("0x{}00", "11".repeat(19));
+    let side = dataset_candidate(&dir, "untraceable.db", &[&wallet]);
+    let mut conversion = projection_v3_row("0xe", "removed-trigger", FRESH_END - 2);
+    conversion["proxyWallet"] = wallet.clone().into();
+    conversion["type"] = "CONVERSION".into();
+    let source = DatasetFetcher {
+        rows: vec![conversion],
+        ..Default::default()
+    };
+    history_v3_collect(&side, &source, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    projection_v3_payouts(&side);
+    finalize_cache_v2_unbound(&side, None, FRESH_END + 1).unwrap();
+    let mut later = projection_v3_row("0xa", "later-dropped-buy", FRESH_END - 1);
+    later["proxyWallet"] = wallet.clone().into();
+    let source = DatasetFetcher {
+        rows: vec![later],
+        ..Default::default()
+    };
+    // Decision 1: full replacement keeps the certified drop after its trigger disappears.
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[wallet])
+        .await
+        .unwrap();
+    finalize_cache_v2_unbound(&side, None, FRESH_END + 2).unwrap();
+    let before = sha256_file(&side).unwrap();
+    let error = pe_bootstrap::cache_migration::measure_classifier_v6_sample(&side).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("unexplained certified-drop trigger"),
+        "{error}"
+    );
+    assert_eq!(sha256_file(&side).unwrap(), before);
+}
+
+// PASS: an authentic classifier-3 format-two commitment with payout evidence is reused unchanged.
+// FAIL: reuse changes the digest or treats the historical four-field payout binding as damage.
+#[tokio::test]
+async fn historical_classifier_three_reuses_four_field_payout_commitment() {
+    let dir = TempDir::new().unwrap();
+    let (side, _) = history_v3_legacy_seed(
+        &dir,
+        vec![projection_v3_row("0xa", "historical", FRESH_END)],
+    )
+    .await;
+    projection_v3_payouts(&side);
+    seed_historical_format_two(&side, 3, FRESH_END + 1);
+    let before = query_values(
+        &side,
+        "SELECT ranker_projection_count, ranker_projection_digest, ranker_projection_inputs_json FROM cache_v2_migration_state",
+    );
+    assert!(count(&side, "SELECT COUNT(*) FROM clob_payout_evidence_v2") > 0);
+    assert_eq!(before[0][0], rusqlite::types::Value::Integer(1));
+    let stage = finalize_cache_v2_unbound(
+        &side,
+        Some(&dir.path().join("historical.final.json")),
+        FRESH_END + 2,
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(stage.ranker_classifier_version, 3);
+    assert_eq!(
+        before,
+        query_values(
+            &side,
+            "SELECT ranker_projection_count, ranker_projection_digest, ranker_projection_inputs_json FROM cache_v2_migration_state"
+        )
+    );
+    assert_eq!(
+        before[0][1],
+        rusqlite::types::Value::Text(stage.ranker_projection_digest)
+    );
+}
+
+// PASS: each collection invocation reports its own commit modes, row I/O and separate fetch/drain times,
+// including a sealed resume, a failed verification and a full queue behind a slow writer.
+// FAIL: counters include earlier runs, send waits extend fetching, or an error suppresses the event.
+#[tokio::test]
+async fn history_v3_collection_reports_run_timing_and_writer_counts() {
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "timing.db", &[]);
+    let mut source = DatasetFetcher {
+        rows: vec![projection_v3_row("0xa", "a", FRESH_END)],
+        ..Default::default()
+    };
+    history_v3_collect(&side, &source, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    projection_v3_payouts(&side);
+    finalize_cache_v2_unbound(&side, None, FRESH_END + 1).unwrap();
+    admit_dataset_wallet(&side, WALLET_B);
+    source.rows.extend([
+        projection_v3_row("0xb", "b", FRESH_END + 1),
+        dataset_row(WALLET_B, "0xa", "new", "BUY", FRESH_END + 1),
+    ]);
+    let log = CheckLog::default();
+    let writer = log.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_ansi(false)
+        .with_writer(move || writer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    let take = |generation, incremental, full, unchanged, excluded, inserted, deleted, verified| {
+        let events = log.take_named("activity collection run completed");
+        assert_eq!(events.len(), 1, "{events:?}");
+        let fields = &events[0]["fields"];
+        assert_eq!(fields["generation"], generation);
+        assert!(fields["run_started_at_unix"].as_i64().is_some());
+        for name in [
+            "fetch_completed_ms",
+            "writer_completed_ms",
+            "producer_blocked_ms",
+            "final_drain_ms",
+        ] {
+            assert!(fields[name].as_u64().is_some(), "{fields}");
+        }
+        let difference = fields["writer_completed_ms"]
+            .as_u64()
+            .unwrap()
+            .saturating_sub(fields["fetch_completed_ms"].as_u64().unwrap());
+        assert_eq!(difference, fields["final_drain_ms"].as_u64().unwrap());
+        assert_eq!(fields["incremental_wallets"], incremental);
+        assert_eq!(fields["differing_full_wallets"], full);
+        assert_eq!(fields["unchanged_full_wallets"], unchanged);
+        assert_eq!(fields["excluded_wallets"], excluded);
+        assert_eq!(fields["deferred_wallets"], 0);
+        assert_eq!(fields["rows_inserted"], inserted);
+        assert_eq!(fields["rows_deleted"], deleted);
+        assert_eq!(fields["rows_verified"], verified);
+        fields.clone()
+    };
+    take(2, 1, 1, 0, 0, 2, 0, 0);
+    history_v3_collect(&side, &source, 2, FRESH_END + 1, &[])
+        .await
+        .unwrap();
+    let fields = take(2, 0, 0, 0, 0, 0, 0, 0);
+    assert_eq!(fields["fetch_completed_ms"], 0);
+    source.rows.push(history_v3_bad_row(FRESH_END + 2));
+    history_v3_collect(&side, &source, 3, FRESH_END + 2, &[])
+        .await
+        .unwrap();
+    take(3, 1, 0, 0, 1, 0, 0, 2);
+    source
+        .rows
+        .retain(|row| row["transactionHash"] != "bad-price");
+    history_v3_collect(&side, &source, 4, FRESH_END + 3, &[])
+        .await
+        .unwrap();
+    take(4, 1, 0, 1, 0, 0, 0, 0);
+    history_v3_collect(&side, &source, 5, FRESH_END + 4, &[WALLET.to_owned()])
+        .await
+        .unwrap();
+    take(5, 1, 1, 0, 0, 2, 2, 2);
+    source.rows.push(history_v3_bad_row(FRESH_END + 5));
+    history_v3_damage_connection(&side)
+        .execute(
+            "UPDATE activity_groups_v2 SET share_amount_str = '2.250001' WHERE wallet_hex = ?1",
+            [WALLET],
+        )
+        .unwrap();
+    let error = history_v3_collect(&side, &source, 6, FRESH_END + 5, &[])
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("activity history chain mismatch"),
+        "{error}"
+    );
+    let events = log.take_named("activity collection run completed");
+    assert_eq!(events.len(), 1, "{events:?}");
+    let fields = &events[0]["fields"];
+    assert_eq!(fields["generation"], 6);
+    assert_eq!(fields["rows_verified"], 2);
+    assert_eq!(fields["excluded_wallets"], 0);
+    assert_eq!(fields["rows_deleted"], 0);
+    let already_committed = count(
+        &side,
+        "SELECT COUNT(*) FROM activity_wallet_coverage_staging_v2 WHERE generation = 6",
+    );
+    history_v3_damage_connection(&side)
+        .execute(
+            "UPDATE activity_groups_v2 SET share_amount_str = '1.250001' WHERE wallet_hex = ?1",
+            [WALLET],
+        )
+        .unwrap();
+    history_v3_collect(&side, &source, 6, FRESH_END + 5, &[])
+        .await
+        .unwrap();
+    take(6, 1 - already_committed, 0, 0, 1, 0, 0, 2);
+
+    // Thirty-four instant reads leave one writer, a full thirty-two-slot queue
+    // and the final send waiting. Fetch completion must precede that send wait.
+    for index in 1..=32 {
+        admit_dataset_wallet(&side, &format!("0x{index:040x}"));
+    }
+    populate_activity_fresh_v2(
+        &side,
+        &HistoryV3StopFetcher,
+        "https://data.example",
+        7,
+        FRESH_END + 6,
+        FRESH_END + 7,
+    )
+    .await
+    .unwrap_err();
+    log.take_named("activity collection run completed");
+    source.calls.lock().unwrap().clear();
+    struct LastReadFetcher<'a> {
+        source: &'a DatasetFetcher,
+        barrier: Arc<std::sync::Barrier>,
+    }
+    impl PageFetcher for LastReadFetcher<'_> {
+        async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+            let bytes = self.source.fetch_page(url).await?;
+            if self.source.calls.lock().unwrap().len() == 34 {
+                self.barrier.wait();
+            }
+            Ok(bytes)
+        }
+    }
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let fetcher = LastReadFetcher {
+        source: &source,
+        barrier: Arc::clone(&barrier),
+    };
+    let connection = Connection::open(&side).unwrap();
+    let commit_delay = std::time::Duration::from_millis(250);
+    let measured_drain = Arc::new(Mutex::new(std::time::Duration::ZERO));
+    let observed = Arc::clone(&measured_drain);
+    let mut commits = 0;
+    let mut commit_started = None;
+    connection.commit_hook(Some(move || {
+        if commits == 0 {
+            barrier.wait();
+            commit_started = Some(std::time::Instant::now());
+        }
+        std::thread::sleep(commit_delay);
+        commits += 1;
+        if commits == 34 {
+            *observed.lock().unwrap() = commit_started.unwrap().elapsed();
+        }
+        false
+    }));
+    pe_bootstrap::cache_migration::collect_activity_v2_for_test(
+        connection,
+        &fetcher,
+        "https://data.example",
+        FRESH_END + 7,
+    )
+    .await
+    .unwrap();
+    assert_eq!(source.calls.lock().unwrap().len(), 34);
+    let fields = take(7, 1, 32, 0, 1, 0, 0, 2);
+    assert!(
+        fields["producer_blocked_ms"].as_u64().unwrap() > 0,
+        "{fields}"
+    );
+    let drain = fields["writer_completed_ms"].as_u64().unwrap()
+        - fields["fetch_completed_ms"].as_u64().unwrap();
+    let delay_ms = u64::try_from(commit_delay.as_millis()).unwrap();
+    assert!(drain >= delay_ms * 33, "{fields}");
+    // Compare with the measured writer span so SQLite overhead cannot mask
+    // the missing send wait; allow half a commit for the last read's processing.
+    let measured_ms = u64::try_from(measured_drain.lock().unwrap().as_millis()).unwrap();
+    assert!(
+        drain + delay_ms / 2 >= measured_ms,
+        "{fields}; measured drain: {measured_ms} ms"
+    );
+    assert_eq!(fields["final_drain_ms"], drain);
 }

@@ -6,6 +6,7 @@ use pe_core_types::{
     OutcomeId, PolymarketConditionId, PolymarketTokenId, ReceivedAt, ShareAmount, SourceId,
     SourceTimestamp, WalletAddress,
 };
+use pe_source_polymarket_public::activity::ActivityRowAcceptance;
 use pe_source_polymarket_public::{
     ACTIVITY_MAX_OFFSET, ActivityAssetMapping, ActivityParseContext, ActivityReadError,
     ActivityTransport, FixtureFetcher, PolymarketEndpoint, PositionClassification,
@@ -52,6 +53,260 @@ fn context() -> ActivityParseContext {
         received_at: ReceivedAt(now),
         transport: ActivityTransport::Rest,
     }
+}
+
+fn activity_fixture(row: Value) -> FixtureFetcher {
+    FixtureFetcher::new(HashMap::from([(
+        activity_url(None, 100, 0),
+        serde_json::to_vec(&vec![row]).unwrap(),
+    )]))
+}
+
+#[tokio::test]
+async fn acquisition_three_keeps_missing_mappings_but_strict_paths_refuse() {
+    for (activity_type, missing) in [
+        ("SPLIT", vec!["conditionId"]),
+        ("MERGE", vec!["conditionId"]),
+        ("REDEEM", vec!["conditionId"]),
+        ("TRADE", vec!["conditionId"]),
+        ("TRADE", vec!["asset"]),
+        ("TRADE", vec!["conditionId", "asset"]),
+    ] {
+        let mut row = activity_row(50, "0xmissing".to_owned(), ASSET.to_owned(), 0);
+        row["type"] = json!(activity_type);
+        for field in &missing {
+            row.as_object_mut().unwrap().remove(*field);
+        }
+        let raw = serde_json::to_vec(&vec![row.clone()]).unwrap();
+        let strict_error = parse_activity_response(&raw, wallet(), &context()).unwrap_err();
+        assert!(
+            matches!(strict_error, pe_source_polymarket_public::ActivityParseError::InvalidRow {
+            source: pe_source_polymarket_public::ActivityValidationError::MissingField { field }, ..
+        } if field == missing[0])
+        );
+        assert_eq!(
+            pe_source_polymarket_public::parse_activity_row(
+                &serde_json::to_vec(&row).unwrap(),
+                Some(wallet()),
+                &context()
+            )
+            .unwrap_err(),
+            strict_error
+        );
+        let api = activity_fixture(row);
+        for error in [
+            fetch_complete_activity(&api, BASE, wallet(), None, 100)
+                .await
+                .unwrap_err(),
+            fetch_complete_activity_semantic(
+                &api,
+                BASE,
+                wallet(),
+                None,
+                100,
+                ActivityRowAcceptance::Strict,
+            )
+            .await
+            .unwrap_err(),
+        ] {
+            assert!(matches!(error, ActivityReadError::Parse(error) if error == strict_error));
+        }
+        let accepted = fetch_complete_activity_semantic(
+            &api,
+            BASE,
+            wallet(),
+            None,
+            100,
+            ActivityRowAcceptance::Acquisition3,
+        )
+        .await
+        .unwrap();
+        assert_eq!(accepted.rows.len(), 1);
+        let parsed = &accepted.rows[0];
+        assert_eq!(
+            parsed.condition_id.is_none(),
+            missing.contains(&"conditionId")
+        );
+        assert_eq!(parsed.asset.is_none(), missing.contains(&"asset"));
+        assert_eq!(parsed.parser_version, 2);
+        assert_eq!(accepted.pages[0].parser_version, 2);
+        let aggregates = aggregate_activity_rows(&accepted.rows).unwrap();
+        assert_eq!(aggregates.len(), 1);
+        let components = aggregates[0].group_id.components();
+        assert_eq!(components.condition_id, parsed.condition_id);
+        assert_eq!(components.asset, parsed.asset);
+        aggregates[0].group_id.verify_components().unwrap();
+    }
+}
+
+#[tokio::test]
+async fn acquisition_three_keeps_unmapped_rows_beside_valid_activity() {
+    let valid = activity_row(50, "0xvalid".to_owned(), ASSET.to_owned(), 0);
+    let mut split = activity_row(49, "0xsplit".to_owned(), ASSET.to_owned(), 0);
+    split["type"] = json!("SPLIT");
+    split.as_object_mut().unwrap().remove("conditionId");
+    let mut trade = activity_row(50, "0xtokenless".to_owned(), ASSET.to_owned(), 0);
+    trade.as_object_mut().unwrap().remove("asset");
+    let api = FixtureFetcher::new(HashMap::from([(
+        activity_url(None, 100, 0),
+        serde_json::to_vec(&vec![valid, split, trade]).unwrap(),
+    )]));
+    let read = fetch_complete_activity_semantic(
+        &api,
+        BASE,
+        wallet(),
+        None,
+        100,
+        ActivityRowAcceptance::Acquisition3,
+    )
+    .await
+    .unwrap();
+    let aggregates = aggregate_activity_rows(&read.rows).unwrap();
+    assert_eq!(aggregates.len(), 3);
+    assert_eq!(
+        aggregates
+            .iter()
+            .filter(|aggregate| aggregate.group_id.components().condition_id.is_none())
+            .count(),
+        1
+    );
+    assert_eq!(
+        aggregates
+            .iter()
+            .filter(|aggregate| aggregate.group_id.components().asset.is_none())
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn acquisition_three_preserves_other_row_validation() {
+    for (field, value) in [
+        ("proxyWallet", json!(null)),
+        ("proxyWallet", json!("invalid")),
+        (
+            "proxyWallet",
+            json!("0x1111111111111111111111111111111111111111"),
+        ),
+        ("timestamp", json!(null)),
+        ("timestamp", json!("fractional.1")),
+        ("timestamp", json!(i64::MAX)),
+        ("transactionHash", json!(null)),
+        ("transactionHash", json!("")),
+        ("type", json!(null)),
+        ("type", json!("")),
+        ("price", json!(null)),
+        ("price", json!("1.1")),
+        ("price", json!("bad")),
+        ("size", json!(null)),
+        ("size", json!("-1")),
+        ("size", json!("0.0000001")),
+        ("size", json!("18446744073710")),
+        ("usdcSize", json!(null)),
+        ("usdcSize", json!("-1")),
+        ("usdcSize", json!("0.0000001")),
+        ("usdcSize", json!("18446744073710")),
+        ("side", json!(null)),
+        ("side", json!("invalid")),
+        ("outcomeIndex", json!(null)),
+        ("outcomeIndex", json!("invalid")),
+        ("outcomeIndex", json!(65536)),
+    ] {
+        let mut row = activity_row(50, "0xinvalid".to_owned(), ASSET.to_owned(), 0);
+        row[field] = value;
+        let raw = serde_json::to_vec(&vec![row.clone()]).unwrap();
+        let expected = parse_activity_response(&raw, wallet(), &context()).unwrap_err();
+        for missing in ["conditionId", "asset"] {
+            let mut unmapped = row.clone();
+            unmapped.as_object_mut().unwrap().remove(missing);
+            let api = activity_fixture(unmapped);
+            let error = fetch_complete_activity_semantic(
+                &api,
+                BASE,
+                wallet(),
+                None,
+                100,
+                ActivityRowAcceptance::Acquisition3,
+            )
+            .await
+            .unwrap_err();
+            let error = match error {
+                ActivityReadError::Parse(error) => Some(error),
+                _ => None,
+            }
+            .expect("row validation must remain a parse error");
+            match (&error, &expected) {
+                (
+                    pe_source_polymarket_public::ActivityParseError::Json { message },
+                    pe_source_polymarket_public::ActivityParseError::Json { message: expected },
+                ) => {
+                    // Removing a field shifts serde's byte-column diagnostic.
+                    assert_eq!(
+                        message.split(" at line").next(),
+                        expected.split(" at line").next()
+                    );
+                }
+                _ => assert_eq!(error, expected, "{field} with absent {missing}"),
+            }
+        }
+    }
+    let mut redeem = activity_row(50, "0xredeem".to_owned(), ASSET.to_owned(), 0);
+    redeem["type"] = json!("REDEEM");
+    redeem.as_object_mut().unwrap().remove("outcome");
+    redeem.as_object_mut().unwrap().remove("conditionId");
+    let error = fetch_complete_activity_semantic(
+        &activity_fixture(redeem),
+        BASE,
+        wallet(),
+        None,
+        100,
+        ActivityRowAcceptance::Acquisition3,
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(error, ActivityReadError::Parse(pe_source_polymarket_public::ActivityParseError::InvalidRow {
+        source: pe_source_polymarket_public::ActivityValidationError::InvalidConditionOutcomeMapping, ..
+    })));
+    let mut future = activity_row(101, "0xfuture".to_owned(), ASSET.to_owned(), 0);
+    future.as_object_mut().unwrap().remove("conditionId");
+    assert!(matches!(
+        fetch_complete_activity_semantic(
+            &activity_fixture(future),
+            BASE,
+            wallet(),
+            None,
+            100,
+            ActivityRowAcceptance::Acquisition3,
+        )
+        .await,
+        Err(ActivityReadError::RowOutsideBounds {
+            timestamp: 101,
+            start: None,
+            end: 100
+        })
+    ));
+    let mut boundary = activity_row(50, "0xboundary".to_owned(), ASSET.to_owned(), 0);
+    boundary.as_object_mut().unwrap().remove("asset");
+    let api = FixtureFetcher::new(HashMap::from([(
+        activity_url(Some(50), 100, 0),
+        serde_json::to_vec(&vec![boundary]).unwrap(),
+    )]));
+    assert!(matches!(
+        fetch_complete_activity_semantic(
+            &api,
+            BASE,
+            wallet(),
+            Some(50),
+            100,
+            ActivityRowAcceptance::Acquisition3,
+        )
+        .await,
+        Err(ActivityReadError::RowOutsideBounds {
+            timestamp: 50,
+            start: Some(50),
+            end: 100
+        })
+    ));
 }
 
 fn mapping(rows: Vec<Value>) -> ActivityAssetMapping {
@@ -1151,9 +1406,16 @@ async fn semantic_read_matches_the_default_read_without_row_provenance() {
     let full = fetch_complete_activity(&api, BASE, wallet(), None, 100)
         .await
         .unwrap();
-    let semantic = fetch_complete_activity_semantic(&api, BASE, wallet(), None, 100)
-        .await
-        .unwrap();
+    let semantic = fetch_complete_activity_semantic(
+        &api,
+        BASE,
+        wallet(),
+        None,
+        100,
+        ActivityRowAcceptance::Strict,
+    )
+    .await
+    .unwrap();
 
     // Receipt clocks are sampled per read; every other evidence field is equal.
     let evidence = |pages: &[pe_source_polymarket_public::ReconciliationPageEvidence]| {
@@ -1226,9 +1488,16 @@ async fn semantic_read_matches_the_default_read_without_row_provenance() {
         activity_row(20, "0xsplit".to_owned(), "asset-split".to_owned(), 0),
         activity_row(22, "0xsplit".to_owned(), "asset-split".to_owned(), 0),
     ]);
-    let read = fetch_complete_activity_semantic(&mixed, BASE, wallet(), None, 100)
-        .await
-        .unwrap();
+    let read = fetch_complete_activity_semantic(
+        &mixed,
+        BASE,
+        wallet(),
+        None,
+        100,
+        ActivityRowAcceptance::Strict,
+    )
+    .await
+    .unwrap();
     let bucketed = read.buckets().unwrap_err().to_string();
     let direct = aggregate_activity_rows(&read.rows)
         .map_err(ActivityReadError::from)

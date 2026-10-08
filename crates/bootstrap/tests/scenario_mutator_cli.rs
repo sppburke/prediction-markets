@@ -306,6 +306,74 @@ fn activate_next_cli_is_audited_idempotent_and_locks_before_open() {
 }
 
 #[test]
+fn activate_next_cli_batch_size_comes_from_the_environment() {
+    let dir = TempDir::new().unwrap();
+    let cache_path = dir.path().join("cache.db");
+    let audit_path = dir.path().join("activation.csv");
+    {
+        let mut cache = WalletCache::open(&cache_path).unwrap();
+        for byte in [0x61, 0x62, 0x63] {
+            upsert(&mut cache, &wallet_hex(byte));
+        }
+    }
+    let run = |batch_id: &str, size: &str| {
+        run_cli_with_env(
+            dir.path(),
+            &cache_path,
+            &[
+                "activate-next",
+                "--batch-id",
+                batch_id,
+                "--audit-csv",
+                audit_path.to_str().unwrap(),
+            ],
+            &[
+                ("RUST_LOG", "info"),
+                ("PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS", size),
+            ],
+        )
+    };
+    let active_wallets = || -> i64 {
+        WalletCache::open(&cache_path)
+            .unwrap()
+            .raw_conn_for_test()
+            .query_row(
+                "SELECT COUNT(*) FROM wallets WHERE is_active = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+
+    let none = run("env-zero", "0");
+    assert!(
+        none.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&none.stderr)
+    );
+    assert!(String::from_utf8_lossy(&none.stderr).contains("activation batch size is 0"));
+    assert_eq!(
+        std::fs::read_to_string(&audit_path).unwrap(),
+        "batch_id,wallet_hex\n"
+    );
+    assert_eq!(active_wallets(), 0);
+
+    // A resumed run under another value stops instead of admitting a different cohort.
+    let changed = run("env-zero", "2");
+    assert_eq!(changed.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&changed.stderr).contains("requested_count mismatch"));
+    assert_eq!(active_wallets(), 0);
+
+    let two = run("env-two", "2");
+    assert!(
+        two.status.success(),
+        "stderr={}",
+        String::from_utf8_lossy(&two.stderr)
+    );
+    assert_eq!(active_wallets(), 2);
+}
+
+#[test]
 fn purge_infra_cli_is_report_only_until_shared_purge_flag_is_enabled() {
     let dir = TempDir::new().unwrap();
     let cache_path = dir.path().join("cache.db");

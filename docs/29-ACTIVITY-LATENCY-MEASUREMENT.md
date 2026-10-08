@@ -59,11 +59,13 @@ budget; the websocket path below is the primary (#530).
 - A **1-minute TTR floor is reliably copyable** (≥ ~40s of margin after worst-case latency).
 - Sub-minute breaks down (a 30s-TTR trade observed at +15–20s leaves too little to fill).
 
-→ The 72h buy-and-hold ranking uses **`--min-ttr-hours 0.0167` (60s)** as the reliability
-floor. (An earlier exploratory re-run this session passed a 6h floor on the command line —
-before this latency was measured — which is far stricter than the ~10–20s copy latency
-warrants; the script default has always been 60s.) The *capturable* edge near resolution is governed separately
-by latency-shifted fill pricing in the ranking, not by this floor.
+→ Historically, the 72h buy-and-hold ranking used **`--min-ttr-hours 0.0167` (60s)** as
+the REST reliability floor. Classifier 6 (#739) replaces that production floor with the one
+[`MIN_TTR_SECS` value](_GLOSSARY.md#ranking-horizon-floor) used by both pass-two calls and
+recorded from the scoring run in the published batch; the copy gate aligns in pe-service release 2
+on [#588](https://github.com/sppburke/prediction-markets/issues/588). The measured REST fallback
+latency above remains historical evidence, not the current ranking floor. The *capturable* edge
+near resolution is governed separately by latency-shifted fill pricing in the ranking.
 
 ## Caveats
 

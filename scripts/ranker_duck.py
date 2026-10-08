@@ -30,6 +30,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import re
 import time
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
@@ -64,6 +65,8 @@ REQUIRED_V2_PARQUET = (
     CACHE_V2_STATE_PARQUET,
 )
 REQUIRED_V2_FILES = REQUIRED_V2_PARQUET + (V2_EXPORT_MANIFEST,)
+PROJECTION_PARQUET = "projection.parquet"
+REQUIRED_V3_PARQUET = (CLOB_PAYOUT_EVIDENCE_V2_PARQUET, PROJECTION_PARQUET)
 
 DEFAULT_PARQUET_DIR = "data/parquet"
 DEFAULT_MAX_AGE_HOURS = 4.0
@@ -94,8 +97,9 @@ def _load_v2_export_manifest(parquet_dir: str) -> dict:
     path = os.path.join(parquet_dir, V2_EXPORT_MANIFEST)
     with open(path, encoding="utf-8") as source:
         value = json.load(source)
-    if value.get("version") not in (1, 2) or set(value.get("tables", {})) != {
-        name.removesuffix(".parquet") for name in REQUIRED_V2_PARQUET
+    required = REQUIRED_V3_PARQUET if value.get("version") == 3 else REQUIRED_V2_PARQUET
+    if value.get("version") not in (1, 2, 3) or set(value.get("tables", {})) != {
+        name.removesuffix(".parquet") for name in required
     }:
         raise SchemaTwoEngineError("schema-two export manifest has an invalid shape")
     if value["version"] == 2:
@@ -106,7 +110,20 @@ def _load_v2_export_manifest(parquet_dir: str) -> dict:
                         == value["tables"]["ranker_entries_v2"].get("count")
                         == projection.get("count"))):
             raise SchemaTwoEngineError("schema-two certified activity scope/count mismatch")
-    for name in REQUIRED_V2_PARQUET:
+    if value["version"] == 3:
+        projection = value.get("projection", {})
+        if (not isinstance(projection, dict)
+                or any(type(projection.get(field)) is not int
+                       for field in ("count", "classifier_version", "oracle_version", "activity_generation"))
+                or any(not isinstance(projection.get(field), str)
+                       or re.fullmatch(r"[0-9a-f]{64}", projection[field]) is None
+                       for field in ("digest", "spool_sha256"))):
+            raise SchemaTwoEngineError("format-three projection summary is incomplete or invalid")
+        if (value.get("activity_scope") != "projection_spool"
+                or projection.get("classifier_version") != 6 or projection.get("oracle_version") != 6
+                or value["tables"]["projection"].get("count") != projection.get("count")):
+            raise SchemaTwoEngineError("format-three projection scope/count/version mismatch")
+    for name in required:
         table = name.removesuffix(".parquet")
         expected = value["tables"][table].get("sha256")
         actual = _sha256_file(os.path.join(parquet_dir, name))
@@ -196,7 +213,10 @@ def get_engine(force: str | None = None,
         log("duckdb not importable -> SQLite path")
         return None
 
-    required = REQUIRED_V2_FILES if schema_two else REQUIRED_PARQUET
+    export_manifest = _load_v2_export_manifest(parquet_dir) if schema_two else None
+    format_three = schema_two and export_manifest["version"] == 3
+    required_parquet = REQUIRED_V3_PARQUET if format_three else REQUIRED_V2_PARQUET
+    required = required_parquet + (V2_EXPORT_MANIFEST,) if schema_two else REQUIRED_PARQUET
     if force == "duck":
         usable, reason = _snapshot_state(
             parquet_dir, 0.0, required
@@ -254,44 +274,55 @@ def get_engine(force: str | None = None,
             ("market_schedules", SCHEDULES_PARQUET),
         )
     )
+    if format_three:
+        base_views = (("projection", PROJECTION_PARQUET),
+                      ("clob_payout_evidence_v2", CLOB_PAYOUT_EVIDENCE_V2_PARQUET))
     for tbl, name in base_views:
         path = _q(os.path.join(parquet_dir, name))
         con.execute(f"CREATE VIEW {tbl} AS SELECT * FROM read_parquet('{path}');")
     if schema_two:
-        export_manifest = _load_v2_export_manifest(parquet_dir)
-        for name in REQUIRED_V2_PARQUET:
+        for name in required_parquet:
             table = name.removesuffix(".parquet")
             actual_count = int(con.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
             if actual_count != int(export_manifest["tables"][table]["count"]):
                 raise SchemaTwoEngineError(
                     f"schema-two Parquet count mismatch for {table}"
                 )
-        state = con.execute(
-            "SELECT phase, ranker_projection_count, ranker_projection_digest, "
-            "ranker_classifier_version FROM cache_v2_migration_state WHERE singleton = 1"
-        ).fetchone()
-        projection = export_manifest.get("projection", {})
-        if (state is None or state[0] != "finalized"
-                or int(state[1]) != int(projection.get("count", -1))
-                or str(state[2]) != str(projection.get("digest", ""))
-                or int(state[3]) != int(projection.get("classifier_version", -1))):
-            raise SchemaTwoEngineError(
-                "schema-two export manifest does not match finalized projection state"
-            )
-        if export_manifest["version"] == 2:
-            generation = projection["activity_generation"]
-            latest = con.execute(
-                "SELECT MAX(generation) FROM activity_coverage_manifests_v2"
-            ).fetchone()[0]
+        if format_three:
+            projection = export_manifest["projection"]
             bad = con.execute(
-                "SELECT COUNT(*) FROM ranker_entries_v2 r "
-                "LEFT JOIN activity_groups_v2 g ON g.source_trade_id = r.source_trade_id "
-                "AND g.coverage_generation = r.activity_generation "
-                "WHERE r.activity_generation IS NULL OR r.activity_generation != ? "
-                "OR g.source_trade_id IS NULL", [generation],
-            ).fetchone()[0]
-            if latest != generation or bad:
-                raise SchemaTwoEngineError("schema-two certified activity generation/rows mismatch")
+                "SELECT COUNT(*) FROM projection WHERE activity_generation IS NULL OR activity_generation != ? "
+                "OR classifier_version IS NULL OR classifier_version != ?",
+                [projection["activity_generation"], projection["classifier_version"]]).fetchone()[0]
+            if bad:
+                raise SchemaTwoEngineError("format-three projection generation/classifier mismatch")
+        else:
+            state = con.execute(
+                "SELECT phase, ranker_projection_count, ranker_projection_digest, "
+                "ranker_classifier_version FROM cache_v2_migration_state WHERE singleton = 1"
+            ).fetchone()
+            projection = export_manifest.get("projection", {})
+            if (state is None or state[0] != "finalized"
+                    or int(state[1]) != int(projection.get("count", -1))
+                    or str(state[2]) != str(projection.get("digest", ""))
+                    or int(state[3]) != int(projection.get("classifier_version", -1))):
+                raise SchemaTwoEngineError(
+                    "schema-two export manifest does not match finalized projection state"
+                )
+            if export_manifest["version"] == 2:
+                generation = projection["activity_generation"]
+                latest = con.execute(
+                    "SELECT MAX(generation) FROM activity_coverage_manifests_v2"
+                ).fetchone()[0]
+                bad = con.execute(
+                    "SELECT COUNT(*) FROM ranker_entries_v2 r "
+                    "LEFT JOIN activity_groups_v2 g ON g.source_trade_id = r.source_trade_id "
+                    "AND g.coverage_generation = r.activity_generation "
+                    "WHERE r.activity_generation IS NULL OR r.activity_generation != ? "
+                    "OR g.source_trade_id IS NULL", [generation],
+                ).fetchone()[0]
+                if latest != generation or bad:
+                    raise SchemaTwoEngineError("schema-two certified activity generation/rows mismatch")
     # Optional CLV view (issue #421 PR4) — registered only when its parquet exists, so the engine
     # stays usable for proxy-CLV / non-CLV runs before the prices-history backfill has run.
     mph_path = os.path.join(parquet_dir, MARKET_PRICE_HISTORY_PARQUET)
@@ -567,6 +598,9 @@ def duck_extract_positions(con, wallets, win_start, win_end, ttr_lo, ttr_secs,
     return df
 
 
+TRADED_OUTCOME = "list_position(json_extract_string(p.tokens_json, '$[*].token_id'), g.asset) - 1"
+
+
 def duck_extract_positions_v2(con, wallets, win_start, win_end):
     """Yield every structurally valid Rust-classified schema-two first buy.
 
@@ -588,22 +622,31 @@ def duck_extract_positions_v2(con, wallets, win_start, win_end):
         con.execute("SELECT current_setting('temp_directory')").fetchone()[0],
         "positions_v2.parquet",
     )
+    compact = con.execute("SELECT COUNT(*) FROM duckdb_views() WHERE view_name = 'projection'").fetchone()[0] > 0
+    marker = "g" if compact else "r"
+    source = (
+        "FROM projection g " if compact else
+        "FROM ranker_entries_v2 r LEFT JOIN activity_groups_v2 g "
+        "ON g.source_trade_id = r.source_trade_id AND g.coverage_generation = r.activity_generation "
+    ) + "LEFT JOIN clob_payout_evidence_v2 p ON p.market_id = g.condition_id "
+    payout = "g" if compact else "p"
+    payout_mismatch = (
+        " OR g.payout_vector_json IS DISTINCT FROM p.payout_vector_json "
+        "OR g.end_date_unix IS DISTINCT FROM p.end_date_unix" if compact else ""
+    )
     try:
         bad = con.execute(
-            "SELECT COUNT(*) FROM ranker_entries_v2 r "
-            "LEFT JOIN activity_groups_v2 g "
-            "ON g.source_trade_id = r.source_trade_id "
-            "AND g.coverage_generation = r.activity_generation "
-            "LEFT JOIN clob_payout_evidence_v2 p ON p.market_id = g.condition_id "
-            "WHERE NOT regexp_full_match(r.source_trade_id, 'g2:[0-9a-f]{64}') "
+            f"SELECT COUNT(*) {source} "
+            f"WHERE NOT regexp_full_match({marker}.source_trade_id, 'g2:[0-9a-f]{{64}}') "
             "OR g.source_trade_id IS NULL OR p.market_id IS NULL OR g.condition_id IS NULL "
             "OR g.asset IS NULL OR g.outcome_id IS NULL OR g.side != 'buy' "
+            f"OR {TRADED_OUTCOME} IS NULL "
             "OR TRY_CAST(g.share_amount_str AS DECIMAL(38,6)) IS NULL "
             "OR TRY_CAST(g.share_amount_str AS DECIMAL(38,6)) <= 0 "
             "OR TRY_CAST(g.price_weighted_share_amount_str AS DECIMAL(38,12)) IS NULL "
             "OR p.end_date_unix IS NULL OR p.payout_status != 'resolved' "
             "OR p.payout_vector_json NOT IN ('[\"1\",\"0\"]','[\"0\",\"1\"]',"
-            "'[\"0.5\",\"0.5\"]')"
+            "'[\"0.5\",\"0.5\"]')" + payout_mismatch
         ).fetchone()[0]
         if bad:
             raise RuntimeError(
@@ -611,19 +654,15 @@ def duck_extract_positions_v2(con, wallets, win_start, win_end):
             )
         con.execute(
             "COPY (SELECT g.wallet_hex AS wallet, g.condition_id AS market_id, "
-            "g.outcome_id, g.source_time_unix AS entry_ts, "
-            "CAST(p.end_date_unix - g.source_time_unix AS BIGINT) AS ttr_secs, "
+            f"{TRADED_OUTCOME} AS outcome_id, g.source_time_unix AS entry_ts, "
+            f"CAST({payout}.end_date_unix - g.source_time_unix AS BIGINT) AS ttr_secs, "
             "CAST(TRY_CAST(g.price_weighted_share_amount_str AS DECIMAL(38,12)) / "
             "TRY_CAST(g.share_amount_str AS DECIMAL(38,6)) AS DOUBLE) AS price, "
             "g.share_amount_str AS contracts, "
-            "CAST(json_extract_string(p.payout_vector_json, "
-            "'$[' || CAST(g.outcome_id AS VARCHAR) || ']') AS DOUBLE) AS payoff, "
-            "p.end_date_unix AS resolved_at, r.source_trade_id "
-            "FROM ranker_entries_v2 r "
-            "JOIN activity_groups_v2 g ON g.source_trade_id = r.source_trade_id "
-            "AND g.coverage_generation = r.activity_generation "
-            "JOIN clob_payout_evidence_v2 p ON p.market_id = g.condition_id "
-            "JOIN universe u ON u.wallet_hex = g.wallet_hex "
+            f"CAST(json_extract_string({payout}.payout_vector_json, "
+            f"'$[' || CAST({TRADED_OUTCOME} AS VARCHAR) || ']') AS DOUBLE) AS payoff, "
+            f"{payout}.end_date_unix AS resolved_at, {marker}.source_trade_id "
+            f"{source} JOIN universe u ON u.wallet_hex = g.wallet_hex "
             f"WHERE g.source_time_unix >= {int(win_start)} AND g.source_time_unix < {int(win_end)}) "
             f"TO '{_q(staged)}' (FORMAT PARQUET)"
         )
