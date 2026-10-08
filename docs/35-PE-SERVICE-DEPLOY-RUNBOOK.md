@@ -1856,11 +1856,13 @@ PID, lock times and copy latency through its first advance and retirements.
 Run each actual-6e09b86 case separately and record its pause or release point and pass condition,
 against the durable inventory (`paper_state.db` and its WAL, `paper.log`, `live_journal.log`, the
 source log, checkpoint, receipts, invalidation record, authority and committed feed files; 6e09b86's
-own diagnostic logs are outside it). Before the fresh boot, on the restored, unfenced base, start a
-6e09b86 preparation, identified by its executable. Observe (10 ms polling, within 600 s) its FLOCK on
-`<log>.boot-checkpoint.lock` in `/proc/locks` for the initial checkpoint load, then, within 1,800 s,
-that hold's release and its walk underway (no lock of its PID; `rchar` in `/proc/<pid>/io` at least
-1 GB past the release). Hold the checkpoint lock so it blocks entering publication, and within
+own diagnostic logs are outside it). Before the fresh boot, on the restored, unfenced base, record
+the inventory hashes and start a 6e09b86 preparation. From the launch, one poller (5 ms, within
+600 s) observes a FLOCK on `<log>.boot-checkpoint.lock` in `/proc/locks` held by the process
+executing 6e09b86 for its initial checkpoint load (about 0.5 s after it starts, for about 0.2 s),
+which identifies its PID; then, within 1,800 s, that hold's release and its walk underway (no lock
+of its PID; `rchar` in `/proc/<pid>/io` at least 1 GB past the release). Hold the checkpoint lock
+so it blocks entering publication, and within
 3,600 s confirm a waiting FLOCK of its PID with `rchar` at least the log's size (the command prints
 only its final receipt). While holding the lock, SIGSTOP it and confirm within 10 s that it is
 stopped and has not acquired the lock; release the lock and confirm within 10 s that it holds and
@@ -1891,6 +1893,11 @@ epoch zero/format 2, install no fence and erase nothing. The first census runs w
 serves with its executable still installed (the staged census script, step 4). Repeat
 and verify each stray's identity before stopping it. Then disable and stop the unit, confirm both states and its process exit, and clear another
 readable census before swapping the binary. Keep the unit disabled/stopped over every interruption.
+A resume never starts a new binary that has booted before (fence present, or an invalidation
+record the service cannot read) or that exited 78. Before any disable or stop of the new binary's
+unit, a status 78, or a status that cannot be read, is recorded durably as `recovery-required` in
+the deploy's artifact directory; the unit then stays disabled and stopped until the recovery below
+is recorded.
 Every resume reruns the census: before a start it must find no matching process, and when
 accepting an already healthy desired unit it may contain only that unit's freshly
 ownership-verified MainPID; old receipts only document history. A blocked/unreadable census stops deployment and is
