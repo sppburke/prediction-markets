@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use pe_core_types::{EventSeq, WalletAddress};
-use pe_paper_state::{PaperStateDb, WalletRetentionWait};
+use pe_paper_state::{AnchorProofCursor, PaperStateDb, WalletRetentionWait};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::live_watchlist::LiveWatchlist;
@@ -14,11 +14,15 @@ use crate::orchestrator_control::OrchestratorControl;
 use crate::paper_recovery::{PaperLog, PaperLogFrame, PaperLogRecord, ScannedPaperFrame};
 use crate::watchlist_admission::AdmissionPreparer;
 
-/// Superseded proofs blanked per transaction (~0.1 s at the rehearsal's ~6.8 ms per row).
-const BLANK_BATCH_ROWS: usize = 16;
-const CANDIDATE_PAGE_WALLETS: usize = 128;
-/// Trade ids a drain transaction removes (about four row deletions each).
-const DRAIN_TRADE_IDS: usize = 500;
+/// Superseded proofs blanked per transaction. Each run's transactions resume after the last key
+/// blanked; on 10/8 in production, 16-row batches that rescanned the blank rows held the shared
+/// connection for up to 5.3 s.
+const BLANK_BATCH_ROWS: usize = 4;
+/// A page walks every row of its wallets' tables; one 128-wallet page held 0.53 s in production on 10/8.
+const CANDIDATE_PAGE_WALLETS: usize = 32;
+/// Trade ids a drain transaction removes (about four row deletions each; 2.6 ms per trade id in
+/// production on 10/8, so about 0.17 s per transaction).
+const DRAIN_TRADE_IDS: usize = 64;
 /// Every retention transaction and eligibility check is followed by a pause at least as long as it
 /// held the shared connection, and never shorter than this. That bounds the job's duty cycle only;
 /// the connection's mutex is not fair, so it gives no waiter a maximum wait.
@@ -339,6 +343,7 @@ async fn run_database_retention_steps(
             return Ok(());
         }
     }
+    let mut cursor = AnchorProofCursor::start();
     loop {
         if cancel.load(Ordering::Acquire) {
             report.cancelled = true;
@@ -346,17 +351,19 @@ async fn run_database_retention_steps(
         }
         let batch = state
             .paper_state
-            .blank_superseded_anchor_proofs(BLANK_BATCH_ROWS)?;
-        report.anchors_blanked += batch.result;
+            .blank_superseded_anchor_proofs(&cursor, BLANK_BATCH_ROWS)?;
+        let (blanked, next) = batch.result;
+        report.anchors_blanked += blanked;
         tracing::info!(
-            anchors_blanked = batch.result,
+            anchors_blanked = blanked,
             lock_time_micros = batch.lock_time.as_micros(),
             "source retention database transaction"
         );
         pace(batch.lock_time).await;
-        if batch.result < BLANK_BATCH_ROWS {
+        if blanked < BLANK_BATCH_ROWS {
             break;
         }
+        cursor = next;
     }
     let mut after = None;
     loop {

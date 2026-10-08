@@ -2,7 +2,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use pe_core_types::{EventSeq, WalletAddress};
-use pe_paper_state::{PaperStateDb, PaperStateError, WalletRetentionWait};
+use pe_paper_state::{AnchorProofCursor, PaperStateDb, PaperStateError, WalletRetentionWait};
 use rusqlite::{Connection, params};
 
 fn wallet(n: u8) -> WalletAddress {
@@ -106,18 +106,29 @@ fn retention_blanks_bounded_batches_keeps_newest_and_skips_blank_rows() {
             .unwrap();
         }
     }
-    sql.execute_batch("CREATE TRIGGER forbid_blank_or_newest BEFORE UPDATE OF proof_json ON position_anchors
-        WHEN OLD.proof_json = '{}' OR OLD.anchor_seq = 3 BEGIN SELECT RAISE(ABORT, 'must skip row'); END;").unwrap();
-    assert_eq!(db.blank_superseded_anchor_proofs(2).unwrap().result, 2);
+    forbid_blank_or_newest(&sql);
+    let (blanked, cursor) = db
+        .blank_superseded_anchor_proofs(&AnchorProofCursor::start(), 2)
+        .unwrap()
+        .result;
+    assert_eq!(blanked, 2);
     // Another caller can start its batch between retention transactions.
     db.begin_batch().unwrap();
     assert!(matches!(
-        db.blank_superseded_anchor_proofs(2),
+        db.blank_superseded_anchor_proofs(&cursor, 2),
         Err(PaperStateError::RetentionBatchOpen)
     ));
     db.rollback_batch().unwrap();
-    assert_eq!(db.blank_superseded_anchor_proofs(2).unwrap().result, 2);
-    assert_eq!(db.blank_superseded_anchor_proofs(2).unwrap().result, 0);
+    let (blanked, cursor) = db
+        .blank_superseded_anchor_proofs(&cursor, 2)
+        .unwrap()
+        .result;
+    assert_eq!(blanked, 2);
+    let (blanked, unchanged) = db
+        .blank_superseded_anchor_proofs(&cursor, 2)
+        .unwrap()
+        .result;
+    assert_eq!((blanked, unchanged), (0, cursor));
     assert_eq!(
         sql.query_row(
             "SELECT COUNT(*) FROM position_anchors WHERE proof_json = '{}'",
@@ -128,6 +139,167 @@ fn retention_blanks_bounded_batches_keeps_newest_and_skips_blank_rows() {
         6
     );
     assert_eq!(sql.query_row("SELECT COUNT(*) FROM position_anchors WHERE balances_json = 'balances' AND activity_cutoff_unix = 2", [], |row| row.get::<_, i64>(0)).unwrap(), 8);
+}
+
+/// Any update of an already blank or a wallet's newest proof aborts, so every proof is blanked at most once.
+fn forbid_blank_or_newest(sql: &Connection) {
+    sql.execute_batch(
+        "CREATE TRIGGER forbid_blank_or_newest BEFORE UPDATE OF proof_json ON position_anchors
+        WHEN OLD.proof_json = '{}' OR OLD.anchor_seq = (SELECT MAX(newest.anchor_seq)
+            FROM position_anchors newest WHERE newest.wallet_hex = OLD.wallet_hex)
+        BEGIN SELECT RAISE(ABORT, 'must skip row'); END;",
+    )
+    .unwrap();
+}
+
+fn anchor(sql: &Connection, wallet: WalletAddress, anchor_seq: i64) {
+    sql.execute(
+        "INSERT INTO position_anchors VALUES (?1, ?2, 1, 2, 'balances', 'hash', '{\"proof\":1}')",
+        params![wallet.to_string(), anchor_seq],
+    )
+    .unwrap();
+}
+
+fn nonblank_anchors(sql: &Connection) -> Vec<(String, i64)> {
+    sql.prepare(
+        "SELECT wallet_hex, anchor_seq FROM position_anchors WHERE proof_json != '{}' ORDER BY 1, 2",
+    )
+    .unwrap()
+    .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+    .unwrap()
+    .collect::<Result<_, _>>()
+    .unwrap()
+}
+
+/// One blanking run: each transaction resumes from the cursor the last one returned, until a short batch.
+fn blanking_run(db: &PaperStateDb, limit: usize) -> Vec<usize> {
+    let mut cursor = AnchorProofCursor::start();
+    let mut batches = Vec::new();
+    loop {
+        let (blanked, next) = db
+            .blank_superseded_anchor_proofs(&cursor, limit)
+            .unwrap()
+            .result;
+        batches.push(blanked);
+        if blanked < limit {
+            return batches;
+        }
+        cursor = next;
+    }
+}
+
+#[test]
+fn retention_blanking_run_resumes_and_blanks_every_superseded_proof_once() {
+    let (_dir, db, sql) = fixture();
+    // Shuffled insertion across wallets; wallet 4 has only its newest proof.
+    for (n, seq) in [
+        (2, 3),
+        (1, 1),
+        (4, 0),
+        (3, 0),
+        (2, 0),
+        (1, 4),
+        (3, 2),
+        (2, 1),
+        (1, 0),
+        (3, 1),
+    ] {
+        anchor(&sql, wallet(n), seq);
+    }
+    for (n, seq) in [(2, 2), (1, 3), (1, 2)] {
+        anchor(&sql, wallet(n), seq);
+    }
+    forbid_blank_or_newest(&sql);
+    // Superseded: wallet 1 seqs 0-3, wallet 2 seqs 0-2, wallet 3 seqs 0-1 (nine); limit 4 ends on a partial batch.
+    assert_eq!(blanking_run(&db, 4), vec![4, 4, 1]);
+    assert_eq!(
+        nonblank_anchors(&sql),
+        vec![
+            (wallet(1).to_string(), 4),
+            (wallet(2).to_string(), 3),
+            (wallet(3).to_string(), 2),
+            (wallet(4).to_string(), 0),
+        ]
+    );
+    // A run that finds nothing left ends on its first, empty batch.
+    assert_eq!(blanking_run(&db, 4), vec![0]);
+    assert_eq!(sql.query_row("SELECT COUNT(*) FROM position_anchors WHERE balances_json = 'balances' AND activity_cutoff_unix = 2", [], |row| row.get::<_, i64>(0)).unwrap(), 13);
+}
+
+#[test]
+fn retention_blanking_leaves_proofs_superseded_behind_the_cursor_to_the_next_run() {
+    let (_dir, db, sql) = fixture();
+    for n in [1, 2, 3] {
+        for seq in 0..4 {
+            anchor(&sql, wallet(n), seq);
+        }
+    }
+    forbid_blank_or_newest(&sql);
+    // The run passes wallet 1's superseded proofs, then wallet 2's: the cursor is at (wallet 2, seq 2).
+    let (blanked, cursor) = db
+        .blank_superseded_anchor_proofs(&AnchorProofCursor::start(), 3)
+        .unwrap()
+        .result;
+    assert_eq!(blanked, 3);
+    let (blanked, cursor) = db
+        .blank_superseded_anchor_proofs(&cursor, 3)
+        .unwrap()
+        .result;
+    assert_eq!(blanked, 3);
+    // New anchors supersede a proof behind the cursor (crossed wallet 1) and proofs above it (the cursor's
+    // own wallet 2 and the later wallet 3).
+    for n in [1, 2, 3] {
+        anchor(&sql, wallet(n), 4);
+    }
+    let (blanked, cursor) = db
+        .blank_superseded_anchor_proofs(&cursor, 3)
+        .unwrap()
+        .result;
+    assert_eq!(blanked, 3);
+    let (blanked, _) = db
+        .blank_superseded_anchor_proofs(&cursor, 3)
+        .unwrap()
+        .result;
+    assert_eq!(blanked, 2, "the short batch ends the run");
+    assert_eq!(
+        nonblank_anchors(&sql),
+        vec![
+            (wallet(1).to_string(), 3),
+            (wallet(1).to_string(), 4),
+            (wallet(2).to_string(), 4),
+            (wallet(3).to_string(), 4),
+        ]
+    );
+    // The next run starts from the beginning and blanks the crossed wallet's proof.
+    assert_eq!(blanking_run(&db, 3), vec![1]);
+    assert_eq!(
+        nonblank_anchors(&sql),
+        [1, 2, 3].map(|n| (wallet(n).to_string(), 4)).to_vec()
+    );
+}
+
+#[test]
+fn retention_blanking_dropped_mid_run_finishes_from_the_start_after_reopening() {
+    let (dir, db, sql) = fixture();
+    for n in [1, 2, 3] {
+        for seq in 0..4 {
+            anchor(&sql, wallet(n), seq);
+        }
+    }
+    forbid_blank_or_newest(&sql);
+    // A cancelled run loses only its in-memory cursor; what it committed stays blank.
+    let (blanked, _dropped) = db
+        .blank_superseded_anchor_proofs(&AnchorProofCursor::start(), 4)
+        .unwrap()
+        .result;
+    assert_eq!(blanked, 4);
+    drop(db);
+    let db = PaperStateDb::open(&dir.path().join("paper.db")).unwrap();
+    assert_eq!(blanking_run(&db, 4), vec![4, 1]);
+    assert_eq!(
+        nonblank_anchors(&sql),
+        [1, 2, 3].map(|n| (wallet(n).to_string(), 3)).to_vec()
+    );
 }
 
 #[test]
@@ -423,8 +595,8 @@ fn retention_largest_wallet_fixture_drains_in_bounded_transactions() {
     assert_eq!(retired.result, None);
     let (mut transactions, mut trade_ids, mut longest) = (0, 0, retired.lock_time);
     loop {
-        let drain = db.drain_retired_wallet(wallet(1), 500).unwrap();
-        assert!(drain.result.trade_ids <= 500);
+        let drain = db.drain_retired_wallet(wallet(1), 64).unwrap();
+        assert!(drain.result.trade_ids <= 64);
         transactions += 1;
         trade_ids += drain.result.trade_ids;
         longest = longest.max(drain.lock_time);
@@ -437,7 +609,7 @@ fn retention_largest_wallet_fixture_drains_in_bounded_transactions() {
         retired.lock_time
     );
     assert_eq!(trade_ids, 179_573);
-    assert_eq!(transactions, 179_573_usize.div_ceil(500) + 1);
+    assert_eq!(transactions, 179_573_usize.div_ceil(64) + 1);
     assert_eq!(count(&sql, "activity_groups"), 0);
     assert_eq!(count(&sql, "activity_group_revisions"), 0);
     assert_eq!(count(&sql, "seen_trades_v2"), 0);

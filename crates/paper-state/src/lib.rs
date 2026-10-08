@@ -818,6 +818,24 @@ pub struct RetentionTransaction<T> {
     pub lock_time: std::time::Duration,
 }
 
+/// Where one run's next blanking transaction resumes: the largest `(wallet_hex, anchor_seq)` key it
+/// blanked so far. It lives only in memory; each run starts again from [`Self::start`].
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AnchorProofCursor {
+    wallet_hex: String,
+    anchor_seq: i64,
+}
+
+impl AnchorProofCursor {
+    /// Precedes every anchor key: wallet hex is never empty.
+    pub fn start() -> Self {
+        Self {
+            wallet_hex: String::new(),
+            anchor_seq: i64::MIN,
+        }
+    }
+}
+
 /// Candidate wallets with working state after `?1` (`''` for the first page), at most `?2`. Every wallet
 /// table is read through an index: one `activity_groups` seek per wallet, and an index range of at most `?2`
 /// wallets for each other table. Frontier-only candidates come from the `feed_history_frontiers` JSON in `meta`.
@@ -847,6 +865,18 @@ SELECT wallet_hex FROM (
         FROM json_each((SELECT value FROM meta WHERE key = 'feed_history_frontiers'), '$.frontiers')
         WHERE wallet_hex > ?1 ORDER BY 1 LIMIT ?2)
 ) ORDER BY wallet_hex LIMIT ?2";
+/// Blank at most `?1` superseded nonblank proofs after the cursor key `(?2, ?3)`, in key order, and return
+/// their keys. The row-value bound seeks the primary-key index from the cursor, so a run never rereads the
+/// blank rows its earlier transactions passed.
+const BLANK_SUPERSEDED_ANCHOR_PROOFS_SQL: &str =
+    "UPDATE position_anchors SET proof_json = '{}' WHERE rowid IN (
+    SELECT old.rowid FROM position_anchors old
+    WHERE (old.wallet_hex, old.anchor_seq) > (?2, ?3)
+      AND old.proof_json != '{}'
+      AND old.anchor_seq < (SELECT MAX(newest.anchor_seq)
+          FROM position_anchors newest WHERE newest.wallet_hex = old.wallet_hex)
+    ORDER BY old.wallet_hex, old.anchor_seq LIMIT ?1)
+RETURNING wallet_hex, anchor_seq";
 /// Up to `?2` of a listed wallet's group trade ids, through the wallet index.
 const DRAIN_GROUP_IDS_SQL: &str = "INSERT INTO wallet_drain_trade_ids
     SELECT source_trade_id FROM activity_groups WHERE wallet_hex = ?1 LIMIT ?2";
@@ -937,12 +967,15 @@ fn write_retirement_drains(conn: &Connection, wallets: &[String]) -> Result<(), 
 }
 
 impl PaperStateDb {
-    /// Blank only superseded nonblank proofs; balances and cutoff columns stay intact.
-    /// Each call owns one bounded transaction and releases the connection before returning.
+    /// Blank only superseded nonblank proofs after `after`; balances and cutoff columns stay intact.
+    /// Each call owns one bounded transaction and releases the connection before returning. Returns
+    /// the number blanked and the cursor for the run's next call: the largest key blanked, or `after`
+    /// when none was. A proof superseded behind the cursor waits for the next run.
     pub fn blank_superseded_anchor_proofs(
         &self,
+        after: &AnchorProofCursor,
         limit: usize,
-    ) -> Result<RetentionTransaction<usize>, PaperStateError> {
+    ) -> Result<RetentionTransaction<(usize, AnchorProofCursor)>, PaperStateError> {
         let limit =
             i64::try_from(limit).map_err(|error| PaperStateError::Internal(error.to_string()))?;
         let mut conn = self.lock();
@@ -951,18 +984,22 @@ impl PaperStateDb {
             return Err(PaperStateError::RetentionBatchOpen);
         }
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let changed = tx.execute(
-            "UPDATE position_anchors SET proof_json = '{}' WHERE rowid IN (
-                SELECT old.rowid FROM position_anchors old
-                WHERE old.proof_json != '{}'
-                  AND old.anchor_seq < (SELECT MAX(newest.anchor_seq)
-                      FROM position_anchors newest WHERE newest.wallet_hex = old.wallet_hex)
-                ORDER BY old.wallet_hex, old.anchor_seq LIMIT ?1)",
-            params![limit],
-        )?;
+        let (mut blanked, mut next) = (0, after.clone());
+        {
+            let mut stmt = tx.prepare(BLANK_SUPERSEDED_ANCHOR_PROOFS_SQL)?;
+            let mut rows = stmt.query(params![limit, after.wallet_hex, after.anchor_seq])?;
+            // RETURNING order is unspecified, so the cursor takes the largest key.
+            while let Some(row) = rows.next()? {
+                blanked += 1;
+                next = next.max(AnchorProofCursor {
+                    wallet_hex: row.get(0)?,
+                    anchor_seq: row.get(1)?,
+                });
+            }
+        }
         tx.commit()?;
         Ok(RetentionTransaction {
-            result: changed,
+            result: (blanked, next),
             lock_time: started.elapsed(),
         })
     }
@@ -8548,6 +8585,135 @@ mod tests {
                 "no indexed read in {plan:?} for {query}"
             );
         }
+    }
+
+    fn insert_anchor(conn: &Connection, wallet: u8, anchor_seq: i64, proof_json: &str) {
+        conn.execute(
+            "INSERT INTO position_anchors VALUES (?1, ?2, 1, 1, 'balances', 'hash', ?3)",
+            params![
+                WalletAddress([wallet; 20]).to_string(),
+                anchor_seq,
+                proof_json
+            ],
+        )
+        .unwrap();
+    }
+
+    fn anchor_key(wallet: u8, anchor_seq: i64) -> AnchorProofCursor {
+        AnchorProofCursor {
+            wallet_hex: WalletAddress([wallet; 20]).to_string(),
+            anchor_seq,
+        }
+    }
+
+    #[test]
+    fn blanking_returns_the_largest_blanked_key_and_resumes_after_it() {
+        let (_dir, db) = db();
+        {
+            let conn = db.lock();
+            for (wallet, anchor_seq) in [
+                (3, 1),
+                (1, 0),
+                (2, 2),
+                (1, 2),
+                (3, 0),
+                (2, 0),
+                (1, 1),
+                (3, 2),
+                (2, 1),
+                (1, 3),
+                (3, 3),
+                (2, 3),
+            ] {
+                insert_anchor(&conn, wallet, anchor_seq, "{\"proof\":1}");
+            }
+        }
+        let first = db
+            .blank_superseded_anchor_proofs(&AnchorProofCursor::start(), 4)
+            .unwrap()
+            .result;
+        assert_eq!(first, (4, anchor_key(2, 0)));
+        let second = db
+            .blank_superseded_anchor_proofs(&first.1, 4)
+            .unwrap()
+            .result;
+        assert_eq!(second, (4, anchor_key(3, 1)));
+        let third = db
+            .blank_superseded_anchor_proofs(&second.1, 4)
+            .unwrap()
+            .result;
+        assert_eq!(third, (1, anchor_key(3, 2)));
+        let fourth = db
+            .blank_superseded_anchor_proofs(&third.1, 4)
+            .unwrap()
+            .result;
+        assert_eq!(fourth, (0, anchor_key(3, 2)));
+        let conn = db.lock();
+        let nonblank: Vec<(String, i64)> = conn
+            .prepare("SELECT wallet_hex, anchor_seq FROM position_anchors WHERE proof_json != '{}' ORDER BY 1, 2")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            nonblank,
+            [1, 2, 3].map(|wallet| (WalletAddress([wallet; 20]).to_string(), 3))
+        );
+    }
+
+    #[test]
+    fn blanking_seeks_after_the_cursor_without_reading_the_cleared_prefix() {
+        let (_plan_dir, plan_db) = db();
+        let plan: Vec<String> = plan_db
+            .lock()
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {BLANK_SUPERSEDED_ANCHOR_PROOFS_SQL}"
+            ))
+            .unwrap()
+            .query_map(params![4_i64, wallet().to_string(), 0_i64], |row| {
+                row.get(3)
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert!(
+            plan.iter().any(|detail| detail
+                == "SEARCH old USING INDEX sqlite_autoindex_position_anchors_1 ((wallet_hex,anchor_seq)>(?,?))"),
+            "blanking must seek the anchor key from the cursor: {plan:?}"
+        );
+        assert!(
+            plan.iter().all(|detail| !detail.starts_with("SCAN ")),
+            "blanking must not walk a table: {plan:?}"
+        );
+        // The same candidates after the cursor take the same VM steps whether or not 10,000 blank rows
+        // precede it, each counted on a freshly prepared statement.
+        let steps = |cleared: i64| {
+            let (_dir, db) = db();
+            let conn = db.lock();
+            for anchor_seq in 0..cleared {
+                insert_anchor(&conn, 1, anchor_seq, "{}");
+            }
+            insert_anchor(&conn, 1, cleared, "{\"proof\":1}");
+            for anchor_seq in 0..9 {
+                insert_anchor(&conn, 2, anchor_seq, "{\"proof\":1}");
+            }
+            let after = anchor_key(1, i64::MAX);
+            let mut stmt = conn.prepare(BLANK_SUPERSEDED_ANCHOR_PROOFS_SQL).unwrap();
+            let mut rows = stmt
+                .query(params![4_i64, after.wallet_hex, after.anchor_seq])
+                .unwrap();
+            let mut blanked = 0;
+            while rows.next().unwrap().is_some() {
+                blanked += 1;
+            }
+            drop(rows);
+            assert_eq!(blanked, 4);
+            stmt.get_status(rusqlite::StatementStatus::VmStep)
+        };
+        let without_prefix = steps(0);
+        assert!(without_prefix > 0);
+        assert_eq!(steps(10_000), without_prefix);
     }
 
     #[test]
