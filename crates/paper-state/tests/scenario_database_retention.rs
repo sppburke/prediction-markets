@@ -485,3 +485,144 @@ fn retention_drain_list_absent_means_empty_and_malformed_fails_closed() {
         }
     }
 }
+
+/// Every table's rows, sorted, for comparing two databases table by table.
+fn table_rows(sql: &Connection) -> std::collections::BTreeMap<String, Vec<String>> {
+    let tables: Vec<String> = sql
+        .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    tables
+        .into_iter()
+        .map(|table| {
+            let mut statement = sql.prepare(&format!("SELECT * FROM {table}")).unwrap();
+            let columns = statement.column_count();
+            let mut rows: Vec<String> = statement
+                .query_map([], |row| {
+                    Ok((0..columns)
+                        .map(|i| match row.get_ref(i).unwrap() {
+                            rusqlite::types::ValueRef::Null => "NULL".to_owned(),
+                            rusqlite::types::ValueRef::Integer(v) => v.to_string(),
+                            rusqlite::types::ValueRef::Real(v) => v.to_string(),
+                            rusqlite::types::ValueRef::Text(v) => {
+                                String::from_utf8_lossy(v).into_owned()
+                            }
+                            rusqlite::types::ValueRef::Blob(v) => {
+                                format!("blob:{}", String::from_utf8_lossy(v))
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join("|"))
+                })
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            rows.sort();
+            (table, rows)
+        })
+        .collect()
+}
+
+#[test]
+fn retention_removal_and_drains_delete_exactly_the_one_transaction_set() {
+    // Decision-only, gate-only and overlapping trade ids with several revisions; fences, market
+    // history and financial rows that reuse the departing wallet's ids must all survive.
+    let (dir, db, sql) = fixture();
+    for byte in [1, 2] {
+        seed(&sql, wallet(byte));
+    }
+    let w = wallet(1).to_string();
+    let (group, decision) = (format!("group-{w}"), format!("decision-{w}"));
+    sql.execute_batch(&format!(
+        "INSERT INTO entry_gate_results VALUES ('{group}', '{w}', 'market-2', 1, 'admitted', 1);
+         INSERT INTO activity_group_revisions VALUES ('{group}', 'r2', 'tx', 'applied', '{{}}', 1);
+         INSERT INTO activity_group_revisions VALUES ('{decision}', 'r2', 'tx', 'applied', '{{}}', 1);
+         INSERT INTO wallet_fences VALUES ('{w2}', 'fenced-trade', 'fixture', '{{}}', 1);
+         INSERT INTO wallet_fences VALUES ('{w3}', 'fenced-trade', 'fixture', '{{}}', 1);
+         INSERT INTO fills VALUES ('{decision}', 'market', 0, 'buy', '10', '0.5', '5', '0', 1, 0, NULL, NULL, NULL);
+         INSERT INTO fill_market_snapshots VALUES ('{decision}', NULL, NULL, NULL, NULL, 1);
+         INSERT INTO positions VALUES ('market', 0, '10', '0');
+         INSERT INTO bankroll VALUES (0, '995');
+         INSERT INTO settled_markets VALUES ('market', '[\"0\",\"1\"]', '0', 1, NULL, NULL);",
+        w2 = wallet(2),
+        w3 = wallet(3),
+    ))
+    .unwrap();
+    db.publish_feed_history_frontiers(&serde_json::json!({"version":1,"frontiers":[
+        {"wallet":wallet(1)}, {"wallet":wallet(2)}]}))
+        .unwrap();
+    // The one-transaction design, applied literally to a copy of the database.
+    let copy = dir.path().join("one-transaction.db");
+    sql.execute("VACUUM INTO ?1", [copy.to_str().unwrap()])
+        .unwrap();
+    let expected = Connection::open(&copy).unwrap();
+    expected
+        .execute_batch(&format!(
+            "CREATE TEMP TABLE gone AS
+               SELECT source_trade_id FROM activity_groups WHERE wallet_hex = '{w}'
+               UNION SELECT source_trade_id FROM decision_pending WHERE wallet_hex = '{w}'
+               UNION SELECT source_trade_id FROM entry_gate_results WHERE wallet_hex = '{w}';
+             DELETE FROM seen_trades_v2 WHERE source_trade_id IN gone;
+             DELETE FROM no_copy_dispositions WHERE source_trade_id IN gone;
+             DELETE FROM activity_group_revisions WHERE source_trade_id IN gone;
+             DELETE FROM activity_groups WHERE wallet_hex = '{w}';
+             DELETE FROM decision_pending WHERE wallet_hex = '{w}';
+             DELETE FROM entry_gate_results WHERE wallet_hex = '{w}';
+             DELETE FROM position_anchors WHERE wallet_hex = '{w}';
+             DELETE FROM position_validations WHERE wallet_hex = '{w}';
+             DELETE FROM wallet_history_status_v2 WHERE wallet_hex = '{w}';
+             DELETE FROM leader_positions WHERE wallet_hex = '{w}';
+             DELETE FROM poll_cursors WHERE wallet_hex = '{w}';"
+        ))
+        .unwrap();
+    // The removal, then drains of one trade id each until the entry clears.
+    assert_eq!(db.retire_wallet(wallet(1), 100, None).unwrap().result, None);
+    let mut drains = 0;
+    while !db
+        .drain_retired_wallet(wallet(1), 1)
+        .unwrap()
+        .result
+        .finished
+    {
+        drains += 1;
+        assert!(drains < 10, "the drain never finished");
+    }
+    assert_eq!(
+        drains, 3,
+        "the group, its overlapping gate result and the gate-only result"
+    );
+    assert!(db.retirement_drains().unwrap().result.is_empty());
+    let (mut actual, mut wanted) = (table_rows(&sql), table_rows(&expected));
+    // `meta` differs only by the frontier hint the removal drops and the drain list left empty.
+    assert_eq!(
+        db.feed_history_frontiers().unwrap(),
+        serde_json::json!({"version":1,"frontiers":[{"wallet":wallet(2)}]})
+    );
+    let other_meta = |rows: &[String]| -> Vec<String> {
+        rows.iter()
+            .filter(|row| {
+                !row.starts_with("feed_history_frontiers|")
+                    && !row.starts_with("wallet_retirement_drains|")
+            })
+            .cloned()
+            .collect()
+    };
+    assert_eq!(other_meta(&actual["meta"]), other_meta(&wanted["meta"]));
+    actual.remove("meta");
+    wanted.remove("meta");
+    assert_eq!(actual, wanted);
+    for table in [
+        "wallet_market_history_v2",
+        "wallet_fences",
+        "fills",
+        "fill_market_snapshots",
+        "positions",
+        "bankroll",
+        "settled_markets",
+    ] {
+        assert!(!actual[table].is_empty(), "{table} was populated");
+    }
+}
