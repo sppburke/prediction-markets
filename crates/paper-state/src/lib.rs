@@ -867,12 +867,14 @@ SELECT wallet_hex FROM (
 ) ORDER BY wallet_hex LIMIT ?2";
 /// Blank at most `?1` superseded nonblank proofs after the cursor key `(?2, ?3)`, in key order, and return
 /// their keys. The row-value bound seeks the primary-key index from the cursor, so a run never rereads the
-/// blank rows its earlier transactions passed.
+/// blank rows its earlier transactions passed. A blank proof is the 2-byte `{}`, and every written proof is a
+/// longer JSON document: testing the length reads only the record header, so passing a blank row never walks
+/// its `balances_json` overflow pages to reach `proof_json`, the last column.
 const BLANK_SUPERSEDED_ANCHOR_PROOFS_SQL: &str =
     "UPDATE position_anchors SET proof_json = '{}' WHERE rowid IN (
     SELECT old.rowid FROM position_anchors old
     WHERE (old.wallet_hex, old.anchor_seq) > (?2, ?3)
-      AND old.proof_json != '{}'
+      AND octet_length(old.proof_json) > 2
       AND old.anchor_seq < (SELECT MAX(newest.anchor_seq)
           FROM position_anchors newest WHERE newest.wallet_hex = old.wallet_hex)
     ORDER BY old.wallet_hex, old.anchor_seq LIMIT ?1)
@@ -8714,6 +8716,42 @@ mod tests {
         let without_prefix = steps(0);
         assert!(without_prefix > 0);
         assert_eq!(steps(10_000), without_prefix);
+    }
+
+    #[test]
+    fn blanking_tells_blank_proofs_by_length_without_loading_them() {
+        // `proof_json` (column 6) is the last column, after `balances_json`'s overflow pages. While choosing
+        // candidates (the program before the update opens its write cursor), each read of it must ask SQLite
+        // for the byte length alone (`OPFLAG_BYTELENARG`, 0xc0), which comes from the record header, so passing
+        // an already blank row never walks its overflow chain. Only the row being blanked is read in full.
+        let (_dir, db) = db();
+        let conn = db.lock();
+        let program: Vec<(String, i64, i64)> = conn
+            .prepare(&format!("EXPLAIN {BLANK_SUPERSEDED_ANCHOR_PROOFS_SQL}"))
+            .unwrap()
+            .query_map(params![1_i64, wallet().to_string(), 0_i64], |row| {
+                Ok((row.get(1)?, row.get(3)?, row.get(6)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let write = program
+            .iter()
+            .position(|(opcode, _, _)| opcode == "OpenWrite")
+            .unwrap();
+        let selection_reads: Vec<i64> = program[..write]
+            .iter()
+            .filter(|(opcode, column, _)| opcode == "Column" && *column == 6)
+            .map(|(_, _, p5)| *p5)
+            .collect();
+        assert!(
+            !selection_reads.is_empty(),
+            "no proof_json read while choosing candidates: {program:?}"
+        );
+        assert!(
+            selection_reads.iter().all(|p5| p5 & 0xc0 == 0xc0),
+            "candidates must be chosen by proof_json's length only: {program:?}"
+        );
     }
 
     #[test]
