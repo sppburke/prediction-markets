@@ -4239,8 +4239,9 @@ async fn previous_binary_rollback_matrix() {
     }
 }
 
-/// PASS: the previous binary serves but rejects the tail anchor, re-bracketing or deferring
-/// the wallet without changing finances, gate history or decisions; the new binary reuses it.
+/// PASS: on a genuine refresh proof rewritten into the re-entry tail shape, the previous binary
+/// serves but rejects the tail anchor, re-bracketing or deferring the wallet without changing
+/// finances, gate history or decisions; the new binary reuses it.
 /// FAIL: a crash, refused boot, silent reuse by the previous binary, proof decoding ERROR,
 /// changed durable finances/history/decisions, or a new-binary boot bracket for the wallet.
 #[tokio::test]
@@ -4335,17 +4336,55 @@ async fn previous_binary_rejects_tail_anchor() {
     assert!(replayed.post_start_record_replayed);
     assert_eq!(replayed.watchlist.entries[0].wallet, wallet);
 
+    // The fixture's helper anchor carries a synthetic proof. As in the rollback matrix, an
+    // age-due anchor makes the new binary's routine refresh re-bracket the wallet, so the tail
+    // rewrite below starts from a genuine validator proof in the production shape.
+    let helper_seq = fixture
+        .paper
+        .wallet_coverage(&wallet)
+        .unwrap()
+        .anchor_seq
+        .unwrap();
+    fixture.stale_anchors();
+    fixture.clear_logs();
+    let child = checkpoint_rollout::Child::start_checkpoint(&fixture.config_path, current, &[]);
+    fixture.wait_log("wallet bracket completed").await;
+    let logs = fixture.logs();
+    assert!(
+        logs.lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .any(|event| {
+                let fields = event.get("fields").unwrap_or(&event);
+                fields["message"] == "wallet bracket completed"
+                    && fields["wallet"] == wallet.to_string()
+                    && fields["outcome"] == "accepted"
+            }),
+        "genuine refresh bracket: {logs}"
+    );
+    checkpoint_until(|| {
+        fixture.paper.wallet_coverage(&wallet).unwrap().anchor_seq != Some(helper_seq)
+    })
+    .await;
+    let output = child.finish_checkpoint(Some("-INT")).await;
+    assert!(output.status.success(), "genuine refresh: {output:?}");
+
     let coverage = fixture.paper.wallet_coverage(&wallet).unwrap();
     let anchor_seq = coverage.anchor_seq.unwrap();
+    assert_ne!(anchor_seq, helper_seq);
     assert!(!coverage.reanchor_required);
     assert!(coverage.activity_cutoff_unix.is_some());
     assert!(fixture.paper.cursor(&wallet).unwrap().is_some());
     assert!(fixture.paper.wallet_history_complete(&wallet).unwrap());
     assert!(!fixture.paper.is_wallet_fenced(&wallet).unwrap());
+    // The refreshed anchor is not age-due, so neither rollback boot refreshes it and the proof
+    // shape is the sole reason the old reader refuses.
+    assert!(
+        coverage.anchored_at_unix.unwrap()
+            + i64::try_from(pe_service::trade_poller::ANCHOR_REFRESH_SECS).unwrap()
+            > OffsetDateTime::now_utc().unix_timestamp()
+    );
     // Boot selects position_anchors.proof_json by coverage.anchor_seq. Mirror any surviving
     // validation (the genuine copy can invalidate it); history-status completeness is true.
-    // Do not stale_anchors():
-    // reuse has no age gate, and the proof shape must be the sole reason the old reader refuses.
     let mut proof: serde_json::Value = serde_json::from_str(
         &fixture
             .paper
@@ -4354,6 +4393,19 @@ async fn previous_binary_rejects_tail_anchor() {
             .unwrap(),
     )
     .unwrap();
+    // The genuine full-history proof that finish() writes: top-level evidence and real pages.
+    assert_eq!(proof["version"], 1);
+    assert_eq!(proof["positions_reads"].as_array().unwrap().len(), 2);
+    assert!(proof["metadata_reads"].is_array());
+    assert!(proof.get("baseline_walk").is_none());
+    for walk in proof["activity_walks"].as_array().unwrap() {
+        for page in walk["pages"].as_array().unwrap() {
+            serde_json::from_value::<pe_source_polymarket_public::ReconciliationPageEvidence>(
+                page.clone(),
+            )
+            .unwrap();
+        }
+    }
     let baseline = proof["activity_walks"][0].clone();
     let baseline_end = baseline["fixed_end"].as_i64().unwrap();
     let tail_start = baseline_end
