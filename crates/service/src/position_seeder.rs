@@ -1170,7 +1170,7 @@ impl CausalPositionValidator {
             .asset_mapping()
             .map_err(|source| CausalPositionError::Positions { wallet, source })?;
         let tokens = mapping.tokens().cloned().collect::<Vec<_>>();
-        let resolved = self
+        let mut resolved = self
             .asset_identity
             .resolve_historical_for_bracket(tokens.clone())
             .await
@@ -1180,6 +1180,39 @@ impl CausalPositionValidator {
                 .apply_verified(asset, identity)
                 .map_err(|source| CausalPositionError::Positions { wallet, source })?;
         }
+
+        // SPLIT/MERGE activity names the market, so discover its outcomes through the same
+        // recorded metadata authority. Activity alone does not enumerate every outcome token.
+        let conditions = mapping
+            .split_merge_conditions()
+            .cloned()
+            .collect::<Vec<_>>();
+        let discovered = self
+            .asset_identity
+            .discover_conditions_for_bracket(conditions)
+            .await
+            .map_err(|source| CausalPositionError::Identity { wallet, source })?;
+        for asset in resolved.verified.keys() {
+            if let Some(reason) = discovered.unverified.get(asset) {
+                return Err(CausalPositionError::Identity {
+                    wallet,
+                    source: SourceError::Fatal {
+                        message: format!(
+                            "condition discovery rejected token {}: {reason}",
+                            asset.0
+                        ),
+                    },
+                });
+            }
+        }
+        for (asset, identity) in &discovered.verified {
+            mapping
+                .insert_verified_split_merge(&identity.condition_id, asset.clone(), identity)
+                .map_err(|source| CausalPositionError::Positions { wallet, source })?;
+        }
+        resolved.verified.extend(discovered.verified);
+        resolved.provenance.extend(discovered.provenance);
+
         for asset in &tokens {
             if mapping.classification(asset).is_none() {
                 let source = PositionReadError::MixedActivityClassification {
