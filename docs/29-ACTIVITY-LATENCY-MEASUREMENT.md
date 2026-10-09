@@ -756,7 +756,8 @@ changes = sorted((e for e in paper.values() if e["seq"] > start_seq and e["seq"]
                  key=lambda e: e["seq"])
 # The service's replay applies one pinned repair (crates/service/src/paper_recovery.rs HISTORICAL_MEMBERSHIP_PIN):
 # six wallets that paper era act-557-62ed205-2's sequence-28 full rerank omitted leave the membership just before
-# that record applies. Mirror it with the same identity checks: any partial match stops the inspection.
+# that record applies. Mirror it as the service does: identity checks over the era from Start, where any partial
+# match stops the inspection, and a stop for a pinned era that reaches sequence 28 without any membership record.
 REPAIR = {"activation_id": "act-557-62ed205-2", "seq": 28,
           "this_hash": "d76e36115b72ef6b842c425f8bb082522a65ea85c0187a0d8d8c2591a6ea2b5b",
           "raw_payload_hash": "f472fd1aabb73cabc61f3f2baabf1d559a07165b115d05391b06dd20b7e228db",
@@ -766,9 +767,10 @@ REPAIR = {"activation_id": "act-557-62ed205-2", "seq": 28,
 def pinned(e):
     return (start["activation_id"] == REPAIR["activation_id"] and e["seq"] == REPAIR["seq"],
             e["this_hash"] == REPAIR["this_hash"], e["raw_payload_hash"] == REPAIR["raw_payload_hash"])
-repairs = {e["seq"] for e in paper.values() if e["seq"] > start_seq and any(pinned(e))}
+repairs = {e["seq"] for e in paper.values() if changes and e["seq"] >= start_seq and any(pinned(e))}
 for s in repairs:
     assert all(pinned(paper[s])) and s in membership and membership[s]["reason"] == "full_rerank", ("membership repair identity", s)
+assert changes or not (start["activation_id"] == REPAIR["activation_id"] and max(paper) >= REPAIR["seq"]), "membership repair: pinned era without its record"
 intervals = []; opened = {w: ns(paper[start_seq]["received_at"]) for w in members}
 for e in changes:
     at = ns(e["received_at"]); c = membership[e["seq"]]
@@ -838,7 +840,7 @@ membership_changes = [{"seq": e["seq"], "hash": e["this_hash"], "at_ns": ns(e["r
                        "removed": membership[e["seq"]]["removed"], "added": membership[e["seq"]]["added"]}
                       for e in changes]
 membership_records = [membership_record(e, membership[e["seq"]])
-                      for e in sorted(paper.values(), key=lambda e: e["seq"]) if e["seq"] in membership]
+                      for e in paper.values() if e["seq"] in membership]
 deferrals = []
 for e in source.values("pe-service.watchlist-deferral"):
     if e["source_id"] != "pe-service.watchlist-deferral": continue
