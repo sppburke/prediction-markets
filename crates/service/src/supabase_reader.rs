@@ -32,11 +32,9 @@ use time::format_description::well_known::Rfc3339;
 /// it is not a gate. A t-stat of 2.5 maps to 2500 bps. See `docs/_GLOSSARY.md`.
 const LS_TSTAT_BPS_SCALE: i64 = 1_000;
 
-/// Candidate freshness window in hours (#357): a benched wallet is an eligible backfill
-/// candidate only if its real last trade (`last_trade_unix`) is within this window. Mirrors
-/// the canonical `upload_active_window_hours` = 72 in `docs/_GLOSSARY.md` (the ranker drops
-/// wallets idle > 72h at upload; this is the read-side gate for the same window). Typed `i64`
-/// for direct unix-second arithmetic with the poll clock — no narrowing cast.
+/// Strict-canary ranked-trade freshness window in hours. Ordinary bench admission and
+/// re-entry trust ranked survivors regardless of age; inactivity belongs to the knockout.
+/// See `docs/_GLOSSARY.md`.
 pub const ACTIVE_WINDOW_HOURS: i64 = 72;
 pub const CANARY_RANKING_MAX_AGE_SECS: i64 = 21_600;
 
@@ -679,21 +677,15 @@ pub async fn fetch(
 /// Build the PostgREST query string for [`fetch_candidates`]: the top-`n` SURVIVING
 /// batch-pinned `ranking_entries` rows ([`RANKING_SURVIVOR_FILTER`], #518; with the
 /// [`RANKING_EXACT_SELECT`] score aliases, #514) excluding `exclude`,
-/// optionally freshness-filtered, ordered by rank. Pure (no network)
-/// so the `not.in.` and `gte` filters are unit-testable. Excluded wallets render as canonical
-/// lowercase `0x` hex (matching `latest_ranking.wallet_hex`) and are sorted + deduped for a
+/// with a non-null ranked last-trade value, ordered by rank. Pure (no network)
+/// so the `not.in.` and `not.is.null` filters are unit-testable. Excluded wallets render as
+/// canonical lowercase `0x` hex (matching `latest_ranking.wallet_hex`) and are sorted + deduped for a
 /// deterministic, cache-friendly URL. An empty `exclude` omits that filter (PostgREST rejects
 /// an empty `in.()` list).
 ///
-/// `freshness_cutoff` (#357), when `Some(cutoff)`, appends `last_trade_unix=gte.{cutoff}` so
-/// only wallets that traded at/after `cutoff` are returned. NULL `last_trade_unix` fails `gte`
-/// and is excluded — a not-yet-populated bench pauses backfill, it never empties the live set.
-fn candidates_query(
-    exclude: &[WalletAddress],
-    n: usize,
-    freshness_cutoff: Option<i64>,
-    batch_id: i64,
-) -> String {
+/// Missing `last_trade_unix` stays excluded; a not-yet-populated bench pauses backfill,
+/// it never empties the live set. Ranked survivors otherwise have no age bound.
+fn candidates_query(exclude: &[WalletAddress], n: usize, batch_id: i64) -> String {
     let mut filters: Vec<String> = vec![
         format!("select={RANKING_EXACT_SELECT}"),
         RANKING_SURVIVOR_FILTER.to_string(),
@@ -705,9 +697,7 @@ fn candidates_query(
         hexes.dedup();
         filters.push(format!("wallet_hex=not.in.({})", hexes.join(",")));
     }
-    if let Some(cutoff) = freshness_cutoff {
-        filters.push(format!("last_trade_unix=gte.{cutoff}"));
-    }
+    filters.push("last_trade_unix=not.is.null".to_owned());
     filters.push(format!("order=rank&limit={n}"));
     filters.join("&")
 }
@@ -716,18 +706,18 @@ fn candidates_query(
 /// `exclude` (the current live ∪ evicted set), ordered by rank. Used by the maintenance tick
 /// (issue #350 WS1 PR-D) to backfill freed live slots from the Supabase bench.
 ///
-/// `GET {base_url}/rest/v1/ranking_entries?select=<exact-aliases>&batch_id=eq.<batch>&wallet_hex=not.in.(<exclude>)&last_trade_unix=gte.<cutoff>&order=rank&limit={n}`
+/// `GET {base_url}/rest/v1/ranking_entries?select=<exact-aliases>&survives=is.true&batch_id=eq.<batch>&wallet_hex=not.in.(<exclude>)&last_trade_unix=not.is.null&order=rank&limit={n}`
 /// with the same token in both headers (see [`auth_token`]). The server-side `not.in.` filter
 /// is an over-fetch optimisation, not a correctness boundary: it is matched case-sensitively
 /// against `ranking_entries.wallet_hex` (canonical lowercase), and
 /// [`crate::live_watchlist::LiveWatchlist::replace`] independently dedups the results against
 /// the live and evicted sets by byte-equality, so a casing miss cannot re-admit a wallet.
 ///
-/// `now_unix` (unix seconds) anchors the candidate freshness gate (#357): only wallets whose
-/// real last trade is within [`ACTIVE_WINDOW_HOURS`] of `now_unix` are returned, so a stale
-/// bench wallet is never backfilled into the live set. Returns the [`Watchlist`] plus the
-/// last-trade side-map (consumed by the PR-3 admission cursor-seed).
-#[allow(clippy::too_many_arguments)]
+/// Ranked survivors are prepared regardless of the ranked value's age; missing values stay
+/// excluded. Inactivity is decided by the existing knockout from the activity clock, kept
+/// current by bracket commits and accepted bracket installation. An inactive survivor stays
+/// live until the next successful knockout publication that includes it. Returns the
+/// [`Watchlist`] plus the last-trade side-map for admission cursor seeding.
 pub async fn fetch_candidates(
     client: &reqwest::Client,
     base_url: &str,
@@ -736,13 +726,11 @@ pub async fn fetch_candidates(
     batch_id: i64,
     exclude: &[WalletAddress],
     n: usize,
-    now_unix: i64,
 ) -> Result<(Watchlist, HashMap<WalletAddress, i64>), SupabaseError> {
-    let freshness_cutoff = now_unix - ACTIVE_WINDOW_HOURS * 3600;
     let url = format!(
         "{}/rest/v1/ranking_entries?{}",
         base_url.trim_end_matches('/'),
-        candidates_query(exclude, n, Some(freshness_cutoff), batch_id)
+        candidates_query(exclude, n, batch_id)
     );
     let rows = get_ranking_rows(client, &url, auth_token(anon_key, secret_key)).await?;
     for row in &rows {
@@ -973,8 +961,10 @@ mod tests {
     fn candidates_query_empty_exclude_omits_filter() {
         // PostgREST rejects an empty `in.()`; with nothing to exclude this is a plain top-n.
         assert_eq!(
-            candidates_query(&[], 5, None, 7),
-            format!("{EXACT_SELECT_SURVIVORS}&batch_id=eq.7&order=rank&limit=5")
+            candidates_query(&[], 5, 7),
+            format!(
+                "{EXACT_SELECT_SURVIVORS}&batch_id=eq.7&last_trade_unix=not.is.null&order=rank&limit=5"
+            )
         );
     }
 
@@ -983,35 +973,35 @@ mod tests {
         let a = WalletAddress::from_hex("0x00000000000000000000000000000000000000AA").unwrap();
         let b = WalletAddress::from_hex("0x0000000000000000000000000000000000000001").unwrap();
         // Out of order + a duplicate + upper-case input -> sorted, deduped, lowercase output.
-        let q = candidates_query(&[a, b, a], 3, None, 7);
+        let q = candidates_query(&[a, b, a], 3, 7);
         assert_eq!(
             q,
             format!(
                 "{EXACT_SELECT_SURVIVORS}&batch_id=eq.7&wallet_hex=not.in.(0x0000000000000000000000000000000000000001,\
-                 0x00000000000000000000000000000000000000aa)&order=rank&limit=3"
+                 0x00000000000000000000000000000000000000aa)&last_trade_unix=not.is.null&order=rank&limit=3"
             )
         );
     }
 
     #[test]
-    fn candidates_query_appends_freshness_filter() {
-        // No exclude + a cutoff -> the gte filter precedes order/limit (#357).
+    fn candidates_query_excludes_missing_ranked_values_without_age_bound() {
+        // A missing ranked value stays excluded; survivors have no age bound.
         assert_eq!(
-            candidates_query(&[], 5, Some(1_000), 7),
+            candidates_query(&[], 5, 7),
             format!(
-                "{EXACT_SELECT_SURVIVORS}&batch_id=eq.7&last_trade_unix=gte.1000&order=rank&limit=5"
+                "{EXACT_SELECT_SURVIVORS}&batch_id=eq.7&last_trade_unix=not.is.null&order=rank&limit=5"
             )
         );
     }
 
     #[test]
-    fn candidates_query_combines_exclude_and_freshness() {
+    fn candidates_query_combines_exclude_and_non_null_ranked_value() {
         let a = WalletAddress::from_hex(HEX_A).unwrap();
         assert_eq!(
-            candidates_query(&[a], 3, Some(1_000), 7),
+            candidates_query(&[a], 3, 7),
             format!(
                 "{EXACT_SELECT_SURVIVORS}&batch_id=eq.7&wallet_hex=not.in.(0x0000000000000000000000000000000000000001)\
-                 &last_trade_unix=gte.1000&order=rank&limit=3"
+                 &last_trade_unix=not.is.null&order=rank&limit=3"
             )
         );
     }
@@ -1027,7 +1017,7 @@ mod tests {
                  ?{EXACT_SELECT_SURVIVORS}&order=rank&limit=25"
             )
         );
-        assert!(candidates_query(&[], 5, None, 7).starts_with(EXACT_SELECT));
+        assert!(candidates_query(&[], 5, 7).starts_with(EXACT_SELECT));
     }
 
     #[test]
