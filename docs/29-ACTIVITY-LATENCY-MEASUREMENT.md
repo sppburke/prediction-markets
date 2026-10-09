@@ -318,8 +318,9 @@ PY
 
 Record identities and run this inspection on the capture, substituting the cohort boundary
 sequence (the deployment sequence, or a recorded re-measurement boundary) and cohort size (one fill
-for AC15; the AC16 size for latency acceptance). The inspection keeps REST pages compressed and
-decodes them on access. It counts bindings to observations before the capture and fails if one binds
+for AC15; the AC16 size for latency acceptance). The inspection keeps only each captured frame's
+location in memory and reads, CRC-checks and decodes a frame from the log on access; its source
+scans read only the frames of the sources they examine. It counts bindings to observations before the capture and fails if one binds
 an admitted frame decision or an audited identity. For each market whose earliest captured BUY is not
 before the window, it reads recorded BUYs at or before that stamp from `activity_groups` effects
 before applying the window: an identity seen in the capture keeps its earliest stamp, as the
@@ -373,15 +374,22 @@ def decode(block, where):
     return json.loads(out.raw[:length])
 
 class Prefix(dict):
-    """Envelopes by sequence. REST history and Gamma pages stay compressed and decode on access."""
+    """Frame locations by sequence, in log order: offset << 40 | block size << 8 | source index. Each access reads the
+    frame from the log, checks its CRC and decodes it, so memory follows the frame count, not the log size; `values`
+    given source IDs reads and decodes only those sources' frames."""
+    def __init__(self, path):
+        super().__init__(); self.path = path; self.fd = os.open(path, os.O_RDONLY); self.sources = []
     def __getitem__(self, seq):
-        e = dict.__getitem__(self, seq)
-        return decode(e, seq) if isinstance(e, bytes) else e
-    def values(self):
-        return (self[seq] for seq in self)
+        location = dict.__getitem__(self, seq); offset, size = location >> 40, location >> 8 & 0xFFFFFFFF
+        raw = os.pread(self.fd, size + 4, offset + 4)
+        assert len(raw) == size + 4 and zlib.crc32(raw[:size]) == struct.unpack("<I", raw[size:])[0], (self.path, offset)
+        return decode(raw[:size], (self.path, offset))
+    def values(self, *source_ids):
+        indexes = {i for i, s in enumerate(self.sources) if s in source_ids}
+        return (self[seq] for seq, location in dict.items(self) if not source_ids or location & 0xFF in indexes)
 
 def read_prefix(path):
-    envelopes = Prefix(); digest = hashlib.sha256(); size_total = 0; tail = None
+    envelopes = Prefix(path); digest = hashlib.sha256(); tail = None
     with open(path, "rb") as f:
         header = f.read(5); assert header == b"EDGE\x01", (path, "header"); digest.update(header)
         offset = 5
@@ -393,10 +401,13 @@ def read_prefix(path):
             assert len(block) == size and len(crc) == 4, (path, "incomplete frame", offset)
             assert zlib.crc32(block) == struct.unpack("<I", crc)[0], (path, offset)
             digest.update(head); digest.update(block); digest.update(crc)
-            e = decode(block, (path, offset)); assert e["seq"] not in envelopes
+            e = decode(block, (path, offset))
+            # Sequences strictly increase in log order (the log verifier's rule), so log order is sequence order.
+            assert tail is None or e["seq"] > tail[0], (path, "sequence order", offset)
             tail = (e["seq"], e["this_hash"])
-            dict.__setitem__(envelopes, e["seq"],
-                             block if e["source_id"] in ("polymarket-public.activity-reconciliation", "polymarket.gamma.markets") else e)
+            if e["source_id"] not in envelopes.sources: envelopes.sources.append(e["source_id"])
+            index = envelopes.sources.index(e["source_id"]); assert index <= 0xFF, (path, "source count")
+            dict.__setitem__(envelopes, e["seq"], offset << 40 | size << 8 | index)
             offset += 4 + size + 4
     print(path, offset, digest.hexdigest(), tail)
     return envelopes
@@ -624,7 +635,8 @@ for purpose, values in (("book receipt", book_receipt_spans), ("trade time / fee
     print(purpose, "n", n, "missing/invalid", len(cohort) - n, "median/p95/max ms",
           None if not n else (statistics.median(values), values[(95*n+99)//100-1], values[-1]))
 fallbacks = {}; fallback_rows = []; window_fallbacks = []
-for e in (source[seq] for seq in sorted(source)):
+for e in source.values("pe-service.activity-frame-fallback", "pe-service.activity-read-commitment",
+                       "polymarket-public.activity-reconciliation"):
     if e["source_id"] == "pe-service.activity-frame-fallback":
         a = payload(e); r = a["frame_receipt"]; frame = receipt(source, r)
         assert e["schema_version"] == 1 and e["parser_version"] == 1 and a["version"] == 1
@@ -667,7 +679,7 @@ def frame_row(identity, e):
                   and not r.get("isCombo", r.get("is_combo", False)))
     return {"id": identity, "frame_seq": e["seq"], "frame_hash": e["this_hash"],
             "admitted": (e["seq"], e["this_hash"]) in admitted, "qualifying": qualifying}
-for e in source.values():
+for e in source.values("polymarket-activity-ws", "polymarket-public.activity-reconciliation"):
     is_frame = e["source_id"] == "polymarket-activity-ws"
     if not is_frame and e["source_id"] != "polymarket-public.activity-reconciliation": continue
     # Dispatch by the recorded contract; historical pages remain identity-join evidence.
@@ -721,7 +733,7 @@ print("unmatched group identities; resolve from authenticated corrections or rep
 print("multi-leg controls", [(w, tx, sorted(ids)) for (w, tx), ids in legs.items() if len(ids) > 1])
 # Bind corrected/aliased frame identities using authenticated commitment receipts.
 first_captured = min(source); outside = 0; outside_ids = set()
-for e in source.values():
+for e in source.values("pe-service.activity-read-commitment"):
     if e["source_id"] != "pe-service.activity-read-commitment": continue
     for b in payload(e).get("bindings") or []:
         r = b["stream_receipt"]
@@ -742,9 +754,29 @@ def canonical_wallet(w):
 start = payload(paper[start_seq]); members = {canonical_wallet(w) for w in start["membership"]}
 changes = sorted((e for e in paper.values() if e["seq"] > start_seq and e["seq"] in membership),
                  key=lambda e: e["seq"])
+# The service's replay applies one pinned repair (crates/service/src/paper_recovery.rs HISTORICAL_MEMBERSHIP_PIN):
+# six wallets that paper era act-557-62ed205-2's sequence-28 full rerank omitted leave the membership just before
+# that record applies. Mirror it as the service does: identity checks over the era from Start, where any partial
+# match stops the inspection, and a stop for a pinned era that reaches sequence 28 without any membership record.
+REPAIR = {"activation_id": "act-557-62ed205-2", "seq": 28,
+          "this_hash": "d76e36115b72ef6b842c425f8bb082522a65ea85c0187a0d8d8c2591a6ea2b5b",
+          "raw_payload_hash": "f472fd1aabb73cabc61f3f2baabf1d559a07165b115d05391b06dd20b7e228db",
+          "wallets": ("0x3925c4477052d34dc440068286ae693b728242fc", "0x803a112b5eb1404eea463b26a2318cfcb3b9219e",
+                      "0xb26dfe6953c9814f03b7f16ac4c717305b4673f7", "0xf25de1a7357bbe92adf84ea58eff101375789d7a",
+                      "0x27f738fe203827445690339104aae35b20bc44b0", "0x40604cb1f958c03bea0b18aa43e4cb0d62f33ec3")}
+def pinned(e):
+    return (start["activation_id"] == REPAIR["activation_id"] and e["seq"] == REPAIR["seq"],
+            e["this_hash"] == REPAIR["this_hash"], e["raw_payload_hash"] == REPAIR["raw_payload_hash"])
+repairs = {e["seq"] for e in paper.values() if changes and e["seq"] >= start_seq and any(pinned(e))}
+for s in repairs:
+    assert all(pinned(paper[s])) and s in membership and membership[s]["reason"] == "full_rerank", ("membership repair identity", s)
+assert changes or not (start["activation_id"] == REPAIR["activation_id"] and max(paper) >= REPAIR["seq"]), "membership repair: pinned era without its record"
 intervals = []; opened = {w: ns(paper[start_seq]["received_at"]) for w in members}
 for e in changes:
     at = ns(e["received_at"]); c = membership[e["seq"]]
+    if e["seq"] in repairs:
+        print("historical membership repair", e["seq"], e["this_hash"], REPAIR["wallets"])
+        for w in REPAIR["wallets"]: intervals.append((w, opened.pop(w), at)); members.remove(w)
     for w in c["removed"]: intervals.append((w, opened.pop(w), at)); members.remove(w)
     for w in c["added"]: assert w not in members; members.add(w); opened[w] = at
 intervals.extend((w, at, window_end * 10**9) for w, at in opened.items())
@@ -796,11 +828,11 @@ audited_ids.update(b["id"] for b in population)
 assert not outside_ids & audited_ids, ("capture starts after bindings audited identities need", sorted(outside_ids & audited_ids)[:5])
 # AC-C's receipt census is independent of source-time first-entry population membership.
 # Count directly from the captured prefix, never from frame_rows or the JSON being exported.
-raw_receipt_count = len({(e["seq"], e["this_hash"]) for e in source.values()
+raw_receipt_count = len({(e["seq"], e["this_hash"]) for e in source.values("polymarket-activity-ws")
                          if e["source_id"] == "polymarket-activity-ws"})
 print("unique captured feed receipts", raw_receipt_count, "exported receipts", len(receipts))
 assert raw_receipt_count == len(receipts), "receipt export dropped captured feed inputs"
-raw_window_receipt_count = len({(e["seq"], e["this_hash"]) for e in source.values()
+raw_window_receipt_count = len({(e["seq"], e["this_hash"]) for e in source.values("polymarket-activity-ws")
     if e["source_id"] == "polymarket-activity-ws" and ns(sys.argv[6]) <= ns(e["received_at"]) < ns(sys.argv[7])})
 assert raw_window_receipt_count == sum(ns(sys.argv[6]) <= r["received_at_ns"] < ns(sys.argv[7]) for r in receipts.values())
 print("unique in-window feed receipts", raw_window_receipt_count)
@@ -808,9 +840,9 @@ membership_changes = [{"seq": e["seq"], "hash": e["this_hash"], "at_ns": ns(e["r
                        "removed": membership[e["seq"]]["removed"], "added": membership[e["seq"]]["added"]}
                       for e in changes]
 membership_records = [membership_record(e, membership[e["seq"]])
-                      for e in sorted(paper.values(), key=lambda e: e["seq"]) if e["seq"] in membership]
+                      for e in paper.values() if e["seq"] in membership]
 deferrals = []
-for e in source.values():
+for e in source.values("pe-service.watchlist-deferral"):
     if e["source_id"] != "pe-service.watchlist-deferral": continue
     assert (e["schema_version"], e["parser_version"], e["content_type"]) == (1, 1, "json")
     a = payload(e); assert a["version"] == 1
