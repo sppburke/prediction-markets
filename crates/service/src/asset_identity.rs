@@ -355,51 +355,59 @@ impl AssetIdentityResolver {
             return Ok(resolved);
         }
         let mut read_pages = BTreeMap::new();
-        let _misses = self.misses.lock().await;
-        let store = self.store.read().await.clone();
-        let mut conditions = Vec::new();
-        {
-            let mut cache = self.cache.write().await;
-            for condition in &requested {
-                let Some(tokens) = cache.discovered_conditions.get(condition).cloned() else {
-                    conditions.push(condition.clone());
-                    continue;
-                };
-                if let Some(store) = &store {
-                    check_condition_rejection(store, &mut cache, condition)?;
-                    cache.rejected_tokens.extend(
-                        store
-                            .paper_state
-                            .rejected_asset_tokens(
-                                &store.generation,
-                                &tokens.iter().cloned().collect::<Vec<_>>(),
-                            )
-                            .map_err(identity_store_error)?
-                            .into_keys(),
-                    );
-                }
-                for token in tokens {
-                    if cache.rejected.contains(condition) || cache.rejected_tokens.contains(&token)
-                    {
-                        resolved
-                            .unverified
-                            .insert(token, rejected_identity_reason());
-                    } else if let Some(cached) = cache.identities.get(&token) {
-                        resolved
-                            .verified
-                            .insert(token.clone(), cached.identity.clone());
-                        resolved.provenance.insert(token, cached.provenance.clone());
-                    } else {
-                        resolved.unverified.insert(token, absent_identity_reason());
-                    }
-                }
-            }
-            evict_rejected(&mut cache, &mut resolved);
-        }
+        let conditions = requested.iter().cloned().collect::<Vec<_>>();
         for chunk in conditions.chunks(self.gamma_batch_size.min(GAMMA_BATCH_SIZE)) {
             let mut pending = chunk.to_vec();
             let mut recorded = RecordedIdentityPages::default();
             for filter in [MarketFilter::OpenOnly, MarketFilter::ClosedOnly] {
+                // One bounded attempt owns the FIFO mutex, just like the token path.
+                let _misses = self.misses.lock().await;
+                let store = self.store.read().await.clone();
+                let mut misses = Vec::new();
+                {
+                    let mut cache = self.cache.write().await;
+                    for condition in &pending {
+                        let Some(tokens) = cache.discovered_conditions.get(condition).cloned()
+                        else {
+                            misses.push(condition.clone());
+                            continue;
+                        };
+                        if let Some(store) = &store {
+                            check_condition_rejection(store, &mut cache, condition)?;
+                            cache.rejected_tokens.extend(
+                                store
+                                    .paper_state
+                                    .rejected_asset_tokens(
+                                        &store.generation,
+                                        &tokens.iter().cloned().collect::<Vec<_>>(),
+                                    )
+                                    .map_err(identity_store_error)?
+                                    .into_keys(),
+                            );
+                        }
+                        for token in tokens {
+                            if cache.rejected.contains(condition)
+                                || cache.rejected_tokens.contains(&token)
+                            {
+                                resolved
+                                    .unverified
+                                    .insert(token, rejected_identity_reason());
+                            } else if let Some(cached) = cache.identities.get(&token) {
+                                resolved
+                                    .verified
+                                    .insert(token.clone(), cached.identity.clone());
+                                resolved.provenance.insert(token, cached.provenance.clone());
+                            } else {
+                                resolved.unverified.insert(token, absent_identity_reason());
+                            }
+                        }
+                    }
+                    evict_rejected(&mut cache, &mut resolved);
+                }
+                pending = misses;
+                if pending.is_empty() {
+                    break;
+                }
                 let (pages, fetched) =
                     match self.client.fetch_markets_with_pages(&pending, filter).await {
                         Ok(fetched) => {
@@ -3387,6 +3395,173 @@ mod tests {
                 assert_eq!(urls.len(), 2);
                 assert!(!urls[0].contains("closed=true"));
                 assert!(urls[1].contains("closed=true"));
+            }
+        }
+    }
+
+    struct InterleavedConditionFixture {
+        urls: StdMutex<Vec<String>>,
+        release: tokio::sync::Notify,
+        live_completed: std::sync::atomic::AtomicBool,
+        closed_first: bool,
+        empty_last: bool,
+    }
+
+    impl ReconciliationFetcher for InterleavedConditionFixture {
+        fn fetch<'a>(
+            &'a self,
+            url: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
+            Box::pin(async move {
+                let url = reqwest::Url::parse(url).unwrap();
+                self.urls.lock().unwrap().push(url.to_string());
+                let conditions = url
+                    .query_pairs()
+                    .filter(|(key, _)| key == "condition_ids")
+                    .map(|(_, condition)| condition.into_owned())
+                    .collect::<Vec<_>>();
+                assert!(conditions.len() <= GAMMA_BATCH_SIZE);
+                let closed = url.query_pairs().any(|(key, _)| key == "closed");
+                let first = conditions
+                    .iter()
+                    .any(|condition| condition == "condition-000");
+                if first && !closed {
+                    self.release.notified().await;
+                    if self.closed_first {
+                        return Ok(b"[]".to_vec());
+                    }
+                } else if first
+                    || conditions
+                        .iter()
+                        .any(|condition| condition == "condition-050")
+                {
+                    assert!(self.live_completed.load(Ordering::SeqCst));
+                }
+                let markets =
+                    if conditions.is_empty() {
+                        assert!(url.query_pairs().any(|(key, value)| {
+                            key == "clob_token_ids" && value == "token-live"
+                        }));
+                        vec![serde_json::json!({
+                            "conditionId": "condition-live",
+                            "clobTokenIds": ["token-live"],
+                        })]
+                    } else {
+                        conditions
+                            .iter()
+                            .filter(|condition| !self.empty_last || *condition != "condition-050")
+                            .map(|condition| {
+                                serde_json::json!({
+                                    "conditionId": condition,
+                                    "clobTokenIds": [condition.replace("condition-", "token-")],
+                                })
+                            })
+                            .collect()
+                    };
+                serde_json::to_vec(&markets).map_err(identity_store_error)
+            })
+        }
+    }
+
+    /// PASS: queued live work completes between discovery attempts; a queued discovery's
+    /// completed condition and empty result are reused by the first discovery's later chunk.
+    /// FAIL: discovery retains the FIFO mutex across attempts or refetches another caller's memo.
+    #[tokio::test(start_paused = true)]
+    async fn live_identity_lookup_completes_between_condition_discovery_chunks() {
+        for durable in [false, true] {
+            for closed_first in [false, true] {
+                for overlapping_discovery in [false, true] {
+                    let empty_last = closed_first && overlapping_discovery;
+                    let dir = tempfile::tempdir().unwrap();
+                    let path = dir.path().join("source.log");
+                    let fetcher = Arc::new(InterleavedConditionFixture {
+                        urls: StdMutex::new(Vec::new()),
+                        release: tokio::sync::Notify::new(),
+                        live_completed: std::sync::atomic::AtomicBool::new(false),
+                        closed_first,
+                        empty_last,
+                    });
+                    let resolver = if durable {
+                        durable_resolver(
+                            &path,
+                            Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap()),
+                            "installed",
+                            fetcher.clone(),
+                            GAMMA_BATCH_SIZE,
+                        )
+                    } else {
+                        AssetIdentityResolver::new(
+                            fetcher.clone(),
+                            BASE.into(),
+                            GAMMA_BATCH_SIZE,
+                            Arc::new(Mutex::new(SourceEventSink::open(&path).unwrap())),
+                        )
+                    };
+                    let conditions = (0..=GAMMA_BATCH_SIZE)
+                        .map(|index| PolymarketConditionId(format!("condition-{index:03}")))
+                        .collect::<Vec<_>>();
+                    let mut discovery =
+                        Box::pin(resolver.discover_conditions_for_bracket(conditions));
+                    std::future::poll_fn(|cx| {
+                        assert!(discovery.as_mut().poll(cx).is_pending());
+                        std::task::Poll::Ready(())
+                    })
+                    .await;
+                    let live_token = PolymarketTokenId("token-live".into());
+                    let mut live = Box::pin(async {
+                        let resolved = resolver.resolve_live([live_token.clone()]).await.unwrap();
+                        fetcher.live_completed.store(true, Ordering::SeqCst);
+                        resolved
+                    });
+                    // Explicit polling queues live work while the first condition chunk is gated.
+                    std::future::poll_fn(|cx| {
+                        assert!(live.as_mut().poll(cx).is_pending());
+                        std::task::Poll::Ready(())
+                    })
+                    .await;
+                    let mut queued = Vec::new();
+                    if overlapping_discovery {
+                        let mut waiting = Box::pin(resolver.discover_conditions_for_bracket([
+                            PolymarketConditionId("condition-050".into()),
+                        ]));
+                        std::future::poll_fn(|cx| {
+                            assert!(waiting.as_mut().poll(cx).is_pending());
+                            std::task::Poll::Ready(())
+                        })
+                        .await;
+                        queued.push(waiting);
+                    }
+                    assert_eq!(fetcher.urls.lock().unwrap().len(), 1);
+                    fetcher.release.notify_one();
+                    let (discovery, live, queued) =
+                        tokio::join!(discovery, live, futures::future::join_all(queued));
+                    let discovery = discovery.unwrap();
+                    assert_eq!(
+                        discovery.verified.len(),
+                        GAMMA_BATCH_SIZE + usize::from(!empty_last)
+                    );
+                    assert!(discovery.unverified.is_empty());
+                    assert_eq!(live.verified.len(), 1);
+                    assert_eq!(live.provenance[&live_token].source_log_sequence, 1);
+                    for completed in queued {
+                        let completed = completed.unwrap();
+                        let token = PolymarketTokenId("token-050".into());
+                        assert_eq!(completed.verified.len(), usize::from(!empty_last));
+                        if empty_last {
+                            assert!(
+                                resolver.cache.read().await.discovered_conditions["condition-050"]
+                                    .is_empty()
+                            );
+                        } else {
+                            assert_eq!(discovery.provenance[&token], completed.provenance[&token]);
+                        }
+                    }
+                    let urls = fetcher.urls.lock().unwrap();
+                    let expected = 3 + usize::from(closed_first) + usize::from(empty_last);
+                    assert_eq!(urls.len(), expected);
+                    assert!(urls[1].contains("clob_token_ids=token-live"));
+                    assert_eq!(Reader::replay(&path).unwrap().count(), expected);
+                }
             }
         }
     }

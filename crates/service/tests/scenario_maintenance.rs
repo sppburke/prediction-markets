@@ -673,9 +673,9 @@ async fn backfilled_wallet_seeded_from_real_last_trade() {
     let existing = wallet(1);
     let live = LiveWatchlist::new(watchlist(vec![entry(existing, 200)]));
 
-    // A backfill candidate that passed the `gte.{now-72h}` freshness filter: its real last trade
-    // is recent (idle ~1000s). The anchor fixture represents completed admission preparation;
-    // structural publication must preserve that causal cursor rather than jump it to `now`.
+    // A ranked backfill candidate with a present last-trade value is admitted regardless of age;
+    // this one's real last trade is recent (idle ~1000s). The anchor fixture represents completed
+    // admission preparation; structural publication preserves that causal cursor instead of `now`.
     let fresh = wallet(2);
     let fresh_last_trade = NOW - 1_000;
     assert_eq!(
@@ -738,8 +738,8 @@ async fn stale_seeded_wallet_no_admission_grace() {
     let existing = wallet(1);
     let live = LiveWatchlist::new(watchlist(vec![entry(existing, 200)]));
 
-    // A wallet admitted with a real last trade already 72h old (e.g. a stale bootstrap admission
-    // that slipped the candidate freshness filter). Its prepared anchor retains that real time, so
+    // A ranked survivor is admitted with a present real last trade regardless of its age.
+    // This one's last trade is already 72h old; its prepared anchor retains that real time, so
     // there is NO admission grace: it is eviction-eligible on the very next tick.
     let stale = wallet(2);
     let stale_last_trade = NOW - H72;

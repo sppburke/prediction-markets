@@ -101,8 +101,9 @@ struct RankingRow {
     #[serde(default)]
     n_trades: Option<i64>,
     /// Wallet's real last on-chain trade time (unix seconds), stamped by the ranker (#357).
-    /// Absent column or JSON `null` → `None`. Drives the candidate freshness filter and seeds the
-    /// poll cursor / inactivity clock (#357 PR-3); it never affects the row→entry map.
+    /// Absent column or JSON `null` → `None`, excluded from bench reads. Present values seed the
+    /// poll cursor / inactivity clock (#357 PR-3) regardless of age; inactivity belongs to the
+    /// knockout. This value never affects the row→entry map.
     #[serde(default)]
     last_trade_unix: Option<i64>,
     /// Exact text projection of `hit_rate` ([`RANKING_EXACT_SELECT`], #514). Preferred
@@ -654,9 +655,9 @@ pub async fn fetch_batch(
 /// `GET {base_url}/rest/v1/latest_ranking?select=<RANKING_EXACT_SELECT>&survives=is.true&order=rank&limit={limit}`
 /// with the SAME token in both the `apikey` and `Authorization: Bearer` headers (see
 /// [`auth_token`]). This is the
-/// bootstrap + score-refresh path: it is intentionally NOT freshness-filtered (the bootstrap
-/// admits the top-`limit` SURVIVORS by rank; freshness for live wallets is enforced by the poll
-/// cursor + maintenance tick, and the refresh must not drop live members). It IS survivor-filtered
+/// bootstrap + score-refresh path: it has no ranked-value age bound (the bootstrap admits
+/// the top-`limit` SURVIVORS by rank; inactivity belongs to the maintenance knockout from the
+/// activity clock, and score refresh preserves live membership). It IS survivor-filtered
 /// (#518), so `limit` caps survivors rather than selecting the raw top-`limit`, and a batch with
 /// no verdict yields zero rows. See [`fetch_candidates`].
 pub async fn fetch(

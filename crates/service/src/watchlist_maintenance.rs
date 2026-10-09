@@ -136,7 +136,7 @@ pub enum MembershipApplyError {
         applied_generation: u64,
         applied_target: usize,
     },
-    /// A freshness-filtered/ranked admission unexpectedly lacked its real last-trade cursor.
+    /// A ranked admission unexpectedly lacked its required last-trade cursor.
     #[error("missing last_trade_unix for newly admitted wallet {wallet}")]
     MissingCursor { wallet: WalletAddress },
     /// SQLite rejected the all-or-nothing cursor batch.
