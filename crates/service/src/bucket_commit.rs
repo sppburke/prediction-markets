@@ -4639,12 +4639,14 @@ impl BucketCommitEngine {
                 recorded_at_unix: install.proof.recorded_at_unix,
             });
         }
-        self.paper_state.install_anchors(&records)?;
+        // Acquired activity advances the MAX-only clock before the anchor commit, so a clock-write
+        // failure mutates no anchor and nothing fallible separates the commit from its projections.
         for install in installs {
             if let Some(epoch) = install.newest_activity_unix {
                 self.paper_state.set_activity(&install.wallet, epoch)?;
             }
         }
+        self.paper_state.install_anchors(&records)?;
         self.ledger = candidate;
         for record in &records {
             self.apply_history_projection(

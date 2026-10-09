@@ -271,6 +271,407 @@ fn activity(wallet: WalletAddress, byte: u8, amount: &str, tx: &str, epoch: i64)
     })
 }
 
+fn split_merge_activity(wallet: WalletAddress, byte: u8, combo: bool) -> Vec<Value> {
+    [("MERGE", "1", 20), ("SPLIT", "2", 10)]
+        .into_iter()
+        .map(|(kind, size, epoch)| {
+            json!({
+                "proxyWallet": wallet,
+                "timestamp": epoch,
+                "conditionId": condition(byte),
+                "type": kind,
+                "size": size,
+                "usdcSize": size,
+                "transactionHash": format!("0x{kind}"),
+                "price": "0",
+                "isCombo": combo
+            })
+        })
+        .collect()
+}
+
+fn condition_metadata(byte: u8, closed: bool) -> Vec<u8> {
+    serde_json::to_vec(&json!([{
+        "conditionId": condition(byte),
+        "clobTokenIds": [asset(byte), format!("{}-no", asset(byte))],
+        "closed": closed
+    }]))
+    .unwrap()
+}
+
+fn condition_url(byte: u8, closed: bool) -> String {
+    let filter = if closed { "&closed=true" } else { "" };
+    format!(
+        "{BASE}/markets?condition_ids={}{filter}&limit=500",
+        condition(byte)
+    )
+}
+
+fn bracket_failure(
+    result: Result<pe_service::position_seeder::DirectValidationOutcome, CausalPositionError>,
+) -> CausalPositionError {
+    match result {
+        Err(error) => error,
+        Ok(mut outcome) => {
+            assert!(outcome.accepted.is_empty());
+            assert_eq!(outcome.deferred.len(), 1);
+            outcome.deferred.pop().unwrap().1
+        }
+    }
+}
+
+/// PASS: SPLIT/MERGE-only history discovers both outcomes and accepts either position, including closed markets.
+/// FAIL: discovery is absent from metadata_reads, skips recording, or omits the closed fallback.
+#[tokio::test]
+async fn split_merge_only_positions_accept_both_outcomes_with_recorded_discovery() {
+    for closed in [false, true] {
+        for outcome in [0, 1] {
+            let wallet = wallet(0xa1);
+            let (_dir, paper, mut engine) = fresh(&[]);
+            let mut positions = position(wallet, 1, "1");
+            positions["outcomeIndex"] = json!(outcome);
+            positions["asset"] = if outcome == 0 {
+                json!(asset(1))
+            } else {
+                json!(format!("{}-no", asset(1)))
+            };
+            let metadata = condition_metadata(1, closed);
+            let mut responses = HashMap::from([
+                (
+                    activity_url(wallet),
+                    vec![serde_json::to_vec(&split_merge_activity(wallet, 1, false)).unwrap(); 3],
+                ),
+                (
+                    position_url(wallet, PositionPartition::NotRedeemable),
+                    vec![serde_json::to_vec(&vec![positions]).unwrap(); 2],
+                ),
+                (
+                    position_url(wallet, PositionPartition::Redeemable),
+                    vec![b"[]".to_vec(); 2],
+                ),
+                (
+                    condition_url(1, false),
+                    vec![
+                        if closed {
+                            b"[]".to_vec()
+                        } else {
+                            metadata.clone()
+                        };
+                        3
+                    ],
+                ),
+            ]);
+            if closed {
+                responses.insert(condition_url(1, true), vec![metadata.clone(); 3]);
+            }
+            let fetcher = Arc::new(QueueFetcher::new(responses));
+            let (_log_dir, source_path, validator) = recording_validator(fetcher.clone());
+            let installs = validator
+                .validate_direct(&[wallet], &mut engine, &paper)
+                .await
+                .unwrap();
+            assert_eq!(installs.len(), 1);
+            assert_eq!(
+                installs[0].balances,
+                vec![(
+                    MarketId(VenueMarketId(condition(1))),
+                    OutcomeId(outcome),
+                    ShareAmount::from_atomic(1_000_000)
+                )]
+            );
+            let proof: Value = serde_json::from_str(&installs[0].proof.document).unwrap();
+            let reads = proof["metadata_reads"].as_array().unwrap();
+            assert_eq!(
+                reads.len(),
+                2,
+                "both discovered outcomes carry metadata provenance"
+            );
+            let entries = Reader::replay(&source_path)
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>();
+            for read in reads {
+                let sequence = read["source_log_sequence"].as_u64().unwrap();
+                let (_, envelope) = entries.iter().find(|(seq, _)| seq.0 == sequence).unwrap();
+                assert_eq!(envelope.source_id.0, GAMMA_MARKETS_SOURCE_ID);
+                assert_eq!(envelope.payload, metadata);
+                assert_eq!(
+                    read["canonical_page_hash"],
+                    pe_source_polymarket_public::canonical_page_hash(&envelope.payload).unwrap()
+                );
+            }
+            let urls = fetcher.urls();
+            let lookups = urls
+                .iter()
+                .filter(|url| url.contains("condition_ids="))
+                .collect::<Vec<_>>();
+            assert_eq!(lookups.len(), if closed { 6 } else { 3 });
+            if closed {
+                for pair in lookups.chunks(2) {
+                    assert_eq!(pair[0], &condition_url(1, false));
+                    assert_eq!(pair[1], &condition_url(1, true));
+                }
+            }
+            assert!(!urls.iter().any(|url| url.contains("clob_token_ids=")));
+            assert_eq!(paper.position_anchors(&wallet).unwrap().len(), 1);
+        }
+    }
+}
+
+/// PASS: activity on another SPLIT/MERGE market does not map a position-only market.
+/// FAIL: discovering one market guesses identities for a market with no wallet activity.
+#[tokio::test]
+async fn split_merge_discovery_keeps_no_activity_market_wallet_persistent() {
+    let wallet = wallet(0xa2);
+    let (_dir, paper, mut engine) = fresh(&[]);
+    let responses = HashMap::from([
+        (
+            activity_url(wallet),
+            vec![serde_json::to_vec(&split_merge_activity(wallet, 1, false)).unwrap(); 3],
+        ),
+        (
+            position_url(wallet, PositionPartition::NotRedeemable),
+            vec![serde_json::to_vec(&vec![position(wallet, 2, "1")]).unwrap()],
+        ),
+        (
+            position_url(wallet, PositionPartition::Redeemable),
+            vec![b"[]".to_vec()],
+        ),
+        (
+            condition_url(1, false),
+            vec![condition_metadata(1, false); 3],
+        ),
+    ]);
+    let fetcher = Arc::new(QueueFetcher::new(responses));
+    let error = validator_from_fetcher(fetcher.clone())
+        .validate_direct_with_deferrals(&[wallet], &mut engine, &paper)
+        .await;
+    let error = bracket_failure(error);
+    assert!(
+        matches!(&error, CausalPositionError::Positions { source: PositionReadError::MissingActivityMapping { asset: missing }, .. } if missing == &asset(2))
+    );
+    assert_eq!(
+        error.class(),
+        pe_service::position_seeder::FailureClass::WalletPersistent
+    );
+    assert!(!fetcher.urls().contains(&condition_url(2, false)));
+    assert!(paper.position_anchors(&wallet).unwrap().is_empty());
+}
+
+/// PASS: conflicting SPLIT/MERGE combo flags leave the condition unresolved and positions deferred.
+/// FAIL: metadata manufactures a unanimous classification for conflicting wallet activity.
+#[tokio::test]
+async fn split_merge_conflicting_combo_flags_do_not_discover_positions() {
+    let wallet = wallet(0xa3);
+    let (_dir, paper, mut engine) = fresh(&[]);
+    let mut rows = split_merge_activity(wallet, 1, false);
+    rows[0]["isCombo"] = json!(true);
+    let responses = HashMap::from([
+        (
+            activity_url(wallet),
+            vec![serde_json::to_vec(&rows).unwrap(); 3],
+        ),
+        (
+            position_url(wallet, PositionPartition::NotRedeemable),
+            vec![serde_json::to_vec(&vec![position(wallet, 1, "1")]).unwrap()],
+        ),
+        (
+            position_url(wallet, PositionPartition::Redeemable),
+            vec![b"[]".to_vec()],
+        ),
+    ]);
+    let fetcher = Arc::new(QueueFetcher::new(responses));
+    let error = validator_from_fetcher(fetcher.clone())
+        .validate_direct_with_deferrals(&[wallet], &mut engine, &paper)
+        .await;
+    let error = bracket_failure(error);
+    assert!(matches!(
+        error,
+        CausalPositionError::Positions {
+            source: PositionReadError::MissingActivityMapping { .. },
+            ..
+        }
+    ));
+    assert!(!fetcher.urls().iter().any(|url| url.contains("/markets?")));
+    assert!(paper.position_anchors(&wallet).unwrap().is_empty());
+}
+
+/// PASS: cache conflicts, durable token rejections, and condition mismatches leave split positions unmapped.
+/// FAIL: condition discovery bypasses a rejection or accepts a different market's identity.
+#[tokio::test]
+async fn split_merge_discovery_rejections_and_condition_mismatch_fail_closed() {
+    for case in ["warmed", "warmed_activity", "rejected", "mismatch"] {
+        let wallet = wallet(0xa4);
+        let (_dir, paper, mut engine) = fresh(&[]);
+        let mut discovery = condition_metadata(1, false);
+        let seed = if case == "rejected" {
+            serde_json::to_vec(&json!([
+                {"conditionId": condition(3), "clobTokenIds": [asset(1)]},
+                {"conditionId": condition(4), "clobTokenIds": [asset(1)]}
+            ]))
+            .unwrap()
+        } else {
+            condition_metadata(1, false)
+        };
+        if case.starts_with("warmed") {
+            discovery = serde_json::to_vec(&json!([{
+                "conditionId": condition(1), "clobTokenIds": [format!("{}-no", asset(1)), asset(1)]
+            }]))
+            .unwrap();
+        } else if case == "mismatch" {
+            discovery = condition_metadata(2, false);
+        }
+        let mut rows = split_merge_activity(wallet, 1, false);
+        if case == "warmed_activity" {
+            rows.push(activity(wallet, 1, "1", "0xtrade", 5));
+        }
+        let responses = HashMap::from([
+            (
+                activity_url(wallet),
+                vec![serde_json::to_vec(&rows).unwrap(); 3],
+            ),
+            (
+                position_url(wallet, PositionPartition::NotRedeemable),
+                vec![serde_json::to_vec(&vec![position(wallet, 1, "1")]).unwrap()],
+            ),
+            (
+                position_url(wallet, PositionPartition::Redeemable),
+                vec![b"[]".to_vec()],
+            ),
+            (condition_url(1, false), vec![discovery; 3]),
+            (condition_url(1, true), vec![b"[]".to_vec(); 3]),
+        ]);
+        let fetcher = Arc::new(QueueFetcher::with_gamma(responses, Some(seed)));
+        let log_dir = tempfile::tempdir().unwrap();
+        let path = log_dir.path().join("source.log");
+        let sink = Arc::new(tokio::sync::Mutex::new(
+            SourceEventSink::open(&path).unwrap(),
+        ));
+        let resolver = Arc::new(
+            AssetIdentityResolver::new(fetcher.clone(), BASE.into(), GAMMA_BATCH_SIZE, sink)
+                .with_paper_state(
+                    paper.clone(),
+                    "installed".into(),
+                    pe_service::risk_inputs::SourceReceiptIndex::replay(&path).unwrap(),
+                ),
+        );
+        if case != "mismatch" {
+            let seeded = resolver
+                .resolve_live([pe_core_types::PolymarketTokenId(asset(1))])
+                .await
+                .unwrap();
+            assert_eq!(seeded.verified.is_empty(), case == "rejected");
+        }
+        let validator =
+            CausalPositionValidator::new(fetcher, BASE, "source-generation-test", resolver)
+                .with_clock(Arc::new(|| END));
+        let error = validator
+            .validate_direct_with_deferrals(&[wallet], &mut engine, &paper)
+            .await;
+        let error = bracket_failure(error);
+        if case == "warmed_activity" {
+            assert!(
+                matches!(
+                    error,
+                    CausalPositionError::Identity {
+                        source: SourceError::Fatal { .. },
+                        ..
+                    }
+                ),
+                "{case}: {error}"
+            );
+        } else {
+            assert!(
+                matches!(
+                    error,
+                    CausalPositionError::Positions {
+                        source: PositionReadError::MissingActivityMapping { .. },
+                        ..
+                    }
+                ),
+                "{case}: {error}"
+            );
+        }
+        assert!(paper.position_anchors(&wallet).unwrap().is_empty());
+    }
+}
+
+/// PASS: a token first discovered on the next read remains InterveningActivity through the bounded retry.
+/// FAIL: a later discovery silently repairs the earlier positions read and installs an anchor.
+#[tokio::test]
+async fn split_merge_identity_appearing_later_remains_intervening_activity() {
+    let wallet = wallet(0xa5);
+    let (_dir, paper, mut engine) = fresh(&[]);
+    let metadata = condition_metadata(1, false);
+    let responses = HashMap::from([
+        (
+            activity_url(wallet),
+            vec![serde_json::to_vec(&split_merge_activity(wallet, 1, false)).unwrap(); 4],
+        ),
+        (
+            position_url(wallet, PositionPartition::NotRedeemable),
+            vec![serde_json::to_vec(&vec![position(wallet, 1, "1")]).unwrap(); 2],
+        ),
+        (
+            position_url(wallet, PositionPartition::Redeemable),
+            vec![b"[]".to_vec(); 2],
+        ),
+        (
+            condition_url(1, false),
+            vec![b"[]".to_vec(), metadata.clone(), b"[]".to_vec(), metadata],
+        ),
+        (condition_url(1, true), vec![b"[]".to_vec(); 2]),
+    ]);
+    let error = validator(responses)
+        .validate_direct_with_deferrals(&[wallet], &mut engine, &paper)
+        .await;
+    let error = bracket_failure(error);
+    assert!(
+        matches!(error, CausalPositionError::InterveningActivity { .. }),
+        "{error}"
+    );
+    assert!(paper.position_anchors(&wallet).unwrap().is_empty());
+}
+
+/// PASS: a condition discovery transport failure keeps the existing Identity/Transient classification.
+/// FAIL: a source outage becomes a persistent missing-activity failure or an accepted bracket.
+#[tokio::test]
+async fn split_merge_discovery_source_failure_is_identity_transient() {
+    struct UnavailableConditions(QueueFetcher);
+    impl PageFetcher for UnavailableConditions {
+        async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+            if url.contains("condition_ids=") {
+                return Err(SourceError::Transient {
+                    message: "fixture unavailable".into(),
+                });
+            }
+            self.0.fetch_page(url).await
+        }
+    }
+    let wallet = wallet(0xa6);
+    let (_dir, paper, mut engine) = fresh(&[]);
+    let fetcher = Arc::new(UnavailableConditions(QueueFetcher::new(HashMap::from([(
+        activity_url(wallet),
+        vec![serde_json::to_vec(&split_merge_activity(wallet, 1, false)).unwrap()],
+    )]))));
+    let error = validator_from_reconciliation(fetcher)
+        .validate_direct_with_deferrals(&[wallet], &mut engine, &paper)
+        .await;
+    let error = bracket_failure(error);
+    assert!(matches!(
+        &error,
+        CausalPositionError::Identity {
+            source: SourceError::Transient { .. },
+            ..
+        }
+    ));
+    assert_eq!(
+        error.class(),
+        pe_service::position_seeder::FailureClass::WalletTransient
+    );
+    assert!(paper.position_anchors(&wallet).unwrap().is_empty());
+}
+
 fn position(wallet: WalletAddress, byte: u8, amount: &str) -> Value {
     json!({
         "proxyWallet": wallet,

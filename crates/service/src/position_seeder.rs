@@ -1299,13 +1299,81 @@ impl CausalPositionValidator {
         mut mapping: ActivityAssetMapping,
     ) -> Result<(ActivityAssetMapping, ResolvedIdentities), CausalPositionError> {
         let tokens = mapping.tokens().cloned().collect::<Vec<_>>();
-        let resolved = self
+        let mut resolved = self
             .asset_identity
             .resolve_historical_for_bracket(tokens)
             .await
             .map_err(|source| CausalPositionError::Identity { wallet, source })?;
         apply_resolved_mapping(wallet, &mut mapping, &resolved)?;
+        self.discover_split_merge(wallet, &mut mapping, &mut resolved)
+            .await?;
         Ok((mapping, resolved))
+    }
+
+    /// SPLIT/MERGE activity names a market without naming its outcome tokens. Discover those
+    /// outcomes through the same recorded metadata authority and insert them only for tokens no
+    /// activity row names. A discovery rejection of, or disagreement with, an activity token the
+    /// token path verified fails this wallet closed; an unverified activity token is left as is.
+    async fn discover_split_merge(
+        &self,
+        wallet: WalletAddress,
+        mapping: &mut ActivityAssetMapping,
+        resolved: &mut ResolvedIdentities,
+    ) -> Result<(), CausalPositionError> {
+        let conditions = mapping
+            .split_merge_conditions()
+            .cloned()
+            .collect::<Vec<_>>();
+        if conditions.is_empty() {
+            return Ok(());
+        }
+        let activity_tokens = mapping.tokens().cloned().collect::<HashSet<_>>();
+        let discovered = self
+            .asset_identity
+            .discover_conditions_for_bracket(conditions)
+            .await
+            .map_err(|source| CausalPositionError::Identity { wallet, source })?;
+        let conflict = |asset: &pe_core_types::PolymarketTokenId| CausalPositionError::Positions {
+            wallet,
+            source: PositionReadError::ConflictingActivityMapping {
+                asset: asset.0.clone(),
+            },
+        };
+        if let Some(asset) = discovered
+            .unverified
+            .keys()
+            .find(|asset| resolved.verified.contains_key(*asset))
+        {
+            return Err(conflict(asset));
+        }
+        for (asset, identity) in discovered.verified {
+            if activity_tokens.contains(&asset) {
+                if resolved.verified.get(&asset).is_some_and(|verified| {
+                    verified.condition_id != identity.condition_id
+                        || verified.outcome != identity.outcome
+                }) {
+                    return Err(conflict(&asset));
+                }
+                continue;
+            }
+            let Some(provenance) = discovered.provenance.get(&asset) else {
+                return Err(CausalPositionError::Identity {
+                    wallet,
+                    source: SourceError::Fatal {
+                        message: format!(
+                            "discovered token {} has no durable metadata provenance",
+                            asset.0
+                        ),
+                    },
+                });
+            };
+            mapping
+                .insert_verified_split_merge(&identity.condition_id, asset.clone(), &identity)
+                .map_err(|source| CausalPositionError::Positions { wallet, source })?;
+            resolved.provenance.insert(asset.clone(), provenance.clone());
+            resolved.verified.insert(asset, identity);
+        }
+        Ok(())
     }
 
     fn prepare_resolved_activity(
