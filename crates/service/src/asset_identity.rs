@@ -133,6 +133,10 @@ struct CachedIdentity {
 #[derive(Default)]
 struct IdentityCache {
     identities: HashMap<PolymarketTokenId, CachedIdentity>,
+    /// Completed condition lookups, including empty results, last for this resolver's process
+    /// lifetime. Refetching each bracket read would put Gamma requests inside the stability
+    /// window and re-record pages (R2 observed 78 wallets across 7,154 conditions).
+    discovered_conditions: HashMap<String, BTreeSet<PolymarketTokenId>>,
     rejected: BTreeSet<String>,
     rejected_tokens: BTreeSet<PolymarketTokenId>,
     memory_pages: MemoryIdentityPages,
@@ -331,8 +335,9 @@ impl AssetIdentityResolver {
         self.resolve_inner(tokens, LookupPurpose::Historical).await
     }
 
-    /// Discover outcomes of activity-backed conditions from fresh, durably recorded Gamma pages.
-    /// Cache hits still participate in the combined-page conflict and rejection checks.
+    /// Discover activity-backed conditions once per process lifetime, retaining empty results.
+    /// Later reads reuse token-cache identities and original provenance, subject to rejections;
+    /// refetching would put Gamma requests inside the stability window and re-record pages.
     pub async fn discover_conditions_for_bracket(
         &self,
         conditions: impl IntoIterator<Item = PolymarketConditionId>,
@@ -352,7 +357,45 @@ impl AssetIdentityResolver {
         let mut read_pages = BTreeMap::new();
         let _misses = self.misses.lock().await;
         let store = self.store.read().await.clone();
-        let conditions = requested.iter().cloned().collect::<Vec<_>>();
+        let mut conditions = Vec::new();
+        {
+            let mut cache = self.cache.write().await;
+            for condition in &requested {
+                let Some(tokens) = cache.discovered_conditions.get(condition).cloned() else {
+                    conditions.push(condition.clone());
+                    continue;
+                };
+                if let Some(store) = &store {
+                    check_condition_rejection(store, &mut cache, condition)?;
+                    cache.rejected_tokens.extend(
+                        store
+                            .paper_state
+                            .rejected_asset_tokens(
+                                &store.generation,
+                                &tokens.iter().cloned().collect::<Vec<_>>(),
+                            )
+                            .map_err(identity_store_error)?
+                            .into_keys(),
+                    );
+                }
+                for token in tokens {
+                    if cache.rejected.contains(condition) || cache.rejected_tokens.contains(&token)
+                    {
+                        resolved
+                            .unverified
+                            .insert(token, rejected_identity_reason());
+                    } else if let Some(cached) = cache.identities.get(&token) {
+                        resolved
+                            .verified
+                            .insert(token.clone(), cached.identity.clone());
+                        resolved.provenance.insert(token, cached.provenance.clone());
+                    } else {
+                        resolved.unverified.insert(token, absent_identity_reason());
+                    }
+                }
+            }
+            evict_rejected(&mut cache, &mut resolved);
+        }
         for chunk in conditions.chunks(self.gamma_batch_size.min(GAMMA_BATCH_SIZE)) {
             let mut pending = chunk.to_vec();
             let mut recorded = RecordedIdentityPages::default();
@@ -395,9 +438,6 @@ impl AssetIdentityResolver {
                     &mut newly_verified,
                     &mut resolved.unverified,
                 );
-                // save_verified preserves cache provenance. The bracket must also cite this
-                // discovery's fresh page, which has just been acknowledged by record_page.
-                let discovered = newly_verified.clone();
                 let saved = self
                     .save_verified(
                         store.as_ref(),
@@ -414,16 +454,28 @@ impl AssetIdentityResolver {
                     return Err(error);
                 }
                 saved?;
-                for (token, fresh) in discovered {
-                    if newly_verified.contains_key(&token)
-                        && requested.contains(&fresh.identity.condition_id.0)
-                    {
+                for (token, fresh) in newly_verified {
+                    if requested.contains(&fresh.identity.condition_id.0) {
                         resolved.unverified.remove(&token);
                         resolved.verified.insert(token.clone(), fresh.identity);
                         resolved.provenance.insert(token, fresh.provenance);
                     }
                 }
-                evict_rejected(&mut *self.cache.write().await, &mut resolved);
+                let mut cache = self.cache.write().await;
+                evict_rejected(&mut cache, &mut resolved);
+                for condition in &pending {
+                    let tokens = resolved
+                        .verified
+                        .iter()
+                        .filter(|(_, identity)| &identity.condition_id.0 == condition)
+                        .map(|(token, _)| token.clone())
+                        .collect::<BTreeSet<_>>();
+                    if filter == MarketFilter::ClosedOnly || !tokens.is_empty() {
+                        cache
+                            .discovered_conditions
+                            .insert(condition.clone(), tokens);
+                    }
+                }
                 pending.retain(|condition| {
                     !resolved
                         .verified
@@ -1953,7 +2005,7 @@ mod tests {
     }
 
     /// PASS: open discovery verifies both outcomes, filters unrelated markets, and records provenance.
-    /// FAIL: a cache hit hides a new condition read or substitutes old provenance.
+    /// FAIL: a warmed token skips the first condition read or loses its original provenance.
     #[tokio::test]
     async fn condition_discovery_records_fresh_pages_even_with_warmed_cache() {
         let fetcher = Arc::new(GammaFixture::new(
@@ -1974,10 +2026,7 @@ mod tests {
             OutcomeId(1)
         );
         assert_eq!(discovered.provenance.len(), 2);
-        assert!(
-            discovered.provenance[&a].source_log_sequence
-                > cached.provenance[&a].source_log_sequence
-        );
+        assert_eq!(discovered.provenance[&a], cached.provenance[&a]);
         assert_eq!(
             fetcher.urls.lock().unwrap()[1],
             format!("{BASE}/markets?condition_ids=condition&limit=500")
@@ -1988,7 +2037,10 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(entries.len(), 2);
         for provenance in discovered.provenance.values() {
-            let (sequence, envelope) = &entries[1];
+            let (sequence, envelope) = entries
+                .iter()
+                .find(|(sequence, _)| sequence.0 == provenance.source_log_sequence)
+                .unwrap();
             assert_eq!(provenance.source_log_sequence, sequence.0);
             assert_eq!(
                 provenance.canonical_page_hash,
@@ -1998,6 +2050,273 @@ mod tests {
             assert_eq!(envelope.schema_version, GAMMA_MARKETS_SCHEMA_VERSION);
             assert_eq!(envelope.parser_version, GAMMA_MARKETS_PARSER_VERSION);
         }
+    }
+
+    /// PASS: completed open, closed and empty discoveries reuse identities and original receipts.
+    /// FAIL: another read requests Gamma or re-records a completed condition's pages.
+    #[tokio::test]
+    async fn condition_discovery_memo_reuses_original_provenance_and_empty_results() {
+        let fetcher = Arc::new(GammaFixture::new(
+            br#"[{"conditionId":"open","clobTokenIds":["open-a","open-b"]}]"#,
+            br#"[{"conditionId":"closed","clobTokenIds":["closed-a","closed-b"]}]"#,
+        ));
+        let (_dir, path, _sink, resolver) = boot_resolver(fetcher.clone());
+        let conditions = ["open", "closed", "empty"].map(|id| PolymarketConditionId(id.into()));
+        let first = resolver
+            .discover_conditions_for_bracket(conditions.clone())
+            .await
+            .unwrap();
+        assert_eq!(first.verified.len(), 4);
+        assert!(resolver.cache.read().await.discovered_conditions["empty"].is_empty());
+        let calls = fetcher.calls.load(Ordering::SeqCst);
+        let second = resolver
+            .discover_conditions_for_bracket(conditions)
+            .await
+            .unwrap();
+        assert_eq!(second.verified, first.verified);
+        assert_eq!(second.provenance, first.provenance);
+        assert_eq!(second.unverified, first.unverified);
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), calls);
+        assert_eq!(Reader::replay(path).unwrap().count(), calls);
+    }
+
+    /// PASS: a mixed discovery requests only conditions whose lookup has not completed.
+    /// FAIL: a remembered condition enters either the open or closed query again.
+    #[tokio::test]
+    async fn condition_discovery_mixed_request_fetches_only_unremembered_conditions() {
+        let fetcher = Arc::new(GammaFixture::new(
+            br#"[{"conditionId":"open","clobTokenIds":["token-a"]}]"#,
+            br#"[{"conditionId":"closed","clobTokenIds":["token-b"]}]"#,
+        ));
+        let (_dir, _path, _sink, resolver) = boot_resolver(fetcher.clone());
+        let first = resolver
+            .discover_conditions_for_bracket([PolymarketConditionId("open".into())])
+            .await
+            .unwrap();
+        let mixed = resolver
+            .discover_conditions_for_bracket([
+                PolymarketConditionId("open".into()),
+                PolymarketConditionId("closed".into()),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(mixed.verified.len(), 2);
+        assert_eq!(
+            mixed.provenance[&PolymarketTokenId("token-a".into())],
+            first.provenance[&PolymarketTokenId("token-a".into())]
+        );
+        assert_eq!(
+            *fetcher.urls.lock().unwrap(),
+            [
+                format!("{BASE}/markets?condition_ids=open&limit=500"),
+                format!("{BASE}/markets?condition_ids=closed&limit=500"),
+                format!("{BASE}/markets?condition_ids=closed&closed=true&limit=500"),
+            ]
+        );
+    }
+
+    /// PASS: token-path conflicts invalidate every remembered sibling without another discovery.
+    /// FAIL: memoized discovery resurrects an evicted or rejected token.
+    #[tokio::test]
+    async fn condition_discovery_memo_honors_later_token_path_rejection() {
+        let fetcher = Arc::new(SequenceFixture {
+            pages: StdMutex::new(std::collections::VecDeque::from([
+                br#"[{"conditionId":"condition","clobTokenIds":["token-a","token-x"]}]"#.to_vec(),
+                br#"[{"conditionId":"condition","clobTokenIds":["token-z","token-b"]}]"#.to_vec(),
+            ])),
+        });
+        let (_dir, _path, _sink, resolver) = boot_resolver(fetcher.clone());
+        let condition = PolymarketConditionId("condition".into());
+        let first = resolver
+            .discover_conditions_for_bracket([condition.clone()])
+            .await
+            .unwrap();
+        assert_eq!(first.verified.len(), 2);
+        let rejected = resolver
+            .resolve_live([PolymarketTokenId("token-b".into())])
+            .await
+            .unwrap();
+        assert!(rejected.verified.is_empty());
+        let second = resolver
+            .discover_conditions_for_bracket([condition])
+            .await
+            .unwrap();
+        assert!(second.verified.is_empty());
+        assert!(second.provenance.is_empty());
+        for token in first.verified.keys() {
+            assert_eq!(second.unverified[token], rejected_identity_reason());
+        }
+        assert!(fetcher.pages.lock().unwrap().is_empty());
+    }
+
+    /// PASS: a missing cached token and durable condition/token markers remain unresolved.
+    /// FAIL: remembering discovery bypasses the existing rejection or absence authority.
+    #[tokio::test]
+    async fn condition_discovery_memo_honors_absence_and_durable_rejections() {
+        for case in ["absent", "condition", "token"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("source.log");
+            let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+            let fetcher = Arc::new(GammaFixture::new(
+                br#"[{"conditionId":"condition","clobTokenIds":["token-a","token-b"]}]"#,
+                b"[]",
+            ));
+            let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher.clone(), 50);
+            let condition = PolymarketConditionId("condition".into());
+            let token = PolymarketTokenId("token-a".into());
+            let first = resolver
+                .discover_conditions_for_bracket([condition.clone()])
+                .await
+                .unwrap();
+            if case == "absent" {
+                resolver.cache.write().await.identities.remove(&token);
+            } else {
+                let sequence = i64::try_from(first.provenance[&token].source_log_sequence).unwrap();
+                paper
+                    .save_asset_identities(
+                        "installed",
+                        &[],
+                        &if case == "condition" {
+                            BTreeMap::from([("condition".into(), sequence)])
+                        } else {
+                            BTreeMap::new()
+                        },
+                        &BTreeMap::new(),
+                        &if case == "token" {
+                            BTreeMap::from([(token.clone(), sequence)])
+                        } else {
+                            BTreeMap::new()
+                        },
+                    )
+                    .unwrap();
+            }
+            let second = resolver
+                .discover_conditions_for_bracket([condition])
+                .await
+                .unwrap();
+            assert!(!second.verified.contains_key(&token));
+            assert!(!second.provenance.contains_key(&token));
+            assert_eq!(
+                second.unverified[&token],
+                if case == "absent" {
+                    absent_identity_reason()
+                } else {
+                    rejected_identity_reason()
+                }
+            );
+            assert_eq!(second.verified.len(), usize::from(case != "condition"));
+            assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    /// PASS: failed lookups remain eligible for a fresh open/closed attempt on retry.
+    /// FAIL: a transient failure is remembered as a completed empty discovery.
+    #[tokio::test(start_paused = true)]
+    async fn condition_discovery_transient_failure_remembers_nothing_and_retries() {
+        let fetcher = Arc::new(RetryFixture {
+            attempts: StdMutex::new(Vec::new()),
+        });
+        let (_dir, _path, _sink, resolver) = boot_resolver(fetcher.clone());
+        let condition = PolymarketConditionId("condition-closed".into());
+        for _ in 0..4 {
+            assert!(matches!(
+                resolver
+                    .discover_conditions_for_bracket([condition.clone()])
+                    .await,
+                Err(SourceError::Transient { .. })
+            ));
+            assert!(resolver.cache.read().await.discovered_conditions.is_empty());
+        }
+        let retried = resolver
+            .discover_conditions_for_bracket([condition.clone()])
+            .await
+            .unwrap();
+        assert_eq!(retried.verified.len(), 1);
+        assert_eq!(
+            fetcher
+                .attempts
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(closed, _)| *closed)
+                .collect::<Vec<_>>(),
+            [false, false, false, true, false, true, false, true]
+        );
+        let repeated = resolver
+            .discover_conditions_for_bracket([condition])
+            .await
+            .unwrap();
+        assert_eq!(repeated.provenance, retried.provenance);
+        assert_eq!(fetcher.attempts.lock().unwrap().len(), 8);
+    }
+
+    /// PASS: an open condition stays remembered when another condition's closed lookup fails.
+    /// FAIL: a partial discovery remembers an unfinished condition or refetches completed progress.
+    #[tokio::test]
+    async fn condition_discovery_partial_failure_remembers_only_completed_conditions() {
+        struct ClosedFailure {
+            inner: GammaFixture,
+            closed_calls: AtomicUsize,
+        }
+        impl ReconciliationFetcher for ClosedFailure {
+            fn fetch<'a>(
+                &'a self,
+                url: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>>
+            {
+                Box::pin(async move {
+                    let page = self.inner.fetch(url).await?;
+                    if url.contains("closed=true")
+                        && self.closed_calls.fetch_add(1, Ordering::SeqCst) == 0
+                    {
+                        return Err(SourceError::Transient {
+                            message: "closed lookup failed".into(),
+                        });
+                    }
+                    Ok(page)
+                })
+            }
+        }
+        let fetcher = Arc::new(ClosedFailure {
+            inner: GammaFixture::new(
+                br#"[{"conditionId":"open","clobTokenIds":["token-a"]}]"#,
+                br#"[{"conditionId":"closed","clobTokenIds":["token-b"]}]"#,
+            ),
+            closed_calls: AtomicUsize::new(0),
+        });
+        let (_dir, _path, _sink, resolver) = boot_resolver(fetcher.clone());
+        let conditions = ["open", "closed"].map(|id| PolymarketConditionId(id.into()));
+        assert!(matches!(
+            resolver
+                .discover_conditions_for_bracket(conditions.clone())
+                .await,
+            Err(SourceError::Transient { .. })
+        ));
+        assert_eq!(
+            resolver
+                .cache
+                .read()
+                .await
+                .discovered_conditions
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            ["open"]
+        );
+        let retried = resolver
+            .discover_conditions_for_bracket(conditions)
+            .await
+            .unwrap();
+        assert_eq!(retried.verified.len(), 2);
+        assert_eq!(
+            *fetcher.inner.urls.lock().unwrap(),
+            [
+                format!("{BASE}/markets?condition_ids=closed&condition_ids=open&limit=500"),
+                format!("{BASE}/markets?condition_ids=closed&closed=true&limit=500"),
+                format!("{BASE}/markets?condition_ids=closed&limit=500"),
+                format!("{BASE}/markets?condition_ids=closed&closed=true&limit=500"),
+            ]
+        );
     }
 
     /// PASS: only unresolved conditions get a closed lookup and condition pages restore on restart.

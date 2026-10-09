@@ -1370,7 +1370,9 @@ impl CausalPositionValidator {
             mapping
                 .insert_verified_split_merge(&identity.condition_id, asset.clone(), &identity)
                 .map_err(|source| CausalPositionError::Positions { wallet, source })?;
-            resolved.provenance.insert(asset.clone(), provenance.clone());
+            resolved
+                .provenance
+                .insert(asset.clone(), provenance.clone());
             resolved.verified.insert(asset, identity);
         }
         Ok(())
