@@ -7,7 +7,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Weak};
 
-use pe_core_types::{EventSeq, OutcomeId, PolymarketTokenId, SourceTimestamp};
+use pe_core_types::{
+    EventSeq, OutcomeId, PolymarketConditionId, PolymarketTokenId, SourceTimestamp,
+};
 use pe_event_log::{AppendReceipt, ContentType, EnvelopeIn};
 use pe_paper_state::{
     ASSET_IDENTITY_INSERT_LIMIT, AssetIdentityRow, MigrationPhase, MigrationRecord, PaperStateDb,
@@ -131,11 +133,17 @@ struct CachedIdentity {
 #[derive(Default)]
 struct IdentityCache {
     identities: HashMap<PolymarketTokenId, CachedIdentity>,
+    /// Completed condition lookups, including empty results, last for this resolver's process
+    /// lifetime. Refetching each bracket read would put Gamma requests inside the stability
+    /// window and re-record pages (R2 observed 78 wallets across 7,154 conditions).
+    discovered_conditions: HashMap<String, BTreeSet<PolymarketTokenId>>,
     rejected: BTreeSet<String>,
     rejected_tokens: BTreeSet<PolymarketTokenId>,
     memory_pages: MemoryIdentityPages,
     // An expired caller cannot make a later live lookup skip the open query.
     completed_open: HashMap<PolymarketTokenId, Weak<()>>,
+    // Unfinished condition discoveries share open progress only while their caller lives.
+    completed_open_conditions: HashMap<String, Weak<()>>,
     // Boot's shared receipt index is extended only after its reducer walk. These pages
     // already have a synchronized append receipt and are dropped when that index is installed.
     boot_pages: BTreeMap<u64, (AppendReceipt, IdentityPage)>,
@@ -327,6 +335,196 @@ impl AssetIdentityResolver {
         tokens: impl IntoIterator<Item = PolymarketTokenId>,
     ) -> Result<ResolvedIdentities, SourceError> {
         self.resolve_inner(tokens, LookupPurpose::Historical).await
+    }
+
+    /// Discover activity-backed conditions once per process lifetime, retaining empty results.
+    /// Later reads reuse token-cache identities and original provenance, subject to rejections;
+    /// refetching would put Gamma requests inside the stability window and re-record pages.
+    pub async fn discover_conditions_for_bracket(
+        &self,
+        conditions: impl IntoIterator<Item = PolymarketConditionId>,
+    ) -> Result<ResolvedIdentities, SourceError> {
+        let requested = conditions
+            .into_iter()
+            .map(|condition| condition.0)
+            .collect::<BTreeSet<_>>();
+        let mut resolved = ResolvedIdentities {
+            verified: BTreeMap::new(),
+            unverified: BTreeMap::new(),
+            provenance: BTreeMap::new(),
+        };
+        if requested.is_empty() {
+            return Ok(resolved);
+        }
+        let mut read_pages = BTreeMap::new();
+        let conditions = requested.iter().cloned().collect::<Vec<_>>();
+        let open_phase = Arc::new(());
+        for chunk in conditions.chunks(self.gamma_batch_size.min(GAMMA_BATCH_SIZE)) {
+            let mut pending = chunk.to_vec();
+            let mut recorded = RecordedIdentityPages::default();
+            for filter in [MarketFilter::OpenOnly, MarketFilter::ClosedOnly] {
+                // One bounded attempt owns the FIFO mutex, just like the token path.
+                let _misses = self.misses.lock().await;
+                let store = self.store.read().await.clone();
+                let mut misses = Vec::new();
+                {
+                    let mut cache = self.cache.write().await;
+                    for condition in &pending {
+                        let Some(tokens) = cache.discovered_conditions.get(condition).cloned()
+                        else {
+                            misses.push(condition.clone());
+                            continue;
+                        };
+                        if let Some(store) = &store {
+                            check_condition_rejection(store, &mut cache, condition)?;
+                            cache.rejected_tokens.extend(
+                                store
+                                    .paper_state
+                                    .rejected_asset_tokens(
+                                        &store.generation,
+                                        &tokens.iter().cloned().collect::<Vec<_>>(),
+                                    )
+                                    .map_err(identity_store_error)?
+                                    .into_keys(),
+                            );
+                        }
+                        for token in tokens {
+                            if cache.rejected.contains(condition)
+                                || cache.rejected_tokens.contains(&token)
+                            {
+                                resolved
+                                    .unverified
+                                    .insert(token, rejected_identity_reason());
+                            } else if let Some(cached) = cache.identities.get(&token) {
+                                resolved
+                                    .verified
+                                    .insert(token.clone(), cached.identity.clone());
+                                resolved.provenance.insert(token, cached.provenance.clone());
+                            } else {
+                                resolved.unverified.insert(token, absent_identity_reason());
+                            }
+                        }
+                    }
+                    evict_rejected(&mut cache, &mut resolved);
+                }
+                pending = misses;
+                if pending.is_empty() {
+                    break;
+                }
+                let mut fetch_conditions = pending.clone();
+                if filter == MarketFilter::OpenOnly {
+                    let cache = self.cache.read().await;
+                    fetch_conditions.retain(|condition| {
+                        cache
+                            .completed_open_conditions
+                            .get(condition)
+                            .is_none_or(|phase| phase.strong_count() == 0)
+                    });
+                } else {
+                    let mut cache = self.cache.write().await;
+                    for condition in &fetch_conditions {
+                        cache.completed_open_conditions.remove(condition);
+                    }
+                }
+                if fetch_conditions.is_empty() {
+                    continue;
+                }
+                let (pages, fetched) = match self
+                    .client
+                    .fetch_markets_with_pages(&fetch_conditions, filter)
+                    .await
+                {
+                    Ok(fetched) => {
+                        let result = if fetched.markets.unfetched.is_empty() {
+                            Ok(())
+                        } else {
+                            Err(SourceError::Fatal {
+                                message: format!(
+                                    "gamma condition lookup rejected: {}",
+                                    fetched.markets.unfetched.join(",")
+                                ),
+                            })
+                        };
+                        (fetched.pages, result)
+                    }
+                    Err(error) => (error.pages, Err(map_gamma_error(error.source))),
+                };
+                for page in pages {
+                    let sequence = self.record_page(&page).await?;
+                    recorded.last_sequence = Some(sequence);
+                    recorded
+                        .sequences
+                        .entry(page.0.canonical_page_hash.clone())
+                        .or_insert(sequence);
+                    recorded.pages.push(page);
+                }
+                let tokens = page_token_conditions(&recorded.pages)
+                    .into_iter()
+                    .filter(|(_, conditions)| conditions.iter().any(|id| requested.contains(id)))
+                    .map(|(token, _)| token)
+                    .collect::<Vec<_>>();
+                let mut newly_verified = BTreeMap::new();
+                collect_verified(
+                    verify_token_identities(&tokens, &recorded.pages),
+                    &recorded.sequences,
+                    &mut newly_verified,
+                    &mut resolved.unverified,
+                );
+                let saved = self
+                    .save_verified(
+                        store.as_ref(),
+                        &recorded,
+                        &mut read_pages,
+                        &mut newly_verified,
+                        &mut resolved,
+                    )
+                    .await;
+                if let Err(error) = fetched {
+                    if let Err(save_error) = saved {
+                        tracing::error!(%save_error, "failed to save partial Gamma condition identity progress");
+                    }
+                    return Err(error);
+                }
+                saved?;
+                for (token, fresh) in newly_verified {
+                    if requested.contains(&fresh.identity.condition_id.0) {
+                        resolved.unverified.remove(&token);
+                        resolved.verified.insert(token.clone(), fresh.identity);
+                        resolved.provenance.insert(token, fresh.provenance);
+                    }
+                }
+                let mut cache = self.cache.write().await;
+                evict_rejected(&mut cache, &mut resolved);
+                for condition in &pending {
+                    let tokens = resolved
+                        .verified
+                        .iter()
+                        .filter(|(_, identity)| &identity.condition_id.0 == condition)
+                        .map(|(token, _)| token.clone())
+                        .collect::<BTreeSet<_>>();
+                    if filter == MarketFilter::ClosedOnly || !tokens.is_empty() {
+                        cache
+                            .discovered_conditions
+                            .insert(condition.clone(), tokens);
+                    } else if fetch_conditions.contains(condition) {
+                        cache
+                            .completed_open_conditions
+                            .insert(condition.clone(), Arc::downgrade(&open_phase));
+                    }
+                }
+                pending.retain(|condition| {
+                    !resolved
+                        .verified
+                        .values()
+                        .any(|identity| &identity.condition_id.0 == condition)
+                });
+                if pending.is_empty() {
+                    break;
+                }
+            }
+        }
+        evict_rejected(&mut *self.cache.write().await, &mut resolved);
+        Ok(resolved)
     }
 
     async fn resolve_inner(
@@ -1842,6 +2040,545 @@ mod tests {
         assert!(cache.memory_pages.by_condition.is_empty());
     }
 
+    /// PASS: open discovery verifies both outcomes, filters unrelated markets, and records provenance.
+    /// FAIL: a warmed token skips the first condition read or loses its original provenance.
+    #[tokio::test]
+    async fn condition_discovery_records_fresh_pages_even_with_warmed_cache() {
+        let fetcher = Arc::new(GammaFixture::new(
+            br#"[{"conditionId":"condition","clobTokenIds":["token-a","token-b"]},{"conditionId":"other","clobTokenIds":["unrequested"]}]"#,
+            b"[]",
+        ));
+        let (_dir, path, _sink, resolver) = boot_resolver(fetcher.clone());
+        let a = PolymarketTokenId("token-a".into());
+        let cached = resolver.resolve_live([a.clone()]).await.unwrap();
+        let discovered = resolver
+            .discover_conditions_for_bracket([PolymarketConditionId("condition".into())])
+            .await
+            .unwrap();
+        assert_eq!(discovered.verified.len(), 2);
+        assert_eq!(discovered.verified[&a].outcome, OutcomeId(0));
+        assert_eq!(
+            discovered.verified[&PolymarketTokenId("token-b".into())].outcome,
+            OutcomeId(1)
+        );
+        assert_eq!(discovered.provenance.len(), 2);
+        assert_eq!(discovered.provenance[&a], cached.provenance[&a]);
+        assert_eq!(
+            fetcher.urls.lock().unwrap()[1],
+            format!("{BASE}/markets?condition_ids=condition&limit=500")
+        );
+        let entries = Reader::replay(&path)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 2);
+        for provenance in discovered.provenance.values() {
+            let (sequence, envelope) = entries
+                .iter()
+                .find(|(sequence, _)| sequence.0 == provenance.source_log_sequence)
+                .unwrap();
+            assert_eq!(provenance.source_log_sequence, sequence.0);
+            assert_eq!(
+                provenance.canonical_page_hash,
+                canonical_page_hash(&envelope.payload).unwrap()
+            );
+            assert_eq!(envelope.source_id.0, GAMMA_MARKETS_SOURCE_ID);
+            assert_eq!(envelope.schema_version, GAMMA_MARKETS_SCHEMA_VERSION);
+            assert_eq!(envelope.parser_version, GAMMA_MARKETS_PARSER_VERSION);
+        }
+    }
+
+    /// PASS: completed open, closed and empty discoveries reuse identities and original receipts.
+    /// FAIL: another read requests Gamma or re-records a completed condition's pages.
+    #[tokio::test]
+    async fn condition_discovery_memo_reuses_original_provenance_and_empty_results() {
+        let fetcher = Arc::new(GammaFixture::new(
+            br#"[{"conditionId":"open","clobTokenIds":["open-a","open-b"]}]"#,
+            br#"[{"conditionId":"closed","clobTokenIds":["closed-a","closed-b"]}]"#,
+        ));
+        let (_dir, path, _sink, resolver) = boot_resolver(fetcher.clone());
+        let conditions = ["open", "closed", "empty"].map(|id| PolymarketConditionId(id.into()));
+        let first = resolver
+            .discover_conditions_for_bracket(conditions.clone())
+            .await
+            .unwrap();
+        assert_eq!(first.verified.len(), 4);
+        assert!(resolver.cache.read().await.discovered_conditions["empty"].is_empty());
+        let calls = fetcher.calls.load(Ordering::SeqCst);
+        let second = resolver
+            .discover_conditions_for_bracket(conditions)
+            .await
+            .unwrap();
+        assert_eq!(second.verified, first.verified);
+        assert_eq!(second.provenance, first.provenance);
+        assert_eq!(second.unverified, first.unverified);
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), calls);
+        assert_eq!(Reader::replay(path).unwrap().count(), calls);
+    }
+
+    /// PASS: a mixed discovery requests only conditions whose lookup has not completed.
+    /// FAIL: a remembered condition enters either the open or closed query again.
+    #[tokio::test]
+    async fn condition_discovery_mixed_request_fetches_only_unremembered_conditions() {
+        let fetcher = Arc::new(GammaFixture::new(
+            br#"[{"conditionId":"open","clobTokenIds":["token-a"]}]"#,
+            br#"[{"conditionId":"closed","clobTokenIds":["token-b"]}]"#,
+        ));
+        let (_dir, _path, _sink, resolver) = boot_resolver(fetcher.clone());
+        let first = resolver
+            .discover_conditions_for_bracket([PolymarketConditionId("open".into())])
+            .await
+            .unwrap();
+        let mixed = resolver
+            .discover_conditions_for_bracket([
+                PolymarketConditionId("open".into()),
+                PolymarketConditionId("closed".into()),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(mixed.verified.len(), 2);
+        assert_eq!(
+            mixed.provenance[&PolymarketTokenId("token-a".into())],
+            first.provenance[&PolymarketTokenId("token-a".into())]
+        );
+        assert_eq!(
+            *fetcher.urls.lock().unwrap(),
+            [
+                format!("{BASE}/markets?condition_ids=open&limit=500"),
+                format!("{BASE}/markets?condition_ids=closed&limit=500"),
+                format!("{BASE}/markets?condition_ids=closed&closed=true&limit=500"),
+            ]
+        );
+    }
+
+    /// PASS: token-path conflicts invalidate every remembered sibling without another discovery.
+    /// FAIL: memoized discovery resurrects an evicted or rejected token.
+    #[tokio::test]
+    async fn condition_discovery_memo_honors_later_token_path_rejection() {
+        let fetcher = Arc::new(SequenceFixture {
+            pages: StdMutex::new(std::collections::VecDeque::from([
+                br#"[{"conditionId":"condition","clobTokenIds":["token-a","token-x"]}]"#.to_vec(),
+                br#"[{"conditionId":"condition","clobTokenIds":["token-z","token-b"]}]"#.to_vec(),
+            ])),
+        });
+        let (_dir, _path, _sink, resolver) = boot_resolver(fetcher.clone());
+        let condition = PolymarketConditionId("condition".into());
+        let first = resolver
+            .discover_conditions_for_bracket([condition.clone()])
+            .await
+            .unwrap();
+        assert_eq!(first.verified.len(), 2);
+        let rejected = resolver
+            .resolve_live([PolymarketTokenId("token-b".into())])
+            .await
+            .unwrap();
+        assert!(rejected.verified.is_empty());
+        let second = resolver
+            .discover_conditions_for_bracket([condition])
+            .await
+            .unwrap();
+        assert!(second.verified.is_empty());
+        assert!(second.provenance.is_empty());
+        for token in first.verified.keys() {
+            assert_eq!(second.unverified[token], rejected_identity_reason());
+        }
+        assert!(fetcher.pages.lock().unwrap().is_empty());
+    }
+
+    /// PASS: a missing cached token and durable condition/token markers remain unresolved.
+    /// FAIL: remembering discovery bypasses the existing rejection or absence authority.
+    #[tokio::test]
+    async fn condition_discovery_memo_honors_absence_and_durable_rejections() {
+        for case in ["absent", "condition", "token"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("source.log");
+            let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+            let fetcher = Arc::new(GammaFixture::new(
+                br#"[{"conditionId":"condition","clobTokenIds":["token-a","token-b"]}]"#,
+                b"[]",
+            ));
+            let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher.clone(), 50);
+            let condition = PolymarketConditionId("condition".into());
+            let token = PolymarketTokenId("token-a".into());
+            let first = resolver
+                .discover_conditions_for_bracket([condition.clone()])
+                .await
+                .unwrap();
+            if case == "absent" {
+                resolver.cache.write().await.identities.remove(&token);
+            } else {
+                let sequence = i64::try_from(first.provenance[&token].source_log_sequence).unwrap();
+                paper
+                    .save_asset_identities(
+                        "installed",
+                        &[],
+                        &if case == "condition" {
+                            BTreeMap::from([("condition".into(), sequence)])
+                        } else {
+                            BTreeMap::new()
+                        },
+                        &BTreeMap::new(),
+                        &if case == "token" {
+                            BTreeMap::from([(token.clone(), sequence)])
+                        } else {
+                            BTreeMap::new()
+                        },
+                    )
+                    .unwrap();
+            }
+            let second = resolver
+                .discover_conditions_for_bracket([condition])
+                .await
+                .unwrap();
+            assert!(!second.verified.contains_key(&token));
+            assert!(!second.provenance.contains_key(&token));
+            assert_eq!(
+                second.unverified[&token],
+                if case == "absent" {
+                    absent_identity_reason()
+                } else {
+                    rejected_identity_reason()
+                }
+            );
+            assert_eq!(second.verified.len(), usize::from(case != "condition"));
+            assert_eq!(fetcher.calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    /// PASS: failed lookups remain eligible for a fresh open/closed attempt on retry.
+    /// FAIL: a transient failure is remembered as a completed empty discovery.
+    #[tokio::test(start_paused = true)]
+    async fn condition_discovery_transient_failure_remembers_nothing_and_retries() {
+        let fetcher = Arc::new(RetryFixture {
+            attempts: StdMutex::new(Vec::new()),
+        });
+        let (_dir, _path, _sink, resolver) = boot_resolver(fetcher.clone());
+        let condition = PolymarketConditionId("condition-closed".into());
+        for _ in 0..4 {
+            assert!(matches!(
+                resolver
+                    .discover_conditions_for_bracket([condition.clone()])
+                    .await,
+                Err(SourceError::Transient { .. })
+            ));
+            assert!(resolver.cache.read().await.discovered_conditions.is_empty());
+        }
+        let retried = resolver
+            .discover_conditions_for_bracket([condition.clone()])
+            .await
+            .unwrap();
+        assert_eq!(retried.verified.len(), 1);
+        assert_eq!(
+            fetcher
+                .attempts
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(closed, _)| *closed)
+                .collect::<Vec<_>>(),
+            [false, false, false, true, false, true, false, true]
+        );
+        let repeated = resolver
+            .discover_conditions_for_bracket([condition])
+            .await
+            .unwrap();
+        assert_eq!(repeated.provenance, retried.provenance);
+        assert_eq!(fetcher.attempts.lock().unwrap().len(), 8);
+    }
+
+    /// PASS: an open condition stays remembered when another condition's closed lookup fails.
+    /// FAIL: a partial discovery remembers an unfinished condition or refetches completed progress.
+    #[tokio::test]
+    async fn condition_discovery_partial_failure_remembers_only_completed_conditions() {
+        struct ClosedFailure {
+            inner: GammaFixture,
+            closed_calls: AtomicUsize,
+        }
+        impl ReconciliationFetcher for ClosedFailure {
+            fn fetch<'a>(
+                &'a self,
+                url: &'a str,
+            ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>>
+            {
+                Box::pin(async move {
+                    let page = self.inner.fetch(url).await?;
+                    if url.contains("closed=true")
+                        && self.closed_calls.fetch_add(1, Ordering::SeqCst) == 0
+                    {
+                        return Err(SourceError::Transient {
+                            message: "closed lookup failed".into(),
+                        });
+                    }
+                    Ok(page)
+                })
+            }
+        }
+        let fetcher = Arc::new(ClosedFailure {
+            inner: GammaFixture::new(
+                br#"[{"conditionId":"open","clobTokenIds":["token-a"]}]"#,
+                br#"[{"conditionId":"closed","clobTokenIds":["token-b"]}]"#,
+            ),
+            closed_calls: AtomicUsize::new(0),
+        });
+        let (_dir, _path, _sink, resolver) = boot_resolver(fetcher.clone());
+        let conditions = ["open", "closed"].map(|id| PolymarketConditionId(id.into()));
+        assert!(matches!(
+            resolver
+                .discover_conditions_for_bracket(conditions.clone())
+                .await,
+            Err(SourceError::Transient { .. })
+        ));
+        assert_eq!(
+            resolver
+                .cache
+                .read()
+                .await
+                .discovered_conditions
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>(),
+            ["open"]
+        );
+        let retried = resolver
+            .discover_conditions_for_bracket(conditions)
+            .await
+            .unwrap();
+        assert_eq!(retried.verified.len(), 2);
+        assert_eq!(
+            *fetcher.inner.urls.lock().unwrap(),
+            [
+                format!("{BASE}/markets?condition_ids=closed&condition_ids=open&limit=500"),
+                format!("{BASE}/markets?condition_ids=closed&closed=true&limit=500"),
+                format!("{BASE}/markets?condition_ids=closed&limit=500"),
+                format!("{BASE}/markets?condition_ids=closed&closed=true&limit=500"),
+            ]
+        );
+    }
+
+    /// PASS: only unresolved conditions get a closed lookup and condition pages restore on restart.
+    /// FAIL: an empty open lookup loses a closed market's remaining outcome tokens.
+    #[tokio::test]
+    async fn condition_discovery_closed_fallback_persists_reauthenticatable_identities() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let fetcher = Arc::new(GammaFixture::new(
+            br#"[{"conditionId":"open","clobTokenIds":["open-a","open-b"]}]"#,
+            br#"[{"conditionId":"closed","closed":true,"clobTokenIds":["closed-a","closed-b"]}]"#,
+        ));
+        let resolver = durable_resolver(&path, paper.clone(), "installed", fetcher.clone(), 50);
+        let discovered = resolver
+            .discover_conditions_for_bracket([
+                PolymarketConditionId("open".into()),
+                PolymarketConditionId("closed".into()),
+            ])
+            .await
+            .unwrap();
+        assert_eq!(discovered.verified.len(), 4);
+        assert_eq!(
+            *fetcher.urls.lock().unwrap(),
+            [
+                format!("{BASE}/markets?condition_ids=closed&condition_ids=open&limit=500"),
+                format!("{BASE}/markets?condition_ids=closed&closed=true&limit=500")
+            ]
+        );
+        let tokens = discovered.verified.keys().cloned().collect::<Vec<_>>();
+        assert_eq!(
+            paper.asset_identities("installed", &tokens).unwrap().len(),
+            4
+        );
+        drop(resolver);
+        let fetcher = Arc::new(GammaFixture::new(b"[]", b"[]"));
+        let restarted = durable_resolver(&path, paper, "installed", fetcher.clone(), 50);
+        let restored = restarted
+            .resolve_historical_for_bracket(tokens)
+            .await
+            .unwrap();
+        assert_eq!(restored.verified, discovered.verified);
+        assert_eq!(restored.provenance, discovered.provenance);
+        assert_eq!(fetcher.calls.load(Ordering::SeqCst), 0);
+    }
+
+    /// PASS: fresh conflicting discovery rejects warmed and stored identities through the existing owner.
+    /// FAIL: a cache hit or a cold stored row bypasses the new page's conflict.
+    #[tokio::test]
+    async fn condition_discovery_rejects_conflicting_warmed_and_stored_identities() {
+        for durable in [false, true] {
+            for warmed in [false, true] {
+                if !durable && !warmed {
+                    continue;
+                }
+                let fetcher = Arc::new(SequenceFixture {
+                    pages: StdMutex::new(std::collections::VecDeque::from([
+                        br#"[{"conditionId":"condition","clobTokenIds":["token-a","token-b"]}]"#
+                            .to_vec(),
+                        br#"[{"conditionId":"condition","clobTokenIds":["token-b","token-a"]}]"#
+                            .to_vec(),
+                        b"[]".to_vec(),
+                    ])),
+                });
+                let (dir, path, sink, resolver) = boot_resolver(fetcher.clone());
+                let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+                let resolver = if durable {
+                    resolver.with_paper_state(
+                        paper.clone(),
+                        "installed".into(),
+                        SourceReceiptIndex::replay(&path).unwrap(),
+                    )
+                } else {
+                    resolver
+                };
+                let token = PolymarketTokenId("token-a".into());
+                resolver.resolve_live([token.clone()]).await.unwrap();
+                let resolver = if warmed {
+                    resolver
+                } else {
+                    drop(resolver);
+                    drop(sink);
+                    durable_resolver(&path, paper.clone(), "installed", fetcher, 50)
+                };
+                let discovered = resolver
+                    .discover_conditions_for_bracket([PolymarketConditionId("condition".into())])
+                    .await
+                    .unwrap();
+                assert!(discovered.verified.is_empty());
+                assert!(discovered.provenance.is_empty());
+                assert!(discovered.unverified.contains_key(&token));
+                assert!(resolver.cache.read().await.identities.is_empty());
+                if durable {
+                    assert!(
+                        paper
+                            .asset_identity_condition_rejection("installed", "condition")
+                            .unwrap()
+                            .is_some()
+                    );
+                    assert!(
+                        paper
+                            .rejected_asset_tokens("installed", std::slice::from_ref(&token))
+                            .unwrap()
+                            .contains_key(&token)
+                    );
+                }
+            }
+        }
+    }
+
+    /// PASS: a durably rejected token without an identity row rejects its new condition and sibling.
+    /// FAIL: condition discovery resurrects a previously rejected token after restart.
+    #[tokio::test]
+    async fn condition_discovery_previously_rejected_token_rejects_new_condition() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.log");
+        let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let token = PolymarketTokenId("token-a".into());
+        let resolver = durable_resolver(&path, paper.clone(), "installed", Arc::new(GammaFixture::new(
+            br#"[{"conditionId":"old-a","clobTokenIds":["token-a"]},{"conditionId":"old-b","clobTokenIds":["token-a"]}]"#, b"[]")), 50);
+        assert!(
+            resolver
+                .resolve_live([token.clone()])
+                .await
+                .unwrap()
+                .verified
+                .is_empty()
+        );
+        assert!(
+            paper
+                .asset_identities("installed", std::slice::from_ref(&token))
+                .unwrap()
+                .is_empty()
+        );
+        drop(resolver);
+        let resolver = durable_resolver(
+            &path,
+            paper.clone(),
+            "installed",
+            Arc::new(GammaFixture::new(
+                br#"[{"conditionId":"new","clobTokenIds":["token-a","token-b"]}]"#,
+                b"[]",
+            )),
+            50,
+        );
+        let discovered = resolver
+            .discover_conditions_for_bracket([PolymarketConditionId("new".into())])
+            .await
+            .unwrap();
+        assert!(discovered.verified.is_empty());
+        assert!(discovered.provenance.is_empty());
+        let tokens = [token, PolymarketTokenId("token-b".into())];
+        assert!(
+            tokens
+                .iter()
+                .all(|token| discovered.unverified.contains_key(token))
+        );
+        assert!(
+            paper
+                .asset_identity_condition_rejection("installed", "new")
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            paper
+                .rejected_asset_tokens("installed", &tokens)
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    /// PASS: returned identities belong to requested conditions; duplicate outcomes fail verification.
+    /// FAIL: a mismatched condition or malformed outcome vector supplies a discovered identity.
+    #[tokio::test]
+    async fn condition_discovery_mismatch_and_invalid_vector_return_no_identities() {
+        for page in [
+            br#"[{"conditionId":"other","clobTokenIds":["token-a","token-b"]}]"#.as_slice(),
+            br#"[{"conditionId":"condition","clobTokenIds":["token-a","token-a"]}]"#.as_slice(),
+        ] {
+            let fetcher = Arc::new(GammaFixture::new(page, b"[]"));
+            let (_dir, path, _sink, resolver) = boot_resolver(fetcher.clone());
+            let discovered = resolver
+                .discover_conditions_for_bracket([PolymarketConditionId("condition".into())])
+                .await
+                .unwrap();
+            assert!(discovered.verified.is_empty());
+            assert!(discovered.provenance.is_empty());
+            assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
+            assert_eq!(Reader::replay(path).unwrap().count(), 2);
+        }
+    }
+
+    /// PASS: parse failures retain their raw page; transport failures remain transient.
+    /// FAIL: discovery uses malformed bytes or converts a transient failure into a persistent one.
+    #[tokio::test]
+    async fn condition_discovery_errors_record_parse_pages_and_preserve_transience() {
+        let (_dir, path, _sink, resolver) =
+            boot_resolver(Arc::new(GammaFixture::new(b"invalid-json", b"[]")));
+        assert!(matches!(
+            resolver
+                .discover_conditions_for_bracket([PolymarketConditionId("condition".into())])
+                .await,
+            Err(SourceError::Fatal { .. })
+        ));
+        assert_eq!(
+            Reader::replay(path)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .1
+                .payload,
+            b"invalid-json"
+        );
+        let (_dir, _path, _sink, resolver) = boot_resolver(Arc::new(RetryFixture {
+            attempts: StdMutex::new(Vec::new()),
+        }));
+        assert!(matches!(
+            resolver
+                .discover_conditions_for_bracket([PolymarketConditionId("condition".into())])
+                .await,
+            Err(SourceError::Transient { .. })
+        ));
+    }
+
     #[tokio::test]
     async fn memory_only_handoff_preserves_comparison_evidence_and_rejects_later_conflict() {
         let fetcher = Arc::new(SequenceFixture {
@@ -2686,6 +3423,324 @@ mod tests {
                 assert_eq!(urls.len(), 2);
                 assert!(!urls[0].contains("closed=true"));
                 assert!(urls[1].contains("closed=true"));
+            }
+        }
+    }
+
+    struct InterleavedConditionFixture {
+        urls: StdMutex<Vec<String>>,
+        release: tokio::sync::Notify,
+        live_completed: std::sync::atomic::AtomicBool,
+        closed_first: bool,
+        empty_last: bool,
+    }
+
+    impl ReconciliationFetcher for InterleavedConditionFixture {
+        fn fetch<'a>(
+            &'a self,
+            url: &'a str,
+        ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
+            Box::pin(async move {
+                let url = reqwest::Url::parse(url).unwrap();
+                let first_request = {
+                    let mut urls = self.urls.lock().unwrap();
+                    urls.push(url.to_string());
+                    urls.len() == 1
+                };
+                let conditions = url
+                    .query_pairs()
+                    .filter(|(key, _)| key == "condition_ids")
+                    .map(|(_, condition)| condition.into_owned())
+                    .collect::<Vec<_>>();
+                assert!(conditions.len() <= GAMMA_BATCH_SIZE);
+                let closed = url.query_pairs().any(|(key, _)| key == "closed");
+                let first = conditions
+                    .iter()
+                    .any(|condition| condition == "condition-000");
+                if first && !closed {
+                    if first_request {
+                        self.release.notified().await;
+                    }
+                    if self.closed_first {
+                        return Ok(b"[]".to_vec());
+                    }
+                } else if first
+                    || conditions
+                        .iter()
+                        .any(|condition| condition == "condition-050")
+                {
+                    assert!(self.live_completed.load(Ordering::SeqCst));
+                }
+                let markets =
+                    if conditions.is_empty() {
+                        assert!(url.query_pairs().any(|(key, value)| {
+                            key == "clob_token_ids" && value == "token-live"
+                        }));
+                        vec![serde_json::json!({
+                            "conditionId": "condition-live",
+                            "clobTokenIds": ["token-live"],
+                        })]
+                    } else {
+                        conditions
+                            .iter()
+                            .filter(|condition| !self.empty_last || *condition != "condition-050")
+                            .map(|condition| {
+                                serde_json::json!({
+                                    "conditionId": condition,
+                                    "clobTokenIds": [condition.replace("condition-", "token-")],
+                                })
+                            })
+                            .collect()
+                    };
+                serde_json::to_vec(&markets).map_err(identity_store_error)
+            })
+        }
+    }
+
+    /// PASS: overlapping discoveries share the completed open phase and the closed result.
+    /// FAIL: a queued discovery repeats the empty open request or records its page again.
+    #[tokio::test(start_paused = true)]
+    async fn overlapping_closed_condition_discoveries_share_completed_open_query() {
+        for durable in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("source.log");
+            let fetcher = Arc::new(InterleavedConditionFixture {
+                urls: StdMutex::new(Vec::new()),
+                release: tokio::sync::Notify::new(),
+                live_completed: std::sync::atomic::AtomicBool::new(true),
+                closed_first: true,
+                empty_last: false,
+            });
+            let resolver = if durable {
+                durable_resolver(
+                    &path,
+                    Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap()),
+                    "installed",
+                    fetcher.clone(),
+                    1,
+                )
+            } else {
+                AssetIdentityResolver::new(
+                    fetcher.clone(),
+                    BASE.into(),
+                    1,
+                    Arc::new(Mutex::new(SourceEventSink::open(&path).unwrap())),
+                )
+            };
+            let condition = PolymarketConditionId("condition-000".into());
+            let mut first = Box::pin(resolver.discover_conditions_for_bracket([condition.clone()]));
+            std::future::poll_fn(|cx| {
+                assert!(first.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            let mut second = Box::pin(resolver.discover_conditions_for_bracket([condition]));
+            std::future::poll_fn(|cx| {
+                assert!(second.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert_eq!(fetcher.urls.lock().unwrap().len(), 1);
+            fetcher.release.notify_one();
+            let (first, second) = tokio::join!(first, second);
+            let first = first.unwrap();
+            let second = second.unwrap();
+            assert_eq!(first.verified.len(), 1);
+            assert!(first.unverified.is_empty());
+            assert_eq!(second.verified, first.verified);
+            assert_eq!(second.provenance, first.provenance);
+            assert_eq!(second.unverified, first.unverified);
+            assert_eq!(
+                *fetcher.urls.lock().unwrap(),
+                [
+                    format!("{BASE}/markets?condition_ids=condition-000&limit=500"),
+                    format!("{BASE}/markets?condition_ids=condition-000&closed=true&limit=500"),
+                ]
+            );
+            assert_eq!(Reader::replay(&path).unwrap().count(), 2);
+        }
+    }
+
+    /// PASS: dropping a discovery after its empty open lookup lets a later caller fetch open.
+    /// FAIL: unfinished condition progress outlives its caller or becomes a completed empty memo.
+    #[tokio::test(start_paused = true)]
+    async fn dropped_condition_discovery_does_not_share_completed_open_query() {
+        for durable in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("source.log");
+            let fetcher = Arc::new(InterleavedConditionFixture {
+                urls: StdMutex::new(Vec::new()),
+                release: tokio::sync::Notify::new(),
+                live_completed: std::sync::atomic::AtomicBool::new(true),
+                closed_first: true,
+                empty_last: false,
+            });
+            let resolver = if durable {
+                durable_resolver(
+                    &path,
+                    Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap()),
+                    "installed",
+                    fetcher.clone(),
+                    1,
+                )
+            } else {
+                AssetIdentityResolver::new(
+                    fetcher.clone(),
+                    BASE.into(),
+                    1,
+                    Arc::new(Mutex::new(SourceEventSink::open(&path).unwrap())),
+                )
+            };
+            let condition = PolymarketConditionId("condition-000".into());
+            let mut first = Box::pin(resolver.discover_conditions_for_bracket([condition.clone()]));
+            std::future::poll_fn(|cx| {
+                assert!(first.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            // Queue a mutex waiter before the discovery can advance to its closed attempt.
+            let mut waiting = Box::pin(resolver.misses.lock());
+            std::future::poll_fn(|cx| {
+                assert!(waiting.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            fetcher.release.notify_one();
+            std::future::poll_fn(|cx| {
+                assert!(first.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert_eq!(fetcher.urls.lock().unwrap().len(), 1);
+            assert_eq!(Reader::replay(&path).unwrap().count(), 1);
+            assert_eq!(
+                resolver.cache.read().await.completed_open_conditions[&condition.0].strong_count(),
+                1
+            );
+            drop(first);
+            assert_eq!(
+                resolver.cache.read().await.completed_open_conditions[&condition.0].strong_count(),
+                0
+            );
+            assert!(resolver.cache.read().await.discovered_conditions.is_empty());
+            drop(waiting.await);
+            let retried = resolver
+                .discover_conditions_for_bracket([condition])
+                .await
+                .unwrap();
+            assert_eq!(retried.verified.len(), 1);
+            assert!(retried.unverified.is_empty());
+            assert_eq!(
+                *fetcher.urls.lock().unwrap(),
+                [
+                    format!("{BASE}/markets?condition_ids=condition-000&limit=500"),
+                    format!("{BASE}/markets?condition_ids=condition-000&limit=500"),
+                    format!("{BASE}/markets?condition_ids=condition-000&closed=true&limit=500"),
+                ]
+            );
+            assert_eq!(Reader::replay(&path).unwrap().count(), 3);
+        }
+    }
+
+    /// PASS: queued live work completes between discovery attempts; a queued discovery's
+    /// completed condition and empty result are reused by the first discovery's later chunk.
+    /// FAIL: discovery retains the FIFO mutex across attempts or refetches another caller's memo.
+    #[tokio::test(start_paused = true)]
+    async fn live_identity_lookup_completes_between_condition_discovery_chunks() {
+        for durable in [false, true] {
+            for closed_first in [false, true] {
+                for overlapping_discovery in [false, true] {
+                    let empty_last = closed_first && overlapping_discovery;
+                    let dir = tempfile::tempdir().unwrap();
+                    let path = dir.path().join("source.log");
+                    let fetcher = Arc::new(InterleavedConditionFixture {
+                        urls: StdMutex::new(Vec::new()),
+                        release: tokio::sync::Notify::new(),
+                        live_completed: std::sync::atomic::AtomicBool::new(false),
+                        closed_first,
+                        empty_last,
+                    });
+                    let resolver = if durable {
+                        durable_resolver(
+                            &path,
+                            Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap()),
+                            "installed",
+                            fetcher.clone(),
+                            GAMMA_BATCH_SIZE,
+                        )
+                    } else {
+                        AssetIdentityResolver::new(
+                            fetcher.clone(),
+                            BASE.into(),
+                            GAMMA_BATCH_SIZE,
+                            Arc::new(Mutex::new(SourceEventSink::open(&path).unwrap())),
+                        )
+                    };
+                    let conditions = (0..=GAMMA_BATCH_SIZE)
+                        .map(|index| PolymarketConditionId(format!("condition-{index:03}")))
+                        .collect::<Vec<_>>();
+                    let mut discovery =
+                        Box::pin(resolver.discover_conditions_for_bracket(conditions));
+                    std::future::poll_fn(|cx| {
+                        assert!(discovery.as_mut().poll(cx).is_pending());
+                        std::task::Poll::Ready(())
+                    })
+                    .await;
+                    let live_token = PolymarketTokenId("token-live".into());
+                    let mut live = Box::pin(async {
+                        let resolved = resolver.resolve_live([live_token.clone()]).await.unwrap();
+                        fetcher.live_completed.store(true, Ordering::SeqCst);
+                        resolved
+                    });
+                    // Explicit polling queues live work while the first condition chunk is gated.
+                    std::future::poll_fn(|cx| {
+                        assert!(live.as_mut().poll(cx).is_pending());
+                        std::task::Poll::Ready(())
+                    })
+                    .await;
+                    let mut queued = Vec::new();
+                    if overlapping_discovery {
+                        let mut waiting = Box::pin(resolver.discover_conditions_for_bracket([
+                            PolymarketConditionId("condition-050".into()),
+                        ]));
+                        std::future::poll_fn(|cx| {
+                            assert!(waiting.as_mut().poll(cx).is_pending());
+                            std::task::Poll::Ready(())
+                        })
+                        .await;
+                        queued.push(waiting);
+                    }
+                    assert_eq!(fetcher.urls.lock().unwrap().len(), 1);
+                    fetcher.release.notify_one();
+                    let (discovery, live, queued) =
+                        tokio::join!(discovery, live, futures::future::join_all(queued));
+                    let discovery = discovery.unwrap();
+                    assert_eq!(
+                        discovery.verified.len(),
+                        GAMMA_BATCH_SIZE + usize::from(!empty_last)
+                    );
+                    assert!(discovery.unverified.is_empty());
+                    assert_eq!(live.verified.len(), 1);
+                    assert_eq!(live.provenance[&live_token].source_log_sequence, 1);
+                    for completed in queued {
+                        let completed = completed.unwrap();
+                        let token = PolymarketTokenId("token-050".into());
+                        assert_eq!(completed.verified.len(), usize::from(!empty_last));
+                        if empty_last {
+                            assert!(
+                                resolver.cache.read().await.discovered_conditions["condition-050"]
+                                    .is_empty()
+                            );
+                        } else {
+                            assert_eq!(discovery.provenance[&token], completed.provenance[&token]);
+                        }
+                    }
+                    let urls = fetcher.urls.lock().unwrap();
+                    let expected = 3 + usize::from(closed_first) + usize::from(empty_last);
+                    assert_eq!(urls.len(), expected);
+                    assert!(urls[1].contains("clob_token_ids=token-live"));
+                    assert_eq!(Reader::replay(&path).unwrap().count(), expected);
+                }
             }
         }
     }

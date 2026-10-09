@@ -271,6 +271,496 @@ fn activity(wallet: WalletAddress, byte: u8, amount: &str, tx: &str, epoch: i64)
     })
 }
 
+fn split_merge_activity(wallet: WalletAddress, byte: u8, combo: bool) -> Vec<Value> {
+    [("MERGE", "1", 20), ("SPLIT", "2", 10)]
+        .into_iter()
+        .map(|(kind, size, epoch)| {
+            json!({
+                "proxyWallet": wallet,
+                "timestamp": epoch,
+                "conditionId": condition(byte),
+                "type": kind,
+                "size": size,
+                "usdcSize": size,
+                "transactionHash": format!("0x{kind}"),
+                "price": "0",
+                "isCombo": combo
+            })
+        })
+        .collect()
+}
+
+fn condition_metadata(byte: u8, closed: bool) -> Vec<u8> {
+    serde_json::to_vec(&json!([{
+        "conditionId": condition(byte),
+        "clobTokenIds": [asset(byte), format!("{}-no", asset(byte))],
+        "closed": closed
+    }]))
+    .unwrap()
+}
+
+fn condition_url(byte: u8, closed: bool) -> String {
+    let filter = if closed { "&closed=true" } else { "" };
+    format!(
+        "{BASE}/markets?condition_ids={}{filter}&limit=500",
+        condition(byte)
+    )
+}
+
+fn bracket_failure(
+    result: Result<pe_service::position_seeder::DirectValidationOutcome, CausalPositionError>,
+) -> CausalPositionError {
+    match result {
+        Err(error) => error,
+        Ok(mut outcome) => {
+            assert!(outcome.accepted.is_empty());
+            assert_eq!(outcome.deferred.len(), 1);
+            outcome.deferred.pop().unwrap().1
+        }
+    }
+}
+
+/// PASS: SPLIT/MERGE-only history discovers both outcomes and accepts either position, including closed markets.
+/// FAIL: discovery is absent from metadata_reads, skips recording, or omits the closed fallback.
+#[tokio::test]
+async fn split_merge_only_positions_accept_both_outcomes_with_recorded_discovery() {
+    for closed in [false, true] {
+        for outcome in [0, 1] {
+            let wallet = wallet(0xa1);
+            let (_dir, paper, mut engine) = fresh(&[]);
+            let mut positions = position(wallet, 1, "1");
+            positions["outcomeIndex"] = json!(outcome);
+            positions["asset"] = if outcome == 0 {
+                json!(asset(1))
+            } else {
+                json!(format!("{}-no", asset(1)))
+            };
+            let metadata = condition_metadata(1, closed);
+            let mut responses = HashMap::from([
+                (
+                    activity_url(wallet),
+                    vec![serde_json::to_vec(&split_merge_activity(wallet, 1, false)).unwrap(); 6],
+                ),
+                (
+                    position_url(wallet, PositionPartition::NotRedeemable),
+                    vec![serde_json::to_vec(&vec![positions]).unwrap(); 4],
+                ),
+                (
+                    position_url(wallet, PositionPartition::Redeemable),
+                    vec![b"[]".to_vec(); 4],
+                ),
+                (
+                    condition_url(1, false),
+                    vec![
+                        if closed {
+                            b"[]".to_vec()
+                        } else {
+                            metadata.clone()
+                        };
+                        1
+                    ],
+                ),
+            ]);
+            if closed {
+                responses.insert(condition_url(1, true), vec![metadata.clone()]);
+            }
+            let fetcher = Arc::new(QueueFetcher::new(responses));
+            let (_log_dir, source_path, validator) = recording_validator(fetcher.clone());
+            let installs = validator
+                .validate_direct(&[wallet], &mut engine, &paper)
+                .await
+                .unwrap();
+            assert_eq!(installs.len(), 1);
+            assert_eq!(
+                installs[0].balances,
+                vec![(
+                    MarketId(VenueMarketId(condition(1))),
+                    OutcomeId(outcome),
+                    ShareAmount::from_atomic(1_000_000)
+                )]
+            );
+            let proof: Value = serde_json::from_str(&installs[0].proof.document).unwrap();
+            let reads = proof["metadata_reads"].as_array().unwrap();
+            assert_eq!(
+                reads.len(),
+                2,
+                "both discovered outcomes carry metadata provenance"
+            );
+            let entries = Reader::replay(&source_path)
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>();
+            for read in reads {
+                let sequence = read["source_log_sequence"].as_u64().unwrap();
+                let (_, envelope) = entries.iter().find(|(seq, _)| seq.0 == sequence).unwrap();
+                assert_eq!(envelope.source_id.0, GAMMA_MARKETS_SOURCE_ID);
+                assert_eq!(envelope.payload, metadata);
+                assert_eq!(
+                    read["canonical_page_hash"],
+                    pe_source_polymarket_public::canonical_page_hash(&envelope.payload).unwrap()
+                );
+            }
+            let second = validator
+                .validate_direct(&[wallet], &mut engine, &paper)
+                .await
+                .unwrap();
+            assert_eq!(second.len(), 1);
+            assert_eq!(second[0].balances, installs[0].balances);
+            let second_proof: Value = serde_json::from_str(&second[0].proof.document).unwrap();
+            assert_eq!(second_proof["metadata_reads"], proof["metadata_reads"]);
+            let urls = fetcher.urls();
+            let lookups = urls
+                .iter()
+                .filter(|url| url.contains("condition_ids="))
+                .collect::<Vec<_>>();
+            assert_eq!(lookups.len(), if closed { 2 } else { 1 });
+            if closed {
+                for pair in lookups.chunks(2) {
+                    assert_eq!(pair[0], &condition_url(1, false));
+                    assert_eq!(pair[1], &condition_url(1, true));
+                }
+            }
+            assert!(!urls.iter().any(|url| url.contains("clob_token_ids=")));
+            assert_eq!(paper.position_anchors(&wallet).unwrap().len(), 2);
+        }
+    }
+}
+
+/// PASS: activity on another SPLIT/MERGE market does not map a position-only market.
+/// FAIL: discovering one market guesses identities for a market with no wallet activity.
+#[tokio::test]
+async fn split_merge_discovery_keeps_no_activity_market_wallet_persistent() {
+    let wallet = wallet(0xa2);
+    let (_dir, paper, mut engine) = fresh(&[]);
+    let responses = HashMap::from([
+        (
+            activity_url(wallet),
+            vec![serde_json::to_vec(&split_merge_activity(wallet, 1, false)).unwrap(); 3],
+        ),
+        (
+            position_url(wallet, PositionPartition::NotRedeemable),
+            vec![serde_json::to_vec(&vec![position(wallet, 2, "1")]).unwrap()],
+        ),
+        (
+            position_url(wallet, PositionPartition::Redeemable),
+            vec![b"[]".to_vec()],
+        ),
+        (
+            condition_url(1, false),
+            vec![condition_metadata(1, false); 3],
+        ),
+    ]);
+    let fetcher = Arc::new(QueueFetcher::new(responses));
+    let error = validator_from_fetcher(fetcher.clone())
+        .validate_direct_with_deferrals(&[wallet], &mut engine, &paper)
+        .await;
+    let error = bracket_failure(error);
+    assert!(
+        matches!(&error, CausalPositionError::Positions { source: PositionReadError::MissingActivityMapping { asset: missing }, .. } if missing == &asset(2))
+    );
+    assert_eq!(
+        error.class(),
+        pe_service::position_seeder::FailureClass::WalletPersistent
+    );
+    assert!(!fetcher.urls().contains(&condition_url(2, false)));
+    assert!(paper.position_anchors(&wallet).unwrap().is_empty());
+}
+
+/// PASS: conflicting SPLIT/MERGE combo flags leave the condition unresolved and positions deferred.
+/// FAIL: metadata manufactures a unanimous classification for conflicting wallet activity.
+#[tokio::test]
+async fn split_merge_conflicting_combo_flags_do_not_discover_positions() {
+    let wallet = wallet(0xa3);
+    let (_dir, paper, mut engine) = fresh(&[]);
+    let mut rows = split_merge_activity(wallet, 1, false);
+    rows[0]["isCombo"] = json!(true);
+    let responses = HashMap::from([
+        (
+            activity_url(wallet),
+            vec![serde_json::to_vec(&rows).unwrap(); 3],
+        ),
+        (
+            position_url(wallet, PositionPartition::NotRedeemable),
+            vec![serde_json::to_vec(&vec![position(wallet, 1, "1")]).unwrap()],
+        ),
+        (
+            position_url(wallet, PositionPartition::Redeemable),
+            vec![b"[]".to_vec()],
+        ),
+    ]);
+    let fetcher = Arc::new(QueueFetcher::new(responses));
+    let error = validator_from_fetcher(fetcher.clone())
+        .validate_direct_with_deferrals(&[wallet], &mut engine, &paper)
+        .await;
+    let error = bracket_failure(error);
+    assert!(matches!(
+        error,
+        CausalPositionError::Positions {
+            source: PositionReadError::MissingActivityMapping { .. },
+            ..
+        }
+    ));
+    assert!(!fetcher.urls().iter().any(|url| url.contains("/markets?")));
+    assert!(paper.position_anchors(&wallet).unwrap().is_empty());
+}
+
+/// PASS: cache conflicts, durable token rejections, and condition mismatches leave split positions unmapped.
+/// FAIL: condition discovery bypasses a rejection or accepts a different market's identity.
+#[tokio::test]
+async fn split_merge_discovery_rejections_and_condition_mismatch_fail_closed() {
+    for case in ["warmed", "warmed_activity", "rejected", "mismatch"] {
+        let wallet = wallet(0xa4);
+        let (_dir, paper, mut engine) = fresh(&[]);
+        let mut discovery = condition_metadata(1, false);
+        let seed = if case == "rejected" {
+            serde_json::to_vec(&json!([
+                {"conditionId": condition(3), "clobTokenIds": [asset(1)]},
+                {"conditionId": condition(4), "clobTokenIds": [asset(1)]}
+            ]))
+            .unwrap()
+        } else {
+            condition_metadata(1, false)
+        };
+        if case.starts_with("warmed") {
+            discovery = serde_json::to_vec(&json!([{
+                "conditionId": condition(1), "clobTokenIds": [format!("{}-no", asset(1)), asset(1)]
+            }]))
+            .unwrap();
+        } else if case == "mismatch" {
+            discovery = condition_metadata(2, false);
+        }
+        let mut rows = split_merge_activity(wallet, 1, false);
+        if case == "warmed_activity" {
+            rows.push(activity(wallet, 1, "1", "0xtrade", 5));
+        }
+        let responses = HashMap::from([
+            (
+                activity_url(wallet),
+                vec![serde_json::to_vec(&rows).unwrap(); 3],
+            ),
+            (
+                position_url(wallet, PositionPartition::NotRedeemable),
+                vec![serde_json::to_vec(&vec![position(wallet, 1, "1")]).unwrap()],
+            ),
+            (
+                position_url(wallet, PositionPartition::Redeemable),
+                vec![b"[]".to_vec()],
+            ),
+            (condition_url(1, false), vec![discovery; 3]),
+            (condition_url(1, true), vec![b"[]".to_vec(); 3]),
+        ]);
+        let fetcher = Arc::new(QueueFetcher::with_gamma(responses, Some(seed)));
+        let log_dir = tempfile::tempdir().unwrap();
+        let path = log_dir.path().join("source.log");
+        let sink = Arc::new(tokio::sync::Mutex::new(
+            SourceEventSink::open(&path).unwrap(),
+        ));
+        let resolver = Arc::new(
+            AssetIdentityResolver::new(fetcher.clone(), BASE.into(), GAMMA_BATCH_SIZE, sink)
+                .with_paper_state(
+                    paper.clone(),
+                    "installed".into(),
+                    pe_service::risk_inputs::SourceReceiptIndex::replay(&path).unwrap(),
+                ),
+        );
+        if case != "mismatch" {
+            let seeded = resolver
+                .resolve_live([pe_core_types::PolymarketTokenId(asset(1))])
+                .await
+                .unwrap();
+            assert_eq!(seeded.verified.is_empty(), case == "rejected");
+        }
+        let validator =
+            CausalPositionValidator::new(fetcher, BASE, "source-generation-test", resolver)
+                .with_clock(Arc::new(|| END));
+        let error = validator
+            .validate_direct_with_deferrals(&[wallet], &mut engine, &paper)
+            .await;
+        let error = bracket_failure(error);
+        if case == "warmed_activity" {
+            assert!(
+                matches!(
+                    error,
+                    CausalPositionError::Positions {
+                        source: PositionReadError::ConflictingActivityMapping { .. },
+                        ..
+                    }
+                ),
+                "{case}: {error}"
+            );
+            assert_eq!(error.kind(), "positions.conflicting_activity_mapping");
+        } else {
+            assert!(
+                matches!(
+                    error,
+                    CausalPositionError::Positions {
+                        source: PositionReadError::MissingActivityMapping { .. },
+                        ..
+                    }
+                ),
+                "{case}: {error}"
+            );
+        }
+        assert_eq!(
+            error.class(),
+            pe_service::position_seeder::FailureClass::WalletPersistent
+        );
+        assert!(paper.position_anchors(&wallet).unwrap().is_empty());
+    }
+}
+
+/// PASS: a token verified by later activity remains InterveningActivity through the bounded retry.
+/// FAIL: an empty discovery is refetched or a later identity repairs the earlier positions read.
+#[tokio::test]
+async fn split_merge_identity_appearing_later_remains_intervening_activity() {
+    let wallet = wallet(0xa5);
+    let (_dir, paper, mut engine) = fresh(&[]);
+    let rows = split_merge_activity(wallet, 1, false);
+    let mut later = rows.clone();
+    later.push(activity(wallet, 1, "1", "0xlater-identity", 5));
+    let responses = HashMap::from([
+        (
+            activity_url(wallet),
+            [rows.clone(), later.clone(), rows, later]
+                .iter()
+                .map(|rows| serde_json::to_vec(rows).unwrap())
+                .collect(),
+        ),
+        (
+            position_url(wallet, PositionPartition::NotRedeemable),
+            vec![serde_json::to_vec(&vec![position(wallet, 1, "1")]).unwrap(); 2],
+        ),
+        (
+            position_url(wallet, PositionPartition::Redeemable),
+            vec![b"[]".to_vec(); 2],
+        ),
+        (condition_url(1, false), vec![b"[]".to_vec()]),
+        (condition_url(1, true), vec![b"[]".to_vec()]),
+    ]);
+    let fetcher = Arc::new(QueueFetcher::new(responses));
+    let error = validator_from_fetcher(fetcher.clone())
+        .validate_direct_with_deferrals(&[wallet], &mut engine, &paper)
+        .await;
+    let error = bracket_failure(error);
+    assert!(
+        matches!(error, CausalPositionError::InterveningActivity { .. }),
+        "{error}"
+    );
+    assert_eq!(
+        fetcher
+            .urls()
+            .iter()
+            .filter(|url| url.contains("condition_ids="))
+            .count(),
+        2
+    );
+    assert!(paper.position_anchors(&wallet).unwrap().is_empty());
+}
+
+/// PASS: discovery leaves an unverified activity token raw-only while its sibling position anchors.
+/// FAIL: discovery inserts an activity-named token or blocks a wallet without a position on it.
+#[tokio::test]
+async fn split_merge_unverified_activity_token_stays_raw_only_without_current_position() {
+    let wallet = wallet(0xa7);
+    let (_dir, paper, mut engine) = fresh(&[]);
+    let trade = activity(wallet, 1, "1", "0xunverified-activity", 5);
+    let group = aggregate(trade.clone(), wallet);
+    let mut rows = split_merge_activity(wallet, 1, false);
+    rows.push(trade);
+    let mut sibling = position(wallet, 1, "1");
+    sibling["asset"] = json!(format!("{}-no", asset(1)));
+    sibling["outcomeIndex"] = json!(1);
+    let fetcher = Arc::new(QueueFetcher::with_gamma(
+        HashMap::from([
+            (
+                activity_url(wallet),
+                vec![serde_json::to_vec(&rows).unwrap(); 6],
+            ),
+            (
+                position_url(wallet, PositionPartition::NotRedeemable),
+                vec![serde_json::to_vec(&vec![sibling]).unwrap(); 4],
+            ),
+            (
+                position_url(wallet, PositionPartition::Redeemable),
+                vec![b"[]".to_vec(); 4],
+            ),
+            (condition_url(1, false), vec![condition_metadata(1, false)]),
+        ]),
+        Some(b"[]".to_vec()),
+    ));
+    let installs = validator_from_fetcher(fetcher.clone())
+        .validate_direct(&[wallet], &mut engine, &paper)
+        .await
+        .unwrap();
+    assert_eq!(installs.len(), 1);
+    assert_eq!(
+        installs[0].balances,
+        vec![(
+            MarketId(VenueMarketId(condition(1))),
+            OutcomeId(1),
+            ShareAmount::from_atomic(1_000_000)
+        )]
+    );
+    let stored = paper
+        .activity_group_state(group.group_id.key())
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.disposition, "raw_only");
+    assert_eq!(
+        pe_position_ledger::AppliedEffect::from_document(&stored.proof_json)
+            .unwrap()
+            .effect,
+        pe_position_ledger::LedgerEffect::RawOnly
+    );
+    assert_eq!(
+        fetcher
+            .urls()
+            .iter()
+            .filter(|url| url.contains("condition_ids="))
+            .count(),
+        1
+    );
+}
+
+/// PASS: a condition discovery transport failure keeps the existing Identity/Transient classification.
+/// FAIL: a source outage becomes a persistent missing-activity failure or an accepted bracket.
+#[tokio::test]
+async fn split_merge_discovery_source_failure_is_identity_transient() {
+    struct UnavailableConditions(QueueFetcher);
+    impl PageFetcher for UnavailableConditions {
+        async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+            if url.contains("condition_ids=") {
+                return Err(SourceError::Transient {
+                    message: "fixture unavailable".into(),
+                });
+            }
+            self.0.fetch_page(url).await
+        }
+    }
+    let wallet = wallet(0xa6);
+    let (_dir, paper, mut engine) = fresh(&[]);
+    let fetcher = Arc::new(UnavailableConditions(QueueFetcher::new(HashMap::from([(
+        activity_url(wallet),
+        vec![serde_json::to_vec(&split_merge_activity(wallet, 1, false)).unwrap()],
+    )]))));
+    let error = validator_from_reconciliation(fetcher)
+        .validate_direct_with_deferrals(&[wallet], &mut engine, &paper)
+        .await;
+    let error = bracket_failure(error);
+    assert!(matches!(
+        &error,
+        CausalPositionError::Identity {
+            source: SourceError::Transient { .. },
+            ..
+        }
+    ));
+    assert_eq!(
+        error.class(),
+        pe_service::position_seeder::FailureClass::WalletTransient
+    );
+    assert!(paper.position_anchors(&wallet).unwrap().is_empty());
+}
+
 fn position(wallet: WalletAddress, byte: u8, amount: &str) -> Value {
     json!({
         "proxyWallet": wallet,
@@ -290,6 +780,7 @@ fn activity_url(wallet: WalletAddress) -> String {
 fn assert_full_history_proof(document: &str) {
     assert!(anchor_proves_full_history(document));
     let proof: Value = serde_json::from_str(document).unwrap();
+    assert!(proof.get("baseline_walk").is_none());
     let walks = proof["activity_walks"].as_array().unwrap();
     assert_eq!(walks.len(), 3);
     for walk in walks {
@@ -473,6 +964,7 @@ fn install_empty_anchor(
     let captured = ledger_capture(engine.ledger(), paper, wallet).unwrap();
     engine
         .install_anchors(&[AnchorInstall {
+            newest_activity_unix: None,
             fresh_history: Vec::new(),
             expected_fence: None,
             history_status: None,
@@ -544,9 +1036,18 @@ fn aggregate(row: Value, wallet: WalletAddress) -> pe_source_polymarket_public::
 }
 
 fn spawn_control_actor(
+    control_rx: mpsc::Receiver<OrchestratorControl>,
+    engine: BucketCommitEngine,
+    paper: Arc<PaperStateDb>,
+) -> tokio::task::JoinHandle<()> {
+    spawn_counted_control_actor(control_rx, engine, paper, None)
+}
+
+fn spawn_counted_control_actor(
     mut control_rx: mpsc::Receiver<OrchestratorControl>,
     mut engine: BucketCommitEngine,
     paper: Arc<PaperStateDb>,
+    commits: Option<Arc<AtomicUsize>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(message) = control_rx.recv().await {
@@ -572,6 +1073,9 @@ fn spawn_control_actor(
                     context,
                     committed,
                 } => {
+                    if let Some(commits) = &commits {
+                        commits.fetch_add(1, Ordering::SeqCst);
+                    }
                     let _ = committed.send(
                         engine
                             .commit(aggregates, context.as_ref(), zero_basis())
@@ -893,7 +1397,7 @@ async fn stored_market_recovered_in_second_read_counts_as_activity_and_retries()
     );
     assert_eq!(paper.gate_history().unwrap()[&wallet].len(), 3);
     assert_eq!(paper.cursor(&wallet).unwrap(), Some(30));
-    assert_eq!(paper.activity(&wallet).unwrap(), None);
+    assert_eq!(paper.activity(&wallet).unwrap(), Some(30));
     assert_eq!(stored_activity_snapshot(&path), before);
     assert!(paper.decision_pending_history().unwrap().is_empty());
 }
@@ -3292,6 +3796,7 @@ fn anchor_transaction_failure_preserves_engine_before_retry_and_rejects_regresse
         ShareAmount::from_atomic(3_000_000),
     );
     let install = AnchorInstall {
+        newest_activity_unix: None,
         fresh_history: Vec::new(),
         expected_fence: None,
         history_status: None,
@@ -3360,6 +3865,7 @@ fn anchor_transaction_failure_preserves_engine_before_retry_and_rejects_regresse
         paper.wallet_coverage(&wallet).unwrap(),
     );
     let regressed = AnchorInstall {
+        newest_activity_unix: None,
         fresh_history: Vec::new(),
         expected_fence: None,
         history_status: None,
@@ -3408,6 +3914,7 @@ fn cursor_and_anchor_sequence_cas_reject_stale_expectations() {
     paper.set_cursor(&cursor_wallet, 10).unwrap();
     let captured = ledger_capture(engine.ledger(), &paper, cursor_wallet).unwrap();
     let candidate = AnchorInstall {
+        newest_activity_unix: None,
         fresh_history: Vec::new(),
         expected_fence: None,
         history_status: None,
@@ -3439,6 +3946,7 @@ fn cursor_and_anchor_sequence_cas_reject_stale_expectations() {
     install_empty_anchor(&mut engine, &paper, wallet, 10);
     let captured = ledger_capture(engine.ledger(), &paper, wallet).unwrap();
     let candidate = AnchorInstall {
+        newest_activity_unix: None,
         fresh_history: Vec::new(),
         expected_fence: None,
         history_status: None,
@@ -3473,6 +3981,7 @@ fn covered_late_generation_change_rejects_an_otherwise_unchanged_anchor() {
     install_empty_anchor(&mut engine, &paper, wallet, 100);
     let captured = ledger_capture(engine.ledger(), &paper, wallet).unwrap();
     let candidate = AnchorInstall {
+        newest_activity_unix: None,
         fresh_history: Vec::new(),
         expected_fence: None,
         history_status: None,
@@ -4667,6 +5176,7 @@ async fn runtime_completion_transaction_failure_publishes_neither_completion_nor
         }
         let captured = ledger_capture(engine.ledger(), &paper, wallet).unwrap();
         let install = AnchorInstall {
+            newest_activity_unix: None,
             fresh_history: Vec::new(),
             expected_fence: None,
             wallet,
@@ -5753,6 +6263,16 @@ fn rollout_record_effect(
     effect: &pe_position_ledger::LedgerEffect,
     disposition: &str,
 ) {
+    rollout_record_effect_with_cursor(paper, row, effect, disposition, true);
+}
+
+fn rollout_record_effect_with_cursor(
+    paper: &PaperStateDb,
+    row: &pe_source_polymarket_public::ActivityAggregate,
+    effect: &pe_position_ledger::LedgerEffect,
+    disposition: &str,
+    advance_cursor: bool,
+) {
     paper
         .commit_activity_bucket(&pe_paper_state::ActivityBucketCommit {
             wallet: row.group_id.components().wallet,
@@ -5775,7 +6295,7 @@ fn rollout_record_effect(
             pending: Vec::new(),
             fence: None,
             reanchor: None,
-            advance_cursor: true,
+            advance_cursor,
         })
         .unwrap();
 }
@@ -6435,4 +6955,849 @@ async fn paper_service_rollout_novel_revision_on_first_read_refuses_then_safe_re
     engine.install_anchors(&outcomes.accepted).unwrap();
     assert!(!paper.is_wallet_fenced(&wallet).unwrap());
     assert_eq!(rollout_history(&dir).len(), 1);
+}
+
+fn tail_url(wallet: WalletAddress, baseline_end: i64, end: i64) -> String {
+    PolymarketEndpoint::UserPositionActivityPage {
+        user: wallet.to_string(),
+        end,
+        start: Some(baseline_end - pe_service::position_seeder::REENTRY_HISTORY_OVERLAP_SECS + 1),
+        offset: 0,
+    }
+    .url(BASE)
+}
+
+fn reentry_reads(
+    wallet: WalletAddress,
+    baseline_end: i64,
+    ends: [i64; 3],
+    baseline: &[Value],
+    tails: [&[Value]; 3],
+    positions: &[Value],
+) -> HashMap<String, Vec<Vec<u8>>> {
+    let mut responses = HashMap::from([(
+        activity_url_at(wallet, baseline_end),
+        vec![serde_json::to_vec(baseline).unwrap()],
+    )]);
+    for (end, rows) in ends.into_iter().zip(tails) {
+        responses
+            .entry(tail_url(wallet, baseline_end, end))
+            .or_default()
+            .push(serde_json::to_vec(rows).unwrap());
+    }
+    responses.insert(
+        position_url(wallet, PositionPartition::NotRedeemable),
+        vec![serde_json::to_vec(positions).unwrap(); 2],
+    );
+    responses.insert(
+        position_url(wallet, PositionPartition::Redeemable),
+        vec![b"[]".to_vec(); 2],
+    );
+    responses
+}
+
+fn clocked_validator(
+    fetcher: Arc<dyn ReconciliationFetcher>,
+    ends: Vec<i64>,
+) -> CausalPositionValidator {
+    let fallback = *ends.last().unwrap();
+    let ends = Mutex::new(VecDeque::from(ends));
+    validator_from_reconciliation(fetcher).with_clock(Arc::new(move || {
+        ends.lock().unwrap().pop_front().unwrap_or(fallback)
+    }))
+}
+
+/// PASS: re-entry routes through one full baseline and three overlapping tails, catches up a
+/// baseline-time trade, and maps an older position using cached baseline identity evidence.
+/// FAIL: extra full walks, repeated baseline metadata fetches, union-row commits, or lost old positions.
+#[tokio::test]
+async fn reentry_baseline_and_three_tails_install_older_positions_and_catch_up() {
+    let wallet = wallet(0xe1);
+    let (dir, paper, engine) = fresh(&[wallet]);
+    let old = activity(wallet, 1, "1", "0xbaseline-old", 10);
+    let during_baseline = activity(wallet, 2, "1", "0xduring-baseline", 4000);
+    let tails = vec![during_baseline.clone()];
+    let fetcher = Arc::new(QueueFetcher::new(reentry_reads(
+        wallet,
+        4000,
+        [4001, 4002, 4003],
+        std::slice::from_ref(&old),
+        [&tails; 3],
+        &[position(wallet, 1, "1"), position(wallet, 2, "1")],
+    )));
+    let (tx, rx) = mpsc::channel(2);
+    let commits = Arc::new(AtomicUsize::new(0));
+    let actor = spawn_counted_control_actor(rx, engine, paper.clone(), Some(commits.clone()));
+    let preparer = AdmissionPreparer::with_validator(
+        tx,
+        paper.clone(),
+        clocked_validator(fetcher.clone(), vec![4000, 4001, 4002, 4003, 4003]),
+    );
+    let result = preparer
+        .scenario_prepare_reentry(&[wallet], &HashMap::from([(wallet, 10)]))
+        .await
+        .unwrap();
+    assert_eq!(result.admitted, vec![wallet]);
+    let anchor = paper.position_anchors(&wallet).unwrap().remove(0);
+    assert_eq!(anchor.activity_cutoff_unix, 4002);
+    let proof: Value = serde_json::from_str(&anchor.proof_json).unwrap();
+    assert_eq!(proof["baseline_walk"]["fixed_end"], 4000);
+    assert_eq!(
+        proof["baseline_walk"]["pages"][0]["bounds"],
+        json!({"start":0,"end":4000})
+    );
+    assert_eq!(proof["metadata_reads"].as_array().unwrap().len(), 2);
+    for (walk, end) in proof["activity_walks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip([4001, 4002, 4003])
+    {
+        assert_eq!(walk["fixed_end"], end);
+        assert_eq!(walk["pages"][0]["bounds"], json!({"start":400,"end":end}));
+    }
+    assert!(anchor_proves_full_history(&anchor.proof_json));
+    let urls = fetcher.urls();
+    assert_eq!(
+        urls.iter()
+            .filter(|url| url.contains("/activity?"))
+            .cloned()
+            .collect::<Vec<_>>(),
+        vec![
+            activity_url_at(wallet, 4000),
+            tail_url(wallet, 4000, 4001),
+            tail_url(wallet, 4000, 4002),
+            tail_url(wallet, 4000, 4003)
+        ]
+    );
+    let gamma = urls
+        .iter()
+        .filter(|url| url.contains("/markets?"))
+        .collect::<Vec<_>>();
+    assert_eq!(gamma.len(), 2);
+    assert_eq!(
+        gamma.iter().filter(|url| url.contains(&asset(1))).count(),
+        1
+    );
+    assert_eq!(
+        commits.load(Ordering::SeqCst),
+        4,
+        "baseline is committed once; each tail commits only its own group"
+    );
+    assert!(
+        paper
+            .activity_group_state(aggregate(during_baseline, wallet).group_id.key())
+            .unwrap()
+            .is_some()
+    );
+    let path = dir.path().join("paper.db");
+    drop(preparer);
+    actor.await.unwrap();
+    drop(paper);
+    let reopened = PaperStateDb::open(&path).unwrap();
+    let installed = reopened.position_anchors(&wallet).unwrap().remove(0);
+    assert_eq!(installed, anchor);
+    assert!(anchor_proves_full_history(&installed.proof_json));
+    assert_eq!(
+        ledger_capture(&build_leader_ledger(&reopened).unwrap(), &reopened, wallet)
+            .unwrap()
+            .hash,
+        ledger_capture(
+            &replay_wallet_ledger(&reopened, wallet).unwrap(),
+            &reopened,
+            wallet
+        )
+        .unwrap()
+        .hash
+    );
+    assert_eq!(reopened.leader_positions().unwrap().len(), 2);
+}
+
+/// PASS: new activity after the first tail invalidates stability and the one bounded retry
+/// repeats the baseline and succeeds; the failed attempt installs no anchor.
+/// FAIL: a changed second tail is accepted, or retry uses stale baseline bounds/evidence.
+#[tokio::test]
+async fn reentry_intervening_tail_activity_retries_from_a_new_baseline() {
+    let wallet = wallet(0xe2);
+    let (_dir, paper, engine) = fresh(&[wallet]);
+    let old = activity(wallet, 1, "1", "0xretry-old", 10);
+    let late = activity(wallet, 2, "1", "0xretry-new", 4002);
+    let tail = vec![late.clone()];
+    let mut reads = reentry_reads(
+        wallet,
+        4000,
+        [4001, 4002, 4003],
+        std::slice::from_ref(&old),
+        [&[], &tail, &tail],
+        &[position(wallet, 1, "1")],
+    );
+    let retry = reentry_reads(
+        wallet,
+        4003,
+        [4004, 4005, 4006],
+        &[late, old],
+        [&tail; 3],
+        &[position(wallet, 1, "1"), position(wallet, 2, "1")],
+    );
+    reads
+        .get_mut(&position_url(wallet, PositionPartition::NotRedeemable))
+        .unwrap()
+        .truncate(1);
+    reads
+        .get_mut(&position_url(wallet, PositionPartition::Redeemable))
+        .unwrap()
+        .truncate(1);
+    for (url, pages) in retry {
+        reads.entry(url).or_default().extend(pages);
+    }
+    let fetcher = Arc::new(QueueFetcher::new(reads));
+    let validator = clocked_validator(
+        fetcher.clone(),
+        vec![4000, 4001, 4002, 4003, 4004, 4005, 4006, 4006],
+    );
+    let (tx, rx) = mpsc::channel(2);
+    let actor = spawn_control_actor(rx, engine, paper.clone());
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .without_time()
+        .with_writer(BracketLogs(bytes.clone()))
+        .finish();
+    use tracing::instrument::WithSubscriber;
+    let outcomes = validator
+        .validate_via_control(
+            &[wallet],
+            &tx,
+            &paper,
+            pe_service::position_seeder::ValidationPurpose::Reentry,
+            None,
+        )
+        .with_subscriber(subscriber)
+        .await;
+    let logged = bytes.lock().unwrap().clone();
+    let attempts = std::str::from_utf8(&logged)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|line| line["fields"]["message"] == "reentry bracket attempt")
+        .map(|line| line["fields"]["outcome"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(attempts, ["validation.intervening_activity", "accepted"]);
+    assert!(outcomes.shared.is_none());
+    assert!(outcomes.deferred.is_empty());
+    assert_eq!(outcomes.accepted.len(), 1);
+    assert!(paper.position_anchors(&wallet).unwrap().is_empty());
+    let proof: Value = serde_json::from_str(&outcomes.accepted[0].proof.document).unwrap();
+    assert_eq!(proof["baseline_walk"]["fixed_end"], 4003);
+    assert_eq!(outcomes.accepted[0].cutoff, 4005);
+    assert_eq!(
+        fetcher
+            .urls()
+            .iter()
+            .filter(|url| url.contains("/activity?"))
+            .count(),
+        7
+    );
+    let (acknowledged, ack) = tokio::sync::oneshot::channel();
+    tx.send(OrchestratorControl::InstallAnchors {
+        installs: outcomes.accepted,
+        acknowledged,
+    })
+    .await
+    .unwrap();
+    ack.await.unwrap().unwrap();
+    drop(tx);
+    actor.await.unwrap();
+}
+
+/// PASS: late-group recovery clears a fence only when the second tail ends strictly after
+/// its epoch, even if the final tail ends later; successful proof retains the baseline.
+/// FAIL: the baseline or final tail substitutes for the second tail's fence boundary.
+#[tokio::test]
+async fn reentry_late_group_recovery_enforces_second_tail_fence_epoch() {
+    for (fence_epoch, accepted) in [(3999, true), (4002, false)] {
+        let wallet = wallet(0xe3);
+        let (dir, paper, _engine) = fresh(&[wallet]);
+        let row = activity(wallet, 1, "1", "0xlate-recovery", 3999);
+        let group = aggregate(row.clone(), wallet);
+        rollout_record_effect(
+            &paper,
+            &group,
+            &pe_position_ledger::LedgerEffect::RawOnly,
+            "reanchor_required_late_group",
+        );
+        rollout_fence(
+            &dir,
+            wallet,
+            group.group_id.key(),
+            "late_group_after_bucket_commit",
+            fence_epoch,
+        );
+        let engine = BucketCommitEngine::load(paper.clone(), PositionLedger::new()).unwrap();
+        let tails = vec![row.clone()];
+        let fetcher = Arc::new(QueueFetcher::new(reentry_reads(
+            wallet,
+            4000,
+            [4001, 4002, 4003],
+            &[row],
+            [&tails; 3],
+            &[position(wallet, 1, "1")],
+        )));
+        let (tx, rx) = mpsc::channel(2);
+        let actor = spawn_control_actor(rx, engine, paper.clone());
+        let preparer = AdmissionPreparer::with_validator(
+            tx,
+            paper.clone(),
+            clocked_validator(fetcher, vec![4000, 4001, 4002, 4003, 4003]),
+        );
+        let outcome = preparer
+            .scenario_prepare_reentry(&[wallet], &HashMap::from([(wallet, 10)]))
+            .await
+            .unwrap();
+        assert_eq!(outcome.admitted == vec![wallet], accepted);
+        assert_eq!(paper.is_wallet_fenced(&wallet).unwrap(), !accepted);
+        if !accepted {
+            assert_eq!(outcome.deferred[0].kind, "validation.fenced");
+            assert!(rollout_history(&dir).is_empty());
+        }
+        drop(preparer);
+        actor.await.unwrap();
+    }
+}
+
+struct HistoryInspectingFetcher {
+    inner: QueueFetcher,
+    path: std::path::PathBuf,
+    fenced: bool,
+    wallet: WalletAddress,
+    old_id: pe_core_types::SourceTradeId,
+}
+impl PageFetcher for HistoryInspectingFetcher {
+    async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+        if url.contains("/activity?") && url.contains("&start=401") {
+            let conn = rusqlite::Connection::open(&self.path).unwrap();
+            let history=conn.query_row("SELECT first_epoch,source_trade_id FROM wallet_market_history_v2 WHERE wallet_hex=?1",[self.wallet.to_string()],|row|Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?)));
+            if self.fenced {
+                assert!(matches!(history, Err(rusqlite::Error::QueryReturnedNoRows)));
+            } else {
+                assert_eq!(history.unwrap(), (10, self.old_id.0.clone()));
+            }
+        }
+        self.inner.fetch_page(url).await
+    }
+}
+
+/// PASS: the unfenced baseline repairs history before tails; fenced recovery retains the
+/// baseline-only oldest BUY until installation; failed fenced brackets repair nothing.
+/// FAIL: a later tail BUY consumes the first entry, or a failed recovery repairs history early.
+#[tokio::test]
+async fn reentry_baseline_repairs_earliest_purchase_in_both_paths() {
+    for (fenced, fail) in [(false, false), (true, false), (true, true)] {
+        let wallet = wallet(0xe4);
+        let (dir, paper, _engine) = fresh(&[wallet]);
+        let old = activity(wallet, 1, "1", "0xearliest", 10);
+        let old_group = aggregate(old.clone(), wallet);
+        rollout_record_effect(
+            &paper,
+            &old_group,
+            &pe_position_ledger::LedgerEffect::RawOnly,
+            "raw_only",
+        );
+        if fenced {
+            rollout_fence(
+                &dir,
+                wallet,
+                old_group.group_id.key(),
+                "late_group_after_bucket_commit",
+                10,
+            );
+        }
+        let engine = BucketCommitEngine::load(paper.clone(), PositionLedger::new()).unwrap();
+        let tail = vec![activity(wallet, 1, "1", "0xlater", 3990)];
+        let mut reads = reentry_reads(
+            wallet,
+            4000,
+            [4000; 3],
+            &[old],
+            [&tail; 3],
+            &[position(wallet, 1, "2")],
+        );
+        if fail {
+            let positions = reads
+                .get_mut(&position_url(wallet, PositionPartition::NotRedeemable))
+                .unwrap();
+            positions[0] = serde_json::to_vec(&vec![position(wallet, 1, "1")]).unwrap();
+            for pages in reads.values_mut() {
+                pages.extend(pages.clone());
+            }
+        }
+        let fetcher = Arc::new(HistoryInspectingFetcher {
+            inner: QueueFetcher::new(reads),
+            path: dir.path().join("paper.db"),
+            fenced,
+            wallet,
+            old_id: old_group.group_id.key().clone(),
+        });
+        let validator = clocked_validator(fetcher, vec![4000]);
+        let (tx, rx) = mpsc::channel(2);
+        let actor = spawn_control_actor(rx, engine, paper.clone());
+        let preparer = AdmissionPreparer::with_validator(tx, paper.clone(), validator);
+        let outcome = preparer
+            .scenario_prepare_reentry(&[wallet], &HashMap::from([(wallet, 10)]))
+            .await
+            .unwrap();
+        if fail {
+            assert!(outcome.admitted.is_empty());
+            assert_eq!(outcome.deferred[0].kind, "validation.position_revision");
+            assert!(rollout_history(&dir).is_empty());
+            assert!(paper.is_wallet_fenced(&wallet).unwrap());
+        } else {
+            assert_eq!(outcome.admitted, vec![wallet]);
+            let history = rollout_history(&dir);
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0].first_epoch, 10);
+            assert_eq!(history[0].source_trade_id, *old_group.group_id.key());
+            assert!(!paper.is_wallet_fenced(&wallet).unwrap());
+        }
+        assert_eq!(
+            paper
+                .activity_group_state(old_group.group_id.key())
+                .unwrap()
+                .unwrap()
+                .disposition,
+            "raw_only"
+        );
+        drop(preparer);
+        actor.await.unwrap();
+    }
+}
+
+/// PASS: current baseline metadata makes a previously raw-only conversion attributable and
+/// refuses fenced recovery before tails, retaining its original evidence and empty history.
+/// FAIL: a short tail hides the conversion or the baseline commits unsafe recovery early.
+#[tokio::test]
+async fn reentry_baseline_refuses_previously_raw_only_conversion() {
+    let wallet = wallet(0xe5);
+    let (dir, paper, _) = fresh(&[wallet]);
+    let mut row = activity(wallet, 1, "1", "0xunsafe-baseline", 10);
+    row["type"] = json!("CONVERSION");
+    let group = aggregate(row.clone(), wallet);
+    rollout_record_effect(
+        &paper,
+        &group,
+        &pe_position_ledger::LedgerEffect::RawOnly,
+        "raw_only",
+    );
+    rollout_fence(&dir, wallet, group.group_id.key(), "position_underflow", 10);
+    let original = paper.activity_group_state(group.group_id.key()).unwrap();
+    let engine = BucketCommitEngine::load(paper.clone(), PositionLedger::new()).unwrap();
+    let fetcher = Arc::new(QueueFetcher::new(HashMap::from([(
+        activity_url_at(wallet, 4000),
+        vec![serde_json::to_vec(&vec![row]).unwrap()],
+    )])));
+    let (tx, rx) = mpsc::channel(2);
+    let actor = spawn_control_actor(rx, engine, paper.clone());
+    let preparer = AdmissionPreparer::with_validator(
+        tx,
+        paper.clone(),
+        clocked_validator(fetcher.clone(), vec![4000]),
+    );
+    let outcome = preparer
+        .scenario_prepare_reentry(&[wallet], &HashMap::from([(wallet, 10)]))
+        .await
+        .unwrap();
+    assert!(outcome.admitted.is_empty());
+    assert_eq!(outcome.deferred[0].kind, "validation.unsafe_recovery");
+    assert!(paper.is_wallet_fenced(&wallet).unwrap());
+    assert!(paper.position_anchors(&wallet).unwrap().is_empty());
+    assert!(rollout_history(&dir).is_empty());
+    assert_eq!(
+        paper.activity_group_state(group.group_id.key()).unwrap(),
+        original
+    );
+    assert_eq!(
+        fetcher
+            .urls()
+            .iter()
+            .filter(|url| url.contains("/activity?"))
+            .count(),
+        1
+    );
+    drop(preparer);
+    actor.await.unwrap();
+}
+
+fn inactivity_config() -> pe_service::watchlist_maintenance::MaintenanceConfig {
+    let config = pe_service::config::ServiceConfig::default();
+    pe_service::watchlist_maintenance::MaintenanceConfig {
+        interval_secs: config.maintenance_interval_secs,
+        inactivity_threshold_secs: config.inactivity_threshold_secs,
+        inactivity_hard_cap_secs: config.inactivity_hard_cap_secs,
+        demotion_min_trades: config.demotion_min_trades,
+        demotion_cb_alpha: config.demotion_cb_alpha.parse().unwrap(),
+        demotion_pnl_window_secs: config.demotion_pnl_window_secs,
+        membership_mode: pe_service::watchlist_maintenance::MembershipMode::default(),
+    }
+}
+
+/// PASS: catch-up admission, re-entry with baseline-only activity, and direct boot advance a
+/// stale clock from pre-recorded late groups, keep a larger clock, and preserve the delivery cursor.
+/// FAIL: cutoff/current-time clocks, an immediate inactivity knockout, or clock updates moving delivery.
+#[tokio::test]
+async fn accepted_brackets_install_newest_activity_clock_from_pre_recorded_late_groups() {
+    use pe_service::watchlist_maintenance::{KnockoutReason, knockout_decision};
+    for path in ["catch_up", "reentry", "direct"] {
+        for larger in [None, Some(999_999)] {
+            let wallet = wallet(0xe6);
+            let (_dir, paper, _) = fresh(&[wallet]);
+            paper.seed_cursor_if_absent(&wallet, 10).unwrap();
+            paper.set_cursor(&wallet, 990_001).unwrap();
+            if let Some(epoch) = larger {
+                paper.set_activity(&wallet, epoch).unwrap();
+            }
+            let row = activity(wallet, 1, "1", "0xpre-recorded-active", 990_000);
+            let group = aggregate(row.clone(), wallet);
+            rollout_record_effect_with_cursor(
+                &paper,
+                &group,
+                &pe_position_ledger::LedgerEffect::RawOnly,
+                "reanchor_required_late_group",
+                false,
+            );
+            assert_eq!(paper.activity(&wallet).unwrap(), larger.or(Some(10)));
+            let before_cursor = paper.cursor(&wallet).unwrap();
+            assert_eq!(
+                knockout_decision(Some(10), None, &inactivity_config(), 1_000_000),
+                Some(KnockoutReason::Inactivity)
+            );
+            let positions = vec![position(wallet, 1, "1")];
+            let reads = if path == "reentry" {
+                reentry_reads(
+                    wallet,
+                    1_000_000,
+                    [1_000_000; 3],
+                    &[row],
+                    [&[]; 3],
+                    &positions,
+                )
+            } else {
+                HashMap::from([
+                    (
+                        activity_url_at(wallet, 1_000_000),
+                        vec![serde_json::to_vec(&vec![row]).unwrap(); 3],
+                    ),
+                    (
+                        position_url(wallet, PositionPartition::NotRedeemable),
+                        vec![serde_json::to_vec(&positions).unwrap(); 2],
+                    ),
+                    (
+                        position_url(wallet, PositionPartition::Redeemable),
+                        vec![b"[]".to_vec(); 2],
+                    ),
+                ])
+            };
+            let fetcher = Arc::new(QueueFetcher::new(reads));
+            let validator = clocked_validator(fetcher, vec![1_000_000]);
+            let mut engine =
+                BucketCommitEngine::load(paper.clone(), PositionLedger::new()).unwrap();
+            if path == "direct" {
+                let installs = validator
+                    .validate_direct(&[wallet], &mut engine, &paper)
+                    .await
+                    .unwrap();
+                assert_eq!(installs[0].newest_activity_unix, Some(990_000));
+            } else {
+                let (tx, rx) = mpsc::channel(2);
+                let actor = spawn_control_actor(rx, engine, paper.clone());
+                let preparer = AdmissionPreparer::with_validator(tx, paper.clone(), validator);
+                let outcome = if path == "reentry" {
+                    preparer
+                        .scenario_prepare_reentry(&[wallet], &HashMap::from([(wallet, 10)]))
+                        .await
+                        .unwrap()
+                } else {
+                    preparer
+                        .scenario_prepare_ranked_until(
+                            &[wallet],
+                            &HashMap::from([(wallet, 10)]),
+                            None,
+                        )
+                        .await
+                        .unwrap()
+                };
+                assert_eq!(outcome.admitted, vec![wallet]);
+                drop(preparer);
+                actor.await.unwrap();
+            }
+            assert_eq!(
+                paper.activity(&wallet).unwrap(),
+                Some(larger.unwrap_or(990_000)),
+                "{path}"
+            );
+            assert_eq!(paper.cursor(&wallet).unwrap(), before_cursor, "{path}");
+            assert_eq!(
+                knockout_decision(
+                    paper.activity(&wallet).unwrap(),
+                    None,
+                    &inactivity_config(),
+                    1_000_000
+                ),
+                None
+            );
+            assert_eq!(
+                paper
+                    .activity_group_state(group.group_id.key())
+                    .unwrap()
+                    .unwrap()
+                    .disposition,
+                "reanchor_required_late_group"
+            );
+        }
+    }
+}
+
+/// PASS: catch-up admission, routine refresh and boot retain exactly three full reads and
+/// their legacy proof shape, with no baseline field.
+/// FAIL: re-entry routing leaks into another path or a full read becomes an incremental tail.
+#[tokio::test]
+async fn non_reentry_paths_keep_three_full_walks_and_legacy_proofs() {
+    for path in ["catch_up", "refresh", "direct"] {
+        let wallet = wallet(0xe7);
+        let (_dir, paper, mut engine) = fresh(&[wallet]);
+        let fetcher = Arc::new(QueueFetcher::new(stable_responses(&[(wallet, 1, "1")])));
+        let validator = validator_from_fetcher(fetcher.clone());
+        if path == "direct" {
+            validator
+                .validate_direct(&[wallet], &mut engine, &paper)
+                .await
+                .unwrap();
+        } else {
+            let (tx, rx) = mpsc::channel(2);
+            let actor = spawn_control_actor(rx, engine, paper.clone());
+            let preparer = AdmissionPreparer::with_validator(tx, paper.clone(), validator);
+            if path == "catch_up" {
+                assert_eq!(
+                    preparer.prepare(&[wallet]).await.unwrap().admitted,
+                    vec![wallet]
+                );
+            } else {
+                assert_eq!(
+                    preparer.prepare_if_due(wallet, END, 1).await.unwrap(),
+                    AnchorRefreshOutcome::Anchored
+                );
+            }
+            drop(preparer);
+            actor.await.unwrap();
+        }
+        assert_eq!(
+            fetcher
+                .urls()
+                .into_iter()
+                .filter(|url| url.contains("/activity?"))
+                .collect::<Vec<_>>(),
+            vec![activity_url(wallet); 3],
+            "{path}"
+        );
+        assert_full_history_proof(&paper.position_anchors(&wallet).unwrap()[0].proof_json);
+    }
+}
+
+/// PASS: a clock rollback between baseline and tails refuses installation using the baseline
+/// in the non-monotonic bound check.
+/// FAIL: three internally monotonic tails hide a baseline end newer than their first end.
+#[tokio::test]
+async fn reentry_rejects_non_monotonic_bounds_including_baseline() {
+    let wallet = wallet(0xe8);
+    let (_dir, paper, engine) = fresh(&[wallet]);
+    let fetcher = Arc::new(QueueFetcher::new(reentry_reads(
+        wallet,
+        4000,
+        [3999, 3999, 3999],
+        &[],
+        [&[]; 3],
+        &[],
+    )));
+    let validator = clocked_validator(fetcher, vec![4000, 3999, 3999, 3999]);
+    let (tx, rx) = mpsc::channel(2);
+    let actor = spawn_control_actor(rx, engine, paper.clone());
+    let outcomes = validator
+        .validate_via_control(
+            &[wallet],
+            &tx,
+            &paper,
+            pe_service::position_seeder::ValidationPurpose::Reentry,
+            None,
+        )
+        .await;
+    assert!(outcomes.accepted.is_empty());
+    assert!(matches!(
+        outcomes.shared.unwrap(),
+        CausalPositionError::NonMonotonicActivityBounds {
+            previous: 4000,
+            next: 3999,
+            ..
+        }
+    ));
+    assert!(paper.position_anchors(&wallet).unwrap().is_empty());
+    drop(tx);
+    actor.await.unwrap();
+}
+
+#[derive(Clone)]
+struct BracketLogs(Arc<Mutex<Vec<u8>>>);
+impl std::io::Write for BracketLogs {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BracketLogs {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+struct TimedBracketFetcher {
+    inner: QueueFetcher,
+    calls: AtomicUsize,
+}
+impl PageFetcher for TimedBracketFetcher {
+    async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+        if url.contains("/activity?") {
+            let first = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+            tokio::time::advance(std::time::Duration::from_secs(if first { 20 } else { 1 })).await;
+        }
+        self.inner.fetch_page(url).await
+    }
+}
+
+/// PASS: each accepted or failed attempt emits its outcome and separate baseline/stability
+/// durations; the first-tail sample starts the window and no tail means a zero window.
+/// FAIL: missing attempt logs, lifetime baseline time counted as stability, or failure time omitted.
+#[tokio::test(start_paused = true)]
+async fn reentry_attempt_logs_separate_baseline_and_stability_timing() {
+    use tracing::instrument::WithSubscriber;
+    for failure in ["none", "baseline", "tail"] {
+        let wallet = wallet(0xe9);
+        let (_dir, paper, engine) = fresh(&[wallet]);
+        let mut reads = reentry_reads(wallet, 4000, [4000; 3], &[], [&[]; 3], &[]);
+        if failure == "baseline" {
+            reads.insert(activity_url_at(wallet, 4000), vec![b"{".to_vec()]);
+        }
+        if failure == "tail" {
+            reads.insert(tail_url(wallet, 4000, 4000), vec![b"{".to_vec()]);
+        }
+        let fetcher = Arc::new(TimedBracketFetcher {
+            inner: QueueFetcher::new(reads),
+            calls: AtomicUsize::new(0),
+        });
+        let validator = clocked_validator(fetcher, vec![4000]);
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .without_time()
+            .with_writer(BracketLogs(bytes.clone()))
+            .finish();
+        let (tx, rx) = mpsc::channel(2);
+        let actor = spawn_control_actor(rx, engine, paper.clone());
+        let outcomes = validator
+            .validate_via_control(
+                &[wallet],
+                &tx,
+                &paper,
+                pe_service::position_seeder::ValidationPurpose::Reentry,
+                None,
+            )
+            .with_subscriber(subscriber)
+            .await;
+        if failure == "none" {
+            assert_eq!(outcomes.accepted.len(), 1);
+        } else {
+            assert!(outcomes.shared.is_some());
+        }
+        let bytes = bytes.lock().unwrap().clone();
+        let logs = std::str::from_utf8(&bytes)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|line| line["fields"]["message"] == "reentry bracket attempt")
+            .collect::<Vec<_>>();
+        assert_eq!(logs.len(), 1);
+        let fields = &logs[0]["fields"];
+        assert_eq!(fields["wallet"], wallet.to_string());
+        assert_eq!(fields["baseline_ms"], 20_000);
+        assert_eq!(
+            fields["stability_window_ms"],
+            match failure {
+                "baseline" => 0,
+                "tail" => 1000,
+                _ => 3000,
+            }
+        );
+        assert_eq!(
+            fields["outcome"],
+            if failure == "none" {
+                "accepted"
+            } else {
+                "activity.json"
+            }
+        );
+        drop(bytes);
+        drop(tx);
+        actor.await.unwrap();
+    }
+}
+
+/// PASS: contradictory ordinary/combo classifications across baseline and tail fail through
+/// the shared mapping helper before the tail commits or a positions read runs.
+/// FAIL: independently valid per-read mappings conceal a conflict in their union.
+#[tokio::test]
+async fn reentry_union_mapping_rejects_baseline_tail_classification_conflict() {
+    let wallet = wallet(0xea);
+    let (_dir, paper, engine) = fresh(&[wallet]);
+    let old = activity(wallet, 1, "1", "0xordinary-baseline", 10);
+    let mut tail = activity(wallet, 1, "1", "0xcombo-tail", 3990);
+    tail["isCombo"] = json!(true);
+    let tails = vec![tail.clone()];
+    let fetcher = Arc::new(QueueFetcher::new(reentry_reads(
+        wallet,
+        4000,
+        [4000; 3],
+        &[old],
+        [&tails; 3],
+        &[],
+    )));
+    let validator = clocked_validator(fetcher.clone(), vec![4000]);
+    let (tx, rx) = mpsc::channel(2);
+    let actor = spawn_control_actor(rx, engine, paper.clone());
+    let outcomes = validator
+        .validate_via_control(
+            &[wallet],
+            &tx,
+            &paper,
+            pe_service::position_seeder::ValidationPurpose::Reentry,
+            None,
+        )
+        .await;
+    assert!(outcomes.accepted.is_empty());
+    assert!(outcomes.shared.is_none());
+    assert!(matches!(
+        &outcomes.deferred[0].1,
+        CausalPositionError::Positions {
+            source: PositionReadError::MixedActivityClassification { .. },
+            ..
+        }
+    ));
+    assert!(
+        paper
+            .activity_group_state(aggregate(tail, wallet).group_id.key())
+            .unwrap()
+            .is_none()
+    );
+    assert!(!fetcher.urls().iter().any(|url| url.contains("/positions?")));
+    drop(tx);
+    actor.await.unwrap();
 }

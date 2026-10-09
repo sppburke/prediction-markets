@@ -673,9 +673,9 @@ async fn backfilled_wallet_seeded_from_real_last_trade() {
     let existing = wallet(1);
     let live = LiveWatchlist::new(watchlist(vec![entry(existing, 200)]));
 
-    // A backfill candidate that passed the `gte.{now-72h}` freshness filter: its real last trade
-    // is recent (idle ~1000s). The anchor fixture represents completed admission preparation;
-    // structural publication must preserve that causal cursor rather than jump it to `now`.
+    // A ranked backfill candidate with a present last-trade value is admitted regardless of age;
+    // this one's real last trade is recent (idle ~1000s). The anchor fixture represents completed
+    // admission preparation; structural publication preserves that causal cursor instead of `now`.
     let fresh = wallet(2);
     let fresh_last_trade = NOW - 1_000;
     assert_eq!(
@@ -738,8 +738,8 @@ async fn stale_seeded_wallet_no_admission_grace() {
     let existing = wallet(1);
     let live = LiveWatchlist::new(watchlist(vec![entry(existing, 200)]));
 
-    // A wallet admitted with a real last trade already 72h old (e.g. a stale bootstrap admission
-    // that slipped the candidate freshness filter). Its prepared anchor retains that real time, so
+    // A ranked survivor is admitted with a present real last trade regardless of its age.
+    // This one's last trade is already 72h old; its prepared anchor retains that real time, so
     // there is NO admission grace: it is eviction-eligible on the very next tick.
     let stale = wallet(2);
     let stale_last_trade = NOW - H72;
@@ -1273,6 +1273,273 @@ async fn full_rerank_swap_on_a_batch_with_no_survivors_empties_the_live_set() {
         "an empty batch never moves the applied capacity target"
     );
     println!("PASS: full-rerank-swap-on-a-batch-with-no-survivors-empties-the-live-set");
+}
+
+/// PASS: a full structural set restores its stale-ranked live-absent member and replaces an
+/// inactive member with the highest-ranked stale survivor through the real admission bracket.
+/// FAIL: ranked age blocks either path, a lower-ranked survivor takes the vacancy, or membership
+/// publishes before the admitted wallet has complete history and an installed anchor.
+#[tokio::test]
+async fn full_structural_set_backfills_vacancy_from_stale_survivors_in_rank_order() {
+    use axum::{
+        Json, Router,
+        extract::{Query, State},
+        routing::get,
+    };
+    use pe_position_ledger::PositionLedger;
+    use pe_service::{
+        activity_ingest::{ActivityIngest, SourceLogHandle},
+        asset_identity::AssetIdentityResolver,
+        bucket_commit::{BucketCommitEngine, FrozenDecisionBasis},
+        health::new_shared_health_with_ws,
+        position_seeder::{CausalPositionValidator, ledger_capture},
+        source_event_sink::SourceEventSink,
+        watchlist_maintenance::ScenarioMaintenanceState,
+    };
+    use pe_source_polymarket_public::{GAMMA_BATCH_SIZE, ReqwestFetcher};
+    use serde_json::{Value, json};
+
+    #[derive(Clone)]
+    struct Population {
+        starts: Arc<std::sync::Mutex<Vec<String>>>,
+        candidates: Arc<AtomicUsize>,
+    }
+    async fn respond(
+        State(state): State<Population>,
+        uri: axum::http::Uri,
+        Query(query): Query<HashMap<String, String>>,
+    ) -> Json<Value> {
+        Json(match uri.path() {
+            "/rest/v1/ranking_batches" => json!([{"batch_id":1}]),
+            "/rest/v1/ranking_entries" => {
+                assert_eq!(query["batch_id"], "eq.1");
+                assert_eq!(query["survives"], "is.true");
+                assert_eq!(query["order"], "rank");
+                let excluded = query
+                    .get("wallet_hex")
+                    .map(|value| {
+                        value
+                            .strip_prefix("not.in.(")
+                            .unwrap()
+                            .strip_suffix(')')
+                            .unwrap()
+                            .split(',')
+                            .collect::<HashSet<_>>()
+                    })
+                    .unwrap_or_default();
+                if let Some(value) = query.get("last_trade_unix") {
+                    assert_eq!(value, "not.is.null");
+                    state.candidates.fetch_add(1, Ordering::SeqCst);
+                }
+                let limit = query["limit"].parse::<usize>().unwrap();
+                json!(
+                    (1..=102)
+                        .filter(|n| !excluded.contains(wallet(*n).to_string().as_str()))
+                        .take(limit)
+                        .map(|n| json!({"batch_id":1,"rank":n,"wallet_hex":wallet(n),
+                        "ls_tstat":"3","hit_rate":"0.7","n_trades":60,
+                        "last_trade_unix":NOW-H72-1,"survives":true}))
+                        .collect::<Vec<_>>()
+                )
+            }
+            "/activity" => {
+                let user = query["user"].clone();
+                let mut starts = state.starts.lock().unwrap();
+                if !starts.contains(&user) {
+                    starts.push(user.clone());
+                }
+                json!([{"proxyWallet":user,"timestamp":NOW-10,"conditionId":"stale-survivor-market",
+                    "type":"TRADE","size":"1","usdcSize":"0.5","transactionHash":"0xsurvivor",
+                    "price":"0.5","asset":"123","side":"BUY","outcomeIndex":0}])
+            }
+            "/positions" => json!([]),
+            "/markets" => {
+                json!([{"conditionId":"stale-survivor-market","clobTokenIds":["123","456"]}])
+            }
+            _ => json!([]),
+        })
+    }
+    let (dir, paper) = temp_db();
+    // Every installed member's activity clock already reflects its acquired history.
+    for n in 1..=100 {
+        install_anchor(
+            &paper,
+            wallet(n),
+            if n == 99 { NOW - H72 - 1 } else { NOW - 10 },
+        );
+    }
+    for n in 100..=102 {
+        paper
+            .record_reconciled_history_status(&WalletHistoryStatusRecord {
+                wallet: wallet(n),
+                complete: false,
+                proof_json: "{\"scenario\":\"stale-survivor\"}".to_owned(),
+                updated_at_unix: NOW - H72 - 1,
+            })
+            .unwrap();
+    }
+    let live = LiveWatchlist::new(watchlist(
+        (1..=100).map(|n| entry(wallet(n), 300)).collect(),
+    ));
+    live.remove_fenced(&HashSet::from([wallet(100)]));
+    assert_eq!(
+        live.structural_membership().len(),
+        DEFAULT_ACTIVE_WATCHLIST_SIZE
+    );
+    let (applied, _) = capacity(DEFAULT_ACTIVE_WATCHLIST_SIZE);
+    let lock = Arc::new(Mutex::new(()));
+    let starts = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let candidates = Arc::new(AtomicUsize::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(
+        axum::serve(
+            listener,
+            Router::new().fallback(get(respond)).with_state(Population {
+                starts: starts.clone(),
+                candidates: candidates.clone(),
+            }),
+        )
+        .into_future(),
+    );
+    let (source, source_rx) = SourceLogHandle::channel(32);
+    let (trigger, _triggers) = mpsc::channel(1);
+    let source_task = tokio::spawn(
+        ActivityIngest::poll_only(
+            SourceEventSink::open(dir.path().join("source.log")).unwrap(),
+            source_rx,
+            trigger,
+            new_shared_health_with_ws(false, true, 30),
+        )
+        .run(),
+    );
+    let fetcher = Arc::new(ReqwestFetcher::new(reqwest::Client::new()));
+    let identity = Arc::new(AssetIdentityResolver::new_runtime(
+        fetcher.clone(),
+        base.clone(),
+        GAMMA_BATCH_SIZE,
+        source.clone(),
+    ));
+    let validator =
+        CausalPositionValidator::new(fetcher, base.clone(), "stale-survivors", identity)
+            .with_clock(Arc::new(|| NOW));
+    let (control, mut commands) = mpsc::channel(16);
+    let actor_paper = paper.clone();
+    let actor_live = live.clone();
+    let actor_lock = lock.clone();
+    let actor = tokio::spawn(async move {
+        let mut engine =
+            BucketCommitEngine::load(actor_paper.clone(), PositionLedger::new()).unwrap();
+        while let Some(command) = commands.recv().await {
+            match command {
+                OrchestratorControl::CommitActivityBucket {
+                    aggregates,
+                    context,
+                    committed,
+                } => {
+                    let _ = committed.send(
+                        engine
+                            .commit(
+                                aggregates,
+                                &context,
+                                FrozenDecisionBasis {
+                                    win_rate_p: pe_core_types::Probability::ZERO,
+                                    bankroll: Decimal::ZERO,
+                                },
+                            )
+                            .map_err(|error| error.to_string()),
+                    );
+                }
+                OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
+                    let _ = captured.send(
+                        ledger_capture(engine.ledger(), &actor_paper, wallet)
+                            .map_err(|error| error.to_string()),
+                    );
+                }
+                OrchestratorControl::InstallAnchors {
+                    installs,
+                    acknowledged,
+                } => {
+                    let _ = acknowledged.send(engine.install_anchors(&installs));
+                }
+                OrchestratorControl::PublishMembership {
+                    change,
+                    replacements,
+                    checks,
+                    acknowledged,
+                } => {
+                    let _writer = actor_lock.lock().await;
+                    if let Err(error) =
+                        checks.recheck_and_seed(&actor_paper, &actor_live, &change, &replacements)
+                    {
+                        let _ = acknowledged.send(Err(error.into_publish()));
+                        continue;
+                    }
+                    for wallet in &change.added {
+                        assert!(actor_paper.wallet_history_complete(wallet).unwrap());
+                        assert!(!actor_paper.position_anchors(wallet).unwrap().is_empty());
+                    }
+                    actor_live.scenario_commit_structural_change(&change.removed, &change.added);
+                    actor_live.replace(
+                        &change.removed.iter().copied().collect(),
+                        &replacements,
+                        change.capacity,
+                    );
+                    let _ = acknowledged.send(Ok(pe_event_log::AppendReceipt {
+                        sequence: pe_core_types::EventSeq(1),
+                        this_hash: blake3::hash(b"stale-survivor-publication"),
+                    }));
+                }
+                _ => panic!("unexpected stale-survivor control"),
+            }
+        }
+    });
+    let preparer = AdmissionPreparer::with_validator(control, paper.clone(), validator)
+        .with_source_log(source);
+    let mut state = ScenarioMaintenanceState::new(Some(1), applied.load().generation);
+    state
+        .tick(
+            &live,
+            &paper,
+            &reqwest::Client::new(),
+            &base,
+            &lock,
+            &applied,
+            &preparer,
+            &cfg(),
+            NOW,
+        )
+        .await;
+    let expected = (1..=101)
+        .filter(|n| *n != 99)
+        .map(wallet)
+        .collect::<HashSet<_>>();
+    assert_eq!(live.structural_membership(), expected);
+    assert_eq!(
+        live.snapshot()
+            .entries
+            .iter()
+            .map(|entry| entry.wallet)
+            .collect::<HashSet<_>>(),
+        expected
+    );
+    assert_eq!(live.snapshot().entries.len(), DEFAULT_ACTIVE_WATCHLIST_SIZE);
+    // #749 starts this tick with additions; rank 101 takes the vacancy before member 100
+    // re-enters. Rank 102 remains untouched on the bench.
+    assert_eq!(
+        *starts.lock().unwrap(),
+        vec![wallet(101).to_string(), wallet(100).to_string()]
+    );
+    assert_eq!(candidates.load(Ordering::SeqCst), 1);
+    assert!(paper.wallet_history_complete(&wallet(100)).unwrap());
+    assert!(paper.wallet_history_complete(&wallet(101)).unwrap());
+    assert!(!paper.wallet_history_complete(&wallet(102)).unwrap());
+    assert!(paper.position_anchors(&wallet(102)).unwrap().is_empty());
+    assert_eq!(paper.cursor(&wallet(102)).unwrap(), None);
+    assert_eq!(applied.load().target, DEFAULT_ACTIVE_WATCHLIST_SIZE);
+    actor.abort();
+    source_task.abort();
+    server.abort();
 }
 
 /// PASS: 95 proved members plus five ranked newcomers reach 100 across two ticks. The first

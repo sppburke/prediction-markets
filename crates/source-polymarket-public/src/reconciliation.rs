@@ -20,7 +20,7 @@ use serde_json::value::RawValue;
 
 use crate::activity::{
     ACTIVITY_PARSER_VERSION, ACTIVITY_SCHEMA_VERSION, ActivityAggregate, ActivityParseContext,
-    ActivityParseError, ActivityRowAcceptance, ActivityTransport, NormalizedActivity,
+    ActivityParseError, ActivityRowAcceptance, ActivityTransport, ActivityType, NormalizedActivity,
     aggregate_activity_rows, parse_activity_response_with_acceptance,
 };
 use crate::endpoint::{PolymarketEndpoint, PositionPartition};
@@ -584,6 +584,7 @@ pub struct ActivityAssetMapping {
     by_asset: HashMap<PolymarketTokenId, ActivityAssetIdentity>,
     unresolved: BTreeMap<PolymarketTokenId, Vec<ActivityAssetIdentity>>,
     classification_by_asset: HashMap<PolymarketTokenId, Option<PositionClassification>>,
+    split_merge_conditions: HashMap<PolymarketConditionId, Option<PositionClassification>>,
     journal_verified_assets: HashSet<PolymarketTokenId>,
 }
 
@@ -593,14 +594,27 @@ impl ActivityAssetMapping {
         let mut candidates = BTreeMap::<PolymarketTokenId, Vec<ActivityAssetIdentity>>::new();
         let mut classification_by_asset =
             HashMap::<PolymarketTokenId, Option<PositionClassification>>::new();
+        let mut split_merge_conditions = HashMap::new();
         for row in rows {
-            let Some(asset) = row.asset.clone() else {
-                continue;
-            };
             let classification = if row.is_combo {
                 PositionClassification::Combo
             } else {
                 PositionClassification::Ordinary
+            };
+            if matches!(row.activity_type, ActivityType::Split | ActivityType::Merge)
+                && let Some(condition) = &row.condition_id
+            {
+                split_merge_conditions
+                    .entry(condition.clone())
+                    .and_modify(|current: &mut Option<PositionClassification>| {
+                        if current.is_some_and(|current| current != classification) {
+                            *current = None;
+                        }
+                    })
+                    .or_insert(Some(classification));
+            }
+            let Some(asset) = row.asset.clone() else {
+                continue;
             };
             classification_by_asset
                 .entry(asset.clone())
@@ -615,7 +629,7 @@ impl ActivityAssetMapping {
             else {
                 // SPLIT/MERGE rows may legitimately omit an outcome even when
                 // another row supplies an asset. Such a row cannot establish a
-                // mapping; a position that relies on it fails later as missing.
+                // token mapping; their condition can instead support metadata discovery.
                 continue;
             };
             let identity = ActivityAssetIdentity {
@@ -682,6 +696,7 @@ impl ActivityAssetMapping {
             by_asset,
             unresolved,
             classification_by_asset,
+            split_merge_conditions,
             journal_verified_assets: HashSet::new(),
         }
     }
@@ -689,6 +704,80 @@ impl ActivityAssetMapping {
     #[must_use]
     pub fn identity(&self, asset: &PolymarketTokenId) -> Option<&ActivityAssetIdentity> {
         self.by_asset.get(asset)
+    }
+
+    /// Conditions with unanimous SPLIT/MERGE classification, in deterministic order.
+    pub fn split_merge_conditions(&self) -> impl Iterator<Item = &PolymarketConditionId> {
+        let mut conditions = self
+            .split_merge_conditions
+            .iter()
+            .filter_map(|(condition, classification)| classification.map(|_| condition))
+            .collect::<Vec<_>>();
+        conditions.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+        conditions.into_iter()
+    }
+
+    /// Discover an outcome only under a condition established by wallet SPLIT/MERGE activity.
+    /// Existing activity mappings are preserved; disagreements and reverse reuse fail closed.
+    pub fn insert_verified_split_merge(
+        &mut self,
+        condition: &PolymarketConditionId,
+        asset: PolymarketTokenId,
+        verified: &VerifiedTokenIdentity,
+    ) -> Result<(), PositionReadError> {
+        if &verified.condition_id != condition {
+            return Err(PositionReadError::ConflictingActivityMapping { asset: asset.0 });
+        }
+        let classification = match self.split_merge_conditions.get(condition) {
+            Some(Some(classification)) => *classification,
+            Some(None) => {
+                return Err(PositionReadError::MixedActivityClassification { asset: asset.0 });
+            }
+            None => return Err(PositionReadError::MissingActivityMapping { asset: asset.0 }),
+        };
+        let outcome_is_reused = self.by_asset.iter().any(|(existing_asset, identity)| {
+            existing_asset != &asset
+                && identity.condition_id == *condition
+                && identity.outcome == verified.outcome
+        }) || self.unresolved.iter().any(|(existing_asset, identities)| {
+            existing_asset != &asset
+                && identities.iter().any(|identity| {
+                    identity.condition_id == *condition && identity.outcome == verified.outcome
+                })
+        });
+        if outcome_is_reused {
+            return Err(PositionReadError::ConflictingOutcomeMapping {
+                condition_id: condition.0.clone(),
+                outcome: verified.outcome.0,
+            });
+        }
+        if let Some(existing) = self.by_asset.get(&asset) {
+            return if existing.condition_id == *condition
+                && existing.outcome == verified.outcome
+                && existing.classification == classification
+            {
+                Ok(())
+            } else {
+                Err(PositionReadError::ConflictingActivityMapping { asset: asset.0 })
+            };
+        }
+        if self.classification_by_asset.contains_key(&asset) || self.unresolved.contains_key(&asset)
+        {
+            return Err(PositionReadError::ConflictingActivityMapping { asset: asset.0 });
+        }
+        self.classification_by_asset
+            .insert(asset.clone(), Some(classification));
+        self.journal_verified_assets.insert(asset.clone());
+        self.by_asset.insert(
+            asset,
+            ActivityAssetIdentity {
+                condition_id: condition.clone(),
+                outcome: verified.outcome,
+                classification,
+                verified: true,
+            },
+        );
+        Ok(())
     }
 
     /// Insert one ordinary identity already verified by a journaled live-admission response.
@@ -1196,6 +1285,204 @@ mod tests {
 
     struct PositionFixture;
 
+    fn split_merge_row(activity_type: ActivityType, is_combo: bool) -> NormalizedActivity {
+        let timestamp = SourceTimestamp(time::OffsetDateTime::from_unix_timestamp(10).unwrap());
+        NormalizedActivity {
+            activity_type,
+            source_id: SourceId("fixture".to_owned()),
+            wallet: WalletAddress([1; 20]),
+            transaction_hash: "tx".to_owned(),
+            condition_id: Some(PolymarketConditionId("condition-1".to_owned())),
+            asset: None,
+            outcome: None,
+            side: None,
+            price: pe_core_types::Price::new(Decimal::ZERO).unwrap(),
+            share_amount: ShareAmount::from_atomic(1_000_000),
+            source_usdc_amount: pe_core_types::CollateralAmount::from_atomic(1_000_000),
+            is_combo,
+            source_time: timestamp.clone(),
+            observed_at: timestamp.clone(),
+            received_at: ReceivedAt(timestamp.0),
+            raw_row_hash: "raw-hash".to_owned(),
+            raw_row_json: "{}".to_owned(),
+            parser_version: ACTIVITY_PARSER_VERSION,
+            schema_version: ACTIVITY_SCHEMA_VERSION,
+            transport: ActivityTransport::Rest,
+        }
+    }
+
+    /// PASS: asset-less SPLIT/MERGE rows retain unanimous condition classification.
+    /// FAIL: other activity or a missing condition authorizes discovery.
+    #[test]
+    fn split_merge_conditions_require_activity_and_unanimous_classification() {
+        for combo in [false, true] {
+            let mut ignored = split_merge_row(ActivityType::Split, combo);
+            ignored.condition_id = None;
+            let mapping = ActivityAssetMapping::from_rows(&[
+                split_merge_row(ActivityType::Split, combo),
+                split_merge_row(ActivityType::Merge, combo),
+                ignored,
+            ]);
+            assert_eq!(mapping.split_merge_conditions().count(), 1);
+            assert_eq!(mapping.tokens().count(), 0);
+            let mut mapping = mapping;
+            let asset = PolymarketTokenId("token".to_owned());
+            let verified = VerifiedTokenIdentity {
+                condition_id: PolymarketConditionId("condition-1".to_owned()),
+                outcome: OutcomeId(0),
+                evidence_hash: "gamma".to_owned(),
+            };
+            mapping
+                .insert_verified_split_merge(&verified.condition_id, asset.clone(), &verified)
+                .unwrap();
+            assert_eq!(
+                mapping.identity(&asset).unwrap().classification,
+                if combo {
+                    PositionClassification::Combo
+                } else {
+                    PositionClassification::Ordinary
+                }
+            );
+        }
+        let mut rows = vec![
+            split_merge_row(ActivityType::Split, false),
+            split_merge_row(ActivityType::Merge, true),
+            split_merge_row(ActivityType::Split, false),
+        ];
+        let mut mapping = ActivityAssetMapping::from_rows(&rows);
+        assert_eq!(mapping.split_merge_conditions().count(), 0);
+        assert_eq!(mapping.split_merge_conditions.values().next(), Some(&None));
+        let verified = VerifiedTokenIdentity {
+            condition_id: PolymarketConditionId("condition-1".to_owned()),
+            outcome: OutcomeId(0),
+            evidence_hash: "gamma".to_owned(),
+        };
+        assert!(matches!(
+            mapping.insert_verified_split_merge(
+                &verified.condition_id,
+                PolymarketTokenId("token".to_owned()),
+                &verified
+            ),
+            Err(PositionReadError::MixedActivityClassification { .. })
+        ));
+        rows[0].activity_type = ActivityType::Redeem;
+        assert_eq!(
+            ActivityAssetMapping::from_rows(&rows[..1])
+                .split_merge_conditions()
+                .count(),
+            0
+        );
+    }
+
+    /// PASS: insertion is idempotent, requires its recorded condition, and rejects all reuse.
+    /// FAIL: discovery replaces a stamped or unresolved activity mapping.
+    #[test]
+    fn split_merge_insertion_is_narrow_and_preserves_activity_mappings() {
+        let condition = PolymarketConditionId("condition-1".to_owned());
+        let asset = PolymarketTokenId("token".to_owned());
+        let verified = VerifiedTokenIdentity {
+            condition_id: condition.clone(),
+            outcome: OutcomeId(0),
+            evidence_hash: "gamma".to_owned(),
+        };
+        let mut mapping =
+            ActivityAssetMapping::from_rows(&[split_merge_row(ActivityType::Split, false)]);
+        mapping
+            .insert_verified_split_merge(&condition, asset.clone(), &verified)
+            .unwrap();
+        let original = mapping.clone();
+        mapping
+            .insert_verified_split_merge(&condition, asset.clone(), &verified)
+            .unwrap();
+        assert_eq!(mapping, original);
+        let mut conflict = verified.clone();
+        conflict.outcome = OutcomeId(1);
+        assert!(matches!(
+            mapping.insert_verified_split_merge(&condition, asset.clone(), &conflict),
+            Err(PositionReadError::ConflictingActivityMapping { .. })
+        ));
+        conflict.condition_id = PolymarketConditionId("other".to_owned());
+        assert!(matches!(
+            mapping.insert_verified_split_merge(&condition, asset.clone(), &conflict),
+            Err(PositionReadError::ConflictingActivityMapping { .. })
+        ));
+        assert!(matches!(
+            mapping.insert_verified_split_merge(
+                &verified.condition_id,
+                PolymarketTokenId("other-token".to_owned()),
+                &verified
+            ),
+            Err(PositionReadError::ConflictingOutcomeMapping { .. })
+        ));
+        assert!(
+            ActivityAssetMapping::from_rows(&[])
+                .insert_verified_split_merge(&condition, asset.clone(), &verified)
+                .is_err()
+        );
+
+        let mut stamped = split_merge_row(ActivityType::Trade, false);
+        stamped.asset = Some(asset.clone());
+        stamped.outcome = Some(OutcomeId(0));
+        let split = split_merge_row(ActivityType::Split, false);
+        let mut mapping = ActivityAssetMapping::from_rows(&[stamped.clone(), split.clone()]);
+        let original = mapping.clone();
+        mapping
+            .insert_verified_split_merge(&condition, asset.clone(), &verified)
+            .unwrap();
+        assert_eq!(mapping, original);
+        assert!(!mapping.identity(&asset).unwrap().verified);
+        conflict = verified.clone();
+        conflict.outcome = OutcomeId(1);
+        assert!(
+            mapping
+                .insert_verified_split_merge(&condition, asset.clone(), &conflict)
+                .is_err()
+        );
+        stamped.outcome = Some(OutcomeId(1));
+        let mut mapping = ActivityAssetMapping::from_rows(&[stamped, split]);
+        mapping.unresolved.insert(
+            PolymarketTokenId("unresolved".to_owned()),
+            vec![ActivityAssetIdentity {
+                condition_id: condition.clone(),
+                outcome: OutcomeId(0),
+                classification: PositionClassification::Ordinary,
+                verified: false,
+            }],
+        );
+        assert!(matches!(
+            mapping.insert_verified_split_merge(
+                &condition,
+                PolymarketTokenId("new".to_owned()),
+                &verified
+            ),
+            Err(PositionReadError::ConflictingOutcomeMapping { .. })
+        ));
+        let original = mapping.clone();
+        assert!(
+            mapping
+                .insert_verified_split_merge(
+                    &condition,
+                    PolymarketTokenId("unresolved".to_owned()),
+                    &verified
+                )
+                .is_err()
+        );
+        assert_eq!(mapping, original);
+        mapping.unresolved.insert(
+            PolymarketTokenId("reverse-conflict".to_owned()),
+            vec![ActivityAssetIdentity {
+                condition_id: condition.clone(),
+                outcome: OutcomeId(1),
+                classification: PositionClassification::Ordinary,
+                verified: false,
+            }],
+        );
+        assert!(matches!(
+            mapping.insert_verified_split_merge(&condition, asset, &conflict),
+            Err(PositionReadError::ConflictingOutcomeMapping { .. })
+        ));
+    }
+
     impl ReconciliationFetcher for PositionFixture {
         fn fetch<'a>(
             &'a self,
@@ -1272,6 +1559,7 @@ mod tests {
                 }],
             )]),
             classification_by_asset: HashMap::new(),
+            split_merge_conditions: HashMap::new(),
             journal_verified_assets: HashSet::new(),
         };
 

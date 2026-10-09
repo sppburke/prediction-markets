@@ -4639,6 +4639,13 @@ impl BucketCommitEngine {
                 recorded_at_unix: install.proof.recorded_at_unix,
             });
         }
+        // Acquired activity advances the MAX-only clock before the anchor commit, so a clock-write
+        // failure mutates no anchor and nothing fallible separates the commit from its projections.
+        for install in installs {
+            if let Some(epoch) = install.newest_activity_unix {
+                self.paper_state.set_activity(&install.wallet, epoch)?;
+            }
+        }
         self.paper_state.install_anchors(&records)?;
         self.ledger = candidate;
         for record in &records {
@@ -8726,6 +8733,184 @@ pub(crate) mod continuation_v3_tests {
             wrong.observation_from_receipt_index(&index),
             Err(DecisionContinuationError::SourceReceiptMismatch { .. })
         ));
+    }
+}
+
+#[cfg(test)]
+mod anchor_install_tests {
+    #![allow(clippy::unwrap_used)]
+
+    use pe_core_types::{OutcomeId, SourceTradeId, VenueMarketId};
+
+    use super::*;
+
+    /// PASS: a clock UPDATE fault preserves durable and in-memory anchor state; retry publishes all.
+    /// FAIL: anchors, repaired history, fence clearance or projections escape a failed clock write.
+    #[test]
+    fn activity_clock_write_fault_preserves_install_state_and_retry_advances_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("paper.db");
+        let paper = Arc::new(PaperStateDb::open(&path).unwrap());
+        let wallet = WalletAddress([0xaa; 20]);
+        let market = MarketId(VenueMarketId("condition".to_owned()));
+        paper.seed_cursor_if_absent(&wallet, 10).unwrap();
+        paper
+            .record_reconciled_history_status(&WalletHistoryStatusRecord {
+                wallet,
+                complete: false,
+                proof_json: "{}".to_owned(),
+                updated_at_unix: 1,
+            })
+            .unwrap();
+        paper
+            .install_anchors(&[AnchorInstallRecord {
+                wallet,
+                balances: Vec::new(),
+                activity_cutoff_unix: 10,
+                anchored_at_unix: 10,
+                ledger_hash_after: "empty".to_owned(),
+                positions_proof_hash: "empty".to_owned(),
+                activity_bounds_json: "[]".to_owned(),
+                source_log_generation: "fixture".to_owned(),
+                history_status: None,
+                proof_json: "{}".to_owned(),
+                recorded_at_unix: 10,
+                repaired_history: Vec::new(),
+                expected_fence: None,
+            }])
+            .unwrap();
+        let connection = rusqlite::Connection::open(path).unwrap();
+        connection
+            .execute(
+                "INSERT INTO wallet_fences VALUES (?1, ?2, ?3, ?4, 11)",
+                rusqlite::params![
+                    wallet.to_string(),
+                    "trigger",
+                    "late_group_after_bucket_commit",
+                    "{\"bucket_epoch\":10}",
+                ],
+            )
+            .unwrap();
+        let mut engine = BucketCommitEngine::load(paper.clone(), PositionLedger::new()).unwrap();
+        let captured = ledger_capture(engine.ledger(), &paper, wallet).unwrap();
+        let fence = paper.wallet_fence(&wallet).unwrap();
+        let anchors = paper.position_anchors(&wallet).unwrap();
+        let positions = paper.leader_positions().unwrap();
+        let validation = paper.position_validation(&wallet).unwrap();
+        let coverage = paper.wallet_coverage(&wallet).unwrap();
+        let history_status = paper.wallet_history_status(&wallet).unwrap();
+        let history = paper.gate_history().unwrap();
+        let market_history = paper.market_history_record(&wallet, &market).unwrap();
+        let complete_history = engine.complete_history.clone();
+        let fences = engine.fences.clone();
+        let gate_wallet = engine.entry_gate.has_wallet(&wallet);
+        let gate_market = engine.entry_gate.has_market(&wallet, &market);
+        let install = AnchorInstall {
+            wallet,
+            balances: vec![(
+                market.clone(),
+                OutcomeId(0),
+                ShareAmount::from_atomic(3_000_000),
+            )],
+            cutoff: 100,
+            newest_activity_unix: Some(90),
+            fresh_history: vec![MarketHistoryRecord {
+                wallet,
+                market_id: market.clone(),
+                first_epoch: 90,
+                source_trade_id: SourceTradeId("purchase".to_owned()),
+            }],
+            expected_fence: fence.clone(),
+            history_status: Some(WalletHistoryStatusRecord {
+                wallet,
+                complete: true,
+                proof_json: "{}".to_owned(),
+                updated_at_unix: 100,
+            }),
+            proof: crate::position_seeder::AnchorProof {
+                positions_proof_hash: "positions".to_owned(),
+                activity_bounds_json: "[]".to_owned(),
+                source_log_generation: "fixture".to_owned(),
+                document: "{}".to_owned(),
+                recorded_at_unix: 100,
+            },
+            expected: crate::position_seeder::AnchorExpectation {
+                ledger_hash: captured.hash.clone(),
+                cursor: captured.cursor,
+                anchor_seq: captured.anchor_seq,
+                coverage_generation: captured.coverage_generation,
+            },
+        };
+        connection
+            .execute_batch(&format!(
+                "CREATE TRIGGER fail_activity_clock BEFORE UPDATE ON poll_cursors
+             WHEN NEW.wallet_hex = '{wallet}'
+             BEGIN SELECT RAISE(ABORT, 'injected activity clock failure'); END;"
+            ))
+            .unwrap();
+        let error = engine
+            .install_anchors(std::slice::from_ref(&install))
+            .unwrap_err();
+        assert!(matches!(&error, AnchorInstallError::Durability(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("injected activity clock failure")
+        );
+        assert_eq!(paper.activity(&wallet).unwrap(), Some(10));
+        assert_eq!(
+            ledger_capture(engine.ledger(), &paper, wallet).unwrap(),
+            captured
+        );
+        assert_eq!(paper.position_anchors(&wallet).unwrap(), anchors);
+        assert_eq!(paper.leader_positions().unwrap(), positions);
+        assert_eq!(paper.position_validation(&wallet).unwrap(), validation);
+        assert_eq!(paper.wallet_coverage(&wallet).unwrap(), coverage);
+        assert_eq!(
+            paper.wallet_history_status(&wallet).unwrap(),
+            history_status
+        );
+        assert_eq!(paper.gate_history().unwrap(), history);
+        assert_eq!(
+            paper.market_history_record(&wallet, &market).unwrap(),
+            market_history
+        );
+        assert_eq!(paper.wallet_fence(&wallet).unwrap(), fence);
+        assert_eq!(engine.complete_history, complete_history);
+        assert_eq!(engine.fences, fences);
+        assert_eq!(engine.entry_gate.has_wallet(&wallet), gate_wallet);
+        assert_eq!(engine.entry_gate.has_market(&wallet, &market), gate_market);
+
+        connection
+            .execute_batch("DROP TRIGGER fail_activity_clock;")
+            .unwrap();
+        engine.install_anchors(&[install]).unwrap();
+        assert_eq!(paper.activity(&wallet).unwrap(), Some(90));
+        assert_eq!(paper.cursor(&wallet).unwrap(), captured.cursor);
+        assert_eq!(
+            paper.position_anchors(&wallet).unwrap().len(),
+            anchors.len() + 1
+        );
+        assert!(paper.wallet_history_complete(&wallet).unwrap());
+        assert_eq!(
+            paper
+                .market_history_record(&wallet, &market)
+                .unwrap()
+                .unwrap()
+                .first_epoch,
+            90
+        );
+        assert!(paper.wallet_fence(&wallet).unwrap().is_none());
+        assert!(engine.history_complete(&wallet));
+        assert!(!engine.is_fenced(&wallet));
+        assert!(engine.entry_gate.has_wallet(&wallet));
+        assert!(engine.entry_gate.has_market(&wallet, &market));
+        assert_ne!(
+            ledger_capture(engine.ledger(), &paper, wallet)
+                .unwrap()
+                .hash,
+            captured.hash
+        );
     }
 }
 

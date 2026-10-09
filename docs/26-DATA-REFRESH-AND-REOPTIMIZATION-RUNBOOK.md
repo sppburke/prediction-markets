@@ -523,9 +523,12 @@ walk — no RPC required, #369/#372).
 >   (the dropped count is logged; the comparison is case-insensitive).
 >
 > Each ranking row also carries `last_trade_unix` — the wallet's real last on-chain
-> trade time — which seeds `pe-service`'s inactivity clock at admission and is the
-> candidate-freshness filter (`ACTIVE_WINDOW_HOURS = 72`, #357). It is a push-time
-> snapshot of the cache; backfilling immediately before the push is mandatory.
+> trade time — which seeds `pe-service`'s poll cursor and inactivity clock at admission.
+> Service bench reads exclude only a missing ranked value; present values have no age bound.
+> Inactivity belongs to the knockout from the activity clock, as defined by the
+> [Live wallet source](_GLOSSARY.md#live-wallet-source-supabase-ranking-handoff-issue-339).
+> The ranked timestamp is a push-time snapshot of the cache; backfilling immediately before
+> the push is mandatory. The upload-time activity filter above remains separate.
 >
 > Because these checks read `wallet_cache.db`, **run Part 1 (backfill) immediately
 > before Part 2's ranking push.** A stale cache would otherwise filter out every

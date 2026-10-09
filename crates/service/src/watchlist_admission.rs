@@ -795,6 +795,22 @@ impl AdmissionPreparer {
         .await
     }
 
+    /// Exercise the runtime re-entry routing with the same ranked cursor seeding as maintenance.
+    #[cfg(feature = "scenario")]
+    pub async fn scenario_prepare_reentry(
+        &self,
+        wallets: &[WalletAddress],
+        ranked_last_trade: &HashMap<WalletAddress, i64>,
+    ) -> Result<AdmissionOutcome, AdmissionAbort> {
+        self.prepare_ranked_until(
+            wallets,
+            ranked_last_trade,
+            None,
+            AdmissionContext::Reentry { first: false },
+        )
+        .await
+    }
+
     /// Reject fences before validation and require complete history after the accepted
     /// anchor installation is acknowledged. Validator-free callers require complete
     /// history before handing preparation to the orchestrator.
@@ -930,7 +946,11 @@ impl AdmissionPreparer {
                     &eligible,
                     &preparer.control_tx,
                     &preparer.paper_state,
-                    ValidationPurpose::CatchUp,
+                    if matches!(context, AdmissionContext::Reentry { .. }) {
+                        ValidationPurpose::Reentry
+                    } else {
+                        ValidationPurpose::CatchUp
+                    },
                     deadline,
                 )
                 .await;

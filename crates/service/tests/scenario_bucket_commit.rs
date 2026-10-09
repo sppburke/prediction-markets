@@ -393,6 +393,7 @@ fn paper_service_rollout_ordinary_retry_of_disposed_revision_preserves_fence() {
     let captured = ledger_capture(engine.ledger(), &paper, wallet()).unwrap();
     engine
         .install_anchors(&[AnchorInstall {
+            newest_activity_unix: None,
             fresh_history: Vec::new(),
             expected_fence: Some(fence),
             history_status: None,
@@ -548,6 +549,7 @@ fn install_anchor_for_wallet(
     let captured = ledger_capture(engine.ledger(), paper, wallet).unwrap();
     engine
         .install_anchors(&[AnchorInstall {
+            newest_activity_unix: None,
             fresh_history: Vec::new(),
             expected_fence: None,
             history_status: None,
@@ -874,6 +876,7 @@ fn bracket_unverified_covered_group_is_raw_only_without_reanchor_then_anchors() 
     let captured = ledger_capture(engine.ledger(), &paper, wallet()).unwrap();
     engine
         .install_anchors(&[AnchorInstall {
+            newest_activity_unix: None,
             fresh_history: Vec::new(),
             expected_fence: None,
             history_status: None,

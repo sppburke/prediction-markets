@@ -136,7 +136,7 @@ pub enum MembershipApplyError {
         applied_generation: u64,
         applied_target: usize,
     },
-    /// A freshness-filtered/ranked admission unexpectedly lacked its real last-trade cursor.
+    /// A ranked admission unexpectedly lacked its required last-trade cursor.
     #[error("missing last_trade_unix for newly admitted wallet {wallet}")]
     MissingCursor { wallet: WalletAddress },
     /// SQLite rejected the all-or-nothing cursor batch.
@@ -1440,42 +1440,23 @@ enum Reentry {
     Admit,
     /// Missing or future ranking timestamp: today's seed deferral, parked until another batch.
     Park,
-    /// Not eligible on the evidence available now; check again next tick without parking.
-    Retry,
 }
 
 /// Re-entry eligibility of a live-absent structural member. The pinned batch's
-/// `last_trade_unix` admits it inside [`supabase_reader::ACTIVE_WINDOW_HOURS`]. Past that window
-/// its own activity clock (#511) admits it when the knockout would keep it, proven winners
-/// included, so a restart cannot strand a wallet the live set would have kept. A missing or
-/// future batch value parks: neither changes within a batch, and admission seeding would raise
-/// the activity clock to a future value.
-fn reentry(
-    ranked: Option<i64>,
-    observed: Option<i64>,
-    stats: Option<&HashMap<String, WalletEdgeStats>>,
-    wallet: &WalletAddress,
-    cfg: &MaintenanceConfig,
-    now_unix: i64,
-) -> Reentry {
-    let Some(ranked) = ranked.filter(|at| *at <= now_unix) else {
-        return Reentry::Park;
-    };
-    if ranked >= now_unix.saturating_sub(supabase_reader::ACTIVE_WINDOW_HOURS * 3_600) {
+/// `last_trade_unix` admits it regardless of age. Inactivity belongs to the existing knockout
+/// after admission. A missing or future batch value parks: neither changes within a batch,
+/// and admission seeding would raise the activity clock to a future value.
+fn reentry(ranked: Option<i64>, now_unix: i64) -> Reentry {
+    if ranked.is_some_and(|at| at <= now_unix) {
         return Reentry::Admit;
     }
-    let kept = observed.is_some_and(|at| at <= now_unix)
-        && stats.is_some_and(|stats| {
-            knockout_decision(observed, stats.get(&wallet.to_string()), cfg, now_unix).is_none()
-        });
-    if kept { Reentry::Admit } else { Reentry::Retry }
+    Reentry::Park
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn live_reentry_tick(
     live: &LiveWatchlist,
     paper_state: &Arc<PaperStateDb>,
-    cfg: &MaintenanceConfig,
     client: &reqwest::Client,
     base_url: &str,
     anon_key: &str,
@@ -1533,37 +1514,15 @@ async fn live_reentry_tick(
     };
     let before_live = live.snapshot().entries.len();
     let mut deferred = Vec::new();
-    let retryable = planned_live_reentries(live, entries)
+    let candidates = planned_live_reentries(live, entries)
         .into_iter()
         .filter(|wallet| {
             !attempted.contains(wallet) && sync.reentry_launchable(wallet, before_additions)
         })
-        .map(|wallet| (wallet, paper_state.activity(&wallet).unwrap_or(None)))
-        .collect::<Vec<_>>();
-    // Statistics decide only a stale-ranked wallet with a usable clock: load them once, then.
-    let stats = retryable
-        .iter()
-        .any(|(wallet, observed)| {
-            observed.is_some_and(|at| at <= now_unix)
-                && reentry(
-                    last_trade.get(wallet).copied(),
-                    *observed,
-                    None,
-                    wallet,
-                    cfg,
-                    now_unix,
-                ) == Reentry::Retry
-        })
-        .then(|| load_edge_stats(paper_state, cfg, now_unix))
-        .flatten();
-    let candidates = retryable
-        .into_iter()
-        .filter(|(wallet, observed)| {
+        .filter(|wallet| {
             let ranked = last_trade.get(wallet).copied();
-            let by_wallet = stats.as_ref().map(|loaded| &loaded.by_wallet);
-            match reentry(ranked, *observed, by_wallet, wallet, cfg, now_unix) {
+            match reentry(ranked, now_unix) {
                 Reentry::Admit => true,
-                Reentry::Retry => false,
                 Reentry::Park => {
                     deferred.push(crate::watchlist_admission::Deferral {
                         completed_at: Some(tokio::time::Instant::now()),
@@ -1581,7 +1540,6 @@ async fn live_reentry_tick(
                 }
             }
         })
-        .map(|(wallet, _)| wallet)
         .collect::<Vec<_>>();
     if candidates.is_empty() && deferred.is_empty() {
         return None;
@@ -1936,7 +1894,6 @@ async fn maintenance_tick_inner(
         let report = live_reentry_tick(
             live,
             paper_state,
-            cfg,
             client,
             base_url,
             anon_key,
@@ -2307,7 +2264,6 @@ async fn maintenance_tick_inner(
                                 let report = live_reentry_tick(
                                     live,
                                     paper_state,
-                                    cfg,
                                     client,
                                     base_url,
                                     anon_key,
@@ -2374,7 +2330,6 @@ async fn maintenance_tick_inner(
         live_reentry_tick(
             live,
             paper_state,
-            cfg,
             client,
             base_url,
             anon_key,
@@ -2510,7 +2465,6 @@ async fn knockout_tick(
             batch_id,
             &exclude,
             MAX_ACTIVE_WATCHLIST_SIZE,
-            now_unix,
         )
         .await
         {
@@ -3114,37 +3068,19 @@ mod tests {
     }
 
     #[test]
-    fn reentry_admits_fresh_batch_or_kept_clock_and_parks_only_bad_batch_values() {
-        let wallet = WalletAddress::from_hex("0x00000000000000000000000000000000000000aa").unwrap();
-        let by_wallet = |edge: WalletEdgeStats| HashMap::from([(wallet.to_string(), edge)]);
-        let winner = by_wallet(stats(40, dec!(120), Some(dec!(0.05)), Some(dec!(0.30))));
-        let loser = by_wallet(stats(20, dec!(-50), Some(dec!(-0.30)), Some(dec!(-0.05))));
-        let none = HashMap::new();
-        let (recent, stale, future) = (Some(NOW - 60), Some(NOW - 300_000), Some(NOW + 60));
-        let (four_days, eight_days) = (Some(NOW - 345_600), Some(NOW - 691_200));
-        use Reentry::{Admit, Park, Retry};
-        let (empty, winners, losers) = (Some(&none), Some(&winner), Some(&loser));
+    fn reentry_admits_stale_ranked_survivors_and_parks_missing_or_future_values() {
+        use Reentry::{Admit, Park};
         let cases = [
-            (recent, None, empty, Admit),        // fresh batch
-            (stale, recent, empty, Admit),       // stale batch, recent clock
-            (stale, stale, empty, Retry),        // both stale
-            (future, recent, empty, Park),       // future batch
-            (None, recent, empty, Park),         // missing batch
-            (stale, future, empty, Retry),       // future clock
-            (stale, future, None, Retry),        // future clock, statistics unavailable
-            (stale, None, empty, Retry),         // no clock (also a read error)
-            (stale, None, None, Retry),          // no clock, statistics unavailable
-            (stale, four_days, winners, Admit),  // proven winner idle 4 d
-            (stale, four_days, empty, Retry),    // unproven idle 4 d
-            (stale, eight_days, winners, Retry), // winner past the hard cap
-            (stale, recent, losers, Retry),      // demotable
-            (recent, None, None, Admit),         // statistics unavailable, fresh batch
-            (stale, recent, None, Retry),        // statistics unavailable, stale batch
-            (future, recent, None, Park),        // statistics unavailable, future batch
+            (Some(NOW), Admit),
+            (Some(NOW - 60), Admit),
+            (Some(NOW - 300_000), Admit),
+            (Some(NOW - 691_200), Admit),
+            (Some(0), Admit),
+            (None, Park),
+            (Some(NOW + 1), Park),
         ];
-        for (index, (ranked, observed, edge, expected)) in cases.into_iter().enumerate() {
-            let actual = reentry(ranked, observed, edge, &wallet, &cfg(), NOW);
-            assert_eq!(actual, expected, "case {index}");
+        for (ranked, expected) in cases {
+            assert_eq!(reentry(ranked, NOW), expected, "ranked {ranked:?}");
         }
     }
 
@@ -3336,7 +3272,8 @@ mod tests {
         }
 
         /// Fake Supabase + Polymarket. `ranking_entries` is served filtered by the `batch_id`
-        /// query the pinned read sends; candidate queries also enforce exclusions and freshness.
+        /// query the pinned read sends; candidate queries also enforce exclusions and
+        /// non-null timestamps.
         #[derive(Clone)]
         struct Fake {
             latest_batch: Arc<AtomicI64>,
@@ -3383,9 +3320,10 @@ mod tests {
                     let batch = q
                         .get("batch_id")
                         .map(|value| value.strip_prefix("eq.").unwrap().parse::<i64>().unwrap());
-                    let cutoff = q
-                        .get("last_trade_unix")
-                        .map(|value| value.strip_prefix("gte.").unwrap().parse::<i64>().unwrap());
+                    let excludes_missing = q.get("last_trade_unix").is_some_and(|value| {
+                        assert_eq!(value, "not.is.null");
+                        true
+                    });
                     let excluded = q
                         .get("wallet_hex")
                         .map(|value| {
@@ -3403,11 +3341,7 @@ mod tests {
                         .filter(|row| {
                             row["survives"] == true
                                 && batch.is_none_or(|batch| row["batch_id"].as_i64() == Some(batch))
-                                && cutoff.is_none_or(|cutoff| {
-                                    row["last_trade_unix"]
-                                        .as_i64()
-                                        .is_some_and(|time| time >= cutoff)
-                                })
+                                && (!excludes_missing || !row["last_trade_unix"].is_null())
                                 && !excluded.contains(row["wallet_hex"].as_str().unwrap())
                         })
                         .cloned()
@@ -4740,14 +4674,11 @@ mod tests {
 
         #[tokio::test]
         async fn pinned_batch_live_reentry_precedes_edge_failure_and_full_capacity_returns() {
-            // Loaded statistics and a recent clock admit both wallets in one tick. A stale clock
-            // (full capacity) or hidden statistics (edge failure) leaves the stale-ranked wallet
-            // out, unparked, until that evidence recovers within the same batch.
-            for (full_capacity, first_activity) in
-                [(true, NOW - 60), (true, NOW - 300_000), (false, NOW - 60)]
-            {
+            // Stale-ranked re-entry is independent of knockout statistics and the structural
+            // capacity return. Both members re-enter before either can stop the tick.
+            for full_capacity in [true, false] {
                 let deferred = wallet(72);
-                // Stale in the pinned batch; only its own activity clock can bring it back.
+                // Stale in the pinned batch; the ranker still admits it.
                 let stale_ranked = wallet(75);
                 let peers = if full_capacity {
                     vec![wallet(73)]
@@ -4768,9 +4699,7 @@ mod tests {
                 h.paper_state
                     .set_cursor(&stale_ranked, NOW - 300_000)
                     .unwrap();
-                h.paper_state
-                    .set_activity(&stale_ranked, first_activity)
-                    .unwrap();
+                h.paper_state.set_activity(&stale_ranked, NOW - 60).unwrap();
                 h.live.remove_fenced(&set(&[deferred, stale_ranked]));
                 let paper_db = h._temp.path().join("paper.db");
                 if !full_capacity {
@@ -4795,22 +4724,13 @@ mod tests {
                 };
                 h.tick_synced(MembershipMode::Knockout, &mut HashSet::new(), &mut sync)
                     .await;
-                let at_once = full_capacity && first_activity == NOW - 60;
-                let mut first_live = if at_once {
-                    vec![deferred, stale_ranked]
-                } else {
-                    vec![deferred]
-                };
-                first_live.extend(peers.iter().copied());
-                assert_eq!(members(&h.live), set(&first_live));
-                assert_eq!(h.controls().len(), if at_once { 2 } else { 1 });
+                assert_eq!(members(&h.live), set(&initial));
+                assert_eq!(h.controls().len(), 2);
                 assert!(
                     sync.knockout_deferred.is_empty(),
-                    "a retried wallet is never parked"
+                    "an admitted survivor is never parked"
                 );
-                if full_capacity {
-                    h.paper_state.set_activity(&stale_ranked, NOW - 60).unwrap();
-                } else {
+                if !full_capacity {
                     rusqlite::Connection::open(&paper_db)
                         .unwrap()
                         .execute("ALTER TABLE hidden_fills RENAME TO fills", [])
@@ -4821,10 +4741,7 @@ mod tests {
                 assert_eq!(members(&h.live), set(&initial));
                 assert_eq!(h.controls().len(), 2);
                 // With every structural member live, the second tick reads no ranking.
-                assert_eq!(
-                    pinned_reads.load(Ordering::SeqCst),
-                    if at_once { 1 } else { 2 }
-                );
+                assert_eq!(pinned_reads.load(Ordering::SeqCst), 1);
                 assert_eq!(sync.marker, Some(1));
                 assert!(sync.knockout_deferred.is_empty());
                 assert_eq!(
@@ -4872,7 +4789,6 @@ mod tests {
             let first = live_reentry_tick(
                 &h.live,
                 &h.paper_state,
-                &cfg(),
                 &h.client,
                 &h.base_url,
                 "anon",
@@ -4903,7 +4819,6 @@ mod tests {
             let second = live_reentry_tick(
                 &h.live,
                 &h.paper_state,
-                &cfg(),
                 &h.client,
                 &h.base_url,
                 "anon",
@@ -5423,7 +5338,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn knockout_selection_preserves_inactivity_and_eviction_exclusions() {
+        async fn knockout_selection_admits_stale_survivors_and_preserves_exclusions() {
             let (idle, live, remembered, fenced, stale, missing, eligible, newer) = (
                 wallet(31),
                 wallet(32),
@@ -5456,11 +5371,147 @@ mod tests {
             let (mut evicted, mut marker) = (set(&[remembered]), Some(1));
             h.tick(MembershipMode::Knockout, &mut evicted, &mut marker)
                 .await;
-            assert_eq!(members(&h.live), set(&[live, eligible]));
+            assert_eq!(members(&h.live), set(&[live, stale, eligible]));
             assert_eq!(marker, Some(1));
             assert_eq!(evicted, set(&[remembered, idle]));
+            assert_eq!(
+                h.controls()
+                    .iter()
+                    .map(|(wallets, _)| wallets.clone())
+                    .collect::<Vec<_>>(),
+                vec![set(&[stale]), set(&[eligible])]
+            );
+            assert_eq!(
+                h.paper_state.cursor(&stale).unwrap(),
+                Some(NOW - supabase_reader::ACTIVE_WINDOW_HOURS * 3600 - 1)
+            );
+            assert_eq!(h.paper_state.cursor(&missing).unwrap(), None);
+            assert_eq!(h.paper_state.cursor(&newer).unwrap(), None);
             assert_eq!(h.paper_state.cursor(&eligible).unwrap(), Some(NOW - 60));
         }
+        /// PASS: stale-ranked survivors pass admission; the next knockout evicts the inactive
+        /// wallet with its causal artifact, keeps a proven winner below the hard cap, and
+        /// subsequent vacancies cannot backfill the eviction in the same loop and batch.
+        /// FAIL: ranked age blocks admission, inactivity has no recorded cause, the winner
+        /// leaves, or the evicted wallet is prepared again without a batch transition.
+        #[tokio::test]
+        async fn stale_ranked_inactive_survivor_evicted_once_with_causal_artifact() {
+            let (idle, winner) = (wallet(111), wallet(112));
+            let config = cfg();
+            let stale = NOW - i64::try_from(config.inactivity_threshold_secs).unwrap() - 1;
+            let mut fake = Fake::new(Some(1));
+            fake.ranking_entries = vec![row(1, 2, winner), row(1, 1, idle)];
+            for row in &mut fake.ranking_entries {
+                row["last_trade_unix"] = serde_json::json!(stale);
+            }
+            let h = harness(fake, &[]).await;
+            let winning = settled_edge_artifact(winner, true, Some(stale));
+            for fill in &winning.fills {
+                h.paper_state
+                    .reconcile_fill(
+                        &pe_paper_state::FillRecord {
+                            idempotency_key: fill.idempotency_key.clone(),
+                            market_id: fill.market_id.clone(),
+                            outcome_id: fill.outcome_id,
+                            side: fill.side,
+                            quantity: fill.quantity,
+                            fill_price: fill.fill_price,
+                            principal: fill.principal,
+                            fee: fill.fee,
+                        },
+                        fill.event_seq,
+                    )
+                    .unwrap();
+            }
+            for settlement in &winning.settlements {
+                let row = settlement.to_row().unwrap();
+                h.paper_state
+                    .record_settled_market(
+                        &row.market_id,
+                        &row.outcome_prices_json,
+                        row.credit_applied,
+                        row.settled_at_unix,
+                    )
+                    .unwrap();
+            }
+            let preparer = validator_preparer(&h, None, HashSet::new());
+            let mut sync = admission_sync(1);
+            let mut evicted = HashSet::new();
+            h.tick_synced_with_preparer(
+                &preparer,
+                MembershipMode::Knockout,
+                &mut evicted,
+                &mut sync,
+            )
+            .await;
+            assert_eq!(members(&h.live), set(&[idle, winner]));
+            assert!(evicted.is_empty());
+            for wallet in [idle, winner] {
+                assert_eq!(h.paper_state.activity(&wallet).unwrap(), Some(stale));
+                assert_eq!(h.paper_state.position_anchors(&wallet).unwrap().len(), 1);
+            }
+            assert!(
+                load_edge_stats(&h.paper_state, &config, NOW)
+                    .unwrap()
+                    .by_wallet[&winner.to_string()]
+                    .is_proven_winner(config.demotion_min_trades)
+            );
+
+            h.tick_synced_with_preparer(
+                &preparer,
+                MembershipMode::Knockout,
+                &mut evicted,
+                &mut sync,
+            )
+            .await;
+            assert_eq!(members(&h.live), set(&[winner]));
+            assert_eq!(h.live.structural_membership(), set(&[winner]));
+            assert_eq!(evicted, set(&[idle]));
+            let artifacts = || {
+                pe_event_log::Reader::replay(h._temp.path().join("source.log"))
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .filter(|(_, frame)| frame.source_id.0 == KNOCKOUT_CAUSAL_SOURCE_ID)
+                    .map(|(_, frame)| {
+                        serde_json::from_slice::<KnockoutCausalArtifact>(&frame.payload).unwrap()
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let causal = artifacts();
+            assert_eq!(causal.len(), 1);
+            assert_eq!(causal[0].wallet, idle);
+            assert_eq!(causal[0].evaluated_at_unix, NOW);
+            assert_eq!(causal[0].last_trade_unix, Some(stale));
+            assert_eq!(
+                causal[0].inactivity_threshold_secs,
+                config.inactivity_threshold_secs
+            );
+            assert_eq!(
+                causal[0].inactivity_hard_cap_secs,
+                config.inactivity_hard_cap_secs
+            );
+            assert!(causal[0].fills.is_empty());
+            assert!(causal[0].settlements.is_empty());
+            // The harness verifies the publication against its receipt-bound source artifacts.
+            assert_eq!(h.membership_publications.load(Ordering::SeqCst), 2);
+            for _ in 0..2 {
+                h.tick_synced_with_preparer(
+                    &preparer,
+                    MembershipMode::Knockout,
+                    &mut evicted,
+                    &mut sync,
+                )
+                .await;
+                assert_eq!(members(&h.live), set(&[winner]));
+                assert_eq!(sync.marker, Some(1));
+                assert_eq!(evicted, set(&[idle]));
+                assert_eq!(sync.started, 0, "the evicted wallet cannot launch again");
+                assert_eq!(h.paper_state.position_anchors(&idle).unwrap().len(), 1);
+                assert_eq!(h.membership_publications.load(Ordering::SeqCst), 2);
+                assert_eq!(artifacts().len(), 1);
+            }
+        }
+
         #[tokio::test]
         async fn empty_selection_preserves_each_consumer_failure_contract() {
             for mode in [MembershipMode::FullRerank, MembershipMode::Knockout] {
@@ -6584,7 +6635,6 @@ mod tests {
                 let report = live_reentry_tick(
                     &h.live,
                     &h.paper_state,
-                    &cfg(),
                     &h.client,
                     &h.base_url,
                     "anon",
