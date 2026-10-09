@@ -142,6 +142,8 @@ struct IdentityCache {
     memory_pages: MemoryIdentityPages,
     // An expired caller cannot make a later live lookup skip the open query.
     completed_open: HashMap<PolymarketTokenId, Weak<()>>,
+    // Unfinished condition discoveries share open progress only while their caller lives.
+    completed_open_conditions: HashMap<String, Weak<()>>,
     // Boot's shared receipt index is extended only after its reducer walk. These pages
     // already have a synchronized append receipt and are dropped when that index is installed.
     boot_pages: BTreeMap<u64, (AppendReceipt, IdentityPage)>,
@@ -356,6 +358,7 @@ impl AssetIdentityResolver {
         }
         let mut read_pages = BTreeMap::new();
         let conditions = requested.iter().cloned().collect::<Vec<_>>();
+        let open_phase = Arc::new(());
         for chunk in conditions.chunks(self.gamma_batch_size.min(GAMMA_BATCH_SIZE)) {
             let mut pending = chunk.to_vec();
             let mut recorded = RecordedIdentityPages::default();
@@ -408,23 +411,44 @@ impl AssetIdentityResolver {
                 if pending.is_empty() {
                     break;
                 }
-                let (pages, fetched) =
-                    match self.client.fetch_markets_with_pages(&pending, filter).await {
-                        Ok(fetched) => {
-                            let result = if fetched.markets.unfetched.is_empty() {
-                                Ok(())
-                            } else {
-                                Err(SourceError::Fatal {
-                                    message: format!(
-                                        "gamma condition lookup rejected: {}",
-                                        fetched.markets.unfetched.join(",")
-                                    ),
-                                })
-                            };
-                            (fetched.pages, result)
-                        }
-                        Err(error) => (error.pages, Err(map_gamma_error(error.source))),
-                    };
+                let mut fetch_conditions = pending.clone();
+                if filter == MarketFilter::OpenOnly {
+                    let cache = self.cache.read().await;
+                    fetch_conditions.retain(|condition| {
+                        cache
+                            .completed_open_conditions
+                            .get(condition)
+                            .is_none_or(|phase| phase.strong_count() == 0)
+                    });
+                } else {
+                    let mut cache = self.cache.write().await;
+                    for condition in &fetch_conditions {
+                        cache.completed_open_conditions.remove(condition);
+                    }
+                }
+                if fetch_conditions.is_empty() {
+                    continue;
+                }
+                let (pages, fetched) = match self
+                    .client
+                    .fetch_markets_with_pages(&fetch_conditions, filter)
+                    .await
+                {
+                    Ok(fetched) => {
+                        let result = if fetched.markets.unfetched.is_empty() {
+                            Ok(())
+                        } else {
+                            Err(SourceError::Fatal {
+                                message: format!(
+                                    "gamma condition lookup rejected: {}",
+                                    fetched.markets.unfetched.join(",")
+                                ),
+                            })
+                        };
+                        (fetched.pages, result)
+                    }
+                    Err(error) => (error.pages, Err(map_gamma_error(error.source))),
+                };
                 for page in pages {
                     let sequence = self.record_page(&page).await?;
                     recorded.last_sequence = Some(sequence);
@@ -482,6 +506,10 @@ impl AssetIdentityResolver {
                         cache
                             .discovered_conditions
                             .insert(condition.clone(), tokens);
+                    } else if fetch_conditions.contains(condition) {
+                        cache
+                            .completed_open_conditions
+                            .insert(condition.clone(), Arc::downgrade(&open_phase));
                     }
                 }
                 pending.retain(|condition| {
@@ -3414,7 +3442,11 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, SourceError>> + Send + 'a>> {
             Box::pin(async move {
                 let url = reqwest::Url::parse(url).unwrap();
-                self.urls.lock().unwrap().push(url.to_string());
+                let first_request = {
+                    let mut urls = self.urls.lock().unwrap();
+                    urls.push(url.to_string());
+                    urls.len() == 1
+                };
                 let conditions = url
                     .query_pairs()
                     .filter(|(key, _)| key == "condition_ids")
@@ -3426,7 +3458,9 @@ mod tests {
                     .iter()
                     .any(|condition| condition == "condition-000");
                 if first && !closed {
-                    self.release.notified().await;
+                    if first_request {
+                        self.release.notified().await;
+                    }
                     if self.closed_first {
                         return Ok(b"[]".to_vec());
                     }
@@ -3460,6 +3494,151 @@ mod tests {
                     };
                 serde_json::to_vec(&markets).map_err(identity_store_error)
             })
+        }
+    }
+
+    /// PASS: overlapping discoveries share the completed open phase and the closed result.
+    /// FAIL: a queued discovery repeats the empty open request or records its page again.
+    #[tokio::test(start_paused = true)]
+    async fn overlapping_closed_condition_discoveries_share_completed_open_query() {
+        for durable in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("source.log");
+            let fetcher = Arc::new(InterleavedConditionFixture {
+                urls: StdMutex::new(Vec::new()),
+                release: tokio::sync::Notify::new(),
+                live_completed: std::sync::atomic::AtomicBool::new(true),
+                closed_first: true,
+                empty_last: false,
+            });
+            let resolver = if durable {
+                durable_resolver(
+                    &path,
+                    Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap()),
+                    "installed",
+                    fetcher.clone(),
+                    1,
+                )
+            } else {
+                AssetIdentityResolver::new(
+                    fetcher.clone(),
+                    BASE.into(),
+                    1,
+                    Arc::new(Mutex::new(SourceEventSink::open(&path).unwrap())),
+                )
+            };
+            let condition = PolymarketConditionId("condition-000".into());
+            let mut first = Box::pin(resolver.discover_conditions_for_bracket([condition.clone()]));
+            std::future::poll_fn(|cx| {
+                assert!(first.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            let mut second = Box::pin(resolver.discover_conditions_for_bracket([condition]));
+            std::future::poll_fn(|cx| {
+                assert!(second.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert_eq!(fetcher.urls.lock().unwrap().len(), 1);
+            fetcher.release.notify_one();
+            let (first, second) = tokio::join!(first, second);
+            let first = first.unwrap();
+            let second = second.unwrap();
+            assert_eq!(first.verified.len(), 1);
+            assert!(first.unverified.is_empty());
+            assert_eq!(second.verified, first.verified);
+            assert_eq!(second.provenance, first.provenance);
+            assert_eq!(second.unverified, first.unverified);
+            assert_eq!(
+                *fetcher.urls.lock().unwrap(),
+                [
+                    format!("{BASE}/markets?condition_ids=condition-000&limit=500"),
+                    format!("{BASE}/markets?condition_ids=condition-000&closed=true&limit=500"),
+                ]
+            );
+            assert_eq!(Reader::replay(&path).unwrap().count(), 2);
+        }
+    }
+
+    /// PASS: dropping a discovery after its empty open lookup lets a later caller fetch open.
+    /// FAIL: unfinished condition progress outlives its caller or becomes a completed empty memo.
+    #[tokio::test(start_paused = true)]
+    async fn dropped_condition_discovery_does_not_share_completed_open_query() {
+        for durable in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("source.log");
+            let fetcher = Arc::new(InterleavedConditionFixture {
+                urls: StdMutex::new(Vec::new()),
+                release: tokio::sync::Notify::new(),
+                live_completed: std::sync::atomic::AtomicBool::new(true),
+                closed_first: true,
+                empty_last: false,
+            });
+            let resolver = if durable {
+                durable_resolver(
+                    &path,
+                    Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap()),
+                    "installed",
+                    fetcher.clone(),
+                    1,
+                )
+            } else {
+                AssetIdentityResolver::new(
+                    fetcher.clone(),
+                    BASE.into(),
+                    1,
+                    Arc::new(Mutex::new(SourceEventSink::open(&path).unwrap())),
+                )
+            };
+            let condition = PolymarketConditionId("condition-000".into());
+            let mut first = Box::pin(resolver.discover_conditions_for_bracket([condition.clone()]));
+            std::future::poll_fn(|cx| {
+                assert!(first.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            // Queue a mutex waiter before the discovery can advance to its closed attempt.
+            let mut waiting = Box::pin(resolver.misses.lock());
+            std::future::poll_fn(|cx| {
+                assert!(waiting.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            fetcher.release.notify_one();
+            std::future::poll_fn(|cx| {
+                assert!(first.as_mut().poll(cx).is_pending());
+                std::task::Poll::Ready(())
+            })
+            .await;
+            assert_eq!(fetcher.urls.lock().unwrap().len(), 1);
+            assert_eq!(Reader::replay(&path).unwrap().count(), 1);
+            assert_eq!(
+                resolver.cache.read().await.completed_open_conditions[&condition.0].strong_count(),
+                1
+            );
+            drop(first);
+            assert_eq!(
+                resolver.cache.read().await.completed_open_conditions[&condition.0].strong_count(),
+                0
+            );
+            assert!(resolver.cache.read().await.discovered_conditions.is_empty());
+            drop(waiting.await);
+            let retried = resolver
+                .discover_conditions_for_bracket([condition])
+                .await
+                .unwrap();
+            assert_eq!(retried.verified.len(), 1);
+            assert!(retried.unverified.is_empty());
+            assert_eq!(
+                *fetcher.urls.lock().unwrap(),
+                [
+                    format!("{BASE}/markets?condition_ids=condition-000&limit=500"),
+                    format!("{BASE}/markets?condition_ids=condition-000&limit=500"),
+                    format!("{BASE}/markets?condition_ids=condition-000&closed=true&limit=500"),
+                ]
+            );
+            assert_eq!(Reader::replay(&path).unwrap().count(), 3);
         }
     }
 
