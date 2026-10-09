@@ -158,6 +158,7 @@ fn install(
     let captured = ledger_capture(engine.ledger(), paper, wallet()).unwrap();
     engine
         .install_anchors(&[AnchorInstall {
+            newest_activity_unix: None,
             fresh_history: Vec::new(),
             expected_fence: None,
             history_status: None,
@@ -644,4 +645,105 @@ fn history_only_bracket_disposition_replays_as_applied() {
         replay_wallet_ledger(&reopened, wallet()),
         Err(WalletLedgerReplayError::UnknownDisposition { .. })
     ));
+}
+
+/// PASS: a tail-installed anchor keeps baseline proof and source-derived activity clock across
+/// restart, boot reuse, and ordered post-anchor ledger replay.
+/// FAIL: restart requires lifetime tail walks, loses the older balance, or replays covered activity twice.
+#[test]
+fn baseline_tail_anchor_survives_restart_and_replays_post_anchor_activity() {
+    use pe_service::position_seeder::anchor_proves_full_history;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("paper.db");
+    let paper = Arc::new(PaperStateDb::open(&path).unwrap());
+    paper.seed_cursor_if_absent(&wallet(), 3990).unwrap();
+    let mut engine = BucketCommitEngine::load(paper.clone(), PositionLedger::new()).unwrap();
+    let captured = ledger_capture(engine.ledger(), &paper, wallet()).unwrap();
+    let walk = |start, end| json!({"fixed_end":end,"pages":[{"offset":0,"bounds":{"start":start,"end":end}}]});
+    let proof=json!({"version":1,"baseline_walk":walk(0,4000),"activity_walks":[walk(400,4001),walk(400,4002),walk(400,4003)]}).to_string();
+    engine
+        .install_anchors(&[AnchorInstall {
+            newest_activity_unix: Some(3990),
+            fresh_history: Vec::new(),
+            expected_fence: None,
+            history_status: Some(WalletHistoryStatusRecord {
+                wallet: wallet(),
+                complete: true,
+                proof_json: proof.clone(),
+                updated_at_unix: 4003,
+            }),
+            wallet: wallet(),
+            balances: vec![(
+                market("market-old"),
+                OutcomeId(0),
+                ShareAmount::from_atomic(5_000_000),
+            )],
+            cutoff: 4002,
+            proof: AnchorProof {
+                positions_proof_hash: "old-position".to_owned(),
+                activity_bounds_json: "[]".to_owned(),
+                source_log_generation: "scenario".to_owned(),
+                document: proof.clone(),
+                recorded_at_unix: 4003,
+            },
+            expected: AnchorExpectation {
+                ledger_hash: captured.hash,
+                cursor: captured.cursor,
+                anchor_seq: captured.anchor_seq,
+                coverage_generation: captured.coverage_generation,
+            },
+        }])
+        .unwrap();
+    engine
+        .commit(
+            vec![aggregate(
+                "0xpost-tail-anchor",
+                "market-old",
+                0,
+                "BUY",
+                "2",
+                4010,
+            )],
+            &context(4010),
+            zero_basis(),
+        )
+        .unwrap();
+    let expected = ledger_capture(engine.ledger(), &paper, wallet())
+        .unwrap()
+        .hash;
+    drop(engine);
+    drop(paper);
+    let paper = PaperStateDb::open(&path).unwrap();
+    let coverage = paper.wallet_coverage(&wallet()).unwrap();
+    let anchor = paper.position_anchors(&wallet()).unwrap().remove(0);
+    assert_eq!(anchor.proof_json, proof);
+    assert!(anchor_proves_full_history(&anchor.proof_json));
+    assert!(!paper.is_wallet_fenced(&wallet()).unwrap());
+    assert!(paper.wallet_history_complete(&wallet()).unwrap());
+    assert!(paper.cursor(&wallet()).unwrap().is_some());
+    assert_eq!(coverage.activity_cutoff_unix, Some(4002));
+    assert_eq!(coverage.anchor_seq, Some(anchor.anchor_seq));
+    assert!(!coverage.reanchor_required);
+    assert_eq!(paper.activity(&wallet()).unwrap(), Some(4010));
+    let replayed = replay_wallet_ledger(&paper, wallet()).unwrap();
+    assert_eq!(
+        ledger_capture(&replayed, &paper, wallet()).unwrap().hash,
+        expected
+    );
+    assert_eq!(
+        ledger_capture(&build_leader_ledger(&paper).unwrap(), &paper, wallet())
+            .unwrap()
+            .hash,
+        expected
+    );
+    assert_eq!(
+        replayed
+            .position(&wallet())
+            .unwrap()
+            .positions
+            .get(&MarketOutcomeId::new(market("market-old"), OutcomeId(0)))
+            .unwrap()
+            .long_contracts,
+        ShareAmount::from_atomic(7_000_000)
+    );
 }

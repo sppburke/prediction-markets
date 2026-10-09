@@ -382,7 +382,10 @@ activity cutoff, has an installed anchor regardless of age, and has
 `reanchor_required = false`. Any failed condition selects the wallet for `validate_direct`.
 The durable `position_anchors` proof selected by coverage must also retain all three full-history
 activity walks: each walk includes its original page-zero request with exclusive start zero and
-that walk's fixed end. Split pages keep their narrower bounds. Missing or older proof shapes,
+that walk's fixed end. A re-entry proof can instead retain a full `baseline_walk` with that
+page-zero evidence plus three tail walks whose page-zero starts are at or before the baseline's
+fixed end and whose ends equal their own fixed ends. Split pages keep their narrower bounds.
+Missing or older proof shapes,
 including omitted-start walks, require validation even when an old completion flag is true.
 `position_validation_current` is not a reuse prerequisite: ordinary activity can delete that
 temporary projection without deleting the durable anchor. Only reused wallets and wallets accepted
@@ -470,14 +473,26 @@ Copies only a leader's first BUY entry into a market that resolves within the co
 “History complete” means complete over attributable rows: rows whose asset no configured metadata authority can verify are recorded `raw_only` and cannot contribute a market to first-entry history.
 
 Every causal bracket requests full attributable history through exclusive `Some(0)` (wire
-`start=1`) for each of its three independently bounded activity walks. During catch-up, verified
-prior purchases for unfenced wallets consume all missing markets through the existing bucket
+`start=1`) for each of its three independently bounded activity walks, except runtime re-entry:
+one full baseline read and catch-up commit precede three stability reads from the baseline's fixed
+end minus `REENTRY_HISTORY_OVERLAP_SECS`, with the second tail's fixed end as the cutoff.
+A row absent from the baseline and timestamped before that overlap may escape re-detection at
+that re-entry, including a row that becomes visible during the sequential baseline acquisition or
+before the bracket completes.
+
+| Constant | Canonical value | Owner |
+|---|---:|---|
+| `REENTRY_HISTORY_OVERLAP_SECS` | 3,600 s | Compiled `pub const` in `crates/service/src/position_seeder.rs`; no runtime key. |
+
+During catch-up, verified prior purchases for unfenced wallets consume all missing markets
+through the existing bucket
 transaction and history projection, including while reanchoring is required and when a group was
 already stored without history. Fenced bracket reconciliation defers all covered-history repair to installation. Recovery permits
 only the existing order-dependent, underflow, overflow and late-group causes, or a revised aggregate
 with a unique durably dispositioned trigger matching original wallet/source epoch, canonical
 transaction identity and fence recording time. The second activity read's fixed end must be strictly
-after the integer fence bucket epoch. Missing or ambiguous evidence refuses recovery.
+after the integer fence bucket epoch (the second tail for re-entry). Missing or ambiguous evidence
+refuses recovery.
 Fresh metadata-prepared and immutable recorded originals plus all attributable revisions must contain
 no effective conversion or unknown effect. At serialized installation their BUY evidence through
 the cutoff repairs each missing market using the earliest `(source_epoch, source_trade_id)`; SELL
@@ -495,6 +510,12 @@ and invalidates the current bracket, including on its first read; exact retries 
 Committed clearance is a forward-only recovery boundary.
 Existing complete records and historical membership proof snapshots remain intact; the corrected
 durable anchor proves current full-history coverage (#641).
+
+Re-entry adds only `baseline_walk` to the existing proof; ledger replay is unchanged and no
+runtime key or migration is required. A rollback reader that requires three full walks refuses
+tail-installed anchors and leaves those wallets awaiting its full-history runtime re-entry,
+without deleting their durable state. Each re-entry attempt logs `reentry bracket attempt` with
+its outcome, baseline duration and stability-window duration for deployment measurement.
 
 For validator-backed runtime admission, a successful full-history bracket carries
 `WalletHistoryStatusRecord` through `AnchorInstall.history_status` into the accepted anchor
@@ -815,7 +836,7 @@ both tokens and row count agree, retrying one token race before returning typed 
 | `clv_compare_trades_fill_min_pp` | 5 | CLV source-comparison gate (#429 PR2, const `TRADES_FILL_MIN_PP`): min coverage (percentage points) the trades series must add beyond CLOB (AND be a sound proxy) to select `clob_primary_with_trades_fill`; below it the trades pass is dropped (`clob_only`). |
 | `true_clv_coverage_warn_pct` | 30 | Warn floor (percent) for the `true_clv` estimator's *position-level* CLOB coverage, checked in `suff_stats.materialize` when the optional `market_price_history` + `token_conditions` views ARE registered (issue #429 PR4): the share of materialized positions carrying a non-NaN `true_clv_close`. `true_clv` is best-effort (PR2's ~63.6% market-level ceiling, less at position level), so 30 catches the degenerate/mis-wired case (≈0% — empty backfill or a broken join) without false-warning on the expected partial coverage. Distinct from the bootstrap-side `prices_history_coverage_warn_pct` (market-level, Rust). Const `TRUE_CLV_COVERAGE_WARN_PCT` in `scripts/ranker/suff_stats.py`. |
 | `maintenance_interval_secs` | 600 | `ServiceConfig` field (issue #350 WS1 PR-D). The first maintenance tick runs at startup; this interval's sleep follows each completed tick (inactivity + underperformance knockout + atomic backfill). `0` disables the tick entirely (skipped, not a zero-duration loop). The task is spawned only when `supabase_url` is non-empty and this is `> 0`. `PE_MAINTENANCE_INTERVAL_SECS`. One monotonic launch deadline covers mutex waiting, full rerank, replanning, live reentry and knockout/backfill. Expiry prevents new brackets and optional retries; started work drains and completed acceptances use existing publication checks. Unstarted wallets remain retryable without failure, cooldown or attempted status. Launch order uses per-wallet queue keys in the shared admission preparer: first offers take keys in rank order, each started wallet moves behind every waiting wallet, and keys survive ranking-batch and capacity resynchronization. Additions and live re-entries alternate which path prepares first each tick. A live re-entry with a counted admission failure since it was last live (see [`admission_retry_secs`](#admission_retry_secs)) is skipped by every re-entry call that runs before its tick's additions (both calls on a re-entry-first tick); it stays eligible for the call after additions on the next tick and for the call after a full-rerank swap (#749). `admission launch order` reports `path`, `first`, `eligible`, `started` and `started_previous_keys`; `maintenance admission budget completed` reports `attempted_batch_id`, `applied_batch_id` and `capacity_generation` alongside its timing and outcome counts. |
-| `inactivity_threshold_secs` | 259_200 | `ServiceConfig` field (#350 WS1 PR-D). A live wallet idle (no observed trade) ≥ this many seconds is evicted, unless it is a proven winner (then spared up to `inactivity_hard_cap_secs`). 72 h. Inactivity uses the Activity clock (#511), falling back to the delivery cursor; ranking timestamps seed that clock without an admission grace period. `PE_INACTIVITY_THRESHOLD_SECS`. |
+| `inactivity_threshold_secs` | 259_200 | `ServiceConfig` field (#350 WS1 PR-D). A live wallet idle (no observed trade) ≥ this many seconds is evicted, unless it is a proven winner (then spared up to `inactivity_hard_cap_secs`). 72 h. Inactivity uses the Activity clock (#511), falling back to the delivery cursor; ranking timestamps seed that clock without an admission grace period. Every accepted anchor installation MAX-advances it to the newest acquired activity source timestamp (baseline and tails for re-entry, all three full reads otherwise), before membership publication, without changing the delivery cursor; neither the cutoff nor current time supplies this update. `PE_INACTIVITY_THRESHOLD_SECS`. |
 | `inactivity_hard_cap_secs` | 604_800 | `ServiceConfig` field (#350 WS1 PR-D). Hard ceiling on sparing a proven winner from inactivity eviction: past this idle span the wallet is evicted unconditionally (a winner silent for a week is more likely abandoned than patient). 7 d. `PE_INACTIVITY_HARD_CAP_SECS`. |
 | `bench_overfetch` | 10 | `ServiceConfig` field (#350 WS1 PR-D). Accepted for configuration compatibility only; since #588 it has no runtime effect because membership maintenance reads the latest ranking batch bounded by `MAX_ACTIVE_WATCHLIST_SIZE` (fence-before-cap selection). `PE_BENCH_OVERFETCH`. |
 | `demotion_min_trades` | 10 | `ServiceConfig` field (#350 WS1 PR-D). Minimum settled fills before either the underperformance demotion (`WalletEdgeStats::should_demote`) or the proven-winner inactivity exception (`is_proven_winner`) applies — no judgement on small samples. `PE_DEMOTION_MIN_TRADES`. |

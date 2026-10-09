@@ -34,7 +34,9 @@ use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
-use crate::asset_identity::{AssetIdentityResolver, BootSourceLog, IdentityProvenance};
+use crate::asset_identity::{
+    AssetIdentityResolver, BootSourceLog, IdentityProvenance, ResolvedIdentities,
+};
 use crate::bucket_commit::{
     AnchorInstallError, BucketCommitEngine, BucketDecisionContext, IdentityOverride,
 };
@@ -48,17 +50,21 @@ type BracketStepHook = Arc<dyn Fn(WalletAddress, usize, &mut BucketCommitEngine)
 type AnchorInstallHook = Arc<dyn Fn(&[AnchorInstall]) + Send + Sync>;
 
 pub const BRACKET_CONCURRENCY: usize = 4;
+pub const REENTRY_HISTORY_OVERLAP_SECS: i64 = 3_600;
 
 /// Routine refresh yields unseen post-anchor activity to ordinary reconciliation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ValidationPurpose {
     CatchUp,
+    Reentry,
     RoutineRefresh { cutoff: i64 },
 }
 
 /// A venue-authoritative balance snapshot waiting for the single-owner install.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnchorInstall {
+    /// Newest acquired source timestamp; installation MAX-advances activity without moving delivery.
+    pub newest_activity_unix: Option<i64>,
     pub fresh_history: Vec<MarketHistoryRecord>,
     pub expected_fence: Option<WalletFenceRecord>,
     /// Runtime acceptance completes history in the anchor transaction; direct boot leaves this absent.
@@ -79,14 +85,15 @@ pub struct AnchorProof {
     pub recorded_at_unix: i64,
 }
 
-/// Whether an accepted anchor retained the original full-history request for
-/// each bracket walk. Split pages can have narrower bounds and are not substitutes
+/// Whether an accepted anchor retained full-history walks or a full baseline
+/// with overlapping re-entry tails. Split pages can have narrower bounds and do not substitute
 /// for the original page-zero evidence. Older proof shapes require revalidation.
 #[must_use]
 pub fn anchor_proves_full_history(document: &str) -> bool {
     #[derive(Deserialize)]
     struct Proof {
         activity_walks: [Walk; 3],
+        baseline_walk: Option<Walk>,
     }
     #[derive(Deserialize)]
     struct Walk {
@@ -100,14 +107,25 @@ pub fn anchor_proves_full_history(document: &str) -> bool {
     }
 
     serde_json::from_str::<Proof>(document).is_ok_and(|proof| {
-        proof.activity_walks.iter().all(|walk| {
+        let has_page_zero = |walk: &Walk, start: &dyn Fn(i64) -> bool| {
             walk.pages.iter().any(|page| {
                 page.offset == 0
                     && page.bounds.is_some_and(|bounds| {
-                        bounds.start == Some(0) && bounds.end == walk.fixed_end
+                        bounds.start.is_some_and(start) && bounds.end == walk.fixed_end
                     })
             })
-        })
+        };
+        proof
+            .activity_walks
+            .iter()
+            .all(|walk| has_page_zero(walk, &|start| start == 0))
+            || proof.baseline_walk.as_ref().is_some_and(|baseline| {
+                has_page_zero(baseline, &|start| start == 0)
+                    && proof
+                        .activity_walks
+                        .iter()
+                        .all(|walk| has_page_zero(walk, &|start| start <= baseline.fixed_end))
+            })
     })
 }
 
@@ -604,6 +622,12 @@ pub struct CausalPositionValidator {
 struct ActivityEvidence {
     fixed_end: i64,
     pages: Vec<pe_source_polymarket_public::ReconciliationPageEvidence>,
+    newest_activity_unix: Option<i64>,
+}
+
+struct BracketActivityEvidence<'a> {
+    walks: [&'a ActivityEvidence; 3],
+    baseline: Option<&'a ActivityEvidence>,
 }
 
 struct PreparedActivity {
@@ -618,6 +642,7 @@ struct PreparedActivity {
 impl From<CompleteActivityRead> for ActivityEvidence {
     fn from(read: CompleteActivityRead) -> Self {
         Self {
+            newest_activity_unix: newest_activity_unix(&read),
             fixed_end: read.fixed_end,
             pages: read.pages,
         }
@@ -908,125 +933,186 @@ impl CausalPositionValidator {
         purpose: ValidationPurpose,
         ordinary_reconciliation_needed: &mut bool,
     ) -> Result<AnchorInstall, CausalPositionError> {
-        let expected_fence = paper_state.wallet_fence(&wallet)?;
-        if let Some(fence) = &expected_fence
-            && !recoverable_fence(paper_state, fence)?
-        {
-            return Err(CausalPositionError::Fenced { wallet });
-        }
-        let mut fresh_history = Vec::new();
-        let mut metadata_reads = BTreeMap::new();
-        let mut unresolved_assets = BTreeMap::new();
-        let first_activity = self.activity(wallet).await?;
-        self.preflight_control_read(
-            wallet,
-            &first_activity,
-            paper_state,
-            purpose,
-            ordinary_reconciliation_needed,
-        )?;
-        let first_prepared = self.prepare_activity(wallet, &first_activity).await?;
-        if expected_fence.is_some() {
-            fresh_history.extend(recovery_fresh_history(
-                wallet,
-                &first_activity,
-                &first_prepared,
-            )?);
-        }
-        metadata_reads.extend(first_prepared.metadata_reads.clone());
-        unresolved_assets.extend(first_prepared.unresolved_assets.clone());
-        self.commit_control(wallet, &first_activity, &first_prepared, control_tx, false)
-            .await?;
-        let first_ledger = capture_control(wallet, control_tx).await?;
-        let first_positions =
-            retain_missing_mapping(self.positions(wallet, &first_prepared.mapping).await)?;
-        let first_activity = ActivityEvidence::from(first_activity);
-
-        let second_activity = self.activity(wallet).await?;
-        self.preflight_control_read(
-            wallet,
-            &second_activity,
-            paper_state,
-            purpose,
-            ordinary_reconciliation_needed,
-        )?;
-        let second_prepared = self.prepare_activity(wallet, &second_activity).await?;
-        if expected_fence.is_some() {
-            fresh_history.extend(recovery_fresh_history(
-                wallet,
-                &second_activity,
-                &second_prepared,
-            )?);
-        }
-        resolve_missing_mapping(wallet, &first_positions, &second_prepared.mapping)?;
-        metadata_reads.extend(second_prepared.metadata_reads.clone());
-        unresolved_assets.extend(second_prepared.unresolved_assets.clone());
-        if self
-            .commit_control(wallet, &second_activity, &second_prepared, control_tx, true)
-            .await?
-        {
-            return Err(CausalPositionError::InterveningActivity { wallet });
-        }
-        let second_ledger = capture_control(wallet, control_tx).await?;
-        let second_positions =
-            retain_missing_mapping(self.positions(wallet, &second_prepared.mapping).await)?;
-        let second_activity = ActivityEvidence::from(second_activity);
-
-        let final_activity = self.activity(wallet).await?;
-        self.preflight_control_read(
-            wallet,
-            &final_activity,
-            paper_state,
-            purpose,
-            ordinary_reconciliation_needed,
-        )?;
-        let final_prepared = self.prepare_activity(wallet, &final_activity).await?;
-        if expected_fence.is_some() {
-            fresh_history.extend(recovery_fresh_history(
-                wallet,
-                &final_activity,
-                &final_prepared,
-            )?);
-        }
-        resolve_missing_mapping(wallet, &second_positions, &final_prepared.mapping)?;
-        unresolved_assets.extend(final_prepared.unresolved_assets.clone());
-        metadata_reads.extend(final_prepared.metadata_reads.clone());
-        if self
-            .commit_control(wallet, &final_activity, &final_prepared, control_tx, true)
-            .await?
-        {
-            return Err(CausalPositionError::InterveningActivity { wallet });
-        }
-        let final_ledger = capture_control(wallet, control_tx).await?;
-        let final_activity = ActivityEvidence::from(final_activity);
-        let mut install = self.finish(
-            wallet,
-            [&first_activity, &second_activity, &final_activity],
-            [&first_ledger, &second_ledger, &final_ledger],
-            first_positions
-                .as_ref()
-                .map_err(|_| CausalPositionError::InterveningActivity { wallet })?,
-            second_positions
-                .as_ref()
-                .map_err(|_| CausalPositionError::InterveningActivity { wallet })?,
-            metadata_reads.into_values().collect(),
-        )?;
-        log_unresolved_activity_assets(wallet, &unresolved_assets);
-        if let Some(fence) = &expected_fence {
-            if fence_epoch(fence).is_none_or(|epoch| install.cutoff <= epoch) {
+        let mut baseline_started = None;
+        let mut baseline_completed = None;
+        let mut stability_started = None;
+        let mut stability_completed = None;
+        let result = async {
+            let expected_fence = paper_state.wallet_fence(&wallet)?;
+            if let Some(fence) = &expected_fence
+                && !recoverable_fence(paper_state, fence)?
+            {
                 return Err(CausalPositionError::Fenced { wallet });
             }
-            fresh_history.retain(|history| history.first_epoch <= install.cutoff);
-            install.fresh_history = fresh_history;
-            install.expected_fence = expected_fence;
+            let mut fresh_history = Vec::new();
+            let mut metadata_reads = BTreeMap::new();
+            let mut unresolved_assets = BTreeMap::new();
+            let mut baseline = if purpose == ValidationPurpose::Reentry {
+                baseline_started = Some(Instant::now());
+                let activity = self.activity(wallet).await?;
+                self.preflight_control_read(
+                    wallet,
+                    &activity,
+                    paper_state,
+                    purpose,
+                    ordinary_reconciliation_needed,
+                )?;
+                let mut prepared = self.prepare_activity(wallet, &activity).await?;
+                if expected_fence.is_some() {
+                    fresh_history.extend(recovery_fresh_history(wallet, &activity, &prepared)?);
+                }
+                metadata_reads.extend(std::mem::take(&mut prepared.metadata_reads));
+                unresolved_assets.extend(std::mem::take(&mut prepared.unresolved_assets));
+                self.commit_control(wallet, &activity, &prepared, control_tx, false)
+                    .await?;
+                baseline_completed = Some(Instant::now());
+                Some(activity)
+            } else {
+                None
+            };
+            let start = baseline.as_ref().map_or(Some(0), |read| {
+                Some(read.fixed_end.saturating_sub(REENTRY_HISTORY_OVERLAP_SECS))
+            });
+            let first_fixed_end = (self.now)();
+            if baseline.is_some() {
+                stability_started = Some(Instant::now());
+            }
+            let first_activity = self.activity_since(wallet, start, first_fixed_end).await?;
+            self.preflight_control_read(
+                wallet,
+                &first_activity,
+                paper_state,
+                purpose,
+                ordinary_reconciliation_needed,
+            )?;
+            let (mut first_prepared, first_mapping) = self
+                .prepare_bracket_activity(wallet, &first_activity, baseline.as_mut())
+                .await?;
+            if expected_fence.is_some() {
+                fresh_history.extend(recovery_fresh_history(
+                    wallet,
+                    &first_activity,
+                    &first_prepared,
+                )?);
+            }
+            metadata_reads.extend(std::mem::take(&mut first_prepared.metadata_reads));
+            unresolved_assets.extend(std::mem::take(&mut first_prepared.unresolved_assets));
+            self.commit_control(wallet, &first_activity, &first_prepared, control_tx, false)
+                .await?;
+            let first_ledger = capture_control(wallet, control_tx).await?;
+            let first_positions =
+                retain_missing_mapping(self.positions(wallet, &first_mapping).await)?;
+            drop(first_mapping);
+            let first_activity = ActivityEvidence::from(first_activity);
+
+            let second_activity = self.activity_since(wallet, start, (self.now)()).await?;
+            self.preflight_control_read(
+                wallet,
+                &second_activity,
+                paper_state,
+                purpose,
+                ordinary_reconciliation_needed,
+            )?;
+            let (mut second_prepared, second_mapping) = self
+                .prepare_bracket_activity(wallet, &second_activity, baseline.as_mut())
+                .await?;
+            if expected_fence.is_some() {
+                fresh_history.extend(recovery_fresh_history(
+                    wallet,
+                    &second_activity,
+                    &second_prepared,
+                )?);
+            }
+            resolve_missing_mapping(wallet, &first_positions, &second_mapping)?;
+            metadata_reads.extend(std::mem::take(&mut second_prepared.metadata_reads));
+            unresolved_assets.extend(std::mem::take(&mut second_prepared.unresolved_assets));
+            if self
+                .commit_control(wallet, &second_activity, &second_prepared, control_tx, true)
+                .await?
+            {
+                return Err(CausalPositionError::InterveningActivity { wallet });
+            }
+            let second_ledger = capture_control(wallet, control_tx).await?;
+            let second_positions =
+                retain_missing_mapping(self.positions(wallet, &second_mapping).await)?;
+            drop(second_mapping);
+            let second_activity = ActivityEvidence::from(second_activity);
+
+            let final_activity = self.activity_since(wallet, start, (self.now)()).await?;
+            self.preflight_control_read(
+                wallet,
+                &final_activity,
+                paper_state,
+                purpose,
+                ordinary_reconciliation_needed,
+            )?;
+            let (mut final_prepared, final_mapping) = self
+                .prepare_bracket_activity(wallet, &final_activity, baseline.as_mut())
+                .await?;
+            if expected_fence.is_some() {
+                fresh_history.extend(recovery_fresh_history(
+                    wallet,
+                    &final_activity,
+                    &final_prepared,
+                )?);
+            }
+            resolve_missing_mapping(wallet, &second_positions, &final_mapping)?;
+            drop(final_mapping);
+            unresolved_assets.extend(std::mem::take(&mut final_prepared.unresolved_assets));
+            metadata_reads.extend(std::mem::take(&mut final_prepared.metadata_reads));
+            if self
+                .commit_control(wallet, &final_activity, &final_prepared, control_tx, true)
+                .await?
+            {
+                return Err(CausalPositionError::InterveningActivity { wallet });
+            }
+            stability_completed = Some(Instant::now());
+            let final_ledger = capture_control(wallet, control_tx).await?;
+            let final_activity = ActivityEvidence::from(final_activity);
+            let mut install = self.finish(
+                wallet,
+                BracketActivityEvidence {
+                    walks: [&first_activity, &second_activity, &final_activity],
+                    baseline: baseline.map(ActivityEvidence::from).as_ref(),
+                },
+                [&first_ledger, &second_ledger, &final_ledger],
+                first_positions
+                    .as_ref()
+                    .map_err(|_| CausalPositionError::InterveningActivity { wallet })?,
+                second_positions
+                    .as_ref()
+                    .map_err(|_| CausalPositionError::InterveningActivity { wallet })?,
+                metadata_reads.into_values().collect(),
+            )?;
+            log_unresolved_activity_assets(wallet, &unresolved_assets);
+            if let Some(fence) = &expected_fence {
+                if fence_epoch(fence).is_none_or(|epoch| install.cutoff <= epoch) {
+                    return Err(CausalPositionError::Fenced { wallet });
+                }
+                fresh_history.retain(|history| history.first_epoch <= install.cutoff);
+                install.fresh_history = fresh_history;
+                install.expected_fence = expected_fence;
+            }
+            install.history_status = Some(WalletHistoryStatusRecord {
+                wallet,
+                complete: true,
+                proof_json: install.proof.document.clone(),
+                updated_at_unix: install.proof.recorded_at_unix,
+            });
+            Ok(install)
         }
-        install.history_status = Some(WalletHistoryStatusRecord {
-            wallet,
-            complete: true,
-            proof_json: install.proof.document.clone(),
-            updated_at_unix: install.proof.recorded_at_unix,
-        });
-        Ok(install)
+        .await;
+        if purpose == ValidationPurpose::Reentry {
+            let ended = Instant::now();
+            tracing::info!(
+                wallet = %wallet,
+                outcome = result.as_ref().map_or_else(|error| error.kind(), |_| "accepted"),
+                baseline_ms = u64::try_from(baseline_started.map_or(0, |start| baseline_completed.unwrap_or(ended).duration_since(start).as_millis())).unwrap_or(u64::MAX),
+                stability_window_ms = u64::try_from(stability_started.map_or(0, |start| if result.is_err() { ended } else { stability_completed.unwrap_or(ended) }.duration_since(start).as_millis())).unwrap_or(u64::MAX),
+                "reentry bracket attempt"
+            );
+        }
+        result
     }
 
     async fn validate_one_direct(
@@ -1120,7 +1206,10 @@ impl CausalPositionValidator {
         let final_activity = ActivityEvidence::from(final_activity);
         let install = self.finish(
             wallet,
-            [&first_activity, &second_activity, &final_activity],
+            BracketActivityEvidence {
+                walks: [&first_activity, &second_activity, &final_activity],
+                baseline: None,
+            },
             [&first_ledger, &second_ledger, &final_ledger],
             first_positions
                 .as_ref()
@@ -1150,12 +1239,21 @@ impl CausalPositionValidator {
         &self,
         wallet: WalletAddress,
     ) -> Result<CompleteActivityRead, CausalPositionError> {
+        self.activity_since(wallet, Some(0), (self.now)()).await
+    }
+
+    async fn activity_since(
+        &self,
+        wallet: WalletAddress,
+        start: Option<i64>,
+        fixed_end: i64,
+    ) -> Result<CompleteActivityRead, CausalPositionError> {
         fetch_complete_activity(
             self.fetcher.as_ref(),
             &self.base_url,
             wallet,
-            Some(0),
-            (self.now)(),
+            start,
+            fixed_end,
         )
         .await
         .map_err(|source| CausalPositionError::Activity { wallet, source })
@@ -1166,40 +1264,58 @@ impl CausalPositionValidator {
         wallet: WalletAddress,
         activity: &CompleteActivityRead,
     ) -> Result<PreparedActivity, CausalPositionError> {
-        let mut mapping = activity
-            .asset_mapping()
-            .map_err(|source| CausalPositionError::Positions { wallet, source })?;
+        let (mapping, resolved) = self
+            .resolve_activity_mapping(wallet, ActivityAssetMapping::from_rows(&activity.rows))
+            .await?;
+        self.prepare_resolved_activity(wallet, activity, mapping, resolved)
+    }
+
+    async fn prepare_bracket_activity(
+        &self,
+        wallet: WalletAddress,
+        activity: &CompleteActivityRead,
+        baseline: Option<&mut CompleteActivityRead>,
+    ) -> Result<(PreparedActivity, ActivityAssetMapping), CausalPositionError> {
+        let Some(baseline) = baseline else {
+            let prepared = self.prepare_activity(wallet, activity).await?;
+            let mapping = prepared.mapping.clone();
+            return Ok((prepared, mapping));
+        };
+        // Build the union in place before awaiting resolution; only the short tail is cloned.
+        let baseline_len = baseline.rows.len();
+        baseline.rows.extend_from_slice(&activity.rows);
+        let union = ActivityAssetMapping::from_rows(&baseline.rows);
+        baseline.rows.truncate(baseline_len);
+        let (mapping, resolved) = self.resolve_activity_mapping(wallet, union).await?;
+        let mut tail_mapping = ActivityAssetMapping::from_rows(&activity.rows);
+        apply_resolved_mapping(wallet, &mut tail_mapping, &resolved)?;
+        let prepared = self.prepare_resolved_activity(wallet, activity, tail_mapping, resolved)?;
+        Ok((prepared, mapping))
+    }
+
+    async fn resolve_activity_mapping(
+        &self,
+        wallet: WalletAddress,
+        mut mapping: ActivityAssetMapping,
+    ) -> Result<(ActivityAssetMapping, ResolvedIdentities), CausalPositionError> {
         let tokens = mapping.tokens().cloned().collect::<Vec<_>>();
         let resolved = self
             .asset_identity
-            .resolve_historical_for_bracket(tokens.clone())
+            .resolve_historical_for_bracket(tokens)
             .await
             .map_err(|source| CausalPositionError::Identity { wallet, source })?;
-        for (asset, identity) in &resolved.verified {
-            mapping
-                .apply_verified(asset, identity)
-                .map_err(|source| CausalPositionError::Positions { wallet, source })?;
-        }
-        for asset in &tokens {
-            if mapping.classification(asset).is_none() {
-                let source = PositionReadError::MixedActivityClassification {
-                    asset: asset.0.clone(),
-                };
-                return Err(CausalPositionError::Positions { wallet, source });
-            }
-            if resolved.verified.contains_key(asset) && !resolved.provenance.contains_key(asset) {
-                return Err(CausalPositionError::Identity {
-                    wallet,
-                    source: SourceError::Fatal {
-                        message: format!(
-                            "verified token {} has no durable metadata provenance",
-                            asset.0
-                        ),
-                    },
-                });
-            }
-        }
+        apply_resolved_mapping(wallet, &mut mapping, &resolved)?;
+        Ok((mapping, resolved))
+    }
 
+    fn prepare_resolved_activity(
+        &self,
+        wallet: WalletAddress,
+        activity: &CompleteActivityRead,
+        mapping: ActivityAssetMapping,
+        resolved: ResolvedIdentities,
+    ) -> Result<PreparedActivity, CausalPositionError> {
+        let tokens = mapping.tokens().cloned().collect::<Vec<_>>();
         let mut identity_overrides = HashMap::new();
         let unresolved_assets = tokens
             .iter()
@@ -1349,13 +1465,18 @@ impl CausalPositionValidator {
     fn finish(
         &self,
         wallet: WalletAddress,
-        activities: [&ActivityEvidence; 3],
+        activity: BracketActivityEvidence<'_>,
         ledgers: [&AdmissionLedgerCapture; 3],
         first_positions: &CompletePositionsRead,
         second_positions: &CompletePositionsRead,
         metadata_reads: Vec<IdentityProvenance>,
     ) -> Result<AnchorInstall, CausalPositionError> {
-        for pair in activities.windows(2) {
+        let BracketActivityEvidence {
+            walks: activities,
+            baseline,
+        } = activity;
+        let reads = baseline.into_iter().chain(activities).collect::<Vec<_>>();
+        for pair in reads.windows(2) {
             if pair[1].fixed_end < pair[0].fixed_end {
                 return Err(CausalPositionError::NonMonotonicActivityBounds {
                     wallet,
@@ -1389,7 +1510,7 @@ impl CausalPositionValidator {
                 })
             })
             .collect::<Vec<_>>();
-        let proof = json!({
+        let mut proof = json!({
             "version": 1,
             "wallet": wallet,
             "source_id": ACTIVITY_POLL_SOURCE_ID,
@@ -1409,7 +1530,17 @@ impl CausalPositionValidator {
                 },
             ],
         });
+        if let Some(baseline) = baseline {
+            proof["baseline_walk"] = json!({
+                "fixed_end": baseline.fixed_end,
+                "pages": baseline.pages,
+            });
+        }
         Ok(AnchorInstall {
+            newest_activity_unix: reads
+                .iter()
+                .filter_map(|read| read.newest_activity_unix)
+                .max(),
             fresh_history: Vec::new(),
             expected_fence: None,
             history_status: None,
@@ -1431,6 +1562,51 @@ impl CausalPositionValidator {
             },
         })
     }
+}
+
+fn newest_activity_unix(activity: &CompleteActivityRead) -> Option<i64> {
+    activity
+        .rows
+        .iter()
+        .map(|row| row.source_time.0.unix_timestamp())
+        .max()
+}
+
+fn apply_resolved_mapping(
+    wallet: WalletAddress,
+    mapping: &mut ActivityAssetMapping,
+    resolved: &ResolvedIdentities,
+) -> Result<(), CausalPositionError> {
+    let tokens = mapping.tokens().cloned().collect::<Vec<_>>();
+    for asset in &tokens {
+        let Some(identity) = resolved.verified.get(asset) else {
+            continue;
+        };
+        mapping
+            .apply_verified(asset, identity)
+            .map_err(|source| CausalPositionError::Positions { wallet, source })?;
+    }
+    for asset in &tokens {
+        if mapping.classification(asset).is_none() {
+            let source = PositionReadError::MixedActivityClassification {
+                asset: asset.0.clone(),
+            };
+            return Err(CausalPositionError::Positions { wallet, source });
+        }
+        if resolved.verified.contains_key(asset) && !resolved.provenance.contains_key(asset) {
+            return Err(CausalPositionError::Identity {
+                wallet,
+                source: SourceError::Fatal {
+                    message: format!(
+                        "verified token {} has no durable metadata provenance",
+                        asset.0
+                    ),
+                },
+            });
+        }
+    }
+
+    Ok(())
 }
 
 // Only an absent activity mapping is held across the next walk. Every other position-read
@@ -1866,6 +2042,155 @@ mod tests {
         PositionReadError, aggregate_activity_rows, parse_activity_response,
     };
 
+    fn walk_proof(start: Option<i64>, end: i64) -> serde_json::Value {
+        json!({"fixed_end": end, "pages": [{"offset": 0, "bounds": {"start": start, "end": end}}]})
+    }
+
+    #[tokio::test]
+    async fn finish_preserves_legacy_proof_bytes_and_uses_all_acquired_source_clocks() {
+        let wallet = WalletAddress([1; 20]);
+        let dir = tempfile::tempdir().unwrap();
+        let fetcher: Arc<dyn ReconciliationFetcher> = Arc::new(EmptyFetcher);
+        let source_log = Arc::new(tokio::sync::Mutex::new(
+            SourceEventSink::open(dir.path().join("source.log")).unwrap(),
+        ));
+        let resolver = Arc::new(AssetIdentityResolver::new(
+            Arc::clone(&fetcher),
+            "https://gamma.example.com".to_owned(),
+            10,
+            source_log,
+        ));
+        let validator = CausalPositionValidator::new(
+            fetcher,
+            "https://data.example.com",
+            "fixture-generation",
+            resolver,
+        )
+        .with_clock(Arc::new(|| 5000));
+        let positions = validator
+            .positions(wallet, &ActivityAssetMapping::from_rows(&[]))
+            .await
+            .unwrap();
+        let evidence = [
+            ActivityEvidence {
+                fixed_end: 4001,
+                pages: Vec::new(),
+                newest_activity_unix: Some(100),
+            },
+            ActivityEvidence {
+                fixed_end: 4002,
+                pages: Vec::new(),
+                newest_activity_unix: Some(200),
+            },
+            ActivityEvidence {
+                fixed_end: 4003,
+                pages: Vec::new(),
+                newest_activity_unix: Some(300),
+            },
+        ];
+        let baseline = ActivityEvidence {
+            fixed_end: 4000,
+            pages: Vec::new(),
+            newest_activity_unix: Some(1000),
+        };
+        let ledger = AdmissionLedgerCapture {
+            wallet,
+            hash: "unchanged".to_owned(),
+            cursor: Some(300),
+            anchor_seq: None,
+            coverage_generation: 0,
+        };
+        let finish = |baseline| {
+            validator
+                .finish(
+                    wallet,
+                    BracketActivityEvidence {
+                        walks: [&evidence[0], &evidence[1], &evidence[2]],
+                        baseline,
+                    },
+                    [&ledger; 3],
+                    &positions,
+                    &positions,
+                    Vec::new(),
+                )
+                .unwrap()
+        };
+        let legacy = finish(None);
+        // The pre-R1 wire document is kept exactly, including key ordering and no new field.
+        let expected = json!({
+            "version": 1, "wallet": wallet, "source_id": ACTIVITY_POLL_SOURCE_ID,
+            "positions_semantic_hash": positions.semantic_hash(), "expected_ledger_hash": "unchanged",
+            "source_log_generation": "fixture-generation",
+            "activity_walks": [{"fixed_end":4001,"pages":[]},{"fixed_end":4002,"pages":[]},{"fixed_end":4003,"pages":[]}],
+            "metadata_reads": [], "positions_reads": [
+                {"semantic_hash":positions.semantic_hash(),"pages":positions.pages},
+                {"semantic_hash":positions.semantic_hash(),"pages":positions.pages},
+            ],
+        });
+        assert_eq!(legacy.proof.document, expected.to_string());
+        assert_eq!(legacy.newest_activity_unix, Some(300));
+        let reentry = finish(Some(&baseline));
+        assert_eq!(reentry.newest_activity_unix, Some(1000));
+        assert_eq!(reentry.cutoff, 4002);
+        let mut proof: serde_json::Value = serde_json::from_str(&reentry.proof.document).unwrap();
+        assert_eq!(
+            proof.as_object_mut().unwrap().remove("baseline_walk"),
+            Some(json!({"fixed_end":4000,"pages":[]}))
+        );
+        assert_eq!(proof.to_string(), legacy.proof.document);
+    }
+
+    #[test]
+    fn anchor_full_history_accepts_legacy_and_overlapping_baseline_proofs() {
+        let full = json!({"activity_walks": [walk_proof(Some(0), 4000), walk_proof(Some(0), 4001), walk_proof(Some(0), 4002)]});
+        assert!(anchor_proves_full_history(&full.to_string()));
+        for start in [400, 4000, -1] {
+            let proof = json!({
+                "baseline_walk": walk_proof(Some(0), 4000),
+                "activity_walks": [walk_proof(Some(start), 4001), walk_proof(Some(start), 4002), walk_proof(Some(start), 4003)]
+            });
+            assert!(anchor_proves_full_history(&proof.to_string()));
+        }
+    }
+
+    #[test]
+    fn anchor_full_history_rejects_missing_or_incoherent_page_zero_evidence() {
+        let valid = json!({
+            "baseline_walk": walk_proof(Some(0), 4000),
+            "activity_walks": [walk_proof(Some(400), 4001), walk_proof(Some(400), 4002), walk_proof(Some(400), 4003)]
+        });
+        let mut cases = Vec::new();
+        let mut proof = valid.clone();
+        proof.as_object_mut().unwrap().remove("baseline_walk");
+        cases.push(proof);
+        for path in ["baseline", "tail"] {
+            for field in ["start", "end", "offset", "bounds", "pages"] {
+                let mut proof = valid.clone();
+                let walk = if path == "baseline" {
+                    &mut proof["baseline_walk"]
+                } else {
+                    &mut proof["activity_walks"][2]
+                };
+                match field {
+                    "start" => walk["pages"][0]["bounds"]["start"] = json!(4001),
+                    "end" => walk["pages"][0]["bounds"]["end"] = json!(999),
+                    "offset" => walk["pages"][0]["offset"] = json!(500),
+                    "bounds" => walk["pages"][0]["bounds"] = serde_json::Value::Null,
+                    "pages" => walk["pages"] = json!([]),
+                    _ => unreachable!(),
+                }
+                cases.push(proof);
+            }
+        }
+        let mut proof = valid;
+        proof["activity_walks"][1]["pages"][0]["bounds"]["start"] = serde_json::Value::Null;
+        cases.push(proof);
+        cases.extend([json!({}), json!({"activity_walks": []})]);
+        for proof in cases {
+            assert!(!anchor_proves_full_history(&proof.to_string()), "{proof}");
+        }
+    }
+
     #[test]
     fn admission_failure_classes_follow_typed_origins() {
         let wallet = WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap();
@@ -2276,6 +2601,7 @@ mod tests {
         let captured = ledger_capture(engine.ledger(), &paper, wallet).unwrap();
         engine
             .install_anchors(&[AnchorInstall {
+                newest_activity_unix: None,
                 fresh_history: Vec::new(),
                 expected_fence: None,
                 history_status: None,

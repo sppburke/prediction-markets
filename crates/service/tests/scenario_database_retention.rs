@@ -576,6 +576,7 @@ fn retention_rejects_anchor_capture_from_before_swap_out() {
     let before = ledger_capture(engine.ledger(), &db, wallet()).unwrap();
     let make_install =
         |capture: pe_service::orchestrator_control::AdmissionLedgerCapture| AnchorInstall {
+            newest_activity_unix: None,
             fresh_history: Vec::new(),
             expected_fence: None,
             history_status: Some(WalletHistoryStatusRecord {

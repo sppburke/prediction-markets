@@ -4640,6 +4640,11 @@ impl BucketCommitEngine {
             });
         }
         self.paper_state.install_anchors(&records)?;
+        for install in installs {
+            if let Some(epoch) = install.newest_activity_unix {
+                self.paper_state.set_activity(&install.wallet, epoch)?;
+            }
+        }
         self.ledger = candidate;
         for record in &records {
             self.apply_history_projection(

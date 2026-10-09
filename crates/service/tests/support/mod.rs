@@ -852,6 +852,7 @@ pub fn install_verified_empty_anchor(
     let captured = ledger_capture(engine.ledger(), paper, wallet).unwrap();
     engine
         .install_anchors(&[AnchorInstall {
+            newest_activity_unix: None,
             fresh_history: Vec::new(),
             expected_fence: None,
             wallet,

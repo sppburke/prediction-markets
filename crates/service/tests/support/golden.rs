@@ -1697,6 +1697,7 @@ pub(crate) async fn golden_source_stream_replays_exact_economic_core() {
         .map(|wallet| {
             let captured = ledger_capture(seed_engine.ledger(), &paper, *wallet).unwrap();
             AnchorInstall {
+                newest_activity_unix: None,
                 fresh_history: Vec::new(),
                 expected_fence: None,
                 history_status: None,

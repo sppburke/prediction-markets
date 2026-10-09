@@ -4528,6 +4528,7 @@ fn produced_decision_continuation(
         .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
     engine
         .install_anchors(&[crate::position_seeder::AnchorInstall {
+            newest_activity_unix: None,
             fresh_history: Vec::new(),
             expected_fence: None,
             history_status: None,

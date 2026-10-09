@@ -6340,6 +6340,7 @@ async fn frame_capture_size_is_independent_of_unrelated_wallet_state() {
                     .unwrap();
             engine
                 .install_anchors(&[pe_service::position_seeder::AnchorInstall {
+                    newest_activity_unix: None,
                     wallet: wallet(),
                     balances: (0..4000)
                         .map(|ordinal| {
@@ -6449,6 +6450,7 @@ impl Harness {
             .unwrap()
             .send(OrchestratorControl::InstallAnchors {
                 installs: vec![pe_service::position_seeder::AnchorInstall {
+                    newest_activity_unix: None,
                     wallet: wallet(),
                     balances,
                     cutoff,
