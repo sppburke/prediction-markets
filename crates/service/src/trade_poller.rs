@@ -1310,7 +1310,8 @@ impl TradePoller {
     }
 
     /// Receive triggers throughout reads. Shutdown cancels venue work, but a sent bucket
-    /// commit or anchor install retains wallet ownership until its acknowledgement or timeout.
+    /// commit or anchor install retains wallet ownership until its acknowledgement arrives or its
+    /// channel closes.
     /// Accepted source pages, commitments, and buckets remain durable; an obligation whose
     /// target was not disposed is rebuilt from the source log at the next boot. A refresh not
     /// handed over is re-derived from the anchor at the next boot. A failed operation stops
