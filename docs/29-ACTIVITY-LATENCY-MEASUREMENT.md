@@ -213,10 +213,10 @@ capture reads pinned frames by their recorded offsets and walks contiguously fro
 the start earlier for a required receipt before it, the capture stops if retention did not keep a
 required receipt, and derive other offsets only within an unpunched range by walking frame lengths
 forward from a known receipt (the deploy boot's checkpoint tail or an earlier capture's recorded
-start); do not infer them from trade epochs. The capture records where its contiguous walk starts
-(`source_walk_start`), and the inspection refuses a capture whose walk starts after its cohort
-boundary: receipts in the audit window may have been retired, so capture before retention passes
-the cohort boundary. A re-measurement uses the same
+start); do not infer them from trade epochs. The capture records its walk start and, from the dense
+receipt records (`<source-log>.boot-checkpoint.receipts`, kept for retired frames too), the
+receive-time span of the frames it lacks (`source_coverage.json`); the inspection refuses a capture
+whose lacked span overlaps its window. A re-measurement uses the same
 capture start and passes its own cohort boundary to the inspection below. Retain verification
 receipts and physical prefix bounds with the capture.
 
@@ -307,14 +307,14 @@ with open(live_source, "rb") as f, open(out / "source_filtered.log", "wb") as w:
         assert seq == p["sequence"] and json.loads(text)["this_hash"] == p["hash"], ("pin", p["sequence"])
         pinned.add(seq); required.extend(artifact_receipts(sid, text))
         if sid in KEEP: w.write(raw); kept += 1
-    expected = walk_seq; end = walk_offset
+    expected = walk_seq; end = walk_offset; walk_hash = None
     for end, raw, block in frames(f, walk_offset):
         seq, sid, text = envelope(block); assert seq == expected, (seq, expected); expected += 1
+        if seq == walk_seq: walk_hash = json.loads(text)["this_hash"]
         required.extend(artifact_receipts(sid, text))
         if sid in KEEP: w.write(raw); kept += 1
         end += len(raw)
 print("source sequences", walk_seq, expected - 1, "end offset", end, "kept", kept, "pinned", len(pinned))
-(out / "source_walk_start").write_text(f"{walk_seq}\n")
 
 # 3. The whole paper log through its last complete frame.
 with open(live_paper, "rb") as f, open(out / "paper.log", "wb") as w:
@@ -335,6 +335,16 @@ with open(live_paper, "rb") as f, open(out / "paper.log", "wb") as w:
 missing = sorted(s for s in required if s < walk_seq and s not in pinned)
 assert not missing or missing[0] >= start_seq, ("capture again from a receipt at or before", missing[0])
 assert not missing, ("retention did not keep a required receipt", missing[0])
+# 4. Coverage: the dense receipt records keep every sequence's receive time, retired frames included. Record the walk
+#    start and the receive-time span of the frames the capture lacks below it.
+lo = hi = None
+if walk_seq:
+    with open(live_source + ".boot-checkpoint.receipts", "rb") as r:
+        for seq in range(walk_seq):
+            (received,) = struct.unpack("<32xq40x", r.read(80))
+            if seq not in pinned: lo, hi = (received, received) if lo is None else (min(lo, received), max(hi, received))
+        assert r.read(32).hex() == walk_hash, "receipt records do not match the walk"
+(out / "source_coverage.json").write_text(json.dumps({"walk_start": walk_seq, "lacked_received_ms": None if lo is None else [lo, hi]}))
 PY
 ```
 
@@ -342,9 +352,9 @@ Record identities and run this inspection on the capture, substituting the cohor
 sequence (the deployment sequence, or a recorded re-measurement boundary) and cohort size (one fill
 for AC15; the AC16 size for latency acceptance). The inspection keeps only each captured frame's
 location in memory and reads, CRC-checks and decodes a frame from the log on access; its source
-scans read only the frames of the sources they examine. It counts bindings to observations outside the capture (before its start,
-or below the retention boundary and not pinned) and fails if one binds
-an admitted frame decision or an audited identity. For each market whose earliest captured BUY is not
+scans read only the frames of the sources they examine. It counts bindings to observations the capture lacks below its walk start
+(before its start, or retired and not pinned) as outside and fails if one binds
+an admitted frame decision or an audited identity; a target missing from the walk fails. For each market whose earliest captured BUY is not
 before the window, it reads recorded BUYs at or before that stamp from `activity_groups` effects
 before applying the window: an identity seen in the capture keeps its earliest stamp, as the
 whole-prefix reader does, and any other identity, including a captured one whose recorded effect
@@ -516,9 +526,11 @@ def membership_record(e, c):
             "kind": evidence.get("kind"), "references": references, "evidence_errors": errors}
 
 audit_unix_ns = time.time_ns(); print("audit clock", audit_unix_ns)
-# Only the contiguous walk holds every receipt; retention keeps just its pins below it.
-walk_start = int(Path(sys.argv[2]).with_name("source_walk_start").read_text())
-assert walk_start <= int(sys.argv[4]), ("capture walk starts after the cohort boundary", walk_start)
+# The capture holds every receipt from its walk start on and only pins below it: the receive times it lacks must
+# not overlap the window (millisecond records cover their whole millisecond).
+coverage = json.loads(Path(sys.argv[2]).with_name("source_coverage.json").read_text())
+lacked = coverage["lacked_received_ms"]
+assert lacked is None or lacked[0] * 10**6 >= ns(sys.argv[7]) or (lacked[1] + 1) * 10**6 <= ns(sys.argv[6]), ("capture lacks receipts received in the window", lacked)
 source = read_prefix(sys.argv[2]); paper = read_prefix(sys.argv[3])
 # Decode every membership record once; the replay and both exports read only this canonical form.
 # The shared replay cannot continue past a record the verifier cannot decode, so it stops here.
@@ -763,7 +775,7 @@ for e in source.values("pe-service.activity-read-commitment"):
     if e["source_id"] != "pe-service.activity-read-commitment": continue
     for b in payload(e).get("bindings") or []:
         r = b["stream_receipt"]
-        if r["sequence"] not in source:
+        if r["sequence"] < coverage["walk_start"] and r["sequence"] not in source:
             assert (r["sequence"], r["this_hash"]) not in admitted, ("audited frame outside the capture", r)
             outside += 1; outside_ids.add(b["history_group_id"]); continue
         f = receipt(source, r)

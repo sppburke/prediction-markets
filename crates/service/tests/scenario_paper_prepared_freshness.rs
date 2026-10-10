@@ -7174,7 +7174,7 @@ async fn recovered_pre_start_frame_admitted_after_fresh_read_qualifies() {
     assert_eq!(selected(cutoff), vec![recorded.id.0]);
     assert!(selected(cutoff + 1).is_empty());
     let snapshot = census_snapshot(&h, &CensusLogs::default());
-    assert_eq!(inspection_cohort_size(&h.dir.path().join("capture"), 0), 1);
+    assert_eq!(inspection_cohort_size(&h.dir.path().join("capture")), 1);
     assert_eq!(snapshot.population["frames"].as_array().unwrap().len(), 1);
 }
 
@@ -8146,7 +8146,7 @@ fn census_snapshot(h: &Harness, logs: &CensusLogs) -> CensusSnapshot {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("snapshot started"));
-    let output = inspection_run(h, &capture, Some(env!("CARGO_BIN_EXE_pe-service")), 0);
+    let output = inspection_run(h, &capture, Some(env!("CARGO_BIN_EXE_pe-service")));
     assert!(
         output.status.success(),
         "inspection: {}\n{}",
@@ -8166,7 +8166,7 @@ fn census_snapshot(h: &Harness, logs: &CensusLogs) -> CensusSnapshot {
     assert!(String::from_utf8_lossy(&output.stdout).contains(&format!(
         "unique captured feed receipts {raw} exported receipts {raw}"
     )));
-    let cohort_size = inspection_cohort_size(&capture, 0);
+    let cohort_size = inspection_cohort_size(&capture);
     if cohort_size == 0 {
         assert!(String::from_utf8_lossy(&output.stdout).contains("FROZEN COHORT []"));
     } else {
@@ -8311,15 +8311,35 @@ fn ac_b_capture(
     )
 }
 
+/// Write the dense receipt records the service keeps beside a source log, retired frames included.
+fn write_dense_receipts(log: &std::path::Path) {
+    let records = Reader::replay_with_offsets(log)
+        .unwrap()
+        .map(Result::unwrap)
+        .flat_map(|(offset, sequence, envelope)| {
+            pe_event_log::ReceiptRecord {
+                receipt: AppendReceipt {
+                    sequence,
+                    this_hash: envelope.this_hash,
+                },
+                received_millis: i64::try_from(
+                    envelope.received_at.0.unix_timestamp_nanos() / 1_000_000,
+                )
+                .unwrap(),
+                byte_offset: Some(offset),
+            }
+            .encode()
+        })
+        .collect::<Vec<_>>();
+    std::fs::write(
+        format!("{}.boot-checkpoint.receipts", log.display()),
+        records,
+    )
+    .unwrap();
+}
+
 fn ac_b_inspect(h: &Harness, capture: &std::path::Path) -> Value {
-    // Each capture is inspected from its own walk start, the earliest boundary it covers.
-    let walk_start = std::fs::read_to_string(capture.join("source_walk_start")).unwrap();
-    let output = inspection_run(
-        h,
-        capture,
-        Some(env!("CARGO_BIN_EXE_pe-service")),
-        walk_start.trim().parse().unwrap(),
-    );
+    let output = inspection_run(h, capture, Some(env!("CARGO_BIN_EXE_pe-service")));
     assert!(
         output.status.success(),
         "inspection: {}\n{}",
@@ -8329,7 +8349,7 @@ fn ac_b_inspect(h: &Harness, capture: &std::path::Path) -> Value {
     serde_json::from_slice(&std::fs::read(capture.join("ac16-population.json")).unwrap()).unwrap()
 }
 
-fn inspection_cohort_size(capture: &std::path::Path, boundary: i64) -> usize {
+fn inspection_cohort_size(capture: &std::path::Path) -> usize {
     let connection = rusqlite::Connection::open_with_flags(
         capture.join("paper_state.db"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -8339,7 +8359,7 @@ fn inspection_cohort_size(capture: &std::path::Path, boundary: i64) -> usize {
     connection
         .query_row(
             &format!("SELECT count(*) FROM ({sql})"),
-            rusqlite::params![boundary, i64::MAX],
+            rusqlite::params![0, i64::MAX],
             |row| row.get(0),
         )
         .unwrap()
@@ -8349,7 +8369,6 @@ fn inspection_run(
     h: &Harness,
     capture: &std::path::Path,
     pe_service: Option<&str>,
-    boundary: i64,
 ) -> std::process::Output {
     census_python_with(
         &recipe_extract("import calendar, ctypes", "\nPY\n"),
@@ -8361,8 +8380,8 @@ fn inspection_run(
                 .unwrap()
                 .to_owned(),
             capture.join("paper.log").to_str().unwrap().to_owned(),
-            boundary.to_string(),
-            inspection_cohort_size(capture, boundary).to_string(),
+            "0".to_owned(),
+            inspection_cohort_size(capture).to_string(),
             at().format(&time::format_description::well_known::Rfc3339)
                 .unwrap(),
             (at() + time::Duration::seconds(60))
@@ -8409,7 +8428,7 @@ async fn measurement_recipe_authenticates_version_two_admission_and_new_fallback
     );
     h.stop().await;
     let snapshot = census_snapshot(&h, &CensusLogs::default());
-    assert_eq!(inspection_cohort_size(&h.dir.path().join("capture"), 0), 1);
+    assert_eq!(inspection_cohort_size(&h.dir.path().join("capture")), 1);
     let fallbacks = snapshot.population["window_fallbacks"].as_array().unwrap();
     for (receipt, reason) in [(mismatch, "identity_unverified"), (expiry, "copy_expired")] {
         assert!(fallbacks.iter().any(|row| {
@@ -8450,7 +8469,6 @@ async fn measurement_recipe_authenticates_version_two_admission_and_new_fallback
             &h,
             &h.dir.path().join("capture"),
             Some(env!("CARGO_BIN_EXE_pe-service")),
-            0,
         );
         assert!(!output.status.success(), "{field}");
         assert!(
@@ -8483,7 +8501,7 @@ async fn measurement_recipe_authenticates_historical_version_one_admission() {
     ).unwrap();
     h.stop().await;
     census_snapshot(&h, &CensusLogs::default());
-    assert_eq!(inspection_cohort_size(&h.dir.path().join("capture"), 0), 1);
+    assert_eq!(inspection_cohort_size(&h.dir.path().join("capture")), 1);
 }
 
 /// Reframe a deliberately invalid receipt reference, retaining all other captured paper records.
@@ -8772,7 +8790,7 @@ async fn ac_b_membership_reference_checks() {
     );
     // The inspection refuses to run without the deployed decoder, including a directory value.
     for pe_service in [None, Some(capture.to_str().unwrap())] {
-        let refused = inspection_run(&h, &capture, pe_service, 0);
+        let refused = inspection_run(&h, &capture, pe_service);
         assert!(!refused.status.success());
         assert!(String::from_utf8_lossy(&refused.stderr).contains("PE_SERVICE_BIN must name"));
     }
@@ -8871,6 +8889,7 @@ async fn ac_b_membership_reference_checks() {
         "incomplete"
     );
 
+    write_dense_receipts(&h.dir.path().join("source.log"));
     // The ranking record cites source seq 0. Starting at its admission receipt omits that
     // ranking; an inclusive paper boundary fails and names 0. An older record is ignored.
     let (offset, seq, _) = &sources[1];
@@ -8920,19 +8939,27 @@ async fn ac_b_membership_reference_checks() {
     assert!(output.status.success(), "{output:?}");
 
     // Below the retention boundary only pinned frames survive: from a start below it the capture
-    // reads the pinned ranking frame and walks from the boundary; an unkept receipt stops it.
+    // reads the pinned frames and walks from the boundary; an unkept required receipt stops it.
     let retained = h.dir.path().join("retained");
     std::fs::create_dir(&retained).unwrap();
     let log = retained.join("source.log");
     std::fs::copy(h.dir.path().join("source.log"), &log).unwrap();
-    let (pin_offset, pin_seq, pin) = &sources[0];
-    let (boundary_offset, boundary_seq, _) = &sources[1];
-    let authority = |pins: Value| {
-        json!({"authority": {"boundary": {"sequence": boundary_seq.0, "offset": boundary_offset}, "pins": pins}})
-            .to_string()
+    write_dense_receipts(&log);
+    let retain = |boundary: usize, pins: &[usize]| {
+        let pins = pins
+            .iter()
+            .map(|&i| {
+                let (offset, seq, envelope) = &sources[i];
+                json!({"sequence": seq.0, "offset": offset, "hash": envelope.this_hash.to_hex().to_string()})
+            })
+            .collect::<Vec<_>>();
+        let (offset, seq, _) = &sources[boundary];
+        let authority =
+            json!({"authority": {"boundary": {"sequence": seq.0, "offset": offset}, "pins": pins}});
+        std::fs::write(retained.join("source.log.retention"), authority.to_string()).unwrap();
     };
-    let pinned = json!([{"sequence": pin_seq.0, "offset": pin_offset, "hash": pin.this_hash.to_hex().to_string()}]);
-    std::fs::write(retained.join("source.log.retention"), authority(pinned)).unwrap();
+    let (pin_offset, pin_seq, _) = &sources[0];
+    retain(1, &[0]);
     let output = ac_b_capture(
         &h,
         &log,
@@ -8946,11 +8973,12 @@ async fn ac_b_membership_reference_checks() {
         std::fs::read(h.dir.path().join("pinned").join("source_filtered.log")).unwrap(),
         std::fs::read(capture.join("source_filtered.log")).unwrap()
     );
-    // A retained commitment can bind an observation the capture lacks: the inspection counts it
-    // outside the capture instead of reading it.
+    // A commitment may bind an observation the capture lacks below its walk (here retired and not
+    // pinned): it counts as outside the capture. A target missing from the walk fails.
     let last = sources.last().unwrap().1.0;
-    let appended = census_python(
-        r#"import ctypes, ctypes.util, json, struct, sys, zlib
+    let commit = |capture: &str, bound: u64| {
+        census_python(
+            r#"import ctypes, ctypes.util, json, struct, sys, zlib
 z = ctypes.CDLL(ctypes.util.find_library("zstd"))
 z.ZSTD_compressBound.argtypes = [ctypes.c_size_t]; z.ZSTD_compressBound.restype = ctypes.c_size_t
 z.ZSTD_compress.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
@@ -8963,40 +8991,29 @@ env = json.dumps({"seq": seq, "source_id": "pe-service.activity-read-commitment"
 cap = z.ZSTD_compressBound(len(env)); buf = ctypes.create_string_buffer(cap)
 n = z.ZSTD_compress(buf, cap, env, len(env), 3); block = buf.raw[:n]
 open(path, "ab").write(struct.pack("<I", len(block)) + block + struct.pack("<I", zlib.crc32(block)))"#,
-        &[
-            h.dir
-                .path()
-                .join("pinned")
-                .join("source_filtered.log")
-                .to_str()
-                .unwrap()
-                .to_owned(),
-            (last + 2).to_string(),
-            (last + 1).to_string(),
-        ],
-        &h.dir.path().join("bin"),
-    );
+            &[
+                h.dir
+                    .path()
+                    .join(capture)
+                    .join("source_filtered.log")
+                    .to_str()
+                    .unwrap()
+                    .to_owned(),
+                (last + 2).to_string(),
+                bound.to_string(),
+            ],
+            &h.dir.path().join("bin"),
+        )
+    };
+    retain(2, &[0]);
+    let output = ac_b_capture(&h, &log, "gap", *pin_offset, pin_seq.0, None);
+    assert!(output.status.success(), "{output:?}");
+    let appended = commit("gap", sources[1].1.0);
     assert!(appended.status.success(), "{appended:?}");
-    // Its walk starts at the retention boundary, so an audit from an earlier cohort boundary could
-    // miss retired receipts: the inspection refuses it.
-    let refused = inspection_run(
-        &h,
-        &h.dir.path().join("pinned"),
-        Some(env!("CARGO_BIN_EXE_pe-service")),
-        0,
-    );
-    assert!(
-        String::from_utf8_lossy(&refused.stderr).contains(&format!(
-            "('capture walk starts after the cohort boundary', {})",
-            boundary_seq.0
-        )),
-        "{refused:?}"
-    );
     let inspected = inspection_run(
         &h,
-        &h.dir.path().join("pinned"),
+        &h.dir.path().join("gap"),
         Some(env!("CARGO_BIN_EXE_pe-service")),
-        i64::try_from(boundary_seq.0).unwrap(),
     );
     assert!(inspected.status.success(), "{inspected:?}");
     assert!(
@@ -9004,11 +9021,36 @@ open(path, "ab").write(struct.pack("<I", len(block)) + block + struct.pack("<I",
             .contains("bindings to observations outside the capture 1\n"),
         "{inspected:?}"
     );
+    let appended = commit("pinned", last + 1);
+    assert!(appended.status.success(), "{appended:?}");
+    let failed = inspection_run(
+        &h,
+        &h.dir.path().join("pinned"),
+        Some(env!("CARGO_BIN_EXE_pe-service")),
+    );
+    assert!(
+        String::from_utf8_lossy(&failed.stderr).contains(&format!("KeyError: {}", last + 1)),
+        "{failed:?}"
+    );
+    // A capture that lacks a receipt received in the audit window is refused, whatever its cohort.
+    retain(6, &[]);
+    let (start_offset, start_seq, _) = &sources[5];
+    let output = ac_b_capture(&h, &log, "retired", *start_offset, start_seq.0, None);
+    assert!(output.status.success(), "{output:?}");
+    let refused = inspection_run(
+        &h,
+        &h.dir.path().join("retired"),
+        Some(env!("CARGO_BIN_EXE_pe-service")),
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("capture lacks receipts received in the window"),
+        "{refused:?}"
+    );
     let mut punched = std::fs::read(&log).unwrap();
-    punched[usize::try_from(*pin_offset).unwrap()..usize::try_from(*boundary_offset).unwrap()]
-        .fill(0);
+    punched[usize::try_from(*pin_offset).unwrap()..usize::try_from(sources[1].0).unwrap()].fill(0);
     std::fs::write(&log, punched).unwrap();
-    std::fs::write(retained.join("source.log.retention"), authority(json!([]))).unwrap();
+    retain(1, &[]);
     let output = ac_b_capture(
         &h,
         &log,
@@ -9027,7 +9069,7 @@ open(path, "ab").write(struct.pack("<I", len(block)) + block + struct.pack("<I",
     ac_b_rewrite_paper(&capture, exclusion_sequence, |r| {
         r["evidence"]["kind"] = json!("not_a_membership_kind");
     });
-    let stopped = inspection_run(&h, &capture, Some(env!("CARGO_BIN_EXE_pe-service")), 0);
+    let stopped = inspection_run(&h, &capture, Some(env!("CARGO_BIN_EXE_pe-service")));
     assert!(!stopped.status.success());
     let stderr = String::from_utf8_lossy(&stopped.stderr);
     assert!(
@@ -9077,7 +9119,7 @@ async fn ac_c_receipt_census_query() {
         // This capture holds no membership record, yet the inspection still refuses to run
         // without the deployed decoder.
         assert_eq!(snapshot.population["membership_records"], json!([]));
-        let refused = inspection_run(&h, &h.dir.path().join("capture"), None, 0);
+        let refused = inspection_run(&h, &h.dir.path().join("capture"), None);
         assert!(!refused.status.success());
         assert!(String::from_utf8_lossy(&refused.stderr).contains("PE_SERVICE_BIN must name"));
         for excluded in [zero, sell, combo] {
