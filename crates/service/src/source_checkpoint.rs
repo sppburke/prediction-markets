@@ -130,6 +130,24 @@ fn read_record(reader: &mut impl Read, sequence: usize) -> io::Result<SourceFram
     })
 }
 
+/// Read-only audit summary of the receipt sidecar below `walk`: the walk record's hash and the newest receive
+/// time among the records not in `kept`. Every record read is checksum-verified.
+pub fn lacked_receipt_coverage(
+    source_log: &Path,
+    walk: usize,
+    kept: &std::collections::BTreeSet<usize>,
+) -> io::Result<(blake3::Hash, Option<i64>)> {
+    let mut reader = BufReader::new(File::open(receipts_path(source_log))?);
+    let mut newest = None;
+    for sequence in 0..walk {
+        let record = read_record(&mut reader, sequence)?;
+        if !kept.contains(&sequence) {
+            newest = newest.max(Some(record.received_millis));
+        }
+    }
+    Ok((read_record(&mut reader, walk)?.receipt.this_hash, newest))
+}
+
 fn restore_receipts(
     path: &Path,
     count: usize,
@@ -1620,6 +1638,37 @@ mod tests {
         assert_eq!(decoded.receipt, frame.receipt);
         assert_eq!(decoded.received_millis, frame.received_millis);
         assert_eq!(decoded.byte_offset, None);
+    }
+
+    #[test]
+    fn lacked_receipt_coverage_reads_checksummed_records_below_the_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("source_events.log");
+        let record = |sequence: u64, received_millis| {
+            encode_record(&SourceFrameMetadata {
+                receipt: pe_event_log::AppendReceipt {
+                    sequence: pe_core_types::EventSeq(sequence),
+                    this_hash: blake3::hash(&sequence.to_le_bytes()),
+                },
+                received_millis,
+                byte_offset: Some(sequence * 100),
+            })
+        };
+        let mut bytes = [record(0, 30), record(1, 50), record(2, 40), record(3, 60)].concat();
+        std::fs::write(receipts_path(&log), &bytes).unwrap();
+        // Record 1 is kept: the newest lacked receive time comes from records 0 and 2.
+        let kept = std::collections::BTreeSet::from([1]);
+        let (walk_hash, newest) = lacked_receipt_coverage(&log, 3, &kept).unwrap();
+        assert_eq!(walk_hash, blake3::hash(&3_u64.to_le_bytes()));
+        assert_eq!(newest, Some(40));
+        assert_eq!(
+            lacked_receipt_coverage(&log, 0, &kept).unwrap(),
+            (blake3::hash(&0_u64.to_le_bytes()), None)
+        );
+        // A changed receive time fails its record's checksum instead of moving the bound.
+        bytes[2 * 80 + 32] ^= 1;
+        std::fs::write(receipts_path(&log), &bytes).unwrap();
+        assert!(lacked_receipt_coverage(&log, 3, &kept).is_err());
     }
 
     #[test]

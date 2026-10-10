@@ -340,6 +340,32 @@ async fn run() -> Result<()> {
     }
     if let Some(position) = args
         .iter()
+        .position(|argument| argument == "--receipt-coverage-json")
+    {
+        let [source_log, walk, kept @ ..] = &args[position + 1..] else {
+            anyhow::bail!(
+                "--receipt-coverage-json requires a source log, a walk sequence and kept sequences"
+            );
+        };
+        let kept = kept
+            .iter()
+            .map(|sequence| sequence.parse())
+            .collect::<Result<std::collections::BTreeSet<usize>, _>>()
+            .context("parse the kept sequences")?;
+        let (walk_hash, newest) = pe_service::source_checkpoint::lacked_receipt_coverage(
+            std::path::Path::new(source_log),
+            walk.parse().context("parse the walk sequence")?,
+            &kept,
+        )
+        .context("read the receipt records below the walk")?;
+        println!(
+            "{}",
+            serde_json::json!({"walk_hash": walk_hash.to_hex().to_string(), "newest_lacked_received_ms": newest})
+        );
+        return Ok(());
+    }
+    if let Some(position) = args
+        .iter()
         .position(|argument| argument == "--verify-staged-revision")
     {
         let expected = args

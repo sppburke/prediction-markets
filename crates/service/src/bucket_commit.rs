@@ -5448,6 +5448,9 @@ impl BucketCommitEngine {
                 advance_cursor: false,
             })?;
         self.apply_history_projection(wallet, &history_effects, None);
+        // The groups are durable: deliver past them now, as their all-stored re-read would,
+        // so a later re-read never moves the cursor between a bracket's captures.
+        self.paper_state.set_cursor(&wallet, source_epoch)?;
         Ok(BucketCommitResult {
             retained_revision: false,
             wallet,
@@ -9320,8 +9323,10 @@ mod activity_exemption_tests {
     #[test]
     fn all_twins_precede_late_covered_and_partial_routing_without_effects() {
         for covered in [false, true] {
-            for alongside_recorded in [false, true] {
-                let (_dir, paper, mut engine) = fixture();
+            for (alongside_recorded, reanchoring) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let (dir, paper, mut engine) = fixture();
                 let original = group("TRADE", "trade", 100, 999, false, "market");
                 let wallet = original.group_id.components().wallet;
                 let mut initial = context();
@@ -9392,6 +9397,15 @@ mod activity_exemption_tests {
                 let mut bucket = vec![twin.clone(), redeem.clone()];
                 if alongside_recorded {
                     bucket.push(original);
+                }
+                if reanchoring {
+                    rusqlite::Connection::open(dir.path().join("paper.db"))
+                        .unwrap()
+                        .execute(
+                            "UPDATE poll_cursors SET reanchor_required = 1 WHERE wallet_hex = ?1",
+                            rusqlite::params![wallet.to_string()],
+                        )
+                        .unwrap();
                 }
                 let ledger_before = engine.ledger().snapshots().clone();
                 let history_before = paper.gate_history().unwrap();

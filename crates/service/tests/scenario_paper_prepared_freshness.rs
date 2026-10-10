@@ -8285,6 +8285,7 @@ fn ac_b_reference_rows(population: &Value) -> Vec<Value> {
 
 fn ac_b_capture(
     h: &Harness,
+    source: &std::path::Path,
     name: &str,
     offset: u64,
     sequence: u64,
@@ -8292,7 +8293,7 @@ fn ac_b_capture(
 ) -> std::process::Output {
     let mut args = [
         h.dir.path().join("paper.db"),
-        h.dir.path().join("source.log"),
+        source.to_path_buf(),
         h.dir.path().join("paper.log"),
         h.dir.path().join(name),
     ]
@@ -8310,8 +8311,40 @@ fn ac_b_capture(
     )
 }
 
+/// Write the dense receipt records the service keeps beside a source log, retired frames included.
+fn write_dense_receipts(log: &std::path::Path) {
+    let records = Reader::replay_with_offsets(log)
+        .unwrap()
+        .map(Result::unwrap)
+        .flat_map(|(offset, sequence, envelope)| {
+            pe_event_log::ReceiptRecord {
+                receipt: AppendReceipt {
+                    sequence,
+                    this_hash: envelope.this_hash,
+                },
+                received_millis: i64::try_from(
+                    envelope.received_at.0.unix_timestamp_nanos() / 1_000_000,
+                )
+                .unwrap(),
+                byte_offset: Some(offset),
+            }
+            .encode()
+        })
+        .collect::<Vec<_>>();
+    std::fs::write(
+        format!("{}.boot-checkpoint.receipts", log.display()),
+        records,
+    )
+    .unwrap();
+}
+
 fn ac_b_inspect(h: &Harness, capture: &std::path::Path) -> Value {
-    let output = inspection_run(h, capture, Some(env!("CARGO_BIN_EXE_pe-service")));
+    let output = inspection_run_at(
+        h,
+        capture,
+        Some(env!("CARGO_BIN_EXE_pe-service")),
+        after_every_fixture_frame(),
+    );
     assert!(
         output.status.success(),
         "inspection: {}\n{}",
@@ -8342,6 +8375,21 @@ fn inspection_run(
     capture: &std::path::Path,
     pe_service: Option<&str>,
 ) -> std::process::Output {
+    inspection_run_at(h, capture, pe_service, at())
+}
+
+/// AC-B reference checks do not depend on the receive window. A window after every fixture frame keeps a
+/// capture that lacks setup frames, which carry wall-clock receive times, inspectable on any date.
+fn after_every_fixture_frame() -> OffsetDateTime {
+    OffsetDateTime::from_unix_timestamp(253_402_214_400).unwrap()
+}
+
+fn inspection_run_at(
+    h: &Harness,
+    capture: &std::path::Path,
+    pe_service: Option<&str>,
+    window_start: OffsetDateTime,
+) -> std::process::Output {
     census_python_with(
         &recipe_extract("import calendar, ctypes", "\nPY\n"),
         &[
@@ -8354,9 +8402,10 @@ fn inspection_run(
             capture.join("paper.log").to_str().unwrap().to_owned(),
             "0".to_owned(),
             inspection_cohort_size(capture).to_string(),
-            at().format(&time::format_description::well_known::Rfc3339)
+            window_start
+                .format(&time::format_description::well_known::Rfc3339)
                 .unwrap(),
-            (at() + time::Duration::seconds(60))
+            (window_start + time::Duration::seconds(60))
                 .format(&time::format_description::well_known::Rfc3339)
                 .unwrap(),
             capture.to_str().unwrap().to_owned(),
@@ -8861,17 +8910,32 @@ async fn ac_b_membership_reference_checks() {
         "incomplete"
     );
 
+    write_dense_receipts(&h.dir.path().join("source.log"));
     // The ranking record cites source seq 0. Starting at its admission receipt omits that
     // ranking; an inclusive paper boundary fails and names 0. An older record is ignored.
     let (offset, seq, _) = &sources[1];
-    let output = ac_b_capture(&h, "covered", *offset, seq.0, Some(ranking_sequence));
+    let output = ac_b_capture(
+        &h,
+        &h.dir.path().join("source.log"),
+        "covered",
+        *offset,
+        seq.0,
+        Some(ranking_sequence),
+    );
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr)
             .contains("('capture again from a receipt at or before', 0)"),
         "{output:?}"
     );
-    let output = ac_b_capture(&h, "older", *offset, seq.0, Some(ranking_sequence + 1));
+    let output = ac_b_capture(
+        &h,
+        &h.dir.path().join("source.log"),
+        "older",
+        *offset,
+        seq.0,
+        Some(ranking_sequence + 1),
+    );
     assert!(output.status.success(), "{output:?}");
     let older = ac_b_reference_rows(&ac_b_inspect(&h, &h.dir.path().join("older")));
     assert_eq!(
@@ -8885,8 +8949,178 @@ async fn ac_b_membership_reference_checks() {
             .unwrap()["verdict"],
         "pass"
     );
-    let output = ac_b_capture(&h, "omitted", *offset, seq.0, None);
+    let output = ac_b_capture(
+        &h,
+        &h.dir.path().join("source.log"),
+        "omitted",
+        *offset,
+        seq.0,
+        None,
+    );
     assert!(output.status.success(), "{output:?}");
+
+    // Below the retention boundary only pinned frames survive: from a start below it the capture
+    // reads the pinned frames and walks from the boundary; an unkept required receipt stops it.
+    let retained = h.dir.path().join("retained");
+    std::fs::create_dir(&retained).unwrap();
+    let log = retained.join("source.log");
+    std::fs::copy(h.dir.path().join("source.log"), &log).unwrap();
+    write_dense_receipts(&log);
+    let retain = |boundary: usize, pins: &[usize]| {
+        let pins = pins
+            .iter()
+            .map(|&i| {
+                let (offset, seq, envelope) = &sources[i];
+                json!({"sequence": seq.0, "offset": offset, "hash": envelope.this_hash.to_hex().to_string()})
+            })
+            .collect::<Vec<_>>();
+        let (offset, seq, _) = &sources[boundary];
+        let authority =
+            json!({"authority": {"boundary": {"sequence": seq.0, "offset": offset}, "pins": pins}});
+        std::fs::write(retained.join("source.log.retention"), authority.to_string()).unwrap();
+    };
+    let (pin_offset, pin_seq, _) = &sources[0];
+    retain(1, &[0]);
+    let output = ac_b_capture(
+        &h,
+        &log,
+        "pinned",
+        *pin_offset,
+        pin_seq.0,
+        Some(ranking_sequence),
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        std::fs::read(h.dir.path().join("pinned").join("source_filtered.log")).unwrap(),
+        std::fs::read(capture.join("source_filtered.log")).unwrap()
+    );
+    // A commitment may bind an observation the capture lacks below its walk (here retired and not
+    // pinned): it counts as outside the capture. A target missing from the walk fails.
+    let last = sources.last().unwrap().1.0;
+    let commit = |capture: &str, bound: u64| {
+        census_python(
+            r#"import ctypes, ctypes.util, json, struct, sys, zlib
+z = ctypes.CDLL(ctypes.util.find_library("zstd"))
+z.ZSTD_compressBound.argtypes = [ctypes.c_size_t]; z.ZSTD_compressBound.restype = ctypes.c_size_t
+z.ZSTD_compress.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+z.ZSTD_compress.restype = ctypes.c_size_t
+path, seq, bound = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+binding = {"stream_receipt": {"sequence": bound, "this_hash": "00" * 32}, "history_group_id": "g2:" + "0" * 64}
+payload = json.dumps({"bindings": [binding]}).encode()
+env = json.dumps({"seq": seq, "source_id": "pe-service.activity-read-commitment", "this_hash": "11" * 32,
+                  "payload": list(payload)}, separators=(",", ":")).encode()
+cap = z.ZSTD_compressBound(len(env)); buf = ctypes.create_string_buffer(cap)
+n = z.ZSTD_compress(buf, cap, env, len(env), 3); block = buf.raw[:n]
+open(path, "ab").write(struct.pack("<I", len(block)) + block + struct.pack("<I", zlib.crc32(block)))"#,
+            &[
+                h.dir
+                    .path()
+                    .join(capture)
+                    .join("source_filtered.log")
+                    .to_str()
+                    .unwrap()
+                    .to_owned(),
+                (last + 2).to_string(),
+                bound.to_string(),
+            ],
+            &h.dir.path().join("bin"),
+        )
+    };
+    retain(2, &[0]);
+    let output = ac_b_capture(&h, &log, "gap", *pin_offset, pin_seq.0, None);
+    assert!(output.status.success(), "{output:?}");
+    let appended = commit("gap", sources[1].1.0);
+    assert!(appended.status.success(), "{appended:?}");
+    let inspected = inspection_run_at(
+        &h,
+        &h.dir.path().join("gap"),
+        Some(env!("CARGO_BIN_EXE_pe-service")),
+        after_every_fixture_frame(),
+    );
+    assert!(inspected.status.success(), "{inspected:?}");
+    assert!(
+        String::from_utf8_lossy(&inspected.stdout)
+            .contains("bindings to observations outside the capture 1\n"),
+        "{inspected:?}"
+    );
+    // Receipt records hold no trade time: a retired frame leaves the first-entry population unproven.
+    assert!(
+        String::from_utf8_lossy(&inspected.stdout).contains(
+            "first-entry population incomplete: retention retired 1 frames between the capture start and its walk"
+        ),
+        "{inspected:?}"
+    );
+    let appended = commit("pinned", last + 1);
+    assert!(appended.status.success(), "{appended:?}");
+    let failed = inspection_run(
+        &h,
+        &h.dir.path().join("pinned"),
+        Some(env!("CARGO_BIN_EXE_pe-service")),
+    );
+    assert!(
+        String::from_utf8_lossy(&failed.stderr).contains(&format!("KeyError: {}", last + 1)),
+        "{failed:?}"
+    );
+    // A capture that lacks a frame received from the window on is refused, whatever its cohort.
+    retain(6, &[0, 1, 2, 3, 4]);
+    let output = ac_b_capture(&h, &log, "retired", *pin_offset, pin_seq.0, None);
+    assert!(output.status.success(), "{output:?}");
+    let refused = inspection_run(
+        &h,
+        &h.dir.path().join("retired"),
+        Some(env!("CARGO_BIN_EXE_pe-service")),
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("capture lacks a frame received from the window on"),
+        "{refused:?}"
+    );
+    // The lacked receive times come only from checksummed receipt records.
+    let receipts = format!("{}.boot-checkpoint.receipts", log.display());
+    let records = std::fs::read(&receipts).unwrap();
+    let mut corrupt = records.clone();
+    corrupt[80 + 32] ^= 1;
+    std::fs::write(&receipts, corrupt).unwrap();
+    retain(2, &[0]);
+    let output = ac_b_capture(&h, &log, "corrupt", *pin_offset, pin_seq.0, None);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("checkpoint receipt checksum mismatch"),
+        "{output:?}"
+    );
+    std::fs::write(&receipts, records).unwrap();
+    // Every required receipt below the walk is checked, not only the earliest: with the earliest
+    // pinned, the next one retention did not keep stops the capture.
+    retain(4, &[0]);
+    let output = ac_b_capture(
+        &h,
+        &log,
+        "later",
+        *pin_offset,
+        pin_seq.0,
+        Some(ranking_sequence),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("('retention did not keep a required receipt', 1)"),
+        "{output:?}"
+    );
+    let mut punched = std::fs::read(&log).unwrap();
+    punched[usize::try_from(*pin_offset).unwrap()..usize::try_from(sources[1].0).unwrap()].fill(0);
+    std::fs::write(&log, punched).unwrap();
+    retain(1, &[]);
+    let output = ac_b_capture(
+        &h,
+        &log,
+        "unkept",
+        *pin_offset,
+        pin_seq.0,
+        Some(ranking_sequence),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("('retention did not keep a required receipt', 0)"),
+        "{output:?}"
+    );
 
     // A record the verifier cannot decode stops the inspection and names it.
     ac_b_rewrite_paper(&capture, exclusion_sequence, |r| {
