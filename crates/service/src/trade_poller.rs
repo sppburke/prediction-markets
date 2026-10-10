@@ -1335,6 +1335,8 @@ impl TradePoller {
         let mut refresh_busy = false;
         let mut refresh_pending = None;
         let mut refresh_visit: Option<(WalletAddress, RefreshHandoff, AbortHandle)> = None;
+        // Whether the visiting refresh yields to its wallet's new observations (set at launch).
+        let mut refresh_yields = true;
         let mut backstop_visit: Option<(WalletAddress, watch::Sender<bool>)> = None;
         let mut urgent_visit: Option<watch::Sender<bool>> = None;
         // Expiry changes readiness, not ownership: the frozen frontier returns to the backstop
@@ -1385,7 +1387,10 @@ impl TradePoller {
                     &self.obligations.retired_frame_ids,
                 );
                 let now = (self.now)();
+                // A pending daily boundary waits on every pre-cutoff obligation and paper risk
+                // needs its mark, so then every refresh yields.
                 if let Some((wallet, handoff, handle)) = &refresh_visit
+                    && (refresh_yields || self.obligations.pending_boundary().is_some())
                     && self.obligations.by_wallet.contains_key(wallet)
                     && handoff.cancel_before_handoff()
                 {
@@ -1595,6 +1600,18 @@ impl TradePoller {
                     if let Some(wallet) = selected {
                         if refresh_pending == Some(wallet) {
                             refresh_pending = None;
+                        }
+                        // Unflagged refreshes yield to their wallet's observations. A flagged
+                        // wallet cannot admit new copy decisions, so its refresh keeps the wallet
+                        // until its baseline finishes, unless a daily boundary is pending.
+                        match self.paper_state.wallet_coverage(&wallet) {
+                            Ok(coverage) => refresh_yields = !coverage.reanchor_required,
+                            Err(error) => {
+                                failure =
+                                    Some(TradePollerOwnerError::AnchorRefresh(error.to_string()));
+                                stopping = true;
+                                continue;
+                            }
                         }
                         let handoff = RefreshHandoff::default();
                         let observed = handoff.clone();
@@ -3046,10 +3063,19 @@ fn obligation_disposed(
                 .activity_group_state(&obligation.group_id)?
                 .is_some());
     }
+    // Successive reads re-bind the observation, nearly always to the same target: query each run
+    // of one target once, or a stalled wallet's checks grow with the square of its reads. Skipping
+    // a run's repeats adds no outcome a full scan could not also produce.
+    let mut previous = None;
     for binding in &obligation.bindings {
+        let target = (&binding.history_group_id, &binding.semantic_revision);
+        if previous == Some(target) {
+            continue;
+        }
         if binding_target_disposed(paper_state, binding)? {
             return Ok(true);
         }
+        previous = Some(target);
     }
     Ok(false)
 }
@@ -4315,5 +4341,54 @@ mod tests {
         assert!(obligations.boundary_anchor().is_none());
         assert!(obligations.pending_boundary().is_none());
         assert!(!missing_source_path.exists());
+    }
+
+    #[test]
+    fn obligation_disposal_queries_each_change_of_bound_target() {
+        let dir = tempdir().unwrap();
+        let paper_state = PaperStateDb::open(&dir.path().join("paper.db")).unwrap();
+        let recorded = activity_payload('b', 100);
+        resolve_activity_group(&paper_state, &recorded);
+        let recorded = parse_activity_trade_observation(&recorded).unwrap();
+        let unseen = parse_activity_trade_observation(&activity_payload('a', 100)).unwrap();
+        let receipt = AppendReceipt {
+            sequence: pe_core_types::EventSeq(1),
+            this_hash: blake3::Hash::from_bytes([1; 32]),
+        };
+        let binding = |history: &SourceTradeId, revision: &str| ObservationBinding {
+            stream_group_id: unseen.group_id.key().clone(),
+            stream_receipt: receipt,
+            history_group_id: history.clone(),
+            semantic_revision: revision.to_owned(),
+            page_raw_hash: "recorded".to_owned(),
+            page_occurrence_index: 0,
+            identity_provenance: None,
+            identity_receipt: None,
+            counterpart_basis_receipt: None,
+            frame_admission_receipt: None,
+        };
+        let disposed = |bindings: Vec<ObservationBinding>| {
+            obligation_disposed(
+                &paper_state,
+                false,
+                &Obligation {
+                    qualifying_buy: false,
+                    group_id: unseen.group_id.key().clone(),
+                    received_at: OffsetDateTime::UNIX_EPOCH,
+                    receipt,
+                    bindings,
+                },
+            )
+            .unwrap()
+        };
+        // Repeats of one undisposed target stay undisposed; a following other group, or another
+        // revision of a recorded group, is still queried and disposes the observation.
+        let stale = vec![binding(unseen.group_id.key(), "candidate-split-test-v1"); 3];
+        assert!(!disposed(stale.clone()));
+        let current = binding(recorded.group_id.key(), "candidate-split-test-v1");
+        assert!(disposed([stale, vec![current.clone()]].concat()));
+        let revised = vec![binding(recorded.group_id.key(), "superseded"); 3];
+        assert!(!disposed(revised.clone()));
+        assert!(disposed([revised, vec![current]].concat()));
     }
 }

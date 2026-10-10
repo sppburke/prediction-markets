@@ -5369,7 +5369,20 @@ async fn boot_newcomer_and_required_reanchor_history_never_copy() {
             )
             .unwrap();
         }
-        let validator = validator(stable_responses_for_attempts(&[(wallet, 1, "1")], 2));
+        let validator = validator(if kind == "required_reanchor" {
+            // A re-anchoring refresh reads one baseline and three tails, as re-entry does.
+            let row = activity(wallet, 1, "1.000000", "0xbase1", 10);
+            reentry_reads(
+                wallet,
+                END,
+                [END; 3],
+                std::slice::from_ref(&row),
+                [std::slice::from_ref(&row); 3],
+                &[position(wallet, 1, "1")],
+            )
+        } else {
+            stable_responses_for_attempts(&[(wallet, 1, "1")], 2)
+        });
         if kind.starts_with("boot_") {
             let installs = validator
                 .validate_direct(&[wallet], &mut engine, &paper)
