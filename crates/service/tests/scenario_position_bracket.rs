@@ -4830,6 +4830,79 @@ async fn routine_refresh_preflights_every_group_after_known_activity() {
     }
 }
 
+/// PASS (#763): a routine refresh meets the venue's restamp of a redemption recorded after the
+/// cutoff. The twin is not intervening activity: the bracket anchors, the twin records
+/// `raw_only`, and nothing re-anchors or fences. FAIL: every refresh defers as intervening.
+#[tokio::test]
+async fn routine_refresh_anchors_past_a_restamped_redemption() {
+    let wallet = wallet(0x92);
+    let (_dir, paper, mut engine) = fresh(&[wallet]);
+    install_empty_anchor(&mut engine, &paper, wallet, 1);
+    let mut original = activity(wallet, 9, "0", "0xrestamped-redeem", 90);
+    original["type"] = json!("REDEEM");
+    original["usdcSize"] = json!("0");
+    original["price"] = json!("0");
+    original["side"] = json!("");
+    original["asset"] = json!("");
+    let mut restamp = original.clone();
+    original["outcomeIndex"] = json!(999);
+    engine
+        .commit(
+            vec![aggregate(original, wallet)],
+            &context(90),
+            zero_basis(),
+        )
+        .unwrap();
+    // A later anchor clears any re-anchor flag; its cutoff stays before the redemption.
+    install_empty_anchor(&mut engine, &paper, wallet, 1);
+    restamp["outcomeIndex"] = json!(0);
+    let restamp_id = aggregate(restamp.clone(), wallet).group_id.key().clone();
+    let fetcher = Arc::new(QueueFetcher::new(HashMap::from([
+        (
+            activity_url(wallet),
+            vec![serde_json::to_vec(&vec![restamp]).unwrap(); 3],
+        ),
+        (
+            position_url(wallet, PositionPartition::NotRedeemable),
+            vec![b"[]".to_vec(); 2],
+        ),
+        (
+            position_url(wallet, PositionPartition::Redeemable),
+            vec![b"[]".to_vec(); 2],
+        ),
+    ])));
+    let identity = Arc::new(AssetIdentityResolver::new(
+        fetcher.clone(),
+        BASE.to_owned(),
+        GAMMA_BATCH_SIZE,
+        Arc::new(tokio::sync::Mutex::new(
+            SourceEventSink::open(_dir.path().join("source.log")).unwrap(),
+        )),
+    ));
+    let validator = CausalPositionValidator::new(fetcher, BASE, "restamp", identity)
+        .with_clock(Arc::new(|| END));
+    let (tx, rx) = mpsc::channel(2);
+    let actor = spawn_control_actor(rx, engine, paper.clone());
+    let preparer = AdmissionPreparer::with_validator(tx, paper.clone(), validator);
+    assert_eq!(
+        preparer.prepare_if_due(wallet, END, 1).await.unwrap(),
+        AnchorRefreshOutcome::Anchored
+    );
+    assert_eq!(
+        paper
+            .activity_group_state(&restamp_id)
+            .unwrap()
+            .unwrap()
+            .disposition,
+        "raw_only"
+    );
+    assert!(!paper.wallet_coverage(&wallet).unwrap().reanchor_required);
+    assert!(!paper.is_wallet_fenced(&wallet).unwrap());
+    assert_eq!(paper.position_anchors(&wallet).unwrap().len(), 3);
+    drop(preparer);
+    actor.await.unwrap();
+}
+
 async fn runtime_completion_case(
     incomplete: bool,
     repeat: bool,

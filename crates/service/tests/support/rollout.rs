@@ -91,6 +91,71 @@ struct HttpState {
     gamma_failures: std::sync::atomic::AtomicUsize,
     resolved: std::sync::atomic::AtomicBool,
 }
+/// The daily-boundary mark the service requests for an open position after a UTC midnight (#761).
+fn prices_history(q: &HashMap<String, String>) -> Value {
+    assert!(q["market"].parse::<usize>().unwrap() >= 101);
+    let end = q["endTs"].parse::<i64>().unwrap();
+    assert_eq!(q["startTs"].parse::<i64>().unwrap(), end - 120);
+    assert_eq!(q["fidelity"], "1");
+    json!({"history":[{"t":end,"p":"0.50"}]})
+}
+
+/// The production mark adapter values a position from this fixture's answer at a fixed cutoff.
+pub async fn boundary_mark() {
+    use pe_service::activity_ingest::{ActivityIngest, SourceLogHandle};
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    let state = Arc::new(HttpState {
+        boot_waves: false,
+        rows: Vec::new(),
+        now: 0,
+        ranked_wallets: 0,
+        full_history_requests: Mutex::new(Vec::new()),
+        start: Mutex::new(None),
+        authority: Mutex::new(Authority::default()),
+        activity: Mutex::new(HashMap::new()),
+        positions: Mutex::new(Vec::new()),
+        slow_started: Notify::new(),
+        slow: Semaphore::new(0),
+        release_slow: AtomicBool::new(true),
+        gamma_fails: AtomicBool::new(false),
+        stale_ranked_wallet_2: AtomicBool::new(false),
+        gamma_failures: AtomicUsize::new(0),
+        resolved: AtomicBool::new(false),
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, Router::new().fallback(serve).with_state(state))
+            .await
+            .unwrap();
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let (source_log, source_rx) = SourceLogHandle::channel(4);
+    let (trigger_tx, _triggers) = tokio::sync::mpsc::channel(1);
+    tokio::spawn(
+        ActivityIngest::poll_only(
+            pe_service::source_event_sink::SourceEventSink::open(dir.path().join("source.log"))
+                .unwrap(),
+            source_rx,
+            trigger_tx,
+            pe_service::health::new_shared_health_with_ws(false, false, 90),
+        )
+        .run(),
+    );
+    let cutoff = 1_790_985_600;
+    let (mark, closure) = pe_service::mark_prices::HistoricalMarkAdapter::new(
+        reqwest::Client::new(),
+        base,
+        source_log,
+    )
+    .fetch_paper(&condition(1), "103", cutoff)
+    .await
+    .unwrap();
+    assert_eq!(mark.price.0, dec!(0.50));
+    assert_eq!(mark.sample_unix, cutoff);
+    assert!(closure.is_none());
+}
+
 async fn serve(
     State(state): State<Arc<HttpState>>,
     OriginalUri(uri): OriginalUri,
@@ -224,6 +289,9 @@ async fn serve(
         v["t"][0]["t"] = (market * 2 + 101).to_string().into();
         v["t"][1]["t"] = (market * 2 + 102).to_string().into();
         return (StatusCode::OK, Json(v));
+    }
+    if path == "/prices-history" {
+        return (StatusCode::OK, Json(prices_history(&q)));
     }
     if path == "/book" {
         let token = q["token_id"].parse::<usize>().unwrap();

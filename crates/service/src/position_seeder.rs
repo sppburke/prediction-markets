@@ -41,7 +41,7 @@ use crate::bucket_commit::{
     AnchorInstallError, BucketCommitEngine, BucketDecisionContext, IdentityOverride,
 };
 use crate::orchestrator_control::{AdmissionLedgerCapture, OrchestratorControl};
-use crate::trade_poller::ACTIVITY_POLL_SOURCE_ID;
+use crate::trade_poller::{ACTIVITY_POLL_SOURCE_ID, restamp_twins};
 
 #[cfg(feature = "scenario")]
 type BracketStepHook = Arc<dyn Fn(WalletAddress, usize, &mut BucketCommitEngine) + Send + Sync>;
@@ -950,7 +950,7 @@ impl CausalPositionValidator {
             let mut baseline = if purpose == ValidationPurpose::Reentry {
                 baseline_started = Some(Instant::now());
                 let activity = self.activity(wallet).await?;
-                self.preflight_control_read(
+                let twins = self.preflight_control_read(
                     wallet,
                     &activity,
                     paper_state,
@@ -963,7 +963,7 @@ impl CausalPositionValidator {
                 }
                 metadata_reads.extend(std::mem::take(&mut prepared.metadata_reads));
                 unresolved_assets.extend(std::mem::take(&mut prepared.unresolved_assets));
-                self.commit_control(wallet, &activity, &prepared, control_tx, false)
+                self.commit_control(wallet, &activity, &prepared, twins, control_tx, false)
                     .await?;
                 baseline_completed = Some(Instant::now());
                 Some(activity)
@@ -978,7 +978,7 @@ impl CausalPositionValidator {
                 stability_started = Some(Instant::now());
             }
             let first_activity = self.activity_since(wallet, start, first_fixed_end).await?;
-            self.preflight_control_read(
+            let first_twins = self.preflight_control_read(
                 wallet,
                 &first_activity,
                 paper_state,
@@ -997,8 +997,15 @@ impl CausalPositionValidator {
             }
             metadata_reads.extend(std::mem::take(&mut first_prepared.metadata_reads));
             unresolved_assets.extend(std::mem::take(&mut first_prepared.unresolved_assets));
-            self.commit_control(wallet, &first_activity, &first_prepared, control_tx, false)
-                .await?;
+            self.commit_control(
+                wallet,
+                &first_activity,
+                &first_prepared,
+                first_twins,
+                control_tx,
+                false,
+            )
+            .await?;
             let first_ledger = capture_control(wallet, control_tx).await?;
             let first_positions =
                 retain_missing_mapping(self.positions(wallet, &first_mapping).await)?;
@@ -1006,7 +1013,7 @@ impl CausalPositionValidator {
             let first_activity = ActivityEvidence::from(first_activity);
 
             let second_activity = self.activity_since(wallet, start, (self.now)()).await?;
-            self.preflight_control_read(
+            let second_twins = self.preflight_control_read(
                 wallet,
                 &second_activity,
                 paper_state,
@@ -1027,7 +1034,14 @@ impl CausalPositionValidator {
             metadata_reads.extend(std::mem::take(&mut second_prepared.metadata_reads));
             unresolved_assets.extend(std::mem::take(&mut second_prepared.unresolved_assets));
             if self
-                .commit_control(wallet, &second_activity, &second_prepared, control_tx, true)
+                .commit_control(
+                    wallet,
+                    &second_activity,
+                    &second_prepared,
+                    second_twins,
+                    control_tx,
+                    true,
+                )
                 .await?
             {
                 return Err(CausalPositionError::InterveningActivity { wallet });
@@ -1039,7 +1053,7 @@ impl CausalPositionValidator {
             let second_activity = ActivityEvidence::from(second_activity);
 
             let final_activity = self.activity_since(wallet, start, (self.now)()).await?;
-            self.preflight_control_read(
+            let final_twins = self.preflight_control_read(
                 wallet,
                 &final_activity,
                 paper_state,
@@ -1061,7 +1075,14 @@ impl CausalPositionValidator {
             unresolved_assets.extend(std::mem::take(&mut final_prepared.unresolved_assets));
             metadata_reads.extend(std::mem::take(&mut final_prepared.metadata_reads));
             if self
-                .commit_control(wallet, &final_activity, &final_prepared, control_tx, true)
+                .commit_control(
+                    wallet,
+                    &final_activity,
+                    &final_prepared,
+                    final_twins,
+                    control_tx,
+                    true,
+                )
                 .await?
             {
                 return Err(CausalPositionError::InterveningActivity { wallet });
@@ -1133,6 +1154,7 @@ impl CausalPositionValidator {
                 wallet,
                 &first_activity,
                 &first_prepared,
+                paper_state,
                 &mut engine,
                 false,
                 &self.source_log_generation,
@@ -1164,6 +1186,7 @@ impl CausalPositionValidator {
                 wallet,
                 &second_activity,
                 &second_prepared,
+                paper_state,
                 &mut engine,
                 true,
                 &self.source_log_generation,
@@ -1195,6 +1218,7 @@ impl CausalPositionValidator {
                 wallet,
                 &final_activity,
                 &final_prepared,
+                paper_state,
                 &mut engine,
                 true,
                 &self.source_log_generation,
@@ -1462,6 +1486,8 @@ impl CausalPositionValidator {
             .map_err(|source| CausalPositionError::Positions { wallet, source })
     }
 
+    /// Returns the read's restamp twins (#763), which are not intervening activity and commit
+    /// under the twin exemption.
     fn preflight_control_read(
         &self,
         wallet: WalletAddress,
@@ -1469,7 +1495,13 @@ impl CausalPositionValidator {
         paper_state: &PaperStateDb,
         purpose: ValidationPurpose,
         ordinary_reconciliation_needed: &mut bool,
-    ) -> Result<(), CausalPositionError> {
+    ) -> Result<HashSet<SourceTradeId>, CausalPositionError> {
+        let twins = restamp_twins(paper_state, &activity.rows).map_err(|error| {
+            CausalPositionError::BucketCommit {
+                wallet,
+                message: error.to_string(),
+            }
+        })?;
         if let ValidationPurpose::RoutineRefresh { cutoff } = purpose {
             for bucket in activity
                 .buckets()
@@ -1477,6 +1509,7 @@ impl CausalPositionValidator {
             {
                 for aggregate in bucket {
                     if aggregate.source_time.0.unix_timestamp() > cutoff
+                        && !twins.contains(aggregate.group_id.key())
                         && paper_state
                             .activity_group_state(aggregate.group_id.key())?
                             .is_none()
@@ -1487,7 +1520,7 @@ impl CausalPositionValidator {
                 }
             }
         }
-        Ok(())
+        Ok(twins)
     }
 
     async fn commit_control(
@@ -1495,6 +1528,7 @@ impl CausalPositionValidator {
         wallet: WalletAddress,
         activity: &CompleteActivityRead,
         prepared: &PreparedActivity,
+        twins: HashSet<SourceTradeId>,
         control_tx: &mpsc::Sender<OrchestratorControl>,
         count_change: bool,
     ) -> Result<bool, CausalPositionError> {
@@ -1506,6 +1540,7 @@ impl CausalPositionValidator {
             activity,
             &self.source_log_generation,
             prepared,
+            twins,
         )?);
         for bucket in buckets {
             let (committed, acknowledgement) = oneshot::channel();
@@ -1780,7 +1815,7 @@ fn recovery_fresh_history(
     read: &CompleteActivityRead,
     prepared: &PreparedActivity,
 ) -> Result<Vec<MarketHistoryRecord>, CausalPositionError> {
-    let context = bracket_context(read, "", prepared)?;
+    let context = bracket_context(read, "", prepared, HashSet::new())?;
     let mut history = Vec::new();
     for bucket in read
         .buckets()
@@ -1868,6 +1903,7 @@ fn bracket_context(
     activity: &CompleteActivityRead,
     source_log_generation: &str,
     prepared: &PreparedActivity,
+    restamp_twins: HashSet<SourceTradeId>,
 ) -> Result<BucketDecisionContext, CausalPositionError> {
     let reconstruction_quality =
         ReconstructionQuality::new(100).map_err(|_| CausalPositionError::ReconstructionQuality)?;
@@ -1894,7 +1930,7 @@ fn bracket_context(
         no_copy_dispositions: prepared.no_copy_dispositions.clone(),
         identity_overrides: prepared.identity_overrides.clone(),
         identity_unresolved: prepared.identity_unresolved.clone(),
-        restamp_twins: Default::default(),
+        restamp_twins,
         history_status: None,
     })
 }
@@ -1903,6 +1939,7 @@ fn commit_direct(
     wallet: WalletAddress,
     activity: &CompleteActivityRead,
     prepared: &PreparedActivity,
+    paper_state: &PaperStateDb,
     engine: &mut BucketCommitEngine,
     count_change: bool,
     source_log_generation: &str,
@@ -1915,7 +1952,13 @@ fn commit_direct(
     let buckets = activity
         .buckets()
         .map_err(|source| CausalPositionError::Activity { wallet, source })?;
-    let context = bracket_context(activity, source_log_generation, prepared)?;
+    let twins = restamp_twins(paper_state, &activity.rows).map_err(|error| {
+        CausalPositionError::BucketCommit {
+            wallet,
+            message: error.to_string(),
+        }
+    })?;
+    let context = bracket_context(activity, source_log_generation, prepared, twins)?;
     let outcome = engine
         .commit_batch(|engine| {
             let mut changed = false;
@@ -2601,7 +2644,14 @@ mod tests {
 
         assert!(
             validator
-                .commit_control(wallet, &activity, &prepared, &control_tx, true)
+                .commit_control(
+                    wallet,
+                    &activity,
+                    &prepared,
+                    HashSet::new(),
+                    &control_tx,
+                    true
+                )
                 .await
                 .unwrap()
         );
@@ -2698,6 +2748,7 @@ mod tests {
             wallet,
             &activity,
             &prepared,
+            &paper,
             &mut engine,
             false,
             "fixture-generation",

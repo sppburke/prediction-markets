@@ -1469,17 +1469,18 @@ impl AdmissionPreparer {
             installs,
             acknowledged,
         });
-        tokio::time::timeout(
-            Duration::from_secs(ADMISSION_PREPARE_ACK_TIMEOUT_SECS),
-            acknowledgement,
-        )
-        .await
-        .map_err(|_| AdmissionError::AcknowledgementTimeout(ADMISSION_PREPARE_ACK_TIMEOUT_SECS))?
-        .map_err(|_| AdmissionError::AcknowledgementClosed)?
-        .map_err(|error| match error {
-            AnchorInstallError::Durability(message) => AdmissionError::ValidationInstall(message),
-            rejection => AdmissionError::ValidationRejected(rejection),
-        })
+        // The orchestrator installs whatever it receives and then replies (or drops the sender on
+        // exit), so the outcome is always known: a deadline here would discard an install that
+        // lands (#765).
+        acknowledgement
+            .await
+            .map_err(|_| AdmissionError::AcknowledgementClosed)?
+            .map_err(|error| match error {
+                AnchorInstallError::Durability(message) => {
+                    AdmissionError::ValidationInstall(message)
+                }
+                rejection => AdmissionError::ValidationRejected(rejection),
+            })
     }
     /// Exercise production artifact capture and locked publication from scenario harnesses.
     #[cfg(feature = "scenario")]

@@ -1726,6 +1726,75 @@ async fn refresh_cooldown_clears_queued_wallet_so_other_wallet_refreshes() {
     running.finish().await;
 }
 
+/// PASS: a wallet queued for refresh while another refresh holds the slot, which then gains an
+/// observation that never resolves, yields its turn when the next round ends; the next due
+/// wallet refreshes. FAIL: every routine refresh waits behind it.
+#[tokio::test(start_paused = true)]
+async fn queued_refresh_wallet_that_becomes_obligated_yields_its_turn() {
+    use pe_service::trade_poller::PollerProgress;
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (first, other) = (WalletAddress([0x11; 20]), WalletAddress([0xbb; 20]));
+    let (mut running, _paper) = start_recorded_poller_with_anchors(
+        &dir,
+        &[first, wallet(), other],
+        false,
+        true,
+        Some(EPOCH),
+    );
+    let refresh_of = |url: &str, target: WalletAddress| {
+        url.contains(&target.to_string()) && url.ends_with("&start=1")
+    };
+    // Round 1 starts `first`'s refresh, held here; round 2 queues wallet() behind it.
+    let mut held = None;
+    let mut rounds = 0;
+    while rounds < 2 {
+        tokio::select! {
+            request = running.requests.recv() => {
+                let request = request.unwrap();
+                if refresh_of(&request.url, first) {
+                    held = Some(request);
+                } else {
+                    request.respond.send(b"[]".to_vec()).unwrap();
+                }
+            }
+            progress = running.progress.recv() => {
+                if matches!(progress, Some(PollerProgress::RoundCompleted)) {
+                    rounds += 1;
+                }
+            }
+        }
+    }
+    let missing = activity_row(
+        "TRADE",
+        "0xmissing",
+        "0xcondition-a",
+        "BUY",
+        "10",
+        "asset-a",
+        EPOCH - 5,
+    );
+    running.observe_with(missing, false).await;
+    held.expect("first refresh holds the slot")
+        .respond
+        .send(b"[]".to_vec())
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(600), async {
+        loop {
+            let request = running.requests.recv().await.unwrap();
+            let refresh = refresh_of(&request.url, other);
+            request.respond.send(b"[]".to_vec()).unwrap();
+            if refresh {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the next due wallet refreshes");
+    running.finish().await;
+}
+
 /// PASS: a short non-routine deferral has no queued duplicate or retry; normal selection
 /// refreshes another eligible wallet before the deadline and the deferred wallet at expiry.
 #[tokio::test(start_paused = true)]
@@ -2206,6 +2275,9 @@ async fn sent_anchor_install_holds_wallet_until_ack_then_urgent_reconciles() {
         running.requests.try_recv().is_err(),
         "urgent waits for install acknowledgement"
     );
+    // However long the acknowledgement takes, the refresh waits for it (#765).
+    tokio::time::advance(std::time::Duration::from_secs(31)).await;
+    assert!(running.requests.try_recv().is_err());
     drop(held);
     let urgent = running.requests.recv().await.unwrap();
     urgent
@@ -2853,13 +2925,18 @@ async fn older_unmatched_observation_holds_newer_bucket_until_correlated() {
         .send(serde_json::to_vec(&[newer.clone(), older.clone()]).unwrap())
         .unwrap();
     assert_eq!(running.completed(wallet()).await, vec![newer_receipt]);
+    // A later read may resend decided buckets; only first decisions count.
     let commits = running.finish().await;
-    assert_eq!(commits.len(), 2);
-    assert_eq!(commits[0].2.source_epoch, EPOCH);
-    assert_eq!(commits[1].2.source_epoch, EPOCH + 1);
-    assert!(commits[1].1.no_copy_dispositions.is_empty());
+    let decided = commits
+        .iter()
+        .filter(|(_, _, result)| !result.already_committed)
+        .collect::<Vec<_>>();
+    assert_eq!(decided.len(), 2);
+    assert_eq!(decided[0].2.source_epoch, EPOCH);
+    assert_eq!(decided[1].2.source_epoch, EPOCH + 1);
+    assert!(decided[1].1.no_copy_dispositions.is_empty());
     assert_eq!(
-        commits[1].2.pending,
+        decided[1].2.pending,
         vec![aggregate(newer.clone()).group_id.key().clone()]
     );
     assert!(
@@ -4033,7 +4110,7 @@ async fn existing_fence_discharges_new_ambiguity_and_releases_oldest_boundary() 
     let fresh_receipt = running.observe(fresh.clone()).await;
     let request = running.requests.recv().await.unwrap();
     assert!(
-        request.url.contains(&format!("start={}", cutoff - 1)),
+        request.url.contains(&format!("start={}", cutoff - 60)),
         "{}",
         request.url
     );
@@ -4953,6 +5030,94 @@ async fn feed_observation_of_a_restamp_pair_binds_the_recorded_original() {
             open.len()
         );
     }
+}
+
+/// PASS: the feed stamps a trade two seconds after the history row its original was recorded
+/// from, and the cursor has passed that row. The observation's read still reaches the restamped
+/// row, binds it as a twin and retires, so later history commits. FAIL: the observation stays
+/// unmatched and holds every later bucket of the wallet.
+#[tokio::test(start_paused = true)]
+async fn feed_observation_stamped_after_its_history_row_still_binds() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (mut running, paper) = start_recorded_poller_with_owner(&dir, &[wallet()], true);
+    let mut original = stream_row(wallet(), "skewed-feed", EPOCH - 2);
+    original["outcomeIndex"] = json!(999);
+    let original_id = aggregate(original.clone()).group_id.key().clone();
+    let later = activity_row("TRADE", "later", MARKET_A, "BUY", "1", "asset-a", EPOCH);
+    running
+        .requests
+        .recv()
+        .await
+        .unwrap()
+        .respond
+        .send(serde_json::to_vec(&[original, later.clone()]).unwrap())
+        .unwrap();
+    running.round_completed().await;
+    assert!(paper.activity_group_state(&original_id).unwrap().is_some());
+    assert_eq!(paper.cursor(&wallet()).unwrap(), Some(EPOCH));
+
+    let restamp = stream_row(wallet(), "skewed-feed", EPOCH - 2);
+    let restamp_id = aggregate(restamp.clone()).group_id.key().clone();
+    let mut stream = restamp.clone();
+    stream["timestamp"] = json!(EPOCH);
+    running.now.store(EPOCH + 3, Ordering::SeqCst);
+    running.observe_with(stream, false).await;
+    let newest = activity_row(
+        "TRADE",
+        "newest",
+        MARKET_A,
+        "SELL",
+        "1",
+        "asset-a",
+        EPOCH + 3,
+    );
+    let newest_id = aggregate(newest.clone()).group_id.key().clone();
+    let venue = [restamp, later, newest];
+    tokio::time::timeout(Duration::from_secs(600), async {
+        while paper.activity_group_state(&newest_id).unwrap().is_none() {
+            let request = running.requests.recv().await.unwrap();
+            let start = request
+                .url
+                .split("&start=")
+                .nth(1)
+                .and_then(|start| start.split('&').next())
+                .map_or(0, |start| start.parse::<i64>().unwrap());
+            let rows = venue
+                .iter()
+                .filter(|row| row["timestamp"].as_i64().unwrap() >= start)
+                .collect::<Vec<_>>();
+            request
+                .respond
+                .send(serde_json::to_vec(&rows).unwrap())
+                .unwrap();
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("later history commits once the observation binds");
+    let commits = running.finish().await;
+    let (_, context, twin) = commits
+        .iter()
+        .find(|(aggregates, _, _)| {
+            aggregates
+                .iter()
+                .any(|aggregate| aggregate.group_id.key() == &restamp_id)
+        })
+        .unwrap();
+    assert!(context.restamp_twins.contains(&restamp_id));
+    assert_eq!(twin.dispositions[&restamp_id.0], "raw_only");
+    assert!(paper.wallet_fences().unwrap().is_empty());
+    assert!(!paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+    assert!(
+        pe_service::trade_poller::rebuild_reconciliation_obligations(
+            &dir.path().join("source.log"),
+            &paper
+        )
+        .unwrap()
+        .is_empty()
+    );
 }
 
 /// AC5 boundary: a restamp first seen beside its unrecorded original is not a twin. A feed

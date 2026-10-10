@@ -67,6 +67,9 @@ pub const DAILY_BOUNDARY_SOURCE_ID: &str = "pe-service.boundary";
 pub const ACTIVITY_POLL_PAGE_SCHEMA_VERSION: u32 = 3;
 /// Best-effort cadence for refreshing venue-authoritative position anchors.
 pub const ANCHOR_REFRESH_SECS: u64 = 3_600;
+/// How far before a feed observation's own second its complete read starts: the venue's history
+/// can stamp the same trade seconds earlier than the feed did (`_GLOSSARY.md`).
+const FEED_HISTORY_SKEW_SECS: i64 = 60;
 /// Compiled bound: one urgent, one backstop/boundary, and one refresh operation.
 pub const TRADE_RECONCILIATION_CONCURRENCY: usize = 3;
 const SECONDS_PER_DAY: i64 = 86_400;
@@ -990,7 +993,7 @@ fn source_rebuild_error(error: anyhow::Error) -> ObligationRebuildError {
 }
 
 #[derive(Debug, thiserror::Error)]
-enum ReconciliationError {
+pub(crate) enum ReconciliationError {
     #[error("backstop visit yielded to a newer websocket obligation")]
     Preempted,
     #[error("activity reconciliation: {0}")]
@@ -1307,7 +1310,8 @@ impl TradePoller {
     }
 
     /// Receive triggers throughout reads. Shutdown cancels venue work, but a sent bucket
-    /// commit or anchor install retains wallet ownership until its acknowledgement or timeout.
+    /// commit or anchor install retains wallet ownership until its acknowledgement arrives or its
+    /// channel closes.
     /// Accepted source pages, commitments, and buckets remain durable; an obligation whose
     /// target was not disposed is rebuilt from the source log at the next boot. A refresh not
     /// handed over is re-derived from the anchor at the next boot. A failed operation stops
@@ -1526,7 +1530,12 @@ impl TradePoller {
                         RoundStage::Publish => {
                             round.stage = RoundStage::Done;
                             self.record_round_health(&round);
-                            if refresh_pending.is_none() {
+                            // A pending wallet still busy or holding obligations a round later
+                            // yields its turn: the cursor has passed it, so it comes round again.
+                            if refresh_pending.is_none_or(|wallet| {
+                                busy_wallets.contains(&wallet)
+                                    || self.obligations.by_wallet.contains_key(&wallet)
+                            }) {
                                 match self.select_refresh_wallet(&round.live_wallets) {
                                     Ok(wallet) => refresh_pending = wallet,
                                     Err(error) => {
@@ -2194,7 +2203,7 @@ impl WalletOperation {
             .map(|value| value.saturating_sub(1));
         let obligation_start = selected
             .first_key_value()
-            .map(|(epoch, _)| epoch.saturating_sub(1));
+            .map(|(epoch, _)| epoch.saturating_sub(1 + FEED_HISTORY_SKEW_SECS));
         let mut start = match (cursor_start, obligation_start) {
             (Some(left), Some(right)) => Some(left.min(right)),
             (left, None) => left,
@@ -2958,7 +2967,7 @@ fn raw_only_combo(aggregate: &ActivityAggregate) -> bool {
 /// Groups of this read that are restamps of a recorded original (#730 item 5), recorded
 /// themselves or not: bucket routing applies the exemption to unseen ones, and feed correlation
 /// counts any of them with its original.
-fn restamp_twins(
+pub(crate) fn restamp_twins(
     paper_state: &PaperStateDb,
     rows: &[NormalizedActivity],
 ) -> Result<HashSet<SourceTradeId>, ReconciliationError> {
