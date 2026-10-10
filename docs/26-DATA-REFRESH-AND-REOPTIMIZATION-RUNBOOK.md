@@ -145,6 +145,15 @@ and fix forward; never downgrade that cache in place.
 
 ### Large-wallet collection progress (#747, AC9)
 
+The post-COMMIT `activity wallet excluded from generation` warning records `commit_ms` from before
+BEGIN through the COMMIT return, including any automatic checkpoint, and physical `rows_deleted`
+and `rows_inserted`. Record these fields for tracked partial commits. The collection run summary
+reports physical write counts for successfully committed wallets; rolled-back wallets contribute
+zero. Its fetch/writer completion and final-drain times measure invocation progress, not individual
+wallet commit service time. `producer_blocked_ms` sums wallet send waits, which can overlap; it
+measures neither writer service time nor elapsed wall-clock blockage. Receipt-proved source rows
+measure acquired coverage, not physical writes: a full read can keep most fetched rows in place.
+
 Keep one resumable operator record across cycles for wallets logged with `acquisition budget
 exhausted` or holding partial receipts, until their first successful finalize or a documented
 existing unreadable-row/aggregation exclusion. Run this read-only query against each cycle's cache,
@@ -937,9 +946,13 @@ Admission preserves activity rows, receipts, manifests and cumulative drops, cle
 projection/binding and invalidates finalization. Incremental collection strictly inserts only fetched
 rows and their fetched-set receipt in one wallet transaction; no carry or re-stamping occurs.
 The receipt-chain verifier owns effective history. An unchanged automatic full read writes only its
-receipt, without a history read/write or per-aggregate identity probe. A differing full read checks
-stored history before replacing it; a foreign-wallet identity is fatal. A full partial also checks
-and replaces retained history; an incremental partial inserts its proved rows. Explicit repairs
+receipt, without a history read/write or per-aggregate identity probe. A differing non-repair full
+read with a history proof checks all stored history, keeps rows at the same source second and ID
+with identical canonical aggregate bytes, deletes other stored rows and strictly inserts only
+unkept fetched aggregates; a foreign-wallet identity is fatal. A non-repair full partial with a
+history proof follows the same rule inside its fetched window and deletes the tail after its
+acquired end; an incremental partial inserts its proved rows. Full reads without a history proof
+retain delete-all replacement. Explicit repairs
 always replace after logging stored/certified digests, keeping a proved partial or empty history
 when no window was proved or proved windows failed aggregation. Other exclusions and deferrals keep retained rows and never reset the chain. Historical manifests are
 commitments, not queryable snapshots. Keep staging evidence and `H0`; resumed staging leaves progress
