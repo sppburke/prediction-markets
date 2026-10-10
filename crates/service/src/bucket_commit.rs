@@ -5448,6 +5448,9 @@ impl BucketCommitEngine {
                 advance_cursor: false,
             })?;
         self.apply_history_projection(wallet, &history_effects, None);
+        // The groups are durable: deliver past them now, as their all-stored re-read would,
+        // so a later re-read never moves the cursor between a bracket's captures.
+        self.paper_state.set_cursor(&wallet, source_epoch)?;
         Ok(BucketCommitResult {
             retained_revision: false,
             wallet,

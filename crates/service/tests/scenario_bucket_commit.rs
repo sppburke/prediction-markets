@@ -2531,8 +2531,9 @@ fn changed_group_fences_but_an_all_unseen_late_group_requires_reanchor() {
 
     let decrement = position_row("TRADE", "0x83", MARKET_B, 0, "SELL", "1", "0.5", 701);
     let decrement_id = decrement.group_id.key().clone();
+    let activity_before = paper.activity(&wallet()).unwrap();
     let result = engine
-        .commit_read(vec![decrement], &context(701, true), zero_basis())
+        .commit_read(vec![decrement.clone()], &context(701, true), zero_basis())
         .unwrap();
     assert_eq!(result.newly_fenced, None);
     assert_eq!(
@@ -2542,6 +2543,17 @@ fn changed_group_fences_but_an_all_unseen_late_group_requires_reanchor() {
     assert!(result.pending.is_empty());
     assert_eq!(state(&engine, MARKET_B, 0).atomic(), 5_000_000);
     assert!(paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+    // The late group is delivered: the cursor moves forward to its second, the activity clock is
+    // untouched, and re-reading it changes neither cursor nor coverage.
+    assert_eq!(paper.cursor(&wallet()).unwrap(), Some(701));
+    assert_eq!(paper.activity(&wallet()).unwrap(), activity_before);
+    let coverage = paper.wallet_coverage(&wallet()).unwrap();
+    let reread = engine
+        .commit_read(vec![decrement], &context(701, true), zero_basis())
+        .unwrap();
+    assert!(reread.already_committed);
+    assert_eq!(paper.cursor(&wallet()).unwrap(), Some(701));
+    assert_eq!(paper.wallet_coverage(&wallet()).unwrap(), coverage);
     let decrement_group = paper
         .activity_groups_after(&wallet(), 700)
         .unwrap()

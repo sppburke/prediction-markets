@@ -2190,9 +2190,20 @@ impl PaperStateDb {
             )
             .optional()?
             .is_some();
+        // Late-group commits deliver past what they store, so a wallet awaiting re-anchoring
+        // signals a bucket's new groups through its coverage generation instead of its cursor.
+        let wallet_reanchoring = tx
+            .query_row(
+                "SELECT reanchor_required FROM poll_cursors WHERE wallet_hex = ?1",
+                params![bucket.wallet.to_string()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            == Some(1);
         let mut invalidates_position_validation = false;
         let mut inserts_reanchor_trigger = false;
         let mut retains_novel_revision = false;
+        let mut inserts_group = false;
 
         for record in &bucket.dispositions {
             let mut non_original = false;
@@ -2244,6 +2255,7 @@ impl PaperStateDb {
                 non_original = revision != record.semantic_revision;
             } else {
                 invalidates_position_validation = true;
+                inserts_group = true;
                 inserts_reanchor_trigger |= bucket
                     .reanchor
                     .as_ref()
@@ -2347,7 +2359,9 @@ impl PaperStateDb {
             invalidates_position_validation = true;
         }
 
-        if retains_novel_revision && !inserts_reanchor_trigger {
+        if (retains_novel_revision || (wallet_reanchoring && inserts_group))
+            && !inserts_reanchor_trigger
+        {
             tx.execute("UPDATE poll_cursors SET coverage_generation = coverage_generation + 1 WHERE wallet_hex = ?1", params![bucket.wallet.to_string()])?;
         }
 
@@ -8443,6 +8457,13 @@ mod tests {
 
         db.commit_activity_bucket(&bucket).unwrap();
         assert_eq!(db.wallet_coverage(&wallet).unwrap().coverage_generation, 1);
+        // While re-anchoring is required, a bucket of new groups without a trigger changes the
+        // generation once; its exact retry does not.
+        let siblings = activity_bucket(wallet, 101, &['b', 'e']);
+        db.commit_activity_bucket(&siblings).unwrap();
+        assert_eq!(db.wallet_coverage(&wallet).unwrap().coverage_generation, 2);
+        db.commit_activity_bucket(&siblings).unwrap();
+        assert_eq!(db.wallet_coverage(&wallet).unwrap().coverage_generation, 2);
 
         db.install_anchors(&[anchor_install(
             wallet,
@@ -8453,10 +8474,14 @@ mod tests {
         )])
         .unwrap();
         let coverage = db.wallet_coverage(&wallet).unwrap();
-        assert_eq!(coverage.coverage_generation, 1);
+        assert_eq!(coverage.coverage_generation, 2);
         assert!(!coverage.reanchor_required);
         assert_eq!(coverage.anchor_seq, Some(1));
         assert!(db.position_validation(&wallet).unwrap().is_some());
+        // Once re-anchored, a new group leaves the generation alone.
+        db.commit_activity_bucket(&activity_bucket(wallet, 130, &['f']))
+            .unwrap();
+        assert_eq!(db.wallet_coverage(&wallet).unwrap().coverage_generation, 2);
     }
 
     #[test]

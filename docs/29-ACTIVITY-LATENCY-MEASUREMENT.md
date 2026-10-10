@@ -208,9 +208,12 @@ and decided after it: the inspection authenticates the original frame and frozen
 of every continuation-7 frame decision and the receipts referenced by every admission or fallback
 artifact. The capture checks these and stops, naming the earliest missing sequence, when one
 precedes its start; capture again from a known
-receipt at or before that sequence. Find a start's byte offset by walking frame lengths forward from a
-known receipt (the deploy boot's checkpoint tail, an earlier capture's recorded start, or the log
-header at offset 5, sequence 0); do not infer it from trade epochs. A re-measurement uses the same
+receipt at or before that sequence. Below the retention boundary (`source_events.log.retention`) the
+capture reads pinned frames by their recorded offsets and walks contiguously from the boundary; move
+the start earlier for a required receipt before it, the capture stops if retention did not keep a
+required receipt, and derive other offsets only within an unpunched range by walking frame lengths
+forward from a known receipt (the deploy boot's checkpoint tail or an earlier capture's recorded
+start); do not infer them from trade epochs. A re-measurement uses the same
 capture start and passes its own cohort boundary to the inspection below. Retain verification
 receipts and physical prefix bounds with the capture.
 
@@ -252,16 +255,21 @@ print("database copy seconds", round(time.time() - started, 1),
       "snapshot started", time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(started)))
 # The capture must hold the original frame and identity receipts of every continuation-7 frame decision.
 copy = sqlite3.connect((out / "paper_state.db").resolve().as_uri() + "?mode=ro", uri=True)
-(earliest,) = copy.execute(
-    "SELECT min(json_extract(frozen_inputs_json,'$.observed_source_receipt.sequence')) FROM decision_pending "
+required = [s for row in copy.execute(
+    "SELECT json_extract(frozen_inputs_json,'$.observed_source_receipt.sequence'), "
+    "json_extract(frozen_inputs_json,'$.decision_inputs.inputs.identity.receipt.sequence') FROM decision_pending "
     "WHERE json_extract(frozen_inputs_json,'$.version')=7 "
-    "AND json_extract(frozen_inputs_json,'$.source_authority')='activity_frame'").fetchone()
-(identity_earliest,) = copy.execute(
-    "SELECT min(json_extract(frozen_inputs_json,'$.decision_inputs.inputs.identity.receipt.sequence')) FROM decision_pending "
-    "WHERE json_extract(frozen_inputs_json,'$.version')=7 "
-    "AND json_extract(frozen_inputs_json,'$.source_authority')='activity_frame'").fetchone()
+    "AND json_extract(frozen_inputs_json,'$.source_authority')='activity_frame'") for s in row if s is not None]
 copy.close()
-missing = [r for r in (earliest, identity_earliest) if r is not None and r < start_seq]
+# Retention punches the log below its boundary except the frames it pins: a start below the boundary reads
+# the pinned frames from the start individually and walks contiguously from the boundary.
+walk_offset, walk_seq, pins = start_offset, start_seq, []
+retention = Path(live_source + ".retention")
+if retention.exists():
+    authority = json.loads(retention.read_text())["authority"]
+    if start_seq < authority["boundary"]["sequence"]:
+        walk_offset, walk_seq = authority["boundary"]["offset"], authority["boundary"]["sequence"]
+        pins = sorted((p for p in authority["pins"] if start_seq <= p["sequence"] < walk_seq), key=lambda p: p["sequence"])
 
 def frames(f, offset):
     f.seek(offset)
@@ -283,18 +291,26 @@ def envelope(block):
 # 2. Source frames from the capture start to the last complete frame, filtered to the recipe's IDs.
 #    Captured after the copy; admission and fallback artifacts must reference frames inside it.
 REFERENCING = {b"pe-service.activity-frame-admission", b"pe-service.activity-frame-fallback"}
+def artifact_receipts(sid, text):
+    if sid not in REFERENCING: return []
+    a = json.loads(bytes(json.loads(text)["payload"]))
+    return [a["frame_receipt"]["sequence"]] + ([a["identity"]["receipt"]["sequence"]] if a.get("identity") is not None else [])
+pinned = set()
 with open(live_source, "rb") as f, open(out / "source_filtered.log", "wb") as w:
-    w.write(b"EDGE\x01"); expected = start_seq; kept = 0; end = start_offset
-    for end, raw, block in frames(f, start_offset):
+    w.write(b"EDGE\x01"); kept = 0
+    for p in pins:
+        _, raw, block = next(frames(f, p["offset"]))
+        seq, sid, text = envelope(block)
+        assert seq == p["sequence"] and json.loads(text)["this_hash"] == p["hash"], ("pin", p["sequence"])
+        pinned.add(seq); required.extend(artifact_receipts(sid, text))
+        if sid in KEEP: w.write(raw); kept += 1
+    expected = walk_seq; end = walk_offset
+    for end, raw, block in frames(f, walk_offset):
         seq, sid, text = envelope(block); assert seq == expected, (seq, expected); expected += 1
-        if sid in REFERENCING:
-            a = json.loads(bytes(json.loads(text)["payload"]))
-            references = [a["frame_receipt"]]
-            if a.get("identity") is not None: references.append(a["identity"]["receipt"])
-            missing.extend(r["sequence"] for r in references if r["sequence"] < start_seq)
+        required.extend(artifact_receipts(sid, text))
         if sid in KEEP: w.write(raw); kept += 1
         end += len(raw)
-print("source sequences", start_seq, expected - 1, "end offset", end, "kept", kept)
+print("source sequences", walk_seq, expected - 1, "end offset", end, "kept", kept, "pinned", len(pinned))
 
 # 3. The whole paper log through its last complete frame.
 with open(live_paper, "rb") as f, open(out / "paper.log", "wb") as w:
@@ -310,9 +326,11 @@ with open(live_paper, "rb") as f, open(out / "paper.log", "wb") as w:
         references = [evidence.get("ranking_receipt"), evidence.get("config_receipt")]
         references.extend(a["receipt"] for a in evidence["admission_receipts"])
         references.extend(a["causal_receipt"] for a in evidence.get("evictions", []))
-        missing.extend(r["sequence"] for r in references if r is not None and r["sequence"] < start_seq)
+        required.extend(r["sequence"] for r in references if r is not None)
 # Paper references can only be checked after both finite prefixes have been captured.
-assert not missing, ("capture again from a receipt at or before", min(missing))
+missing = sorted(s for s in required if s < walk_seq and s not in pinned)
+assert not missing or missing[0] >= start_seq, ("capture again from a receipt at or before", missing[0])
+assert not missing, ("retention did not keep a required receipt", missing[0])
 PY
 ```
 
@@ -320,7 +338,8 @@ Record identities and run this inspection on the capture, substituting the cohor
 sequence (the deployment sequence, or a recorded re-measurement boundary) and cohort size (one fill
 for AC15; the AC16 size for latency acceptance). The inspection keeps only each captured frame's
 location in memory and reads, CRC-checks and decodes a frame from the log on access; its source
-scans read only the frames of the sources they examine. It counts bindings to observations before the capture and fails if one binds
+scans read only the frames of the sources they examine. It counts bindings to observations outside the capture (before its start,
+or below the retention boundary and not pinned) and fails if one binds
 an admitted frame decision or an audited identity. For each market whose earliest captured BUY is not
 before the window, it reads recorded BUYs at or before that stamp from `activity_groups` effects
 before applying the window: an identity seen in the capture keeps its earliest stamp, as the
@@ -732,12 +751,12 @@ for e in source.values("polymarket-activity-ws", "polymarket-public.activity-rec
 print("unmatched group identities; resolve from authenticated corrections or report unknown", sorted(set(groups) - matched))
 print("multi-leg controls", [(w, tx, sorted(ids)) for (w, tx), ids in legs.items() if len(ids) > 1])
 # Bind corrected/aliased frame identities using authenticated commitment receipts.
-first_captured = min(source); outside = 0; outside_ids = set()
+outside = 0; outside_ids = set()
 for e in source.values("pe-service.activity-read-commitment"):
     if e["source_id"] != "pe-service.activity-read-commitment": continue
     for b in payload(e).get("bindings") or []:
         r = b["stream_receipt"]
-        if r["sequence"] < first_captured:
+        if r["sequence"] not in source:
             assert (r["sequence"], r["this_hash"]) not in admitted, ("audited frame outside the capture", r)
             outside += 1; outside_ids.add(b["history_group_id"]); continue
         f = receipt(source, r)
@@ -745,7 +764,7 @@ for e in source.values("pe-service.activity-read-commitment"):
         frame_rows.append(frame_row(b["history_group_id"], f))
         twins = receipts[f["seq"]]["history_group_ids"]
         if b["history_group_id"] not in twins: twins.append(b["history_group_id"])
-print("bindings to observations before the capture", outside)
+print("bindings to observations outside the capture", outside)
 # Replay recorded membership, retaining removed wallets and all prices.
 def canonical_wallet(w):
     # WalletAddress::from_hex: "0x" then 40 hex digits in either case; canonical form is lowercase.

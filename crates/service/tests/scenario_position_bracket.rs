@@ -1040,17 +1040,19 @@ fn spawn_control_actor(
     engine: BucketCommitEngine,
     paper: Arc<PaperStateDb>,
 ) -> tokio::task::JoinHandle<()> {
-    spawn_counted_control_actor(control_rx, engine, paper, None)
+    spawn_hooked_control_actor(control_rx, engine, paper, |_, _| {})
 }
 
-fn spawn_counted_control_actor(
+/// Runs `hook` on each control message before the actor handles it.
+fn spawn_hooked_control_actor(
     mut control_rx: mpsc::Receiver<OrchestratorControl>,
     mut engine: BucketCommitEngine,
     paper: Arc<PaperStateDb>,
-    commits: Option<Arc<AtomicUsize>>,
+    mut hook: impl FnMut(&OrchestratorControl, &mut BucketCommitEngine) + Send + 'static,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while let Some(message) = control_rx.recv().await {
+            hook(&message, &mut engine);
             match message {
                 OrchestratorControl::PrepareAdmissions { acknowledged, .. } => {
                     let _ = acknowledged.send(());
@@ -1073,9 +1075,6 @@ fn spawn_counted_control_actor(
                     context,
                     committed,
                 } => {
-                    if let Some(commits) = &commits {
-                        commits.fetch_add(1, Ordering::SeqCst);
-                    }
                     let _ = committed.send(
                         engine
                             .commit(aggregates, context.as_ref(), zero_basis())
@@ -1367,7 +1366,7 @@ async fn stored_market_recovered_in_second_read_counts_as_activity_and_retries()
     install_empty_anchor(&mut engine, &paper, wallet, 0);
     require_reanchor(&path, wallet);
     store_old_late_groups(&mut engine, wallet);
-    assert_eq!(paper.cursor(&wallet).unwrap(), Some(0));
+    assert_eq!(paper.cursor(&wallet).unwrap(), Some(30));
     assert_eq!(paper.activity(&wallet).unwrap(), None);
     let before = stored_activity_snapshot(&path);
     let mut responses = older_market_responses(wallet, 2);
@@ -1471,8 +1470,14 @@ fn cursor_write_failure_after_stored_repair_keeps_the_projection_published() {
     store_old_late_groups(&mut engine, wallet);
     let stored = aggregate(activity(wallet, 3, "1", "0xbase3", 30), wallet);
     let stored_before = paper.activity_group_state(stored.group_id.key()).unwrap();
-    assert_eq!(paper.cursor(&wallet).unwrap(), Some(0));
     let conn = rusqlite::Connection::open(&path).unwrap();
+    // As stored by a binary whose late-group commits left the delivery cursor behind.
+    conn.execute(
+        "UPDATE poll_cursors SET last_ts_unix = 0 WHERE wallet_hex = ?1",
+        [wallet.to_string()],
+    )
+    .unwrap();
+    assert_eq!(paper.cursor(&wallet).unwrap(), Some(0));
     conn.execute_batch(
         "CREATE TRIGGER fail_cursor BEFORE UPDATE ON poll_cursors          BEGIN SELECT RAISE(FAIL, 'cursor fault'); END;",
     )
@@ -7027,7 +7032,12 @@ async fn reentry_baseline_and_three_tails_install_older_positions_and_catch_up()
     )));
     let (tx, rx) = mpsc::channel(2);
     let commits = Arc::new(AtomicUsize::new(0));
-    let actor = spawn_counted_control_actor(rx, engine, paper.clone(), Some(commits.clone()));
+    let counted = commits.clone();
+    let actor = spawn_hooked_control_actor(rx, engine, paper.clone(), move |message, _| {
+        if matches!(message, OrchestratorControl::CommitActivityBucket { .. }) {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }
+    });
     let preparer = AdmissionPreparer::with_validator(
         tx,
         paper.clone(),
@@ -7157,31 +7167,7 @@ async fn reentry_intervening_tail_activity_retries_from_a_new_baseline() {
     );
     let (tx, rx) = mpsc::channel(2);
     let actor = spawn_control_actor(rx, engine, paper.clone());
-    let bytes = Arc::new(Mutex::new(Vec::new()));
-    let subscriber = tracing_subscriber::fmt()
-        .json()
-        .without_time()
-        .with_writer(BracketLogs(bytes.clone()))
-        .finish();
-    use tracing::instrument::WithSubscriber;
-    let outcomes = validator
-        .validate_via_control(
-            &[wallet],
-            &tx,
-            &paper,
-            pe_service::position_seeder::ValidationPurpose::Reentry,
-            None,
-        )
-        .with_subscriber(subscriber)
-        .await;
-    let logged = bytes.lock().unwrap().clone();
-    let attempts = std::str::from_utf8(&logged)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .filter(|line| line["fields"]["message"] == "reentry bracket attempt")
-        .map(|line| line["fields"]["outcome"].as_str().unwrap().to_owned())
-        .collect::<Vec<_>>();
+    let (outcomes, attempts) = reentry_attempts(&validator, wallet, &tx, &paper).await;
     assert_eq!(attempts, ["validation.intervening_activity", "accepted"]);
     assert!(outcomes.shared.is_none());
     assert!(outcomes.deferred.is_empty());
@@ -7263,6 +7249,126 @@ async fn reentry_late_group_recovery_enforces_second_tail_fence_epoch() {
         drop(preparer);
         actor.await.unwrap();
     }
+}
+
+/// PASS: a re-anchoring wallet's re-entry accepts on its first attempt when the bracket first
+/// stores its newest row (re-reading stored rows moves nothing); when another reader stores a new
+/// group of that second between captures, the attempt is rejected and the retry accepts.
+/// FAIL: a re-read moves the cursor between captures, or the other reader's group changes
+/// neither the cursor nor the coverage generation.
+#[tokio::test]
+async fn reentry_of_reanchoring_wallet_sees_only_new_groups_between_captures() {
+    for intervening in [false, true] {
+        let wallet = wallet(0xe9);
+        let (dir, paper, mut engine) = fresh(&[wallet]);
+        install_empty_anchor(&mut engine, &paper, wallet, 3000);
+        let old = activity(wallet, 1, "1", "0xreanchor-old", 3999);
+        let new = activity(wallet, 1, "1", "0xreanchor-new", 4001);
+        let same_second = activity(wallet, 2, "1", "0xreanchor-same-second", 4001);
+        let group = aggregate(old.clone(), wallet);
+        paper.set_cursor(&wallet, 3990).unwrap();
+        rollout_record_effect_with_cursor(
+            &paper,
+            &group,
+            &pe_position_ledger::LedgerEffect::RawOnly,
+            "reanchor_required_late_group",
+            false,
+        );
+        rollout_fence(
+            &dir,
+            wallet,
+            group.group_id.key(),
+            "late_group_after_bucket_commit",
+            3999,
+        );
+        require_reanchor(&dir.path().join("paper.db"), wallet);
+        let engine = BucketCommitEngine::load(paper.clone(), PositionLedger::new()).unwrap();
+        let positions = [position(wallet, 1, "2")];
+        let tails = vec![new.clone(), old.clone()];
+        let mut reads = reentry_reads(
+            wallet,
+            4000,
+            [4002, 4003, 4004],
+            std::slice::from_ref(&old),
+            [&tails; 3],
+            &positions,
+        );
+        // The retry starts from a new baseline that holds the other reader's group.
+        let all = vec![new.clone(), same_second.clone(), old];
+        for (url, pages) in reentry_reads(
+            wallet,
+            4005,
+            [4006, 4007, 4008],
+            &all,
+            [&all; 3],
+            &positions,
+        ) {
+            reads.entry(url).or_default().extend(pages);
+        }
+        let validator = clocked_validator(
+            Arc::new(QueueFetcher::new(reads)),
+            vec![4000, 4002, 4003, 4004, 4005, 4006, 4007, 4008, 4008],
+        );
+        let (tx, rx) = mpsc::channel(2);
+        let injected = vec![aggregate(new, wallet), aggregate(same_second, wallet)];
+        let mut captures = 0;
+        let actor =
+            spawn_hooked_control_actor(rx, engine, paper.clone(), move |message, engine| {
+                if matches!(message, OrchestratorControl::CaptureAdmissionLedger { .. }) {
+                    captures += 1;
+                    if intervening && captures == 2 {
+                        engine
+                            .commit(injected.clone(), &context(4001), zero_basis())
+                            .unwrap();
+                    }
+                }
+            });
+        let (outcomes, attempts) = reentry_attempts(&validator, wallet, &tx, &paper).await;
+        let expected: &[&str] = if intervening {
+            &["validation.intervening_activity", "accepted"]
+        } else {
+            &["accepted"]
+        };
+        assert_eq!(attempts, expected, "intervening {intervening}");
+        assert_eq!(outcomes.accepted.len(), 1, "intervening {intervening}");
+        drop(tx);
+        actor.await.unwrap();
+    }
+}
+
+/// Runs one re-entry validation and returns its outcomes and each attempt's logged outcome.
+async fn reentry_attempts(
+    validator: &CausalPositionValidator,
+    wallet: WalletAddress,
+    tx: &mpsc::Sender<OrchestratorControl>,
+    paper: &PaperStateDb,
+) -> (pe_service::position_seeder::ValidationOutcomes, Vec<String>) {
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .without_time()
+        .with_writer(BracketLogs(bytes.clone()))
+        .finish();
+    use tracing::instrument::WithSubscriber;
+    let outcomes = validator
+        .validate_via_control(
+            &[wallet],
+            tx,
+            paper,
+            pe_service::position_seeder::ValidationPurpose::Reentry,
+            None,
+        )
+        .with_subscriber(subscriber)
+        .await;
+    let logged = bytes.lock().unwrap().clone();
+    let attempts = std::str::from_utf8(&logged)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|line| line["fields"]["message"] == "reentry bracket attempt")
+        .map(|line| line["fields"]["outcome"].as_str().unwrap().to_owned())
+        .collect();
+    (outcomes, attempts)
 }
 
 struct HistoryInspectingFetcher {

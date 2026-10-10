@@ -8285,6 +8285,7 @@ fn ac_b_reference_rows(population: &Value) -> Vec<Value> {
 
 fn ac_b_capture(
     h: &Harness,
+    source: &std::path::Path,
     name: &str,
     offset: u64,
     sequence: u64,
@@ -8292,7 +8293,7 @@ fn ac_b_capture(
 ) -> std::process::Output {
     let mut args = [
         h.dir.path().join("paper.db"),
-        h.dir.path().join("source.log"),
+        source.to_path_buf(),
         h.dir.path().join("paper.log"),
         h.dir.path().join(name),
     ]
@@ -8864,14 +8865,28 @@ async fn ac_b_membership_reference_checks() {
     // The ranking record cites source seq 0. Starting at its admission receipt omits that
     // ranking; an inclusive paper boundary fails and names 0. An older record is ignored.
     let (offset, seq, _) = &sources[1];
-    let output = ac_b_capture(&h, "covered", *offset, seq.0, Some(ranking_sequence));
+    let output = ac_b_capture(
+        &h,
+        &h.dir.path().join("source.log"),
+        "covered",
+        *offset,
+        seq.0,
+        Some(ranking_sequence),
+    );
     assert!(!output.status.success());
     assert!(
         String::from_utf8_lossy(&output.stderr)
             .contains("('capture again from a receipt at or before', 0)"),
         "{output:?}"
     );
-    let output = ac_b_capture(&h, "older", *offset, seq.0, Some(ranking_sequence + 1));
+    let output = ac_b_capture(
+        &h,
+        &h.dir.path().join("source.log"),
+        "older",
+        *offset,
+        seq.0,
+        Some(ranking_sequence + 1),
+    );
     assert!(output.status.success(), "{output:?}");
     let older = ac_b_reference_rows(&ac_b_inspect(&h, &h.dir.path().join("older")));
     assert_eq!(
@@ -8885,8 +8900,61 @@ async fn ac_b_membership_reference_checks() {
             .unwrap()["verdict"],
         "pass"
     );
-    let output = ac_b_capture(&h, "omitted", *offset, seq.0, None);
+    let output = ac_b_capture(
+        &h,
+        &h.dir.path().join("source.log"),
+        "omitted",
+        *offset,
+        seq.0,
+        None,
+    );
     assert!(output.status.success(), "{output:?}");
+
+    // Below the retention boundary only pinned frames survive: from a start below it the capture
+    // reads the pinned ranking frame and walks from the boundary; an unkept receipt stops it.
+    let retained = h.dir.path().join("retained");
+    std::fs::create_dir(&retained).unwrap();
+    let log = retained.join("source.log");
+    std::fs::copy(h.dir.path().join("source.log"), &log).unwrap();
+    let (pin_offset, pin_seq, pin) = &sources[0];
+    let (boundary_offset, boundary_seq, _) = &sources[1];
+    let authority = |pins: Value| {
+        json!({"authority": {"boundary": {"sequence": boundary_seq.0, "offset": boundary_offset}, "pins": pins}})
+            .to_string()
+    };
+    let pinned = json!([{"sequence": pin_seq.0, "offset": pin_offset, "hash": pin.this_hash.to_hex().to_string()}]);
+    std::fs::write(retained.join("source.log.retention"), authority(pinned)).unwrap();
+    let output = ac_b_capture(
+        &h,
+        &log,
+        "pinned",
+        *pin_offset,
+        pin_seq.0,
+        Some(ranking_sequence),
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        std::fs::read(h.dir.path().join("pinned").join("source_filtered.log")).unwrap(),
+        std::fs::read(capture.join("source_filtered.log")).unwrap()
+    );
+    let mut punched = std::fs::read(&log).unwrap();
+    punched[usize::try_from(*pin_offset).unwrap()..usize::try_from(*boundary_offset).unwrap()]
+        .fill(0);
+    std::fs::write(&log, punched).unwrap();
+    std::fs::write(retained.join("source.log.retention"), authority(json!([]))).unwrap();
+    let output = ac_b_capture(
+        &h,
+        &log,
+        "unkept",
+        *pin_offset,
+        pin_seq.0,
+        Some(ranking_sequence),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("('retention did not keep a required receipt', 0)"),
+        "{output:?}"
+    );
 
     // A record the verifier cannot decode stops the inspection and names it.
     ac_b_rewrite_paper(&capture, exclusion_sequence, |r| {
