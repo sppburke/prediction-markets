@@ -103,14 +103,32 @@ fn prices_history(q: &HashMap<String, String>) -> Value {
 /// The production mark adapter values a position from this fixture's answer at a fixed cutoff.
 pub async fn boundary_mark() {
     use pe_service::activity_ingest::{ActivityIngest, SourceLogHandle};
-    let app = Router::new().fallback(|OriginalUri(uri): OriginalUri| async move {
-        let url = reqwest::Url::parse(&format!("http://localhost{uri}")).unwrap();
-        assert_eq!(url.path(), "/prices-history");
-        Json(prices_history(&url.query_pairs().into_owned().collect()))
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+    let state = Arc::new(HttpState {
+        boot_waves: false,
+        rows: Vec::new(),
+        now: 0,
+        ranked_wallets: 0,
+        full_history_requests: Mutex::new(Vec::new()),
+        start: Mutex::new(None),
+        authority: Mutex::new(Authority::default()),
+        activity: Mutex::new(HashMap::new()),
+        positions: Mutex::new(Vec::new()),
+        slow_started: Notify::new(),
+        slow: Semaphore::new(0),
+        release_slow: AtomicBool::new(true),
+        gamma_fails: AtomicBool::new(false),
+        stale_ranked_wallet_2: AtomicBool::new(false),
+        gamma_failures: AtomicUsize::new(0),
+        resolved: AtomicBool::new(false),
     });
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tokio::spawn(async move {
+        axum::serve(listener, Router::new().fallback(serve).with_state(state))
+            .await
+            .unwrap();
+    });
     let dir = tempfile::tempdir().unwrap();
     let (source_log, source_rx) = SourceLogHandle::channel(4);
     let (trigger_tx, _triggers) = tokio::sync::mpsc::channel(1);
