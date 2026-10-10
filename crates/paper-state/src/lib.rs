@@ -2190,16 +2190,6 @@ impl PaperStateDb {
             )
             .optional()?
             .is_some();
-        // Late-group commits deliver past what they store, so a wallet awaiting re-anchoring
-        // signals a bucket's new groups through its coverage generation instead of its cursor.
-        let wallet_reanchoring = tx
-            .query_row(
-                "SELECT reanchor_required FROM poll_cursors WHERE wallet_hex = ?1",
-                params![bucket.wallet.to_string()],
-                |row| row.get::<_, i64>(0),
-            )
-            .optional()?
-            == Some(1);
         let mut invalidates_position_validation = false;
         let mut inserts_reanchor_trigger = false;
         let mut retains_novel_revision = false;
@@ -2359,10 +2349,15 @@ impl PaperStateDb {
             invalidates_position_validation = true;
         }
 
-        if (retains_novel_revision || (wallet_reanchoring && inserts_group))
-            && !inserts_reanchor_trigger
-        {
-            tx.execute("UPDATE poll_cursors SET coverage_generation = coverage_generation + 1 WHERE wallet_hex = ?1", params![bucket.wallet.to_string()])?;
+        // A retained revision changes coverage. So does a bucket of new groups for a wallet awaiting
+        // re-anchoring: its late-group commits deliver past what they store, so the generation,
+        // not the cursor, signals them.
+        if (retains_novel_revision || inserts_group) && !inserts_reanchor_trigger {
+            tx.execute(
+                "UPDATE poll_cursors SET coverage_generation = coverage_generation + 1 \
+                 WHERE wallet_hex = ?1 AND (?2 OR reanchor_required = 1)",
+                params![bucket.wallet.to_string(), retains_novel_revision],
+            )?;
         }
 
         for leader in &bucket.leader_positions {

@@ -8937,6 +8937,48 @@ async fn ac_b_membership_reference_checks() {
         std::fs::read(h.dir.path().join("pinned").join("source_filtered.log")).unwrap(),
         std::fs::read(capture.join("source_filtered.log")).unwrap()
     );
+    // A retained commitment can bind an observation the capture lacks: the inspection counts it
+    // outside the capture instead of reading it.
+    let last = sources.last().unwrap().1.0;
+    let appended = census_python(
+        r#"import ctypes, ctypes.util, json, struct, sys, zlib
+z = ctypes.CDLL(ctypes.util.find_library("zstd"))
+z.ZSTD_compressBound.argtypes = [ctypes.c_size_t]; z.ZSTD_compressBound.restype = ctypes.c_size_t
+z.ZSTD_compress.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+z.ZSTD_compress.restype = ctypes.c_size_t
+path, seq, bound = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+binding = {"stream_receipt": {"sequence": bound, "this_hash": "00" * 32}, "history_group_id": "g2:" + "0" * 64}
+payload = json.dumps({"bindings": [binding]}).encode()
+env = json.dumps({"seq": seq, "source_id": "pe-service.activity-read-commitment", "this_hash": "11" * 32,
+                  "payload": list(payload)}, separators=(",", ":")).encode()
+cap = z.ZSTD_compressBound(len(env)); buf = ctypes.create_string_buffer(cap)
+n = z.ZSTD_compress(buf, cap, env, len(env), 3); block = buf.raw[:n]
+open(path, "ab").write(struct.pack("<I", len(block)) + block + struct.pack("<I", zlib.crc32(block)))"#,
+        &[
+            h.dir
+                .path()
+                .join("pinned")
+                .join("source_filtered.log")
+                .to_str()
+                .unwrap()
+                .to_owned(),
+            (last + 2).to_string(),
+            (last + 1).to_string(),
+        ],
+        &h.dir.path().join("bin"),
+    );
+    assert!(appended.status.success(), "{appended:?}");
+    let inspected = inspection_run(
+        &h,
+        &h.dir.path().join("pinned"),
+        Some(env!("CARGO_BIN_EXE_pe-service")),
+    );
+    assert!(inspected.status.success(), "{inspected:?}");
+    assert!(
+        String::from_utf8_lossy(&inspected.stdout)
+            .contains("bindings to observations outside the capture 1\n"),
+        "{inspected:?}"
+    );
     let mut punched = std::fs::read(&log).unwrap();
     punched[usize::try_from(*pin_offset).unwrap()..usize::try_from(*boundary_offset).unwrap()]
         .fill(0);
