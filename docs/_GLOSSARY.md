@@ -360,8 +360,8 @@ anchor coverage and beside exact recorded groups. In feed correlation, a twin li
 recorded original counts with it as one candidate, so an `activity/trades` observation stamped
 like neither binds the original. An observation of either stamp of a pair first seen together
 (neither recorded), or one fitting genuinely distinct candidates, keeps the invalid-mapping fence;
-without a feed observation, such a pair keeps today's routing. Position brackets recognize twins the same way, and a routine refresh does not count one as
-intervening activity. A twin mixed with a genuinely new
+without a feed observation, such a pair keeps today's routing. Position brackets recognize twins the same way. A routine refresh's preflight permits proven twins; a
+twin first recorded in a later stability walk keeps the existing bounded retry. A twin mixed with a genuinely new
 group keeps the existing routing. Revisions still fence; partially recorded non-twin buckets retain their fence,
 and covered non-twin arrivals retain `anchor_covered_late` re-anchoring.
 
