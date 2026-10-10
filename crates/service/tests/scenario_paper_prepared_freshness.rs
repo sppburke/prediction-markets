@@ -8339,7 +8339,12 @@ fn write_dense_receipts(log: &std::path::Path) {
 }
 
 fn ac_b_inspect(h: &Harness, capture: &std::path::Path) -> Value {
-    let output = inspection_run(h, capture, Some(env!("CARGO_BIN_EXE_pe-service")));
+    let output = inspection_run_at(
+        h,
+        capture,
+        Some(env!("CARGO_BIN_EXE_pe-service")),
+        after_every_fixture_frame(),
+    );
     assert!(
         output.status.success(),
         "inspection: {}\n{}",
@@ -8370,6 +8375,21 @@ fn inspection_run(
     capture: &std::path::Path,
     pe_service: Option<&str>,
 ) -> std::process::Output {
+    inspection_run_at(h, capture, pe_service, at())
+}
+
+/// AC-B reference checks do not depend on the receive window. A window after every fixture frame keeps a
+/// capture that lacks setup frames, which carry wall-clock receive times, inspectable on any date.
+fn after_every_fixture_frame() -> OffsetDateTime {
+    OffsetDateTime::from_unix_timestamp(253_402_214_400).unwrap()
+}
+
+fn inspection_run_at(
+    h: &Harness,
+    capture: &std::path::Path,
+    pe_service: Option<&str>,
+    window_start: OffsetDateTime,
+) -> std::process::Output {
     census_python_with(
         &recipe_extract("import calendar, ctypes", "\nPY\n"),
         &[
@@ -8382,9 +8402,10 @@ fn inspection_run(
             capture.join("paper.log").to_str().unwrap().to_owned(),
             "0".to_owned(),
             inspection_cohort_size(capture).to_string(),
-            at().format(&time::format_description::well_known::Rfc3339)
+            window_start
+                .format(&time::format_description::well_known::Rfc3339)
                 .unwrap(),
-            (at() + time::Duration::seconds(60))
+            (window_start + time::Duration::seconds(60))
                 .format(&time::format_description::well_known::Rfc3339)
                 .unwrap(),
             capture.to_str().unwrap().to_owned(),
@@ -9010,10 +9031,11 @@ open(path, "ab").write(struct.pack("<I", len(block)) + block + struct.pack("<I",
     assert!(output.status.success(), "{output:?}");
     let appended = commit("gap", sources[1].1.0);
     assert!(appended.status.success(), "{appended:?}");
-    let inspected = inspection_run(
+    let inspected = inspection_run_at(
         &h,
         &h.dir.path().join("gap"),
         Some(env!("CARGO_BIN_EXE_pe-service")),
+        after_every_fixture_frame(),
     );
     assert!(inspected.status.success(), "{inspected:?}");
     assert!(
@@ -9032,10 +9054,9 @@ open(path, "ab").write(struct.pack("<I", len(block)) + block + struct.pack("<I",
         String::from_utf8_lossy(&failed.stderr).contains(&format!("KeyError: {}", last + 1)),
         "{failed:?}"
     );
-    // A capture that lacks a receipt received in the audit window is refused, whatever its cohort.
-    retain(6, &[]);
-    let (start_offset, start_seq, _) = &sources[5];
-    let output = ac_b_capture(&h, &log, "retired", *start_offset, start_seq.0, None);
+    // A capture that lacks a frame received from the window on is refused, whatever its cohort.
+    retain(6, &[0, 1, 2, 3, 4]);
+    let output = ac_b_capture(&h, &log, "retired", *pin_offset, pin_seq.0, None);
     assert!(output.status.success(), "{output:?}");
     let refused = inspection_run(
         &h,
@@ -9044,8 +9065,49 @@ open(path, "ab").write(struct.pack("<I", len(block)) + block + struct.pack("<I",
     );
     assert!(
         String::from_utf8_lossy(&refused.stderr)
-            .contains("capture lacks receipts received in the window"),
+            .contains("capture lacks a frame received from the window on"),
         "{refused:?}"
+    );
+    // A frame received after the window can still hold a window trade: that capture is refused too.
+    let refused = inspection_run_at(
+        &h,
+        &h.dir.path().join("retired"),
+        Some(env!("CARGO_BIN_EXE_pe-service")),
+        at() - time::Duration::seconds(120),
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("capture lacks a frame received from the window on"),
+        "{refused:?}"
+    );
+    // The lacked receive times come only from checksummed receipt records.
+    let receipts = format!("{}.boot-checkpoint.receipts", log.display());
+    let records = std::fs::read(&receipts).unwrap();
+    let mut corrupt = records.clone();
+    corrupt[80 + 32] ^= 1;
+    std::fs::write(&receipts, corrupt).unwrap();
+    retain(2, &[0]);
+    let output = ac_b_capture(&h, &log, "corrupt", *pin_offset, pin_seq.0, None);
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("checkpoint receipt checksum mismatch"),
+        "{output:?}"
+    );
+    std::fs::write(&receipts, records).unwrap();
+    // Every required receipt below the walk is checked, not only the earliest: with the earliest
+    // pinned, the next one retention did not keep stops the capture.
+    retain(4, &[0]);
+    let output = ac_b_capture(
+        &h,
+        &log,
+        "later",
+        *pin_offset,
+        pin_seq.0,
+        Some(ranking_sequence),
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("('retention did not keep a required receipt', 1)"),
+        "{output:?}"
     );
     let mut punched = std::fs::read(&log).unwrap();
     punched[usize::try_from(*pin_offset).unwrap()..usize::try_from(sources[1].0).unwrap()].fill(0);

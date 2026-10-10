@@ -213,10 +213,12 @@ capture reads pinned frames by their recorded offsets and walks contiguously fro
 the start earlier for a required receipt before it, the capture stops if retention did not keep a
 required receipt, and derive other offsets only within an unpunched range by walking frame lengths
 forward from a known receipt (the deploy boot's checkpoint tail or an earlier capture's recorded
-start); do not infer them from trade epochs. The capture records its walk start and, from the dense
-receipt records (`<source-log>.boot-checkpoint.receipts`, kept for retired frames too), the
-receive-time span of the frames it lacks (`source_coverage.json`); the inspection refuses a capture
-whose lacked span overlaps its window. A re-measurement uses the same
+start); do not infer them from trade epochs. The capture records its walk start and the newest
+receive time among the frames it lacks below it (`source_coverage.json`), read from the dense receipt
+records (`<source-log>.boot-checkpoint.receipts`, kept for retired frames too) through the deployed
+binary's checksummed, read-only `--receipt-coverage-json` command; set `PE_SERVICE_BIN` as for the
+inspection. The inspection refuses a capture that lacks a frame received from its window's first second
+on. A re-measurement uses the same
 capture start and passes its own cohort boundary to the inspection below. Retain verification
 receipts and physical prefix bounds with the capture.
 
@@ -229,7 +231,7 @@ ranking, admission, knockout, capacity-config and deferral. AC16 still selects i
 
 ```bash
 python3 - <live-paper_state.db> <live-source_events.log> <live-paper.log> <capture-dir> <capture-start-offset> <capture-start-sequence> [<membership-from-paper-seq>] <<'PY'
-import ctypes, ctypes.util, json, os, re, sqlite3, struct, sys, time, zlib
+import ctypes, ctypes.util, json, os, re, sqlite3, struct, subprocess, sys, time, zlib
 from pathlib import Path
 
 live_db, live_source, live_paper, out, start_offset, start_seq = sys.argv[1:7]
@@ -335,16 +337,17 @@ with open(live_paper, "rb") as f, open(out / "paper.log", "wb") as w:
 missing = sorted(s for s in required if s < walk_seq and s not in pinned)
 assert not missing or missing[0] >= start_seq, ("capture again from a receipt at or before", missing[0])
 assert not missing, ("retention did not keep a required receipt", missing[0])
-# 4. Coverage: the dense receipt records keep every sequence's receive time, retired frames included. Record the walk
-#    start and the receive-time span of the frames the capture lacks below it.
-lo = hi = None
+# 4. Coverage: the dense receipt records keep every sequence's receive time, retired frames included. The deployed
+#    binary reads and checksums them; record the walk start and the newest receive time the capture lacks below it.
+newest = None
 if walk_seq:
-    with open(live_source + ".boot-checkpoint.receipts", "rb") as r:
-        for seq in range(walk_seq):
-            (received,) = struct.unpack("<32xq40x", r.read(80))
-            if seq not in pinned: lo, hi = (received, received) if lo is None else (min(lo, received), max(hi, received))
-        assert r.read(32).hex() == walk_hash, "receipt records do not match the walk"
-(out / "source_coverage.json").write_text(json.dumps({"walk_start": walk_seq, "lacked_received_ms": None if lo is None else [lo, hi]}))
+    PE_SERVICE = os.environ.get("PE_SERVICE_BIN")
+    assert PE_SERVICE and os.path.isfile(PE_SERVICE) and os.access(PE_SERVICE, os.X_OK), "PE_SERVICE_BIN must name the deployed pe-service binary"
+    coverage = json.loads(subprocess.run([PE_SERVICE, "--receipt-coverage-json", live_source, str(walk_seq), *map(str, sorted(pinned))],
+                                         check=True, stdout=subprocess.PIPE, text=True).stdout)
+    assert coverage["walk_hash"] == walk_hash, "receipt records do not match the walk"
+    newest = coverage["newest_lacked_received_ms"]
+(out / "source_coverage.json").write_text(json.dumps({"walk_start": walk_seq, "newest_lacked_received_ms": newest}))
 PY
 ```
 
@@ -381,8 +384,8 @@ parsing and canonical page hashes. The inspection stops without these commands. 
 record, at a membership record that command cannot decode; AC-B, AC-C and AC16 are then incomplete.
 
 ```bash
-sha256sum paper_state.db source_filtered.log paper.log
-stat -c '%s %n' paper_state.db source_filtered.log paper.log
+sha256sum paper_state.db source_filtered.log paper.log source_coverage.json
+stat -c '%s %n' paper_state.db source_filtered.log paper.log source_coverage.json
 python3 - paper_state.db source_filtered.log paper.log <boundary-sequence> <AC16-cohort-size> <window-start-CT> <window-end-CT> <audit-directory> <<'PY'
 import calendar, ctypes, ctypes.util, hashlib, json, os, re, sqlite3, statistics, struct, subprocess, sys, time, zlib
 from datetime import datetime
@@ -526,11 +529,12 @@ def membership_record(e, c):
             "kind": evidence.get("kind"), "references": references, "evidence_errors": errors}
 
 audit_unix_ns = time.time_ns(); print("audit clock", audit_unix_ns)
-# The capture holds every receipt from its walk start on and only pins below it: the receive times it lacks must
-# not overlap the window (millisecond records cover their whole millisecond).
+# The capture holds every receipt from its walk start on and only pins below it. Every frame it lacks was received
+# before the window's first second, so it holds no window receipt and, as a receipt never precedes its trade, no
+# window trade.
 coverage = json.loads(Path(sys.argv[2]).with_name("source_coverage.json").read_text())
-lacked = coverage["lacked_received_ms"]
-assert lacked is None or lacked[0] * 10**6 >= ns(sys.argv[7]) or (lacked[1] + 1) * 10**6 <= ns(sys.argv[6]), ("capture lacks receipts received in the window", lacked)
+lacked = coverage["newest_lacked_received_ms"]
+assert lacked is None or (lacked + 1) * 10**6 <= ns(sys.argv[6]) // 10**9 * 10**9, ("capture lacks a frame received from the window on", lacked)
 source = read_prefix(sys.argv[2]); paper = read_prefix(sys.argv[3])
 # Decode every membership record once; the replay and both exports read only this canonical form.
 # The shared replay cannot continue past a record the verifier cannot decode, so it stops here.
