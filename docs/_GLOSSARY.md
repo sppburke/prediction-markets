@@ -1373,14 +1373,20 @@ Acquisition-3 receipt counts/digest describe the fetched set; `predecessor` is i
 history snapshot. The manifest's `aggregate_digest` commits the ordered receipts' fetched digests;
 `receipt_set_digest` keeps its encoding. A partial is an acquisition-3 excluded `acquisition_failure` receipt with complete aggregation,
 `start < acquired_end < generation_end`, page evidence and fetched commitments (possibly zero rows).
-It atomically inserts its rows; a full partial first verifies and deletes old history like a full
-replacement. SQL `fixed_end_unix` remains the frozen generation end, with zero outer counts and the
-empty outer digest on every excluded receipt. Complete receipts end at the generation end;
-aggregation failures and incremental collisions may end at a proved earlier end. Not-attempted
+It atomically inserts its rows; a non-repair full partial with a history proof first verifies old
+history, keeps rows with identical canonical aggregate bytes, deletes other in-window rows and the
+tail after its acquired end, then strictly inserts only unkept fetched aggregates. Repairs and
+full reads without a history proof retain delete-all replacement. SQL `fixed_end_unix` remains the
+frozen generation end, with zero outer counts and the empty outer digest on every excluded receipt.
+Complete receipts end at the generation end; aggregation failures and incremental collisions may
+end at a proved earlier end. Not-attempted
 receipts keep the generation end and no pages. Acquisition 2 does not accept partials.
 An unchanged automatic full read writes only a receipt;
-a differing full read verifies stored history before replacing it. Every non-deferral failed
-acquisition without a partial verifies retained history inside its exclusion transaction, except
+a differing non-repair full read with a history proof verifies stored history, keeps rows at the
+same source second and ID with identical canonical aggregate bytes, deletes other stored rows and
+strictly inserts only unkept fetched aggregates. Repairs and full reads without a history proof
+retain delete-all replacement. Every non-deferral failed acquisition without a partial verifies
+retained history inside its exclusion transaction, except
 an explicit repair, which logs stored/certified digests and replaces even on acquisition failure.
 Partial history parts are verified at finalize when the wallet completes.
 

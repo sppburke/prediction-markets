@@ -13434,6 +13434,7 @@ async fn quiet_wallet_weekly_deferral_recovery_and_topups() {
     )
     .await
     .unwrap();
+    collection_766_assert_automatic_proved_full(&side);
     for wallet in [WALLET, passive.as_str(), empty.as_str()] {
         assert_eq!(
             source
@@ -13450,11 +13451,28 @@ async fn quiet_wallet_weekly_deferral_recovery_and_topups() {
     assert_eq!(
         count(
             &side,
+            &format!("SELECT COUNT(*) FROM activity_groups_v2 WHERE wallet_hex = '{WALLET}'")
+        ),
+        2
+    );
+    // A differing automatic full read preserves the old row's insertion provenance.
+    assert_eq!(
+        count(
+            &side,
             &format!(
                 "SELECT COUNT(*) FROM activity_groups_v2 WHERE wallet_hex = '{WALLET}' AND coverage_generation = 5"
             )
         ),
-        2
+        1
+    );
+    assert_eq!(
+        query_values(
+            &side,
+            &format!(
+                "SELECT * FROM activity_groups_v2 WHERE wallet_hex = '{WALLET}' AND transaction_hash = 'old'"
+            )
+        ),
+        retained
     );
     source.calls.lock().unwrap().clear();
     populate_activity_fresh_v2(
@@ -17481,6 +17499,1119 @@ async fn history_v3_collection_reports_run_timing_and_writer_counts() {
         "{fields}; measured drain: {measured_ms} ms"
     );
     assert_eq!(fields["final_drain_ms"], drain);
+}
+
+// #766 full-read differences (AC1-AC5).
+
+async fn collection_766_seed_full(dir: &TempDir, rows: Vec<Value>) -> std::path::PathBuf {
+    let side = dataset_candidate(dir, "diff.db", &[]);
+    let source = DatasetFetcher {
+        rows,
+        ..Default::default()
+    };
+    history_v3_collect(&side, &source, 1, FRESH_END, &[])
+        .await
+        .unwrap();
+    dataset_payouts(&side, &source.rows).await;
+    finalize_cache_v2_unbound(&side, None, FRESH_END + 1).unwrap();
+    collection_766_exclude(&side, 2, FRESH_END + 1).await;
+    side
+}
+
+async fn collection_766_exclude(side: &std::path::Path, generation: u64, end: i64) {
+    let source = DatasetFetcher {
+        rows: vec![dataset_row(
+            WALLET,
+            "0xa",
+            &collection_decoded_history(side)[0]
+                .group_id
+                .components()
+                .transaction_hash,
+            "BUY",
+            end,
+        )],
+        ..Default::default()
+    };
+    history_v3_collect(side, &source, generation, end, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        collection_proof(side, generation, WALLET)["acquisition"]["exclusion_reason"],
+        "cross_boundary_collision"
+    );
+}
+
+fn collection_766_assert_automatic_proved_full(side: &std::path::Path) {
+    let identity = fresh_record(side);
+    assert_eq!(identity["version"], 4);
+    assert!(
+        identity["full_read_wallets"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::from(WALLET))
+    );
+    assert!(
+        !identity["repair_wallets"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::from(WALLET))
+    );
+    assert_eq!(
+        count(
+            side,
+            &format!(
+                "SELECT COUNT(*) FROM activity_wallet_history_v3 WHERE wallet_hex = '{WALLET}' AND generation <= {}",
+                identity["base_generation"]
+            )
+        ),
+        1
+    );
+    assert_eq!(
+        collection_proof(side, 1, WALLET)["acquisition"]["mode"],
+        "full"
+    );
+}
+
+fn collection_766_copy(side: &std::path::Path, target: &std::path::Path) {
+    Connection::open(side)
+        .unwrap()
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    std::fs::copy(side, target).unwrap();
+}
+
+fn collection_766_normalized_receipt(mut receipt: Value) -> Value {
+    for page in receipt["pages"].as_array_mut().unwrap() {
+        page["received_at"] = Value::Null;
+    }
+    receipt["acquisition"]["read_sha256"] = Value::Null;
+    receipt
+}
+
+fn collection_766_events(log: &CheckLog, message: &str) -> Vec<Value> {
+    String::from_utf8(log.0.lock().unwrap().clone())
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|event| event["fields"]["message"] == message)
+        .map(|event| {
+            if message == "activity wallet excluded from generation" {
+                assert_eq!(event["threadName"], "activity-cache-writer");
+            }
+            event["fields"].clone()
+        })
+        .collect()
+}
+
+fn collection_766_log() -> CheckLog {
+    let log = CheckLog::default();
+    let writer = log.clone();
+    // Nextest isolates each scenario; the process subscriber also captures the OS writer thread.
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .json()
+            .with_ansi(false)
+            .with_thread_names(true)
+            .with_writer(move || writer.clone())
+            .finish(),
+    )
+    .unwrap();
+    log
+}
+
+fn collection_766_writes(
+    connection: &Connection,
+) -> Arc<Mutex<Vec<(rusqlite::hooks::Action, i64)>>> {
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&writes);
+    connection.update_hook(Some(move |action, _: &str, table: &str, rowid| {
+        if table == "activity_groups_v2" {
+            observed.lock().unwrap().push((action, rowid));
+        }
+    }));
+    writes
+}
+
+static COLLECTION_766_DELETE_SQL: Mutex<Vec<String>> = Mutex::new(Vec::new());
+fn collection_766_trace_deletes(sql: &str) {
+    if sql.starts_with("DELETE FROM activity_groups_v2") {
+        COLLECTION_766_DELETE_SQL
+            .lock()
+            .unwrap()
+            .push(sql.to_owned());
+    }
+}
+
+#[tokio::test]
+async fn collection_766_complete_keeps_equal_second_rows_and_empty_full_deletes_all() {
+    let dir = TempDir::new().unwrap();
+    let rows = ["keep-a", "drop", "change", "keep-b"]
+        .into_iter()
+        .map(|id| dataset_row(WALLET, "0xa", id, "BUY", FRESH_END - 1))
+        .collect::<Vec<_>>();
+    let side = collection_766_seed_full(&dir, rows.clone()).await;
+    let comparator = dir.path().join("replace.db");
+    collection_766_copy(&side, &comparator);
+    let retained_sql = "SELECT rowid, coverage_generation, source_trade_id FROM activity_groups_v2 WHERE transaction_hash IN ('keep-a','keep-b') ORDER BY source_trade_id";
+    let retained = query_values(&side, retained_sql);
+    let mut changed = rows[2].clone();
+    changed["size"] = Value::from("2.5");
+    let source = DatasetFetcher {
+        rows: vec![
+            rows[3].clone(),
+            changed,
+            rows[0].clone(),
+            dataset_row(WALLET, "0xa", "new", "BUY", FRESH_END - 1),
+        ],
+        ..Default::default()
+    };
+    collection_admit(&side, 3, FRESH_END + 2, &[]).await;
+    collection_766_assert_automatic_proved_full(&side);
+    let log = collection_766_log();
+    collection_run(
+        &side,
+        &source,
+        FRESH_END + 2,
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        None,
+    )
+    .await
+    .unwrap();
+    let fields = collection_766_events(&log, "activity collection run completed");
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0]["rows_deleted"], 2);
+    assert_eq!(fields[0]["rows_inserted"], 2);
+    assert_eq!(fields[0]["rows_verified"], 4);
+    assert_eq!(fields[0]["differing_full_wallets"], 1);
+    assert_eq!(query_values(&side, retained_sql), retained);
+    assert_eq!(generation_rows(&side, 1), 2);
+    assert_eq!(generation_rows(&side, 3), 2);
+    assert_eq!(
+        count(
+            &side,
+            "SELECT COUNT(*) FROM activity_groups_v2 WHERE transaction_hash = 'drop'"
+        ),
+        0
+    );
+    history_v3_collect(&comparator, &source, 3, FRESH_END + 2, &[WALLET.to_owned()])
+        .await
+        .unwrap();
+    assert_eq!(
+        collection_766_normalized_receipt(collection_proof(&side, 3, WALLET)),
+        collection_766_normalized_receipt(collection_proof(&comparator, 3, WALLET))
+    );
+    assert_eq!(
+        serde_json::to_vec(&collection_decoded_history(&side)).unwrap(),
+        serde_json::to_vec(&collection_decoded_history(&comparator)).unwrap()
+    );
+    dataset_payouts(&side, &source.rows).await;
+    finalize_cache_v2_unbound(&side, None, FRESH_END + 3).unwrap();
+    collection_766_exclude(&side, 4, FRESH_END + 3).await;
+    let empty_comparator = dir.path().join("empty-replace.db");
+    collection_766_copy(&side, &empty_comparator);
+    collection_admit(&side, 5, FRESH_END + 4, &[]).await;
+    collection_766_assert_automatic_proved_full(&side);
+    log.0.lock().unwrap().clear();
+    let empty = DatasetFetcher::default();
+    collection_run(
+        &side,
+        &empty,
+        FRESH_END + 4,
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        None,
+    )
+    .await
+    .unwrap();
+    let fields = collection_766_events(&log, "activity collection run completed");
+    assert_eq!(fields[0]["rows_deleted"], 4);
+    assert_eq!(fields[0]["rows_inserted"], 0);
+    assert_eq!(history_v3_wallet_count(&side), 0);
+    history_v3_collect(
+        &empty_comparator,
+        &empty,
+        5,
+        FRESH_END + 4,
+        &[WALLET.to_owned()],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        collection_766_normalized_receipt(collection_proof(&side, 5, WALLET)),
+        collection_766_normalized_receipt(collection_proof(&empty_comparator, 5, WALLET))
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn collection_766_certified_full_partial_keeps_prefix_deletes_stale_and_tail_then_continues()
+{
+    let dir = TempDir::new().unwrap();
+    let rows = collection_rows(WALLET, 6000);
+    let side = collection_766_seed_full(&dir, rows.clone()).await;
+    let comparator = dir.path().join("partial-replace.db");
+    collection_766_copy(&side, &comparator);
+    // Dropping one prefix row leaves 4,999 proved rows in the first window.
+    let source = CollectionDataset::new(
+        rows.iter()
+            .enumerate()
+            .filter(|(index, _)| *index != 10)
+            .map(|(_, row)| row.clone())
+            .collect(),
+        1,
+    );
+    let before = query_values(
+        &side,
+        "SELECT rowid, coverage_generation, source_trade_id, source_time_unix FROM activity_groups_v2 ORDER BY source_time_unix, source_trade_id",
+    );
+    collection_admit(&side, 3, FRESH_END + 2, &[]).await;
+    collection_766_assert_automatic_proved_full(&side);
+    collection_admit(&comparator, 3, FRESH_END + 2, &[WALLET.to_owned()]).await;
+    let held = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let log = collection_766_log();
+    collection_run(
+        &side,
+        &source,
+        FRESH_END + 2,
+        Arc::clone(&held),
+        Some(std::time::Duration::from_secs(1)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(held.load(Ordering::SeqCst), 0);
+    let proof = collection_proof(&side, 3, WALLET);
+    assert_eq!(proof["acquisition"]["mode"], "full");
+    assert_eq!(proof["acquisition"]["disposition"], "excluded");
+    assert_eq!(proof["aggregate_count"], 0);
+    assert_eq!(proof["source_row_count"], 0);
+    assert_eq!(proof["acquisition"]["fetched_aggregate_count"], 4999);
+    let acquired = proof["acquisition"]["fixed_end_unix"].as_i64().unwrap();
+    assert!(acquired < FRESH_END + 2);
+    let expected = before
+        .iter()
+        .filter(|row| {
+            matches!(row[3], rusqlite::types::Value::Integer(second) if second <= acquired && second != FRESH_END - 19_990)
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(
+        query_values(
+            &side,
+            "SELECT rowid, coverage_generation, source_trade_id, source_time_unix FROM activity_groups_v2 ORDER BY source_time_unix, source_trade_id"
+        ),
+        expected
+    );
+    let fields = collection_766_events(&log, "activity collection run completed");
+    assert_eq!(fields[0]["rows_deleted"], 1001);
+    assert_eq!(fields[0]["rows_inserted"], 0);
+    let warnings = collection_766_events(&log, "activity wallet excluded from generation");
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0]["wallet"], WALLET);
+    assert_eq!(warnings[0]["generation"], 3);
+    assert!(
+        warnings[0]["commit_ms"]
+            .as_str()
+            .unwrap()
+            .parse::<u128>()
+            .is_ok()
+    );
+    assert_eq!(warnings[0]["rows_deleted"], 1001);
+    assert_eq!(warnings[0]["rows_inserted"], 0);
+    collection_run(
+        &comparator,
+        &source,
+        FRESH_END + 2,
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        Some(std::time::Duration::from_secs(1)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        collection_766_normalized_receipt(proof),
+        collection_766_normalized_receipt(collection_proof(&comparator, 3, WALLET))
+    );
+    assert_eq!(
+        serde_json::to_vec(&collection_decoded_history(&side)).unwrap(),
+        serde_json::to_vec(&collection_decoded_history(&comparator)).unwrap()
+    );
+    source.source.calls.lock().unwrap().clear();
+    collection_run(
+        &side,
+        &HistoryV3StopFetcher,
+        FRESH_END + 2,
+        Arc::clone(&held),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(source.source.calls.lock().unwrap().is_empty());
+    dataset_payouts(&side, &source.source.rows).await;
+    finalize_cache_v2_unbound(&side, None, FRESH_END + 3).unwrap();
+    assert!(projection_v3_rows(&side).is_empty());
+    assert_eq!(
+        count(&side, "SELECT generation FROM activity_wallet_history_v3"),
+        1
+    );
+    collection_admit(&side, 4, FRESH_END + 3, &[]).await;
+    collection_run(
+        &side,
+        &source.source,
+        FRESH_END + 3,
+        Arc::clone(&held),
+        None,
+    )
+    .await
+    .unwrap();
+    let proof = collection_proof(&side, 4, WALLET);
+    assert_eq!(proof["acquisition"]["mode"], "incremental");
+    assert_eq!(proof["acquisition"]["start_exclusive"], acquired);
+    assert_eq!(source.source.calls.lock().unwrap()[0].1, acquired + 1);
+    assert_eq!(proof["acquisition"]["disposition"], "complete");
+    finalize_cache_v2_unbound(&side, None, FRESH_END + 4).unwrap();
+    assert_eq!(
+        count(
+            &side,
+            "SELECT aggregate_count FROM activity_wallet_history_v3 WHERE generation = 4"
+        ),
+        5999
+    );
+    let venue = dataset_candidate(&dir, "venue.db", &[]);
+    history_v3_collect(&venue, &source.source, 4, FRESH_END + 3, &[])
+        .await
+        .unwrap();
+    dataset_payouts(&venue, &source.source.rows).await;
+    finalize_cache_v2_unbound(&venue, None, FRESH_END + 4).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&collection_decoded_history(&side)).unwrap(),
+        serde_json::to_vec(&collection_decoded_history(&venue)).unwrap()
+    );
+    assert_eq!(
+        query_values(&side, "SELECT * FROM activity_wallet_history_v3"),
+        query_values(&venue, "SELECT * FROM activity_wallet_history_v3")
+    );
+    collection_run(&side, &HistoryV3StopFetcher, FRESH_END + 3, held, None)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn collection_766_zero_row_full_partial_deletes_certified_tail() {
+    struct EmptyPrefix<'a>(&'a DatasetFetcher);
+    impl PageFetcher for EmptyPrefix<'_> {
+        async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, SourceError> {
+            if url.contains("sortDirection=ASC") {
+                return Ok(serde_json::to_vec(&vec![self.0.rows[0].clone()]).unwrap());
+            }
+            self.0.fetch_page(url).await
+        }
+    }
+    let dir = TempDir::new().unwrap();
+    let rows = collection_rows(WALLET, 6000);
+    let side = collection_766_seed_full(&dir, rows.clone()).await;
+    let comparator = dir.path().join("empty-partial-replace.db");
+    collection_766_copy(&side, &comparator);
+    collection_admit(&side, 3, FRESH_END + 2, &[]).await;
+    collection_766_assert_automatic_proved_full(&side);
+    collection_admit(&comparator, 3, FRESH_END + 2, &[WALLET.to_owned()]).await;
+    let source = DatasetFetcher {
+        rows,
+        ..Default::default()
+    };
+    let held = Arc::new(std::sync::atomic::AtomicU64::new(2_000_000));
+    let log = collection_766_log();
+    collection_run(
+        &side,
+        &EmptyPrefix(&source),
+        FRESH_END + 2,
+        Arc::clone(&held),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(held.load(Ordering::SeqCst), 2_000_000);
+    let proof = collection_proof(&side, 3, WALLET);
+    assert_eq!(proof["aggregate_count"], 0);
+    assert_eq!(proof["source_row_count"], 0);
+    assert_eq!(proof["acquisition"]["fetched_source_row_count"], 0);
+    assert_eq!(proof["acquisition"]["fixed_end_unix"], FRESH_END - 20_001);
+    assert_eq!(history_v3_wallet_count(&side), 0);
+    let fields = collection_766_events(&log, "activity wallet excluded from generation");
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0]["rows_deleted"], 6000);
+    assert_eq!(fields[0]["rows_inserted"], 0);
+    assert!(
+        fields[0]["commit_ms"]
+            .as_str()
+            .unwrap()
+            .parse::<u128>()
+            .is_ok()
+    );
+    collection_run(
+        &comparator,
+        &EmptyPrefix(&source),
+        FRESH_END + 2,
+        Arc::new(std::sync::atomic::AtomicU64::new(2_000_000)),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        collection_766_normalized_receipt(proof),
+        collection_766_normalized_receipt(collection_proof(&comparator, 3, WALLET)),
+    );
+    assert!(collection_decoded_history(&side).is_empty());
+    assert!(collection_decoded_history(&comparator).is_empty());
+    collection_run(&side, &HistoryV3StopFetcher, FRESH_END + 2, held, None)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn collection_766_moved_time_and_equal_decimal_bytes_are_replaced() {
+    let dir = TempDir::new().unwrap();
+    let side = dataset_candidate(&dir, "decimal.db", &[]);
+    let source = DatasetFetcher {
+        rows: ["kept", "moved", "weighted"]
+            .into_iter()
+            .map(|id| dataset_row(WALLET, "0xa", id, "BUY", FRESH_END - 1))
+            .collect(),
+        ..Default::default()
+    };
+    collection_admit(&side, 1, FRESH_END, &[]).await;
+    let read = pe_source_polymarket_public::fetch_complete_activity(
+        &source,
+        "https://data.example",
+        WalletAddress::from_hex(WALLET).unwrap(),
+        Some(0),
+        FRESH_END,
+    )
+    .await
+    .unwrap();
+    let mut aggregates = read
+        .buckets()
+        .unwrap()
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    for aggregate in &mut aggregates {
+        if aggregate.group_id.components().transaction_hash == "weighted" {
+            aggregate.price_weighted_share_sum.0 =
+                rust_decimal::Decimal::from_str_exact("1.0").unwrap();
+        }
+    }
+    pe_bootstrap::cache_migration::commit_activity_batch_for_test(
+        &mut Connection::open(&side).unwrap(),
+        WALLET.to_owned(),
+        read.pages,
+        aggregates.clone(),
+    )
+    .unwrap();
+    collection_run(
+        &side,
+        &HistoryV3StopFetcher,
+        FRESH_END,
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        None,
+    )
+    .await
+    .unwrap();
+    dataset_payouts(&side, &source.rows).await;
+    finalize_cache_v2_unbound(&side, None, FRESH_END + 1).unwrap();
+    collection_766_exclude(&side, 2, FRESH_END + 1).await;
+    collection_admit(&side, 3, FRESH_END + 2, &[]).await;
+    collection_766_assert_automatic_proved_full(&side);
+    let retained = query_values(
+        &side,
+        "SELECT rowid, coverage_generation FROM activity_groups_v2 WHERE transaction_hash = 'kept'",
+    );
+    for aggregate in &mut aggregates {
+        match aggregate.group_id.components().transaction_hash.as_str() {
+            "moved" => {
+                aggregate.source_time =
+                    SourceTimestamp(time::OffsetDateTime::from_unix_timestamp(FRESH_END).unwrap())
+            }
+            "weighted" => {
+                let original = aggregate.clone();
+                aggregate.price_weighted_share_sum.0 =
+                    rust_decimal::Decimal::from_str_exact("1.00").unwrap();
+                assert_eq!(*aggregate, original);
+                assert_ne!(
+                    serde_json::to_vec(aggregate).unwrap(),
+                    serde_json::to_vec(&original).unwrap()
+                );
+            }
+            _ => {}
+        }
+    }
+    aggregates.sort_by_key(|aggregate| {
+        (
+            aggregate.source_time.0.unix_timestamp(),
+            aggregate.group_id.key().0.clone(),
+        )
+    });
+    let read = pe_source_polymarket_public::fetch_complete_activity(
+        &source,
+        "https://data.example",
+        WalletAddress::from_hex(WALLET).unwrap(),
+        Some(0),
+        FRESH_END + 2,
+    )
+    .await
+    .unwrap();
+    let mut connection = Connection::open(&side).unwrap();
+    let writes = collection_766_writes(&connection);
+    pe_bootstrap::cache_migration::commit_activity_batch_for_test(
+        &mut connection,
+        WALLET.to_owned(),
+        read.pages,
+        aggregates.clone(),
+    )
+    .unwrap();
+    assert_eq!(
+        writes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(action, _)| *action == rusqlite::hooks::Action::SQLITE_DELETE)
+            .count(),
+        2
+    );
+    assert_eq!(
+        writes
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(action, _)| *action == rusqlite::hooks::Action::SQLITE_INSERT)
+            .count(),
+        2
+    );
+    assert_eq!(
+        query_values(
+            &side,
+            "SELECT rowid, coverage_generation FROM activity_groups_v2 WHERE transaction_hash = 'kept'"
+        ),
+        retained
+    );
+    assert_eq!(generation_rows(&side, 3), 2);
+    assert_eq!(
+        serde_json::to_vec(&collection_decoded_history(&side)).unwrap(),
+        serde_json::to_vec(&aggregates).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn collection_766_duplicate_and_foreign_ids_roll_back_indexed_full_read() {
+    for foreign in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let source = DatasetFetcher {
+            rows: vec![dataset_row(WALLET, "0xa", "keep", "BUY", FRESH_END)],
+            ..Default::default()
+        };
+        let side = collection_766_seed_full(&dir, source.rows.clone()).await;
+        collection_admit(&side, 3, FRESH_END + 2, &[]).await;
+        collection_766_assert_automatic_proved_full(&side);
+        assert_eq!(
+            count(
+                &side,
+                "SELECT COUNT(*) FROM pragma_index_list('activity_groups_v2') WHERE name = 'idx_activity_groups_v2_source_trade_id' AND \"unique\" = 1"
+            ),
+            1
+        );
+        let read = pe_source_polymarket_public::fetch_complete_activity(
+            &source,
+            "https://data.example",
+            WalletAddress::from_hex(WALLET).unwrap(),
+            Some(0),
+            FRESH_END + 2,
+        )
+        .await
+        .unwrap();
+        let mut aggregates = read
+            .buckets()
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        if foreign {
+            let mut components = aggregates[0].group_id.components().clone();
+            components.transaction_hash = "foreign-id".to_owned();
+            let mut new = aggregates[0].clone();
+            new.group_id =
+                pe_source_polymarket_public::SourceActivityGroupId::derive(components).unwrap();
+            let connection = history_v3_damage_connection(&side);
+            connection.execute("INSERT INTO activity_groups_v2 SELECT ?1, coverage_generation, semantic_revision, components_json, ?2, transaction_hash, activity_type, condition_id, asset, outcome_id, side, row_count, share_amount_str, price_weighted_share_amount_str, source_usdc_amount_str, source_time_unix, is_combo, schema_version, parser_version FROM activity_groups_v2 LIMIT 1", params![new.group_id.key().0, WALLET_B]).unwrap();
+            aggregates.push(new);
+        } else {
+            aggregates.push(aggregates[0].clone());
+        }
+        let before = query_values(
+            &side,
+            "SELECT rowid, * FROM activity_groups_v2 ORDER BY source_trade_id",
+        );
+        let mut connection = Connection::open(&side).unwrap();
+        let error = pe_bootstrap::cache_migration::commit_activity_batch_for_test(
+            &mut connection,
+            WALLET.to_owned(),
+            read.pages,
+            aggregates,
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("UNIQUE constraint failed"),
+            "{error}"
+        );
+        assert_eq!(
+            query_values(
+                &side,
+                "SELECT rowid, * FROM activity_groups_v2 ORDER BY source_trade_id"
+            ),
+            before
+        );
+        assert!(receipt(&side, 3, WALLET).is_none());
+    }
+}
+
+#[tokio::test]
+async fn collection_766_late_history_failure_attempts_no_activity_writes() {
+    let log = collection_766_log();
+    for (damage, expected) in [
+        ("components_json = '{}'", "activity history decoding failed"),
+        (
+            "share_amount_str = '2.250001'",
+            "activity history chain mismatch",
+        ),
+        (
+            "source_time_unix = -62167219201",
+            "activity history serialization failed",
+        ),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let rows = collection_rows(WALLET, 1100);
+        let side = collection_766_seed_full(&dir, rows.clone()).await;
+        collection_admit(&side, 3, FRESH_END + 2, &[]).await;
+        collection_766_assert_automatic_proved_full(&side);
+        history_v3_damage_connection(&side)
+            .execute(
+                &format!("UPDATE activity_groups_v2 SET {damage} WHERE source_time_unix = ?1"),
+                [FRESH_END - 19_000],
+            )
+            .unwrap();
+        let before = query_values(
+            &side,
+            "SELECT rowid, * FROM activity_groups_v2 ORDER BY source_trade_id",
+        );
+        let mut fetched = rows;
+        fetched.pop(); // Force a differing full read while reproducing the healthy stored rows.
+        let source = DatasetFetcher {
+            rows: fetched,
+            ..Default::default()
+        };
+        let connection = Connection::open(&side).unwrap();
+        let writes = collection_766_writes(&connection);
+        let attempted = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&attempted);
+        connection.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+            use rusqlite::hooks::{AuthAction, Authorization};
+            if matches!(
+                context.action,
+                AuthAction::Insert {
+                    table_name: "activity_groups_v2"
+                } | AuthAction::Delete {
+                    table_name: "activity_groups_v2"
+                }
+            ) {
+                observed.fetch_add(1, Ordering::SeqCst);
+            }
+            Authorization::Allow
+        }));
+        log.0.lock().unwrap().clear();
+        let error = pe_bootstrap::cache_migration::collect_activity_v2_for_test(
+            connection,
+            &source,
+            "https://data.example",
+            FRESH_END + 3,
+        )
+        .await
+        .unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+        assert_eq!(attempted.load(Ordering::SeqCst), 0);
+        assert!(writes.lock().unwrap().is_empty());
+        let fields = collection_766_events(&log, "activity collection run completed");
+        assert_eq!(fields.len(), 1);
+        assert!(fields[0]["rows_verified"].as_u64().unwrap() >= 512);
+        assert_eq!(fields[0]["rows_deleted"], 0);
+        assert_eq!(fields[0]["rows_inserted"], 0);
+        assert!(receipt(&side, 3, WALLET).is_none());
+        assert_eq!(
+            query_values(
+                &side,
+                "SELECT rowid, * FROM activity_groups_v2 ORDER BY source_trade_id"
+            ),
+            before
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn collection_766_insert_or_commit_failure_restores_history_releases_rows_and_zeroes_counts()
+{
+    let log = collection_766_log();
+    for commit_fails in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let rows = collection_rows(WALLET, 6000);
+        let side = collection_766_seed_full(&dir, rows.clone()).await;
+        let mut fetched = rows;
+        fetched.remove(10);
+        fetched[0]["size"] = Value::from("2.5");
+        fetched[1]["size"] = Value::from("2.5");
+        let source = CollectionDataset::new(fetched, 1);
+        collection_admit(&side, 3, FRESH_END + 2, &[]).await;
+        collection_766_assert_automatic_proved_full(&side);
+        let before = query_values(
+            &side,
+            "SELECT rowid, * FROM activity_groups_v2 ORDER BY source_trade_id",
+        );
+        if !commit_fails {
+            history_v3_damage_connection(&side).execute_batch("CREATE TRIGGER collection_766_abort BEFORE INSERT ON activity_groups_v2 WHEN (SELECT COUNT(*) FROM activity_groups_v2 WHERE coverage_generation = 3) = 1 BEGIN SELECT RAISE(ABORT, 'fixture diff insert failure'); END;").unwrap();
+        }
+        let connection = Connection::open(&side).unwrap();
+        let writes = collection_766_writes(&connection);
+        if commit_fails {
+            // Refuse the COMMIT of the wallet transaction after all its deletes and inserts.
+            let observed = Arc::clone(&writes);
+            connection.commit_hook(Some(move || !observed.lock().unwrap().is_empty()));
+        }
+        let held = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        log.0.lock().unwrap().clear();
+        let error = pe_bootstrap::cache_migration::collect_activity_v2_with_limits_for_test(
+            connection,
+            &source,
+            "https://data.example",
+            FRESH_END + 3,
+            Arc::clone(&held),
+            Some(std::time::Duration::from_secs(1)),
+        )
+        .await
+        .unwrap_err();
+        if commit_fails {
+            assert!(
+                matches!(
+                    &error,
+                    pe_bootstrap::error::BootstrapError::Sqlite(rusqlite::Error::SqliteFailure(error, _))
+                        if error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_COMMITHOOK
+                ),
+                "{error}"
+            );
+        } else {
+            assert!(
+                error.to_string().contains("fixture diff insert failure"),
+                "{error}"
+            );
+        }
+        {
+            let writes = writes.lock().unwrap();
+            assert!(
+                writes
+                    .iter()
+                    .filter(|(action, _)| *action == rusqlite::hooks::Action::SQLITE_DELETE)
+                    .count()
+                    > 2
+            );
+            assert_eq!(
+                writes
+                    .iter()
+                    .filter(|(action, _)| *action == rusqlite::hooks::Action::SQLITE_INSERT)
+                    .count(),
+                if commit_fails { 2 } else { 1 }
+            );
+        }
+        assert_eq!(held.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            query_values(
+                &side,
+                "SELECT rowid, * FROM activity_groups_v2 ORDER BY source_trade_id"
+            ),
+            before
+        );
+        assert!(receipt(&side, 3, WALLET).is_none());
+        let fields = collection_766_events(&log, "activity collection run completed");
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0]["rows_deleted"], 0);
+        assert_eq!(fields[0]["rows_inserted"], 0);
+        assert!(collection_766_events(&log, "activity wallet excluded from generation").is_empty());
+        if !commit_fails {
+            history_v3_damage_connection(&side)
+                .execute_batch("DROP TRIGGER collection_766_abort")
+                .unwrap();
+        }
+        collection_run(
+            &side,
+            &source,
+            FRESH_END + 2,
+            Arc::clone(&held),
+            Some(std::time::Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(held.load(Ordering::SeqCst), 0);
+        assert_eq!(history_v3_wallet_count(&side), 4999);
+    }
+}
+
+#[tokio::test]
+async fn collection_766_unchanged_repair_and_incremental_keep_their_commit_paths() {
+    let log = collection_766_log();
+    for path in ["unchanged", "repair", "incremental"] {
+        let dir = TempDir::new().unwrap();
+        let side = dataset_candidate(&dir, "preserved.db", &[]);
+        let mut source = DatasetFetcher {
+            rows: collection_rows(WALLET, 3),
+            ..Default::default()
+        };
+        history_v3_collect(&side, &source, 1, FRESH_END, &[])
+            .await
+            .unwrap();
+        dataset_payouts(&side, &source.rows).await;
+        finalize_cache_v2_unbound(&side, None, FRESH_END + 1).unwrap();
+        let generation = if path == "incremental" {
+            source
+                .rows
+                .push(dataset_row(WALLET, "0xa", "delta", "BUY", FRESH_END + 1));
+            2
+        } else {
+            collection_766_exclude(&side, 2, FRESH_END + 1).await;
+            3
+        };
+        let before = query_values(
+            &side,
+            "SELECT rowid, * FROM activity_groups_v2 ORDER BY source_trade_id",
+        );
+        let repairs = if path == "repair" {
+            vec![WALLET.to_owned()]
+        } else {
+            Vec::new()
+        };
+        collection_admit(&side, generation, FRESH_END + 2, &repairs).await;
+        let identity = fresh_record(&side);
+        assert_eq!(identity["version"], 4);
+        assert_eq!(
+            identity["repair_wallets"]
+                .as_array()
+                .unwrap()
+                .contains(&Value::from(WALLET)),
+            path == "repair"
+        );
+        if path == "unchanged" {
+            collection_766_assert_automatic_proved_full(&side);
+        }
+        let connection = Connection::open(&side).unwrap();
+        let writes = collection_766_writes(&connection);
+        let history_reads = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&history_reads);
+        connection.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
+            use rusqlite::hooks::{AuthAction, Authorization};
+            if matches!(
+                context.action,
+                AuthAction::Read {
+                    table_name: "activity_groups_v2",
+                    column_name: "components_json",
+                    ..
+                }
+            ) {
+                observed.fetch_add(1, Ordering::SeqCst);
+            }
+            Authorization::Allow
+        }));
+        log.0.lock().unwrap().clear();
+        pe_bootstrap::cache_migration::collect_activity_v2_for_test(
+            connection,
+            &source,
+            "https://data.example",
+            FRESH_END + 3,
+        )
+        .await
+        .unwrap();
+        let fields = collection_766_events(&log, "activity collection run completed");
+        assert_eq!(fields.len(), 1);
+        let fields = &fields[0];
+        let proof = collection_proof(&side, generation, WALLET);
+        assert_eq!(
+            proof["acquisition"]["mode"],
+            if path == "incremental" {
+                "incremental"
+            } else {
+                "full"
+            }
+        );
+        let writes = writes.lock().unwrap();
+        match path {
+            "unchanged" => {
+                assert_eq!(fields["unchanged_full_wallets"], 1);
+                assert_eq!(fields["rows_verified"], 0);
+                assert_eq!(history_reads.load(Ordering::SeqCst), 0);
+                assert!(writes.is_empty());
+                assert_eq!(
+                    query_values(
+                        &side,
+                        "SELECT rowid, * FROM activity_groups_v2 ORDER BY source_trade_id"
+                    ),
+                    before
+                );
+            }
+            "repair" => {
+                assert_eq!(fields["rows_verified"], 3);
+                assert_eq!(fields["rows_deleted"], 3);
+                assert_eq!(fields["rows_inserted"], 3);
+                assert_eq!(generation_rows(&side, 1), 0);
+                assert_eq!(generation_rows(&side, 3), 3);
+                assert_eq!(
+                    writes
+                        .iter()
+                        .filter(|(action, _)| *action == rusqlite::hooks::Action::SQLITE_DELETE)
+                        .count(),
+                    3
+                );
+                assert_eq!(
+                    writes
+                        .iter()
+                        .filter(|(action, _)| *action == rusqlite::hooks::Action::SQLITE_INSERT)
+                        .count(),
+                    3
+                );
+                assert_eq!(
+                    collection_766_events(&log, "replacing explicitly repaired wallet history")
+                        .len(),
+                    1
+                );
+            }
+            "incremental" => {
+                assert_eq!(fields["incremental_wallets"], 1);
+                assert_eq!(fields["rows_verified"], 0);
+                assert_eq!(history_reads.load(Ordering::SeqCst), 0);
+                assert_eq!(fields["rows_deleted"], 0);
+                assert_eq!(fields["rows_inserted"], 1);
+                assert_eq!(generation_rows(&side, 1), 3);
+                assert_eq!(generation_rows(&side, 2), 1);
+                assert_eq!(writes.len(), 1);
+                assert_eq!(writes[0].0, rusqlite::hooks::Action::SQLITE_INSERT);
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn collection_766_repair_partial_still_replaces_every_stored_row() {
+    let dir = TempDir::new().unwrap();
+    let rows = collection_rows(WALLET, 6000);
+    let side = collection_766_seed_full(&dir, rows.clone()).await;
+    collection_admit(&side, 3, FRESH_END + 2, &[WALLET.to_owned()]).await;
+    assert_eq!(fresh_record(&side)["version"], 4);
+    assert_eq!(
+        fresh_record(&side)["repair_wallets"],
+        serde_json::json!([WALLET])
+    );
+    let source = CollectionDataset::new(rows, 1);
+    let log = collection_766_log();
+    collection_run(
+        &side,
+        &source,
+        FRESH_END + 2,
+        Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        Some(std::time::Duration::from_secs(1)),
+    )
+    .await
+    .unwrap();
+    let proof = collection_proof(&side, 3, WALLET);
+    assert_eq!(proof["acquisition"]["mode"], "full");
+    assert_eq!(proof["acquisition"]["disposition"], "excluded");
+    assert_eq!(generation_rows(&side, 1), 0);
+    assert_eq!(generation_rows(&side, 3), 4999);
+    let fields = collection_766_events(&log, "activity wallet excluded from generation");
+    assert_eq!(fields.len(), 1);
+    assert_eq!(fields[0]["rows_deleted"], 6000);
+    assert_eq!(fields[0]["rows_inserted"], 4999);
+    assert!(
+        fields[0]["commit_ms"]
+            .as_str()
+            .unwrap()
+            .parse::<u128>()
+            .is_ok()
+    );
+    assert_eq!(
+        collection_766_events(&log, "replacing explicitly repaired wallet history").len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn collection_766_no_proof_full_and_bulk_root_still_insert_every_fetched_row() {
+    let log = collection_766_log();
+    for bulk in [false, true] {
+        let fixture = BulkRootFixture::new();
+        if bulk {
+            fixture.admit().await;
+            assert_eq!(count(&fixture.side, "PRAGMA user_version"), -2);
+        } else {
+            collection_admit(&fixture.side, 1, FRESH_END, &[]).await;
+        }
+        assert_eq!(fresh_record(&fixture.side)["version"], 4);
+        assert_eq!(fresh_record(&fixture.side)["base_generation"], Value::Null);
+        assert_eq!(
+            fresh_record(&fixture.side)["repair_wallets"],
+            serde_json::json!([])
+        );
+        assert_eq!(
+            count(
+                &fixture.side,
+                "SELECT COUNT(*) FROM activity_wallet_history_v3"
+            ),
+            0
+        );
+        let mut connection = Connection::open(&fixture.side).unwrap();
+        let writes = collection_766_writes(&connection);
+        connection.trace(Some(collection_766_trace_deletes));
+        COLLECTION_766_DELETE_SQL.lock().unwrap().clear();
+        log.0.lock().unwrap().clear();
+        pe_bootstrap::cache_migration::collect_activity_v2_for_test(
+            connection,
+            &bulk_source(),
+            "https://data.example",
+            FRESH_END + 1,
+        )
+        .await
+        .unwrap();
+        // Proofless full reads still execute the wallet-wide delete, once per wallet.
+        let mut deletes = COLLECTION_766_DELETE_SQL.lock().unwrap().clone();
+        deletes.sort();
+        assert_eq!(
+            deletes,
+            [WALLET, WALLET_B].map(|wallet| format!(
+                "DELETE FROM activity_groups_v2 WHERE wallet_hex = '{wallet}'"
+            ))
+        );
+        let writes = writes.lock().unwrap();
+        assert_eq!(writes.len(), 2);
+        assert!(
+            writes
+                .iter()
+                .all(|(action, _)| *action == rusqlite::hooks::Action::SQLITE_INSERT)
+        );
+        let fields = collection_766_events(&log, "activity collection run completed");
+        assert_eq!(fields[0]["rows_inserted"], 2);
+        assert_eq!(fields[0]["rows_deleted"], 0);
+        assert_eq!(fields[0]["rows_verified"], 0);
+        assert_eq!(fields[0]["differing_full_wallets"], 2);
+        assert_eq!(count(&fixture.side, "PRAGMA user_version"), 2);
+        for wallet in [WALLET, WALLET_B] {
+            assert_eq!(
+                collection_proof(&fixture.side, 1, wallet)["acquisition"]["mode"],
+                "full"
+            );
+            assert_eq!(
+                collection_proof(&fixture.side, 1, wallet)["acquisition"]["predecessor"],
+                Value::Null
+            );
+        }
+    }
 }
 
 // #747 collection (AC1-AC6)

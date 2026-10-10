@@ -230,6 +230,7 @@ impl HistoryChain {
         scan: &mut aggregate_scan::Scan,
         connection: &Connection,
         rows_verified: &mut u64,
+        mut observe: impl FnMut(&ActivityAggregate, Option<&[u8]>) -> Result<(), BootstrapError>,
     ) -> Result<HistoryCertificate, BootstrapError> {
         let mut check = self.check();
         let held = scan
@@ -238,7 +239,7 @@ impl HistoryChain {
                 if let Some(json) = json {
                     check.push(&aggregate, json)?;
                 }
-                Ok(())
+                observe(&aggregate, json)
             })
             .map_err(|error| BootstrapError::Invalid {
                 message: format!(
@@ -1865,6 +1866,7 @@ fn commit_history_wallet(
         let wallet = &completion.wallet_hex;
         let identity = &proof.identity;
         let generation = to_i64(identity.generation, "activity generation")?;
+        let began = Instant::now();
         let transaction =
             connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let _authorization = authorize_history_writes(&transaction)?;
@@ -1955,6 +1957,9 @@ fn commit_history_wallet(
                 return invalid("fetched aggregate outside acquisition window".to_owned());
             }
         }
+        let mut rows_deleted = 0;
+        let mut rows_inserted = 0;
+        let mut kept = None;
         if repair {
             let certificate = HistoryCertificate::load(&transaction, wallet)?;
             let mut digest = JsonArrayDigest::new();
@@ -1983,28 +1988,100 @@ fn commit_history_wallet(
                 }
                 Err(error) => return Err(error),
             }
-            counts.rows_deleted = u64::try_from(transaction.execute(
+            rows_deleted = u64::try_from(transaction.execute(
                 "DELETE FROM activity_groups_v2 WHERE wallet_hex = ?1",
                 [wallet],
             )?)
             .map_err(|_| BootstrapError::Internal)?;
         } else if excluded && !partial {
             if !proof.deferred(wallet) && chain.has_history_proof() {
-                chain.verify_stored(scan, &transaction, &mut counts.rows_verified)?;
+                chain.verify_stored(
+                    scan,
+                    &transaction,
+                    &mut counts.rows_verified,
+                    |_, _| Ok(()),
+                )?;
             }
         } else if mode == ActivityReadMode::Full && !unchanged_full {
             if chain.has_history_proof() {
-                chain.verify_stored(scan, &transaction, &mut counts.rows_verified)?;
+                let mut matched = vec![false; completion.aggregates.len()];
+                let mut stale = Vec::new();
+                let mut fetched_index = 0;
+                chain.verify_stored(
+                    scan,
+                    &transaction,
+                    &mut counts.rows_verified,
+                    |stored, json| {
+                        let second = stored.source_time.0.unix_timestamp();
+                        if second > completion.acquired_end {
+                            return Ok(());
+                        }
+                        let key = (second, &stored.group_id.key().0);
+                        while let Some(fetched) = completion.aggregates.get(fetched_index) {
+                            let fetched_key = (
+                                fetched.source_time.0.unix_timestamp(),
+                                &fetched.group_id.key().0,
+                            );
+                            if fetched_key >= key {
+                                break;
+                            }
+                            fetched_index += 1;
+                        }
+                        if let Some(fetched) = completion.aggregates.get(fetched_index)
+                            && (
+                                fetched.source_time.0.unix_timestamp(),
+                                &fetched.group_id.key().0,
+                            ) == key
+                        {
+                            let fetched_json = canonical_json(fetched)?;
+                            let equal = json.is_some_and(|json| json == fetched_json.as_bytes());
+                            matched[fetched_index] = equal;
+                            fetched_index += 1;
+                            if equal {
+                                return Ok(());
+                            }
+                        }
+                        stale.push(stored.group_id.key().0.clone());
+                        Ok(())
+                    },
+                )?;
+                // The complete history must verify before any activity write.
+                let mut delete = transaction.prepare_cached(
+                    "DELETE FROM activity_groups_v2 WHERE source_trade_id = ?1 AND wallet_hex = ?2",
+                )?;
+                for id in stale {
+                    let deleted = delete.execute(params![id, wallet])?;
+                    rows_deleted = checked_activity_count(
+                        rows_deleted,
+                        u64::try_from(deleted).map_err(|_| BootstrapError::Internal)?,
+                    )?;
+                }
+                if partial {
+                    let deleted = transaction.execute(
+                        "DELETE FROM activity_groups_v2 WHERE wallet_hex = ?1 AND source_time_unix > ?2",
+                        params![wallet, completion.acquired_end],
+                    )?;
+                    rows_deleted = checked_activity_count(
+                        rows_deleted,
+                        u64::try_from(deleted).map_err(|_| BootstrapError::Internal)?,
+                    )?;
+                }
+                kept = Some(matched);
+            } else {
+                rows_deleted = u64::try_from(transaction.execute(
+                    "DELETE FROM activity_groups_v2 WHERE wallet_hex = ?1",
+                    [wallet],
+                )?)
+                .map_err(|_| BootstrapError::Internal)?;
             }
-            counts.rows_deleted = u64::try_from(transaction.execute(
-                "DELETE FROM activity_groups_v2 WHERE wallet_hex = ?1",
-                [wallet],
-            )?)
-            .map_err(|_| BootstrapError::Internal)?;
         }
         if (!excluded || partial) && !unchanged_full {
-            for aggregate in &completion.aggregates {
+            for (index, aggregate) in completion.aggregates.iter().enumerate() {
+                if kept.as_ref().is_some_and(|kept| kept[index]) {
+                    continue;
+                }
                 insert_activity_aggregate_strict(&transaction, generation, wallet, aggregate)?;
+                rows_inserted = checked_activity_count(rows_inserted, 1)?;
             }
         }
         acquisition.read_sha256 = read_digest(wallet, &completion.pages, &acquisition)?;
@@ -2050,15 +2127,9 @@ fn commit_history_wallet(
     )?;
         drop(_authorization);
         transaction.commit()?;
-        counts.rows_inserted = if (!excluded || partial) && !unchanged_full {
-            receipt
-                .acquisition
-                .as_ref()
-                .and_then(|acquisition| acquisition.fetched_aggregate_count)
-                .ok_or(BootstrapError::Internal)?
-        } else {
-            0
-        };
+        let commit_ms = began.elapsed().as_millis();
+        counts.rows_deleted = rows_deleted;
+        counts.rows_inserted = rows_inserted;
         if proof.deferred(wallet) {
             counts.deferred_wallets = 1;
         } else if excluded {
@@ -2071,13 +2142,10 @@ fn commit_history_wallet(
             counts.differing_full_wallets = 1;
         }
         if excluded && !proof.deferred(wallet) {
-            tracing::warn!(wallet, generation, reason = ?receipt.acquisition.as_ref().and_then(|acquisition| acquisition.exclusion_reason.as_ref()), "activity wallet excluded from generation");
+            tracing::warn!(wallet, generation, commit_ms, rows_deleted, rows_inserted, reason = ?receipt.acquisition.as_ref().and_then(|acquisition| acquisition.exclusion_reason.as_ref()), "activity wallet excluded from generation");
         }
         Ok(())
     })();
-    if result.is_err() {
-        counts.rows_deleted = 0;
-    }
     (counts, result)
 }
 
