@@ -17632,6 +17632,16 @@ fn collection_766_writes(
     writes
 }
 
+static COLLECTION_766_DELETE_SQL: Mutex<Vec<String>> = Mutex::new(Vec::new());
+fn collection_766_trace_deletes(sql: &str) {
+    if sql.starts_with("DELETE FROM activity_groups_v2") {
+        COLLECTION_766_DELETE_SQL
+            .lock()
+            .unwrap()
+            .push(sql.to_owned());
+    }
+}
+
 #[tokio::test]
 async fn collection_766_complete_keeps_equal_second_rows_and_empty_full_deletes_all() {
     let dir = TempDir::new().unwrap();
@@ -18241,85 +18251,109 @@ async fn collection_766_late_history_failure_attempts_no_activity_writes() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn collection_766_insert_failure_restores_deletes_releases_rows_and_zeroes_counts() {
-    let dir = TempDir::new().unwrap();
-    let rows = collection_rows(WALLET, 6000);
-    let side = collection_766_seed_full(&dir, rows.clone()).await;
-    let mut fetched = rows;
-    fetched.remove(10);
-    fetched[0]["size"] = Value::from("2.5");
-    fetched[1]["size"] = Value::from("2.5");
-    let source = CollectionDataset::new(fetched, 1);
-    collection_admit(&side, 3, FRESH_END + 2, &[]).await;
-    collection_766_assert_automatic_proved_full(&side);
-    let before = query_values(
-        &side,
-        "SELECT rowid, * FROM activity_groups_v2 ORDER BY source_trade_id",
-    );
-    history_v3_damage_connection(&side).execute_batch("CREATE TRIGGER collection_766_abort BEFORE INSERT ON activity_groups_v2 WHEN (SELECT COUNT(*) FROM activity_groups_v2 WHERE coverage_generation = 3) = 1 BEGIN SELECT RAISE(ABORT, 'fixture diff insert failure'); END;").unwrap();
-    let connection = Connection::open(&side).unwrap();
-    let writes = collection_766_writes(&connection);
-    let held = Arc::new(std::sync::atomic::AtomicU64::new(0));
+async fn collection_766_insert_or_commit_failure_restores_history_releases_rows_and_zeroes_counts()
+{
     let log = collection_766_log();
-    let error = pe_bootstrap::cache_migration::collect_activity_v2_with_limits_for_test(
-        connection,
-        &source,
-        "https://data.example",
-        FRESH_END + 3,
-        Arc::clone(&held),
-        Some(std::time::Duration::from_secs(1)),
-    )
-    .await
-    .unwrap_err();
-    assert!(
-        error.to_string().contains("fixture diff insert failure"),
-        "{error}"
-    );
-    {
-        let writes = writes.lock().unwrap();
-        assert!(
-            writes
-                .iter()
-                .filter(|(action, _)| *action == rusqlite::hooks::Action::SQLITE_DELETE)
-                .count()
-                > 2
-        );
-        assert_eq!(
-            writes
-                .iter()
-                .filter(|(action, _)| *action == rusqlite::hooks::Action::SQLITE_INSERT)
-                .count(),
-            1
-        );
-    }
-    assert_eq!(held.load(Ordering::SeqCst), 0);
-    assert_eq!(
-        query_values(
+    for commit_fails in [false, true] {
+        let dir = TempDir::new().unwrap();
+        let rows = collection_rows(WALLET, 6000);
+        let side = collection_766_seed_full(&dir, rows.clone()).await;
+        let mut fetched = rows;
+        fetched.remove(10);
+        fetched[0]["size"] = Value::from("2.5");
+        fetched[1]["size"] = Value::from("2.5");
+        let source = CollectionDataset::new(fetched, 1);
+        collection_admit(&side, 3, FRESH_END + 2, &[]).await;
+        collection_766_assert_automatic_proved_full(&side);
+        let before = query_values(
             &side,
-            "SELECT rowid, * FROM activity_groups_v2 ORDER BY source_trade_id"
-        ),
-        before
-    );
-    assert!(receipt(&side, 3, WALLET).is_none());
-    let fields = collection_766_events(&log, "activity collection run completed");
-    assert_eq!(fields.len(), 1);
-    assert_eq!(fields[0]["rows_deleted"], 0);
-    assert_eq!(fields[0]["rows_inserted"], 0);
-    assert!(collection_766_events(&log, "activity wallet excluded from generation").is_empty());
-    history_v3_damage_connection(&side)
-        .execute_batch("DROP TRIGGER collection_766_abort")
+            "SELECT rowid, * FROM activity_groups_v2 ORDER BY source_trade_id",
+        );
+        if !commit_fails {
+            history_v3_damage_connection(&side).execute_batch("CREATE TRIGGER collection_766_abort BEFORE INSERT ON activity_groups_v2 WHEN (SELECT COUNT(*) FROM activity_groups_v2 WHERE coverage_generation = 3) = 1 BEGIN SELECT RAISE(ABORT, 'fixture diff insert failure'); END;").unwrap();
+        }
+        let connection = Connection::open(&side).unwrap();
+        let writes = collection_766_writes(&connection);
+        if commit_fails {
+            // Refuse the COMMIT of the wallet transaction after all its deletes and inserts.
+            let observed = Arc::clone(&writes);
+            connection.commit_hook(Some(move || !observed.lock().unwrap().is_empty()));
+        }
+        let held = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        log.0.lock().unwrap().clear();
+        let error = pe_bootstrap::cache_migration::collect_activity_v2_with_limits_for_test(
+            connection,
+            &source,
+            "https://data.example",
+            FRESH_END + 3,
+            Arc::clone(&held),
+            Some(std::time::Duration::from_secs(1)),
+        )
+        .await
+        .unwrap_err();
+        if commit_fails {
+            assert!(
+                matches!(
+                    &error,
+                    pe_bootstrap::error::BootstrapError::Sqlite(rusqlite::Error::SqliteFailure(error, _))
+                        if error.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_COMMITHOOK
+                ),
+                "{error}"
+            );
+        } else {
+            assert!(
+                error.to_string().contains("fixture diff insert failure"),
+                "{error}"
+            );
+        }
+        {
+            let writes = writes.lock().unwrap();
+            assert!(
+                writes
+                    .iter()
+                    .filter(|(action, _)| *action == rusqlite::hooks::Action::SQLITE_DELETE)
+                    .count()
+                    > 2
+            );
+            assert_eq!(
+                writes
+                    .iter()
+                    .filter(|(action, _)| *action == rusqlite::hooks::Action::SQLITE_INSERT)
+                    .count(),
+                if commit_fails { 2 } else { 1 }
+            );
+        }
+        assert_eq!(held.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            query_values(
+                &side,
+                "SELECT rowid, * FROM activity_groups_v2 ORDER BY source_trade_id"
+            ),
+            before
+        );
+        assert!(receipt(&side, 3, WALLET).is_none());
+        let fields = collection_766_events(&log, "activity collection run completed");
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0]["rows_deleted"], 0);
+        assert_eq!(fields[0]["rows_inserted"], 0);
+        assert!(collection_766_events(&log, "activity wallet excluded from generation").is_empty());
+        if !commit_fails {
+            history_v3_damage_connection(&side)
+                .execute_batch("DROP TRIGGER collection_766_abort")
+                .unwrap();
+        }
+        collection_run(
+            &side,
+            &source,
+            FRESH_END + 2,
+            Arc::clone(&held),
+            Some(std::time::Duration::from_secs(1)),
+        )
+        .await
         .unwrap();
-    collection_run(
-        &side,
-        &source,
-        FRESH_END + 2,
-        Arc::clone(&held),
-        Some(std::time::Duration::from_secs(1)),
-    )
-    .await
-    .unwrap();
-    assert_eq!(held.load(Ordering::SeqCst), 0);
-    assert_eq!(history_v3_wallet_count(&side), 4999);
+        assert_eq!(held.load(Ordering::SeqCst), 0);
+        assert_eq!(history_v3_wallet_count(&side), 4999);
+    }
 }
 
 #[tokio::test]
@@ -18532,22 +18566,10 @@ async fn collection_766_no_proof_full_and_bulk_root_still_insert_every_fetched_r
             ),
             0
         );
-        let connection = Connection::open(&fixture.side).unwrap();
+        let mut connection = Connection::open(&fixture.side).unwrap();
         let writes = collection_766_writes(&connection);
-        let delete_statements = Arc::new(AtomicUsize::new(0));
-        let observed = Arc::clone(&delete_statements);
-        connection.authorizer(Some(move |context: rusqlite::hooks::AuthContext<'_>| {
-            use rusqlite::hooks::{AuthAction, Authorization};
-            if matches!(
-                context.action,
-                AuthAction::Delete {
-                    table_name: "activity_groups_v2"
-                }
-            ) {
-                observed.fetch_add(1, Ordering::SeqCst);
-            }
-            Authorization::Allow
-        }));
+        connection.trace(Some(collection_766_trace_deletes));
+        COLLECTION_766_DELETE_SQL.lock().unwrap().clear();
         log.0.lock().unwrap().clear();
         pe_bootstrap::cache_migration::collect_activity_v2_for_test(
             connection,
@@ -18557,9 +18579,14 @@ async fn collection_766_no_proof_full_and_bulk_root_still_insert_every_fetched_r
         )
         .await
         .unwrap();
-        assert!(
-            delete_statements.load(Ordering::SeqCst) > 0,
-            "proofless full reads still execute delete-all"
+        // Proofless full reads still execute the wallet-wide delete, once per wallet.
+        let mut deletes = COLLECTION_766_DELETE_SQL.lock().unwrap().clone();
+        deletes.sort();
+        assert_eq!(
+            deletes,
+            [WALLET, WALLET_B].map(|wallet| format!(
+                "DELETE FROM activity_groups_v2 WHERE wallet_hex = '{wallet}'"
+            ))
         );
         let writes = writes.lock().unwrap();
         assert_eq!(writes.len(), 2);
