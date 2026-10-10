@@ -2245,7 +2245,7 @@ impl PaperStateDb {
                 non_original = revision != record.semantic_revision;
             } else {
                 invalidates_position_validation = true;
-                inserts_group = true;
+                inserts_group |= record.disposition != "raw_only";
                 inserts_reanchor_trigger |= bucket
                     .reanchor
                     .as_ref()
@@ -2351,7 +2351,8 @@ impl PaperStateDb {
 
         // A retained revision changes coverage. So does a bucket of new groups for a wallet awaiting
         // re-anchoring: its late-group commits deliver past what they store, so the generation,
-        // not the cursor, signals them.
+        // not the cursor, signals them. Raw-only groups are restamp twins, which have no coverage
+        // effect, or unresolved groups, which carry their own re-anchor trigger when they need one.
         if (retains_novel_revision || inserts_group) && !inserts_reanchor_trigger {
             tx.execute(
                 "UPDATE poll_cursors SET coverage_generation = coverage_generation + 1 \

@@ -9323,8 +9323,10 @@ mod activity_exemption_tests {
     #[test]
     fn all_twins_precede_late_covered_and_partial_routing_without_effects() {
         for covered in [false, true] {
-            for alongside_recorded in [false, true] {
-                let (_dir, paper, mut engine) = fixture();
+            for (alongside_recorded, reanchoring) in
+                [(false, false), (true, false), (false, true), (true, true)]
+            {
+                let (dir, paper, mut engine) = fixture();
                 let original = group("TRADE", "trade", 100, 999, false, "market");
                 let wallet = original.group_id.components().wallet;
                 let mut initial = context();
@@ -9395,6 +9397,15 @@ mod activity_exemption_tests {
                 let mut bucket = vec![twin.clone(), redeem.clone()];
                 if alongside_recorded {
                     bucket.push(original);
+                }
+                if reanchoring {
+                    rusqlite::Connection::open(dir.path().join("paper.db"))
+                        .unwrap()
+                        .execute(
+                            "UPDATE poll_cursors SET reanchor_required = 1 WHERE wallet_hex = ?1",
+                            rusqlite::params![wallet.to_string()],
+                        )
+                        .unwrap();
                 }
                 let ledger_before = engine.ledger().snapshots().clone();
                 let history_before = paper.gate_history().unwrap();

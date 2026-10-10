@@ -213,7 +213,10 @@ capture reads pinned frames by their recorded offsets and walks contiguously fro
 the start earlier for a required receipt before it, the capture stops if retention did not keep a
 required receipt, and derive other offsets only within an unpunched range by walking frame lengths
 forward from a known receipt (the deploy boot's checkpoint tail or an earlier capture's recorded
-start); do not infer them from trade epochs. A re-measurement uses the same
+start); do not infer them from trade epochs. The capture records where its contiguous walk starts
+(`source_walk_start`), and the inspection refuses a capture whose walk starts after its cohort
+boundary: receipts in the audit window may have been retired, so capture before retention passes
+the cohort boundary. A re-measurement uses the same
 capture start and passes its own cohort boundary to the inspection below. Retain verification
 receipts and physical prefix bounds with the capture.
 
@@ -311,6 +314,7 @@ with open(live_source, "rb") as f, open(out / "source_filtered.log", "wb") as w:
         if sid in KEEP: w.write(raw); kept += 1
         end += len(raw)
 print("source sequences", walk_seq, expected - 1, "end offset", end, "kept", kept, "pinned", len(pinned))
+(out / "source_walk_start").write_text(f"{walk_seq}\n")
 
 # 3. The whole paper log through its last complete frame.
 with open(live_paper, "rb") as f, open(out / "paper.log", "wb") as w:
@@ -512,6 +516,9 @@ def membership_record(e, c):
             "kind": evidence.get("kind"), "references": references, "evidence_errors": errors}
 
 audit_unix_ns = time.time_ns(); print("audit clock", audit_unix_ns)
+# Only the contiguous walk holds every receipt; retention keeps just its pins below it.
+walk_start = int(Path(sys.argv[2]).with_name("source_walk_start").read_text())
+assert walk_start <= int(sys.argv[4]), ("capture walk starts after the cohort boundary", walk_start)
 source = read_prefix(sys.argv[2]); paper = read_prefix(sys.argv[3])
 # Decode every membership record once; the replay and both exports read only this canonical form.
 # The shared replay cannot continue past a record the verifier cannot decode, so it stops here.

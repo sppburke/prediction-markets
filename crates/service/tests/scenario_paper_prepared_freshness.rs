@@ -7174,7 +7174,7 @@ async fn recovered_pre_start_frame_admitted_after_fresh_read_qualifies() {
     assert_eq!(selected(cutoff), vec![recorded.id.0]);
     assert!(selected(cutoff + 1).is_empty());
     let snapshot = census_snapshot(&h, &CensusLogs::default());
-    assert_eq!(inspection_cohort_size(&h.dir.path().join("capture")), 1);
+    assert_eq!(inspection_cohort_size(&h.dir.path().join("capture"), 0), 1);
     assert_eq!(snapshot.population["frames"].as_array().unwrap().len(), 1);
 }
 
@@ -8146,7 +8146,7 @@ fn census_snapshot(h: &Harness, logs: &CensusLogs) -> CensusSnapshot {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).contains("snapshot started"));
-    let output = inspection_run(h, &capture, Some(env!("CARGO_BIN_EXE_pe-service")));
+    let output = inspection_run(h, &capture, Some(env!("CARGO_BIN_EXE_pe-service")), 0);
     assert!(
         output.status.success(),
         "inspection: {}\n{}",
@@ -8166,7 +8166,7 @@ fn census_snapshot(h: &Harness, logs: &CensusLogs) -> CensusSnapshot {
     assert!(String::from_utf8_lossy(&output.stdout).contains(&format!(
         "unique captured feed receipts {raw} exported receipts {raw}"
     )));
-    let cohort_size = inspection_cohort_size(&capture);
+    let cohort_size = inspection_cohort_size(&capture, 0);
     if cohort_size == 0 {
         assert!(String::from_utf8_lossy(&output.stdout).contains("FROZEN COHORT []"));
     } else {
@@ -8312,7 +8312,14 @@ fn ac_b_capture(
 }
 
 fn ac_b_inspect(h: &Harness, capture: &std::path::Path) -> Value {
-    let output = inspection_run(h, capture, Some(env!("CARGO_BIN_EXE_pe-service")));
+    // Each capture is inspected from its own walk start, the earliest boundary it covers.
+    let walk_start = std::fs::read_to_string(capture.join("source_walk_start")).unwrap();
+    let output = inspection_run(
+        h,
+        capture,
+        Some(env!("CARGO_BIN_EXE_pe-service")),
+        walk_start.trim().parse().unwrap(),
+    );
     assert!(
         output.status.success(),
         "inspection: {}\n{}",
@@ -8322,7 +8329,7 @@ fn ac_b_inspect(h: &Harness, capture: &std::path::Path) -> Value {
     serde_json::from_slice(&std::fs::read(capture.join("ac16-population.json")).unwrap()).unwrap()
 }
 
-fn inspection_cohort_size(capture: &std::path::Path) -> usize {
+fn inspection_cohort_size(capture: &std::path::Path, boundary: i64) -> usize {
     let connection = rusqlite::Connection::open_with_flags(
         capture.join("paper_state.db"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
@@ -8332,7 +8339,7 @@ fn inspection_cohort_size(capture: &std::path::Path) -> usize {
     connection
         .query_row(
             &format!("SELECT count(*) FROM ({sql})"),
-            rusqlite::params![0, i64::MAX],
+            rusqlite::params![boundary, i64::MAX],
             |row| row.get(0),
         )
         .unwrap()
@@ -8342,6 +8349,7 @@ fn inspection_run(
     h: &Harness,
     capture: &std::path::Path,
     pe_service: Option<&str>,
+    boundary: i64,
 ) -> std::process::Output {
     census_python_with(
         &recipe_extract("import calendar, ctypes", "\nPY\n"),
@@ -8353,8 +8361,8 @@ fn inspection_run(
                 .unwrap()
                 .to_owned(),
             capture.join("paper.log").to_str().unwrap().to_owned(),
-            "0".to_owned(),
-            inspection_cohort_size(capture).to_string(),
+            boundary.to_string(),
+            inspection_cohort_size(capture, boundary).to_string(),
             at().format(&time::format_description::well_known::Rfc3339)
                 .unwrap(),
             (at() + time::Duration::seconds(60))
@@ -8401,7 +8409,7 @@ async fn measurement_recipe_authenticates_version_two_admission_and_new_fallback
     );
     h.stop().await;
     let snapshot = census_snapshot(&h, &CensusLogs::default());
-    assert_eq!(inspection_cohort_size(&h.dir.path().join("capture")), 1);
+    assert_eq!(inspection_cohort_size(&h.dir.path().join("capture"), 0), 1);
     let fallbacks = snapshot.population["window_fallbacks"].as_array().unwrap();
     for (receipt, reason) in [(mismatch, "identity_unverified"), (expiry, "copy_expired")] {
         assert!(fallbacks.iter().any(|row| {
@@ -8442,6 +8450,7 @@ async fn measurement_recipe_authenticates_version_two_admission_and_new_fallback
             &h,
             &h.dir.path().join("capture"),
             Some(env!("CARGO_BIN_EXE_pe-service")),
+            0,
         );
         assert!(!output.status.success(), "{field}");
         assert!(
@@ -8474,7 +8483,7 @@ async fn measurement_recipe_authenticates_historical_version_one_admission() {
     ).unwrap();
     h.stop().await;
     census_snapshot(&h, &CensusLogs::default());
-    assert_eq!(inspection_cohort_size(&h.dir.path().join("capture")), 1);
+    assert_eq!(inspection_cohort_size(&h.dir.path().join("capture"), 0), 1);
 }
 
 /// Reframe a deliberately invalid receipt reference, retaining all other captured paper records.
@@ -8763,7 +8772,7 @@ async fn ac_b_membership_reference_checks() {
     );
     // The inspection refuses to run without the deployed decoder, including a directory value.
     for pe_service in [None, Some(capture.to_str().unwrap())] {
-        let refused = inspection_run(&h, &capture, pe_service);
+        let refused = inspection_run(&h, &capture, pe_service, 0);
         assert!(!refused.status.success());
         assert!(String::from_utf8_lossy(&refused.stderr).contains("PE_SERVICE_BIN must name"));
     }
@@ -8968,10 +8977,26 @@ open(path, "ab").write(struct.pack("<I", len(block)) + block + struct.pack("<I",
         &h.dir.path().join("bin"),
     );
     assert!(appended.status.success(), "{appended:?}");
+    // Its walk starts at the retention boundary, so an audit from an earlier cohort boundary could
+    // miss retired receipts: the inspection refuses it.
+    let refused = inspection_run(
+        &h,
+        &h.dir.path().join("pinned"),
+        Some(env!("CARGO_BIN_EXE_pe-service")),
+        0,
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains(&format!(
+            "('capture walk starts after the cohort boundary', {})",
+            boundary_seq.0
+        )),
+        "{refused:?}"
+    );
     let inspected = inspection_run(
         &h,
         &h.dir.path().join("pinned"),
         Some(env!("CARGO_BIN_EXE_pe-service")),
+        i64::try_from(boundary_seq.0).unwrap(),
     );
     assert!(inspected.status.success(), "{inspected:?}");
     assert!(
@@ -9002,7 +9027,7 @@ open(path, "ab").write(struct.pack("<I", len(block)) + block + struct.pack("<I",
     ac_b_rewrite_paper(&capture, exclusion_sequence, |r| {
         r["evidence"]["kind"] = json!("not_a_membership_kind");
     });
-    let stopped = inspection_run(&h, &capture, Some(env!("CARGO_BIN_EXE_pe-service")));
+    let stopped = inspection_run(&h, &capture, Some(env!("CARGO_BIN_EXE_pe-service")), 0);
     assert!(!stopped.status.success());
     let stderr = String::from_utf8_lossy(&stopped.stderr);
     assert!(
@@ -9052,7 +9077,7 @@ async fn ac_c_receipt_census_query() {
         // This capture holds no membership record, yet the inspection still refuses to run
         // without the deployed decoder.
         assert_eq!(snapshot.population["membership_records"], json!([]));
-        let refused = inspection_run(&h, &h.dir.path().join("capture"), None);
+        let refused = inspection_run(&h, &h.dir.path().join("capture"), None, 0);
         assert!(!refused.status.success());
         assert!(String::from_utf8_lossy(&refused.stderr).contains("PE_SERVICE_BIN must name"));
         for excluded in [zero, sell, combo] {
