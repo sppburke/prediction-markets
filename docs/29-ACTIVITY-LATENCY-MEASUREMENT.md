@@ -217,8 +217,10 @@ start); do not infer them from trade epochs. The capture records its walk start 
 receive time among the frames it lacks below it (`source_coverage.json`), read from the dense receipt
 records (`<source-log>.boot-checkpoint.receipts`, kept for retired frames too) through the deployed
 binary's checksummed, read-only `--receipt-coverage-json` command; set `PE_SERVICE_BIN` as for the
-inspection. The inspection refuses a capture that lacks a frame received from its window's first second
-on. A re-measurement uses the same
+inspection. The inspection refuses a capture that lacks a frame received from its window start on, which
+keeps the receive-time census complete. Receipt records hold no trade time, so when retention retired
+frames between the capture start and its walk the inspection reports the first-entry population
+incomplete and its acceptance unproven. A re-measurement uses the same
 capture start and passes its own cohort boundary to the inspection below. Retain verification
 receipts and physical prefix bounds with the capture.
 
@@ -338,7 +340,8 @@ missing = sorted(s for s in required if s < walk_seq and s not in pinned)
 assert not missing or missing[0] >= start_seq, ("capture again from a receipt at or before", missing[0])
 assert not missing, ("retention did not keep a required receipt", missing[0])
 # 4. Coverage: the dense receipt records keep every sequence's receive time, retired frames included. The deployed
-#    binary reads and checksums them; record the walk start and the newest receive time the capture lacks below it.
+#    binary reads and checksums them; record the walk start, the newest receive time the capture lacks below it and
+#    how many frames between its start and walk retention retired.
 newest = None
 if walk_seq:
     PE_SERVICE = os.environ.get("PE_SERVICE_BIN")
@@ -347,7 +350,8 @@ if walk_seq:
                                          check=True, stdout=subprocess.PIPE, text=True).stdout)
     assert coverage["walk_hash"] == walk_hash, "receipt records do not match the walk"
     newest = coverage["newest_lacked_received_ms"]
-(out / "source_coverage.json").write_text(json.dumps({"walk_start": walk_seq, "newest_lacked_received_ms": newest}))
+(out / "source_coverage.json").write_text(json.dumps({"walk_start": walk_seq, "newest_lacked_received_ms": newest,
+                                                     "retired": walk_seq - start_seq - len(pinned)}))
 PY
 ```
 
@@ -529,12 +533,11 @@ def membership_record(e, c):
             "kind": evidence.get("kind"), "references": references, "evidence_errors": errors}
 
 audit_unix_ns = time.time_ns(); print("audit clock", audit_unix_ns)
-# The capture holds every receipt from its walk start on and only pins below it. Every frame it lacks was received
-# before the window's first second, so it holds no window receipt and, as a receipt never precedes its trade, no
-# window trade.
+# The capture holds every receipt from its walk start on and only pins below it: every frame it lacks was received
+# before the window, so the receive-time census is complete (a millisecond record covers its whole millisecond).
 coverage = json.loads(Path(sys.argv[2]).with_name("source_coverage.json").read_text())
 lacked = coverage["newest_lacked_received_ms"]
-assert lacked is None or (lacked + 1) * 10**6 <= ns(sys.argv[6]) // 10**9 * 10**9, ("capture lacks a frame received from the window on", lacked)
+assert lacked is None or (lacked + 1) * 10**6 <= ns(sys.argv[6]), ("capture lacks a frame received from the window on", lacked)
 source = read_prefix(sys.argv[2]); paper = read_prefix(sys.argv[3])
 # Decode every membership record once; the replay and both exports read only this canonical form.
 # The shared replay cannot continue past a record the verifier cannot decode, so it stops here.
@@ -854,6 +857,10 @@ for (wallet, market), epoch in list(first.items()):
     if raw: unattributable[wallet] = max(unattributable.get(wallet, 0), raw)
 print("captured BUY identities with an earlier recorded stamp (identity, captured, recorded)", restamped)
 print("in-window first entries without captured source evidence (unknown; acceptance unproven)", unknown)
+if coverage["retired"]:
+    # Receipt records hold no trade time, so a retired BUY could still be a first entry inside the window.
+    print("first-entry population incomplete: retention retired", coverage["retired"],
+          "frames between the capture start and its walk (acceptance unproven)")
 print("earlier raw-only TRADE groups that cannot be attributed to a market, by wallet", unattributable)
 population = []
 for b in buys.values():

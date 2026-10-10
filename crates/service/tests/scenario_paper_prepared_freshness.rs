@@ -9043,6 +9043,13 @@ open(path, "ab").write(struct.pack("<I", len(block)) + block + struct.pack("<I",
             .contains("bindings to observations outside the capture 1\n"),
         "{inspected:?}"
     );
+    // Receipt records hold no trade time: a retired frame leaves the first-entry population unproven.
+    assert!(
+        String::from_utf8_lossy(&inspected.stdout).contains(
+            "first-entry population incomplete: retention retired 1 frames between the capture start and its walk"
+        ),
+        "{inspected:?}"
+    );
     let appended = commit("pinned", last + 1);
     assert!(appended.status.success(), "{appended:?}");
     let failed = inspection_run(
@@ -9062,18 +9069,6 @@ open(path, "ab").write(struct.pack("<I", len(block)) + block + struct.pack("<I",
         &h,
         &h.dir.path().join("retired"),
         Some(env!("CARGO_BIN_EXE_pe-service")),
-    );
-    assert!(
-        String::from_utf8_lossy(&refused.stderr)
-            .contains("capture lacks a frame received from the window on"),
-        "{refused:?}"
-    );
-    // A frame received after the window can still hold a window trade: that capture is refused too.
-    let refused = inspection_run_at(
-        &h,
-        &h.dir.path().join("retired"),
-        Some(env!("CARGO_BIN_EXE_pe-service")),
-        at() - time::Duration::seconds(120),
     );
     assert!(
         String::from_utf8_lossy(&refused.stderr)
