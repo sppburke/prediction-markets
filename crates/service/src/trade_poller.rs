@@ -1335,6 +1335,8 @@ impl TradePoller {
         let mut refresh_busy = false;
         let mut refresh_pending = None;
         let mut refresh_visit: Option<(WalletAddress, RefreshHandoff, AbortHandle)> = None;
+        // Whether the visiting refresh yields to its wallet's new observations (set at launch).
+        let mut refresh_yields = true;
         let mut backstop_visit: Option<(WalletAddress, watch::Sender<bool>)> = None;
         let mut urgent_visit: Option<watch::Sender<bool>> = None;
         // Expiry changes readiness, not ownership: the frozen frontier returns to the backstop
@@ -1385,7 +1387,10 @@ impl TradePoller {
                     &self.obligations.retired_frame_ids,
                 );
                 let now = (self.now)();
+                // A pending daily boundary waits on every pre-cutoff obligation and paper risk
+                // needs its mark, so then every refresh yields.
                 if let Some((wallet, handoff, handle)) = &refresh_visit
+                    && (refresh_yields || self.obligations.pending_boundary().is_some())
                     && self.obligations.by_wallet.contains_key(wallet)
                     && handoff.cancel_before_handoff()
                 {
@@ -1595,6 +1600,18 @@ impl TradePoller {
                     if let Some(wallet) = selected {
                         if refresh_pending == Some(wallet) {
                             refresh_pending = None;
+                        }
+                        // Unflagged refreshes yield to their wallet's observations. A flagged
+                        // wallet cannot admit new copy decisions, so its refresh keeps the wallet
+                        // until its baseline finishes, unless a daily boundary is pending.
+                        match self.paper_state.wallet_coverage(&wallet) {
+                            Ok(coverage) => refresh_yields = !coverage.reanchor_required,
+                            Err(error) => {
+                                failure =
+                                    Some(TradePollerOwnerError::AnchorRefresh(error.to_string()));
+                                stopping = true;
+                                continue;
+                            }
                         }
                         let handoff = RefreshHandoff::default();
                         let observed = handoff.clone();

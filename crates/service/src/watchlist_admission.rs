@@ -1342,6 +1342,9 @@ impl AdmissionPreparer {
             {
                 ValidationPurpose::RoutineRefresh { cutoff }
             }
+            // A wallet that must re-anchor reads its full history once and then short tails, as
+            // re-entry does: a busy wallet's three full reads would never agree.
+            _ if coverage.reanchor_required => ValidationPurpose::Reentry,
             _ => ValidationPurpose::CatchUp,
         };
         let outcomes = validator

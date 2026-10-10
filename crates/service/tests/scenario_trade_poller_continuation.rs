@@ -1977,6 +1977,12 @@ async fn refresh_cooldown_uses_terminal_time_and_gates_normal_queued_and_retry_p
         let activity = running.requests.recv().await.unwrap();
         assert!(activity.url.ends_with("&start=1"));
         activity.respond.send(b"[]".to_vec()).unwrap();
+        if !routine {
+            // A re-anchoring refresh reads its first tail after the full baseline.
+            let tail = running.requests.recv().await.unwrap();
+            assert!(tail.url.contains("/activity?") && !tail.url.ends_with("&start=1"));
+            tail.respond.send(b"[]".to_vec()).unwrap();
+        }
         let positions = running.requests.recv().await.unwrap();
         assert!(positions.url.contains("/positions?"));
 
@@ -2155,14 +2161,18 @@ async fn refresh_cooldown_resets_on_restart() {
 }
 
 async fn fail_refresh_positions(running: &mut RunningPoll, wallet: WalletAddress) {
-    let activity = running.requests.recv().await.unwrap();
-    assert!(activity.url.contains("/activity?"));
-    assert!(activity.url.contains(&wallet.to_string()));
-    activity.respond.send(b"[]".to_vec()).unwrap();
-    let positions = running.requests.recv().await.unwrap();
-    assert!(positions.url.contains("/positions?"));
-    assert!(positions.url.contains(&wallet.to_string()));
-    positions.respond.fail();
+    // A routine refresh reads activity once before positions; a re-anchoring one reads its
+    // baseline and first tail.
+    loop {
+        let request = running.requests.recv().await.unwrap();
+        assert!(request.url.contains(&wallet.to_string()));
+        if request.url.contains("/positions?") {
+            request.respond.fail();
+            return;
+        }
+        assert!(request.url.contains("/activity?"));
+        request.respond.send(b"[]".to_vec()).unwrap();
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -2234,6 +2244,216 @@ async fn last_wallet_refresh_defers_unvisited_health_and_yields_to_same_wallet_t
         running.waiting().await.refresh_cooldown.is_empty(),
         "cancelled and unstarted refreshes create no cooldown"
     );
+    running.finish().await;
+}
+
+/// PASS: a busy wallet that must re-anchor refreshes as re-entry does. Its own observation
+/// arrives while the slow full baseline is in flight without cancelling it, the baseline misses
+/// that trade and the tails catch it up; the wallet anchors on the matching position with a
+/// reusable full-history proof before the observation reconciles, and no copy decision is made.
+/// FAIL: three full reads that a busy wallet never lets agree, or the observation cancels the
+/// baseline and every retry, so the flag never clears.
+#[tokio::test(start_paused = true)]
+async fn reanchor_refresh_finishes_through_its_wallets_observations() {
+    use pe_service::position_seeder::REENTRY_HISTORY_OVERLAP_SECS;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (mut running, paper) =
+        start_recorded_poller_with_anchors(&dir, &[wallet()], false, true, Some(EPOCH));
+    rusqlite::Connection::open(dir.path().join("paper.db"))
+        .unwrap()
+        .execute(
+            "UPDATE poll_cursors SET reanchor_required = 1 WHERE wallet_hex = ?1",
+            [wallet().to_string()],
+        )
+        .unwrap();
+    let backstop = running.requests.recv().await.unwrap();
+    backstop.respond.send(b"[]".to_vec()).unwrap();
+    running.completed(wallet()).await;
+    running.round_completed().await;
+    let baseline = running.requests.recv().await.unwrap();
+    assert!(baseline.url.ends_with("&start=1"));
+
+    // The harness validator's clock stays at EPOCH: the trade becomes visible after the baseline
+    // read its window, so only the tails return it.
+    tokio::time::advance(std::time::Duration::from_secs(600)).await;
+    let row = stream_row(wallet(), "caught-up-by-the-tails", EPOCH);
+    let receipt = running.observe(row.clone()).await;
+    baseline
+        .respond
+        .send(b"[]".to_vec())
+        .expect("the observation must not cancel a re-anchor baseline");
+    let position = json!({
+        "proxyWallet": wallet().to_string(),
+        "asset": "asset-b",
+        "conditionId": MARKET_B,
+        "size": "1",
+        "outcomeIndex": 0,
+        "negativeRisk": false
+    });
+    let tail = format!("&start={}", EPOCH - REENTRY_HISTORY_OVERLAP_SECS + 1);
+    let mut tails = 0;
+    // The harness records the install before acknowledging it, so Anchored precedes any urgent read.
+    loop {
+        tokio::select! {
+            biased;
+            event = running.controls.recv() => if matches!(event, Some(ControlCompletion::Anchored(w)) if w == wallet()) { break },
+            request = running.requests.recv() => {
+                let request = request.unwrap();
+                let body = if request.url.ends_with(&tail) {
+                    tails += 1;
+                    serde_json::to_vec(std::slice::from_ref(&row)).unwrap()
+                } else {
+                    assert!(
+                        request.url.contains("/positions?"),
+                        "only re-entry tails and positions until it anchors: {}",
+                        request.url
+                    );
+                    if request.url.contains("redeemable=false") {
+                        serde_json::to_vec(std::slice::from_ref(&position)).unwrap()
+                    } else {
+                        b"[]".to_vec()
+                    }
+                };
+                request.respond.send(body).unwrap();
+            }
+        }
+    }
+    assert_eq!(tails, 3, "one full baseline, then three tails");
+    assert!(!paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+    let anchors = paper.position_anchors(&wallet()).unwrap();
+    assert_eq!(anchors.len(), 2);
+    assert!(pe_service::position_seeder::anchor_proves_full_history(
+        &anchors[1].proof_json
+    ));
+    assert_eq!(
+        paper
+            .activity_groups_after(&wallet(), EPOCH - 1)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(paper.gate_history().unwrap()[&wallet()].contains(&market(MARKET_B)));
+    let held = paper
+        .leader_positions()
+        .unwrap()
+        .into_iter()
+        .find(|row| row.wallet == wallet() && row.market_id == market(MARKET_B))
+        .unwrap();
+    assert_eq!(held.long_contracts, ShareAmount::from_whole(1).unwrap());
+    assert!(paper.decision_pending_history().unwrap().is_empty());
+    let urgent = running.requests.recv().await.unwrap();
+    assert!(urgent.url.contains(&wallet().to_string()));
+    urgent
+        .respond
+        .send(serde_json::to_vec(&[row]).unwrap())
+        .unwrap();
+    assert_eq!(running.completed(wallet()).await, vec![receipt]);
+    running.finish().await;
+}
+
+/// PASS: a pending daily boundary waits on every pre-cutoff obligation and paper risk needs its
+/// mark, so a re-anchoring refresh still yields to its wallet's observation while a boundary is
+/// pending; the boundary publishes, and the retry's fresh baseline then keeps the wallet through a
+/// later observation and anchors. FAIL: the refresh keeps the wallet and the boundary waits.
+#[tokio::test(start_paused = true)]
+async fn reanchor_refresh_yields_while_a_daily_boundary_waits_on_its_wallet() {
+    use pe_service::position_seeder::REENTRY_HISTORY_OVERLAP_SECS;
+
+    let dir = tempfile::tempdir().unwrap();
+    let cutoff = (EPOCH.div_euclid(86_400) + 1) * 86_400;
+    let (mut running, paper) =
+        start_recorded_poller_with_anchors(&dir, &[wallet()], false, true, Some(cutoff - 86_400));
+    rusqlite::Connection::open(dir.path().join("paper.db"))
+        .unwrap()
+        .execute(
+            "UPDATE poll_cursors SET reanchor_required = 1 WHERE wallet_hex = ?1",
+            [wallet().to_string()],
+        )
+        .unwrap();
+    let backstop = running.requests.recv().await.unwrap();
+    backstop.respond.send(b"[]".to_vec()).unwrap();
+    running.completed(wallet()).await;
+    running.round_completed().await;
+    let baseline = running.requests.recv().await.unwrap();
+    assert!(baseline.url.ends_with("&start=1"));
+
+    running.now.store(cutoff - 1, Ordering::SeqCst);
+    let row = stream_row(wallet(), "boundary-reanchor", cutoff - 1);
+    let receipt = running.observe(row.clone()).await;
+    running.now.store(cutoff, Ordering::SeqCst);
+    tokio::time::advance(std::time::Duration::from_secs(30)).await;
+    let urgent = tokio::time::timeout(std::time::Duration::from_secs(60), running.requests.recv())
+        .await
+        .expect("the pending boundary must make the refresh yield")
+        .unwrap();
+    assert!(!urgent.url.ends_with("&start=1"));
+    assert!(
+        baseline.respond.send(b"[]".to_vec()).is_err(),
+        "the baseline was cancelled"
+    );
+    urgent
+        .respond
+        .send(serde_json::to_vec(&[row]).unwrap())
+        .unwrap();
+    assert_eq!(running.completed(wallet()).await, vec![receipt]);
+    loop {
+        match running.controls.recv().await.unwrap() {
+            ControlCompletion::Boundary(value) => {
+                assert_eq!(value, cutoff);
+                break;
+            }
+            other => assert!(
+                matches!(other, ControlCompletion::BucketCommitted),
+                "unexpected control before the boundary"
+            ),
+        }
+    }
+
+    let retry = tokio::time::timeout(std::time::Duration::from_secs(60), running.requests.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        retry.url.ends_with("&start=1"),
+        "a fresh full baseline: {}",
+        retry.url
+    );
+    running.now.store(cutoff + 1, Ordering::SeqCst);
+    let later = stream_row(wallet(), "after-boundary-retry-keeps-walking", cutoff + 1);
+    let later_receipt = running.observe(later.clone()).await;
+    retry.respond.send(b"[]".to_vec()).unwrap();
+    // The harness's validator clock stays at EPOCH, so the retry's tails start from it.
+    let tail = format!("&start={}", EPOCH - REENTRY_HISTORY_OVERLAP_SECS + 1);
+    let mut tails = 0;
+    loop {
+        tokio::select! {
+            biased;
+            event = running.controls.recv() => if matches!(event, Some(ControlCompletion::Anchored(w)) if w == wallet()) { break },
+            request = running.requests.recv() => {
+                let request = request.unwrap();
+                if request.url.ends_with(&tail) {
+                    tails += 1;
+                } else {
+                    assert!(
+                        request.url.contains("/positions?"),
+                        "no urgent read while the boundary is clear: {}",
+                        request.url
+                    );
+                }
+                request.respond.send(b"[]".to_vec()).unwrap();
+            }
+        }
+    }
+    assert_eq!(tails, 3);
+    assert!(!paper.wallet_coverage(&wallet()).unwrap().reanchor_required);
+    let urgent = running.requests.recv().await.unwrap();
+    assert!(urgent.url.contains(&wallet().to_string()));
+    urgent
+        .respond
+        .send(serde_json::to_vec(&[later]).unwrap())
+        .unwrap();
+    assert_eq!(running.completed(wallet()).await, vec![later_receipt]);
     running.finish().await;
 }
 
