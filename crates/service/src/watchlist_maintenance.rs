@@ -3593,9 +3593,11 @@ mod tests {
                             installs,
                             acknowledged,
                         } => {
-                            acknowledged
-                                .send(engine.install_anchors(&installs))
-                                .unwrap();
+                            let installed = engine.install_anchors(&installs);
+                            if failure == Some("slow_install") {
+                                tokio::time::sleep(Duration::from_secs(60)).await;
+                            }
+                            acknowledged.send(installed).unwrap();
                         }
                         OrchestratorControl::CaptureAdmissionLedger { wallet, captured } => {
                             captured
@@ -6659,6 +6661,54 @@ mod tests {
                     assert_eq!(pinned_reads.load(Ordering::SeqCst), 1);
                 }
             }
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn reentry_admits_after_a_slow_install_acknowledgement() {
+            let _io = paused_io();
+            let member = wallet(1);
+            let mut fake = Fake::new(Some(1));
+            fake.ranking_entries = vec![row(1, 1, member)];
+            fake.failure = Some("slow_install");
+            let h = harness(fake, &[member]).await;
+            h.live.remove_fenced(&set(&[member]));
+            let preparer = admission_preparer(&h, Arc::new(StdMutex::new(HashSet::new())), false);
+            let anchored = h.paper_state.wallet_coverage(&member).unwrap().anchor_seq;
+            let mut sync = admission_sync(1);
+            let mut attempted = HashSet::new();
+            let tick = live_reentry_tick(
+                &h.live,
+                &h.paper_state,
+                &h.client,
+                &h.base_url,
+                "anon",
+                "",
+                &h.writer_lock,
+                &h.applied,
+                h.applied.load(),
+                &preparer,
+                &mut sync,
+                None,
+                &mut attempted,
+                NOW,
+                None,
+                false,
+            );
+            // The install lands and its reply outlasts the former 30 s deadline (#765).
+            let drive = async {
+                while h.paper_state.wallet_coverage(&member).unwrap().anchor_seq == anchored {
+                    tokio::task::yield_now().await;
+                }
+                tokio::time::advance(Duration::from_secs(31)).await;
+                assert!(
+                    !members(&h.live).contains(&member),
+                    "the reply is still pending"
+                );
+                tokio::time::advance(Duration::from_secs(30)).await;
+            };
+            let (report, ()) = tokio::join!(tick, drive);
+            assert_eq!(report.unwrap().admitted, vec![member]);
+            assert!(members(&h.live).contains(&member));
         }
 
         #[tokio::test(start_paused = true)]

@@ -47,6 +47,12 @@ async fn paper_service_rollout_restarts_settles_and_replays() {
     rollout::run().await;
 }
 
+/// PASS: a run that crosses a UTC midnight gets a usable daily-boundary mark from the fixture.
+#[tokio::test]
+async fn paper_service_rollout_serves_the_daily_boundary_mark() {
+    rollout::boundary_mark().await;
+}
+
 /// PASS: duplicate delivery is refused by the existing prepared-identity guard and credits no
 /// cash twice. This exercises the real settlement control once, without altering golden policy.
 #[tokio::test]
