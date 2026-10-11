@@ -374,6 +374,8 @@ pub struct RejectedConfigSnapshot {
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimeConfigStatusSnapshot {
     pub applied_hash: String,
+    /// Canonical applied `sizing_mode` text, so operators can confirm a hot sizing change.
+    pub sizing_mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rejected: Option<RejectedConfigSnapshot>,
 }
@@ -389,6 +391,7 @@ impl RuntimeConfigStatus {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(RuntimeConfigStatusSnapshot {
                 applied_hash: applied.canonical_hash(),
+                sizing_mode: canonical_sizing_mode(applied.sizing_mode),
                 rejected: None,
             })),
         }
@@ -401,14 +404,16 @@ impl RuntimeConfigStatus {
     pub fn record_applied(&self, applied: &RuntimeConfig) {
         self.inner.store(Arc::new(RuntimeConfigStatusSnapshot {
             applied_hash: applied.canonical_hash(),
+            sizing_mode: canonical_sizing_mode(applied.sizing_mode),
             rejected: None,
         }));
     }
 
     pub fn record_rejected(&self, rows: &[ConfigRow], error: ConfigSnapshotError) {
-        let applied_hash = self.inner.load().applied_hash.clone();
+        let current = self.inner.load();
         self.inner.store(Arc::new(RuntimeConfigStatusSnapshot {
-            applied_hash,
+            applied_hash: current.applied_hash.clone(),
+            sizing_mode: current.sizing_mode.clone(),
             rejected: Some(RejectedConfigSnapshot {
                 error,
                 rows: rows.to_vec(),
@@ -1028,6 +1033,15 @@ mod tests {
             parsed.sizing_mode
         );
         assert_eq!(HOT_CONFIG_KEYS.len(), 15);
+        let status = RuntimeConfigStatus::new(&parsed);
+        assert_eq!(status.snapshot().sizing_mode, "cash_fraction:0.00375");
+        status.record_rejected(
+            &rows,
+            ConfigSnapshotError::CrossField {
+                reason: "test".to_owned(),
+            },
+        );
+        assert_eq!(status.snapshot().sizing_mode, "cash_fraction:0.00375");
         for value in [
             "cash_fraction:0",
             "cash_fraction:1",

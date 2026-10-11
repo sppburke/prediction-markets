@@ -830,7 +830,7 @@ class Response:
 def urlopen(request, timeout=30):
     url = request.full_url
     if "/rpc/publish_ranking_batch" in url: return Response(7)
-    if "/ranking_entries" in url:
+    if "/latest_ranking" in url or "/ranking_entries" in url:
         return Response([{"batch_id": 7, "rank": 1, "survives": None}])
     if "/ranking_batches?" in url: return Response([])
     raise RuntimeError("unexpected fixture URL: " + url)

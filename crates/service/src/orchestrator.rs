@@ -2853,6 +2853,10 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .map_err(|_| LadderError::KellySizing)?;
             ShareAmount::from_whole(quantity.0).map_err(|_| LadderError::Amount)
         };
+        let cash_fraction = matches!(
+            self.strategy.config().sizing_mode,
+            SizingMode::CashFraction { .. }
+        );
         let sizing = match self.strategy.config().sizing_mode {
             SizingMode::CashFraction { fraction } => BuySizing::DollarUpTo {
                 budget: to_budget(
@@ -2922,7 +2926,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         let schedule = admission.fee_schedule;
         let minimum_order_size = admission.market.minimum_order_size;
         let minimum_tick_size = admission.market.minimum_tick_size;
-        match plan_sized_buy(
+        let planned = plan_sized_buy(
             &ladder,
             schedule,
             sizing,
@@ -2937,7 +2941,15 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 signal.leader_price
             },
             ceiling,
-        ) {
+        );
+        // A cash-fraction budget below the venue minimum reflects paper cash, not the book:
+        // it takes the paper-only skip, never a shared rejection of live targets.
+        let below_cash_minimum = cash_fraction && matches!(planned, Err(LadderError::BelowMinimum));
+        match if below_cash_minimum {
+            Err(LadderError::NothingAffordable)
+        } else {
+            planned
+        } {
             Ok(sized) => {
                 let budget = sized.budget;
                 let worst_case_all_in_debit =
@@ -2987,7 +2999,14 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     best_ask: Some(best.0.normalize().to_string()),
                     vwap_basis: None,
                     ladder_plan_blake3: None,
-                    reason: Some("budget afforded no atomic share".to_owned()),
+                    reason: Some(
+                        if below_cash_minimum {
+                            "cash-fraction budget is below the venue minimum"
+                        } else {
+                            "budget afforded no atomic share"
+                        }
+                        .to_owned(),
+                    ),
                 },
                 gate: GatePlan::NothingAffordable { best_ask: best },
                 book_receipt: book.source_receipt,
@@ -7881,6 +7900,18 @@ mod tests {
                     })
                 ),
                 succeeds,
+                "cash={cash}, depth={depth}"
+            );
+            // A refusal is paper-only: it never suppresses live targets (#508 Decision 10).
+            assert!(
+                succeeds
+                    || matches!(
+                        &result,
+                        Ok(GatePlanEvidence {
+                            gate: GatePlan::NothingAffordable { .. },
+                            ..
+                        })
+                    ),
                 "cash={cash}, depth={depth}"
             );
             if let Ok(GatePlanEvidence {

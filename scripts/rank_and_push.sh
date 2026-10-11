@@ -5,8 +5,8 @@
 #
 # THERE IS EXACTLY ONE RANKER: scripts/rank_72hr_buyandhold.py (buy-and-hold,
 # decay-aware, memory-safe inline scan over the full trade universe; the "72hr" in
-# the filename is historical — the production TTR ceiling is 48h since the run28
-# cutover, docs/_GLOSSARY `ranker_ttr_hours`). pass-2
+# the filename is historical — the production TTR ceiling is 24h since #757,
+# docs/_GLOSSARY `ranker_ttr_hours`). pass-2
 # (latency_shift_rerank.py) reranks and adds hit_rate; push_ranking_to_supabase.py
 # publishes the `latest_ranking` table that pe-service reads. No second ranker, no
 # curated-universe pre-gate — the ranker's own filters decide the cohort (#370).

@@ -1353,6 +1353,12 @@ do not change the owner's requested mode.
 
 ## Rollback
 
+**#757 copy pipeline:** fix forward after the new binary's first recorded decision. Every new
+decision, including a Shadow decline, records `KillOnly` economics that a pre-#757 binary cannot
+verify at boot. Before that first decision the prior binary may return; afterwards restore the
+sizing, band, watchlist and mode rows hot or ship a fix. Gate C's next-UTC-midnight horizon is
+compiled. The previous rules are in docs/32 "Rules before #757".
+
 **#752 group YES gate:** no forward-only boundary; pre-#752 builds such as `7e43d59` read `meta` by exact key, decode the new reason and ignore the group mappings.
 
 **Release-2 retention prerequisite:** fix forward. Once the fence is installed, 6e09b86 cannot

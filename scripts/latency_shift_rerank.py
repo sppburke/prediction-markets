@@ -237,20 +237,7 @@ POSITION_FIELDS = ["ordinal", "wallet", "market_id", "outcome_id", "entry_ts",
                    "ttr_secs", "resolved_at", "payoff", "in_scope"]
 
 
-def load_positions(con, a, schema_version):
-    if schema_version < 2:
-        con.execute("CREATE TABLE candidates (wallet VARCHAR)")
-        batch = []
-        for row in load_candidates(a.ranked_csv, a.floor_tstat):
-            batch.append(row)
-            if len(batch) == 4096:
-                append_rows(con, "candidates", ["wallet"], batch)
-        append_rows(con, "candidates", ["wallet"], batch)
-        con.execute("CREATE TABLE wallets AS SELECT DISTINCT wallet, 0::BIGINT AS first_ordinal, "
-                    "0::BIGINT AS n_total, true AS candidate FROM candidates")
-        con.execute("DROP TABLE candidates")
-        if not con.execute("SELECT COUNT(*) FROM wallets").fetchone()[0]:
-            return
+def load_positions(con, a):
     with open(a.positions_csv, newline="") as source:
         if "outcome_id" not in (csv.DictReader(source).fieldnames or []):
             raise ValueError("positions CSV lacks outcome_id — re-run pass 1 with the "
@@ -270,8 +257,7 @@ def load_positions(con, a, schema_version):
         [a.positions_csv],
     )
     con.execute("SET preserve_insertion_order=false")
-    if schema_version >= 2:
-        load_survivable_wallets(con, a)
+    load_survivable_wallets(con, a)
     con.execute(
         "CREATE TABLE positions AS SELECT ordinal, r.wallet, market_id, outcome_id, "
         "position_int(entry_ts) AS entry_ts, position_int(ttr_secs) AS ttr_secs, "
@@ -371,8 +357,7 @@ def score_wallets(con, a, as_of):
         "COALESCE(TRY_CAST(s.tstat_net_ls AS DOUBLE), -9) DESC, s.wallet IS NOT NULL DESC, "
         "s.first_market, s.first_outcome, COALESCE(s.first_ordinal, w.first_ordinal)) AS rank "
         "FROM wallets w LEFT JOIN scores s ON w.wallet=s.wallet "
-        "LEFT JOIN maker_shares m ON m.wallet=w.wallet "
-        + ("" if a.schema_two else "WHERE s.wallet IS NOT NULL")
+        "LEFT JOIN maker_shares m ON m.wallet=w.wallet"
     )
 
 
@@ -385,8 +370,9 @@ def ranked_rows(con, *, by_wallet=False):
 
 def main() -> int:
     a = parse_args()
-    if a.fill_window_secs <= 0:
-        log("FATAL: --fill-window-secs must be positive")
+    if a.latency_shift_secs <= 0 or a.fill_window_secs <= 0:
+        # A positive shift keeps the wallet's own first entry out of its print window.
+        log("FATAL: --latency-shift-secs and --fill-window-secs must be positive")
         return 1
     os.makedirs(a.out_dir, exist_ok=True)
     probe = sqlite3.connect(f"file:{a.db}?mode=ro", uri=True)
@@ -402,9 +388,12 @@ def main() -> int:
         # An explicit anchor keeps decay independent of which wallets are evaluated.
         log("FATAL: schema two requires cycle-start ranking, cache manifests and --as-of")
         return 1
-    if schema_version < 2 and next(load_candidates(a.ranked_csv, a.floor_tstat), None) is None:
-        log("no candidates; nothing to re-rank")
-        return 76
+    if schema_version < 2:
+        if next(load_candidates(a.ranked_csv, a.floor_tstat), None) is None:
+            log("no candidates; nothing to re-rank")
+            return 76
+        log("FATAL: pass 2 prices the schema-two export's first-entry prints; migrate the cache first")
+        return 1
     spill_dir = os.path.join(a.out_dir, "pass2-spill")
     if os.path.lexists(spill_dir):
         if os.path.islink(spill_dir) or not os.path.isdir(spill_dir):
@@ -421,22 +410,18 @@ def main() -> int:
 
 def rerank(con, a, schema_version):
     slip = a.slip_cents / 100.0
-    a.schema_two = schema_version >= 2
     try:
-        load_positions(con, a, schema_version)
+        load_positions(con, a)
     except ValueError as error:
         log(f"FATAL: {error}")
         return 1
     universe_count, candidate_count = con.execute(
         "SELECT COUNT(*), COUNT(*) FILTER (WHERE candidate) FROM wallets").fetchone()
-    if a.schema_two:
-        log(f"survivable position wallets: {candidate_count} of {universe_count}; the rest "
-            f"cannot meet the survival gates at any price and are not evaluated")
-    else:
-        log(f"pass-1 edge-floor candidates: {candidate_count} wallets")
+    log(f"survivable position wallets: {candidate_count} of {universe_count}; the rest "
+        f"cannot meet the survival gates at any price and are not evaluated")
     if not universe_count:
         log("no candidates; nothing to re-rank")
-        return 1 if a.schema_two else 76
+        return 1
     npos = con.execute("SELECT COUNT(*) FROM positions").fetchone()[0]
     pair_count = con.execute("SELECT COUNT(*) FROM pairs").fetchone()[0]
     log(f"candidate positions: {npos} across {pair_count} (market,outcome) pairs")

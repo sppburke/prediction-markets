@@ -2952,7 +2952,7 @@ def transport(method,url,key,body=None,**kwargs):
     if method=="POST":
         entries=body["p_entries"];config_hash=body["p_batch"]["config_hash"]
         return 200,1
-    if "ranking_entries" in url:
+    if "ranking_entries" in url or "latest_ranking" in url:
         return 200,[dict(batch_id=1,rank=r["rank"],survives=r["survives"]) for r in entries]
     if "select=config_hash" in url:
         return 200,[{{"config_hash":"wrong" if {case!r}=="integrity" else config_hash}}]

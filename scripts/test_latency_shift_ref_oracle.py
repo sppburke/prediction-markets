@@ -62,7 +62,7 @@ class PrintOracle(unittest.TestCase):
         self.con.executemany('INSERT INTO entries VALUES (?,?,?,?,?,?,?)',
                              [first_entry(row) for row in positions] + prints)
         a = args(self.root, **overrides)
-        ranker.load_positions(self.con, a, 2)
+        ranker.load_positions(self.con, a)
         ranker.reprice_positions(self.con, a)
         ranker.score_wallets(self.con, a, DAY + 86400)
         return a
@@ -141,7 +141,7 @@ class PrintOracle(unittest.TestCase):
                     first_entry(positions[0], fee=False, wallet=WALLET, second=DAY + 86400 + 1)]
         self.con.executemany('INSERT INTO entries VALUES (?,?,?,?,?,?,?)', entries)
         a = args(self.root)
-        ranker.load_positions(self.con, a, 2)
+        ranker.load_positions(self.con, a)
         self.assertEqual(self.con.execute('SELECT maker_share FROM maker_shares').fetchone()[0], .5)
         ranker.reprice_positions(self.con, a)
         self.assertEqual(self.outcomes()['horizon'][0], 'scheduled_horizon')
@@ -253,6 +253,14 @@ class ManifestRun(unittest.TestCase):
 
 
 class Horizon(unittest.TestCase):
+    def test_non_positive_shift_or_window_is_refused(self):
+        # A zero shift would let a wallet's own first entry be its copy print.
+        for flag in ('--latency-shift-secs', '--fill-window-secs'):
+            argv = ['latency_shift_rerank.py', '--ranked-csv', 'unused.csv', '--positions-csv', 'unused.csv',
+                    flag, '0']
+            with self.subTest(flag=flag), mock.patch.object(sys, 'argv', argv):
+                self.assertEqual(ranker.main(), 1)
+
     def test_day_markers_floor_and_exclusive_ceiling(self):
         a = SimpleNamespace(min_ttr_secs=60, ttr_max_secs=86400, latency_shift_secs=2)
         for marker in ('2026-04-17T00:00:00+00:00', '2026-04-17T12:00:00+00:00',

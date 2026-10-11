@@ -303,7 +303,7 @@ earlier admission unreplayable.
 The venue planner alone evaluates the requested allocation against the current ask ladder, venue
 minimum, and resolved monetary bounds. Historical paper, ordinary live and backtest return
 `InsufficientDepth` when the complete request cannot fill inside its price bounds. Only
-continuation-7 paper Dollar sizing uses `BuySizing::DollarUpTo` to sign the principal that fits,
+continuation-7 paper Dollar and CashFraction sizing use `BuySizing::DollarUpTo` to sign the principal that fits,
 subject to the admission minimum. All policies return `CapExceeded` when signed principal plus
 fee reserve exceeds a monetary bound. Contract mode either plans exactly the configured quantity
 or declines; it never silently reduces an over-cap or under-depth request.
