@@ -93,8 +93,9 @@ pub const REMOVED_CONFIG_KEYS: [&str; 22] = [
     "trade_poll_interval_secs",
 ];
 
-pub const DEFAULT_ACTIVE_WATCHLIST_SIZE: usize = 100;
-pub const MIN_ACTIVE_WATCHLIST_SIZE: usize = 1;
+/// Effective cap for the default service_config value of 0 (every survivor).
+pub const DEFAULT_ACTIVE_WATCHLIST_SIZE: usize = usize::MAX;
+pub const MIN_ACTIVE_WATCHLIST_SIZE: usize = 0;
 pub const MAX_ACTIVE_WATCHLIST_SIZE: usize = 200;
 pub const MIN_PRICE_IMPACT_CAP_BPS: i32 = 1;
 pub const MAX_PRICE_IMPACT_CAP_BPS: i32 = 10_000;
@@ -272,7 +273,7 @@ impl RuntimeConfig {
         let (sizing_dollar_usd, sizing_contracts) = match cfg.strategy.sizing_mode {
             SizingMode::Dollar { usd } => (usd, 0),
             SizingMode::Contract { contracts } => (Decimal::ZERO, contracts),
-            SizingMode::Kelly => (Decimal::ZERO, 0),
+            SizingMode::Kelly | SizingMode::CashFraction { .. } => (Decimal::ZERO, 0),
         };
         Self {
             era: ConfigEra::Financial15,
@@ -373,6 +374,8 @@ pub struct RejectedConfigSnapshot {
 #[derive(Debug, Clone, Serialize)]
 pub struct RuntimeConfigStatusSnapshot {
     pub applied_hash: String,
+    /// Canonical applied `sizing_mode` text, so operators can confirm a hot sizing change.
+    pub sizing_mode: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rejected: Option<RejectedConfigSnapshot>,
 }
@@ -388,6 +391,7 @@ impl RuntimeConfigStatus {
         Self {
             inner: Arc::new(ArcSwap::from_pointee(RuntimeConfigStatusSnapshot {
                 applied_hash: applied.canonical_hash(),
+                sizing_mode: canonical_sizing_mode(applied.sizing_mode),
                 rejected: None,
             })),
         }
@@ -400,14 +404,16 @@ impl RuntimeConfigStatus {
     pub fn record_applied(&self, applied: &RuntimeConfig) {
         self.inner.store(Arc::new(RuntimeConfigStatusSnapshot {
             applied_hash: applied.canonical_hash(),
+            sizing_mode: canonical_sizing_mode(applied.sizing_mode),
             rejected: None,
         }));
     }
 
     pub fn record_rejected(&self, rows: &[ConfigRow], error: ConfigSnapshotError) {
-        let applied_hash = self.inner.load().applied_hash.clone();
+        let current = self.inner.load();
         self.inner.store(Arc::new(RuntimeConfigStatusSnapshot {
-            applied_hash,
+            applied_hash: current.applied_hash.clone(),
+            sizing_mode: current.sizing_mode.clone(),
             rejected: Some(RejectedConfigSnapshot {
                 error,
                 rows: rows.to_vec(),
@@ -465,8 +471,13 @@ pub fn parse_config(
 
     let active_watchlist_size = parse::<usize>(&map, "active_watchlist_size")?;
     if !(MIN_ACTIVE_WATCHLIST_SIZE..=MAX_ACTIVE_WATCHLIST_SIZE).contains(&active_watchlist_size) {
-        return invalid("active_watchlist_size", "must be in 1..=200");
+        return invalid("active_watchlist_size", "must be in 0..=200");
     }
+    let active_watchlist_size = if active_watchlist_size == 0 {
+        usize::MAX
+    } else {
+        active_watchlist_size
+    };
 
     let mode_raw = raw(&map, "mode")?;
     let mode = validate_mode_transition(mode_raw, clob_creds_present, &last_good.mode).map_err(
@@ -589,7 +600,18 @@ pub fn parse_config(
             contracts: sizing_contracts,
         },
         "contract" => return cross("sizing_mode=contract requires sizing_contracts > 0"),
-        _ => return invalid("sizing_mode", "must be kelly, dollar, or contract"),
+        other => {
+            let fraction = other
+                .strip_prefix("cash_fraction:")
+                .and_then(|value| Decimal::from_str(value).ok())
+                .filter(|value| *value > Decimal::ZERO && *value < Decimal::ONE)
+                .ok_or_else(|| ConfigSnapshotError::InvalidValue {
+                    key: "sizing_mode".to_owned(),
+                    reason: "must be kelly, dollar, contract, or cash_fraction:f with 0 < f < 1"
+                        .to_owned(),
+                })?;
+            SizingMode::CashFraction { fraction }
+        }
     };
 
     Ok(RuntimeConfig {
@@ -792,11 +814,12 @@ fn canonical_per_trade_cap(value: PerTradeCap) -> String {
     }
 }
 
-fn canonical_sizing_mode(value: SizingMode) -> &'static str {
+fn canonical_sizing_mode(value: SizingMode) -> String {
     match value {
-        SizingMode::Kelly => "kelly",
-        SizingMode::Dollar { .. } => "dollar",
-        SizingMode::Contract { .. } => "contract",
+        SizingMode::CashFraction { fraction } => format!("cash_fraction:{}", fraction.normalize()),
+        SizingMode::Kelly => "kelly".to_owned(),
+        SizingMode::Dollar { .. } => "dollar".to_owned(),
+        SizingMode::Contract { .. } => "contract".to_owned(),
     }
 }
 
@@ -845,6 +868,35 @@ mod tests {
 
     fn parse_rows(rows: &[ConfigRow]) -> Result<RuntimeConfig, ConfigSnapshotError> {
         parse_config(rows, &baseline(), false, ConfigEra::Financial15)
+    }
+
+    #[test]
+    fn watchlist_zero_roundtrips_as_unlimited_and_seed_defaults_to_zero() {
+        let mut rows = complete_rows();
+        set(&mut rows, "active_watchlist_size", "0");
+        let parsed = parse_rows(&rows).unwrap();
+        assert_eq!(parsed.active_watchlist_size, usize::MAX);
+        assert_eq!(baseline().active_watchlist_size, usize::MAX);
+        let wire = serde_json::to_vec(&parsed).unwrap();
+        let restored = serde_json::from_slice::<RuntimeConfig>(&wire).unwrap();
+        assert_eq!(restored, parsed);
+        assert_eq!(restored.canonical_hash(), parsed.canonical_hash());
+        let seed = schema_seed_rows();
+        let row = seed
+            .iter()
+            .find(|row| row.key == "active_watchlist_size")
+            .unwrap();
+        assert_eq!(row.value, "0");
+        assert_eq!(row.value_type, "integer");
+        assert_eq!(parse_rows(&seed).unwrap().active_watchlist_size, usize::MAX);
+        for cap in 1..=200 {
+            set(&mut rows, "active_watchlist_size", &cap.to_string());
+            assert_eq!(parse_rows(&rows).unwrap().active_watchlist_size, cap);
+        }
+        for value in ["-1", "201", "invalid"] {
+            set(&mut rows, "active_watchlist_size", value);
+            assert!(parse_rows(&rows).is_err(), "{value}");
+        }
     }
 
     fn legacy_rows() -> Vec<ConfigRow> {
@@ -945,6 +997,62 @@ mod tests {
             quoted_keys(delete),
             ["fill_mode", "polymarket_fee_rate"].into_iter().collect()
         );
+    }
+
+    #[test]
+    fn cash_fraction_roundtrips_hot_text_hash_and_boot_config() {
+        let mut rows = complete_rows();
+        set(&mut rows, "sizing_mode", "cash_fraction:0.003750");
+        let parsed = parse_rows(&rows).unwrap();
+        assert_eq!(
+            parsed.sizing_mode,
+            SizingMode::CashFraction {
+                fraction: dec!(0.00375)
+            }
+        );
+        assert_eq!(
+            canonical_sizing_mode(parsed.sizing_mode),
+            "cash_fraction:0.00375"
+        );
+        let hash = parsed.canonical_hash();
+        set(&mut rows, "sizing_mode", "cash_fraction:0.00375");
+        assert_eq!(parse_rows(&rows).unwrap().canonical_hash(), hash);
+        set(&mut rows, "sizing_mode", "cash_fraction:0.004");
+        assert_ne!(parse_rows(&rows).unwrap().canonical_hash(), hash);
+        let wire = serde_json::to_vec(&parsed).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<RuntimeConfig>(&wire).unwrap(),
+            parsed
+        );
+        let mut boot = ServiceConfig::default();
+        boot.strategy.sizing_mode = parsed.sizing_mode;
+        let from_boot = RuntimeConfig::from_service_config(&boot);
+        assert_eq!(from_boot.sizing_mode, parsed.sizing_mode);
+        assert_eq!(
+            from_boot.winner_follow_config().sizing_mode,
+            parsed.sizing_mode
+        );
+        assert_eq!(HOT_CONFIG_KEYS.len(), 15);
+        let status = RuntimeConfigStatus::new(&parsed);
+        assert_eq!(status.snapshot().sizing_mode, "cash_fraction:0.00375");
+        status.record_rejected(
+            &rows,
+            ConfigSnapshotError::CrossField {
+                reason: "test".to_owned(),
+            },
+        );
+        assert_eq!(status.snapshot().sizing_mode, "cash_fraction:0.00375");
+        for value in [
+            "cash_fraction:0",
+            "cash_fraction:1",
+            "cash_fraction:-0.1",
+            "cash_fraction:1.1",
+            "cash_fraction:bad",
+            "cash_fraction:",
+        ] {
+            set(&mut rows, "sizing_mode", value);
+            assert!(parse_rows(&rows).is_err(), "{value}");
+        }
     }
 
     #[test]
@@ -1109,7 +1217,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(rows.len(), 14);
-        assert_eq!(parsed.active_watchlist_size, 100);
+        assert_eq!(parsed.active_watchlist_size, usize::MAX);
         assert_eq!(parsed.price_impact_cap_bps, 100);
         assert_eq!(parsed.sizing_mode, SizingMode::Dollar { usd: dec!(25) });
         assert_eq!(parsed.per_trade_cap, PerTradeCap::ModeDefault);

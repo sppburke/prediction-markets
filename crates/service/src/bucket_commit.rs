@@ -271,10 +271,14 @@ pub(crate) fn pre_545_frozen_inputs(facts: &DecisionContinuationFacts) -> String
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 pub(crate) fn synthetic_legacy17_runtime_config() -> RuntimeConfig {
-    let mut value = serde_json::to_value(RuntimeConfig::from_service_config(
-        &crate::config::ServiceConfig::default(),
-    ))
-    .expect("RuntimeConfig must serialize");
+    let historical = crate::config::ServiceConfig {
+        max_resolution_horizon_secs: 172_800,
+        max_fill_price: "0.85".to_owned(),
+        ..crate::config::ServiceConfig::default()
+    };
+    let mut value = serde_json::to_value(RuntimeConfig::from_service_config(&historical))
+        .expect("RuntimeConfig must serialize");
+    value["active_watchlist_size"] = json!(100);
     value["era"] = Value::String("legacy17".to_owned());
     value["legacy_compatibility"] = json!({
         "fill_mode": "clob_best_ask",

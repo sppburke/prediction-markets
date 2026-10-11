@@ -1,3 +1,5 @@
+import type { SupabaseClient } from "@supabase/supabase-js";
+
 import { getSupabase } from "./supabase";
 import type { PaperFill, ServiceRuntime, WalletLiveStats } from "./types";
 
@@ -8,18 +10,37 @@ export class NotConfiguredError extends Error {
   }
 }
 
+const PAGE_SIZE = 1000;
+
+/** Traverse a unique key so refreshed values cannot move rows across page boundaries. */
+async function fetchPagedRows<Row>(
+  sb: SupabaseClient,
+  table: string,
+  columns: string,
+  key: keyof Row & string,
+): Promise<Row[]> {
+  const rows: Row[] = [];
+  let cursor: string | null = null;
+  for (;;) {
+    let query = sb.from(table).select(columns).order(key, { ascending: true }).limit(PAGE_SIZE);
+    if (cursor !== null) query = query.gt(key, cursor);
+    const { data, error } = await query;
+    if (error) throw new Error(error.message);
+    if (!data) throw new Error(`The ${table} query returned no data.`);
+    const page = data as Row[];
+    rows.push(...page);
+    if (page.length < PAGE_SIZE) return rows;
+    cursor = String(page[page.length - 1][key]);
+  }
+}
+
 /** All wallets in the historical-vs-watched view. Reads the `wallet_live_stats_mv` materialized
  * view (a periodically-refreshed cache of the `wallet_live_stats` aggregation) so the heavy
  * full-table aggregation runs on a schedule, not on every page view. */
 export async function fetchWalletStats(): Promise<WalletLiveStats[]> {
   const sb = getSupabase();
   if (!sb) throw new NotConfiguredError();
-  const { data, error } = await sb
-    .from("wallet_live_stats_mv")
-    .select("*")
-    .order("live_realized_pnl", { ascending: false, nullsFirst: false });
-  if (error) throw new Error(error.message);
-  return (data ?? []) as WalletLiveStats[];
+  return fetchPagedRows<WalletLiveStats>(sb, "wallet_live_stats_mv", "*", "wallet");
 }
 
 /** pe-service's current paper watchlist size ("N watched"), or null if not yet published. */
@@ -71,7 +92,7 @@ export type WatchedSetResult =
 
 type WatchlistRow = { wallet_hex: unknown };
 
-/** Validate the two-token read around one watchlist query (#544). Exported for deterministic
+/** Validate the two-token read around the full watchlist traversal (#544). Exported for deterministic
  * unit proof; callers must never convert an unavailable result into an empty watchlist. */
 export function guardWatchedSnapshot(
   before: ServiceRuntime,
@@ -187,13 +208,10 @@ export async function fetchWatchedSet(): Promise<WatchedSetResult> {
           error: result.error?.message ?? null,
         };
       },
-      async () => {
-        const result = await sb.from("service_watchlist").select("wallet_hex");
-        return {
-          data: (result.data as WatchlistRow[] | null) ?? null,
-          error: result.error?.message ?? null,
-        };
-      },
+      async () => ({
+        data: await fetchPagedRows<WatchlistRow>(sb, "service_watchlist", "wallet_hex", "wallet_hex"),
+        error: null,
+      }),
     );
   } catch (error) {
     return {
@@ -211,9 +229,8 @@ export async function fetchWatchedSet(): Promise<WatchedSetResult> {
 export async function fetchSettledMarketIds(): Promise<Set<string>> {
   const sb = getSupabase();
   if (!sb) throw new NotConfiguredError();
-  const { data, error } = await sb.from("settled_markets").select("market_id");
-  if (error) throw new Error(error.message);
-  return new Set((data ?? []).map((r) => String(r.market_id)));
+  const rows = await fetchPagedRows<{ market_id: string }>(sb, "settled_markets", "market_id", "market_id");
+  return new Set(rows.map((row) => row.market_id));
 }
 
 /** All OPEN (not-yet-settled) paper fills, newest first, capped — the unrealized-PnL basis

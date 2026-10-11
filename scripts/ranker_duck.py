@@ -606,7 +606,7 @@ def duck_extract_positions_v2(con, wallets, win_start, win_end):
 
     No leader-price, scheduled-horizon, price-band, or statistical filter is
     applied here. Those eligibility decisions belong to pass two after the
-    minute-price approximation is selected. Rows arrive in (wallet, time,
+    copy print price is selected. Rows arrive in (wallet, time,
     trade id) order as bounded DataFrame chunks: the full window is tens of
     millions of rows, several times the host's memory as one frame. The join
     is staged to Parquet in the spill directory and sorted from there, because
@@ -676,3 +676,36 @@ def duck_extract_positions_v2(con, wallets, win_start, win_end):
         con.unregister("universe")
         if os.path.exists(staged):
             os.remove(staged)
+
+
+def duck_first_entry_prints_v2(con, shift: float, window: float) -> None:
+    """Materialize candidate-pair taker prints and unfiltered window maker shares.
+
+    raw_positions is pass one's complete window, before any pass-two filter.
+    The print tape includes the +window tail, independently of the decay anchor.
+    """
+    compact = con.execute("SELECT COUNT(*) FROM duckdb_views() WHERE view_name = 'projection'").fetchone()[0] > 0
+    source = ("FROM projection g " if compact else
+              "FROM ranker_entries_v2 r JOIN activity_groups_v2 g "
+              "ON g.source_trade_id=r.source_trade_id AND g.coverage_generation=r.activity_generation "
+              "LEFT JOIN clob_payout_evidence_v2 p ON p.market_id=g.condition_id ")
+    outcome = "g.outcome_id" if compact else TRADED_OUTCOME
+    fee = ("CAST(g.source_usdc_amount_str AS DECIMAL(38,12)) > "
+           "CAST(g.price_weighted_share_amount_str AS DECIMAL(38,12)) * 1.0005")
+    con.execute(
+        "CREATE TABLE maker_shares AS SELECT r.wallet, AVG(CASE WHEN " + fee +
+        " THEN 0.0 ELSE 1.0 END) AS maker_share " + source +
+        "JOIN raw_positions r ON r.wallet=g.wallet_hex AND r.market_id=g.condition_id "
+        f"AND CAST(r.outcome_id AS INTEGER)={outcome} "
+        "AND CAST(r.entry_ts AS BIGINT)=g.source_time_unix GROUP BY r.wallet"
+    )
+    con.execute(
+        "CREATE TABLE first_entry_prints AS SELECT pair.market_id, pair.outcome_id, "
+        "g.source_time_unix AS sample_t, "
+        "MAX(CAST(g.price_weighted_share_amount_str AS DOUBLE) / "
+        "CAST(g.share_amount_str AS DOUBLE)) AS sample_price " + source +
+        f"JOIN pairs pair ON pair.market_id=g.condition_id AND CAST(pair.outcome_id AS INTEGER)={outcome} "
+        "WHERE " + fee + " AND g.source_time_unix >= pair.first_entry + ? "
+        "AND g.source_time_unix <= pair.last_entry + ? "
+        "GROUP BY pair.market_id, pair.outcome_id, g.source_time_unix", [shift, window],
+    )

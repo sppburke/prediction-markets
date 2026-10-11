@@ -12,7 +12,7 @@ pub mod error;
 pub mod evaluate;
 pub mod mode;
 
-pub use config::{PerTradeCap, SizingMode, WinnerFollowConfig};
+pub use config::{PerTradeCap, SizingMode, WinnerFollowConfig, cash_fraction_budget};
 pub use error::{KellyErrorAudit, WinnerFollowDeclineAudit, WinnerFollowError};
 pub use evaluate::{
     OrganicCanaryOrder, OrganicCanaryPolicy, OrganicDecisionProof, WinnerFollowStrategy,

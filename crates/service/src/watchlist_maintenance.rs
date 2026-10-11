@@ -69,9 +69,7 @@ use crate::paper_recovery::{
     KnockoutCausalArtifact, KnockoutFillArtifact, KnockoutSettlementArtifact, MembershipChange,
     MembershipReason, SealedMembershipEvidence,
 };
-use crate::runtime_config::{
-    AppliedWatchlistCapacity, MAX_ACTIVE_WATCHLIST_SIZE, WatchlistCapacityEpoch,
-};
+use crate::runtime_config::{AppliedWatchlistCapacity, WatchlistCapacityEpoch};
 use crate::supabase_reader;
 use crate::watchlist_admission::AdmissionPreparer;
 
@@ -1495,12 +1493,7 @@ async fn live_reentry_tick(
         (&watchlist.entries, last_trade)
     } else {
         fetched = match supabase_reader::fetch_batch(
-            client,
-            base_url,
-            anon_key,
-            secret_key,
-            batch_id,
-            MAX_ACTIVE_WATCHLIST_SIZE,
+            client, base_url, anon_key, secret_key, batch_id,
         )
         .await
         {
@@ -1937,12 +1930,7 @@ async fn maintenance_tick_inner(
                     {
                         sync.attempted_batch_id = Some(batch_id);
                         match supabase_reader::fetch_batch(
-                            client,
-                            base_url,
-                            anon_key,
-                            secret_key,
-                            batch_id,
-                            MAX_ACTIVE_WATCHLIST_SIZE,
+                            client, base_url, anon_key, secret_key, batch_id,
                         )
                         .await
                         {
@@ -1996,12 +1984,7 @@ async fn maintenance_tick_inner(
                     {
                         sync.attempted_batch_id = Some(batch_id);
                         match supabase_reader::fetch_batch(
-                            client,
-                            base_url,
-                            anon_key,
-                            secret_key,
-                            batch_id,
-                            MAX_ACTIVE_WATCHLIST_SIZE,
+                            client, base_url, anon_key, secret_key, batch_id,
                         )
                         .await
                         {
@@ -2458,13 +2441,7 @@ async fn knockout_tick(
     {
         let exclude: Vec<WalletAddress> = backfill_excluded.iter().copied().collect();
         match supabase_reader::fetch_candidates(
-            client,
-            base_url,
-            anon_key,
-            secret_key,
-            batch_id,
-            &exclude,
-            MAX_ACTIVE_WATCHLIST_SIZE,
+            client, base_url, anon_key, secret_key, batch_id, &exclude,
         )
         .await
         {
@@ -3347,8 +3324,8 @@ mod tests {
                         .cloned()
                         .collect::<Vec<_>>();
                     selected.sort_by_key(|row| row["rank"].as_i64().unwrap());
-                    selected.truncate(limit);
-                    selected
+                    let offset = q["offset"].parse::<usize>().unwrap();
+                    selected.into_iter().skip(offset).take(limit).collect()
                 }
                 async fn batches(State(fake): State<Fake>) -> Json<serde_json::Value> {
                     Json(match fake.latest_batch.load(Ordering::SeqCst) {
@@ -4762,16 +4739,10 @@ mod tests {
             fake.history_missing.insert(missing);
             let h = harness(fake, &[ready, missing]).await;
             h.live.remove_fenced(&set(&[ready, missing]));
-            let (watchlist, last_trade) = supabase_reader::fetch_batch(
-                &h.client,
-                &h.base_url,
-                "anon",
-                "",
-                1,
-                MAX_ACTIVE_WATCHLIST_SIZE,
-            )
-            .await
-            .unwrap();
+            let (watchlist, last_trade) =
+                supabase_reader::fetch_batch(&h.client, &h.base_url, "anon", "", 1)
+                    .await
+                    .unwrap();
             let held = (1, watchlist, last_trade);
             let mut attempted = HashSet::new();
             let mut sync = BatchSync {
@@ -5534,6 +5505,24 @@ mod tests {
                 assert!(h.paper_state.cursor(&fenced).unwrap().is_none());
             }
         }
+        #[tokio::test]
+        async fn empty_survivor_batch_empties_unlimited_followed_set() {
+            let incumbent = wallet(91);
+            let h = harness(Fake::new(Some(2)), &[incumbent]).await;
+            h.applied.store(WatchlistCapacityEpoch {
+                generation: 1,
+                target: usize::MAX,
+            });
+            let (mut evicted, mut marker) = (HashSet::new(), Some(1));
+            h.tick(MembershipMode::FullRerank, &mut evicted, &mut marker)
+                .await;
+            assert!(h.live.snapshot().entries.is_empty());
+            assert!(h.live.structural_membership().is_empty());
+            assert_eq!(marker, Some(2));
+            assert_eq!(h.applied.load().target, usize::MAX);
+            assert_eq!(h.membership_publications.load(Ordering::SeqCst), 1);
+        }
+
         fn admission_sync(marker: i64) -> BatchSync {
             BatchSync {
                 cooldowns: HashMap::new(),

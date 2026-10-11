@@ -50,9 +50,7 @@ use pe_service::demotion_stat::WalletEdgeStats;
 use pe_service::live_watchlist::LiveWatchlist;
 use pe_service::orchestrator_control::OrchestratorControl;
 use pe_service::paper_recovery::MembershipReason;
-use pe_service::runtime_config::{
-    AppliedWatchlistCapacity, DEFAULT_ACTIVE_WATCHLIST_SIZE, WatchlistCapacityEpoch,
-};
+use pe_service::runtime_config::{AppliedWatchlistCapacity, WatchlistCapacityEpoch};
 use pe_service::watchlist_admission::AdmissionPreparer;
 use pe_service::watchlist_maintenance::{
     KnockoutReason, MaintenanceConfig, MembershipMode, MembershipPublication, PublicationBinding,
@@ -790,9 +788,9 @@ async fn stale_seeded_wallet_no_admission_grace() {
 async fn writer_mutex_serializes_refresh_and_replace() {
     let (_dir, db) = temp_db();
     let lock = Arc::new(Mutex::new(()));
-    let cap = DEFAULT_ACTIVE_WATCHLIST_SIZE;
+    let cap = 100;
     let (applied, epoch) = capacity(cap);
-    assert_eq!(cap, 100, "production default must follow the top 100");
+    assert_eq!(cap, 100, "explicit cap must follow the top 100");
 
     // Live set starts full: wallets 1..=100.
     let initial: Vec<WatchlistEntry> = (1..=100u8)
@@ -1382,11 +1380,8 @@ async fn full_structural_set_backfills_vacancy_from_stale_survivors_in_rank_orde
         (1..=100).map(|n| entry(wallet(n), 300)).collect(),
     ));
     live.remove_fenced(&HashSet::from([wallet(100)]));
-    assert_eq!(
-        live.structural_membership().len(),
-        DEFAULT_ACTIVE_WATCHLIST_SIZE
-    );
-    let (applied, _) = capacity(DEFAULT_ACTIVE_WATCHLIST_SIZE);
+    assert_eq!(live.structural_membership().len(), 100);
+    let (applied, _) = capacity(100);
     let lock = Arc::new(Mutex::new(()));
     let starts = Arc::new(std::sync::Mutex::new(Vec::new()));
     let candidates = Arc::new(AtomicUsize::new(0));
@@ -1523,7 +1518,7 @@ async fn full_structural_set_backfills_vacancy_from_stale_survivors_in_rank_orde
             .collect::<HashSet<_>>(),
         expected
     );
-    assert_eq!(live.snapshot().entries.len(), DEFAULT_ACTIVE_WATCHLIST_SIZE);
+    assert_eq!(live.snapshot().entries.len(), 100);
     // #749 starts this tick with additions; rank 101 takes the vacancy before member 100
     // re-enters. Rank 102 remains untouched on the bench.
     assert_eq!(
@@ -1536,7 +1531,7 @@ async fn full_structural_set_backfills_vacancy_from_stale_survivors_in_rank_orde
     assert!(!paper.wallet_history_complete(&wallet(102)).unwrap());
     assert!(paper.position_anchors(&wallet(102)).unwrap().is_empty());
     assert_eq!(paper.cursor(&wallet(102)).unwrap(), None);
-    assert_eq!(applied.load().target, DEFAULT_ACTIVE_WATCHLIST_SIZE);
+    assert_eq!(applied.load().target, 100);
     actor.abort();
     source_task.abort();
     server.abort();

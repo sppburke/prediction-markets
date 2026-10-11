@@ -102,6 +102,7 @@ fn runtime() -> RuntimeConfig {
     config.mode = "paper".to_owned();
     config.min_resolution_horizon_secs = 0;
     config.max_resolution_horizon_secs = 0;
+    config.max_fill_price = dec!(0.85);
     config.price_impact_cap_bps = 300;
     config.per_trade_cap = PerTradeCap::Bps(1000);
     config.slippage_rate = Decimal::ZERO;
@@ -8611,13 +8612,18 @@ async fn ac_b_membership_reference_checks() {
         ranking_row(2, newcomer)
     ])));
     let server_rows = rows.clone();
-    let router = axum::Router::new().route(
-        "/rest/v1/latest_ranking",
-        axum::routing::get(move || {
-            let rows = server_rows.clone();
-            async move { axum::Json(rows.lock().unwrap().clone()) }
-        }),
-    );
+    let router = axum::Router::new()
+        .route(
+            "/rest/v1/ranking_batches",
+            axum::routing::get(|| async { axum::Json(json!([{"batch_id": 546}])) }),
+        )
+        .route(
+            "/rest/v1/ranking_entries",
+            axum::routing::get(move || {
+                let rows = server_rows.clone();
+                async move { axum::Json(rows.lock().unwrap().clone()) }
+            }),
+        );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });

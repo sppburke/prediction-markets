@@ -125,11 +125,8 @@ pub struct ServiceConfig {
     #[serde(default = "default_gamma_resolution_poll_interval_secs")]
     pub gamma_resolution_poll_interval_secs: u64,
 
-    /// Drop entry signals whose market `endDate` is further than this many seconds
-    /// into the future. Set to 0 to disable. Default: 172_800 (48 h) — the run28
-    /// production TTR ceiling (2026-07-03 cutover, `docs/33` §5: 48 h ≈ 72 h on paired
-    /// weekly P&L, so the capital-velocity preference is free; was 72 h per issue #290).
-    /// Selection twin: `ranker_ttr_hours` in `docs/_GLOSSARY.md`.
+    /// Exclusive upper bound on seconds until the next UTC midnight after the scheduled marker.
+    /// Zero disables it. See `docs/_GLOSSARY.md`: `max_resolution_horizon_secs`.
     #[serde(default = "default_max_resolution_horizon_secs")]
     pub max_resolution_horizon_secs: u64,
 
@@ -257,8 +254,7 @@ pub struct ServiceConfig {
     pub inactivity_hard_cap_secs: u64,
 
     /// Accepted for configuration compatibility only. Since #588 it has no runtime effect:
-    /// membership maintenance reads the latest ranking batch bounded by
-    /// `MAX_ACTIVE_WATCHLIST_SIZE` instead of over-fetching freed slots. Default: 10. See
+    /// membership maintenance reads the complete pinned ranking batch instead of over-fetching freed slots. Default: 10. See
     /// `docs/_GLOSSARY.md`: `bench_overfetch`.
     #[serde(default = "default_bench_overfetch")]
     pub bench_overfetch: usize,
@@ -326,7 +322,7 @@ const fn default_trade_poll_interval_secs() -> u64 {
 }
 
 const fn default_max_resolution_horizon_secs() -> u64 {
-    48 * 3600 // 172_800 s = 48 h (run28 production TTR ceiling, 2026-07-03 cutover)
+    86_400
 }
 
 const fn default_min_resolution_horizon_secs() -> u64 {
@@ -334,7 +330,7 @@ const fn default_min_resolution_horizon_secs() -> u64 {
 }
 
 fn default_max_fill_price() -> String {
-    "0.85".to_string()
+    "0.65".to_string()
 }
 
 fn default_watchlist_membership_mode() -> String {
@@ -612,6 +608,39 @@ mod tests {
     }
 
     #[test]
+    fn copy_defaults_match_seed_rows_and_smoke_boot_stays_dollar() {
+        let boot: ServiceConfig =
+            toml::from_str(include_str!("../../../smoke-test/service.toml")).unwrap();
+        let defaults = ServiceConfig::default();
+        assert_eq!(
+            boot.max_resolution_horizon_secs,
+            defaults.max_resolution_horizon_secs
+        );
+        assert_eq!(boot.max_fill_price, defaults.max_fill_price);
+        let sql = include_str!("../../../scripts/supabase_schema.sql");
+        for (key, expected) in [
+            (
+                "max_resolution_horizon_secs",
+                defaults.max_resolution_horizon_secs.to_string(),
+            ),
+            ("max_fill_price", defaults.max_fill_price),
+            ("sizing_mode", "dollar".to_owned()),
+        ] {
+            let row = sql
+                .lines()
+                .find(|line| line.trim_start().starts_with(&format!("('{key}',")))
+                .unwrap();
+            assert_eq!(row.split('\'').nth(3).unwrap(), expected);
+        }
+        assert_eq!(
+            boot.strategy.sizing_mode,
+            pe_strategy_winner_follow::SizingMode::Dollar {
+                usd: rust_decimal::Decimal::from(25)
+            }
+        );
+    }
+
+    #[test]
     fn default_values() {
         let cfg = ServiceConfig::default();
         assert_eq!(cfg.copy_latency_budget_secs, 120);
@@ -632,9 +661,9 @@ mod tests {
             cfg.legacy_wallet_history_path,
             PathBuf::from("./wallet_market_history.json")
         );
-        assert_eq!(cfg.max_resolution_horizon_secs, 172_800);
+        assert_eq!(cfg.max_resolution_horizon_secs, 86_400);
         assert_eq!(cfg.min_resolution_horizon_secs, 60);
-        assert_eq!(cfg.max_fill_price, "0.85");
+        assert_eq!(cfg.max_fill_price, "0.65");
         assert_eq!(cfg.min_fill_price, "0.15");
         assert_eq!(cfg.watchlist_membership_mode, "knockout");
         assert_eq!(cfg.supabase_url, "");

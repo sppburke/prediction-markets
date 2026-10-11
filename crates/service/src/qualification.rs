@@ -4313,6 +4313,7 @@ async fn verify_economic(
             "risk snapshot reconstruction failed: {error}"
         ))
     })?;
+    reconstructed.drawdown_policy = economic.risk.snapshot.drawdown_policy;
     // The paper owner appends the transitions this same pre-overlay snapshot implies before it
     // applies the overlay (`Orchestrator::synchronize_paper_risk_halts`), so a mechanically
     // released paper cause carries no overlay and an engaged one is already at or beyond its
@@ -5090,7 +5091,11 @@ async fn bind_final_receipts(
                 "fill decision, Prepared economics, and FinancialFinal identity/configuration disagree",
             );
         }
-        verify_winner_follow_fill_decision(&decision.continuation, fill)?;
+        verify_winner_follow_fill_decision(
+            &decision.continuation,
+            fill,
+            started.starting_bankroll.to_decimal(),
+        )?;
     }
     if matched_finals.len() != fills.len() {
         return insufficient("a FinancialFinal has no identical terminal fill decision");
@@ -5101,6 +5106,7 @@ async fn bind_final_receipts(
 fn verify_winner_follow_fill_decision(
     continuation: &DecisionContinuationV3,
     fill: &CompletedFill,
+    starting_bankroll: Decimal,
 ) -> Result<(), QualificationError> {
     let frozen = &continuation.facts;
     let economic = &fill.economic;
@@ -5116,7 +5122,8 @@ fn verify_winner_follow_fill_decision(
         ));
     }
 
-    let (signal, mode) = verify_winner_follow_economic_policy(continuation, economic)?;
+    let (signal, mode) =
+        verify_winner_follow_economic_policy(continuation, economic, starting_bankroll)?;
     let mut intent =
         pe_strategy_winner_follow::WinnerFollowStrategy::new(configuration.winner_follow_config())
             .evaluate_at_price_with_limit(
@@ -5181,6 +5188,7 @@ fn verify_winner_follow_fill_decision(
 fn verify_winner_follow_economic_policy(
     continuation: &DecisionContinuationV3,
     economic: &EconomicPrepared,
+    starting_bankroll: Decimal,
 ) -> Result<(LeaderSignal, pe_strategy_winner_follow::ExecutionMode), QualificationError> {
     continuation
         .validate_authority()
@@ -5191,6 +5199,20 @@ fn verify_winner_follow_economic_policy(
     let strategy =
         pe_strategy_winner_follow::WinnerFollowStrategy::new(configuration.winner_follow_config());
     let expected_sizing = match strategy.config().sizing_mode {
+        pe_strategy_winner_follow::SizingMode::CashFraction { fraction } => {
+            SizingModeAudit::Dollar {
+                usd: pe_strategy_winner_follow::cash_fraction_budget(
+                    fraction,
+                    economic.balance.cash_before.to_decimal(),
+                    starting_bankroll,
+                )
+                .ok_or_else(|| {
+                    QualificationError::InsufficientEvidence(
+                        "cash-fraction budget arithmetic failed".to_owned(),
+                    )
+                })?,
+            }
+        }
         pe_strategy_winner_follow::SizingMode::Kelly => SizingModeAudit::Kelly {
             fraction: strategy.effective_kelly_fraction(mode),
             probability: frozen.frozen_basis.win_rate_p,
@@ -5405,7 +5427,11 @@ async fn verify_winner_follow_decline_decision(
                     frozen.source_trade_id
                 ));
             }
-            let (signal, mode) = verify_winner_follow_economic_policy(continuation, economic)?;
+            let (signal, mode) = verify_winner_follow_economic_policy(
+                continuation,
+                economic,
+                started.starting_bankroll.to_decimal(),
+            )?;
             let paper_prefix = paper_prefix_at_financial_prefix(
                 &context.frames[context.start_index..],
                 economic.risk.financial_prefix,
@@ -7012,6 +7038,7 @@ mod tests {
                     copy_latency_kill_switch_active: false,
                     proposed_trade_bps: pe_core_types::BasisPoints::ZERO,
                     per_trade_cap_bps: 10_000,
+                    drawdown_policy: pe_risk_engine::DrawdownPolicy::Stops,
                     concentration_caps: None,
                 },
                 decision: RiskDecisionAudit::Approved,
@@ -7092,8 +7119,13 @@ mod tests {
         let source_trade_id = SourceTradeId("g2:classification-fixture".to_owned());
         let market_id = MarketId(VenueMarketId("classification-market".to_owned()));
         let source_epoch = 1_700_000_000;
-        let configuration =
-            crate::runtime_config::RuntimeConfig::from_service_config(&ServiceConfig::default());
+        let mut configuration =
+            crate::runtime_config::RuntimeConfig::from_service_config(&ServiceConfig {
+                max_resolution_horizon_secs: 172_800,
+                max_fill_price: "0.85".to_owned(),
+                ..ServiceConfig::default()
+            });
+        configuration.active_watchlist_size = 100;
         let continuation = DecisionContinuationV3::new(
             crate::bucket_commit::DecisionContinuationFacts {
                 paper_freshness_policy: None,
@@ -7641,6 +7673,7 @@ mod tests {
             pe_strategy_winner_follow::SizingMode::Contract { contracts: 5 };
         continuation.facts.applied_configuration.sizing_contracts = 5;
         continuation.facts.applied_configuration.slippage_rate = Decimal::ZERO;
+        continuation.facts.applied_configuration.max_fill_price = dec!(0.85);
         continuation.facts.applied_configuration_hash =
             continuation.facts.applied_configuration.canonical_hash();
 
@@ -7811,6 +7844,7 @@ mod tests {
         verify_winner_follow_economic_policy(
             &fixture.decision.continuation,
             evaluated_economic(&fixture.decision),
+            dec!(100),
         )
         .unwrap();
     }
@@ -7833,7 +7867,11 @@ mod tests {
         let mut economic = evaluated_economic(&fixture.decision).clone();
         economic.sizing.mode = SizingModeAudit::Contract { contracts: 10 };
         assert_qualification_refusal(
-            verify_winner_follow_economic_policy(&fixture.decision.continuation, &economic),
+            verify_winner_follow_economic_policy(
+                &fixture.decision.continuation,
+                &economic,
+                dec!(100),
+            ),
             "EconomicPrepared execution policy differs from its frozen configuration and signal",
         );
     }
@@ -7845,7 +7883,11 @@ mod tests {
         let mut economic = evaluated_economic(&fixture.decision).clone();
         economic.sizing.slippage_rate = dec!(0.01);
         assert_qualification_refusal(
-            verify_winner_follow_economic_policy(&fixture.decision.continuation, &economic),
+            verify_winner_follow_economic_policy(
+                &fixture.decision.continuation,
+                &economic,
+                dec!(100),
+            ),
             "EconomicPrepared execution policy differs from its frozen configuration and signal",
         );
     }
@@ -7857,7 +7899,11 @@ mod tests {
         let mut economic = evaluated_economic(&fixture.decision).clone();
         economic.balance.price_impact_cap_bps = 10_000;
         assert_qualification_refusal(
-            verify_winner_follow_economic_policy(&fixture.decision.continuation, &economic),
+            verify_winner_follow_economic_policy(
+                &fixture.decision.continuation,
+                &economic,
+                dec!(100),
+            ),
             "EconomicPrepared execution policy differs from its frozen configuration and signal",
         );
     }
@@ -7869,7 +7915,11 @@ mod tests {
         let mut economic = evaluated_economic(&fixture.decision).clone();
         economic.balance.band_floor = Price::ZERO;
         assert_qualification_refusal(
-            verify_winner_follow_economic_policy(&fixture.decision.continuation, &economic),
+            verify_winner_follow_economic_policy(
+                &fixture.decision.continuation,
+                &economic,
+                dec!(100),
+            ),
             "EconomicPrepared execution policy differs from its frozen configuration and signal",
         );
     }
@@ -7881,7 +7931,11 @@ mod tests {
         let mut economic = evaluated_economic(&fixture.decision).clone();
         economic.balance.band_ceiling_exclusive = Price::ONE;
         assert_qualification_refusal(
-            verify_winner_follow_economic_policy(&fixture.decision.continuation, &economic),
+            verify_winner_follow_economic_policy(
+                &fixture.decision.continuation,
+                &economic,
+                dec!(100),
+            ),
             "EconomicPrepared execution policy differs from its frozen configuration and signal",
         );
     }
@@ -7893,7 +7947,11 @@ mod tests {
         let mut economic = evaluated_economic(&fixture.decision).clone();
         economic.balance.chase_ceiling = Price::new(dec!(0.90)).unwrap();
         assert_qualification_refusal(
-            verify_winner_follow_economic_policy(&fixture.decision.continuation, &economic),
+            verify_winner_follow_economic_policy(
+                &fixture.decision.continuation,
+                &economic,
+                dec!(100),
+            ),
             "EconomicPrepared execution policy differs from its frozen configuration and signal",
         );
     }
@@ -7910,7 +7968,7 @@ mod tests {
             *fraction = KELLY_NORMAL;
         }
         assert_qualification_refusal(
-            verify_winner_follow_economic_policy(&continuation, &economic),
+            verify_winner_follow_economic_policy(&continuation, &economic, dec!(100)),
             "EconomicPrepared execution policy differs from its frozen configuration and signal",
         );
     }
@@ -7927,7 +7985,7 @@ mod tests {
             *probability = Probability::new(dec!(0.70)).unwrap();
         }
         assert_qualification_refusal(
-            verify_winner_follow_economic_policy(&continuation, &economic),
+            verify_winner_follow_economic_policy(&continuation, &economic, dec!(100)),
             "EconomicPrepared execution policy differs from its frozen configuration and signal",
         );
     }
@@ -7938,7 +7996,7 @@ mod tests {
     fn winner_follow_intent_allocation_must_equal_the_sized_plan() {
         let (continuation, mut economic) = winner_follow_policy_fixture();
         let (signal, mode) =
-            verify_winner_follow_economic_policy(&continuation, &economic).unwrap();
+            verify_winner_follow_economic_policy(&continuation, &economic, dec!(100)).unwrap();
         let intent = pe_strategy_winner_follow::WinnerFollowStrategy::new(
             continuation
                 .facts
@@ -8023,6 +8081,72 @@ mod tests {
     }
 
     #[test]
+    fn cash_fraction_qualification_uses_recorded_cash_and_rejects_wrong_start() {
+        let (mut continuation, mut economic) = winner_follow_policy_fixture();
+        continuation.facts.applied_configuration.sizing_mode =
+            pe_strategy_winner_follow::SizingMode::CashFraction {
+                fraction: dec!(0.00375),
+            };
+        let cash = economic.balance.cash_before.to_decimal();
+        let start = (cash - dec!(0.1)) / dec!(0.7);
+        economic.sizing.mode = SizingModeAudit::Dollar {
+            usd: pe_strategy_winner_follow::cash_fraction_budget(dec!(0.00375), cash, start)
+                .unwrap(),
+        };
+        verify_winner_follow_economic_policy(&continuation, &economic, start).unwrap();
+        assert!(
+            verify_winner_follow_economic_policy(&continuation, &economic, start + dec!(1))
+                .is_err()
+        );
+        economic.balance.cash_before =
+            CollateralAmount::from_decimal_exact(cash + dec!(1)).unwrap();
+        assert!(verify_winner_follow_economic_policy(&continuation, &economic, start).is_err());
+    }
+
+    #[tokio::test]
+    async fn economic_risk_replay_rebuilds_recorded_kill_only_policy() {
+        let fixture = receipt_backed_decline_fixture().await;
+        let continuation = fixture.decision.continuation.clone();
+        let mut economic = evaluated_economic(&fixture.decision).clone();
+        economic.risk.snapshot.drawdown_policy = pe_risk_engine::DrawdownPolicy::KillOnly;
+        economic.risk.decision = match evaluate_risk(&economic.risk.snapshot) {
+            RiskDecision::Approved => RiskDecisionAudit::Approved,
+            RiskDecision::Blocked(reason) => RiskDecisionAudit::Blocked { reason },
+        };
+        assert_eq!(economic.risk.decision, RiskDecisionAudit::Approved);
+        let financial = financial_state_at_prefix(
+            fixture.start.starting_bankroll.to_decimal(),
+            &fixture.facts,
+            economic.risk.financial_prefix,
+        )
+        .unwrap();
+        let context = RiskReplayContext {
+            cash: financial.cash,
+            positions: &financial.positions,
+            fills: &financial.fills,
+            settlements: &financial.settlements,
+            last_completed: financial.last_completed,
+            start_receipt: fixture.frames[0].receipt,
+            paper_prefix: &fixture.frames,
+            source: &fixture.source,
+            prepared_received_unix_ms: economic.risk.evaluated_at_unix_ms,
+            start_hot_config_hash: &fixture.start.hot_config_hash,
+            financial_semantic_version: fixture.start.financial_semantic_version,
+        };
+        let operation = crate::paper_recovery::PaperFillOperationIdentity {
+            leader_wallet: continuation.facts.wallet,
+            source_trade_id: continuation.facts.source_trade_id,
+            observed_at_bucket: continuation.facts.source_epoch,
+        };
+        assert_eq!(
+            verify_economic(&operation, &economic, &context, None, true)
+                .await
+                .unwrap(),
+            economic
+        );
+    }
+
+    #[test]
     fn semantic_two_replay_requires_neutral_chase_and_exact_signed_limit() {
         let (mut continuation, mut economic) = winner_follow_policy_fixture();
         let mut encoded = serde_json::to_value(&continuation).unwrap();
@@ -8032,7 +8156,7 @@ mod tests {
         economic.version = 2;
         economic.balance.chase_ceiling = Price::ONE;
         let (signal, mode) =
-            verify_winner_follow_economic_policy(&continuation, &economic).unwrap();
+            verify_winner_follow_economic_policy(&continuation, &economic, dec!(100)).unwrap();
         let strategy = pe_strategy_winner_follow::WinnerFollowStrategy::new(
             continuation
                 .facts
@@ -8060,7 +8184,7 @@ mod tests {
         .unwrap();
         economic.balance.chase_ceiling = signal.leader_price;
         assert_qualification_refusal(
-            verify_winner_follow_economic_policy(&continuation, &economic),
+            verify_winner_follow_economic_policy(&continuation, &economic, dec!(100)),
             "EconomicPrepared execution policy differs from its frozen configuration and signal",
         );
         economic.balance.chase_ceiling = Price::ONE;
@@ -8086,7 +8210,7 @@ mod tests {
         assert_eq!(current.financial_semantic(), 3);
         economic.version = 2;
         economic.balance.chase_ceiling = Price::ONE;
-        verify_winner_follow_economic_policy(&current, &economic).unwrap();
+        verify_winner_follow_economic_policy(&current, &economic, dec!(100)).unwrap();
         for semantic in [2, 3] {
             verify_economic_configuration(
                 &economic,
@@ -8097,7 +8221,7 @@ mod tests {
         }
         economic.version = 3;
         assert_qualification_refusal(
-            verify_winner_follow_economic_policy(&current, &economic),
+            verify_winner_follow_economic_policy(&current, &economic, dec!(100)),
             "EconomicPrepared execution policy differs from its frozen configuration and signal",
         );
         assert_qualification_refusal(
@@ -8108,7 +8232,7 @@ mod tests {
         frame.source_authority = Some(crate::bucket_commit::SourceAuthority::ActivityFrame);
         economic.version = 2;
         assert_qualification_refusal(
-            verify_winner_follow_economic_policy(&frame, &economic),
+            verify_winner_follow_economic_policy(&frame, &economic, dec!(100)),
             "frozen continuation does not match durable row",
         );
         assert_qualification_refusal(
@@ -8123,7 +8247,7 @@ mod tests {
     fn winner_follow_intent_limit_must_bound_the_sized_plan() {
         let (continuation, mut economic) = winner_follow_policy_fixture();
         let (signal, mode) =
-            verify_winner_follow_economic_policy(&continuation, &economic).unwrap();
+            verify_winner_follow_economic_policy(&continuation, &economic, dec!(100)).unwrap();
         let intent = pe_strategy_winner_follow::WinnerFollowStrategy::new(
             continuation
                 .facts
@@ -8892,7 +9016,7 @@ mod tests {
             economic,
         };
 
-        verify_winner_follow_fill_decision(&continuation, &fill).unwrap();
+        verify_winner_follow_fill_decision(&continuation, &fill, dec!(100)).unwrap();
     }
 
     /// PASS: a paper Entry whose receipt-backed financial loss blocks risk is sealed as a typed
@@ -9343,6 +9467,7 @@ mod tests {
                     copy_latency_kill_switch_active: false,
                     proposed_trade_bps: BasisPoints(10),
                     per_trade_cap_bps: 25,
+                    drawdown_policy: pe_risk_engine::DrawdownPolicy::Stops,
                     concentration_caps: None,
                 },
                 decision: RiskDecisionAudit::Approved,

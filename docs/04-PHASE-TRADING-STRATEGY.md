@@ -38,7 +38,7 @@ It still has real risk: the strategy's edge is not "free money"; it is a measura
 Candidate discovery
   -> public trader ledger reconstruction
   -> walk-forward follower simulation
-  -> top-N active leader ranking                   (N = active_watchlist_size, _GLOSSARY.md)
+  -> active leader ranking                         (active_watchlist_size policy, _GLOSSARY.md)
   -> continuous leader watch
   -> trade classification
   -> copy eligibility check
@@ -57,7 +57,9 @@ Kalshi candidate discovery is not equivalent because public trades do not identi
 
 ### Eligibility thresholds
 
-See the canonical eligibility table in `19-WINNER-FOLLOW-STRATEGY.md` ("Eligibility thresholds"). Watchlist sizes are `active_watchlist_size = 100` (a Supabase-authoritative runtime cap) and `incubator_watchlist_size = 250` (`_GLOSSARY.md`).
+See the canonical eligibility table in `19-WINNER-FOLLOW-STRATEGY.md` ("Eligibility thresholds"). The active watchlist follows every survivor by default, with optional rank-ordered caps through
+Supabase-authoritative [`active_watchlist_size`](_GLOSSARY.md#active-watchlist-size). The research
+incubator bound is `incubator_watchlist_size` in `_GLOSSARY.md`.
 
 ### Trade classification
 

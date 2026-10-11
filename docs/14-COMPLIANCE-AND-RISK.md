@@ -110,6 +110,9 @@ pub enum RiskBlock {
 The halt scope for each variant (this trade, strategy-wide) is documented canonically in `19-`.
 Source health remains a separate service-readiness/admission gate; it is not a fabricated field in
 the pure risk snapshot. Absolute loss remains latched until its own audited
-`risk_halt_release_hash` is synchronized. Intraday and rolling causes release mechanically.
-Historical `CopyLatency` records retain their audited-release path, but current decisions ignore
-that cause. One cause never releases another.
+`risk_halt_release_hash` is synchronized. Every new paper/live decision records `KillOnly`: only
+absolute loss gates new entries. Historical `Stops` snapshots retain intraday/rolling rules and
+mechanical releases; recorded day/week causes do not gate new decisions. Historical `CopyLatency`
+records retain their audited-release path, but current decisions ignore that cause. Qualification
+and strict live replay rebuild with the recorded [policy](_GLOSSARY.md#drawdown-policy). One cause
+never releases another.

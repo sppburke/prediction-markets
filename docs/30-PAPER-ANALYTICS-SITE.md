@@ -37,14 +37,19 @@ pe-service (Rust)                         Supabase                     site/ (Ne
   financial-era cost basis:
   `payout × exact_quantity − aggregate_principal − aggregate_fee`. The FULL OUTER join keeps both ranking-only and
   aged-out wallets visible. Since #518 a ranking-only row is a **bench** row: the batch
-  carries 200 wallets with a pass/fail `survives` verdict and only survivors are admitted,
+  keeps every survivor, plus non-survivor bench rows when needed to reach the publisher's
+  requested minimum, with a pass/fail `survives` verdict; only survivors are admitted,
   so a ranking-only row may never have been followed at all. The view does not project
   `survives`, so the site cannot distinguish the two — surfacing it needs a view change.
 - **`wallet_live_stats_mv` materialized view** (`scripts/supabase_wallet_live_stats_mv.sql`):
   a periodically-refreshed cache of `wallet_live_stats` (the aggregation is expensive and was
   recomputed on every page view). `pg_cron` runs `refresh materialized view concurrently`
   every 2 min; a unique index on `wallet` enables the concurrent refresh. The site reads the
-  matview. Apply the SQL to Supabase, then deploy the site. (The pg_cron block self-skips on a
+  matview in unique-wallet-key pages, so refreshed profit values cannot repeat or skip a wallet
+  across page boundaries. Watched membership and settled-market IDs also page by their unique
+  keys; the runtime-token/count guard covers the whole watched traversal and retries one replace
+  race. A failed later page fails the read, rather than displaying a partial total. Apply the SQL
+  to Supabase, then deploy the site. (The pg_cron block self-skips on a
   Postgres without the extension, so the file also loads in CI.)
 - **Site** (`site/`, PR3 + issue #508 Phase C): the shared Paper overview and per-wallet
   historical-vs-watched panels remain read-only Next.js views (App Router + Tailwind + Recharts +

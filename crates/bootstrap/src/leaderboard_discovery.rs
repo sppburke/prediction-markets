@@ -56,13 +56,14 @@ impl<F: PageFetcher + Send + Sync> LeaderboardFetcher<F> {
         sort: LeaderboardSort,
         window: LeaderboardWindow,
         category: LeaderboardCategory,
-        limit: u32,
+        offset: u32,
     ) -> Result<Vec<LeaderboardEntry>, BootstrapError> {
         let ep = PolymarketEndpoint::Leaderboard {
             sort,
             window,
             category,
-            limit,
+            limit: 50,
+            offset,
         };
         let url = ep.url(&self.base_url);
         let bytes =
@@ -124,24 +125,36 @@ pub async fn run_leaderboard_discovery_with_policy<F: PageFetcher + Send + Sync>
     for &category in categories {
         for (sort, window) in SORT_WINDOW_SLICES {
             slices_attempted += 1;
-            match fetcher.fetch_slice(sort, window, category, top_n).await {
-                Ok(entries) => {
-                    slices_fetched += 1;
-                    for e in entries {
-                        let hex = e.proxy_wallet.to_ascii_lowercase();
-                        if hex.starts_with("0x") && hex.len() == 42 {
-                            all.push(hex);
+            let mut offset = 0;
+            let mut fetched = false;
+            while offset < top_n {
+                match fetcher.fetch_slice(sort, window, category, offset).await {
+                    Ok(entries) => {
+                        fetched = true;
+                        let short_page = entries.len() < 50;
+                        for e in entries {
+                            let hex = e.proxy_wallet.to_ascii_lowercase();
+                            if hex.starts_with("0x") && hex.len() == 42 {
+                                all.push(hex);
+                            }
                         }
+                        if short_page {
+                            break;
+                        }
+                        offset += 50;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            category = category.as_param(),
+                            offset,
+                            "leaderboard: slice failed (e.g. 4xx for an unsupported category), continuing"
+                        );
+                        break;
                     }
                 }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        category = category.as_param(),
-                        "leaderboard: slice failed (e.g. 4xx for an unsupported category), continuing"
-                    );
-                }
             }
+            slices_fetched += usize::from(fetched);
         }
     }
 
@@ -219,6 +232,7 @@ mod tests {
                     window,
                     category,
                     limit: top_n,
+                    offset: 0,
                 };
                 map.insert(ep.url(BASE), bytes.clone());
             }
@@ -270,6 +284,7 @@ mod tests {
                 window,
                 category: LeaderboardCategory::Overall,
                 limit: 50,
+                offset: 0,
             };
             responses.insert(ep.url(BASE), b"[]".to_vec());
         }
@@ -312,20 +327,121 @@ mod tests {
             window: LeaderboardWindow::Monthly,
             category: LeaderboardCategory::Overall,
             limit: 50,
+            offset: 0,
         };
         assert_eq!(
             ep.url("https://data-api.polymarket.com"),
-            "https://data-api.polymarket.com/v1/leaderboard?orderBy=PNL&timePeriod=MONTH&category=OVERALL&limit=50"
+            "https://data-api.polymarket.com/v1/leaderboard?orderBy=PNL&timePeriod=MONTH&category=OVERALL&limit=50&offset=0"
         );
         let ep2 = PolymarketEndpoint::Leaderboard {
             sort: LeaderboardSort::Volume,
             window: LeaderboardWindow::Day,
             category: LeaderboardCategory::Crypto,
             limit: 50,
+            offset: 0,
         };
         assert_eq!(
             ep2.url("https://data-api.polymarket.com"),
-            "https://data-api.polymarket.com/v1/leaderboard?orderBy=VOL&timePeriod=DAY&category=CRYPTO&limit=50"
+            "https://data-api.polymarket.com/v1/leaderboard?orderBy=VOL&timePeriod=DAY&category=CRYPTO&limit=50&offset=0"
+        );
+    }
+    struct RecordingFetcher {
+        inner: FixtureFetcher,
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl PageFetcher for RecordingFetcher {
+        async fn fetch_page(&self, url: &str) -> Result<Vec<u8>, pe_source_core::SourceError> {
+            self.calls.lock().unwrap().push(url.to_owned());
+            self.inner.fetch_page(url).await
+        }
+    }
+
+    async fn paged_discovery(
+        pages: &[usize],
+        depth: u32,
+    ) -> (LeaderboardDiscoveryReport, Vec<String>) {
+        let dir = TempDir::new().unwrap();
+        let mut cache = open_temp_cache(&dir);
+        let mut responses = HashMap::new();
+        for (sort, window) in SORT_WINDOW_SLICES {
+            for (page, &count) in pages.iter().enumerate() {
+                let offset = u32::try_from(page).unwrap() * 50;
+                let ep = PolymarketEndpoint::Leaderboard {
+                    sort,
+                    window,
+                    category: LeaderboardCategory::Overall,
+                    limit: 50,
+                    offset,
+                };
+                let body = (0..count).map(|index| serde_json::json!({
+                    "proxyWallet":format!("0x{:040x}", usize::try_from(offset).unwrap() + index)
+                })).collect::<Vec<_>>();
+                responses.insert(ep.url(BASE), serde_json::to_vec(&body).unwrap());
+            }
+        }
+        let lb = LeaderboardFetcher::new(
+            BASE.to_owned(),
+            RecordingFetcher {
+                inner: FixtureFetcher::new(responses),
+                calls: std::sync::Mutex::new(Vec::new()),
+            },
+        );
+        let report =
+            run_leaderboard_discovery(&lb, &[LeaderboardCategory::Overall], depth, &mut cache)
+                .await
+                .unwrap();
+        let first = lb.fetcher.calls.lock().unwrap().clone();
+        let rerun =
+            run_leaderboard_discovery(&lb, &[LeaderboardCategory::Overall], depth, &mut cache)
+                .await
+                .unwrap();
+        assert_eq!(rerun.unique_wallets, report.unique_wallets);
+        assert_eq!(cache.wallet_pile_size().unwrap(), report.unique_wallets);
+        (report, first)
+    }
+
+    #[tokio::test]
+    async fn pages_through_offset_1000_and_dedupes_on_rerun() {
+        let (report, calls) = paged_discovery(&[50; 21], 1050).await;
+        assert_eq!(report.unique_wallets, 1050);
+        assert_eq!(report.raw_entries, 1050 * 8);
+        assert_eq!(report.slices_fetched, 8);
+        assert_eq!(calls.len(), 21 * 8);
+        for slice in calls.chunks(21) {
+            for (page, url) in slice.iter().enumerate() {
+                assert!(
+                    url.ends_with(&format!("&limit=50&offset={}", page * 50)),
+                    "{url}"
+                );
+            }
+        }
+        assert_eq!(
+            crate::config::BootstrapConfig::default().leaderboard_top_n,
+            1050
+        );
+    }
+
+    #[tokio::test]
+    async fn short_page_stops_each_list() {
+        let (report, calls) = paged_discovery(&[50, 3, 50], 1050).await;
+        assert_eq!(report.unique_wallets, 53);
+        assert_eq!(calls.len(), 2 * 8);
+        assert!(calls.iter().all(|url| !url.ends_with("offset=100")));
+    }
+
+    #[tokio::test]
+    async fn failed_page_keeps_earlier_pages_and_continues_other_lists() {
+        let (report, calls) = paged_discovery(&[50, 50], 1050).await;
+        assert_eq!(report.unique_wallets, 100);
+        assert_eq!(report.slices_fetched, 8);
+        assert_eq!(calls.len(), 3 * 8);
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|url| url.ends_with("offset=100"))
+                .count(),
+            8
         );
     }
 }

@@ -257,7 +257,11 @@ jobs:
           python-version: "3.11"
 
       - name: Install Python analytics deps
-        run: python3 -m pip install -r scripts/requirements.txt
+        run: |
+          python3 -m pip install -r scripts/requirements.txt
+          # Suites run in parallel; install the exporter's extension once here so no suite depends
+          # on another having downloaded it first (#757).
+          python3 -c "import duckdb; c = duckdb.connect(); c.execute('INSTALL sqlite_scanner'); c.close()"
 
       # The financial-era suite executes this exact command, so it stays a literal step here.
       - name: Rehearsal dry run

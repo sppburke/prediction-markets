@@ -107,6 +107,28 @@ fn ac_snapshot_reflects_state() {
 }
 
 #[test]
+fn unlimited_watchlist_target_is_zero_in_status_json() {
+    let (dir, db) = seeded_db();
+    let path = dir.path().join("status.json");
+    let snapshot = build_snapshot(
+        &db,
+        "paper",
+        true,
+        123,
+        1_700_000_500,
+        1_001,
+        &[],
+        usize::MAX,
+        42,
+        None,
+    );
+    write_snapshot(&path, &snapshot).unwrap();
+    let status: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    assert_eq!(status["watchlist_target_size"], 0);
+    assert_eq!(status["watchlist_size"], 1_001);
+}
+
+#[test]
 fn ac_write_is_atomic_and_valid_json() {
     let (dir, db) = seeded_db();
     let path = dir.path().join("status.json");

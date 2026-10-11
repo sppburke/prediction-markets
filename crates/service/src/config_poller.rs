@@ -666,7 +666,9 @@ mod tests {
     use crate::runtime_config::RuntimeConfig;
 
     fn boot() -> RuntimeConfig {
-        RuntimeConfig::from_service_config(&ServiceConfig::default())
+        let mut config = RuntimeConfig::from_service_config(&ServiceConfig::default());
+        config.active_watchlist_size = 100;
+        config
     }
 
     fn cfg_row(key: &str, value: &str, value_type: &str) -> ConfigRow {
@@ -1020,7 +1022,7 @@ mod tests {
             else {
                 return Err("received another control before SealCheck");
             };
-            assert_eq!(observed.snapshot().max_fill_price, Decimal::new(85, 2));
+            assert_eq!(observed.snapshot().max_fill_price, Decimal::new(65, 2));
             assert_eq!(
                 proposed_financial_semantic_version,
                 crate::paper_recovery::FINANCIAL_SEMANTIC_VERSION
@@ -1112,7 +1114,7 @@ mod tests {
             .await;
         assert_eq!(responder, Ok(()));
 
-        assert_eq!(live.snapshot().max_fill_price, Decimal::new(85, 2));
+        assert_eq!(live.snapshot().max_fill_price, Decimal::new(65, 2));
         let bytes = captured
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

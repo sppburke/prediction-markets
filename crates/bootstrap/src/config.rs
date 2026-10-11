@@ -32,7 +32,7 @@ const DEFAULT_CLOB_TOKEN_COVERAGE_WARN_PCT: u8 = 90;
 const DEFAULT_PRICES_HISTORY_COVERAGE_WARN_PCT: u8 = 60;
 // Issue #324: winner-discovery pipeline defaults.
 const DEFAULT_LEADERBOARD_REQUEST_INTERVAL_MS: u64 = 500;
-const DEFAULT_LEADERBOARD_TOP_N: u32 = 50;
+const DEFAULT_LEADERBOARD_TOP_N: u32 = 1_050;
 // Issue #365: datadash.xyz cohort-discovery defaults.
 const DEFAULT_DATADASH_API_URL: &str = "https://api.datadash.xyz";
 const DEFAULT_DATADASH_REQUEST_INTERVAL_MS: u64 = 500;
@@ -324,9 +324,8 @@ pub struct BootstrapConfig {
     )]
     pub leaderboard_request_interval_ms: u64,
 
-    /// Top-N entries requested per leaderboard (category × sort × window) slice.
-    /// Default 50 — the `/v1/leaderboard` API hard-caps `limit` at 50; larger
-    /// values are silently truncated server-side (verified live 2026-06-14).
+    /// List depth per leaderboard (category × sort × window) slice.
+    /// Default 1,050, read in 50-row pages through offset 1,000.
     /// Canonical default in `docs/_GLOSSARY.md` "Bootstrap defaults".
     /// `PE_BOOTSTRAP_LEADERBOARD_TOP_N` overrides.
     #[serde(

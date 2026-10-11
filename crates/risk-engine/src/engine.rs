@@ -2,7 +2,7 @@ use pe_core_types::{BasisPoints, CollateralAmount};
 
 use crate::{
     CANARY_MAX_ALLOWANCE, CANARY_MAX_ORDER_DEBIT, CANARY_PER_TRADE_CAP_BPS, INTRADAY_STOP_BPS,
-    KILL_SWITCH_DRAWDOWN_BPS, ROLLING_7D_STOP_BPS,
+    ROLLING_7D_STOP_BPS,
     block::RiskBlock,
     snapshot::{CanaryRiskSnapshot, RiskSnapshot},
 };
@@ -23,17 +23,21 @@ pub enum RiskDecision {
 /// removed in the wallet-isolation purge, #326.)
 pub fn evaluate_risk(s: &RiskSnapshot) -> RiskDecision {
     // 1. Absolute kill switch (strategy-wide; manual review required to resume)
-    if s.absolute_pnl_bps.0 <= KILL_SWITCH_DRAWDOWN_BPS {
+    if s.absolute_pnl_bps.0 <= s.drawdown_policy.absolute_loss_bps() {
         return RiskDecision::Blocked(RiskBlock::KillSwitchDrawdown);
     }
 
     // 2. Intraday drawdown stop (-200 bps)
-    if s.intraday_pnl_bps.0 <= INTRADAY_STOP_BPS {
+    if s.drawdown_policy == crate::DrawdownPolicy::Stops
+        && s.intraday_pnl_bps.0 <= INTRADAY_STOP_BPS
+    {
         return RiskDecision::Blocked(RiskBlock::IntradayDrawdownStop);
     }
 
     // 3. Rolling 7-day drawdown stop (-600 bps)
-    if s.rolling_7d_pnl_bps.0 <= ROLLING_7D_STOP_BPS {
+    if s.drawdown_policy == crate::DrawdownPolicy::Stops
+        && s.rolling_7d_pnl_bps.0 <= ROLLING_7D_STOP_BPS
+    {
         return RiskDecision::Blocked(RiskBlock::Rolling7dDrawdownStop);
     }
 
@@ -170,6 +174,7 @@ mod tests {
             copy_latency_kill_switch_active: false,
             proposed_trade_bps: BasisPoints(10),
             per_trade_cap_bps: 25,
+            drawdown_policy: crate::DrawdownPolicy::Stops,
             concentration_caps: Some(crate::ConcentrationCaps::CANONICAL),
         }
     }

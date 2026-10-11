@@ -298,7 +298,11 @@ pub fn build_snapshot(
         watchlist_size,
         live_wallets: None,
         live_wallets_at_unix_ms: None,
-        watchlist_target_size,
+        watchlist_target_size: if watchlist_target_size == usize::MAX {
+            0
+        } else {
+            watchlist_target_size
+        },
         runtime_config: None,
         watchlist_projection: None,
         supabase_rpc_calls,

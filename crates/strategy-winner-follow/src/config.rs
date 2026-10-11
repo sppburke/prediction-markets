@@ -59,6 +59,8 @@ pub enum SizingMode {
     /// Fixed contract count passed through unchanged. The venue planner rejects, rather than
     /// shrinks, a request that exceeds any book, collateral, or monetary cap.
     Contract { contracts: u64 },
+    /// Fraction of causal cash, clipped so a debit cannot cross the starting-bankroll floor.
+    CashFraction { fraction: Decimal },
 }
 
 /// Configuration for the Winner-Follow strategy.
@@ -111,4 +113,21 @@ impl Default for WinnerFollowConfig {
             sizing_mode: SizingMode::default(),
         }
     }
+}
+
+/// All-in cash-fraction budget, rounded down to collateral precision.
+/// The caller validates `0 < fraction < 1`; arithmetic overflow fails closed.
+pub fn cash_fraction_budget(fraction: Decimal, cash: Decimal, start: Decimal) -> Option<Decimal> {
+    let floor_fraction = Decimal::ONE.checked_add(
+        Decimal::from(pe_risk_engine::KILL_ONLY_DRAWDOWN_BPS).checked_div(Decimal::from(10_000))?,
+    )?;
+    let room = cash
+        .checked_sub(floor_fraction.checked_mul(start)?)?
+        .max(Decimal::ZERO);
+    Some(
+        fraction
+            .checked_mul(cash)?
+            .min(room)
+            .round_dp_with_strategy(6, rust_decimal::RoundingStrategy::ToNegativeInfinity),
+    )
 }

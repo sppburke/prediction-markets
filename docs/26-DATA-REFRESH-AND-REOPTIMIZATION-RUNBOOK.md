@@ -121,7 +121,7 @@ intent stopped until its explicit owner-consent points.
 
 Verify installed checkout/binary identities, retained-cycle recovery, exact publication and
 successor creation. Observe the first three ordinary publications and the existing
-batch-application, bounded-membership and service-health checks while the loop runs. Record
+batch-application, membership-policy and service-health checks while the loop runs. Record
 same-revision stage durations, source ages and publication cadence; no total saving is projected.
 
 Rollback reinstalls the recorded prior binary/checkout pair through these same seven steps,
@@ -203,7 +203,7 @@ no-regression gate, not demonstrated margin. Record every failed observation, it
 resolution by later wallet advance/completion or existing exclusion, or a later passing measurement
 of the same memory stage. The first cycle must add no error class. Keep the issue open until no
 wallet remains tracked, all failed observations are resolved, and three ordinary publications pass
-the existing batch-application, bounded-membership and service-health checks.
+the existing batch-application, membership-policy and service-health checks.
 
 ## Wallet-cache tuning measurement and rollback (#606)
 
@@ -574,23 +574,17 @@ schedule `end_date`s, then audits and repairs every traded, scheduled past-end
 market still missing a terminal row. The subcommand runs the full
 `fetch_resolutions_and_schedules`, so no separate `schedules` stage is needed
 (#383/#519). **Stage 1** ranks the full trade
-universe (`--universe-from-trades` —
-have-data ⇒ in-universe; the ranker's own eligibility filters decide the cohort, so
-there is no curated pre-gate); **Stage 2** rerank in three sub-stages (#536): **2a**
-emit the per-token reference fetch windows for the candidate positions (on schema two, the
-in-horizon positions of every wallet with at least MinTRL of them; other wallets are ranked
-non-surviving without price work, #588). Schema two judges repricing coverage over the copy scope:
-positions outside the shifted horizon need no reference window and do not count, and a position
-whose slippage-adjusted reference price is outside the band leaves the denominator, while a missing or stale sample
-still counts against the wallet; **2b**
-`pe-bootstrap prices-history --targets-csv` fetches only the uncovered remainder of
-minute reference prices into the isolated ranker price store (write-once + range
-algebra ⇒ resumable; transient page failures are a partial and pass-2's
-terminal-coverage gate then exits 75 so the supervisor retries — a partially fetched
-cycle can never publish); **2c** pass-2 reprices every candidate position at the
-latest reference sample at-or-before `entry+Δ` (adds `hit_rate`, writes the
-per-position `oracle_outcomes.csv` and the versioned `oracle_manifest.json` whose
-canonical hash the push stores as `ranking_batches.config_hash`); **Stage 3** record
+universe (`--universe-from-trades` — have-data ⇒ in-universe). Schema two exports every
+certified first-entry position in the ranking window without a leader-price, horizon or
+statistical pre-gate. **Stage 2** waits for candidate capture, then runs export-bound
+`cache-finalize-v2 --stage-record` before pass two. Pass two prices the first eligible
+fee-paying first-entry print second on each market/outcome, using the highest price in that
+second, the canonical cushion and scoring fee. Horizon uses the scheduled marker's next UTC
+midnight; band, horizon and survival limits are the [glossary contracts](_GLOSSARY.md#ranking-copy-price).
+Maker share counts the unfiltered window entries; coverage is published rather than gated.
+No print yields `no_print`; outside the band/horizon yields the corresponding disposition.
+Pass two writes `hit_rate`, `maker_share`, per-position `oracle_outcomes.csv`, and the versioned
+`oracle_manifest.json` whose canonical hash is `ranking_batches.config_hash`; **Stage 3** record
 the exact publication request, atomically publish it through the idempotent
 `publish_ranking_batch_v2` RPC (classifier 6; historical requests belong to their prior release),
 verify that exact batch is `latest_ranking`, and write the
@@ -600,7 +594,7 @@ retention deletes eligible old cycle cache files; there is no SQLite reclamation
 or checkpoint stage (#544).
 
 
-**Oracle rollback (#536):** reverting the ranker code alone does NOT restore the
+**Oracle rollback:** reverting the ranker code alone does NOT restore the
 prior ranking — `latest_ranking` always serves the maximum `batch_id`. To roll back
 externally: restore the prior binary/checkout pair through the
 [release procedure](#forge-release-deployment-and-rollback), leaving the loop stopped, run the
@@ -609,7 +603,9 @@ one-shot with a unique
 publish key, guaranteeing a NEW batch even same-day with unchanged inputs — a
 same-day revert without it can reproduce an old key and silently fail to advance the
 epoch), then verify a strictly larger `batch_id` is `latest_ranking` and service
-membership converged. The additive `ranker_price_*` tables are inert thereafter.
+membership converged. #757 removes the prior oracle's writer/reader paths; its two installed
+cache tables remain inert. The prior rules and exact code are preserved in
+[Rules before #757](32-RANKER-DECISION-RECORD-AND-FORWARD-BENCH.md#rules-before-757).
 
 
 > **Purge-free publication (#544).** `rank_and_push.sh` never invokes `purge` or
@@ -621,13 +617,14 @@ membership converged. The additive `ranker_price_*` tables are inert thereafter.
 > command cannot select or delete wallets.
 
 Production defaults are baked in (override via flags): `--universe-from-trades`,
-`HALF_LIFE_DAYS=30` (30-day recency decay, #366/#370), relative 180-day window,
-mid-price band 0.15–0.85, TTR 48h (`ranker_ttr_hours`), MinTRL 20 (`ranker_prod_min_trl`
-— replaces the per-month activity gates, which production zeroes; run28 cutover
-2026-07-03), `--scheduled-only` (no resolved-at look-ahead), `floor_tstat=2.0`,
-`top_n=200`, latency shift Δ=2s (#530: the measured websocket-path copy speed —
-batch-68 sweep: survivors/active 290/12 at 2s vs 185/6 at the old 20s; tape ties
-resolve deterministically via `(timestamp_unix, source_trade_id)`).
+[`ranker_half_life_days`, `ranker_window_days`, `ranker_ttr_hours`, `ranker_prod_min_trl`
+and the scoring price/band/survival limits](_GLOSSARY.md#ranking-copy-price). Pass one keeps its
+zeroed per-month gates and `--scheduled-only`; pass two has no per-month or coverage gate.
+The publisher keeps every survivor, plus non-survivor bench rows as needed to reach its
+requested minimum. Publication read-back and cycle-start snapshots pin the latest batch id
+and page its immutable entries in rank order; read-back must match the exact published batch.
+Latency shift uses the canonical print window; deterministic first-entry order remains
+`(timestamp_unix, source_trade_id)`.
 
 > **Δ deploy ordering (#530).** The ranker's Δ=2 assumes the service copies at
 > websocket speed. Deploying a Δ-lowering ranker change follows SERVICE-FIRST
@@ -759,15 +756,16 @@ group with its receipt intact) is detected at collection completion instead of r
 and full content validation remains mandatory at completion and first finalization.
 
 Rank and cut over through the one publication path. This snapshots the current published batch,
-exports and verifies the schema-two Parquet projection, computes the minute-price rerank and exact
-diff, durably prepares the publication request, activates the side cache, then resumes that exact
+exports and verifies the schema-two Parquet projection, computes the first-entry taker-print
+rerank and exact diff, durably prepares the publication request, activates the side cache, then resumes that exact
 request. The export copies the certified activity rows with eight DuckDB cursors, one key range
 each, merged into one file, and certifies the exported projection against the finalized count and
 digest; it does not re-read SQLite's projection or assert that SQLite stays unchanged afterwards. An
 export failure stops a schema-two cutover run. The fresh lane's first finalization certifies,
 checkpoints and syncs without hashing the file or writing a stage record. It re-finalizes with
-`--stage-record` after the targeted price-store write and before request preparation, so the stage hash covers the installed
-bytes; a pending request's replay relies on activation's bound-artifact checks.
+`--stage-record` after export and before pass two/request preparation, so the stage hash covers
+the installed bytes and certified export; a pending request's replay relies on activation's
+bound-artifact checks.
 Refinalization reuses the projection only when the finalized database's saved activity generation,
 reference, aggregate and manifest digests, payout generation/coverage and evidence digest, and
 classifier version are unchanged, and the existing projection's recomputed count and digest match
@@ -1020,10 +1018,10 @@ its uncommitted/temporary spool first; committed reuse leaves it intact. Readers
 and SHA-256 before reading. Missing/altered committed spools fail closed and require guarded
 pre-prepare abandonment/restaging. Export converts it to compact Parquet, keeps payout evidence,
 recomputes projection count/digest from Parquet and writes manifest 3 last. A retry after export or
-an interrupted reference fetch reruns export from the retained spool. Retirement deletes it;
+an interrupted pass two reruns export from the retained spool. Retirement deletes it;
 retained requests keep it. Format 3 has no marker inserts, join digests or copied activity export.
 
-After price writes, the wrapper re-finalizes with the actual cycle export manifest, including a
+Before pass two, the wrapper re-finalizes with the actual cycle export manifest, including a
 non-default Parquet directory:
 
 ```bash
@@ -1115,9 +1113,9 @@ the installed cache is schema two, and for the one-time initial cutover when `.e
 opt-in changes and an outstanding legacy cycle completes under its original contract. In
 the lane, Step 0 is the sequence above (legacy `backfill`, `events` and `resolutions` read
 retired `trades`/`source_cursor` and do not run), followed by the existing cutover path:
-candidate capture into `candidate_cycle_manifest.json` alongside Parquet export, pass one and
-target emission, then targeted `prices-history` and second finalization with `--stage-record`
-and `--export-manifest`, which binds the price writes and manifest-3 export summary. Pass two binds that
+candidate capture into `candidate_cycle_manifest.json` alongside Parquet export, pass one,
+then export-bound second finalization with `--stage-record` and `--export-manifest` before
+pass two. This binds the installed bytes and manifest-3 export summary. Pass two binds that
 capture. An initial schema-one cutover keeps its full initial `cycle_manifest.json` capture and
 same-day gate; recurring cycles started on installed schema two write a two-field lane record
 (`version`, `configuration`) instead. The new-cycle `pipeline-versions` output remains available
@@ -1290,25 +1288,22 @@ to the owner. Record each completed step and resume it, rather than starting ano
    | `PE_RANK_SCHEMA_TWO_CUTOVER` | `prepare` |
    | `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS` | `0` |
 
-   Keep existing `PE_BOOTSTRAP_CLOB_CONCURRENCY` unless a two-minute read-only Forge probe of
-   reference pages/s shows request latency, rather than the shared rate gate, binding. If so, raise
-   that existing knob before starting, preserving the [canonical prices-history gate and documented
-   limit](_GLOSSARY.md#bootstrap-defaults-pe-bootstrap). Never change configuration during the cycle.
+   Keep existing `PE_BOOTSTRAP_CLOB_CONCURRENCY`; pass-two pricing reads the certified export and
+   has no separate fetch stage. Never change configuration during the cycle.
 5. **Owner consent to the catch-up**, then run one detached `bash scripts/rank_and_push.sh` while
    the loop unit stays inactive; record its PID/process group and log. It runs staging → transition
-   → collection → payout → finalize → export → passes/reference fetch → export-bound re-finalize →
+   → collection → payout → finalize → export → pass one → export-bound re-finalize → pass two →
    prepare. Acceptance is `RANK_AND_PUSH_PREPARED_ONLY=<request>` and exit 2 with request/pending
    pointer retained and installed bytes unchanged; other exit-2 failures are not acceptance.
    Before launching, cross-build from the tested tree with the bootstrap release recipe:
    `cargo build --release -p pe-bootstrap --features scenario --example classifier_v6_sample`,
    keeping the same Forge target/toolchain arguments and environment. Record the example executable's
-   SHA-256 beside the tested tree. Right after finalize, while later stages write only prices, run
+   SHA-256 beside the tested tree. Right after finalize, before request preparation, run
    `<release-example>/classifier_v6_sample <finalized-candidate-side-cache>` for #739 AC1's
    deterministic wallet sample through an ordinary read-only connection. It compares selected IDs,
    all fourteen spool fields and certificate drops, and explains classifier-5 differences by their
    explicit rules. Keep its stdout JSON and exit status in the cycle's record; on any nonzero exit,
    stop the recorded wrapper process group before preparation. Pre-prepare abandonment stays available.
-   Reference pages warm through the ordinary resumable stage, not a special pre-head fetch.
    Record the full candidate-through-prepare acceptance on the tested tree;
    activation/publication/retention and cadence complete acceptance after merge.
 6. Merge only after green CI with an expected-head guard, coordinating the runtime-change window on
@@ -1333,14 +1328,13 @@ to the owner. Record each completed step and resume it, rather than starting ano
    well as exact latest-batch/application checks. pe-service release 2 starts on its coordinated
    restart after this batch is applied; its code and deploy belong to #588, not this Forge release.
 9. Recompute both drives' capacity headroom, retention horizon and stage forecasts from measured
-   classifier-6 spool bytes, positions and reference demand at the [shared floor](_GLOSSARY.md#ranking-horizon-floor).
+   classifier-6 spool bytes, positions and print-pricing demand at the [shared floor](_GLOSSARY.md#ranking-horizon-floor).
    Set `PE_BOOTSTRAP_ACTIVATION_BATCH_WALLETS` to the owner's ordinary-cycle choice. **Explicit owner
    restart consent** is required before setting flag `run` and starting the loop unit. Ordinary
    cycles keep the [interim freshness override](_GLOSSARY.md#catch-up-freshness) through the
-   quiet-wallet re-read wave: deferred wallets due after the catch-up read in full and fetch their
-   unwarmed reference pages. Remove that override by a `.env` edit between cycles once its glossary
-   removal condition holds. Observe three ordinary publications under the existing batch-application,
-   bounded-membership and service-health checks.
+   quiet-wallet re-read wave: deferred wallets due after the catch-up read in full. Remove that
+   override by a `.env` edit between cycles once its glossary removal condition holds. Observe three ordinary publications under the existing batch-application,
+   membership-policy and service-health checks.
 
 For each cycle record stage durations, rows read/written and commitments, drops and ignored records,
 peak RSS, spool/export/spill/WAL bytes and both drives' free space. Collection timing separates fetch
@@ -1710,12 +1704,14 @@ cycle pointer, and either pointer takes precedence over this new-cycle check.
 (score-update-only). MEMBERSHIP follows `watchlist_membership_mode` (`_GLOSSARY.md`):
 `knockout` (legacy — the maintenance tick's eviction/backfill is the sole membership
 path) or `full_rerank` (each batch transition wholesale-replaces the live
-top-`active_watchlist_size` SURVIVORS — the cutover production mode; the rows are read
+SURVIVORS subject to [`active_watchlist_size`](_GLOSSARY.md#active-watchlist-size) — the cutover
+production mode; the rows are read
 from `ranking_entries` pinned to the triggering `batch_id`, never from the moving view, so
 the applied rows and the committed marker name one batch, #542). Every read is
 gated on the ranker's `survives` verdict (#518), so the published batch is a bench and
-`active_watchlist_size` caps the survivors admitted from it rather than selecting a raw
-top-N. A financial Start boots from the replayed Start-bound structural membership;
+`active_watchlist_size` follows every survivor by default, or caps rank-ordered survivors
+when explicitly bounded. A financial Start boots from the replayed Start-bound structural
+membership;
 a newer published batch is applied on a maintenance tick, subject to live admission filters.
 Every post-boot addition on either path is prepared first
 (#542/#544): its prior-market history is complete and its current positions pass the
@@ -1724,8 +1720,10 @@ published. A typed wallet failure defers that wallet and replans from the remain
 survivors; each published structural change is one atomic record with proofs for its additions.
 Shared failures keep full-rerank and capacity unchanged for their next retry, while knockout
 may publish decided evictions without a failed backfill. `active_watchlist_size` is
-Supabase-authoritative (default 100, valid `1..=200`) and is polled every 30 seconds. A
-grow fetches the requested top-N and validates all newly admitted wallets' prior-market
+Supabase-authoritative ([default and valid values](_GLOSSARY.md#active-watchlist-size)) and is
+polled at `config_poll_interval_secs`. Every read pins one batch and pages all survivors before
+selection; a failed page or foreign batch id applies nothing. A grow selects from that pinned
+set and validates all newly admitted wallets' prior-market
 history and current positions before the atomic validation/membership swap; a shrink uses
 the same atomic membership swap. Typed wallet deferrals allow a nonempty partial capacity result
 to apply the requested cap. A zero-member result remains pending with no membership record;
@@ -1733,7 +1731,8 @@ invalid values, Supabase failures, and other shared errors keep the last-known-g
 membership. Pending or failed requests retry independently on the capacity worker's next
 30-second retry. Check
 `status.json`: `watchlist_size` is actual membership and `watchlist_target_size` is the
-last safely applied runtime cap. The additive optional `live` block reports
+last safely applied runtime target (`0` renders the every-survivor policy). The additive optional
+`live` block reports
 `pending_dispatch_seeds`, `ready_dispatch_seeds`, `fetched_at_unix` (last successful accounts
 poll; `null` before one succeeds), `stale` (`true` past `live_accounts_stale_after_secs` —
 no new live work is staged while stale, #514), `control_available` and `control_age_secs`,
@@ -1742,9 +1741,9 @@ effective_live_mode, armed, credential_binding_ready`. `armed` means both observ
 `live_tiny`; control availability and credential readiness are separate order observations. Installing this runtime-capacity support
 requires one normal `pe-service` restart; subsequent valid `service_config` edits hot-swap without
 a restart.
-Run28 fixed `k=25` and did not sweep watchlist width. The earlier top-50 paper experiment
-adopted 2026-07-13 and the superseding 100-wallet default are operator-directed choices,
-not run28-backed N choices.
+Run28 fixed `k=25` and did not sweep watchlist width. Earlier fixed paper widths were
+operator-directed experiments; the current all-survivor default is the #757 owner decision,
+not a run28-backed N choice.
 
 ---
 

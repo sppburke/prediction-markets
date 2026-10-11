@@ -562,24 +562,26 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
     ) -> Result<(), String> {
         use crate::paper_recovery::{HaltState, RiskHaltOwner};
         use pe_risk_engine::{
-            INTRADAY_STOP_BPS, KILL_SWITCH_DRAWDOWN_BPS, ROLLING_7D_STOP_BPS, RiskHaltCause,
+            DrawdownPolicy, INTRADAY_STOP_BPS, ROLLING_7D_STOP_BPS, RiskHaltCause,
         };
 
         let owner = RiskHaltOwner::Paper;
         for (cause, desired, manual_release_only) in [
             (
                 RiskHaltCause::AbsoluteLoss,
-                snapshot.absolute_pnl_bps.0 <= KILL_SWITCH_DRAWDOWN_BPS,
+                snapshot.absolute_pnl_bps.0 <= snapshot.drawdown_policy.absolute_loss_bps(),
                 true,
             ),
             (
                 RiskHaltCause::IntradayDrawdown,
-                snapshot.intraday_pnl_bps.0 <= INTRADAY_STOP_BPS,
+                snapshot.drawdown_policy == DrawdownPolicy::Stops
+                    && snapshot.intraday_pnl_bps.0 <= INTRADAY_STOP_BPS,
                 false,
             ),
             (
                 RiskHaltCause::Rolling7dDrawdown,
-                snapshot.rolling_7d_pnl_bps.0 <= ROLLING_7D_STOP_BPS,
+                snapshot.drawdown_policy == DrawdownPolicy::Stops
+                    && snapshot.rolling_7d_pnl_bps.0 <= ROLLING_7D_STOP_BPS,
                 false,
             ),
             (
@@ -1239,6 +1241,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             financial_semantic_version,
         )
         .map_err(|cause| ActivePaperRiskFailure::new(cause, &attempt))?;
+        snapshot.drawdown_policy = pe_risk_engine::DrawdownPolicy::KillOnly;
         self.synchronize_paper_risk_halts(
             &snapshot,
             evaluated_at_unix_ms,
@@ -1284,6 +1287,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         observation: &pe_execution_core::ObservationEvidence,
         probability: Probability,
         budget: CollateralAmount,
+        cash_before: CollateralAmount,
+        starting_bankroll: Decimal,
         risk: pe_execution_core::RiskAudit,
         applied_configuration_hash: String,
     ) -> Result<pe_execution_core::EconomicPrepared, String> {
@@ -1305,14 +1310,15 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             Decimal::ONE
         })
         .map_err(|error| error.to_string())?;
-        let cash_before = CollateralAmount::from_decimal_exact(
-            self.paper_state
-                .financial_snapshot(self.financial_now().unix_timestamp())
-                .map_err(|error| error.to_string())?
-                .cash,
-        )
-        .map_err(|error| error.to_string())?;
         let sizing_mode = match self.strategy.config().sizing_mode {
+            SizingMode::CashFraction { fraction } => pe_execution_core::SizingModeAudit::Dollar {
+                usd: pe_strategy_winner_follow::cash_fraction_budget(
+                    fraction,
+                    cash_before.to_decimal(),
+                    starting_bankroll,
+                )
+                .ok_or_else(|| "cash-fraction budget arithmetic failed".to_owned())?,
+            },
             SizingMode::Dollar { usd } => pe_execution_core::SizingModeAudit::Dollar { usd },
             SizingMode::Contract { contracts } => {
                 pe_execution_core::SizingModeAudit::Contract { contracts }
@@ -2635,12 +2641,15 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
     /// mode: `Dollar` requests its USD notional; `Contract` requests its exact configured count;
     /// `Kelly` requests its allocator result. The venue planner declines requests that depth or a
     /// monetary bound cannot satisfy.
+    #[allow(clippy::too_many_arguments)]
     async fn plan_impact_gate(
         &self,
         signal: &LeaderSignal,
         continuation_version: u16,
         probability: Probability,
         sizing_bankroll: Decimal,
+        cash_before: CollateralAmount,
+        starting_bankroll: Decimal,
         admission: &pe_execution_core::LiveAdmissionArtifact,
         early_book: Option<BookReadResult>,
     ) -> Result<GatePlanEvidence, GatePlanFailure> {
@@ -2844,7 +2853,32 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .map_err(|_| LadderError::KellySizing)?;
             ShareAmount::from_whole(quantity.0).map_err(|_| LadderError::Amount)
         };
+        let cash_fraction = matches!(
+            self.strategy.config().sizing_mode,
+            SizingMode::CashFraction { .. }
+        );
         let sizing = match self.strategy.config().sizing_mode {
+            SizingMode::CashFraction { fraction } => BuySizing::DollarUpTo {
+                budget: to_budget(
+                    pe_strategy_winner_follow::cash_fraction_budget(
+                        fraction,
+                        cash_before.to_decimal(),
+                        starting_bankroll,
+                    )
+                    .ok_or_else(|| GatePlanFailure {
+                        reason: "impact budget not constructible",
+                        book: Box::new(book_failure(
+                            Some(&token_id),
+                            "arithmetic_failure",
+                            Some(&book.response_blake3),
+                            Some(book.fetched_at_ms),
+                            None,
+                            "cash-fraction budget arithmetic failed",
+                        )),
+                        checked_at_unix_ms: Some(checked_at_unix_ms),
+                    })?,
+                )?,
+            },
             SizingMode::Dollar { usd } => {
                 let budget = to_budget(usd)?;
                 if continuation_version == 7 {
@@ -2892,7 +2926,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
         let schedule = admission.fee_schedule;
         let minimum_order_size = admission.market.minimum_order_size;
         let minimum_tick_size = admission.market.minimum_tick_size;
-        match plan_sized_buy(
+        let planned = plan_sized_buy(
             &ladder,
             schedule,
             sizing,
@@ -2907,7 +2941,15 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 signal.leader_price
             },
             ceiling,
-        ) {
+        );
+        // A cash-fraction budget below the venue minimum reflects paper cash, not the book:
+        // it takes the paper-only skip, never a shared rejection of live targets.
+        let below_cash_minimum = cash_fraction && matches!(planned, Err(LadderError::BelowMinimum));
+        match if below_cash_minimum {
+            Err(LadderError::NothingAffordable)
+        } else {
+            planned
+        } {
             Ok(sized) => {
                 let budget = sized.budget;
                 let worst_case_all_in_debit =
@@ -2957,7 +2999,14 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                     best_ask: Some(best.0.normalize().to_string()),
                     vwap_basis: None,
                     ladder_plan_blake3: None,
-                    reason: Some("budget afforded no atomic share".to_owned()),
+                    reason: Some(
+                        if below_cash_minimum {
+                            "cash-fraction budget is below the venue minimum"
+                        } else {
+                            "budget afforded no atomic share"
+                        }
+                        .to_owned(),
+                    ),
                 },
                 gate: GatePlan::NothingAffordable { best_ask: best },
                 book_receipt: book.source_receipt,
@@ -3962,19 +4011,54 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             .as_ref()
             .map(|continuation| continuation.facts.frozen_basis.win_rate_p)
             .unwrap_or_else(|| self.win_rate_p_for(&watchlist, &signal.leader));
-        let sizing_bankroll = match pending.as_ref() {
-            Some(continuation) => continuation.facts.frozen_basis.bankroll,
-            None => match self
-                .paper_state
-                .financial_snapshot(OffsetDateTime::now_utc().unix_timestamp())
-            {
-                Ok(snapshot) => snapshot.cash,
+        let cash_before = match self
+            .paper_state
+            .financial_snapshot(self.financial_now().unix_timestamp())
+        {
+            Ok(snapshot) => match CollateralAmount::from_decimal_exact(snapshot.cash) {
+                Ok(cash) => cash,
                 Err(error) => {
-                    error!(%error, trade = %trade.source_trade_id, "read active sizing bankroll failed");
+                    error!(%error, "active cash cannot be represented exactly");
                     self.intake_stopped = true;
                     return;
                 }
             },
+            Err(error) => {
+                error!(%error, trade = %trade.source_trade_id, "read active sizing bankroll failed");
+                self.intake_stopped = true;
+                return;
+            }
+        };
+        let sizing_bankroll = pending
+            .as_ref()
+            .map_or(cash_before.to_decimal(), |continuation| {
+                continuation.facts.frozen_basis.bankroll
+            });
+        let starting_bankroll = if matches!(
+            self.strategy.config().sizing_mode,
+            SizingMode::CashFraction { .. }
+        ) {
+            match self
+                .paper_writer
+                .snapshot()
+                .map(crate::paper_recovery::paper_era)
+            {
+                Ok(era) => match era.start {
+                    Some((_, start)) => start.starting_bankroll.to_decimal(),
+                    None => {
+                        error!("cash-fraction sizing has no era start");
+                        self.intake_stopped = true;
+                        return;
+                    }
+                },
+                Err(error) => {
+                    error!(%error, "read cash-fraction era start failed");
+                    self.intake_stopped = true;
+                    return;
+                }
+            }
+        } else {
+            Decimal::ZERO
         };
         let early_book = match early_book {
             Some(book) => Some(book.finish().await.1),
@@ -3986,6 +4070,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 continuation_version,
                 p,
                 sizing_bankroll,
+                cash_before,
+                starting_bankroll,
                 &admission,
                 early_book,
             )
@@ -4331,6 +4417,8 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
             &observation,
             p,
             plan_budget,
+            cash_before,
+            starting_bankroll,
             risk,
             applied_configuration_hash,
         ) {
@@ -4376,7 +4464,7 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
                 if continuation_seven
                     && matches!(
                         self.strategy.config().sizing_mode,
-                        SizingMode::Dollar { .. }
+                        SizingMode::Dollar { .. } | SizingMode::CashFraction { .. }
                     )
                 {
                     intent.contracts = match pe_venue_polymarket::ladder::signed_share_contracts(
@@ -4814,10 +4902,14 @@ impl<F: PageFetcher + Send + Sync, B: ClobBookFetcher, S: SupabaseStateTrait + C
     }
 }
 
+fn next_utc_midnight(unix: i64) -> Option<i64> {
+    unix.div_euclid(86_400).checked_add(1)?.checked_mul(86_400)
+}
+
 /// Resolution-horizon gate decision (#290, #339). Returns `Some(reason)` to reject the
 /// copy, `None` to allow it.
 ///
-/// `max_secs` rejects markets resolving more than that many seconds out (0 disables the
+/// `max_secs` rejects markets resolving at least that many seconds out (0 disables the
 /// upper bound); `min_secs` rejects markets resolving sooner than that (0 disables the
 /// lower bound). An unknown resolution time (`None`) always fails closed — the horizon
 /// cannot be confirmed, so the copy is skipped.
@@ -4830,10 +4922,12 @@ fn check_resolution_horizon(
     let Some(unix) = resolution_unix else {
         return Some("market resolution time unknown");
     };
-    let secs_until = unix - now_unix;
+    let Some(secs_until) = next_utc_midnight(unix).and_then(|end| end.checked_sub(now_unix)) else {
+        return Some("market resolution time unknown");
+    };
     let max = i64::try_from(max_secs).unwrap_or(i64::MAX);
     let min = i64::try_from(min_secs).unwrap_or(i64::MAX);
-    if max_secs > 0 && secs_until > max {
+    if max_secs > 0 && secs_until >= max {
         return Some("market resolves too far out");
     }
     if min_secs > 0 && secs_until < min {
@@ -5168,7 +5262,8 @@ mod tests {
                 let connection =
                     rusqlite::Connection::open(harness._fixture.dir.path().join("paper.db"))
                         .unwrap();
-                connection.execute_batch(if insert_failure {
+                let fails = neg_risk && group.is_some();
+                connection.execute_batch(if insert_failure || !fails {
                     "CREATE TRIGGER fail_group_insert BEFORE INSERT ON meta WHEN NEW.key LIKE 'neg_risk_group:%' BEGIN SELECT RAISE(FAIL, 'group insert failed'); END;"
                 } else {
                     "ALTER TABLE settled_markets RENAME TO unavailable_settled_markets;"
@@ -5176,7 +5271,6 @@ mod tests {
                 harness.release.take().unwrap().send(()).unwrap();
                 harness.owner.handle_trade_once(harness.trade.clone()).await;
                 assert_eq!(harness.books.started.lock().unwrap().len(), 1);
-                let fails = neg_risk && group.is_some();
                 assert_eq!(harness.owner.intake_stopped, fails);
                 let row = harness
                     .owner
@@ -6425,6 +6519,10 @@ mod tests {
             .map_err(|error| error.cause)
             .unwrap();
         assert_eq!(risk.decision, RiskDecisionAudit::Approved);
+        assert_eq!(
+            risk.snapshot.drawdown_policy,
+            pe_risk_engine::DrawdownPolicy::KillOnly
+        );
         assert!(matches!(
             owner
                 .apply_active_financial_fill(
@@ -7602,12 +7700,42 @@ mod tests {
             copy_latency_kill_switch_active: false,
             proposed_trade_bps: BasisPoints(1),
             per_trade_cap_bps: 25,
+            drawdown_policy: pe_risk_engine::DrawdownPolicy::Stops,
             concentration_caps: Some(ConcentrationCaps::CANONICAL),
         }
     }
 
     /// PASS: a halt owned by a live account blocks the paper snapshot through the global set.
     /// FAIL: paper evaluates only its locally derived risk state and approves the entry.
+    #[test]
+    fn legacy_snapshot_roundtrips_identically_and_keeps_stops() {
+        let mut snapshot = healthy_risk_snapshot();
+        let encoded = serde_json::to_vec(&snapshot).unwrap();
+        assert!(!String::from_utf8_lossy(&encoded).contains("drawdown_policy"));
+        let restored: RiskSnapshot = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(restored, snapshot);
+        assert_eq!(serde_json::to_vec(&restored).unwrap(), encoded);
+        for (day, week, absolute, block) in [
+            (-200, 0, 0, RiskBlock::IntradayDrawdownStop),
+            (0, -600, 0, RiskBlock::Rolling7dDrawdownStop),
+            (0, 0, -1000, RiskBlock::KillSwitchDrawdown),
+        ] {
+            snapshot.intraday_pnl_bps = BasisPoints(day);
+            snapshot.rolling_7d_pnl_bps = BasisPoints(week);
+            snapshot.absolute_pnl_bps = BasisPoints(absolute);
+            let restored: RiskSnapshot =
+                serde_json::from_slice(&serde_json::to_vec(&snapshot).unwrap()).unwrap();
+            assert_eq!(evaluate_risk(&restored), RiskDecision::Blocked(block));
+        }
+        snapshot.drawdown_policy = pe_risk_engine::DrawdownPolicy::KillOnly;
+        let encoded = serde_json::to_vec(&snapshot).unwrap();
+        assert!(String::from_utf8_lossy(&encoded).contains("\"drawdown_policy\":\"kill_only\""));
+        assert_eq!(
+            serde_json::from_slice::<RiskSnapshot>(&encoded).unwrap(),
+            snapshot
+        );
+    }
+
     #[test]
     fn live_owner_halt_gates_paper_risk() {
         let account = AccountId::new("live-a").unwrap();
@@ -7667,6 +7795,183 @@ mod tests {
         assert_eq!(scan_paper_log(&paper_path).unwrap().len(), 3);
     }
 
+    #[cfg(feature = "scenario")]
+    #[tokio::test]
+    async fn cash_fraction_paper_planner_takes_partial_depth_and_declines_floor_or_dust() {
+        use super::*;
+        let test_receipt = |sequence| AppendReceipt {
+            sequence: pe_core_types::EventSeq(sequence),
+            this_hash: blake3::hash(b"cash-fraction"),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let (_, control_rx) = mpsc::channel(4);
+        let mut owner = build_test_orchestrator(
+            crate::paper_recovery::PaperLog::open(dir.path().join("paper.log")).unwrap(),
+            paper,
+            control_rx,
+            String::new(),
+            None,
+        );
+        owner.strategy = WinnerFollowStrategy::new(WinnerFollowConfig {
+            sizing_mode: SizingMode::CashFraction {
+                fraction: dec!(0.00375),
+            },
+            per_trade_cap: pe_strategy_winner_follow::PerTradeCap::Unlimited,
+            ..WinnerFollowConfig::default()
+        });
+        let hooks = Arc::new(super::ScenarioHooks::default());
+        hooks.financial_clock_unix.store(100, Ordering::SeqCst);
+        owner.scenario_hooks = Some(hooks);
+        let condition = PolymarketConditionId("cash-fraction".to_owned());
+        let admission = pe_execution_core::LiveAdmissionArtifact {
+            market: pe_source_polymarket_public::LiveMarketEvidence {
+                condition_id: condition.clone(),
+                ordered_outcome_token_ids: [
+                    PolymarketTokenId("yes".to_owned()),
+                    PolymarketTokenId("no".to_owned()),
+                ],
+                neg_risk: false,
+                neg_risk_market_id: None,
+                minimum_tick_size: Price::new(dec!(0.01)).unwrap(),
+                minimum_order_size: ShareAmount::from_whole(5).unwrap(),
+                scheduled_end_unix: Some(86400),
+                observed_at_unix: 100,
+                schema_version: 1,
+                parser_version: 1,
+                freshness_window_secs: 60,
+            },
+            settlement: seal_test_economic(test_receipt(1), test_receipt(1))
+                .admission
+                .settlement,
+            fee_schedule: pe_venue_polymarket::CompactFeeSchedule::Zero,
+            receipts: pe_execution_core::AdmissionReceipts {
+                gamma: test_receipt(1),
+                clob_long: test_receipt(1),
+                clob_compact: test_receipt(1),
+            },
+        };
+        let signal = LeaderSignal {
+            leader: TraderId(
+                WalletAddress::from_hex("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").unwrap(),
+            ),
+            venue: VenueId::polymarket(),
+            market_id: MarketId(pe_core_types::VenueMarketId(condition.0)),
+            outcome_id: OutcomeId(0),
+            action: pe_core_types::LeaderAction::Entry,
+            leader_side: Side::Buy,
+            leader_price: Price::new(dec!(0.5)).unwrap(),
+            leader_size: ShareAmount::from_whole(10).unwrap(),
+            observed_at: time::OffsetDateTime::UNIX_EPOCH,
+            received_at: time::OffsetDateTime::UNIX_EPOCH,
+            reconstruction_quality: pe_core_types::ReconstructionQuality::new(100).unwrap(),
+            source_trade_id: SourceTradeId("cash-fraction".to_owned()),
+            action_confidence_ppm: pe_core_types::ProbabilityPpm(1_000_000),
+        };
+        for (cash, depth, succeeds) in [
+            (dec!(6999), dec!(100), false),
+            (dec!(7000), dec!(100), false),
+            (dec!(7001), dec!(100), false),
+            (dec!(10000), dec!(4.99), false),
+            (dec!(10000), dec!(10), true),
+        ] {
+            let body = serde_json::to_vec(&serde_json::json!({ "market": "cash-fraction", "asset_id": "yes", "timestamp": "100000", "min_order_size": "5", "tick_size": "0.01", "neg_risk": false, "bids": [], "asks": [{ "price": "0.50", "size": depth.to_string() }] })).unwrap();
+            let mut book = OrderBook::from_book_json(&body).unwrap();
+            book.source_receipt = Some(test_receipt(2));
+            book.fetched_at_ms = 100000;
+            let result = owner
+                .plan_impact_gate(
+                    &signal,
+                    7,
+                    Probability::new(dec!(0.8)).unwrap(),
+                    dec!(10000),
+                    CollateralAmount::from_decimal_exact(cash).unwrap(),
+                    dec!(10000),
+                    &admission,
+                    Some(Ok(Ok(book))),
+                )
+                .await;
+            assert_eq!(
+                matches!(
+                    &result,
+                    Ok(GatePlanEvidence {
+                        gate: GatePlan::Planned(_),
+                        ..
+                    })
+                ),
+                succeeds,
+                "cash={cash}, depth={depth}"
+            );
+            // A refusal is paper-only: it never suppresses live targets (#508 Decision 10).
+            assert!(
+                succeeds
+                    || matches!(
+                        &result,
+                        Ok(GatePlanEvidence {
+                            gate: GatePlan::NothingAffordable { .. },
+                            ..
+                        })
+                    ),
+                "cash={cash}, depth={depth}"
+            );
+            if let Ok(GatePlanEvidence {
+                gate: GatePlan::Planned(plan),
+                budget,
+                ..
+            }) = result
+            {
+                assert_eq!(plan.shares, ShareAmount::from_whole(10).unwrap());
+                assert_eq!(budget.to_decimal(), dec!(37.5));
+            }
+        }
+    }
+
+    #[test]
+    fn kill_only_paper_halts_ignore_stops_and_latch_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let paper_path = dir.path().join("paper.log");
+        let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let (_, control_rx) = mpsc::channel(4);
+        let mut owner = build_test_orchestrator(
+            crate::paper_recovery::PaperLog::open(&paper_path).unwrap(),
+            paper,
+            control_rx,
+            String::new(),
+            None,
+        );
+        let mut snapshot = healthy_risk_snapshot();
+        snapshot.drawdown_policy = pe_risk_engine::DrawdownPolicy::KillOnly;
+        snapshot.intraday_pnl_bps.0 = -200;
+        snapshot.rolling_7d_pnl_bps.0 = -600;
+        snapshot.absolute_pnl_bps.0 = -2999;
+        owner
+            .synchronize_paper_risk_halts(&snapshot, 1000, 3)
+            .unwrap();
+        assert!(owner.active_risk_halts.is_empty());
+        snapshot.absolute_pnl_bps.0 = -3000;
+        owner
+            .synchronize_paper_risk_halts(&snapshot, 2000, 3)
+            .unwrap();
+        assert_eq!(
+            owner.active_risk_halts,
+            HashSet::from([(RiskHaltOwner::Paper, RiskHaltCause::AbsoluteLoss)])
+        );
+        snapshot.absolute_pnl_bps.0 = 0;
+        owner
+            .synchronize_paper_risk_halts(&snapshot, 3000, 3)
+            .unwrap();
+        let restored = crate::paper_recovery::active_risk_halts(&crate::paper_recovery::paper_era(
+            scan_paper_log(&paper_path).unwrap(),
+        ));
+        assert_eq!(restored, owner.active_risk_halts);
+        apply_global_risk_halts(&restored, &mut snapshot, false);
+        assert_eq!(snapshot.absolute_pnl_bps.0, -3000);
+        assert_eq!(
+            evaluate_risk(&snapshot),
+            RiskDecision::Blocked(RiskBlock::KillSwitchDrawdown)
+        );
+    }
+
     /// PASS: the first valid boundary that reaches both canonical completion counts requests the
     /// existing Complete seal; an invalid mark or either below-threshold count requests no seal.
     /// FAIL: the boundary can seal early, seal invalid evidence, or misses the first valid mark.
@@ -7717,56 +8022,59 @@ mod tests {
     }
 
     #[test]
-    fn rejects_too_far_out() {
-        // Resolves 72h + 1s out, max = 72h → rejected.
-        let unix = NOW + 259_200 + 1;
-        assert_eq!(
-            check_resolution_horizon(Some(unix), NOW, 259_200, 60),
-            Some("market resolves too far out")
-        );
-    }
-
-    #[test]
-    fn rejects_too_soon() {
-        // Resolves 59s out, min = 60s → rejected.
-        let unix = NOW + 59;
-        assert_eq!(
-            check_resolution_horizon(Some(unix), NOW, 259_200, 60),
-            Some("market resolves too soon")
-        );
-    }
-
-    #[test]
-    fn admits_within_both_bounds() {
-        // Resolves 1h out — inside [60s, 72h].
-        let unix = NOW + 3_600;
-        assert_eq!(check_resolution_horizon(Some(unix), NOW, 259_200, 60), None);
-    }
-
-    #[test]
-    fn bounds_are_inclusive_at_edges() {
-        // Exactly max out and exactly min out are both allowed (strict >/< rejects).
-        assert_eq!(
-            check_resolution_horizon(Some(NOW + 259_200), NOW, 259_200, 60),
-            None
-        );
-        assert_eq!(
-            check_resolution_horizon(Some(NOW + 60), NOW, 259_200, 60),
-            None
-        );
+    fn same_day_horizon_boundaries_for_midnight_noon_and_offset_markers() {
+        use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+        for marker in [
+            "2026-10-11T00:00:00Z",
+            "2026-10-11T12:00:00Z",
+            "2026-10-11T18:00:00+06:00",
+        ] {
+            let unix = OffsetDateTime::parse(marker, &Rfc3339)
+                .unwrap()
+                .unix_timestamp();
+            let day_end = OffsetDateTime::parse("2026-10-12T00:00:00Z", &Rfc3339)
+                .unwrap()
+                .unix_timestamp();
+            assert_eq!(super::next_utc_midnight(unix), Some(day_end));
+            for (remaining, expected) in [
+                (60, None),
+                (86399, None),
+                (59, Some("market resolves too soon")),
+                (86400, Some("market resolves too far out")),
+            ] {
+                assert_eq!(
+                    check_resolution_horizon(Some(unix), day_end - remaining, 86400, 60),
+                    expected,
+                    "{marker}, {remaining}"
+                );
+            }
+        }
+        assert_eq!(super::next_utc_midnight(-1), Some(0));
+        assert_eq!(super::next_utc_midnight(-86400), Some(0));
     }
 
     #[test]
     fn zero_disables_each_bound_independently() {
-        // max=0 disables the upper bound; a far-future market is allowed.
+        let marker = 86400;
+        assert_eq!(check_resolution_horizon(Some(marker), 0, 0, 60), None);
         assert_eq!(
-            check_resolution_horizon(Some(NOW + 10_000_000), NOW, 0, 60),
+            check_resolution_horizon(Some(marker), 172799, 86400, 0),
             None
         );
-        // min=0 disables the lower bound; an imminent market is allowed.
+        assert_eq!(check_resolution_horizon(Some(marker), 172800, 0, 0), None);
         assert_eq!(
-            check_resolution_horizon(Some(NOW + 1), NOW, 259_200, 0),
-            None
+            check_resolution_horizon(None, NOW, 0, 0),
+            Some("market resolution time unknown")
         );
+    }
+
+    #[test]
+    fn overflowing_resolution_day_or_difference_fails_closed() {
+        for (marker, now) in [(i64::MAX, 0), (0, i64::MIN)] {
+            assert_eq!(
+                check_resolution_horizon(Some(marker), now, 0, 0),
+                Some("market resolution time unknown")
+            );
+        }
     }
 }

@@ -1249,7 +1249,7 @@ fn recovery_authorization(
             .any(|attempt| redemption_posture(&attempt.state).closes_new_buy_admission);
     if state.closures.reason(account_id.as_str()).is_some()
         || redemption_closed
-        || global_risk_halt_active(state)?
+        || global_risk_halt_active(state, pe_risk_engine::DrawdownPolicy::KillOnly)?
     {
         return Ok(RecoveryAuthorization::Pause);
     }
@@ -2354,6 +2354,26 @@ async fn process_target(
         account_state.reconciled_free_collateral.to_decimal(),
     );
     let requested_sizing = match strategy_config.sizing_mode {
+        SizingMode::CashFraction { fraction } => {
+            let events = replay_live_account(state, &account.account_id)?;
+            let derived = derive_projection_rows_for_state(state, &account.account_id, &events)
+                .map_err(|error| FanoutError::Signal(error.to_string()))?;
+            let baseline = derived.baseline_equity.ok_or_else(|| {
+                FanoutError::Signal("live cash-fraction baseline missing".to_owned())
+            })?;
+            let budget = pe_strategy_winner_follow::cash_fraction_budget(
+                fraction,
+                account_state.reconciled_free_collateral.to_decimal(),
+                baseline.to_decimal(),
+            )
+            .ok_or_else(|| {
+                FanoutError::Signal("live cash-fraction budget arithmetic failed".to_owned())
+            })?;
+            BuySizing::Dollar {
+                budget: CollateralAmount::from_decimal_exact(budget)
+                    .map_err(|error| FanoutError::Signal(error.to_string()))?,
+            }
+        }
         SizingMode::Dollar { usd } => {
             let budget = CollateralAmount::from_decimal_exact(
                 usd.round_dp_with_strategy(6, RoundingStrategy::ToNegativeInfinity),
@@ -2459,6 +2479,9 @@ async fn process_target(
     let outcome_index = u8::try_from(signal.outcome_id.0)
         .map_err(|_| FanoutError::Signal("outcome index exceeds u8".to_owned()))?;
     let sizing_mode = match strategy_config.sizing_mode {
+        SizingMode::CashFraction { .. } => SizingModeAudit::Dollar {
+            usd: sized.budget.to_decimal(),
+        },
         SizingMode::Kelly => SizingModeAudit::Kelly {
             fraction: strategy.effective_kelly_fraction(ExecutionMode::LiveTiny),
             probability,
@@ -2506,7 +2529,7 @@ async fn process_target(
         )?;
         return Ok(PassControl::Continue);
     }
-    if global_risk_halt_active(state)? {
+    if global_risk_halt_active(state, economic.risk.snapshot.drawdown_policy)? {
         return Ok(PassControl::StopSeed);
     }
     let binding = CredentialBindingIdentity {
@@ -3035,6 +3058,7 @@ async fn live_risk_audit(
             market_id: signal.map(|signal| signal.market_id.to_string()),
             proposed_debit,
             per_trade_cap_bps,
+            drawdown_policy: pe_risk_engine::DrawdownPolicy::KillOnly,
         },
     )
 }
@@ -3045,6 +3069,7 @@ struct LiveRiskProposal {
     market_id: Option<String>,
     proposed_debit: CollateralAmount,
     per_trade_cap_bps: i32,
+    drawdown_policy: pe_risk_engine::DrawdownPolicy,
 }
 
 fn evaluated_at_millis(now: OffsetDateTime) -> Result<i64, RiskInputsUnavailable> {
@@ -3195,6 +3220,7 @@ fn compose_live_risk_audit(
         copy_latency_kill_switch_active: false,
         proposed_trade_bps: to_bps(proposal.proposed_debit)?,
         per_trade_cap_bps: proposal.per_trade_cap_bps,
+        drawdown_policy: proposal.drawdown_policy,
         concentration_caps: None,
     };
     apply_global_risk_halts(&active_risk_halts(paper_era), &mut snapshot, false);
@@ -3228,15 +3254,17 @@ async fn sync_live_risk_halts(
     let desired = [
         (
             pe_risk_engine::RiskHaltCause::IntradayDrawdown,
-            risk.snapshot.intraday_pnl_bps.0 <= pe_risk_engine::INTRADAY_STOP_BPS,
+            risk.snapshot.drawdown_policy == pe_risk_engine::DrawdownPolicy::Stops
+                && risk.snapshot.intraday_pnl_bps.0 <= pe_risk_engine::INTRADAY_STOP_BPS,
         ),
         (
             pe_risk_engine::RiskHaltCause::Rolling7dDrawdown,
-            risk.snapshot.rolling_7d_pnl_bps.0 <= pe_risk_engine::ROLLING_7D_STOP_BPS,
+            risk.snapshot.drawdown_policy == pe_risk_engine::DrawdownPolicy::Stops
+                && risk.snapshot.rolling_7d_pnl_bps.0 <= pe_risk_engine::ROLLING_7D_STOP_BPS,
         ),
         (
             pe_risk_engine::RiskHaltCause::AbsoluteLoss,
-            risk.snapshot.absolute_pnl_bps.0 <= pe_risk_engine::KILL_SWITCH_DRAWDOWN_BPS
+            risk.snapshot.absolute_pnl_bps.0 <= risk.snapshot.drawdown_policy.absolute_loss_bps()
                 || current.contains(&(owner.clone(), pe_risk_engine::RiskHaltCause::AbsoluteLoss)),
         ),
     ];
@@ -3275,10 +3303,13 @@ async fn sync_live_risk_halts(
             .map_err(|_| FanoutError::Signal("risk halt acknowledgement dropped".to_owned()))?
             .map_err(FanoutError::Signal)?;
     }
-    global_risk_halt_active(state)
+    global_risk_halt_active(state, risk.snapshot.drawdown_policy)
 }
 
-fn global_risk_halt_active(state: &FanoutState) -> Result<bool, FanoutError> {
+fn global_risk_halt_active(
+    state: &FanoutState,
+    drawdown_policy: pe_risk_engine::DrawdownPolicy,
+) -> Result<bool, FanoutError> {
     Ok(active_risk_halts(&paper_era(
         state
             .config
@@ -3287,7 +3318,14 @@ fn global_risk_halt_active(state: &FanoutState) -> Result<bool, FanoutError> {
             .map_err(|error| FanoutError::Signal(error.to_string()))?,
     ))
     .iter()
-    .any(|(_, cause)| *cause != pe_risk_engine::RiskHaltCause::CopyLatency))
+    .any(|(_, cause)| match cause {
+        pe_risk_engine::RiskHaltCause::AbsoluteLoss => true,
+        pe_risk_engine::RiskHaltCause::IntradayDrawdown
+        | pe_risk_engine::RiskHaltCause::Rolling7dDrawdown => {
+            drawdown_policy == pe_risk_engine::DrawdownPolicy::Stops
+        }
+        pe_risk_engine::RiskHaltCause::CopyLatency => false,
+    }))
 }
 
 fn sorted_price_receipts(
@@ -4421,6 +4459,7 @@ fn verify_replayed_live_risk_with_index(
             market_id: Some(projection.market_id.clone()),
             proposed_debit,
             per_trade_cap_bps,
+            drawdown_policy: admission.economic.risk.snapshot.drawdown_policy,
         },
     )
     .map_err(|_| ProjectionReducerError::InvalidRiskEvidence)?;
@@ -8867,6 +8906,7 @@ mod tests {
                 market_id: Some(projection.market_id.clone()),
                 proposed_debit: candidate.economic.balance.worst_case_debit,
                 per_trade_cap_bps: 10_000,
+                drawdown_policy: pe_risk_engine::DrawdownPolicy::Stops,
             },
         )
         .unwrap();
@@ -9365,43 +9405,109 @@ mod tests {
                     })
                     .unwrap();
             }
-            let economic = &mut prepared.economic;
-            economic.version = 2;
-            economic.balance.chase_ceiling = Price::ONE;
-            economic.sizing.mode = SizingModeAudit::Dollar { usd: dec!(25) };
-            let lookup = |receipt| {
-                sources
-                    .iter()
-                    .find(|(candidate, _)| *candidate == receipt)
-                    .map(|(_, source)| source.clone())
-                    .ok_or_else(|| EconomicReplayError("fixture receipt missing".to_owned()))
-            };
-            let cash = CollateralAmount::from_decimal_exact(dec!(1000)).unwrap();
-            let partial =
-                replay_source_backed_economic(economic, 30_000, cash, Some(&continuation), lookup)
-                    .unwrap();
-            assert_eq!(
-                partial.sized.ladder.worst_case_debit.to_decimal(),
-                dec!(2.5)
-            );
-            assert!(partial.sized.ladder.shares.to_decimal() >= dec!(1));
-            let mut historical_wire = serde_json::to_value(&continuation).unwrap();
-            // Historical authority keeps a REST proof; partial policy is selected by the
-            // supplied continuation, independently of economic wire 2.
-            if !frame_authority {
-                historical_wire["version"] = serde_json::json!(6);
-                historical_wire
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("source_authority");
-                let historical: DecisionContinuationV3 =
-                    serde_json::from_value(historical_wire).unwrap();
+            for usd in [
+                dec!(25),
+                pe_strategy_winner_follow::cash_fraction_budget(
+                    dec!(0.00375),
+                    dec!(1000),
+                    dec!(1000),
+                )
+                .unwrap(),
+            ] {
+                let economic = &mut prepared.economic;
+                economic.version = 2;
+                economic.balance.chase_ceiling = Price::ONE;
+                economic.sizing.mode = SizingModeAudit::Dollar { usd };
+                let lookup = |receipt| {
+                    sources
+                        .iter()
+                        .find(|(candidate, _)| *candidate == receipt)
+                        .map(|(_, source)| source.clone())
+                        .ok_or_else(|| EconomicReplayError("fixture receipt missing".to_owned()))
+                };
+                let cash = CollateralAmount::from_decimal_exact(dec!(1000)).unwrap();
+                let partial = replay_source_backed_economic(
+                    economic,
+                    30_000,
+                    cash,
+                    Some(&continuation),
+                    lookup,
+                )
+                .unwrap();
+                assert_eq!(
+                    partial.sized.ladder.worst_case_debit.to_decimal(),
+                    dec!(2.5)
+                );
+                assert!(partial.sized.ladder.shares.to_decimal() >= dec!(1));
+                let mut historical_wire = serde_json::to_value(&continuation).unwrap();
+                // Historical authority keeps a REST proof; partial policy is selected by the
+                // supplied continuation, independently of economic wire 2.
+                if !frame_authority {
+                    historical_wire["version"] = serde_json::json!(6);
+                    historical_wire
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("source_authority");
+                    let historical: DecisionContinuationV3 =
+                        serde_json::from_value(historical_wire).unwrap();
+                    assert!(
+                        replay_source_backed_economic(
+                            economic,
+                            30_000,
+                            cash,
+                            Some(&historical),
+                            lookup
+                        )
+                        .err()
+                        .unwrap()
+                        .0
+                        .contains("cannot fill")
+                    );
+                }
+                let recomposed = EconomicPrepared::compose_wire_two(EconomicInputs {
+                    market: economic.market.clone(),
+                    admission: &partial.admission,
+                    plan: &partial.sized.ladder,
+                    book_receipt: economic.book_receipt,
+                    observation: economic.observation.clone(),
+                    sizing_mode: economic.sizing.mode,
+                    budget: partial.sized.budget,
+                    slippage_rate: economic.sizing.slippage_rate,
+                    risk: economic.risk.clone(),
+                    cash_before: cash,
+                    price_impact_cap_bps: economic.balance.price_impact_cap_bps,
+                    chase_ceiling: Price::ONE,
+                    band_floor: economic.balance.band_floor,
+                    band_ceiling_exclusive: economic.balance.band_ceiling_exclusive,
+                    applied_configuration_hash: economic.applied_configuration_hash.clone(),
+                })
+                .unwrap();
+                replay_source_backed_economic(
+                    &recomposed,
+                    30_000,
+                    cash,
+                    Some(&continuation),
+                    lookup,
+                )
+                .unwrap()
+                .recompose(
+                    &recomposed,
+                    recomposed.risk.clone(),
+                    recomposed.applied_configuration_hash.clone(),
+                )
+                .unwrap();
                 assert!(
-                    replay_source_backed_economic(
+                    replay_source_backed_economic_with_live_binding(
                         economic,
                         30_000,
                         cash,
-                        Some(&historical),
+                        None,
+                        Some(LiveObservationBinding {
+                            account_id: &account,
+                            identity: &prepared.identity,
+                            continuation: &continuation,
+                            correction: None
+                        }),
                         lookup
                     )
                     .err()
@@ -9410,51 +9516,6 @@ mod tests {
                     .contains("cannot fill")
                 );
             }
-            let recomposed = EconomicPrepared::compose_wire_two(EconomicInputs {
-                market: economic.market.clone(),
-                admission: &partial.admission,
-                plan: &partial.sized.ladder,
-                book_receipt: economic.book_receipt,
-                observation: economic.observation.clone(),
-                sizing_mode: economic.sizing.mode,
-                budget: partial.sized.budget,
-                slippage_rate: economic.sizing.slippage_rate,
-                risk: economic.risk.clone(),
-                cash_before: cash,
-                price_impact_cap_bps: economic.balance.price_impact_cap_bps,
-                chase_ceiling: Price::ONE,
-                band_floor: economic.balance.band_floor,
-                band_ceiling_exclusive: economic.balance.band_ceiling_exclusive,
-                applied_configuration_hash: economic.applied_configuration_hash.clone(),
-            })
-            .unwrap();
-            replay_source_backed_economic(&recomposed, 30_000, cash, Some(&continuation), lookup)
-                .unwrap()
-                .recompose(
-                    &recomposed,
-                    recomposed.risk.clone(),
-                    recomposed.applied_configuration_hash.clone(),
-                )
-                .unwrap();
-            assert!(
-                replay_source_backed_economic_with_live_binding(
-                    economic,
-                    30_000,
-                    cash,
-                    None,
-                    Some(LiveObservationBinding {
-                        account_id: &account,
-                        identity: &prepared.identity,
-                        continuation: &continuation,
-                        correction: None
-                    }),
-                    lookup
-                )
-                .err()
-                .unwrap()
-                .0
-                .contains("cannot fill")
-            );
         }
     }
 
@@ -12332,6 +12393,26 @@ mod tests {
         }
     }
 
+    #[test]
+    fn strict_live_risk_rebuilds_recorded_kill_only_policy() {
+        let (_dir, account, events, sources, frames, mut admission) =
+            reconstructed_live_risk_fixture();
+        admission.economic.risk.snapshot.drawdown_policy = pe_risk_engine::DrawdownPolicy::KillOnly;
+        admission.economic.risk.decision =
+            match pe_risk_engine::evaluate_risk(&admission.economic.risk.snapshot) {
+                pe_risk_engine::RiskDecision::Approved => RiskDecisionAudit::Approved,
+                pe_risk_engine::RiskDecision::Blocked(reason) => {
+                    RiskDecisionAudit::Blocked { reason }
+                }
+            };
+        verify_replayed_live_risk(&account, &events, &admission, &sources, &frames).unwrap();
+        admission.economic.risk.snapshot.absolute_pnl_bps.0 -= 1;
+        assert!(matches!(
+            verify_replayed_live_risk(&account, &events, &admission, &sources, &frames),
+            Err(ProjectionReducerError::InvalidRiskEvidence)
+        ));
+    }
+
     /// PASS: a frame made durable after runtime captured its paper prefix cannot enter replay only
     /// because its earlier receive timestamp predates evaluation; absent or tampered prefixes fail.
     #[test]
@@ -12470,7 +12551,7 @@ mod tests {
     }
 
     /// An active latency-only record remains in the journal without causing a live transition
-    /// or a global halt. The three drawdown causes still halt independently.
+    /// or a global halt. New decisions gate only the durable absolute-loss latch.
     #[tokio::test]
     async fn live_halt_sync_ignores_retired_latency_cause() {
         for cause in [
@@ -12519,7 +12600,11 @@ mod tests {
                 pe_risk_engine::RiskHaltCause::CopyLatency => {}
             }
             assert_eq!(
-                global_risk_halt_active(&state).unwrap(),
+                global_risk_halt_active(&state, pe_risk_engine::DrawdownPolicy::KillOnly).unwrap(),
+                cause == pe_risk_engine::RiskHaltCause::AbsoluteLoss
+            );
+            assert_eq!(
+                global_risk_halt_active(&state, pe_risk_engine::DrawdownPolicy::Stops).unwrap(),
                 cause != pe_risk_engine::RiskHaltCause::CopyLatency
             );
             assert_eq!(
@@ -12528,6 +12613,130 @@ mod tests {
             );
             assert_eq!(state.config.paper_log.snapshot().unwrap().len(), 1);
         }
+    }
+
+    #[tokio::test]
+    async fn kill_only_live_sync_releases_legacy_stops_and_latches_absolute_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let paper = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        let accounts = armed_snapshot("kill-only");
+        let account = accounts.accounts[0].clone();
+        let mut state = fanout_state(&dir, paper, accounts, "http://127.0.0.1:9", None);
+        let now = OffsetDateTime::from_unix_timestamp(20).unwrap();
+        let append = |record: &PaperLogRecord| {
+            state
+                .config
+                .paper_log
+                .append_synced(EnvelopeIn {
+                    source_id: SourceId("pe-service.paper".to_owned()),
+                    schema_version: crate::paper_recovery::PAPER_LOG_SCHEMA_VERSION,
+                    parser_version: 1,
+                    observed_at: SourceTimestamp(now),
+                    received_at: ReceivedAt(now),
+                    content_type: ContentType::Json,
+                    payload: serde_json::to_vec(record).unwrap(),
+                })
+                .unwrap()
+        };
+        for cause in [
+            pe_risk_engine::RiskHaltCause::IntradayDrawdown,
+            pe_risk_engine::RiskHaltCause::Rolling7dDrawdown,
+        ] {
+            append(&PaperLogRecord::RiskHaltChanged {
+                owner: RiskHaltOwner::LiveAccount(account.account_id.clone()),
+                cause,
+                state: HaltState::Engaged,
+                evidence: serde_json::json!({}),
+            });
+        }
+        assert!(
+            !global_risk_halt_active(&state, pe_risk_engine::DrawdownPolicy::KillOnly).unwrap()
+        );
+        let (control, mut receiver) = tokio::sync::mpsc::channel(4);
+        state.config.orchestrator_control = control.downgrade();
+        let mut risk = finality_prepared().economic.risk;
+        risk.snapshot.drawdown_policy = pe_risk_engine::DrawdownPolicy::KillOnly;
+        risk.snapshot.intraday_pnl_bps.0 = -200;
+        risk.snapshot.rolling_7d_pnl_bps.0 = -600;
+        risk.snapshot.absolute_pnl_bps.0 = -2999;
+        let owner = async {
+            for _ in 0..2 {
+                let OrchestratorControl::RiskHaltChange {
+                    owner,
+                    cause,
+                    state: transition,
+                    evidence,
+                    acknowledged,
+                } = receiver.recv().await.unwrap()
+                else {
+                    panic!("expected halt control")
+                };
+                assert_eq!(transition, HaltState::Released);
+                let receipt = state
+                    .config
+                    .paper_log
+                    .append_synced(EnvelopeIn {
+                        source_id: SourceId("pe-service.paper".to_owned()),
+                        schema_version: crate::paper_recovery::PAPER_LOG_SCHEMA_VERSION,
+                        parser_version: 1,
+                        observed_at: SourceTimestamp(now),
+                        received_at: ReceivedAt(now),
+                        content_type: ContentType::Json,
+                        payload: serde_json::to_vec(&PaperLogRecord::RiskHaltChanged {
+                            owner,
+                            cause,
+                            state: transition,
+                            evidence,
+                        })
+                        .unwrap(),
+                    })
+                    .unwrap();
+                acknowledged.send(Ok(receipt)).unwrap();
+            }
+        };
+        let (result, ()) = tokio::join!(sync_live_risk_halts(&state, &account, &risk), owner);
+        assert!(!result.unwrap());
+        risk.snapshot.absolute_pnl_bps.0 = -3000;
+        let owner = async {
+            let OrchestratorControl::RiskHaltChange {
+                owner,
+                cause,
+                state: transition,
+                evidence,
+                acknowledged,
+            } = receiver.recv().await.unwrap()
+            else {
+                panic!("expected halt control")
+            };
+            assert_eq!(cause, pe_risk_engine::RiskHaltCause::AbsoluteLoss);
+            assert_eq!(transition, HaltState::Engaged);
+            let receipt = state
+                .config
+                .paper_log
+                .append_synced(EnvelopeIn {
+                    source_id: SourceId("pe-service.paper".to_owned()),
+                    schema_version: crate::paper_recovery::PAPER_LOG_SCHEMA_VERSION,
+                    parser_version: 1,
+                    observed_at: SourceTimestamp(now),
+                    received_at: ReceivedAt(now),
+                    content_type: ContentType::Json,
+                    payload: serde_json::to_vec(&PaperLogRecord::RiskHaltChanged {
+                        owner,
+                        cause,
+                        state: transition,
+                        evidence,
+                    })
+                    .unwrap(),
+                })
+                .unwrap();
+            acknowledged.send(Ok(receipt)).unwrap();
+        };
+        let (result, ()) = tokio::join!(sync_live_risk_halts(&state, &account, &risk), owner);
+        assert!(result.unwrap());
+        risk.snapshot.absolute_pnl_bps.0 = 0;
+        assert!(sync_live_risk_halts(&state, &account, &risk).await.unwrap());
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(state.config.paper_log.snapshot().unwrap().len(), 5);
     }
 
     #[cfg(feature = "scenario")]
@@ -12570,11 +12779,17 @@ mod tests {
             .unwrap();
         assert_eq!(risk.decision, RiskDecisionAudit::Approved);
         assert_eq!(
+            risk.snapshot.drawdown_policy,
+            pe_risk_engine::DrawdownPolicy::KillOnly
+        );
+        assert_eq!(
             risk.financial_prefix,
             prepared.economic.risk.financial_prefix
         );
         assert!(!sync_live_risk_halts(&state, &account, &risk).await.unwrap());
-        assert!(!global_risk_halt_active(&state).unwrap());
+        assert!(
+            !global_risk_halt_active(&state, pe_risk_engine::DrawdownPolicy::KillOnly).unwrap()
+        );
         assert_eq!(
             pe_event_log::scan_metrics::count(&path).unwrap(),
             paper_walks
@@ -12887,6 +13102,34 @@ mod tests {
         assert_eq!(
             settings(Some("bogus"), Some("1"), None).sizing_mode(fallback),
             Err("live_sizing_mode_invalid")
+        );
+    }
+
+    #[test]
+    fn cash_fraction_live_null_inherits_and_explicit_modes_override() {
+        let fallback = SizingMode::CashFraction {
+            fraction: dec!(0.00375),
+        };
+        assert_eq!(
+            settings(None, None, None).sizing_mode(fallback),
+            Ok(fallback)
+        );
+        assert_eq!(
+            settings(Some("dollar"), Some("1"), None).sizing_mode(fallback),
+            Ok(SizingMode::Dollar { usd: dec!(1) })
+        );
+        assert_eq!(
+            settings(Some("contract"), None, Some(5)).sizing_mode(fallback),
+            Ok(SizingMode::Contract { contracts: 5 })
+        );
+        assert_eq!(
+            settings(Some("kelly"), None, None).sizing_mode(fallback),
+            Ok(SizingMode::Kelly)
+        );
+        assert!(
+            settings(Some("cash_fraction:0.00375"), None, None)
+                .sizing_mode(fallback)
+                .is_err()
         );
     }
 
@@ -14471,6 +14714,7 @@ mod tests {
                     copy_latency_kill_switch_active: false,
                     proposed_trade_bps: BasisPoints(0),
                     per_trade_cap_bps: 25,
+                    drawdown_policy: pe_risk_engine::DrawdownPolicy::Stops,
                     concentration_caps: None,
                 },
                 decision: RiskDecisionAudit::Approved,
@@ -14777,6 +15021,7 @@ mod tests {
                     market_id: Some(projection.market_id.clone()),
                     proposed_debit: prepared.economic.balance.worst_case_debit,
                     per_trade_cap_bps: 10_000,
+                    drawdown_policy: pe_risk_engine::DrawdownPolicy::Stops,
                 },
             )
             .unwrap();
@@ -18492,6 +18737,7 @@ mod tests {
                 copy_latency_kill_switch_active: false,
                 proposed_trade_bps: BasisPoints(2_501),
                 per_trade_cap_bps: 10_000,
+                drawdown_policy: pe_risk_engine::DrawdownPolicy::Stops,
                 concentration_caps: None,
             },
             decision: RiskDecisionAudit::Approved,
