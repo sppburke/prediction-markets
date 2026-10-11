@@ -40,6 +40,7 @@ fn fixtures(
                 window,
                 category: c,
                 limit: top_n,
+                offset: 0,
             };
             map.insert(ep.url(BASE), bytes.clone());
         }

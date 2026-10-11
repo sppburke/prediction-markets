@@ -63,6 +63,7 @@ impl<F: PageFetcher + Send + Sync> LeaderboardFetcher<F> {
             window,
             category,
             limit,
+            offset: 0,
         };
         let url = ep.url(&self.base_url);
         let bytes =
@@ -219,6 +220,7 @@ mod tests {
                     window,
                     category,
                     limit: top_n,
+                    offset: 0,
                 };
                 map.insert(ep.url(BASE), bytes.clone());
             }
@@ -270,6 +272,7 @@ mod tests {
                 window,
                 category: LeaderboardCategory::Overall,
                 limit: 50,
+                offset: 0,
             };
             responses.insert(ep.url(BASE), b"[]".to_vec());
         }
@@ -312,6 +315,7 @@ mod tests {
             window: LeaderboardWindow::Monthly,
             category: LeaderboardCategory::Overall,
             limit: 50,
+            offset: 0,
         };
         assert_eq!(
             ep.url("https://data-api.polymarket.com"),
@@ -322,6 +326,7 @@ mod tests {
             window: LeaderboardWindow::Day,
             category: LeaderboardCategory::Crypto,
             limit: 50,
+            offset: 0,
         };
         assert_eq!(
             ep2.url("https://data-api.polymarket.com"),
