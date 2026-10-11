@@ -15,9 +15,9 @@ env:
 # (test_activate_generation.sh and test_activate_financial_era.sh) were ~16 min each, because
 # both replay the real activation driver once per crash boundary.
 #
-# Splitting by owner turns sum() into max(). The two activation suites use three financial-era
-# shards and two generation shards. Neither suite invokes cargo, so those jobs skip the
-# toolchain, the cargo tools, the build cache and the disk reclaim entirely.
+# Splitting by owner turns sum() into max(). The two activation suites use six financial-era
+# shards and three generation shards. Neither suite invokes cargo, so those jobs skip the
+# toolchain, the cargo tools and the build cache.
 #
 # Measured again on 2026-09-18 (#664): pull requests waited about 26 min, set by the financial-era
 # suite (25 min) although neither activation suite reads anything under crates/. Pull requests now
@@ -94,17 +94,12 @@ jobs:
         with:
           python-version: "3.11"
 
-      # The Rust target/ plus the (#397) redundant `pe-service --features scenario` re-link can
-      # exhaust the runner root fs; that surfaces as `ld ... signal 7 [Bus error]` while linking
-      # (a full-fs mmap fault, not OOM). Adding the #421 Python deps (arch/statsmodels) tipped it
-      # over, so reclaim the preinstalled SDKs this job never uses (~tens of GB). df -h is kept as
-      # a diagnostic so disk headroom is visible in the log.
-      - name: Free disk space
-        run: |
-          df -h /
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
-            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/share/powershell || true
-          df -h /
+      # Hosted runners now start with ~86 GiB free, and a fresh full workspace test build peaks at
+      # ~36 GiB (measured 10/11), so the preinstalled-SDK reclaim (53-160 s per Rust job) is gone. A
+      # full disk shows up as `ld ... signal 7 [Bus error]` while linking; if that returns, restore
+      # the reclaim from this step's history. df -h stays so disk headroom is visible in the log.
+      - name: Disk space
+        run: df -h /
 
       - name: Install pinned toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -143,12 +138,14 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - suite: nextest 1/3
+          - suite: nextest 1/4
             shard: 1
-          - suite: nextest 2/3
+          - suite: nextest 2/4
             shard: 2
-          - suite: nextest 3/3
+          - suite: nextest 3/4
             shard: 3
+          - suite: nextest 4/4
+            shard: 4
           - suite: doc
     steps:
       - uses: actions/checkout@v4
@@ -161,12 +158,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Free disk space
-        run: |
-          df -h /
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
-            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/share/powershell || true
-          df -h /
+      - name: Disk space
+        run: df -h /
 
       - name: Install pinned toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -203,7 +196,7 @@ jobs:
         if: matrix.suite != 'doc'
         env:
           SHARD: ${{ matrix.shard }}
-        run: cargo nextest run --workspace --all-features --partition "hash:${SHARD}/3" -E 'not (binary_id(pe-service::scenario_golden_stream_v1) | binary_id(pe-service::scenario_deployed_flow))'
+        run: cargo nextest run --workspace --all-features --partition "hash:${SHARD}/4" -E 'not (binary_id(pe-service::scenario_golden_stream_v1) | binary_id(pe-service::scenario_deployed_flow))'
 
       - name: Doc tests
         if: matrix.suite == 'doc'
@@ -217,12 +210,8 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Free disk space
-        run: |
-          df -h /
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
-            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/share/powershell || true
-          df -h /
+      - name: Disk space
+        run: df -h /
 
       - name: Install pinned toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -280,7 +269,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2]
+        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -293,7 +282,8 @@ jobs:
 
       - run: bash scripts/deploy/test_activate_generation.sh
         env:
-          SHARD: "${{ matrix.shard }}/2"
+          SHARD: "${{ matrix.shard }}/3"
+          PE_ACTIVATION_TEST_VERBOSE: "1"
 
   activation-financial:
     name: financial-era activation scenarios
@@ -303,7 +293,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3]
+        shard: [1, 2, 3, 4, 5, 6]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -316,7 +306,7 @@ jobs:
 
       - run: bash scripts/paper_reset/test_activate_financial_era.sh
         env:
-          SHARD: "${{ matrix.shard }}/3"
+          SHARD: "${{ matrix.shard }}/6"
 
   postgres:
     name: Postgres scenarios
@@ -346,12 +336,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Free disk space
-        run: |
-          df -h /
-          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
-            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/local/share/powershell || true
-          df -h /
+      - name: Disk space
+        run: df -h /
 
       - name: Install pinned toolchain
         uses: dtolnay/rust-toolchain@stable
