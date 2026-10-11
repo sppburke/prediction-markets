@@ -2048,6 +2048,9 @@ assert rows["final_status_sha256"] == hashlib.sha256(open(sys.argv[2],"rb").read
 PY
 done
 
+fi
+
+if shard_owns 5; then
 # Scenario REHEARSAL-FINAL-STATUS-INVALID-09C: every malformed, stale, unsafe, or non-final shape
 # refuses PASS independently of the preserved-file digest (#586).
 final_status_cases=(
@@ -2146,6 +2149,9 @@ for path in states:
     assert int(os.stat(path).st_mtime) <= signal_unix, (path, os.stat(path).st_mtime, signal_unix)
 PY
 
+fi
+
+if shard_owns 1; then
 # Scenario REHEARSAL-STALE-QUIESCE-FLAG-09J: a quiesce flag left by an earlier run in the same root is
 # cleared at startup, so a same-revision rerun still reaches PASS (#586 branch review).
 root="$TEST_TMP/rehearsal-stale-quiesce-flag"

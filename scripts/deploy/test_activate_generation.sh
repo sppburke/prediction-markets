@@ -1574,6 +1574,9 @@ rm "$root/test-state/projection-fail"
 activate "$root" activation-557 >/dev/null
 assert_verified "$root" 2
 
+fi
+
+if shard_owns 4; then
 # Verification remains bound to the frozen ranking batch. This drift is non-repairable in place.
 root=$(make_case ranking-batch-drift)
 set +e
