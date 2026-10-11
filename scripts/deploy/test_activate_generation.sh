@@ -1105,9 +1105,6 @@ for phase in started verified; do
   refuse_post_start_process "$phase" exe "running pe-service hash is not the generation hash"
 done
 
-fi
-
-if shard_owns 3; then
 # A pending daemon-reload means the loaded unit may differ from the files on disk: refuse.
 root=$(make_case unit-daemon-reload-pending)
 : > "$root/test-state/daemon-reload-pending"
@@ -1205,6 +1202,9 @@ grep -q 'activation id already used: rows stamped .*; choose a new id' "$root/ol
 [[ "$(sha256sum "$root/pe-activation.json" | awk '{print $1}')" == "$new_manifest_before" ]] ||
   fail "old-id refusal changed the new verified manifest"
 
+fi
+
+if shard_owns 2; then
 # Explicit host-reboot resumes from the durable guarded/reset/switched states.
 for state in guarded reset switched; do
   root=$(make_case "reboot-$state")
@@ -1404,6 +1404,9 @@ for entry in \
   assert_verified "$root"
 done
 
+fi
+
+if shard_owns 3; then
 # A disabled but active generation is refused at both the started and verified proofs.
 for phase in started verified; do
   root=$(make_case "disabled-active-$phase")
@@ -1574,9 +1577,6 @@ rm "$root/test-state/projection-fail"
 activate "$root" activation-557 >/dev/null
 assert_verified "$root" 2
 
-fi
-
-if shard_owns 4; then
 # Verification remains bound to the frozen ranking batch. This drift is non-repairable in place.
 root=$(make_case ranking-batch-drift)
 set +e

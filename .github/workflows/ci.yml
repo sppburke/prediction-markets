@@ -16,7 +16,7 @@ env:
 # both replay the real activation driver once per crash boundary.
 #
 # Splitting by owner turns sum() into max(). The two activation suites use six financial-era
-# shards and four generation shards. Neither suite invokes cargo, so those jobs skip the
+# shards and three generation shards. Neither suite invokes cargo, so those jobs skip the
 # toolchain, the cargo tools and the build cache.
 #
 # Measured again on 2026-09-18 (#664): pull requests waited about 26 min, set by the financial-era
@@ -265,7 +265,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -278,7 +278,7 @@ jobs:
 
       - run: bash scripts/deploy/test_activate_generation.sh
         env:
-          SHARD: "${{ matrix.shard }}/4"
+          SHARD: "${{ matrix.shard }}/3"
           PE_ACTIVATION_TEST_VERBOSE: "1"
 
   activation-financial:
