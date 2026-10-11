@@ -2400,6 +2400,9 @@ set -e
   fail "traded era did not durably record verified"
 echo "PASS: FE-VERIFY-70"
 
+fi
+
+if shard_owns 4; then
 # Scenario FE-VERIFY-71 — while nothing has traded, the balance is still pinned, in every store.
 # Preconditions: an UNTRADED era (fills zero everywhere) whose cash is wrong in exactly one store.
 # PASS: each store refuses with its own diagnostic. The #628 relaxation made the bankroll assertion
@@ -2439,6 +2442,9 @@ except FileNotFoundError: print("absent")' "$root/pe-financial-era.json") != ver
 done
 echo "PASS: FE-VERIFY-71"
 
+fi
+
+if shard_owns 1; then
 # Scenario FE-VERIFY-72 — an installed bind on the unspecified address is probed on loopback (#545).
 # Preconditions: the adopted target environment binds `0.0.0.0:18080`, the production shape
 #   (`PE_BIND=0.0.0.0:8080`), which every earlier proof of this step sidestepped: the rehearsal
@@ -2478,6 +2484,9 @@ except FileNotFoundError: print("absent")' "$root/pe-financial-era.json")
 done
 echo "PASS: FE-VERIFY-72"
 
+fi
+
+if shard_owns 3; then
 # Scenario FE-VERIFY-73 — membership is continuity, not stasis (#545 attempt 17). The service's own
 # #350 knockout evicted a prepared member 3.5 h after Start, audited in wallet_lifecycle_events, and
 # the frozen equality refused a healthy era for good.
@@ -2518,6 +2527,9 @@ for case in \
 done
 echo "PASS: FE-VERIFY-73"
 
+fi
+
+if shard_owns 1; then
 # Scenario FE-PREFLIGHT-66 — the decisive one: clean before the stop, dirty because of it (#618).
 # Preconditions: the status is clean when the earlier rollback-check and the pre-stop preflight read
 #   it; the shutdown write then records `stale: true` — the #545 attempt-15 shape.
@@ -3782,6 +3794,9 @@ assert_restored_sqlite "$root"
   fail "WAL-only rollback did not restore/start exactly once"
 echo 'PASS: FE-ROLLBACK-WAL-ONLY-10'
 
+fi
+
+if shard_owns 4; then
 # Scenario FE-ROLLBACK-STALE-RECEIPTS-11
 # PASS: skipped/restored receipts never bypass physical restore, including a backup-equal main
 # with stale WAL and a main with no sidecars but no restore intent; a clean main with restore intent
@@ -3826,6 +3841,9 @@ PY
 done
 echo 'PASS: FE-ROLLBACK-STALE-RECEIPTS-11'
 
+fi
+
+if shard_owns 3; then
 # Scenario FE-ROLLBACK-RESTORE-RETRY-12
 # PASS: every restore receipt boundary, replacement-before-sidecar-cleanup and SHM-only interruption
 # converges without duplicate archive restoration or old start. FAIL: stale WAL certifies completion.
@@ -3875,6 +3893,9 @@ for boundary in "${wal_restore_boundaries[@]}"; do
 done
 echo 'PASS: FE-ROLLBACK-RESTORE-RETRY-12'
 
+fi
+
+if shard_owns 2; then
 # Scenario FE-ROLLBACK-RESUMED-WRITES-13
 # PASS: active old service retains legitimate WAL/log suffix writes with or without a completed
 # start receipt; pre-systemctl start-intent retry accepts only an untouched restored image;

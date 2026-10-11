@@ -810,7 +810,9 @@ for state in "${manifest_boundaries[@]}"; do
   run_crash_case "$state"
   run_crash_case "after-manifest-$state"
 done
+fi
 
+if shard_owns 1; then
 artifact_boundaries=(
   seed-main seed-paper-log seed-live-journal seed-source-log seed-history seed-history-hashes
   stage-binary rendered-config rendered-rehearsal-config rendered-env rendered-rehearsal-env
@@ -821,10 +823,7 @@ artifact_boundaries=(
   adopted-config adopted-env adopted-binary db-commit service-started
 )
 for boundary in "${artifact_boundaries[@]}"; do run_crash_case "$boundary"; done
-(( SHARD_TOTAL == 1 )) || echo "activation crash matrix: PASS"
-fi
 
-if shard_owns 1; then
 # The production lock is provisioned out of band; an absent lock fails before any state is created.
 root=$(make_case lock-absent)
 rm "$root/.pe-deploy.lock"
@@ -1106,6 +1105,9 @@ for phase in started verified; do
   refuse_post_start_process "$phase" exe "running pe-service hash is not the generation hash"
 done
 
+fi
+
+if shard_owns 3; then
 # A pending daemon-reload means the loaded unit may differ from the files on disk: refuse.
 root=$(make_case unit-daemon-reload-pending)
 : > "$root/test-state/daemon-reload-pending"
@@ -2109,6 +2111,7 @@ for state in reset switched started verified; do
   [[ "$state" != started && "$state" != verified ]] || expected_starts=2
   assert_rolled_back "$root" true "$expected_starts"
 done
+fi
 
 if shard_owns 2; then
 # Release-2 census: a known pe-service binary (by path), a renamed copy of one (by size and hash) and a process
@@ -2161,7 +2164,8 @@ PYCHECK
 echo "release-2 process census: PASS"
 fi
 
-(( SHARD_TOTAL > 1 )) || echo "activation crash matrix: PASS"
+if [[ "$SHARD_TOTAL" == 1 ]]; then
+echo "activation crash matrix: PASS"
 echo "archive stamp exactly once and fresh service starts at most once: PASS"
 echo "rollback durable-fact restore and forward-refusal matrix: PASS"
 echo "lock, preflight, invocation, batch, site, and reboot: PASS"
@@ -2169,4 +2173,6 @@ echo "post-start refusal stop, disable, rewind, audit, and rerun-or-rollback rec
 echo "process cwd, stable snapshot, and exact environment ownership: PASS"
 echo "strict environment grammar and loader-control refusal: PASS"
 echo "Forge pause tri-state, live status proof, and serialization: PASS"
+else
+  echo "PASS: generation shard $SHARD"
 fi
