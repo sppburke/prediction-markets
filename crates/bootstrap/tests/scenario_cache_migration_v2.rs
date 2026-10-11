@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use pe_bootstrap::BootstrapConfig;
-use pe_bootstrap::cache::{RankerPageStatus, RankerPricePage, WalletCache};
+use pe_bootstrap::cache::WalletCache;
 use pe_bootstrap::cache_migration::{
     CacheActivationRequest, CacheFinalStageRecord, CacheV2BuildManifest, FrozenCacheFreshness,
     FrozenPayloadReference, PriorCacheBinding, PublicationConsumptionProbe,
@@ -830,7 +830,7 @@ class Response:
 def urlopen(request, timeout=30):
     url = request.full_url
     if "/rpc/publish_ranking_batch" in url: return Response(7)
-    if "/latest_ranking" in url:
+    if "/latest_ranking" in url or "/ranking_entries" in url:
         return Response([{"batch_id": 7, "rank": 1, "survives": None}])
     if "/ranking_batches?" in url: return Response([])
     raise RuntimeError("unexpected fixture URL: " + url)
@@ -2234,119 +2234,6 @@ fn classifier_projection_rows(path: &std::path::Path) -> Vec<(String, i64, i64)>
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap()
-}
-
-#[tokio::test]
-async fn refinalization_reuses_projection_after_targeted_price_write() {
-    let dir = TempDir::new().unwrap();
-    let side = dir.path().join("side.db");
-    let frozen = retained_classifier_activity_at_version(&dir, &side, 3).await;
-    let stage_path = dir.path().join("initial-stage.json");
-    let first: CacheFinalStageRecord =
-        serde_json::from_slice(&std::fs::read(&stage_path).unwrap()).unwrap();
-    let rows_before = serde_json::to_vec(&classifier_projection_rows(&side)).unwrap();
-    assert_eq!(first.ranker_projection_count, 2);
-    assert_eq!(
-        first.ranker_projection_digest,
-        reference_projection_digest(&side)
-    );
-
-    let connection = Connection::open(&side).unwrap();
-    // A rebuild deletes these two real entries before classifying. Exercise the
-    // guard now so later success cannot be a vacuous test of an empty projection.
-    connection
-        .execute_batch(
-            "CREATE TRIGGER forbid_projection_rebuild BEFORE DELETE ON ranker_entries_v2
-         BEGIN SELECT RAISE(ABORT, 'projection rebuild forbidden by scenario'); END;",
-        )
-        .unwrap();
-    let error = connection
-        .execute("DELETE FROM ranker_entries_v2", [])
-        .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("projection rebuild forbidden by scenario")
-    );
-    // Removing a real receipt makes full activity verification impossible while
-    // leaving its installed manifest and every projected row intact.
-    assert_eq!(
-        connection
-            .execute("DELETE FROM activity_wallet_coverage_staging_v2", [])
-            .unwrap(),
-        1
-    );
-    drop(connection);
-    let verification = populate_activity_v2(
-        &collection_config(&side),
-        &FixtureFetcher::new(HashMap::new()),
-        "https://data.example",
-        &frozen,
-        CLASSIFIER_FIXED_END,
-        7,
-        CLASSIFIER_FIXED_END + 3,
-    )
-    .await;
-    assert!(
-        verification.is_err(),
-        "full activity verification must need the deleted receipt"
-    );
-    let before_price_sha256 = sha256_file(&side).unwrap();
-
-    let mut cache = WalletCache::open(&side).unwrap();
-    cache
-        .commit_ranker_price_page(
-            &RankerPricePage {
-                token_id: "123".to_owned(),
-                start_ts: CLASSIFIER_FIXED_END - 60,
-                end_ts: CLASSIFIER_FIXED_END,
-                fidelity_minutes: 1,
-                status: RankerPageStatus::Complete,
-                point_count: 1,
-                raw_sha256: "ab".repeat(32),
-                source_id: "polymarket-clob-prices-history".to_owned(),
-                schema_version: 1,
-                parser_version: 1,
-                observed_at_unix: CLASSIFIER_FIXED_END + 3,
-                fetched_at_unix: CLASSIFIER_FIXED_END + 3,
-                request_envelope: "https://clob.example/prices-history?market=123".to_owned(),
-            },
-            &[(CLASSIFIER_FIXED_END - 30, "0.55".to_owned())],
-        )
-        .unwrap();
-    drop(cache);
-    assert_ne!(
-        sha256_file(&side).unwrap(),
-        before_price_sha256,
-        "the price write must change the artifact"
-    );
-
-    let second = finalize_cache_v2(&side, Some(&stage_path), CLASSIFIER_FIXED_END + 4)
-        .unwrap()
-        .unwrap();
-    let recorded: CacheFinalStageRecord =
-        serde_json::from_slice(&std::fs::read(stage_path).unwrap()).unwrap();
-    assert_eq!(recorded, second);
-    assert_ne!(second.cache_sha256, first.cache_sha256);
-    assert_eq!(second.cache_sha256, sha256_file(&side).unwrap());
-    assert_eq!(
-        second.ranker_projection_count,
-        first.ranker_projection_count
-    );
-    assert_eq!(
-        second.ranker_projection_digest,
-        first.ranker_projection_digest
-    );
-    assert_eq!(
-        second.ranker_projection_digest,
-        reference_projection_digest(&side)
-    );
-    assert_eq!(
-        serde_json::to_vec(&classifier_projection_rows(&side)).unwrap(),
-        rows_before
-    );
-    assert!(!side.with_extension("db-wal").exists());
-    assert!(!side.with_extension("db-shm").exists());
 }
 
 #[tokio::test]
@@ -13770,9 +13657,9 @@ async fn incremental_interrupted_v2_resume_preserves_identity_and_receipts() {
     assert_eq!(serde_json::from_str::<Value>(&archive).unwrap(), identity);
 }
 // PASS: certification without a record survives resume and the later record binds
-// targeted price writes; FAIL: a record appears early or binds the earlier bytes.
+// the certified export; FAIL: a record appears early or binds different inputs.
 #[tokio::test]
-async fn finalization_without_stage_record_resumes_and_binds_price_writes() {
+async fn finalization_without_stage_record_resumes_and_binds_export() {
     let dir = TempDir::new().unwrap();
     let side = dir.path().join("no-record.db");
     prepare_fresh_initial(&dir, &side).await;
@@ -13791,7 +13678,6 @@ async fn finalization_without_stage_record_resumes_and_binds_price_writes() {
         1
     );
     assert!(!side.with_extension("db-wal").exists());
-    let old_hash = sha256_file(&side).unwrap();
     let projection = classifier_projection_rows(&side);
     let no_reads = DatasetFetcher::default();
     populate_activity_fresh_v2(
@@ -13805,32 +13691,24 @@ async fn finalization_without_stage_record_resumes_and_binds_price_writes() {
     .await
     .unwrap();
     assert!(no_reads.calls.lock().unwrap().is_empty());
-    WalletCache::open(&side)
-        .unwrap()
-        .commit_ranker_price_page(
-            &RankerPricePage {
-                token_id: "123".to_owned(),
-                start_ts: FRESH_END - 60,
-                end_ts: FRESH_END,
-                fidelity_minutes: 1,
-                status: RankerPageStatus::Complete,
-                point_count: 1,
-                raw_sha256: "ab".repeat(32),
-                source_id: "polymarket-clob-prices-history".to_owned(),
-                schema_version: 1,
-                parser_version: 1,
-                observed_at_unix: FRESH_END + 3,
-                fetched_at_unix: FRESH_END + 3,
-                request_envelope: "https://clob.example/prices-history?market=123".to_owned(),
-            },
-            &[(FRESH_END - 30, "0.55".to_owned())],
-        )
-        .unwrap();
     let finalized = finalize_cache_v2(&side, Some(&record), FRESH_END + 4)
         .unwrap()
         .unwrap();
+    assert_eq!(
+        finalized.export_manifest_sha256,
+        Some(
+            sha256_file(
+                &side
+                    .with_extension("fixture-parquet")
+                    .join("cache-export-v2.json")
+            )
+            .unwrap()
+        )
+    );
+    let export_projection = finalized.export_projection.as_ref().unwrap();
+    assert_eq!(export_projection.count, finalized.ranker_projection_count);
+    assert_eq!(export_projection.digest, finalized.ranker_projection_digest);
     assert_eq!(finalized.cache_sha256, sha256_file(&side).unwrap());
-    assert_ne!(finalized.cache_sha256, old_hash);
     assert_eq!(classifier_projection_rows(&side), projection);
     assert_eq!(
         serde_json::from_slice::<CacheFinalStageRecord>(&std::fs::read(record).unwrap()).unwrap(),
@@ -13894,12 +13772,11 @@ async fn staging_interruption_refuses_source_drift_and_checks_before_copying() {
         std::fs::remove_file(blocked).unwrap();
     }
 }
-type PublicationPricePoints = Vec<(String, i64, String)>;
+const PUBLICATION_PRINT_WALLET: &str = "0x5555555555555555555555555555555555555555";
 
-fn publication_dataset(now: i64, quiet: &str) -> (Vec<Value>, Vec<Value>, PublicationPricePoints) {
+fn publication_dataset(now: i64, quiet: &str) -> (Vec<Value>, Vec<Value>) {
     let mut rows = Vec::new();
     let mut markets = Vec::new();
-    let mut points = Vec::new();
     let old = now - 40 * 86_400;
     for index in 0..20 {
         let market = format!("0x{:064x}", index + 100);
@@ -13907,7 +13784,11 @@ fn publication_dataset(now: i64, quiet: &str) -> (Vec<Value>, Vec<Value>, Public
         let entry = old + index * 3600;
         let price = format!("0.{:02}", 20 + index);
         let reference = format!("0.{:02}", 25 + index);
-        for (wallet, epoch) in [(WALLET, entry), (quiet, old + (19 - index) * 10)] {
+        for (wallet, epoch) in [
+            (WALLET, entry),
+            (quiet, old + (19 - index) * 10),
+            (PUBLICATION_PRINT_WALLET, entry + 2),
+        ] {
             let mut row = dataset_row(
                 wallet,
                 &market,
@@ -13917,16 +13798,25 @@ fn publication_dataset(now: i64, quiet: &str) -> (Vec<Value>, Vec<Value>, Public
             );
             row["asset"] = Value::from(token.clone());
             row["size"] = Value::from("10");
-            row["usdcSize"] =
-                Value::from(format!("{}.{:01}", (20 + index) / 10, (20 + index) % 10));
-            row["price"] = Value::from(price.clone());
+            let entry_price = if wallet == PUBLICATION_PRINT_WALLET {
+                &reference
+            } else {
+                &price
+            };
+            row["price"] = Value::from(entry_price.clone());
+            // USDC exceeds principal by more than the taker-print proxy threshold.
+            row["usdcSize"] = Value::from(if wallet == PUBLICATION_PRINT_WALLET {
+                format!("{}.{:02}", (25 + index) / 10, ((25 + index) % 10) * 10 + 1)
+            } else {
+                format!("{}.{:02}", (20 + index) / 10, ((20 + index) % 10) * 10 + 1)
+            });
             rows.push(row);
-            points.push((token.clone(), epoch + 2, reference.clone()));
         }
-        let scheduled = time::OffsetDateTime::from_unix_timestamp(entry + 7200)
-            .unwrap()
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap();
+        let scheduled =
+            time::OffsetDateTime::from_unix_timestamp(entry.div_euclid(86_400) * 86_400)
+                .unwrap()
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap();
         markets.push(serde_json::json!({"condition_id":market,"active":false,"closed":true,
             "end_date_iso":scheduled,"is_50_50_outcome":false,
             "tokens":[{"token_id":token,"outcome":"Yes","price":"1","winner":true},
@@ -13935,7 +13825,17 @@ fn publication_dataset(now: i64, quiet: &str) -> (Vec<Value>, Vec<Value>, Public
     let mut fresh = dataset_row(WALLET, "0xff", "fresh-unprojected", "BUY", now - 3600);
     fresh["asset"] = Value::from("9000");
     rows.push(fresh);
-    (rows, markets, points)
+    // Keep print history in every certified head while its wallet is idle at publication.
+    let mut print_activity = dataset_row(
+        PUBLICATION_PRINT_WALLET,
+        "0xff",
+        "print-unprojected",
+        "BUY",
+        now - 5 * 86_400,
+    );
+    print_activity["asset"] = Value::from("9000");
+    rows.push(print_activity);
+    (rows, markets)
 }
 
 fn publication_payouts(path: &std::path::Path, markets: &[Value], now: i64) {
@@ -13985,12 +13885,12 @@ async fn quiet_wallet_deferral_preserves_exact_publication_entries() {
     let now = FRESH_END;
     let phase = (-(now + 3 * 86_400)).rem_euclid(604_800);
     let quiet = format!("0x{}{:012x}", "22".repeat(14), phase);
-    let deferred = dataset_candidate(&dir, "deferring.db", &[&quiet]);
+    let deferred = dataset_candidate(&dir, "deferring.db", &[&quiet, PUBLICATION_PRINT_WALLET]);
     let source = DatasetFetcher {
         rows: publication_dataset(now, &quiet).0,
         ..Default::default()
     };
-    let (_, markets, points) = publication_dataset(now, &quiet);
+    let (_, markets) = publication_dataset(now, &quiet);
     for (generation, end) in [(1, now - 100), (2, now - 90)] {
         populate_activity_fresh_v2(
             &deferred,
@@ -14052,32 +13952,6 @@ async fn quiet_wallet_deferral_preserves_exact_publication_entries() {
     ];
     for (path, record) in [(&deferred, &records[0]), (&control, &records[1])] {
         publication_payouts(path, &markets, now);
-        let mut cache = WalletCache::open(path).unwrap();
-        for (token, epoch, price) in &points {
-            cache
-                .commit_ranker_price_page(
-                    &RankerPricePage {
-                        token_id: token.clone(),
-                        start_ts: epoch - 121,
-                        end_ts: epoch + 1,
-                        fidelity_minutes: 1,
-                        status: RankerPageStatus::Complete,
-                        point_count: 1,
-                        raw_sha256: "ab".repeat(32),
-                        source_id: "polymarket-clob-prices-history".to_owned(),
-                        schema_version: 1,
-                        parser_version: 1,
-                        observed_at_unix: now,
-                        fetched_at_unix: now,
-                        request_envelope: format!(
-                            "https://clob.example/prices-history?market={token}"
-                        ),
-                    },
-                    &[(*epoch, price.clone())],
-                )
-                .unwrap();
-        }
-        drop(cache);
         finalize_cache_v2(path, Some(record), now + 1)
             .unwrap()
             .unwrap();
@@ -14142,7 +14016,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
         "22".repeat(14),
         (-(now + 3 * 86_400)).rem_euclid(604_800)
     );
-    let (mut rows, mut markets, mut points) = publication_dataset(now, &quiet);
+    let (mut rows, mut markets) = publication_dataset(now, &quiet);
     let mut conversion = dataset_row(WALLET, "0xe", "wrapper-conversion", "BUY", now - 220);
     conversion["type"] = Value::from("CONVERSION");
     conversion["asset"] = Value::from("8000");
@@ -14165,9 +14039,21 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
     let fixed = data.join("wallet_cache.db");
     let mut cache = seed_v1(&fixed, now - 300);
     cache
-        .upsert_wallets_bulk(&[(quiet.clone(), SRC_TRADES, false, None, None, None, 0)])
+        .upsert_wallets_bulk(&[
+            (quiet.clone(), SRC_TRADES, false, None, None, None, 0),
+            (
+                PUBLICATION_PRINT_WALLET.to_owned(),
+                SRC_TRADES,
+                false,
+                None,
+                None,
+                None,
+                0,
+            ),
+        ])
         .unwrap();
     cache.conn_for_test_set_active(&quiet, 1);
+    cache.conn_for_test_set_active(PUBLICATION_PRINT_WALLET, 1);
     drop(cache);
     if !bulk_root {
         let build = write_build_manifest(&dir, &fixed);
@@ -14178,7 +14064,12 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
         std::fs::write(&build, serde_json::to_vec(&manifest).unwrap()).unwrap();
         migrate_cache_v2(&fixed, &build).unwrap();
         // AC5 / Change 2: a historical format-two head transitions in the first real cycle.
-        history_v3_freeze_legacy_root_at(&fixed, &[WALLET, &quiet], 1, now - 240);
+        history_v3_freeze_legacy_root_at(
+            &fixed,
+            &[WALLET, &quiet, PUBLICATION_PRINT_WALLET],
+            1,
+            now - 240,
+        );
         populate_activity_fresh_v2(
             &fixed,
             &DatasetFetcher {
@@ -14203,7 +14094,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
             1
         );
         assert!(finalize_cache_v2_unbound(&fixed, None, now - 237).is_ok());
-        assert_eq!(classifier_projection_rows(&fixed).len(), 40);
+        assert_eq!(classifier_projection_rows(&fixed).len(), 60);
     }
     // AC8 / Decision 1: these defects are acquired only under acquisition three, beside valid BUYs.
     let scoped_row = |market: &str, token: &str, id: &str, epoch: i64| {
@@ -14270,7 +14161,6 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
                 .format(&time::format_description::well_known::Rfc3339).unwrap(),
             "tokens":[{"token_id":token.to_string(),"outcome":"Yes","price":"1","winner":true},
                 {"token_id":(token + 1).to_string(),"outcome":"No","price":"0","winner":false}]}));
-        points.push((token.to_string(), epoch + 2, "0.55".to_owned()));
     }
     if bulk_root && !legacy_root {
         // AC5: a raw-only market-less SPLIT beside a valid BUY reaches the new root's pass.
@@ -14378,18 +14268,6 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
                     "200 OK",
                     serde_json::json!({"data":markets,"next_cursor":"LTE="}),
                 ),
-                "/prices-history" => {
-                    let start = query["startTs"].parse::<i64>().unwrap();
-                    let end = query["endTs"].parse::<i64>().unwrap();
-                    let history = points
-                        .iter()
-                        .filter(|(token, epoch, _)| {
-                            token == &query["market"] && *epoch > start && *epoch < end
-                        })
-                        .map(|(_, epoch, price)| serde_json::json!({"t":epoch,"p":price}))
-                        .collect::<Vec<_>>();
-                    ("200 OK", serde_json::json!({"history":history}))
-                }
                 "/rest/v1/rpc/publish_ranking_batch_v2" => {
                     let payload: Value =
                         serde_json::from_slice(&request[header_end..header_end + content_length])
@@ -14398,7 +14276,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
                     batches.push(payload);
                     ("200 OK", Value::from(u64::try_from(batches.len()).unwrap()))
                 }
-                "/rest/v1/latest_ranking" => {
+                "/rest/v1/latest_ranking" | "/rest/v1/ranking_entries" => {
                     let batches = server_batches.lock().unwrap();
                     let latest = batches.last().map_or(Vec::new(), |batch| {
                         batch["p_entries"]
@@ -14454,7 +14332,7 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
     )
     .unwrap();
     std::fs::write(dir.path().join(".env"), format!(
-        "SUPABASE_URL=http://{address}\nSUPABASE_SECRET_KEY=fixture-key\nPE_POLYMARKET_BASE_URL=http://{address}\nPE_CLOB_BASE_URL=http://{address}\nPE_GAMMA_BASE_URL=http://{address}\nPE_BOOTSTRAP_LEADERBOARD_BASE_URL=http://{address}\nPE_BOOTSTRAP_LEADERBOARD_CATEGORIES='[\"OVERALL\"]'\nPE_BOOTSTRAP_LEADERBOARD_REQUEST_INTERVAL_MS=0\nPE_BOOTSTRAP_DATADASH_API_URL=\nPE_BOOTSTRAP_PRICES_HISTORY_MIN_INTERVAL_MS=0\nPE_BOOTSTRAP_OUTPUT={}\nPE_RANK_SCHEMA_TWO_CUTOVER=1\nPE_RANKER_ENGINE=duck\n",
+        "SUPABASE_URL=http://{address}\nSUPABASE_SECRET_KEY=fixture-key\nPE_POLYMARKET_BASE_URL=http://{address}\nPE_CLOB_BASE_URL=http://{address}\nPE_GAMMA_BASE_URL=http://{address}\nPE_BOOTSTRAP_LEADERBOARD_BASE_URL=http://{address}\nPE_BOOTSTRAP_LEADERBOARD_CATEGORIES='[\"OVERALL\"]'\nPE_BOOTSTRAP_LEADERBOARD_REQUEST_INTERVAL_MS=0\nPE_BOOTSTRAP_DATADASH_API_URL=\nPE_BOOTSTRAP_OUTPUT={}\nPE_RANK_SCHEMA_TWO_CUTOVER=1\nPE_RANKER_ENGINE=duck\n",
         dir.path().join("watchlist.json").display())).unwrap();
     let python = Command::new("python3")
         .args(["-c", "import sys; print(sys.executable)"])
@@ -14545,7 +14423,12 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
     if legacy_root {
         let (out, side, _, build) = prepare_cycle(0);
         migrate_cache_v2(&side, &build).unwrap();
-        history_v3_freeze_legacy_root_at(&side, &[WALLET, &quiet], 1, now - 240);
+        history_v3_freeze_legacy_root_at(
+            &side,
+            &[WALLET, &quiet, PUBLICATION_PRINT_WALLET],
+            1,
+            now - 240,
+        );
         Connection::open(&side)
             .unwrap()
             .execute_batch(
@@ -14815,8 +14698,8 @@ async fn real_wrapper_publications(scenario: PublicationScenario) {
                 ),
                 0
             );
-            let exported = Command::new("python3").args(["-c", "import duckdb,sys; rows=duckdb.connect().execute('SELECT DISTINCT wallet_hex FROM read_parquet(?)', [sys.argv[1]]).fetchall(); assert rows == [(sys.argv[2],)], rows"])
-                .arg(data.join("parquet/projection.parquet")).arg(WALLET).output().unwrap();
+            let exported = Command::new("python3").args(["-c", "import duckdb,sys; rows=duckdb.connect().execute('SELECT DISTINCT wallet_hex FROM read_parquet(?)', [sys.argv[1]]).fetchall(); assert set(rows) == {(sys.argv[2],), (sys.argv[3],)}, rows"])
+                .arg(data.join("parquet/projection.parquet")).arg(WALLET).arg(PUBLICATION_PRINT_WALLET).output().unwrap();
             assert!(
                 exported.status.success(),
                 "{}",

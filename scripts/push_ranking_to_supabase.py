@@ -662,7 +662,8 @@ def prepare_publish_request(a: argparse.Namespace, process_now: int) -> dict:
         )
 
     rows.sort(key=key_fn, reverse=True)
-    top = rows[: a.top_n]
+    survivors = sum(_bool(row, "survives") for row in rows)
+    top = rows[: max(a.top_n, survivors)]
     if not top:
         schema_version = 1
         if a.db:
@@ -766,6 +767,31 @@ def _postgres_integer(value, field: str) -> int:
     return int(number)
 
 
+def read_ranking_batch(url: str, key: str, fields: str) -> list[dict]:
+    """Pin the latest batch before traversing its immutable entries in 1,000-row pages."""
+    _, head = _req("GET", f"{url}/rest/v1/latest_ranking?select=batch_id&limit=1", key)
+    if not isinstance(head, list):
+        raise ValueError("latest_ranking snapshot was not an array")
+    if not head:
+        return []
+    batch_id = head[0]["batch_id"]
+    rows = []
+    while True:
+        _, page = _req(
+            "GET", f"{url}/rest/v1/ranking_entries?select=batch_id,{fields}"
+            f"&batch_id=eq.{batch_id}&order=rank.asc&limit=1000&offset={len(rows)}", key,
+        )
+        if (not isinstance(page, list)
+                or any(not isinstance(row, dict) or row.get("batch_id") != batch_id
+                       for row in page)):
+            raise ValueError(f"ranking entries did not expose exact batch {batch_id}")
+        if [row.get("rank") for row in page] != list(range(len(rows) + 1, len(rows) + len(page) + 1)):
+            raise ValueError(f"batch {batch_id} entries omitted or repeated ranks")
+        rows.extend(page)
+        if len(page) < 1000:
+            return rows
+
+
 def publish_request_to_supabase(request: dict, url: str, key: str) -> int:
     validate_publish_request(request)
     if type(request["batch"].get("classifier_version")) is not int:
@@ -794,12 +820,7 @@ def publish_request_to_supabase(request: dict, url: str, key: str) -> int:
     )
 
     # Verify the exact committed epoch, not merely that an older ranking exists.
-    _, latest = _req(
-        "GET",
-        f"{url}/rest/v1/latest_ranking"
-        f"?select=batch_id,rank,survives&order=rank.asc&limit={len(entries)}",
-        key,
-    )
+    latest = read_ranking_batch(url, key, "rank,survives")
     expected_ranks = list(range(1, len(entries) + 1))
     if (
         not isinstance(latest, list)
@@ -908,14 +929,9 @@ def main() -> int:
                   file=sys.stderr)
             return 1
         try:
-            _, current = _req(
-                "GET",
-                f"{url.rstrip('/')}/rest/v1/latest_ranking"
-                "?select=rank,wallet_hex,ls_tstat,survives&order=rank.asc",
-                key,
+            current = read_ranking_batch(
+                url.rstrip('/'), key, "rank,wallet_hex,ls_tstat,survives",
             )
-            if not isinstance(current, list):
-                raise ValueError("latest_ranking snapshot was not an array")
             snapshot = [
                 {
                     "wallet": str(row["wallet_hex"]).lower(),

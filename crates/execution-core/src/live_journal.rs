@@ -2955,6 +2955,7 @@ mod tests {
                         copy_latency_kill_switch_active: false,
                         proposed_trade_bps: BasisPoints::ZERO,
                         per_trade_cap_bps: 100,
+                        drawdown_policy: pe_risk_engine::DrawdownPolicy::Stops,
                         concentration_caps: None,
                     },
                     decision: RiskDecisionAudit::Approved,

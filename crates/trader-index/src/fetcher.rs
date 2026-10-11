@@ -91,6 +91,7 @@ impl<F: PageFetcher> WatchlistFetcher<F> {
             window: LeaderboardWindow::AllTime,
             category: LeaderboardCategory::Overall,
             limit: u32::try_from(self.config.watchlist_size).unwrap_or(u32::MAX),
+            offset: 0,
         }
         .url(&self.config.base_url);
         let bytes =

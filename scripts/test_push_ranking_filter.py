@@ -602,10 +602,10 @@ class PublishRequestTest(unittest.TestCase):
                 ),
                 mock.patch.object(
                     pr, "_req",
-                    return_value=(200, [{
-                        "rank": 1, "wallet_hex": "0xABC", "ls_tstat": 3.5,
+                    side_effect=[(200, [{"batch_id": 42}]), (200, [{
+                        "batch_id": 42, "rank": 1, "wallet_hex": "0xABC", "ls_tstat": 3.5,
                         "survives": True,
-                    }]),
+                    }])],
                 ),
             ):
                 self.assertEqual(pr.main(), 0)
@@ -743,13 +743,14 @@ class PublishRequestTest(unittest.TestCase):
         with mock.patch.object(
             pr,
             "_req",
-            side_effect=[(200, 42), (200, latest)],
+            side_effect=[(200, 42), (200, [{"batch_id": 42}]), (200, latest)],
         ) as request_mock:
             batch_id = pr.publish_request_to_supabase(
                 request, "https://x.supabase.co", "secret"
             )
         self.assertEqual(batch_id, 42)
-        self.assertEqual(request_mock.call_count, 2)
+        self.assertEqual(request_mock.call_count, 3)
+        self.assertIn("/latest_ranking?select=batch_id", request_mock.call_args_list[1].args[1])
         rpc = request_mock.call_args_list[0]
         self.assertEqual(rpc.args[0], "POST")
         self.assertTrue(rpc.args[1].endswith("/rest/v1/rpc/publish_ranking_batch_v2"))
@@ -757,7 +758,25 @@ class PublishRequestTest(unittest.TestCase):
         self.assertNotIn("batch_id", rpc.kwargs["body"]["p_entries"][0])
         self.assertIs(rpc.kwargs["body"]["p_entries"][0]["survives"], True)
         # The post-publication read must ask for the verdict, or it cannot verify it (#518).
-        self.assertIn("survives", request_mock.call_args_list[1].args[1])
+        self.assertIn("survives", request_mock.call_args_list[2].args[1])
+
+    def test_rpc_publication_rejects_an_older_latest_batch(self):
+        # Batch 42 committed but latest_ranking still exposes batch 41: the read-back must fail.
+        request = self._request(keep_batches=0)
+
+        def respond(method, url, key, body=None):
+            if method == "POST":
+                return 200, 42
+            if "/latest_ranking?" in url:
+                return 200, [{"batch_id": 41}]
+            batch = int(url.split("batch_id=eq.")[1].split("&")[0])
+            return 200, [{"batch_id": batch, "rank": 1, "survives": True},
+                         {"batch_id": batch, "rank": 2, "survives": False}]
+
+        with mock.patch.object(pr, "_req", side_effect=respond):
+            with self.assertRaises(ValueError) as caught:
+                pr.publish_request_to_supabase(request, "https://x.supabase.co", "secret")
+        self.assertIn("latest_ranking did not expose exact batch 42", str(caught.exception))
 
     def test_rpc_publication_rejects_a_mismatched_stored_verdict(self):
         # The batch committed, but the stored verdict is not what this request sent — a real
@@ -768,7 +787,7 @@ class PublishRequestTest(unittest.TestCase):
             {"batch_id": 42, "rank": 1, "survives": False},   # submitted True
             {"batch_id": 42, "rank": 2, "survives": False},
         ]
-        with mock.patch.object(pr, "_req", side_effect=[(200, 42), (200, latest)]):
+        with mock.patch.object(pr, "_req", side_effect=[(200, 42), (200, [{"batch_id": 42}]), (200, latest)]):
             with self.assertRaises(ValueError) as caught:
                 pr.publish_request_to_supabase(request, "https://x.supabase.co", "secret")
         self.assertIn("survives", str(caught.exception))
@@ -959,7 +978,7 @@ class ManifestBindingTest(unittest.TestCase):
             "price_band": {"minimum_inclusive": 0.15, "maximum_exclusive": 0.85},
             "scheduled_horizon": {"minimum_secs": 10, "maximum_secs_exclusive": 172800},
             "latency_shift_secs": 2.0,
-            "oracle": "clob-minute-reference",
+            "oracle": "first-entry-taker-print",
             "outputs": {"latency_shift_ranked_sha256": "0" * 64 if tamper else digest},
         }))
         return argparse.Namespace(
@@ -980,6 +999,58 @@ class ManifestBindingTest(unittest.TestCase):
             pr.prepare_publish_request(self._prep(tamper=True), 1_700_000_000)
         self.assertIn("refusing to publish", str(ctx.exception))
         print("PASS: manifest/ranking digest mismatch refuses publication")
+
+    def test_1001_survivors_all_publish_and_read_back_in_two_pages(self):
+        a = self._prep(tamper=False)
+        ranked = Path(a.ranked_csv)
+        # An unsuccessful high scorer must still sort behind every survivor.
+        ranked.write_text("wallet,survives,tstat_net_ls,mean_net_ls,n_filled,fill_rate,hit_rate\n"
+                          "0xfail,False,100,1,20,1,1\n" + "".join(
+                              f"0x{index:040x},True,3.5,0.1,20,0.8,0.6\n" for index in range(1001)))
+        manifest = Path(a.manifest_file)
+        value = json.loads(manifest.read_text())
+        value["outputs"]["latency_shift_ranked_sha256"] = hashlib.sha256(ranked.read_bytes()).hexdigest()
+        manifest.write_text(json.dumps(value))
+        request = pr.prepare_publish_request(a, NOW)
+        self.assertEqual(len(request["entries"]), 1001)
+        self.assertTrue(all(row["survives"] for row in request["entries"]))
+        request = pr.build_publish_request(
+            {**request["batch"], "classifier_version": 6},
+            [{**row, "history_through_unix": NOW, "scope_drops": []} for row in request["entries"]], 0,
+        )
+        latest = [dict(batch_id=42, rank=row["rank"], survives=row["survives"]) for row in request["entries"]]
+        with mock.patch.object(pr, "_req", side_effect=[(200, 42), (200, [{"batch_id": 42}]), (200, latest[:1000]), (200, latest[1000:]), (200, [{"config_hash": request["batch"]["config_hash"]}])]) as rpc:
+            self.assertEqual(pr.publish_request_to_supabase(request, "https://example.test", "test"), 42)
+        for call, offset in zip(rpc.call_args_list[2:4], (0, 1000)):
+            self.assertIn("/ranking_entries?", call.args[1])
+            self.assertIn("batch_id=eq.42", call.args[1])
+            self.assertIn(f"limit=1000&offset={offset}", call.args[1])
+
+    def test_snapshot_1001_rows_pins_one_batch_and_writes_complete_array(self):
+        rows = [dict(batch_id=42, rank=index + 1, wallet_hex=f"0x{index:040x}", ls_tstat=3.5, survives=True)
+                for index in range(1001)]
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "before.json"
+            with mock.patch.object(sys, "argv", ["push", "--snapshot-current", str(output)]), \
+                    mock.patch.dict(os.environ, {"SUPABASE_URL": "https://example.test", "SUPABASE_SECRET_KEY": "test"}), \
+                    mock.patch.object(pr, "_req", side_effect=[(200, [{"batch_id": 42}]), (200, rows[:1000]), (200, rows[1000:])]) as rpc:
+                self.assertEqual(pr.main(), 0)
+            self.assertEqual([row["rank"] for row in json.loads(output.read_text())], list(range(1, 1002)))
+            self.assertIn("latest_ranking?select=batch_id&limit=1", rpc.call_args_list[0].args[1])
+            self.assertTrue(all("batch_id=eq.42" in call.args[1] for call in rpc.call_args_list[1:]))
+
+    def test_pager_rejects_foreign_batch_and_failed_page_without_replacing_snapshot(self):
+        rows = [dict(batch_id=42, rank=index + 1) for index in range(1000)]
+        for later in ((200, [{"batch_id": 43, "rank": 1001}]), ValueError("page failed")):
+            with self.subTest(later=later), tempfile.TemporaryDirectory() as tmp:
+                output = Path(tmp) / "before.json"
+                output.write_text("retained snapshot")
+                with mock.patch.object(sys, "argv", ["push", "--snapshot-current", str(output)]), \
+                        mock.patch.dict(os.environ, {"SUPABASE_URL": "https://example.test", "SUPABASE_SECRET_KEY": "test"}), \
+                        mock.patch.object(pr, "_req", side_effect=[(200, [{"batch_id": 42}]), (200, rows), later]), \
+                        redirect_stderr(io.StringIO()):
+                    self.assertEqual(pr.main(), 1)
+                self.assertEqual(output.read_text(), "retained snapshot")
 
 
 class FormatThreePublicationTest(unittest.TestCase):
@@ -1029,7 +1100,7 @@ class FormatThreePublicationTest(unittest.TestCase):
                           limits["ttr_max_secs"], limits["latency_shift_secs"]), (0.15, 0.85, 10, 172800, 2))
         self.assertTrue(all(type(limits[key]) is int for key in ("ttr_floor_secs", "ttr_max_secs", "latency_shift_secs")))
         latest = [{"batch_id": 42, "rank": 1, "survives": True}]
-        with mock.patch.object(pr, "_req", side_effect=[(200, 42), (200, latest),
+        with mock.patch.object(pr, "_req", side_effect=[(200, 42), (200, [{"batch_id": 42}]), (200, latest),
                                                        (200, [{"config_hash": limits["config_hash"]}])]) as rpc:
             self.assertEqual(pr.publish_request_to_supabase(request, "https://example.test", "test"), 42)
         body = rpc.call_args_list[0].kwargs["body"]

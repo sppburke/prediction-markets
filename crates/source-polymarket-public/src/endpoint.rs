@@ -121,11 +121,13 @@ pub enum PolymarketEndpoint {
     ///
     /// `limit`: entries per request. The API hard-caps this at 50; larger values are
     /// silently truncated server-side (verified live 2026-06-14).
+    /// `offset`: rank offset of the first entry; the official maximum is 1000.
     Leaderboard {
         sort: LeaderboardSort,
         window: LeaderboardWindow,
         category: LeaderboardCategory,
         limit: u32,
+        offset: u32,
     },
     /// Cursor-based trade history for a single wallet via `/activity?type=TRADE`.
     ///
@@ -212,9 +214,10 @@ impl PolymarketEndpoint {
                 window,
                 category,
                 limit,
+                offset,
             } => {
                 format!(
-                    "{base}/v1/leaderboard?orderBy={}&timePeriod={}&category={}&limit={limit}",
+                    "{base}/v1/leaderboard?orderBy={}&timePeriod={}&category={}&limit={limit}&offset={offset}",
                     sort.as_order_by(),
                     window.as_time_period(),
                     category.as_param(),
@@ -332,11 +335,12 @@ mod tests {
             window: LeaderboardWindow::Monthly,
             category: LeaderboardCategory::Overall,
             limit: 50,
+            offset: 0,
         };
         assert_eq!(ep.key(), "leaderboard");
         assert_eq!(
             ep.url("https://data-api.polymarket.com"),
-            "https://data-api.polymarket.com/v1/leaderboard?orderBy=PNL&timePeriod=MONTH&category=OVERALL&limit=50"
+            "https://data-api.polymarket.com/v1/leaderboard?orderBy=PNL&timePeriod=MONTH&category=OVERALL&limit=50&offset=0"
         );
     }
 
@@ -347,10 +351,26 @@ mod tests {
             window: LeaderboardWindow::AllTime,
             category: LeaderboardCategory::Crypto,
             limit: 50,
+            offset: 0,
         };
         assert_eq!(
             ep.url("https://data-api.polymarket.com"),
-            "https://data-api.polymarket.com/v1/leaderboard?orderBy=VOL&timePeriod=ALL&category=CRYPTO&limit=50"
+            "https://data-api.polymarket.com/v1/leaderboard?orderBy=VOL&timePeriod=ALL&category=CRYPTO&limit=50&offset=0"
+        );
+    }
+
+    #[test]
+    fn leaderboard_offset_in_url() {
+        let ep = PolymarketEndpoint::Leaderboard {
+            sort: LeaderboardSort::Profit,
+            window: LeaderboardWindow::Week,
+            category: LeaderboardCategory::Sports,
+            limit: 50,
+            offset: 1000,
+        };
+        assert_eq!(
+            ep.url("https://data-api.polymarket.com"),
+            "https://data-api.polymarket.com/v1/leaderboard?orderBy=PNL&timePeriod=WEEK&category=SPORTS&limit=50&offset=1000"
         );
     }
 

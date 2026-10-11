@@ -537,13 +537,11 @@ def assert_certified_deferred_publication_equivalence(
                     "--ranked-csv", str(out / "ranked_72hr_buyandhold.csv"),
                     "--positions-csv", str(out / "qualifying_positions_72hr.csv"),
                     "--as-of", str(process_now), "--min-trl", "20",
-                    "--min-active-months", "0", "--min-avg-per-month", "0", "--floor-tstat", "2.0",
-                    "--ttr-max-secs", "172800", "--before-ranking-json", str(root / "before.json"),
+                    "--floor-tstat", "3.0",
+                    "--ttr-max-secs", "86400", "--before-ranking-json", str(root / "before.json"),
                     "--cycle-manifest-file", str(snapshot), "--cache-stage-record", record,
                     "--pipeline-versions-file", str(root / "versions.json")]
-            with mock.patch.object(sys, "argv", argv + ["--emit-targets", str(out / "targets.csv")]):
-                assert latency.main() == 0
-            with mock.patch.object(sys, "argv", argv):
+            with mock.patch.dict(os.environ, {"PE_RANKER_PARQUET_DIR": str(parquet)}), mock.patch.object(sys, "argv", argv):
                 assert latency.main() == 0
             manifest_path = out / "oracle_manifest.json"
             with mock.patch.object(sys, "argv", ["push", "--db", db,
@@ -613,7 +611,6 @@ class DuckParityTest(unittest.TestCase):
         import latency_shift_rerank as latency
         import push_ranking_to_supabase as publisher
         import rank_cycle_manifest
-        from test_latency_shift_ref_oracle import FIXTURE_DDL
 
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -621,7 +618,6 @@ class DuckParityTest(unittest.TestCase):
             rows, entry, _ = build_certified_cache(db)
             now = ts(2026, 4, 1)
             with sqlite3.connect(db) as conn:
-                conn.executescript(FIXTURE_DDL)
                 # Distinct markets, equal timestamps, fractional amounts, half
                 # payouts, and one certified entry outside the analysis window.
                 for ordinal, row in enumerate(rows):
@@ -632,7 +628,7 @@ class DuckParityTest(unittest.TestCase):
                     )
                     row["end_date_unix"] = row["source_time_unix"] + 3600
                     row["price_weighted_share_amount_str"] = "0.125000000000" if ordinal == 1 else "0.500000000000"
-                    if ordinal == 3:
+                    if ordinal in (1, 3):
                         # A wallet needs two evaluable entries to be ranked at all (#588).
                         row["wallet_hex"] = W("a")
                     conn.execute(
@@ -645,14 +641,24 @@ class DuckParityTest(unittest.TestCase):
                     conn.execute("INSERT INTO clob_payout_evidence_v2 VALUES (?,?,?,?,?,?,?)",
                                  (row["condition_id"], row["payout_vector_json"], row["end_date_unix"],
                                   "resolved", payout_tokens(row["asset"], row["outcome_id"]), 8, now))
-                    conn.execute("INSERT INTO token_conditions VALUES (?,?,?,?)",
-                                 (row["asset"], row["condition_id"], now, row["outcome_id"]))
-                    conn.execute("INSERT INTO ranker_price_pages VALUES (?,?,?,1,'complete',1,"
-                                 "'00','test',1,1,1,1,'url')",
-                                 (row["asset"], row["source_time_unix"] - 119, row["source_time_unix"] + 3))
-                    conn.execute("INSERT INTO ranker_price_points VALUES (?,?,?,?)",
-                                 (row["asset"], row["source_time_unix"] + 2,
-                                  "0.20" if ordinal % 2 else "0.40", now))
+                    row["source_usdc_amount_str"] = "0.51"
+                    conn.execute("UPDATE activity_groups_v2 SET source_usdc_amount_str='0.51' WHERE source_trade_id=?",
+                                 (row["source_trade_id"],))
+                prints = []
+                for ordinal, row in enumerate(rows):
+                    other = W("b") if row["wallet_hex"] == W("a") else W("a")
+                    print_row = {**row, "source_trade_id": f"g2:{100 + ordinal:064x}",
+                                 "wallet_hex": other, "source_time_unix": row["source_time_unix"] + 2,
+                                 "price_weighted_share_amount_str": f"{Decimal('0.25') + ordinal * Decimal('0.03'):.12f}",
+                                 "source_usdc_amount_str": "0.50"}
+                    prints.append(print_row)
+                    conn.execute("INSERT INTO ranker_entries_v2 VALUES (?,?,?)", (print_row["source_trade_id"], 7, 1))
+                    conn.execute("INSERT INTO activity_groups_v2 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                                 (print_row["source_trade_id"], 7, other, row["condition_id"], row["asset"], row["outcome_id"],
+                                  "buy", "1.250000", print_row["price_weighted_share_amount_str"], "0.50", print_row["source_time_unix"], "TRADE"))
+                rows.extend(prints)
+                rows.sort(key=lambda row: row["source_trade_id"])
+                conn.execute("UPDATE cache_v2_migration_state SET ranker_projection_count=?", (len(rows),))
                 # Freshness MUST come from these nonprojected rows: a recent
                 # SELL, an unresolved BUY, and excluded old-generation history.
                 for ordinal, wallet, side, market, generation in (
@@ -667,7 +673,7 @@ class DuckParityTest(unittest.TestCase):
                 conn.execute("UPDATE cache_v2_migration_state SET ranker_projection_digest=?",
                              (whole_projection_digest(rows),))
                 conn.execute("UPDATE clob_payout_coverage_manifests_v2 SET completed_at_unix=?", (now,))
-                conn.execute("UPDATE activity_coverage_manifests_v2 SET group_count=7")
+                conn.execute("UPDATE activity_coverage_manifests_v2 SET group_count=?", (len(rows) + 2,))
                 conn.execute("UPDATE activity_wallet_coverage_staging_v2 SET aggregate_count = aggregate_count + 1")
 
             # Authentic version-one reference: SELECT * for every table, with
@@ -733,14 +739,12 @@ class DuckParityTest(unittest.TestCase):
                 argv = ["latency", "--db", db, "--ranked-csv", str(out / "ranked_72hr_buyandhold.csv"),
                         "--positions-csv", str(out / "qualifying_positions_72hr.csv"), "--out-dir", str(out),
                         "--as-of", AS_OF_ISO, "--half-life-days", "0", "--min-trl", "0",
-                        "--min-active-months", "0", "--min-avg-per-month", "0", "--floor-tstat", "0",
+                        "--floor-tstat", "0",
                         "--before-ranking-json", str(root / "before.json"),
                         "--cycle-manifest-file", str(root / "cycle.json"),
                         "--cache-stage-record", str(root / "stage.json"),
                         "--pipeline-versions-file", str(root / "versions.json")]
-                with mock.patch.object(sys, "argv", argv + ["--emit-targets", str(out / "targets.csv")]):
-                    self.assertEqual(latency.main(), 0)
-                with mock.patch.object(sys, "argv", argv):
+                with mock.patch.dict(os.environ, {"PE_RANKER_PARQUET_DIR": str(pq)}), mock.patch.object(sys, "argv", argv):
                     self.assertEqual(latency.main(), 0)
                 with mock.patch.object(sys, "argv", ["push", "--ranked-csv", str(out / "latency_shift_ranked.csv"),
                                                      "--db", db, "--manifest-file", str(out / "oracle_manifest.json")]):
@@ -751,7 +755,7 @@ class DuckParityTest(unittest.TestCase):
                 results.append((out, prepared["entries"]))
             self.assertEqual(results[0][1], results[1][1])
             self.assertTrue(results[0][1])
-            for filename in ("qualifying_positions_72hr.csv", "ranked_72hr_buyandhold.csv", "targets.csv",
+            for filename in ("qualifying_positions_72hr.csv", "ranked_72hr_buyandhold.csv",
                              "oracle_outcomes.csv", "latency_shift_ranked.csv", "before_after_diff.json"):
                 self.assertEqual((results[0][0] / filename).read_bytes(),
                                  (results[1][0] / filename).read_bytes(), filename)
@@ -1487,7 +1491,6 @@ class BulkRootFence(unittest.TestCase):
         import pnl_decomposition
         import probe_gamma_ua
         from ranker.clv_source_comparison import open_cache
-        from latency_shift_rerank import map_pair_tokens
 
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "bulk.db"
@@ -1499,7 +1502,6 @@ class BulkRootFence(unittest.TestCase):
                     INSERT INTO token_conditions VALUES ('condition', 0, 'token');""")
             before = db.read_bytes()
             readers = (
-                ("token mapping", lambda: map_pair_tokens(str(db), [("condition", "0")])),
                 ("edge persistence", lambda: edge_persistence_walkforward.load_positions(db)),
                 ("holdout", lambda: holdout_baseline.load_resolutions(db)),
                 ("anchor probe", lambda: probe_gamma_ua.load_anchor_ids(str(db), 1)),

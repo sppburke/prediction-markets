@@ -986,7 +986,7 @@ async fn pre_start_boot_membership_case(case: PreStartBootCase) {
             "/rest/v1/ranking_entries" => {
                 assert_eq!(source.batch.load(Ordering::SeqCst), 9);
                 assert!(query.contains("batch_id=eq.8"), "{uri}");
-                assert!(query.contains("limit=200"), "{uri}");
+                assert!(query.contains("limit=1000&offset=0"), "{uri}");
                 assert!(query.contains("survives=is.true"), "{uri}");
                 json!([
                     {"batch_id":8,"rank":1,"wallet_hex":source.fenced,"ls_tstat":"3","hit_rate":"0.6","n_trades":20,"last_trade_unix":10,"survives":true},

@@ -31,6 +31,7 @@ fn build_connector() -> PolymarketPublicConnector<FixtureFetcher> {
             window: LeaderboardWindow::AllTime,
             category: LeaderboardCategory::Overall,
             limit: 500,
+            offset: 0,
         },
         PolymarketEndpoint::UserTradeActivity {
             user: USER.into(),
@@ -54,6 +55,7 @@ fn build_connector() -> PolymarketPublicConnector<FixtureFetcher> {
             window: LeaderboardWindow::AllTime,
             category: LeaderboardCategory::Overall,
             limit: 500,
+            offset: 0,
         }
         .url(BASE),
         fixture("leaderboard.json"),

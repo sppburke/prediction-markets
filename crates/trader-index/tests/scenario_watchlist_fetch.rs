@@ -26,6 +26,7 @@ fn make_fetcher(fixture_bytes: Vec<u8>) -> WatchlistFetcher<FixtureFetcher> {
         window: LeaderboardWindow::AllTime,
         category: LeaderboardCategory::Overall,
         limit: 5,
+        offset: 0,
     }
     .url(base);
     let mut responses = HashMap::new();
@@ -99,6 +100,7 @@ async fn scenario_watchlist_size_cap() {
         window: LeaderboardWindow::AllTime,
         category: LeaderboardCategory::Overall,
         limit: 3,
+        offset: 0,
     }
     .url("https://data-api.polymarket.com");
     let mut responses = HashMap::new();
@@ -140,6 +142,7 @@ async fn scenario_parse_error_on_bad_json() {
         window: LeaderboardWindow::AllTime,
         category: LeaderboardCategory::Overall,
         limit: 20,
+        offset: 0,
     }
     .url("https://data-api.polymarket.com");
     let mut responses = HashMap::new();

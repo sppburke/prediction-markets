@@ -1967,6 +1967,7 @@ mod paper_log_tests {
                     copy_latency_kill_switch_active: false,
                     proposed_trade_bps: BasisPoints(10),
                     per_trade_cap_bps: 25,
+                    drawdown_policy: pe_risk_engine::DrawdownPolicy::Stops,
                     concentration_caps: None,
                 },
                 decision: RiskDecisionAudit::Approved,
@@ -4482,6 +4483,160 @@ mod paper_log_tests {
             drop(source);
             ingest.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn unlimited_capacity_admits_1001_survivors_and_replays_after_restart() {
+        use crate::activity_ingest::{ActivityIngest, SourceLogHandle};
+        use crate::source_event_sink::SourceEventSink;
+        use crate::watchlist_maintenance::{MembershipCommit, PublicationBinding};
+
+        let dir = tempdir().unwrap();
+        let paper_path = dir.path().join("paper.log");
+        let source_path = dir.path().join("source.log");
+        let incumbent = wallet();
+        let newcomers = (1..=1_000_u32)
+            .map(|index| WalletAddress::from_hex(&format!("0x{index:040x}")).unwrap())
+            .collect::<Vec<_>>();
+        let initial = watchlist(vec![watchlist_entry(incumbent, 2_000)]);
+        let live = LiveWatchlist::new(initial.clone());
+        let mut paper_writer = Writer::open(&paper_path).unwrap();
+        append(
+            &mut paper_writer,
+            PAPER_LOG_SCHEMA_VERSION,
+            &PaperLogRecord::QualificationStarted(Arc::new(start("unlimited-capacity"))),
+        );
+        let state = Arc::new(PaperStateDb::open(&dir.path().join("paper.db")).unwrap());
+        for wallet in &newcomers {
+            state
+                .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
+                    wallet: *wallet,
+                    complete: true,
+                    proof_json: "{}".to_owned(),
+                    updated_at_unix: 10,
+                })
+                .unwrap();
+            state.set_cursor(wallet, 10).unwrap();
+        }
+        state
+            .install_anchors(
+                &newcomers
+                    .iter()
+                    .map(|wallet| pe_paper_state::AnchorInstallRecord {
+                        repaired_history: Vec::new(),
+                        expected_fence: None,
+                        history_status: None,
+                        wallet: *wallet,
+                        balances: Vec::new(),
+                        activity_cutoff_unix: 10,
+                        anchored_at_unix: 10,
+                        ledger_hash_after: "empty".to_owned(),
+                        positions_proof_hash: "empty".to_owned(),
+                        activity_bounds_json: "[]".to_owned(),
+                        source_log_generation: "capacity".to_owned(),
+                        proof_json: "{}".to_owned(),
+                        recorded_at_unix: 10,
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+        let (source, source_rx) = SourceLogHandle::channel(4);
+        let (trigger, _triggers) = mpsc::channel(1);
+        let ingest = tokio::spawn(
+            ActivityIngest::poll_only(
+                SourceEventSink::open(&source_path).unwrap(),
+                source_rx,
+                trigger,
+                new_shared_health(false),
+            )
+            .run(),
+        );
+        let (tx, rx) = mpsc::channel(1);
+        let runtime = spawn_membership_orchestrator(live.clone(), paper_writer, state.clone(), rx);
+        let preparer = AdmissionPreparer::new(tx, state).with_source_log(source.clone());
+        let outcome = preparer.prepare(&newcomers).await.unwrap();
+        assert_eq!(outcome.admitted, newcomers);
+        assert!(outcome.deferred.is_empty());
+        let bench = watchlist(
+            std::iter::once(watchlist_entry(incumbent, 2_000))
+                .chain(newcomers.iter().enumerate().map(|(index, wallet)| {
+                    watchlist_entry(*wallet, 1_000 - i32::try_from(index).unwrap())
+                }))
+                .collect(),
+        );
+        let (selected, _) = crate::supabase_reader::select_membership(
+            bench,
+            HashMap::new(),
+            &HashSet::new(),
+            usize::MAX,
+        );
+        assert_eq!(selected.entries.len(), 1_001);
+        let (proofs, deferrals) = preparer.capture_proofs(&newcomers).unwrap();
+        assert!(deferrals.is_empty());
+        let binding = PublicationBinding::capture(live.structural_membership(), &proofs).unwrap();
+        let admissions = preparer.record_admission_proofs(&proofs).await.unwrap();
+        assert_eq!(admissions.len(), 1_000);
+        let config_receipt = preparer
+            .record_capacity_config(1, usize::MAX, selected.entries.clone())
+            .await
+            .unwrap();
+        preparer
+            .publish_membership(
+                MembershipChange {
+                    reason: MembershipReason::CapacityChange,
+                    removed: Vec::new(),
+                    added: newcomers,
+                    capacity: usize::MAX,
+                    ranking_batch_id: None,
+                    evidence: SealedMembershipEvidence::capacity_change(
+                        1,
+                        config_receipt,
+                        admissions,
+                    )
+                    .unwrap(),
+                },
+                selected.entries.clone(),
+                MembershipCommit {
+                    binding,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(live.snapshot().entries.len(), 1_001);
+        assert_eq!(live.structural_membership().len(), 1_001);
+        drop(preparer);
+        runtime.await.unwrap();
+        drop(source);
+        ingest.await.unwrap();
+        let frames = pe_event_log::Reader::replay(&source_path)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        let config = frames
+            .iter()
+            .find(|(_, envelope)| envelope.source_id.0 == CAPACITY_CONFIG_SOURCE_ID)
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&config.1.payload).unwrap();
+        assert_eq!(
+            payload["target"].as_u64(),
+            Some(u64::try_from(usize::MAX).unwrap())
+        );
+        let era = paper_era(scan_paper_log(&paper_path).unwrap());
+        let restored = replay_membership(&era, initial, &source_path)
+            .unwrap()
+            .unwrap();
+        assert!(restored.post_start_record_replayed);
+        assert_eq!(
+            serde_json::to_vec(&restored.watchlist.entries).unwrap(),
+            serde_json::to_vec(&selected.entries).unwrap()
+        );
+        let restarted = LiveWatchlist::new(restored.watchlist);
+        assert_eq!(restarted.snapshot().entries.len(), 1_001);
+        assert_eq!(
+            restarted.structural_membership(),
+            live.structural_membership()
+        );
     }
 
     /// PASS: a crash before the new MembershipChanged record leaves boot on Start's A/N;

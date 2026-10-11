@@ -46,6 +46,28 @@ impl ConcentrationCaps {
     };
 }
 
+/// Drawdown rules recorded with each decision. Missing fields retain the historical stops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DrawdownPolicy {
+    #[default]
+    Stops,
+    KillOnly,
+}
+
+impl DrawdownPolicy {
+    pub const fn absolute_loss_bps(self) -> i32 {
+        match self {
+            Self::Stops => crate::KILL_SWITCH_DRAWDOWN_BPS,
+            Self::KillOnly => crate::KILL_ONLY_DRAWDOWN_BPS,
+        }
+    }
+
+    fn is_stops(&self) -> bool {
+        *self == Self::Stops
+    }
+}
+
 /// Point-in-time snapshot of all risk inputs for a single proposed trade.
 ///
 /// All exposure values are in basis points of current bankroll.
@@ -89,6 +111,9 @@ pub struct RiskSnapshot {
     /// Default 25 for serde backwards compatibility with snapshots written before this field existed.
     #[serde(default = "default_per_trade_cap_bps")]
     pub per_trade_cap_bps: i32,
+    /// Historical stops are omitted to preserve the bytes of existing snapshots.
+    #[serde(default, skip_serializing_if = "DrawdownPolicy::is_stops")]
+    pub drawdown_policy: DrawdownPolicy,
     /// Concentration-cap enforcement (#508 Phase A): `Some` enforces, `None` = un-enforced
     /// by owner decision (the production copy path). No serde default — every snapshot is
     /// code-constructed (none is persisted anywhere), so the posture is always explicit.

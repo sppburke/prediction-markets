@@ -228,6 +228,11 @@ impl WinnerFollowStrategy {
                     .to_u64()
                     .ok_or(WinnerFollowError::NoEdge)?
             }
+            SizingMode::CashFraction { fraction } => fraction
+                .checked_mul(bankroll)
+                .and_then(|usd| usd.checked_div(all_in_kelly_price.0))
+                .and_then(|quantity| quantity.floor().to_u64())
+                .ok_or(WinnerFollowError::NoEdge)?,
             SizingMode::Contract { contracts } => contracts,
             SizingMode::Kelly => {
                 // 4. Kelly fraction.

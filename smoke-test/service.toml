@@ -25,11 +25,11 @@ mode                             = "paper"
 # legacy history file the previous service wrote at this path. It must stay present and
 # unchanged until the migration reaches phase `installed`; later boots ignore it.
 legacy_wallet_history_path       = "smoke-test/wallet_market_history.json"
-max_resolution_horizon_secs      = 172800  # 48 h (run28 cutover)
+max_resolution_horizon_secs      = 86400  # exclusive same-day ceiling
 min_fill_price                   = "0.15"  # run28 entry-band floor (current price)
 watchlist_membership_mode        = "full_rerank"  # run28 cutover; knockout = legacy
 min_resolution_horizon_secs      = 60      # docs/29 copy floor; sub-minute breaks down
-max_fill_price                   = "0.85"  # #142 parity: skip BUYs at/above this current price
+max_fill_price                   = "0.65"  # #142 parity: skip BUYs at/above this current price
 
 # Live wallet source (#339, #370): Supabase ranking handoff — the SOLE wallet source.
 # The url is empty here; the live box overrides it via PE_SUPABASE_URL from .env (figment

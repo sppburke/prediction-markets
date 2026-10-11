@@ -373,12 +373,12 @@ create table if not exists service_config (
 -- RuntimeConfig-only keys (including the three keys reassembled into SizingMode) in runtime_config
 -- `seed_reconstructs_boot_strategy`.
 insert into service_config (key, value, value_type, description) values
-  ('active_watchlist_size',                 '100',    'integer', 'Maximum top-ranked wallets pe-service actively follows; hot-reloaded every 30 seconds (1..200)'),
+  ('active_watchlist_size',                 '0',      'integer', 'Maximum top-ranked wallets pe-service actively follows; hot-reloaded every 30 seconds (0 = every survivor, 1..200 caps)'),
   ('mode',                                  'paper',  'text',    'Trading mode: paper | shadow | live_tiny | promoted'),
-  ('max_fill_price',                        '0.85',   'decimal', 'Skip BUYs at or above this current price'),
+  ('max_fill_price',                        '0.65',   'decimal', 'Skip BUYs at or above this current price'),
   ('min_fill_price',                        '0.15',   'decimal', 'Skip BUYs below this current price (run28 band lower bound; 0 disables)'),
   ('min_resolution_horizon_secs',           '60',     'integer', 'Min time-to-resolution copy floor (seconds)'),
-  ('max_resolution_horizon_secs',           '172800', 'integer', 'Max time-to-resolution, 48 h (run28 cutover; seconds)'),
+  ('max_resolution_horizon_secs',           '86400',  'integer', 'Exclusive copy horizon to next UTC midnight (seconds)'),
   ('price_impact_cap_bps',                  '100',    'integer', 'Mandatory price-impact cap (bps of best ask), the sole policy size limit (#508); valid 1..=10000'),
   ('flip_human_approved',                   'false',  'bool',    'Approval flag: allow Flip trades (admin-editable, audit-logged)'),
   ('kelly_fraction_above_default_human_approved', 'false', 'bool', 'Approval flag: allow a Kelly fraction above the mode default'),

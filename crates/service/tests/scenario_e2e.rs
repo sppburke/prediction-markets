@@ -146,6 +146,7 @@ fn clean_snapshot() -> RiskSnapshot {
         copy_latency_kill_switch_active: false,
         proposed_trade_bps: BasisPoints(10),
         per_trade_cap_bps: 25,
+        drawdown_policy: pe_risk_engine::DrawdownPolicy::Stops,
         concentration_caps: Some(ConcentrationCaps::CANONICAL),
     }
 }
