@@ -128,10 +128,6 @@ class RankAndPushScenario(unittest.TestCase):
             '  printf missing >> pe_bootstrap_cycle.log\n'
             'fi\n'
             'printf "\\n" >> pe_bootstrap_cycle.log\n'
-            'if [[ "$1" == "prices-history" ]]; then\n'
-            '  t=""; n=$#; for ((j=1; j<=n; j++)); do [[ "${!j}" == "--targets-csv" ]] && { k=$((j+1)); t="${!k}"; }; done\n'
-            '  if [[ -n "$t" && -f "$t" ]]; then echo present >> targets_seen.log; else echo absent >> targets_seen.log; fi\n'
-            'fi\n'
             'sub="$1"\n'
             'key="STUB_EXIT_${sub//-/_}"\n'
             'code="${!key:-0}"\n'
@@ -165,9 +161,7 @@ class RankAndPushScenario(unittest.TestCase):
             'open(os.path.join(out, "qualifying_positions_72hr.csv"), "w").write("wallet,outcome_id\\n0xabc,1\\n")\n',
         )
         # Fake pass-2 rerank: log argv, emit latency_shift_ranked.csv (non-empty).
-        # Models BOTH #536 invocations: stage 2a (--emit-targets writes the targets
-        # file, no ranking; STUB_EXIT_emit) and stage 2c (writes ranking + manifest;
-        # STUB_EXIT_rerank).
+        # The single pass-two invocation writes ranking and manifest.
         _write_exec(
             self.root / "scripts" / "latency_shift_rerank.py",
             "#!/usr/bin/env python3\n"
@@ -178,19 +172,15 @@ class RankAndPushScenario(unittest.TestCase):
             '    open("rerank.log", "a").write(" ".join(a) + "\\n")\n'
             '    out = a[a.index("--out-dir") + 1] if "--out-dir" in a else "."\n'
             "    os.makedirs(out, exist_ok=True)\n"
-            '    if "--emit-targets" in a:\n'
-            '        tpath = a[a.index("--emit-targets") + 1]\n'
-            '        open(tpath, "w").write("token_id,start_ts,end_ts\\nTOK,1,100\\n")\n'
-            '        return int(os.environ.get("STUB_EXIT_emit", "0"))\n'
             '    rc = int(os.environ.get("STUB_EXIT_rerank", "0"))\n'
             "    if rc:\n"
-            "        return rc  # the real coverage gate exits before writing any output\n"
+            "        return rc\n"
             '    open(os.path.join(out, "latency_shift_ranked.csv"), "w").write("wallet\\n0xabc\\n")\n'
             '    if not os.environ.get("STUB_NO_MANIFEST"):\n'
             '        import hashlib, json\n'
             '        ranked = open(os.path.join(out, "latency_shift_ranked.csv"), "rb").read()\n'
             '        open(os.path.join(out, "oracle_manifest.json"), "w").write(json.dumps(\n'
-            '            {"oracle": "clob-minute-reference",\n'
+            '            {"oracle": "first-entry-taker-print",\n'
             '             "price_band": {"minimum_inclusive": float(a[a.index("--price-min") + 1]), "maximum_exclusive": float(a[a.index("--price-max") + 1])},\n'
             '             "scheduled_horizon": {"minimum_secs": int(a[a.index("--min-ttr-secs") + 1]), "maximum_secs_exclusive": int(a[a.index("--ttr-max-secs") + 1])},\n'
             '             "latency_shift_secs": float(a[a.index("--latency-shift-secs") + 1]),\n'
@@ -427,8 +417,6 @@ class RankAndPushScenario(unittest.TestCase):
                 "backfill",
                 "events",
                 "resolutions",
-                # #536: the targeted reference fetch runs between the rank passes.
-                "prices-history",
             ],
             "refresh/rank stages ran out of canonical purge-free order",
         )
@@ -560,49 +548,15 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertFalse(any(line.startswith("purge-infra") for line in boot))
         print("PASS: resolutions exit 75 aborts before rank/push and retains cycle pointer")
 
-    def test_reference_stages_flow_targets_manifest_and_push(self):
-        # #536 stage 2a→2b→2c data flow: the emit call writes the targets file, the
-        # targeted fetch consumes an EXISTING file, the full rerank writes the
-        # manifest, and the push binds it via --manifest-file.
+    def test_print_rerank_manifest_reaches_push_without_fetch_stages(self):
         r = self._run()
-        self.assertEqual(r.returncode, 0, f"stdout={r.stdout}\nstderr={r.stderr}")
+        self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
         rerank = (self._log("rerank.log") or "").splitlines()
-        self.assertEqual(len(rerank), 2, "expected the emit call then the full rerank")
-        self.assertIn("--emit-targets", rerank[0])
-        self.assertNotIn("--emit-targets", rerank[1])
-        self.assertIn("--git-sha", rerank[1])
-        # 2a applies 2c's survival bounds, so both evaluate the same wallets (#588).
-        emit, full = rerank[0].split(), rerank[1].split()
-        for flag in ("--min-trl", "--min-ttr-secs", "--ttr-max-secs"):
-            self.assertEqual(emit[emit.index(flag) + 1], full[full.index(flag) + 1], flag)
-        boot = self._log("pe_bootstrap.log") or ""
-        self.assertIn("prices-history --targets-csv", boot)
-        self.assertEqual((self._log("targets_seen.log") or "").strip(), "present",
-                         "the targeted fetch must consume a real targets file")
-        push = self._log("push.log") or ""
-        self.assertIn("--manifest-file", push)
-        print("PASS: 2a targets -> 2b fetch(consumed) -> 2c manifest -> push binding")
-
-    def test_reference_fetch_partial_then_rerank_tempfail_holds_publication(self):
-        # Fetch partial (exit 2 continues) then the coverage gate tempfails (75):
-        # publication must not run and the cycle pointer must survive for the retry.
-        r = self._run(exit_env={"STUB_EXIT_prices_history": "2", "STUB_EXIT_rerank": "75"})
-        self.assertEqual(r.returncode, 75, f"stdout={r.stdout}\nstderr={r.stderr}")
-        self.assertIsNone(self._log("push.log"), "publication ran despite un-terminal coverage")
-        rerank = (self._log("rerank.log") or "").splitlines()
-        self.assertEqual(len(rerank), 2, "the coverage-gate rerank itself must have run")
-        cycle = self.root / "data" / "eval-results" / "rank_and_push.cycle"
-        self.assertTrue(cycle.is_file(), "tempfail lost the cycle recovery pointer")
-        self.assertIn("[reference-fetch] WARN exit 2", r.stdout + r.stderr)
-        print("PASS: fetch partial -> rerank 75 -> no publication, pointer retained")
-
-    def test_reference_fetch_fatal_aborts_before_rerank(self):
-        r = self._run(exit_env={"STUB_EXIT_prices_history": "1"})
-        self.assertEqual(r.returncode, 1, f"stderr={r.stderr}")
-        rerank = (self._log("rerank.log") or "").splitlines()
-        self.assertEqual(len(rerank), 1, "only the emit call may precede a fatal fetch")
-        self.assertIsNone(self._log("push.log"), "publication ran despite a fatal fetch")
-        print("PASS: fatal reference fetch aborts before the full rerank and push")
+        self.assertEqual(len(rerank), 1)
+        self.assertNotIn("--emit-targets", rerank[0])
+        self.assertIn("--git-sha", rerank[0])
+        self.assertNotIn("prices-history", self._log("pe_bootstrap.log") or "")
+        self.assertIn("--manifest-file", self._log("push.log") or "")
 
     def test_forced_export_failure_stops_before_rank_and_publish(self):
         r = self._run("--engine", "duck", exit_env={"STUB_EXIT_export": "1"})
@@ -614,16 +568,6 @@ class RankAndPushScenario(unittest.TestCase):
         r = self._run(exit_env={"STUB_EXIT_rank": "1"})
         self.assertEqual(r.returncode, 1, r.stderr)
         self.assertIsNone(self._log("rerank.log"))
-        self.assertIsNone(self._log("push.log"))
-        self.assertTrue(
-            (self.root / "data/eval-results/rank_and_push.cycle").is_file()
-        )
-
-    def test_target_emission_failure_stops_before_fetch_and_publish(self):
-        r = self._run(exit_env={"STUB_EXIT_emit": "1"})
-        self.assertEqual(r.returncode, 1, r.stderr)
-        boot = (self._log("pe_bootstrap.log") or "").splitlines()
-        self.assertFalse(any(line.startswith("prices-history") for line in boot))
         self.assertIsNone(self._log("push.log"))
         self.assertTrue(
             (self.root / "data/eval-results/rank_and_push.cycle").is_file()
@@ -802,8 +746,8 @@ class RankAndPushScenario(unittest.TestCase):
         for removed in ("--band-lo", "--band-hi", "--ttr-floor-secs", "--ttr-max-secs", "--latency-shift-secs"):
             self.assertNotIn(removed, fresh_args)
         calls = [shlex.split(line) for line in self._log("rerank.log").splitlines()]
-        self.assertEqual([call[call.index("--min-ttr-secs") + 1] for call in calls], ["10", "10"])
-        self.assertEqual(json.loads(request.read_text())["batch"]["ttr_floor_secs"], 10)
+        self.assertEqual([call[call.index("--min-ttr-secs") + 1] for call in calls], ["60"])
+        self.assertEqual(json.loads(request.read_text())["batch"]["ttr_floor_secs"], 60)
         # Emulate a request prepared by the prior checkout; its recorded floor is immutable.
         payload = json.loads(request.read_text())
         payload["batch"]["ttr_floor_secs"] = 30
@@ -1065,7 +1009,7 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertEqual(
             self._bootstrap_ops(),
             ["cache-stage-v2", "winner-discovery", "activate-next", "cache-populate-activity-v2",
-             "cache-populate-payout-v2", "cache-finalize-v2", "prices-history", "cache-finalize-v2",
+             "cache-populate-payout-v2", "cache-finalize-v2", "cache-finalize-v2",
              "cache-activate"],
             "a schema-two prior is not sealed again",
         )
@@ -1254,7 +1198,7 @@ class RankAndPushScenario(unittest.TestCase):
         operations = [line.split()[0] for line in bootstrap]
         self.assertEqual(
             operations,
-            ["prices-history", "cache-finalize-v2", "cache-activate"],
+            ["cache-finalize-v2", "cache-activate"],
         )
         print("PASS: schema-two request preparation precedes activation and exact resume")
 
@@ -1412,23 +1356,25 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertIn(flag, self._log("rerank.log"), "pass-2 missing the default half-life")
         print(f"PASS: production default half-life ({EXPECTED_DEFAULT_HALF_LIFE}) threaded to both passes")
 
-    def test_run28_shape_threaded_to_stages(self):
-        """run28 cutover (#417): TTR 48h + MinTRL-20 (per-month gates zeroed) reach both
-        ranking passes, and the push receives the manifest with matching limits."""
+    def test_copy_pipeline_defaults_reach_both_passes_and_manifest(self):
         r = self._run()
-        self.assertEqual(r.returncode, 0, f"stderr={r.stderr}")
+        self.assertEqual(r.returncode, 0, r.stderr)
         for logname in ("rank.log", "rerank.log"):
             log = self._log(logname)
-            self.assertIn("--min-trl 20", log, f"{logname} missing the MinTRL-20 gate")
-            self.assertIn("--min-avg-per-month 0", log, f"{logname} per-month gate not zeroed")
-            self.assertIn("--min-active-months 0", log, f"{logname} per-month gate not zeroed")
-        self.assertIn("--ttr-hours 48", self._log("rank.log"), "pass-1 missing TTR 48h")
-        self.assertIn("--ttr-max-secs 172800", self._log("rerank.log"))
-        manifest = next((self.root / "data/eval-results").glob("cron-*/oracle_manifest.json"))
-        self.assertEqual(json.loads(manifest.read_text())["scheduled_horizon"]["maximum_secs_exclusive"], 172800)
+            for flag in ("--min-trl 20", "--price-max 0.65", "--floor-tstat 3.0"):
+                self.assertIn(flag, log)
+        self.assertIn("--min-avg-per-month 0", self._log("rank.log"))
+        self.assertIn("--min-active-months 0", self._log("rank.log"))
+        self.assertNotIn("--min-avg-per-month", self._log("rerank.log"))
+        self.assertNotIn("--min-active-months", self._log("rerank.log"))
+        self.assertIn("--ttr-hours 24", self._log("rank.log"))
+        self.assertIn("--min-ttr-secs 60", self._log("rerank.log"))
+        self.assertIn("--ttr-max-secs 86400", self._log("rerank.log"))
+        path = next((self.root / "data/eval-results").glob("cron-*/oracle_manifest.json"))
+        manifest = json.loads(path.read_text())
+        self.assertEqual(manifest["scheduled_horizon"]["maximum_secs_exclusive"], 86400)
+        self.assertEqual(manifest["price_band"]["maximum_exclusive"], .65)
         self.assertIn("--manifest-file", self._log("push.log"))
-        self.assertNotIn("--ttr-max-secs", self._log("push.log"))
-        print("PASS: run28 shape (ttr48 + trl20, per-month zeroed) threaded to rank/rerank/push")
 
     def test_missing_bootstrap_binary_is_fatal(self):
         (self.root / "target" / "release" / "pe-bootstrap").unlink()
@@ -1974,9 +1920,9 @@ class RankAndPushScenario(unittest.TestCase):
             handle.write("PE_RANK_SCHEMA_TWO_CUTOVER=prepare\n")
         return fixed
 
-    def test_fresh_finalize_without_record_resumes_to_record_after_price_fetch(self):
+    def test_fresh_finalize_without_record_resumes_to_record_before_pass_two(self):
         self._prepare_incremental_fixture(two_file=True)
-        stopped = self._run(exit_env={"STUB_EXIT_prices_history": "75"})
+        stopped = self._run(exit_env={"STUB_EXIT_rank": "75"})
         self.assertEqual(stopped.returncode, 75, stopped.stderr + stopped.stdout)
         out = self.root / (self.root / "data/eval-results/rank_and_push.cycle").read_text().strip()
         stage = out / "cache_stage_record.json"
@@ -1992,7 +1938,7 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertIn("RANK_AND_PUSH_PREPARED_ONLY=", resumed.stdout)
         self.assertEqual(self._bootstrap_ops()[before:],
                          ["cache-stage-v2", "winner-discovery", "activate-next",
-                          "cache-finalize-v2", "prices-history", "cache-finalize-v2"])
+                          "cache-finalize-v2", "cache-finalize-v2"])
         finalizes = [shlex.split(line) for line in self._bootstrap_lines("cache-finalize-v2")]
         self.assertEqual(len(finalizes), 3)
         self.assertTrue(all("--stage-record" not in args for args in finalizes[:2]))
@@ -2005,10 +1951,12 @@ class RankAndPushScenario(unittest.TestCase):
         self.assertEqual(request["cache_activation"]["side_path"], record["cache_path"])
 
     def _install_candidate_capture_probe(self):
+        os.mkfifo(self.root / "capture-started.pipe")
+        os.mkfifo(self.root / "rank-complete.pipe")
         manifest = self.root / "scripts/rank_cycle_manifest.py"
         manifest.rename(self.root / "scripts/_rank_cycle_manifest_real.py")
         _write_exec(manifest, """#!/usr/bin/env python3
-import os, signal, subprocess, sys, time
+import os, signal, subprocess, sys
 from pathlib import Path
 from _rank_cycle_manifest_real import *
 a = sys.argv[1:]
@@ -2018,18 +1966,19 @@ if a and a[0] == 'capture' and '--output' in a and 'candidate_cycle_manifest' in
     if 'cache-finalize-v2' not in Path('pe_bootstrap.log').read_text() or not (output.parent / 'cycle_configuration.json').is_file():
         raise SystemExit(97)
     mode = os.environ.get('STUB_CAPTURE_MODE', 'normal')
-    if mode == 'fail':
-        raise SystemExit(47)
     if mode == 'block':
         def stopped(_signal, _frame):
             Path('capture_reaped').write_text('yes')
             raise SystemExit(0)
         signal.signal(signal.SIGTERM, stopped)
-        while True: time.sleep(0.01)
-    deadline = time.monotonic() + 5
-    while not (output.parent / 'oracle_targets.csv').is_file():
-        if time.monotonic() > deadline: raise SystemExit(96)
-        time.sleep(0.01)
+    with open('capture-started.pipe', 'w') as ready:
+        ready.write('started')
+    if mode == 'fail':
+        raise SystemExit(47)
+    if mode == 'block':
+        while True: signal.pause()
+    with open('rank-complete.pipe') as complete:
+        complete.read()
     result = subprocess.run([sys.executable, 'scripts/_rank_cycle_manifest_real.py', *a])
     if result.returncode == 0: Path('capture_done').write_text('yes')
     raise SystemExit(result.returncode)
@@ -2039,22 +1988,20 @@ raise SystemExit(subprocess.run([sys.executable, 'scripts/_rank_cycle_manifest_r
         body = export.read_text()
         body = body.replace(
             "import os, sys\n",
-            "import os, sys, time\nfrom pathlib import Path\n"
-            "deadline = time.monotonic() + 5\n"
-            "while not Path('capture_started').is_file():\n"
-            "    if time.monotonic() > deadline: raise SystemExit(95)\n"
-            "    time.sleep(0.01)\n",
+            "import os, sys\n"
+            "with open('capture-started.pipe') as ready:\n"
+            "    ready.read()\n",
             1,
         )
         _write_exec(export, body)
-        bootstrap = self.root / "target/release/pe-bootstrap"
-        body = bootstrap.read_text().replace(
-            'if [[ "$1" == "prices-history" ]]; then\n',
-            'if [[ "$1" == "prices-history" ]]; then\n'
-            '  [[ -f capture_done ]] || exit 94\n',
-            1,
-        )
-        _write_exec(bootstrap, body)
+        first = self.root / "scripts/rank_72hr_buyandhold.py"
+        _write_exec(first, first.read_text() +
+                    "if os.environ.get('STUB_CAPTURE_MODE', 'normal') == 'normal':\n"
+                    "    with open('rank-complete.pipe', 'w') as complete:\n"
+                    "        complete.write('ranked')\n")
+        rerank = self.root / "scripts/latency_shift_rerank.py"
+        body = rerank.read_text().replace("def main():\n", "def main():\n    assert os.path.isfile('capture_done')\n", 1)
+        _write_exec(rerank, body)
 
     def test_format_three_refinalize_receives_nondefault_export_manifest(self):
         self._prepare_incremental_fixture(two_file=True)
@@ -2066,7 +2013,7 @@ raise SystemExit(subprocess.run([sys.executable, 'scripts/_rank_cycle_manifest_r
         manifest = calls[0][calls[0].index("--export-manifest") + 1]
         self.assertEqual(manifest, "data/custom-parquet/schema_v2_export_manifest.json")
 
-    def test_candidate_capture_overlaps_export_and_targets_then_finishes_before_fetch(self):
+    def test_candidate_capture_overlaps_export_and_rank_then_finishes_before_pass_two(self):
         self._prepare_incremental_fixture(two_file=True)
         self._install_candidate_capture_probe()
         result = self._run()
@@ -2075,15 +2022,17 @@ raise SystemExit(subprocess.run([sys.executable, 'scripts/_rank_cycle_manifest_r
         self.assertTrue(self._log("export.log"))
         self.assertTrue(self._log("rank.log"))
         self.assertTrue((self.root / "capture_done").is_file())
-        self.assertIn("prices-history", self._bootstrap_ops())
+        self.assertNotIn("prices-history", self._bootstrap_ops())
+        self.assertTrue(self._log("rerank.log"))
 
-    def test_candidate_capture_failure_stops_before_price_fetch(self):
+    def test_candidate_capture_failure_stops_before_pass_two(self):
         self._prepare_incremental_fixture(two_file=True)
         self._install_candidate_capture_probe()
         result = self._run(exit_env={"STUB_CAPTURE_MODE": "fail"})
         self.assertEqual(result.returncode, 47, result.stderr + result.stdout)
         self.assertTrue((self.root / "capture_started").is_file())
         self.assertNotIn("prices-history", self._bootstrap_ops())
+        self.assertIsNone(self._log("rerank.log"))
 
     def test_export_failure_reaps_background_candidate_capture(self):
         self._prepare_incremental_fixture(two_file=True)
@@ -2141,7 +2090,7 @@ raise SystemExit(subprocess.run([sys.executable, 'scripts/_rank_cycle_manifest_r
         self.assertEqual(pointer.read_bytes(), cycle)
         self.assertEqual(fixed.read_bytes(), before)
         self.assertEqual(self._bootstrap_ops()[len(operations):], [
-            "cache-populate-activity-v2", "cache-populate-payout-v2", "cache-finalize-v2", "prices-history",
+            "cache-populate-activity-v2", "cache-populate-payout-v2", "cache-finalize-v2",
             "cache-finalize-v2",
         ])
         for line in self._bootstrap_lines("cache-populate-activity-v2"):
@@ -2650,7 +2599,7 @@ finally:
             self._bootstrap_ops(),
             ["cache-stage-v2", "cache-migrate-v2", "winner-discovery", "activate-next",
              "cache-populate-activity-v2", "cache-populate-payout-v2", "cache-finalize-v2",
-             "prices-history", "cache-finalize-v2", "cache-activate"],
+             "cache-finalize-v2", "cache-activate"],
         )
         self.assertNotIn("backfill", result.stdout)
         side = f"{self.root}/phys/wallet_cache.{cycle}.side.db"
@@ -2689,7 +2638,7 @@ finally:
         self.assertEqual(
             later_ops,
             ["cache-stage-v2", "winner-discovery", "activate-next", "cache-populate-activity-v2",
-             "cache-populate-payout-v2", "cache-finalize-v2", "prices-history",
+             "cache-populate-payout-v2", "cache-finalize-v2",
              "cache-finalize-v2", "cache-activate"],
         )
         self.assertIn("--fresh-generation 2", self._bootstrap_lines("cache-populate-activity-v2")[-1])
@@ -3003,7 +2952,7 @@ def transport(method,url,key,body=None,**kwargs):
     if method=="POST":
         entries=body["p_entries"];config_hash=body["p_batch"]["config_hash"]
         return 200,1
-    if "latest_ranking" in url:
+    if "ranking_entries" in url:
         return 200,[dict(batch_id=1,rank=r["rank"],survives=r["survives"]) for r in entries]
     if "select=config_hash" in url:
         return 200,[{{"config_hash":"wrong" if {case!r}=="integrity" else config_hash}}]

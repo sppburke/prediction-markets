@@ -53,8 +53,8 @@ use pe_service::mid_price_cache::MidPriceCache;
 use pe_service::orchestrator::{LiveJournalAccess, Orchestrator, OrchestratorConfig};
 use pe_service::paper_api::PaperApiState;
 use pe_service::runtime_config::{
-    AppliedWatchlistCapacity, ConfigEra, LiveRuntimeConfig, MAX_ACTIVE_WATCHLIST_SIZE,
-    RuntimeConfigStatus, load_initial_runtime_config,
+    AppliedWatchlistCapacity, ConfigEra, LiveRuntimeConfig, RuntimeConfigStatus,
+    load_initial_runtime_config,
 };
 use pe_service::snapshot_worker::{SnapshotHandle, run_snapshot_worker};
 use pe_service::supabase_backfill::backfill_supabase;
@@ -692,7 +692,6 @@ async fn run() -> Result<()> {
             &cfg.supabase_anon_key,
             &cfg.supabase_secret_key,
             start.ranking_batch_id,
-            MAX_ACTIVE_WATCHLIST_SIZE,
         )
         .await
         .context("fetch QualificationStarted ranking batch")?;
@@ -735,7 +734,6 @@ async fn run() -> Result<()> {
             &cfg.supabase_anon_key,
             &cfg.supabase_secret_key,
             marker,
-            MAX_ACTIVE_WATCHLIST_SIZE,
         )
         .await
         .context("bootstrap watchlist from Supabase (the sole pre-Start wallet source)")?;

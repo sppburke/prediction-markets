@@ -1697,6 +1697,7 @@ fn build_risk_snapshot(ctx: &RiskContext<'_>) -> RiskSnapshot {
         copy_latency_kill_switch_active: false,
         proposed_trade_bps: BasisPoints(ctx.proposed_bps),
         per_trade_cap_bps: ctx.per_trade_cap_bps,
+        drawdown_policy: pe_risk_engine::DrawdownPolicy::Stops,
         // Backtest keeps concentration enforcement at the docs/19 canonical ladder (#508).
         concentration_caps: Some(ConcentrationCaps::CANONICAL),
     }

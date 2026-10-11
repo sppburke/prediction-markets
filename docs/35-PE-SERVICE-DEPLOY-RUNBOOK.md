@@ -835,7 +835,8 @@ the first seal's cause is the semantic change. Investigate any unexpected mismat
 
 At the locked cut, record the **applied** `price_impact_cap_bps`, `min_fill_price`, and
 `max_fill_price` and the canonical applied hash, then reconcile the hash to status. This release
-requires the owner-approved 100 bps, 0.15, and 0.85 applied values; defaults do not prove them.
+requires the owner-approved applied values for the selected release (canonical contracts in
+`_GLOSSARY.md`); defaults do not prove them.
 The automated seal test covers idempotence and local reopen; it does not cover a full deployment
 restart or producer release. Verify the deployed seal before paper recovery and producer release.
 The first seal remains unique and durable;
@@ -957,8 +958,8 @@ Hash comparisons decide what remains, but never substitute for process clearance
    re-finalize its cache beneath it, or start a competing cycle. Retain the new stage record before
    allowing new capture/ranking through `scripts/rank_and_push.sh` and its normal append-only
    publication. Restore only this task's recorded Forge flag, enablement, and activity independently.
-   The wrapper's later cutover finalization binds its targeted writes and does not replace this
-   pre-capture finalization.
+   The wrapper's later cutover finalization binds its certified export and installed cache bytes
+   before pass two; it does not replace this pre-capture finalization.
 2. **Ship** hash-qualified, with the reviewed census script and ownership helper (the VPS checkout
    does not carry `scripts/`; record `sha256sum scripts/deploy/pe_service_census.sh
    scripts/deploy/generation_common.sh` from the release checkout as `<census-sha256>` and
@@ -1231,10 +1232,11 @@ Activate the dashboard as its own `pe-site` lane. Build it from the reviewed com
 hash-qualified release path early if useful. Do not switch the unit's release path until the new
 service has completed one successful `service_watchlist_replace_v1` transaction and the returned
 token, count, and rows have been independently verified. Then activate that reviewed release,
-restart only `pe-site`, and verify `systemctl is-active pe-site` plus the signed-in Live page. The
-site must show a valid empty or nonempty watched set only when runtime-token → watchlist →
-runtime-token and count agree; induce no database writes during this read check. Site rollback
-restores the prior release path and restarts only `pe-site`; the additive RPC/schema remain
+restart only `pe-site`, and verify `systemctl is-active pe-site` plus the Overview page's Watched
+tab and count. The site pages membership, wallet statistics and settled markets by unique keys;
+it must show a valid empty or nonempty watched set only when runtime-token → the whole watchlist
+traversal → runtime-token and count agree; induce no database writes during this read check.
+Site rollback restores the prior release path and restarts only `pe-site`; the additive RPC/schema remain
 installed. If service rollback to the legacy publisher is still permitted, roll the site back
 first—the token-guarded reader must never run against the legacy producer.
 

@@ -137,7 +137,7 @@ A ledger event is one of buy/open, add, trim, exit, flip, settlement, merge/spli
 | Max uncopiable profit | ≤ 35 % | ≤ 50 % |
 | Max drawdown in follower sim | per bankroll tier | observation only |
 | Min simulated follower turnover | ≥ 0.35 bankroll/day | not required |
-| Watchlist size | **up to** `active_watchlist_size` (= 100 default) survivors | up to `incubator_watchlist_size` (= 250) |
+| Watchlist size | Every survivor by default; optional rank-ordered `active_watchlist_size` cap ([contract](_GLOSSARY.md#active-watchlist-size)) | up to `incubator_watchlist_size` ([_GLOSSARY.md](_GLOSSARY.md)) |
 
 The incubator list is for research and paper-copying; it cannot receive meaningful live capital until promoted.
 
@@ -321,6 +321,7 @@ Backtest override: `PE_BACKTEST_PER_TRADE_CAP=unlimited` (or `bps:N` / `mode_def
 Kelly                  → fractional-Kelly (the full c/p/bankroll math)
 Dollar { usd }         → principal = the conservative compact-fee budget principal
 Contract { contracts } → minimum shares = exactly N
+CashFraction { fraction } → causal-cash all-in budget, clipped at the era cash floor
 ```
 
 All modes share one signed ask ladder and compact CLOB fee schedule. Its worst accepted tick is the
@@ -329,7 +330,9 @@ decimals. The fee is computed once for the final aggregate quantity at that pric
 five decimals. Kelly first derives a candidate from the one-share all-in cost, recomputes the
 aggregate all-in cost for that candidate, resizes once, and takes the smaller size. Dollar mode
 derives conservative principal from its monetary budget; continuation-7 paper can reduce that
-principal to available in-band capacity once. Historical paper, ordinary live and backtest retain
+principal to available in-band capacity once. CashFraction derives its budget from causal cash
+and the era start, then uses that partial policy in paper and the complete-request policy in live.
+Historical paper, ordinary live and backtest retain
 the complete-request Dollar policy; economic wire 2 does not select partial sizing. Contract passes
 exactly its configured shares, and Kelly remains exact-or-decline. Every monetary cap bounds
 principal plus the conservative fee reserve. Quantity below the admission minimum, unusable depth,
@@ -337,7 +340,14 @@ stale evidence, or an invalid all-in price is a typed rejection with no fixed-po
 
 **When to use `Dollar`/`Contract`:** when the Kelly `p` input is a per-leader constant with no per-trade information (e.g. a blended historical win rate). A constant `p` collapses Kelly to a pure function of price, which is noise with respect to per-trade edge; the fixed modes eliminate that noise and also eliminate bankroll compounding — position size does not grow with bankroll.
 
-Default: `Kelly`; the deployed service's boot default is `Dollar` (the USD amount is canonical in `_GLOSSARY.md` `sizing_mode_default`). The Supabase KV layer stores three flat keys (`sizing_mode`/`sizing_dollar_usd`/`sizing_contracts`) reassembled in `runtime_config::parse_config`.
+Default: `Kelly`; the service boot/seed default remains `Dollar` (canonical values in `_GLOSSARY.md`
+`sizing_mode_default`). The existing Supabase `sizing_mode` key accepts `cash_fraction:<f>`; the
+flat dollar/contract keys and account schema stay unchanged. The [cash-fraction contract](_GLOSSARY.md#cash-fraction-sizing)
+defines the selected fraction, cash floor, rounding and causal balance. Paper and live record an
+ordinary Dollar audit with the derived budget; qualification uses recorded `cash_before` and the
+Start-bound era bankroll. At/below the floor or below the venue share minimum, no order is placed.
+Other modes keep their sizing contracts. NULL account mode inherits the shared setting; an explicit
+account mode overrides it.
 
 ## Anti-gaming flags
 
@@ -366,8 +376,9 @@ All values in basis points (1 bp = 0.01 %). Comments show the percent equivalent
 # - Concentration caps: UN-ENFORCED BY DECISION on the production copy path. The values below
 #   remain canonical for backtest/tests, carried as `RiskSnapshot.concentration_caps =
 #   Some(ConcentrationCaps::CANONICAL)`; production passes `None` (typed, not accidental).
-# - Drawdown stops: ARMED from exact owner-local financial snapshots and durable
-#   paper/live evidence. The copy-latency halt is retired for current decisions.
+# - Drawdown policy: every new paper/live decision records KillOnly; absolute loss alone
+#   is armed from exact owner-local snapshots and durable evidence. Historical Stops snapshots
+#   retain their recorded rules (_GLOSSARY.md drawdown_policy). Current copy-latency halt is retired.
 
 [winner_follow.modes]
 leader_follow                = "live_tiny"   # ordinary live mode; promoted remains deferred
@@ -391,10 +402,13 @@ max_market_bps                       = 200   # 2.00 % per market
 max_family_bps                       = 800   # 8.00 % per MarketFamily
 max_total_copy_bps                   = 2500  # 25.00 % total open copy exposure
 
-# Drawdown stops (armed; fixed owner-local baseline and denominator)
-intraday_stop_bps                    = -200  # halt new entries at -2.00 % intraday
-rolling_7d_stop_bps                  = -600  # halt at -6.00 % over rolling 7d
+# Drawdown (fixed owner-local baseline and denominator)
+drawdown_policy                      = "kill_only" # recorded by every new paper/live decision
+kill_only_drawdown_bps               = -3000 # -30.00 % bankroll absolute kill; manual release
+# Historical `stops` snapshots keep their recorded rules
 kill_switch_drawdown_bps             = -1000 # -10.00 % bankroll absolute kill
+intraday_stop_bps                    = -200  # -2.00 % intraday
+rolling_7d_stop_bps                  = -600  # -6.00 % over rolling 7d
 
 [winner_follow.copy]
 order_validity_seconds               = 30    # cancel if unfilled within window
@@ -405,7 +419,7 @@ The TOML above is the only authoritative copy. README, `04-PHASE-TRADING-STRATEG
 
 ## Copy-scope gates (service-side, issue #290)
 
-These gates live in `crates/service` (the orchestrator copy path), fire **before** the strategy-level gates below: a copied trade must be a **per-wallet first BUY entry** under its frozen source authority, resolving **within `[min, max]` of now**, **held to resolution**, with usable current market and mandatory book evidence inside `[min_fill_price, max_fill_price)`. They are production-only (the orchestrator path is not exercised in backtest, which uses `simulation.rs`). The leader-price band of the original 72hr cohort was **removed in #339**; a **current fill-basis floor returned at the 2026-07-03 run28 cutover** (`min_fill_price`, #468 selection↔deployment parity — the run28 eval filtered forward copies to the band) alongside the pre-existing `max_fill_price` cap.
+These gates live in `crates/service` (the orchestrator copy path), fire **before** the strategy-level gates below: a copied trade must be a **per-wallet first BUY entry** under its frozen source authority, whose scheduled marker's next UTC midnight is **within `[min, max)` of now**, **held to resolution**, with usable current market and mandatory book evidence inside `[min_fill_price, max_fill_price)`. They are production-only (the orchestrator path is not exercised in backtest, which uses `simulation.rs`). The leader-price band of the original 72hr cohort was **removed in #339**; a **current fill-basis floor returned at the 2026-07-03 run28 cutover** (`min_fill_price`, #468 selection↔deployment parity — the run28 eval filtered forward copies to the band) alongside the pre-existing `max_fill_price` cap.
 
 Gate order in `orchestrator.rs::handle_trade`, after dedup → watchlist → classify:
 
@@ -413,7 +427,7 @@ Gate order in `orchestrator.rs::handle_trade`, after dedup → watchlist → cla
 |---|---|---|---|---|
 | A | Hold-to-resolution | continuation 7 applies no same-market cross-leader paper hold, subject to gate E; continuations through 6 require `(market, outcome)` not already held | frozen continuation and coherent exact financial snapshot | Each wallet's first entry can copy into a held market on either outcome; same-outcome fills accumulate. Per-wallet history still prevents a second entry. Older paper decisions keep the outcome-keyed `paper_held` check. SELLs remain ignored and copied BUYs are held to resolution. |
 | B | BUY-only first-ever entry | `signal.leader_side == Buy` **and** `signal.action == Entry` **and** `signal.market_id ∉ history[leader]` | authority-specific frame or wallet-second commit + durable `entry_gate_results` / `wallet_market_history_v2`; `CopyEntryGate` is the rebuilt projection | Frame authority takes the first qualifying admission-time Entry in receipt order; complete reads prove the first-ever BUY from history. Continuation-7 homogeneous same-second same-outcome BUY pieces admit only the minimum-source-ID representative; mixed outcomes remain ambiguous. Older continuations retain their ambiguity rule. SELL, `Add`/`Trim`/`Exit`/`Flip` and re-entry never copy; admission consumes history despite later rejection. See the [authority contract](_GLOSSARY.md#continuation-and-commitment-compatibility-588). |
-| C | Resolution horizon | `now + min_resolution_horizon_secs ≤` market resolution `≤ now + max_resolution_horizon_secs` | admission's recorded CLOB-long `scheduled_end_unix` | Too far out locks capital for months; too soon (below `min_resolution_horizon_secs`) cannot be filled and held (`docs/29` copy floor). pe-service release 2 sets that bound to the ranking floor's one [`MIN_TTR_SECS` value](_GLOSSARY.md#ranking-horizon-floor) (#588); historical decisions retain their recorded bound. The same admission read supplies the horizon and economic evidence; the dashboard market-end cache is not consulted by this path. Each bound's `0` disables it; **unknown** resolution time **fails closed** (skipped). |
+| C | Resolution horizon | `min_resolution_horizon_secs ≤ next_utc_midnight(scheduled_end_unix) − now < max_resolution_horizon_secs` | admission's recorded raw CLOB-long `scheduled_end_unix` | The marker names the scheduled end's UTC day; gate C uses the next midnight, with inclusive floor and exclusive ceiling ([defaults](_GLOSSARY.md#copy-entry-gate-first-ever-buy-entry-issues-290-339)). The same admission read supplies horizon/economics; dashboard market-end cache is not consulted. Each bound's `0` disables it. Missing or overflowing end evidence fails closed while either bound is enabled. Raw marker stays in replay evidence. |
 | E | Neg-risk group YES hold | before first staging, a grouped neg-risk outcome-0 BUY has no outcome-0 `buy` fill on another market of that group without a `settled_markets` row | admission's recorded CLOB `neg_risk_market_id`; write-once `meta` mapping and paper fills/settlements | [#752](https://github.com/sppburke/prediction-markets/issues/752) E1–E2 estimated that sibling YES copies lost money; the owner chose this any-leader exception for every group, with unchanged ranker scoring. It skips paper and live together; staged decisions retain admission. Same-market YES and all NO legs are unaffected. The gate maps accepted markets before filling; the resolution poll maps unresolved holdings bought before deploy or restored by recovery. Until successfully mapped, a holding does not block siblings. Gate store errors stop intake; poll store errors fail that market's pass and retry next time. A refusal records a `group_yes_gate` clock and `group_yes_held:<group>:<lowest held sibling market>` in the hashed terminal document; structural replay consumes the reason and qualification does not re-evaluate the gate. |
 | D | Signed-price band | current admission and book evidence are usable, and the signed ladder's worst accepted tick is `≥ min_fill_price` and `< max_fill_price` | shared venue ladder/economic-preparation owner | Continuation 7 checks accepted asks once: inclusive floor, exclusive ceiling and impact ceiling; no later VWAP band refusal or decision mid acquisition/refusal. Horizon, admission, book freshness and risk remain mandatory. Accounting retains VWAP; older paper checks and ordinary-live policy remain frozen. The upper boundary skips and the lower boundary fills. |
 
@@ -446,8 +460,8 @@ balance proof, applied configuration hash, and source observation. The signal's 
 frozen audit evidence and cannot substitute for current-book evidence. Paper semantics 2 and 3 walk the
 current ask ladder up to the applied best-ask impact cap, inside `[min_fill_price, max_fill_price)`,
 and sign the ladder's tick-aligned limit without a leader-price ceiling. Semantic 3 selects
-continuation-7 paper partial Dollar sizing only; intent contracts equal the checked whole-contract
-conversion of signed shares. Its per-ask band check has no subsequent VWAP refusal or decision
+continuation-7 paper partial Dollar sizing, including the derived CashFraction budget; intent
+contracts equal the checked whole-contract conversion of signed shares. Its per-ask band check has no subsequent VWAP refusal or decision
 mid gate. Semantic 2 retains its historical policy. Paper admission permits
 positive or absent matching delay. Ordinary live uses the same current-book impact cap and neutral
 chase ceiling, with a strict zero-delay check on a fresh target-specific admission read. The
@@ -488,9 +502,9 @@ simulation.rs gates (backtest only, lines 457-518)
 
 | Block reason | Halt scope |
 |---|---|
-| `KillSwitchDrawdown` | strategy-wide new entries; absolute-loss cause remains latched until its own audited append hash releases it |
-| `IntradayDrawdownStop` | strategy-wide new entries; releases mechanically when the current fixed-denominator intraday value clears the threshold |
-| `Rolling7dDrawdownStop` | strategy-wide new entries; releases mechanically when closes age out or the fixed-denominator value clears the threshold |
+| `KillSwitchDrawdown` | strategy-wide new entries at the recorded policy's absolute threshold; new decisions use `KillOnly` ([policy](_GLOSSARY.md#drawdown-policy)). Absolute loss stays latched until its own audited append hash releases it. |
+| `IntradayDrawdownStop` | historical `Stops` snapshots only; releases mechanically when the fixed-denominator intraday value clears its recorded threshold. No day gate for new `KillOnly` decisions, even with a recorded cause. |
+| `Rolling7dDrawdownStop` | historical `Stops` snapshots only; releases mechanically as closes age out or the fixed-denominator value clears its recorded threshold. No week gate for new `KillOnly` decisions, even with a recorded cause. |
 | `CopyLatencyKillSwitch` | historical semantic-1 replay only; retired for current paper and live decisions |
 | `PerTradeSizeExceeded` | this trade |
 | `LeaderConcentrationExceeded` | this trade |

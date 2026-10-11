@@ -122,7 +122,7 @@ struct RankingRow {
 const RANKING_EXACT_SELECT: &str = "*,hit_rate_text:hit_rate::text,ls_tstat_text:ls_tstat::text";
 
 /// Survivor gate applied to EVERY `latest_ranking` read (#518). The published batch is a
-/// 200-row bench; only rows carrying the ranker's `survives` verdict are Leaders, so only they
+/// ranked bench; only rows carrying the ranker's `survives` verdict are Leaders, so only they
 /// may reach the live watchlist. Fail-closed by construction: `is.true` excludes SQL NULL, so a
 /// batch with no verdict (pre-#518, or a legacy replayed publication) admits nobody rather than
 /// admitting everybody. `active_watchlist_size` is therefore a pure cap, not the followed count.
@@ -141,14 +141,16 @@ fn latest_ranking_url(base_url: &str, limit: usize) -> String {
 /// `select e.* from ranking_entries e where e.batch_id = (select max(batch_id) …)`
 /// (`scripts/supabase_schema.sql`), so the same columns, select aliases, survivor filter, and
 /// rank ordering apply — only the moving `max(batch_id)` predicate is replaced by an explicit one.
-fn batch_ranking_url(base_url: &str, batch_id: i64, limit: usize) -> String {
+fn batch_ranking_url(base_url: &str, batch_id: i64) -> String {
     format!(
         "{}/rest/v1/ranking_entries\
          ?select={RANKING_EXACT_SELECT}&batch_id=eq.{batch_id}&{RANKING_SURVIVOR_FILTER}\
-         &order=rank&limit={limit}",
+         &order=rank",
         base_url.trim_end_matches('/')
     )
 }
+
+const RANKING_PAGE_SIZE: usize = 1_000;
 
 /// Strict canary-only ranking read. Unlike the ordinary paper reader, this rejects malformed,
 /// stale, duplicate, incomplete, or cross-batch rows and raw-captures the owning batch timestamp.
@@ -583,19 +585,8 @@ pub(crate) fn auth_token<'a>(anon_key: &'a str, secret_key: &'a str) -> &'a str 
     }
 }
 
-/// Issue an authenticated `GET {url}` against PostgREST and map the ranking rows to a
-/// [`Watchlist`]. Shared by [`fetch`] and [`fetch_candidates`]: the same `token` goes in BOTH
-/// the `apikey` and `Authorization: Bearer` headers (see [`auth_token`]).
-async fn get_ranking(
-    client: &reqwest::Client,
-    url: &str,
-    token: &str,
-) -> Result<(Watchlist, HashMap<WalletAddress, i64>), SupabaseError> {
-    Ok(to_watchlist(&get_ranking_rows(client, url, token).await?))
-}
-
 /// Issue the authenticated ranking `GET` and decode its rows, without mapping them. Shared by
-/// [`get_ranking`] and [`fetch_batch`], which validates batch identity before mapping.
+/// the paged batch reader, which validates batch identity before mapping.
 async fn get_ranking_rows(
     client: &reqwest::Client,
     url: &str,
@@ -617,7 +608,7 @@ async fn get_ranking_rows(
 }
 
 /// Fetch one ranking batch's surviving rows, pinned to `batch_id`, and map them exactly as
-/// [`fetch`] maps the `latest_ranking` view.
+/// [`fetch`] maps the latest pinned batch.
 ///
 /// `latest_ranking` is a moving view over `max(batch_id)` (`scripts/supabase_schema.sql`), so a
 /// full re-rank that triggers on batch `B` and then reads the view can apply rows from a newer
@@ -630,52 +621,57 @@ pub async fn fetch_batch(
     anon_key: &str,
     secret_key: &str,
     batch_id: i64,
-    limit: usize,
 ) -> Result<(Watchlist, HashMap<WalletAddress, i64>), SupabaseError> {
-    let rows = get_ranking_rows(
+    get_batch_ranking(
         client,
-        &batch_ranking_url(base_url, batch_id, limit),
+        &batch_ranking_url(base_url, batch_id),
         auth_token(anon_key, secret_key),
+        batch_id,
     )
-    .await?;
-    for row in &rows {
-        if row.batch_id != Some(batch_id) {
-            return Err(SupabaseError::BatchMismatch {
-                expected: batch_id,
-                found: row.batch_id,
-            });
-        }
-    }
-    Ok(to_watchlist(&rows))
+    .await
 }
 
-/// Fetch the latest ranking from Supabase and map it to a [`Watchlist`] plus the last-trade
-/// side-map (#357).
-///
-/// `GET {base_url}/rest/v1/latest_ranking?select=<RANKING_EXACT_SELECT>&survives=is.true&order=rank&limit={limit}`
-/// with the SAME token in both the `apikey` and `Authorization: Bearer` headers (see
-/// [`auth_token`]). This is the
-/// bootstrap + score-refresh path: it has no ranked-value age bound (the bootstrap admits
-/// the top-`limit` SURVIVORS by rank; inactivity belongs to the maintenance knockout from the
-/// activity clock, and score refresh preserves live membership). It IS survivor-filtered
-/// (#518), so `limit` caps survivors rather than selecting the raw top-`limit`, and a batch with
-/// no verdict yields zero rows. See [`fetch_candidates`].
+/// Read every survivor from one batch. A failed page or foreign row discards the whole read.
+async fn get_batch_ranking(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+    batch_id: i64,
+) -> Result<(Watchlist, HashMap<WalletAddress, i64>), SupabaseError> {
+    let mut rows = Vec::new();
+    loop {
+        let page_url = format!("{url}&limit={RANKING_PAGE_SIZE}&offset={}", rows.len());
+        let page = get_ranking_rows(client, &page_url, token).await?;
+        for row in &page {
+            if row.batch_id != Some(batch_id) {
+                return Err(SupabaseError::BatchMismatch {
+                    expected: batch_id,
+                    found: row.batch_id,
+                });
+            }
+        }
+        let complete = page.len() < RANKING_PAGE_SIZE;
+        rows.extend(page);
+        if complete {
+            return Ok(to_watchlist(&rows));
+        }
+    }
+}
+
+/// Pin the latest batch once, then read its complete survivor set for capacity and score refresh.
 pub async fn fetch(
     client: &reqwest::Client,
     base_url: &str,
     anon_key: &str,
     secret_key: &str,
-    limit: usize,
 ) -> Result<(Watchlist, HashMap<WalletAddress, i64>), SupabaseError> {
-    get_ranking(
-        client,
-        &latest_ranking_url(base_url, limit),
-        auth_token(anon_key, secret_key),
-    )
-    .await
+    match fetch_latest_batch_id(client, base_url, anon_key, secret_key).await? {
+        Some(batch_id) => fetch_batch(client, base_url, anon_key, secret_key, batch_id).await,
+        None => Ok(to_watchlist(&[])),
+    }
 }
 
-/// Build the PostgREST query string for [`fetch_candidates`]: the top-`n` SURVIVING
+/// Build the PostgREST query string for [`fetch_candidates`]: the SURVIVING
 /// batch-pinned `ranking_entries` rows ([`RANKING_SURVIVOR_FILTER`], #518; with the
 /// [`RANKING_EXACT_SELECT`] score aliases, #514) excluding `exclude`,
 /// with a non-null ranked last-trade value, ordered by rank. Pure (no network)
@@ -686,7 +682,7 @@ pub async fn fetch(
 ///
 /// Missing `last_trade_unix` stays excluded; a not-yet-populated bench pauses backfill,
 /// it never empties the live set. Ranked survivors otherwise have no age bound.
-fn candidates_query(exclude: &[WalletAddress], n: usize, batch_id: i64) -> String {
+fn candidates_query(exclude: &[WalletAddress], batch_id: i64) -> String {
     let mut filters: Vec<String> = vec![
         format!("select={RANKING_EXACT_SELECT}"),
         RANKING_SURVIVOR_FILTER.to_string(),
@@ -699,15 +695,15 @@ fn candidates_query(exclude: &[WalletAddress], n: usize, batch_id: i64) -> Strin
         filters.push(format!("wallet_hex=not.in.({})", hexes.join(",")));
     }
     filters.push("last_trade_unix=not.is.null".to_owned());
-    filters.push(format!("order=rank&limit={n}"));
+    filters.push("order=rank".to_owned());
     filters.join("&")
 }
 
-/// Fetch the top-`n` on-deck candidates from the recorded `batch_id`, excluding any wallet in
+/// Fetch all on-deck candidates from the recorded `batch_id`, excluding any wallet in
 /// `exclude` (the current live ∪ evicted set), ordered by rank. Used by the maintenance tick
 /// (issue #350 WS1 PR-D) to backfill freed live slots from the Supabase bench.
 ///
-/// `GET {base_url}/rest/v1/ranking_entries?select=<exact-aliases>&survives=is.true&batch_id=eq.<batch>&wallet_hex=not.in.(<exclude>)&last_trade_unix=not.is.null&order=rank&limit={n}`
+/// `GET {base_url}/rest/v1/ranking_entries?select=<exact-aliases>&survives=is.true&batch_id=eq.<batch>&wallet_hex=not.in.(<exclude>)&last_trade_unix=not.is.null&order=rank`
 /// with the same token in both headers (see [`auth_token`]). The server-side `not.in.` filter
 /// is an over-fetch optimisation, not a correctness boundary: it is matched case-sensitively
 /// against `ranking_entries.wallet_hex` (canonical lowercase), and
@@ -726,23 +722,13 @@ pub async fn fetch_candidates(
     secret_key: &str,
     batch_id: i64,
     exclude: &[WalletAddress],
-    n: usize,
 ) -> Result<(Watchlist, HashMap<WalletAddress, i64>), SupabaseError> {
     let url = format!(
         "{}/rest/v1/ranking_entries?{}",
         base_url.trim_end_matches('/'),
-        candidates_query(exclude, n, batch_id)
+        candidates_query(exclude, batch_id)
     );
-    let rows = get_ranking_rows(client, &url, auth_token(anon_key, secret_key)).await?;
-    for row in &rows {
-        if row.batch_id != Some(batch_id) {
-            return Err(SupabaseError::BatchMismatch {
-                expected: batch_id,
-                found: row.batch_id,
-            });
-        }
-    }
-    Ok(to_watchlist(&rows))
+    get_batch_ranking(client, &url, auth_token(anon_key, secret_key), batch_id).await
 }
 
 /// Fetch the current (max) `batch_id` from `ranking_batches`, or `None` when no batch exists.
@@ -960,11 +946,11 @@ mod tests {
 
     #[test]
     fn candidates_query_empty_exclude_omits_filter() {
-        // PostgREST rejects an empty `in.()`; with nothing to exclude this is a plain top-n.
+        // PostgREST rejects an empty `in.()`; omit it when nothing is excluded.
         assert_eq!(
-            candidates_query(&[], 5, 7),
+            candidates_query(&[], 7),
             format!(
-                "{EXACT_SELECT_SURVIVORS}&batch_id=eq.7&last_trade_unix=not.is.null&order=rank&limit=5"
+                "{EXACT_SELECT_SURVIVORS}&batch_id=eq.7&last_trade_unix=not.is.null&order=rank"
             )
         );
     }
@@ -974,12 +960,12 @@ mod tests {
         let a = WalletAddress::from_hex("0x00000000000000000000000000000000000000AA").unwrap();
         let b = WalletAddress::from_hex("0x0000000000000000000000000000000000000001").unwrap();
         // Out of order + a duplicate + upper-case input -> sorted, deduped, lowercase output.
-        let q = candidates_query(&[a, b, a], 3, 7);
+        let q = candidates_query(&[a, b, a], 7);
         assert_eq!(
             q,
             format!(
                 "{EXACT_SELECT_SURVIVORS}&batch_id=eq.7&wallet_hex=not.in.(0x0000000000000000000000000000000000000001,\
-                 0x00000000000000000000000000000000000000aa)&last_trade_unix=not.is.null&order=rank&limit=3"
+                 0x00000000000000000000000000000000000000aa)&last_trade_unix=not.is.null&order=rank"
             )
         );
     }
@@ -988,9 +974,9 @@ mod tests {
     fn candidates_query_excludes_missing_ranked_values_without_age_bound() {
         // A missing ranked value stays excluded; survivors have no age bound.
         assert_eq!(
-            candidates_query(&[], 5, 7),
+            candidates_query(&[], 7),
             format!(
-                "{EXACT_SELECT_SURVIVORS}&batch_id=eq.7&last_trade_unix=not.is.null&order=rank&limit=5"
+                "{EXACT_SELECT_SURVIVORS}&batch_id=eq.7&last_trade_unix=not.is.null&order=rank"
             )
         );
     }
@@ -999,17 +985,17 @@ mod tests {
     fn candidates_query_combines_exclude_and_non_null_ranked_value() {
         let a = WalletAddress::from_hex(HEX_A).unwrap();
         assert_eq!(
-            candidates_query(&[a], 3, 7),
+            candidates_query(&[a], 7),
             format!(
                 "{EXACT_SELECT_SURVIVORS}&batch_id=eq.7&wallet_hex=not.in.(0x0000000000000000000000000000000000000001)\
-                 &last_trade_unix=not.is.null&order=rank&limit=3"
+                 &last_trade_unix=not.is.null&order=rank"
             )
         );
     }
 
     #[test]
     fn every_latest_ranking_read_carries_the_exact_aliases() {
-        // All three read sites (#514): the shared ordinary/canary URL and the candidates
+        // The canary URL and both ordinary batch queries (#514)
         // query request the exact `::text` score projections.
         assert_eq!(
             latest_ranking_url("https://example.test/", 25),
@@ -1018,7 +1004,7 @@ mod tests {
                  ?{EXACT_SELECT_SURVIVORS}&order=rank&limit=25"
             )
         );
-        assert!(candidates_query(&[], 5, 7).starts_with(EXACT_SELECT));
+        assert!(candidates_query(&[], 7).starts_with(EXACT_SELECT));
     }
 
     #[test]
@@ -1228,12 +1214,12 @@ mod tests {
 
     #[test]
     fn batch_ranking_url_pins_the_base_table_to_one_batch() {
-        let url = batch_ranking_url("https://x.supabase.co/", 42, 7);
+        let url = batch_ranking_url("https://x.supabase.co/", 42);
         assert_eq!(
             url,
             format!(
                 "https://x.supabase.co/rest/v1/ranking_entries?select={RANKING_EXACT_SELECT}\
-                 &batch_id=eq.42&{RANKING_SURVIVOR_FILTER}&order=rank&limit=7"
+                 &batch_id=eq.42&{RANKING_SURVIVOR_FILTER}&order=rank"
             )
         );
     }
@@ -1256,7 +1242,7 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let base = format!("http://{address}");
 
-        let error = fetch_batch(&reqwest::Client::new(), &base, "anon", "", 2, 10)
+        let error = fetch_batch(&reqwest::Client::new(), &base, "anon", "", 2)
             .await
             .unwrap_err();
         assert!(
@@ -1269,6 +1255,162 @@ mod tests {
             ),
             "expected a batch mismatch, got: {error:?}"
         );
+    }
+
+    #[derive(Clone)]
+    struct PagedRankingFixture {
+        latest: std::sync::Arc<std::sync::atomic::AtomicI64>,
+        latest_reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        offsets: std::sync::Arc<std::sync::Mutex<Vec<usize>>>,
+        failure: Option<u16>,
+        foreign_batch: bool,
+    }
+
+    async fn paged_ranking_server(
+        failure: Option<u16>,
+        foreign_batch: bool,
+    ) -> (String, PagedRankingFixture, tokio::task::JoinHandle<()>) {
+        use axum::{
+            Json, Router,
+            extract::{Query, State},
+            response::IntoResponse,
+            routing::get,
+        };
+        use std::sync::atomic::Ordering;
+        let fixture = PagedRankingFixture {
+            latest: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(7)),
+            latest_reads: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            offsets: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            failure,
+            foreign_batch,
+        };
+        let app = Router::new()
+            .route(
+                "/rest/v1/ranking_batches",
+                get(|State(state): State<PagedRankingFixture>| async move {
+                    state.latest_reads.fetch_add(1, Ordering::SeqCst);
+                    Json(json!([{"batch_id": state.latest.load(Ordering::SeqCst)}]))
+                }),
+            )
+            .route(
+                "/rest/v1/ranking_entries",
+                get(
+                    |State(state): State<PagedRankingFixture>,
+                     Query(query): Query<HashMap<String, String>>,
+                     headers: axum::http::HeaderMap| async move {
+                        assert_eq!(query["batch_id"], "eq.7");
+                        assert_eq!(query["survives"], "is.true");
+                        assert_eq!(query["select"], RANKING_EXACT_SELECT);
+                        assert_eq!(query["order"], "rank");
+                        assert_eq!(query["limit"], "1000");
+                        assert_eq!(headers["apikey"], "secret");
+                        assert_eq!(headers["authorization"], "Bearer secret");
+                        let offset = query["offset"].parse::<usize>().unwrap();
+                        state.offsets.lock().unwrap().push(offset);
+                        if offset > 0
+                            && let Some(status) = state.failure
+                        {
+                            return axum::http::StatusCode::from_u16(status)
+                                .unwrap()
+                                .into_response();
+                        }
+                        // A publication during traversal must not change the selected batch's rows.
+                        state.latest.store(8, Ordering::SeqCst);
+                        let rows = (offset..1_001).take(1_000).map(|index| json!({
+                    "batch_id": if offset > 0 && state.foreign_batch { 8 } else { 7 },
+                    "rank": index + 1,
+                    "wallet_hex": format!("0x{:040x}", index + 1),
+                    "hit_rate_text": "0.6", "ls_tstat_text": "3", "n_trades": 20,
+                    "last_trade_unix": 1_700_000_000_i64,
+                })).collect::<Vec<_>>();
+                        Json(rows).into_response()
+                    },
+                ),
+            )
+            .with_state(fixture.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (base, fixture, server)
+    }
+
+    #[tokio::test]
+    async fn survivor_pages_pin_latest_once_and_candidates_read_the_complete_batch() {
+        use std::sync::atomic::Ordering;
+        let (base, fixture, server) = paged_ranking_server(None, false).await;
+        let client = reqwest::Client::new();
+        let (watchlist, last_trade) = fetch(&client, &base, "anon", "secret").await.unwrap();
+        assert_eq!(fixture.latest_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.latest.load(Ordering::SeqCst), 8);
+        assert_eq!(*fixture.offsets.lock().unwrap(), vec![0, 1_000]);
+        assert_eq!(watchlist.entries.len(), 1_001);
+        assert_eq!(last_trade.len(), 1_001);
+        let expected = watchlist
+            .entries
+            .iter()
+            .map(|entry| entry.wallet)
+            .collect::<HashSet<_>>();
+        assert_eq!(expected.len(), 1_001);
+        for cap in [1, 100, 200, usize::MAX] {
+            let (selected, times) =
+                select_membership(watchlist.clone(), last_trade.clone(), &HashSet::new(), cap);
+            assert_eq!(selected.entries.len(), cap.min(1_001));
+            assert_eq!(times.len(), selected.entries.len());
+        }
+        fixture.offsets.lock().unwrap().clear();
+        let (candidates, times) = fetch_candidates(&client, &base, "anon", "secret", 7, &[])
+            .await
+            .unwrap();
+        assert_eq!(fixture.latest_reads.load(Ordering::SeqCst), 1);
+        assert_eq!(*fixture.offsets.lock().unwrap(), vec![0, 1_000]);
+        assert_eq!(
+            candidates
+                .entries
+                .iter()
+                .map(|entry| entry.wallet)
+                .collect::<HashSet<_>>(),
+            expected
+        );
+        assert_eq!(times, last_trade);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_survivor_page_discards_batch_and_candidates() {
+        let (base, fixture, server) = paged_ranking_server(Some(503), false).await;
+        let client = reqwest::Client::new();
+        assert!(matches!(
+            fetch(&client, &base, "anon", "secret").await,
+            Err(SupabaseError::Status(503))
+        ));
+        assert_eq!(*fixture.offsets.lock().unwrap(), vec![0, 1_000]);
+        assert!(matches!(
+            fetch_candidates(&client, &base, "anon", "secret", 7, &[]).await,
+            Err(SupabaseError::Status(503))
+        ));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn foreign_survivor_page_discards_batch_and_candidates() {
+        let (base, fixture, server) = paged_ranking_server(None, true).await;
+        let client = reqwest::Client::new();
+        assert!(matches!(
+            fetch(&client, &base, "anon", "secret").await,
+            Err(SupabaseError::BatchMismatch {
+                expected: 7,
+                found: Some(8)
+            })
+        ));
+        assert_eq!(*fixture.offsets.lock().unwrap(), vec![0, 1_000]);
+        assert!(matches!(
+            fetch_candidates(&client, &base, "anon", "secret", 7, &[]).await,
+            Err(SupabaseError::BatchMismatch {
+                expected: 7,
+                found: Some(8)
+            })
+        ));
+        server.abort();
     }
 
     #[tokio::test]

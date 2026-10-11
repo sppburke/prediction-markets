@@ -38,6 +38,17 @@
 
 ## Polymarket
 
+> **Scheduled-end day and leaderboard paging (#757).** Last checked: **2026-10-09** for
+> CLOB `end_date_iso`: the supplied issue evidence measured UTC-midnight markers in 99.19% of
+> 1,442,086 markets. The marker names the scheduled end's UTC day; scoring and gate C use its
+> next UTC midnight, preserving the raw marker as evidence. This is a scheduled-day projection,
+> not proof of actual closure or a Gamma real-time end lookup. Re-verify by **2026-12-08**.
+> Last checked: **2026-10-10** for the [leaderboard contract](https://docs.polymarket.com/api-reference/core/get-trader-leaderboard-rankings):
+> `/v1/leaderboard` accepts `offset` through **1000**; discovery pages to the canonical
+> [`bootstrap_leaderboard_top_n`](_GLOSSARY.md#bootstrap-defaults-pe-bootstrap) depth.
+> Re-verify by **2026-12-09**. These dates retain the issue's source-pass provenance;
+> the documentation implementation made no network requests.
+
 > **CLOB neg-risk groups (#739/#588), Last checked: 2026-10-05; re-verify by
 > 2026-12-04.** The official [long-market schema](https://docs.polymarket.com/api-spec/clob-openapi.yaml)
 > exposes boolean `neg_risk` and string `neg_risk_market_id`. The approved #739 source pass records
@@ -317,12 +328,12 @@ earliest time's rows as that earliest listing and still refuses any other mixed-
 | https://docs.polymarket.com/api-reference/relayer/submit-a-transaction | 2026-08-11 | 2026-10-10 |
 | https://docs.polymarket.com/api-reference/relayer/get-relayer-address-and-nonce | 2026-08-11 | 2026-10-10 |
 | https://docs.polymarket.com/api-reference/relayer/get-a-transaction-by-id | 2026-08-11 | 2026-10-10 |
-| https://docs.polymarket.com/api-reference/core/get-trader-leaderboard-rankings | 2026-05-04 | 2026-07-03 |
+| https://docs.polymarket.com/api-reference/core/get-trader-leaderboard-rankings | 2026-10-10 | 2026-12-09 |
 | https://docs.polymarket.com/api-reference/core/get-user-activity | 2026-09-16 | 2026-11-15 |
 | https://docs.polymarket.com/api-reference/feeds/list-account-activity | 2026-09-10 | 2026-11-09 |
 | https://docs.polymarket.com/api-reference/service/get-data-freshness | 2026-09-10 | 2026-11-09 |
 | https://docs.polymarket.com/api-reference/data-api/migrating-from-v1 | 2026-09-10 | 2026-11-09 |
-| https://clob.polymarket.com/markets?closed=true | 2026-09-01 | 2026-10-31 |
+| https://clob.polymarket.com/markets?closed=true | 2026-10-09 | 2026-12-08 |
 | https://docs.polymarket.com/api-reference/markets/list-markets | 2026-10-09 | 2026-12-08 |
 | https://docs.polymarket.com/api-reference/events/list-events | 2026-07-28 | 2026-09-26 |
 | https://docs.polymarket.com/api-reference/markets/get-market-by-id | 2026-09-27 | 2026-11-26 |

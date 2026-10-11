@@ -18,7 +18,7 @@ use tracing::{error, info, warn};
 use crate::config_poller::{CapacityRequest, WatchlistCapacityApplier};
 use crate::live_watchlist::LiveWatchlist;
 use crate::paper_recovery::{MembershipReason, SealedMembershipEvidence};
-use crate::runtime_config::{AppliedWatchlistCapacity, MAX_ACTIVE_WATCHLIST_SIZE};
+use crate::runtime_config::AppliedWatchlistCapacity;
 use crate::supabase_reader::{self, SupabaseError};
 use crate::watchlist_admission::{
     AdmissionError, AdmissionPreparer, Deferral, DeferralContext, DeferralOutcome,
@@ -99,7 +99,6 @@ impl SupabaseWatchlistCapacity {
             &self.supabase_url,
             &self.supabase_anon_key,
             &self.supabase_secret_key,
-            MAX_ACTIVE_WATCHLIST_SIZE,
         )
         .await?;
         let fenced = crate::position_seeder::unrecoverable_fenced_wallets(&self.paper_state)
@@ -625,7 +624,7 @@ mod tests {
             .iter()
             .map(|w| {
                 serde_json::json!({
-                    "wallet_hex": w.to_string(),
+                    "batch_id": 1, "wallet_hex": w.to_string(),
                     "hit_rate": "0.60",
                     "ls_tstat": "2.0",
                     "n_trades": 10,
@@ -635,7 +634,11 @@ mod tests {
             .collect();
         let app = Router::new()
             .route(
-                "/rest/v1/latest_ranking",
+                "/rest/v1/ranking_batches",
+                get(|| async { Json(serde_json::json!([{"batch_id": 1}])) }),
+            )
+            .route(
+                "/rest/v1/ranking_entries",
                 get(move || {
                     let ranking = ranking.clone();
                     async move { Json(ranking) }
@@ -838,18 +841,23 @@ mod tests {
             .iter()
             .map(|wallet| {
                 serde_json::json!({
-                    "wallet_hex": wallet.to_string(), "hit_rate": "0.6", "ls_tstat": "2",
+                    "batch_id": 1, "wallet_hex": wallet.to_string(), "hit_rate": "0.6", "ls_tstat": "2",
                     "n_trades": 10, "last_trade_unix": 1_700_000_100_i64
                 })
             })
             .collect::<Vec<_>>();
-        let app = Router::new().route(
-            "/rest/v1/latest_ranking",
-            get(move || {
-                let ranking = ranking.clone();
-                async move { Json(ranking) }
-            }),
-        );
+        let app = Router::new()
+            .route(
+                "/rest/v1/ranking_batches",
+                get(|| async { Json(serde_json::json!([{"batch_id": 1}])) }),
+            )
+            .route(
+                "/rest/v1/ranking_entries",
+                get(move || {
+                    let ranking = ranking.clone();
+                    async move { Json(ranking) }
+                }),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -981,10 +989,13 @@ mod tests {
     async fn shared_live_reentry_failure_keeps_capacity_request_unapplied() {
         let retained = WalletAddress([14; 20]);
         let app = Router::new().route(
-            "/rest/v1/latest_ranking",
+            "/rest/v1/ranking_batches",
+            get(|| async { Json(serde_json::json!([{"batch_id": 1}])) }),
+        ).route(
+            "/rest/v1/ranking_entries",
             get(move || async move {
                 Json(vec![serde_json::json!({
-                    "wallet_hex": retained.to_string(), "hit_rate": "0.6", "ls_tstat": "2",
+                    "batch_id": 1, "wallet_hex": retained.to_string(), "hit_rate": "0.6", "ls_tstat": "2",
                     "n_trades": 10, "last_trade_unix": 1_700_000_100_i64
                 })])
             }),
@@ -1059,7 +1070,10 @@ mod tests {
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let app = Router::new().route(
-            "/rest/v1/latest_ranking",
+            "/rest/v1/ranking_batches",
+            get(|| async { Json(serde_json::json!([{"batch_id": 1}])) }),
+        ).route(
+            "/rest/v1/ranking_entries",
             get({
                 let entered = Arc::clone(&entered);
                 let release = Arc::clone(&release);
@@ -1070,7 +1084,7 @@ mod tests {
                         entered.notify_one();
                         release.notified().await;
                         Json(vec![serde_json::json!({
-                            "wallet_hex": existing.to_string(), "hit_rate": "0.6", "ls_tstat": "2",
+                            "batch_id": 1, "wallet_hex": existing.to_string(), "hit_rate": "0.6", "ls_tstat": "2",
                             "n_trades": 10, "last_trade_unix": 1_700_000_100_i64
                         })])
                     }
@@ -1136,17 +1150,17 @@ mod tests {
         let newcomer_last_trade = 1_700_000_123_i64;
         let ranking = Arc::new(std::sync::Mutex::new(vec![
             serde_json::json!({
-                "wallet_hex": fenced.to_string(), "hit_rate": "0.70", "ls_tstat": "3.0", "n_trades": 10,
+                "batch_id": 1, "wallet_hex": fenced.to_string(), "hit_rate": "0.70", "ls_tstat": "3.0", "n_trades": 10,
             }),
             serde_json::json!({
-                "wallet_hex": existing.to_string(),
+                "batch_id": 1, "wallet_hex": existing.to_string(),
                 "hit_rate": "0.60",
                 "ls_tstat": "2.0",
                 "n_trades": 10,
                 "last_trade_unix": 1_700_000_100_i64
             }),
             serde_json::json!({
-                "wallet_hex": newcomer.to_string(),
+                "batch_id": 1, "wallet_hex": newcomer.to_string(),
                 "hit_rate": "0.55",
                 "ls_tstat": "1.5",
                 "n_trades": 8,
@@ -1156,7 +1170,11 @@ mod tests {
         let fetches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let app = Router::new()
             .route(
-                "/rest/v1/latest_ranking",
+                "/rest/v1/ranking_batches",
+                get(|| async { Json(serde_json::json!([{"batch_id": 1}])) }),
+            )
+            .route(
+                "/rest/v1/ranking_entries",
                 get({
                     let ranking = Arc::clone(&ranking);
                     let fetches = fetches.clone();
@@ -1166,9 +1184,10 @@ mod tests {
                         let ranking = Arc::clone(&ranking);
                         let fetches = fetches.clone();
                         async move {
-                            assert_eq!(query["limit"], MAX_ACTIVE_WATCHLIST_SIZE.to_string());
+                            assert_eq!(query["limit"], "1000");
+                            assert_eq!(query["offset"], "0");
                             assert_eq!(query["survives"], "is.true");
-                            assert!(!query.contains_key("batch_id"));
+                            assert_eq!(query["batch_id"], "eq.1");
                             fetches.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                             let limit = query["limit"].parse::<usize>().unwrap();
                             Json(
@@ -1411,9 +1430,12 @@ mod tests {
     #[tokio::test]
     async fn empty_selection_preserves_each_consumer_failure_contract() {
         let (existing, fenced) = (WalletAddress([41; 20]), WalletAddress([42; 20]));
-        let app = Router::new().route("/rest/v1/latest_ranking", get(move || async move {
+        let app = Router::new().route(
+            "/rest/v1/ranking_batches",
+            get(|| async { Json(serde_json::json!([{"batch_id": 1}])) }),
+        ).route("/rest/v1/ranking_entries", get(move || async move {
             Json(vec![serde_json::json!({
-                "wallet_hex": fenced.to_string(), "hit_rate": "0.6", "ls_tstat": "2", "n_trades": 10,
+                "batch_id": 1, "wallet_hex": fenced.to_string(), "hit_rate": "0.6", "ls_tstat": "2", "n_trades": 10,
             })])
         }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1507,13 +1529,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unlimited_capacity_empty_batch_stays_pending_then_nonempty_retry_applies() {
+        let survivor = WalletAddress([91; 20]);
+        let rows = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let server_rows = rows.clone();
+        let app = Router::new()
+            .route(
+                "/rest/v1/ranking_batches",
+                get(|| async { Json(serde_json::json!([{"batch_id": 1}])) }),
+            )
+            .route(
+                "/rest/v1/ranking_entries",
+                get(move || {
+                    let rows = server_rows.clone();
+                    async move { Json(rows.lock().unwrap().clone()) }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let temp = TempDir::new().unwrap();
+        let source_log = test_source_log(&temp);
+        let paper = Arc::new(PaperStateDb::open(&temp.path().join("paper.db")).unwrap());
+        paper
+            .record_reconciled_history_status(&pe_paper_state::WalletHistoryStatusRecord {
+                wallet: survivor,
+                complete: true,
+                proof_json: "{}".to_owned(),
+                updated_at_unix: 10,
+            })
+            .unwrap();
+        let live = LiveWatchlist::new(watchlist(Vec::new()));
+        let applied = AppliedWatchlistCapacity::new(100);
+        let before = applied.load();
+        let writer_lock = Arc::new(Mutex::new(()));
+        let (requests, desired) = capacity_request_channel(100, writer_lock.clone());
+        let request = requests.request(usize::MAX).await;
+        let (tx, mut rx) = mpsc::channel(1);
+        let applier = SupabaseWatchlistCapacity::new(
+            live.clone(),
+            paper.clone(),
+            writer_lock,
+            applied.clone(),
+            desired,
+            AdmissionPreparer::new(tx, paper.clone()).with_source_log(source_log.handle.clone()),
+            reqwest::Client::new(),
+            base,
+            "anon".to_owned(),
+            String::new(),
+        );
+        assert!(matches!(
+            applier.apply_inner(request).await,
+            Err(CapacityError::EmptyRanking { target: usize::MAX })
+        ));
+        assert!(live.snapshot().entries.is_empty());
+        assert_eq!(applied.load(), before);
+        assert_eq!(requests.current(), request);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        assert_eq!(
+            pe_event_log::Reader::replay(&source_log.path)
+                .unwrap()
+                .count(),
+            0
+        );
+        rows.lock().unwrap().push(serde_json::json!({
+            "batch_id": 1, "wallet_hex": survivor.to_string(), "hit_rate_text": "0.6",
+            "ls_tstat_text": "3", "n_trades": 20, "last_trade_unix": 10,
+        }));
+        let control_live = live.clone();
+        let path = source_log.path.clone();
+        let control = tokio::spawn(async move {
+            while let Some(command) = rx.recv().await {
+                match command {
+                    OrchestratorControl::PrepareAdmissions {
+                        wallets,
+                        acknowledged,
+                    } => {
+                        assert_eq!(wallets, vec![survivor]);
+                        fake_install_anchors(&paper, &wallets, 10);
+                        acknowledged.send(()).unwrap();
+                    }
+                    OrchestratorControl::PublishMembership {
+                        change,
+                        replacements,
+                        checks,
+                        acknowledged,
+                    } => {
+                        checks
+                            .recheck_and_seed(&paper, &control_live, &change, &replacements)
+                            .unwrap();
+                        crate::qualification::verify_published_membership_change(
+                            &change.clone().into_record(),
+                            &path,
+                            &control_live.structural_membership(),
+                        )
+                        .unwrap();
+                        assert_eq!(change.capacity, usize::MAX);
+                        control_live.commit_structural_change(&change.removed, &change.added);
+                        control_live.replace(
+                            &change.removed.into_iter().collect(),
+                            &replacements,
+                            change.capacity,
+                        );
+                        checks.commit_capacity();
+                        acknowledged
+                            .send(Ok(pe_event_log::AppendReceipt {
+                                sequence: pe_core_types::EventSeq(1),
+                                this_hash: blake3::hash(b"unlimited-retry"),
+                            }))
+                            .unwrap();
+                    }
+                    _ => panic!("unexpected unlimited capacity control"),
+                }
+            }
+        });
+        assert_eq!(applier.apply_inner(request).await.unwrap(), 1);
+        assert_eq!(applied.load(), request);
+        assert_eq!(live.structural_membership(), HashSet::from([survivor]));
+        assert_eq!(live.snapshot().entries.len(), 1);
+        drop(applier);
+        control.await.unwrap();
+        source_log.task.abort();
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn zero_capacity_after_wallet_deferral_is_pending_and_audited() {
         let (existing, missing) = (WalletAddress([61; 20]), WalletAddress([62; 20]));
         let app = Router::new().route(
-            "/rest/v1/latest_ranking",
+            "/rest/v1/ranking_batches",
+            get(|| async { Json(serde_json::json!([{"batch_id": 1}])) }),
+        ).route(
+            "/rest/v1/ranking_entries",
             get(move || async move {
                 Json(vec![serde_json::json!({
-                    "wallet_hex": missing.to_string(), "hit_rate": "0.6", "ls_tstat": "2",
+                    "batch_id": 1, "wallet_hex": missing.to_string(), "hit_rate": "0.6", "ls_tstat": "2",
                     "n_trades": 10, "last_trade_unix": 1_700_000_100_i64
                 })])
             }),
@@ -1579,10 +1732,13 @@ mod tests {
         // its live-only reentry defers: publishing would commit the epoch with no live wallet.
         let excluded = WalletAddress([63; 20]);
         let app = Router::new().route(
-            "/rest/v1/latest_ranking",
+            "/rest/v1/ranking_batches",
+            get(|| async { Json(serde_json::json!([{"batch_id": 1}])) }),
+        ).route(
+            "/rest/v1/ranking_entries",
             get(move || async move {
                 Json(vec![serde_json::json!({
-                    "wallet_hex": excluded.to_string(), "hit_rate": "0.6", "ls_tstat": "2",
+                    "batch_id": 1, "wallet_hex": excluded.to_string(), "hit_rate": "0.6", "ls_tstat": "2",
                     "n_trades": 10, "last_trade_unix": 1_700_000_100_i64
                 })])
             }),

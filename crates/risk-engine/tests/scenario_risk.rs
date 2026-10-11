@@ -18,6 +18,7 @@ fn base_snapshot() -> RiskSnapshot {
         copy_latency_kill_switch_active: false,
         proposed_trade_bps: BasisPoints(10),
         per_trade_cap_bps: 25,
+        drawdown_policy: pe_risk_engine::DrawdownPolicy::Stops,
         concentration_caps: Some(ConcentrationCaps::CANONICAL),
     }
 }
@@ -92,4 +93,23 @@ fn scenario_7_unlimited_cap_approves_large_trade() {
     s.per_trade_cap_bps = 10_000;
     s.proposed_trade_bps = BasisPoints(50);
     assert_eq!(evaluate_risk(&s), RiskDecision::Approved);
+}
+
+#[test]
+fn scenario_kill_only_ignores_day_and_week_and_kills_at_minus_3000() {
+    let mut snapshot = base_snapshot();
+    snapshot.drawdown_policy = pe_risk_engine::DrawdownPolicy::KillOnly;
+    snapshot.intraday_pnl_bps = BasisPoints(-200);
+    snapshot.rolling_7d_pnl_bps = BasisPoints(-600);
+    for loss in [-1000, -2999] {
+        snapshot.absolute_pnl_bps = BasisPoints(loss);
+        assert_eq!(evaluate_risk(&snapshot), RiskDecision::Approved);
+    }
+    for loss in [-3000, -3001] {
+        snapshot.absolute_pnl_bps = BasisPoints(loss);
+        assert_eq!(
+            evaluate_risk(&snapshot),
+            RiskDecision::Blocked(RiskBlock::KillSwitchDrawdown)
+        );
+    }
 }

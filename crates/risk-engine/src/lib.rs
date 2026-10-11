@@ -15,7 +15,9 @@ pub use inputs::{
     nearest_rank_p95, pnl_bps, realized_closes_7d, worst_owner,
 };
 pub use pe_core_types::CanaryOrigin;
-pub use snapshot::{CanaryRiskSnapshot, ConcentrationCaps, RiskSnapshot, TradingMode};
+pub use snapshot::{
+    CanaryRiskSnapshot, ConcentrationCaps, DrawdownPolicy, RiskSnapshot, TradingMode,
+};
 
 use pe_core_types::{BasisPoints, CollateralAmount};
 use serde::{Deserialize, Serialize};
@@ -26,6 +28,7 @@ pub const CANARY_MAX_ALLOWANCE: CollateralAmount = CollateralAmount::from_atomic
 
 /// Canonical `docs/19` absolute-loss kill-switch threshold.
 pub const KILL_SWITCH_DRAWDOWN_BPS: i32 = -1_000;
+pub const KILL_ONLY_DRAWDOWN_BPS: i32 = -3_000;
 pub const INTRADAY_STOP_BPS: i32 = -200;
 pub const ROLLING_7D_STOP_BPS: i32 = -600;
 

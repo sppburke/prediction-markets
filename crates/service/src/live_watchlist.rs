@@ -197,7 +197,7 @@ impl LiveWatchlist {
     /// the result to at most `cap` entries, then publish; returns the new total count.
     ///
     /// This is the eviction+backfill primitive for the maintenance tick (issue #350 WS1).
-    /// The caller reads the latest ranking batch (bounded by `MAX_ACTIVE_WATCHLIST_SIZE`) and
+    /// The caller reads the complete pinned ranking batch and
     /// supplies it rank-sorted in `replacements`; `replace` trims them to the working set.
     ///
     /// Semantics (all unit-tested):

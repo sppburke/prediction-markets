@@ -131,3 +131,18 @@ async fn paper_service_rollout_duplicate_resolution_candidate_never_credits_twic
 async fn paper_service_rollout_boot_continues_past_history_incomplete_wave_to_readiness() {
     rollout::run_boot_waves().await;
 }
+
+#[tokio::test]
+async fn cash_fraction_two_decisions_in_one_bucket_preserve_start_floor() {
+    golden::cash_fraction_floor_scenario(false).await;
+}
+
+#[tokio::test]
+async fn cash_fraction_restart_between_fills_preserves_start_floor() {
+    golden::cash_fraction_floor_scenario(true).await;
+}
+
+#[tokio::test]
+async fn kill_only_shadow_terminal_evidence_boots_after_restart() {
+    golden::kill_only_shadow_restart_scenario().await;
+}

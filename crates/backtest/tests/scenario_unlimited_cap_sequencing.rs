@@ -69,6 +69,7 @@ fn clean_snapshot() -> RiskSnapshot {
         copy_latency_kill_switch_active: false,
         proposed_trade_bps: BasisPoints(0),
         per_trade_cap_bps: 0, // overridden by evaluate()
+        drawdown_policy: pe_risk_engine::DrawdownPolicy::Stops,
         concentration_caps: Some(ConcentrationCaps::CANONICAL),
     }
 }

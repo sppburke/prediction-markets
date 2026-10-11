@@ -42,25 +42,33 @@ pub(crate) fn apply_global_risk_halts(
     snapshot: &mut RiskSnapshot,
     copy_latency_enabled: bool,
 ) {
-    use pe_risk_engine::{INTRADAY_STOP_BPS, KILL_SWITCH_DRAWDOWN_BPS, ROLLING_7D_STOP_BPS};
+    use pe_risk_engine::{DrawdownPolicy, INTRADAY_STOP_BPS, ROLLING_7D_STOP_BPS};
 
     for (_, cause) in active {
         match cause {
             RiskHaltCause::AbsoluteLoss => {
-                snapshot.absolute_pnl_bps.0 =
-                    snapshot.absolute_pnl_bps.0.min(KILL_SWITCH_DRAWDOWN_BPS);
+                snapshot.absolute_pnl_bps.0 = snapshot
+                    .absolute_pnl_bps
+                    .0
+                    .min(snapshot.drawdown_policy.absolute_loss_bps());
             }
-            RiskHaltCause::IntradayDrawdown => {
+            RiskHaltCause::IntradayDrawdown
+                if snapshot.drawdown_policy == DrawdownPolicy::Stops =>
+            {
                 snapshot.intraday_pnl_bps.0 = snapshot.intraday_pnl_bps.0.min(INTRADAY_STOP_BPS);
             }
-            RiskHaltCause::Rolling7dDrawdown => {
+            RiskHaltCause::Rolling7dDrawdown
+                if snapshot.drawdown_policy == DrawdownPolicy::Stops =>
+            {
                 snapshot.rolling_7d_pnl_bps.0 =
                     snapshot.rolling_7d_pnl_bps.0.min(ROLLING_7D_STOP_BPS);
             }
             RiskHaltCause::CopyLatency if copy_latency_enabled => {
                 snapshot.copy_latency_kill_switch_active = true;
             }
-            RiskHaltCause::CopyLatency => {}
+            RiskHaltCause::CopyLatency
+            | RiskHaltCause::IntradayDrawdown
+            | RiskHaltCause::Rolling7dDrawdown => {}
         }
     }
 }
@@ -606,6 +614,7 @@ fn compose_paper_risk_snapshot(
         copy_latency_kill_switch_active,
         proposed_trade_bps: base.proposed_trade_bps,
         per_trade_cap_bps: base.per_trade_cap_bps,
+        drawdown_policy: pe_risk_engine::DrawdownPolicy::Stops,
         concentration_caps: None,
     })
 }
@@ -2313,6 +2322,7 @@ mod tests {
                     copy_latency_kill_switch_active: false,
                     proposed_trade_bps: BasisPoints(10),
                     per_trade_cap_bps: 25,
+                    drawdown_policy: pe_risk_engine::DrawdownPolicy::Stops,
                     concentration_caps: None,
                 },
                 decision: RiskDecisionAudit::Approved,
@@ -3597,6 +3607,7 @@ mod tests {
                 copy_latency_kill_switch_active: false,
                 proposed_trade_bps: BasisPoints(1),
                 per_trade_cap_bps: 25,
+                drawdown_policy: pe_risk_engine::DrawdownPolicy::Stops,
                 concentration_caps: None,
             };
 
@@ -3609,8 +3620,46 @@ mod tests {
         }
     }
 
-    /// Current paper and live decisions ignore a historical latency-only cause; every other
-    /// durable cause still blocks by itself.
+    #[test]
+    fn kill_only_overlay_ignores_recorded_day_week_halts_and_uses_its_loss_threshold() {
+        let mut snapshot = RiskSnapshot {
+            leader_exposure_bps: pe_core_types::BasisPoints::ZERO,
+            market_exposure_bps: pe_core_types::BasisPoints::ZERO,
+            family_exposure_bps: pe_core_types::BasisPoints::ZERO,
+            total_copy_exposure_bps: pe_core_types::BasisPoints::ZERO,
+            intraday_pnl_bps: pe_core_types::BasisPoints::ZERO,
+            rolling_7d_pnl_bps: pe_core_types::BasisPoints::ZERO,
+            absolute_pnl_bps: pe_core_types::BasisPoints::ZERO,
+            copy_latency_kill_switch_active: false,
+            proposed_trade_bps: pe_core_types::BasisPoints(1),
+            per_trade_cap_bps: 10000,
+            drawdown_policy: pe_risk_engine::DrawdownPolicy::KillOnly,
+            concentration_caps: None,
+        };
+        let stops = HashSet::from([
+            (RiskHaltOwner::Paper, RiskHaltCause::IntradayDrawdown),
+            (RiskHaltOwner::Paper, RiskHaltCause::Rolling7dDrawdown),
+        ]);
+        let before = snapshot.clone();
+        apply_global_risk_halts(&stops, &mut snapshot, false);
+        assert_eq!(snapshot, before);
+        assert_eq!(
+            pe_risk_engine::evaluate_risk(&snapshot),
+            pe_risk_engine::RiskDecision::Approved
+        );
+        apply_global_risk_halts(
+            &HashSet::from([(RiskHaltOwner::Paper, RiskHaltCause::AbsoluteLoss)]),
+            &mut snapshot,
+            false,
+        );
+        assert_eq!(snapshot.absolute_pnl_bps.0, -3000);
+        assert_eq!(
+            pe_risk_engine::evaluate_risk(&snapshot),
+            pe_risk_engine::RiskDecision::Blocked(pe_risk_engine::RiskBlock::KillSwitchDrawdown)
+        );
+    }
+
+    /// Historical Stops snapshots ignore retired latency causes and retain the other halts.
     #[test]
     fn retired_latency_overlay_keeps_other_single_cause_halts() {
         let cases = [
@@ -3640,6 +3689,7 @@ mod tests {
                 copy_latency_kill_switch_active: false,
                 proposed_trade_bps: BasisPoints(1),
                 per_trade_cap_bps: 25,
+                drawdown_policy: pe_risk_engine::DrawdownPolicy::Stops,
                 concentration_caps: None,
             };
             apply_global_risk_halts(
@@ -3723,6 +3773,7 @@ mod tests {
             copy_latency_kill_switch_active: false,
             proposed_trade_bps: BasisPoints(1),
             per_trade_cap_bps: 25,
+            drawdown_policy: pe_risk_engine::DrawdownPolicy::Stops,
             concentration_caps: None,
         };
 

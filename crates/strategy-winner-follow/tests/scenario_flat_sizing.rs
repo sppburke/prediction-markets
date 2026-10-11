@@ -82,6 +82,7 @@ fn clean_snapshot() -> RiskSnapshot {
         copy_latency_kill_switch_active: false,
         proposed_trade_bps: BasisPoints(10),
         per_trade_cap_bps: 25,
+        drawdown_policy: pe_risk_engine::DrawdownPolicy::Stops,
         concentration_caps: Some(ConcentrationCaps::CANONICAL),
     }
 }
@@ -522,5 +523,69 @@ fn scenario_contract_sizing_is_not_clamped_by_per_trade_cap() {
         intent.contracts.0, 1000,
         "contract N must pass through unchanged, got {}",
         intent.contracts.0
+    );
+}
+
+#[test]
+fn scenario_cash_fraction_strategy_emits_uncapped_allocation() {
+    let strategy = WinnerFollowStrategy::new(WinnerFollowConfig {
+        sizing_mode: SizingMode::CashFraction {
+            fraction: dec!(0.00375),
+        },
+        ..flat_config(dec!(25))
+    });
+    let intent = strategy
+        .evaluate(
+            &make_signal(0xF9, LeaderAction::Entry),
+            p_high(),
+            clean_snapshot(),
+            dec!(10_000),
+            ExecutionMode::Paper,
+        )
+        .unwrap();
+    assert_eq!(intent.contracts.0, 75);
+    assert!(matches!(
+        strategy.evaluate(
+            &make_signal(0xF9, LeaderAction::Entry),
+            p_high(),
+            clean_snapshot(),
+            dec!(1),
+            ExecutionMode::Paper
+        ),
+        Err(WinnerFollowError::NoEdge)
+    ));
+}
+
+#[test]
+fn scenario_cash_fraction_budget_clips_rounds_and_uses_causal_cash() {
+    use pe_strategy_winner_follow::cash_fraction_budget;
+    assert_eq!(
+        cash_fraction_budget(dec!(0.00375), dec!(10000), dec!(10000)),
+        Some(dec!(37.5))
+    );
+    assert_eq!(
+        cash_fraction_budget(dec!(0.00375), dec!(7001.1234567), dec!(10000)),
+        Some(dec!(1.123456))
+    );
+    for cash in [dec!(6999), dec!(7000)] {
+        assert_eq!(
+            cash_fraction_budget(dec!(0.00375), cash, dec!(10000)),
+            Some(dec!(0))
+        );
+    }
+    let mut cash = dec!(7050);
+    for _ in 0..4 {
+        let debit = cash_fraction_budget(dec!(0.00375), cash, dec!(10000)).unwrap();
+        cash -= debit;
+        assert!(cash >= dec!(7000));
+    }
+    assert_eq!(cash, dec!(7000));
+    assert_eq!(
+        cash_fraction_budget(
+            dec!(0.5),
+            rust_decimal::Decimal::MAX,
+            rust_decimal::Decimal::ZERO
+        ),
+        Some(rust_decimal::Decimal::MAX * dec!(0.5))
     );
 }

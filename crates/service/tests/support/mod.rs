@@ -1104,6 +1104,7 @@ pub fn economic_prepared(
                 copy_latency_kill_switch_active: false,
                 proposed_trade_bps: BasisPoints(1_000),
                 per_trade_cap_bps: 1_000,
+                drawdown_policy: pe_risk_engine::DrawdownPolicy::Stops,
                 concentration_caps: None,
             },
             decision: RiskDecisionAudit::Approved,

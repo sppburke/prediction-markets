@@ -32,10 +32,10 @@
 #   Verify           that exact batch and contiguous rank set are latest_ranking.
 #
 # Production defaults are baked in (override via flags): --universe-from-trades,
-# HALF_LIFE_DAYS, relative 180d window, band 0.15–0.85, TTR 48h, MinTRL 20 (the run28
+# HALF_LIFE_DAYS, relative 180d window, band 0.15–0.65, TTR 24h, MinTRL 20 (the run28
 # winner shape, 2026-07-03 cutover: --min-trl 20 REPLACES the per-month activity gates,
 # which production zeroes), --scheduled-only (drops the resolved-at look-ahead fallback),
-# floor_tstat 2.0, top_n 200.
+# floor_tstat 3.0, top_n 200.
 #
 # Continuous production execution is owned by scripts/rank_and_push_loop.sh.
 # A zero-argument run persists its logical run directory before activation. A
@@ -81,7 +81,7 @@
 # initial schema-one candidate once (cache-migrate-v2) → discover → activate →
 # collect complete activity for the union of current acquisition candidates and
 # retained histories (cache-populate-activity-v2 --fresh-generation) → payout →
-# cache-finalize-v2 → the existing cutover path (rank, targeted prices, re-finalize,
+# cache-finalize-v2 → the existing cutover path (rank, export-bound re-finalize,
 # prepare-only publication, cache-activate, exact resume). Legacy backfill/events/
 # resolutions read retired tables and do not run in this lane. The lane is frozen
 # in the cycle configuration, so a resumed cycle keeps its lane.
@@ -111,11 +111,11 @@ HALF_LIFE_DAYS="30"
 # Shared decay age anchor for BOTH passes; empty => resolved below to UTC-midnight today (= the
 # relative win_end) so the two passes weight every trade against the identical anchor.
 AS_OF=""
-TTR_HOURS="48"
+TTR_HOURS="24"
 TARGET_N="25"
 PRICE_MIN="0.15"
-PRICE_MAX="0.85"
-FLOOR_TSTAT="2.0"
+PRICE_MAX="0.65"
+FLOOR_TSTAT="3.0"
 # MinTRL eligibility (run28 winner shape, 2026-07-03 cutover): >=20 qualifying positions
 # in-window REPLACES the per-month activity gates (run28's trl20 axis has no per-month
 # component), so production zeroes both. docs/_GLOSSARY `ranker_prod_min_trl`.
@@ -260,7 +260,7 @@ fi
 # SUPABASE_SECRET_KEY from the environment) sees them. Sourcing only before the verify step
 # would leave the push stage without credentials.
 set -a; source .env; set +a
-MIN_TTR_SECS=10
+MIN_TTR_SECS=60
 
 # Neutralize PE_BOOTSTRAP_FETCH_RESOLUTIONS for the `backfill` stage (issue #383). `.env` sets
 # it =1 (.env:30) and the `set -a; source .env` above exports it GLOBALLY, so without this unset
@@ -911,8 +911,7 @@ print(int(json.load(open(sys.argv[1], encoding="utf-8"))["side_schema"]))' "$sta
     run_refresh_stage "payout" "$PE_BOOTSTRAP_BIN" cache-populate-payout-v2 --db "$side" \
       "${BOOTSTRAP_CONFIG_ARGS[@]}"
   fi
-  # Certify only: the re-finalize after the targeted price writes records the bytes
-  # activation binds, and nothing reads a record before it.
+  # Certify first; re-finalize binds the exported projection before pass two.
   CACHE_STAGE_RECORD="$OUT_DIR/cache_stage_record.json"
   run_refresh_stage "cache-finalize" "$PE_BOOTSTRAP_BIN" cache-finalize-v2 --db "$side" \
     "${BOOTSTRAP_CONFIG_ARGS[@]}"
@@ -996,33 +995,15 @@ if [[ "$SKIP_RANK" == "0" ]]; then
     --min-active-months "$MIN_ACTIVE_MONTHS" \
     --floor-tstat "$FLOOR_TSTAT" --scheduled-only
 
-  echo "── Stage 2a/3: emit reference-oracle fetch targets (#536) ─────────────────────"
-  TARGETS_CSV="$OUT_DIR/oracle_targets.csv"
-  run_ranking_stage "pass-2" "$PYTHON_BIN" scripts/latency_shift_rerank.py \
-    --db "$DB" --ranked-csv "$RANKED_CSV" --positions-csv "$POSITIONS_CSV" \
-    --out-dir "$OUT_DIR" \
-    --latency-shift-secs "$LATENCY_SHIFT_SECS" --fill-window-secs "$FILL_WINDOW_SECS" \
-    --min-trl "$MIN_TRL" --min-ttr-secs "$MIN_TTR_SECS" --ttr-max-secs "$TTR_MAX_SECS" \
-    --floor-tstat "$FLOOR_TSTAT" --emit-targets "$TARGETS_CSV"
-
-  echo "── Stage 2b/3: targeted reference fetch into the ranker price store (#536) ────"
+  echo "── Stage 2/3: bind the certified export and price first-entry prints ────────"
   if [[ -n "$CAPTURE_PID" ]]; then
     capture_status=0
     wait "$CAPTURE_PID" || capture_status=$?
     CAPTURE_PID=""
     [[ "$capture_status" -eq 0 ]] || exit "$capture_status"
   fi
-  # Write-once + range algebra => resumable; transient page failures return partial
-  # (exit 2, WARN + continue) and pass-2's terminal-coverage gate then exits 75 so the
-  # supervisor retries the cycle — a partially fetched cycle can never publish.
-  export PE_BOOTSTRAP_CACHE_PATH="$DB"
-  run_refresh_stage "reference-fetch" "$PE_BOOTSTRAP_BIN" prices-history \
-    --targets-csv "$TARGETS_CSV" "${BOOTSTRAP_CONFIG_ARGS[@]}"
   if [[ "$CUTOVER_MODE" == "1" ]]; then
-    # The price store lives in the same SQLite file. Re-finalize after its
-    # targeted writes so activation is bound to the exact ranked cache bytes.
-    # The candidate snapshot already captured the finalized inputs alongside
-    # export and ranking; the fetch changes only the price store.
+    # Bind publication and activation to the exact certified export and cache bytes.
     EXPORT_MANIFEST_ARGS=()
     EXPORT_MANIFEST="$PARQUET_DIR/schema_v2_export_manifest.json"
     if [[ "$("$PYTHON_BIN" -c 'import json, sys
@@ -1033,14 +1014,13 @@ print(json.load(open(sys.argv[1], encoding="utf-8"))["version"])' "$EXPORT_MANIF
       "${EXPORT_MANIFEST_ARGS[@]}" --stage-record "$CACHE_STAGE_RECORD" "${BOOTSTRAP_CONFIG_ARGS[@]}"
   fi
 
-  echo "── Stage 2c/3: pass-2 reference-oracle rerank (adds hit_rate) ─────────────────"
+  echo "── Pass 2: first-entry taker-print rerank ───────────────────────────────────"
   run_ranking_stage "pass-2" "$PYTHON_BIN" scripts/latency_shift_rerank.py \
     --db "$DB" --ranked-csv "$RANKED_CSV" --positions-csv "$POSITIONS_CSV" \
     --out-dir "$OUT_DIR" \
     --latency-shift-secs "$LATENCY_SHIFT_SECS" --fill-window-secs "$FILL_WINDOW_SECS" \
     --half-life-days "$HALF_LIFE_DAYS" --as-of "$AS_OF" \
-    --min-trl "$MIN_TRL" --min-avg-per-month "$MIN_AVG_PER_MONTH" \
-    --min-active-months "$MIN_ACTIVE_MONTHS" \
+    --min-trl "$MIN_TRL" \
     --min-ttr-secs "$MIN_TTR_SECS" --ttr-max-secs "$TTR_MAX_SECS" \
     --price-min "$PRICE_MIN" --price-max "$PRICE_MAX" \
     --floor-tstat "$FLOOR_TSTAT" --git-sha "$GIT_SHA" \

@@ -26,10 +26,15 @@ defaults"):
 
 ```
 PE_BOOTSTRAP_LEADERBOARD_BASE_URL        # override leaderboard host (testing)
-PE_BOOTSTRAP_LEADERBOARD_TOP_N           # default 50 (API hard-caps at 50)
+PE_BOOTSTRAP_LEADERBOARD_TOP_N           # list depth; paged (canonical default in _GLOSSARY.md)
 PE_BOOTSTRAP_DATADASH_API_URL            # default https://api.datadash.xyz (on by default; "" disables)
 PE_BOOTSTRAP_CACHE_PATH                  # default wallet_cache.db
 ```
+
+Each leaderboard slice is read to the configured list depth in fixed-size pages; see
+[`bootstrap_leaderboard_top_n`](_GLOSSARY.md#bootstrap-defaults-pe-bootstrap) for depth, page size
+and maximum offset. A short page ends the list; a failed page preserves earlier pages and moves
+to the next list. Dedupe and source-bit upserts remain unchanged.
 
 ## Invocation
 

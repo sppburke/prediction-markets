@@ -116,7 +116,6 @@ async fn main() {
         let mut confirm = false;
         let mut batch_id: Option<&str> = None;
         let mut audit_csv: Option<std::path::PathBuf> = None;
-        let mut targets_csv: Option<std::path::PathBuf> = None;
         let mut wallet_arg: Option<&str> = None;
         let mut db_arg: Option<std::path::PathBuf> = None;
         let mut manifest_arg: Option<std::path::PathBuf> = None;
@@ -189,20 +188,6 @@ async fn main() {
                 audit_csv = Some(std::path::PathBuf::from(rest[i]));
             } else if let Some(v) = a.strip_prefix("--audit-csv=") {
                 audit_csv = Some(std::path::PathBuf::from(v));
-            } else if a == "--targets-csv" {
-                // A bare flag must never silently fall through to the legacy
-                // prices-history workflow (#536 review). Usage error is FATAL
-                // (exit 1): this binary's exit 2 means "partial, retry", and a
-                // supervisor must never retry a malformed invocation.
-                if i + 1 >= rest.len() {
-                    eprintln!("error: --targets-csv requires a file path");
-                    std::process::exit(1);
-                }
-                i += 1;
-                flag_values.insert(rest[i]);
-                targets_csv = Some(std::path::PathBuf::from(rest[i]));
-            } else if let Some(v) = a.strip_prefix("--targets-csv=") {
-                targets_csv = Some(std::path::PathBuf::from(v));
             } else if a == "--wallet" && i + 1 < rest.len() {
                 i += 1;
                 flag_values.insert(rest[i]);
@@ -1019,37 +1004,6 @@ async fn main() {
                 }
             }
 
-            // Targeted ranker-oracle mode (#536): fetch only the pass-2-emitted uncovered
-            // minute windows into the isolated ranker price store. Skips the Gamma
-            // start-date pass and the legacy close-anchored targeting entirely.
-            "prices-history" if let Some(targets) = targets_csv.as_deref() => {
-                match pe_bootstrap::prices_history::run_targeted_prices_history(
-                    &bootstrap_config,
-                    &mut cache,
-                    targets,
-                )
-                .await
-                {
-                    Ok(r) => {
-                        tracing::info!(
-                            tokens = r.tokens,
-                            needed_ranges = r.needed_ranges,
-                            pages_complete = r.pages_complete,
-                            pages_empty = r.pages_empty,
-                            points_written = r.points_written,
-                            transient_failures = r.transient_failures,
-                            "prices-history targeted: complete"
-                        );
-                        // Transient page failures → partial (exit 2): durable + resumable,
-                        // the uncovered remainder is re-requested on the next invocation.
-                        if r.transient_failures > 0 { 2 } else { 0 }
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "prices-history targeted: fatal");
-                        1
-                    }
-                }
-            }
             "prices-history" => {
                 match pe_bootstrap::prices_history::run_prices_history(
                     &bootstrap_config,
