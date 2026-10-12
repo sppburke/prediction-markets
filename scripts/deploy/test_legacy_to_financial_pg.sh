@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Real-PostgreSQL Legacy17 -> Financial15 transition proof for issue #545.
+# Real-PostgreSQL first and successor financial-era transition proofs (#545, #770).
 
 set -euo pipefail
 
@@ -724,6 +724,207 @@ end $$;
 SQL
 pass_step
 
+start_step "prepare the successor through the Rust owner with the generation seal"
+# This explicit ignored test writes only the recorded fixture seal with the production PaperLog
+# encoder. Prepare, reset and Start below use the same service binary as the first-era flow.
+PE_SUCCESSOR_PG_FIXTURE="$financial_fixture" cargo test -p pe-service --features scenario \
+  --test scenario_successor_era postgres_successor_generation_seal_fixture -- --ignored --exact
+psql_service_db -v ON_ERROR_STOP=1 -Atc \
+  "select coalesce(json_agg(json_build_object('key',key,'value',value,'value_type',value_type) order by key),'[]'::json)::text from service_config;" \
+  > "$financial_config_rows"
+
+# Compare complete rows, including Start, cursor, snapshots and timestamps, rather than counts.
+financial_rows_json() {
+  psql_service_db -v ON_ERROR_STOP=1 -At <<'SQL'
+select jsonb_build_object(
+  'paper_fills', (select coalesce(jsonb_agg(to_jsonb(t) order by to_jsonb(t)::text), '[]') from paper_fills t),
+  'settled_markets', (select coalesce(jsonb_agg(to_jsonb(t) order by to_jsonb(t)::text), '[]') from settled_markets t),
+  'paper_positions', (select coalesce(jsonb_agg(to_jsonb(t) order by to_jsonb(t)::text), '[]') from paper_positions t),
+  'paper_bankroll', (select coalesce(jsonb_agg(to_jsonb(t) order by to_jsonb(t)::text), '[]') from paper_bankroll t),
+  'fill_market_snapshots', (select coalesce(jsonb_agg(to_jsonb(t) order by to_jsonb(t)::text), '[]') from fill_market_snapshots t));
+SQL
+}
+predecessor_archive_json() {
+  psql_service_db -v ON_ERROR_STOP=1 -At <<'SQL'
+select jsonb_build_object(
+  'paper_fills', (select coalesce(jsonb_agg(to_jsonb(t) order by to_jsonb(t)::text), '[]') from paper_fills_archive t where activation_id in ('ci-545-transition','ci-545-fractional')),
+  'settled_markets', (select coalesce(jsonb_agg(to_jsonb(t) order by to_jsonb(t)::text), '[]') from settled_markets_archive t where activation_id in ('ci-545-transition','ci-545-fractional')),
+  'paper_positions', (select coalesce(jsonb_agg(to_jsonb(t) order by to_jsonb(t)::text), '[]') from paper_positions_archive t where activation_id in ('ci-545-transition','ci-545-fractional')),
+  'paper_bankroll', (select coalesce(jsonb_agg(to_jsonb(t) order by to_jsonb(t)::text), '[]') from paper_bankroll_archive t where activation_id in ('ci-545-transition','ci-545-fractional')),
+  'fill_market_snapshots', (select coalesce(jsonb_agg(to_jsonb(t) order by to_jsonb(t)::text), '[]') from fill_market_snapshots_archive t where activation_id in ('ci-545-transition','ci-545-fractional')));
+SQL
+}
+predecessor_archive_before=$(predecessor_archive_json)
+predecessor_rows=$(financial_rows_json)
+predecessor_manifest=$activation_manifest
+successor_manifest="$financial_fixture/pe-successor-era.json"
+make_successor_manifest() {
+  python3 - "$predecessor_manifest" "$successor_manifest" "$start_first" "$1" <<'PY'
+import json,sys
+old,path,receipt,activation=sys.argv[1:]
+value=json.load(open(old))
+value.update(state="prepared",activation_id=activation,predecessor_start=json.loads(receipt),
+             membership=[],schema_version=3,parser_version=1,financial_semantic_version=3,
+             preparation=None,start_receipt=None,start_unix=1700000002)
+with open(path,"w") as output:
+ json.dump(value,output,sort_keys=True,separators=(",",":"))
+PY
+}
+prepare_successor() {
+  successor_preparation=$(run_financial_era "$fixture_config" --financial-era=prepare \
+    --activation-manifest="$successor_manifest" --financial-config-rows="$financial_config_rows")
+  local retry
+  retry=$(run_financial_era "$fixture_config" --financial-era=prepare \
+    --activation-manifest="$successor_manifest" --financial-config-rows="$financial_config_rows")
+  [[ "$successor_preparation" == "$retry" ]] || die "successor preparation retry changed"
+  MANIFEST=$successor_manifest
+  retry_manifest_patch preparation "$(python3 -c 'import json,sys; print(json.dumps({"preparation":json.loads(sys.argv[1])}))' "$successor_preparation")"
+  retry_manifest_advance guarded
+}
+make_successor_manifest ci-770-rollback
+prepare_successor
+pass_step
+
+start_step "restore the successor archive exactly on the pre-Start rollback branch"
+psql_service_db -v ON_ERROR_STOP=1 -v activation_id=ci-770-rollback \
+  -v bankroll=10000 -f "$REPO_ROOT/scripts/paper_reset/archive_paper_state.sql"
+rollback_verdict=$(run_financial_era "$fixture_config" --financial-era=rollback-check \
+  --activation-manifest="$successor_manifest")
+python3 -c 'import json,sys
+value=json.loads(sys.argv[1])
+if value.get("complete_start") is not False or value.get("start_state") != "absent":
+ raise SystemExit("successor rollback did not prove the absent Start")' "$rollback_verdict"
+psql_service_db -v ON_ERROR_STOP=1 -v activation_id=ci-770-rollback \
+  -f "$REPO_ROOT/scripts/paper_reset/restore_paper_state.sql"
+psql_service_db -v ON_ERROR_STOP=1 -v activation_id=ci-770-rollback \
+  -f "$REPO_ROOT/scripts/paper_reset/restore_paper_state.sql"
+[[ "$(financial_rows_json)" == "$predecessor_rows" ]] || die "successor rollback changed a financial row"
+[[ "$(predecessor_archive_json)" == "$predecessor_archive_before" ]] || die "successor rollback changed the predecessor archive"
+pass_step
+
+start_step "archive under a fresh successor id and append the second physical Start"
+make_successor_manifest ci-770-successor
+prepare_successor
+psql_service_db -v ON_ERROR_STOP=1 -v activation_id=ci-770-successor \
+  -v bankroll=10000 -f "$REPO_ROOT/scripts/paper_reset/archive_paper_state.sql"
+psql_service_db -v ON_ERROR_STOP=1 -v activation_id=ci-770-successor \
+  -v bankroll=10000 -f "$REPO_ROOT/scripts/paper_reset/archive_paper_state.sql"
+[[ "$(predecessor_archive_json)" == "$predecessor_archive_before" ]] || die "successor archive changed the predecessor archive"
+psql_service_db -v ON_ERROR_STOP=1 <<'SQL'
+do $$ begin
+  if (select count(*) from paper_fills) <> 0
+     or (select count(*) from settled_markets) <> 0
+     or (select count(*) from paper_positions) <> 0
+     or (select count(*) from fill_market_snapshots) <> 0
+     or not exists (select 1 from paper_bankroll where id=0 and bankroll_str::numeric=10000
+                    and start_seq is null and start_hash is null and last_prepared_seq is null)
+     or not exists (select 1 from paper_bankroll_archive where activation_id='ci-770-successor'
+                    and bankroll_str::numeric=9998.625 and last_prepared_seq=44)
+     or not exists (select 1 from paper_fills_archive where activation_id='ci-770-successor'
+                    and idempotency_key='financial-fill' and principal=0.6875 and fee=0.001)
+     or not exists (select 1 from paper_positions_archive where activation_id='ci-770-successor'
+                    and long_contracts=1.125 and short_contracts=0.375)
+     or not exists (select 1 from settled_markets_archive where activation_id='ci-770-successor'
+                    and credit_applied=0.625)
+     or not exists (select 1 from fill_market_snapshots_archive where activation_id='ci-770-successor'
+                    and idempotency_key='financial-fill') then
+    raise exception 'successor archive/reset changed the expected row sets';
+  end if;
+end $$;
+SQL
+successor_start=$(run_financial_era "$fixture_config" --financial-era=start \
+  --activation-manifest="$successor_manifest" --financial-config-rows="$financial_config_rows")
+successor_start_retry=$(run_financial_era "$fixture_config" --financial-era=start \
+  --activation-manifest="$successor_manifest" --financial-config-rows="$financial_config_rows")
+[[ "$successor_start" == "$successor_start_retry" ]] || die "successor Start retry changed its receipt"
+python3 -c 'import json,sys
+start,old,preparation=map(json.loads,sys.argv[1:])
+if start != preparation["expected_receipt"] or start["sequence"] <= old["sequence"] or start == old:
+ raise SystemExit("successor Start does not match its prepared successor identity")' \
+  "$successor_start" "$start_first" "$successor_preparation"
+mapfile -t successor_identity < <(python3 -c 'import json,sys
+value=json.loads(sys.argv[1]); print(value["sequence"]); print(value["this_hash"])' "$successor_start")
+successor_seq=${successor_identity[0]}
+successor_hash=${successor_identity[1]}
+pass_step
+
+start_step "seed the second Start and exercise exact idempotent financial RPCs"
+psql_service_db -v ON_ERROR_STOP=1 \
+  -v successor_seq="$successor_seq" -v successor_hash="$successor_hash" \
+  -v predecessor_seq="$start_seq" -v predecessor_hash="$start_hash" <<'SQL'
+begin;
+set local role service_role;
+select set_config('pe.successor_seq', :'successor_seq', true);
+select set_config('pe.successor_hash', :'successor_hash', true);
+select set_config('pe.predecessor_seq', :'predecessor_seq', true);
+select set_config('pe.predecessor_hash', :'predecessor_hash', true);
+do $$
+declare
+  seq bigint := current_setting('pe.successor_seq')::bigint;
+  digest text := current_setting('pe.successor_hash');
+  result jsonb;
+  expected text;
+begin
+  foreach expected in array array['applied','existing'] loop
+    result := seed_financial_start(seq, digest);
+    if result->>'outcome' is distinct from expected or (result->>'start_seq')::bigint is distinct from seq
+       or result->>'start_hash' is distinct from digest then
+      raise exception 'successor Start seed/retry differs: %', result;
+    end if;
+  end loop;
+  if not exists (select 1 from paper_bankroll where id=0 and start_seq=seq and start_hash=digest
+                 and last_prepared_seq is null and bankroll_str::numeric=10000) then
+    raise exception 'seeded successor Start does not equal the fresh authority';
+  end if;
+  foreach expected in array array['applied','existing'] loop
+    result := commit_fill_v2(seq,digest,null,seq+1,'successor-fill',
+      '0x2222222222222222222222222222222222222222','successor-source',
+      'successor-market',0,'buy',1.25,0.55,0.6875,0.001,1700000003);
+    if result->>'outcome' is distinct from expected or (result->>'bankroll')::numeric is distinct from 9999.3115
+       or (result->>'applied_prepared_seq')::bigint is distinct from seq+1 then
+      raise exception 'successor fill/retry differs: %', result;
+    end if;
+  end loop;
+  foreach expected in array array['applied','existing'] loop
+    result := apply_resolution_v2(seq,digest,seq+1,seq+2,'successor-market','["1","0"]',1700000004);
+    if result->>'outcome' is distinct from expected or (result->>'credit')::numeric is distinct from 1.25
+       or (result->>'bankroll')::numeric is distinct from 10000.5615
+       or (result->>'applied_prepared_seq')::bigint is distinct from seq+2 then
+      raise exception 'successor resolution/retry differs: %', result;
+    end if;
+  end loop;
+  result := commit_fill_v2(current_setting('pe.predecessor_seq')::bigint,
+    current_setting('pe.predecessor_hash'),seq+2,seq+3,'stale-start-fill',
+    '0x2222222222222222222222222222222222222222','stale-start-source',
+    'stale-start-market',0,'buy',1,0.5,0.5,0,1700000005);
+  if result->>'outcome' is distinct from 'conflict' or result->>'conflict_reason' is distinct from 'financial_start_mismatch' then
+    raise exception 'predecessor-bound fill was not refused: %', result;
+  end if;
+  result := apply_resolution_v2(current_setting('pe.predecessor_seq')::bigint,
+    current_setting('pe.predecessor_hash'),seq+2,seq+3,'stale-start-market','["1","0"]',1700000005);
+  if result->>'outcome' is distinct from 'conflict' or result->>'conflict_reason' is distinct from 'financial_start_mismatch' then
+    raise exception 'predecessor-bound resolution was not refused: %', result;
+  end if;
+  if (select count(*) from paper_fills) <> 1 or (select count(*) from settled_markets) <> 1
+     or (select count(*) from paper_positions) <> 1
+     or not exists (select 1 from paper_fills where idempotency_key='successor-fill'
+                    and source_trade_id='successor-source' and contracts=1.25 and fill_price=0.55
+                    and principal=0.6875 and fee=0.001 and prepared_seq=seq+1 and event_seq=seq+1)
+     or not exists (select 1 from settled_markets where market_id='successor-market'
+                    and outcome_prices='["1","0"]'::jsonb and credit_applied=1.25
+                    and settled_at_unix=1700000004 and prepared_seq=seq+2)
+     or not exists (select 1 from paper_positions where market_id='successor-market'
+                    and long_contracts=1.25 and short_contracts=0)
+     or not exists (select 1 from paper_bankroll where bankroll_str::numeric=10000.5615
+                    and start_seq=seq and start_hash=digest and last_prepared_seq=seq+2) then
+    raise exception 'successor retries or rejected predecessor requests mutated the book';
+  end if;
+end $$;
+commit;
+SQL
+[[ "$(predecessor_archive_json)" == "$predecessor_archive_before" ]] || die "successor RPCs changed the predecessor archive"
+pass_step
+
 start_step "prove protected account reads and the rehearsal census against the candidate schema"
 for table_name in accounts account_credentials; do
   denied_log="$RUNNER_TEMP/anon-${table_name}-select.log"
@@ -813,4 +1014,4 @@ read -r after_count after_digest after_safe <<< "$after_census"
   die "the shared rehearsal census did not detect the live_tiny mode change"
 pass_step
 
-echo "CIPG PASS: real PostgreSQL Legacy17-to-Financial15 scenario completed"
+echo "CIPG PASS: real PostgreSQL first and successor financial-era scenarios completed"
