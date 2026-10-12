@@ -1053,8 +1053,9 @@ statistics remain. This dashboard confirmation is an operator check, not a drive
 
 **Recovery-required.** Inactive/failed activation, nonzero `ExecMainStatus` (including status 78),
 unknown unit outcomes, or interrupted enable/start require diagnosis from the unit journal and
-durable receipts before retry. The driver normalizes failed starts to disabled/stopped with cleared
-census and emits `recovery-required`. A failed unit stays `failed` after `systemctl stop`, and the
+durable receipts before retry. The driver attempts to normalize a failed start to disabled/stopped,
+certifies clearance only after its stop proof passes, and emits `recovery-required`. A failed unit
+stays `failed` after `systemctl stop`, and the
 stop proof requires `inactive`, so a rerun refuses instead of restarting a status-78 binary. Record
 the outcome as in [O2](#o2--deployment), preserving retention authority, receipts, pins, feed files
 and checkpoint companions, then `systemctl reset-failed pe-service` and rerun the same command.

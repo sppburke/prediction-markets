@@ -86,7 +86,10 @@ if value.get("state") != "verified": raise SystemExit("#557 activation is not ve
 activation=value.get("activation_id"); generation=value.get("generation_dir"); commit=value.get("merge_commit")
 if not isinstance(activation,str) or re.fullmatch(r"[A-Za-z0-9._-]+",activation) is None:
     raise SystemExit("invalid #557 activation id")
-if not isinstance(generation,str) or not os.path.isabs(generation) or not os.path.isdir(generation) or os.path.realpath(generation) != generation:
+# A successor rehearsal relocates its private copy, so there the generation is the captured logical
+# identity; bootstrap isolation proves the physical paths.
+relocated=os.environ.get("PE_ACTIVATION_TESTING")=="1" and os.environ.get("PE_SUCCESSOR_REHEARSAL_BOOTSTRAP")=="1"
+if not isinstance(generation,str) or not os.path.isabs(generation) or (not relocated and (not os.path.isdir(generation) or os.path.realpath(generation) != generation)):
     raise SystemExit("invalid #557 generation directory")
 if not isinstance(commit,str) or re.fullmatch(r"[0-9a-f]{40}",commit) is None:
     raise SystemExit("invalid #557 merge commit")
