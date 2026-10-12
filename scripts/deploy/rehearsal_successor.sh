@@ -5,18 +5,18 @@ set -euo pipefail
 harness_deploy_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 source "$harness_deploy_dir/generation_common.sh"
 usage() {
-  echo "usage: $0 [--dry-run] --capture PATH --run-root PATH --target-binary PATH --target-config PATH --target-environment PATH --old-binary PATH --old-config PATH --old-environment PATH --old-unit-policy PATH [--pg-port PORT --http-port PORT --service-port PORT --postgrest-port PORT --fresh-bankroll DECIMAL]" >&2
+  echo "usage: $0 [--dry-run] --capture PATH --run-root PATH --target-binary PATH --target-config PATH --target-environment PATH --old-binary PATH --old-config PATH --old-environment PATH --old-unit-policy PATH [--pg-port PORT --http-port PORT --service-port PORT --postgrest-port PORT --fresh-bankroll DECIMAL --venue-url http://127.0.0.1:PORT]" >&2
   exit 2
 }
 dry_run=false
 capture= run_root= target_binary= target_config= target_environment=
 old_binary= old_config= old_environment= old_unit_policy=
 # Below Linux's ephemeral range (32768-60999), so no outgoing connection can hold a listener's port.
-pg_port=26432 http_port=26321 service_port=28080 postgrest_port=26322 fresh_bankroll=
+pg_port=26432 http_port=26321 service_port=28080 postgrest_port=26322 fresh_bankroll= venue_url=
 while (($#)); do
   case "$1" in
     --dry-run) dry_run=true; shift ;;
-    --capture|--run-root|--target-binary|--target-config|--target-environment|--old-binary|--old-config|--old-environment|--old-unit-policy|--pg-port|--http-port|--service-port|--postgrest-port|--fresh-bankroll)
+    --capture|--run-root|--target-binary|--target-config|--target-environment|--old-binary|--old-config|--old-environment|--old-unit-policy|--pg-port|--http-port|--service-port|--postgrest-port|--fresh-bankroll|--venue-url)
       [[ $# -ge 2 && -n "$2" ]] || usage
       name=${1#--}; name=${name//-/_}; printf -v "$name" '%s' "$2"; shift 2 ;;
     *) usage ;;
@@ -31,10 +31,12 @@ done
 [[ "$pg_port" != "$http_port" && "$pg_port" != "$service_port" && "$http_port" != "$service_port" &&
    "$postgrest_port" != "$pg_port" && "$postgrest_port" != "$http_port" && "$postgrest_port" != "$service_port" ]] || usage
 [[ -z "$fresh_bankroll" || "$fresh_bankroll" =~ ^[0-9]+([.][0-9]{1,6})?$ ]] || usage
+[[ -z "$venue_url" || "$venue_url" =~ ^http://127\.0\.0\.1:[0-9]+$ ]] || usage
 if [[ "$dry_run" == true ]]; then
   printf '%s\n' 'SUCCESSOR_REHEARSAL_DRY_RUN=1' "capture=$capture" "run_root=$run_root" \
     "target_binary=$target_binary" "target_config=$target_config" "target_environment=$target_environment" \
     "old_binary=$old_binary" "old_config=$old_config" "old_environment=$old_environment" "old_unit_policy=$old_unit_policy" \
+    "venue_url=$venue_url" \
     'capture_contract=capture.json,copied.sha256,state/,authority/*.csv,pe-financial-era.json,pe-activation.json' \
     'authority=private-loopback-PostgreSQL-and-PostgREST,local-service-role-JWT' \
     'branches=forward,writer-lock-rollback,fresh-attempt' 'ownership_proof=skipped: testing mode' \
@@ -261,9 +263,10 @@ prepare_branch() {
   printf 'SUPABASE_DB_URL=%s\n' "$SUPABASE_DB_URL" >> "$branch_root/credentials"
   chmod 600 "$branch_root/credentials"
   # Every normalized assignment is explicit and hash-bound; unknown secret-bearing assignments are dropped.
+  # The venue substitution happens here, so the evidence keeps hashing the unedited target environment.
   for tuple in old target; do
     env_file_values "$branch_root/$tuple.template" "${SERVICE_ENV_ALLOWLIST[@]}" | python3 -c 'import json,pathlib,sys
-root,tuple,port,http=sys.argv[1:]; root=pathlib.Path(root); generation=root/"prediction-markets/gen/capture"
+root,tuple,port,http,venue=sys.argv[1:]; root=pathlib.Path(root); generation=root/"prediction-markets/gen/capture"
 values=dict(part.decode().split("=",1) for part in sys.stdin.buffer.read().split(b"\0") if part)
 credentials=dict(line.rstrip("\n").split("=",1) for line in (root/"credentials").read_text().splitlines())
 values.update({key:credentials[key] for key in ("PE_SUPABASE_SECRET_KEY","PE_SUPABASE_ANON_KEY")})
@@ -273,11 +276,12 @@ values.update(PE_SUPABASE_URL="http://127.0.0.1:"+http,PE_BIND="127.0.0.1:"+port
  PE_STATUS_PATH=str(generation/"status.json"),PE_JSONL_LOG_PATH=str(generation/"paper.jsonl"))
 for key in ("PE_LEGACY_WALLET_HISTORY_PATH",):
     if key in values: values[key]=str(generation/"legacy_wallet_history.jsonl")
+if venue: values.update(PE_POLYMARKET_BASE_URL=venue,PE_GAMMA_BASE_URL=venue,PE_POLYMARKET_CLOB_BASE_URL=venue)
 if any("\n" in v or "\x27" in v or "\\" in v for v in values.values()): raise SystemExit("unrepresentable normalized environment")
 path=root/"prediction-markets/.env" if tuple=="old" else root/"target/service.env"
 path.write_text("".join(k+"=\x27"+v+"\x27\n" for k,v in sorted(values.items()))); path.chmod(0o600)
-(root/(tuple+".transformations.json")).write_text(json.dumps({"normalized_environment_sha256":"computed-in-result","paths":str(generation),"http_authority":values["PE_SUPABASE_URL"],"credential_provenance":"fresh local JWT"},sort_keys=True))
-' "$branch_root" "$tuple" "$service_port" "$http_port"
+(root/(tuple+".transformations.json")).write_text(json.dumps({"normalized_environment_sha256":"computed-in-result","paths":str(generation),"http_authority":values["PE_SUPABASE_URL"],"venue_request_api":venue or None,"credential_provenance":"fresh local JWT"},sort_keys=True))
+' "$branch_root" "$tuple" "$service_port" "$http_port" "$venue_url"
   done
   mkdir "$branch_root/normalized-old"
   cp "$service/target/release/pe-service" "$branch_root/normalized-old/binary"
@@ -362,10 +366,11 @@ if list(map(int,sys.argv[2].split()))!=[census[key] for key in ("paper_fills","s
     raise SystemExit("successor archive differs from guarded census")
 ' "$branch_root/pe-financial-era.json" "$census"
 }
-# systemd unloads a disabled, inactive unit, so its own stop timestamp reads zero; use the journal's.
+# systemd unloads a disabled, inactive unit, so its own stop timestamp reads zero; use the journal's
+# monotonic one from this boot, the clock time.monotonic_ns() reads.
 stop_origin() {
-  stop_origin_us=$(journalctl --user -u "$unit" -o json --no-pager | python3 -c 'import json,sys
-stops=[int(e["__REALTIME_TIMESTAMP"]) for e in map(json.loads,sys.stdin) if str(e.get("MESSAGE","")).startswith("Stopped ")]
+  stop_origin_us=$(journalctl --user -b -u "$unit" -o json --no-pager | python3 -c 'import json,sys
+stops=[int(e["__MONOTONIC_TIMESTAMP"]) for e in map(json.loads,sys.stdin) if str(e.get("MESSAGE","")).startswith("Stopped ")]
 print(stops[-1] if stops else "")')
   [[ "$stop_origin_us" =~ ^[1-9][0-9]*$ ]] || die "private unit lacks a stop timestamp"
   stop_previous_ns=$((stop_origin_us * 1000))
@@ -373,7 +378,7 @@ print(stops[-1] if stops else "")')
 
 record_stop_phase() {
   local phase=$1 now
-  now=$(date +%s%N)
+  now=$(python3 -c 'import time; print(time.monotonic_ns())')
   (( now >= stop_previous_ns )) || die "private stop clock moved backwards"
   printf '%s|%s|%s\n' "$phase" "$((now-stop_previous_ns))" "$((now-stop_origin_us*1000))" >> "$branch_root/stop-durations.tsv"
   stop_previous_ns=$now

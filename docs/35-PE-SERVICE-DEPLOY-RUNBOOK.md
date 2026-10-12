@@ -872,9 +872,12 @@ production credential directory/environment; the evidence explicitly says
 Readiness needs a successful venue poll, and the `verified` status proof needs the activity
 websocket on (`source_health` is published only then; its address is fixed in the binary). The dev
 box shares Forge's public address, and the venue rate-limits Forge's request API, so keep the
-websocket on but point `PE_POLYMARKET_BASE_URL`, `PE_GAMMA_BASE_URL` and
-`PE_POLYMARKET_CLOB_BASE_URL` in both environment templates at a loopback endpoint that answers
-every request with an empty JSON list, and record that substitution in the transformation receipt:
+websocket on and pass `--venue-url http://127.0.0.1:28009`, a loopback endpoint that answers every
+request with an empty JSON list. The harness points the private environments'
+`PE_POLYMARKET_BASE_URL`, `PE_GAMMA_BASE_URL` and `PE_POLYMARKET_CLOB_BASE_URL` at it and records the
+substitution in each branch's transformation receipt. Do not edit the venue addresses into either
+environment input: the evidence binds the target environment's hash, and activation compares it with
+the reviewed production file.
 
 ```bash
 python3 -c 'import http.server as h
