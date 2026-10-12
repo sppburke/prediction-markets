@@ -869,6 +869,21 @@ processes. `verify_installed_unit_owner` retains its testing-mode skip because i
 production credential directory/environment; the evidence explicitly says
 `ownership_proof: skipped: testing mode`. Production still requires that proof before its stop.
 
+Readiness needs a successful venue poll, and the `verified` status proof needs the activity
+websocket on (`source_health` is published only then; its address is fixed in the binary). The dev
+box shares Forge's public address, and the venue rate-limits Forge's request API, so keep the
+websocket on but point `PE_POLYMARKET_BASE_URL`, `PE_GAMMA_BASE_URL` and
+`PE_POLYMARKET_CLOB_BASE_URL` in both environment templates at a loopback endpoint that answers
+every request with an empty JSON list, and record that substitution in the transformation receipt:
+
+```bash
+python3 -c 'import http.server as h
+class S(h.BaseHTTPRequestHandler):
+    def do_GET(self): self.send_response(200); self.send_header("Content-Type","application/json"); self.send_header("Content-Length","2"); self.end_headers(); self.wfile.write(b"[]")
+    def log_message(self,*a): pass
+h.ThreadingHTTPServer(("127.0.0.1",28009),S).serve_forever()'
+```
+
 The forward clone exercises `prepared → guarded → archive → Start → seed → adopt → started →
 verified`, interrupted at guarded and before producers start. Before starting producers it checks
 the fresh authority's empty detail tables, new Start/bankroll and null Prepared cursor, archive
