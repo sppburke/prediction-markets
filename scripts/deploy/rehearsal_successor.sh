@@ -11,7 +11,8 @@ usage() {
 dry_run=false
 capture= run_root= target_binary= target_config= target_environment=
 old_binary= old_config= old_environment= old_unit_policy=
-pg_port=56432 http_port=56321 service_port=58080 postgrest_port=56322 fresh_bankroll=
+# Below Linux's ephemeral range (32768-60999), so no outgoing connection can hold a listener's port.
+pg_port=26432 http_port=26321 service_port=28080 postgrest_port=26322 fresh_bankroll=
 while (($#)); do
   case "$1" in
     --dry-run) dry_run=true; shift ;;
