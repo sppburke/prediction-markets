@@ -14,8 +14,8 @@ usage() {
   echo "usage: $0 --target-binary PATH --target-config PATH --target-environment PATH \
 --paper-log PATH --source-log PATH --live-journal PATH --paper-state PATH \
 --fresh-bankroll DECIMAL --rehearsal-evidence PATH \
---ranking-batch-id ID --membership-json PATH \
-[--rollback-before-start] [--simulate-crash-after BOUNDARY]" >&2
+{--ranking-batch-id ID --membership-json PATH | --successor-of SHA256} \
+ [--rollback-before-start] [--simulate-crash-after BOUNDARY]" >&2
   exit 2
 }
 
@@ -24,6 +24,10 @@ paper_log= source_log= live_journal= paper_state=
 fresh_bankroll= artifact_blake3= ranking_batch_id=
 target_revision=
 membership_json= rehearsal_evidence=
+successor_of= successor=false
+membership_supplied=false batch_supplied=false
+# Compiled owners check these during successor preparation; the envelope remains schema two.
+readonly SUCCESSOR_SCHEMA_VERSION=3 SUCCESSOR_FINANCIAL_SEMANTIC_VERSION=3 SUCCESSOR_PARSER_VERSION=1
 rollback_before_start=false
 while (($#)); do
   case "$1" in
@@ -36,8 +40,9 @@ while (($#)); do
     --paper-state) [[ $# -ge 2 ]] || usage; paper_state=$2; shift 2 ;;
     --fresh-bankroll) [[ $# -ge 2 ]] || usage; fresh_bankroll=$2; shift 2 ;;
     --rehearsal-evidence) [[ $# -ge 2 ]] || usage; rehearsal_evidence=$2; shift 2 ;;
-    --ranking-batch-id) [[ $# -ge 2 ]] || usage; ranking_batch_id=$2; shift 2 ;;
-    --membership-json) [[ $# -ge 2 ]] || usage; membership_json=$2; shift 2 ;;
+    --ranking-batch-id) [[ $# -ge 2 ]] || usage; ranking_batch_id=$2; batch_supplied=true; shift 2 ;;
+    --membership-json) [[ $# -ge 2 ]] || usage; membership_json=$2; membership_supplied=true; shift 2 ;;
+    --successor-of) [[ $# -ge 2 ]] || usage; successor_of=$2; successor=true; shift 2 ;;
     --rollback-before-start) rollback_before_start=true; shift ;;
     --simulate-crash-after) [[ $# -ge 2 ]] || usage; SIMULATE_CRASH_AFTER=$2; shift 2 ;;
     *) usage ;;
@@ -45,14 +50,21 @@ while (($#)); do
 done
 
 for value in target_binary target_config target_environment paper_log source_log live_journal \
-  paper_state fresh_bankroll rehearsal_evidence ranking_batch_id membership_json; do
+  paper_state fresh_bankroll rehearsal_evidence; do
   [[ -n "${!value}" ]] || usage
 done
 [[ "$fresh_bankroll" =~ ^[0-9]+([.][0-9]{1,6})?$ ]] || die "fresh bankroll must be an exact non-negative six-decimal value"
-[[ "$ranking_batch_id" =~ ^[0-9]+$ ]] || die "invalid ranking batch id"
+if [[ "$successor" == true ]]; then
+  [[ "$successor_of" =~ ^[0-9a-f]{64}$ ]] || die "invalid predecessor manifest sha256"
+  [[ "$membership_supplied" == false && "$batch_supplied" == false ]] ||
+    die "successor mode forbids supplied membership or ranking batch"
+else
+  [[ -n "$ranking_batch_id" && -n "$membership_json" ]] || usage
+  [[ "$ranking_batch_id" =~ ^[0-9]+$ ]] || die "invalid ranking batch id"
+  [[ -f "$membership_json" ]] || die "membership JSON is absent"
+fi
 [[ -f "$target_binary" && -f "$target_config" && -f "$target_environment" ]] ||
   die "one or more reviewed target artifacts are absent"
-[[ -f "$membership_json" ]] || die "membership JSON is absent"
 
 for command in python3 sha256sum flock systemctl psql mktemp curl; do
   command -v "$command" >/dev/null || die "$command not installed"
@@ -120,6 +132,7 @@ print(artifacts["binary"]["sha256"]); print(artifacts["config"]["sha256"]); prin
 mapfile -t identity_parts <<< "$identity"
 [[ ${#identity_parts[@]} -eq 9 ]] || die "invalid #557 identity result"
 activation_id=${identity_parts[0]}
+generation_activation_id=$activation_id
 generation=${identity_parts[1]}
 generation_merge_commit=${identity_parts[2]}
 generation_bankroll=${identity_parts[3]}
@@ -128,6 +141,39 @@ generation_legacy_history=${identity_parts[5]}
 generation_artifact_sha256=${identity_parts[6]}
 generation_config_sha256=${identity_parts[7]}
 generation_environment_sha256=${identity_parts[8]}
+
+predecessor_path= predecessor_start= predecessor_activation_id=
+if [[ "$successor" == true ]]; then
+  [[ -f "$MANIFEST" ]] || die "successor requires a verified predecessor manifest"
+  predecessor_path=$MANIFEST
+  current_state=$(manifest_get state)
+  if [[ "$current_state" != verified || "$(sha256_file "$MANIFEST")" != "$successor_of" ]]; then
+    [[ "$(manifest_get predecessor_manifest_sha256)" == "$successor_of" ]] || die "predecessor manifest identity changed"
+    predecessor_path=$(manifest_get predecessor_manifest_path)
+    if [[ "$current_state" == rolling_back && "$rollback_before_start" == false ]]; then
+      die "rolling_back resumes only through --rollback-before-start"
+    fi
+    activation_id=$(manifest_get activation_id)
+    [[ "$activation_id" =~ ^era-[0-9]{8}T[0-9]{6}Z$ ]] || die "invalid persisted transition id"
+  fi
+  [[ -f "$predecessor_path" && ! -L "$predecessor_path" && "$(sha256_file "$predecessor_path")" == "$successor_of" ]] ||
+    die "predecessor manifest sha256 differs"
+  predecessor_fields=$(python3 -c 'import json,re,sys
+value=json.load(open(sys.argv[1]))
+if value.get("state")!="verified" or value.get("kind")!="financial-era-v1": raise SystemExit("predecessor is not verified")
+if value.get("generation_activation_id",value["activation_id"])!=sys.argv[2] or value.get("generation")!=sys.argv[3]:
+    raise SystemExit("predecessor belongs to another generation")
+start=value.get("start_receipt")
+if not isinstance(start,dict) or not isinstance(start.get("sequence"),int) or re.fullmatch("[0-9a-f]{64}",start.get("this_hash","")) is None:
+    raise SystemExit("invalid predecessor Start")
+if re.fullmatch("[A-Za-z0-9._-]+",value["activation_id"]) is None: raise SystemExit("invalid predecessor activation id")
+print(value["activation_id"]); print(value["ranking_batch_id"]); print(json.dumps(start,separators=(",",":")))' \
+    "$predecessor_path" "$generation_activation_id" "$generation") || die "invalid predecessor authority"
+  mapfile -t predecessor_parts <<< "$predecessor_fields"
+  predecessor_activation_id=${predecessor_parts[0]}
+  ranking_batch_id=${predecessor_parts[1]}
+  predecessor_start=${predecessor_parts[2]}
+fi
 
 staged_identity_output=$("$target_binary" --verify-staged-identity) ||
   die "staged binary could not derive its own identity"
@@ -189,16 +235,22 @@ export_financial_config_rows() {
     financial_config_rows_dir=$(mktemp -d)
     financial_config_rows_file="$financial_config_rows_dir/service_config.financial15.json"
   fi
-  psql_service_db -v ON_ERROR_STOP=1 -Atc \
+  local filter="where key not in ('fill_mode','polymarket_fee_rate','risk_halt_release_hash')"
+  [[ "$successor" == false ]] || filter=
+  financial_psql -v ON_ERROR_STOP=1 -Atc \
     "select coalesce(json_agg(json_build_object('key',key,'value',value,'value_type',value_type) order by key),'[]'::json)::text
        from service_config
-      where key not in ('fill_mode','polymarket_fee_rate','risk_halt_release_hash');" \
+      $filter;" \
     > "$financial_config_rows_file" || die "export the exact Financial15 configuration rows"
   [[ -s "$financial_config_rows_file" ]] || die "Financial15 configuration export is empty"
 }
 
 read_rehearsal_evidence() {
   local expected_harness_bundle
+  if [[ "$successor" == true ]]; then
+    read_successor_rehearsal_evidence
+    return
+  fi
   expected_harness_bundle=$(harness_bundle_digest "$financial_deploy_dir") ||
     die "derive the current rehearsal harness bundle"
   python3 -c 'import hashlib,json,os,re,sys
@@ -293,10 +345,69 @@ bound={
     "unit_kill_signal":int(unit_kill_signal),
     "unit_timeout_stop_secs":int(unit_timeout_stop_secs),
 }
+
+
 print(json.dumps(bound,sort_keys=True,separators=(",",":")))' \
     "$rehearsal_evidence" "$target_revision" "$artifact_blake3" "$target_artifact_sha256" \
     "$activation_id" "$generation" "$(sha256_file "$target_config")" "$(sha256_file "$target_environment")" \
     "$expected_harness_bundle"
+}
+
+read_successor_rehearsal_evidence() {
+  local bundle
+  bundle=$(successor_harness_bundle_digest "$financial_deploy_dir") || die "derive successor execution closure"
+  if [[ "${PE_SUCCESSOR_REHEARSAL_BOOTSTRAP:-0}" == 1 ]]; then
+    verify_successor_bootstrap "$target_environment" "$target_binary" "$target_config" \
+      "$paper_log" "$source_log" "$live_journal" "$paper_state" || die "successor bootstrap isolation refused"
+    local policy
+    policy=$(service_unit_stop_policy pe-service) || die "read private unit stop policy"
+    python3 -c 'import json,sys
+bundle,policy,predecessor=sys.argv[1:]; kill,timeout=map(int,policy.split())
+if kill!=2 or timeout<=0: raise SystemExit("invalid private stop policy")
+print(json.dumps({"kind":"successor-rehearsal-bootstrap-v1","harness_bundle_sha256":bundle,
+"predecessor_manifest_sha256":predecessor,"unit_kill_signal":kill,"unit_timeout_stop_secs":timeout},separators=(",",":")))' \
+      "$bundle" "$policy" "$successor_of"
+    return
+  fi
+  python3 -c 'import hashlib,json,os,re,sys
+path,bundle,predecessor,start,generation,root,revision,artifact,*hashes=sys.argv[1:]
+def refuse(reason): raise SystemExit("REHEARSAL_REFUSAL="+reason)
+def load(path):
+    if not os.path.isfile(path) or os.path.islink(path): refuse("missing_or_linked_evidence")
+    try: return json.load(open(path))
+    except (ValueError,OSError): refuse("malformed_evidence")
+outer=load(path)
+if outer.get("kind")!="successor-rehearsal-evidence-v1" or outer.get("result")!="PASS": refuse("successor_pass_required")
+result_path=outer.get("manifest_path")
+if not isinstance(result_path,str) or not os.path.isabs(result_path): refuse("malformed_result_path")
+result=load(result_path)
+digest=hashlib.sha256(open(result_path,"rb").read()).hexdigest()
+if outer.get("evidence_sha256")!=digest: refuse("evidence_hash_mismatch")
+expected={"harness_bundle_sha256":bundle,"predecessor_manifest_sha256":predecessor,
+"predecessor_start":json.loads(start),"generation_activation_id":generation,"generation_dir":root,
+"target_revision":revision,"artifact_blake3":artifact}
+if any(result.get(key)!=value for key,value in expected.items()): refuse("successor_binding_mismatch")
+for tuple_name,expected_hashes in (("target_tuple",hashes[:3]),("old_tuple",hashes[3:])):
+    row=result.get(tuple_name,{})
+    if [row.get(key+"_sha256") for key in ("binary","config","environment")]!=expected_hashes:
+        refuse(tuple_name+"_mismatch")
+required={"capture_consistent","forward_verified","rollback_reset_before_append","rollback_exact_restore","fresh_attempt_verified"}
+passes=result.get("pass_rows",{})
+if not required<=passes.keys() or any(passes[key]!="PASS" for key in required): refuse("incomplete_successor_pass")
+if result.get("ownership_proof")!="skipped: testing mode": refuse("ownership_disclosure_missing")
+for key in ("copy_manifest_sha256","normalized_copy_sha256"):
+    if re.fullmatch("[0-9a-f]{64}",result.get(key,"")) is None: refuse("malformed_copy_binding")
+for key in ("unit_kill_signal","unit_timeout_stop_secs"):
+    if type(result.get(key)) is not int: refuse("malformed_unit_policy")
+if result["unit_kill_signal"]!=2 or result["unit_timeout_stop_secs"]<=0: refuse("invalid_unit_policy")
+print(json.dumps({"kind":outer["kind"],"path":os.path.realpath(path),"sha256":digest,
+"manifest_path":result_path,**expected,"old_tuple":result["old_tuple"],
+"copy_manifest_sha256":result["copy_manifest_sha256"],"normalized_copy_sha256":result["normalized_copy_sha256"],
+"unit_kill_signal":result["unit_kill_signal"],"unit_timeout_stop_secs":result["unit_timeout_stop_secs"]},sort_keys=True,separators=(",",":")))' \
+    "$rehearsal_evidence" "$bundle" "$successor_of" "$predecessor_start" "$generation_activation_id" "$generation" \
+    "$target_revision" "$artifact_blake3" "$target_artifact_sha256" "$(sha256_file "$target_config")" \
+    "$(sha256_file "$target_environment")" "$(sha256_file "$SERVICE_BINARY")" \
+    "$(sha256_file "$SERVICE_CONFIG")" "$(sha256_file "$SERVICE_ENV")"
 }
 
 verify_persisted_financial_guard() {
@@ -304,7 +415,9 @@ verify_persisted_financial_guard() {
   local observed_kill observed_timeout expected_kill expected_timeout
   case "$guard" in
     harness_bundle)
-      current=$(harness_bundle_digest "$financial_deploy_dir") ||
+      local digest_owner=harness_bundle_digest
+      [[ "$successor" == false ]] || digest_owner=successor_harness_bundle_digest
+      current=$("$digest_owner" "$financial_deploy_dir") ||
         die "derive the current rehearsal harness bundle"
       persisted=$(manifest_get rehearsal_evidence.harness_bundle_sha256)
       if [[ "$current" != "$persisted" ]]; then
@@ -326,6 +439,73 @@ verify_persisted_financial_guard() {
       ;;
     *) die "unknown persisted financial guard: $guard" ;;
   esac
+}
+
+verify_mode_contract() {
+  if [[ "$successor" == true ]]; then verify_financial_service_contract
+  else verify_legacy_service_contract; fi
+}
+
+financial_census() {
+  local boundary=$1 allow=${2:-} helper output
+  helper=$(manifest_get census_helper.path)
+  [[ "$helper" == "$DEPLOY_HOME/pe-service-census.$target_revision.sh" &&
+     "$(manifest_get census_helper.sha256)" == "$(sha256_file "$financial_deploy_dir/pe_service_census.sh")" ]] || die "census helper is not the reviewed owner"
+  [[ "$(sha256_file "$helper")" == "$(manifest_get census_helper.sha256)" ]] || die "staged census helper changed"
+  local -a args=(--config "$SERVICE_CONFIG" --cwd-root "$SERVICE_ROOT" --binary "$SERVICE_BINARY"
+    --binary "$target_binary" --binary-glob "$SERVICE_ROOT/target/release/pe-service*" --binary-glob '/tmp/pe-service.new.*')
+  [[ -z "$allow" ]] || args+=(--allow "$allow")
+  output=$("$helper" "${args[@]}") || die "process census refused at $boundary: $output"
+  [[ "$(manifest_get state)" != rolled_back ]] || return 0
+  manifest_patch_boundary "census-$boundary" "$(printf '%s' "$output" | python3 -c 'import json,sys
+rows=[json.loads(line) for line in sys.stdin if line.strip()]
+if not rows or rows[-1].get("census")!="clear": raise SystemExit("census is not clear")
+print(json.dumps({"process_census":{"boundary":sys.argv[1],"rows":rows}},separators=(",",":")))' "$boundary")"
+}
+
+financial_serving_proof() {
+  local boundary=$1 pid
+  [[ "${PE_ACTIVATION_TESTING:-0}" == 1 ]] || verify_installed_unit_owner
+  pid=$(systemctl show pe-service -p MainPID --value) || die "read serving MainPID"
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || die "serving unit has no MainPID"
+  financial_census "$boundary" "$pid"
+}
+
+financial_stop() {
+  local boundary=$1 pid active status=0
+  pid=$(systemctl show pe-service -p MainPID --value) || die "read pre-stop MainPID"
+  "${SERVICE_MUTATE[@]}" disable pe-service
+  maybe_crash "$boundary-disabled"
+  active=$(systemctl is-active pe-service 2>/dev/null) || status=$?
+  case "$active:$status" in
+    active:0|failed:3) "${SERVICE_MUTATE[@]}" stop pe-service ;;
+    inactive:3) ;;
+    *) die "recovery-required: could not prove unit activity before stop" ;;
+  esac
+  status=0
+  active=$(systemctl is-active pe-service 2>/dev/null) || status=$?
+  [[ "$(systemctl_enabled_state pe-service)" == false && "$active:$status" == inactive:3 &&
+     "$(systemctl show pe-service -p MainPID --value)" == 0 ]] || die "recovery-required: disabled/inactive/MainPID proof failed"
+  [[ "$pid" == 0 || ! -e "$PROC_ROOT/$pid" ]] || die "recovery-required: old PID remains"
+  financial_census "$boundary"
+}
+
+financial_start_service() {
+  local boundary=$1
+  financial_stop "$boundary-clearance"
+  "${SERVICE_MUTATE[@]}" enable pe-service
+  maybe_crash "$boundary-enabled"
+  if ! "${SERVICE_MUTATE[@]}" start pe-service; then
+    financial_stop "$boundary-start-failed"
+    die "recovery-required: service start failed"
+  fi
+  maybe_crash "$boundary-start-invoked"
+  [[ "$(systemctl_active_state pe-service)" == true && "$(systemctl_enabled_state pe-service)" == true &&
+     "$(systemctl show pe-service -p ExecMainStatus --value)" == 0 ]] || {
+    financial_stop "$boundary-start-failed"
+    die "recovery-required: service activation did not succeed"
+  }
+  financial_serving_proof "$boundary-serving"
 }
 
 file_identity_json() {
@@ -374,12 +554,14 @@ print(f"http://{url_host}:{port}/health/ready")' "$installed_bind"
 }
 
 run_target_offline() {
+  local begin end status operation=${1#--financial-era=}
+  begin=$(date +%s%N)
   local -a preserved=("PATH=$PATH")
   [[ -z "${HOME:-}" ]] || preserved+=("HOME=$HOME")
   if [[ "${PE_ACTIVATION_TESTING:-0}" == 1 ]]; then
     preserved+=("PE_ACTIVATION_TESTING=1" "PE_ACTIVATION_TEST_ROOT=$PE_ACTIVATION_TEST_ROOT")
   fi
-  env -i "${preserved[@]}" /bin/bash -c '
+  if env -i "${preserved[@]}" /bin/bash -c '
 parsed=0
 while IFS= read -r -d "" assignment <&3; do
   if [[ $assignment == __PE_ENV_FILE_PARSED__ ]]; then parsed=1; break; fi
@@ -390,7 +572,19 @@ exec 3<&-
 exec "$@"
 ' bash "$target_binary" "$target_config" "$@" \
     3< <(env_file_values "$target_environment" "${SERVICE_ENV_ALLOWLIST[@]}" &&
-      printf '__PE_ENV_FILE_PARSED__\0')
+      printf '__PE_ENV_FILE_PARSED__\0'); then status=0; else status=$?; fi
+  end=$(date +%s%N)
+  printf 'financial-era timing phase=%s elapsed_ns=%s result=%s\n' "$operation" "$((end-begin))" "$status" >&2
+  return "$status"
+}
+
+financial_psql() {
+  local begin end status
+  begin=$(date +%s%N)
+  if psql_service_db "$@"; then status=0; else status=$?; fi
+  end=$(date +%s%N)
+  printf 'financial-era timing phase=authority elapsed_ns=%s result=%s\n' "$((end-begin))" "$status" >&2
+  return "$status"
 }
 
 manifest_complete_start() {
@@ -423,14 +617,19 @@ complete_sqlite_backup() {
   local source=$1 destination=$2
   python3 -c 'import os,sqlite3,sys
 source,destination=sys.argv[1:]
+import time
 tmp=destination+".tmp.%d" % os.getpid()
 src=sqlite3.connect("file:"+source+"?mode=ro", uri=True)
 dst=sqlite3.connect(tmp)
 try:
+    started=time.monotonic_ns()
     src.backup(dst)
+    print("financial-era timing phase=sqlite_backup elapsed_ns=%d result=0" % (time.monotonic_ns()-started),file=sys.stderr)
+    started=time.monotonic_ns()
     dst.execute("pragma cache_size=-262144")
     answer=dst.execute("pragma integrity_check").fetchone()
     if answer != ("ok",): raise SystemExit("SQLite backup integrity check failed")
+    print("financial-era timing phase=sqlite_integrity elapsed_ns=%d result=0" % (time.monotonic_ns()-started),file=sys.stderr)
     dst.commit()
 finally:
     dst.close(); src.close()
@@ -471,7 +670,7 @@ raise SystemExit(0 if value.get(sys.argv[2]) is True else 1)' "$MANIFEST" "$key"
 }
 
 remote_paper_census() {
-  psql_service_db -v ON_ERROR_STOP=1 -Atc \
+  financial_psql -v ON_ERROR_STOP=1 -Atc \
     "select json_build_object('paper_fills',(select count(*) from paper_fills),'settled_markets',(select count(*) from settled_markets),'paper_positions',(select count(*) from paper_positions),'paper_bankroll',(select count(*) from paper_bankroll),'fill_market_snapshots',(select count(*) from fill_market_snapshots))::text;"
 }
 
@@ -479,7 +678,7 @@ remote_paper_census() {
 # A nonzero result means restoration is still required; success proves a retry need not mutate.
 activation_archive_matches_live() {
   local activation_id=$1
-  psql_service_db -v ON_ERROR_STOP=1 -v activation_id="$activation_id" <<'SQL'
+  financial_psql -v ON_ERROR_STOP=1 -v activation_id="$activation_id" <<'SQL'
 select set_config('pe.activation_id', :'activation_id', true);
 do $$
 declare
@@ -517,6 +716,8 @@ SQL
 verify_guarded_log_identities() {
   python3 -c 'import hashlib,json,os,sys
 def digest(path,limit=None):
+    import time
+    started=time.monotonic_ns()
     handle=open(path,"rb"); total=0; hasher=hashlib.sha256()
     try:
         while limit is None or total < limit:
@@ -525,6 +726,7 @@ def digest(path,limit=None):
             if not chunk: break
             hasher.update(chunk); total+=len(chunk); chunk=None
     finally: handle.close()
+    print("financial-era timing phase=hashing elapsed_ns=%d result=0" % (time.monotonic_ns()-started),file=sys.stderr)
     return hasher.hexdigest(),total
 manifest=json.load(open(sys.argv[1],encoding="utf-8"))
 logs=manifest.get("guarded_logs")
@@ -540,6 +742,8 @@ for name in ("paper","source","live"):
 verify_guarded_log_prefixes() {
   python3 -c 'import hashlib,json,os,sys
 def digest(path,limit=None):
+    import time
+    started=time.monotonic_ns()
     handle=open(path,"rb"); total=0; hasher=hashlib.sha256()
     try:
         while limit is None or total < limit:
@@ -548,17 +752,105 @@ def digest(path,limit=None):
             if not chunk: break
             hasher.update(chunk); total+=len(chunk); chunk=None
     finally: handle.close()
+    print("financial-era timing phase=hashing elapsed_ns=%d result=0" % (time.monotonic_ns()-started),file=sys.stderr)
     return hasher.hexdigest(),total
 manifest=json.load(open(sys.argv[1],encoding="utf-8"))
 logs=manifest.get("guarded_logs")
 if not isinstance(logs,dict) or set(logs) != {"paper","source","live"}: raise SystemExit(1)
 for name in ("paper","source","live"):
+    if name == "source" and manifest.get("predecessor_start") is not None: continue
     row=logs[name]; path=row.get("path"); size=row.get("bytes")
     if not isinstance(path,str) or not isinstance(size,int) or size < 0: raise SystemExit(1)
     if not os.path.isfile(path) or os.path.getsize(path) < size: raise SystemExit(1)
     actual,consumed=digest(path,size)
     if consumed != size or actual != row.get("sha256"): raise SystemExit(1)' \
     "$MANIFEST"
+}
+
+verify_source_continuity() {
+  [[ "$successor" == true ]] || return 0
+  python3 -c 'import json,sys
+manifest=json.load(open(sys.argv[1]))
+if not manifest.get("guarded_logs"): raise SystemExit(0)
+verdict=json.loads(sys.argv[2]).get("source_continuity")
+# Rust owns receipt authentication and fails the command on a broken anchor; a missing verdict refuses.
+if not isinstance(verdict,dict) or verdict.get("authenticated") is not True:
+    raise SystemExit("guarded source continuity was not certified")
+' "$MANIFEST" "$COMPLETE_START_OUTPUT" || die "retention-aware source continuity refused"
+}
+
+verify_successor_financial_state() {
+  local status_size=$1 observation receipt
+  receipt=$(manifest_get start_receipt)
+  observation=$(local_financial_observation "$paper_state") || die "read coherent local financial observation"
+  printf '%s' "$observation" | verify_financial_observation "$receipt" "$fresh_bankroll" || die "local financial conservation refused"
+  observation=$(financial_psql -v ON_ERROR_STOP=1 -Atc "
+    select json_build_object(
+      'bankroll',(select json_agg(json_build_object('bankroll_str',bankroll_str)) from paper_bankroll),
+      'start_seq',(select start_seq from paper_bankroll where id=0),
+      'start_hash',(select start_hash from paper_bankroll where id=0),
+      'cursor',(select last_prepared_seq from paper_bankroll where id=0),
+      'fills',coalesce((select json_agg(json_build_object('market_id',market_id,'outcome_id',outcome_id,'side',side,
+        'quantity',contracts::text,'principal',principal::text,'fee',fee::text,'prepared_seq',prepared_seq)) from paper_fills),'[]'::json),
+      'positions',coalesce((select json_agg(json_build_object('market_id',market_id,'outcome_id',outcome_id,
+        'long',long_contracts::text,'short',short_contracts::text)) from paper_positions),'[]'::json),
+      'settlements',coalesce((select json_agg(json_build_object('market_id',market_id,'payouts',outcome_prices,
+        'credit',credit_applied::text,'prepared_seq',prepared_seq)) from settled_markets),'[]'::json),
+      'projection_token',(select updated_at from service_runtime where id=1),
+      'projection_count',(select count(*) from service_watchlist))::text;") || die "read coherent authority financial observation"
+  printf '%s' "$observation" | verify_financial_observation "$receipt" "$fresh_bankroll" || die "authority financial conservation refused"
+  printf '%s' "$observation" | python3 -c 'import datetime,json,sys
+observation=json.load(sys.stdin)
+status=json.load(open(sys.argv[1]))
+def instant(value): return datetime.datetime.fromisoformat(value.replace("Z","+00:00"))
+if observation["projection_count"]!=int(sys.argv[2]) or instant(observation["projection_token"])!=instant(status["watchlist_projection"]["applied"]["token"]):
+    raise SystemExit("authority projection has not converged")
+' "$generation/status.json" "$status_size" || die "successor projection convergence refused"
+}
+
+durable_manifest_copy() {
+  local source=$1 destination=$2 boundary=$3
+  if [[ -e "$destination" ]]; then
+    [[ ! -L "$destination" ]] && cmp -s "$source" "$destination" || die "conflicting retired manifest: $destination"
+  else
+    atomic_adopt "$source" "$destination" 0600 "$boundary" "$(sha256_file "$source")"
+  fi
+  maybe_crash "$boundary"
+}
+
+reinstate_predecessor() {
+  [[ "$successor" == true ]] || return 0
+  [[ "$(sha256_file "$predecessor_path")" == "$successor_of" ]] || die "predecessor changed before reinstatement"
+  if manifest_complete_start; then die "successor Start forbids predecessor reinstatement"
+  else [[ $? == 1 ]] || die "predecessor reinstatement Start state is unknown"; fi
+  verify_source_continuity
+  if python3 -c 'import json,sys; raise SystemExit(0 if json.load(open(sys.argv[1])).get("guarded_logs") else 1)' "$MANIFEST"; then
+    verify_guarded_log_prefixes || die "guarded paper/live continuity refused before reinstatement"
+  fi
+  durable_manifest_copy "$MANIFEST" "$DEPLOY_HOME/pe-financial-era.$activation_id.rolled_back.json" failed-manifest-retired
+  atomic_manifest_json "$(cat "$predecessor_path")" predecessor-reinstated
+}
+
+certify_completed_rollback() {
+  local counts
+  if manifest_complete_start; then die "completed rollback contains a successor Start"
+  else [[ $? == 1 ]] || die "completed rollback Start state is unknown"; fi
+  [[ "$(sha256_file "$SERVICE_BINARY")" == "$(manifest_get old_artifact_sha256)" &&
+     "$(sha256_file "$SERVICE_CONFIG")" == "$(manifest_get old_config_sha256)" &&
+     "$(sha256_file "$SERVICE_ENV")" == "$(manifest_get old_environment_sha256)" ]] || die "rollback installed authority changed"
+  if ! reconcile_remote_archive_receipt; then
+    manifest_flag no_financial_mutation || die "rollback lacks no-mutation certification"
+    counts=$(activation_archive_counts "$activation_id" false) || die "read rollback archive absence"
+    ! activation_archive_stamp_exists "$counts" || die "no-mutation rollback has an archive stamp"
+    ! manifest_flag qualification_start_intent || die "no-mutation rollback has a reset intent"
+    verify_predecessor_local_start
+  else
+    manifest_flag restoration_certified || die "archive rollback lacks inert restoration certification"
+  fi
+  verify_source_continuity
+  if [[ "$(systemctl_active_state pe-service)" == true ]]; then financial_serving_proof rollback-completed
+  elif manifest_flag service_was_active; then financial_start_service rollback-completed
+  else financial_stop rollback-completed; fi
 }
 
 verify_pre_start_restore_authority() {
@@ -597,7 +889,25 @@ if actual[3] != 1: raise SystemExit(1)' "$counts" "$MANIFEST" ||
   manifest_patch_boundary remote-archived '{"remote_archive_completed":true,"remote_archive_reconciled":true}'
 }
 
+verify_predecessor_local_start() {
+  [[ "$successor" == true ]] || return 0
+  python3 -c 'import json,sqlite3,sys
+receipt=json.loads(sys.argv[2]); db=sqlite3.connect("file:"+sys.argv[1]+"?mode=ro",uri=True); db.execute("BEGIN")
+rows=dict(db.execute("select key,value from meta where key in (\"financial_start_seq\",\"financial_start_hash\")"))
+def text(value): return value.decode() if isinstance(value,bytes) else str(value)
+if text(rows.get("financial_start_seq"))!=str(receipt["sequence"]) or text(rows.get("financial_start_hash"))!=receipt["this_hash"]:
+    raise SystemExit("no-mutation rollback has a local reset")
+' "$paper_state" "$predecessor_start" || die "predecessor local Start proof refused"
+}
+
 finish_unmutated_rollback() {
+  if [[ "$successor" == true ]]; then
+    local counts
+    counts=$(activation_archive_counts "$activation_id" false) || die "read no-mutation archive absence"
+    ! activation_archive_stamp_exists "$counts" || die "no-mutation rollback has an archive stamp"
+    verify_source_continuity
+    verify_predecessor_local_start
+  fi
   manifest_flag qualification_start_intent &&
     die "a local Start intent without an archive receipt is inconsistent"
   [[ "$(sha256_file "$SERVICE_BINARY")" == "$(manifest_get old_artifact_sha256)" ]] ||
@@ -606,52 +916,80 @@ finish_unmutated_rollback() {
     die "pre-Start service config changed"
   [[ "$(sha256_file "$SERVICE_ENV")" == "$(manifest_get old_environment_sha256)" ]] ||
     die "pre-Start service environment changed"
+  [[ "$(manifest_get state)" == rolling_back ]] || manifest_advance rolling_back
   if manifest_flag service_stop_intent; then
     local was_active current_active
     was_active=$(manifest_get service_was_active)
     current_active=$(systemctl_active_state pe-service)
     if [[ "$was_active" == true && "$current_active" == false ]]; then
       manifest_patch_boundary rollback-old-service-start-intent '{"old_service_start_intent":true}'
-      "${SERVICE_MUTATE[@]}" start pe-service
+      financial_start_service rollback-old
       [[ "$(systemctl_active_state pe-service)" == true ]] || die "old pe-service did not start"
-      [[ "${PE_ACTIVATION_TESTING:-0}" == 1 ]] || verify_installed_unit_owner
       manifest_patch_boundary old-service-started '{"old_service_started":true}'
+    elif [[ "$was_active" == true && "$current_active" == true ]]; then
+      financial_serving_proof rollback-old-already-running
     elif [[ "$was_active" == false && "$current_active" != false ]]; then
       die "originally inactive service unexpectedly became active"
     fi
   fi
+  manifest_patch_boundary no-mutation-certified '{"no_financial_mutation_certified":true}'
   manifest_advance rolled_back \
     '{"archive_restore_skipped":true,"local_restore_skipped":true,"no_financial_mutation":true}'
   echo "activation_id=$activation_id state=rolled_back"
+  reinstate_predecessor
   exit 0
 }
 
-if [[ ! -f "$MANIFEST" ]]; then
+if [[ "$successor" == true && "$(manifest_get state)" == rolled_back ]]; then
+  certify_completed_rollback
+  reinstate_predecessor
+  if [[ "$rollback_before_start" == true ]]; then echo "activation_id=$activation_id state=rolled_back"; exit 0; fi
+  predecessor_path=$MANIFEST
+fi
+
+if [[ ! -f "$MANIFEST" ]] || { [[ "$successor" == true && "$(sha256_file "$MANIFEST")" == "$successor_of" ]]; }; then
   [[ "$rollback_before_start" == false ]] || die "financial-era manifest is absent"
+  if [[ "$successor" == true ]]; then
+    activation_id="era-$(date -u +%Y%m%dT%H%M%SZ)"
+    [[ "$activation_id" =~ ^era-[0-9]{8}T[0-9]{6}Z$ ]] || die "invalid generated transition id"
+    [[ "$activation_id" != "$predecessor_activation_id" ]] || die "transition id was already used"
+    [[ ! -e "$DEPLOY_HOME/pe-financial-era.$activation_id.verified.json" &&
+       ! -e "$DEPLOY_HOME/pe-financial-era.$activation_id.rolled_back.json" &&
+       ! -e "$SERVICE_ROOT/financial-era-$activation_id-paper-state.db" ]] || die "transition id collides with a retired manifest or backup"
+    counts=$(activation_archive_counts "$activation_id" false) || die "read transition archive freshness"
+    ! activation_archive_stamp_exists "$counts" || die "transition id collides with an archive stamp"
+    [[ "${PE_ACTIVATION_TESTING:-0}" == 1 ]] || verify_installed_unit_owner
+    verify_financial_service_contract
+  fi
   rehearsal_evidence_json=$(read_rehearsal_evidence) ||
     die "financial-era rehearsal evidence was refused"
+  if [[ "$successor" == false ]]; then
   [[ "$(sha256_file "$SERVICE_BINARY")" == "$generation_artifact_sha256" ]] ||
     die "installed old binary differs from the verified #557 artifact"
   [[ "$(sha256_file "$SERVICE_CONFIG")" == "$generation_config_sha256" ]] ||
     die "installed old config differs from the verified #557 artifact"
   [[ "$(sha256_file "$SERVICE_ENV")" == "$generation_environment_sha256" ]] ||
     die "installed old environment differs from the verified #557 artifact"
+  fi
   old_binary=$(file_identity_json "$SERVICE_BINARY")
   old_config=$(file_identity_json "$SERVICE_CONFIG")
   old_environment=$(file_identity_json "$SERVICE_ENV")
   target_binary_json=$(file_identity_json "$target_binary")
   target_config_json=$(file_identity_json "$target_config")
   target_environment_json=$(file_identity_json "$target_environment")
+  census_helper="$DEPLOY_HOME/pe-service-census.$target_revision.sh"
+  atomic_adopt "$financial_deploy_dir/pe_service_census.sh" "$census_helper" 0755 census-helper-staged
   initial=$(python3 -c 'import decimal,json,sys,time
 (activation,generation,generation_commit,generation_bankroll,generation_source,generation_history,
  bankroll,revision,artifact,static,batch,members_path,
- paper,source,live,state,old_binary,old_config,old_env,target_binary,target_config,target_env,rehearsal)=sys.argv[1:]
+ paper,source,live,state,old_binary,old_config,old_env,target_binary,target_config,target_env,rehearsal,
+ successor,predecessor,predecessor_hash,predecessor_path,generation_activation,census,schema,semantic,parser)=sys.argv[1:]
 amount=decimal.Decimal(bankroll)
 atomic=amount*decimal.Decimal(1000000)
 if atomic != atomic.to_integral_value(): raise SystemExit("bankroll is not exact")
-members=json.load(open(members_path,encoding="utf-8"))
+members=[] if successor=="true" else json.load(open(members_path,encoding="utf-8"))
 if not isinstance(members,list) or len(members)!=len(set(members)): raise SystemExit("membership must be a unique JSON array")
-if not members: raise SystemExit("membership must not be empty")
+if not members and successor!="true": raise SystemExit("membership must not be empty")
 value={
  "kind":"financial-era-v1","state":"prepared","activation_id":activation,"generation":generation,
  "generation_merge_commit":generation_commit,"generation_bankroll":generation_bankroll,
@@ -659,12 +997,15 @@ value={
  "generation_legacy_history":json.loads(generation_history),
  "fresh_bankroll":int(atomic),"target_revision":revision,"artifact_blake3":artifact,"static_config_hash":static,
  "ranking_batch_id":int(batch),"membership":members,
- "schema_version":3,"parser_version":1,"financial_semantic_version":1,
+ "schema_version":int(schema),"parser_version":int(parser),"financial_semantic_version":int(semantic) if successor=="true" else 1,
  "start_unix":int(time.time()),"paths":{"paper_log":paper,"source_log":source,"live_journal":live,"paper_state":state},
  "old_artifact_sha256":json.loads(old_binary)["sha256"],"target_artifact_sha256":json.loads(target_binary)["sha256"],
  "old_config_sha256":json.loads(old_config)["sha256"],"target_config_sha256":json.loads(target_config)["sha256"],
  "old_environment_sha256":json.loads(old_env)["sha256"],"target_environment_sha256":json.loads(target_env)["sha256"],
  "rehearsal_evidence":json.loads(rehearsal),"preparation":None}
+value["census_helper"]=json.loads(census)
+if successor=="true": value.update(predecessor_start=json.loads(predecessor),predecessor_manifest_sha256=predecessor_hash,
+  predecessor_manifest_path=predecessor_path,generation_activation_id=generation_activation)
 print(json.dumps(value,sort_keys=True,separators=(",",":")))' \
     "$activation_id" "$generation" "$generation_merge_commit" "$generation_bankroll" \
     "$generation_source_v1_main" "$generation_legacy_history" \
@@ -672,12 +1013,28 @@ print(json.dumps(value,sort_keys=True,separators=(",",":")))' \
     "$artifact_blake3" "$static_config_hash" "$ranking_batch_id" "$membership_json" \
     "$paper_log" "$source_log" "$live_journal" "$paper_state" \
     "$old_binary" "$old_config" "$old_environment" "$target_binary_json" \
-    "$target_config_json" "$target_environment_json" "$rehearsal_evidence_json") || die "construct financial-era manifest"
+    "$target_config_json" "$target_environment_json" "$rehearsal_evidence_json" \
+    "$successor" "$predecessor_start" "$successor_of" "$DEPLOY_HOME/pe-financial-era.$predecessor_activation_id.verified.json" \
+    "$generation_activation_id" "$(file_identity_json "$census_helper")" "$SUCCESSOR_SCHEMA_VERSION" \
+    "$SUCCESSOR_FINANCIAL_SEMANTIC_VERSION" "$SUCCESSOR_PARSER_VERSION") || die "construct financial-era manifest"
+  if [[ "$successor" == true ]]; then
+    candidate=$(mktemp "$DEPLOY_HOME/.pe-successor-candidate.XXXXXX")
+    printf '%s' "$initial" > "$candidate"
+    export_financial_config_rows
+    if ! run_target_offline --financial-era=preflight --activation-manifest="$candidate" \
+      --financial-config-rows="$financial_config_rows_file"; then
+      rm -f "$candidate"; die "successor preflight refused before authority replacement"
+    fi
+    rm -f "$candidate"
+    retired_predecessor="$DEPLOY_HOME/pe-financial-era.$predecessor_activation_id.verified.json"
+    durable_manifest_copy "$predecessor_path" "$retired_predecessor" predecessor-copied
+    predecessor_path=$retired_predecessor
+  fi
   atomic_manifest_json "$initial" prepared
 fi
 
 [[ "$(manifest_get kind)" == financial-era-v1 ]] || die "wrong financial-era manifest kind"
-[[ "$(manifest_get activation_id)" == "$activation_id" ]] || die "#557 activation identity changed"
+[[ "$(manifest_get activation_id)" == "$activation_id" ]] || die "financial transition identity changed"
 [[ "$(manifest_get generation)" == "$generation" ]] || die "#557 generation identity changed"
 [[ "$(manifest_get generation_merge_commit)" == "$generation_merge_commit" ]] || die "#557 merge-commit identity changed"
 [[ "$(manifest_get generation_bankroll)" == "$generation_bankroll" ]] || die "#557 bankroll identity changed"
@@ -686,9 +1043,14 @@ manifest=json.load(open(sys.argv[1],encoding="utf-8"))
 if manifest.get("generation_source_v1_main") != json.loads(sys.argv[2]): raise SystemExit("#557 source evidence changed")
 if manifest.get("generation_legacy_history") != json.loads(sys.argv[3]): raise SystemExit("#557 legacy-history evidence changed")' \
   "$MANIFEST" "$generation_source_v1_main" "$generation_legacy_history" || die "#557 source/history identity changed"
+if [[ "$successor" == false ]]; then
 [[ "$(manifest_get old_artifact_sha256)" == "$generation_artifact_sha256" ]] || die "recorded old binary is not the verified #557 artifact"
 [[ "$(manifest_get old_config_sha256)" == "$generation_config_sha256" ]] || die "recorded old config is not the verified #557 artifact"
 [[ "$(manifest_get old_environment_sha256)" == "$generation_environment_sha256" ]] || die "recorded old environment is not the verified #557 artifact"
+else
+[[ "$(manifest_get predecessor_start)" == "$predecessor_start" &&
+   "$(manifest_get generation_activation_id)" == "$generation_activation_id" ]] || die "successor predecessor or generation changed"
+fi
 [[ "$(manifest_get target_revision)" == "$target_revision" ]] || die "reviewed target revision changed"
 [[ "$(sha256_file "$target_binary")" == "$(manifest_get target_artifact_sha256)" ]] || die "reviewed target artifact changed"
 [[ "$(sha256_file "$target_config")" == "$(manifest_get target_config_sha256)" ]] || die "reviewed target config changed"
@@ -702,13 +1064,15 @@ if manifest.get("generation_legacy_history") != json.loads(sys.argv[3]): raise S
    "$ranking_batch_id" == "$(manifest_get ranking_batch_id)" ]] ||
   die "financial-era evidence identity changed"
 python3 -c 'import decimal,json,sys
-manifest,members,bankroll=sys.argv[1:]
+manifest,members,bankroll,successor=sys.argv[1:]
 value=json.load(open(manifest,encoding="utf-8"))
-supplied=json.load(open(members,encoding="utf-8"))
+supplied=[] if successor=="true" else json.load(open(members,encoding="utf-8"))
 if supplied != value["membership"]: raise SystemExit("membership identity changed")
+if successor=="true" and value.get("preparation") and value["preparation"]["start"]["activation_id"]!=value["activation_id"]:
+    raise SystemExit("transition preparation identity changed")
 atomic=decimal.Decimal(bankroll)*decimal.Decimal(1000000)
 if atomic != decimal.Decimal(value["fresh_bankroll"]): raise SystemExit("fresh bankroll identity changed")' \
-  "$MANIFEST" "$membership_json" "$fresh_bankroll" || die "financial-era membership or bankroll identity changed"
+  "$MANIFEST" "$membership_json" "$fresh_bankroll" "$successor" || die "financial-era membership or bankroll identity changed"
 
 state=$(manifest_get state)
 if [[ "$state" == prepared && "$rollback_before_start" == false ]]; then
@@ -732,7 +1096,7 @@ fi
 if [[ "$rollback_before_start" == true ]]; then
   case "$state" in
     started|verified) die "rollback is forbidden at or after QualificationStarted" ;;
-    rolled_back) echo "activation_id=$activation_id state=rolled_back"; exit 0 ;;
+    rolled_back) certify_completed_rollback; reinstate_predecessor; echo "activation_id=$activation_id state=rolled_back"; exit 0 ;;
     prepared|guarded|rolling_back) ;;
     *) die "rollback-before-start is invalid from state $state" ;;
   esac
@@ -747,26 +1111,39 @@ if [[ "$rollback_before_start" == true ]]; then
   [[ "$(sha256_file "$backup_path")" == "$(manifest_get backup.sha256)" ]] || die "local backup hash mismatch"
   old_start_inflight=false
   if manifest_flag old_service_start_intent && manifest_flag archive_restored &&
-     manifest_flag local_restored && [[ "$(systemctl_active_state pe-service)" == true ]]; then
+     manifest_flag local_restored && { [[ "$(systemctl_active_state pe-service)" == true ]] ||
+       { [[ "$successor" == true ]] && manifest_flag restoration_certified; }; }; then
     old_start_inflight=true
     verify_guarded_log_prefixes || die "old service does not extend the guarded log prefixes"
+    verify_source_continuity
+    verify_predecessor_local_start
   else
     verify_guarded_log_identities || die "guarded paper/source/live log identity changed"
   fi
   [[ "$(sha256_file "$SERVICE_BINARY")" == "$(manifest_get old_artifact_sha256)" ]] || die "pre-Start service binary changed"
   [[ "$(sha256_file "$SERVICE_CONFIG")" == "$(manifest_get old_config_sha256)" ]] || die "pre-Start service config changed"
   [[ "$(sha256_file "$SERVICE_ENV")" == "$(manifest_get old_environment_sha256)" ]] || die "pre-Start service environment changed"
+  if [[ "$old_start_inflight" == false ]] && manifest_flag old_service_start_intent; then
+    [[ "$(sha256_file "$paper_state")" == "$(manifest_get backup.sha256)" &&
+       ! -e "$paper_state-wal" && ! -e "$paper_state-shm" ]] ||
+      die "old-service resumption is ambiguous; refusing local restore"
+  fi
   if [[ "$old_start_inflight" == true ]]; then
-    [[ "${PE_ACTIVATION_TESTING:-0}" == 1 ]] || verify_installed_unit_owner
+    if [[ "$(systemctl_active_state pe-service)" == false ]]; then financial_start_service rollback-old-resumed; fi
+    financial_serving_proof rollback-old-resumed
     manifest_patch_boundary old-service-started '{"old_service_started":true}'
     manifest_advance rolled_back
+    reinstate_predecessor
     echo "activation_id=$activation_id state=rolled_back"
     exit 0
   fi
   if [[ "$(systemctl_active_state pe-service)" == true ]]; then
-    "${SERVICE_MUTATE[@]}" stop pe-service
+    financial_serving_proof rollback-pre-stop
+    manifest_patch_boundary rollback-service-stop-intent '{"rollback_service_stop_intent":true}'
+    financial_stop rollback-stopped
     manifest_patch_boundary rollback-service-stopped '{"rollback_service_stopped":true}'
   fi
+  financial_stop rollback-clearance
   [[ "$(systemctl_active_state pe-service)" == false ]] || die "pe-service is not inert before rollback"
   [[ "$state" == rolling_back ]] || manifest_advance rolling_back
   if ! manifest_flag archive_restored; then
@@ -775,7 +1152,7 @@ if [[ "$rollback_before_start" == true ]]; then
       :
     else
       manifest_patch_boundary rollback-archive-restore-intent '{"archive_restore_intent":true}'
-      psql_service_db -v ON_ERROR_STOP=1 -v activation_id="$activation_id" \
+      financial_psql -v ON_ERROR_STOP=1 -v activation_id="$activation_id" \
         -f "$REPO_ROOT/scripts/paper_reset/restore_paper_state.sql"
     fi
     restored_census=$(remote_paper_census)
@@ -788,7 +1165,7 @@ raise SystemExit(0 if json.loads(sys.argv[1]) == json.loads(sys.argv[2]) else 1)
   if ! manifest_flag rollback_wallet_live_stats_refreshed; then
     manifest_patch_boundary rollback-wallet-live-stats-refresh-intent \
       '{"rollback_wallet_live_stats_refresh_intent":true}'
-    psql_service_db -v ON_ERROR_STOP=1 -c \
+    financial_psql -v ON_ERROR_STOP=1 -c \
       'refresh materialized view concurrently public.wallet_live_stats_mv;'
     manifest_patch_boundary rollback-wallet-live-stats-refreshed \
       '{"rollback_wallet_live_stats_refreshed":true}'
@@ -796,7 +1173,7 @@ raise SystemExit(0 if json.loads(sys.argv[1]) == json.loads(sys.argv[2]) else 1)
   if ! manifest_flag local_restored || manifest_flag qualification_start_intent; then
     [[ "$(systemctl_active_state pe-service)" == false ]] || die "pe-service is not inert before local restore"
     current_local_sha=$(sha256_file "$paper_state")
-    if manifest_flag qualification_start_intent ||
+    if manifest_flag qualification_start_intent || [[ "$successor" == true ]] ||
        [[ "$current_local_sha" != "$(manifest_get guarded_paper_state_sha256)" ]]; then
       # An inactive unit with an old-start intent may have run and stopped again. Only the
       # untouched restored image permits a retry; never erase possible post-resumption writes.
@@ -812,7 +1189,8 @@ raise SystemExit(0 if json.loads(sys.argv[1]) == json.loads(sys.argv[2]) else 1)
       fi
       # Start may commit only into WAL, leaving either main-file hash unchanged. A durable
       # restore intent plus backup equality AND absent sidecars certifies helper completion.
-      if { manifest_flag qualification_start_intent && ! manifest_flag local_restore_intent; } ||
+      if { [[ "$successor" == true ]] && ! manifest_flag local_restore_intent; } ||
+         { manifest_flag qualification_start_intent && ! manifest_flag local_restore_intent; } ||
          [[ "$current_local_sha" != "$(manifest_get backup.sha256)" ]] ||
          { [[ -e "$paper_state-wal" || -e "$paper_state-shm" ]] &&
            { manifest_flag qualification_start_intent || manifest_flag local_restore_intent; }; }; then
@@ -842,10 +1220,12 @@ raise SystemExit(0 if json.loads(sys.argv[1]) == json.loads(sys.argv[2]) else 1)
     verify_guarded_log_identities || die "paper/source/live log identity changed during rollback"
     manifest_patch_boundary local-restored '{"local_restored":true}'
   fi
+  activation_archive_matches_live "$activation_id" || die "restored archive row sets differ"
+  manifest_patch_boundary restoration-certified '{"restoration_certified":true}'
   if [[ "$(manifest_get service_was_active)" == true ]] && ! manifest_flag old_service_started; then
     [[ "$(systemctl_active_state pe-service)" == false ]] || die "pe-service is not inert before old-service start"
     manifest_patch_boundary rollback-old-service-start-intent '{"old_service_start_intent":true}'
-    "${SERVICE_MUTATE[@]}" start pe-service
+    financial_start_service rollback-old
     [[ "$(systemctl_active_state pe-service)" == true ]] || die "old pe-service did not start"
     [[ "${PE_ACTIVATION_TESTING:-0}" == 1 ]] || verify_installed_unit_owner
     manifest_patch_boundary old-service-started '{"old_service_started":true}'
@@ -854,6 +1234,7 @@ raise SystemExit(0 if json.loads(sys.argv[1]) == json.loads(sys.argv[2]) else 1)
     manifest_patch_boundary old-service-start-skipped '{"old_service_start_skipped":true}'
   fi
   manifest_advance rolled_back
+  reinstate_predecessor
   echo "activation_id=$activation_id state=rolled_back"
   exit 0
 fi
@@ -861,7 +1242,7 @@ fi
 # A manifest recorded with an empty membership (possible before #567) must never go forward:
 # the first ordinary boot after Start refuses an empty watchlist, and Start is irreversible.
 # Rollback exited above; a complete durable Start must still roll forward.
-if [[ ( "$state" == prepared || "$state" == guarded ) && "$complete_start" == false ]]; then
+if [[ "$successor" == false && ( "$state" == prepared || "$state" == guarded ) && "$complete_start" == false ]]; then
   python3 -c 'import json,sys
 if not json.load(open(sys.argv[1],encoding="utf-8"))["membership"]: raise SystemExit("membership must not be empty")' \
     "$MANIFEST" || die "financial-era manifest membership is empty; refusing to go forward"
@@ -879,7 +1260,9 @@ case "$state" in
       # still runs after the stop; this is an early warning, not a replacement. Both it and the rows
       # export are `psql` calls, and both are free here because nothing is stopped yet.
       if [[ "$current_active" == true ]]; then
-        verify_legacy_service_contract
+        financial_serving_proof pre-stop
+        account_census_receipt >/dev/null || die "authority account census refused before stop"
+        verify_mode_contract
         export_financial_config_rows
         preflight_report=$(run_target_offline --financial-era=preflight \
           --activation-manifest="$MANIFEST" \
@@ -893,12 +1276,11 @@ case "$state" in
       else
         was_active=$(manifest_get service_was_active)
       fi
-      if [[ "$current_active" == true ]]; then
-        "${SERVICE_MUTATE[@]}" stop pe-service
-      fi
+      financial_stop stopped
       [[ "$(systemctl_active_state pe-service)" == false ]] || die "pe-service did not become inert"
       manifest_patch_boundary service-stopped "{\"stop_invoked\":true,\"service_was_active\":$was_active}"
     fi
+    financial_stop prepared-resume
     [[ "$(systemctl_active_state pe-service)" == false ]] || die "pe-service is not inert"
     # #618: the service wrote `status.json` once more on its way down, and that write can poison the
     # very flag the pre-stop preflight just approved. Re-ask the same local gates NOW — before
@@ -919,15 +1301,26 @@ case "$state" in
       --financial-config-rows="$financial_config_rows_file") ||
       die "financial-era preflight refused immediately after the stop; no backup was started"
     printf 'financial-era preflight post-stop: %s\n' "$preflight_report"
-    verify_legacy_service_contract
+    account_census_receipt >/dev/null || die "authority account census refused after stop"
+    verify_mode_contract
     manifest_patch_boundary legacy-contract-verified '{"legacy_contract_verified":true}'
     backup_path="$SERVICE_ROOT/financial-era-$activation_id-paper-state.db"
+    if [[ -e "$backup_path" ]]; then
+      manifest_flag backup_intent || die "backup name collision"
+    fi
+    manifest_patch_boundary backup-intent '{"backup_intent":true}'
     complete_sqlite_backup "$paper_state" "$backup_path"
+    maybe_crash backup-completed
+    hash_begin=$(date +%s%N)
     backup_sha=$(sha256_file "$backup_path")
+    hash_end=$(date +%s%N)
+    printf 'financial-era timing phase=hashing elapsed_ns=%s result=0\n' "$((hash_end-hash_begin))" >&2
     census=$(remote_paper_census)
     guarded_paper_state_sha=$(sha256_file "$paper_state")
     patch=$(python3 -c 'import hashlib,json,os,sys
 def digest(path,limit=None):
+    import time
+    started=time.monotonic_ns()
     handle=open(path,"rb"); total=0; hasher=hashlib.sha256()
     try:
         while limit is None or total < limit:
@@ -936,6 +1329,7 @@ def digest(path,limit=None):
             if not chunk: break
             hasher.update(chunk); total+=len(chunk); chunk=None
     finally: handle.close()
+    print("financial-era timing phase=hashing elapsed_ns=%d result=0" % (time.monotonic_ns()-started),file=sys.stderr)
     return hasher.hexdigest(),total
 backup,sha,guarded_state_sha,census,paper,source,live=sys.argv[1:]
 logs={name:{"path":path,"sha256":digest(path)[0],"bytes":os.path.getsize(path)} for name,path in (("paper",paper),("source",source),("live",live))}
@@ -968,10 +1362,12 @@ if [[ "$state" == guarded ]]; then
     verify_persisted_financial_guard harness_bundle
     verify_persisted_financial_guard unit_stop_policy "$service_active"
     [[ "$service_active" == false ]] || die "pre-Start guarded activation requires an inert service"
-    verify_legacy_service_contract
+    financial_stop guarded-resume
+    verify_guarded_log_identities || die "stopped guarded log identity changed"
+    verify_mode_contract
     if ! python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); raise SystemExit(0 if value.get("remote_archive_completed") is True else 1)' "$MANIFEST"; then
       manifest_patch_boundary remote-archive-intent '{"remote_archive_intent":true}'
-      psql_service_db -v ON_ERROR_STOP=1 -v activation_id="$activation_id" \
+      financial_psql -v ON_ERROR_STOP=1 -v activation_id="$activation_id" \
         -v bankroll="$fresh_bankroll" -f "$REPO_ROOT/scripts/paper_reset/archive_paper_state.sql"
       manifest_patch_boundary remote-archived '{"remote_archive_completed":true}'
     fi
@@ -991,8 +1387,19 @@ if [[ "$state" == guarded ]]; then
       [[ "$(sha256_file "$SERVICE_BINARY")" == "$(manifest_get target_artifact_sha256)" ]] || die "running post-Start binary is not the reviewed target"
       [[ "$(sha256_file "$SERVICE_CONFIG")" == "$(manifest_get target_config_sha256)" ]] || die "running post-Start config is not the reviewed target"
       [[ "$(sha256_file "$SERVICE_ENV")" == "$(manifest_get target_environment_sha256)" ]] || die "running post-Start environment is not the reviewed target"
-      [[ "${PE_ACTIVATION_TESTING:-0}" == 1 ]] || verify_installed_unit_owner
+      financial_serving_proof post-start-resume
     fi
+  fi
+  if [[ "$successor" == true ]]; then
+    verify_financial_service_contract
+    for receipt in authority_schema live_schema financial_config; do
+      case "$receipt" in
+        authority_schema) patch='{"authority_schema_installed":true,"authority_schema_receipt":{"skipped":"successor"}}' ;;
+        live_schema) patch='{"live_schema_installed":true,"live_schema_receipt":{"skipped":"successor"}}' ;;
+        financial_config) patch='{"financial_config_migrated":true,"financial_config_receipt":{"skipped":"successor"}}' ;;
+      esac
+      manifest_patch_boundary "$receipt-skipped" "$patch"
+    done
   fi
   [[ -f "$REPO_ROOT/scripts/migrate_service_config_545.sql" ]] || die "post-Start service-config migration is absent"
   start_seq=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["sequence"])' "$start_receipt") ||
@@ -1001,12 +1408,12 @@ if [[ "$state" == guarded ]]; then
     die "Start hash is invalid"
   if ! manifest_flag authority_schema_installed; then
     manifest_patch_boundary authority-schema-intent '{"authority_schema_intent":true}'
-    psql_service_db -v ON_ERROR_STOP=1 -f "$REPO_ROOT/scripts/supabase_paper_state_schema.sql"
+    financial_psql -v ON_ERROR_STOP=1 -f "$REPO_ROOT/scripts/supabase_paper_state_schema.sql"
     manifest_patch_boundary authority-schema-installed '{"authority_schema_installed":true}'
   fi
   if ! manifest_flag live_schema_installed; then
     manifest_patch_boundary live-schema-intent '{"live_schema_intent":true}'
-    psql_service_db -v ON_ERROR_STOP=1 -f "$REPO_ROOT/scripts/supabase_multi_account_live_schema.sql"
+    financial_psql -v ON_ERROR_STOP=1 -f "$REPO_ROOT/scripts/supabase_multi_account_live_schema.sql"
     manifest_patch_boundary live-schema-installed '{"live_schema_installed":true}'
   fi
   # #628: initial authority seeding and RESUME are different states. The pristine assertions below
@@ -1023,7 +1430,7 @@ if [[ "$state" == guarded ]]; then
   else
     authority_start_mode=initial
   fi
-  authority_start=$(psql_service_db -v ON_ERROR_STOP=1 -Atc \
+  authority_start=$(financial_psql -v ON_ERROR_STOP=1 -Atc \
     "select seed_financial_start($start_seq,'$start_hash');
      select json_build_object('bankroll',(select bankroll_str from paper_bankroll where id=0),
        'start_seq',(select start_seq from paper_bankroll where id=0),
@@ -1048,17 +1455,18 @@ if mode == "initial":
     "$(python3 -c 'import json,sys; print(json.dumps({"authority_start_seeded":True,"authority_start_proof":[json.loads(line) for line in sys.argv[1].splitlines() if line]},sort_keys=True,separators=(",",":")))' "$authority_start")"
   if ! manifest_flag financial_config_migrated; then
     manifest_patch_boundary financial-config-migration-intent '{"financial_config_migration_intent":true}'
-    psql_service_db -v ON_ERROR_STOP=1 -f "$REPO_ROOT/scripts/migrate_service_config_545.sql"
+    financial_psql -v ON_ERROR_STOP=1 -f "$REPO_ROOT/scripts/migrate_service_config_545.sql"
     manifest_patch_boundary financial-config-migrated '{"financial_config_migrated":true}'
   fi
   if ! manifest_flag wallet_live_stats_refreshed; then
     manifest_patch_boundary wallet-live-stats-refresh-intent \
       '{"wallet_live_stats_refresh_intent":true}'
-    psql_service_db -v ON_ERROR_STOP=1 -c \
+    financial_psql -v ON_ERROR_STOP=1 -c \
       'refresh materialized view concurrently public.wallet_live_stats_mv;'
     manifest_patch_boundary wallet-live-stats-refreshed \
       '{"wallet_live_stats_refreshed":true}'
   fi
+  if [[ "$(systemctl_active_state pe-service)" == false ]]; then financial_stop artifact-clearance; fi
   if ! manifest_flag target_config_adopted; then
     manifest_patch_boundary target-config-adopt-intent '{"target_config_adopt_intent":true}'
     atomic_adopt "$target_config" "$SERVICE_CONFIG" 0644 financial-config-adopted \
@@ -1082,10 +1490,10 @@ if mode == "initial":
     verify_persisted_financial_guard unit_stop_policy "$service_active"
     manifest_flag service_start_intent ||
       manifest_patch_boundary service-start-intent '{"service_start_intent":true}'
-    "${SERVICE_MUTATE[@]}" start pe-service
+    financial_start_service target
   else
     [[ "$service_active" == true ]] || die "pe-service has an invalid active state"
-    [[ "${PE_ACTIVATION_TESTING:-0}" == 1 ]] || verify_installed_unit_owner
+    financial_serving_proof target-already-running
   fi
   manifest_flag service_started ||
     manifest_patch_boundary service-started '{"service_started":true}'
@@ -1097,7 +1505,8 @@ fi
 
 if [[ "$state" == started ]]; then
   [[ "$complete_start" == true ]] || die "verified state requires the manifest-bound QualificationStarted"
-  [[ "${PE_ACTIVATION_TESTING:-0}" == 1 ]] || verify_installed_unit_owner
+  if [[ "$(systemctl_active_state pe-service)" == false ]]; then financial_start_service target-resume; fi
+  financial_serving_proof verified
   [[ "$(sha256_file "$SERVICE_BINARY")" == "$(manifest_get target_artifact_sha256)" ]] || die "installed target artifact hash mismatch"
   [[ "$(sha256_file "$SERVICE_CONFIG")" == "$(manifest_get target_config_sha256)" ]] || die "installed target config hash mismatch"
   [[ "$(sha256_file "$SERVICE_ENV")" == "$(manifest_get target_environment_sha256)" ]] || die "installed target environment hash mismatch"
@@ -1105,8 +1514,10 @@ if [[ "$state" == started ]]; then
   hot_config_hash=$(manifest_get preparation.start.hot_config_hash)
   [[ "$hot_config_hash" =~ ^[0-9a-f]{64}$ ]] || die "prepared hot-config identity is invalid"
   verify_guarded_log_prefixes || die "paper/source/live prefixes do not extend their guarded identities"
+  verify_source_continuity
+  [[ "$successor" == false ]] || verify_financial_service_contract
   status_watchlist_size=$(python3 -c 'import decimal,json,os,sys
-path,started,revision,hot,bankroll,membership_count=sys.argv[1:]
+path,started,revision,hot,bankroll,membership_count,successor=sys.argv[1:]
 started=int(started); membership_count=int(membership_count)
 value=json.load(open(path,encoding="utf-8"))
 if os.stat(path).st_mtime < started: raise SystemExit("status predates financial-era start")
@@ -1130,7 +1541,7 @@ if runtime.get("applied_hash") != hot or runtime.get("rejected") is not None: ra
 # continuity, not drift (attempt 17 lost a member 3.5 h after Start). The remote proof explains
 # every absence; the size is printed so both proofs compare against this ONE status read.
 size=value.get("watchlist_size")
-if not isinstance(size,int) or size > membership_count: raise SystemExit("status membership count exceeds the prepared membership")
+if not isinstance(size,int) or size < 0 or (successor!="true" and size > membership_count): raise SystemExit("status membership count exceeds the prepared membership")
 if size and not isinstance(value.get("oldest_anchor_age_secs"),int): raise SystemExit("status does not prove installed membership anchors")
 projection=value.get("watchlist_projection") or {}
 applied=projection.get("applied") or {}
@@ -1161,7 +1572,7 @@ for account in accounts:
 if None in identities or len(identities) != len(set(identities)): raise SystemExit("live account inventory is not uniquely identified")
 print(size)' \
     "$generation/status.json" "$(manifest_get started_unix)" "$target_revision" \
-    "$hot_config_hash" "$fresh_bankroll" "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["membership"]))' "$MANIFEST")") ||
+    "$hot_config_hash" "$fresh_bankroll" "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["membership"]))' "$MANIFEST")" "$successor") ||
     die "first fresh health proof is incomplete"
   [[ "$status_watchlist_size" =~ ^[0-9]+$ ]] || die "first fresh health proof is incomplete"
   readiness_url=$(installed_readiness_url) || die "installed readiness endpoint is invalid"
@@ -1179,6 +1590,9 @@ if not isinstance(value,dict) or value.get("ready") is not True or value.get("is
     raise SystemExit("installed invocation is not ready")' "$financial_readiness_response" ||
     die "installed readiness proof is incomplete"
   verified_readiness_sha256=$(sha256_file "$financial_readiness_response")
+  if [[ "$successor" == true ]]; then
+    verify_successor_financial_state "$status_watchlist_size"
+  else
   python3 -c 'import decimal,json,sqlite3,sys
 path,start_seq,start_hash,bankroll=sys.argv[1:]
 db=sqlite3.connect("file:"+path+"?mode=ro",uri=True)
@@ -1205,7 +1619,7 @@ if fills == 0 and decimal.Decimal(rows[0][0]) != decimal.Decimal(bankroll): rais
     die "local financial reset/Start proof is incomplete"
   started_unix=$(manifest_get started_unix)
   [[ "$started_unix" =~ ^[0-9]+$ ]] || die "manifest started_unix is invalid"
-  remote_verified=$(psql_service_db -v ON_ERROR_STOP=1 -Atc \
+  remote_verified=$(financial_psql -v ON_ERROR_STOP=1 -Atc \
     "select json_build_object(
        'paper_fills',(select count(*) from paper_fills),
        'bankroll_count',(select count(*) from paper_bankroll),
@@ -1236,9 +1650,12 @@ if not live <= prepared: raise SystemExit("remote membership admits a wallet out
 if not (prepared - live) <= set(actual["demoted_since_start"]): raise SystemExit("remote membership differs")
 if len(live) != int(sys.argv[4]): raise SystemExit("status membership count differs from the authority")' \
     "$remote_verified" "$MANIFEST" "$fresh_bankroll" "$status_watchlist_size" || die "remote financial/ranking/membership proof is incomplete"
+  fi
   manifest_advance verified \
     "$(python3 -c 'import json,sys
-print(json.dumps({"verified_state_assertions":True,"verified_start_reset":True,"verified_source_replay_continuity":True,"verified_ranking_membership":True,"verified_producers_projection":True,"verified_accounts_off_unarmed":True,"verified_readiness_sha256":sys.argv[1]},sort_keys=True,separators=(",",":")))' "$verified_readiness_sha256")"
+value={"verified_state_assertions":True,"verified_start_reset":True,"verified_source_replay_continuity":True,"verified_ranking_membership":True,"verified_producers_projection":True,"verified_accounts_off_unarmed":True,"verified_readiness_sha256":sys.argv[1]}
+if sys.argv[2]=="true": value.update(verified_ranking_membership="skipped: successor",verified_financial_conservation=True)
+print(json.dumps(value,sort_keys=True,separators=(",",":")))' "$verified_readiness_sha256" "$successor")"
 fi
 
 echo "activation_id=$activation_id state=$(manifest_get state)"

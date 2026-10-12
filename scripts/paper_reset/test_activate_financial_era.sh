@@ -28,11 +28,13 @@ SHARD_TOTAL=${BASH_REMATCH[2]}
 
 shard_owns() {
   local owner=$1
+  if [[ "${SUCCESSOR_ONLY:-0}" == 1 ]]; then [[ "$owner" == 9 ]]; return; fi
   (( SHARD_TOTAL == 1 || SHARD_INDEX == (owner < SHARD_TOTAL ? owner : SHARD_TOTAL) ))
 }
 
 MATRIX_ROW=0
 matrix_row_selected() {
+  [[ "${SUCCESSOR_ONLY:-0}" != 1 ]] || return 1
   MATRIX_ROW=$((MATRIX_ROW + 1))
   (( SHARD_TOTAL == 1 || SHARD_INDEX == 2 + (MATRIX_ROW - 1) % (SHARD_TOTAL - 1) ))
 }
@@ -158,7 +160,7 @@ driver,runbook=sys.argv[1:]
 source=open(driver,encoding="utf-8").read()
 usage=source.split("usage() {",1)[1].split("}",1)[0]
 usage_flags=set(re.findall(r"--[a-z][a-z0-9-]*",usage))
-optional={"--rollback-before-start","--simulate-crash-after"}
+optional={"--successor-of","--rollback-before-start","--simulate-crash-after"}
 text=open(runbook,encoding="utf-8").read()
 section=text.split("Run the exact reviewed driver command on the production host:",1)[1]
 command=section.split("```bash",1)[1].split("```",1)[0]
@@ -236,6 +238,16 @@ def space(path):
 os.statvfs=space
 exec(compile(sys.stdin.read(),"capture-space-fixture","exec"))' "$available" "$@"
 fi
+if [[ "${1-}" == - ]]; then
+  script=$(cat)
+  if [[ "$script" == *'ProcessLookupError'* && "$script" == *'known_binaries'* ]]; then
+    if [[ -e "$state/census-refusal" ]]; then echo '{"census":"matches"}'; exit 3; fi
+    if [[ -e "$state/census-uninspectable" ]]; then echo '{"census":"unreadable"}'; exit 2; fi
+    echo '{"census":"clear","matches":[],"unreadable":[]}'
+    exit 0
+  fi
+  exec /usr/bin/python3 "$@" <<< "$script"
+fi
 exec /usr/bin/python3 "$@"
 SH
   cat > "$bin/systemctl" <<'SH'
@@ -244,18 +256,30 @@ set -euo pipefail
 state=${PE_ACTIVATION_TEST_ROOT:?}/test-state
 case "$1" in
   is-active)
+    [[ ! -e "$state/service.failed" ]] || { echo failed; exit 3; }
+    [[ ! -e "$state/activity-unknown" ]] || { echo activating; exit 3; }
     if [[ $(<"$state/service.active") == true ]]; then echo active; exit 0; fi
     echo inactive; exit 3
     ;;
-  is-enabled) echo enabled ;;
+  is-enabled)
+    if [[ ! -f "$state/service.enabled" || $(<"$state/service.enabled") == true ]]; then echo enabled; exit 0; fi
+    echo disabled; exit 1 ;;
+  disable|enable)
+    [[ ! -e "$state/fail-$1" ]] || exit 95
+    if [[ "$1" == enable ]]; then echo true > "$state/service.enabled"; else echo false > "$state/service.enabled"; fi ;;
   show)
-    if [[ -f "$state/unit-stop-policy" ]]; then
+    if [[ "$*" == *MainPID* ]]; then
+      if [[ $(<"$state/service.active") == true ]]; then echo 99999999; else echo 0; fi
+    elif [[ "$*" == *ExecMainStatus* ]]; then
+      if [[ -e "$state/status-78" ]]; then echo 78; else echo 0; fi
+    elif [[ -f "$state/unit-stop-policy" ]]; then
       cat "$state/unit-stop-policy"
     else
       printf '%s\n' 'KillSignal=2' 'TimeoutStopUSec=5s'
     fi
     ;;
   stop)
+    rm -f "$state/service.failed"
     echo false > "$state/service.active"
     count=0; [[ ! -f "$state/stop-count" ]] || count=$(<"$state/stop-count")
     echo $((count + 1)) > "$state/stop-count"
@@ -275,6 +299,8 @@ json.dump(value,open(path,"w"))' \
     fi
     ;;
   start)
+    [[ ! -e "$state/fail-start" ]] || exit 95
+    if [[ -e "$state/fail-start-outcome" ]]; then echo false > "$state/service.active"; touch "$state/service.failed"; exit 0; fi
     echo true > "$state/service.active"
     count=0; [[ ! -f "$state/start-count" ]] || count=$(<"$state/start-count")
     echo $((count + 1)) > "$state/start-count"
@@ -329,12 +355,12 @@ state=${PE_ACTIVATION_TEST_ROOT:?}/test-state
 [[ "${PGHOST:-}" == 127.0.0.1 && "${PGPORT:-}" == 1 && "${PGUSER:-}" == harness && "${PGPASSWORD:-}" == harness && "${PGDATABASE:-}" == harness ]] || exit 91
 for argument in "$@"; do [[ "$argument" != *://* ]] || exit 91; done
 [[ " $* " != *" fake "* ]] || exit 92
-file= sql= stdin=
+file= sql= stdin= activation_id=
 while (($#)); do
   case "$1" in
     -f) file=$2; shift 2 ;;
     -c|-Atc) sql=$2; shift 2 ;;
-    -v) shift 2 ;;
+    -v) [[ "$2" != activation_id=* ]] || activation_id=${2#*=}; shift 2 ;;
     *) shift ;;
   esac
 done
@@ -358,6 +384,8 @@ if [[ "$file" == *archive_paper_state.sql ]]; then
   [[ ! -f "$state/remote-state" || $(<"$state/remote-state") != fresh ]] &&
     echo $((count + 1)) > "$state/archive-count"
   echo fresh > "$state/remote-state"
+  if [[ -e "$state/successor" ]]; then echo "$activation_id" >> "$state/archive-ids"; fi
+  [[ ! -e "$state/crash-after-archive-commit" ]] || { rm "$state/crash-after-archive-commit"; exit 86; }
 elif [[ "$file" == *restore_paper_state.sql ]]; then
   [[ $(<"$state/service.active") == false ]] || exit 99
   count=0; [[ ! -f "$state/restore-count" ]] || count=$(<"$state/restore-count")
@@ -377,6 +405,8 @@ elif [[ "$sql" == *"refresh materialized view concurrently public.wallet_live_st
   fi
 elif [[ "$stdin" == *"live % differs from activation"* ]]; then
   [[ -f "$state/remote-state" && $(<"$state/remote-state") == restored ]] || exit 1
+elif [[ "$stdin" == *"Financial15 callable inventory differs"* ]]; then
+  [[ ! -e "$state/financial15-refusal" ]] || { echo "Financial15 contract refusal" >&2; exit 94; }
 elif [[ "$stdin" == *"anon must exist and must not bypass RLS"* ]]; then
   [[ "$stdin" == *"legacy_keys || array['risk_halt_release_hash']"* ]] || exit 93
   [[ "$stdin" == *"value_type <> 'text' or value !~ '^[0-9a-f]{64}$'"* ]] || exit 93
@@ -393,19 +423,31 @@ elif [[ "$sql" == *"from public.accounts"* ]]; then
     count=$(<"$state/rehearsal-account-census-query-count")
   count=$((count + 1))
   printf '%s\n' "$count" > "$state/rehearsal-account-census-query-count"
-  if ((count == 1)); then
+  if [[ -e "$state/authority-account-unsafe" ]]; then
+    echo "live-a|off|live_tiny"
+  elif [[ ! -e "$state/rehearsal-account-census-before" ]]; then
+    echo "live-a|off|off"
+  elif ((count == 1)); then
     cat "$state/rehearsal-account-census-before"
   else
     cat "$state/rehearsal-account-census-after"
   fi
 elif [[ "$sql" == *"json_agg(json_build_object('key',key,'value',value,'value_type',value_type) order by key)"* ]]; then
+  if [[ -e "$state/raw-config.json" ]]; then
+    [[ "$sql" != *"where key not in"* ]] || exit 95
+    cat "$state/raw-config.json"
+    exit 0
+  fi
   cat <<'JSON'
 [{"key":"active_watchlist_size","value":"100","value_type":"integer"},{"key":"flip_human_approved","value":"false","value_type":"bool"},{"key":"kelly_fraction_above_default_human_approved","value":"false","value_type":"bool"},{"key":"max_fill_price","value":"0.85","value_type":"decimal"},{"key":"max_resolution_horizon_secs","value":"172800","value_type":"integer"},{"key":"min_fill_price","value":"0.15","value_type":"decimal"},{"key":"min_resolution_horizon_secs","value":"60","value_type":"integer"},{"key":"mode","value":"paper","value_type":"text"},{"key":"per_trade_cap","value":"unlimited","value_type":"text"},{"key":"price_impact_cap_bps","value":"100","value_type":"integer"},{"key":"sizing_contracts","value":"1","value_type":"integer"},{"key":"sizing_dollar_usd","value":"25","value_type":"decimal"},{"key":"sizing_mode","value":"dollar","value_type":"text"},{"key":"slippage_rate","value":"0.01","value_type":"decimal"}]
 JSON
 elif [[ "$sql" == *information_schema.columns* ]]; then
   echo 5
 elif [[ "$sql" == *paper_fills_archive* ]]; then
-  echo '0 0 0 1 0'
+  if [[ -e "$state/successor" ]]; then
+    requested=$(sed -n "s/.*where activation_id='\([^']*\)'.*/\1/p" <<< "$sql" | head -n 1)
+    if [[ -e "$state/archive-collision" ]] || { [[ -e "$state/archive-ids" ]] && grep -Fxq "$requested" "$state/archive-ids"; }; then echo '0 0 0 1 0'; else echo '0 0 0 0 0'; fi
+  else echo '0 0 0 1 0'; fi
 elif [[ "$sql" == *seed_financial_start* ]]; then
   # #628: `authority-has-traded` makes the authority report a legitimately PROGRESSED era -- the
   # exact state a resumed activation meets after the service started and filled. `seed_financial_start`
@@ -420,6 +462,10 @@ elif [[ "$sql" == *seed_financial_start* ]]; then
   else
     echo '{"outcome":"applied","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}'
     echo '{"bankroll":"10000","start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","last_prepared_seq":null}'
+  fi
+elif [[ "$sql" == *"'projection_token'"* ]]; then
+  if [[ -e "$state/remote-financial.json" ]]; then cat "$state/remote-financial.json"; else
+    echo '{"bankroll":[{"bankroll_str":"10000"}],"start_seq":1,"start_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","cursor":null,"fills":[],"positions":[],"settlements":[],"projection_token":"2026-09-14T18:36:09.442332+00:00","projection_count":1}'
   fi
 elif [[ "$sql" == *"'start_seq'"* ]]; then
   # The shim cannot run SQL, so it pins the shape of the verified-state statement: the lifecycle
@@ -599,10 +645,12 @@ setup_hermetic_financial_driver() {
   mkdir -p "$copy_root/scripts/deploy" "$copy_root/scripts/paper_reset"
   cp "$DRIVER" "$SCRIPT_DIR/archive_paper_state.sql" "$SCRIPT_DIR/restore_paper_state.sql" \
     "$copy_root/scripts/paper_reset/"
-  cp "$REHEARSAL" "$COMMON" "$REHEARSAL_PREFLIGHT" "$copy_root/scripts/deploy/"
+  cp "$REHEARSAL" "$COMMON" "$REHEARSAL_PREFLIGHT" "$REPO_ROOT/scripts/deploy/pe_service_census.sh" \
+    "$REPO_ROOT/scripts/deploy/rehearsal_successor.sh" "$copy_root/scripts/deploy/"
   cp "$REPO_ROOT/scripts/migrate_service_config_545.sql" \
     "$REPO_ROOT/scripts/supabase_paper_state_schema.sql" \
-    "$REPO_ROOT/scripts/supabase_multi_account_live_schema.sql" "$copy_root/scripts/"
+    "$REPO_ROOT/scripts/supabase_multi_account_live_schema.sql" "$REPO_ROOT/scripts/supabase_schema.sql" \
+    "$REPO_ROOT/scripts/supabase_wallet_live_stats_mv.sql" "$copy_root/scripts/"
   HERMETIC_DRIVER="$copy_root/scripts/paper_reset/activate_financial_era.sh"
   HERMETIC_PREFLIGHT="$copy_root/scripts/deploy/rehearsal_preflight.sh"
   HERMETIC_BUNDLE_SHA256=$(bash -c 'source "$1"; harness_bundle_digest "$2"' bash \
@@ -699,12 +747,35 @@ with open(sys.argv[1], "wb") as output:
         output.write(name + b"=" + value + b"\0")
 PY
 }
+if [[ -e "$state/successor" && "$*" == *--financial-config-rows=* ]]; then
+  for arg in "$@"; do [[ "$arg" != --financial-config-rows=* ]] || rows=${arg#*=}; done
+  python3 -c 'import json,re,sys
+rows=json.load(open(sys.argv[1])); known={"active_watchlist_size","flip_human_approved","kelly_fraction_above_default_human_approved","max_fill_price","max_resolution_horizon_secs","min_fill_price","min_resolution_horizon_secs","mode","per_trade_cap","price_impact_cap_bps","sizing_contracts","sizing_dollar_usd","sizing_mode","slippage_rate","kelly_fraction_override"}
+keys=[r["key"] for r in rows]
+if len(keys)!=len(set(keys)) or not (known-{"kelly_fraction_override"})<=set(keys): raise SystemExit("Financial15 missing keys")
+for row in rows:
+    if row["key"]=="risk_halt_release_hash":
+        if row["value_type"]!="text" or re.fullmatch("[0-9a-f]{64}",row["value"]) is None: raise SystemExit("invalid incident row")
+    elif row["key"] not in known: raise SystemExit("Financial15 unknown or retired key")
+' "$rows"
+fi
 case "$*" in
   *--verify-staged-identity*)
     echo 'pe-service 0.1.0 revision=1111111111111111111111111111111111111111 config_identity=runtime-applied artifact_blake3=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
     ;;
   *--financial-era=prepare*)
     record_offline_environment prepare
+    if [[ -e "$state/successor" ]]; then
+      for argument in "$@"; do [[ "$argument" != --activation-manifest=* ]] || manifest=${argument#*=}; done
+      python3 -c 'import json,sys
+m=json.load(open(sys.argv[1]))
+prefix={"physical_tail":5,"last_sequence":None,"last_hash":"0"*64}
+start={key:m[key] for key in ("activation_id","ranking_batch_id","membership","schema_version","parser_version","financial_semantic_version","start_unix")}
+start.update(starting_bankroll=m["fresh_bankroll"],paper_prefix=prefix,source_prefix=prefix,live_prefix=prefix,
+ hot_config_hash="b"*64,artifact_blake3=m["artifact_blake3"],static_config_hash=m["static_config_hash"],generation=m["generation"],membership_proofs_hash="empty")
+print(json.dumps({"start":start,"expected_receipt":{"sequence":1,"this_hash":"c"*64}}))' "$manifest"
+      exit 0
+    fi
     if grep -Fq 'approved-only' \
       "$PE_ACTIVATION_TEST_ROOT/prediction-markets/gen/g557/live_journal.log"; then
       echo 'financial-era prepare found an unmatched Approved admission' >&2
@@ -798,6 +869,7 @@ db.commit()
 if wal_crash: os._exit(86)
 db.close()' \
       "$PE_ACTIVATION_TEST_ROOT/prediction-markets/gen/g557/paper_state.db" "$state"
+    [[ ! -e "$state/successor-start-locked" ]] || { echo "LogError::Locked" >&2; exit 95; }
     : > "$state/complete-start"
     if [[ -f "$state/replace-target-binary-after-start" ]]; then
       mv "$PE_ACTIVATION_TEST_ROOT/target/pe-service.next" \
@@ -807,6 +879,11 @@ db.close()' \
     ;;
   *--financial-era=preflight*)
     record_offline_environment preflight
+    if [[ -e "$state/successor" ]]; then
+      [[ ! -e "$state/paper-id-collision" ]] || { echo "duplicate Start activation id" >&2; exit 95; }
+      [[ ! -e "$state/predecessor-impostor" ]] || { echo "latest Start is not predecessor" >&2; exit 95; }
+      [[ ! -e "$state/config-refusal" ]] || { echo "Financial15 config inventory refused" >&2; exit 95; }
+    fi
     # #618: exercise the real gate rather than bypassing it. Record every call so a test can assert
     # which observation refused, then apply the live-status predicate to the actual status file.
     [[ "$*" == *--financial-config-rows=* ]] || {
@@ -831,6 +908,20 @@ raise SystemExit(1 if bad else 0)' \
     ;;
   *--financial-era=rollback-check*)
     record_offline_environment rollback-check
+    if [[ -e "$state/successor" ]]; then
+      [[ ! -e "$state/predecessor-impostor" ]] || { echo "latest Start is not predecessor" >&2; exit 95; }
+      for argument in "$@"; do [[ "$argument" != --activation-manifest=* ]] || manifest=${argument#*=}; done
+      python3 -c 'import json,os,sys
+m=json.load(open(sys.argv[1])); state=sys.argv[2]
+v={"complete_start":os.path.exists(state+"/complete-start"),"repaired":False}
+if v["complete_start"]: v["receipt"]={"sequence":1,"this_hash":"c"*64}
+if m.get("guarded_logs"):
+    if os.path.exists(state+"/continuity-refusal"):
+        raise SystemExit("guarded source receipt differs from the authenticated index")
+    v["source_continuity"]={"authenticated":True,"anchor":{"sequence":0,"hash":"e"*64,"end_offset":5}}
+print(json.dumps(v))' "$manifest" "$state" || exit 95
+      exit 0
+    fi
     if [[ -f "$state/complete-start" ]]; then
       echo '{"complete_start":true,"receipt":{"sequence":1,"this_hash":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}}'
     else
@@ -1148,7 +1239,9 @@ drive_to_verified() {
     state=$(python3 -c 'import json,sys
 try: print(json.load(open(sys.argv[1]))["state"])
 except FileNotFoundError: print("absent")' "$root/pe-financial-era.json")
-    [[ "$state" == verified ]] && return 0
+    if [[ "$state" == verified ]]; then
+      if [[ ! -e "$root/test-state/successor" || "$(sha256sum "$root/pe-financial-era.json" | awk '{print $1}')" != "$SUCCESSOR_SHA" ]]; then return 0; fi
+    fi
     # `touch` deliberately, NOT write_clean_status: on an existing file touch preserves content,
     # so a dirty status written by the fake `systemctl start` still refuses here. Replacing the
     # document would hand these convergence tests passing evidence they never earned.
@@ -4207,7 +4300,360 @@ cur.execute("pragma integrity_check").fetchone(); c.close()'
 echo "PASS: FE-BACKUPCACHE-64"
 fi
 
-if [[ "$SHARD_TOTAL" == 1 ]]; then
+# Successor cases use the same fake binary, libpq and systemctl boundaries as first-era cases.
+setup_successor_fixture() {
+  local root=$1
+  setup_fixture "$root"
+  driver_args "$root"
+  local result=0
+  run_driver "$root" --simulate-crash-after prepared >/dev/null 2>&1 || result=$?
+  [[ "$result" == 86 ]] || fail "could not construct predecessor fixture"
+  python3 - "$root" <<'PY'
+import json,pathlib,sqlite3,sys
+root=pathlib.Path(sys.argv[1]); path=root/"pe-financial-era.json"; value=json.loads(path.read_text())
+value.update(state="verified",start_receipt={"sequence":0,"this_hash":"d"*64})
+path.write_text(json.dumps(value,sort_keys=True,separators=(",",":"))+"\n")
+db=sqlite3.connect(root/"prediction-markets/gen/g557/paper_state.db")
+for table in ("fills","positions","settled_markets"): db.execute("drop table "+table)
+db.executescript("""
+create table fills(market_id text,outcome_id integer,side text,quantity_str text,principal_str text,fee_str text,prepared_seq integer);
+create table positions(market_id text,outcome_id integer,long_str text,short_str text);
+create table settled_markets(market_id text,outcome_prices text,credit_applied text,prepared_seq integer);
+insert into meta values('financial_start_seq','0');
+""")
+db.execute("insert into meta values('financial_start_hash',?)",("d"*64,)); db.commit(); db.close()
+PY
+  touch "$root/test-state/successor"
+  cp "$root/pe-financial-era.json" "$root/test-state/predecessor.json"
+  # Fixed UTC clock per attempt; tests explicitly advance it for the next attempt.
+  cat > "$root/bin/date" <<'DATE'
+#!/usr/bin/env bash
+if [[ "$*" == '-u +%Y%m%dT%H%M%SZ' ]]; then
+  if [[ -f "$PE_ACTIVATION_TEST_ROOT/test-state/era-stamp" ]]; then cat "$PE_ACTIVATION_TEST_ROOT/test-state/era-stamp"; else echo 20330518T033320Z; fi
+else exec /usr/bin/date "$@"; fi
+DATE
+  chmod +x "$root/bin/date"
+  SUCCESSOR_SHA=$(sha256sum "$root/pe-financial-era.json" | awk '{print $1}')
+  DRIVER_ARGS=("${DRIVER_ARGS[@]:0:${#DRIVER_ARGS[@]}-4}" --successor-of "$SUCCESSOR_SHA")
+  write_successor_evidence "$root"
+}
+
+write_successor_evidence() {
+  local root=$1
+  local bundle
+  bundle=$(bash -c 'source "$1"; successor_harness_bundle_digest "$2"' bash "$COMMON" "$REPO_ROOT/scripts/deploy")
+  python3 - "$root" "$bundle" <<'PY'
+import hashlib,json,pathlib,sys
+root=pathlib.Path(sys.argv[1]); predecessor=root/"test-state/predecessor.json"; m=json.loads(predecessor.read_text())
+def digest(path): return hashlib.sha256(path.read_bytes()).hexdigest()
+def tuple_at(paths): return {key+"_sha256":digest(path) for key,path in zip(("binary","config","environment"),paths)}
+result={"harness_bundle_sha256":sys.argv[2],"predecessor_manifest_sha256":digest(predecessor),"predecessor_start":m["start_receipt"],
+"generation_activation_id":"act-545","generation_dir":str(root/"prediction-markets/gen/g557"),"target_revision":"1"*40,"artifact_blake3":"a"*64,
+"target_tuple":tuple_at([root/"target/pe-service",root/"target/service.toml",root/"target/service.env"]),
+"old_tuple":tuple_at([root/"prediction-markets/target/release/pe-service",root/"prediction-markets/smoke-test/service.toml",root/"prediction-markets/.env"]),
+"copy_manifest_sha256":"e"*64,"normalized_copy_sha256":"f"*64,"ownership_proof":"skipped: testing mode","unit_kill_signal":2,"unit_timeout_stop_secs":5,
+"pass_rows":{key:"PASS" for key in ("capture_consistent","forward_verified","rollback_reset_before_append","rollback_exact_restore","fresh_attempt_verified")}}
+path=root/"rehearsal/successor-result.json"; path.write_text(json.dumps(result,sort_keys=True,separators=(",",":"))+"\n")
+(root/"rehearsal/evidence.json").write_text(json.dumps({"kind":"successor-rehearsal-evidence-v1","result":"PASS","manifest_path":str(path),"evidence_sha256":digest(path)})+"\n")
+PY
+}
+
+successor_expect_refusal() {
+  local root=$1 reason=$2; shift 2
+  local status=0 output
+  output=$(run_driver "$root" "$@" 2>&1) || status=$?
+  [[ "$status" != 0 && "$output" == *"$reason"* ]] || fail "successor refusal $reason: $output"
+}
+
+assert_successor_reinstated() {
+  local root=$1
+  cmp -s "$root/pe-financial-era.json" "$root/test-state/predecessor.json" || fail "predecessor not reinstated atomically"
+  [[ -f "$root/pe-financial-era.era-20330518T033320Z.rolled_back.json" ]] || fail "failed transition authority not retired"
+}
+
+SUCCESSOR_SHARD=${SUCCESSOR_SHARD:-1/1}
+[[ "$SUCCESSOR_SHARD" =~ ^([1-9][0-9]?)/([1-9][0-9]?)$ ]] || fail "invalid SUCCESSOR_SHARD"
+SUCCESSOR_SHARD_INDEX=${BASH_REMATCH[1]}; SUCCESSOR_SHARD_TOTAL=${BASH_REMATCH[2]}
+(( SUCCESSOR_SHARD_INDEX <= SUCCESSOR_SHARD_TOTAL )) || fail "invalid SUCCESSOR_SHARD"
+SUCCESSOR_ROW=0
+successor_row_selected() {
+  SUCCESSOR_ROW=$((SUCCESSOR_ROW + 1))
+  (( (SUCCESSOR_ROW - 1) % SUCCESSOR_SHARD_TOTAL + 1 == SUCCESSOR_SHARD_INDEX ))
+}
+
+if shard_owns 9 && [[ "${SKIP_SUCCESSOR_CASES:-0}" != 1 ]]; then
+for script in "$REPO_ROOT/scripts/deploy/rehearsal_successor.sh" "$DRIVER" "$COMMON"; do bash -n "$script"; done
+"$REPO_ROOT/scripts/deploy/rehearsal_successor.sh" --dry-run --capture /unused/capture --run-root /unused/run \
+  --target-binary /unused/bin --target-config /unused/config --target-environment /unused/env \
+  --old-binary /unused/old-bin --old-config /unused/old-config --old-environment /unused/old-env --old-unit-policy /unused/policy >/dev/null || fail "successor dry-run consulted the filesystem"
+if "$REPO_ROOT/scripts/deploy/rehearsal_successor.sh" --dry-run --capture /unused >/dev/null 2>&1; then fail "successor dry-run accepted incomplete tuple"; fi
+
+# Forward lifecycle: each interruption resumes the persisted transition, including copy/replace.
+for boundary in predecessor-copied before-manifest-prepared prepared service-stop-intent stopped-disabled service-stopped \
+  backup-intent backup-completed before-manifest-guarded guarded remote-archive-intent remote-archived qualification-start-intent \
+  qualification-started authority_schema-skipped live_schema-skipped financial_config-skipped authority-start-seeded \
+  target-config-adopted target-environment-adopted target-binary-adopted target-enabled target-start-invoked service-started started; do
+  successor_row_selected || continue
+  root=$TEST_TMP/successor-forward-$boundary
+  setup_successor_fixture "$root"
+  result=0; run_driver "$root" --simulate-crash-after "$boundary" > "$root/output" 2>&1 || result=$?
+  [[ "$result" == 86 ]] || fail "successor forward boundary $boundary did not interrupt: $(<"$root/output")"
+  drive_to_verified "$root" || fail "successor did not resume $boundary"
+  python3 - "$root/pe-financial-era.json" <<'PY'
+import json,sys
+m=json.load(open(sys.argv[1]))
+assert m["activation_id"]=="era-20330518T033320Z" and m["generation_activation_id"]=="act-545"
+assert m["predecessor_start"]=={"sequence":0,"this_hash":"d"*64}
+assert m["membership"]==[] and m["ranking_batch_id"]==545
+assert (m["schema_version"],m["financial_semantic_version"],m["parser_version"])==(3,3,1)
+for key in ("authority_schema_receipt","live_schema_receipt","financial_config_receipt"): assert m[key]=={"skipped":"successor"}
+assert m["backup"]["path"].endswith("financial-era-era-20330518T033320Z-paper-state.db")
+PY
+  [[ ! -f "$root/test-state/live-schema-count" ]] || fail "successor installed the first-era schema"
+  echo "PASS: FE-SUCCESSOR-FORWARD/$boundary"
+done
+
+# Both rollback certificates across pre-stop, pre-backup and in-flight archive boundaries.
+for boundary in prepared service-stop-intent service-stopped backup-intent backup-completed guarded remote-archive-intent remote-archived; do
+  successor_row_selected || continue
+  root=$TEST_TMP/successor-rollback-$boundary
+  setup_successor_fixture "$root"
+  result=0; run_driver "$root" --simulate-crash-after "$boundary" > "$root/output" 2>&1 || result=$?
+  [[ "$result" == 86 ]] || fail "successor rollback setup $boundary: $(<"$root/output")"
+  result=0; run_driver "$root" --rollback-before-start --simulate-crash-after rolled_back > "$root/output" 2>&1 || result=$?
+  [[ "$result" == 86 ]] || fail "successor rollback $boundary: $(<"$root/output")"
+  # Later old-book activity and lawful retention advance are allowed even without guarded evidence.
+  python3 - "$root" <<'PY'
+import json,pathlib,sqlite3,sys
+root=pathlib.Path(sys.argv[1]); m=json.loads((root/"pe-financial-era.json").read_text())
+assert m["state"]=="rolled_back"
+if m.get("remote_archive_completed"): assert m["restoration_certified"] is True
+else: assert m["no_financial_mutation"] is True
+if not m.get("guarded_logs"): assert "source_continuity" not in m
+with (root/"prediction-markets/gen/g557/source_events.log").open("ab") as log: log.write(b"retention advance")
+db=sqlite3.connect(root/"prediction-markets/gen/g557/paper_state.db"); db.execute("update bankroll set bankroll_str='9998.99'"); db.commit(); db.close()
+PY
+  result=0; run_driver "$root" --rollback-before-start --simulate-crash-after failed-manifest-retired > "$root/output" 2>&1 || result=$?
+  [[ "$result" == 86 ]] || fail "failed-manifest retirement $boundary: $(<"$root/output")"
+  run_driver "$root" --rollback-before-start >/dev/null || fail "completed rollback re-entry $boundary"
+  assert_successor_reinstated "$root"
+  echo 20330518T033321Z > "$root/test-state/era-stamp"
+  drive_to_verified "$root" || fail "fresh attempt after $boundary"
+  [[ $(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["activation_id"])' "$root/pe-financial-era.json") == era-20330518T033321Z ]] || fail "rolled-back id reused"
+  echo "PASS: FE-SUCCESSOR-ROLLBACK/$boundary"
+done
+
+# Archive committed without a completion receipt; writer-lock reset and restarted-old interruption.
+for boundary in archive-commit restoration-certified rollback-old-start-invoked old-service-started old-service-failed before-manifest-predecessor-reinstated; do
+  successor_row_selected || continue
+  root=$TEST_TMP/successor-rollback-resume-$boundary
+  setup_successor_fixture "$root"
+  if [[ "$boundary" == archive-commit ]]; then touch "$root/test-state/crash-after-archive-commit";
+  else touch "$root/test-state/successor-start-locked"; fi
+  run_driver "$root" > "$root/output" 2>&1 && fail "rollback fixture passed unexpectedly" || true
+  rm -f "$root/test-state/successor-start-locked"
+  if [[ "$boundary" == archive-commit ]]; then crash=rolled_back; elif [[ "$boundary" == old-service-failed ]]; then crash=old-service-started; else crash=$boundary; fi
+  result=0; run_driver "$root" --rollback-before-start --simulate-crash-after "$crash" > "$root/output" 2>&1 || result=$?
+  [[ "$result" == 86 ]] || fail "rollback interruption $boundary: $(<"$root/output")"
+  if [[ "$boundary" != before-manifest-predecessor-reinstated && "$boundary" != archive-commit ]]; then
+    successor_expect_refusal "$root" 'rolling_back resumes only'  # rolled_back forward is allowed below
+  fi
+  if [[ "$boundary" == rollback-old-start-invoked || "$boundary" == old-service-started || "$boundary" == old-service-failed ]]; then
+    python3 - "$root" <<'PYPROGRESS'
+import pathlib,sqlite3,sys
+root=pathlib.Path(sys.argv[1]); generation=root/"prediction-markets/gen/g557"
+with (generation/"paper.log").open("ab") as log: log.write(b"old financial fill")
+with (generation/"source_events.log").open("ab") as log: log.write(b"retention advance")
+db=sqlite3.connect(generation/"paper_state.db"); db.execute("insert into fills values('old-market',0,'buy','2','1','0.01',5)")
+db.execute("insert into positions values('old-market',0,'2','0')"); db.execute("update bankroll set bankroll_str='9998.99'")
+db.commit(); db.close()
+PYPROGRESS
+  fi
+  if [[ "$boundary" == old-service-failed ]]; then echo false > "$root/test-state/service.active"; touch "$root/test-state/service.failed"; fi
+  run_driver "$root" --rollback-before-start >/dev/null || fail "resumed writer-lock rollback $boundary"
+  assert_successor_reinstated "$root"
+  echo "PASS: FE-SUCCESSOR-ROLLBACK-RESUME/$boundary"
+done
+
+for scenario in archive backup retired paper-id; do
+  successor_row_selected || continue
+  root=$TEST_TMP/successor-collision-$scenario; setup_successor_fixture "$root"
+  case "$scenario" in
+    archive) touch "$root/test-state/archive-collision" ;;
+    backup) touch "$root/prediction-markets/financial-era-era-20330518T033320Z-paper-state.db" ;;
+    retired) touch "$root/pe-financial-era.era-20330518T033320Z.rolled_back.json" ;;
+    paper-id) touch "$root/test-state/paper-id-collision" ;;
+  esac
+  if [[ "$scenario" == paper-id ]]; then reason='successor preflight refused'; else reason=colli; fi
+  successor_expect_refusal "$root" "$reason"
+  cmp -s "$root/pe-financial-era.json" "$root/test-state/predecessor.json" || fail "collision replaced active predecessor"
+  [[ ! -e "$root/test-state/stop-count" ]] || fail "collision stopped production"
+done
+for flag in --membership-json --ranking-batch-id; do
+  successor_row_selected || continue
+  root=$TEST_TMP/successor-cli-${flag#--}; setup_successor_fixture "$root"
+  successor_expect_refusal "$root" 'forbids supplied' "$flag" anything
+done
+if [[ "$SUCCESSOR_SHARD_INDEX" == 1 ]]; then
+root=$TEST_TMP/successor-tamper; setup_successor_fixture "$root"
+printf '\n' >> "$root/pe-financial-era.json"
+successor_expect_refusal "$root" 'predecessor manifest identity changed'
+root=$TEST_TMP/successor-retired-tamper; setup_successor_fixture "$root"
+run_driver "$root" --simulate-crash-after guarded >/dev/null 2>&1 || [[ $? == 86 ]] || fail "guard fixture"
+printf '\n' >> "$root/pe-financial-era.act-545.verified.json"
+successor_expect_refusal "$root" 'predecessor manifest sha256 differs'
+root=$TEST_TMP/successor-retired-conflict; setup_successor_fixture "$root"
+echo conflicting > "$root/pe-financial-era.act-545.verified.json"
+successor_expect_refusal "$root" 'conflicting retired manifest'
+
+# Current installed tuple, rather than #557 bytes, is the rollback authority.
+root=$TEST_TMP/successor-redeployed; setup_successor_fixture "$root"
+echo redeployed-binary >> "$root/prediction-markets/target/release/pe-service"
+echo '# redeployed config' >> "$root/prediction-markets/smoke-test/service.toml"
+echo '# redeployed environment' >> "$root/prediction-markets/.env"
+write_successor_evidence "$root"
+drive_to_verified "$root" || fail "redeployed old authority refused"
+for scenario in transition-id prepared-id census-owner; do
+  root=$TEST_TMP/successor-manifest-$scenario; setup_successor_fixture "$root"
+  if [[ "$scenario" == prepared-id ]]; then boundary=guarded; else boundary=prepared; fi
+  run_driver "$root" --simulate-crash-after "$boundary" >/dev/null 2>&1 || [[ $? == 86 ]] || fail "manifest identity setup"
+  python3 - "$root/pe-financial-era.json" "$scenario" <<'PYID'
+import json,sys
+path,scenario=sys.argv[1:]; value=json.load(open(path))
+if scenario=="transition-id": value["activation_id"]="act-545"
+if scenario=="prepared-id": value["activation_id"]="era-20330518T033322Z"
+if scenario=="census-owner": value["census_helper"]["sha256"]="0"*64
+json.dump(value,open(path,"w"))
+PYID
+  case "$scenario" in
+    transition-id) reason='invalid persisted transition id' ;;
+    prepared-id) reason='transition preparation identity changed' ;;
+    census-owner) reason='census helper is not the reviewed owner' ;;
+  esac
+  successor_expect_refusal "$root" "$reason"
+done
+
+fi
+for scenario in financial15 census-uninspectable census-stray account-census disable enable start status78 failed-outcome activity-unknown; do
+  successor_row_selected || continue
+  root=$TEST_TMP/successor-gate-$scenario; setup_successor_fixture "$root"
+  case "$scenario" in
+    financial15) marker=financial15-refusal; reason='Financial15 contract refusal' ;;
+    census-uninspectable) marker=census-uninspectable; reason='process census refused' ;;
+    census-stray) marker=census-refusal; reason='process census refused' ;;
+    account-census) marker=authority-account-unsafe; reason='authority account census refused' ;;
+    disable) marker=fail-disable; reason='' ;;
+    enable) marker=fail-enable; reason='' ;;
+    start) marker=fail-start; reason='recovery-required' ;;
+    status78) marker=status-78; reason='recovery-required' ;;
+    activity-unknown) marker=activity-unknown; reason='could not prove' ;;
+    failed-outcome) marker=fail-start-outcome; reason='recovery-required' ;;
+  esac
+  touch "$root/test-state/$marker"
+  successor_expect_refusal "$root" "$reason"
+  [[ ! -e "$root/test-state/complete-start" || "$scenario" == enable || "$scenario" == start || "$scenario" == status78 || "$scenario" == failed-outcome ]] || fail "$scenario crossed Start"
+  rm "$root/test-state/$marker"
+  drive_to_verified "$root" || fail "gate $scenario did not resume"
+done
+
+for scenario in absent incident wrong-incident omitted-override retired unknown; do
+  successor_row_selected || continue
+  root=$TEST_TMP/successor-config-$scenario; setup_successor_fixture "$root"
+  python3 - "$root/test-state/raw-config.json" "$scenario" <<'PY'
+import json,sys
+keys={"active_watchlist_size":"100","flip_human_approved":"false","kelly_fraction_above_default_human_approved":"false","max_fill_price":"0.85","max_resolution_horizon_secs":"172800","min_fill_price":"0.15","min_resolution_horizon_secs":"60","mode":"paper","per_trade_cap":"unlimited","price_impact_cap_bps":"100","sizing_contracts":"1","sizing_dollar_usd":"25","sizing_mode":"dollar","slippage_rate":"0.01"}
+rows=[{"key":key,"value":value,"value_type":"text"} for key,value in keys.items()]
+scenario=sys.argv[2]
+if scenario in ("incident","wrong-incident"): rows.append({"key":"risk_halt_release_hash","value":"a"*64,"value_type":"text" if scenario=="incident" else "integer"})
+if scenario in ("retired","unknown"): rows.append({"key":"fill_mode" if scenario=="retired" else "unknown","value":"value","value_type":"text"})
+json.dump(rows,open(sys.argv[1],"w"))
+PY
+  case "$scenario" in
+    wrong-incident|retired|unknown) successor_expect_refusal "$root" 'successor preflight refused before authority replacement' ;;
+    *) drive_to_verified "$root" || fail "full config inventory $scenario" ;;
+  esac
+done
+
+for scenario in missing malformed closure binding old-tuple; do
+  successor_row_selected || continue
+  root=$TEST_TMP/successor-evidence-$scenario; setup_successor_fixture "$root"
+  case "$scenario" in
+    missing) rm "$root/rehearsal/evidence.json" ;;
+    malformed) echo '{}' > "$root/rehearsal/evidence.json" ;;
+    *) python3 - "$root/rehearsal/successor-result.json" "$root/rehearsal/evidence.json" "$scenario" <<'PY'
+import hashlib,json,pathlib,sys
+path=pathlib.Path(sys.argv[1]); v=json.loads(path.read_text()); scenario=sys.argv[3]
+if scenario=="closure": v["harness_bundle_sha256"]="0"*64
+if scenario=="binding": v["predecessor_manifest_sha256"]="0"*64
+if scenario=="old-tuple": v["old_tuple"]["binary_sha256"]="0"*64
+path.write_text(json.dumps(v)); outer=json.load(open(sys.argv[2])); outer["evidence_sha256"]=hashlib.sha256(path.read_bytes()).hexdigest(); json.dump(outer,open(sys.argv[2],"w"))
+PY
+      ;;
+  esac
+  successor_expect_refusal "$root" 'rehearsal evidence was refused'
+  [[ ! -e "$root/test-state/stop-count" ]] || fail "bad successor evidence stopped production"
+done
+if [[ "$SUCCESSOR_SHARD_INDEX" == 1 ]]; then
+root=$TEST_TMP/successor-evidence-resume; setup_successor_fixture "$root"
+run_driver "$root" --simulate-crash-after prepared >/dev/null 2>&1 || [[ $? == 86 ]] || fail "prepared setup"
+echo '{}' > "$root/rehearsal/evidence.json"
+successor_expect_refusal "$root" 'rehearsal evidence was refused'
+# Bootstrap production refusal is tested at its owner before filesystem/credential use.
+if bash -c 'source "$1"; verify_successor_bootstrap /unused /unused' bash "$COMMON" >/dev/null 2>&1; then fail "production bootstrap accepted"; fi
+
+root=$TEST_TMP/successor-retention; setup_successor_fixture "$root"
+run_driver "$root" >/dev/null
+printf 'punched-prefix\n' >> "$root/prediction-markets/gen/g557/source_events.log"
+touch "$root/prediction-markets/gen/g557/status.json"
+run_driver "$root" >/dev/null || fail "lawful source retention blocked verified"
+root=$TEST_TMP/successor-continuity-refusal; setup_successor_fixture "$root"
+run_driver "$root" >/dev/null
+touch "$root/test-state/continuity-refusal"
+successor_expect_refusal "$root" 'guarded source receipt differs'
+
+fi
+# Independent conservation, including physical settled positions and zero-credit settlements.
+for scenario in pristine fractional settled zero-credit cash holdings cursor remote-cash remote-holdings remote-cursor; do
+  successor_row_selected || continue
+  root=$TEST_TMP/successor-conservation-$scenario; setup_successor_fixture "$root"
+  run_driver "$root" >/dev/null
+  python3 - "$root" "$scenario" <<'PY'
+import decimal,json,pathlib,sqlite3,sys
+root=pathlib.Path(sys.argv[1]); scenario=sys.argv[2]; db=sqlite3.connect(root/"prediction-markets/gen/g557/paper_state.db")
+value={"bankroll":[{"bankroll_str":"10000"}],"start_seq":1,"start_hash":"c"*64,"cursor":None,"fills":[],"positions":[],"settlements":[],"projection_token":"2026-09-14T18:36:09.442332+00:00","projection_count":1}
+if scenario in ("fractional","settled","zero-credit"):
+    q="0.000003" if scenario=="fractional" else "2"
+    payouts=["0.5","0.5"] if scenario=="fractional" else ["1","0"]
+    outcome=1 if scenario=="zero-credit" else 0
+    credit="0.000001" if scenario=="fractional" else "0" if scenario=="zero-credit" else "2"
+    cash=str(decimal.Decimal("9998.99")+decimal.Decimal(credit))
+    db.execute("insert into fills values(?,?,?,?,?,?,?)",("market",outcome,"buy",q,"1","0.01",2))
+    db.execute("insert into positions values(?,?,?,?)",("market",outcome,q,"0"))
+    db.execute("insert into settled_markets values(?,?,?,?)",("market",json.dumps(payouts),credit,3))
+    db.execute("update bankroll set bankroll_str=?",(cash,)); db.execute("insert into meta values('financial_last_prepared_seq','3')")
+    value.update(bankroll=[{"bankroll_str":cash}],cursor=3,fills=[{"market_id":"market","outcome_id":outcome,"side":"buy","quantity":q,"principal":"1","fee":"0.01","prepared_seq":2}],positions=[{"market_id":"market","outcome_id":outcome,"long":q,"short":"0"}],settlements=[{"market_id":"market","payouts":payouts,"credit":credit,"prepared_seq":3}])
+if scenario=="cash": db.execute("update bankroll set bankroll_str='9999'")
+if scenario=="holdings": db.execute("insert into positions values('extra',0,'1','0')")
+if scenario=="cursor": db.execute("insert into meta values('financial_last_prepared_seq','99')")
+if scenario=="remote-cash": value["bankroll"][0]["bankroll_str"]="9999"
+if scenario=="remote-holdings": value["positions"]=[{"market_id":"extra","outcome_id":0,"long":"1","short":"0"}]
+if scenario=="remote-cursor": value["cursor"]=99
+db.commit(); db.close(); json.dump(value,open(root/"test-state/remote-financial.json","w"))
+if scenario in ("fractional","settled","zero-credit"):
+    path=root/"prediction-markets/gen/g557/status.json"; status=json.loads(path.read_text()); status.update(fills_total=1,bankroll=cash); path.write_text(json.dumps(status))
+PY
+  touch "$root/prediction-markets/gen/g557/status.json"
+  case "$scenario" in
+    cash|holdings|cursor|remote-*) successor_expect_refusal "$root" 'financial conservation refused' ;;
+    *) run_driver "$root" >/dev/null || fail "conservation $scenario refused" ;;
+  esac
+done
+echo 'PASS: FE-SUCCESSOR-CONTRACTS lifecycle, identity, CLI, authority, Financial15, census, evidence, continuity and conservation'
+fi
+
+if [[ "${SUCCESSOR_ONLY:-0}" == 1 ]]; then
+  echo "PASS: financial-era successor shard $SUCCESSOR_SHARD"
+elif [[ "$SHARD_TOTAL" == 1 ]]; then
 echo "PASS: 73 scenario contracts, including the pre-stop and immediate post-stop financial-era preflight, WAL-only rollback and resumed-write preservation; ${#forward_boundaries[@]} network-free forward hooks and ${#rollback_boundaries[@]} mutation-observed rollback hooks converge; ${#wal_restore_boundaries[@]} WAL restore hooks converge; PostgreSQL execution remains shimmed"
 else
   echo "PASS: financial-era shard $SHARD"

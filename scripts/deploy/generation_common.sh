@@ -76,6 +76,185 @@ print(hashlib.sha256("\n".join(sys.argv[1:]).encode("ascii")).hexdigest())' \
     "$rehearsal" "$common" "$preflight"
 }
 
+# Successor evidence binds every executable and SQL owner reached by the real driver.
+successor_harness_bundle_digest() {
+  [[ $# -eq 1 ]] || die "successor_harness_bundle_digest requires the deploy directory"
+  local deploy_dir=$1 root path
+  root=$(realpath "$deploy_dir/../..")
+  local -a digests=()
+  for path in scripts/deploy/rehearsal_successor.sh scripts/paper_reset/activate_financial_era.sh \
+    scripts/deploy/generation_common.sh scripts/deploy/pe_service_census.sh \
+    scripts/paper_reset/archive_paper_state.sql scripts/paper_reset/restore_paper_state.sql \
+    scripts/supabase_paper_state_schema.sql scripts/supabase_multi_account_live_schema.sql \
+    scripts/supabase_schema.sql scripts/supabase_wallet_live_stats_mv.sql scripts/migrate_service_config_545.sql; do
+    digests+=("$(sha256_file "$root/$path")") || return
+  done
+  python3 -c 'import hashlib,sys
+print(hashlib.sha256("\n".join(sys.argv[1:]).encode("ascii")).hexdigest())' "${digests[@]}"
+}
+
+# Read-only Financial15 callable/ACL contract. RuntimeConfig owns the raw key/type inventory.
+verify_financial_service_contract() {
+  psql_service_db -v ON_ERROR_STOP=1 <<'SQL'
+set search_path = public, pg_catalog;
+do $$
+declare
+  signature text;
+  role_name text;
+  expected_functions constant text[] := array[
+    'commit_fill_v2(bigint,text,bigint,bigint,text,text,text,text,integer,text,numeric,numeric,numeric,numeric,bigint)',
+    'apply_resolution_v2(bigint,text,bigint,bigint,text,jsonb,bigint)',
+    'seed_financial_start(bigint,text)',
+    'service_watchlist_replace_v1(timestamp with time zone,jsonb)',
+    'account_set_effective_mode(text,text,text,text)'
+  ];
+begin
+  if (select rolbypassrls from pg_roles where rolname='anon') is distinct from false
+     or (select rolbypassrls from pg_roles where rolname='authenticated') is distinct from false
+     or (select rolbypassrls from pg_roles where rolname='service_role') is distinct from true then
+    raise exception 'Financial15 role attributes differ';
+  end if;
+  if exists (
+    select signature from unnest(expected_functions) signature
+    except select p.oid::regprocedure::text from pg_proc p
+      where p.pronamespace='public'::regnamespace and p.proname in
+        ('commit_fill','commit_fill_v2','apply_resolution','apply_resolution_v2',
+         'seed_financial_start','service_watchlist_replace_v1','account_set_effective_mode')
+  ) or exists (
+    select p.oid::regprocedure::text from pg_proc p
+      where p.pronamespace='public'::regnamespace and p.proname in
+        ('commit_fill','commit_fill_v2','apply_resolution','apply_resolution_v2',
+         'seed_financial_start','service_watchlist_replace_v1','account_set_effective_mode')
+    except select signature from unnest(expected_functions) signature
+  ) then raise exception 'Financial15 callable inventory differs'; end if;
+  foreach signature in array expected_functions loop
+    foreach role_name in array array['anon','authenticated','service_role'] loop
+      if has_function_privilege(role_name,signature,'EXECUTE') is distinct from (role_name='service_role') then
+        raise exception 'Financial15 EXECUTE grant differs for % on %',role_name,signature;
+      end if;
+    end loop;
+  end loop;
+  foreach signature in array array['accounts','account_credentials'] loop
+    if not has_table_privilege('service_role',signature,'SELECT')
+       or has_table_privilege('anon',signature,'SELECT')
+       or has_table_privilege('authenticated',signature,'SELECT') then
+      raise exception 'Financial15 account SELECT grant differs on %',signature;
+    end if;
+  end loop;
+  if (select count(*) from information_schema.columns where table_schema='public'
+       and table_name='paper_bankroll' and
+       ((column_name in ('start_seq','last_prepared_seq') and data_type='bigint')
+        or (column_name='start_hash' and data_type='text'))) <> 3 then
+    raise exception 'Financial15 bankroll Start columns differ';
+  end if;
+end $$;
+SQL
+}
+
+# Bootstrap is only for a private rehearsal copy. It cannot waive production PASS evidence.
+verify_successor_bootstrap() {
+  [[ "${PE_ACTIVATION_TESTING:-0}" == 1 ]] || die "successor bootstrap requires testing mode"
+  local environment=$1; shift
+  export SUPABASE_DB_URL PE_SUCCESSOR_BOOTSTRAP_CREDENTIALS
+  env_file_values "$environment" | python3 -c 'import ipaddress,os,sys,urllib.parse
+root,credential_file,*paths=sys.argv[1:]
+root=os.path.realpath(root)
+def isolated(path):
+    return os.path.commonpath((root,os.path.realpath(path))) == root and os.path.realpath(path) != root
+if root in ("/","/home/sean","/home/sean/prediction-markets") or not all(map(isolated,paths+[credential_file])):
+    raise SystemExit("bootstrap paths are not isolated")
+values=dict(part.decode().split("=",1) for part in sys.stdin.buffer.read().split(b"\0") if part)
+credentials=dict(line.rstrip("\n").split("=",1) for line in open(credential_file) if line.strip())
+for name in ("PE_SUPABASE_SECRET_KEY","PE_SUPABASE_ANON_KEY"):
+    if not credentials.get(name) or values.get(name) != credentials[name]:
+        raise SystemExit("bootstrap credentials are not the local credentials")
+for value,schemes in ((values.get("PE_SUPABASE_URL",""),("http",)),(os.environ["SUPABASE_DB_URL"],("postgres","postgresql"))):
+    parsed=urllib.parse.urlsplit(value)
+    if parsed.scheme not in schemes or not parsed.port or not ipaddress.ip_address(parsed.hostname).is_loopback:
+        raise SystemExit("bootstrap authority is not loopback")
+if os.environ["SUPABASE_DB_URL"] != credentials.get("SUPABASE_DB_URL"):
+    raise SystemExit("bootstrap SQL credentials are not local")
+' "$DEPLOY_HOME" "${PE_SUCCESSOR_BOOTSTRAP_CREDENTIALS:-}" "$environment" "$@"
+}
+
+# One SQLite read transaction, with decimal columns kept as strings.
+local_financial_observation() {
+  python3 -c 'import json,sqlite3,sys
+db=sqlite3.connect("file:"+sys.argv[1]+"?mode=ro",uri=True)
+db.row_factory=sqlite3.Row
+db.execute("BEGIN")
+def rows(sql): return [dict(row) for row in db.execute(sql)]
+def meta(key):
+    row=db.execute("select value from meta where key=?",(key,)).fetchone()
+    if row is None: return None
+    return row[0].decode() if isinstance(row[0],bytes) else str(row[0])
+print(json.dumps({"bankroll":rows("select bankroll_str from bankroll"),
+"start_seq":meta("financial_start_seq"),"start_hash":meta("financial_start_hash"),
+"cursor":meta("financial_last_prepared_seq"),
+"fills":rows("select market_id,outcome_id,side,quantity_str as quantity,principal_str as principal,fee_str as fee,prepared_seq from fills"),
+"positions":rows("select market_id,outcome_id,long_str as long,short_str as short from positions"),
+"settlements":rows("select market_id,outcome_prices as payouts,credit_applied as credit,prepared_seq from settled_markets")},separators=(",",":")))
+' "$1"
+}
+
+# Independent conservation oracle; cash is derived from the Start, never from the observed cash.
+verify_financial_observation() {
+  local receipt=$1 bankroll=$2
+  python3 -c 'import collections,decimal,json,sys
+decimal.getcontext().prec=80
+D=decimal.Decimal
+value=json.load(sys.stdin,parse_float=D)
+receipt=json.loads(sys.argv[1]); baseline=D(sys.argv[2]); quantum=D("0.000001")
+def exact(raw):
+    amount=D(str(raw))
+    if not amount.is_finite() or amount < 0 or amount % quantum: raise SystemExit("invalid exact financial amount")
+    return amount
+if int(value["start_seq"]) != receipt["sequence"] or value["start_hash"] != receipt["this_hash"]:
+    raise SystemExit("financial Start identity differs")
+positions=collections.defaultdict(lambda:D(0)); cash=baseline; frontier=[]; settled=set(); touched=set()
+events=[(row,"fill") for row in value["fills"]]+[(row,"settle") for row in value["settlements"]]
+events.sort(key=lambda item:int(item[0]["prepared_seq"]))
+for row,kind in events:
+    sequence=row["prepared_seq"]
+    if isinstance(sequence,bool) or sequence is None or int(sequence) <= receipt["sequence"] or int(sequence) in frontier:
+        raise SystemExit("financial row is outside the latest era or duplicates Prepared")
+    frontier.append(int(sequence)); market=row["market_id"]
+    if kind == "fill":
+        outcome=row["outcome_id"]
+        if outcome not in (0,1) or market in settled: raise SystemExit("invalid financial fill")
+        quantity=exact(row["quantity"])
+        if not quantity or row["side"] not in ("buy","sell"): raise SystemExit("invalid financial fill")
+        touched.add((market,outcome))
+        positions[(market,outcome)]+=quantity if row["side"]=="buy" else -quantity
+        cash-=exact(row["principal"])+exact(row["fee"])
+    else:
+        if market in settled: raise SystemExit("duplicate settlement")
+        settled.add(market)
+        payouts=row["payouts"]
+        if isinstance(payouts,str): payouts=json.loads(payouts)
+        if len(payouts)!=2 or [str(p) for p in payouts] not in (["1","0"],["0","1"],["0.5","0.5"]):
+            raise SystemExit("invalid settlement payouts")
+        credit=sum((max(positions[(market,index)],D(0))*D(str(payout))).quantize(quantum,rounding=decimal.ROUND_DOWN)
+                   for index,payout in enumerate(payouts))
+        if exact(row["credit"])!=credit: raise SystemExit("settlement credit differs")
+        cash+=credit
+physical={}
+for row in value["positions"]:
+    key=(row["market_id"],row["outcome_id"])
+    if key in physical or key[1] not in (0,1): raise SystemExit("duplicate or invalid position")
+    long,short=exact(row["long"]),exact(row["short"])
+    if long and short: raise SystemExit("position is not netted")
+    physical[key]=long-short
+# Settlement retains physical rows; a zero-credit settlement need not create a position row.
+expected={key:positions[key] for key in touched}
+if physical != expected: raise SystemExit("financial holdings differ")
+if len(value["bankroll"])!=1 or exact(value["bankroll"][0]["bankroll_str"])!=cash:
+    raise SystemExit("financial cash differs")
+cursor=None if value["cursor"] is None else int(value["cursor"])
+if cursor != (max(frontier) if frontier else None): raise SystemExit("financial cursor differs")
+' "$receipt" "$bankroll"
+}
+
 # Issue #586: both the rehearsal and financial-era driver interpret the live systemd stop policy
 # through this owner. Print `<KillSignal|absent> <TimeoutStopSec|absent>` even on malformed input;
 # success means both values parsed, while callers enforce SIGINT, positivity, and persisted equality.
