@@ -681,7 +681,9 @@ remote_paper_census() {
 # A nonzero result means restoration is still required; success proves a retry need not mutate.
 activation_archive_matches_live() {
   local activation_id=$1
+  # One read-only transaction: the transaction-local setting must reach the check below.
   financial_psql -v ON_ERROR_STOP=1 -v activation_id="$activation_id" <<'SQL'
+begin read only;
 select set_config('pe.activation_id', :'activation_id', true);
 do $$
 declare
@@ -713,6 +715,7 @@ begin
     end if;
   end loop;
 end $$;
+commit;
 SQL
 }
 
